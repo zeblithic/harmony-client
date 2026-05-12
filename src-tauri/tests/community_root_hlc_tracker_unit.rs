@@ -4,7 +4,7 @@
 //! ZEB-256: tracker key changed from `device_id: String` to
 //! `(OwnerAddr, String)`. Cross-addr collisions are now structurally
 //! impossible — Alice cannot squat Bob's HLC slot even with the
-//! MembershipKey, because tracker entries are namespaced by addr.
+//! EpochKey, because tracker entries are namespaced by addr.
 
 use harmony_app::community_state_sync::CommunityRootHlcTracker;
 use harmony_app::owner_state_types::{Hlc, OwnerAddr};

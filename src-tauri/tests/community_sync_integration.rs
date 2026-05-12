@@ -34,7 +34,7 @@ use harmony_app::community_state_sync::{
 };
 use harmony_app::content_store::{CasOp, ContentStore, RuntimeContentStore};
 use harmony_app::owner_state_crypto::canonical_cbor_encode;
-use harmony_app::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
+use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
 use harmony_identity::PrivateIdentity;
 use std::sync::Arc;
 use std::time::Duration;
@@ -146,7 +146,7 @@ async fn two_members_dag_sync_full_event_log() {
     ));
 
     let community_id = SpaceId([1u8; 16]);
-    let mk = MembershipKey::new([0x42; 32]);
+    let mk = EpochKey::new([0x42; 32]);
 
     let id_admin = PrivateIdentity::from_seed(&[0xa1; 32]);
     let admin = OwnerAddr(id_admin.identity.address_hash);
@@ -188,6 +188,7 @@ async fn two_members_dag_sync_full_event_log() {
         // ZEB-256 Task 6: A's registry signs publishes as admin.
         self_owner: admin,
         signing_key: Arc::clone(&admin_signing),
+        crdt_state: None,
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "b-dev".into(),
@@ -201,6 +202,7 @@ async fn two_members_dag_sync_full_event_log() {
         // values just need to satisfy the type bound.
         self_owner: b_owner,
         signing_key: Arc::clone(&b_signing),
+        crdt_state: None,
     });
 
     // B's publisher and A's subscriber are unused in this one-way
@@ -369,7 +371,7 @@ async fn forged_signature_event_is_rejected_on_receive() {
     use harmony_app::community_state_sync::CommunityRootSignedPayload;
 
     let community_id = SpaceId([2u8; 16]);
-    let mk = MembershipKey::new([0x55; 32]);
+    let mk = EpochKey::new([0x55; 32]);
 
     let id_admin = PrivateIdentity::from_seed(&[0xb1; 32]);
     let admin = OwnerAddr(id_admin.identity.address_hash);
@@ -398,6 +400,7 @@ async fn forged_signature_event_is_rejected_on_receive() {
         // engine matches what production would have.
         self_owner: admin,
         signing_key: Arc::clone(&admin_signing),
+        crdt_state: None,
     });
 
     // We need direct access to B's subscriber channel sender to
@@ -500,7 +503,7 @@ async fn forged_signature_event_is_rejected_on_receive() {
     };
     let signed_bytes = canonical_cbor_encode(&signed).expect("encode signed");
     let sig = admin_signing.sign(&signed_bytes).to_bytes();
-    let publish = signed.into_wire(sig);
+    let publish = signed.into_wire(sig, None);
     let publish_bytes = canonical_cbor_encode(&publish).expect("encode publish");
     let wire = encrypt_root_publish(&mk, &publish_bytes).expect("encrypt root");
 
@@ -590,7 +593,7 @@ async fn malformed_wire_packet_does_not_panic_engine() {
     ));
 
     let community_id = SpaceId([3u8; 16]);
-    let mk = MembershipKey::new([0x77; 32]);
+    let mk = EpochKey::new([0x77; 32]);
 
     let id_admin = PrivateIdentity::from_seed(&[0xc1; 32]);
     let admin = OwnerAddr(id_admin.identity.address_hash);
@@ -618,6 +621,7 @@ async fn malformed_wire_packet_does_not_panic_engine() {
         // ZEB-256 Task 6: A publishes as admin.
         self_owner: admin,
         signing_key: Arc::clone(&admin_signing),
+        crdt_state: None,
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "b-dev".into(),
@@ -631,6 +635,7 @@ async fn malformed_wire_packet_does_not_panic_engine() {
         // works here for the type-bound.
         self_owner: admin,
         signing_key: Arc::clone(&admin_signing),
+        crdt_state: None,
     });
 
     let (b_pub_tx, _b_pub_rx) = mpsc::channel(8);
@@ -789,7 +794,7 @@ async fn replay_of_same_root_publish_is_idempotent() {
     ));
 
     let community_id = SpaceId([4u8; 16]);
-    let mk = MembershipKey::new([0x88; 32]);
+    let mk = EpochKey::new([0x88; 32]);
 
     let id_admin = PrivateIdentity::from_seed(&[0xd1; 32]);
     let admin = OwnerAddr(id_admin.identity.address_hash);
@@ -817,6 +822,7 @@ async fn replay_of_same_root_publish_is_idempotent() {
         // ZEB-256 Task 6: A publishes as admin.
         self_owner: admin,
         signing_key: Arc::clone(&admin_signing),
+        crdt_state: None,
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "b-dev".into(),
@@ -830,6 +836,7 @@ async fn replay_of_same_root_publish_is_idempotent() {
         // the type bound.
         self_owner: admin,
         signing_key: Arc::clone(&admin_signing),
+        crdt_state: None,
     });
 
     let (b_pub_tx, _b_pub_rx) = mpsc::channel(8);
@@ -998,7 +1005,7 @@ async fn replay_of_same_root_publish_is_idempotent() {
 
 /// ZEB-256 § 11 acceptance: "Spoofing test demonstrates the censorship
 /// attack is no longer possible." Prior to publisher authentication,
-/// any member with the shared `MembershipKey` could publish a state-
+/// any member with the shared `EpochKey` could publish a state-
 /// root payload claiming `publisher_addr = alice_addr` at HLC `huge`,
 /// advancing every receiver's `(alice_addr, alice_dev)` tracker slot
 /// past `huge`. Alice's subsequent legitimate publishes — at
@@ -1015,7 +1022,7 @@ async fn replay_of_same_root_publish_is_idempotent() {
 ///   2. We craft a forged publish: `publisher_addr = alice_addr`,
 ///      `at = Hlc { wall_ms: huge, device_id: "a-dev" }`,
 ///      `publisher_sig = bob_sk.sign(...)`. This decrypts cleanly
-///      (Bob has the `MembershipKey`) AND passes the membership-at-
+///      (Bob has the `EpochKey`) AND passes the membership-at-
 ///      HLC gate (Alice IS Joined), but FAILS the publisher-sig
 ///      verify because `bob_sk` does not match `alice_pub`. B emits a
 ///      `publisher_sig_invalid` degraded report and DOES NOT advance
@@ -1046,7 +1053,7 @@ async fn spoofed_publish_does_not_block_real_publisher() {
     ));
 
     let community_id = SpaceId([5u8; 16]);
-    let mk = MembershipKey::new([0xAA; 32]);
+    let mk = EpochKey::new([0xAA; 32]);
 
     // Alice — the real, legitimate publisher. Engine A signs publishes
     // with `alice_signing`; both registries' resolvers map
@@ -1058,7 +1065,7 @@ async fn spoofed_publish_does_not_block_real_publisher() {
     let alice_signing = signing_key_from(&id_alice);
 
     // Bob — the attacker. Bob is also a community member (so Bob has
-    // the `MembershipKey`), but Bob's signing key is NOT Alice's. The
+    // the `EpochKey`), but Bob's signing key is NOT Alice's. The
     // forged publish below is signed with `bob_signing` while claiming
     // `publisher_addr = alice_addr`; verify-on-receive rejects it
     // because `bob_signing` does not match Alice's resolver-resolved
@@ -1116,6 +1123,7 @@ async fn spoofed_publish_does_not_block_real_publisher() {
         // publisher under attack.
         self_owner: alice_addr,
         signing_key: Arc::clone(&alice_signing),
+        crdt_state: None,
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "b-dev".into(),
@@ -1133,6 +1141,7 @@ async fn spoofed_publish_does_not_block_real_publisher() {
         // B's own publishes (if it ever ran one) would also validate.
         self_owner: bob_addr,
         signing_key: Arc::clone(&bob_signing),
+        crdt_state: None,
     });
 
     // B's publisher and A's subscriber are unused in this one-way sync
@@ -1262,7 +1271,7 @@ async fn spoofed_publish_does_not_block_real_publisher() {
     // Step 2 — Build the forged publish OUTSIDE any registry.
     //
     // The attacker's threat model: Bob is a paid-up community member
-    // with the `MembershipKey`. Bob crafts a wire packet claiming
+    // with the `EpochKey`. Bob crafts a wire packet claiming
     // `publisher_addr = alice_addr`, signs it with `bob_signing`, and
     // ships it to B's Zenoh subscriber. The packet AEAD-decrypts
     // cleanly (Bob has the MK), the publisher-membership gate passes
@@ -1312,7 +1321,7 @@ async fn spoofed_publish_does_not_block_real_publisher() {
     // line that distinguishes the forged packet from a legitimate
     // Alice publish; everything else is byte-perfect imitation.
     let forged_sig = bob_signing.sign(&forged_signed_bytes).to_bytes();
-    let forged_publish = forged_signed.into_wire(forged_sig);
+    let forged_publish = forged_signed.into_wire(forged_sig, None);
     let forged_publish_bytes =
         canonical_cbor_encode(&forged_publish).expect("encode forged publish");
     let forged_wire =
@@ -1527,7 +1536,7 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
     ));
 
     let community_id = SpaceId([0x77; 16]);
-    let mk = MembershipKey::new([0x55; 32]);
+    let mk = EpochKey::new([0x55; 32]);
 
     // Alice is the admin AND the publisher under test. She'll Join then
     // Leave — exercising the tracker's behavior across a Leave so we
@@ -1576,6 +1585,7 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
         delta_tx: None,
         self_owner: alice_addr,
         signing_key: Arc::clone(&alice_signing),
+        crdt_state: None,
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "b-dev".into(),
@@ -1587,6 +1597,7 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
         delta_tx: None,
         self_owner: b_owner,
         signing_key: Arc::clone(&b_signing),
+        crdt_state: None,
     });
 
     // B never publishes, A never receives — but spawn_engine requires
@@ -1930,6 +1941,7 @@ async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
         delta_tx: None,
         self_owner,
         signing_key: Arc::clone(&signing_key),
+        crdt_state: None,
     }));
 
     // ZEB-271: ChannelLogRegistry required by the new create_community_inner
@@ -2221,6 +2233,7 @@ mod task3_kick_setpower_round_trip {
             error_tx: None,
             delta_tx: Some(delta_a_tx),
             pending_redemptions: None,
+            crdt_state: None,
         });
         let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
             community_id,
@@ -2244,6 +2257,7 @@ mod task3_kick_setpower_round_trip {
             error_tx: None,
             delta_tx: Some(delta_b_tx),
             pending_redemptions: None,
+            crdt_state: None,
         });
 
         // Step 1: A inserts its bootstrap Join.
@@ -2274,7 +2288,12 @@ mod task3_kick_setpower_round_trip {
         // Step 2: B redeems an open invite for the same community.
         let invite_payload = harmony_app::community_invite::CommunityInvitePayload {
             community_id,
-            membership_key: minted_a.membership_key.clone(),
+            epoch_snapshot: harmony_app::community_invite::InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: minted_a.membership_key.as_bytes().to_vec(),
+                state_snapshot: harmony_app::community_invite::MaterializedCommunityState::default(
+                ),
+            },
             admin_addr: owner_a,
             community_name: "TestCommunity".into(),
             is_invite_only: false,
@@ -2477,7 +2496,10 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
     use harmony_app::community_channel_log_engine::{
         ChannelLogEngineConfig, ChannelLogRegistry, ChannelLogRegistryConfig,
     };
-    use harmony_app::community_invite::{encode_invite_url, CommunityInvitePayload, InviteToken};
+    use harmony_app::community_invite::{
+        encode_invite_url, CommunityInvitePayload, InviteEpochSnapshot, InviteToken,
+        MaterializedCommunityState,
+    };
     use harmony_app::community_state_sync::{
         CommunityRegistryConfig, CommunitySyncRegistry, IdentityResolver, DEFAULT_DEBOUNCE_MS,
     };
@@ -2485,7 +2507,7 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
     use harmony_app::dm_outbox::{DmOutbox, UnicastSendRequest};
     use harmony_app::owner_state_crdt::OwnerState;
     use harmony_app::owner_state_persist::canonicalize;
-    use harmony_app::owner_state_types::{DeviceIdentityHash, MembershipKey};
+    use harmony_app::owner_state_types::{DeviceIdentityHash, EpochKey};
     use std::collections::BTreeMap;
 
     // Short timeout so the test runs fast. RAII guard restores any
@@ -2539,7 +2561,7 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
     // `canonical_invite_token_bytes` (which only reads the payload
     // fields, ignoring `sig`), then re-construct with the real sig.
     let community_id = SpaceId([0x33; 16]);
-    let mk = MembershipKey::new([0xaa; 32]);
+    let mk = EpochKey::new([0xaa; 32]);
     let minted_at = Hlc {
         wall_ms: 1000,
         logical: 0,
@@ -2581,9 +2603,28 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         };
         sign_event_with_identity(&payload, &alice).expect("sign admin bootstrap")
     };
+    // CR Major (PR #106 R6): use a real sealed_epoch_key so the snapshot
+    // decrypts successfully and any Err must come from the intended
+    // "inviter unreachable" rollback branch, not from AEAD failure.
+    // Seal `mk` to Bob's x25519 pubkey (derived from Bob's ed25519 signing key).
+    let sealed_epoch_key = {
+        use harmony_app::dm_signing::{ed25519_pub_to_x25519, seal_to_owner};
+        let bob_pub32 = bob_signing_key.verifying_key().to_bytes();
+        let x25519_pub = ed25519_pub_to_x25519(&bob_pub32).expect("ed25519_pub_to_x25519");
+        seal_to_owner(&x25519_pub, mk.as_bytes()).expect("seal_to_owner")
+    };
+    assert_eq!(
+        sealed_epoch_key.len(),
+        92,
+        "sealed_epoch_key for invite-only must be 92 bytes"
+    );
     let url = encode_invite_url(&CommunityInvitePayload {
         community_id,
-        membership_key: mk.clone(),
+        epoch_snapshot: InviteEpochSnapshot {
+            epoch: 0,
+            sealed_epoch_key,
+            state_snapshot: MaterializedCommunityState::default(),
+        },
         admin_addr: alice_addr,
         community_name: "Test".into(),
         is_invite_only: true,
@@ -2636,6 +2677,7 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         delta_tx: None,
         self_owner: bob_addr,
         signing_key: Arc::clone(&bob_signing_key),
+        crdt_state: None,
     }));
 
     let crdt_state = Arc::new(Mutex::new(OwnerState::default()));

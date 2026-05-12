@@ -7,7 +7,7 @@ use harmony_app::community_state_sync::{
     CommunityRegistryConfig, CommunitySyncRegistry, IdentityResolver, DEFAULT_DEBOUNCE_MS,
 };
 use harmony_app::content_store::{ContentStore, RuntimeContentStore};
-use harmony_app::owner_state_types::{MembershipKey, OwnerAddr, SpaceId};
+use harmony_app::owner_state_types::{EpochKey, OwnerAddr, SpaceId};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -43,10 +43,11 @@ async fn registry_spawns_and_tears_down_per_community() {
         // satisfy the type bound.
         self_owner: OwnerAddr([0x01; 16]),
         signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
+        crdt_state: None,
     });
 
     let cid_a = SpaceId([1u8; 16]);
-    let mk_a = MembershipKey::new([0xa1; 32]);
+    let mk_a = EpochKey::new([0xa1; 32]);
     let admin_a = OwnerAddr([0xb1; 16]);
 
     let (a_pub_tx, _a_pub_rx) = mpsc::channel(8);
@@ -87,6 +88,7 @@ async fn registry_spawn_is_idempotent_and_known_ids_is_sorted() {
         // arbitrary, no publishes go through the wire.
         self_owner: OwnerAddr([0x01; 16]),
         signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
+        crdt_state: None,
     });
 
     // Spawn two distinct communities. Use unsorted ID order to verify
@@ -102,7 +104,7 @@ async fn registry_spawn_is_idempotent_and_known_ids_is_sorted() {
     registry
         .spawn_engine_inner_now(
             cid_b,
-            MembershipKey::new([0xb1; 32]),
+            EpochKey::new([0xb1; 32]),
             OwnerAddr([0xb1; 16]),
             false,
             b_pub_tx,
@@ -113,7 +115,7 @@ async fn registry_spawn_is_idempotent_and_known_ids_is_sorted() {
     registry
         .spawn_engine_inner_now(
             cid_a,
-            MembershipKey::new([0xa1; 32]),
+            EpochKey::new([0xa1; 32]),
             OwnerAddr([0xa1; 16]),
             false,
             a_pub_tx,
@@ -128,7 +130,7 @@ async fn registry_spawn_is_idempotent_and_known_ids_is_sorted() {
     registry
         .spawn_engine_inner_now(
             cid_a,
-            MembershipKey::new([0xa1; 32]),
+            EpochKey::new([0xa1; 32]),
             OwnerAddr([0xa1; 16]),
             false,
             a2_pub_tx,
@@ -172,6 +174,7 @@ async fn shutdown_engine_and_cleanup_persistence_idempotent_on_unknown_id() {
         delta_tx: None,
         self_owner: OwnerAddr([0x01; 16]),
         signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
+        crdt_state: None,
     });
 
     let unknown_id = SpaceId([0xff; 16]);
@@ -216,10 +219,11 @@ async fn shutdown_engine_and_cleanup_persistence_removes_dir_after_engine_stops(
         delta_tx: None,
         self_owner: OwnerAddr([0x01; 16]),
         signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
+        crdt_state: None,
     });
 
     let cid = SpaceId([1u8; 16]);
-    let mk = MembershipKey::new([0xaa; 32]);
+    let mk = EpochKey::new([0xaa; 32]);
     let admin = OwnerAddr([0xbb; 16]);
 
     let (pub_tx, mut pub_rx) = mpsc::channel(8);
@@ -313,10 +317,11 @@ async fn pending_redemption_oneshot_fires_when_event_id_inserts_via_local() {
         delta_tx: None,
         self_owner: admin_addr,
         signing_key: Arc::clone(&admin_sk),
+        crdt_state: None,
     }));
 
     let cid = SpaceId([0x10; 16]);
-    let mk = MembershipKey::new([0xaa; 32]);
+    let mk = EpochKey::new([0xaa; 32]);
     let (pub_tx, _pub_rx) = mpsc::channel(8);
     let (_sub_tx, sub_rx) = mpsc::channel(8);
     registry
@@ -409,10 +414,11 @@ async fn pending_redemption_unregistered_when_no_match() {
         delta_tx: None,
         self_owner: admin_addr,
         signing_key: Arc::clone(&admin_sk),
+        crdt_state: None,
     }));
 
     let cid = SpaceId([0x10; 16]);
-    let mk = MembershipKey::new([0xaa; 32]);
+    let mk = EpochKey::new([0xaa; 32]);
     let (pub_tx, _pub_rx) = mpsc::channel(8);
     let (_sub_tx, sub_rx) = mpsc::channel(8);
     registry

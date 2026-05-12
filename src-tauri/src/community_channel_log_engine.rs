@@ -25,7 +25,7 @@ use crate::community_channel_log::{
     CommunityStateAtHlc, MessageId, SignedChannelEvent,
 };
 use crate::community_membership::{ChannelId, MaterializedMembership};
-use crate::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
+use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
 
 // ── Error type ──────────────────────────────────────────────────────────────
 
@@ -1729,7 +1729,7 @@ impl<R: tauri::Runtime> ChannelLogRegistry<R> {
         self: &Arc<Self>,
         community_id: SpaceId,
         materialized: &MaterializedMembership,
-        membership_key: &MembershipKey,
+        membership_key: &EpochKey,
         state_at_hlc: Arc<dyn CommunityStateAtHlc + Send + Sync>,
         resolver: Arc<dyn ChannelIdentityResolver + Send + Sync>,
         hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
@@ -1803,7 +1803,7 @@ mod tests {
     use super::*;
     use crate::community_channel_log::derive_channel_key;
     use crate::community_membership::ChannelInfo;
-    use crate::owner_state_types::MembershipKey;
+    use crate::owner_state_types::EpochKey;
     use ed25519_dalek::SigningKey;
     use harmony_identity::PrivateIdentity;
     use std::collections::HashMap;
@@ -1902,7 +1902,7 @@ mod tests {
 
         let community_id = SpaceId([0xc1; 16]);
         let channel_id = ChannelId([0x77; 16]);
-        let membership_key = MembershipKey::new([0x55; 32]);
+        let membership_key = EpochKey::new([0x55; 32]);
 
         let channel_key = Arc::new(derive_channel_key(
             &membership_key,
@@ -2785,7 +2785,7 @@ mod tests {
         state: Arc<AlwaysJoinedState>,
         resolver: Arc<FixedIdentityResolver>,
         hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
-        membership_key: MembershipKey,
+        membership_key: EpochKey,
         self_owner: OwnerAddr,
         // Held to keep the temp dir alive for the duration of the test.
         _tmp: TempDir,
@@ -2899,7 +2899,7 @@ mod tests {
             state,
             resolver,
             hlc_tracker,
-            membership_key: MembershipKey::new([0x55; 32]),
+            membership_key: EpochKey::new([0x55; 32]),
             self_owner,
             _tmp: tmp,
             _adapter_drainer,

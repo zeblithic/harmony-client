@@ -143,6 +143,7 @@ mod tests {
             delta_tx: None,
             self_owner: OwnerAddr([0x01; 16]),
             signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
+            crdt_state: None,
         }))
     }
 

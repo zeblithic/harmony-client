@@ -54,7 +54,7 @@ use crate::owner_state_crypto::{
     canonical_cbor_decode, sealed::CanonicalPayloadSealed, CanonicalPayload,
 };
 use crate::owner_state_types::{
-    deserialize_bytes_from_bstr, serialize_bytes_as_bstr, Hlc, MembershipKey, OwnerAddr, SpaceId,
+    deserialize_bytes_from_bstr, serialize_bytes_as_bstr, EpochKey, Hlc, OwnerAddr, Space, SpaceId,
 };
 
 /// Errors specific to community-state encryption + decryption.
@@ -89,14 +89,14 @@ const COMMUNITY_BLOB_NONCE_PREFIX: &[u8] = b"harmony-community-blob-v1";
 const COMMUNITY_ROOT_PUBLISH_AAD: &[u8] = b"harmony-community-root-publish-v1";
 
 /// Encrypt a state-root publish payload with the community's
-/// `MembershipKey`. Random 12-byte nonce prepended to the ciphertext;
+/// `EpochKey`. Random 12-byte nonce prepended to the ciphertext;
 /// receiver splits and verifies via ChaCha20-Poly1305 AAD binding.
 ///
 /// Random nonce is correct here (every publish is a distinct wire
 /// packet — we WANT freshness; replay protection is the receiver's
 /// `RootHlcTracker`, not nonce reuse).
 pub fn encrypt_root_publish(
-    mk: &MembershipKey,
+    mk: &EpochKey,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CommunityCryptoError> {
     let cipher = ChaCha20Poly1305::new(mk.as_chacha_key());
@@ -124,10 +124,7 @@ pub fn encrypt_root_publish(
 /// `encrypt_root_publish`. Verifies the AAD binding; rejects packets
 /// shorter than `NONCE_LEN + TAG_LEN` bytes before slicing to avoid
 /// panics on truncated input.
-pub fn decrypt_root_publish(
-    mk: &MembershipKey,
-    wire: &[u8],
-) -> Result<Vec<u8>, CommunityCryptoError> {
+pub fn decrypt_root_publish(mk: &EpochKey, wire: &[u8]) -> Result<Vec<u8>, CommunityCryptoError> {
     if wire.len() < MIN_WIRE_LEN {
         return Err(CommunityCryptoError::Truncated);
     }
@@ -156,7 +153,7 @@ pub fn decrypt_root_publish(
 /// is a nonce-reuse-resistance hedge (an attacker without `mk` cannot
 /// derive the nonce, so a chosen-plaintext nonce-collision attack
 /// requires already having the key).
-pub fn encrypt_blob(mk: &MembershipKey, plaintext: &[u8]) -> Result<Vec<u8>, CommunityCryptoError> {
+pub fn encrypt_blob(mk: &EpochKey, plaintext: &[u8]) -> Result<Vec<u8>, CommunityCryptoError> {
     let mut h = Sha256::new();
     h.update(COMMUNITY_BLOB_NONCE_PREFIX);
     h.update(mk.as_bytes());
@@ -182,7 +179,7 @@ pub fn encrypt_blob(mk: &MembershipKey, plaintext: &[u8]) -> Result<Vec<u8>, Com
 /// the head is treated as opaque; correctness rests on the Poly1305
 /// tag, not on re-deriving the nonce. Rejects wires shorter than
 /// `NONCE_LEN + TAG_LEN` bytes before slicing.
-pub fn decrypt_blob(mk: &MembershipKey, wire: &[u8]) -> Result<Vec<u8>, CommunityCryptoError> {
+pub fn decrypt_blob(mk: &EpochKey, wire: &[u8]) -> Result<Vec<u8>, CommunityCryptoError> {
     if wire.len() < MIN_WIRE_LEN {
         return Err(CommunityCryptoError::Truncated);
     }
@@ -202,9 +199,16 @@ pub fn decrypt_blob(mk: &MembershipKey, wire: &[u8]) -> Result<Vec<u8>, Communit
 /// convergence), and the per-(addr, device) replay tracker before
 /// merging events.
 ///
-/// Wire format: 4-key CBOR map. All field codes are 2 chars
-/// (`rc`/`pa`/`at`/`ps`) to satisfy the same-length-keys invariant
-/// at this nesting level.
+/// Wire format: 4-key CBOR map (or 5-key if `epoch` is Some). All
+/// field codes are 2 chars (`rc`/`pa`/`at`/`ps`/`ep`) to satisfy the
+/// same-length-keys invariant at this nesting level.
+///
+/// ZEB-249 §10.6 (Phase A): added optional `epoch` field so receivers
+/// can select the correct historical epoch key for decryption when the
+/// sender's epoch differs from the receiver's current epoch. Legacy
+/// messages without this field fall back to the current-then-old-key
+/// trial decryption. `skip_serializing_if = "Option::is_none"` keeps
+/// the wire bytes identical to v1 for publishers that haven't upgraded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommunityRootPublishPayload {
     /// Content-ID of the encrypted CommunityState blob in the shared
@@ -232,6 +236,13 @@ pub struct CommunityRootPublishPayload {
         deserialize_with = "deserialize_bytes_from_bstr"
     )]
     pub publisher_sig: [u8; 64],
+
+    /// ZEB-249 §10.6: epoch counter at publish time. Receivers use this
+    /// to select `old_epoch_keys[epoch]` when their `current_epoch`
+    /// differs. `None` for legacy publishes (pre-§10.6); receivers fall
+    /// back to trying current key then old keys in reverse order.
+    #[serde(rename = "ep", skip_serializing_if = "Option::is_none", default)]
+    pub epoch: Option<u64>,
 }
 
 impl CanonicalPayloadSealed for CommunityRootPublishPayload {}
@@ -260,13 +271,19 @@ impl CanonicalPayload for CommunityRootSignedPayload {}
 
 impl CommunityRootSignedPayload {
     /// Convert a signed sub-payload into its full wire envelope by
-    /// attaching the Ed25519 signature.
-    pub fn into_wire(self, publisher_sig: [u8; 64]) -> CommunityRootPublishPayload {
+    /// attaching the Ed25519 signature and the publisher's current epoch
+    /// (ZEB-249 §10.6: receivers use this to select the right epoch key).
+    pub fn into_wire(
+        self,
+        publisher_sig: [u8; 64],
+        epoch: Option<u64>,
+    ) -> CommunityRootPublishPayload {
         CommunityRootPublishPayload {
             root_cid: self.root_cid,
             publisher_addr: self.publisher_addr,
             at: self.at,
             publisher_sig,
+            epoch,
         }
     }
 }
@@ -282,6 +299,143 @@ impl From<&CommunityRootPublishPayload> for CommunityRootSignedPayload {
             at: w.at.clone(),
         }
     }
+}
+
+/// Per-event encrypted envelope. Replaces the bare ChaCha20-Poly1305
+/// output of v1's membership-topic encryption with an epoch-tagged
+/// container that lets receivers select the right historical key.
+///
+/// Wire format: 3-key or 4-key CBOR map. All keys are 2 chars to
+/// satisfy the same-length-keys invariant at this nesting level.
+///
+/// `ratchet_generation` is reserved for a future forward-secrecy
+/// extension (ZEB-249 spec §9.2). v2 readers MUST tolerate `rg`
+/// present-but-null; v2 writers MUST always set `rg = None`.
+///
+/// See ZEB-249 spec §3.4 + §7.2.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncryptedEnvelope {
+    #[serde(rename = "ep")]
+    pub epoch: u64,
+
+    #[serde(
+        rename = "nc",
+        serialize_with = "crate::owner_state_types::serialize_bytes_as_bstr",
+        deserialize_with = "crate::owner_state_types::deserialize_bytes_from_bstr"
+    )]
+    pub nonce: [u8; 12],
+
+    #[serde(
+        rename = "ct",
+        serialize_with = "crate::owner_state_types::serialize_vec_as_bstr",
+        deserialize_with = "crate::owner_state_types::deserialize_vec_from_bstr"
+    )]
+    pub ciphertext: Vec<u8>,
+
+    /// Reserved for ZEB-249 spec §9.2 forward-secrecy extension.
+    /// Always `None` in v2 writers; `None` and `Some(_)` both decode in
+    /// v2 readers (forward-compat).
+    #[serde(rename = "rg", default, skip_serializing_if = "Option::is_none")]
+    pub ratchet_generation: Option<u64>,
+}
+
+impl crate::owner_state_crypto::sealed::CanonicalPayloadSealed for EncryptedEnvelope {}
+impl crate::owner_state_crypto::CanonicalPayload for EncryptedEnvelope {}
+
+/// Failure modes for epoch-aware encryption/decryption.
+/// See ZEB-249 spec §6.2.
+#[derive(Debug, thiserror::Error)]
+pub enum EpochError {
+    #[error("key for epoch {0} not available locally")]
+    KeyNotAvailable(u64),
+
+    #[error("AEAD encryption failed at epoch {0}")]
+    EncryptionFailed(u64),
+
+    #[error("AEAD tag mismatch on event at epoch {0}")]
+    DecryptionFailed(u64),
+
+    #[error("rotation references stale prior_epoch {provided}, current is {current}")]
+    StaleRotation { provided: u64, current: u64 },
+
+    #[error("malformed rotation: target {target:?} included in recipient_ciphertexts")]
+    MalformedRotation {
+        target: crate::owner_state_types::OwnerAddr,
+    },
+
+    #[error("rotation issuer {issuer:?} lacks authority (not admin and not target)")]
+    InvalidIssuer {
+        issuer: crate::owner_state_types::OwnerAddr,
+    },
+
+    /// C6: `encrypt_for_topic` was called on a Space that is missing
+    /// `current_epoch` or `current_epoch_key`. This can happen with
+    /// partially-migrated Spaces deserialized before ZEB-249 epoch fields
+    /// were populated. Replaces the previous `expect(...)` panic.
+    #[error("community Space is missing current_epoch or current_epoch_key")]
+    MissingEpochState,
+}
+
+/// Encrypt `plaintext` under the community's current epoch key,
+/// wrapping the AEAD output in an `EncryptedEnvelope` that tags the
+/// epoch for receiver-side key selection.
+///
+/// `space` MUST be a Community Space with `current_epoch` and
+/// `current_epoch_key` both `Some`. Returns
+/// `EpochError::MissingEpochState` if either field is absent — a
+/// partially-migrated Space (e.g., deserialized before ZEB-249 fields
+/// were added) can reach this helper and must not panic.
+pub fn encrypt_for_topic(space: &Space, plaintext: &[u8]) -> Result<EncryptedEnvelope, EpochError> {
+    // C6: return Err instead of panicking on missing epoch state.
+    let epoch = space.current_epoch.ok_or(EpochError::MissingEpochState)?;
+    let key = space
+        .current_epoch_key
+        .as_ref()
+        .ok_or(EpochError::MissingEpochState)?;
+    let cipher = ChaCha20Poly1305::new(key.as_chacha_key());
+
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
+        .map_err(|_| EpochError::EncryptionFailed(epoch))?;
+
+    Ok(EncryptedEnvelope {
+        epoch,
+        nonce: nonce_bytes,
+        ciphertext,
+        ratchet_generation: None,
+    })
+}
+
+/// Decrypt an `EncryptedEnvelope` using the appropriate epoch key
+/// from the community Space's current or old epoch keys.
+///
+/// Returns `EpochError::KeyNotAvailable(epoch)` if neither
+/// `current_epoch_key` (when epoch matches `current_epoch`) nor
+/// `old_epoch_keys[epoch]` contains the needed key.
+pub fn decrypt_for_topic(
+    space: &Space,
+    envelope: &EncryptedEnvelope,
+) -> Result<Vec<u8>, EpochError> {
+    let current_epoch = space
+        .current_epoch
+        .ok_or(EpochError::KeyNotAvailable(envelope.epoch))?;
+    let key = if envelope.epoch == current_epoch {
+        space.current_epoch_key.as_ref()
+    } else {
+        space.old_epoch_keys.get(&envelope.epoch)
+    }
+    .ok_or(EpochError::KeyNotAvailable(envelope.epoch))?;
+
+    let cipher = ChaCha20Poly1305::new(key.as_chacha_key());
+    cipher
+        .decrypt(
+            Nonce::from_slice(&envelope.nonce),
+            envelope.ciphertext.as_slice(),
+        )
+        .map_err(|_| EpochError::DecryptionFailed(envelope.epoch))
 }
 
 /// Default debounce window between a `notify_dirty` and the resulting
@@ -411,12 +565,39 @@ pub enum CommunitySyncError {
     /// Ed25519 signature over `canonical_cbor(CommunityRootSignedPayload)`
     /// did not validate against the resolved identity_pub. This is
     /// the load-bearing defense against the spoofing attack: a
-    /// malicious member with the `MembershipKey` cannot forge a
+    /// malicious member with the `EpochKey` cannot forge a
     /// publish claiming another member's `publisher_addr` because
     /// they don't have that member's signing key. Tracker NOT
     /// advanced.
     #[error("publisher signature invalid for addr {addr:?}")]
     PublisherSigInvalid { addr: OwnerAddr },
+
+    /// `publish_root_now` detected an epoch change between the pre-snapshot
+    /// key read and the post-snapshot key read on every retry attempt.
+    /// This should be unreachable in a correct cluster (rotations are rare
+    /// and bounded by the number of members); if it fires it indicates
+    /// continuous rapid epoch rotation, which is a bug or an adversarial
+    /// condition. ZEB-249 PR #106 R5 (CodeRabbit Critical).
+    #[error(
+        "publish_root_now: epoch changed on every retry attempt (5); \
+         publish aborted to prevent encrypting post-rotation snapshot \
+         under pre-rotation key"
+    )]
+    PublishRetryExhausted,
+
+    /// CR Critical (PR #106 R7): `live_epoch_key` was called with
+    /// `crdt_state = Some(...)` (owner-state IS wired) but the Space entry
+    /// or its epoch fields are absent / incomplete.  Silently falling back to
+    /// the spawn-time key would reopen the §10.6 backward-secrecy gap, so
+    /// this is surfaced as an error instead.
+    ///
+    /// `crdt_state = None` (test/legacy mode) still takes the explicit
+    /// fallback path and never produces this error.
+    #[error(
+        "live_epoch_key: crdt_state is wired but Space/epoch is incomplete for community {0:?}; \
+         refusing to fall back to spawn-time key (would reopen §10.6 backward-secrecy gap)"
+    )]
+    LiveEpochKeyMissing(SpaceId),
 }
 
 /// Failure modes specific to `CommunitySyncEngine::insert_local_event`.
@@ -441,12 +622,20 @@ pub enum LocalInsertError {
         "event community_id {got:?} doesn't match engine's configured community_id {expected:?}"
     )]
     WrongCommunity { expected: SpaceId, got: SpaceId },
+    /// C5: `insert_local_event_pair` pre-validation rejected the first event
+    /// before any state mutation. Neither event was inserted.
+    #[error("pair rejected at first event pre-validation: {0}")]
+    FirstPreValidationFailed(String),
+    /// C5: `insert_local_event_pair` pre-validation rejected the second event
+    /// (first passed). Neither event was inserted — atomicity preserved.
+    #[error("pair rejected at second event pre-validation: {0}")]
+    SecondPreValidationFailed(String),
 }
 
 /// Per-publisher-device latest-accepted HLC, namespaced by publisher
 /// `OwnerAddr`. ZEB-256: re-keyed from `BTreeMap<String, Hlc>` so a
 /// member cannot squat another member's HLC slot via shared
-/// `MembershipKey`. Each publisher's address gets its own per-device
+/// `EpochKey`. Each publisher's address gets its own per-device
 /// namespace, so a malicious Alice cannot squat Bob's HLC slot even if
 /// she emits a publish carrying `at.device_id == bob_dev`.
 ///
@@ -579,7 +768,7 @@ pub struct CommunityMembershipDelta {
 /// owner-state engine has 9 positional args and is already at the limit.
 pub struct CommunitySyncEngineConfig {
     pub community_id: SpaceId,
-    pub membership_key: MembershipKey,
+    pub membership_key: EpochKey,
     pub admin_addr: OwnerAddr,
     /// Whether this community requires invite-only counter-sigs on
     /// non-admin Joins. Plumbed into `VerifyContext` at receive time
@@ -628,6 +817,23 @@ pub struct CommunitySyncEngineConfig {
     /// without a back-reference to the registry. `None` for tests /
     /// pre-Phase-4 callers that don't exercise the redeem path.
     pub pending_redemptions: Option<PendingRedemptionMap>,
+
+    /// ZEB-249 §10.6 (Phase A): live reference to the owner-state CRDT.
+    /// When `Some`, `publish_root_now` reads the current epoch key from
+    /// `spaces[community_id].current_epoch_key` rather than the
+    /// spawn-time captured `membership_key`. `handle_incoming_publish`
+    /// similarly uses the live key (with fallback to `old_epoch_keys`
+    /// keyed on `payload.epoch`). `None` for tests and for call sites
+    /// that haven't threaded crdt_state through yet; those fall back to
+    /// the captured `membership_key`.
+    ///
+    /// Lock-order note: the engine NEVER holds both the community-state
+    /// mutex and the owner-state mutex at the same time. In
+    /// `publish_root_now`, the owner-state lock is released before the
+    /// community-state snapshot is taken. In `handle_incoming_publish`,
+    /// the owner-state lock is released before the community-state merge
+    /// lock is acquired.
+    pub crdt_state: Option<Arc<Mutex<crate::owner_state_crdt::OwnerState>>>,
 }
 
 /// Per-community state-CRDT sync engine. Owns a tokio task that
@@ -667,9 +873,9 @@ pub struct CommunitySyncEngine {
     /// keys via `derive_channel_key(membership_key, cid, chid)`) can
     /// reach it through `engine_arc(cid).membership_key()` without
     /// re-plumbing the value through `NodeState` or the registry.
-    /// `MembershipKey` derives `Clone` (just a 32-byte wrapper) so the
+    /// `EpochKey` derives `Clone` (just a 32-byte wrapper) so the
     /// accessor returns by value.
-    membership_key: MembershipKey,
+    membership_key: EpochKey,
     /// Community identity this engine was configured with. Bound at
     /// construction so `insert_local_event` can:
     ///   1. Reject mis-routed events (caller passed an event whose
@@ -741,6 +947,11 @@ impl CommunitySyncEngine {
         // `engine_arc(cid).membership_key()`. Cheap clone (32-byte
         // wrapper); the spawned task gets its own clone via cfg.
         let membership_key_for_engine = cfg.membership_key.clone();
+        // ZEB-249 §10.6: pass crdt_state to the spawned task (InternalCtx)
+        // so publish_root_now / handle_incoming_publish can read the live
+        // epoch key. The engine struct itself doesn't need the reference —
+        // only the task does.
+        let crdt_state_for_task = cfg.crdt_state;
 
         let task = tokio::spawn(internal_task(InternalCtx {
             community_id: cfg.community_id,
@@ -765,6 +976,7 @@ impl CommunitySyncEngine {
             error_tx: cfg.error_tx,
             delta_tx: cfg.delta_tx,
             pending_redemptions: cfg.pending_redemptions,
+            crdt_state: crdt_state_for_task,
         }));
 
         Self {
@@ -817,14 +1029,14 @@ impl CommunitySyncEngine {
         self.admin_addr
     }
 
-    /// Returns this engine's per-community symmetric `MembershipKey`.
+    /// Returns this engine's per-community symmetric `EpochKey`.
     /// ZEB-270 Phase 3 Task 4.5: the channel-log registry's `spawn`
     /// derives a per-channel symmetric key via
     /// `derive_channel_key(membership_key, community_id, channel_id)`.
     /// The membership key is bound at `spawn_engine` time and never
     /// changes for the engine's lifetime, so handing out a clone is
     /// safe.
-    pub(crate) fn membership_key(&self) -> MembershipKey {
+    pub(crate) fn membership_key(&self) -> EpochKey {
         self.membership_key.clone()
     }
 
@@ -1010,6 +1222,188 @@ impl CommunitySyncEngine {
         Ok(outcome)
     }
 
+    /// Atomic pair insert: inserts `first` then `second` under a single
+    /// `state` lock hold, then emits both deltas and fires `notify_dirty`
+    /// once.
+    ///
+    /// ZEB-249 Task 6 §4.1 atomicity: the kick+rotation pair (and the
+    /// leave+rotation pair) must land together. Sequential
+    /// `insert_local_event` calls have a crash window between the two
+    /// writes — if a crash occurs after the Kick but before the Rotation
+    /// is inserted, the CRDT has a Kick with no matching Rotation and
+    /// `pending_rotation_for` remains set until the self-healing observer
+    /// runs. This method collapses that window to zero at the cost of a
+    /// slightly longer lock hold (both `CommunityState::insert_event`
+    /// calls run under the same mutex guard, then the lock is released
+    /// before the async delta-emit + oneshot-notify calls).
+    ///
+    /// Returns `(first_outcome, second_outcome)`.
+    ///
+    /// - If `first` returns `Rejected`, `second` is NOT inserted (the pair is
+    ///   rejected together — caller should treat this as an atomic failure).
+    /// - If `first` returns `Inserted` OR `AlreadyKnown`, `second` IS inserted
+    ///   (idempotent retry: a re-issued kick or rotation finds the original
+    ///   event in CRDT and proceeds with the paired event regardless).
+    ///
+    /// When `first` is `AlreadyKnown`, the sentinel `AlreadyKnown` is
+    /// NOT returned for `second` — the second insert still runs so that
+    /// partially-applied pairs from a previous crash are completed.
+    pub async fn insert_local_event_pair(
+        &self,
+        first: crate::community_membership::SignedMembershipEvent,
+        second: crate::community_membership::SignedMembershipEvent,
+    ) -> Result<
+        (
+            crate::community_state_crdt::InsertOutcome,
+            crate::community_state_crdt::InsertOutcome,
+        ),
+        LocalInsertError,
+    > {
+        use crate::community_state_crdt::InsertOutcome;
+
+        // Route check for both events.
+        if first.community_id != self.community_id {
+            return Err(LocalInsertError::WrongCommunity {
+                expected: self.community_id,
+                got: first.community_id,
+            });
+        }
+        if second.community_id != self.community_id {
+            return Err(LocalInsertError::WrongCommunity {
+                expected: self.community_id,
+                got: second.community_id,
+            });
+        }
+
+        let resolver = self
+            .identity_resolver
+            .as_ref()
+            .ok_or(LocalInsertError::MissingIdentityResolver)?;
+
+        // Resolve actor pubs for both events. Both resolves happen
+        // BEFORE the lock — the lock hold is kept as short as possible.
+        let first_actor_pub = resolver
+            .resolve(&first.actor)
+            .await
+            .ok_or(LocalInsertError::UnknownActor(first.actor))?;
+        let first_countersigner_pub = if let Some(cs) = first.countersig.as_ref() {
+            resolver.resolve(&cs.signer).await
+        } else {
+            None
+        };
+
+        let second_actor_pub = resolver
+            .resolve(&second.actor)
+            .await
+            .ok_or(LocalInsertError::UnknownActor(second.actor))?;
+        let second_countersigner_pub = if let Some(cs) = second.countersig.as_ref() {
+            resolver.resolve(&cs.signer).await
+        } else {
+            None
+        };
+
+        let first_ctx = crate::community_membership::VerifyContext {
+            expected_community_id: self.community_id,
+            admin_addr: self.admin_addr,
+            is_invite_only: self.is_invite_only,
+            actor_identity_pub: &first_actor_pub,
+            countersigner_identity_pub: first_countersigner_pub.as_ref(),
+        };
+        let second_ctx = crate::community_membership::VerifyContext {
+            expected_community_id: self.community_id,
+            admin_addr: self.admin_addr,
+            is_invite_only: self.is_invite_only,
+            actor_identity_pub: &second_actor_pub,
+            countersigner_identity_pub: second_countersigner_pub.as_ref(),
+        };
+
+        // C5: pre-validate BOTH events before any state mutation.
+        // Acquires the lock once to run both verifications, then re-acquires
+        // (under the same held guard) to insert. This collapses into a single
+        // lock hold — the Mutex is held across verify + insert for both.
+        let (first_outcome, second_outcome) = {
+            let mut state_g = self.state.lock().await;
+
+            // Pre-validate first: compute prior state from current log.
+            let first_log: Vec<crate::community_membership::SignedMembershipEvent> =
+                state_g.events.values().cloned().collect();
+            let first_prior = crate::community_membership::prior_state_at_event(
+                &first_log,
+                &first,
+                self.admin_addr,
+            );
+            if let Err(e) =
+                crate::community_membership::verify_event(&first, &first_prior, &first_ctx)
+            {
+                // Pre-validation failed — no mutation occurred. Return early.
+                // We return Err so the caller knows NEITHER event landed
+                // (atomicity preserved: first was not inserted).
+                return Err(LocalInsertError::FirstPreValidationFailed(e.to_string()));
+            }
+
+            // Pre-validate second: simulate first already landed by building
+            // a temporary log that includes first.
+            let mut second_log = first_log;
+            second_log.push(first.clone());
+            let second_prior = crate::community_membership::prior_state_at_event(
+                &second_log,
+                &second,
+                self.admin_addr,
+            );
+            if let Err(e) =
+                crate::community_membership::verify_event(&second, &second_prior, &second_ctx)
+            {
+                // Second pre-validation failed — first was NOT inserted.
+                // Atomicity: caller gets a clear error; CRDT is unchanged.
+                return Err(LocalInsertError::SecondPreValidationFailed(e.to_string()));
+            }
+
+            // Both pass: now insert both under the same lock hold.
+            let o1 = state_g.insert_event(first.clone(), &first_ctx);
+            // Only insert second if first landed (AlreadyKnown = idempotent retry OK).
+            let o2 = if matches!(o1, InsertOutcome::Inserted | InsertOutcome::AlreadyKnown) {
+                state_g.insert_event(second.clone(), &second_ctx)
+            } else {
+                InsertOutcome::AlreadyKnown // sentinel: pair rejected at first (should not happen after pre-validation)
+            };
+            (o1, o2)
+        };
+
+        // Post-lock: emit deltas + oneshot notifications.
+        if matches!(first_outcome, InsertOutcome::Inserted) {
+            if let Some(pending) = self.pending_redemptions.as_ref() {
+                notify_pending_redemption_in_map(pending, &first.id).await;
+            }
+            if let Some(tx) = self.delta_tx.as_ref() {
+                let _ = tx.try_send(CommunityMembershipDelta {
+                    community_id: first.community_id,
+                    event: first,
+                });
+            }
+        }
+        if matches!(second_outcome, InsertOutcome::Inserted) {
+            if let Some(pending) = self.pending_redemptions.as_ref() {
+                notify_pending_redemption_in_map(pending, &second.id).await;
+            }
+            if let Some(tx) = self.delta_tx.as_ref() {
+                let _ = tx.try_send(CommunityMembershipDelta {
+                    community_id: second.community_id,
+                    event: second,
+                });
+            }
+        }
+        // A single dirty notification suffices for both inserts.
+        // Only fire on actual fresh insertions — AlreadyKnown idempotent
+        // retries must NOT republish or bump state.
+        if matches!(first_outcome, InsertOutcome::Inserted)
+            || matches!(second_outcome, InsertOutcome::Inserted)
+        {
+            self.notify_dirty();
+        }
+
+        Ok((first_outcome, second_outcome))
+    }
+
     /// Hint that local CRDT state has mutated and a debounced publish
     /// should fire after `debounce_ms`. Non-blocking.
     pub fn notify_dirty(&self) {
@@ -1060,7 +1454,7 @@ impl CommunitySyncEngine {
 /// `internal_task` `select!` loop or its helpers.
 struct InternalCtx {
     community_id: SpaceId,
-    membership_key: MembershipKey,
+    membership_key: EpochKey,
     admin_addr: OwnerAddr,
     is_invite_only: bool,
     device_id: String,
@@ -1085,6 +1479,11 @@ struct InternalCtx {
     /// against an Inserted event's id. `None` skips the notify path —
     /// safe for non-redeem callers.
     pending_redemptions: Option<PendingRedemptionMap>,
+
+    /// ZEB-249 §10.6 (Phase A): live owner-state CRDT for current epoch
+    /// key lookup. `None` for tests that use the spawn-time fallback.
+    /// See `CommunitySyncEngineConfig.crdt_state` for the lock-order contract.
+    crdt_state: Option<Arc<Mutex<crate::owner_state_crdt::OwnerState>>>,
 }
 
 /// Internal task: `select!` loop multiplexing dirty signals, the
@@ -1291,6 +1690,51 @@ async fn internal_task(mut ctx: InternalCtx) {
     }
 }
 
+/// ZEB-249 §10.6 (Phase A): read the live epoch key and epoch counter
+/// for `community_id` from the owner-state CRDT (`crdt_state`), falling
+/// back to the engine's spawn-time `membership_key` when `crdt_state`
+/// is `None` or the Space is absent/incomplete.
+///
+/// Returns `(epoch_key, epoch_counter)`. `epoch_counter` is `None`
+/// when the fallback fires (spawn-time key carries no epoch metadata).
+/// Return the live epoch key and epoch number for `community_id`.
+///
+/// CR Critical (PR #106 R7): the `crdt_state = None` (test/legacy) and
+/// `crdt_state = Some` paths are now explicitly separated:
+///
+/// - `None` → explicit fallback to the spawn-time `fallback` key.
+/// - `Some` → the owner-state IS wired; if the Space/epoch fields are
+///   missing or incomplete we surface `LiveEpochKeyMissing` rather than
+///   silently using the spawn-time key, which would reopen the §10.6
+///   backward-secrecy gap.
+async fn live_epoch_key(
+    community_id: SpaceId,
+    crdt_state: Option<&Arc<Mutex<crate::owner_state_crdt::OwnerState>>>,
+    fallback: &EpochKey,
+) -> Result<(EpochKey, Option<u64>), CommunitySyncError> {
+    match crdt_state {
+        None => {
+            // Test / legacy mode: explicit fallback to spawn-time key.
+            Ok((fallback.clone(), None))
+        }
+        Some(cs) => {
+            let guard = cs.lock().await;
+            match guard.spaces.get(&community_id) {
+                Some(space) => match (&space.current_epoch_key, space.current_epoch) {
+                    (Some(k), Some(e)) => Ok((k.clone(), Some(e))),
+                    _ => {
+                        // crdt_state IS wired but Space/epoch is incomplete.
+                        // Surface as error rather than silently substituting
+                        // the spawn-time key (which would reopen §10.6 gap).
+                        Err(CommunitySyncError::LiveEpochKeyMissing(community_id))
+                    }
+                },
+                None => Err(CommunitySyncError::LiveEpochKeyMissing(community_id)),
+            }
+        }
+    }
+}
+
 /// Snapshot the local CRDT, encrypt it, write to CAS, build a
 /// `CommunityRootPublishPayload`, AEAD-wrap it for the wire, and ship
 /// it on `publisher_tx`.
@@ -1319,11 +1763,69 @@ async fn publish_root_now(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
     use crate::owner_state_crypto::canonical_cbor_encode;
     use ed25519_dalek::Signer;
 
-    // Snapshot CRDT state under brief lock; drop guard before the
-    // expensive encode + AEAD + CAS hops below.
-    let snapshot = {
-        let state = ctx.state.lock().await;
-        state.clone()
+    // ZEB-249 §10.6 Phase A + PR #106 R5 (CodeRabbit Critical):
+    // Recheck-and-retry pattern to close the TOCTOU race where an
+    // EpochRotation lands between the live_epoch_key read and the
+    // community-state snapshot. If that happens, the post-rotation
+    // snapshot would be encrypted under the pre-rotation key — a
+    // backward-secrecy gap. We detect the race by re-reading the
+    // live epoch key after snapshotting and retrying if the epoch changed.
+    //
+    // Lock-order invariant preserved: owner-state lock is acquired
+    // then released (inside live_epoch_key) BEFORE community-state
+    // lock is acquired (inside snapshot clone). We never hold both.
+    //
+    // Rotation events are rare (one per Kick/Leave), so the tight loop
+    // is benign in practice. Bounded at 5 iterations to prevent an
+    // infinite loop in the pathological case where another actor is
+    // continuously rotating (should be impossible in a correct cluster,
+    // but we defend against it anyway).
+    let (current_key, current_epoch, snapshot) = {
+        let mut retries: u8 = 5;
+        loop {
+            // CR Critical (PR #106 R7): live_epoch_key now returns Result.
+            // If crdt_state is Some but Space/epoch is incomplete, abort
+            // immediately rather than looping with a stale key.
+            let (_key_before, epoch_before) = live_epoch_key(
+                ctx.community_id,
+                ctx.crdt_state.as_ref(),
+                &ctx.membership_key,
+            )
+            .await?;
+
+            // Snapshot CRDT state under brief lock; drop guard before
+            // the epoch recheck and the expensive encode + AEAD + CAS
+            // hops below.
+            let snap = {
+                let state = ctx.state.lock().await;
+                state.clone()
+            };
+
+            let (key_after, epoch_after) = live_epoch_key(
+                ctx.community_id,
+                ctx.crdt_state.as_ref(),
+                &ctx.membership_key,
+            )
+            .await?;
+
+            if epoch_before == epoch_after {
+                // Epoch stable across snapshot window — safe to proceed.
+                break (key_after, epoch_after, snap);
+            }
+
+            retries -= 1;
+            if retries == 0 {
+                return Err(CommunitySyncError::PublishRetryExhausted);
+            }
+            // Epoch changed between key reads — retry with fresh key.
+            tracing::debug!(
+                community_id = ?ctx.community_id,
+                epoch_before = ?epoch_before,
+                epoch_after = ?epoch_after,
+                retries_left = retries,
+                "publish_root_now: epoch changed mid-publish, retrying"
+            );
+        }
     };
 
     // 1. Canonical-CBOR encode the CommunityState as the cleartext blob.
@@ -1332,7 +1834,9 @@ async fn publish_root_now(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
 
     // 2. Encrypt with deterministic-nonce blob AEAD so cipher_cid is
     //    reproducible across replicas (dedup + convergence).
-    let blob_ciphertext = encrypt_blob(&ctx.membership_key, &blob_cleartext)?;
+    //    ZEB-249 §10.6: uses `current_key` (live epoch key) rather than
+    //    the spawn-time `membership_key`.
+    let blob_ciphertext = encrypt_blob(&current_key, &blob_cleartext)?;
 
     // 3. Derive structured ContentId for the encrypted blob. Flagged
     //    `encrypted: true` so the eviction policy classifies it as
@@ -1366,13 +1870,17 @@ async fn publish_root_now(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
         .map_err(|e| CommunitySyncError::CborEncode(e.to_string()))?;
     let publisher_sig = ctx.signing_key.sign(&signed_bytes).to_bytes();
 
-    // 7. Wrap into the full wire envelope.
-    let payload = signed.into_wire(publisher_sig);
+    // 7. Wrap into the full wire envelope, including the current epoch
+    //    tag so receivers can select the matching key.
+    //    ZEB-249 §10.6: `current_epoch` is `Some` when crdt_state is
+    //    available; `None` for test-fallback (legacy behaviour).
+    let payload = signed.into_wire(publisher_sig, current_epoch);
     let payload_bytes = canonical_cbor_encode(&payload)
         .map_err(|e| CommunitySyncError::CborEncode(e.to_string()))?;
 
     // 8. Encrypt with random-nonce root AEAD (every publish is fresh).
-    let wire = encrypt_root_publish(&ctx.membership_key, &payload_bytes)?;
+    //    ZEB-249 §10.6: uses `current_key` (live epoch key).
+    let wire = encrypt_root_publish(&current_key, &payload_bytes)?;
 
     // 9. Send onto outbound channel — Zenoh adapter (Task 11) forwards.
     ctx.publisher_tx
@@ -1594,7 +2102,7 @@ impl IncomingOutcome {
 /// runs; per-publisher namespacing on the tracker key
 /// `(publisher_addr, device_id)` further isolates the per-addr
 /// HLC space so an attacker can't claim Alice's slot via shared
-/// `MembershipKey`.
+/// `EpochKey`.
 ///
 /// **Divergence from `owner_state_sync::handle_incoming_publish`:**
 /// owner-state advances the tracker IMMEDIATELY after the replay-check
@@ -1614,10 +2122,69 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     use crate::community_membership::MemberStatus;
     use crate::owner_state_crypto::canonical_cbor_encode;
 
-    // 1. Decrypt root publish.
-    let payload_bytes = match decrypt_root_publish(&ctx.membership_key, &wire) {
-        Ok(b) => b,
-        Err(e) => return IncomingOutcome::ErrPreMutation(CommunitySyncError::Crypto(e)),
+    // ZEB-249 §10.6 Phase A: snapshot live epoch key state BEFORE any
+    // lock on community state.  We collect (current_key, old_keys_rev)
+    // here so the decrypt trial loop below doesn't need to re-acquire
+    // any mutex.  Lock-order: owner-state lock released before community-
+    // state lock is ever taken.
+    let (outer_current_key, outer_old_keys_rev) = if let Some(cs) = ctx.crdt_state.as_ref() {
+        let guard = cs.lock().await;
+        if let Some(space) = guard.spaces.get(&ctx.community_id) {
+            let cur = space
+                .current_epoch_key
+                .clone()
+                .unwrap_or_else(|| ctx.membership_key.clone());
+            // Collect old epoch keys in reverse order (newest first) so we
+            // try the most-likely match before the most-stale.
+            let old_rev: Vec<EpochKey> = {
+                let mut v: Vec<(u64, EpochKey)> = space
+                    .old_epoch_keys
+                    .iter()
+                    .map(|(e, k)| (*e, k.clone()))
+                    .collect();
+                v.sort_by_key(|x| std::cmp::Reverse(x.0));
+                v.into_iter().map(|(_, k)| k).collect()
+            };
+            (cur, old_rev)
+        } else {
+            (ctx.membership_key.clone(), vec![])
+        }
+    } else {
+        (ctx.membership_key.clone(), vec![])
+    };
+
+    // 1. Decrypt root publish.  ZEB-249 §10.6: try current epoch key
+    //    first, then old keys in reverse order (newest first) for the
+    //    brief transition window where a sender may use a key that's one
+    //    epoch behind our current view.
+    //
+    //    CR Major (PR #106 R6): capture WHICH key succeeded so blob
+    //    decryption is bound to the same key. A packet rewrapped under
+    //    any accepted old root key MUST NOT be acceptable with blob under
+    //    a different old key — that would break the root→blob epoch
+    //    binding. `root_key_used` is a reference into `outer_current_key`
+    //    or `outer_old_keys_rev`; the borrow checker ensures it stays
+    //    valid for the lifetime of both Vec values.
+    let (payload_bytes, root_key_used): (Vec<u8>, &EpochKey) = {
+        if let Ok(b) = decrypt_root_publish(&outer_current_key, &wire) {
+            (b, &outer_current_key)
+        } else {
+            let mut found: Option<(Vec<u8>, &EpochKey)> = None;
+            for old_key in &outer_old_keys_rev {
+                if let Ok(b) = decrypt_root_publish(old_key, &wire) {
+                    found = Some((b, old_key));
+                    break;
+                }
+            }
+            match found {
+                Some(v) => v,
+                None => {
+                    return IncomingOutcome::ErrPreMutation(CommunitySyncError::Crypto(
+                        CommunityCryptoError::AeadFailed,
+                    ))
+                }
+            }
+        }
     };
     let payload: CommunityRootPublishPayload = match canonical_cbor_decode(&payload_bytes) {
         Ok(p) => p,
@@ -1828,7 +2395,13 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     };
 
     // 7. Decrypt blob (deterministic-nonce).
-    let blob_cleartext = match decrypt_blob(&ctx.membership_key, &blob_ciphertext) {
+    //    CR Major (PR #106 R6): blob decryption MUST use the SAME epoch
+    //    key that successfully decrypted the root wire packet. Trying
+    //    independent key sets for root and blob would allow an attacker
+    //    to rewrap the outer layer under any accepted old key while
+    //    substituting a blob encrypted under a different old key —
+    //    breaking the root→blob epoch binding contract.
+    let blob_cleartext = match decrypt_blob(root_key_used, &blob_ciphertext) {
         Ok(b) => b,
         Err(e) => return IncomingOutcome::ErrPreMutation(CommunitySyncError::Crypto(e)),
     };
@@ -2190,6 +2763,8 @@ fn classify_incoming_error(err: &CommunitySyncError) -> &'static str {
         CommunitySyncError::PublisherNotJoined { .. } => "publisher_not_joined",
         CommunitySyncError::UnknownPublisher { .. } => "publisher_unknown",
         CommunitySyncError::PublisherSigInvalid { .. } => "publisher_sig_invalid",
+        CommunitySyncError::PublishRetryExhausted => "publish_retry_exhausted",
+        CommunitySyncError::LiveEpochKeyMissing(_) => "live_epoch_key_missing",
     }
 }
 
@@ -2255,6 +2830,12 @@ pub struct CommunityRegistryConfig {
     /// `start_node` time; identical handle to the one Phase 3's
     /// `insert_local_event` uses for membership-event signing.
     pub signing_key: Arc<ed25519_dalek::SigningKey>,
+
+    /// ZEB-249 §10.6 (Phase A): optional reference to the owner-state
+    /// CRDT. When `Some`, every spawned engine receives a clone of this
+    /// Arc so `publish_root_now` / `handle_incoming_publish` can read
+    /// the live epoch key. `None` for tests that use the spawn-time key.
+    pub crdt_state: Option<Arc<Mutex<crate::owner_state_crdt::OwnerState>>>,
 }
 
 /// Multi-community engine lifecycle manager. Owns
@@ -2270,6 +2851,11 @@ pub struct CommunityRegistryConfig {
 pub struct CommunitySyncRegistry {
     cfg: Arc<CommunityRegistryConfig>,
     engines: tokio::sync::Mutex<BTreeMap<SpaceId, Arc<CommunitySyncEngine>>>,
+    /// ZEB-249 §10.6 (Phase A): optional owner-state CRDT reference,
+    /// cloned from `CommunityRegistryConfig.crdt_state` at construction.
+    /// Passed into every `spawn_engine_inner_now` call so engines can
+    /// read the live epoch key. `None` for tests.
+    crdt_state: Option<Arc<Mutex<crate::owner_state_crdt::OwnerState>>>,
     /// ZEB-262 Phase 4: per-`EventId` oneshots that fire when the
     /// matching `SignedMembershipEvent` is Inserted into ANY engine in
     /// this registry. The `redeem_invite` IPC registers a oneshot
@@ -2437,9 +3023,11 @@ impl Drop for CommunitySyncSpawnGuard {
 
 impl CommunitySyncRegistry {
     pub fn new(cfg: CommunityRegistryConfig) -> Self {
+        let crdt_state = cfg.crdt_state.as_ref().map(Arc::clone);
         Self {
             cfg: Arc::new(cfg),
             engines: tokio::sync::Mutex::new(BTreeMap::new()),
+            crdt_state,
             pending_redemptions: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -2489,7 +3077,7 @@ impl CommunitySyncRegistry {
         self: &std::sync::Arc<Self>,
         guard: &mut CommunitySyncSpawnGuard,
         community_id: SpaceId,
-        membership_key: MembershipKey,
+        membership_key: EpochKey,
         admin_addr: OwnerAddr,
         is_invite_only: bool,
         publisher_tx: mpsc::Sender<Vec<u8>>,
@@ -2778,7 +3366,7 @@ impl CommunitySyncRegistry {
     pub async fn spawn_engine_inner_now(
         &self,
         community_id: SpaceId,
-        membership_key: MembershipKey,
+        membership_key: EpochKey,
         admin_addr: OwnerAddr,
         is_invite_only: bool,
         publisher_tx: mpsc::Sender<Vec<u8>>,
@@ -2859,6 +3447,9 @@ impl CommunitySyncRegistry {
             // `Arc` for IPC-side `register_pending_redemption` /
             // `take_pending_redemption` / `notify_pending_redemption`.
             pending_redemptions: Some(std::sync::Arc::clone(&self.pending_redemptions)),
+            // ZEB-249 §10.6 (Phase A): pass the live owner-state CRDT
+            // so the engine can read current_epoch_key dynamically.
+            crdt_state: self.crdt_state.as_ref().map(Arc::clone),
         }));
 
         engines.insert(community_id, engine);
@@ -2969,6 +3560,15 @@ impl CommunitySyncRegistry {
     /// drives the debounced state-root publish.
     pub async fn engine_arc(&self, community_id: &SpaceId) -> Option<Arc<CommunitySyncEngine>> {
         self.engines.lock().await.get(community_id).cloned()
+    }
+
+    /// ZEB-249 Task 6: returns a clone of the registry's shared
+    /// `IdentityResolver`. IPC handlers that need to look up members'
+    /// 64-byte identity pubs (e.g., to derive X25519 pubkeys for
+    /// EpochRotation/EpochCatchup `seal_to_owner` calls) can call this
+    /// without reaching into the engine internals.
+    pub fn identity_resolver(&self) -> Arc<dyn IdentityResolver> {
+        Arc::clone(&self.cfg.identity_resolver)
     }
 
     /// Force the engine for `community_id` to publish its current CRDT
@@ -3201,7 +3801,7 @@ mod tests {
     struct GuardTestFixture {
         registry: std::sync::Arc<CommunitySyncRegistry>,
         identity_dir: std::path::PathBuf,
-        membership_key: MembershipKey,
+        membership_key: EpochKey,
         admin_addr: OwnerAddr,
         community_adapter_tx: mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
         // Held to keep the adapter-request channel alive (and the
@@ -3235,6 +3835,7 @@ mod tests {
             delta_tx: None,
             self_owner: OwnerAddr([0x01; 16]),
             signing_key: std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
+            crdt_state: None,
         }));
 
         // Adapter-request bridge: `spawn_engine_with_guard` will
@@ -3246,7 +3847,7 @@ mod tests {
         GuardTestFixture {
             registry,
             identity_dir,
-            membership_key: MembershipKey::new([0xa1; 32]),
+            membership_key: EpochKey::new([0xa1; 32]),
             admin_addr: OwnerAddr([0xb1; 16]),
             community_adapter_tx,
             community_adapter_rx,
@@ -3783,5 +4384,201 @@ mod tests {
 
         // Commit guard for X to release rollback obligation cleanly.
         guard.commit();
+    }
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+    use crate::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
+    use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, Space, SpaceId, SpaceKind};
+
+    #[test]
+    fn encrypted_envelope_round_trip() {
+        let env = EncryptedEnvelope {
+            epoch: 5,
+            nonce: [0x10; 12],
+            ciphertext: vec![0x20; 32],
+            ratchet_generation: None,
+        };
+        let bytes = canonical_cbor_encode(&env).expect("encode");
+        let decoded: EncryptedEnvelope = canonical_cbor_decode(&bytes).expect("decode");
+        assert_eq!(
+            decoded, env,
+            "EncryptedEnvelope round-trip must preserve all fields"
+        );
+    }
+
+    #[test]
+    fn encrypted_envelope_with_ratchet_generation() {
+        let env = EncryptedEnvelope {
+            epoch: 5,
+            nonce: [0x10; 12],
+            ciphertext: vec![0x20; 32],
+            ratchet_generation: Some(42),
+        };
+        let bytes = canonical_cbor_encode(&env).expect("encode");
+        let decoded: EncryptedEnvelope = canonical_cbor_decode(&bytes).expect("decode");
+        assert_eq!(decoded, env);
+        assert_eq!(decoded.ratchet_generation, Some(42));
+    }
+
+    /// Build a minimal Community-kind Space with the given epoch and key.
+    /// Uses placeholder values for fields not relevant to epoch crypto.
+    fn build_test_community_space(epoch: u64, key: EpochKey) -> Space {
+        let zero_hlc = Hlc {
+            wall_ms: 0,
+            logical: 0,
+            device_id: "t".into(),
+        };
+        Space {
+            id: SpaceId([0xaa; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "Test".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: zero_hlc.clone(),
+            updated_at: zero_hlc,
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: Some(epoch),
+            current_epoch_key: Some(key),
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: Some(OwnerAddr([0xbb; 16])),
+            is_invite_only: Some(false),
+        }
+    }
+
+    #[test]
+    fn encrypt_decrypt_round_trip_current_epoch() {
+        let key = EpochKey::new([0xab; 32]);
+        let space = build_test_community_space(0, key);
+
+        let plaintext = b"hello world from epoch 0";
+        let envelope = encrypt_for_topic(&space, plaintext).expect("encrypt");
+        assert_eq!(envelope.epoch, 0);
+        let decrypted = decrypt_for_topic(&space, &envelope).expect("decrypt");
+        assert_eq!(decrypted.as_slice(), plaintext.as_ref());
+    }
+
+    #[test]
+    fn decrypt_with_old_epoch_key_succeeds() {
+        let old_key = EpochKey::new([0xcc; 32]);
+        let new_key = EpochKey::new([0xdd; 32]);
+        let mut space = build_test_community_space(1, new_key);
+        space.old_epoch_keys.insert(0, old_key.clone());
+
+        // Encrypt with old_key at epoch=0; decrypt under new state with old in old_epoch_keys.
+        let nonce = [0x11u8; 12];
+        let plaintext = b"old epoch message";
+        let cipher = ChaCha20Poly1305::new(old_key.as_chacha_key());
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce), plaintext.as_ref())
+            .expect("encrypt");
+        let envelope = EncryptedEnvelope {
+            epoch: 0,
+            nonce,
+            ciphertext,
+            ratchet_generation: None,
+        };
+        let decrypted = decrypt_for_topic(&space, &envelope).expect("decrypt old epoch");
+        assert_eq!(decrypted.as_slice(), plaintext.as_ref());
+    }
+
+    #[test]
+    fn decrypt_missing_epoch_returns_key_not_available() {
+        let key = EpochKey::new([0xab; 32]);
+        let space = build_test_community_space(0, key);
+        let envelope = EncryptedEnvelope {
+            epoch: 999,
+            nonce: [0; 12],
+            ciphertext: vec![0; 16],
+            ratchet_generation: None,
+        };
+        let err = decrypt_for_topic(&space, &envelope).expect_err("must fail");
+        assert!(
+            matches!(err, EpochError::KeyNotAvailable(999)),
+            "expected KeyNotAvailable(999), got {err:?}"
+        );
+    }
+
+    /// C6: encrypt_for_topic must return Err(MissingEpochState) when
+    /// current_epoch is None (partially-migrated Space). Previously panicked.
+    #[test]
+    fn encrypt_for_topic_returns_error_on_missing_epoch() {
+        let zero_hlc = Hlc {
+            wall_ms: 0,
+            logical: 0,
+            device_id: "t".into(),
+        };
+        let space = Space {
+            id: SpaceId([0xaa; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "Test".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: zero_hlc.clone(),
+            updated_at: zero_hlc,
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: None,     // missing!
+            current_epoch_key: None, // missing!
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: Some(OwnerAddr([0xbb; 16])),
+            is_invite_only: Some(false),
+        };
+        let err = encrypt_for_topic(&space, b"test payload")
+            .expect_err("encrypt_for_topic must return Err on missing epoch state, not panic");
+        assert!(
+            matches!(err, EpochError::MissingEpochState),
+            "expected MissingEpochState, got {err:?}"
+        );
+    }
+
+    /// C6 (variant): current_epoch is Some but current_epoch_key is None.
+    #[test]
+    fn encrypt_for_topic_returns_error_on_missing_epoch_key() {
+        let zero_hlc = Hlc {
+            wall_ms: 0,
+            logical: 0,
+            device_id: "t".into(),
+        };
+        let space = Space {
+            id: SpaceId([0xaa; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "Test".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: zero_hlc.clone(),
+            updated_at: zero_hlc,
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: Some(0),  // set
+            current_epoch_key: None, // missing!
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: Some(OwnerAddr([0xbb; 16])),
+            is_invite_only: Some(false),
+        };
+        let err = encrypt_for_topic(&space, b"test payload")
+            .expect_err("encrypt_for_topic must return Err on missing epoch key, not panic");
+        assert!(
+            matches!(err, EpochError::MissingEpochState),
+            "expected MissingEpochState, got {err:?}"
+        );
     }
 }

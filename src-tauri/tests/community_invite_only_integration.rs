@@ -33,7 +33,8 @@ use harmony_app::community_channel_log_engine::{
     ChannelLogEngineConfig, ChannelLogRegistry, ChannelLogRegistryConfig,
 };
 use harmony_app::community_invite::{
-    self, canonical_invite_token_bytes, CommunityInvitePayload, InviteToken,
+    self, canonical_invite_token_bytes, CommunityInvitePayload, InviteEpochSnapshot, InviteToken,
+    MaterializedCommunityState,
 };
 use harmony_app::community_membership::{materialize, MemberStatus};
 use harmony_app::community_state_sync::{
@@ -41,6 +42,7 @@ use harmony_app::community_state_sync::{
 };
 use harmony_app::content_store::{CasOp, ContentStore, RuntimeContentStore};
 use harmony_app::dm_outbox::{DmOutbox, UnicastSendRequest};
+use harmony_app::dm_signing::{ed25519_pub_to_x25519, seal_to_owner};
 use harmony_app::event_loop::CommunityAdapterRequest;
 use harmony_app::owner_state_crdt::OwnerState;
 use harmony_app::owner_state_types::{DeviceIdentityHash, Hlc, OwnerAddr, OwnerDeviceEntry};
@@ -87,19 +89,33 @@ fn dup_identity(src: &PrivateIdentity) -> PrivateIdentity {
         .expect("PrivateIdentity round-trip via to/from_private_bytes")
 }
 
+/// Process-global mutex serializing mutations to the
+/// `HARMONY_REDEEM_INVITE_TIMEOUT_MS` env var across parallel tests.
+///
+/// CR Major (PR #106 R7): `std::env::set_var` is process-global.
+/// Multiple tests can race on it under `cargo nextest`'s default
+/// parallel test-thread model.  Holding this mutex for the guard's
+/// entire lifetime serializes the set + test + restore sequence so
+/// that no two tests overlap their env-var window.
+static REDEEM_TIMEOUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// RAII guard for the redeem-invite timeout env var. Captures the
 /// pre-existing value (if any) and restores or removes it on Drop, so a
 /// panicking test cannot leak the override into subsequent tests in
 /// this binary. (Cross-binary leakage is moot — each test binary is a
 /// separate OS process.)
 struct RedeemTimeoutGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
     prior: Option<std::ffi::OsString>,
 }
 impl RedeemTimeoutGuard {
     fn set(value: &str) -> Self {
+        let lock = REDEEM_TIMEOUT_ENV_LOCK
+            .lock()
+            .expect("timeout env lock poisoned");
         let prior = std::env::var_os("HARMONY_REDEEM_INVITE_TIMEOUT_MS");
         std::env::set_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS", value);
-        Self { prior }
+        Self { _lock: lock, prior }
     }
 }
 impl Drop for RedeemTimeoutGuard {
@@ -108,6 +124,7 @@ impl Drop for RedeemTimeoutGuard {
             Some(v) => std::env::set_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS", v),
             None => std::env::remove_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS"),
         }
+        // _lock drops here, releasing REDEEM_TIMEOUT_ENV_LOCK.
     }
 }
 
@@ -185,6 +202,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         delta_tx: None,
         self_owner: alice_addr,
         signing_key: Arc::clone(&alice_sk),
+        crdt_state: None,
     }));
     let registry_b = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "bob-dev".into(),
@@ -196,6 +214,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         delta_tx: None,
         self_owner: bob_addr,
         signing_key: Arc::clone(&bob_sk),
+        crdt_state: None,
     }));
 
     // Bob's owner-state CRDT and HLC tracker. Bob's redeem_invite_inner
@@ -328,9 +347,24 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         sig: token_sig,
     };
 
+    // M3: For invite-only communities, the epoch key must be sealed to the
+    // invitee's (Bob's) X25519 public key — derived from Bob's Ed25519 signing
+    // key via the standard birational map. Alice seals the 32-byte epoch key
+    // so Bob's `mint_redemption` can decrypt it with `open_from_owner`.
+    let bob_x25519_pub = {
+        let verifying_bytes = bob_sk.verifying_key().to_bytes();
+        ed25519_pub_to_x25519(&verifying_bytes).expect("bob ed25519→x25519 conversion")
+    };
+    let sealed_epoch_key = seal_to_owner(&bob_x25519_pub, alice_minted.membership_key.as_bytes())
+        .expect("seal epoch key to bob");
+
     let invite_url = community_invite::encode_invite_url(&CommunityInvitePayload {
         community_id,
-        membership_key: alice_minted.membership_key.clone(),
+        epoch_snapshot: InviteEpochSnapshot {
+            epoch: 0,
+            sealed_epoch_key,
+            state_snapshot: MaterializedCommunityState::default(),
+        },
         admin_addr: alice_addr,
         community_name: "InviteOnly".into(),
         is_invite_only: true,
@@ -521,11 +555,10 @@ async fn alice_redeems_invite_only_against_bob_admin() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn community_invite_only_tampered_admin_bootstrap_rejects() {
     use harmony_app::community_invite::{
-        decode_invite_url, encode_invite_url, verify_admin_bootstrap, CommunityInvitePayload,
-        InviteToken, RedeemBootstrapVerifyError,
+        decode_invite_url, encode_invite_url, verify_admin_bootstrap, RedeemBootstrapVerifyError,
     };
     use harmony_app::community_membership::{sign_event, EventPayload, MembershipEventKind};
-    use harmony_app::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
+    use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 
     let alice_identity = PrivateIdentity::from_seed(&[0xAA; 32]);
     let alice_addr = OwnerAddr(alice_identity.identity.address_hash);
@@ -554,9 +587,18 @@ async fn community_invite_only_tampered_admin_bootstrap_rejects() {
     // Tamper: flip a single bit in the signature.
     alice_bootstrap.sig[0] ^= 0x01;
 
+    // sealed_epoch_key must be 92 bytes for invite-only (32 ephemeral_pub +
+    // 12 nonce + 32 ct + 16 tag). The exact value is irrelevant for this
+    // test — we're asserting on the tampered admin_bootstrap.sig rejection,
+    // not the key content. Use a valid-length vector of 0xDD bytes.
+    // ZEB-249 PR #106 R5: encode_invite_url now enforces this length.
     let invite_url = encode_invite_url(&CommunityInvitePayload {
         community_id,
-        membership_key: MembershipKey::new([0xDD; 32]),
+        epoch_snapshot: InviteEpochSnapshot {
+            epoch: 0,
+            sealed_epoch_key: vec![0xDD; 92], // valid invite-only length: 92 bytes
+            state_snapshot: MaterializedCommunityState::default(),
+        },
         admin_addr: alice_addr,
         community_name: "TamperedTest".into(),
         is_invite_only: true,

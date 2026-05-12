@@ -1204,7 +1204,9 @@ impl DmOutbox {
             updated_at: signed.created_at,
             content_key: Some(signed.content_key),
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -2281,7 +2283,9 @@ mod tests {
             },
             content_key: Some(DmContentKey::new([0x42u8; 32])),
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         }
@@ -3975,7 +3979,9 @@ mod tests {
             },
             content_key: Some(content_key.clone()),
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -4298,7 +4304,9 @@ mod tests {
             },
             content_key: Some(content_key.clone()),
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -4498,7 +4506,9 @@ mod tests {
             },
             content_key: Some(DmContentKey::new([0xab; 32])),
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -4597,7 +4607,9 @@ mod tests {
             },
             content_key: Some(k2.clone()),        // current = K2
             prior_content_keys: vec![k1.clone()], // prior contains K1
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -5839,7 +5851,9 @@ mod tests {
             },
             content_key: Some(content_key.clone()),
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };
@@ -6043,7 +6057,9 @@ mod tests {
             },
             content_key: None,
             prior_content_keys: vec![],
-            membership_key: None,
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
         };

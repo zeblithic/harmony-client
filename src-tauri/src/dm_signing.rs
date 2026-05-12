@@ -13,11 +13,183 @@
 //! computed hash match `DeviceIdentityHash` values stored in
 //! OwnerDeviceCache.devices — an Ed25519-only hash would diverge.
 
+use chacha20poly1305::aead::Aead;
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 use sha2::{Digest, Sha256};
+use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
+use zeroize::Zeroizing;
 
 use crate::dm_outbox::DmReceiveError;
 use crate::owner_state_types::DeviceIdentityHash;
+
+/// Errors from epoch-key sealing operations (`seal_to_owner` / `open_from_owner`).
+/// Distinct from `DmReceiveError` because these helpers are used in
+/// EpochRotation/EpochCatchup key-delivery paths (Tasks 3+), not the
+/// DM-packet receive pipeline.
+#[derive(Debug, thiserror::Error)]
+pub enum DmSignError {
+    #[error("AEAD encryption failed")]
+    EncryptionFailed,
+    #[error("AEAD decryption failed (tag mismatch or wrong key)")]
+    DecryptionFailed,
+    #[error("malformed sealed envelope (too short or bad framing)")]
+    MalformedSealedEnvelope,
+    #[error("invalid Ed25519 pubkey (cannot decompress)")]
+    InvalidEd25519Pubkey,
+    /// C1/C2: low-order or small-order public key rejected. Either the
+    /// X25519 ephemeral produced an all-zero shared secret (low-order
+    /// point attack on seal/open), or the Ed25519 point is small-order
+    /// (torsion component attack on the Twisted Edwards → Montgomery
+    /// conversion). In both cases the resulting ECDH output is predictable
+    /// and MUST be rejected before it reaches the AEAD layer.
+    #[error("low-order or small-order public key rejected")]
+    InvalidPublicKey,
+}
+
+/// Seal a payload to a recipient's X25519 public key using
+/// X25519-ECDH-derived ChaCha20-Poly1305 (hybrid public-key encryption).
+///
+/// Output layout (92 bytes total for a 32-byte payload):
+///   - 32 bytes: ephemeral X25519 public key (fresh per call)
+///   - 12 bytes: AEAD random nonce
+///   - 32 bytes: ciphertext
+///   - 16 bytes: Poly1305 authentication tag
+///
+/// The shared secret is HKDF-derived from the ECDH output with empty
+/// salt + a domain-separation `info` string. The ephemeral pubkey is
+/// fresh per call — no nonce-reuse risk across multiple seals to the
+/// same recipient.
+///
+/// Used by ZEB-249's EpochRotation/EpochCatchup events to deliver
+/// fresh EpochKeys to specific recipients.
+pub fn seal_to_owner(
+    recipient_x25519_pub: &[u8; 32],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, DmSignError> {
+    let recipient_pub = PublicKey::from(*recipient_x25519_pub);
+    let ephemeral = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
+    let ephemeral_pub_bytes = *PublicKey::from(&ephemeral).as_bytes();
+
+    let shared = ephemeral.diffie_hellman(&recipient_pub);
+    // C1: reject low-order recipient pubkeys. A recipient X25519 pubkey
+    // that is a small-order (torsion) point yields an all-zero ECDH
+    // output regardless of our ephemeral scalar, so any two senders
+    // using the same nonce would produce the same ciphertext. Reject
+    // immediately rather than encrypting under a predictable key.
+    if shared.as_bytes() == &[0u8; 32] {
+        return Err(DmSignError::InvalidPublicKey);
+    }
+    let key_bytes = derive_seal_key(shared.as_bytes());
+    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key_bytes.as_ref()));
+
+    let mut nonce_bytes = [0u8; 12];
+    use rand::RngCore;
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
+        .map_err(|_| DmSignError::EncryptionFailed)?;
+
+    let mut out = Vec::with_capacity(32 + 12 + ciphertext.len());
+    out.extend_from_slice(&ephemeral_pub_bytes);
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+/// Open a sealed envelope using the recipient's X25519 private key.
+/// Inverse of `seal_to_owner`. Returns `DmSignError::DecryptionFailed`
+/// on AEAD tag mismatch (wrong recipient OR tampered ciphertext).
+pub fn open_from_owner(
+    recipient_x25519_priv: &[u8; 32],
+    sealed: &[u8],
+) -> Result<Vec<u8>, DmSignError> {
+    if sealed.len() < 32 + 12 + 16 {
+        return Err(DmSignError::MalformedSealedEnvelope);
+    }
+    let ephemeral_pub_bytes: [u8; 32] = sealed[0..32]
+        .try_into()
+        .map_err(|_| DmSignError::MalformedSealedEnvelope)?;
+    let nonce_bytes: [u8; 12] = sealed[32..44]
+        .try_into()
+        .map_err(|_| DmSignError::MalformedSealedEnvelope)?;
+    let ciphertext = &sealed[44..];
+
+    let recipient_secret = StaticSecret::from(*recipient_x25519_priv);
+    let ephemeral_pub = PublicKey::from(ephemeral_pub_bytes);
+    let shared = recipient_secret.diffie_hellman(&ephemeral_pub);
+    // C1: reject low-order ephemeral pubkeys. An all-zero shared secret
+    // means the sender used a small-order (torsion) ephemeral point;
+    // any ciphertext produced under such a key is trivially forgeable.
+    if shared.as_bytes() == &[0u8; 32] {
+        return Err(DmSignError::InvalidPublicKey);
+    }
+    let key_bytes = derive_seal_key(shared.as_bytes());
+    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key_bytes.as_ref()));
+
+    cipher
+        .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext)
+        .map_err(|_| DmSignError::DecryptionFailed)
+}
+
+/// Convert an Ed25519 public key to an X25519 public key via the
+/// standard birational map (RFC 7748 §5). Used for sealing material
+/// to recipients identified by their Ed25519 identity.
+///
+/// The Ed25519 curve point is the Twisted Edwards curve point y → u
+/// Montgomery form: u = (1 + y) / (1 - y) mod p.
+pub fn ed25519_pub_to_x25519(ed25519_pub: &[u8; 32]) -> Result<[u8; 32], DmSignError> {
+    use curve25519_dalek::edwards::CompressedEdwardsY;
+    let edwards = CompressedEdwardsY(*ed25519_pub)
+        .decompress()
+        .ok_or(DmSignError::InvalidEd25519Pubkey)?;
+    // C2: reject small-order (torsion) Edwards points. If the Ed25519
+    // pubkey is in the low-order subgroup (8 known small-order points
+    // on the Twisted Edwards curve), to_montgomery() maps them to
+    // small-order Montgomery points, which then produce all-zero ECDH
+    // outputs. Reject here before the conversion, not after.
+    if edwards.is_small_order() {
+        return Err(DmSignError::InvalidEd25519Pubkey);
+    }
+    Ok(edwards.to_montgomery().to_bytes())
+}
+
+/// Convert an Ed25519 signing key to an X25519 private key via the
+/// standard derivation (RFC 7748 §5 with SHA-512 + clamping).
+///
+/// The Ed25519 secret scalar is derived via SHA-512 of the 32-byte
+/// private seed; the first 32 bytes are the X25519 scalar candidate,
+/// clamped per RFC 7748 §5 before use.
+pub fn ed25519_priv_to_x25519(
+    signing_key: &ed25519_dalek::SigningKey,
+) -> zeroize::Zeroizing<[u8; 32]> {
+    // `to_scalar_bytes` is ed25519-dalek 2.x's canonical accessor for the
+    // SHA-512-derived, low-half-clamped scalar — exactly the X25519 private
+    // scalar per RFC 7748 §5. Using the library API avoids an extra SHA-512
+    // call and ensures we stay in sync with dalek's own clamping logic.
+    let mut x_priv = zeroize::Zeroizing::new(signing_key.to_scalar_bytes());
+    // Apply RFC 7748 §5 clamping (dalek's to_scalar_bytes returns the
+    // raw low-half before clamping; we clamp here before use).
+    x_priv[0] &= 248;
+    x_priv[31] &= 127;
+    x_priv[31] |= 64;
+    x_priv
+}
+
+/// HKDF-derive a 32-byte ChaCha20-Poly1305 key from a 32-byte ECDH
+/// shared secret. Empty salt, domain-separated info string.
+/// Returns `Zeroizing<[u8; 32]>` so the HKDF-derived material is
+/// zeroized on drop, matching the protection level of EpochKey itself.
+fn derive_seal_key(shared_secret: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    use hkdf::Hkdf;
+
+    let hk = Hkdf::<Sha256>::new(None, shared_secret);
+    let mut okm = Zeroizing::new([0u8; 32]);
+    hk.expand(b"harmony-zeb-249-epoch-key-seal", okm.as_mut())
+        .expect("HKDF expand to 32 bytes always succeeds");
+    okm
+}
 
 /// Reticulum app+aspect for DM-protocol packets. The full destination
 /// name is `"harmony.dm"` (app `"harmony"`, single aspect `"dm"`); see
@@ -128,6 +300,157 @@ pub fn verify_dm_packet_signature(
         .verify(body_bytes, &sig)
         .map_err(|_| DmReceiveError::SignatureVerificationFailed)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod ed25519_x25519_conversion_tests {
+    use super::*;
+
+    #[test]
+    fn ed25519_to_x25519_round_trip_via_seal() {
+        let signing = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let verifying = signing.verifying_key();
+        let x_pub = ed25519_pub_to_x25519(&verifying.to_bytes()).expect("conversion");
+        let x_priv = ed25519_priv_to_x25519(&signing);
+
+        let payload = b"some 32-byte payload xxxxxxxxxxx";
+        let sealed = seal_to_owner(&x_pub, payload).expect("seal");
+        let opened = open_from_owner(&x_priv, &sealed).expect("open");
+        assert_eq!(opened, payload);
+    }
+
+    #[test]
+    fn ed25519_pub_to_x25519_deterministic() {
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]);
+        let verifying = signing.verifying_key();
+        let x1 = ed25519_pub_to_x25519(&verifying.to_bytes()).expect("first");
+        let x2 = ed25519_pub_to_x25519(&verifying.to_bytes()).expect("second");
+        assert_eq!(x1, x2);
+    }
+
+    #[test]
+    fn ed25519_priv_to_x25519_deterministic() {
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]);
+        let x1 = ed25519_priv_to_x25519(&signing);
+        let x2 = ed25519_priv_to_x25519(&signing);
+        assert_eq!(x1, x2);
+    }
+
+    /// C2: ed25519_pub_to_x25519 must reject small-order (torsion) Edwards
+    /// points. The identity point on the Twisted Edwards curve is
+    /// `(0, 1)` which in compressed form is the byte `0x01` followed by
+    /// 31 zero bytes. This is a small-order point (order 1 in the
+    /// cofactor-8 group) and MUST NOT be converted to a Montgomery form
+    /// for use in ECDH.
+    #[test]
+    fn ed25519_pub_to_x25519_rejects_small_order_identity_point() {
+        // Compressed Edwards Y for the identity point: y=1, sign bit clear.
+        // In little-endian: 0x01 || [0x00; 31].
+        let mut identity_point = [0u8; 32];
+        identity_point[0] = 0x01;
+        let err = ed25519_pub_to_x25519(&identity_point)
+            .expect_err("ed25519_pub_to_x25519 must reject the small-order identity point");
+        assert!(
+            matches!(err, DmSignError::InvalidEd25519Pubkey),
+            "expected InvalidEd25519Pubkey for identity point, got {err:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod epoch_seal_tests {
+    use super::*;
+
+    /// Build a test X25519 keypair from an Ed25519 seed for use in seal
+    /// round-trip tests. Returns (x25519_private_bytes, x25519_public_bytes).
+    fn make_x25519_keypair(seed_byte: u8) -> ([u8; 32], [u8; 32]) {
+        // Derive an Ed25519 signing key from seed, then convert the scalar
+        // to an X25519 static secret. x25519-dalek StaticSecret accepts
+        // the raw 32 bytes directly.
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let seed = [seed_byte; 32];
+        let hk = Hkdf::<Sha256>::new(None, &seed);
+        let mut scalar = [0u8; 32];
+        hk.expand(b"harmony-zeb-249-test-x25519-scalar", &mut scalar)
+            .expect("HKDF 32 bytes always works");
+
+        let secret = StaticSecret::from(scalar);
+        let public = PublicKey::from(&secret);
+        (scalar, *public.as_bytes())
+    }
+
+    #[test]
+    fn seal_and_open_round_trip() {
+        let (priv_bytes, pub_bytes) = make_x25519_keypair(0x01);
+        let plaintext = [0xde_u8; 32];
+        let sealed = seal_to_owner(&pub_bytes, &plaintext).expect("seal must succeed");
+        // Expected layout: 32 ephemeral_pub + 12 nonce + (32 + 16 tag) = 92 bytes.
+        assert_eq!(
+            sealed.len(),
+            92,
+            "sealed length must be 92 for 32-byte plaintext"
+        );
+        let recovered = open_from_owner(&priv_bytes, &sealed).expect("open must succeed");
+        assert_eq!(
+            recovered, plaintext,
+            "recovered plaintext must match original"
+        );
+    }
+
+    #[test]
+    fn open_with_wrong_key_fails() {
+        let (_priv1, pub1) = make_x25519_keypair(0x01);
+        let (priv2, _pub2) = make_x25519_keypair(0x02);
+        let plaintext = b"wrong key test payload";
+        let sealed = seal_to_owner(&pub1, plaintext).expect("seal must succeed");
+        let err = open_from_owner(&priv2, &sealed).expect_err("opening with wrong key must fail");
+        assert!(
+            matches!(err, DmSignError::DecryptionFailed),
+            "expected DecryptionFailed, got {err:?}"
+        );
+    }
+
+    /// C1: seal_to_owner must reject a low-order (all-zero) recipient X25519
+    /// pubkey. The all-zero X25519 point is a small-order (torsion) point;
+    /// ECDH with it yields an all-zero shared secret, making the derived AEAD
+    /// key predictable regardless of the ephemeral scalar.
+    #[test]
+    fn seal_to_owner_rejects_low_order_x25519_pubkey() {
+        // The all-zero X25519 pubkey is a well-known small-order point.
+        let low_order_pub = [0u8; 32];
+        let plaintext = b"low-order attack test";
+        let err = seal_to_owner(&low_order_pub, plaintext)
+            .expect_err("seal_to_owner must reject a low-order (all-zero) X25519 pubkey");
+        assert!(
+            matches!(err, DmSignError::InvalidPublicKey),
+            "expected InvalidPublicKey, got {err:?}"
+        );
+    }
+
+    /// C1: open_from_owner must reject a sealed blob whose embedded ephemeral
+    /// pubkey is the all-zero (low-order) X25519 point. Craft a blob
+    /// with [0; 32] as the ephemeral pub and fill the rest with zeros;
+    /// the shared secret would be all-zero, which we must reject before
+    /// reaching the AEAD layer.
+    #[test]
+    fn open_from_owner_rejects_low_order_ephemeral_pubkey() {
+        let (priv_bytes, _pub_bytes) = make_x25519_keypair(0x01);
+        // Craft a fake sealed blob: 32-byte all-zero ephemeral pub + 12-byte
+        // nonce + at least 16-byte ciphertext+tag (all zeros).
+        let mut fake_sealed = vec![0u8; 32 + 12 + 16];
+        // ephemeral pub bytes [0..32] are already zero — the low-order point.
+        // nonce [32..44] and ciphertext+tag [44..] are zero too.
+        fake_sealed[0..32].fill(0);
+        let err = open_from_owner(&priv_bytes, &fake_sealed)
+            .expect_err("open_from_owner must reject a low-order ephemeral X25519 pubkey");
+        assert!(
+            matches!(err, DmSignError::InvalidPublicKey),
+            "expected InvalidPublicKey, got {err:?}"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -9,7 +9,7 @@ use harmony_app::community_state_sync::{
     CommunityRootHlcTracker, CommunitySyncEngine, CommunitySyncEngineConfig, DEFAULT_DEBOUNCE_MS,
 };
 use harmony_app::content_store::{ContentStore, RuntimeContentStore};
-use harmony_app::owner_state_types::{MembershipKey, OwnerAddr, SpaceId};
+use harmony_app::owner_state_types::{EpochKey, OwnerAddr, SpaceId};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
@@ -60,7 +60,7 @@ async fn engine_constructs_and_shuts_down_cleanly() {
     let (cas_op_tx, _cas_op_rx) = mpsc::channel(8);
 
     let community_id = SpaceId([1u8; 16]);
-    let mk = MembershipKey::new([0x42; 32]);
+    let mk = EpochKey::new([0x42; 32]);
     let admin = OwnerAddr([2u8; 16]);
 
     let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
@@ -94,6 +94,7 @@ async fn engine_constructs_and_shuts_down_cleanly() {
         error_tx: None,
         delta_tx: None,
         pending_redemptions: None,
+        crdt_state: None,
     });
 
     // Shutdown without ever sending dirty — clean path.
@@ -123,7 +124,7 @@ async fn flush_now_publishes_one_root_publish() {
     });
 
     let community_id = SpaceId([1u8; 16]);
-    let mk = MembershipKey::new([0x42; 32]);
+    let mk = EpochKey::new([0x42; 32]);
     let admin = OwnerAddr([2u8; 16]);
 
     let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
@@ -157,6 +158,7 @@ async fn flush_now_publishes_one_root_publish() {
         error_tx: None,
         delta_tx: None,
         pending_redemptions: None,
+        crdt_state: None,
     });
 
     engine.flush_now().await.expect("flush_now");
@@ -220,7 +222,7 @@ async fn engine_receives_remote_publish_and_merges_event() {
     });
 
     let community_id = SpaceId([1u8; 16]);
-    let mk = MembershipKey::new([0x42; 32]);
+    let mk = EpochKey::new([0x42; 32]);
 
     let identity_a = PrivateIdentity::from_seed(&[0xa1; 32]);
     let admin = OwnerAddr(identity_a.identity.address_hash);
@@ -337,6 +339,7 @@ async fn engine_receives_remote_publish_and_merges_event() {
         error_tx: None,
         delta_tx: None,
         pending_redemptions: None,
+        crdt_state: None,
     });
 
     // B needs an OwnerDeviceCache-style lookup that returns
@@ -373,6 +376,7 @@ async fn engine_receives_remote_publish_and_merges_event() {
         error_tx: None,
         delta_tx: None,
         pending_redemptions: None,
+        crdt_state: None,
     });
 
     // Trigger A's publish. B's subscriber arm should fire and merge.
@@ -469,7 +473,7 @@ async fn engine_emits_membership_delta_on_remote_insert() {
     });
 
     let community_id = SpaceId([1u8; 16]);
-    let mk = MembershipKey::new([0x42; 32]);
+    let mk = EpochKey::new([0x42; 32]);
     let identity_a = PrivateIdentity::from_seed(&[0xa1; 32]);
     let admin = OwnerAddr(identity_a.identity.address_hash);
     let identity_a_pub = identity_a.identity.to_public_bytes();
@@ -610,6 +614,7 @@ async fn engine_emits_membership_delta_on_remote_insert() {
         error_tx: None,
         delta_tx: None,
         pending_redemptions: None,
+        crdt_state: None,
     });
 
     struct SingleIdentityResolver {
@@ -657,6 +662,7 @@ async fn engine_emits_membership_delta_on_remote_insert() {
         error_tx: None,
         delta_tx: Some(delta_tx),
         pending_redemptions: None,
+        crdt_state: None,
     });
 
     engine_a.flush_now().await.expect("flush_now");
@@ -701,7 +707,7 @@ async fn engine_insert_local_event_emits_delta_and_notifies_publish() {
     });
 
     let community_id = SpaceId([2u8; 16]);
-    let mk = MembershipKey::new([0x33; 32]);
+    let mk = EpochKey::new([0x33; 32]);
     let identity = PrivateIdentity::from_seed(&[0xc1; 32]);
     let admin = OwnerAddr(identity.identity.address_hash);
     let identity_pub = identity.identity.to_public_bytes();
@@ -756,6 +762,7 @@ async fn engine_insert_local_event_emits_delta_and_notifies_publish() {
         error_tx: None,
         delta_tx: Some(delta_tx),
         pending_redemptions: None,
+        crdt_state: None,
     });
 
     let payload = EventPayload {
@@ -888,7 +895,7 @@ async fn engine_accepts_self_owner_and_signing_key_in_config() {
 
     let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
         community_id,
-        membership_key: MembershipKey::new([0x42; 32]),
+        membership_key: EpochKey::new([0x42; 32]),
         admin_addr: self_owner,
         is_invite_only: false,
         device_id: "test-device".into(),
@@ -908,6 +915,7 @@ async fn engine_accepts_self_owner_and_signing_key_in_config() {
         error_tx: None,
         delta_tx: None,
         pending_redemptions: None,
+        crdt_state: None,
     });
     engine.shutdown().await.expect("shutdown");
 }
@@ -922,7 +930,7 @@ async fn publish_carries_valid_publisher_sig() {
     };
     use harmony_app::content_store::{ContentStore, RuntimeContentStore};
     use harmony_app::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
-    use harmony_app::owner_state_types::{MembershipKey, OwnerAddr, SpaceId};
+    use harmony_app::owner_state_types::{EpochKey, OwnerAddr, SpaceId};
 
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
     let (_in_tx, in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
@@ -941,7 +949,7 @@ async fn publish_carries_valid_publisher_sig() {
     });
 
     let community_id = SpaceId([1u8; 16]);
-    let mk = MembershipKey::new([0x42; 32]);
+    let mk = EpochKey::new([0x42; 32]);
     let signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0xAB; 32]));
     let verifying_key = signing_key.verifying_key();
     // self_owner is just an opaque tag here; the test verifies sig
@@ -981,6 +989,7 @@ async fn publish_carries_valid_publisher_sig() {
         error_tx: None,
         delta_tx: None,
         pending_redemptions: None,
+        crdt_state: None,
     });
 
     engine.flush_now().await.expect("flush_now");
@@ -1069,7 +1078,7 @@ async fn spoofed_publisher_addr_rejected_with_publisher_sig_invalid() {
     });
 
     let community_id = SpaceId([7u8; 16]);
-    let mk = MembershipKey::new([0xAA; 32]);
+    let mk = EpochKey::new([0xAA; 32]);
 
     let alice = PrivateIdentity::from_seed(&[0xa1; 32]);
     let alice_addr = OwnerAddr(alice.identity.address_hash);
@@ -1141,7 +1150,7 @@ async fn spoofed_publisher_addr_rejected_with_publisher_sig_invalid() {
     };
     let signed_bytes = canonical_cbor_encode(&signed).expect("encode signed");
     let bad_sig = bob_signing.sign(&signed_bytes).to_bytes();
-    let envelope = signed.into_wire(bad_sig);
+    let envelope = signed.into_wire(bad_sig, None);
     let envelope_bytes = canonical_cbor_encode(&envelope).expect("encode envelope");
     let wire = encrypt_root_publish(&mk, &envelope_bytes).expect("encrypt root");
 
@@ -1188,6 +1197,7 @@ async fn spoofed_publisher_addr_rejected_with_publisher_sig_invalid() {
         error_tx: Some(degraded_tx),
         delta_tx: None,
         pending_redemptions: None,
+        crdt_state: None,
     });
 
     in_tx.send(wire).await.expect("inject wire");
@@ -1249,7 +1259,7 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
     });
 
     let community_id = SpaceId([8u8; 16]);
-    let mk = MembershipKey::new([0xCC; 32]);
+    let mk = EpochKey::new([0xCC; 32]);
 
     let admin_id = PrivateIdentity::from_seed(&[0xa0; 32]);
     let admin_addr = OwnerAddr(admin_id.identity.address_hash);
@@ -1368,7 +1378,7 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
     };
     let signed_bytes = canonical_cbor_encode(&signed).expect("encode signed");
     let valid_sig = alice_signing.sign(&signed_bytes).to_bytes();
-    let envelope = signed.into_wire(valid_sig);
+    let envelope = signed.into_wire(valid_sig, None);
     let envelope_bytes = canonical_cbor_encode(&envelope).expect("encode env");
     let wire = encrypt_root_publish(&mk, &envelope_bytes).expect("encrypt root");
 
@@ -1408,6 +1418,7 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
         error_tx: Some(degraded_tx),
         delta_tx: None,
         pending_redemptions: None,
+        crdt_state: None,
     });
 
     in_tx.send(wire).await.expect("inject wire");
@@ -1482,7 +1493,7 @@ async fn cold_cache_publish_rejected_then_succeeds_after_propagation() {
     });
 
     let community_id = SpaceId([9u8; 16]);
-    let mk = MembershipKey::new([0xDD; 32]);
+    let mk = EpochKey::new([0xDD; 32]);
 
     let alice = PrivateIdentity::from_seed(&[0xa1; 32]);
     let alice_addr = OwnerAddr(alice.identity.address_hash);
@@ -1543,7 +1554,7 @@ async fn cold_cache_publish_rejected_then_succeeds_after_propagation() {
     };
     let signed_bytes = canonical_cbor_encode(&signed).expect("encode signed");
     let sig = alice_signing.sign(&signed_bytes).to_bytes();
-    let envelope = signed.into_wire(sig);
+    let envelope = signed.into_wire(sig, None);
     let envelope_bytes = canonical_cbor_encode(&envelope).expect("encode env");
     let wire = encrypt_root_publish(&mk, &envelope_bytes).expect("encrypt root");
 
@@ -1586,6 +1597,7 @@ async fn cold_cache_publish_rejected_then_succeeds_after_propagation() {
         error_tx: Some(degraded_tx),
         delta_tx: None,
         pending_redemptions: None,
+        crdt_state: None,
     });
 
     // 1. Cold cache: resolver empty → first delivery rejected.

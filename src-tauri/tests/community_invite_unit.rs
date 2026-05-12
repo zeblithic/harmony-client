@@ -1,14 +1,20 @@
 //! Unit tests for community_invite.rs Phase 1 types.
 
-use harmony_app::community_invite::{CommunityInvitePayload, InviteToken};
+use harmony_app::community_invite::{
+    CommunityInvitePayload, InviteEpochSnapshot, InviteToken, MaterializedCommunityState,
+};
 use harmony_app::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
-use harmony_app::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
+use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
 
 #[test]
 fn community_invite_payload_round_trips_open_form() {
     let p = CommunityInvitePayload {
         community_id: SpaceId([1u8; 16]),
-        membership_key: MembershipKey::new([2u8; 32]),
+        epoch_snapshot: InviteEpochSnapshot {
+            epoch: 0,
+            sealed_epoch_key: EpochKey::new([2u8; 32]).as_bytes().to_vec(),
+            state_snapshot: MaterializedCommunityState::default(),
+        },
         admin_addr: OwnerAddr([3u8; 16]),
         community_name: "harmony-design".into(),
         is_invite_only: false,
@@ -43,7 +49,11 @@ fn community_invite_payload_round_trips_invite_only_form() {
 
     let p = CommunityInvitePayload {
         community_id: SpaceId([1u8; 16]),
-        membership_key: MembershipKey::new([2u8; 32]),
+        epoch_snapshot: InviteEpochSnapshot {
+            epoch: 0,
+            sealed_epoch_key: EpochKey::new([2u8; 32]).as_bytes().to_vec(),
+            state_snapshot: MaterializedCommunityState::default(),
+        },
         admin_addr: OwnerAddr([3u8; 16]),
         community_name: "private".into(),
         is_invite_only: true,
@@ -106,11 +116,15 @@ fn invite_url_round_trips_open_payload() {
     use harmony_app::community_invite::{
         decode_invite_url, encode_invite_url, CommunityInvitePayload,
     };
-    use harmony_app::owner_state_types::{MembershipKey, OwnerAddr, SpaceId};
+    use harmony_app::owner_state_types::{EpochKey, OwnerAddr, SpaceId};
 
     let payload = CommunityInvitePayload {
         community_id: SpaceId([0xab; 16]),
-        membership_key: MembershipKey::new([0x42; 32]),
+        epoch_snapshot: InviteEpochSnapshot {
+            epoch: 0,
+            sealed_epoch_key: EpochKey::new([0x42; 32]).as_bytes().to_vec(),
+            state_snapshot: MaterializedCommunityState::default(),
+        },
         admin_addr: OwnerAddr([0xcd; 16]),
         community_name: "Hackers United".to_string(),
         is_invite_only: false,
@@ -160,7 +174,8 @@ fn decode_rejects_truncated_cbor() {
 #[test]
 fn decode_rejects_oversized_payload() {
     use harmony_app::community_invite::{decode_invite_url, InviteUrlError};
-    let huge_body = "A".repeat(10_000);
+    // Must exceed MAX_INVITE_BODY_B64_CHARS (85_333 = ≈64 KiB decoded).
+    let huge_body = "A".repeat(90_000);
     let url = format!("harmony://invite/{huge_body}");
     let err = decode_invite_url(&url).unwrap_err();
     assert!(matches!(err, InviteUrlError::TooLarge(_)));
@@ -169,12 +184,17 @@ fn decode_rejects_oversized_payload() {
 #[test]
 fn decode_trims_whitespace() {
     use harmony_app::community_invite::{
-        decode_invite_url, encode_invite_url, CommunityInvitePayload,
+        decode_invite_url, encode_invite_url, CommunityInvitePayload, InviteEpochSnapshot,
+        MaterializedCommunityState,
     };
-    use harmony_app::owner_state_types::{MembershipKey, OwnerAddr, SpaceId};
+    use harmony_app::owner_state_types::{EpochKey, OwnerAddr, SpaceId};
     let payload = CommunityInvitePayload {
         community_id: SpaceId([0xab; 16]),
-        membership_key: MembershipKey::new([0x42; 32]),
+        epoch_snapshot: InviteEpochSnapshot {
+            epoch: 0,
+            sealed_epoch_key: EpochKey::new([0x42; 32]).as_bytes().to_vec(),
+            state_snapshot: MaterializedCommunityState::default(),
+        },
         admin_addr: OwnerAddr([0xcd; 16]),
         community_name: "WhitespaceTest".to_string(),
         is_invite_only: false,
@@ -224,12 +244,17 @@ fn encode_rejects_invite_only_without_admin_identity_pub() {
 #[test]
 fn encode_rejects_open_community_with_admin_identity_pub_set() {
     use harmony_app::community_invite::{
-        encode_invite_url, CommunityInvitePayload, InviteUrlError,
+        encode_invite_url, CommunityInvitePayload, InviteEpochSnapshot, InviteUrlError,
+        MaterializedCommunityState,
     };
-    use harmony_app::owner_state_types::{MembershipKey, OwnerAddr, SpaceId};
+    use harmony_app::owner_state_types::{EpochKey, OwnerAddr, SpaceId};
     let payload = CommunityInvitePayload {
         community_id: SpaceId([0xab; 16]),
-        membership_key: MembershipKey::new([0x42; 32]),
+        epoch_snapshot: InviteEpochSnapshot {
+            epoch: 0,
+            sealed_epoch_key: EpochKey::new([0x42; 32]).as_bytes().to_vec(),
+            state_snapshot: MaterializedCommunityState::default(),
+        },
         admin_addr: OwnerAddr([0xcd; 16]),
         community_name: "WriterCheck".to_string(),
         is_invite_only: false,
@@ -247,10 +272,11 @@ fn encode_rejects_open_community_with_admin_identity_pub_set() {
 #[test]
 fn encode_rejects_open_community_with_admin_bootstrap_set() {
     use harmony_app::community_invite::{
-        encode_invite_url, CommunityInvitePayload, InviteUrlError,
+        encode_invite_url, CommunityInvitePayload, InviteEpochSnapshot, InviteUrlError,
+        MaterializedCommunityState,
     };
     use harmony_app::community_membership::{sign_event, EventPayload, MembershipEventKind};
-    use harmony_app::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
+    use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
     // Synthesize a signed admin self-Join just so admin_bootstrap is
     // structurally well-formed; the writer check fires before any
     // signature inspection.
@@ -274,7 +300,11 @@ fn encode_rejects_open_community_with_admin_bootstrap_set() {
     .expect("sign");
     let payload = CommunityInvitePayload {
         community_id,
-        membership_key: MembershipKey::new([0x42; 32]),
+        epoch_snapshot: InviteEpochSnapshot {
+            epoch: 0,
+            sealed_epoch_key: EpochKey::new([0x42; 32]).as_bytes().to_vec(),
+            state_snapshot: MaterializedCommunityState::default(),
+        },
         admin_addr,
         community_name: "WriterCheck".to_string(),
         is_invite_only: false,
@@ -1027,11 +1057,13 @@ mod verify_rejection_tests {
 // =====================================================================
 
 mod admin_bootstrap_helpers {
-    use harmony_app::community_invite::{CommunityInvitePayload, InviteToken};
+    use harmony_app::community_invite::{
+        CommunityInvitePayload, InviteEpochSnapshot, InviteToken, MaterializedCommunityState,
+    };
     use harmony_app::community_membership::{
         sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent,
     };
-    use harmony_app::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
+    use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
 
     /// Deterministic keys: `seed` selects the identity (e.g., 0xAA for
     /// admin in the test). Returns `(identity_pub_64, signing_key,
@@ -1100,7 +1132,11 @@ mod admin_bootstrap_helpers {
 
         CommunityInvitePayload {
             community_id,
-            membership_key: MembershipKey::new([0xBB; 32]),
+            epoch_snapshot: InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: EpochKey::new([0xBB; 32]).as_bytes().to_vec(),
+                state_snapshot: MaterializedCommunityState::default(),
+            },
             admin_addr,
             community_name: "TestCom".into(),
             is_invite_only: true,
@@ -1255,7 +1291,14 @@ mod verify_admin_bootstrap_tests {
 
         let p = harmony_app::community_invite::CommunityInvitePayload {
             community_id,
-            membership_key: harmony_app::owner_state_types::MembershipKey::new([0xBB; 32]),
+            epoch_snapshot: harmony_app::community_invite::InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: harmony_app::owner_state_types::EpochKey::new([0xBB; 32])
+                    .as_bytes()
+                    .to_vec(),
+                state_snapshot: harmony_app::community_invite::MaterializedCommunityState::default(
+                ),
+            },
             admin_addr,
             community_name: "TestCom".into(),
             is_invite_only: true,

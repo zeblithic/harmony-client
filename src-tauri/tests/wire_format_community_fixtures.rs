@@ -5,12 +5,14 @@
 //!
 //! Mirrors src-tauri/tests/wire_format_fixture.rs (owner-state).
 
-use harmony_app::community_invite::{CommunityInvitePayload, InviteToken};
+use harmony_app::community_invite::{
+    CommunityInvitePayload, InviteEpochSnapshot, InviteToken, MaterializedCommunityState,
+};
 use harmony_app::community_membership::{
     ChannelId, CounterSignature, MembershipEventKind, SignedMembershipEvent,
 };
 use harmony_app::owner_state_crypto::canonical_cbor_encode;
-use harmony_app::owner_state_types::{Hlc, MembershipKey, OwnerAddr, SpaceId};
+use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
 
 fn fixture_hlc() -> Hlc {
     Hlc {
@@ -34,13 +36,13 @@ fn fixture_signed_event(kind: MembershipEventKind) -> SignedMembershipEvent {
 
 #[test]
 fn membership_key_wire_bytes_pinned() {
-    let k = MembershipKey::new([0xAA; 32]);
+    let k = EpochKey::new([0xAA; 32]);
     let bytes = canonical_cbor_encode(&k).expect("encode");
     let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     eprintln!("membership_key hex: {hex}");
     assert_eq!(
         hex, "5820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "MembershipKey wire format changed"
+        "EpochKey wire format changed"
     );
 }
 
@@ -141,7 +143,11 @@ fn countersignature_wire_bytes_pinned() {
 fn community_invite_payload_open_wire_bytes_pinned() {
     let p = CommunityInvitePayload {
         community_id: SpaceId([0x37; 16]),
-        membership_key: MembershipKey::new([0xAA; 32]),
+        epoch_snapshot: InviteEpochSnapshot {
+            epoch: 0,
+            sealed_epoch_key: EpochKey::new([0xAA; 32]).as_bytes().to_vec(),
+            state_snapshot: MaterializedCommunityState::default(),
+        },
         admin_addr: OwnerAddr([0x11; 16]),
         community_name: "fix".into(),
         is_invite_only: false,
@@ -153,9 +159,14 @@ fn community_invite_payload_open_wire_bytes_pinned() {
     let bytes = canonical_cbor_encode(&p).expect("encode");
     let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     eprintln!("community_invite_payload_open hex: {hex}");
+    // ZEB-249: wire format updated — "mk" (EpochKey) replaced by "es"
+    // (InviteEpochSnapshot). Re-pinned after Task 5 struct change.
+    let expected = hex::decode("a56263695037373737373737373737373737373737626573a36265700062736b5820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa627373a2626d62a062706ca06261645011111111111111111111111111111111626e6d6366697862696ff4").unwrap_or_else(|_| {
+        eprintln!("\nACTUAL bytes for open payload pinning:\n  hex = \"{hex}\"\n");
+        panic!("update PLACEHOLDER_OPEN with the hex above in wire_format_community_fixtures.rs");
+    });
     assert_eq!(
-        hex,
-        "a56263695037373737373737373737373737373737626d6b5820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa6261645011111111111111111111111111111111626e6d6366697862696ff4",
+        bytes, expected,
         "CommunityInvitePayload (open) wire format changed"
     );
 }
@@ -185,7 +196,11 @@ fn community_invite_payload_invite_only_wire_bytes_pinned() {
 
     let p = CommunityInvitePayload {
         community_id: SpaceId([0x37; 16]),
-        membership_key: MembershipKey::new([0xAA; 32]),
+        epoch_snapshot: InviteEpochSnapshot {
+            epoch: 0,
+            sealed_epoch_key: EpochKey::new([0xAA; 32]).as_bytes().to_vec(),
+            state_snapshot: MaterializedCommunityState::default(),
+        },
         admin_addr: OwnerAddr([0x11; 16]),
         community_name: "fix".into(),
         is_invite_only: true,
@@ -198,9 +213,16 @@ fn community_invite_payload_invite_only_wire_bytes_pinned() {
     let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     eprintln!("community_invite_payload_invite_only hex: {hex}");
 
+    // ZEB-249: wire format updated — "mk" (EpochKey) replaced by "es"
+    // (InviteEpochSnapshot). Re-pinned after Task 5 struct change.
+    let expected = hex::decode("a96263695037373737373737373737373737373737626573a36265700062736b5820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa627373a2626d62a062706ca06261645011111111111111111111111111111111626e6d6366697862696ff5626578a361771b0000018bcfe56800616c0061646366697862746ba462697650111111111111111111111111111111116269685022222222222222222222222222222222626d74a361771b0000018bcfe56800616c006164636669786273675840dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd626162a662696450cccccccccccccccccccccccccccccccc6263695037373737373737373737373737373737626b6ea1627467616a6261635011111111111111111111111111111111626174a361771b0000018bcfe56800616c006164636669786273675840eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee6261705840abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab").unwrap_or_else(|_| {
+        eprintln!("\nACTUAL bytes for invite-only payload pinning:\n  hex = \"{hex}\"\n");
+        panic!(
+            "update PLACEHOLDER_INVITEONLY with the hex above in wire_format_community_fixtures.rs"
+        );
+    });
     assert_eq!(
-        hex,
-        "a96263695037373737373737373737373737373737626d6b5820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa6261645011111111111111111111111111111111626e6d6366697862696ff5626578a361771b0000018bcfe56800616c0061646366697862746ba462697650111111111111111111111111111111116269685022222222222222222222222222222222626d74a361771b0000018bcfe56800616c006164636669786273675840dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd626162a662696450cccccccccccccccccccccccccccccccc6263695037373737373737373737373737373737626b6ea1627467616a6261635011111111111111111111111111111111626174a361771b0000018bcfe56800616c006164636669786273675840eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee6261705840abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
+        bytes, expected,
         "CommunityInvitePayload (invite-only) wire format changed"
     );
 }
