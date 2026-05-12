@@ -41,6 +41,23 @@ export class ProfileBroadcastService {
     });
   }
 
+  /**
+   * Snapshot the set of community SpaceIds currently flagged as shared
+   * in the user's public profile. Use at frontend startup to populate
+   * per-community toggle initial state — without this read, the toggle
+   * defaults to OFF on every restart even when the server-side state is
+   * ON, while the publisher keeps broadcasting (reads from CRDT). That
+   * mismatch inverts the privacy contract.
+   *
+   * Returns hex-encoded SpaceIds (32 chars each).
+   */
+  async listSharedSet(): Promise<string[]> {
+    return (await this.adapter.invoke(
+      'list_shared_in_profile_communities',
+      {},
+    )) as string[];
+  }
+
   /** Subscribe to a peer's broadcast topic. Returns a u64 handle the
    *  caller passes to subsequent unsubscribe / getCached calls. */
   async subscribe(peerAddr: string): Promise<number> {

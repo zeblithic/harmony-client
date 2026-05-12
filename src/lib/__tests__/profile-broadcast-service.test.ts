@@ -18,4 +18,22 @@ describe('ProfileBroadcastService', () => {
     expect(id).toBe(42);
     expect(invoke).toHaveBeenCalledOnce();
   });
+
+  it('service_list_shared_set_returns_ids', async () => {
+    const invoke = vi.fn(async (cmd: string, args?: unknown) => {
+      expect(cmd).toBe('list_shared_in_profile_communities');
+      expect(args).toEqual({});
+      return ['aa'.repeat(16), 'bb'.repeat(16)];
+    });
+    const adapter = {
+      invoke,
+      listen: vi.fn(async () => () => {}),
+    } as unknown as TauriAdapter;
+    const svc = new ProfileBroadcastService(adapter);
+    const ids = await svc.listSharedSet();
+    expect(ids).toHaveLength(2);
+    expect(ids[0]).toBe('aa'.repeat(16));
+    expect(ids[1]).toBe('bb'.repeat(16));
+    expect(invoke).toHaveBeenCalledOnce();
+  });
 });

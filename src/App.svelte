@@ -185,11 +185,12 @@
   // adapter wires up. The CommunitySettingsPanel toggle and the
   // ProfilePopover memberships section both route through this instance.
   let profileBroadcastService = $state<ProfileBroadcastService | null>(null);
-  // Local optimistic mirror of per-community shared_in_profile state.
-  // The backend is the source of truth (no read IPC yet — see Sub-D
-  // Phase 4 follow-up); we default to `false` on first toggle render and
-  // flip the cell on successful toggle. The settings panel rolls back
-  // on failure.
+  // Local mirror of per-community shared_in_profile state. The backend
+  // is the source of truth; we hydrate this Map at startup via
+  // `profileBroadcastService.listSharedSet()` (see ZEB-281 Sub-D Phase 4
+  // R1 — required so the toggle reflects server state after restart and
+  // the UI never claims "off / private" while the publisher broadcasts
+  // "on / public"). The settings panel rolls back on toggle failure.
   let sharedInProfileByCommunity = $state<Map<string, boolean>>(new Map());
   let selectedCommunityId = $state<string | null>(null);
   let communityMembers = $state<CommunityMember[]>([]);
@@ -559,6 +560,30 @@
         await invoke('start_node', { endpoint: null });
       } catch (err) {
         console.warn('[harmony-client] auto-start_node failed:', err);
+      }
+
+      // ZEB-281 Sub-D Phase 4 R1: hydrate the per-community
+      // shared_in_profile mirror from the backend so the toggle in
+      // CommunitySettingsPanel reflects the server-side state on the
+      // very first render after restart. Without this, the toggle would
+      // default to OFF for every community even when the publisher is
+      // still broadcasting opted-in Communities (the publisher reads
+      // from CRDT, not from this Map). Requires crdt_state to be
+      // populated — runs after start_node above. Failure falls back to
+      // an empty Map (all toggles OFF), the safe default for the
+      // privacy invariant.
+      try {
+        const sharedIds = await profileBroadcastService.listSharedSet();
+        const next = new Map<string, boolean>();
+        for (const cid of sharedIds) {
+          next.set(cid, true);
+        }
+        // Re-assign to trigger Svelte 5 reactivity on the $state Map
+        // (same idiom as the toggle handler below).
+        sharedInProfileByCommunity = next;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn('[harmony-client] listSharedSet hydration failed:', msg);
       }
 
       await tryConnect('message', messageService.connectAdapter(adapter));
@@ -1247,8 +1272,8 @@
             throw new Error('profile broadcast service not connected');
           }
           await profileBroadcastService.setShared(cid, shared);
-          // Optimistic local mirror (no read IPC yet — see ZEB-281
-          // Sub-D Phase 4 follow-up). Reassign the map so the
+          // Local mirror — backend is source of truth (hydrated at
+          // startup via listSharedSet). Reassign the map so the
           // reactive read in the parent picks up the change.
           const next = new Map(sharedInProfileByCommunity);
           next.set(cid, shared);

@@ -10340,6 +10340,45 @@ async fn set_space_shared_in_profile(
     Ok(())
 }
 
+/// IPC: Sub-D Phase 4 (ZEB-281). Read the set of community SpaceIds the
+/// user has opted to share in their public profile. Frontend calls this
+/// once at startup to populate the per-community toggle initial state in
+/// CommunitySettingsPanel — without this read, the toggle defaults to
+/// OFF on every restart even when server-side `shared_in_profile == true`
+/// (the publisher continues broadcasting correctly because it reads from
+/// CRDT, but the UI would falsely claim "off / private", inverting the
+/// privacy contract).
+///
+/// Returns hex-encoded SpaceIds (32 chars each), matching the on-the-wire
+/// shape used in `DiscoveredProfileInfo.communityIds`. Sorted + deduped
+/// to mirror `OwnerStateBroadcastSource::current_shared_set` (the
+/// publisher's view of the same predicate).
+#[tauri::command]
+async fn list_shared_in_profile_communities(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+) -> Result<Vec<String>, String> {
+    let crdt_state = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.crdt_state
+            .clone()
+            .ok_or("crdt_state missing — node not running?")?
+    };
+    let g = crdt_state.lock().await;
+    let mut ids: Vec<String> = g
+        .spaces
+        .values()
+        .filter(|s| {
+            matches!(s.kind, crate::owner_state_types::SpaceKind::Community) && s.shared_in_profile
+        })
+        .map(|s| hex::encode(s.id.0))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
 /// IPC: Sub-D Phase 4 (ZEB-281). Subscribe to a peer's profile-broadcast
 /// topic. Returns a u64 SubscriptionId the frontend uses to address
 /// subsequent unsubscribe/get_cached calls + to filter incoming
@@ -12570,6 +12609,7 @@ pub fn run() {
             remove_library,
             browse_library,
             set_space_shared_in_profile,
+            list_shared_in_profile_communities,
             subscribe_peer_profile,
             unsubscribe_peer_profile,
             get_cached_peer_profile,
