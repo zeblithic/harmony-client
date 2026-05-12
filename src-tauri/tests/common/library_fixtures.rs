@@ -52,6 +52,8 @@ pub fn mock_directory_entry(
         listed_by,
         listed_at,
         community_signature: [0u8; 64],
+        library_identity_pub: None,
+        library_signature: None,
     };
     let mut for_sig = entry.clone();
     for_sig.community_signature = [0u8; 64];

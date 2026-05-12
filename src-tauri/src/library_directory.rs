@@ -64,10 +64,69 @@ pub struct LibraryDirectoryEntry {
         deserialize_with = "crate::owner_state_types::deserialize_bytes_from_bstr"
     )]
     pub community_signature: [u8; 64],
+
+    // === Sub-D Phase 3 (ZEB-280) wrapping signature fields ===
+    //
+    // Wire-compatible with Phase 1: `skip_serializing_if = "Option::is_none"`
+    // omits the keys from canonical CBOR when None, so a Phase 1 entry's
+    // bytes are byte-identical regardless of whether it's emitted by a
+    // Phase 1 or Phase 3 client.
+    //
+    // 2-char field keys preserve `canonical_cbor_encode`'s same-length-keys
+    // precondition (mirrors all other Sub-A/B/C wire types).
+    //
+    // See spec §4.1.
+    /// 64-byte identity bundle (X25519_pub || Ed25519_pub) of the
+    /// broadcasting library. None for unwrapped (Phase 1-style) entries.
+    #[serde(
+        rename = "li",
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::owner_state_types::serialize_optional_bytes_as_bstr",
+        deserialize_with = "crate::owner_state_types::deserialize_optional_bytes_from_bstr"
+    )]
+    pub library_identity_pub: Option<[u8; 64]>,
+
+    /// Ed25519 wrapping signature from the broadcasting library over
+    /// the canonical CBOR encoding of all fields with `library_signature`
+    /// zeroed (analogous to Phase 1's `community_signature` pattern).
+    /// None for unwrapped entries.
+    #[serde(
+        rename = "ls",
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::owner_state_types::serialize_optional_bytes_as_bstr",
+        deserialize_with = "crate::owner_state_types::deserialize_optional_bytes_from_bstr"
+    )]
+    pub library_signature: Option<[u8; 64]>,
 }
 
 impl CanonicalPayloadSealed for LibraryDirectoryEntry {}
 impl CanonicalPayload for LibraryDirectoryEntry {}
+
+/// Sub-D Phase 3 (ZEB-280) — outcome of `verify_entry`. Captures the
+/// admin-sig-verified entry's wrapping-signature state, which feeds the
+/// aggregation's broadcasting-library tracking and the frontend
+/// "unattested" badge. Spec §4.2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttestationStatus {
+    /// Phase 1-style entry: no wrapping sig present (both
+    /// `library_signature` and `library_identity_pub` are `None`).
+    /// Implicit trust from subscription topic — entries arriving from
+    /// library X's topic are treated as if X attested to them.
+    Unwrapped,
+    /// Phase 3: wrapping sig present and verified. `OwnerAddr` is the
+    /// broadcasting library's derived address (from
+    /// `library_identity_pub` via `Identity::from_public_bytes`).
+    Attested(OwnerAddr),
+    /// Phase 3: wrapping sig present but invalid. Entry is still
+    /// surfaced — the community admin's signature is the trust anchor
+    /// for content. `OwnerAddr` is the broadcasting library's CLAIMED
+    /// address (the derived addr from `library_identity_pub`; we keep
+    /// it for aggregation tracking even though we couldn't verify the
+    /// claim).
+    Unattested(OwnerAddr),
+}
 
 /// Sub-D Phase 2 auto-discovery announce record. Spec §4.1.
 ///
@@ -162,6 +221,18 @@ pub enum EntryVerifyError {
         entry_addr: OwnerAddr,
         payload_addr: OwnerAddr,
     },
+    /// Sub-D Phase 3: exactly one of `library_signature` and
+    /// `library_identity_pub` is `Some`. Cannot verify a wrapping sig
+    /// without both fields; this is a malformed wire state and must
+    /// be rejected (not silently treated as Unwrapped, which would
+    /// mask a publisher bug). Spec §5.
+    #[error("library_signature and library_identity_pub must both be Some or both be None")]
+    LibrarySignatureFieldsInconsistent,
+
+    /// Sub-D Phase 3: `library_identity_pub` bytes failed
+    /// `Identity::from_public_bytes` validation. Spec §5.
+    #[error("malformed library identity_pub: {0}")]
+    InvalidLibraryIdentityPub(String),
 }
 
 pub const MAX_NAME_LEN: usize = 200;
@@ -1079,6 +1150,8 @@ mod tests {
             listed_by,
             listed_at,
             community_signature: [0u8; 64],
+            library_identity_pub: None,
+            library_signature: None,
         };
         // Sign over canonical CBOR of all fields with community_signature
         // zeroed — verify_entry zeroes the same field before recomputing.
@@ -1168,6 +1241,8 @@ mod tests {
                 device_id: String::new(),
             },
             community_signature: [0u8; 64],
+            library_identity_pub: None,
+            library_signature: None,
         };
         assert!(matches!(
             verify_entry(&entry),
@@ -1723,6 +1798,84 @@ mod tests {
             verify_entry(&bad),
             Err(EntryVerifyError::TooManyTopics)
         ));
+    }
+
+    /// ZEB-280 Phase 3: an entry with `library_identity_pub` and
+    /// `library_signature` both populated (some `[0u8; 64]` sentinel
+    /// here — Task 2 adds real-signer verifier tests) round-trips
+    /// through canonical CBOR and the bstr serde helpers correctly.
+    #[test]
+    fn phase3_wrapped_entry_roundtrips_via_canonical_cbor() {
+        let community_id = SpaceId([0x11; 16]);
+        let admin_addr = OwnerAddr([0; 16]);
+        let (admin_signing_key, admin_identity_pub) = {
+            let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+            let mut bundle = [0u8; 64];
+            bundle[..32].copy_from_slice(&[0x11; 32]);
+            bundle[32..].copy_from_slice(&key.verifying_key().to_bytes());
+            // Sanity-check the bundle parses back to an `Identity`.
+            // (Bundle is X25519_pub(32) || Ed25519_pub(32); the X25519
+            // half here is a constant, but `from_public_bytes` only
+            // validates structural length, not key validity per-half.)
+            let _id =
+                harmony_identity::Identity::from_public_bytes(&bundle).expect("valid identity");
+            (key, bundle)
+        };
+        let _ = admin_signing_key; // referenced for completeness; not signing here
+        let _ = admin_addr;
+
+        let entry = LibraryDirectoryEntry {
+            community_id,
+            community_admin_identity_pub: admin_identity_pub,
+            name: "Phase 3 test".to_string(),
+            description: "Round-trip test for wrapped entry".to_string(),
+            topics: vec!["test".to_string()],
+            invite_url: "harmony://invite/?p=AAAA".to_string(),
+            listed_by: OwnerAddr([0xAA; 16]),
+            listed_at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "test".to_string(),
+            },
+            community_signature: [0u8; 64],
+            library_identity_pub: Some([0xBB; 64]),
+            library_signature: Some([0xCC; 64]),
+        };
+        let bytes = canonical_cbor_encode(&entry).expect("encode");
+        let decoded: LibraryDirectoryEntry = ciborium::de::from_reader(&bytes[..]).expect("decode");
+        assert_eq!(entry, decoded, "wrapped entry round-trips");
+        assert_eq!(decoded.library_identity_pub, Some([0xBB; 64]));
+        assert_eq!(decoded.library_signature, Some([0xCC; 64]));
+    }
+
+    /// ZEB-280 Phase 3: a Phase 1-style entry (both Optional fields
+    /// `None`) round-trips and the decoded fields are still `None`
+    /// (the `#[serde(default)]` attribute lets ciborium decode missing
+    /// fields as `None`).
+    #[test]
+    fn phase1_unwrapped_entry_roundtrips_with_optional_fields_absent() {
+        let entry = LibraryDirectoryEntry {
+            community_id: SpaceId([0x22; 16]),
+            community_admin_identity_pub: [0x33; 64],
+            name: "Phase 1 test".to_string(),
+            description: "Backward compat check".to_string(),
+            topics: vec![],
+            invite_url: "harmony://invite/?p=AAAA".to_string(),
+            listed_by: OwnerAddr([0x44; 16]),
+            listed_at: Hlc {
+                wall_ms: 0,
+                logical: 0,
+                device_id: String::new(),
+            },
+            community_signature: [0x55; 64],
+            library_identity_pub: None,
+            library_signature: None,
+        };
+        let bytes = canonical_cbor_encode(&entry).expect("encode");
+        let decoded: LibraryDirectoryEntry = ciborium::de::from_reader(&bytes[..]).expect("decode");
+        assert_eq!(entry, decoded, "Phase 1-shaped entry round-trips");
+        assert_eq!(decoded.library_identity_pub, None);
+        assert_eq!(decoded.library_signature, None);
     }
 }
 

@@ -39,6 +39,8 @@ fn library_directory_entry_canonical_cbor_pinned() {
         listed_by: OwnerAddr([0x22; 16]),
         listed_at: fixture_hlc(),
         community_signature: [0x33; 64],
+        library_identity_pub: None,
+        library_signature: None,
     };
 
     let bytes = canonical_cbor_encode(&entry).expect("encode");
@@ -124,6 +126,8 @@ fn library_directory_entry_field_keys_are_2char() {
             device_id: String::new(),
         },
         community_signature: [0; 64],
+        library_identity_pub: None,
+        library_signature: None,
     };
     let bytes = canonical_cbor_encode(&entry).expect("encode");
 
