@@ -10,7 +10,7 @@ use crate::owner_state_crypto::{
     canonical_cbor_encode, sealed::CanonicalPayloadSealed, CanonicalPayload,
 };
 use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
-use ed25519_dalek::Signature;
+use ed25519_dalek::{Signature, Signer};
 use serde::{Deserialize, Serialize};
 
 /// Hard cap on number of community IDs per broadcast. 200 SpaceIds × 32
@@ -26,11 +26,16 @@ pub const MAX_SHARED_COMMUNITIES: usize = 200;
 /// from `harmony/announce/{cid_hex}` (storage tier content-availability).
 pub const PROFILE_DISCOVERY_TOPIC_PREFIX: &str = "harmony/discovery/profile/";
 
-/// Hard cap on the wire size of a single `ProfileMembershipBroadcast`
-/// payload before CBOR decode. Bound rationale: MAX_SHARED_COMMUNITIES
-/// (200) × SpaceId (16 bytes raw + ~3 bytes CBOR framing per element) +
-/// owner_identity_pub (64) + Hlc (~30 bytes) + signature (64) + map
-/// framing ≈ 4 KB. 8 KB is 2× headroom for minor schema additions.
+/// Wire-size sanity bound on a single broadcast payload before CBOR
+/// decode. Defends against adversarial-size frames on the
+/// `harmony/discovery/profile/{...}/memberships` topic. The structural
+/// worst case (200 SpaceIds × 32 bytes raw + identity_pub + signature +
+/// Hlc framing) is ≈6.5 KB; 8 KB is generous headroom. Note that
+/// `Hlc.device_id: String` is unbounded, so this is a sanity gate, not
+/// a tight proof — adversarial peers with absurd device_id strings get
+/// dropped here.
+// Referenced by `event_loop.rs` profile-broadcast subscriber pool in Task 5.
+#[allow(dead_code)]
 pub const MAX_BROADCAST_WIRE_BYTES: usize = 8_192;
 
 /// Build a broadcast topic key for the given OwnerAddr.
@@ -96,21 +101,25 @@ pub enum BroadcastVerifyError {
     Encode(#[from] crate::owner_state_crypto::CryptoError),
 }
 
-/// Sign a broadcast: compute canonical CBOR with `signature` zeroed,
-/// Ed25519-sign, return the populated struct. Test-fixtures-only signing
-/// path — production publishes go through `ProfileBroadcastPublisher`
-/// which holds a `SigningKey` and bumps the HLC.
+/// Build + Ed25519-sign a broadcast over canonical CBOR with `signature`
+/// zeroed. Called by `ProfileBroadcastPublisher::maybe_publish` (production
+/// publish path, see Task 2) and by unit tests. The caller is responsible
+/// for HLC monotonicity (the publisher's state machine enforces it; tests
+/// can pass arbitrary HLCs).
 ///
 /// `signer.verifying_key().as_bytes()` MUST be the Ed25519 half (bytes
 /// 32-63) of `owner_identity_pub`, otherwise the caller has a key/identity
 /// mismatch (sig will verify but identity parse may not).
-pub fn sign_broadcast(
+// Called from `ProfileBroadcastPublisher::maybe_publish` in Task 2; until
+// then only `#[cfg(test)]` callers exist, so the non-test build sees this
+// as unused.
+#[allow(dead_code)]
+pub(crate) fn sign_broadcast(
     signer: &ed25519_dalek::SigningKey,
     owner_identity_pub: [u8; 64],
     community_ids: Vec<SpaceId>,
     shared_at: Hlc,
 ) -> Result<ProfileMembershipBroadcast, BroadcastVerifyError> {
-    use ed25519_dalek::Signer;
     let mut broadcast = ProfileMembershipBroadcast {
         owner_identity_pub,
         community_ids,
