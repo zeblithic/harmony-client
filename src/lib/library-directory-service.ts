@@ -46,7 +46,19 @@ export interface DirectoryEntry {
   description: string;
   topics: string[];
   invite_url: string;
+  /**
+   * Count of libraries with valid attestation for this entry
+   * (`attested_by.len()` in the Rust aggregation). Includes Phase 1
+   * unwrapped contributions via fallback to entry.listed_by.
+   */
   listed_by_count: number;
+  /**
+   * Sub-D Phase 3 (ZEB-280): true if at least one broadcasting
+   * library's wrapping sig failed to verify (Rust:
+   * `!unattested_by.is_empty()`). Drives the inline "⚠ Unattested"
+   * badge in `LibraryDirectoryBrowser.svelte`.
+   */
+  unattested: boolean;
   listed_at: Hlc;
 }
 

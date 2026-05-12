@@ -245,9 +245,9 @@ async fn aggregation_dedupes_same_community_from_two_libraries() {
 
     let snap = dir.snapshot_all().await;
     assert_eq!(snap.len(), 1, "dedupe by community_id");
-    assert_eq!(snap[0].listed_by.len(), 2);
-    assert!(snap[0].listed_by.contains(&library_a));
-    assert!(snap[0].listed_by.contains(&library_b));
+    assert_eq!(snap[0].attested_by.len(), 2);
+    assert!(snap[0].attested_by.contains(&library_a));
+    assert!(snap[0].attested_by.contains(&library_b));
 
     let dto = DirectoryEntryDTO::from_aggregated(&snap[0]);
     assert_eq!(dto.listed_by_count, 2);
@@ -886,4 +886,340 @@ async fn click_to_join_redeem_invite_smoke() {
         .shutdown_all()
         .await
         .expect("registry shutdown");
+}
+
+// ── ZEB-280 Sub-D Phase 3: federation integration tests ──────────────
+
+/// ZEB-280 Phase 3: library A broadcasts a wrapped entry; library B
+/// re-syndicates the SAME admin-signed bytes verbatim, replacing only
+/// the wrapping sig with its own. This is the verbatim re-syndication
+/// primitive — the admin sig is portable across libraries, so B can
+/// rebroadcast A's admin-signed entry without re-signing the inner
+/// payload. Aggregation should treat them as 2 distinct broadcasting
+/// attestations of the same community. DTO surfaces
+/// `listed_by_count = 2`, `unattested = false`.
+///
+/// Re-syndication preserves the entry's `listed_at` HLC verbatim, so
+/// the aggregation's `incoming_newer` check on B's `process_sample`
+/// sees an equal-or-not-newer HLC and keeps `existing.entry = entry_a`.
+/// `attested_by` still gains `library_b` (set insert) — the assertions
+/// below match this expected behavior.
+#[tokio::test]
+async fn federation_two_libraries_broadcast_same_community_aggregates() {
+    use common::library_fixtures::{
+        build_test_library_addr, mock_library_entry_republished_by, mock_library_entry_wrapped,
+    };
+
+    let community_id = SpaceId([0x88; 16]);
+    let admin_seed = [42u8; 32];
+
+    let (lib_a_signer, lib_a_bundle, library_a) = build_test_library_addr([1u8; 32]);
+    let (lib_b_signer, lib_b_bundle, library_b) = build_test_library_addr([2u8; 32]);
+
+    // Library A: produce the original admin-signed + A-wrapped entry.
+    let entry_a = mock_library_entry_wrapped(
+        community_id,
+        admin_seed,
+        library_a,
+        Hlc {
+            wall_ms: 1_700_000_000_000,
+            logical: 0,
+            device_id: "test-a".to_string(),
+        },
+        open_invite_url_for(community_id, admin_seed),
+        "Federated Community",
+        "Same community, two libraries.",
+        vec!["federation".to_string()],
+        Some((&lib_a_signer, lib_a_bundle)),
+    );
+    // Library B: verbatim re-syndication — clone A's entry and replace
+    // ONLY the wrapping sig with B's own. listed_by and listed_at HLC
+    // stay as A's (this is what "verbatim" means: the admin-signed
+    // bytes are byte-identical to what A published).
+    let entry_b = mock_library_entry_republished_by(&entry_a, &lib_b_signer, lib_b_bundle);
+
+    let dir = build_directory();
+    let bytes_a = canonical_cbor_encode(&entry_a).expect("encode a");
+    let bytes_b = canonical_cbor_encode(&entry_b).expect("encode b");
+    dir.process_sample(library_a, bytes_a)
+        .await
+        .expect("process a");
+    dir.process_sample(library_b, bytes_b)
+        .await
+        .expect("process b");
+
+    let snap = dir.snapshot_all().await;
+    assert_eq!(
+        snap.len(),
+        1,
+        "single community aggregated across libraries"
+    );
+    assert_eq!(
+        snap[0].attested_by.len(),
+        2,
+        "both broadcasting libraries attested"
+    );
+    assert!(snap[0].attested_by.contains(&library_a));
+    assert!(snap[0].attested_by.contains(&library_b));
+    assert!(snap[0].unattested_by.is_empty(), "no unattested broadcasts");
+
+    let dto = DirectoryEntryDTO::from_aggregated(&snap[0]);
+    assert_eq!(dto.listed_by_count, 2);
+    assert!(!dto.unattested);
+}
+
+/// ZEB-280 Phase 3: library A broadcasts a valid wrapped entry;
+/// library B broadcasts the same community but with a TAMPERED
+/// wrapping sig. Aggregation: attested_by = {A}, unattested_by = {B},
+/// DTO: listed_by_count = 1, unattested = true (badge surfaces).
+#[tokio::test]
+async fn federation_one_library_tampered_wrapping_shows_unattested() {
+    use common::library_fixtures::{build_test_library_addr, mock_library_entry_wrapped};
+
+    let community_id = SpaceId([0x99; 16]);
+    let admin_seed = [43u8; 32];
+
+    let (lib_a_signer, lib_a_bundle, library_a) = build_test_library_addr([3u8; 32]);
+    let (lib_b_signer, lib_b_bundle, library_b) = build_test_library_addr([4u8; 32]);
+
+    // Library A: valid wrapping.
+    let entry_a = mock_library_entry_wrapped(
+        community_id,
+        admin_seed,
+        library_a,
+        Hlc {
+            wall_ms: 1_700_000_000_000,
+            logical: 0,
+            device_id: "test-a".to_string(),
+        },
+        open_invite_url_for(community_id, admin_seed),
+        "Tampered Test",
+        "One good wrap, one bad wrap.",
+        vec![],
+        Some((&lib_a_signer, lib_a_bundle)),
+    );
+
+    // Library B: produce a valid wrap first, then TAMPER the wrapping sig.
+    let mut entry_b = mock_library_entry_wrapped(
+        community_id,
+        admin_seed,
+        library_b,
+        Hlc {
+            wall_ms: 1_700_000_000_001,
+            logical: 0,
+            device_id: "test-b".to_string(),
+        },
+        open_invite_url_for(community_id, admin_seed),
+        "Tampered Test",
+        "One good wrap, one bad wrap.",
+        vec![],
+        Some((&lib_b_signer, lib_b_bundle)),
+    );
+    let mut tampered_sig = entry_b.library_signature.expect("sig present");
+    tampered_sig[0] ^= 0xFF;
+    entry_b.library_signature = Some(tampered_sig);
+
+    let dir = build_directory();
+    let bytes_a = canonical_cbor_encode(&entry_a).expect("encode a");
+    let bytes_b = canonical_cbor_encode(&entry_b).expect("encode b");
+    dir.process_sample(library_a, bytes_a)
+        .await
+        .expect("process a");
+    dir.process_sample(library_b, bytes_b)
+        .await
+        .expect("process b (unattested but NOT dropped)");
+
+    let snap = dir.snapshot_all().await;
+    assert_eq!(snap.len(), 1, "tampered entry still surfaced");
+    assert!(
+        snap[0].attested_by.contains(&library_a),
+        "library_a attested via valid wrap"
+    );
+    assert!(
+        snap[0].unattested_by.contains(&library_b),
+        "library_b in unattested_by (bad wrap)"
+    );
+    assert!(!snap[0].attested_by.contains(&library_b));
+
+    let dto = DirectoryEntryDTO::from_aggregated(&snap[0]);
+    assert_eq!(
+        dto.listed_by_count, 1,
+        "only library_a counted in listed_by_count"
+    );
+    assert!(dto.unattested, "DTO unattested = true triggers UI badge");
+}
+
+/// ZEB-280 Phase 3: a Phase 1-style entry (no wrapping sig) and a
+/// Phase 3 wrapped entry from different libraries aggregate to the
+/// same community. Both contribute to attested_by. DTO unattested = false.
+/// Tests cross-version wire compat.
+#[tokio::test]
+async fn federation_phase1_entry_aggregates_alongside_phase3_wrapped() {
+    use common::library_fixtures::{
+        build_test_library_addr, mock_directory_entry, mock_library_entry_wrapped,
+    };
+
+    let community_id = SpaceId([0xAA; 16]);
+    let admin_seed = [44u8; 32];
+
+    let library_a = OwnerAddr([0xA1; 16]); // Phase 1 library (no key pair needed)
+    let (lib_b_signer, lib_b_bundle, library_b) = build_test_library_addr([5u8; 32]);
+
+    // Library A: Phase 1 unwrapped entry (no wrapping sig).
+    let entry_a = mock_directory_entry(
+        community_id,
+        admin_seed,
+        library_a,
+        Hlc {
+            wall_ms: 1_700_000_000_000,
+            logical: 0,
+            device_id: "test-a".to_string(),
+        },
+        open_invite_url_for(community_id, admin_seed),
+        "Mixed Mode",
+        "Phase 1 + Phase 3 in the same aggregation.",
+        vec![],
+    );
+
+    // Library B: Phase 3 wrapped entry, same community.
+    let entry_b = mock_library_entry_wrapped(
+        community_id,
+        admin_seed,
+        library_b,
+        Hlc {
+            wall_ms: 1_700_000_000_001,
+            logical: 0,
+            device_id: "test-b".to_string(),
+        },
+        open_invite_url_for(community_id, admin_seed),
+        "Mixed Mode",
+        "Phase 1 + Phase 3 in the same aggregation.",
+        vec![],
+        Some((&lib_b_signer, lib_b_bundle)),
+    );
+
+    let dir = build_directory();
+    let bytes_a = canonical_cbor_encode(&entry_a).expect("encode a");
+    let bytes_b = canonical_cbor_encode(&entry_b).expect("encode b");
+    dir.process_sample(library_a, bytes_a)
+        .await
+        .expect("process Phase 1 entry");
+    dir.process_sample(library_b, bytes_b)
+        .await
+        .expect("process Phase 3 wrapped entry");
+
+    let snap = dir.snapshot_all().await;
+    assert_eq!(snap.len(), 1);
+    assert!(
+        snap[0].attested_by.contains(&library_a),
+        "Phase 1 entry: Unwrapped status falls back to entry.listed_by = library_a"
+    );
+    assert!(
+        snap[0].attested_by.contains(&library_b),
+        "Phase 3 entry: Attested(library_b)"
+    );
+    assert!(snap[0].unattested_by.is_empty());
+
+    let dto = DirectoryEntryDTO::from_aggregated(&snap[0]);
+    assert_eq!(dto.listed_by_count, 2);
+    assert!(!dto.unattested, "no unattested contributions");
+}
+
+/// ZEB-280 Phase 3: library_directory::drop_library walks BOTH the
+/// attested_by and unattested_by sets and sweeps the dropped library
+/// from each. A library that was only in unattested_by (no valid
+/// attestation, only bad-sig attempts) is still cleanly removed.
+#[tokio::test]
+async fn federation_remove_library_evicts_attested_and_unattested_contributions() {
+    use common::library_fixtures::{build_test_library_addr, mock_library_entry_wrapped};
+
+    let community_id = SpaceId([0xBB; 16]);
+    let admin_seed = [45u8; 32];
+
+    let (lib_a_signer, lib_a_bundle, library_a) = build_test_library_addr([6u8; 32]);
+    let (lib_b_signer, lib_b_bundle, library_b) = build_test_library_addr([7u8; 32]);
+
+    // Library A: valid wrapping. HLC is NEWER than B's so the stored
+    // entry's `listed_by` stays `library_a` (matters for drop_library:
+    // it evicts when stored `entry.listed_by == dropped_library`,
+    // independent of attested_by membership — see spec §5.3).
+    let entry_a = mock_library_entry_wrapped(
+        community_id,
+        admin_seed,
+        library_a,
+        Hlc {
+            wall_ms: 1_700_000_000_001,
+            logical: 0,
+            device_id: "test-a".to_string(),
+        },
+        open_invite_url_for(community_id, admin_seed),
+        "Remove Test",
+        "A is attested, B is unattested (tampered).",
+        vec![],
+        Some((&lib_a_signer, lib_a_bundle)),
+    );
+
+    // Library B: tampered wrapping. Older HLC than A so it never
+    // overwrites the stored entry — only its unattested broadcast is
+    // recorded in `unattested_by`.
+    let mut entry_b = mock_library_entry_wrapped(
+        community_id,
+        admin_seed,
+        library_b,
+        Hlc {
+            wall_ms: 1_700_000_000_000,
+            logical: 0,
+            device_id: "test-b".to_string(),
+        },
+        open_invite_url_for(community_id, admin_seed),
+        "Remove Test",
+        "A is attested, B is unattested (tampered).",
+        vec![],
+        Some((&lib_b_signer, lib_b_bundle)),
+    );
+    let mut tampered = entry_b.library_signature.expect("sig present");
+    tampered[0] ^= 0xFF;
+    entry_b.library_signature = Some(tampered);
+
+    let dir = build_directory();
+    dir.process_sample(
+        library_a,
+        canonical_cbor_encode(&entry_a).expect("encode a"),
+    )
+    .await
+    .expect("process a");
+    dir.process_sample(
+        library_b,
+        canonical_cbor_encode(&entry_b).expect("encode b"),
+    )
+    .await
+    .expect("process b unattested");
+
+    // Confirm initial state.
+    let snap = dir.snapshot_all().await;
+    assert_eq!(snap.len(), 1);
+    assert!(snap[0].attested_by.contains(&library_a));
+    assert!(snap[0].unattested_by.contains(&library_b));
+
+    // Drop library_b — should sweep it from unattested_by but NOT
+    // evict the community (library_a still attests).
+    let evicted = dir.drop_library(&library_b).await;
+    assert!(
+        evicted.is_empty(),
+        "library_b drop should NOT evict (library_a still attests)"
+    );
+    let snap_after_b = dir.snapshot_all().await;
+    assert_eq!(snap_after_b.len(), 1);
+    assert!(snap_after_b[0].attested_by.contains(&library_a));
+    assert!(snap_after_b[0].unattested_by.is_empty());
+
+    // Drop library_a — should evict (no more attestations).
+    let evicted = dir.drop_library(&library_a).await;
+    assert_eq!(
+        evicted,
+        vec![community_id],
+        "library_a drop evicts community"
+    );
+    let snap_final = dir.snapshot_all().await;
+    assert!(snap_final.is_empty());
 }

@@ -126,6 +126,104 @@ where
     d.deserialize_bytes(BytesVisitor::<N>)
 }
 
+/// Helper: serialize `Option<[u8; N]>` as CBOR bstr (major type 2)
+/// when `Some`. Pair with `deserialize_optional_bytes_from_bstr` and
+/// `#[serde(skip_serializing_if = "Option::is_none")]` on the field so
+/// `None` cases omit the key entirely from canonical CBOR (preserving
+/// wire-format byte-identity with earlier schema versions that didn't
+/// have the field).
+///
+/// ZEB-280 (Sub-D Phase 3) adds Optional `library_identity_pub` and
+/// `library_signature` fields to `LibraryDirectoryEntry`. Phase 1
+/// entries (no wrapping sig) must serialize to byte-identical CBOR
+/// when the new fields are `None` — see spec §4.1.
+pub(crate) fn serialize_optional_bytes_as_bstr<const N: usize, S>(
+    b: &Option<[u8; N]>,
+    s: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    // `skip_serializing_if = "Option::is_none"` on the field guarantees
+    // serializer is only called for `Some(...)` — but be defensive in
+    // case a future caller forgets the attribute.
+    match b {
+        Some(arr) => s.serialize_bytes(arr),
+        None => s.serialize_none(),
+    }
+}
+
+/// Helper: deserialize CBOR bstr into `Option<[u8; N]>`. Returns
+/// `Some(arr)` on a bstr, `None` on CBOR null OR absent field (the
+/// absent-field case is handled by `#[serde(default)]` on the field).
+/// Pair with `serialize_optional_bytes_as_bstr`.
+pub(crate) fn deserialize_optional_bytes_from_bstr<'de, const N: usize, D>(
+    d: D,
+) -> Result<Option<[u8; N]>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Visitor;
+    use std::fmt;
+
+    struct OptBytesVisitor<const N: usize>;
+
+    impl<'de, const N: usize> Visitor<'de> for OptBytesVisitor<N> {
+        type Value = Option<[u8; N]>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            write!(formatter, "an optional byte string of length {}", N)
+        }
+
+        fn visit_none<E>(self) -> Result<Option<[u8; N]>, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Option<[u8; N]>, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D2>(self, d: D2) -> Result<Option<[u8; N]>, D2::Error>
+        where
+            D2: Deserializer<'de>,
+        {
+            let arr: [u8; N] = crate::owner_state_types::deserialize_bytes_from_bstr(d)?;
+            Ok(Some(arr))
+        }
+
+        fn visit_bytes<E>(self, value: &[u8]) -> Result<Option<[u8; N]>, E>
+        where
+            E: serde::de::Error,
+        {
+            if value.len() != N {
+                return Err(E::custom(format!(
+                    "expected {} bytes, got {}",
+                    N,
+                    value.len()
+                )));
+            }
+            let mut arr = [0u8; N];
+            arr.copy_from_slice(value);
+            Ok(Some(arr))
+        }
+
+        fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Option<[u8; N]>, E>
+        where
+            E: serde::de::Error,
+        {
+            self.visit_bytes(&v)
+        }
+    }
+
+    d.deserialize_option(OptBytesVisitor::<N>)
+}
+
 /// Hybrid Logical Clock.
 ///
 /// Wire format (locked): CBOR map with single-char field names `w` / `l`

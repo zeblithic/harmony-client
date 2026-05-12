@@ -64,10 +64,74 @@ pub struct LibraryDirectoryEntry {
         deserialize_with = "crate::owner_state_types::deserialize_bytes_from_bstr"
     )]
     pub community_signature: [u8; 64],
+
+    // === Sub-D Phase 3 (ZEB-280) wrapping signature fields ===
+    //
+    // Wire-compatible with Phase 1: `skip_serializing_if = "Option::is_none"`
+    // omits the keys from canonical CBOR when None, so a Phase 1 entry's
+    // bytes are byte-identical regardless of whether it's emitted by a
+    // Phase 1 or Phase 3 client.
+    //
+    // 2-char field keys preserve `canonical_cbor_encode`'s same-length-keys
+    // precondition (mirrors all other Sub-A/B/C wire types).
+    //
+    // See spec §4.1.
+    /// 64-byte identity bundle (X25519_pub || Ed25519_pub) of the
+    /// broadcasting library. None for unwrapped (Phase 1-style) entries.
+    #[serde(
+        rename = "li",
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::owner_state_types::serialize_optional_bytes_as_bstr",
+        deserialize_with = "crate::owner_state_types::deserialize_optional_bytes_from_bstr"
+    )]
+    pub library_identity_pub: Option<[u8; 64]>,
+
+    /// Ed25519 wrapping signature from the broadcasting library over
+    /// the canonical CBOR encoding of all fields with `library_signature`
+    /// zeroed (analogous to Phase 1's `community_signature` pattern).
+    /// None for unwrapped entries.
+    #[serde(
+        rename = "ls",
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::owner_state_types::serialize_optional_bytes_as_bstr",
+        deserialize_with = "crate::owner_state_types::deserialize_optional_bytes_from_bstr"
+    )]
+    pub library_signature: Option<[u8; 64]>,
 }
 
 impl CanonicalPayloadSealed for LibraryDirectoryEntry {}
 impl CanonicalPayload for LibraryDirectoryEntry {}
+
+/// Sub-D Phase 3 (ZEB-280) — outcome of `verify_entry`. Captures the
+/// admin-sig-verified entry's wrapping-signature state, which feeds the
+/// aggregation's broadcasting-library tracking and the frontend
+/// "unattested" badge. Spec §4.2.
+///
+/// `Copy` is derived defensively (R1, CodeRabbit): `process_sample` matches
+/// on `status` once and then passes it to `on_entry`, which compiles today
+/// via match-ergonomics but would break on future refactors that move the
+/// match. The variant only holds `OwnerAddr` (already `Copy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttestationStatus {
+    /// Phase 1-style entry: no wrapping sig present (both
+    /// `library_signature` and `library_identity_pub` are `None`).
+    /// Implicit trust from subscription topic — entries arriving from
+    /// library X's topic are treated as if X attested to them.
+    Unwrapped,
+    /// Phase 3: wrapping sig present and verified. `OwnerAddr` is the
+    /// broadcasting library's derived address (from
+    /// `library_identity_pub` via `Identity::from_public_bytes`).
+    Attested(OwnerAddr),
+    /// Phase 3: wrapping sig present but invalid. Entry is still
+    /// surfaced — the community admin's signature is the trust anchor
+    /// for content. `OwnerAddr` is the broadcasting library's CLAIMED
+    /// address (the derived addr from `library_identity_pub`; we keep
+    /// it for aggregation tracking even though we couldn't verify the
+    /// claim).
+    Unattested(OwnerAddr),
+}
 
 /// Sub-D Phase 2 auto-discovery announce record. Spec §4.1.
 ///
@@ -162,6 +226,18 @@ pub enum EntryVerifyError {
         entry_addr: OwnerAddr,
         payload_addr: OwnerAddr,
     },
+    /// Sub-D Phase 3: exactly one of `library_signature` and
+    /// `library_identity_pub` is `Some`. Cannot verify a wrapping sig
+    /// without both fields; this is a malformed wire state and must
+    /// be rejected (not silently treated as Unwrapped, which would
+    /// mask a publisher bug). Spec §5.
+    #[error("library_signature and library_identity_pub must both be Some or both be None")]
+    LibrarySignatureFieldsInconsistent,
+
+    /// Sub-D Phase 3: `library_identity_pub` bytes failed
+    /// `Identity::from_public_bytes` validation. Spec §5.
+    #[error("malformed library identity_pub: {0}")]
+    InvalidLibraryIdentityPub(String),
 }
 
 pub const MAX_NAME_LEN: usize = 200;
@@ -208,16 +284,42 @@ pub enum AnnounceVerifyError {
     DescriptionTooLong,
 }
 
-/// Verify a `LibraryDirectoryEntry` end-to-end:
+/// Verify a `LibraryDirectoryEntry` end-to-end and return the
+/// wrapping-signature attestation outcome. Spec §5.
+///
+/// **Phase 1 invariants (unchanged):**
 /// 1. Anti-spam bounds (name/description/topic lengths)
 /// 2. Parse `community_admin_identity_pub` via
-///    `harmony_identity::Identity::from_public_bytes` (validates both
-///    halves)
-/// 3. Verify the Ed25519 signature over canonical-CBOR-encoded fields
-///    with `community_signature` zeroed (so verify == sign exactly)
+///    `harmony_identity::Identity::from_public_bytes`
+/// 3. Verify the Ed25519 admin signature over canonical-CBOR-encoded
+///    fields with `community_signature` zeroed (so verify == sign
+///    exactly). The Optional `library_identity_pub` / `library_signature`
+///    are also zeroed (via `None` + `skip_serializing_if`), so admin
+///    sig bytes are portable across libraries.
 /// 4. Parse `invite_url` and reject if `is_invite_only == true`
-pub fn verify_entry(entry: &LibraryDirectoryEntry) -> Result<(), EntryVerifyError> {
-    // (1) Bounds
+/// 5. Invite payload binding (community_id + admin_addr)
+///
+/// **Phase 3 addition:** if `library_signature` and
+/// `library_identity_pub` are both `Some`, verify the wrapping sig
+/// over canonical-CBOR-encoded fields with only `library_signature`
+/// zeroed (keep `library_identity_pub` + `community_signature`
+/// populated, so the wrapping sig commits to the admin-signed bundle).
+///
+/// **Returns:**
+/// - `Ok(AttestationStatus::Unwrapped)` — Phase 1-style entry (both
+///   Optional fields None)
+/// - `Ok(AttestationStatus::Attested(library_addr))` — wrapping sig
+///   verified, library_addr is derived from `library_identity_pub`
+/// - `Ok(AttestationStatus::Unattested(library_addr))` — wrapping sig
+///   present but invalid; entry NOT dropped (admin sig was valid).
+///   library_addr is the CLAIMED broadcasting library.
+/// - `Err(LibrarySignatureFieldsInconsistent)` — exactly one of
+///   library_signature / library_identity_pub is Some (malformed).
+/// - `Err(InvalidLibraryIdentityPub)` — library_identity_pub bytes
+///   failed `Identity::from_public_bytes`.
+/// - Other `Err(...)` — admin sig path failed; entry should be dropped.
+pub fn verify_entry(entry: &LibraryDirectoryEntry) -> Result<AttestationStatus, EntryVerifyError> {
+    // (1) Bounds — unchanged from Phase 1.
     if entry.name.len() > MAX_NAME_LEN {
         return Err(EntryVerifyError::NameTooLong);
     }
@@ -236,9 +338,17 @@ pub fn verify_entry(entry: &LibraryDirectoryEntry) -> Result<(), EntryVerifyErro
         harmony_identity::Identity::from_public_bytes(&entry.community_admin_identity_pub)
             .map_err(|e| EntryVerifyError::InvalidIdentityPub(format!("{e:?}")))?;
 
-    // (3) Verify sig over canonical CBOR with signature field zeroed.
+    // (3) Verify admin sig over canonical CBOR with cs zeroed and
+    //     li/ls forced to None. The Phase 1 invariant of "sig field
+    //     zeroed during sign/verify" extends to "Optional fields
+    //     forced absent" — skip_serializing_if omits them from CBOR.
+    //     This makes the admin sig portable across libraries (the
+    //     wrapping library can attach li+ls without invalidating the
+    //     admin sig).
     let mut for_sig = entry.clone();
     for_sig.community_signature = [0u8; 64];
+    for_sig.library_identity_pub = None;
+    for_sig.library_signature = None;
     let signed_bytes = canonical_cbor_encode(&for_sig)?;
     let sig = Signature::from_bytes(&entry.community_signature);
     identity
@@ -284,7 +394,34 @@ pub fn verify_entry(entry: &LibraryDirectoryEntry) -> Result<(), EntryVerifyErro
         });
     }
 
-    Ok(())
+    // (6) Sub-D Phase 3 — wrapping signature check.
+    match (&entry.library_signature, &entry.library_identity_pub) {
+        (None, None) => Ok(AttestationStatus::Unwrapped),
+        (Some(_), None) | (None, Some(_)) => {
+            Err(EntryVerifyError::LibrarySignatureFieldsInconsistent)
+        }
+        (Some(lib_sig), Some(lib_pub)) => {
+            let lib_identity = harmony_identity::Identity::from_public_bytes(lib_pub)
+                .map_err(|e| EntryVerifyError::InvalidLibraryIdentityPub(format!("{e:?}")))?;
+            let lib_addr = OwnerAddr(lib_identity.address_hash);
+
+            // Reconstruct sign-time bytes: zero `library_signature`
+            // only (keep `library_identity_pub` + `community_signature`
+            // populated so the wrapping sig commits to the admin sig).
+            let mut for_sig = entry.clone();
+            for_sig.library_signature = None;
+            let signed_bytes = canonical_cbor_encode(&for_sig)?;
+            let sig = Signature::from_bytes(lib_sig);
+
+            match lib_identity
+                .verifying_key
+                .verify_strict(&signed_bytes, &sig)
+            {
+                Ok(()) => Ok(AttestationStatus::Attested(lib_addr)),
+                Err(_) => Ok(AttestationStatus::Unattested(lib_addr)),
+            }
+        }
+    }
 }
 
 /// Verify a `LibraryAnnounce` end-to-end:
@@ -330,9 +467,27 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct AggregatedEntry {
     /// Latest (highest-HLC) entry observed for this community.
     pub entry: LibraryDirectoryEntry,
-    /// Set of libraries that have listed this community. Eviction
-    /// happens when this set empties (last library un-listed it).
-    pub listed_by: BTreeSet<OwnerAddr>,
+
+    /// Sub-D Phase 3 (ZEB-280): libraries whose broadcast of this
+    /// community we trust. Populated by:
+    /// - `AttestationStatus::Attested(lib_addr)` → insert(lib_addr)
+    /// - `AttestationStatus::Unwrapped` → insert(entry.listed_by)
+    ///   (Phase 1 backward compat — implicit trust from subscription
+    ///   topic)
+    ///
+    /// Replaces the Phase 1 `listed_by: BTreeSet<OwnerAddr>` field
+    /// semantics. Eviction triggers when this set empties.
+    pub attested_by: BTreeSet<OwnerAddr>,
+
+    /// Sub-D Phase 3 (ZEB-280): libraries we received this entry from
+    /// whose wrapping sig failed to verify. Drives the "unattested"
+    /// UI badge (entry shown but flagged):
+    ///   unattested = !unattested_by.is_empty()
+    ///
+    /// Tracks the broadcasting library's CLAIMED address (derived from
+    /// the signed `library_identity_pub` — we know who claimed to
+    /// broadcast even when their sig was bad).
+    pub unattested_by: BTreeSet<OwnerAddr>,
 }
 
 /// In-memory aggregation state. NOT persisted — rebuilt on startup
@@ -389,7 +544,7 @@ impl Aggregation {
     pub fn snapshot_filtered_by_library(&self, library: &OwnerAddr) -> Vec<AggregatedEntry> {
         self.by_community
             .values()
-            .filter(|e| e.listed_by.contains(library))
+            .filter(|e| e.attested_by.contains(library) || e.unattested_by.contains(library))
             .cloned()
             .collect()
     }
@@ -401,79 +556,200 @@ impl Aggregation {
     /// Process a verified entry. Caller MUST have run `verify_entry`
     /// first — this method does NOT re-verify the signature.
     ///
-    /// Returns a `ProcessResult` carrying both the outcome discriminant
-    /// (Inserted / Replaced / AccretedListedBy / Idempotent) and any
-    /// orthogonal cap-eviction. Callers must consult both fields: an
-    /// eviction can co-occur with `Replaced` or `AccretedListedBy`,
-    /// not just `Inserted`.
-    pub fn on_entry(&mut self, entry: LibraryDirectoryEntry) -> ProcessResult {
+    /// `status` is the AttestationStatus returned by `verify_entry`,
+    /// which determines whether the broadcasting library is the
+    /// admin-signed `entry.listed_by` (Unwrapped) or the wrapping-sig
+    /// derived `OwnerAddr` (Attested / Unattested). The
+    /// broadcasting library drives:
+    ///   - per-library cap accounting (Phase 1 used entry.listed_by;
+    ///     Phase 3 uses the broadcasting library, which can differ
+    ///     when library A republishes library B's entry verbatim)
+    ///   - eviction by `drop_library` (must sweep both attested_by
+    ///     and unattested_by)
+    ///
+    /// ## ZEB-280 R1 unified policy (CodeRabbit + Qodo)
+    ///
+    /// **Invariant:** `attested_by` and `unattested_by` are DISJOINT per
+    /// community — a library is in at most one set per community.
+    ///
+    /// **`per_library_count[X]`** = count of communities where X is in
+    /// `attested_by`. **Unattested-only contributions do NOT count toward
+    /// the cap.** This shuts down the Qodo DoS finding: a network
+    /// adversary publishing bad-sig entries on library X's open Zenoh
+    /// topic with `library_identity_pub = X` could otherwise pump X's
+    /// count via the unattested path until cap eviction targeted X's
+    /// LEGITIMATE attested contributions.
+    ///
+    /// **Insertion rules:**
+    /// - `Attested(X)` / `Unwrapped` (X = entry.listed_by):
+    ///   - X in `attested_by`: no-op (idempotent)
+    ///   - X in `unattested_by`: recovery — move X to `attested_by`,
+    ///     bump `per_library_count[X]`
+    ///   - X in neither: insert X into `attested_by`, bump count
+    /// - `Unattested(X)`:
+    ///   - X in `attested_by`: no-op (do NOT downgrade trusted attestation)
+    ///   - X in `unattested_by`: no-op (idempotent)
+    ///   - X in neither + community exists: insert into `unattested_by`,
+    ///     do NOT bump `per_library_count`
+    ///   - community does NOT exist: DROP entirely (return Idempotent).
+    ///     Prevents fake-community memory DoS from a network adversary
+    ///     on the library's open topic.
+    ///
+    /// **Cap check** fires only for Attested/Unwrapped status and only
+    /// when X is NOT already attesting this community. Unattested status
+    /// never triggers cap eviction.
+    pub fn on_entry(
+        &mut self,
+        entry: LibraryDirectoryEntry,
+        status: AttestationStatus,
+    ) -> ProcessResult {
         let community_id = entry.community_id;
-        let library = entry.listed_by;
+        // Sub-D Phase 3: the broadcasting library identity comes from
+        // AttestationStatus. For Phase 1-shaped entries (Unwrapped),
+        // it falls back to the admin-signed `listed_by` (which Phase 1
+        // attribution-checking already constrained to equal the topic
+        // owner).
+        let broadcasting_lib = match status {
+            AttestationStatus::Attested(addr) | AttestationStatus::Unattested(addr) => addr,
+            AttestationStatus::Unwrapped => entry.listed_by,
+        };
+        let is_attesting_status = matches!(
+            status,
+            AttestationStatus::Attested(_) | AttestationStatus::Unwrapped
+        );
 
-        // Cap check BEFORE insert. If this library is already at cap and
-        // we're about to add a NEW contribution (not an update), evict
-        // the oldest entry from this library first.
-        let library_at_cap = self.entry_count_for_library(&library) >= MAX_ENTRIES_PER_LIBRARY;
-        let is_new_contribution_for_library = !self
-            .by_community
-            .get(&community_id)
-            .map(|agg| agg.listed_by.contains(&library))
-            .unwrap_or(false);
+        // ZEB-280 R1 (Qodo): drop Unattested entries for communities
+        // that have no prior aggregation. Prevents a network adversary
+        // on library X's open Zenoh topic from publishing bad-sig
+        // entries with `library_identity_pub = X` to fabricate fake
+        // communities in our aggregation map.
+        if !is_attesting_status && !self.by_community.contains_key(&community_id) {
+            return ProcessResult {
+                outcome: OnEntryOutcome::Idempotent,
+                evicted: None,
+            };
+        }
 
+        // Cap check BEFORE insert. ZEB-280 R1: only triggers for
+        // attesting status (Attested/Unwrapped). Unattested entries do
+        // NOT count toward `per_library_count` and therefore cannot
+        // cause cap eviction (defeats Qodo's DoS via spoofed
+        // library_identity_pub on an open topic).
+        //
+        // "is_new_contribution_for_library" under the new disjoint-sets
+        // invariant: X is a new attesting contributor iff X is NOT
+        // already in `attested_by` (membership in `unattested_by` is a
+        // recovery candidate, not "already attesting").
         let mut evicted: Option<SpaceId> = None;
-        if library_at_cap && is_new_contribution_for_library {
-            if let Some(oldest_id) = self.find_oldest_for_library(&library) {
-                self.evict_library_contribution(&library, oldest_id);
-                evicted = Some(oldest_id);
-            } else {
-                // R2 F3 (Medium, defense-in-depth): `per_library_count`
-                // says this library is at cap, but no community in
-                // `by_community` actually has the library in its
-                // `listed_by` set. Counter/map drift — should be
-                // impossible after R2 F2's fix to the cross-library
-                // eviction paths, but defense-in-depth: surface loudly
-                // in dev/test (debug_assert!), observably in release
-                // (tracing::warn!), and fall through to allow the
-                // insert (rather than silently bumping the count above
-                // MAX_ENTRIES_PER_LIBRARY).
-                tracing::warn!(
-                    target: "library_directory",
-                    library = ?library,
-                    per_library_count = self.entry_count_for_library(&library),
-                    max = MAX_ENTRIES_PER_LIBRARY,
-                    "per_library_count says at-cap but find_oldest_for_library returned None — counter invariant violated",
-                );
-                debug_assert!(
-                    false,
-                    "per_library_count invariant violated: library {:?} count={} but no community lists it",
-                    library,
-                    self.entry_count_for_library(&library)
-                );
+        if is_attesting_status {
+            let library_at_cap =
+                self.entry_count_for_library(&broadcasting_lib) >= MAX_ENTRIES_PER_LIBRARY;
+            let already_attesting = self
+                .by_community
+                .get(&community_id)
+                .map(|agg| agg.attested_by.contains(&broadcasting_lib))
+                .unwrap_or(false);
+            if library_at_cap && !already_attesting {
+                if let Some(oldest_id) = self.find_oldest_for_library(&broadcasting_lib) {
+                    self.evict_library_contribution(&broadcasting_lib, oldest_id);
+                    evicted = Some(oldest_id);
+                } else {
+                    tracing::warn!(
+                        target: "library_directory",
+                        library = ?broadcasting_lib,
+                        per_library_count = self.entry_count_for_library(&broadcasting_lib),
+                        max = MAX_ENTRIES_PER_LIBRARY,
+                        "per_library_count says at-cap but find_oldest_for_library returned None — counter invariant violated",
+                    );
+                    debug_assert!(
+                        false,
+                        "per_library_count invariant violated: library {:?} count={} but no community lists it",
+                        broadcasting_lib,
+                        self.entry_count_for_library(&broadcasting_lib)
+                    );
+                }
             }
         }
 
         let outcome = match self.by_community.get_mut(&community_id) {
             None => {
-                // Brand-new community in the aggregation.
-                let mut listed_by = BTreeSet::new();
-                listed_by.insert(library);
-                self.by_community
-                    .insert(community_id, AggregatedEntry { entry, listed_by });
-                *self.per_library_count.entry(library).or_insert(0) += 1;
+                // Brand-new community. Unattested-status branches were
+                // already filtered above (the `!is_attesting_status &&
+                // !contains_key` early-return), so we only land here for
+                // Attested or Unwrapped status — the disjoint-sets
+                // invariant gives `unattested_by = ∅`.
+                debug_assert!(
+                    is_attesting_status,
+                    "ZEB-280 R1: Unattested for new community should have early-returned"
+                );
+                let inserted_lib = match status {
+                    AttestationStatus::Attested(lib_addr) => lib_addr,
+                    AttestationStatus::Unwrapped => entry.listed_by,
+                    // Unreachable: filtered by early-return above.
+                    AttestationStatus::Unattested(addr) => addr,
+                };
+                let mut attested_by = BTreeSet::new();
+                attested_by.insert(inserted_lib);
+                self.by_community.insert(
+                    community_id,
+                    AggregatedEntry {
+                        entry,
+                        attested_by,
+                        unattested_by: BTreeSet::new(),
+                    },
+                );
+                *self.per_library_count.entry(broadcasting_lib).or_insert(0) += 1;
                 OnEntryOutcome::Inserted(community_id)
             }
             Some(existing) => {
                 let incoming_newer = entry
                     .listed_at
                     .is_strictly_newer_than(&existing.entry.listed_at);
-                let listed_by_was_new = existing.listed_by.insert(library);
-                if listed_by_was_new {
-                    *self.per_library_count.entry(library).or_insert(0) += 1;
+                // ZEB-280 R1: disjoint-sets policy. Track whether this
+                // insert grew the *attested* set (which is what drives
+                // both AccretedListedBy and per_library_count).
+                //
+                // Recovery semantics: when an Attested/Unwrapped entry
+                // arrives for a library already in `unattested_by`,
+                // move the library from unattested_by → attested_by
+                // (preserves disjoint invariant; bumps the cap counter
+                // exactly once, treating the move as a new attestation).
+                let was_new_attestation = match status {
+                    AttestationStatus::Attested(lib_addr) => {
+                        let was_new = existing.attested_by.insert(lib_addr);
+                        if was_new {
+                            // Recovery: previously-tampered wrap is now
+                            // valid. Remove the stale unattested entry.
+                            existing.unattested_by.remove(&lib_addr);
+                        }
+                        was_new
+                    }
+                    AttestationStatus::Unwrapped => {
+                        let was_new = existing.attested_by.insert(entry.listed_by);
+                        if was_new {
+                            existing.unattested_by.remove(&entry.listed_by);
+                        }
+                        was_new
+                    }
+                    AttestationStatus::Unattested(lib_addr) => {
+                        // Don't downgrade a trusted attestation: if X
+                        // is already in attested_by, ignore the bad-sig
+                        // broadcast entirely. Otherwise, insert into
+                        // unattested_by (idempotent if already present).
+                        // Unattested NEVER bumps per_library_count.
+                        if !existing.attested_by.contains(&lib_addr) {
+                            let _ = existing.unattested_by.insert(lib_addr);
+                        }
+                        false
+                    }
+                };
+                if was_new_attestation {
+                    *self.per_library_count.entry(broadcasting_lib).or_insert(0) += 1;
                 }
                 if incoming_newer {
                     existing.entry = entry;
                     OnEntryOutcome::Replaced(community_id)
-                } else if listed_by_was_new {
+                } else if was_new_attestation {
                     OnEntryOutcome::AccretedListedBy(community_id)
                 } else {
                     OnEntryOutcome::Idempotent
@@ -505,34 +781,32 @@ impl Aggregation {
     /// - Shared listing where stored entry came from another library
     ///   → reduce `listed_by` set only (unchanged).
     pub fn drop_library(&mut self, library: &OwnerAddr) -> Vec<SpaceId> {
-        // Two-pass to satisfy the borrow checker: we can't mutate
-        // `per_library_count` inside a `retain` closure that already
-        // holds `&mut self`. First pass collects which entries to evict
-        // and (for the F3 source-matches path) which OTHER libraries
-        // were in the evicted entry's `listed_by` set; second pass
-        // applies the mutations.
+        // Two-pass to satisfy the borrow checker (R2 F2 patterns
+        // unchanged from Phase 1 — just generalized to both sets).
         //
-        // R2 F2 (Medium, correctness): the original `retain` swept the
-        // `listed_by` set on remaining communities without rolling back
-        // those OTHER libraries' `per_library_count` when the F3 source-
-        // matches rule (R1) evicted a shared community. Over many
-        // remove/re-add cycles per_library_count drifted upward,
-        // triggering premature `MAX_ENTRIES_PER_LIBRARY` cap enforcement.
+        // ZEB-280 R1: counter rollback uses only `attested_by`
+        // membership (deduped). Under the disjoint-sets invariant a
+        // library appears in at most one of attested_by/unattested_by
+        // per community, but per_library_count tracks ONLY attested
+        // contributions (unattested entries don't count toward the
+        // cap). Decrementing for unattested-set membership would
+        // double-decrement the count for libraries that recovered
+        // from unattested → attested.
         let mut to_evict: Vec<(SpaceId, BTreeSet<OwnerAddr>)> = Vec::new();
         for (community_id, agg) in self.by_community.iter_mut() {
             let source_was_this_library = &agg.entry.listed_by == library;
-            let _ = agg.listed_by.remove(library);
-            if source_was_this_library || agg.listed_by.is_empty() {
-                // Capture the surviving listed_by set so we can
-                // decrement those libraries' counts after the
-                // iter_mut borrow ends.
-                to_evict.push((*community_id, agg.listed_by.clone()));
+            let _ = agg.attested_by.remove(library);
+            let _ = agg.unattested_by.remove(library);
+            let both_sets_empty = agg.attested_by.is_empty() && agg.unattested_by.is_empty();
+            if source_was_this_library || both_sets_empty {
+                // Capture remaining attested_by ONLY for counter rollback.
+                to_evict.push((*community_id, agg.attested_by.clone()));
             }
         }
         let mut evicted_ids = Vec::with_capacity(to_evict.len());
-        for (id, remaining_listed_by) in to_evict {
+        for (id, remaining_attested) in to_evict {
             self.by_community.remove(&id);
-            for other in remaining_listed_by {
+            for other in remaining_attested {
                 if &other != library {
                     if let Some(c) = self.per_library_count.get_mut(&other) {
                         if *c > 0 {
@@ -547,10 +821,15 @@ impl Aggregation {
         evicted_ids
     }
 
+    /// ZEB-280 R1: filter only by `attested_by` membership. Cap eviction
+    /// operates exclusively on attested contributions — unattested
+    /// entries never counted toward `per_library_count` in the first
+    /// place, so they cannot be "the oldest contribution" by cap
+    /// semantics.
     fn find_oldest_for_library(&self, library: &OwnerAddr) -> Option<SpaceId> {
         self.by_community
             .iter()
-            .filter(|(_, agg)| agg.listed_by.contains(library))
+            .filter(|(_, agg)| agg.attested_by.contains(library))
             .min_by(|a, b| {
                 // Lexicographic ordering on the HLC tuple. Note we want
                 // the OLDEST, so we min on (wall_ms, logical, device_id).
@@ -580,25 +859,42 @@ impl Aggregation {
     /// alongside the eviction to keep the counters consistent.
     fn evict_library_contribution(&mut self, library: &OwnerAddr, community_id: SpaceId) {
         // Capture state in a scoped borrow, then apply mutations after.
-        let mut surviving_listed_by: Option<BTreeSet<OwnerAddr>> = None;
+        //
+        // ZEB-280 R1: per_library_count tracks ONLY attested
+        // contributions. Decrement when removing the library from
+        // `attested_by`; removal from `unattested_by` is counter-neutral.
+        // Same dedupe rule for OTHER libraries on surviving eviction:
+        // roll back counts only via attested_by membership.
+        let mut surviving_attested: Option<BTreeSet<OwnerAddr>> = None;
         if let Some(agg) = self.by_community.get_mut(&community_id) {
-            if agg.listed_by.remove(library) {
+            let removed_from_attested = agg.attested_by.remove(library);
+            let _ = agg.unattested_by.remove(library);
+            if removed_from_attested {
                 if let Some(c) = self.per_library_count.get_mut(library) {
                     if *c > 0 {
                         *c -= 1;
                     }
                 }
-                let source_was_this_library = &agg.entry.listed_by == library;
-                if source_was_this_library || agg.listed_by.is_empty() {
-                    // Capture for post-removal count decrement of OTHER
-                    // libraries; clone is bounded by listed_by.len().
-                    surviving_listed_by = Some(agg.listed_by.clone());
-                }
+            }
+            // Phase 3 generalization of the Phase 1 "source matches"
+            // rule: if the stored entry was sourced from this
+            // library, evict the community entirely. The entry's
+            // signed `listed_by` is the closest proxy for "who
+            // sourced the stored metadata". Also evict if both sets
+            // empty after the removal.
+            let source_was_this_library = &agg.entry.listed_by == library;
+            let both_sets_empty = agg.attested_by.is_empty() && agg.unattested_by.is_empty();
+            if source_was_this_library || both_sets_empty {
+                surviving_attested = Some(agg.attested_by.clone());
             }
         }
-        if let Some(remaining) = surviving_listed_by {
+        if let Some(remaining_attested) = surviving_attested {
             self.by_community.remove(&community_id);
-            for other in remaining {
+            // R2 F2: roll back per_library_count for OTHER libraries
+            // whose attested contributions are also being dropped by
+            // this eviction. Unattested contributions don't carry a
+            // counter, so they need no rollback.
+            for other in remaining_attested {
                 if &other != library {
                     if let Some(c) = self.per_library_count.get_mut(&other) {
                         if *c > 0 {
@@ -795,15 +1091,28 @@ impl LibraryDirectory {
     ) -> Result<ProcessResult, ProcessSampleError> {
         let entry: LibraryDirectoryEntry =
             ciborium::de::from_reader(&bytes[..]).map_err(ProcessSampleError::Decode)?;
-        if entry.listed_by != library_addr {
+        // Phase 1 attribution check: signed `listed_by` is the topic
+        // owner's address. Phase 3 generalizes this — for wrapped
+        // entries, the broadcasting library identity (from the
+        // wrapping sig's library_identity_pub) is what must match the
+        // topic owner. Library A republishing library B's entry has
+        // listed_by=B but library_identity_pub=A. We require
+        // library_identity_pub's derived addr == library_addr (the
+        // topic owner). Unwrapped entries fall through to the Phase 1
+        // listed_by == library_addr semantics.
+        let status = verify_entry(&entry).map_err(ProcessSampleError::Verify)?;
+        let broadcasting_lib = match status {
+            AttestationStatus::Attested(addr) | AttestationStatus::Unattested(addr) => addr,
+            AttestationStatus::Unwrapped => entry.listed_by,
+        };
+        if broadcasting_lib != library_addr {
             return Err(ProcessSampleError::AttributionMismatch {
                 expected: library_addr,
-                actual: entry.listed_by,
+                actual: broadcasting_lib,
             });
         }
-        verify_entry(&entry).map_err(ProcessSampleError::Verify)?;
         let mut agg = self.aggregation.lock().await;
-        Ok(agg.on_entry(entry))
+        Ok(agg.on_entry(entry, status))
     }
 
     /// Sub-D Phase 2: ingest one announce-topic sample. Decodes, verifies,
@@ -900,7 +1209,14 @@ pub struct DirectoryEntryDTO {
     pub description: String,
     pub topics: Vec<String>,
     pub invite_url: String,
+    /// Sub-D Phase 3 (ZEB-280): count of libraries with valid attestation
+    /// for this entry (i.e., `attested_by.len()`). Includes Phase 1
+    /// unwrapped contributions (which fall back to entry.listed_by).
     pub listed_by_count: usize,
+    /// Sub-D Phase 3 (ZEB-280): true if at least one broadcasting
+    /// library's wrapping sig failed to verify (`!unattested_by.is_empty()`).
+    /// Drives the inline "unattested" badge in the frontend browser.
+    pub unattested: bool,
     pub listed_at: Hlc,
 }
 
@@ -917,7 +1233,8 @@ impl DirectoryEntryDTO {
             description: agg.entry.description.clone(),
             topics: agg.entry.topics.clone(),
             invite_url: agg.entry.invite_url.clone(),
-            listed_by_count: agg.listed_by.len(),
+            listed_by_count: agg.attested_by.len(),
+            unattested: !agg.unattested_by.is_empty(),
             listed_at: agg.entry.listed_at.clone(),
         }
     }
@@ -1079,12 +1396,81 @@ mod tests {
             listed_by,
             listed_at,
             community_signature: [0u8; 64],
+            library_identity_pub: None,
+            library_signature: None,
         };
         // Sign over canonical CBOR of all fields with community_signature
         // zeroed — verify_entry zeroes the same field before recomputing.
         let bytes = canonical_cbor_encode(&entry).expect("encode for sign");
         let sig = signing_key.sign(&bytes);
         entry.community_signature = sig.to_bytes();
+        entry
+    }
+
+    /// ZEB-280 Phase 3: variant of `build_signed_entry` that lets the
+    /// caller bind a specific `community_id` and `admin_seed` while
+    /// auto-deriving an invite URL whose payload binds to the same
+    /// community_id and the admin_addr derived from the seed (so
+    /// `verify_entry`'s R2 F1 payload-consistency check passes). Returns
+    /// a Phase 1-style entry (`library_identity_pub = None`,
+    /// `library_signature = None`) ready to be wrapped via `wrap_entry`.
+    fn build_signed_open_entry_for(
+        community_id: SpaceId,
+        admin_seed: [u8; 32],
+    ) -> LibraryDirectoryEntry {
+        build_signed_open_entry_for_library(community_id, admin_seed, OwnerAddr([0xAA; 16]))
+    }
+
+    /// ZEB-280 Phase 3: variant of `build_signed_open_entry_for` that
+    /// also binds an explicit `listed_by` OwnerAddr — used by aggregation
+    /// tests that need a Phase 1-shaped entry whose admin-signed
+    /// `listed_by` field is independent of the broadcasting library
+    /// passed via `AttestationStatus`.
+    fn build_signed_open_entry_for_library(
+        community_id: SpaceId,
+        admin_seed: [u8; 32],
+        listed_by: OwnerAddr,
+    ) -> LibraryDirectoryEntry {
+        let invite_url = build_matching_open_invite_url(community_id, admin_seed);
+        build_signed_entry(
+            community_id,
+            admin_seed,
+            listed_by,
+            Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "test".to_string(),
+            },
+            invite_url,
+        )
+    }
+
+    /// ZEB-280 Phase 3: build a library signer + 64-byte identity bundle.
+    /// Uses a distinct X25519 prefix (`[0x22; 32]`) from
+    /// `build_test_identity_pub`'s admin prefix (`[0x11; 32]`) so admin
+    /// and library identities derived from the same Ed25519 seed produce
+    /// distinct `OwnerAddr`s.
+    fn build_test_library_identity(seed: [u8; 32]) -> (SigningKey, [u8; 64]) {
+        let signing = SigningKey::from_bytes(&seed);
+        let verifying = signing.verifying_key().to_bytes();
+        let mut bundle = [0u8; 64];
+        bundle[..32].copy_from_slice(&[0x22; 32]);
+        bundle[32..].copy_from_slice(&verifying);
+        (signing, bundle)
+    }
+
+    /// ZEB-280 Phase 3: take an admin-signed entry, sign it with
+    /// `library_signing_key` over canonical CBOR with `library_signature`
+    /// zeroed (mirror of the verifier's reconstruction).
+    fn wrap_entry(
+        mut entry: LibraryDirectoryEntry,
+        library_signing_key: &SigningKey,
+        library_identity_bundle: [u8; 64],
+    ) -> LibraryDirectoryEntry {
+        entry.library_identity_pub = Some(library_identity_bundle);
+        entry.library_signature = None;
+        let signed_bytes = canonical_cbor_encode(&entry).expect("encode for lib sign");
+        entry.library_signature = Some(library_signing_key.sign(&signed_bytes).to_bytes());
         entry
     }
 
@@ -1101,7 +1487,10 @@ mod tests {
             },
             build_open_invite_url(),
         );
-        assert!(verify_entry(&entry).is_ok(), "signed entry must verify");
+        assert!(
+            matches!(verify_entry(&entry), Ok(AttestationStatus::Unwrapped)),
+            "signed entry must verify as Unwrapped"
+        );
     }
 
     #[test]
@@ -1168,6 +1557,8 @@ mod tests {
                 device_id: String::new(),
             },
             community_signature: [0u8; 64],
+            library_identity_pub: None,
+            library_signature: None,
         };
         assert!(matches!(
             verify_entry(&entry),
@@ -1332,11 +1723,12 @@ mod tests {
             .to_bytes();
 
         assert_eq!(
-            agg.on_entry(e1).outcome,
+            agg.on_entry(e1, AttestationStatus::Unwrapped).outcome,
             OnEntryOutcome::Inserted(community)
         );
         assert_eq!(
-            agg.on_entry(e2.clone()).outcome,
+            agg.on_entry(e2.clone(), AttestationStatus::Unwrapped)
+                .outcome,
             OnEntryOutcome::Replaced(community)
         );
         let snap = agg.snapshot_all();
@@ -1363,19 +1755,19 @@ mod tests {
             build_signed_entry(community, [7; 32], library_b, h.clone(), invite_url.clone());
 
         assert_eq!(
-            agg.on_entry(e_from_a).outcome,
+            agg.on_entry(e_from_a, AttestationStatus::Unwrapped).outcome,
             OnEntryOutcome::Inserted(community)
         );
         assert_eq!(
-            agg.on_entry(e_from_b).outcome,
+            agg.on_entry(e_from_b, AttestationStatus::Unwrapped).outcome,
             OnEntryOutcome::AccretedListedBy(community)
         );
 
         let snap = agg.snapshot_all();
         assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].listed_by.len(), 2);
-        assert!(snap[0].listed_by.contains(&library_a));
-        assert!(snap[0].listed_by.contains(&library_b));
+        assert_eq!(snap[0].attested_by.len(), 2);
+        assert!(snap[0].attested_by.contains(&library_a));
+        assert!(snap[0].attested_by.contains(&library_b));
     }
 
     /// `drop_library` evicts solo listings AND retains shared listings
@@ -1405,37 +1797,40 @@ mod tests {
         };
         let invite_url = build_open_invite_url();
 
-        agg.on_entry(build_signed_entry(
-            solo,
-            [7; 32],
-            library_a,
-            h_old.clone(),
-            invite_url.clone(),
-        ));
-        agg.on_entry(build_signed_entry(
-            shared,
-            [7; 32],
-            library_a,
-            h_old.clone(),
-            invite_url.clone(),
-        ));
+        agg.on_entry(
+            build_signed_entry(solo, [7; 32], library_a, h_old.clone(), invite_url.clone()),
+            AttestationStatus::Unwrapped,
+        );
+        agg.on_entry(
+            build_signed_entry(
+                shared,
+                [7; 32],
+                library_a,
+                h_old.clone(),
+                invite_url.clone(),
+            ),
+            AttestationStatus::Unwrapped,
+        );
         // library_b publishes at a NEWER HLC so its entry becomes the
         // stored source — required for the F3-rule shared-retention
         // path to apply.
-        agg.on_entry(build_signed_entry(
-            shared,
-            [7; 32],
-            library_b,
-            h_new.clone(),
-            invite_url.clone(),
-        ));
+        agg.on_entry(
+            build_signed_entry(
+                shared,
+                [7; 32],
+                library_b,
+                h_new.clone(),
+                invite_url.clone(),
+            ),
+            AttestationStatus::Unwrapped,
+        );
 
         let evicted = agg.drop_library(&library_a);
         assert_eq!(evicted, vec![solo]);
         let snap = agg.snapshot_all();
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].entry.community_id, shared);
-        assert_eq!(snap[0].listed_by, [library_b].into_iter().collect());
+        assert_eq!(snap[0].attested_by, [library_b].into_iter().collect());
     }
 
     /// F3 regression: `drop_library` must evict the community when the
@@ -1477,7 +1872,7 @@ mod tests {
         entry_a.community_signature = sk
             .sign(&canonical_cbor_encode(&for_sig).unwrap())
             .to_bytes();
-        agg.on_entry(entry_a);
+        agg.on_entry(entry_a, AttestationStatus::Unwrapped);
 
         // Library B publishes for the SAME community at HLC 200 with
         // name="from-B" — newer-HLC wins, stored entry becomes B's.
@@ -1498,14 +1893,14 @@ mod tests {
         entry_b.community_signature = sk
             .sign(&canonical_cbor_encode(&for_sig_b).unwrap())
             .to_bytes();
-        agg.on_entry(entry_b);
+        agg.on_entry(entry_b, AttestationStatus::Unwrapped);
 
         // Sanity: pre-drop state has community C listed by both, stored
         // entry sourced from B.
         let snap = agg.snapshot_all();
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].entry.name, "from-B");
-        assert_eq!(snap[0].listed_by.len(), 2);
+        assert_eq!(snap[0].attested_by.len(), 2);
 
         // Drop library B → community must be FULLY evicted, not just
         // reduced to listed_by={A}, because stored entry came from B.
@@ -1544,31 +1939,37 @@ mod tests {
 
         // Library A publishes community at HLC 100 — becomes the stored
         // source.
-        agg.on_entry(build_signed_entry(
-            community,
-            [7; 32],
-            library_a,
-            Hlc {
-                wall_ms: 100,
-                logical: 0,
-                device_id: "d".into(),
-            },
-            invite_url.clone(),
-        ));
+        agg.on_entry(
+            build_signed_entry(
+                community,
+                [7; 32],
+                library_a,
+                Hlc {
+                    wall_ms: 100,
+                    logical: 0,
+                    device_id: "d".into(),
+                },
+                invite_url.clone(),
+            ),
+            AttestationStatus::Unwrapped,
+        );
         // Library B publishes SAME community at HLC 50 (older) — does
         // NOT replace stored entry but DOES accrete to listed_by and
         // increments B's per_library_count.
-        agg.on_entry(build_signed_entry(
-            community,
-            [7; 32],
-            library_b,
-            Hlc {
-                wall_ms: 50,
-                logical: 0,
-                device_id: "d".into(),
-            },
-            invite_url.clone(),
-        ));
+        agg.on_entry(
+            build_signed_entry(
+                community,
+                [7; 32],
+                library_b,
+                Hlc {
+                    wall_ms: 50,
+                    logical: 0,
+                    device_id: "d".into(),
+                },
+                invite_url.clone(),
+            ),
+            AttestationStatus::Unwrapped,
+        );
 
         assert_eq!(
             agg.entry_count_for_library(&library_a),
@@ -1619,7 +2020,7 @@ mod tests {
                 },
                 invite_url.clone(),
             );
-            let result = agg.on_entry(entry);
+            let result = agg.on_entry(entry, AttestationStatus::Unwrapped);
             if i < MAX_ENTRIES_PER_LIBRARY as u32 {
                 assert!(matches!(result.outcome, OnEntryOutcome::Inserted(_)));
                 assert!(result.evicted.is_none(), "no eviction under cap");
@@ -1663,20 +2064,14 @@ mod tests {
         };
         let invite_url = build_open_invite_url();
 
-        agg.on_entry(build_signed_entry(
-            community,
-            [7; 32],
-            library,
-            h_new,
-            invite_url.clone(),
-        ));
-        let result = agg.on_entry(build_signed_entry(
-            community,
-            [7; 32],
-            library,
-            h_old,
-            invite_url.clone(),
-        ));
+        agg.on_entry(
+            build_signed_entry(community, [7; 32], library, h_new, invite_url.clone()),
+            AttestationStatus::Unwrapped,
+        );
+        let result = agg.on_entry(
+            build_signed_entry(community, [7; 32], library, h_old, invite_url.clone()),
+            AttestationStatus::Unwrapped,
+        );
         assert_eq!(result.outcome, OnEntryOutcome::Idempotent);
         assert!(result.evicted.is_none());
     }
@@ -1723,6 +2118,428 @@ mod tests {
             verify_entry(&bad),
             Err(EntryVerifyError::TooManyTopics)
         ));
+    }
+
+    /// ZEB-280 Phase 3: an entry with `library_identity_pub` and
+    /// `library_signature` both populated (static `[0u8; 64]` sentinel
+    /// bytes here — Task 2 adds real-signer verifier tests) round-trips
+    /// through canonical CBOR and the bstr serde helpers correctly.
+    #[test]
+    fn phase3_wrapped_entry_roundtrips_via_canonical_cbor() {
+        let entry = LibraryDirectoryEntry {
+            community_id: SpaceId([0x11; 16]),
+            community_admin_identity_pub: [0x11; 64],
+            name: "Phase 3 test".to_string(),
+            description: "Round-trip test for wrapped entry".to_string(),
+            topics: vec!["test".to_string()],
+            invite_url: "harmony://invite/?p=AAAA".to_string(),
+            listed_by: OwnerAddr([0xAA; 16]),
+            listed_at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "test".to_string(),
+            },
+            community_signature: [0u8; 64],
+            library_identity_pub: Some([0xBB; 64]),
+            library_signature: Some([0xCC; 64]),
+        };
+        let bytes = canonical_cbor_encode(&entry).expect("encode");
+        let decoded: LibraryDirectoryEntry = ciborium::de::from_reader(&bytes[..]).expect("decode");
+        assert_eq!(entry, decoded, "wrapped entry round-trips");
+    }
+
+    /// ZEB-280 Phase 3: a Phase 1-style entry (both Optional fields
+    /// `None`) round-trips and the decoded fields are still `None`
+    /// (the `#[serde(default)]` attribute lets ciborium decode missing
+    /// fields as `None`).
+    #[test]
+    fn phase1_unwrapped_entry_roundtrips_with_optional_fields_absent() {
+        let entry = LibraryDirectoryEntry {
+            community_id: SpaceId([0x22; 16]),
+            community_admin_identity_pub: [0x33; 64],
+            name: "Phase 1 test".to_string(),
+            description: "Backward compat check".to_string(),
+            topics: vec![],
+            invite_url: "harmony://invite/?p=AAAA".to_string(),
+            listed_by: OwnerAddr([0x44; 16]),
+            listed_at: Hlc {
+                wall_ms: 0,
+                logical: 0,
+                device_id: String::new(),
+            },
+            community_signature: [0x55; 64],
+            library_identity_pub: None,
+            library_signature: None,
+        };
+        let bytes = canonical_cbor_encode(&entry).expect("encode");
+        let decoded: LibraryDirectoryEntry = ciborium::de::from_reader(&bytes[..]).expect("decode");
+        assert_eq!(entry, decoded, "Phase 1-shaped entry round-trips");
+        assert_eq!(decoded.library_identity_pub, None);
+        assert_eq!(decoded.library_signature, None);
+    }
+
+    /// ZEB-280 Phase 3: Phase 1-style entry (Optional fields both None)
+    /// verifies as `AttestationStatus::Unwrapped`.
+    #[test]
+    fn verify_entry_phase1_unwrapped_returns_unwrapped() {
+        let community_id = SpaceId([0x11; 16]);
+        let admin_seed = [7u8; 32];
+        let entry = build_signed_open_entry_for(community_id, admin_seed);
+        // (build_signed_open_entry_for returns an entry with li=None, ls=None)
+
+        match verify_entry(&entry) {
+            Ok(AttestationStatus::Unwrapped) => {}
+            other => panic!("expected Unwrapped, got {other:?}"),
+        }
+    }
+
+    /// ZEB-280 Phase 3: a wrapped entry with a valid library signature
+    /// verifies as `AttestationStatus::Attested(library_addr)`.
+    #[test]
+    fn verify_entry_phase3_wrapped_valid_returns_attested() {
+        let community_id = SpaceId([0x22; 16]);
+        let admin_seed = [8u8; 32];
+        let admin_entry = build_signed_open_entry_for(community_id, admin_seed);
+
+        let (lib_signing, lib_bundle) = build_test_library_identity([9u8; 32]);
+        let wrapped = wrap_entry(admin_entry, &lib_signing, lib_bundle);
+
+        let expected_lib_addr = {
+            let id = harmony_identity::Identity::from_public_bytes(&lib_bundle)
+                .expect("library identity");
+            OwnerAddr(id.address_hash)
+        };
+
+        match verify_entry(&wrapped) {
+            Ok(AttestationStatus::Attested(addr)) => {
+                assert_eq!(addr, expected_lib_addr);
+            }
+            other => panic!("expected Attested, got {other:?}"),
+        }
+    }
+
+    /// ZEB-280 Phase 3: a wrapped entry with a TAMPERED library
+    /// signature returns `Ok(AttestationStatus::Unattested(library_addr))`.
+    /// The entry is NOT dropped — admin sig still valid.
+    #[test]
+    fn verify_entry_phase3_tampered_wrapping_sig_returns_unattested() {
+        let community_id = SpaceId([0x33; 16]);
+        let admin_seed = [10u8; 32];
+        let admin_entry = build_signed_open_entry_for(community_id, admin_seed);
+
+        let (lib_signing, lib_bundle) = build_test_library_identity([11u8; 32]);
+        let mut wrapped = wrap_entry(admin_entry, &lib_signing, lib_bundle);
+
+        // Tamper the library signature.
+        let mut bad_sig = wrapped.library_signature.expect("wrapping sig present");
+        bad_sig[0] ^= 0xFF;
+        wrapped.library_signature = Some(bad_sig);
+
+        let expected_lib_addr = {
+            let id = harmony_identity::Identity::from_public_bytes(&lib_bundle)
+                .expect("library identity");
+            OwnerAddr(id.address_hash)
+        };
+
+        match verify_entry(&wrapped) {
+            Ok(AttestationStatus::Unattested(addr)) => {
+                assert_eq!(
+                    addr, expected_lib_addr,
+                    "Unattested still carries the CLAIMED library addr"
+                );
+            }
+            other => panic!("expected Unattested, got {other:?}"),
+        }
+    }
+
+    /// ZEB-280 Phase 3: if the entry's payload is tampered (e.g., name
+    /// field changed), the ADMIN sig fails FIRST, and the entry is
+    /// dropped via `Err(SignatureInvalid)`. The wrapping sig is not
+    /// even reached — admin sig is the gatekeeper.
+    #[test]
+    fn verify_entry_phase3_tampered_payload_invalidates_both_sigs() {
+        let community_id = SpaceId([0x44; 16]);
+        let admin_seed = [12u8; 32];
+        let admin_entry = build_signed_open_entry_for(community_id, admin_seed);
+        let (lib_signing, lib_bundle) = build_test_library_identity([13u8; 32]);
+        let mut wrapped = wrap_entry(admin_entry, &lib_signing, lib_bundle);
+
+        // Tamper the payload (name) AFTER both sigs were applied.
+        wrapped.name = "TAMPERED".to_string();
+
+        match verify_entry(&wrapped) {
+            Err(EntryVerifyError::SignatureInvalid) => {}
+            other => panic!("expected admin SignatureInvalid, got {other:?}"),
+        }
+    }
+
+    /// ZEB-280 Phase 3: an entry with `library_signature = Some` but
+    /// `library_identity_pub = None` returns
+    /// `Err(LibrarySignatureFieldsInconsistent)`.
+    #[test]
+    fn verify_entry_inconsistent_library_fields_rejected_lib_sig_only() {
+        let community_id = SpaceId([0x55; 16]);
+        let admin_seed = [14u8; 32];
+        let mut entry = build_signed_open_entry_for(community_id, admin_seed);
+        entry.library_signature = Some([0xAA; 64]);
+        entry.library_identity_pub = None;
+
+        // Admin sig is over (cs=0, li=None, ls=None) — but the entry
+        // now has li=None, ls=Some. The admin sig verifier reconstructs
+        // by setting cs=0, li=None, ls=None — so admin sig still
+        // verifies (unchanged). Then we hit the inconsistency check.
+        match verify_entry(&entry) {
+            Err(EntryVerifyError::LibrarySignatureFieldsInconsistent) => {}
+            other => panic!("expected LibrarySignatureFieldsInconsistent, got {other:?}"),
+        }
+    }
+
+    /// ZEB-280 Phase 3: an entry with `library_identity_pub = Some` but
+    /// `library_signature = None` returns
+    /// `Err(LibrarySignatureFieldsInconsistent)`.
+    #[test]
+    fn verify_entry_inconsistent_library_fields_rejected_lib_pub_only() {
+        let community_id = SpaceId([0x66; 16]);
+        let admin_seed = [15u8; 32];
+        let mut entry = build_signed_open_entry_for(community_id, admin_seed);
+        entry.library_identity_pub = Some([0xBB; 64]);
+        entry.library_signature = None;
+
+        match verify_entry(&entry) {
+            Err(EntryVerifyError::LibrarySignatureFieldsInconsistent) => {}
+            other => panic!("expected LibrarySignatureFieldsInconsistent, got {other:?}"),
+        }
+    }
+
+    /// ZEB-280 Phase 3: an entry with a malformed `library_identity_pub`
+    /// (bytes that fail `Identity::from_public_bytes`) returns
+    /// `Err(InvalidLibraryIdentityPub)`.
+    #[test]
+    fn verify_entry_malformed_library_identity_pub_rejected() {
+        let community_id = SpaceId([0x77; 16]);
+        let admin_seed = [16u8; 32];
+        let admin_entry = build_signed_open_entry_for(community_id, admin_seed);
+        let (lib_signing, lib_bundle) = build_test_library_identity([17u8; 32]);
+
+        // Wrap with the GOOD bundle (so the wrapping sig is valid for
+        // this bundle), then SWAP IN a malformed bundle. The wrapping
+        // sig won't verify against the malformed pub, but we never
+        // get that far — the Identity::from_public_bytes check fires
+        // first.
+        let mut wrapped = wrap_entry(admin_entry, &lib_signing, lib_bundle);
+        // Ed25519 half `[0x7F; 32]` doesn't decompress under
+        // ed25519-dalek 2.x / curve25519-dalek 4.x — same fixture used by
+        // `malformed_identity_pub_rejected` for the admin-side check.
+        let mut malformed_bundle = [0u8; 64];
+        malformed_bundle[32..].copy_from_slice(&[0x7F; 32]);
+        wrapped.library_identity_pub = Some(malformed_bundle);
+
+        match verify_entry(&wrapped) {
+            Err(EntryVerifyError::InvalidLibraryIdentityPub(_)) => {}
+            other => panic!("expected InvalidLibraryIdentityPub, got {other:?}"),
+        }
+    }
+
+    /// ZEB-280 Phase 3: an `AttestationStatus::Unwrapped` entry
+    /// falls back to `entry.listed_by` when inserting into the
+    /// `attested_by` set.
+    #[test]
+    fn aggregation_on_entry_unwrapped_inserts_into_attested_by_via_listed_by_fallback() {
+        let mut agg = Aggregation::new();
+        let community_id = SpaceId([0x11; 16]);
+        let library = OwnerAddr([0xAA; 16]);
+        let entry = build_signed_open_entry_for_library(community_id, [7u8; 32], library);
+        let _ = agg.on_entry(entry, AttestationStatus::Unwrapped);
+
+        let snap = agg.snapshot_all();
+        assert_eq!(snap.len(), 1);
+        assert!(
+            snap[0].attested_by.contains(&library),
+            "Unwrapped path should insert listed_by into attested_by"
+        );
+        assert!(
+            snap[0].unattested_by.is_empty(),
+            "no unattested contributions"
+        );
+    }
+
+    /// ZEB-280 Phase 3: an `AttestationStatus::Attested(lib_addr)`
+    /// entry inserts `lib_addr` (NOT `entry.listed_by`) into
+    /// `attested_by`.
+    #[test]
+    fn aggregation_on_entry_attested_inserts_into_attested_by_via_lib_addr() {
+        let mut agg = Aggregation::new();
+        let community_id = SpaceId([0x22; 16]);
+        let listed_by = OwnerAddr([0xAA; 16]);
+        let lib_addr = OwnerAddr([0xBB; 16]);
+        // Federation case: admin signed listed_by=A but broadcaster is B.
+        let entry = build_signed_open_entry_for_library(community_id, [8u8; 32], listed_by);
+        let _ = agg.on_entry(entry, AttestationStatus::Attested(lib_addr));
+
+        let snap = agg.snapshot_all();
+        assert_eq!(snap.len(), 1);
+        assert!(
+            snap[0].attested_by.contains(&lib_addr),
+            "Attested(lib_addr) inserts the broadcasting lib, NOT listed_by"
+        );
+        assert!(
+            !snap[0].attested_by.contains(&listed_by),
+            "listed_by is NOT inserted when status is Attested"
+        );
+    }
+
+    /// ZEB-280 Phase 3 (R1, CodeRabbit + Qodo): an
+    /// `AttestationStatus::Unattested(lib_addr)` entry inserts
+    /// `lib_addr` into `unattested_by` ONLY when the community has a
+    /// prior attestation. The DTO surfaces `unattested = true`. The
+    /// disjoint-sets invariant (attested_by ∩ unattested_by = ∅ per
+    /// community) means an unattested broadcast from library X for a
+    /// community where X is the only attester is a no-op.
+    #[test]
+    fn aggregation_on_entry_unattested_inserts_into_unattested_by_when_community_already_attested()
+    {
+        let mut agg = Aggregation::new();
+        let community_id = SpaceId([0x33; 16]);
+        let attested_lib = OwnerAddr([0xAA; 16]);
+        let unattested_lib = OwnerAddr([0xCC; 16]);
+
+        // Step 1: legitimate attested broadcast creates the community.
+        let entry = build_signed_open_entry_for_library(community_id, [9u8; 32], attested_lib);
+        let _ = agg.on_entry(entry.clone(), AttestationStatus::Attested(attested_lib));
+
+        // Step 2: unattested broadcast from a DIFFERENT library on
+        // existing community.
+        let _ = agg.on_entry(entry, AttestationStatus::Unattested(unattested_lib));
+
+        let snap = agg.snapshot_all();
+        assert_eq!(snap.len(), 1);
+        assert!(snap[0].attested_by.contains(&attested_lib));
+        assert!(snap[0].unattested_by.contains(&unattested_lib));
+        assert!(
+            !snap[0].attested_by.contains(&unattested_lib),
+            "library never appears in BOTH sets — disjoint invariant"
+        );
+
+        let dto = DirectoryEntryDTO::from_aggregated(&snap[0]);
+        assert!(dto.unattested);
+    }
+
+    /// ZEB-280 Phase 3 R1 (Qodo finding — DoS prevention): Unattested
+    /// entries for communities that have no prior attestation are
+    /// DROPPED entirely. Prevents a network adversary on a library's
+    /// open Zenoh topic from creating fake-community memory pressure
+    /// via bad-sig broadcasts with `library_identity_pub` spoofed.
+    #[test]
+    fn aggregation_on_entry_unattested_dropped_when_no_prior_attestation() {
+        let mut agg = Aggregation::new();
+        let community_id = SpaceId([0x33; 16]);
+        let lib_addr = OwnerAddr([0xCC; 16]);
+        let entry =
+            build_signed_open_entry_for_library(community_id, [9u8; 32], OwnerAddr([0xAA; 16]));
+
+        let result = agg.on_entry(entry, AttestationStatus::Unattested(lib_addr));
+
+        assert!(matches!(result.outcome, OnEntryOutcome::Idempotent));
+        assert!(
+            agg.snapshot_all().is_empty(),
+            "Unattested entry for new community dropped — no aggregation created"
+        );
+        assert_eq!(
+            agg.entry_count_for_library(&lib_addr),
+            0,
+            "no per-library count bump for dropped Unattested"
+        );
+    }
+
+    /// ZEB-280 Phase 3 R1 (Qodo finding — cap-bypass prevention):
+    /// `per_library_count` tracks attested+unwrapped contributions
+    /// only. Unattested broadcasts (potentially from a network
+    /// adversary on the library's topic) cannot pump the count and
+    /// cause cap eviction of the library's legitimate attestations.
+    #[test]
+    fn aggregation_unattested_does_not_count_toward_per_library_cap() {
+        let mut agg = Aggregation::new();
+        let attested_lib = OwnerAddr([0xAA; 16]);
+        let unattested_lib = OwnerAddr([0xCC; 16]);
+
+        // Create an attested community.
+        let entry = build_signed_open_entry_for_library(SpaceId([1; 16]), [9u8; 32], attested_lib);
+        let _ = agg.on_entry(entry, AttestationStatus::Attested(attested_lib));
+
+        // Have unattested_lib unattested-broadcast many times for this
+        // community. Under R1 policy: each is a no-op for cap (community
+        // exists, after first insertion unattested_lib is in
+        // unattested_by; per_library_count NEVER counts unattested).
+        for _ in 0..100 {
+            let entry =
+                build_signed_open_entry_for_library(SpaceId([1; 16]), [9u8; 32], attested_lib);
+            let _ = agg.on_entry(entry, AttestationStatus::Unattested(unattested_lib));
+        }
+
+        assert_eq!(
+            agg.entry_count_for_library(&unattested_lib),
+            0,
+            "Unattested broadcasts don't count toward cap"
+        );
+        assert_eq!(
+            agg.entry_count_for_library(&attested_lib),
+            1,
+            "Attested broadcast counts once"
+        );
+    }
+
+    /// ZEB-280 Phase 3: drop_library sweeps BOTH attested_by and
+    /// unattested_by sets — the per_library_count decrements for the
+    /// dropped library, and OTHER libraries' counts roll back when
+    /// the source-matches eviction rule fires.
+    #[test]
+    fn aggregation_drop_library_sweeps_both_attestation_sets() {
+        let mut agg = Aggregation::new();
+        let community_id = SpaceId([0x44; 16]);
+        let library_a = OwnerAddr([0xAA; 16]);
+        let library_b = OwnerAddr([0xBB; 16]);
+
+        // Library A attests via Unwrapped (listed_by=A); Library B
+        // also broadcasts the same community but with a TAMPERED
+        // wrapping sig, so they land in unattested_by.
+        let entry_a = build_signed_open_entry_for_library(community_id, [10u8; 32], library_a);
+        let _ = agg.on_entry(entry_a, AttestationStatus::Unwrapped);
+
+        let entry_b = build_signed_open_entry_for_library(community_id, [10u8; 32], library_a);
+        let _ = agg.on_entry(entry_b, AttestationStatus::Unattested(library_b));
+
+        let snap_before = agg.snapshot_all();
+        assert_eq!(snap_before.len(), 1);
+        assert!(snap_before[0].attested_by.contains(&library_a));
+        assert!(snap_before[0].unattested_by.contains(&library_b));
+
+        // Drop library_b — should sweep it from unattested_by, NOT
+        // evict the community (library_a still attests).
+        let evicted = agg.drop_library(&library_b);
+        assert!(
+            evicted.is_empty(),
+            "library_b drop should not evict community (library_a still attests)"
+        );
+        let snap_after_b = agg.snapshot_all();
+        assert_eq!(snap_after_b.len(), 1);
+        assert!(snap_after_b[0].attested_by.contains(&library_a));
+        assert!(
+            !snap_after_b[0].unattested_by.contains(&library_b),
+            "library_b swept from unattested_by"
+        );
+
+        // Drop library_a — should evict (last remaining contributor).
+        let evicted = agg.drop_library(&library_a);
+        assert_eq!(
+            evicted,
+            vec![community_id],
+            "library_a drop should evict the community"
+        );
+        let snap_after_a = agg.snapshot_all();
+        assert!(
+            snap_after_a.is_empty(),
+            "community evicted after both drops"
+        );
     }
 }
 
