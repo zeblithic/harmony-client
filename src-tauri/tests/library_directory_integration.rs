@@ -890,36 +890,33 @@ async fn click_to_join_redeem_invite_smoke() {
 
 // ── ZEB-280 Sub-D Phase 3: federation integration tests ──────────────
 
-/// ZEB-280 Phase 3: library A and library B independently broadcast
-/// the SAME admin-signed community entry, each with their own
-/// wrapping sig. Aggregation should treat them as 2 distinct
-/// broadcasting attestations of the same community. DTO surfaces
-/// listed_by_count = 2, unattested = false.
+/// ZEB-280 Phase 3: library A broadcasts a wrapped entry; library B
+/// re-syndicates the SAME admin-signed bytes verbatim, replacing only
+/// the wrapping sig with its own. This is the verbatim re-syndication
+/// primitive — the admin sig is portable across libraries, so B can
+/// rebroadcast A's admin-signed entry without re-signing the inner
+/// payload. Aggregation should treat them as 2 distinct broadcasting
+/// attestations of the same community. DTO surfaces
+/// `listed_by_count = 2`, `unattested = false`.
+///
+/// Re-syndication preserves the entry's `listed_at` HLC verbatim, so
+/// the aggregation's `incoming_newer` check on B's `process_sample`
+/// sees an equal-or-not-newer HLC and keeps `existing.entry = entry_a`.
+/// `attested_by` still gains `library_b` (set insert) — the assertions
+/// below match this expected behavior.
 #[tokio::test]
 async fn federation_two_libraries_broadcast_same_community_aggregates() {
-    use common::library_fixtures::{build_test_library_identity, mock_library_entry_wrapped};
+    use common::library_fixtures::{
+        build_test_library_addr, mock_library_entry_republished_by, mock_library_entry_wrapped,
+    };
 
     let community_id = SpaceId([0x88; 16]);
     let admin_seed = [42u8; 32];
 
-    let (lib_a_signer, lib_a_bundle) = build_test_library_identity([1u8; 32]);
-    let (lib_b_signer, lib_b_bundle) = build_test_library_identity([2u8; 32]);
-    let library_a = OwnerAddr(
-        harmony_identity::Identity::from_public_bytes(&lib_a_bundle)
-            .expect("identity a")
-            .address_hash,
-    );
-    let library_b = OwnerAddr(
-        harmony_identity::Identity::from_public_bytes(&lib_b_bundle)
-            .expect("identity b")
-            .address_hash,
-    );
+    let (lib_a_signer, lib_a_bundle, library_a) = build_test_library_addr([1u8; 32]);
+    let (lib_b_signer, lib_b_bundle, library_b) = build_test_library_addr([2u8; 32]);
 
-    // Both libraries broadcast the SAME admin-signed community.
-    // The admin sig is over (cs=0, li=None, ls=None) — portable across
-    // libraries. Each library wraps with its own sig. listed_by is the
-    // ORIGINAL lister; since each library is the originator (not
-    // republishing), listed_by = each library's own addr.
+    // Library A: produce the original admin-signed + A-wrapped entry.
     let entry_a = mock_library_entry_wrapped(
         community_id,
         admin_seed,
@@ -935,23 +932,13 @@ async fn federation_two_libraries_broadcast_same_community_aggregates() {
         vec!["federation".to_string()],
         Some((&lib_a_signer, lib_a_bundle)),
     );
-    let entry_b = mock_library_entry_wrapped(
-        community_id,
-        admin_seed,
-        library_b,
-        Hlc {
-            wall_ms: 1_700_000_000_000,
-            logical: 1,
-            device_id: "test-b".to_string(),
-        },
-        open_invite_url_for(community_id, admin_seed),
-        "Federated Community",
-        "Same community, two libraries.",
-        vec!["federation".to_string()],
-        Some((&lib_b_signer, lib_b_bundle)),
-    );
+    // Library B: verbatim re-syndication — clone A's entry and replace
+    // ONLY the wrapping sig with B's own. listed_by and listed_at HLC
+    // stay as A's (this is what "verbatim" means: the admin-signed
+    // bytes are byte-identical to what A published).
+    let entry_b = mock_library_entry_republished_by(&entry_a, &lib_b_signer, lib_b_bundle);
 
-    let (dir, _request_rx) = LibraryDirectory::new();
+    let dir = build_directory();
     let bytes_a = canonical_cbor_encode(&entry_a).expect("encode a");
     let bytes_b = canonical_cbor_encode(&entry_b).expect("encode b");
     dir.process_sample(library_a, bytes_a)
@@ -987,23 +974,13 @@ async fn federation_two_libraries_broadcast_same_community_aggregates() {
 /// DTO: listed_by_count = 1, unattested = true (badge surfaces).
 #[tokio::test]
 async fn federation_one_library_tampered_wrapping_shows_unattested() {
-    use common::library_fixtures::{build_test_library_identity, mock_library_entry_wrapped};
+    use common::library_fixtures::{build_test_library_addr, mock_library_entry_wrapped};
 
     let community_id = SpaceId([0x99; 16]);
     let admin_seed = [43u8; 32];
 
-    let (lib_a_signer, lib_a_bundle) = build_test_library_identity([3u8; 32]);
-    let (lib_b_signer, lib_b_bundle) = build_test_library_identity([4u8; 32]);
-    let library_a = OwnerAddr(
-        harmony_identity::Identity::from_public_bytes(&lib_a_bundle)
-            .expect("identity a")
-            .address_hash,
-    );
-    let library_b = OwnerAddr(
-        harmony_identity::Identity::from_public_bytes(&lib_b_bundle)
-            .expect("identity b")
-            .address_hash,
-    );
+    let (lib_a_signer, lib_a_bundle, library_a) = build_test_library_addr([3u8; 32]);
+    let (lib_b_signer, lib_b_bundle, library_b) = build_test_library_addr([4u8; 32]);
 
     // Library A: valid wrapping.
     let entry_a = mock_library_entry_wrapped(
@@ -1042,7 +1019,7 @@ async fn federation_one_library_tampered_wrapping_shows_unattested() {
     tampered_sig[0] ^= 0xFF;
     entry_b.library_signature = Some(tampered_sig);
 
-    let (dir, _request_rx) = LibraryDirectory::new();
+    let dir = build_directory();
     let bytes_a = canonical_cbor_encode(&entry_a).expect("encode a");
     let bytes_b = canonical_cbor_encode(&entry_b).expect("encode b");
     dir.process_sample(library_a, bytes_a)
@@ -1079,19 +1056,14 @@ async fn federation_one_library_tampered_wrapping_shows_unattested() {
 #[tokio::test]
 async fn federation_phase1_entry_aggregates_alongside_phase3_wrapped() {
     use common::library_fixtures::{
-        build_test_library_identity, mock_directory_entry, mock_library_entry_wrapped,
+        build_test_library_addr, mock_directory_entry, mock_library_entry_wrapped,
     };
 
     let community_id = SpaceId([0xAA; 16]);
     let admin_seed = [44u8; 32];
 
     let library_a = OwnerAddr([0xA1; 16]); // Phase 1 library (no key pair needed)
-    let (lib_b_signer, lib_b_bundle) = build_test_library_identity([5u8; 32]);
-    let library_b = OwnerAddr(
-        harmony_identity::Identity::from_public_bytes(&lib_b_bundle)
-            .expect("identity b")
-            .address_hash,
-    );
+    let (lib_b_signer, lib_b_bundle, library_b) = build_test_library_addr([5u8; 32]);
 
     // Library A: Phase 1 unwrapped entry (no wrapping sig).
     let entry_a = mock_directory_entry(
@@ -1126,7 +1098,7 @@ async fn federation_phase1_entry_aggregates_alongside_phase3_wrapped() {
         Some((&lib_b_signer, lib_b_bundle)),
     );
 
-    let (dir, _request_rx) = LibraryDirectory::new();
+    let dir = build_directory();
     let bytes_a = canonical_cbor_encode(&entry_a).expect("encode a");
     let bytes_b = canonical_cbor_encode(&entry_b).expect("encode b");
     dir.process_sample(library_a, bytes_a)
@@ -1159,23 +1131,13 @@ async fn federation_phase1_entry_aggregates_alongside_phase3_wrapped() {
 /// attestation, only bad-sig attempts) is still cleanly removed.
 #[tokio::test]
 async fn federation_remove_library_evicts_attested_and_unattested_contributions() {
-    use common::library_fixtures::{build_test_library_identity, mock_library_entry_wrapped};
+    use common::library_fixtures::{build_test_library_addr, mock_library_entry_wrapped};
 
     let community_id = SpaceId([0xBB; 16]);
     let admin_seed = [45u8; 32];
 
-    let (lib_a_signer, lib_a_bundle) = build_test_library_identity([6u8; 32]);
-    let (lib_b_signer, lib_b_bundle) = build_test_library_identity([7u8; 32]);
-    let library_a = OwnerAddr(
-        harmony_identity::Identity::from_public_bytes(&lib_a_bundle)
-            .expect("identity a")
-            .address_hash,
-    );
-    let library_b = OwnerAddr(
-        harmony_identity::Identity::from_public_bytes(&lib_b_bundle)
-            .expect("identity b")
-            .address_hash,
-    );
+    let (lib_a_signer, lib_a_bundle, library_a) = build_test_library_addr([6u8; 32]);
+    let (lib_b_signer, lib_b_bundle, library_b) = build_test_library_addr([7u8; 32]);
 
     // Library A: valid wrapping. HLC is NEWER than B's so the stored
     // entry's `listed_by` stays `library_a` (matters for drop_library:
@@ -1219,7 +1181,7 @@ async fn federation_remove_library_evicts_attested_and_unattested_contributions(
     tampered[0] ^= 0xFF;
     entry_b.library_signature = Some(tampered);
 
-    let (dir, _request_rx) = LibraryDirectory::new();
+    let dir = build_directory();
     dir.process_sample(
         library_a,
         canonical_cbor_encode(&entry_a).expect("encode a"),

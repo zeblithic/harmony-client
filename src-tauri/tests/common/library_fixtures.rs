@@ -152,6 +152,24 @@ pub fn build_test_library_identity(seed: [u8; 32]) -> (SigningKey, [u8; 64]) {
     (signing, bundle)
 }
 
+/// ZEB-280 Phase 3: build a library identity + derive its `OwnerAddr`
+/// in one shot. Bundles the common test prelude: signer, identity
+/// bundle, derived `OwnerAddr`.
+///
+/// Distinct from `build_test_library_identity` only in that it ALSO
+/// returns the derived `OwnerAddr` — saves callers from doing
+/// `OwnerAddr(harmony_identity::Identity::from_public_bytes(&bundle).expect(...).address_hash)`
+/// at every call site.
+pub fn build_test_library_addr(seed: [u8; 32]) -> (SigningKey, [u8; 64], OwnerAddr) {
+    let (signing_key, bundle) = build_test_library_identity(seed);
+    let addr = OwnerAddr(
+        harmony_identity::Identity::from_public_bytes(&bundle)
+            .expect("identity from public bytes")
+            .address_hash,
+    );
+    (signing_key, bundle, addr)
+}
+
 /// Build a signed `LibraryAnnounce` ready to publish on
 /// `harmony/discovery/library/announce`. Returns the encoded bytes
 /// plus the derived library `OwnerAddr` (so callers can assert
