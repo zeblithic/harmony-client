@@ -6,6 +6,7 @@
     onSubmit,
     onCancel,
     initialKind = 'dm',
+    onConvertToCommunity,
   }: {
     profiles: Map<string, Profile>;
     onSubmit: (args: { kind: 'dm' | 'group-dm'; members: string[]; name: string }) => void;
@@ -16,6 +17,12 @@
      *  "New group DM") that must produce visibly distinct UX,
      *  per cursor's PR-91 review. */
     initialKind?: 'dm' | 'group-dm';
+    /** Handoff to community-creation flow when the user hits the 16-member cap.
+     *  Optional: when omitted (e.g., in contexts where community creation
+     *  isn't available), the at-cap state shows only the cap-explanation copy
+     *  with no orphan button. ZEB-228 acceptance criteria require this
+     *  handoff once Sub-C ships. */
+    onConvertToCommunity?: () => void;
   } = $props();
 
   const MAX_RECIPIENTS = 15;
@@ -118,8 +125,17 @@
     {selected.length} of {MAX_RECIPIENTS} recipients
     {#if selected.length === MAX_RECIPIENTS}
       <span class="hint">
-        Group DMs cap at 16 members (you + 15). Communities (coming soon) work
-        better for larger groups.
+        Group DMs cap at 16 members (you + 15). Larger groups work better as
+        communities.
+        {#if onConvertToCommunity}
+          <button
+            type="button"
+            class="convert-link"
+            onclick={() => onConvertToCommunity?.()}
+          >
+            Convert to community →
+          </button>
+        {/if}
       </span>
     {/if}
   </div>
@@ -202,6 +218,21 @@
   .counter .hint {
     display: block;
     margin-top: 4px;
+  }
+  .convert-link {
+    display: inline;
+    background: transparent;
+    border: none;
+    padding: 0;
+    margin-left: 4px;
+    color: var(--accent, #5865f2);
+    cursor: pointer;
+    font-size: inherit;
+    text-decoration: underline;
+  }
+  .convert-link:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 2px;
   }
   .actions {
     display: flex;
