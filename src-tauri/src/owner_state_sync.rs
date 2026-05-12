@@ -592,18 +592,18 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
     // closes the snapshot-merge path so the field round-trips correctly
     // across Flow A.
     for (addr, remote_entry) in libraries {
-        let remote_max = match &remote_entry.removed_at {
-            Some(rm) if rm.is_strictly_newer_than(&remote_entry.added_at) => rm.clone(),
-            _ => remote_entry.added_at.clone(),
+        let remote_max: &Hlc = match &remote_entry.removed_at {
+            Some(rm) if rm.is_strictly_newer_than(&remote_entry.added_at) => rm,
+            _ => &remote_entry.added_at,
         };
         let should_replace = match local.libraries.get(&addr) {
             None => true,
             Some(existing) => {
-                let local_max = match &existing.removed_at {
-                    Some(rm) if rm.is_strictly_newer_than(&existing.added_at) => rm.clone(),
-                    _ => existing.added_at.clone(),
+                let local_max: &Hlc = match &existing.removed_at {
+                    Some(rm) if rm.is_strictly_newer_than(&existing.added_at) => rm,
+                    _ => &existing.added_at,
                 };
-                remote_max.is_strictly_newer_than(&local_max)
+                remote_max.is_strictly_newer_than(local_max)
             }
         };
         if should_replace {

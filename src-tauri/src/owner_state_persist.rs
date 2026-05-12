@@ -102,10 +102,8 @@ struct CrdtFileV2 {
     /// list. Absent in pre-Task-1 V2 files; `serde(default)` loads those
     /// as an empty map. `skip_serializing_if` omits when empty.
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
-    libraries: BTreeMap<
-        crate::owner_state_types::OwnerAddr,
-        crate::owner_state_types::LibraryEntry,
-    >,
+    libraries:
+        BTreeMap<crate::owner_state_types::OwnerAddr, crate::owner_state_types::LibraryEntry>,
 }
 
 impl From<&OwnerState> for CrdtFileV2 {
