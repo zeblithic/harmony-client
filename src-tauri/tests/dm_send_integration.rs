@@ -62,6 +62,7 @@ async fn send_dm_round_trip_through_dm_outbox() {
         old_epoch_keys: std::collections::BTreeMap::new(),
         admin_addr: None,
         is_invite_only: None,
+        shared_in_profile: false,
     };
     let space_id = space.id;
     assert!(matches!(

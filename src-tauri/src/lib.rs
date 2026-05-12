@@ -39,6 +39,7 @@ pub mod owner_state_sync;
 pub mod owner_state_types;
 pub mod pairing;
 pub mod pairing_commands;
+pub mod profile_broadcast;
 pub mod recovery_cli;
 pub mod recovery_policy;
 mod save_dialog;
@@ -3540,6 +3541,7 @@ pub fn add_space_dm_inner(
         old_epoch_keys: std::collections::BTreeMap::new(),
         admin_addr: None,
         is_invite_only: None,
+        shared_in_profile: false,
     };
 
     // Validate invariants up front — catches programmer error before we
@@ -7366,6 +7368,7 @@ pub fn mint_community_creation(
         old_epoch_keys: std::collections::BTreeMap::new(),
         admin_addr: Some(self_owner),
         is_invite_only: Some(is_invite_only),
+        shared_in_profile: false,
     };
 
     Ok(MintedCommunity {
@@ -8549,6 +8552,7 @@ pub fn mint_redemption(
         // SpaceId rejection of community-creation field changes would
         // silently reject the redemption Space if these disagreed).
         is_invite_only: Some(payload.is_invite_only),
+        shared_in_profile: false,
     };
 
     Ok(MintedCommunity {

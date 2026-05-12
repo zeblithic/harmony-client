@@ -935,6 +935,7 @@ fn lww_merge_space(a: &Space, b: &Space) -> Space {
         old_epoch_keys: creator_side.old_epoch_keys.clone(),
         admin_addr: creator_side.admin_addr,
         is_invite_only: creator_side.is_invite_only,
+        shared_in_profile: false,
     }
 }
 
@@ -972,6 +973,7 @@ mod apply_space_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         }
     }
 
@@ -1001,6 +1003,7 @@ mod apply_space_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: Some(admin_addr),
             is_invite_only: Some(invite_only),
+            shared_in_profile: false,
         }
     }
 
@@ -1028,6 +1031,7 @@ mod apply_space_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         }
     }
 
@@ -1298,6 +1302,7 @@ mod apply_space_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: Some(original_admin),
             is_invite_only: Some(false),
+            shared_in_profile: false,
         };
         let attacker_replay = Space {
             id: SpaceId([7; 16]),
@@ -1319,6 +1324,7 @@ mod apply_space_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: Some(OwnerAddr([99u8; 16])), // hostile admin takeover
             is_invite_only: Some(true),              // hostile flip to private
+            shared_in_profile: false,
         };
 
         let merged = lww_merge_space(&earlier, &attacker_replay);
@@ -1384,6 +1390,7 @@ mod apply_space_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         let b = Space {
             id: SpaceId([1; 16]),
@@ -1407,6 +1414,7 @@ mod apply_space_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
 
         // Order-independent: both call orderings yield the same merged prior.
@@ -1550,6 +1558,7 @@ mod apply_space_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         assert_eq!(s.apply_space(channel), ApplyOutcome::Inserted);
         // Same SpaceId, kind swapped to GroupDm — dedupe_key still
@@ -1577,6 +1586,7 @@ mod apply_space_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         let outcome = s.apply_space(group_dm);
         assert!(
@@ -2228,6 +2238,7 @@ mod canonicalization_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         }
     }
 
@@ -2525,6 +2536,7 @@ mod crypto_integration_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         }
     }
 
@@ -2619,6 +2631,7 @@ mod crypto_integration_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         };
         // Sanity: invariant check must pass for a well-formed DM.
         dm.validate_invariants().expect("DM invariants");
@@ -3306,6 +3319,7 @@ mod merge_prior_content_keys_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         }
     }
 
@@ -3467,6 +3481,7 @@ mod dm_crypto_integration_tests {
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: None,
             is_invite_only: None,
+            shared_in_profile: false,
         }
     }
 

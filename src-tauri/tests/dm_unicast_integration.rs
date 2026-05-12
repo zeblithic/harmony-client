@@ -157,6 +157,7 @@ fn make_dm_space(
         old_epoch_keys: std::collections::BTreeMap::new(),
         admin_addr: None,
         is_invite_only: None,
+        shared_in_profile: false,
     }
 }
 

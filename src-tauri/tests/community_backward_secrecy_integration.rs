@@ -51,6 +51,7 @@ fn make_space_with_epoch(
         old_epoch_keys: std::collections::BTreeMap::new(),
         admin_addr: Some(admin_addr),
         is_invite_only: Some(false),
+        shared_in_profile: false,
     }
 }
 
