@@ -1682,15 +1682,14 @@
           // the matching directory entry server-side and delegates to
           // the same redeem_invite_inner codepath RedeemInviteDialog uses.
           // Side-effects (nav-updated synthesis, selected-community switch,
-          // member refresh) mirror the dialog handler at line ~1620+.
-          //
-          // Error handling is delegated to the browser component's
-          // handleJoin (LibraryDirectoryBrowser.svelte:175-180), which
-          // catches with `e instanceof Error ? e.message : String(e)`
-          // and surfaces via its own `joinError` state. The dialog has
-          // its own redeemPending/redeemError accumulators; the browser
-          // owns the equivalent state itself — that's why this handler
-          // has no try/catch/finally of its own.
+          // member refresh) mirror the dialog handler at line ~1620+ —
+          // EXCEPT modal visibility, which the browser owns: its
+          // `handleJoin` calls `onClose()` itself on success (and surfaces
+          // failures via its `joinError` state). Closing the modal here
+          // would unmount the component before `refreshCommunityMembers`
+          // resolves, suppressing any late error display. So this handler
+          // intentionally has no try/catch and no `libraryDirectoryOpen
+          // = false` — both responsibilities live in the browser.
           const dto = await communityService.joinOpenCommunity(communityId);
           navService.addOrUpdateNavSpace({
             action: 'added',
@@ -1700,7 +1699,6 @@
             members: [],
             parentId: null,
           });
-          libraryDirectoryOpen = false;
           changeSelectedCommunity(dto.communityId);
           await refreshCommunityMembers(dto.communityId);
         }}

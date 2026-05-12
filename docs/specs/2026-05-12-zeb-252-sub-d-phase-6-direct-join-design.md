@@ -139,7 +139,7 @@ Co-located with `redeem_invite_inner_tests` in `lib.rs`:
 
 In `src-tauri/tests/community_join_integration.rs` (or wherever Phase 1's `redeem_invite` e2e test lives — implementer locates):
 
-4. **`join_open_community_e2e_joins_open_community_from_directory`** — two-engine setup mirroring the existing `redeem_invite` e2e:
+1. **`join_open_community_e2e_joins_open_community_from_directory`** — two-engine setup mirroring the existing `redeem_invite` e2e:
    - Peer A creates an open community + publishes a `LibraryDirectoryEntry` for it
    - Peer B adds A as a library, waits for the entry to land in B's aggregation
    - Peer B calls `join_open_community(A_community_id)`
@@ -147,8 +147,8 @@ In `src-tauri/tests/community_join_integration.rs` (or wherever Phase 1's `redee
 
 ### 6.3 Vitest
 
-5. **`LibraryDirectoryBrowser` Join button click wires through community_id** — update existing test (if present) or add new: simulate click, assert `onJoin` was called with `entry.community_id`, not `entry.invite_url`.
-6. **`community-service.joinOpenCommunity` invokes the right IPC** — assert `adapter.invoke('join_open_community', { communityId: 'abc...' })` is called and returns the DTO.
+1. **`LibraryDirectoryBrowser` Join button click wires through community_id** — update existing test (if present) or add new: simulate click, assert `onJoin` was called with `entry.community_id`, not `entry.invite_url`.
+2. **`community-service.joinOpenCommunity` invokes the right IPC** — assert `adapter.invoke('join_open_community', { communityId: 'abc...' })` is called and returns the DTO.
 
 ### 6.4 Wire-format pinning
 
