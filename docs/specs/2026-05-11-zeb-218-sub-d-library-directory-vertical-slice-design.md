@@ -101,9 +101,16 @@ pub struct LibraryDirectoryEntry {
     #[serde(rename = "cd")]
     pub community_id: SpaceId,
 
-    /// Community admin's signing key (verifies `community_signature`).
-    #[serde(rename = "ca")]
-    pub community_addr: OwnerAddr,
+    /// Community admin's 64-byte identity_pub (X25519_pub(32) ||
+    /// Ed25519_pub(32) per `harmony_identity::Identity::from_public_bytes`).
+    /// The Ed25519 half verifies `community_signature`; the X25519 half
+    /// is unused in this round but kept for consistency with the
+    /// `CommunityInvitePayload.admin_identity_pub` shape so future
+    /// federation or invite-handoff flows can reuse it. Encoded on wire
+    /// as `bstr(64)` via the existing serialize_identity_pub_as_bstr
+    /// helper.
+    #[serde(rename = "ai")]
+    pub community_admin_identity_pub: [u8; 64],
 
     /// User-visible community name (admin-curated).
     #[serde(rename = "nm")]
@@ -124,7 +131,7 @@ pub struct LibraryDirectoryEntry {
     #[serde(rename = "iu")]
     pub invite_url: String,
 
-    /// Library's identity (also the topic owner).
+    /// Library's OwnerAddr (also the topic owner / 16-byte address_hash).
     #[serde(rename = "lb")]
     pub listed_by: OwnerAddr,
 
@@ -133,27 +140,44 @@ pub struct LibraryDirectoryEntry {
     #[serde(rename = "la")]
     pub listed_at: Hlc,
 
-    /// Community admin's Ed25519 signature over all preceding fields
-    /// (canonical CBOR, fields in the declared order, `cs` excluded).
-    /// Verified against `community_addr`; mismatch → entry rejected.
+    /// Community admin's Ed25519 signature over the canonical-CBOR
+    /// encoding of all preceding fields (`cs` excluded). Verified via
+    /// `Identity::from_public_bytes(community_admin_identity_pub)`'s
+    /// Ed25519 verifying-key half; verification failure → entry rejected.
+    /// Wire: `bstr(64)`.
     #[serde(rename = "cs")]
-    pub community_signature: Signature,
+    pub community_signature: [u8; 64],
 
     // Library wrapping signature deferred to Phase 3 federation.
 }
 ```
 
-**Validation invariants** (enforced at receive time):
-- `community_addr.len() == 32` and decodes to a valid Ed25519 pubkey
-- `listed_by.len() == 32` and matches the topic's library address
-- `community_signature` verifies against `community_addr` over the
-  canonical-CBOR encoding of all fields except `cs`
+**Derived helper**: `community_addr() -> OwnerAddr` returns
+`OwnerAddr(Identity::from_public_bytes(&self.community_admin_identity_pub).address_hash)`,
+exposing the 16-byte addressing identity for UI (e.g., "Listed by 0xABC...")
+without storing redundant wire bytes.
+
+**Validation invariants** (enforced at receive time, before sig verify):
+- `Identity::from_public_bytes(&community_admin_identity_pub)` parses
+  successfully (returns `Ok`; checks both halves are valid points)
+- `community_signature` verifies via the derived `Identity.verifying_key`
+  against the canonical-CBOR encoding of all preceding fields
+  (`cs` excluded). Failure → entry rejected at warn-level.
 - `invite_url` parses as a valid open-community invite via existing
   `parse_invite_url` (with `is_invite_only == false`). Invite-only URLs
   in directory entries are rejected.
 - `name.len() <= 200`, `description.len() <= 2000`,
   `topics.iter().all(|t| t.len() <= 64)`, `topics.len() <= 16`
-  (anti-spam bounds; see §7)
+  (anti-spam bounds; see §10)
+
+**Trust model note**: Phase 1 does NOT cross-check
+`Identity::from_public_bytes(community_admin_identity_pub).address_hash`
+against any local Sub-C community state (the joiner hasn't joined yet,
+so they have no community CRDT to compare against). The directory entry
+is trusted by sig integrity only — a party with the claimed identity_pub
+signed this content. Same trust model as social-share invite URLs.
+Phase 3 federation adds library wrapping signatures as an additional
+attestation layer.
 
 ### 4.2 Owner-state CRDT — `LibraryEntry`
 
@@ -223,8 +247,8 @@ Driven by `library_directory.rs`, parallel to how `community_state_sync.rs`
 manages per-community subscriptions:
 
 1. On `add_library(addr)`:
-   - Validate `addr` is a well-formed Ed25519 pubkey hex (64 chars, 32
-     bytes decoded)
+   - Validate `addr` is well-formed OwnerAddr hex (32 hex chars / 16
+     bytes decoded — matches the 16-byte `address_hash` shape)
    - Acquire owner-state lock, insert `LibraryEntry { address: addr,
      added_at: now_hlc(), removed_at: None }` (or update if exists with
      newer HLC than any tombstone). Release lock.
@@ -245,9 +269,11 @@ manages per-community subscriptions:
 1. Decode CBOR into `LibraryDirectoryEntry`. **Reject on decode failure**
    (logged at warn-level, dropped, no IPC event)
 2. Run validation invariants from §4.1. **Reject on any failure**
-3. Verify `community_signature` against `community_addr` over the
-   canonical-CBOR encoding of all preceding fields. **Reject on
-   verification failure**
+3. Parse `community_admin_identity_pub` via
+   `Identity::from_public_bytes` (rejects malformed pubkey halves);
+   verify `community_signature` against the derived
+   `Identity.verifying_key` over the canonical-CBOR encoding of all
+   preceding fields. **Reject on either failure**
 4. Look up `community_id` in `Aggregation`:
    - **New**: insert `AggregatedEntry { entry, listed_by: {listed_by} }`
    - **Existing with older `listed_at`**: replace `entry` field
@@ -305,11 +331,12 @@ async fn remove_library(library_addr: String) -> Result<(), String>;
 async fn browse_library(library_addr: Option<String>)
     -> Vec<DirectoryEntryDTO>;
 
-/// DTO for frontend rendering. Strips `community_signature` (already
-/// verified) and adds the `listed_by_count` hint.
+/// DTO for frontend rendering. Strips `community_signature` and
+/// `community_admin_identity_pub` (already verified at receive); the
+/// derived 16-byte `community_addr` is included for display.
 struct DirectoryEntryDTO {
-    community_id: String,    // hex
-    community_addr: String,  // hex
+    community_id: String,    // hex (32 chars = 16 bytes)
+    community_addr: String,  // hex (32 chars = 16 bytes), derived from identity_pub
     name: String,
     description: String,
     topics: Vec<String>,
@@ -345,8 +372,8 @@ Three states:
     closes the browser, navigates to the new community Space on success
 
 **Add-library dialog**:
-- Input: hex `OwnerAddr` (64 hex chars). Inline validation (length +
-  hex-charset).
+- Input: hex `OwnerAddr` (32 hex chars / 16 bytes). Inline validation
+  (length + hex-charset).
 - Submit → `add_library(addr)`. On success, dialog closes, browser
   refreshes via `browse_library(null)`. On error, surface inline.
 
@@ -437,19 +464,22 @@ New module `tests/common/library_fixtures.rs`. Provides:
 ```rust
 /// Constructs a LibraryDirectoryEntry signed by a deterministic test
 /// keypair. Mirrors how community_membership::tests build signed
-/// MembershipEvents.
+/// MembershipEvents — caller provides the full 64-byte identity_pub
+/// (X25519_pub || Ed25519_pub) plus the Ed25519 signing key.
 pub fn mock_directory_entry(
     community_id: SpaceId,
-    community_signing_key: &SigningKey,
+    admin_identity_pub: [u8; 64],
+    admin_ed25519_signing_key: &SigningKey,
     library_addr: OwnerAddr,
     listed_at: Hlc,
     invite_url: String,
 ) -> LibraryDirectoryEntry { ... }
 
-/// Publishes a sequence of entries through an in-process Zenoh handle
-/// for end-to-end consumer testing.
+/// Publishes a sequence of entries to the per-library Zenoh topic via
+/// an in-process session. The library doesn't sign in Phase 1
+/// (federation is Phase 3), so the publisher just routes raw CBOR.
 pub async fn mock_library_publisher(
-    library_signing_key: &SigningKey,
+    library_addr: OwnerAddr,
     entries: Vec<LibraryDirectoryEntry>,
 ) -> InProcessZenohHandle { ... }
 ```
@@ -483,6 +513,10 @@ pub async fn mock_library_publisher(
 - 2-char field key absence test (CBOR-prefix matching, like Sub-C's
   `non_community_space_skips_membership_fields_in_wire`)
 - Signature verification: happy + tampered-payload + wrong-key
+  (wrong-key uses an `identity_pub` whose Ed25519 half doesn't match
+  the signing key)
+- `Identity::from_public_bytes` rejects malformed identity_pub (e.g.,
+  non-canonical points or 63-byte input)
 - Aggregation invariants:
   - Latest-HLC-wins replaces `entry`
   - `listed_by` set unions correctly across libraries
@@ -503,9 +537,10 @@ in `tests/wire_format_community_sync_fixtures.rs`.
 ### 11.5 Frontend vitest — `src/lib/components/__tests__/LibraryDirectoryBrowser.test.ts` (new)
 
 - Empty-state CTA renders when `list_libraries()` returns `[]`
-- Add-library dialog: paste valid hex → submit → `add_library` IPC
-  called with correct arg; dialog closes on success; error displays
-  inline on failure
+- Add-library dialog: paste valid 32-hex-char address → submit →
+  `add_library` IPC called with correct arg; dialog closes on success;
+  error displays inline on failure (uses
+  `e instanceof Error ? e.message : String(e)` per codebase convention)
 - Browse list renders aggregated entries; topic chips, listed-by hint
   visible
 - Click "Join" → `redeem_invite` IPC called with `entry.invite_url`
