@@ -94,6 +94,24 @@ pub enum EntryVerifyError {
     TooManyTopics,
     #[error("one or more topics exceeds {MAX_TOPIC_LEN} bytes")]
     TopicTooLong,
+    /// The decoded `invite_url` payload's `community_id` doesn't equal
+    /// the entry's signed `community_id`. A malicious publisher could
+    /// otherwise sign an entry advertising community A while embedding
+    /// an invite that joins community B (phishing-style mismatch).
+    #[error("invite payload community_id mismatch: entry={entry:?}, payload={payload:?}")]
+    PayloadCommunityIdMismatch { entry: SpaceId, payload: SpaceId },
+    /// The decoded `invite_url` payload's admin identity doesn't match
+    /// the entry's signed `community_admin_identity_pub`. Defends against
+    /// an entry signed by admin X embedding an invite carrying admin Y's
+    /// epoch state — the joiner would bootstrap under Y's authority while
+    /// the directory UI displays X.
+    #[error(
+        "invite payload admin identity mismatch: entry_addr={entry_addr:?}, payload_addr={payload_addr:?}"
+    )]
+    PayloadAdminIdentityMismatch {
+        entry_addr: OwnerAddr,
+        payload_addr: OwnerAddr,
+    },
 }
 
 pub const MAX_NAME_LEN: usize = 200;
@@ -145,6 +163,37 @@ pub fn verify_entry(entry: &LibraryDirectoryEntry) -> Result<(), EntryVerifyErro
         .map_err(|e| EntryVerifyError::InviteUrlParse(format!("{e}")))?;
     if payload.is_invite_only {
         return Err(EntryVerifyError::InviteOnlyUrl);
+    }
+
+    // (5) Invite-payload consistency with the signed directory entry.
+    //
+    // A malicious directory publisher could sign a `LibraryDirectoryEntry`
+    // advertising community A (name/description/topics presented in the
+    // UI come from the signed entry), but embed an `invite_url` whose
+    // decoded payload points at community B. The browser UI would show
+    // A's metadata, the user clicks "Join", and the backend's
+    // `redeem_invite` uses ONLY the `invite_url` — so the user joins B.
+    // This is a phishing-class attack. Bind the payload to the signed
+    // entry on (a) community_id and (b) admin identity.
+    if payload.community_id != entry.community_id {
+        return Err(EntryVerifyError::PayloadCommunityIdMismatch {
+            entry: entry.community_id,
+            payload: payload.community_id,
+        });
+    }
+    // The entry's `community_admin_identity_pub` is the 64-byte identity
+    // bundle (X25519_pub || Ed25519_pub) that signed the entry. Its
+    // derived 16-byte `address_hash` is the OwnerAddr. The invite payload
+    // carries `admin_addr: OwnerAddr` (always present; for invite-only
+    // payloads the full identity_pub also rides along in
+    // `admin_identity_pub`). For open-community URLs in the directory,
+    // only `admin_addr` is guaranteed-present — compare on that axis.
+    let entry_admin_addr = OwnerAddr(identity.address_hash);
+    if payload.admin_addr != entry_admin_addr {
+        return Err(EntryVerifyError::PayloadAdminIdentityMismatch {
+            entry_addr: entry_admin_addr,
+            payload_addr: payload.admin_addr,
+        });
     }
 
     Ok(())
@@ -252,6 +301,30 @@ impl Aggregation {
             if let Some(oldest_id) = self.find_oldest_for_library(&library) {
                 self.evict_library_contribution(&library, oldest_id);
                 evicted = Some(oldest_id);
+            } else {
+                // R2 F3 (Medium, defense-in-depth): `per_library_count`
+                // says this library is at cap, but no community in
+                // `by_community` actually has the library in its
+                // `listed_by` set. Counter/map drift — should be
+                // impossible after R2 F2's fix to the cross-library
+                // eviction paths, but defense-in-depth: surface loudly
+                // in dev/test (debug_assert!), observably in release
+                // (tracing::warn!), and fall through to allow the
+                // insert (rather than silently bumping the count above
+                // MAX_ENTRIES_PER_LIBRARY).
+                tracing::warn!(
+                    target: "library_directory",
+                    library = ?library,
+                    per_library_count = self.entry_count_for_library(&library),
+                    max = MAX_ENTRIES_PER_LIBRARY,
+                    "per_library_count says at-cap but find_oldest_for_library returned None — counter invariant violated",
+                );
+                debug_assert!(
+                    false,
+                    "per_library_count invariant violated: library {:?} count={} but no community lists it",
+                    library,
+                    self.entry_count_for_library(&library)
+                );
             }
         }
 
@@ -308,18 +381,46 @@ impl Aggregation {
     /// - Shared listing where stored entry came from another library
     ///   → reduce `listed_by` set only (unchanged).
     pub fn drop_library(&mut self, library: &OwnerAddr) -> Vec<SpaceId> {
-        let mut evicted = Vec::new();
-        self.by_community.retain(|community_id, agg| {
+        // Two-pass to satisfy the borrow checker: we can't mutate
+        // `per_library_count` inside a `retain` closure that already
+        // holds `&mut self`. First pass collects which entries to evict
+        // and (for the F3 source-matches path) which OTHER libraries
+        // were in the evicted entry's `listed_by` set; second pass
+        // applies the mutations.
+        //
+        // R2 F2 (Medium, correctness): the original `retain` swept the
+        // `listed_by` set on remaining communities without rolling back
+        // those OTHER libraries' `per_library_count` when the F3 source-
+        // matches rule (R1) evicted a shared community. Over many
+        // remove/re-add cycles per_library_count drifted upward,
+        // triggering premature `MAX_ENTRIES_PER_LIBRARY` cap enforcement.
+        let mut to_evict: Vec<(SpaceId, BTreeSet<OwnerAddr>)> = Vec::new();
+        for (community_id, agg) in self.by_community.iter_mut() {
             let source_was_this_library = &agg.entry.listed_by == library;
             let _ = agg.listed_by.remove(library);
             if source_was_this_library || agg.listed_by.is_empty() {
-                evicted.push(*community_id);
-                return false;
+                // Capture the surviving listed_by set so we can
+                // decrement those libraries' counts after the
+                // iter_mut borrow ends.
+                to_evict.push((*community_id, agg.listed_by.clone()));
             }
-            true
-        });
+        }
+        let mut evicted_ids = Vec::with_capacity(to_evict.len());
+        for (id, remaining_listed_by) in to_evict {
+            self.by_community.remove(&id);
+            for other in remaining_listed_by {
+                if &other != library {
+                    if let Some(c) = self.per_library_count.get_mut(&other) {
+                        if *c > 0 {
+                            *c -= 1;
+                        }
+                    }
+                }
+            }
+            evicted_ids.push(id);
+        }
         self.per_library_count.remove(library);
-        evicted
+        evicted_ids
     }
 
     fn find_oldest_for_library(&self, library: &OwnerAddr) -> Option<SpaceId> {
@@ -347,7 +448,15 @@ impl Aggregation {
     /// Same correctness rule as `drop_library`: if the stored entry was
     /// sourced from `library`, evict the community entirely rather than
     /// retain its stale metadata under another library's `listed_by`.
+    ///
+    /// R2 F2 (Medium, correctness): when the F3 source-matches rule
+    /// triggers eviction of a shared community, OTHER libraries that
+    /// were also in `listed_by` previously had their `per_library_count`
+    /// stale-incremented for this community. Decrement those counts
+    /// alongside the eviction to keep the counters consistent.
     fn evict_library_contribution(&mut self, library: &OwnerAddr, community_id: SpaceId) {
+        // Capture state in a scoped borrow, then apply mutations after.
+        let mut surviving_listed_by: Option<BTreeSet<OwnerAddr>> = None;
         if let Some(agg) = self.by_community.get_mut(&community_id) {
             if agg.listed_by.remove(library) {
                 if let Some(c) = self.per_library_count.get_mut(library) {
@@ -357,7 +466,21 @@ impl Aggregation {
                 }
                 let source_was_this_library = &agg.entry.listed_by == library;
                 if source_was_this_library || agg.listed_by.is_empty() {
-                    self.by_community.remove(&community_id);
+                    // Capture for post-removal count decrement of OTHER
+                    // libraries; clone is bounded by listed_by.len().
+                    surviving_listed_by = Some(agg.listed_by.clone());
+                }
+            }
+        }
+        if let Some(remaining) = surviving_listed_by {
+            self.by_community.remove(&community_id);
+            for other in remaining {
+                if &other != library {
+                    if let Some(c) = self.per_library_count.get_mut(&other) {
+                        if *c > 0 {
+                            *c -= 1;
+                        }
+                    }
                 }
             }
         }
@@ -538,15 +661,22 @@ mod tests {
     /// Build a real open-community invite URL via `encode_invite_url`,
     /// so `decode_invite_url` round-trips it back into a parseable
     /// `CommunityInvitePayload` with `is_invite_only == false`.
-    fn build_open_invite_url() -> String {
+    ///
+    /// R2 F1: `verify_entry` now binds the payload's `community_id` and
+    /// `admin_addr` to the signed entry, so callers must pass the
+    /// matching values. The legacy zero-arg call sites historically used
+    /// `SpaceId([0; 16])` + `OwnerAddr([0; 16])` for both; the
+    /// `build_open_invite_url_default()` shim preserves that for callers
+    /// where the binding isn't load-bearing.
+    fn build_open_invite_url_for(community_id: SpaceId, admin_addr: OwnerAddr) -> String {
         let payload = CommunityInvitePayload {
-            community_id: SpaceId([0u8; 16]),
+            community_id,
             epoch_snapshot: InviteEpochSnapshot {
                 epoch: 0,
                 sealed_epoch_key: vec![0u8; 32], // open communities use 32-byte sealed_epoch_key
                 state_snapshot: MaterializedCommunityState::default(),
             },
-            admin_addr: OwnerAddr([0u8; 16]),
+            admin_addr,
             community_name: "test".to_string(),
             is_invite_only: false,
             expires_at: None,
@@ -555,6 +685,30 @@ mod tests {
             admin_identity_pub: None,
         };
         encode_invite_url(&payload).expect("encode open invite url")
+    }
+
+    /// Build an open-community invite URL whose payload's `community_id`
+    /// and `admin_addr` match what `build_signed_entry(community_id,
+    /// admin_seed, ...)` produces. Derives the admin_addr from the same
+    /// seed via the identity_pub the entry will be signed under, so
+    /// `verify_entry`'s payload-consistency checks (R2 F1) pass.
+    fn build_matching_open_invite_url(community_id: SpaceId, admin_seed: [u8; 32]) -> String {
+        let (_signing_key, identity_pub) = build_test_identity_pub(admin_seed);
+        let admin_addr = OwnerAddr(
+            harmony_identity::Identity::from_public_bytes(&identity_pub)
+                .expect("identity from pub")
+                .address_hash,
+        );
+        build_open_invite_url_for(community_id, admin_addr)
+    }
+
+    /// Convenience for `build_signed_entry(SpaceId([1; 16]), [7; 32], ...)`
+    /// — the most common fixture combination in this module's tests.
+    /// Pre-binds the invite payload's `community_id` and `admin_addr` to
+    /// the values the entry will be signed under, so the R2 F1 payload-
+    /// consistency check passes.
+    fn build_open_invite_url() -> String {
+        build_matching_open_invite_url(SpaceId([1; 16]), [7; 32])
     }
 
     /// Build an invite-only invite URL — same machinery but with
@@ -751,6 +905,77 @@ mod tests {
             verify_entry(&bad),
             Err(EntryVerifyError::NameTooLong)
         ));
+    }
+
+    /// R2 F1 (Critical, security): an entry advertising community A but
+    /// embedding an `invite_url` whose decoded payload points at
+    /// community B must be rejected. Otherwise a malicious directory
+    /// publisher could sign an entry presenting A's name/description in
+    /// the UI while the Join action redeems B (phishing).
+    #[test]
+    fn invite_url_pointing_at_different_community_rejected() {
+        let community_a = SpaceId([0xAA; 16]);
+        let community_b = SpaceId([0xBB; 16]);
+        // Invite payload points at community_b, but entry will be signed
+        // advertising community_a. Admin addr matches the entry's seed so
+        // the admin-identity check would otherwise pass — only the
+        // community_id mismatch should trigger.
+        let invite_url_for_b = build_matching_open_invite_url(community_b, [7; 32]);
+        let entry = build_signed_entry(
+            community_a,
+            [7; 32],
+            OwnerAddr([2; 16]),
+            Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            invite_url_for_b,
+        );
+        let result = verify_entry(&entry);
+        assert!(
+            matches!(
+                result,
+                Err(EntryVerifyError::PayloadCommunityIdMismatch { .. })
+            ),
+            "expected PayloadCommunityIdMismatch, got {:?}",
+            result
+        );
+    }
+
+    /// R2 F1 (Critical, security): an entry whose `community_admin_identity_pub`
+    /// is signed by admin X but embeds an `invite_url` whose payload's
+    /// `admin_addr` derives from a DIFFERENT admin Y must be rejected.
+    /// Otherwise a malicious publisher could present X's reputation in
+    /// the UI while the Join action redeems Y's epoch state.
+    #[test]
+    fn invite_url_pointing_at_different_admin_rejected() {
+        let community = SpaceId([1; 16]);
+        // Build an open invite URL whose admin_addr binds to seed=[9; 32]
+        // (admin Y). The entry will be signed with seed=[7; 32] (admin X)
+        // for the SAME community_id, so only the admin-identity check
+        // should fire.
+        let invite_url_admin_y = build_matching_open_invite_url(community, [9; 32]);
+        let entry = build_signed_entry(
+            community,
+            [7; 32],
+            OwnerAddr([2; 16]),
+            Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            invite_url_admin_y,
+        );
+        let result = verify_entry(&entry);
+        assert!(
+            matches!(
+                result,
+                Err(EntryVerifyError::PayloadAdminIdentityMismatch { .. })
+            ),
+            "expected PayloadAdminIdentityMismatch, got {:?}",
+            result
+        );
     }
 
     /// An invite-only invite URL must be rejected at receive — only
@@ -1004,6 +1229,83 @@ mod tests {
         assert!(
             agg.snapshot_all().is_empty(),
             "no stale metadata retained from dropped library"
+        );
+    }
+
+    /// R2 F2 regression: when `drop_library` evicts a community via the
+    /// F3 source-matches rule (R1), OTHER libraries that were in
+    /// `listed_by` previously had their `per_library_count` incremented
+    /// for that community via the accretion path. Those counts must be
+    /// decremented when the community is dropped, or the counter drifts
+    /// upward → premature cap enforcement.
+    ///
+    /// Scenario: library A publishes community C at HLC 100; library B
+    /// publishes for the SAME C at HLC 200 (newer-HLC wins → stored
+    /// entry sourced from A is overwritten, listed_by={A, B}, B's count
+    /// rises to 1 via accretion). Drop A — F3-rule eviction fires
+    /// because stored entry's listed_by == A. Without R2 F2, B's count
+    /// stays at 1 while no community is actually listed by B.
+    #[test]
+    fn drop_library_decrements_per_library_count_for_other_libraries_when_evicting() {
+        let mut agg = Aggregation::new();
+        let library_a = OwnerAddr([0xAA; 16]);
+        let library_b = OwnerAddr([0xBB; 16]);
+        let community = SpaceId([1; 16]);
+        let invite_url = build_open_invite_url();
+
+        // Library A publishes community at HLC 100 — becomes the stored
+        // source.
+        agg.on_entry(build_signed_entry(
+            community,
+            [7; 32],
+            library_a,
+            Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            invite_url.clone(),
+        ));
+        // Library B publishes SAME community at HLC 50 (older) — does
+        // NOT replace stored entry but DOES accrete to listed_by and
+        // increments B's per_library_count.
+        agg.on_entry(build_signed_entry(
+            community,
+            [7; 32],
+            library_b,
+            Hlc {
+                wall_ms: 50,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            invite_url.clone(),
+        ));
+
+        assert_eq!(
+            agg.entry_count_for_library(&library_a),
+            1,
+            "A contributed via Inserted path"
+        );
+        assert_eq!(
+            agg.entry_count_for_library(&library_b),
+            1,
+            "B contributed via AccretedListedBy path"
+        );
+
+        // Drop A → F3-rule eviction fires (stored entry's listed_by ==
+        // A). Community is FULLY evicted. B's count must be decremented
+        // because B no longer contributes to ANY community.
+        let evicted = agg.drop_library(&library_a);
+        assert_eq!(evicted, vec![community]);
+        assert_eq!(
+            agg.entry_count_for_library(&library_a),
+            0,
+            "A's count cleared by drop_library"
+        );
+        assert_eq!(
+            agg.entry_count_for_library(&library_b),
+            0,
+            "R2 F2: B's count must be decremented when source-matches eviction removes the only community B was listing"
         );
     }
 

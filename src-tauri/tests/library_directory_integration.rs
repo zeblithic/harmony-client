@@ -39,17 +39,30 @@ use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 
 use common::library_fixtures::mock_directory_entry;
 
-/// Build a real open-community invite URL (mirrors the helper in
-/// `library_directory::tests`).
-fn open_invite_url() -> String {
+/// Build a real open-community invite URL whose `community_id` and
+/// `admin_addr` bind to the directory entry the test will sign — so
+/// `verify_entry`'s R2 F1 payload-consistency check passes.
+///
+/// Use `open_invite_url_for(community, admin_seed)` when the test
+/// publishes a specific community_id/admin pair. `open_invite_url()`
+/// preserves the legacy zero-arg signature for the common
+/// (SpaceId([1; 16]), [7; 32]) fixture used throughout this file.
+fn open_invite_url_for(community_id: SpaceId, admin_seed: [u8; 32]) -> String {
+    let (_signing_key, identity_pub) =
+        common::library_fixtures::build_test_admin_identity(admin_seed);
+    let admin_addr = OwnerAddr(
+        harmony_identity::Identity::from_public_bytes(&identity_pub)
+            .expect("identity from pub")
+            .address_hash,
+    );
     let payload = CommunityInvitePayload {
-        community_id: SpaceId([0u8; 16]),
+        community_id,
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
             sealed_epoch_key: vec![0u8; 32],
             state_snapshot: MaterializedCommunityState::default(),
         },
-        admin_addr: OwnerAddr([0u8; 16]),
+        admin_addr,
         community_name: "test".to_string(),
         is_invite_only: false,
         expires_at: None,
@@ -58,6 +71,10 @@ fn open_invite_url() -> String {
         admin_identity_pub: None,
     };
     encode_invite_url(&payload).expect("encode open invite url")
+}
+
+fn open_invite_url() -> String {
+    open_invite_url_for(SpaceId([1; 16]), [7; 32])
 }
 
 /// Build an invite-only invite URL (must be rejected by verify_entry).
@@ -137,9 +154,11 @@ fn build_directory() -> std::sync::Arc<LibraryDirectory> {
 async fn subscribe_to_library_receives_published_entries() {
     let dir = build_directory();
     let library = OwnerAddr([0xAA; 16]);
-    let invite_url = open_invite_url();
 
     for i in 0u8..3 {
+        // R2 F1: invite URL must bind to the same (community_id,
+        // admin_seed) the entry will be signed under.
+        let invite_url = open_invite_url_for(SpaceId([i; 16]), [7u8 + i; 32]);
         let entry = mock_directory_entry(
             SpaceId([i; 16]),
             [7u8 + i; 32],
@@ -408,7 +427,10 @@ async fn remove_library_evicts_entries_and_drops_subscription() {
     let library_b = OwnerAddr([0xBB; 16]);
     let solo = SpaceId([1; 16]);
     let shared = SpaceId([2; 16]);
-    let invite_url = open_invite_url();
+    // R2 F1: each entry needs an invite URL bound to its own community_id
+    // (admin_seed [7; 32] is shared across all three).
+    let invite_solo = open_invite_url_for(solo, [7; 32]);
+    let invite_shared = open_invite_url_for(shared, [7; 32]);
 
     // library_a publishes 2 (one solo + one shared with library_b).
     dir.process_sample(
@@ -418,7 +440,7 @@ async fn remove_library_evicts_entries_and_drops_subscription() {
             [7; 32],
             library_a,
             hlc(1_000),
-            invite_url.clone(),
+            invite_solo,
             "Solo",
             "",
             vec![],
@@ -433,7 +455,7 @@ async fn remove_library_evicts_entries_and_drops_subscription() {
             [7; 32],
             library_a,
             hlc(1_000),
-            invite_url.clone(),
+            invite_shared.clone(),
             "Shared",
             "",
             vec![],
@@ -448,7 +470,7 @@ async fn remove_library_evicts_entries_and_drops_subscription() {
             [7; 32],
             library_b,
             hlc(1_000),
-            invite_url,
+            invite_shared,
             "Shared",
             "",
             vec![],
@@ -501,13 +523,15 @@ async fn remove_library_evicts_entries_and_drops_subscription() {
 async fn per_library_cap_evicts_oldest_on_overflow() {
     let dir = build_directory();
     let library = OwnerAddr([0xAA; 16]);
-    let invite_url = open_invite_url();
 
     for i in 0..(MAX_ENTRIES_PER_LIBRARY as u32 + 1) {
         let mut cid = [0u8; 16];
         cid[..4].copy_from_slice(&i.to_be_bytes());
+        let community_id = SpaceId(cid);
+        // R2 F1: invite URL must bind to this community_id.
+        let invite_url = open_invite_url_for(community_id, [7; 32]);
         let entry = mock_directory_entry(
-            SpaceId(cid),
+            community_id,
             [7; 32],
             library,
             // Strictly-increasing wall_ms — guarantees the find_oldest
@@ -626,15 +650,17 @@ async fn click_to_join_redeem_invite_smoke() {
     let mut founder_identity_pub = [0u8; 64];
     founder_identity_pub[..32].copy_from_slice(&[0x11; 32]);
     founder_identity_pub[32..].copy_from_slice(&founder_ed_pub);
-    // The directory entry's `community_admin_identity_pub` field is
-    // the 64-byte (X25519||Ed25519) compound; the URL's `admin_addr`
-    // is the 16-byte OwnerAddr derived from the same identity. For
-    // this smoke test we use a fixed OwnerAddr — the joiner's
-    // `redeem_invite_inner` doesn't verify the URL's admin_addr
-    // against the directory entry (the directory layer is what
-    // cross-checks those; for click-to-join we only need the URL to
-    // decode + redeem cleanly).
-    let founder_owner_addr = OwnerAddr([0xAA; 16]);
+    // R2 F1: the directory entry's `community_admin_identity_pub`
+    // (derived from `founder_seed` via `mock_directory_entry`) must
+    // resolve to the same `OwnerAddr` the invite payload's `admin_addr`
+    // carries — otherwise `verify_entry`'s payload-consistency check
+    // rejects the entry as `PayloadAdminIdentityMismatch`. Derive both
+    // sides from the same identity_pub.
+    let founder_owner_addr = OwnerAddr(
+        harmony_identity::Identity::from_public_bytes(&founder_identity_pub)
+            .expect("identity from pub")
+            .address_hash,
+    );
 
     let community_id = SpaceId([0xC0; 16]);
     let membership_key = EpochKey::new([0xEC; 32]);

@@ -33,6 +33,7 @@
   let addDialogOpen = $state(false);
   let addPending = $state(false);
   let addError: string | null = $state(null);
+  let removeError: string | null = $state(null);
   let joinPending = $state<string | null>(null); // community_id mid-join
   let joinError: string | null = $state(null);
 
@@ -76,12 +77,23 @@
   }
 
   async function handleRemoveLibrary(addr: string) {
+    let succeeded = false;
     try {
       await service.remove(addr);
-      await refresh();
+      succeeded = true;
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      console.warn('remove failed:', msg);
+      // R2 F4: surface the failure inline. Previously only console.warn'd,
+      // so the user clicked ✕ and saw nothing happen.
+      removeError = e instanceof Error ? e.message : String(e);
+    } finally {
+      // Always re-sync from backend regardless of outcome — defensive
+      // UX in case the remove half-succeeded or the state diverged for
+      // an unrelated reason.
+      await refresh();
+      // Clear stale error only after a successful refresh following a
+      // successful remove (so subsequent unrelated re-renders don't
+      // briefly hide the error message).
+      if (succeeded) removeError = null;
     }
   }
 
@@ -161,6 +173,9 @@
         + Add library
       </button>
     </div>
+    {#if removeError}
+      <p class="remove-error" role="alert">Could not remove library: {removeError}</p>
+    {/if}
 
     {#if entries.length === 0}
       <p class="empty-catalog">No communities listed yet.</p>
@@ -246,6 +261,7 @@
   .join-btn { align-self: center; padding: 6px 12px; background: rgba(120,140,200,0.4); border: none; border-radius: 4px; cursor: pointer; }
   .join-btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .join-error { color: #d83c3e; font-size: 0.85rem; margin-top: 8px; }
+  .remove-error { color: #d83c3e; font-size: 0.8rem; margin: 0 0 8px; }
   .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 1000; }
   .modal-content { background: var(--bg-secondary); border-radius: 6px; }
   .primary { background: rgba(120,140,200,0.4); padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; }

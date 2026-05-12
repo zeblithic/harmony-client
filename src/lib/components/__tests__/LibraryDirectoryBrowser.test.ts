@@ -132,6 +132,25 @@ describe('LibraryDirectoryBrowser', () => {
     expect(svc.list).toHaveBeenCalledTimes(2);
   });
 
+  // R2 F4: previously the remove-library handler only console.warn'd on
+  // service.remove failure — the user clicked ✕ and saw nothing happen.
+  // Now the error surfaces inline next to the libraries bar.
+  it('remove library failure surfaces inline error', async () => {
+    const svc = {
+      list: vi.fn().mockResolvedValue([
+        { address: 'aabbccddeeff00112233445566778899', added_at: { w: 0, l: 0, d: 'd' }, entry_count: 0 },
+      ]),
+      browse: vi.fn().mockResolvedValue([]),
+      add: vi.fn(),
+      remove: vi.fn().mockRejectedValue(new Error('test error')),
+    } as unknown as LibraryDirectoryService;
+    const { findByLabelText, findByText } = render(LibraryDirectoryBrowser, {
+      props: { service: svc, adapter: mockAdapter(), onJoin: vi.fn(), onClose: vi.fn() },
+    });
+    await fireEvent.click(await findByLabelText(/Remove library aabbccdd/));
+    expect(await findByText(/Could not remove library: test error/i)).toBeInTheDocument();
+  });
+
   it('add-library error is surfaced inline', async () => {
     const svc = {
       list: vi.fn().mockResolvedValue([]),
