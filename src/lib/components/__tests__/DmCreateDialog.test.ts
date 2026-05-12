@@ -78,7 +78,7 @@ describe('DmCreateDialog', () => {
       await fireEvent.click(getByText(`Person${i}`));
     }
     expect(getByText(/15 of 15/i)).toBeInTheDocument();
-    expect(getByText(/communities \(coming soon\)/i)).toBeInTheDocument();
+    expect(getByText(/larger groups work better as communities/i)).toBeInTheDocument();
 
     // 16th attempt: Person16 button should still be visible (not yet selected)
     // but clicking it must be a silent no-op — selected length stays at 15.
@@ -87,6 +87,57 @@ describe('DmCreateDialog', () => {
     expect(getByText(/15 of 15/i)).toBeInTheDocument();
     // counter must NOT have advanced past the cap
     expect(queryByText(/16 of 15/i)).toBeNull();
+  });
+
+  it('at-cap: convert-to-community button is visible and click invokes onConvertToCommunity', async () => {
+    const onConvertToCommunity = vi.fn();
+    const onSubmit = vi.fn();
+    const profiles = buildSixteenProfiles();
+    const { getByRole } = render(DmCreateDialog, {
+      props: {
+        profiles,
+        onSubmit,
+        onCancel: vi.fn(),
+        onConvertToCommunity,
+      },
+    });
+
+    // Select the first 15 to reach the cap.
+    for (let i = 1; i <= 15; i++) {
+      await fireEvent.click(getByRole('button', { name: `Person${i}` }));
+    }
+
+    const convertBtn = getByRole('button', { name: /convert to community/i });
+    await fireEvent.click(convertBtn);
+    expect(onConvertToCommunity).toHaveBeenCalledOnce();
+    // DmCreateDialog itself does NOT submit the DM on conversion — App
+    // closes this dialog and opens CreateCommunityDialog instead.
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it('below-cap: convert-to-community button is NOT visible', () => {
+    const { queryByRole } = render(DmCreateDialog, {
+      props: {
+        profiles: testProfiles,
+        onSubmit: vi.fn(),
+        onCancel: vi.fn(),
+        onConvertToCommunity: vi.fn(),
+      },
+    });
+    expect(queryByRole('button', { name: /convert to community/i })).toBeNull();
+  });
+
+  it('at-cap without onConvertToCommunity prop: no button, no error', async () => {
+    const profiles = buildSixteenProfiles();
+    const { getByText, queryByRole } = render(DmCreateDialog, {
+      props: { profiles, onSubmit: vi.fn(), onCancel: vi.fn() },
+    });
+    for (let i = 1; i <= 15; i++) {
+      await fireEvent.click(getByText(`Person${i}`));
+    }
+    expect(getByText(/15 of 15/i)).toBeInTheDocument();
+    // Without the callback prop the button must not appear (no orphan UI).
+    expect(queryByRole('button', { name: /convert to community/i })).toBeNull();
   });
 
   it('calls onCancel without IPC when Cancel clicked', async () => {

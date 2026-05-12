@@ -1453,6 +1453,11 @@
         initialKind={dmCreateInitialKind}
         onSubmit={handleDmCreate}
         onCancel={() => { dmCreateDialogOpen = false; }}
+        onConvertToCommunity={() => {
+          dmCreateDialogOpen = false;
+          createError = null;
+          showCreateCommunity = true;
+        }}
       />
     </div>
   </div>
