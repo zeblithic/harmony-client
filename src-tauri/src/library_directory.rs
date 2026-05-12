@@ -183,9 +183,25 @@ pub enum OnEntryOutcome {
     /// Drop (older-HLC duplicate from a library that already contributes
     /// the newer entry, or no-op).
     Idempotent,
-    /// Cap-eviction triggered: oldest entry from `library` dropped to
-    /// make room for the new arrival.
-    EvictedThenInserted { evicted: SpaceId, inserted: SpaceId },
+}
+
+/// Result of `Aggregation::on_entry` — the outcome plus, independently,
+/// any community evicted by per-library cap enforcement during the same
+/// call. The two dimensions are orthogonal: cap-eviction can co-occur
+/// with `Inserted`, `Replaced`, or `AccretedListedBy` (e.g., when a
+/// library already at cap re-publishes a community whose entry the
+/// library hasn't previously contributed to — the new arrival accretes
+/// to an existing community while the cap forces eviction of the
+/// library's oldest *other* contribution).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessResult {
+    pub outcome: OnEntryOutcome,
+    /// If `Some(community_id)`, the per-library cap was hit and this
+    /// community was the library's oldest contribution, dropped to make
+    /// room. Independent of `outcome`'s discriminant — callers should
+    /// process `evicted` for emit/cleanup even when `outcome` is
+    /// `Replaced` or `AccretedListedBy`.
+    pub evicted: Option<SpaceId>,
 }
 
 impl Aggregation {
@@ -211,7 +227,13 @@ impl Aggregation {
 
     /// Process a verified entry. Caller MUST have run `verify_entry`
     /// first — this method does NOT re-verify the signature.
-    pub fn on_entry(&mut self, entry: LibraryDirectoryEntry) -> OnEntryOutcome {
+    ///
+    /// Returns a `ProcessResult` carrying both the outcome discriminant
+    /// (Inserted / Replaced / AccretedListedBy / Idempotent) and any
+    /// orthogonal cap-eviction. Callers must consult both fields: an
+    /// eviction can co-occur with `Replaced` or `AccretedListedBy`,
+    /// not just `Inserted`.
+    pub fn on_entry(&mut self, entry: LibraryDirectoryEntry) -> ProcessResult {
         let community_id = entry.community_id;
         let library = entry.listed_by;
 
@@ -225,11 +247,11 @@ impl Aggregation {
             .map(|agg| agg.listed_by.contains(&library))
             .unwrap_or(false);
 
-        let mut maybe_evicted: Option<SpaceId> = None;
+        let mut evicted: Option<SpaceId> = None;
         if library_at_cap && is_new_contribution_for_library {
             if let Some(oldest_id) = self.find_oldest_for_library(&library) {
                 self.evict_library_contribution(&library, oldest_id);
-                maybe_evicted = Some(oldest_id);
+                evicted = Some(oldest_id);
             }
         }
 
@@ -262,26 +284,35 @@ impl Aggregation {
             }
         };
 
-        if let Some(evicted_id) = maybe_evicted {
-            // Re-shape outcome to surface the eviction.
-            if let OnEntryOutcome::Inserted(new_id) = outcome {
-                return OnEntryOutcome::EvictedThenInserted {
-                    evicted: evicted_id,
-                    inserted: new_id,
-                };
-            }
-        }
-        outcome
+        ProcessResult { outcome, evicted }
     }
 
     /// Remove all contributions from `library`. Walks the entire
     /// aggregation map (O(N over total entries from this library);
     /// the per-library count is bounded by MAX_ENTRIES_PER_LIBRARY).
     /// Spec §5.3.
+    ///
+    /// Phase 1 correctness trade-off: if the stored `entry.listed_by`
+    /// matches the dropped library, the community is evicted entirely
+    /// even if OTHER libraries also listed it. Rationale: we keep
+    /// exactly one `LibraryDirectoryEntry` per community (the latest-
+    /// HLC), and that entry's metadata (name / description / topics /
+    /// invite_url) was sourced from the removed library — surfacing
+    /// stale curated metadata under a "trusted library" frame would be
+    /// worse than re-discovery on the next subscribe.
+    ///
+    /// Net behavior:
+    /// - Solo listing from this library → evict (unchanged).
+    /// - Shared listing where stored entry came from THIS library →
+    ///   evict (new in R1).
+    /// - Shared listing where stored entry came from another library
+    ///   → reduce `listed_by` set only (unchanged).
     pub fn drop_library(&mut self, library: &OwnerAddr) -> Vec<SpaceId> {
         let mut evicted = Vec::new();
         self.by_community.retain(|community_id, agg| {
-            if agg.listed_by.remove(library) && agg.listed_by.is_empty() {
+            let source_was_this_library = &agg.entry.listed_by == library;
+            let _ = agg.listed_by.remove(library);
+            if source_was_this_library || agg.listed_by.is_empty() {
                 evicted.push(*community_id);
                 return false;
             }
@@ -313,6 +344,9 @@ impl Aggregation {
             .map(|(id, _)| *id)
     }
 
+    /// Same correctness rule as `drop_library`: if the stored entry was
+    /// sourced from `library`, evict the community entirely rather than
+    /// retain its stale metadata under another library's `listed_by`.
     fn evict_library_contribution(&mut self, library: &OwnerAddr, community_id: SpaceId) {
         if let Some(agg) = self.by_community.get_mut(&community_id) {
             if agg.listed_by.remove(library) {
@@ -321,7 +355,8 @@ impl Aggregation {
                         *c -= 1;
                     }
                 }
-                if agg.listed_by.is_empty() {
+                let source_was_this_library = &agg.entry.listed_by == library;
+                if source_was_this_library || agg.listed_by.is_empty() {
                     self.by_community.remove(&community_id);
                 }
             }
@@ -342,16 +377,22 @@ pub enum LibraryDirectoryRequest {
 
 /// Shared state: aggregation map + the request sender. Held inside
 /// `NodeState` (Arc<Mutex<...>>).
+///
+/// `request_tx` is `UnboundedSender` — Subscribe/Unsubscribe traffic is
+/// tiny (single OwnerAddr) and infrequent (user action + startup walk).
+/// Unbounded avoids the F1 deadlock where the startup walk in
+/// `start_node` could block forever on >capacity sends BEFORE the
+/// event-loop consumer task is spawned.
 pub struct LibraryDirectory {
     pub aggregation: Mutex<Aggregation>,
-    pub request_tx: mpsc::Sender<LibraryDirectoryRequest>,
+    pub request_tx: mpsc::UnboundedSender<LibraryDirectoryRequest>,
 }
 
 impl LibraryDirectory {
     /// Construct alongside the matching `request_rx` consumed by the
     /// event loop.
-    pub fn new() -> (Arc<Self>, mpsc::Receiver<LibraryDirectoryRequest>) {
-        let (request_tx, request_rx) = mpsc::channel(64);
+    pub fn new() -> (Arc<Self>, mpsc::UnboundedReceiver<LibraryDirectoryRequest>) {
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
         let dir = Arc::new(Self {
             aggregation: Mutex::new(Aggregation::new()),
             request_tx,
@@ -360,14 +401,31 @@ impl LibraryDirectory {
     }
 
     /// Decode + verify + aggregate one received sample. Returns the
-    /// outcome for the caller (event-loop task) to emit
-    /// `library-directory-updated` from.
+    /// `ProcessResult` (outcome + optional cap-eviction) for the caller
+    /// (event-loop task) to emit `library-directory-updated` from.
+    ///
+    /// `library_addr` is the subscribed library's `OwnerAddr` — the
+    /// topic owner the sample arrived on, captured by the per-library
+    /// subscriber task and passed in here. Used to canonicalize entry
+    /// attribution: if the decoded entry's `listed_by` field disagrees
+    /// with the topic owner, we reject the entry as
+    /// `AttributionMismatch`. This prevents a subscribed library from
+    /// publishing entries attributing themselves to OTHER library
+    /// addresses (which would bypass per-library caps and prevent
+    /// `remove_library` from evicting them).
     pub async fn process_sample(
         &self,
+        library_addr: OwnerAddr,
         bytes: Vec<u8>,
-    ) -> Result<OnEntryOutcome, ProcessSampleError> {
+    ) -> Result<ProcessResult, ProcessSampleError> {
         let entry: LibraryDirectoryEntry =
             ciborium::de::from_reader(&bytes[..]).map_err(ProcessSampleError::Decode)?;
+        if entry.listed_by != library_addr {
+            return Err(ProcessSampleError::AttributionMismatch {
+                expected: library_addr,
+                actual: entry.listed_by,
+            });
+        }
         verify_entry(&entry).map_err(ProcessSampleError::Verify)?;
         let mut agg = self.aggregation.lock().await;
         Ok(agg.on_entry(entry))
@@ -396,6 +454,14 @@ pub enum ProcessSampleError {
     Decode(ciborium::de::Error<std::io::Error>),
     #[error("verify failed: {0}")]
     Verify(#[from] EntryVerifyError),
+    /// The decoded entry's `listed_by` doesn't match the subscribed
+    /// library topic the sample arrived on. Rejected to prevent
+    /// cross-library attribution spoofing — see `process_sample`.
+    #[error("attribution mismatch: topic={expected:?}, entry={actual:?}")]
+    AttributionMismatch {
+        expected: OwnerAddr,
+        actual: OwnerAddr,
+    },
 }
 
 /// Frontend-facing DTO: minimal library info for chip rendering.
@@ -751,9 +817,12 @@ mod tests {
             .sign(&canonical_cbor_encode(&for_sig2).unwrap())
             .to_bytes();
 
-        assert_eq!(agg.on_entry(e1), OnEntryOutcome::Inserted(community));
         assert_eq!(
-            agg.on_entry(e2.clone()),
+            agg.on_entry(e1).outcome,
+            OnEntryOutcome::Inserted(community)
+        );
+        assert_eq!(
+            agg.on_entry(e2.clone()).outcome,
             OnEntryOutcome::Replaced(community)
         );
         let snap = agg.snapshot_all();
@@ -779,9 +848,12 @@ mod tests {
         let e_from_b =
             build_signed_entry(community, [7; 32], library_b, h.clone(), invite_url.clone());
 
-        assert_eq!(agg.on_entry(e_from_a), OnEntryOutcome::Inserted(community));
         assert_eq!(
-            agg.on_entry(e_from_b),
+            agg.on_entry(e_from_a).outcome,
+            OnEntryOutcome::Inserted(community)
+        );
+        assert_eq!(
+            agg.on_entry(e_from_b).outcome,
             OnEntryOutcome::AccretedListedBy(community)
         );
 
@@ -792,6 +864,14 @@ mod tests {
         assert!(snap[0].listed_by.contains(&library_b));
     }
 
+    /// `drop_library` evicts solo listings AND retains shared listings
+    /// whose STORED entry was sourced from another library.
+    ///
+    /// To exercise the "shared listing retained" path under the F3
+    /// rule, library_b must be the stored source (highest-HLC). We
+    /// publish library_b's entry at a newer HLC so the stored entry's
+    /// `listed_by == library_b`; dropping library_a then reduces only
+    /// the `listed_by` set without evicting the community.
     #[test]
     fn drop_library_evicts_solo_listings() {
         let mut agg = Aggregation::new();
@@ -799,8 +879,13 @@ mod tests {
         let library_b = OwnerAddr([0xBB; 16]);
         let solo = SpaceId([1; 16]);
         let shared = SpaceId([2; 16]);
-        let h = Hlc {
+        let h_old = Hlc {
             wall_ms: 100,
+            logical: 0,
+            device_id: "d".into(),
+        };
+        let h_new = Hlc {
+            wall_ms: 200,
             logical: 0,
             device_id: "d".into(),
         };
@@ -810,21 +895,24 @@ mod tests {
             solo,
             [7; 32],
             library_a,
-            h.clone(),
+            h_old.clone(),
             invite_url.clone(),
         ));
         agg.on_entry(build_signed_entry(
             shared,
             [7; 32],
             library_a,
-            h.clone(),
+            h_old.clone(),
             invite_url.clone(),
         ));
+        // library_b publishes at a NEWER HLC so its entry becomes the
+        // stored source — required for the F3-rule shared-retention
+        // path to apply.
         agg.on_entry(build_signed_entry(
             shared,
             [7; 32],
             library_b,
-            h.clone(),
+            h_new.clone(),
             invite_url.clone(),
         ));
 
@@ -834,6 +922,89 @@ mod tests {
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].entry.community_id, shared);
         assert_eq!(snap[0].listed_by, [library_b].into_iter().collect());
+    }
+
+    /// F3 regression: `drop_library` must evict the community when the
+    /// stored entry's `listed_by` field matches the dropped library,
+    /// even when OTHER libraries also list it — otherwise we'd retain
+    /// stale curated metadata under a "trusted library" frame.
+    ///
+    /// Scenario: library A publishes for community C at HLC 100
+    /// (name="from-A"); library B publishes for the SAME community at
+    /// HLC 200 (name="from-B") — newer-HLC wins so stored entry is
+    /// from B. Drop library B → community C must be FULLY evicted
+    /// (not just `listed_by` reduced to {A}), because the stored entry
+    /// metadata came from B.
+    #[test]
+    fn drop_library_evicts_entries_sourced_from_dropped_library() {
+        let mut agg = Aggregation::new();
+        let library_a = OwnerAddr([0xAA; 16]);
+        let library_b = OwnerAddr([0xBB; 16]);
+        let community = SpaceId([1; 16]);
+        let invite_url = build_open_invite_url();
+
+        // Library A publishes first at HLC 100 with name="from-A".
+        let mut entry_a = build_signed_entry(
+            community,
+            [7; 32],
+            library_a,
+            Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            invite_url.clone(),
+        );
+        entry_a.name = "from-A".into();
+        // Re-sign because we changed name.
+        let mut for_sig = entry_a.clone();
+        for_sig.community_signature = [0u8; 64];
+        let (sk, _) = build_test_identity_pub([7; 32]);
+        entry_a.community_signature = sk
+            .sign(&canonical_cbor_encode(&for_sig).unwrap())
+            .to_bytes();
+        agg.on_entry(entry_a);
+
+        // Library B publishes for the SAME community at HLC 200 with
+        // name="from-B" — newer-HLC wins, stored entry becomes B's.
+        let mut entry_b = build_signed_entry(
+            community,
+            [7; 32],
+            library_b,
+            Hlc {
+                wall_ms: 200,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            invite_url.clone(),
+        );
+        entry_b.name = "from-B".into();
+        let mut for_sig_b = entry_b.clone();
+        for_sig_b.community_signature = [0u8; 64];
+        entry_b.community_signature = sk
+            .sign(&canonical_cbor_encode(&for_sig_b).unwrap())
+            .to_bytes();
+        agg.on_entry(entry_b);
+
+        // Sanity: pre-drop state has community C listed by both, stored
+        // entry sourced from B.
+        let snap = agg.snapshot_all();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].entry.name, "from-B");
+        assert_eq!(snap[0].listed_by.len(), 2);
+
+        // Drop library B → community must be FULLY evicted, not just
+        // reduced to listed_by={A}, because stored entry came from B.
+        let evicted = agg.drop_library(&library_b);
+        assert_eq!(
+            evicted,
+            vec![community],
+            "community must be evicted when stored entry's listed_by == dropped library"
+        );
+        assert!(
+            agg.snapshot_all().is_empty(),
+            "no stale metadata retained from dropped library"
+        );
     }
 
     #[test]
@@ -857,19 +1028,25 @@ mod tests {
                 },
                 invite_url.clone(),
             );
-            let outcome = agg.on_entry(entry);
+            let result = agg.on_entry(entry);
             if i < MAX_ENTRIES_PER_LIBRARY as u32 {
-                assert!(matches!(outcome, OnEntryOutcome::Inserted(_)));
+                assert!(matches!(result.outcome, OnEntryOutcome::Inserted(_)));
+                assert!(result.evicted.is_none(), "no eviction under cap");
             } else {
-                // The overflow insert evicts the oldest (i=0).
+                // The overflow insert evicts the oldest (i=0) AND
+                // inserts the new arrival.
                 let mut oldest_cid = [0u8; 16];
                 oldest_cid[..4].copy_from_slice(&0u32.to_be_bytes());
-                match outcome {
-                    OnEntryOutcome::EvictedThenInserted { evicted, .. } => {
-                        assert_eq!(evicted, SpaceId(oldest_cid));
-                    }
-                    other => panic!("expected EvictedThenInserted, got {other:?}"),
-                }
+                assert!(
+                    matches!(result.outcome, OnEntryOutcome::Inserted(_)),
+                    "overflow path inserts the new community: got {:?}",
+                    result.outcome
+                );
+                assert_eq!(
+                    result.evicted,
+                    Some(SpaceId(oldest_cid)),
+                    "overflow must surface eviction of i=0"
+                );
             }
         }
         assert_eq!(
@@ -902,14 +1079,15 @@ mod tests {
             h_new,
             invite_url.clone(),
         ));
-        let outcome = agg.on_entry(build_signed_entry(
+        let result = agg.on_entry(build_signed_entry(
             community,
             [7; 32],
             library,
             h_old,
             invite_url.clone(),
         ));
-        assert_eq!(outcome, OnEntryOutcome::Idempotent);
+        assert_eq!(result.outcome, OnEntryOutcome::Idempotent);
+        assert!(result.evicted.is_none());
     }
 
     #[test]

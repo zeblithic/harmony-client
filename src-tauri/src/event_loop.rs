@@ -345,8 +345,12 @@ pub async fn run<R: Runtime>(
     library_directory: Option<Arc<crate::library_directory::LibraryDirectory>>,
     // ZEB-218 Sub-D Phase 1: receiver paired with `LibraryDirectory.request_tx`.
     // Moved into the long-lived consumer task below. `None` when
-    // `library_directory` is `None`.
-    library_request_rx: Option<mpsc::Receiver<crate::library_directory::LibraryDirectoryRequest>>,
+    // `library_directory` is `None`. Unbounded — see
+    // `library_directory::LibraryDirectory` doc; sized for the F1
+    // startup-walk deadlock fix.
+    library_request_rx: Option<
+        mpsc::UnboundedReceiver<crate::library_directory::LibraryDirectoryRequest>,
+    >,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -609,6 +613,12 @@ pub async fn run<R: Runtime>(
             while let Some(req) = request_rx.recv().await {
                 match req {
                     crate::library_directory::LibraryDirectoryRequest::Subscribe(addr) => {
+                        // F4 self-heal: prune any subscriber tasks that
+                        // have already exited (e.g., zenoh recv_async
+                        // returned Err). Without this sweep, a stale
+                        // handle in the map prevents re-subscription
+                        // until app restart.
+                        handles.retain(|_, h| !h.is_finished());
                         if handles.contains_key(&addr) {
                             continue; // idempotent
                         }
@@ -630,21 +640,32 @@ pub async fn run<R: Runtime>(
                         let dir = Arc::clone(&library_directory_handle);
                         let app_for_task = app_for_libdir.clone();
                         let closing_task = Arc::clone(&closing_libdir);
+                        // F2: capture the subscribed library addr — the
+                        // topic owner — and pass it into process_sample
+                        // so attribution can't be spoofed by a malicious
+                        // library publishing entries under another
+                        // library's listed_by.
+                        let subscribed_addr = addr;
                         let handle = tokio::spawn(async move {
                             loop {
                                 match sub.recv_async().await {
                                     Ok(sample) => {
                                         let bytes = sample.payload().to_bytes().to_vec();
-                                        match dir.process_sample(bytes).await {
-                                            Ok(outcome) => match outcome {
-                                                crate::library_directory::OnEntryOutcome::Idempotent => {}
-                                                _ => {
-                                                    let community_id = match &outcome {
+                                        match dir.process_sample(subscribed_addr, bytes).await {
+                                            Ok(result) => {
+                                                // F6: emit on any non-idempotent state
+                                                // change OR on cap-eviction (independent
+                                                // of outcome's discriminant).
+                                                let outcome_changed = !matches!(
+                                                    result.outcome,
+                                                    crate::library_directory::OnEntryOutcome::Idempotent
+                                                );
+                                                if outcome_changed || result.evicted.is_some() {
+                                                    let community_id = match &result.outcome {
                                                         crate::library_directory::OnEntryOutcome::Inserted(c)
                                                         | crate::library_directory::OnEntryOutcome::Replaced(c)
-                                                        | crate::library_directory::OnEntryOutcome::AccretedListedBy(c) => Some(c),
-                                                        crate::library_directory::OnEntryOutcome::EvictedThenInserted { inserted, .. } => Some(inserted),
-                                                        _ => None,
+                                                        | crate::library_directory::OnEntryOutcome::AccretedListedBy(c) => Some(*c),
+                                                        crate::library_directory::OnEntryOutcome::Idempotent => None,
                                                     };
                                                     let _ = app_for_task.emit(
                                                         "library-directory-updated",
@@ -653,7 +674,7 @@ pub async fn run<R: Runtime>(
                                                         }),
                                                     );
                                                 }
-                                            },
+                                            }
                                             Err(e) => {
                                                 tracing::warn!(
                                                     error = ?e,

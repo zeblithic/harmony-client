@@ -48,7 +48,8 @@
       entries = await service.browse();
     } catch (e) {
       // best-effort; UI just won't refresh
-      console.warn('refresh failed', e);
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn('refresh failed:', msg);
     }
   }
 
@@ -79,7 +80,8 @@
       await service.remove(addr);
       await refresh();
     } catch (e) {
-      console.warn('remove failed', e);
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn('remove failed:', msg);
     }
   }
 

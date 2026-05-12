@@ -2022,9 +2022,13 @@ async fn start_node(
             crate::library_directory::LibraryDirectory::new();
         // ZEB-218 Sub-D Phase 1: walk owner-state at startup and send a
         // Subscribe request for each effective (non-tombstoned) library.
-        // Done BEFORE the event_loop spawn — the channel has capacity
-        // 64 so this never blocks unless the user has >64 libraries
-        // (in which case we'd want a different strategy anyway).
+        // Done BEFORE the event_loop spawn. The channel is unbounded
+        // (UnboundedSender::send is synchronous and never blocks) —
+        // see the F1 fix discussion in `LibraryDirectory::new` doc:
+        // Subscribe/Unsubscribe traffic is small + infrequent + only
+        // grows with user library count, so the bounded(64) variant
+        // could deadlock on >64 libraries here BEFORE the consumer task
+        // even spawned.
         if let Some(ref crdt_arc) = crdt_state_for_state {
             let crdt_g = crdt_arc.lock().await;
             for (addr, lib_entry) in &crdt_g.libraries {
@@ -2032,7 +2036,6 @@ async fn start_node(
                     if let Err(e) = library_directory_arc
                         .request_tx
                         .send(crate::library_directory::LibraryDirectoryRequest::Subscribe(*addr))
-                        .await
                     {
                         tracing::warn!(
                             ?addr,
@@ -9773,8 +9776,7 @@ async fn add_library(
     }
     let _ = library_directory
         .request_tx
-        .send(crate::library_directory::LibraryDirectoryRequest::Subscribe(addr))
-        .await;
+        .send(crate::library_directory::LibraryDirectoryRequest::Subscribe(addr));
     Ok(())
 }
 
@@ -9821,8 +9823,7 @@ async fn remove_library(
     }
     let _ = library_directory
         .request_tx
-        .send(crate::library_directory::LibraryDirectoryRequest::Unsubscribe(addr))
-        .await;
+        .send(crate::library_directory::LibraryDirectoryRequest::Unsubscribe(addr));
     Ok(())
 }
 

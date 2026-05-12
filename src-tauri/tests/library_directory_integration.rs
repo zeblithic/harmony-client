@@ -151,14 +151,18 @@ async fn subscribe_to_library_receives_published_entries() {
             vec![],
         );
         let bytes = encode_entry(&entry);
-        let outcome = dir.process_sample(bytes).await.expect("process_sample");
+        let result = dir
+            .process_sample(library, bytes)
+            .await
+            .expect("process_sample");
         assert!(
             matches!(
-                outcome,
+                result.outcome,
                 harmony_app::library_directory::OnEntryOutcome::Inserted(_)
             ),
-            "first arrival from a library is Inserted, got {outcome:?}"
+            "first arrival from a library is Inserted, got {result:?}"
         );
+        assert!(result.evicted.is_none(), "no cap-eviction expected");
     }
 
     let snap = dir.snapshot_all().await;
@@ -213,8 +217,12 @@ async fn aggregation_dedupes_same_community_from_two_libraries() {
         vec![],
     );
 
-    dir.process_sample(encode_entry(&entry_a)).await.expect("a");
-    dir.process_sample(encode_entry(&entry_b)).await.expect("b");
+    dir.process_sample(library_a, encode_entry(&entry_a))
+        .await
+        .expect("a");
+    dir.process_sample(library_b, encode_entry(&entry_b))
+        .await
+        .expect("b");
 
     let snap = dir.snapshot_all().await;
     assert_eq!(snap.len(), 1, "dedupe by community_id");
@@ -258,8 +266,12 @@ async fn latest_hlc_wins_on_conflict() {
         vec!["new".into()],
     );
 
-    dir.process_sample(encode_entry(&old)).await.expect("old");
-    dir.process_sample(encode_entry(&new)).await.expect("new");
+    dir.process_sample(library, encode_entry(&old))
+        .await
+        .expect("old");
+    dir.process_sample(library, encode_entry(&new))
+        .await
+        .expect("new");
 
     let snap = dir.snapshot_all().await;
     assert_eq!(snap.len(), 1);
@@ -291,7 +303,7 @@ async fn invalid_community_signature_rejected() {
     // Tamper AFTER signing — wire bytes will fail verify_entry.
     entry.name = "Tampered".to_string();
 
-    let res = dir.process_sample(encode_entry(&entry)).await;
+    let res = dir.process_sample(library, encode_entry(&entry)).await;
     assert!(
         matches!(
             res,
@@ -325,7 +337,7 @@ async fn invite_only_invite_url_rejected_at_receive() {
         vec![],
     );
 
-    let res = dir.process_sample(encode_entry(&entry)).await;
+    let res = dir.process_sample(library, encode_entry(&entry)).await;
     assert!(
         matches!(
             res,
@@ -336,6 +348,51 @@ async fn invite_only_invite_url_rejected_at_receive() {
         "expected InviteOnlyUrl, got {res:?}"
     );
     assert!(dir.snapshot_all().await.is_empty());
+}
+
+// ── F2 regression: spoofed listed_by rejected ────────────────────────
+
+/// Security regression: an entry whose payload `listed_by` disagrees
+/// with the subscribed library's topic owner must be rejected as
+/// `AttributionMismatch`, preventing a malicious library from
+/// publishing entries attributing themselves to OTHER libraries (which
+/// would bypass per-library caps and prevent `remove_library` from
+/// evicting them).
+#[tokio::test]
+async fn attribution_spoof_rejected() {
+    let dir = build_directory();
+    let real_library = OwnerAddr([0xAA; 16]);
+    let spoofed_library = OwnerAddr([0xBB; 16]);
+
+    // Entry's payload `listed_by` claims library B but arrives on the
+    // topic subscribed under library A — must reject.
+    let entry = mock_directory_entry(
+        SpaceId([1; 16]),
+        [7; 32],
+        spoofed_library, // payload claims B
+        hlc(1_000),
+        open_invite_url(),
+        "spoofed",
+        "",
+        vec![],
+    );
+    let res = dir
+        .process_sample(real_library, encode_entry(&entry)) // arrived on A's topic
+        .await;
+    match res {
+        Err(harmony_app::library_directory::ProcessSampleError::AttributionMismatch {
+            expected,
+            actual,
+        }) => {
+            assert_eq!(expected, real_library);
+            assert_eq!(actual, spoofed_library);
+        }
+        other => panic!("expected AttributionMismatch, got {other:?}"),
+    }
+    assert!(
+        dir.snapshot_all().await.is_empty(),
+        "spoofed entry must not aggregate"
+    );
 }
 
 // ── Test 6: drop_library evicts entries (the remove_library path) ────
@@ -354,54 +411,76 @@ async fn remove_library_evicts_entries_and_drops_subscription() {
     let invite_url = open_invite_url();
 
     // library_a publishes 2 (one solo + one shared with library_b).
-    dir.process_sample(encode_entry(&mock_directory_entry(
-        solo,
-        [7; 32],
+    dir.process_sample(
         library_a,
-        hlc(1_000),
-        invite_url.clone(),
-        "Solo",
-        "",
-        vec![],
-    )))
+        encode_entry(&mock_directory_entry(
+            solo,
+            [7; 32],
+            library_a,
+            hlc(1_000),
+            invite_url.clone(),
+            "Solo",
+            "",
+            vec![],
+        )),
+    )
     .await
     .expect("solo");
-    dir.process_sample(encode_entry(&mock_directory_entry(
-        shared,
-        [7; 32],
+    dir.process_sample(
         library_a,
-        hlc(1_000),
-        invite_url.clone(),
-        "Shared",
-        "",
-        vec![],
-    )))
+        encode_entry(&mock_directory_entry(
+            shared,
+            [7; 32],
+            library_a,
+            hlc(1_000),
+            invite_url.clone(),
+            "Shared",
+            "",
+            vec![],
+        )),
+    )
     .await
     .expect("shared from a");
-    dir.process_sample(encode_entry(&mock_directory_entry(
-        shared,
-        [7; 32],
+    dir.process_sample(
         library_b,
-        hlc(1_000),
-        invite_url,
-        "Shared",
-        "",
-        vec![],
-    )))
+        encode_entry(&mock_directory_entry(
+            shared,
+            [7; 32],
+            library_b,
+            hlc(1_000),
+            invite_url,
+            "Shared",
+            "",
+            vec![],
+        )),
+    )
     .await
     .expect("shared from b");
 
     assert_eq!(dir.snapshot_all().await.len(), 2);
 
-    // Drop library_a — solo evicts; shared stays with library_b only.
-    let evicted = dir.drop_library(&library_a).await;
-    assert_eq!(evicted, vec![solo]);
+    // Drop library_a — both communities evict.
+    //
+    // `solo` evicts because library_a was its only contributor.
+    //
+    // `shared` evicts because library_a was published FIRST (and the
+    // library_b publish at the same HLC is NOT strictly newer, so the
+    // stored entry's `listed_by` field remained library_a). Per the F3
+    // correctness rule (see `Aggregation::drop_library` doc): when the
+    // stored entry's `listed_by` matches the dropped library, the
+    // community is fully evicted to avoid surfacing stale metadata
+    // sourced from a removed library.
+    let mut evicted = dir.drop_library(&library_a).await;
+    evicted.sort();
+    let mut expected = vec![solo, shared];
+    expected.sort();
+    assert_eq!(evicted, expected);
 
     let snap = dir.snapshot_all().await;
-    assert_eq!(snap.len(), 1);
-    assert_eq!(snap[0].entry.community_id, shared);
-    assert_eq!(snap[0].listed_by.len(), 1);
-    assert!(snap[0].listed_by.contains(&library_b));
+    assert!(
+        snap.is_empty(),
+        "F3 correctness: communities whose stored entry was sourced from the dropped library must evict entirely"
+    );
 
     // browse_library filtered to library_a is now empty.
     let filtered_a = dir.snapshot_filtered_by_library(&library_a).await;
@@ -439,34 +518,34 @@ async fn per_library_cap_evicts_oldest_on_overflow() {
             "",
             vec![],
         );
-        let outcome = dir
-            .process_sample(encode_entry(&entry))
+        let result = dir
+            .process_sample(library, encode_entry(&entry))
             .await
             .expect("process");
         if i < MAX_ENTRIES_PER_LIBRARY as u32 {
             assert!(
                 matches!(
-                    outcome,
+                    result.outcome,
                     harmony_app::library_directory::OnEntryOutcome::Inserted(_)
                 ),
-                "i={i}: expected Inserted, got {outcome:?}"
+                "i={i}: expected Inserted, got {result:?}"
             );
+            assert!(result.evicted.is_none(), "i={i}: no eviction under cap");
         } else {
             let mut oldest_cid = [0u8; 16];
             oldest_cid[..4].copy_from_slice(&0u32.to_be_bytes());
-            match outcome {
-                harmony_app::library_directory::OnEntryOutcome::EvictedThenInserted {
-                    evicted,
-                    ..
-                } => {
-                    assert_eq!(
-                        evicted,
-                        SpaceId(oldest_cid),
-                        "overflow must evict the i=0 (oldest-HLC) entry"
-                    );
-                }
-                other => panic!("expected EvictedThenInserted, got {other:?}"),
-            }
+            assert!(
+                matches!(
+                    result.outcome,
+                    harmony_app::library_directory::OnEntryOutcome::Inserted(_)
+                ),
+                "overflow path: new arrival is Inserted, got {result:?}"
+            );
+            assert_eq!(
+                result.evicted,
+                Some(SpaceId(oldest_cid)),
+                "overflow must evict the i=0 (oldest-HLC) entry"
+            );
         }
     }
 
@@ -597,16 +676,16 @@ async fn click_to_join_redeem_invite_smoke() {
         "smoke-test target",
         vec!["smoke".into()],
     );
-    let outcome = dir
-        .process_sample(encode_entry(&entry))
+    let result = dir
+        .process_sample(library_addr, encode_entry(&entry))
         .await
         .expect("process_sample");
     assert!(
         matches!(
-            outcome,
+            result.outcome,
             harmony_app::library_directory::OnEntryOutcome::Inserted(_)
         ),
-        "directory entry must aggregate, got {outcome:?}"
+        "directory entry must aggregate, got {result:?}"
     );
 
     // The joiner's UI would call browse_library() and read entry
