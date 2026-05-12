@@ -279,16 +279,42 @@ pub enum AnnounceVerifyError {
     DescriptionTooLong,
 }
 
-/// Verify a `LibraryDirectoryEntry` end-to-end:
+/// Verify a `LibraryDirectoryEntry` end-to-end and return the
+/// wrapping-signature attestation outcome. Spec §5.
+///
+/// **Phase 1 invariants (unchanged):**
 /// 1. Anti-spam bounds (name/description/topic lengths)
 /// 2. Parse `community_admin_identity_pub` via
-///    `harmony_identity::Identity::from_public_bytes` (validates both
-///    halves)
-/// 3. Verify the Ed25519 signature over canonical-CBOR-encoded fields
-///    with `community_signature` zeroed (so verify == sign exactly)
+///    `harmony_identity::Identity::from_public_bytes`
+/// 3. Verify the Ed25519 admin signature over canonical-CBOR-encoded
+///    fields with `community_signature` zeroed (so verify == sign
+///    exactly). The Optional `library_identity_pub` / `library_signature`
+///    are also zeroed (via `None` + `skip_serializing_if`), so admin
+///    sig bytes are portable across libraries.
 /// 4. Parse `invite_url` and reject if `is_invite_only == true`
-pub fn verify_entry(entry: &LibraryDirectoryEntry) -> Result<(), EntryVerifyError> {
-    // (1) Bounds
+/// 5. Invite payload binding (community_id + admin_addr)
+///
+/// **Phase 3 addition:** if `library_signature` and
+/// `library_identity_pub` are both `Some`, verify the wrapping sig
+/// over canonical-CBOR-encoded fields with only `library_signature`
+/// zeroed (keep `library_identity_pub` + `community_signature`
+/// populated, so the wrapping sig commits to the admin-signed bundle).
+///
+/// **Returns:**
+/// - `Ok(AttestationStatus::Unwrapped)` — Phase 1-style entry (both
+///   Optional fields None)
+/// - `Ok(AttestationStatus::Attested(library_addr))` — wrapping sig
+///   verified, library_addr is derived from `library_identity_pub`
+/// - `Ok(AttestationStatus::Unattested(library_addr))` — wrapping sig
+///   present but invalid; entry NOT dropped (admin sig was valid).
+///   library_addr is the CLAIMED broadcasting library.
+/// - `Err(LibrarySignatureFieldsInconsistent)` — exactly one of
+///   library_signature / library_identity_pub is Some (malformed).
+/// - `Err(InvalidLibraryIdentityPub)` — library_identity_pub bytes
+///   failed `Identity::from_public_bytes`.
+/// - Other `Err(...)` — admin sig path failed; entry should be dropped.
+pub fn verify_entry(entry: &LibraryDirectoryEntry) -> Result<AttestationStatus, EntryVerifyError> {
+    // (1) Bounds — unchanged from Phase 1.
     if entry.name.len() > MAX_NAME_LEN {
         return Err(EntryVerifyError::NameTooLong);
     }
@@ -307,9 +333,17 @@ pub fn verify_entry(entry: &LibraryDirectoryEntry) -> Result<(), EntryVerifyErro
         harmony_identity::Identity::from_public_bytes(&entry.community_admin_identity_pub)
             .map_err(|e| EntryVerifyError::InvalidIdentityPub(format!("{e:?}")))?;
 
-    // (3) Verify sig over canonical CBOR with signature field zeroed.
+    // (3) Verify admin sig over canonical CBOR with cs zeroed and
+    //     li/ls forced to None. The Phase 1 invariant of "sig field
+    //     zeroed during sign/verify" extends to "Optional fields
+    //     forced absent" — skip_serializing_if omits them from CBOR.
+    //     This makes the admin sig portable across libraries (the
+    //     wrapping library can attach li+ls without invalidating the
+    //     admin sig).
     let mut for_sig = entry.clone();
     for_sig.community_signature = [0u8; 64];
+    for_sig.library_identity_pub = None;
+    for_sig.library_signature = None;
     let signed_bytes = canonical_cbor_encode(&for_sig)?;
     let sig = Signature::from_bytes(&entry.community_signature);
     identity
@@ -355,7 +389,34 @@ pub fn verify_entry(entry: &LibraryDirectoryEntry) -> Result<(), EntryVerifyErro
         });
     }
 
-    Ok(())
+    // (6) Sub-D Phase 3 — wrapping signature check.
+    match (&entry.library_signature, &entry.library_identity_pub) {
+        (None, None) => Ok(AttestationStatus::Unwrapped),
+        (Some(_), None) | (None, Some(_)) => {
+            Err(EntryVerifyError::LibrarySignatureFieldsInconsistent)
+        }
+        (Some(lib_sig), Some(lib_pub)) => {
+            let lib_identity = harmony_identity::Identity::from_public_bytes(lib_pub)
+                .map_err(|e| EntryVerifyError::InvalidLibraryIdentityPub(format!("{e:?}")))?;
+            let lib_addr = OwnerAddr(lib_identity.address_hash);
+
+            // Reconstruct sign-time bytes: zero `library_signature`
+            // only (keep `library_identity_pub` + `community_signature`
+            // populated so the wrapping sig commits to the admin sig).
+            let mut for_sig = entry.clone();
+            for_sig.library_signature = None;
+            let signed_bytes = canonical_cbor_encode(&for_sig)?;
+            let sig = Signature::from_bytes(lib_sig);
+
+            match lib_identity
+                .verifying_key
+                .verify_strict(&signed_bytes, &sig)
+            {
+                Ok(()) => Ok(AttestationStatus::Attested(lib_addr)),
+                Err(_) => Ok(AttestationStatus::Unattested(lib_addr)),
+            }
+        }
+    }
 }
 
 /// Verify a `LibraryAnnounce` end-to-end:
@@ -872,7 +933,11 @@ impl LibraryDirectory {
                 actual: entry.listed_by,
             });
         }
-        verify_entry(&entry).map_err(ProcessSampleError::Verify)?;
+        let status = verify_entry(&entry).map_err(ProcessSampleError::Verify)?;
+        // Task 3 will pass `status` to `on_entry` + evolve the AttributionMismatch
+        // check. For Task 2 we keep the change surgical — verify_entry's signature
+        // shift is the whole delta. Aggregation behavior is unchanged.
+        let _ = status;
         let mut agg = self.aggregation.lock().await;
         Ok(agg.on_entry(entry))
     }
@@ -1161,6 +1226,60 @@ mod tests {
         entry
     }
 
+    /// ZEB-280 Phase 3: variant of `build_signed_entry` that lets the
+    /// caller bind a specific `community_id` and `admin_seed` while
+    /// auto-deriving an invite URL whose payload binds to the same
+    /// community_id and the admin_addr derived from the seed (so
+    /// `verify_entry`'s R2 F1 payload-consistency check passes). Returns
+    /// a Phase 1-style entry (`library_identity_pub = None`,
+    /// `library_signature = None`) ready to be wrapped via `wrap_entry`.
+    fn build_signed_open_entry_for(
+        community_id: SpaceId,
+        admin_seed: [u8; 32],
+    ) -> LibraryDirectoryEntry {
+        let invite_url = build_matching_open_invite_url(community_id, admin_seed);
+        build_signed_entry(
+            community_id,
+            admin_seed,
+            OwnerAddr([0xAA; 16]),
+            Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "test".to_string(),
+            },
+            invite_url,
+        )
+    }
+
+    /// ZEB-280 Phase 3: build a library signer + 64-byte identity bundle.
+    /// Uses a distinct X25519 prefix (`[0x22; 32]`) from
+    /// `build_test_identity_pub`'s admin prefix (`[0x11; 32]`) so admin
+    /// and library identities derived from the same Ed25519 seed produce
+    /// distinct `OwnerAddr`s.
+    fn build_test_library_identity(seed: [u8; 32]) -> (SigningKey, [u8; 64]) {
+        let signing = SigningKey::from_bytes(&seed);
+        let verifying = signing.verifying_key().to_bytes();
+        let mut bundle = [0u8; 64];
+        bundle[..32].copy_from_slice(&[0x22; 32]);
+        bundle[32..].copy_from_slice(&verifying);
+        (signing, bundle)
+    }
+
+    /// ZEB-280 Phase 3: take an admin-signed entry, sign it with
+    /// `library_signing_key` over canonical CBOR with `library_signature`
+    /// zeroed (mirror of the verifier's reconstruction).
+    fn wrap_entry(
+        mut entry: LibraryDirectoryEntry,
+        library_signing_key: &SigningKey,
+        library_identity_bundle: [u8; 64],
+    ) -> LibraryDirectoryEntry {
+        entry.library_identity_pub = Some(library_identity_bundle);
+        entry.library_signature = None;
+        let signed_bytes = canonical_cbor_encode(&entry).expect("encode for lib sign");
+        entry.library_signature = Some(library_signing_key.sign(&signed_bytes).to_bytes());
+        entry
+    }
+
     #[test]
     fn roundtrip_signed_entry_verifies() {
         let entry = build_signed_entry(
@@ -1174,7 +1293,10 @@ mod tests {
             },
             build_open_invite_url(),
         );
-        assert!(verify_entry(&entry).is_ok(), "signed entry must verify");
+        assert!(
+            matches!(verify_entry(&entry), Ok(AttestationStatus::Unwrapped)),
+            "signed entry must verify as Unwrapped"
+        );
     }
 
     #[test]
@@ -1856,6 +1978,168 @@ mod tests {
         assert_eq!(entry, decoded, "Phase 1-shaped entry round-trips");
         assert_eq!(decoded.library_identity_pub, None);
         assert_eq!(decoded.library_signature, None);
+    }
+
+    /// ZEB-280 Phase 3: Phase 1-style entry (Optional fields both None)
+    /// verifies as `AttestationStatus::Unwrapped`.
+    #[test]
+    fn verify_entry_phase1_unwrapped_returns_unwrapped() {
+        let community_id = SpaceId([0x11; 16]);
+        let admin_seed = [7u8; 32];
+        let entry = build_signed_open_entry_for(community_id, admin_seed);
+        // (build_signed_open_entry_for returns an entry with li=None, ls=None)
+
+        match verify_entry(&entry) {
+            Ok(AttestationStatus::Unwrapped) => {}
+            other => panic!("expected Unwrapped, got {other:?}"),
+        }
+    }
+
+    /// ZEB-280 Phase 3: a wrapped entry with a valid library signature
+    /// verifies as `AttestationStatus::Attested(library_addr)`.
+    #[test]
+    fn verify_entry_phase3_wrapped_valid_returns_attested() {
+        let community_id = SpaceId([0x22; 16]);
+        let admin_seed = [8u8; 32];
+        let admin_entry = build_signed_open_entry_for(community_id, admin_seed);
+
+        let (lib_signing, lib_bundle) = build_test_library_identity([9u8; 32]);
+        let wrapped = wrap_entry(admin_entry, &lib_signing, lib_bundle);
+
+        let expected_lib_addr = {
+            let id = harmony_identity::Identity::from_public_bytes(&lib_bundle)
+                .expect("library identity");
+            OwnerAddr(id.address_hash)
+        };
+
+        match verify_entry(&wrapped) {
+            Ok(AttestationStatus::Attested(addr)) => {
+                assert_eq!(addr, expected_lib_addr);
+            }
+            other => panic!("expected Attested, got {other:?}"),
+        }
+    }
+
+    /// ZEB-280 Phase 3: a wrapped entry with a TAMPERED library
+    /// signature returns `Ok(AttestationStatus::Unattested(library_addr))`.
+    /// The entry is NOT dropped — admin sig still valid.
+    #[test]
+    fn verify_entry_phase3_tampered_wrapping_sig_returns_unattested() {
+        let community_id = SpaceId([0x33; 16]);
+        let admin_seed = [10u8; 32];
+        let admin_entry = build_signed_open_entry_for(community_id, admin_seed);
+
+        let (lib_signing, lib_bundle) = build_test_library_identity([11u8; 32]);
+        let mut wrapped = wrap_entry(admin_entry, &lib_signing, lib_bundle);
+
+        // Tamper the library signature.
+        let mut bad_sig = wrapped.library_signature.expect("wrapping sig present");
+        bad_sig[0] ^= 0xFF;
+        wrapped.library_signature = Some(bad_sig);
+
+        let expected_lib_addr = {
+            let id = harmony_identity::Identity::from_public_bytes(&lib_bundle)
+                .expect("library identity");
+            OwnerAddr(id.address_hash)
+        };
+
+        match verify_entry(&wrapped) {
+            Ok(AttestationStatus::Unattested(addr)) => {
+                assert_eq!(
+                    addr, expected_lib_addr,
+                    "Unattested still carries the CLAIMED library addr"
+                );
+            }
+            other => panic!("expected Unattested, got {other:?}"),
+        }
+    }
+
+    /// ZEB-280 Phase 3: if the entry's payload is tampered (e.g., name
+    /// field changed), the ADMIN sig fails FIRST, and the entry is
+    /// dropped via `Err(SignatureInvalid)`. The wrapping sig is not
+    /// even reached — admin sig is the gatekeeper.
+    #[test]
+    fn verify_entry_phase3_tampered_payload_invalidates_both_sigs() {
+        let community_id = SpaceId([0x44; 16]);
+        let admin_seed = [12u8; 32];
+        let admin_entry = build_signed_open_entry_for(community_id, admin_seed);
+        let (lib_signing, lib_bundle) = build_test_library_identity([13u8; 32]);
+        let mut wrapped = wrap_entry(admin_entry, &lib_signing, lib_bundle);
+
+        // Tamper the payload (name) AFTER both sigs were applied.
+        wrapped.name = "TAMPERED".to_string();
+
+        match verify_entry(&wrapped) {
+            Err(EntryVerifyError::SignatureInvalid) => {}
+            other => panic!("expected admin SignatureInvalid, got {other:?}"),
+        }
+    }
+
+    /// ZEB-280 Phase 3: an entry with `library_signature = Some` but
+    /// `library_identity_pub = None` returns
+    /// `Err(LibrarySignatureFieldsInconsistent)`.
+    #[test]
+    fn verify_entry_inconsistent_library_fields_rejected_lib_sig_only() {
+        let community_id = SpaceId([0x55; 16]);
+        let admin_seed = [14u8; 32];
+        let mut entry = build_signed_open_entry_for(community_id, admin_seed);
+        entry.library_signature = Some([0xAA; 64]);
+        entry.library_identity_pub = None;
+
+        // Admin sig is over (cs=0, li=None, ls=None) — but the entry
+        // now has li=None, ls=Some. The admin sig verifier reconstructs
+        // by setting cs=0, li=None, ls=None — so admin sig still
+        // verifies (unchanged). Then we hit the inconsistency check.
+        match verify_entry(&entry) {
+            Err(EntryVerifyError::LibrarySignatureFieldsInconsistent) => {}
+            other => panic!("expected LibrarySignatureFieldsInconsistent, got {other:?}"),
+        }
+    }
+
+    /// ZEB-280 Phase 3: an entry with `library_identity_pub = Some` but
+    /// `library_signature = None` returns
+    /// `Err(LibrarySignatureFieldsInconsistent)`.
+    #[test]
+    fn verify_entry_inconsistent_library_fields_rejected_lib_pub_only() {
+        let community_id = SpaceId([0x66; 16]);
+        let admin_seed = [15u8; 32];
+        let mut entry = build_signed_open_entry_for(community_id, admin_seed);
+        entry.library_identity_pub = Some([0xBB; 64]);
+        entry.library_signature = None;
+
+        match verify_entry(&entry) {
+            Err(EntryVerifyError::LibrarySignatureFieldsInconsistent) => {}
+            other => panic!("expected LibrarySignatureFieldsInconsistent, got {other:?}"),
+        }
+    }
+
+    /// ZEB-280 Phase 3: an entry with a malformed `library_identity_pub`
+    /// (bytes that fail `Identity::from_public_bytes`) returns
+    /// `Err(InvalidLibraryIdentityPub)`.
+    #[test]
+    fn verify_entry_malformed_library_identity_pub_rejected() {
+        let community_id = SpaceId([0x77; 16]);
+        let admin_seed = [16u8; 32];
+        let admin_entry = build_signed_open_entry_for(community_id, admin_seed);
+        let (lib_signing, lib_bundle) = build_test_library_identity([17u8; 32]);
+
+        // Wrap with the GOOD bundle (so the wrapping sig is valid for
+        // this bundle), then SWAP IN a malformed bundle. The wrapping
+        // sig won't verify against the malformed pub, but we never
+        // get that far — the Identity::from_public_bytes check fires
+        // first.
+        let mut wrapped = wrap_entry(admin_entry, &lib_signing, lib_bundle);
+        // Ed25519 half `[0x7F; 32]` doesn't decompress under
+        // ed25519-dalek 2.x / curve25519-dalek 4.x — same fixture used by
+        // `malformed_identity_pub_rejected` for the admin-side check.
+        let mut malformed_bundle = [0u8; 64];
+        malformed_bundle[32..].copy_from_slice(&[0x7F; 32]);
+        wrapped.library_identity_pub = Some(malformed_bundle);
+
+        match verify_entry(&wrapped) {
+            Err(EntryVerifyError::InvalidLibraryIdentityPub(_)) => {}
+            other => panic!("expected InvalidLibraryIdentityPub, got {other:?}"),
+        }
     }
 }
 
