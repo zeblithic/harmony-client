@@ -245,9 +245,9 @@ async fn aggregation_dedupes_same_community_from_two_libraries() {
 
     let snap = dir.snapshot_all().await;
     assert_eq!(snap.len(), 1, "dedupe by community_id");
-    assert_eq!(snap[0].listed_by.len(), 2);
-    assert!(snap[0].listed_by.contains(&library_a));
-    assert!(snap[0].listed_by.contains(&library_b));
+    assert_eq!(snap[0].attested_by.len(), 2);
+    assert!(snap[0].attested_by.contains(&library_a));
+    assert!(snap[0].attested_by.contains(&library_b));
 
     let dto = DirectoryEntryDTO::from_aggregated(&snap[0]);
     assert_eq!(dto.listed_by_count, 2);

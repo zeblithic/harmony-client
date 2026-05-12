@@ -462,9 +462,27 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct AggregatedEntry {
     /// Latest (highest-HLC) entry observed for this community.
     pub entry: LibraryDirectoryEntry,
-    /// Set of libraries that have listed this community. Eviction
-    /// happens when this set empties (last library un-listed it).
-    pub listed_by: BTreeSet<OwnerAddr>,
+
+    /// Sub-D Phase 3 (ZEB-280): libraries whose broadcast of this
+    /// community we trust. Populated by:
+    /// - `AttestationStatus::Attested(lib_addr)` → insert(lib_addr)
+    /// - `AttestationStatus::Unwrapped` → insert(entry.listed_by)
+    ///   (Phase 1 backward compat — implicit trust from subscription
+    ///   topic)
+    ///
+    /// Replaces the Phase 1 `listed_by: BTreeSet<OwnerAddr>` field
+    /// semantics. Eviction triggers when this set empties.
+    pub attested_by: BTreeSet<OwnerAddr>,
+
+    /// Sub-D Phase 3 (ZEB-280): libraries we received this entry from
+    /// whose wrapping sig failed to verify. Drives the "unattested"
+    /// UI badge (entry shown but flagged):
+    ///   unattested = !unattested_by.is_empty()
+    ///
+    /// Tracks the broadcasting library's CLAIMED address (derived from
+    /// the signed `library_identity_pub` — we know who claimed to
+    /// broadcast even when their sig was bad).
+    pub unattested_by: BTreeSet<OwnerAddr>,
 }
 
 /// In-memory aggregation state. NOT persisted — rebuilt on startup
@@ -521,7 +539,7 @@ impl Aggregation {
     pub fn snapshot_filtered_by_library(&self, library: &OwnerAddr) -> Vec<AggregatedEntry> {
         self.by_community
             .values()
-            .filter(|e| e.listed_by.contains(library))
+            .filter(|e| e.attested_by.contains(library) || e.unattested_by.contains(library))
             .cloned()
             .collect()
     }
@@ -533,23 +551,46 @@ impl Aggregation {
     /// Process a verified entry. Caller MUST have run `verify_entry`
     /// first — this method does NOT re-verify the signature.
     ///
-    /// Returns a `ProcessResult` carrying both the outcome discriminant
-    /// (Inserted / Replaced / AccretedListedBy / Idempotent) and any
-    /// orthogonal cap-eviction. Callers must consult both fields: an
-    /// eviction can co-occur with `Replaced` or `AccretedListedBy`,
-    /// not just `Inserted`.
-    pub fn on_entry(&mut self, entry: LibraryDirectoryEntry) -> ProcessResult {
+    /// `status` is the AttestationStatus returned by `verify_entry`,
+    /// which determines whether the broadcasting library is the
+    /// admin-signed `entry.listed_by` (Unwrapped) or the wrapping-sig
+    /// derived `OwnerAddr` (Attested / Unattested). The
+    /// broadcasting library drives:
+    ///   - per-library cap accounting (Phase 1 used entry.listed_by;
+    ///     Phase 3 uses the broadcasting library, which can differ
+    ///     when library A republishes library B's entry verbatim)
+    ///   - eviction by `drop_library` (must sweep both attested_by
+    ///     and unattested_by)
+    pub fn on_entry(
+        &mut self,
+        entry: LibraryDirectoryEntry,
+        status: AttestationStatus,
+    ) -> ProcessResult {
         let community_id = entry.community_id;
-        let library = entry.listed_by;
+        // Sub-D Phase 3: the broadcasting library identity comes from
+        // AttestationStatus. For Phase 1-shaped entries (Unwrapped),
+        // it falls back to the admin-signed `listed_by` (which Phase 1
+        // attribution-checking already constrained to equal the topic
+        // owner).
+        let library = match status {
+            AttestationStatus::Attested(addr) | AttestationStatus::Unattested(addr) => addr,
+            AttestationStatus::Unwrapped => entry.listed_by,
+        };
 
-        // Cap check BEFORE insert. If this library is already at cap and
-        // we're about to add a NEW contribution (not an update), evict
-        // the oldest entry from this library first.
+        // Cap check BEFORE insert. If this library is already at cap
+        // and we're about to add a NEW contribution (not an update),
+        // evict the oldest entry from this library first.
+        //
+        // Phase 3: "is_new_contribution" checks BOTH attested_by AND
+        // unattested_by sets — a library that previously broadcast
+        // this community with a bad wrapping sig (unattested_by) is
+        // still considered a contributor for cap purposes (counts
+        // toward MAX_ENTRIES_PER_LIBRARY).
         let library_at_cap = self.entry_count_for_library(&library) >= MAX_ENTRIES_PER_LIBRARY;
         let is_new_contribution_for_library = !self
             .by_community
             .get(&community_id)
-            .map(|agg| agg.listed_by.contains(&library))
+            .map(|agg| agg.attested_by.contains(&library) || agg.unattested_by.contains(&library))
             .unwrap_or(false);
 
         let mut evicted: Option<SpaceId> = None;
@@ -558,16 +599,6 @@ impl Aggregation {
                 self.evict_library_contribution(&library, oldest_id);
                 evicted = Some(oldest_id);
             } else {
-                // R2 F3 (Medium, defense-in-depth): `per_library_count`
-                // says this library is at cap, but no community in
-                // `by_community` actually has the library in its
-                // `listed_by` set. Counter/map drift — should be
-                // impossible after R2 F2's fix to the cross-library
-                // eviction paths, but defense-in-depth: surface loudly
-                // in dev/test (debug_assert!), observably in release
-                // (tracing::warn!), and fall through to allow the
-                // insert (rather than silently bumping the count above
-                // MAX_ENTRIES_PER_LIBRARY).
                 tracing::warn!(
                     target: "library_directory",
                     library = ?library,
@@ -587,10 +618,31 @@ impl Aggregation {
         let outcome = match self.by_community.get_mut(&community_id) {
             None => {
                 // Brand-new community in the aggregation.
-                let mut listed_by = BTreeSet::new();
-                listed_by.insert(library);
-                self.by_community
-                    .insert(community_id, AggregatedEntry { entry, listed_by });
+                let (attested_by, unattested_by) = match status {
+                    AttestationStatus::Attested(lib_addr) => {
+                        let mut set = BTreeSet::new();
+                        set.insert(lib_addr);
+                        (set, BTreeSet::new())
+                    }
+                    AttestationStatus::Unwrapped => {
+                        let mut set = BTreeSet::new();
+                        set.insert(entry.listed_by);
+                        (set, BTreeSet::new())
+                    }
+                    AttestationStatus::Unattested(lib_addr) => {
+                        let mut set = BTreeSet::new();
+                        set.insert(lib_addr);
+                        (BTreeSet::new(), set)
+                    }
+                };
+                self.by_community.insert(
+                    community_id,
+                    AggregatedEntry {
+                        entry,
+                        attested_by,
+                        unattested_by,
+                    },
+                );
                 *self.per_library_count.entry(library).or_insert(0) += 1;
                 OnEntryOutcome::Inserted(community_id)
             }
@@ -598,14 +650,21 @@ impl Aggregation {
                 let incoming_newer = entry
                     .listed_at
                     .is_strictly_newer_than(&existing.entry.listed_at);
-                let listed_by_was_new = existing.listed_by.insert(library);
-                if listed_by_was_new {
+                // Phase 3: insert into the correct set per AttestationStatus.
+                let was_new_contribution = match status {
+                    AttestationStatus::Attested(lib_addr) => existing.attested_by.insert(lib_addr),
+                    AttestationStatus::Unwrapped => existing.attested_by.insert(entry.listed_by),
+                    AttestationStatus::Unattested(lib_addr) => {
+                        existing.unattested_by.insert(lib_addr)
+                    }
+                };
+                if was_new_contribution {
                     *self.per_library_count.entry(library).or_insert(0) += 1;
                 }
                 if incoming_newer {
                     existing.entry = entry;
                     OnEntryOutcome::Replaced(community_id)
-                } else if listed_by_was_new {
+                } else if was_new_contribution {
                     OnEntryOutcome::AccretedListedBy(community_id)
                 } else {
                     OnEntryOutcome::Idempotent
@@ -637,34 +696,26 @@ impl Aggregation {
     /// - Shared listing where stored entry came from another library
     ///   → reduce `listed_by` set only (unchanged).
     pub fn drop_library(&mut self, library: &OwnerAddr) -> Vec<SpaceId> {
-        // Two-pass to satisfy the borrow checker: we can't mutate
-        // `per_library_count` inside a `retain` closure that already
-        // holds `&mut self`. First pass collects which entries to evict
-        // and (for the F3 source-matches path) which OTHER libraries
-        // were in the evicted entry's `listed_by` set; second pass
-        // applies the mutations.
-        //
-        // R2 F2 (Medium, correctness): the original `retain` swept the
-        // `listed_by` set on remaining communities without rolling back
-        // those OTHER libraries' `per_library_count` when the F3 source-
-        // matches rule (R1) evicted a shared community. Over many
-        // remove/re-add cycles per_library_count drifted upward,
-        // triggering premature `MAX_ENTRIES_PER_LIBRARY` cap enforcement.
-        let mut to_evict: Vec<(SpaceId, BTreeSet<OwnerAddr>)> = Vec::new();
+        // Two-pass to satisfy the borrow checker (R2 F2 patterns
+        // unchanged from Phase 1 — just generalized to both sets).
+        let mut to_evict: Vec<(SpaceId, BTreeSet<OwnerAddr>, BTreeSet<OwnerAddr>)> = Vec::new();
         for (community_id, agg) in self.by_community.iter_mut() {
             let source_was_this_library = &agg.entry.listed_by == library;
-            let _ = agg.listed_by.remove(library);
-            if source_was_this_library || agg.listed_by.is_empty() {
-                // Capture the surviving listed_by set so we can
-                // decrement those libraries' counts after the
-                // iter_mut borrow ends.
-                to_evict.push((*community_id, agg.listed_by.clone()));
+            let _ = agg.attested_by.remove(library);
+            let _ = agg.unattested_by.remove(library);
+            let both_sets_empty = agg.attested_by.is_empty() && agg.unattested_by.is_empty();
+            if source_was_this_library || both_sets_empty {
+                to_evict.push((
+                    *community_id,
+                    agg.attested_by.clone(),
+                    agg.unattested_by.clone(),
+                ));
             }
         }
         let mut evicted_ids = Vec::with_capacity(to_evict.len());
-        for (id, remaining_listed_by) in to_evict {
+        for (id, remaining_attested, remaining_unattested) in to_evict {
             self.by_community.remove(&id);
-            for other in remaining_listed_by {
+            for other in remaining_attested.into_iter().chain(remaining_unattested) {
                 if &other != library {
                     if let Some(c) = self.per_library_count.get_mut(&other) {
                         if *c > 0 {
@@ -682,7 +733,9 @@ impl Aggregation {
     fn find_oldest_for_library(&self, library: &OwnerAddr) -> Option<SpaceId> {
         self.by_community
             .iter()
-            .filter(|(_, agg)| agg.listed_by.contains(library))
+            .filter(|(_, agg)| {
+                agg.attested_by.contains(library) || agg.unattested_by.contains(library)
+            })
             .min_by(|a, b| {
                 // Lexicographic ordering on the HLC tuple. Note we want
                 // the OLDEST, so we min on (wall_ms, logical, device_id).
@@ -712,25 +765,44 @@ impl Aggregation {
     /// alongside the eviction to keep the counters consistent.
     fn evict_library_contribution(&mut self, library: &OwnerAddr, community_id: SpaceId) {
         // Capture state in a scoped borrow, then apply mutations after.
-        let mut surviving_listed_by: Option<BTreeSet<OwnerAddr>> = None;
+        let mut surviving_attested: Option<BTreeSet<OwnerAddr>> = None;
+        let mut surviving_unattested: Option<BTreeSet<OwnerAddr>> = None;
         if let Some(agg) = self.by_community.get_mut(&community_id) {
-            if agg.listed_by.remove(library) {
+            let removed_from_attested = agg.attested_by.remove(library);
+            let removed_from_unattested = agg.unattested_by.remove(library);
+            if removed_from_attested || removed_from_unattested {
                 if let Some(c) = self.per_library_count.get_mut(library) {
                     if *c > 0 {
                         *c -= 1;
                     }
                 }
+                // Phase 3 generalization of the Phase 1 "source matches"
+                // rule: if the stored entry was sourced from this
+                // library AND the broadcasting library identity for
+                // that stored entry's last-write was this library,
+                // evict the community entirely. We can't perfectly know
+                // who broadcast the LATEST entry update without tracking
+                // a separate `last_broadcast_by` field — but the entry's
+                // signed `listed_by` is the closest proxy from the wire
+                // (admin attested who's hosting). For the same Phase 1
+                // R1 F3 rationale, we evict if either set is empty OR
+                // if the stored entry's listed_by equals this library.
                 let source_was_this_library = &agg.entry.listed_by == library;
-                if source_was_this_library || agg.listed_by.is_empty() {
-                    // Capture for post-removal count decrement of OTHER
-                    // libraries; clone is bounded by listed_by.len().
-                    surviving_listed_by = Some(agg.listed_by.clone());
+                let both_sets_empty = agg.attested_by.is_empty() && agg.unattested_by.is_empty();
+                if source_was_this_library || both_sets_empty {
+                    surviving_attested = Some(agg.attested_by.clone());
+                    surviving_unattested = Some(agg.unattested_by.clone());
                 }
             }
         }
-        if let Some(remaining) = surviving_listed_by {
+        if let (Some(remaining_attested), Some(remaining_unattested)) =
+            (surviving_attested, surviving_unattested)
+        {
             self.by_community.remove(&community_id);
-            for other in remaining {
+            // R2 F2: roll back per_library_count for OTHER libraries
+            // whose contributions are also being dropped by this
+            // eviction (both attested and unattested branches).
+            for other in remaining_attested.into_iter().chain(remaining_unattested) {
                 if &other != library {
                     if let Some(c) = self.per_library_count.get_mut(&other) {
                         if *c > 0 {
@@ -927,19 +999,28 @@ impl LibraryDirectory {
     ) -> Result<ProcessResult, ProcessSampleError> {
         let entry: LibraryDirectoryEntry =
             ciborium::de::from_reader(&bytes[..]).map_err(ProcessSampleError::Decode)?;
-        if entry.listed_by != library_addr {
+        // Phase 1 attribution check: signed `listed_by` is the topic
+        // owner's address. Phase 3 generalizes this — for wrapped
+        // entries, the broadcasting library identity (from the
+        // wrapping sig's library_identity_pub) is what must match the
+        // topic owner. Library A republishing library B's entry has
+        // listed_by=B but library_identity_pub=A. We require
+        // library_identity_pub's derived addr == library_addr (the
+        // topic owner). Unwrapped entries fall through to the Phase 1
+        // listed_by == library_addr semantics.
+        let status = verify_entry(&entry).map_err(ProcessSampleError::Verify)?;
+        let broadcasting_lib = match status {
+            AttestationStatus::Attested(addr) | AttestationStatus::Unattested(addr) => addr,
+            AttestationStatus::Unwrapped => entry.listed_by,
+        };
+        if broadcasting_lib != library_addr {
             return Err(ProcessSampleError::AttributionMismatch {
                 expected: library_addr,
-                actual: entry.listed_by,
+                actual: broadcasting_lib,
             });
         }
-        let status = verify_entry(&entry).map_err(ProcessSampleError::Verify)?;
-        // Task 3 will pass `status` to `on_entry` + evolve the AttributionMismatch
-        // check. For Task 2 we keep the change surgical — verify_entry's signature
-        // shift is the whole delta. Aggregation behavior is unchanged.
-        let _ = status;
         let mut agg = self.aggregation.lock().await;
-        Ok(agg.on_entry(entry))
+        Ok(agg.on_entry(entry, status))
     }
 
     /// Sub-D Phase 2: ingest one announce-topic sample. Decodes, verifies,
@@ -1036,7 +1117,14 @@ pub struct DirectoryEntryDTO {
     pub description: String,
     pub topics: Vec<String>,
     pub invite_url: String,
+    /// Sub-D Phase 3 (ZEB-280): count of libraries with valid attestation
+    /// for this entry (i.e., `attested_by.len()`). Includes Phase 1
+    /// unwrapped contributions (which fall back to entry.listed_by).
     pub listed_by_count: usize,
+    /// Sub-D Phase 3 (ZEB-280): true if at least one broadcasting
+    /// library's wrapping sig failed to verify (`!unattested_by.is_empty()`).
+    /// Drives the inline "unattested" badge in the frontend browser.
+    pub unattested: bool,
     pub listed_at: Hlc,
 }
 
@@ -1053,7 +1141,8 @@ impl DirectoryEntryDTO {
             description: agg.entry.description.clone(),
             topics: agg.entry.topics.clone(),
             invite_url: agg.entry.invite_url.clone(),
-            listed_by_count: agg.listed_by.len(),
+            listed_by_count: agg.attested_by.len(),
+            unattested: !agg.unattested_by.is_empty(),
             listed_at: agg.entry.listed_at.clone(),
         }
     }
@@ -1237,11 +1326,24 @@ mod tests {
         community_id: SpaceId,
         admin_seed: [u8; 32],
     ) -> LibraryDirectoryEntry {
+        build_signed_open_entry_for_library(community_id, admin_seed, OwnerAddr([0xAA; 16]))
+    }
+
+    /// ZEB-280 Phase 3: variant of `build_signed_open_entry_for` that
+    /// also binds an explicit `listed_by` OwnerAddr — used by aggregation
+    /// tests that need a Phase 1-shaped entry whose admin-signed
+    /// `listed_by` field is independent of the broadcasting library
+    /// passed via `AttestationStatus`.
+    fn build_signed_open_entry_for_library(
+        community_id: SpaceId,
+        admin_seed: [u8; 32],
+        listed_by: OwnerAddr,
+    ) -> LibraryDirectoryEntry {
         let invite_url = build_matching_open_invite_url(community_id, admin_seed);
         build_signed_entry(
             community_id,
             admin_seed,
-            OwnerAddr([0xAA; 16]),
+            listed_by,
             Hlc {
                 wall_ms: 1_700_000_000_000,
                 logical: 0,
@@ -1529,11 +1631,12 @@ mod tests {
             .to_bytes();
 
         assert_eq!(
-            agg.on_entry(e1).outcome,
+            agg.on_entry(e1, AttestationStatus::Unwrapped).outcome,
             OnEntryOutcome::Inserted(community)
         );
         assert_eq!(
-            agg.on_entry(e2.clone()).outcome,
+            agg.on_entry(e2.clone(), AttestationStatus::Unwrapped)
+                .outcome,
             OnEntryOutcome::Replaced(community)
         );
         let snap = agg.snapshot_all();
@@ -1560,19 +1663,19 @@ mod tests {
             build_signed_entry(community, [7; 32], library_b, h.clone(), invite_url.clone());
 
         assert_eq!(
-            agg.on_entry(e_from_a).outcome,
+            agg.on_entry(e_from_a, AttestationStatus::Unwrapped).outcome,
             OnEntryOutcome::Inserted(community)
         );
         assert_eq!(
-            agg.on_entry(e_from_b).outcome,
+            agg.on_entry(e_from_b, AttestationStatus::Unwrapped).outcome,
             OnEntryOutcome::AccretedListedBy(community)
         );
 
         let snap = agg.snapshot_all();
         assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].listed_by.len(), 2);
-        assert!(snap[0].listed_by.contains(&library_a));
-        assert!(snap[0].listed_by.contains(&library_b));
+        assert_eq!(snap[0].attested_by.len(), 2);
+        assert!(snap[0].attested_by.contains(&library_a));
+        assert!(snap[0].attested_by.contains(&library_b));
     }
 
     /// `drop_library` evicts solo listings AND retains shared listings
@@ -1602,37 +1705,40 @@ mod tests {
         };
         let invite_url = build_open_invite_url();
 
-        agg.on_entry(build_signed_entry(
-            solo,
-            [7; 32],
-            library_a,
-            h_old.clone(),
-            invite_url.clone(),
-        ));
-        agg.on_entry(build_signed_entry(
-            shared,
-            [7; 32],
-            library_a,
-            h_old.clone(),
-            invite_url.clone(),
-        ));
+        agg.on_entry(
+            build_signed_entry(solo, [7; 32], library_a, h_old.clone(), invite_url.clone()),
+            AttestationStatus::Unwrapped,
+        );
+        agg.on_entry(
+            build_signed_entry(
+                shared,
+                [7; 32],
+                library_a,
+                h_old.clone(),
+                invite_url.clone(),
+            ),
+            AttestationStatus::Unwrapped,
+        );
         // library_b publishes at a NEWER HLC so its entry becomes the
         // stored source — required for the F3-rule shared-retention
         // path to apply.
-        agg.on_entry(build_signed_entry(
-            shared,
-            [7; 32],
-            library_b,
-            h_new.clone(),
-            invite_url.clone(),
-        ));
+        agg.on_entry(
+            build_signed_entry(
+                shared,
+                [7; 32],
+                library_b,
+                h_new.clone(),
+                invite_url.clone(),
+            ),
+            AttestationStatus::Unwrapped,
+        );
 
         let evicted = agg.drop_library(&library_a);
         assert_eq!(evicted, vec![solo]);
         let snap = agg.snapshot_all();
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].entry.community_id, shared);
-        assert_eq!(snap[0].listed_by, [library_b].into_iter().collect());
+        assert_eq!(snap[0].attested_by, [library_b].into_iter().collect());
     }
 
     /// F3 regression: `drop_library` must evict the community when the
@@ -1674,7 +1780,7 @@ mod tests {
         entry_a.community_signature = sk
             .sign(&canonical_cbor_encode(&for_sig).unwrap())
             .to_bytes();
-        agg.on_entry(entry_a);
+        agg.on_entry(entry_a, AttestationStatus::Unwrapped);
 
         // Library B publishes for the SAME community at HLC 200 with
         // name="from-B" — newer-HLC wins, stored entry becomes B's.
@@ -1695,14 +1801,14 @@ mod tests {
         entry_b.community_signature = sk
             .sign(&canonical_cbor_encode(&for_sig_b).unwrap())
             .to_bytes();
-        agg.on_entry(entry_b);
+        agg.on_entry(entry_b, AttestationStatus::Unwrapped);
 
         // Sanity: pre-drop state has community C listed by both, stored
         // entry sourced from B.
         let snap = agg.snapshot_all();
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].entry.name, "from-B");
-        assert_eq!(snap[0].listed_by.len(), 2);
+        assert_eq!(snap[0].attested_by.len(), 2);
 
         // Drop library B → community must be FULLY evicted, not just
         // reduced to listed_by={A}, because stored entry came from B.
@@ -1741,31 +1847,37 @@ mod tests {
 
         // Library A publishes community at HLC 100 — becomes the stored
         // source.
-        agg.on_entry(build_signed_entry(
-            community,
-            [7; 32],
-            library_a,
-            Hlc {
-                wall_ms: 100,
-                logical: 0,
-                device_id: "d".into(),
-            },
-            invite_url.clone(),
-        ));
+        agg.on_entry(
+            build_signed_entry(
+                community,
+                [7; 32],
+                library_a,
+                Hlc {
+                    wall_ms: 100,
+                    logical: 0,
+                    device_id: "d".into(),
+                },
+                invite_url.clone(),
+            ),
+            AttestationStatus::Unwrapped,
+        );
         // Library B publishes SAME community at HLC 50 (older) — does
         // NOT replace stored entry but DOES accrete to listed_by and
         // increments B's per_library_count.
-        agg.on_entry(build_signed_entry(
-            community,
-            [7; 32],
-            library_b,
-            Hlc {
-                wall_ms: 50,
-                logical: 0,
-                device_id: "d".into(),
-            },
-            invite_url.clone(),
-        ));
+        agg.on_entry(
+            build_signed_entry(
+                community,
+                [7; 32],
+                library_b,
+                Hlc {
+                    wall_ms: 50,
+                    logical: 0,
+                    device_id: "d".into(),
+                },
+                invite_url.clone(),
+            ),
+            AttestationStatus::Unwrapped,
+        );
 
         assert_eq!(
             agg.entry_count_for_library(&library_a),
@@ -1816,7 +1928,7 @@ mod tests {
                 },
                 invite_url.clone(),
             );
-            let result = agg.on_entry(entry);
+            let result = agg.on_entry(entry, AttestationStatus::Unwrapped);
             if i < MAX_ENTRIES_PER_LIBRARY as u32 {
                 assert!(matches!(result.outcome, OnEntryOutcome::Inserted(_)));
                 assert!(result.evicted.is_none(), "no eviction under cap");
@@ -1860,20 +1972,14 @@ mod tests {
         };
         let invite_url = build_open_invite_url();
 
-        agg.on_entry(build_signed_entry(
-            community,
-            [7; 32],
-            library,
-            h_new,
-            invite_url.clone(),
-        ));
-        let result = agg.on_entry(build_signed_entry(
-            community,
-            [7; 32],
-            library,
-            h_old,
-            invite_url.clone(),
-        ));
+        agg.on_entry(
+            build_signed_entry(community, [7; 32], library, h_new, invite_url.clone()),
+            AttestationStatus::Unwrapped,
+        );
+        let result = agg.on_entry(
+            build_signed_entry(community, [7; 32], library, h_old, invite_url.clone()),
+            AttestationStatus::Unwrapped,
+        );
         assert_eq!(result.outcome, OnEntryOutcome::Idempotent);
         assert!(result.evicted.is_none());
     }
@@ -2140,6 +2246,140 @@ mod tests {
             Err(EntryVerifyError::InvalidLibraryIdentityPub(_)) => {}
             other => panic!("expected InvalidLibraryIdentityPub, got {other:?}"),
         }
+    }
+
+    /// ZEB-280 Phase 3: an `AttestationStatus::Unwrapped` entry
+    /// falls back to `entry.listed_by` when inserting into the
+    /// `attested_by` set.
+    #[test]
+    fn aggregation_on_entry_unwrapped_inserts_into_attested_by_via_listed_by_fallback() {
+        let mut agg = Aggregation::new();
+        let community_id = SpaceId([0x11; 16]);
+        let library = OwnerAddr([0xAA; 16]);
+        let entry = build_signed_open_entry_for_library(community_id, [7u8; 32], library);
+        let _ = agg.on_entry(entry, AttestationStatus::Unwrapped);
+
+        let snap = agg.snapshot_all();
+        assert_eq!(snap.len(), 1);
+        assert!(
+            snap[0].attested_by.contains(&library),
+            "Unwrapped path should insert listed_by into attested_by"
+        );
+        assert!(
+            snap[0].unattested_by.is_empty(),
+            "no unattested contributions"
+        );
+    }
+
+    /// ZEB-280 Phase 3: an `AttestationStatus::Attested(lib_addr)`
+    /// entry inserts `lib_addr` (NOT `entry.listed_by`) into
+    /// `attested_by`.
+    #[test]
+    fn aggregation_on_entry_attested_inserts_into_attested_by_via_lib_addr() {
+        let mut agg = Aggregation::new();
+        let community_id = SpaceId([0x22; 16]);
+        let listed_by = OwnerAddr([0xAA; 16]);
+        let lib_addr = OwnerAddr([0xBB; 16]);
+        // Federation case: admin signed listed_by=A but broadcaster is B.
+        let entry = build_signed_open_entry_for_library(community_id, [8u8; 32], listed_by);
+        let _ = agg.on_entry(entry, AttestationStatus::Attested(lib_addr));
+
+        let snap = agg.snapshot_all();
+        assert_eq!(snap.len(), 1);
+        assert!(
+            snap[0].attested_by.contains(&lib_addr),
+            "Attested(lib_addr) inserts the broadcasting lib, NOT listed_by"
+        );
+        assert!(
+            !snap[0].attested_by.contains(&listed_by),
+            "listed_by is NOT inserted when status is Attested"
+        );
+    }
+
+    /// ZEB-280 Phase 3: an `AttestationStatus::Unattested(lib_addr)`
+    /// entry inserts `lib_addr` into `unattested_by`. The entry is
+    /// NOT dropped from the aggregation — admin sig is still valid.
+    #[test]
+    fn aggregation_on_entry_unattested_inserts_into_unattested_by() {
+        let mut agg = Aggregation::new();
+        let community_id = SpaceId([0x33; 16]);
+        let listed_by = OwnerAddr([0xAA; 16]);
+        let lib_addr = OwnerAddr([0xCC; 16]);
+        let entry = build_signed_open_entry_for_library(community_id, [9u8; 32], listed_by);
+        let _ = agg.on_entry(entry, AttestationStatus::Unattested(lib_addr));
+
+        let snap = agg.snapshot_all();
+        assert_eq!(
+            snap.len(),
+            1,
+            "Unattested entries are NOT dropped from aggregation"
+        );
+        assert!(
+            snap[0].unattested_by.contains(&lib_addr),
+            "Unattested(lib_addr) inserts the lib into unattested_by"
+        );
+        assert!(snap[0].attested_by.is_empty(), "no attested contributions");
+
+        // DTO surfaces unattested = true.
+        let dto = DirectoryEntryDTO::from_aggregated(&snap[0]);
+        assert!(
+            dto.unattested,
+            "DTO unattested = true when unattested_by non-empty"
+        );
+    }
+
+    /// ZEB-280 Phase 3: drop_library sweeps BOTH attested_by and
+    /// unattested_by sets — the per_library_count decrements for the
+    /// dropped library, and OTHER libraries' counts roll back when
+    /// the source-matches eviction rule fires.
+    #[test]
+    fn aggregation_drop_library_sweeps_both_attestation_sets() {
+        let mut agg = Aggregation::new();
+        let community_id = SpaceId([0x44; 16]);
+        let library_a = OwnerAddr([0xAA; 16]);
+        let library_b = OwnerAddr([0xBB; 16]);
+
+        // Library A attests via Unwrapped (listed_by=A); Library B
+        // also broadcasts the same community but with a TAMPERED
+        // wrapping sig, so they land in unattested_by.
+        let entry_a = build_signed_open_entry_for_library(community_id, [10u8; 32], library_a);
+        let _ = agg.on_entry(entry_a, AttestationStatus::Unwrapped);
+
+        let entry_b = build_signed_open_entry_for_library(community_id, [10u8; 32], library_a);
+        let _ = agg.on_entry(entry_b, AttestationStatus::Unattested(library_b));
+
+        let snap_before = agg.snapshot_all();
+        assert_eq!(snap_before.len(), 1);
+        assert!(snap_before[0].attested_by.contains(&library_a));
+        assert!(snap_before[0].unattested_by.contains(&library_b));
+
+        // Drop library_b — should sweep it from unattested_by, NOT
+        // evict the community (library_a still attests).
+        let evicted = agg.drop_library(&library_b);
+        assert!(
+            evicted.is_empty(),
+            "library_b drop should not evict community (library_a still attests)"
+        );
+        let snap_after_b = agg.snapshot_all();
+        assert_eq!(snap_after_b.len(), 1);
+        assert!(snap_after_b[0].attested_by.contains(&library_a));
+        assert!(
+            !snap_after_b[0].unattested_by.contains(&library_b),
+            "library_b swept from unattested_by"
+        );
+
+        // Drop library_a — should evict (last remaining contributor).
+        let evicted = agg.drop_library(&library_a);
+        assert_eq!(
+            evicted,
+            vec![community_id],
+            "library_a drop should evict the community"
+        );
+        let snap_after_a = agg.snapshot_all();
+        assert!(
+            snap_after_a.is_empty(),
+            "community evicted after both drops"
+        );
     }
 }
 
