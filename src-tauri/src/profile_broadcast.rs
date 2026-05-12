@@ -111,7 +111,7 @@ pub enum BroadcastVerifyError {
 /// `signer.verifying_key().as_bytes()` MUST be the Ed25519 half (bytes
 /// 32-63) of `owner_identity_pub`, otherwise the caller has a key/identity
 /// mismatch (sig will verify but identity parse may not).
-pub(crate) fn sign_broadcast(
+pub fn sign_broadcast(
     signer: &ed25519_dalek::SigningKey,
     owner_identity_pub: [u8; 64],
     community_ids: Vec<SpaceId>,

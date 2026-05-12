@@ -218,6 +218,24 @@ pub enum FollowRequest {
     Unfollow { address: String },
 }
 
+/// Sub-D Phase 4 (ZEB-281): control messages for the profile-broadcast
+/// subscriber pool. Each Subscribe declares a Zenoh subscriber for
+/// `harmony/discovery/profile/{peer_addr_hex}/memberships`; Unsubscribe
+/// aborts the task and drops the Zenoh subscriber.
+///
+/// The pool is keyed by `SubscriptionId` (allocated by NodeState via an
+/// AtomicU64) — NOT by `OwnerAddr` — because multiple concurrent
+/// ProfilePopovers may be open for the same peer.
+pub enum ProfileBroadcastRequest {
+    Subscribe {
+        subscription_id: crate::profile_broadcast::SubscriptionId,
+        peer_addr: crate::owner_state_types::OwnerAddr,
+    },
+    Unsubscribe {
+        subscription_id: crate::profile_broadcast::SubscriptionId,
+    },
+}
+
 /// Events bridged from spawned Zenoh tasks back to the main select loop.
 enum ZenohEvent {
     Query {
@@ -351,6 +369,18 @@ pub async fn run<R: Runtime>(
     library_request_rx: Option<
         mpsc::UnboundedReceiver<crate::library_directory::LibraryDirectoryRequest>,
     >,
+    // ZEB-281 Sub-D Phase 4: profile-broadcast peer cache. `None` is
+    // allowed but currently always `Some` when the event loop is started
+    // by production `start_node`. Shared with the per-subscription
+    // Zenoh subscriber tasks spawned by the consumer below.
+    profile_broadcast_cache: Option<Arc<crate::profile_broadcast::ProfileBroadcastCache>>,
+    // ZEB-281 Sub-D Phase 4: receiver paired with NodeState's
+    // `profile_broadcast_request_tx`. IPC handlers send Subscribe /
+    // Unsubscribe; the consumer below maintains a per-subscription
+    // Zenoh subscriber pool with retry/backoff (matching the Phase 2
+    // announce subscriber). `None` when `profile_broadcast_cache` is
+    // `None`.
+    profile_broadcast_request_rx: Option<mpsc::Receiver<ProfileBroadcastRequest>>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -820,6 +850,178 @@ pub async fn run<R: Runtime>(
                 }
             });
         }
+    }
+
+    // ── ZEB-281 Sub-D Phase 4: profile-broadcast subscriber pool ─────
+    // One Zenoh subscriber per (active) subscription_id, keyed off
+    // ProfileBroadcastRequest::{Subscribe, Unsubscribe} from NodeState.
+    // Same retry/backoff shape as the Phase 2 announce subscriber above
+    // (5s initial backoff, max 60s). MAX_BROADCAST_WIRE_BYTES gates the
+    // payload before we materialize an owned Vec<u8>; on decode +
+    // verify success the per-subscription cache is updated and the
+    // FLAT `profile-broadcast-received` event is emitted to the
+    // frontend.
+    if let (Some(profile_broadcast_cache), Some(profile_broadcast_request_rx)) =
+        (profile_broadcast_cache, profile_broadcast_request_rx)
+    {
+        let session_for_profile = Arc::clone(&session_arc);
+        let app_for_profile = app.clone();
+        let closing_for_profile = Arc::clone(&closing);
+        let cache_for_loop = Arc::clone(&profile_broadcast_cache);
+        let mut request_rx = profile_broadcast_request_rx;
+        tokio::spawn(async move {
+            use std::collections::HashMap;
+            let mut handles: HashMap<
+                crate::profile_broadcast::SubscriptionId,
+                tokio::task::JoinHandle<()>,
+            > = HashMap::new();
+            while let Some(req) = request_rx.recv().await {
+                match req {
+                    ProfileBroadcastRequest::Subscribe {
+                        subscription_id,
+                        peer_addr,
+                    } => {
+                        // Self-heal: prune any subscriber tasks that
+                        // have already exited (same pattern as the
+                        // library subscriber pool F4 fix).
+                        handles.retain(|_, h| !h.is_finished());
+                        if handles.contains_key(&subscription_id) {
+                            tracing::warn!(
+                                subscription_id,
+                                "ProfileBroadcastRequest::Subscribe duplicate id — ignoring"
+                            );
+                            continue;
+                        }
+                        let key_expr = crate::profile_broadcast::broadcast_topic_for(&peer_addr);
+                        let session = Arc::clone(&session_for_profile);
+                        let app_for_task = app_for_profile.clone();
+                        let closing_task = Arc::clone(&closing_for_profile);
+                        let cache_for_task = Arc::clone(&cache_for_loop);
+                        let handle = tokio::spawn(async move {
+                            let mut backoff = std::time::Duration::from_secs(5);
+                            const MAX_BACKOFF: std::time::Duration =
+                                std::time::Duration::from_secs(60);
+                            loop {
+                                if closing_task.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                let sub = match session.declare_subscriber(&key_expr).await {
+                                    Ok(s) => {
+                                        backoff = std::time::Duration::from_secs(5);
+                                        s
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            subscription_id,
+                                            backoff_s = backoff.as_secs(),
+                                            "profile broadcast declare_subscriber failed; \
+                                             retrying after backoff"
+                                        );
+                                        tokio::time::sleep(backoff).await;
+                                        backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+                                        continue;
+                                    }
+                                };
+                                loop {
+                                    match sub.recv_async().await {
+                                        Ok(sample) => {
+                                            let bytes_view = sample.payload().to_bytes();
+                                            // Drop oversized payloads BEFORE
+                                            // materializing into an owned
+                                            // Vec<u8>.
+                                            if bytes_view.len()
+                                                > crate::profile_broadcast::MAX_BROADCAST_WIRE_BYTES
+                                            {
+                                                tracing::warn!(
+                                                    size = bytes_view.len(),
+                                                    max = crate::profile_broadcast::MAX_BROADCAST_WIRE_BYTES,
+                                                    subscription_id,
+                                                    "oversized profile broadcast dropped"
+                                                );
+                                                continue;
+                                            }
+                                            let bytes = bytes_view.to_vec();
+                                            let broadcast: crate::profile_broadcast::ProfileMembershipBroadcast =
+                                                match ciborium::from_reader(&bytes[..]) {
+                                                    Ok(b) => b,
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            error = ?e,
+                                                            subscription_id,
+                                                            "profile broadcast CBOR decode failed"
+                                                        );
+                                                        continue;
+                                                    }
+                                                };
+                                            match cache_for_task
+                                                .on_sample(subscription_id, broadcast)
+                                                .await
+                                            {
+                                                Ok(outcome) => {
+                                                    tracing::debug!(
+                                                        ?outcome,
+                                                        subscription_id,
+                                                        "profile broadcast cached"
+                                                    );
+                                                    if let Some(info) = cache_for_task
+                                                        .get_cached(subscription_id)
+                                                        .await
+                                                    {
+                                                        // Spec §7: emit flat payload
+                                                        // (subscriptionId + DiscoveredProfileInfo
+                                                        // fields hoisted).
+                                                        let _ = app_for_task.emit(
+                                                            "profile-broadcast-received",
+                                                            serde_json::json!({
+                                                                "subscriptionId": subscription_id,
+                                                                "ownerAddr": info.owner_addr,
+                                                                "communityIds": info.community_ids,
+                                                                "sharedAt": info.shared_at,
+                                                            }),
+                                                        );
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        error = ?e,
+                                                        subscription_id,
+                                                        "profile broadcast rejected"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(_) => {
+                                            if !closing_task.load(Ordering::SeqCst) {
+                                                tracing::warn!(
+                                                    subscription_id,
+                                                    "profile broadcast subscriber closed; \
+                                                     reconnecting"
+                                                );
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                                if closing_task.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                // Brief pause before re-declaring on
+                                // mid-session recv_async failure.
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            }
+                        });
+                        handles.insert(subscription_id, handle);
+                    }
+                    ProfileBroadcastRequest::Unsubscribe { subscription_id } => {
+                        if let Some(h) = handles.remove(&subscription_id) {
+                            h.abort();
+                        }
+                        cache_for_loop.drop_subscription(subscription_id).await;
+                    }
+                }
+            }
+        });
     }
 
     // ── Process startup actions (declare queryables + subscribers) ────

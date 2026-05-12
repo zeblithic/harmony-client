@@ -166,6 +166,8 @@ async fn ingest_list_pin_burn_roundtrip() {
                     },
                     None, // ZEB-218 Sub-D Phase 1: library_directory not exercised in this test
                     None, // ZEB-218 Sub-D Phase 1: library_request_rx not exercised in this test
+                    None, // ZEB-281 Sub-D Phase 4: profile_broadcast_cache not exercised in this test
+                    None, // ZEB-281 Sub-D Phase 4: profile_broadcast_request_rx not exercised in this test
                 )
                 .await;
             });
@@ -435,6 +437,8 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
                     },
                     None, // ZEB-218 Sub-D Phase 1: library_directory not exercised in this test
                     None, // ZEB-218 Sub-D Phase 1: library_request_rx not exercised in this test
+                    None, // ZEB-281 Sub-D Phase 4: profile_broadcast_cache not exercised in this test
+                    None, // ZEB-281 Sub-D Phase 4: profile_broadcast_request_rx not exercised in this test
                 )
                 .await;
             });
@@ -782,6 +786,8 @@ async fn fetch_complete_arm_pins_root_in_intent() {
                     },
                     None, // ZEB-218 Sub-D Phase 1: library_directory not exercised in this test
                     None, // ZEB-218 Sub-D Phase 1: library_request_rx not exercised in this test
+                    None, // ZEB-281 Sub-D Phase 4: profile_broadcast_cache not exercised in this test
+                    None, // ZEB-281 Sub-D Phase 4: profile_broadcast_request_rx not exercised in this test
                 )
                 .await;
             });

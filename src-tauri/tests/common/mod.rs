@@ -5,3 +5,6 @@
 
 #[cfg(feature = "test-fixtures")]
 pub mod library_fixtures;
+
+#[cfg(feature = "test-fixtures")]
+pub mod profile_fixtures;
