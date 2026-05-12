@@ -545,6 +545,7 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         markers,
         tombstones,
         owner_device_cache,
+        libraries,
     } = remote;
     for (_, space) in spaces {
         local.apply_space_with_canonicalization(space);
@@ -583,6 +584,31 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
             entry.device_identity_pubs,
             entry.learned_at,
         );
+    }
+    // ZEB-218 Sub-D Phase 1: per-OwnerAddr LWW merge of library
+    // entries. Compare the max(added_at, removed_at) HLC of remote vs
+    // local; remote replaces local iff strictly newer. Full
+    // CRDT-Apply IPC plumbing lands in later tasks; this loop only
+    // closes the snapshot-merge path so the field round-trips correctly
+    // across Flow A.
+    for (addr, remote_entry) in libraries {
+        let remote_max = match &remote_entry.removed_at {
+            Some(rm) if rm.is_strictly_newer_than(&remote_entry.added_at) => rm.clone(),
+            _ => remote_entry.added_at.clone(),
+        };
+        let should_replace = match local.libraries.get(&addr) {
+            None => true,
+            Some(existing) => {
+                let local_max = match &existing.removed_at {
+                    Some(rm) if rm.is_strictly_newer_than(&existing.added_at) => rm.clone(),
+                    _ => existing.added_at.clone(),
+                };
+                remote_max.is_strictly_newer_than(&local_max)
+            }
+        };
+        if should_replace {
+            local.libraries.insert(addr, remote_entry);
+        }
     }
 }
 

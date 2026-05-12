@@ -98,6 +98,14 @@ struct CrdtFileV2 {
         default
     )]
     owner_device_cache: crate::owner_state_types::OwnerDeviceCache,
+    /// ZEB-218 Sub-D Phase 1: persisted per-OwnerAddr trusted-library
+    /// list. Absent in pre-Task-1 V2 files; `serde(default)` loads those
+    /// as an empty map. `skip_serializing_if` omits when empty.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    libraries: BTreeMap<
+        crate::owner_state_types::OwnerAddr,
+        crate::owner_state_types::LibraryEntry,
+    >,
 }
 
 impl From<&OwnerState> for CrdtFileV2 {
@@ -109,6 +117,7 @@ impl From<&OwnerState> for CrdtFileV2 {
             markers: s.markers.clone(),
             tombstones: s.tombstones.clone(),
             owner_device_cache: s.owner_device_cache.clone(),
+            libraries: s.libraries.clone(),
         }
     }
 }
@@ -122,6 +131,7 @@ impl From<CrdtFileV2> for OwnerState {
             markers: f.markers,
             tombstones: f.tombstones,
             owner_device_cache: f.owner_device_cache,
+            libraries: f.libraries,
         }
     }
 }

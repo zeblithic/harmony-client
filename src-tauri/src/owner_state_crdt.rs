@@ -7,8 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::owner_state_types::{
     DedupeKey, DeliveryStatus, DeviceIdentityHash, DmContentKey, Hlc, InboxEntry, InboxKey,
-    OutboxEntry, OutboxEntryId, OwnerAddr, OwnerDeviceCache, OwnerDeviceEntry, ReadMarker, Space,
-    SpaceId, SpaceKind, MAX_DEVICES_PER_OWNER, MAX_PRIOR_CONTENT_KEYS,
+    LibraryEntry, OutboxEntry, OutboxEntryId, OwnerAddr, OwnerDeviceCache, OwnerDeviceEntry,
+    ReadMarker, Space, SpaceId, SpaceKind, MAX_DEVICES_PER_OWNER, MAX_PRIOR_CONTENT_KEYS,
 };
 use serde::{Deserialize, Serialize};
 
@@ -44,6 +44,11 @@ pub struct OwnerState {
         default
     )]
     pub owner_device_cache: OwnerDeviceCache,
+    /// ZEB-218 Sub-D Phase 1: per-OwnerAddr trusted-library list.
+    /// Replicates across bound devices via Flow A. LWW add/remove
+    /// semantics; tombstones retained (see `LibraryEntry::is_effective`).
+    #[serde(rename = "lb", skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub libraries: BTreeMap<OwnerAddr, LibraryEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

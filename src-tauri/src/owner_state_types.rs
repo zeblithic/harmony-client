@@ -1069,6 +1069,7 @@ impl_canonical!(
     InboxKey,
     InboxEntry,
     ReadMarker,
+    LibraryEntry,
     RootPublishPayload,
 );
 
@@ -1942,6 +1943,47 @@ pub struct ReadMarker {
     pub space_id: SpaceId,
     #[serde(rename = "lr")]
     pub last_read_at: Hlc,
+}
+
+/// User's per-library trust record. Lives in owner-state CRDT; syncs
+/// across bound devices via existing Flow A. Spec §4.2.
+///
+/// LWW semantics for add/remove:
+/// - Effective state at any HLC = `removed_at.is_none() || added_at >
+///   removed_at`.
+/// - Re-add at HLC > removed_at re-enables; the higher-HLC operation
+///   wins.
+/// - Tombstones (Some(removed_at)) are NEVER GC'd — needed for cross-
+///   device convergence on add-on-A / remove-on-B at later HLC.
+///
+/// 2-char field keys (codebase convention; satisfies
+/// `canonical_cbor_encode`'s same-length-keys precondition).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LibraryEntry {
+    /// Library OwnerAddr (also the BTreeMap key in OwnerState).
+    #[serde(rename = "ad")]
+    pub address: OwnerAddr,
+
+    /// HLC when this device added the library.
+    #[serde(rename = "at")]
+    pub added_at: Hlc,
+
+    /// HLC of the most-recent remove operation; None if never removed.
+    /// Compared against `added_at` to determine effective state.
+    #[serde(rename = "rm", skip_serializing_if = "Option::is_none")]
+    pub removed_at: Option<Hlc>,
+}
+
+impl LibraryEntry {
+    /// True if the user currently has this library in their trust set.
+    /// Implements the LWW rule: present unless a remove with higher HLC
+    /// is recorded.
+    pub fn is_effective(&self) -> bool {
+        match &self.removed_at {
+            None => true,
+            Some(rm) => self.added_at.is_strictly_newer_than(rm),
+        }
+    }
 }
 
 #[cfg(test)]
