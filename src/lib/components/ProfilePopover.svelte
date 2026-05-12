@@ -83,42 +83,67 @@
     let localSubId: number | null = null;
 
     (async () => {
-      const id = await svc.subscribe(peerAddr);
-      if (cancelled) {
-        await svc.unsubscribe(id).catch(() => {});
-        return;
+      try {
+        const id = await svc.subscribe(peerAddr);
+        if (cancelled) {
+          await svc.unsubscribe(id).catch(() => {});
+          return;
+        }
+        localSubId = id;
+        subscriptionId = id;
+        // Attach the listener BEFORE reading the cache. Otherwise a
+        // broadcast can land at the server between `getCached` and
+        // `listen` and be silently dropped: the cache snapshot we read
+        // predates the broadcast, and no listener is attached to
+        // receive the corresponding `profile-broadcast-received` event.
+        // Order: subscribe → listen → getCached. Any event that lands
+        // between subscribe and getCached is queued for the listener;
+        // any event that lands between listen and getCached either
+        // overwrites the cache before we read it (and we render the
+        // newer value) or fires through the listener (and we render
+        // via the event path).
+        // Event payload is flat per spec §7:
+        // { subscriptionId, ownerAddr, communityIds, sharedAt }.
+        const unlisten = await listen<{
+          subscriptionId: number;
+          ownerAddr: string;
+          communityIds: string[];
+          sharedAt: string;
+        }>('profile-broadcast-received', (event) => {
+          // subscriptionId filtering: a final event may race past
+          // server-side abort() — silently drop events for other ids.
+          if (event.payload.subscriptionId !== id) return;
+          memberships = {
+            ownerAddr: event.payload.ownerAddr,
+            communityIds: event.payload.communityIds,
+            sharedAt: event.payload.sharedAt,
+          };
+          isLoading = false;
+        });
+        if (cancelled) {
+          unlisten();
+          return;
+        }
+        unlistenFn = unlisten;
+        // Render immediately if already cached.
+        const cached = await svc.getCached(id);
+        if (!cancelled && cached && isLoading) {
+          // Only paint from cache if a live event hasn't already
+          // painted newer data (isLoading guards against clobbering a
+          // listener-delivered render with a staler cache snapshot).
+          memberships = cached;
+          isLoading = false;
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!cancelled) {
+          console.warn('peer profile subscription setup failed:', msg);
+          // Flip out of the loading state so the popover renders the
+          // empty / "no shared communities" view instead of spinning
+          // until the 3s timeout fires.
+          isLoading = false;
+        }
       }
-      localSubId = id;
-      subscriptionId = id;
-      // Render immediately if already cached.
-      const cached = await svc.getCached(id);
-      if (!cancelled && cached) {
-        memberships = cached;
-        isLoading = false;
-      }
-      // Listen for new arrivals. Event payload is flat per spec §7:
-      // { subscriptionId, ownerAddr, communityIds, sharedAt }.
-      const unlisten = await listen<{
-        subscriptionId: number;
-        ownerAddr: string;
-        communityIds: string[];
-        sharedAt: string;
-      }>('profile-broadcast-received', (event) => {
-        // subscriptionId filtering: a final event may race past
-        // server-side abort() — silently drop events for other ids.
-        if (event.payload.subscriptionId !== id) return;
-        memberships = {
-          ownerAddr: event.payload.ownerAddr,
-          communityIds: event.payload.communityIds,
-          sharedAt: event.payload.sharedAt,
-        };
-        isLoading = false;
-      });
-      if (cancelled) {
-        unlisten();
-        return;
-      }
-      unlistenFn = unlisten;
     })();
 
     const timeout = setTimeout(() => {

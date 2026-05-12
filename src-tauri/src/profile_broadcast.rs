@@ -308,6 +308,22 @@ impl ProfileBroadcastPublisher {
         is_refresh: bool,
     ) {
         let current = source.current_shared_set().await;
+
+        // Hard cap defence-in-depth: `verify_broadcast` rejects payloads
+        // carrying more than `MAX_SHARED_COMMUNITIES` ids, so publishing
+        // an oversize set would silently disappear at every peer. Skip
+        // (no truncation, no `last_published` update) and surface a
+        // warning so the issue isn't invisible.
+        if current.len() > MAX_SHARED_COMMUNITIES {
+            tracing::warn!(
+                len = current.len(),
+                max = MAX_SHARED_COMMUNITIES,
+                "profile broadcast skipped: opted-in set exceeds maximum; \
+                 every peer would reject this payload at verify_broadcast"
+            );
+            return;
+        }
+
         // Lock held across `sink.publish().await` is safe here — single-writer
         // task (the spawned publisher), only other consumer
         // (`last_published_for_test`) is read-only.
@@ -1189,6 +1205,46 @@ mod tests {
             decoded.community_ids,
             vec![fixture_space_id(1)],
             "first broadcast on restart must carry the persisted opt-in set"
+        );
+    }
+
+    /// Regression: an opted-in set larger than `MAX_SHARED_COMMUNITIES`
+    /// must NOT be signed + published. Every peer would reject such a
+    /// payload at `verify_broadcast`, so publishing it makes the
+    /// profile silently disappear from the network. The publisher
+    /// should skip + warn instead, leaving `last_published`
+    /// untouched.
+    #[tokio::test]
+    async fn publisher_skips_publish_when_set_exceeds_max() {
+        let (set, published, publisher) = mock_publisher_setup();
+        // Build MAX_SHARED_COMMUNITIES + 1 distinct SpaceIds. `SpaceId`
+        // is `[u8; 16]`, so encode a u16 index across the first two
+        // bytes to keep all ids distinct (we need 201, which exceeds
+        // the 256 range of a single byte).
+        let oversize: Vec<SpaceId> = (0u16..=(MAX_SHARED_COMMUNITIES as u16))
+            .map(|i| {
+                let mut bytes = [0u8; 16];
+                bytes[0] = (i & 0xff) as u8;
+                bytes[1] = ((i >> 8) & 0xff) as u8;
+                SpaceId(bytes)
+            })
+            .collect();
+        assert_eq!(oversize.len(), MAX_SHARED_COMMUNITIES + 1);
+        *set.lock().await = oversize;
+        publisher.notify_dirty();
+        // Wait past debounce + a refresh tick.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        publisher.shutdown().await;
+        let pubs = published.lock().await;
+        assert!(
+            pubs.is_empty(),
+            "publisher must NOT publish an oversize set; got {} entries",
+            pubs.len()
+        );
+        // last_published must remain None — no snapshot recorded.
+        assert!(
+            publisher.last_published_for_test().await.is_none(),
+            "last_published must remain None when oversize publish is skipped"
         );
     }
 

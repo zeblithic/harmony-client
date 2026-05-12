@@ -169,13 +169,20 @@
           type="checkbox"
           checked={sharedInProfile}
           onchange={async (e) => {
-            const checked = (e.currentTarget as HTMLInputElement).checked;
+            // Capture the checkbox reference BEFORE awaiting. Per the
+            // DOM spec, `event.currentTarget` is nullified once the
+            // synchronous event-dispatch completes, so re-reading
+            // `e.currentTarget` in the catch branch would throw a
+            // TypeError and leave the checkbox stuck in the
+            // optimistic-true state.
+            const target = e.currentTarget as HTMLInputElement;
+            const checked = target.checked;
             try {
               await onToggleSharedInProfile(checked);
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
               // Roll back the UI to match server state on failure.
-              (e.currentTarget as HTMLInputElement).checked = !checked;
+              target.checked = !checked;
               console.warn('toggle shared_in_profile failed:', msg);
             }
           }}
