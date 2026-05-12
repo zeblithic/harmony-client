@@ -1066,6 +1066,14 @@ async fn start_node(
     // sees its receiver close after the publish channel is gone — same
     // ordering as stop_inner.
     drop(old_pairing_handle);
+    // ZEB-281 Sub-D Phase 4: explicitly await the previous identity's
+    // profile-broadcast publisher shutdown BEFORE dropping the prior
+    // publish channels. The publisher's background task may otherwise
+    // wake during teardown and surface a closed-sink Err. Mirrors the
+    // ordering in stop_inner.
+    if let Some(publisher) = old_profile_broadcast_publisher {
+        publisher.shutdown().await;
+    }
     drop(old_publish);
     drop(old_fetch);
     drop(old_ingest);
@@ -1089,13 +1097,6 @@ async fn start_node(
     // so the new generation's RuntimeUnicastTransport (Task 11) sees no
     // stale clones outside the new NodeState.
     drop(old_unicast_send_tx);
-    // ZEB-281 Sub-D Phase 4: explicitly await the previous identity's
-    // profile-broadcast publisher shutdown BEFORE dropping the prior
-    // publish channels. The publisher's background task may otherwise
-    // wake during teardown and surface a closed-sink Err.
-    if let Some(publisher) = old_profile_broadcast_publisher {
-        publisher.shutdown().await;
-    }
     // ZEB-270 Phase 3 Task 4.5: explicitly await the previous channel-
     // log registry's shutdown BEFORE the per-community state engines
     // tear down. The channel-log engine's verify-on-receive path
