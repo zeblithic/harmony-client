@@ -2603,16 +2603,26 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         };
         sign_event_with_identity(&payload, &alice).expect("sign admin bootstrap")
     };
-    // sealed_epoch_key must be 92 bytes for invite-only (32 ephemeral_pub +
-    // 12 nonce + 32 ct + 16 tag). The actual key value doesn't matter for
-    // this rollback test — we construct a dummy 92-byte vector.
-    // ZEB-249 PR #106 R5: encode_invite_url now enforces this length.
-    let _ = mk; // original EpochKey retained for documentation but not used directly
+    // CR Major (PR #106 R6): use a real sealed_epoch_key so the snapshot
+    // decrypts successfully and any Err must come from the intended
+    // "inviter unreachable" rollback branch, not from AEAD failure.
+    // Seal `mk` to Bob's x25519 pubkey (derived from Bob's ed25519 signing key).
+    let sealed_epoch_key = {
+        use harmony_app::dm_signing::{ed25519_pub_to_x25519, seal_to_owner};
+        let bob_pub32 = bob_signing_key.verifying_key().to_bytes();
+        let x25519_pub = ed25519_pub_to_x25519(&bob_pub32).expect("ed25519_pub_to_x25519");
+        seal_to_owner(&x25519_pub, mk.as_bytes()).expect("seal_to_owner")
+    };
+    assert_eq!(
+        sealed_epoch_key.len(),
+        92,
+        "sealed_epoch_key for invite-only must be 92 bytes"
+    );
     let url = encode_invite_url(&CommunityInvitePayload {
         community_id,
         epoch_snapshot: InviteEpochSnapshot {
             epoch: 0,
-            sealed_epoch_key: vec![0xaa; 92], // invite-only: 92 bytes
+            sealed_epoch_key,
             state_snapshot: MaterializedCommunityState::default(),
         },
         admin_addr: alice_addr,

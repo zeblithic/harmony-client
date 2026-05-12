@@ -9807,8 +9807,12 @@ async fn leave_community(
                 return Err(membership_outcome_err("leave_community", &leave_outcome));
             }
 
-            // Surface rotation rejection as a warning — leave committed, but
-            // backward secrecy gap exists until the self-heal observer fires.
+            // Surface rotation rejection as a warning and return Err —
+            // the leaver has committed Leave + lost repair authority, so
+            // the caller needs to know the leave is only partially
+            // successful. The admin self-healing observer will synthesize
+            // the rotation, but the caller cannot assume secrecy is
+            // fully enforced yet.
             if let crate::community_state_crdt::InsertOutcome::Rejected(ref rot_err) = rot_outcome {
                 tracing::warn!(
                     community_id = %hex::encode(space_id.0),
@@ -9817,6 +9821,9 @@ async fn leave_community(
                     "leave_community: Leave committed but paired EpochRotation was \
                      rejected — admin self-healing observer will synthesize rotation"
                 );
+                return Err(format!(
+                    "leave_community committed Leave but paired EpochRotation was rejected: {rot_err}"
+                ));
             }
         }
         Err(e) => {
@@ -10940,7 +10947,15 @@ pub async fn apply_remote_epoch_event(
                 // Catchup is for an epoch we already hold or have surpassed.
                 return;
             }
-            // Catchup delivers the CURRENT epoch key — no archiving.
+            // CR Major (PR #106 R6): archive previous (epoch, key) when
+            // advancing, matching the EpochRotation path. A member that
+            // held K(N) as their current key can still decrypt epoch-N
+            // content after receiving a catchup to K(M>N). Without
+            // archiving, handle_incoming_publish's root_key_used binding
+            // would reject epoch-N blobs after the catchup lands.
+            if let Some(prev_key) = space.current_epoch_key.take() {
+                space.old_epoch_keys.insert(current, prev_key);
+            }
             space.current_epoch = Some(target_epoch);
             space.current_epoch_key = Some(k);
             tracing::debug!(

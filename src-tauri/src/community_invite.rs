@@ -472,10 +472,11 @@ pub enum InviteUrlError {
 }
 
 /// Hard cap on the base64url body length (post-prefix-strip, in base64
-/// chars) we'll hand to the base64 + CBOR decoders. 4096 base64 chars
+/// chars) we'll hand to the base64 + CBOR decoders.
+///
 /// v2 budget: `InviteEpochSnapshot` embeds `MaterializedCommunityState`
 /// which grows linearly with community size. At ~500 members the CBOR
-/// payload is roughly 40-50 KB, base64-encoded to ~60-70 KB. 85333
+/// payload is roughly 40-50 KB, base64-encoded to ~60-70 KB. 85 333
 /// base64 chars decodes to exactly 64 KiB raw — a comfortable ceiling
 /// for moderate communities while still bounding the work done on
 /// untrusted input. Open-community v1 payloads (~180 bytes, ~240 base64
@@ -484,6 +485,32 @@ pub enum InviteUrlError {
 /// Greptile P2 on PR #87 round 2 flagged that the prior name "BYTES"
 /// misled. See `InviteUrlError::TooLarge`.
 const MAX_INVITE_BODY_B64_CHARS: usize = 85_333; // ≈ 64 KiB decoded
+
+/// CR Minor (PR #106 R6): shared helper for the `sealed_epoch_key` byte-length
+/// contract enforced at both the encode and decode boundary. Centralises the
+/// mode labels and expected sizes so they can't drift independently.
+///
+/// - Open community: 32 raw bytes (EpochKey material, no envelope overhead).
+/// - Invite-only: 92 bytes (32 ephemeral x25519 pubkey + 12 nonce +
+///   32 ciphertext + 16 AEAD tag — as produced by `seal_to_owner`).
+fn validate_sealed_epoch_key_len(
+    is_invite_only: bool,
+    sealed_key_len: usize,
+) -> Result<(), InviteUrlError> {
+    let (mode, expected): (&'static str, usize) = if is_invite_only {
+        ("invite-only", 92)
+    } else {
+        ("open", 32)
+    };
+    if sealed_key_len != expected {
+        return Err(InviteUrlError::InvalidSealedEpochKeyLen {
+            mode,
+            expected,
+            got: sealed_key_len,
+        });
+    }
+    Ok(())
+}
 
 /// Canonical-CBOR-encode the payload, then base64url-no-pad the result,
 /// and prefix `harmony://invite/`. The output is copy-paste-safe across
@@ -505,23 +532,11 @@ pub fn encode_invite_url(payload: &CommunityInvitePayload) -> Result<String, Inv
     // ZEB-249 PR #106 R5: enforce sealed_epoch_key byte-length contract
     // BEFORE CBOR encoding so a badly-formed payload is caught at the
     // mint site and never produces a URL that decode_invite_url would
-    // reject. Open: 32 raw bytes. Invite-only: 92 bytes (32 ephemeral
-    // pubkey + 12 nonce + 32 ciphertext + 16 tag).
-    {
-        let (mode, expected_len): (&'static str, usize) = if payload.is_invite_only {
-            ("invite-only", 92)
-        } else {
-            ("open", 32)
-        };
-        let got_len = payload.epoch_snapshot.sealed_epoch_key.len();
-        if got_len != expected_len {
-            return Err(InviteUrlError::InvalidSealedEpochKeyLen {
-                mode,
-                expected: expected_len,
-                got: got_len,
-            });
-        }
-    }
+    // reject. CR Minor (PR #106 R6): delegated to shared helper.
+    validate_sealed_epoch_key_len(
+        payload.is_invite_only,
+        payload.epoch_snapshot.sealed_epoch_key.len(),
+    )?;
     let cbor = canonical_cbor_encode(payload).map_err(|e| InviteUrlError::Cbor(e.to_string()))?;
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&cbor);
     // Encode-time size check: fail fast rather than producing an invite URL
@@ -559,22 +574,12 @@ pub fn decode_invite_url(url: &str) -> Result<CommunityInvitePayload, InviteUrlE
     // ZEB-249 PR #106 R5: enforce sealed_epoch_key byte-length contract
     // AFTER decoding so a tampered or malformed URL is rejected with a
     // clear error rather than silently producing a structurally valid but
-    // semantically broken payload.
-    {
-        let (mode, expected_len): (&'static str, usize) = if payload.is_invite_only {
-            ("invite-only", 92)
-        } else {
-            ("open", 32)
-        };
-        let got_len = payload.epoch_snapshot.sealed_epoch_key.len();
-        if got_len != expected_len {
-            return Err(InviteUrlError::InvalidSealedEpochKeyLen {
-                mode,
-                expected: expected_len,
-                got: got_len,
-            });
-        }
-    }
+    // semantically broken payload. CR Minor (PR #106 R6): delegated to
+    // shared helper.
+    validate_sealed_epoch_key_len(
+        payload.is_invite_only,
+        payload.epoch_snapshot.sealed_epoch_key.len(),
+    )?;
     Ok(payload)
 }
 
@@ -1456,6 +1461,59 @@ mod tests {
         }
     }
 
+    /// Minimal invite-only invite payload with correct 92-byte
+    /// `sealed_epoch_key`. Use as a baseline; mutate the field under test.
+    ///
+    /// All signatures are stubs (all-zeros): `encode_invite_url` only
+    /// validates field *presence*, not cryptographic correctness.
+    fn make_invite_only_payload_correct() -> CommunityInvitePayload {
+        use crate::community_membership::{MembershipEventKind, SignedMembershipEvent};
+        use crate::owner_state_types::Hlc;
+
+        let admin_addr = OwnerAddr([0u8; 16]);
+        let community_id = SpaceId([0u8; 16]);
+
+        let admin_bootstrap = SignedMembershipEvent {
+            id: [0u8; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "test".to_string(),
+            },
+            sig: [0u8; 64],
+            countersig: None,
+        };
+
+        CommunityInvitePayload {
+            community_id,
+            epoch_snapshot: InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: vec![0u8; 92], // correct: 92 bytes for invite-only
+                state_snapshot: MaterializedCommunityState::default(),
+            },
+            admin_addr,
+            community_name: "test-invite-only".to_string(),
+            is_invite_only: true,
+            expires_at: None,
+            invite_token: Some(InviteToken {
+                inviter: admin_addr,
+                invitee_hint: None,
+                minted_at: Hlc {
+                    wall_ms: 1_000,
+                    logical: 0,
+                    device_id: "test".to_string(),
+                },
+                expires_at: None,
+                sig: [0u8; 64],
+            }),
+            admin_bootstrap: Some(admin_bootstrap),
+            admin_identity_pub: Some([0u8; 64]),
+        }
+    }
+
     // ── encode_invite_url ────────────────────────────────────────────
 
     #[test]
@@ -1508,6 +1566,66 @@ mod tests {
                     mode: "open",
                     expected: 32,
                     got: 50,
+                }
+            ),
+            "unexpected err: {err}"
+        );
+    }
+
+    // ── invite-only sealed_epoch_key length contract (CR Minor PR #106 R6) ─
+
+    /// encode_invite_url accepts an invite-only payload with the correct
+    /// 92-byte sealed_epoch_key.
+    #[test]
+    fn encode_invite_url_accepts_correct_invite_only_key_len() {
+        let payload = make_invite_only_payload_correct();
+        assert!(
+            encode_invite_url(&payload).is_ok(),
+            "invite-only payload with 92-byte sealed_epoch_key must encode successfully"
+        );
+    }
+
+    /// encode_invite_url rejects an invite-only payload whose sealed_epoch_key
+    /// is not exactly 92 bytes.
+    #[test]
+    fn encode_invite_url_rejects_wrong_sealed_key_length_for_invite_only() {
+        let mut payload = make_invite_only_payload_correct();
+        payload.epoch_snapshot.sealed_epoch_key = vec![0u8; 32]; // wrong for invite-only
+        let err = encode_invite_url(&payload).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                InviteUrlError::InvalidSealedEpochKeyLen {
+                    mode: "invite-only",
+                    expected: 92,
+                    got: 32,
+                }
+            ),
+            "unexpected err: {err}"
+        );
+    }
+
+    /// decode_invite_url rejects an invite-only URL whose CBOR-decoded
+    /// sealed_epoch_key is not exactly 92 bytes.
+    #[test]
+    fn decode_invite_url_rejects_wrong_sealed_key_length_for_invite_only() {
+        // Build an invite-only payload with wrong sealed_epoch_key length and
+        // CBOR-encode directly (bypassing encode_invite_url's gate) so we
+        // produce a URL the CBOR decoder accepts but the length check rejects.
+        let mut payload = make_invite_only_payload_correct();
+        payload.epoch_snapshot.sealed_epoch_key = vec![0u8; 32]; // wrong for invite-only
+        let cbor = canonical_cbor_encode(&payload).expect("cbor encode");
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&cbor);
+        let url = format!("harmony://invite/{b64}");
+
+        let err = decode_invite_url(&url).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                InviteUrlError::InvalidSealedEpochKeyLen {
+                    mode: "invite-only",
+                    expected: 92,
+                    got: 32,
                 }
             ),
             "unexpected err: {err}"

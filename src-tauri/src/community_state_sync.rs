@@ -2118,19 +2118,33 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     //    first, then old keys in reverse order (newest first) for the
     //    brief transition window where a sender may use a key that's one
     //    epoch behind our current view.
-    let payload_bytes = {
-        let mut result = decrypt_root_publish(&outer_current_key, &wire);
-        if result.is_err() {
+    //
+    //    CR Major (PR #106 R6): capture WHICH key succeeded so blob
+    //    decryption is bound to the same key. A packet rewrapped under
+    //    any accepted old root key MUST NOT be acceptable with blob under
+    //    a different old key — that would break the root→blob epoch
+    //    binding. `root_key_used` is a reference into `outer_current_key`
+    //    or `outer_old_keys_rev`; the borrow checker ensures it stays
+    //    valid for the lifetime of both Vec values.
+    let (payload_bytes, root_key_used): (Vec<u8>, &EpochKey) = {
+        if let Ok(b) = decrypt_root_publish(&outer_current_key, &wire) {
+            (b, &outer_current_key)
+        } else {
+            let mut found: Option<(Vec<u8>, &EpochKey)> = None;
             for old_key in &outer_old_keys_rev {
-                result = decrypt_root_publish(old_key, &wire);
-                if result.is_ok() {
+                if let Ok(b) = decrypt_root_publish(old_key, &wire) {
+                    found = Some((b, old_key));
                     break;
                 }
             }
-        }
-        match result {
-            Ok(b) => b,
-            Err(e) => return IncomingOutcome::ErrPreMutation(CommunitySyncError::Crypto(e)),
+            match found {
+                Some(v) => v,
+                None => {
+                    return IncomingOutcome::ErrPreMutation(CommunitySyncError::Crypto(
+                        CommunityCryptoError::AeadFailed,
+                    ))
+                }
+            }
         }
     };
     let payload: CommunityRootPublishPayload = match canonical_cbor_decode(&payload_bytes) {
@@ -2342,25 +2356,15 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     };
 
     // 7. Decrypt blob (deterministic-nonce).
-    //    ZEB-249 §10.6: use the epoch key selected from payload.epoch.
-    //    If payload.epoch matches outer_current_key's epoch, we use that.
-    //    Otherwise we try to find the key for that epoch in our old_epoch_keys.
-    //    Fall back to the same trial-decrypt order used for the outer wire.
-    let blob_cleartext = {
-        // Try the outer key we used to decrypt the wire (most likely match).
-        let mut result = decrypt_blob(&outer_current_key, &blob_ciphertext);
-        if result.is_err() {
-            for old_key in &outer_old_keys_rev {
-                result = decrypt_blob(old_key, &blob_ciphertext);
-                if result.is_ok() {
-                    break;
-                }
-            }
-        }
-        match result {
-            Ok(b) => b,
-            Err(e) => return IncomingOutcome::ErrPreMutation(CommunitySyncError::Crypto(e)),
-        }
+    //    CR Major (PR #106 R6): blob decryption MUST use the SAME epoch
+    //    key that successfully decrypted the root wire packet. Trying
+    //    independent key sets for root and blob would allow an attacker
+    //    to rewrap the outer layer under any accepted old key while
+    //    substituting a blob encrypted under a different old key —
+    //    breaking the root→blob epoch binding contract.
+    let blob_cleartext = match decrypt_blob(root_key_used, &blob_ciphertext) {
+        Ok(b) => b,
+        Err(e) => return IncomingOutcome::ErrPreMutation(CommunitySyncError::Crypto(e)),
     };
 
     // 8. Decode CommunityState.

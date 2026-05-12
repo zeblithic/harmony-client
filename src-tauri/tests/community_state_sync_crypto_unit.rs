@@ -82,3 +82,43 @@ fn decrypt_blob_rejects_truncated_wire() {
     let err = decrypt_blob(&mk, &too_short).unwrap_err();
     assert!(matches!(err, CommunityCryptoError::Truncated));
 }
+
+/// CR Major (PR #106 R6): verify the root→blob epoch-key binding contract.
+///
+/// A packet where the root wire is encrypted under K(0) and the blob is
+/// encrypted under K(1) MUST be rejected: if the receiver successfully
+/// decrypts the root with K(0) and then tries to decrypt the blob with
+/// K(0), the blob decrypt fails (the Poly1305 tag is wrong).
+///
+/// `handle_incoming_publish` now captures `root_key_used` and passes it
+/// directly to `decrypt_blob`, so a blob encrypted under any other key
+/// is rejected regardless of whether that other key is also "known".
+#[test]
+fn handle_incoming_publish_rejects_mismatched_root_blob_keys() {
+    // K(0) and K(1) are both "known" (would both appear in old_epoch_keys).
+    let k0 = EpochKey::new([0x10; 32]);
+    let k1 = EpochKey::new([0x11; 32]);
+
+    let root_plaintext = b"root-payload-bytes".to_vec();
+    let blob_plaintext = b"blob-payload-bytes".to_vec();
+
+    // Construct a wire packet:
+    //   - root encrypted under K(0)
+    //   - blob encrypted under K(1)  ← mismatched
+    let root_wire = encrypt_root_publish(&k0, &root_plaintext).expect("encrypt root with k0");
+    let blob_ct_k1 = encrypt_blob(&k1, &blob_plaintext).expect("encrypt blob with k1");
+
+    // Root decrypts successfully with K(0).
+    let root_decrypted = decrypt_root_publish(&k0, &root_wire).expect("root must decrypt with k0");
+    assert_eq!(root_decrypted, root_plaintext);
+
+    // Blob decrypt with the root_key_used (K(0)) MUST fail — the blob was
+    // encrypted under K(1). This is the binding contract: after
+    // handle_incoming_publish captures `root_key_used = &k0`, it calls
+    // `decrypt_blob(root_key_used, &blob_ciphertext)` and gets AeadFailed.
+    let err = decrypt_blob(&k0, &blob_ct_k1).unwrap_err();
+    assert!(
+        matches!(err, CommunityCryptoError::AeadFailed),
+        "blob encrypted under K(1) must be rejected when decrypted with K(0): {err:?}"
+    );
+}

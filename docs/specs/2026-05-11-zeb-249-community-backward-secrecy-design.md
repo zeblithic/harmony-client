@@ -635,9 +635,9 @@ needs it. See doc-comment on `current_epoch_key_for` in
 ## 11. Acceptance criteria
 
 1. New communities created post-merge use `EpochKey` rotation. v1's `MembershipKey` field is fully removed from `Space`; no parallel codepath.
-2. Removed members (Kick or Leave) cannot decrypt events published after the matching `EpochRotation` lands. Verified by the two-node integration test in §6.4.
-3. Concurrent kicks resolve correctly via the staleness gate + self-healing path. Verified by the four-node integration test in §6.4.
-4. Offline members successfully catch up across multiple missed rotations. Verified by the offline-catchup integration test in §6.4.
+2. Removed members (Kick or Leave) cannot decrypt events published after the matching `EpochRotation` lands. Verified by the two-node integration test in §6.5.
+3. Concurrent kicks resolve correctly via the staleness gate + self-healing path. Verified by the four-node integration test in §6.5.
+4. Offline members successfully catch up across multiple missed rotations. Verified by the offline-catchup integration test in §6.5.
 5. New members invited at epoch N can decrypt all events with HLC > invite issuance; events with HLC < invite issuance return `KeyNotAvailable` (expected, UI surfaces "joined at epoch N, history unavailable").
 6. New members whose invite snapshot is stale at redemption (`snapshot_epoch < current_epoch`) successfully receive an `EpochCatchup` from an admin and proceed to decrypt new events. Verified by the stale-invite-catchup integration test in §6.5.
 7. All 5 CI gates green: `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`, `cargo nextest run --locked --workspace --all-targets --features test-fixtures`, `cargo check --locked --all-targets --features test-fixtures` (MSRV), `npx tsc --noEmit && npx vitest run` (frontend).

@@ -268,6 +268,12 @@ fn apply_rotation_to_space(
 }
 
 /// Apply an EpochCatchup (same shape as rotation, but targeted at joiners).
+///
+/// CR Major (PR #106 R6): before replacing the current key, archive the
+/// previous (epoch, key) into `old_epoch_keys` if advancing. This preserves
+/// the backward-access invariant — a member that held K(N) as their current
+/// key can still decrypt epoch-N content after receiving a catchup to K(M>N).
+/// Stale catchups (incoming epoch < current) are ignored.
 fn apply_catchup_to_space(
     space: &mut Space,
     catchup_event: &SignedMembershipEvent,
@@ -293,6 +299,19 @@ fn apply_catchup_to_space(
     let k_bytes_vec = open_from_owner(&x25519_priv, sealed).expect("open sealed key");
     let k_bytes: [u8; 32] = k_bytes_vec.try_into().expect("sealed key must be 32 bytes");
     let k = EpochKey::new(k_bytes);
+
+    // Ignore stale catchups (incoming epoch < current).
+    if matches!(space.current_epoch, Some(current) if epoch < current) {
+        return false;
+    }
+    // Archive previous (epoch, key) when advancing.
+    if let (Some(prev_epoch), Some(prev_key)) =
+        (space.current_epoch, space.current_epoch_key.clone())
+    {
+        if epoch > prev_epoch {
+            space.old_epoch_keys.insert(prev_epoch, prev_key);
+        }
+    }
     // Catchup delivers the CURRENT epoch key (no increment).
     space.current_epoch = Some(epoch);
     space.current_epoch_key = Some(k);
@@ -1004,13 +1023,22 @@ async fn stale_invite_catchup_unlocks_decryption_end_to_end() {
             .unwrap_or(false),
         "Dave's current_epoch_key must be K(1) after catchup — observer used crdt_state key, not spawn-time key"
     );
-    // E6 (ZEB-249 §10.6 R3): EpochCatchup must NOT archive keys — it
-    // delivers the current epoch key to a latecomer, so old_epoch_keys
-    // stays empty on Dave's side (Dave never held an earlier key as
-    // "current").
+    // CR Major (PR #106 R6): apply_catchup_to_space now archives the
+    // previous (epoch, key) when advancing. Dave's space was initialized
+    // at epoch=0 with K(0) before the catchup, so K(0) must be archived
+    // in old_epoch_keys — the backward-access invariant requires it.
+    assert_eq!(
+        dave_space.old_epoch_keys.len(),
+        1,
+        "EpochCatchup advancing epoch must archive the prior key"
+    );
     assert!(
-        dave_space.old_epoch_keys.is_empty(),
-        "EpochCatchup must NOT populate old_epoch_keys (Dave had no prior current key)"
+        dave_space
+            .old_epoch_keys
+            .get(&0)
+            .map(|k| k.as_bytes() == k0.as_bytes())
+            .unwrap_or(false),
+        "old_epoch_keys must contain K(0) at epoch 0 after catchup advances to epoch 1"
     );
 
     // ── Step 8: Dave decrypts epoch-1 messages ───────────────────────────────
@@ -1749,8 +1777,9 @@ async fn offline_catchup_via_remote_rotation_observation() {
     )
     .await;
 
-    // Verify: B now has epoch=1 + K(1). old_epoch_keys must be EMPTY
-    // (catchup doesn't archive — B never held K(0) as "current" at epoch 1).
+    // Verify: B now has epoch=1 + K(1). B started at epoch=0 with K(0), so
+    // CR Major (PR #106 R6): old_epoch_keys must contain K(0) — the
+    // backward-access invariant requires archiving when the catchup advances.
     {
         let state = crdt_state.lock().await;
         let space = state.spaces.get(&community_id).expect("space must exist");
@@ -1760,9 +1789,18 @@ async fn offline_catchup_via_remote_rotation_observation() {
             Some(k1.as_bytes()),
             "catchup must install K(1)"
         );
+        assert_eq!(
+            space.old_epoch_keys.len(),
+            1,
+            "EpochCatchup advancing epoch must archive the prior key"
+        );
         assert!(
-            space.old_epoch_keys.is_empty(),
-            "catchup must NOT archive keys (no prior epoch held)"
+            space
+                .old_epoch_keys
+                .get(&0)
+                .map(|k| k.as_bytes() == k0.as_bytes())
+                .unwrap_or(false),
+            "old_epoch_keys must contain K(0) at epoch 0 after catchup advances B to epoch 1"
         );
     }
 
