@@ -572,7 +572,7 @@ impl Aggregation {
         // it falls back to the admin-signed `listed_by` (which Phase 1
         // attribution-checking already constrained to equal the topic
         // owner).
-        let library = match status {
+        let broadcasting_lib = match status {
             AttestationStatus::Attested(addr) | AttestationStatus::Unattested(addr) => addr,
             AttestationStatus::Unwrapped => entry.listed_by,
         };
@@ -586,31 +586,35 @@ impl Aggregation {
         // this community with a bad wrapping sig (unattested_by) is
         // still considered a contributor for cap purposes (counts
         // toward MAX_ENTRIES_PER_LIBRARY).
-        let library_at_cap = self.entry_count_for_library(&library) >= MAX_ENTRIES_PER_LIBRARY;
+        let library_at_cap =
+            self.entry_count_for_library(&broadcasting_lib) >= MAX_ENTRIES_PER_LIBRARY;
         let is_new_contribution_for_library = !self
             .by_community
             .get(&community_id)
-            .map(|agg| agg.attested_by.contains(&library) || agg.unattested_by.contains(&library))
+            .map(|agg| {
+                agg.attested_by.contains(&broadcasting_lib)
+                    || agg.unattested_by.contains(&broadcasting_lib)
+            })
             .unwrap_or(false);
 
         let mut evicted: Option<SpaceId> = None;
         if library_at_cap && is_new_contribution_for_library {
-            if let Some(oldest_id) = self.find_oldest_for_library(&library) {
-                self.evict_library_contribution(&library, oldest_id);
+            if let Some(oldest_id) = self.find_oldest_for_library(&broadcasting_lib) {
+                self.evict_library_contribution(&broadcasting_lib, oldest_id);
                 evicted = Some(oldest_id);
             } else {
                 tracing::warn!(
                     target: "library_directory",
-                    library = ?library,
-                    per_library_count = self.entry_count_for_library(&library),
+                    library = ?broadcasting_lib,
+                    per_library_count = self.entry_count_for_library(&broadcasting_lib),
                     max = MAX_ENTRIES_PER_LIBRARY,
                     "per_library_count says at-cap but find_oldest_for_library returned None — counter invariant violated",
                 );
                 debug_assert!(
                     false,
                     "per_library_count invariant violated: library {:?} count={} but no community lists it",
-                    library,
-                    self.entry_count_for_library(&library)
+                    broadcasting_lib,
+                    self.entry_count_for_library(&broadcasting_lib)
                 );
             }
         }
@@ -643,7 +647,7 @@ impl Aggregation {
                         unattested_by,
                     },
                 );
-                *self.per_library_count.entry(library).or_insert(0) += 1;
+                *self.per_library_count.entry(broadcasting_lib).or_insert(0) += 1;
                 OnEntryOutcome::Inserted(community_id)
             }
             Some(existing) => {
@@ -659,7 +663,7 @@ impl Aggregation {
                     }
                 };
                 if was_new_contribution {
-                    *self.per_library_count.entry(library).or_insert(0) += 1;
+                    *self.per_library_count.entry(broadcasting_lib).or_insert(0) += 1;
                 }
                 if incoming_newer {
                     existing.entry = entry;
