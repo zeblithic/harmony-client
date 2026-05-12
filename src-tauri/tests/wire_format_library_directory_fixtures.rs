@@ -50,12 +50,15 @@ fn library_directory_entry_canonical_cbor_pinned() {
         "round-trip preserves LibraryDirectoryEntry"
     );
 
-    // Sentinel: encoded length must be > 0; serves as a basic
-    // wire-format-stability check. Stricter pinning (exact hex bytes)
-    // can be added in a follow-up if needed — for Phase 1 the
-    // `field_keys_are_2char` test below provides field-key-rename
-    // protection which is the main risk.
-    assert!(!bytes.is_empty());
+    // R3 F5: pin EXACT canonical bytes. Round-trip alone would pass
+    // even if encoder + decoder changed together. The expected hex is
+    // captured from the deterministic fixture above; an encoder rev
+    // that shifts any byte must update this string deliberately.
+    assert_eq!(
+        hex::encode(&bytes),
+        "a96263645011111111111111111111111111111111626169584000070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a11181f262d343b424950575e656c737a81888f969da4abb2b9626e6d714669787475726520436f6d6d756e697479626473782150696e6e656420666f7220776972652d666f726d61742073746162696c6974792e6274708264746573746b776972652d666f726d617462697578186861726d6f6e793a2f2f696e766974652f3f703d41414141626c625022222222222222222222222222222222626c61a361771b0000018bcfe56800616c182a61646e666978747572652d646576696365626373584033333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333",
+        "canonical CBOR bytes drifted from pinned fixture"
+    );
 }
 
 #[test]
@@ -68,7 +71,12 @@ fn library_entry_canonical_cbor_pinned() {
     let bytes = canonical_cbor_encode(&entry).expect("encode");
     let roundtrip: LibraryEntry = ciborium::de::from_reader(&bytes[..]).expect("decode");
     assert_eq!(entry, roundtrip);
-    assert!(!bytes.is_empty());
+    // R3 F5: pin exact canonical bytes (see LibraryDirectoryEntry test).
+    assert_eq!(
+        hex::encode(&bytes),
+        "a262616450abababababababababababababababab626174a361771b0000018bcfe56800616c182a61646e666978747572652d646576696365",
+        "canonical CBOR bytes drifted from pinned fixture"
+    );
 }
 
 #[test]
@@ -84,7 +92,12 @@ fn library_entry_with_tombstone_canonical_cbor_pinned() {
     let bytes = canonical_cbor_encode(&entry).expect("encode");
     let roundtrip: LibraryEntry = ciborium::de::from_reader(&bytes[..]).expect("decode");
     assert_eq!(entry, roundtrip);
-    assert!(!bytes.is_empty());
+    // R3 F5: pin exact canonical bytes (see LibraryDirectoryEntry test).
+    assert_eq!(
+        hex::encode(&bytes),
+        "a362616450cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd626174a361771b0000018bcfe56800616c182a61646e666978747572652d64657669636562726da361771b0000018bcfe56800616c182b61646e666978747572652d646576696365",
+        "canonical CBOR bytes drifted from pinned fixture"
+    );
 }
 
 /// 2-char field-key invariant: every key in the canonical CBOR must be

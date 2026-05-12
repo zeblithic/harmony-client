@@ -9717,6 +9717,65 @@ async fn list_libraries(
     Ok(out)
 }
 
+/// Pure LWW merge for `add_library`. Splits the merge math out of the
+/// IPC handler so it can be unit-tested without spinning up a
+/// `tauri::State<NodeState>` harness.
+///
+/// Returns:
+/// - `Ok(new_entry)` — the LibraryEntry to insert into
+///   `owner_state.libraries[addr]`. Caller persists.
+/// - `Err(msg)` — caller surfaces to the user; mutation MUST be skipped.
+///
+/// Rules:
+/// - If a higher-HLC tombstone exists, refuse (`HLC went backward; refusing to add`).
+/// - Never regress `added_at`: keep `existing.added_at` if it's strictly
+///   newer than `now_hlc` (R3 F1). Otherwise stamp `now_hlc`.
+/// - Carry forward any existing tombstone so re-adds preserve the
+///   removed_at HLC for LWW.
+pub(crate) fn merge_add_library(
+    existing: Option<&crate::owner_state_types::LibraryEntry>,
+    addr: crate::owner_state_types::OwnerAddr,
+    now_hlc: &crate::owner_state_types::Hlc,
+) -> Result<crate::owner_state_types::LibraryEntry, String> {
+    if let Some(prev) = existing {
+        if let Some(prev_remove) = &prev.removed_at {
+            if prev_remove.is_strictly_newer_than(now_hlc) {
+                return Err("HLC went backward; refusing to add".into());
+            }
+        }
+    }
+    let chosen_added = match existing {
+        Some(prev) if prev.added_at.is_strictly_newer_than(now_hlc) => prev.added_at.clone(),
+        _ => now_hlc.clone(),
+    };
+    Ok(crate::owner_state_types::LibraryEntry {
+        address: addr,
+        added_at: chosen_added,
+        removed_at: existing.and_then(|e| e.removed_at.clone()),
+    })
+}
+
+/// Pure LWW guard for `remove_library`. Returns Ok if the caller may
+/// stamp `now_hlc` into the row's `removed_at`; Err otherwise.
+///
+/// Rules:
+/// - Row absent: nothing to remove. Caller treats as a no-op.
+/// - Row present and `now_hlc <= existing.added_at`: refuse (R3 F2). A
+///   write here would leave `is_effective()` true after the tombstone,
+///   so the local unsubscribe + Ok return would create cross-device
+///   divergence.
+pub(crate) fn merge_remove_library(
+    existing: Option<&crate::owner_state_types::LibraryEntry>,
+    now_hlc: &crate::owner_state_types::Hlc,
+) -> Result<(), String> {
+    if let Some(lib) = existing {
+        if !now_hlc.is_strictly_newer_than(&lib.added_at) {
+            return Err("HLC went backward; refusing to remove".into());
+        }
+    }
+    Ok(())
+}
+
 /// IPC: add a library to the user's trust set. LWW-merges into
 /// `owner_state.libraries` and sends a Subscribe request to the
 /// event-loop consumer (which declares the per-library Zenoh
@@ -9727,7 +9786,10 @@ async fn add_library(
     library_addr: String,
 ) -> Result<(), String> {
     let addr = crate::library_directory::parse_owner_addr_hex(&library_addr)?;
-    let (crdt_state, library_directory, hlc_tracker, device_id) = {
+    // R3 F3: snapshot `generation` paired-atomically with the Arcs so
+    // the post-await fence below can detect a stop_node / start_node
+    // racing through this command (mirrors add_space, send_dm).
+    let (crdt_state, library_directory, hlc_tracker, device_id, snapshot_generation) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -9744,6 +9806,7 @@ async fn add_library(
             g.dm_device_id
                 .clone()
                 .ok_or("dm_device_id missing — node not running?")?,
+            g.generation,
         )
     };
     let wall_now_ms = std::time::SystemTime::now()
@@ -9754,22 +9817,31 @@ async fn add_library(
         crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
     {
         let mut crdt_g = crdt_state.lock().await;
-        let existing = crdt_g.libraries.get(&addr).cloned();
-        // If a higher-HLC tombstone exists, our add must beat it.
-        // Otherwise the LWW state stays "removed" and this Subscribe
-        // would be a no-op from the user's perspective.
-        if let Some(prev) = existing.as_ref() {
-            if let Some(prev_remove) = &prev.removed_at {
-                if prev_remove.is_strictly_newer_than(&now_hlc) {
-                    return Err("HLC went backward; refusing to add".into());
-                }
+        // R3 F3: post-await restart fence. If a stop_node/start_node
+        // raced this command, our cloned Arcs are now detached — the
+        // mutation would land in an orphan crdt_state that won't be
+        // persisted, and the request_tx Subscribe would target the
+        // old library_directory consumer task. Re-check generation
+        // under the std lock before mutating.
+        {
+            let g = state_lock
+                .lock()
+                .map_err(|e| format!("NodeState poisoned: {e}"))?;
+            if g.generation != snapshot_generation {
+                return Err(format!(
+                    "node generation changed during add_library (was {}, now {}); \
+                     mutation would land in detached crdt_state — aborted",
+                    snapshot_generation, g.generation
+                ));
             }
         }
-        let new_entry = crate::owner_state_types::LibraryEntry {
-            address: addr,
-            added_at: now_hlc.clone(),
-            removed_at: existing.as_ref().and_then(|e| e.removed_at.clone()),
-        };
+        // R3 F1: never regress the LWW state. If a remote bound device
+        // already synced an add with a HIGHER HLC than our local now_hlc
+        // (e.g., wall-clock skew or a synced concurrent add), keep the
+        // existing `added_at`. Otherwise our overwrite would clobber a
+        // strictly-newer LWW state. Logic is in `merge_add_library` so
+        // it's unit-testable without a tauri::State harness.
+        let new_entry = merge_add_library(crdt_g.libraries.get(&addr), addr, &now_hlc)?;
         crdt_g.libraries.insert(addr, new_entry);
         // Persistence writeback: owner-state SyncEngine debounces its
         // own checkpoint on the same crdt_state Arc (see add_space).
@@ -9790,7 +9862,10 @@ async fn remove_library(
     library_addr: String,
 ) -> Result<(), String> {
     let addr = crate::library_directory::parse_owner_addr_hex(&library_addr)?;
-    let (crdt_state, library_directory, hlc_tracker, device_id) = {
+    // R3 F3: snapshot `generation` paired-atomically with the Arcs so
+    // the post-await fence below can detect a stop_node / start_node
+    // racing through this command (mirrors add_library, add_space).
+    let (crdt_state, library_directory, hlc_tracker, device_id, snapshot_generation) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -9807,6 +9882,7 @@ async fn remove_library(
             g.dm_device_id
                 .clone()
                 .ok_or("dm_device_id missing — node not running?")?,
+            g.generation,
         )
     };
     let wall_now_ms = std::time::SystemTime::now()
@@ -9817,6 +9893,27 @@ async fn remove_library(
         crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
     {
         let mut crdt_g = crdt_state.lock().await;
+        // R3 F3: post-await restart fence (same rationale as add_library).
+        {
+            let g = state_lock
+                .lock()
+                .map_err(|e| format!("NodeState poisoned: {e}"))?;
+            if g.generation != snapshot_generation {
+                return Err(format!(
+                    "node generation changed during remove_library (was {}, now {}); \
+                     mutation would land in detached crdt_state — aborted",
+                    snapshot_generation, g.generation
+                ));
+            }
+        }
+        // R3 F2: symmetric LWW guard. If our tombstone HLC doesn't beat
+        // the row's `added_at` (e.g., a remote add with a later HLC just
+        // synced), `is_effective()` will still return true after this
+        // write — yet we'd unsubscribe locally and return Ok, leaving
+        // cross-device state inconsistent. Refuse and surface the error.
+        // Logic is in `merge_remove_library` so it's unit-testable
+        // without a tauri::State harness.
+        merge_remove_library(crdt_g.libraries.get(&addr), &now_hlc)?;
         if let Some(lib) = crdt_g.libraries.get_mut(&addr) {
             lib.removed_at = Some(now_hlc);
         }
@@ -9855,6 +9952,138 @@ async fn browse_library(
         .iter()
         .map(crate::library_directory::DirectoryEntryDTO::from_aggregated)
         .collect())
+}
+
+#[cfg(test)]
+mod library_directory_lww_tests {
+    //! Unit tests for the pure LWW helpers behind `add_library` /
+    //! `remove_library`. R3 F1 + F2 regression coverage.
+    use super::*;
+    use crate::owner_state_types::{Hlc, LibraryEntry, OwnerAddr};
+
+    fn hlc(wall_ms: u64, logical: u32) -> Hlc {
+        Hlc {
+            wall_ms,
+            logical,
+            device_id: "d".to_string(),
+        }
+    }
+
+    /// R3 F1: a newer synced add (higher HLC than local now_hlc) must
+    /// not be regressed by a local add_library call. The chosen
+    /// `added_at` stays at the existing higher value.
+    #[test]
+    fn add_library_does_not_regress_newer_synced_add() {
+        let addr = OwnerAddr([0xAA; 16]);
+        let existing = LibraryEntry {
+            address: addr,
+            added_at: hlc(1000, 0),
+            removed_at: None,
+        };
+        let local_now = hlc(500, 0);
+        let merged = merge_add_library(Some(&existing), addr, &local_now)
+            .expect("merge should accept non-tombstoned regress attempt");
+        assert_eq!(
+            merged.added_at,
+            hlc(1000, 0),
+            "added_at must NOT regress below the synced higher value",
+        );
+        assert_eq!(merged.removed_at, None);
+        assert_eq!(merged.address, addr);
+    }
+
+    /// Forward direction: a strictly-newer local add advances added_at
+    /// to now_hlc. Sanity check the LWW math both ways.
+    #[test]
+    fn add_library_advances_added_at_when_now_hlc_is_newer() {
+        let addr = OwnerAddr([0xBB; 16]);
+        let existing = LibraryEntry {
+            address: addr,
+            added_at: hlc(500, 0),
+            removed_at: None,
+        };
+        let local_now = hlc(1000, 0);
+        let merged = merge_add_library(Some(&existing), addr, &local_now).expect("merge");
+        assert_eq!(merged.added_at, hlc(1000, 0));
+    }
+
+    /// R1 F1 regression: a higher-HLC tombstone refuses the add.
+    #[test]
+    fn add_library_refuses_when_tombstone_beats_now_hlc() {
+        let addr = OwnerAddr([0xCC; 16]);
+        let existing = LibraryEntry {
+            address: addr,
+            added_at: hlc(100, 0),
+            removed_at: Some(hlc(2000, 0)),
+        };
+        let local_now = hlc(500, 0);
+        let err = merge_add_library(Some(&existing), addr, &local_now)
+            .expect_err("should refuse: tombstone is strictly newer than now_hlc");
+        assert!(err.contains("HLC went backward"));
+    }
+
+    /// First-add path: no existing row, stamp now_hlc directly.
+    #[test]
+    fn add_library_stamps_now_hlc_on_first_add() {
+        let addr = OwnerAddr([0xDD; 16]);
+        let local_now = hlc(1234, 5);
+        let merged = merge_add_library(None, addr, &local_now).expect("merge");
+        assert_eq!(merged.added_at, hlc(1234, 5));
+        assert_eq!(merged.removed_at, None);
+    }
+
+    /// R3 F2: remove must refuse when now_hlc doesn't strictly exceed
+    /// the row's added_at — otherwise the tombstone wouldn't win LWW
+    /// (is_effective() would still return true) and we'd diverge from
+    /// the synced state.
+    #[test]
+    fn remove_library_refuses_if_hlc_does_not_beat_added_at() {
+        let addr = OwnerAddr([0xEE; 16]);
+        let existing = LibraryEntry {
+            address: addr,
+            added_at: hlc(1000, 0),
+            removed_at: None,
+        };
+        let local_now = hlc(500, 0);
+        let err = merge_remove_library(Some(&existing), &local_now)
+            .expect_err("should refuse: now_hlc < added_at");
+        assert!(err.contains("HLC went backward"));
+    }
+
+    /// Equal-HLC remove also refuses (need STRICT > to win LWW).
+    #[test]
+    fn remove_library_refuses_on_equal_hlc() {
+        let addr = OwnerAddr([0xEE; 16]);
+        let existing = LibraryEntry {
+            address: addr,
+            added_at: hlc(1000, 0),
+            removed_at: None,
+        };
+        let local_now = hlc(1000, 0);
+        assert!(merge_remove_library(Some(&existing), &local_now).is_err());
+    }
+
+    /// Remove with strictly-newer HLC: caller may proceed.
+    #[test]
+    fn remove_library_allows_strictly_newer_hlc() {
+        let addr = OwnerAddr([0xFF; 16]);
+        let existing = LibraryEntry {
+            address: addr,
+            added_at: hlc(500, 0),
+            removed_at: None,
+        };
+        let local_now = hlc(1000, 0);
+        merge_remove_library(Some(&existing), &local_now)
+            .expect("strict-greater now_hlc must beat added_at");
+    }
+
+    /// Remove with no existing row is a no-op (caller does the absent-
+    /// row check separately — helper just doesn't error).
+    #[test]
+    fn remove_library_noop_when_row_absent() {
+        let local_now = hlc(1000, 0);
+        merge_remove_library(None, &local_now).expect("absent row is no-op");
+    }
 }
 
 /// Tauri IPC: leave a community we currently belong to.

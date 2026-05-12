@@ -620,4 +620,40 @@ mod tests {
             "pre-Task-8 V2 files must load with empty owner_device_cache",
         );
     }
+
+    /// ZEB-218 Sub-D R3 F6: backward-compat for the new `libraries`
+    /// field. A pre-Task-1 V2 file (written before `libraries` existed)
+    /// must load cleanly with an empty BTreeMap. `serde(default)` on
+    /// the field is what makes this work — this test pins that
+    /// behavior so a future refactor can't quietly remove the default
+    /// and break load on every existing user's disk.
+    #[test]
+    fn crdt_load_v2_without_libraries_field_yields_empty_libraries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old_v2_no_libs.cbor");
+
+        // OwnerState::default() has libraries == empty; the
+        // skip_serializing_if = "BTreeMap::is_empty" omits the field
+        // entirely, mimicking a pre-Task-1 file on disk.
+        let state_no_libs = OwnerState::default();
+        save_crdt(&path, &state_no_libs).unwrap();
+
+        // Confirm the field key was omitted by scanning raw bytes
+        // for the literal UTF-8 of the CBOR text key (CBOR text
+        // strings include the field name verbatim in the byte stream).
+        let raw = std::fs::read(&path).unwrap();
+        let key = b"libraries";
+        assert!(
+            !raw.windows(key.len()).any(|w| w == key),
+            "`libraries` key should not appear in file when map is empty",
+        );
+
+        // Loading must succeed with an empty BTreeMap, not error on
+        // missing field.
+        let loaded = load_crdt(&path).unwrap();
+        assert!(
+            loaded.libraries.is_empty(),
+            "pre-Task-1 V2 files must load with empty libraries",
+        );
+    }
 }
