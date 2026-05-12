@@ -2003,8 +2003,10 @@ mod integration_tests {
 
     /// 10 randomized sequences of (mutate-on-A, mutate-on-B,
     /// publish-A, publish-B) operations. After draining, A and B
-    /// must hold equal `OwnerState`s. Catches non-determinism in
-    /// the merge path that scripted tests miss.
+    /// must hold equal `OwnerState.spaces` maps (the only field this
+    /// test mutates — operations are `apply_space_with_canonicalization`
+    /// calls). Catches non-determinism in the spaces-merge path that
+    /// scripted tests miss.
     ///
     /// ZEB-283: Trial count was reduced from 50 → 10 (2026-05-12) to
     /// cut wall-clock from ~76s to ~15s on every `cargo nextest run`.
