@@ -203,7 +203,7 @@ Sort: newest `listed_at` first (helps users see fresh announces at the top of th
 
 ### 6.2 Refetch event
 
-**Reuse** the existing `library-directory-updated` event. Frontend's existing debounced refetch handler will call `listDiscoveredLibraries()` alongside `listLibraries()` and `browseLibrary()`. No new event type.
+**Reuse** the existing `library-directory-updated` event. Frontend's existing debounced refetch handler will call `LibraryDirectoryService.listDiscovered()` alongside the existing `.list()` and `.browse()` methods. No new event type.
 
 ---
 
@@ -235,24 +235,27 @@ A new section between "Your libraries" and the bottom add-manual affordance:
 
 ### 7.2 `library-directory-service.ts`
 
-Add one wrapper:
+`library-directory-service.ts` exports a class-based `LibraryDirectoryService` (Phase 1 shape; constructor takes a `TauriAdapter`). Phase 2 adds one method + one type:
 
 ```typescript
 export interface DiscoveredLibraryInfo {
   libraryAddr: string;
   name: string;
   description: string;
+  /** `listed_at.wall_ms` as base-10 string for display only — callers
+   *  MUST NOT use this for HLC ordering decisions. */
   listedAt: string;
 }
 
-export async function listDiscoveredLibraries(): Promise<DiscoveredLibraryInfo[]> {
-  return await invoke('list_discovered_libraries');
+// Added to LibraryDirectoryService:
+async listDiscovered(): Promise<DiscoveredLibraryInfo[]> {
+  return (await this.adapter.invoke('list_discovered_libraries', {})) as DiscoveredLibraryInfo[];
 }
 ```
 
 ### 7.3 Event handling
 
-Existing `library-directory-updated` listener in `LibraryDirectoryBrowser.svelte` is extended to refetch the discovered list alongside the existing `listLibraries()`. Debounce reused (no new timer).
+Existing `library-directory-updated` listener in `LibraryDirectoryBrowser.svelte` is extended to refetch the discovered list alongside the existing `.list()` call. Debounce reused (no new timer).
 
 ---
 
