@@ -4489,12 +4489,17 @@ async fn publish_vine_reaction(
 fn list_vine_videos(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<Vec<VineVideoDto>, String> {
-    let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-    let cache = guard
-        .vine_feed_cache
-        .as_ref()
-        .ok_or_else(|| "not connected".to_string())?;
-    let result = cache.lock().unwrap().list_descriptors();
+    let cache = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .vine_feed_cache
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    let result = cache
+        .lock()
+        .map_err(|e| format!("vine_feed_cache lock: {e}"))?
+        .list_descriptors();
     Ok(result)
 }
 
@@ -4588,12 +4593,17 @@ fn mark_vine_viewed(
     vine_id: String,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<bool, String> {
-    let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-    let cache = guard
-        .vine_feed_cache
-        .as_ref()
-        .ok_or_else(|| "not connected".to_string())?;
-    let result = cache.lock().unwrap().mark_viewed(vine_id);
+    let cache = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .vine_feed_cache
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    let result = cache
+        .lock()
+        .map_err(|e| format!("vine_feed_cache lock: {e}"))?
+        .mark_viewed(vine_id);
     Ok(result)
 }
 

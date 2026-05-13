@@ -9,10 +9,6 @@
 //!
 //! See `docs/specs/2026-05-13-zeb-286-vine-integration-test-design.md`.
 
-// Public surface is intentionally forward-declared for Tasks 2-4; wiring
-// into NodeState and Tauri IPCs lands later in this PR.
-#![allow(dead_code)]
-
 use crate::{VineDescriptorPayload, VineReactionPayload, VineVideoDto};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -70,7 +66,9 @@ pub struct VineVideoDtoWithSource {
     pub creator_name: String,
     pub created_at: u64,
     pub video_cid: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reshare_of: Option<String>,
     pub viewed: bool,
     pub source: VineSource,
@@ -246,8 +244,12 @@ impl VineFeedCache {
                 Some(ReactionOutcome::Inserted)
             }
             Some(existing) => {
-                if reaction.timestamp <= existing.timestamp {
-                    // Stale (or duplicate same-timestamp): no-op
+                if reaction.timestamp < existing.timestamp {
+                    // Strictly older: stale, no-op.
+                    // Same-timestamp is treated as UpdatedNewer so that
+                    // rapid toggles within one second (publish_vine_reaction
+                    // uses SystemTime::now().as_secs()) are not silently
+                    // dropped.
                     return Some(ReactionOutcome::Stale);
                 }
                 self.reactions.insert(

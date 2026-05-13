@@ -2748,10 +2748,13 @@ fn emit_frontend_event<R: Runtime>(
             // frontend ONLY on Inserted or UpdatedNewer (stale/duplicate
             // re-arrivals are absorbed silently). The cache's per-LWW
             // dedupe replaces the previous naive every-sample emit.
-            let outcome = vine_feed_cache
-                .lock()
-                .unwrap()
-                .on_reaction_sample(key_expr, payload);
+            let outcome = match vine_feed_cache.lock() {
+                Ok(mut cache) => cache.on_reaction_sample(key_expr, payload),
+                Err(e) => {
+                    tracing::error!(error = %e, "vine_feed_cache mutex poisoned; skipping reaction emit");
+                    None
+                }
+            };
             if matches!(
                 outcome,
                 Some(
@@ -2777,10 +2780,18 @@ fn emit_frontend_event<R: Runtime>(
                     .unwrap_or(0),
             )
             .unwrap_or(u64::MAX);
-            let outcome = {
-                let mut cache = vine_feed_cache.lock().unwrap();
-                let set = followed_set.lock().unwrap();
-                cache.on_descriptor_sample(key_expr, payload, &set, now_ms)
+            let outcome = match vine_feed_cache.lock() {
+                Ok(mut cache) => match followed_set.lock() {
+                    Ok(set) => cache.on_descriptor_sample(key_expr, payload, &set, now_ms),
+                    Err(e) => {
+                        tracing::error!(error = %e, "followed_set mutex poisoned; skipping descriptor emit");
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(error = %e, "vine_feed_cache mutex poisoned; skipping descriptor emit");
+                    None
+                }
             };
             if let Some(crate::vine_feed_cache::DescriptorOutcome::Inserted { dto }) = outcome {
                 let _ = app.emit("vine-received", &dto);
