@@ -439,6 +439,11 @@ pub enum VerifyError {
     /// (an unban) rather than "kick target has no member record" which is
     /// misleading from a UI perspective.
     UnbanTargetNotMember,
+    /// Moderation reason string exceeds `MAX_MODERATION_REASON_CHARS`
+    /// (280 codepoints). Mirrors the UI cap so a malicious peer cannot
+    /// bypass the UI textarea `maxlength` and persist an oversized reason
+    /// to every replica. Applies to both Kick and Unban events.
+    ReasonTooLong,
     /// SetPower assigned a level above POWER_THRESHOLDS.max. Even an
     /// authorized actor cannot grant a power higher than the cap, since
     /// that would create a member admin can no longer kick (admin's own
@@ -561,6 +566,12 @@ impl std::fmt::Display for VerifyError {
                 write!(
                     f,
                     "unban target has no member record in this community"
+                )
+            }
+            VerifyError::ReasonTooLong => {
+                write!(
+                    f,
+                    "moderation reason exceeds {MAX_MODERATION_REASON_CHARS} characters"
                 )
             }
             VerifyError::PowerLevelOutOfRange => {
@@ -1621,7 +1632,7 @@ pub fn verify_event(
                 }
             }
         }
-        MembershipEventKind::Kick { target, .. } => {
+        MembershipEventKind::Kick { target, reason } => {
             if actor_power < POWER_THRESHOLDS.kick {
                 return Err(VerifyError::ActorPowerInsufficient);
             }
@@ -1637,6 +1648,14 @@ pub fn verify_event(
             if actor_power <= target_power {
                 return Err(VerifyError::KickTargetPowerNotLower);
             }
+            // Defense-in-depth: bound the reason string at the CRDT layer
+            // so a malicious peer can't bypass the UI cap and persist a
+            // giant reason on every replica.
+            if let Some(r) = reason {
+                if r.chars().count() > MAX_MODERATION_REASON_CHARS {
+                    return Err(VerifyError::ReasonTooLong);
+                }
+            }
         }
         MembershipEventKind::SetPower { level, .. } => {
             if actor_power < POWER_THRESHOLDS.set_power {
@@ -1646,7 +1665,7 @@ pub fn verify_event(
                 return Err(VerifyError::PowerLevelOutOfRange);
             }
         }
-        MembershipEventKind::Unban { target, .. } => {
+        MembershipEventKind::Unban { target, reason } => {
             // Admin-tier: actor must have power >= set_power threshold (100).
             if actor_power < POWER_THRESHOLDS.set_power {
                 return Err(VerifyError::ActorPowerInsufficient);
@@ -1660,6 +1679,13 @@ pub fn verify_event(
             // Target must currently be Banned.
             if target_state.status != MemberStatus::Banned {
                 return Err(VerifyError::UnbanTargetNotBanned);
+            }
+            // Same reason-length cap as Kick (defense-in-depth against
+            // a peer signing an oversized reason that bypasses the UI).
+            if let Some(r) = reason {
+                if r.chars().count() > MAX_MODERATION_REASON_CHARS {
+                    return Err(VerifyError::ReasonTooLong);
+                }
             }
         }
         MembershipEventKind::ChannelCreate {
@@ -1833,6 +1859,21 @@ pub const POWER_THRESHOLDS: PowerThresholds = PowerThresholds {
     set_power: 100,
     max: 100,
 };
+
+/// Maximum Unicode codepoint count for a moderation reason string
+/// (Kick or Unban event's `reason: Option<String>` field). The UI
+/// `ModerationReasonDialog` already enforces `maxlength="280"` on the
+/// textarea — this constant mirrors that limit at the CRDT verification
+/// layer so a malicious or buggy peer cannot inject an oversized reason
+/// that bypasses the UI cap and persists across all replicas.
+///
+/// `chars().count()` (codepoint count) is the basis because:
+///   - It matches user-perceptible "characters" reasonably well (1 codepoint
+///     per ASCII/BMP char; 1 codepoint per emoji on modern Unicode planes).
+///   - It's deterministic across replicas regardless of UTF-8 byte width.
+///   - 280 codepoints is at minimum as permissive as the UI's
+///     `maxlength="280"` (which counts UTF-16 code units, so emojis double).
+pub const MAX_MODERATION_REASON_CHARS: usize = 280;
 
 #[cfg(test)]
 mod tests {
@@ -2936,6 +2977,98 @@ mod tests {
             verify_event(&unban, &prior, &ctx),
             Err(VerifyError::UnbanTargetNotMember),
             "unban of unknown target must return UnbanTargetNotMember"
+        );
+    }
+
+    /// Kick with a reason longer than `MAX_MODERATION_REASON_CHARS` must be
+    /// rejected at verify_event so an oversized reason cannot bypass the UI
+    /// cap and persist to every replica.
+    #[test]
+    fn kick_event_rejected_when_reason_exceeds_max_chars() {
+        let community_id = SpaceId([0xc0; 16]);
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (_, _, target_addr) = make_identity(0xb1);
+
+        let admin_join = make_join_event(0x01, admin_addr, 1);
+        let target_join = make_join_event(0x02, target_addr, 2);
+        let prior = materialize(&[admin_join, target_join], admin_addr);
+
+        // Build a reason with exactly MAX_MODERATION_REASON_CHARS+1 codepoints.
+        let oversized: String = std::iter::repeat('a')
+            .take(MAX_MODERATION_REASON_CHARS + 1)
+            .collect();
+        let kick_payload = EventPayload {
+            id: [0x10; 16],
+            community_id,
+            kind: MembershipEventKind::Kick {
+                target: target_addr,
+                reason: Some(oversized),
+            },
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        };
+        let kick = sign_with_identity(kick_payload, &admin_priv);
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+        };
+        assert_eq!(
+            verify_event(&kick, &prior, &ctx),
+            Err(VerifyError::ReasonTooLong)
+        );
+    }
+
+    /// Unban with a reason longer than `MAX_MODERATION_REASON_CHARS` must be
+    /// rejected at verify_event so an oversized reason cannot bypass the UI
+    /// cap and persist to every replica.
+    #[test]
+    fn unban_event_rejected_when_reason_exceeds_max_chars() {
+        let community_id = SpaceId([0xc0; 16]);
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (_, _, target_addr) = make_identity(0xb1);
+
+        // Set up Banned target via prior Kick
+        let admin_join = make_join_event(0x01, admin_addr, 1);
+        let target_join = make_join_event(0x02, target_addr, 2);
+        let kick = make_kick_event(0x01, admin_addr, target_addr, 10);
+        let prior = materialize(&[admin_join, target_join, kick], admin_addr);
+        assert_eq!(prior.members[&target_addr].status, MemberStatus::Banned);
+
+        let oversized: String = std::iter::repeat('z')
+            .take(MAX_MODERATION_REASON_CHARS + 1)
+            .collect();
+        let unban_payload = EventPayload {
+            id: [0x20; 16],
+            community_id,
+            kind: MembershipEventKind::Unban {
+                target: target_addr,
+                reason: Some(oversized),
+            },
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        };
+        let unban = sign_with_identity(unban_payload, &admin_priv);
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+        };
+        assert_eq!(
+            verify_event(&unban, &prior, &ctx),
+            Err(VerifyError::ReasonTooLong)
         );
     }
 

@@ -23,13 +23,23 @@
   let members: CommunityMember[] = $state([]);
   let recentEvents = $state<ModerationEvent[]>([]);
   let loading = $state(true);
-  // Two separate error surfaces so an action failure (promote/demote IPC
-  // rejected) does NOT hide the member list. `loadError` blocks the panel
-  // when the initial member-list fetch fails (no list to show); `actionError`
-  // renders as a transient banner above the list so the user can see what
-  // failed AND still interact with the panel.
+  // Three error surfaces with distinct semantics:
+  //   loadError    — initial-fetch failure ONLY; panel-blocking (no usable
+  //                  data to show). Set when the very first `refresh()` call
+  //                  rejects; never written by subsequent refreshes.
+  //   actionError  — action IPC rejection (promote/demote/kick/unban). Shown
+  //                  as a transient banner above the still-rendered list.
+  //   refreshError — post-initial-load refresh failure (e.g., transient
+  //                  backend hiccup during an onMembersChanged tick). Shown
+  //                  the same way as actionError (banner) so the user keeps
+  //                  the last-known-good member list and isn't dropped into
+  //                  a blank panel by a momentary fetch failure.
   let loadError: string | null = $state(null);
   let actionError: string | null = $state(null);
+  let refreshError: string | null = $state(null);
+  // Tracks whether the initial fetch has ever succeeded — gates the
+  // loadError-vs-refreshError routing in `refresh()`.
+  let hasLoadedMembers = $state(false);
   let searchQuery = $state('');
   let bannedExpanded = $state(false);
 
@@ -84,15 +94,28 @@
   );
 
   async function refresh() {
-    loading = true;
+    // Only show the loading skeleton on the very first fetch — subsequent
+    // refreshes (triggered by `onMembersChanged`) keep the last-known-good
+    // list visible to avoid flashing the panel back to a "Loading..." state.
+    if (!hasLoadedMembers) loading = true;
     try {
       members = await communityService.listCommunityMembers(communityId);
       loadError = null;
+      refreshError = null;
       // A successful refresh implies whatever world-state caused the prior
       // action error may have changed; clear it.
       actionError = null;
+      hasLoadedMembers = true;
     } catch (e) {
-      loadError = e instanceof Error ? e.message : String(e);
+      const message = e instanceof Error ? e.message : String(e);
+      if (hasLoadedMembers) {
+        // Initial load already succeeded — preserve the last-known-good
+        // members list and surface the failure as a transient banner.
+        refreshError = message;
+      } else {
+        // First-ever load failed — no usable list to render; panel-block.
+        loadError = message;
+      }
     } finally {
       loading = false;
     }
@@ -204,6 +227,17 @@
           class="dismiss-action-error"
           aria-label="Dismiss error"
           onclick={() => (actionError = null)}
+        >&times;</button>
+      </p>
+    {/if}
+    {#if refreshError}
+      <p class="error refresh-error" role="alert">
+        Refresh failed: {refreshError}
+        <button
+          type="button"
+          class="dismiss-action-error"
+          aria-label="Dismiss refresh error"
+          onclick={() => (refreshError = null)}
         >&times;</button>
       </p>
     {/if}
