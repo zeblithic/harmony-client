@@ -6388,10 +6388,12 @@ pub struct ModerationEventDto {
     /// Hex-encoded target OwnerAddr (32 chars).
     pub target_addr: String,
     /// Free-text reason signed into the CRDT event; None for SetPower.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Serialized as `null` (not omitted) so the JS side observes
+    /// `reason: null` not `reason: undefined` — matches the TS contract
+    /// `string | null` rather than introducing `undefined` semantics.
     pub reason: Option<String>,
-    /// New power level; None for Kick and Unban.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// New power level; None for Kick and Unban. Serialized as `null`
+    /// (not omitted) — same rationale as `reason`.
     pub new_power: Option<u8>,
     /// HLC at which the event was signed and inserted.
     pub hlc: crate::owner_state_types::Hlc,
@@ -12307,12 +12309,17 @@ async fn list_recent_moderation_events(
         })
         .collect();
 
-    // Sort by HLC descending: wall_ms desc, then logical desc.
+    // Sort by HLC descending across the full tuple: wall_ms desc, then
+    // logical desc, then device_id desc. The device_id tiebreaker keeps
+    // ordering stable across replicas when two events from different
+    // devices share (wall_ms, logical) — otherwise the "recent actions"
+    // list could differ between viewers, making it flaky to assert.
     dtos.sort_by(|a, b| {
         b.hlc
             .wall_ms
             .cmp(&a.hlc.wall_ms)
             .then_with(|| b.hlc.logical.cmp(&a.hlc.logical))
+            .then_with(|| b.hlc.device_id.cmp(&a.hlc.device_id))
     });
 
     dtos.truncate(limit);

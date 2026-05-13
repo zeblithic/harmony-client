@@ -103,6 +103,29 @@ describe('MemberRow kebab-matrix', () => {
     expect(queryByRole('menuitem', { name: 'Kick' })).toBeNull();
   });
 
+  it('Admin viewer on PEER Admin target: sees Demote actions but NOT Kick', async () => {
+    // Regression test for the peer-admin demote gate (Qodo bug report on PR #117).
+    // SetPower requires only `actor_power >= 100`; kick requires `actor_power
+    // > target_power` (strictly-greater). So admin-on-admin can demote but
+    // not kick.
+    const peerAdmin = makeMember(100, 'joined', '22'.repeat(16));
+    const { getByRole, queryByRole } = render(MemberRow, {
+      props: {
+        member: peerAdmin,
+        viewer: { addr: VIEWER_ADDR, power: 100, isLastAdmin: false },
+        onaction: vi.fn(),
+      },
+    });
+
+    const kebabBtn = getByRole('button', { name: 'Member actions' });
+    await fireEvent.click(kebabBtn);
+
+    expect(getByRole('menuitem', { name: 'Demote to Moderator' })).toBeTruthy();
+    expect(getByRole('menuitem', { name: 'Demote to Member' })).toBeTruthy();
+    // Kick is gated strictly-greater; peer admin cannot kick peer admin
+    expect(queryByRole('menuitem', { name: 'Kick' })).toBeNull();
+  });
+
   it("Admin viewer on own row when last admin: sees Demote to Moderator action", async () => {
     const selfMember = makeMember(100, 'joined', VIEWER_ADDR);
     const { getByRole } = render(MemberRow, {

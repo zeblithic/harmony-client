@@ -23,6 +23,9 @@
 
   const titleId = `moderation-dialog-title-${Math.random().toString(36).slice(2)}`;
   let actionLabel = $derived(action === 'kick' ? 'Kick' : 'Unban');
+  // Progressive form: "Unban" → "Unbanning" (double-n), not the naive
+  // `${actionLabel}ing` which renders as "Unbaning".
+  let actionLabelProgressive = $derived(action === 'kick' ? 'Kicking' : 'Unbanning');
 
   async function handleConfirm() {
     submitting = true;
@@ -86,7 +89,7 @@
       >
         {#if submitting}
           <span class="spinner" aria-hidden="true"></span>
-          {actionLabel}ing...
+          {actionLabelProgressive}...
         {:else}
           {actionLabel}
         {/if}

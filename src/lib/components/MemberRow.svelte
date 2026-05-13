@@ -44,15 +44,21 @@
       if (viewerPower >= 50) actions.push('demote-member');
       return actions;
     }
-    // Acting on another member
+    // Acting on another member.
+    //
+    // SetPower (promote/demote) requires only that the actor has admin-tier
+    // (>= 100). The backend does NOT compare actor power to target power
+    // for SetPower — see `verify_event` for `MembershipEventKind::SetPower`
+    // in community_membership.rs. So an admin can demote a peer admin.
+    // Kick, by contrast, requires strictly-greater (`actor_power > target_power`).
     const actions: KebabAction[] = [];
-    if (viewerPower > targetPower) {
-      if (viewerPower >= 100 && targetPower < 50) actions.push('promote-mod');
-      if (viewerPower >= 100 && targetPower < 100) actions.push('promote-admin');
-      if (viewerPower >= 100 && targetPower === 100) actions.push('demote-mod');
-      if (viewerPower >= 100 && targetPower >= 50 && targetPower < 100) actions.push('demote-member');
-      if (viewerPower >= 50) actions.push('kick');
-    }
+    const canSetPower = viewerPower >= 100;
+    const canKick = viewerPower >= 50 && viewerPower > targetPower;
+    if (canSetPower && targetPower < 50) actions.push('promote-mod');
+    if (canSetPower && targetPower < 100) actions.push('promote-admin');
+    if (canSetPower && targetPower >= 100) actions.push('demote-mod');
+    if (canSetPower && targetPower >= 50) actions.push('demote-member');
+    if (canKick) actions.push('kick');
     return actions;
   }
 

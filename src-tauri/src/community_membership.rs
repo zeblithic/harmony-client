@@ -1041,7 +1041,10 @@ pub fn materialize(
                 if let Some(s) = m.members.get_mut(target) {
                     if s.status == MemberStatus::Banned {
                         s.status = MemberStatus::Left;
-                        s.joined_at = event.at.clone();
+                        // Preserve the original `joined_at` — overwriting with the
+                        // unban HLC would invert the (joined_at, left_at) ordering
+                        // since the prior Kick already wrote left_at < unban_at.
+                        // Matches the Kick/Leave handlers which also preserve it.
                     }
                 }
             }
