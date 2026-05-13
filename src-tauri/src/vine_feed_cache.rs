@@ -211,6 +211,13 @@ impl VineFeedCache {
     /// LWW per (vine_id, reactor_addr) by `timestamp`. Stale samples
     /// (timestamp older than existing entry) return `Stale` and do
     /// NOT mutate the cache.
+    ///
+    /// `ReactionOutcome::Rejected` is a unit variant — the underlying
+    /// `serde_json` parse error is discarded for now. Callers (currently
+    /// `event_loop::emit_frontend_event`, Task 5) are responsible for
+    /// any observability around malformed reaction payloads. If a future
+    /// telemetry need surfaces, this can be lifted to `Rejected(String)`
+    /// to match `DescriptorOutcome::Rejected`.
     pub fn on_reaction_sample(
         &mut self,
         key_expr: &str,
@@ -621,6 +628,36 @@ mod tests {
         let cache = VineFeedCache::new();
         let summary = cache.get_reaction("nonexistent-vine", "anyone-addr");
         assert_eq!(summary.count, 0);
+        assert!(!summary.liked_by_me);
+    }
+
+    #[test]
+    fn viewer_with_only_unliked_entry_reports_not_liked_by_me() {
+        // Regression test for a subtle invariant: liked_by_me must require
+        // a `liked == true` entry from viewer_addr. A `liked = false`
+        // (unlike) entry for the viewer must NOT set liked_by_me — the
+        // viewer explicitly does NOT like the vine. The `same_reactor_unlike_
+        // then_like_lww_wins` test does insert an unlike, but immediately
+        // overwrites it; this test exercises unlike-as-final-state via
+        // get_reaction.
+        let mut cache = VineFeedCache::new();
+
+        // Alice unlikes
+        let alice_unlike = canonical_reaction_bytes("vine-1", "alice-addr", "Alice", false, 100);
+        cache.on_reaction_sample(
+            "harmony/vines/creator-addr/reactions/vine-1/alice-addr",
+            &alice_unlike,
+        );
+
+        // Bob likes (so count > 0, isolating the liked_by_me=false invariant)
+        let bob_like = canonical_reaction_bytes("vine-1", "bob-addr", "Bob", true, 110);
+        cache.on_reaction_sample(
+            "harmony/vines/creator-addr/reactions/vine-1/bob-addr",
+            &bob_like,
+        );
+
+        let summary = cache.get_reaction("vine-1", "alice-addr");
+        assert_eq!(summary.count, 1);
         assert!(!summary.liked_by_me);
     }
 }
