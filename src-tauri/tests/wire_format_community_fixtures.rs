@@ -119,6 +119,40 @@ fn signed_event_setpower_wire_bytes_pinned() {
 }
 
 #[test]
+fn signed_event_unban_no_reason_wire_bytes_pinned() {
+    let target = OwnerAddr([0x99; 16]);
+    let event = fixture_signed_event(MembershipEventKind::Unban {
+        target,
+        reason: None,
+    });
+    let bytes = canonical_cbor_encode(&event).expect("encode");
+    let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    eprintln!("signed_event_unban_no_reason hex: {hex}");
+    assert_eq!(
+        hex,
+        "a662696450424242424242424242424242424242426263695037373737373737373737373737373737626b6ea2627467617562766ca162746750999999999999999999999999999999996261635011111111111111111111111111111111626174a361771b0000018bcfe56800616c006164636669786273675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "Unban (no reason) wire format changed"
+    );
+}
+
+#[test]
+fn signed_event_unban_with_reason_wire_bytes_pinned() {
+    let target = OwnerAddr([0x99; 16]);
+    let event = fixture_signed_event(MembershipEventKind::Unban {
+        target,
+        reason: Some("test".to_string()),
+    });
+    let bytes = canonical_cbor_encode(&event).expect("encode");
+    let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    eprintln!("signed_event_unban_with_reason hex: {hex}");
+    assert_eq!(
+        hex,
+        "a662696450424242424242424242424242424242426263695037373737373737373737373737373737626b6ea2627467617562766ca2627467509999999999999999999999999999999962727364746573746261635011111111111111111111111111111111626174a361771b0000018bcfe56800616c006164636669786273675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "Unban (with reason) wire format changed"
+    );
+}
+
+#[test]
 fn countersignature_wire_bytes_pinned() {
     let cs = CounterSignature {
         signer: OwnerAddr([0x77; 16]),

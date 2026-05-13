@@ -7,6 +7,7 @@
   import ChannelSubSidebar from './ChannelSubSidebar.svelte';
   import ChannelMessageFeed from './ChannelMessageFeed.svelte';
   import ChannelMembersPanel from './ChannelMembersPanel.svelte';
+  import CommunityMembersPanel from './CommunityMembersPanel.svelte';
   import CreateChannelDialog from './CreateChannelDialog.svelte';
   import ModifyChannelDialog from './ModifyChannelDialog.svelte';
   import TypedConfirmationModal from './TypedConfirmationModal.svelte';
@@ -51,6 +52,7 @@
   let channels = $state<ChannelInfo[]>([]);
   let activeChannelId = $state<string | null>(null);
   let settingsModalOpen = $state(false);
+  let communityMembersPanelOpen = $state(false);
   let showCreateDialog = $state(false);
   let modifyDialogChannel = $state<ChannelInfo | null>(null);
   let deleteConfirmChannel = $state<ChannelInfo | null>(null);
@@ -247,7 +249,36 @@
     onSetPower={onSetPowerLevel}
     onLeave={onLeave}
     onGenerateInvite={onGenerateInvite}
+    onOpenMembersPanel={() => { communityMembersPanelOpen = true; }}
   />
+{/if}
+
+{#if communityMembersPanelOpen}
+  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+  <div
+    class="community-members-overlay"
+    role="dialog"
+    aria-modal="true"
+    aria-label="Community members"
+    onclick={(e) => { if (e.target === e.currentTarget) communityMembersPanelOpen = false; }}
+  >
+    <div class="community-members-overlay-inner">
+      <div class="community-members-overlay-header">
+        <span class="community-members-overlay-title">Members — {communityName}</span>
+        <button
+          class="community-members-overlay-close"
+          onclick={() => { communityMembersPanelOpen = false; }}
+          aria-label="Close members panel"
+        >✕</button>
+      </div>
+      <CommunityMembersPanel
+        {communityId}
+        {communityName}
+        {communityService}
+        ownAddress={ownAddress}
+      />
+    </div>
+  </div>
 {/if}
 
 <CreateChannelDialog
@@ -340,4 +371,48 @@
     text-align: center;
   }
   .empty-channels p { margin: 6px 0; }
+  .community-members-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    z-index: 950;
+    overflow-y: auto;
+    padding: 32px 16px;
+  }
+  .community-members-overlay-inner {
+    background: var(--bg-secondary);
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    max-width: 640px;
+    width: 100%;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+    overflow: hidden;
+  }
+  .community-members-overlay-header {
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .community-members-overlay-title {
+    font-size: 0.9rem;
+    color: var(--text-primary);
+    font-weight: 600;
+  }
+  .community-members-overlay-close {
+    background: transparent;
+    color: var(--text-secondary);
+    border: none;
+    font-size: 1.1rem;
+    padding: 4px 10px;
+    cursor: pointer;
+  }
+  .community-members-overlay-close:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 1px;
+  }
 </style>

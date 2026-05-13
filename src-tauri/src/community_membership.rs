@@ -64,6 +64,20 @@ pub enum MembershipEventKind {
         #[serde(rename = "lv")]
         level: u8,
     },
+    /// Admin-tier action: lifts a prior Kick-as-effective-ban so the target
+    /// can be re-invited. Does NOT auto-rejoin — target must accept a fresh
+    /// Invite. Transitions MemberStatus::Banned → MemberStatus::Left.
+    ///
+    /// Variant code "u" (1-char value, keeps same-length-keys invariant).
+    /// Inner field keys are 2-char (tg, rs).
+    /// See spec `docs/specs/2026-05-13-zeb-284-community-moderation-ux-design.md` §4.1.
+    #[serde(rename = "u")]
+    Unban {
+        #[serde(rename = "tg")]
+        target: OwnerAddr,
+        #[serde(rename = "rs", skip_serializing_if = "Option::is_none", default)]
+        reason: Option<String>,
+    },
     /// Channel-config event: a mod-tier+ actor creates a new channel
     /// in this community. `ch` is a fresh ChannelId (ULID); `nm` is
     /// the display name; `wp` is the per-channel write_power threshold
@@ -415,6 +429,21 @@ pub enum VerifyError {
     /// Reject so the IPC layer surfaces a clear "unban first" error to
     /// the UI rather than silently dropping the invite.
     InviteTargetBanned,
+    /// Unban event targets an addr whose current MemberStatus is not Banned.
+    /// Reject so the IPC layer can surface "target is not currently banned"
+    /// rather than silently no-op.
+    UnbanTargetNotBanned,
+    /// Unban event targets an addr that has no member record at all in this
+    /// community. Distinct from `KickTargetNotMember` so the error message
+    /// surfaced to the user references the actual operation they performed
+    /// (an unban) rather than "kick target has no member record" which is
+    /// misleading from a UI perspective.
+    UnbanTargetNotMember,
+    /// Moderation reason string exceeds `MAX_MODERATION_REASON_CHARS`
+    /// (280 codepoints). Mirrors the UI cap so a malicious peer cannot
+    /// bypass the UI textarea `maxlength` and persist an oversized reason
+    /// to every replica. Applies to both Kick and Unban events.
+    ReasonTooLong,
     /// SetPower assigned a level above POWER_THRESHOLDS.max. Even an
     /// authorized actor cannot grant a power higher than the cap, since
     /// that would create a member admin can no longer kick (admin's own
@@ -526,8 +555,22 @@ impl std::fmt::Display for VerifyError {
             VerifyError::InviteTargetBanned => {
                 write!(
                     f,
-                    "invite target is currently Banned (admin must unban first; \
-                     not yet implemented in v1)"
+                    "invite target is currently Banned (admin must unban first)"
+                )
+            }
+            VerifyError::UnbanTargetNotBanned => {
+                write!(f, "unban target is not currently banned")
+            }
+            VerifyError::UnbanTargetNotMember => {
+                write!(
+                    f,
+                    "unban target has no member record in this community"
+                )
+            }
+            VerifyError::ReasonTooLong => {
+                write!(
+                    f,
+                    "moderation reason exceeds {MAX_MODERATION_REASON_CHARS} characters"
                 )
             }
             VerifyError::PowerLevelOutOfRange => {
@@ -1007,6 +1050,25 @@ pub fn materialize(
             }
             MembershipEventKind::SetPower { target, level } => {
                 m.power_levels.insert(*target, *level);
+            }
+            MembershipEventKind::Unban { target, .. } => {
+                // Transitions Banned → Left so the target can be re-invited.
+                // Only update an existing entry; verify_event rejects Unban
+                // targeting a non-member so an absent entry here is defense-
+                // in-depth (corrupted log, replay from before the Unban
+                // arrived). Power level is preserved — power cleanup is
+                // a future SetPower's job.
+                // No EpochRotation auto-trigger: Unban is additive; re-Join
+                // handles its own epoch via the existing Invite → Join flow.
+                if let Some(s) = m.members.get_mut(target) {
+                    if s.status == MemberStatus::Banned {
+                        s.status = MemberStatus::Left;
+                        // Preserve the original `joined_at` — overwriting with the
+                        // unban HLC would invert the (joined_at, left_at) ordering
+                        // since the prior Kick already wrote left_at < unban_at.
+                        // Matches the Kick/Leave handlers which also preserve it.
+                    }
+                }
             }
             MembershipEventKind::ChannelCreate {
                 channel_id,
@@ -1508,7 +1570,8 @@ pub fn verify_event(
         }
         MembershipEventKind::Invite { .. }
         | MembershipEventKind::Kick { .. }
-        | MembershipEventKind::SetPower { .. } => {
+        | MembershipEventKind::SetPower { .. }
+        | MembershipEventKind::Unban { .. } => {
             if !is_joined_member(prior_state, &event.actor) {
                 return Err(VerifyError::ActorNotJoined);
             }
@@ -1568,7 +1631,7 @@ pub fn verify_event(
                 }
             }
         }
-        MembershipEventKind::Kick { target, .. } => {
+        MembershipEventKind::Kick { target, reason } => {
             if actor_power < POWER_THRESHOLDS.kick {
                 return Err(VerifyError::ActorPowerInsufficient);
             }
@@ -1584,6 +1647,14 @@ pub fn verify_event(
             if actor_power <= target_power {
                 return Err(VerifyError::KickTargetPowerNotLower);
             }
+            // Defense-in-depth: bound the reason string at the CRDT layer
+            // so a malicious peer can't bypass the UI cap and persist a
+            // giant reason on every replica.
+            if let Some(r) = reason {
+                if r.chars().count() > MAX_MODERATION_REASON_CHARS {
+                    return Err(VerifyError::ReasonTooLong);
+                }
+            }
         }
         MembershipEventKind::SetPower { level, .. } => {
             if actor_power < POWER_THRESHOLDS.set_power {
@@ -1591,6 +1662,29 @@ pub fn verify_event(
             }
             if *level > POWER_THRESHOLDS.max {
                 return Err(VerifyError::PowerLevelOutOfRange);
+            }
+        }
+        MembershipEventKind::Unban { target, reason } => {
+            // Admin-tier: actor must have power >= set_power threshold (100).
+            if actor_power < POWER_THRESHOLDS.set_power {
+                return Err(VerifyError::ActorPowerInsufficient);
+            }
+            // Target must have a member record. Use the Unban-specific
+            // variant so the surfaced error message references "unban" not
+            // "kick" when the user is performing an unban.
+            let Some(target_state) = prior_state.members.get(target) else {
+                return Err(VerifyError::UnbanTargetNotMember);
+            };
+            // Target must currently be Banned.
+            if target_state.status != MemberStatus::Banned {
+                return Err(VerifyError::UnbanTargetNotBanned);
+            }
+            // Same reason-length cap as Kick (defense-in-depth against
+            // a peer signing an oversized reason that bypasses the UI).
+            if let Some(r) = reason {
+                if r.chars().count() > MAX_MODERATION_REASON_CHARS {
+                    return Err(VerifyError::ReasonTooLong);
+                }
             }
         }
         MembershipEventKind::ChannelCreate {
@@ -1764,6 +1858,21 @@ pub const POWER_THRESHOLDS: PowerThresholds = PowerThresholds {
     set_power: 100,
     max: 100,
 };
+
+/// Maximum Unicode codepoint count for a moderation reason string
+/// (Kick or Unban event's `reason: Option<String>` field). The UI
+/// `ModerationReasonDialog` already enforces `maxlength="280"` on the
+/// textarea — this constant mirrors that limit at the CRDT verification
+/// layer so a malicious or buggy peer cannot inject an oversized reason
+/// that bypasses the UI cap and persists across all replicas.
+///
+/// `chars().count()` (codepoint count) is the basis because:
+///   - It matches user-perceptible "characters" reasonably well (1 codepoint
+///     per ASCII/BMP char; 1 codepoint per emoji on modern Unicode planes).
+///   - It's deterministic across replicas regardless of UTF-8 byte width.
+///   - 280 codepoints is at minimum as permissive as the UI's
+///     `maxlength="280"` (which counts UTF-16 code units, so emojis double).
+pub const MAX_MODERATION_REASON_CHARS: usize = 280;
 
 #[cfg(test)]
 mod tests {
@@ -2608,6 +2717,413 @@ mod tests {
             m.pending_rotation_for.contains(&bob),
             "bob's rotation still pending"
         );
+    }
+
+    // ── Unban helper (mirrors make_kick_event) ────────────────────────────────
+
+    fn make_unban_event(
+        id_byte: u8,
+        actor: OwnerAddr,
+        target: OwnerAddr,
+        reason: Option<String>,
+        at_wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        let mut id = [0xf0; 16];
+        id[15] = id_byte;
+        SignedMembershipEvent {
+            id,
+            community_id: SpaceId([0xc0; 16]),
+            kind: MembershipEventKind::Unban { target, reason },
+            actor,
+            at: Hlc {
+                wall_ms: at_wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+        }
+    }
+
+    fn make_invite_event(
+        id_byte: u8,
+        actor: OwnerAddr,
+        target: OwnerAddr,
+        at_wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        let mut id = [0xef; 16];
+        id[15] = id_byte;
+        SignedMembershipEvent {
+            id,
+            community_id: SpaceId([0xc0; 16]),
+            kind: MembershipEventKind::Invite { target },
+            actor,
+            at: Hlc {
+                wall_ms: at_wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+        }
+    }
+
+    // ── ZEB-284 Task 1: Unban variant unit tests ──────────────────────────────
+
+    /// Unban by an admin (power 100) on a Banned target must:
+    ///   (a) pass verify_event, and
+    ///   (b) materialize to MemberStatus::Left.
+    #[test]
+    fn unban_event_succeeds_when_actor_is_admin_and_target_is_banned() {
+        let community_id = SpaceId([0xc0; 16]);
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (_, _, target_addr) = make_identity(0xb1);
+
+        // Prior state: admin joined, target joined then kicked (Banned).
+        let admin_join = make_join_event(0x01, admin_addr, 1);
+        let target_join = make_join_event(0x02, target_addr, 2);
+        let kick = make_kick_event(0x01, admin_addr, target_addr, 10);
+        let prior = materialize(
+            &[admin_join.clone(), target_join.clone(), kick.clone()],
+            admin_addr,
+        );
+
+        // Sanity: target is Banned.
+        assert_eq!(prior.members[&target_addr].status, MemberStatus::Banned);
+
+        // Build a signed unban event.
+        let unban_payload = EventPayload {
+            id: [0xf0; 16],
+            community_id,
+            kind: MembershipEventKind::Unban {
+                target: target_addr,
+                reason: Some("test".into()),
+            },
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        };
+        let unban = sign_with_identity(unban_payload, &admin_priv);
+
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+        };
+        let result = verify_event(&unban, &prior, &ctx);
+        assert!(
+            result.is_ok(),
+            "admin unban of Banned target must pass verify_event; got {result:?}"
+        );
+
+        // Materialize: Banned → Left.
+        let m = materialize(&[admin_join, target_join, kick, unban], admin_addr);
+        assert_eq!(m.members[&target_addr].status, MemberStatus::Left);
+    }
+
+    /// Unban by a moderator (power 50, below set_power threshold of 100)
+    /// must be rejected with ActorPowerInsufficient.
+    #[test]
+    fn unban_event_rejected_when_actor_is_moderator() {
+        let community_id = SpaceId([0xc0; 16]);
+        let (_admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
+        let (mod_priv, mod_pub, mod_addr) = make_identity(0xb1);
+        let (_, _, target_addr) = make_identity(0xc1);
+
+        // Build prior state: mod_addr has power 50, target is Banned.
+        let admin_join = make_join_event(0x01, admin_addr, 1);
+        let mod_join = make_join_event(0x02, mod_addr, 2);
+        let target_join = make_join_event(0x03, target_addr, 3);
+        let setpwr_mod = SignedMembershipEvent {
+            id: [0x04; 16],
+            community_id: SpaceId([0xc0; 16]),
+            kind: MembershipEventKind::SetPower {
+                target: mod_addr,
+                level: 50,
+            },
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 4,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+        };
+        let kick = make_kick_event(0x01, admin_addr, target_addr, 10);
+        let prior = materialize(
+            &[admin_join, mod_join, target_join, setpwr_mod, kick],
+            admin_addr,
+        );
+        assert_eq!(prior.power_levels[&mod_addr], 50);
+        assert_eq!(prior.members[&target_addr].status, MemberStatus::Banned);
+
+        // mod_addr (power 50) tries to Unban.
+        let unban_payload = EventPayload {
+            id: [0xf0; 16],
+            community_id,
+            kind: MembershipEventKind::Unban {
+                target: target_addr,
+                reason: None,
+            },
+            actor: mod_addr,
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        };
+        let unban = sign_with_identity(unban_payload, &mod_priv);
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &mod_pub,
+            countersigner_identity_pub: None,
+        };
+        assert_eq!(
+            verify_event(&unban, &prior, &ctx),
+            Err(VerifyError::ActorPowerInsufficient),
+            "moderator (power 50) must not be able to unban"
+        );
+    }
+
+    /// Unban targeting a member whose status is NOT Banned (e.g., Joined)
+    /// must be rejected with UnbanTargetNotBanned.
+    #[test]
+    fn unban_event_rejected_when_target_is_not_banned() {
+        let community_id = SpaceId([0xc0; 16]);
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (_, _, target_addr) = make_identity(0xb1);
+
+        // Prior state: admin joined, target joined (NOT banned).
+        let admin_join = make_join_event(0x01, admin_addr, 1);
+        let target_join = make_join_event(0x02, target_addr, 2);
+        let prior = materialize(&[admin_join, target_join], admin_addr);
+        assert_eq!(prior.members[&target_addr].status, MemberStatus::Joined);
+
+        let unban_payload = EventPayload {
+            id: [0xf0; 16],
+            community_id,
+            kind: MembershipEventKind::Unban {
+                target: target_addr,
+                reason: None,
+            },
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        };
+        let unban = sign_with_identity(unban_payload, &admin_priv);
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+        };
+        assert_eq!(
+            verify_event(&unban, &prior, &ctx),
+            Err(VerifyError::UnbanTargetNotBanned),
+            "unban of non-Banned target must return UnbanTargetNotBanned"
+        );
+    }
+
+    /// Unban targeting an OwnerAddr with no member record (never joined)
+    /// must be rejected with UnbanTargetNotMember (the Unban-specific
+    /// variant so the surfaced message references "unban" not "kick").
+    #[test]
+    fn unban_event_rejected_when_target_is_unknown() {
+        let community_id = SpaceId([0xc0; 16]);
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (_, _, unknown_addr) = make_identity(0xdd);
+
+        // Prior state: only admin joined; unknown_addr never appeared.
+        let admin_join = make_join_event(0x01, admin_addr, 1);
+        let prior = materialize(&[admin_join], admin_addr);
+        assert!(!prior.members.contains_key(&unknown_addr));
+
+        let unban_payload = EventPayload {
+            id: [0xf0; 16],
+            community_id,
+            kind: MembershipEventKind::Unban {
+                target: unknown_addr,
+                reason: None,
+            },
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        };
+        let unban = sign_with_identity(unban_payload, &admin_priv);
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+        };
+        assert_eq!(
+            verify_event(&unban, &prior, &ctx),
+            Err(VerifyError::UnbanTargetNotMember),
+            "unban of unknown target must return UnbanTargetNotMember"
+        );
+    }
+
+    /// Kick with a reason longer than `MAX_MODERATION_REASON_CHARS` must be
+    /// rejected at verify_event so an oversized reason cannot bypass the UI
+    /// cap and persist to every replica.
+    #[test]
+    fn kick_event_rejected_when_reason_exceeds_max_chars() {
+        let community_id = SpaceId([0xc0; 16]);
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (_, _, target_addr) = make_identity(0xb1);
+
+        let admin_join = make_join_event(0x01, admin_addr, 1);
+        let target_join = make_join_event(0x02, target_addr, 2);
+        let prior = materialize(&[admin_join, target_join], admin_addr);
+
+        // Build a reason with exactly MAX_MODERATION_REASON_CHARS+1 codepoints.
+        let oversized: String = std::iter::repeat('a')
+            .take(MAX_MODERATION_REASON_CHARS + 1)
+            .collect();
+        let kick_payload = EventPayload {
+            id: [0x10; 16],
+            community_id,
+            kind: MembershipEventKind::Kick {
+                target: target_addr,
+                reason: Some(oversized),
+            },
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        };
+        let kick = sign_with_identity(kick_payload, &admin_priv);
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+        };
+        assert_eq!(
+            verify_event(&kick, &prior, &ctx),
+            Err(VerifyError::ReasonTooLong)
+        );
+    }
+
+    /// Unban with a reason longer than `MAX_MODERATION_REASON_CHARS` must be
+    /// rejected at verify_event so an oversized reason cannot bypass the UI
+    /// cap and persist to every replica.
+    #[test]
+    fn unban_event_rejected_when_reason_exceeds_max_chars() {
+        let community_id = SpaceId([0xc0; 16]);
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (_, _, target_addr) = make_identity(0xb1);
+
+        // Set up Banned target via prior Kick
+        let admin_join = make_join_event(0x01, admin_addr, 1);
+        let target_join = make_join_event(0x02, target_addr, 2);
+        let kick = make_kick_event(0x01, admin_addr, target_addr, 10);
+        let prior = materialize(&[admin_join, target_join, kick], admin_addr);
+        assert_eq!(prior.members[&target_addr].status, MemberStatus::Banned);
+
+        let oversized: String = std::iter::repeat('z')
+            .take(MAX_MODERATION_REASON_CHARS + 1)
+            .collect();
+        let unban_payload = EventPayload {
+            id: [0x20; 16],
+            community_id,
+            kind: MembershipEventKind::Unban {
+                target: target_addr,
+                reason: Some(oversized),
+            },
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        };
+        let unban = sign_with_identity(unban_payload, &admin_priv);
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+        };
+        assert_eq!(
+            verify_event(&unban, &prior, &ctx),
+            Err(VerifyError::ReasonTooLong)
+        );
+    }
+
+    /// Full lifecycle round-trip via materialize:
+    /// Joined → (Kick) Banned → (Unban) Left → (Invite) Invited → (Join) Joined.
+    /// Validates that unbanned targets can be re-invited and re-join cleanly.
+    #[test]
+    fn unban_then_invite_then_join_round_trip_succeeds() {
+        let admin = OwnerAddr([0xa1; 16]);
+        let target = OwnerAddr([0xb1; 16]);
+
+        // admin has implicit power 100 from bootstrap.
+        let admin_join = make_join_event(0x01, admin, 1);
+        let target_join = make_join_event(0x02, target, 2);
+        let kick = make_kick_event(0x01, admin, target, 10);
+
+        let m_after_kick = materialize(
+            &[admin_join.clone(), target_join.clone(), kick.clone()],
+            admin,
+        );
+        assert_eq!(m_after_kick.members[&target].status, MemberStatus::Banned);
+
+        let unban = make_unban_event(0x01, admin, target, Some("misunderstanding".into()), 20);
+        let m_after_unban = materialize(
+            &[
+                admin_join.clone(),
+                target_join.clone(),
+                kick.clone(),
+                unban.clone(),
+            ],
+            admin,
+        );
+        assert_eq!(m_after_unban.members[&target].status, MemberStatus::Left);
+
+        let invite = make_invite_event(0x01, admin, target, 30);
+        let m_after_invite = materialize(
+            &[
+                admin_join.clone(),
+                target_join.clone(),
+                kick.clone(),
+                unban.clone(),
+                invite.clone(),
+            ],
+            admin,
+        );
+        assert_eq!(
+            m_after_invite.members[&target].status,
+            MemberStatus::Invited
+        );
+
+        let rejoin = make_join_event(0x03, target, 40);
+        let m_final = materialize(
+            &[admin_join, target_join, kick, unban, invite, rejoin],
+            admin,
+        );
+        assert_eq!(m_final.members[&target].status, MemberStatus::Joined);
     }
 
     // ── M9: Invite → Join marks pending_catchup_for ───────────────────────────

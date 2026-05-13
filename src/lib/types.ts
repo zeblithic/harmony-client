@@ -287,6 +287,26 @@ export interface FileManagerSettings {
 
 // ── Community types (ZEB-263) ─────────────────────────────────────
 
+/** HLC timestamp as serialized by Tauri (serde camelCase). */
+export interface Hlc {
+  wallMs: number;
+  logical: number;
+  deviceId: string;
+}
+
+export type ModerationEventKind = 'kick' | 'unban' | 'set_power';
+
+/** Mirrors `ModerationEventDto` in src-tauri (ZEB-284). */
+export interface ModerationEvent {
+  eventId: string;       // 64-char hex
+  kind: ModerationEventKind;
+  actorAddr: string;     // 32-char hex
+  targetAddr: string;    // 32-char hex
+  reason: string | null;
+  newPower: number | null;
+  hlc: Hlc;
+}
+
 export interface CommunityMember {
   address: string;
   displayName?: string;

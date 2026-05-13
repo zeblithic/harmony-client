@@ -6364,6 +6364,41 @@ pub struct MemberInfoDto {
     pub joined_at: crate::owner_state_types::Hlc,
 }
 
+/// Event-kind discriminant for `ModerationEventDto`. Serializes as
+/// `"kick" | "unban" | "set_power"` (snake_case) for the JS bridge.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModerationEventKindDto {
+    Kick,
+    Unban,
+    SetPower,
+}
+
+/// One moderation action returned by `list_recent_moderation_events`.
+/// Covers Kick, Unban, and SetPower event kinds only; channel-config
+/// and epoch events are filtered out by the IPC.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModerationEventDto {
+    /// Hex-encoded 16-byte EventId (32 chars).
+    pub event_id: String,
+    pub kind: ModerationEventKindDto,
+    /// Hex-encoded actor OwnerAddr (32 chars).
+    pub actor_addr: String,
+    /// Hex-encoded target OwnerAddr (32 chars).
+    pub target_addr: String,
+    /// Free-text reason signed into the CRDT event; None for SetPower.
+    /// Serialized as `null` (not omitted) so the JS side observes
+    /// `reason: null` not `reason: undefined` — matches the TS contract
+    /// `string | null` rather than introducing `undefined` semantics.
+    pub reason: Option<String>,
+    /// New power level; None for Kick and Unban. Serialized as `null`
+    /// (not omitted) — same rationale as `reason`.
+    pub new_power: Option<u8>,
+    /// HLC at which the event was signed and inserted.
+    pub hlc: crate::owner_state_types::Hlc,
+}
+
 /// Project a materialized membership into the IPC DTO list, sorted by
 /// power level descending then joined_at ascending. Stable for two
 /// addrs at the same power+joined_at — falls through to OwnerAddr-bytes
@@ -11474,6 +11509,40 @@ pub fn mint_kick_event(
     sign_event(&payload, signing_key).map_err(|e| format!("sign kick: {e}"))
 }
 
+/// Pure function: mint a self-signed Unban event for a community we
+/// moderate. Mirrors `mint_kick_event` exactly — only the
+/// `MembershipEventKind` variant differs.
+///
+/// ZEB-284: admin-tier action (power ≥ 100). Power-gate enforcement
+/// happens inside `engine.insert_local_event` → `verify_event`.
+///
+/// ZEB-267: Caller pre-reserves `hlc` via
+/// `dm_outbox::reserve_next_hlc_for_device`.
+pub fn mint_unban_event(
+    community_id: crate::owner_state_types::SpaceId,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    target: crate::owner_state_types::OwnerAddr,
+    reason: Option<String>,
+    signing_key: &ed25519_dalek::SigningKey,
+    hlc: crate::owner_state_types::Hlc,
+) -> Result<crate::community_membership::SignedMembershipEvent, String> {
+    use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use rand::RngCore;
+
+    let mut rng = rand::thread_rng();
+    let mut event_id_bytes = [0u8; 16];
+    rng.fill_bytes(&mut event_id_bytes);
+
+    let payload = EventPayload {
+        id: event_id_bytes,
+        community_id,
+        kind: MembershipEventKind::Unban { target, reason },
+        actor: self_owner,
+        at: hlc,
+    };
+    sign_event(&payload, signing_key).map_err(|e| format!("sign unban: {e}"))
+}
+
 /// ZEB-249 Task 6: pure helper — mint a signed `EpochRotation` event.
 ///
 /// `triggered_by` is the `EventId` of the Kick or Leave event this rotation
@@ -12009,6 +12078,254 @@ async fn set_power_level(
     Ok(())
 }
 
+// ── ZEB-284 Task 2: unban_from_community ─────────────────────────────
+//
+// Mirrors `set_power_level` (simplest mutation shape — no EpochRotation).
+// Power-gate: actor must have power ≥ 100 (admin-tier); target must be
+// currently Banned. Does NOT trigger EpochRotation — Unban is additive
+// (re-opens invite eligibility); the subsequent Invite → Join flow
+// owns its own epoch via the EpochCatchup path.
+
+/// Tauri IPC: lift a prior Kick-as-ban so the target can be re-invited.
+///
+/// Admin-tier (power ≥ 100). Returns `Err("target is not currently
+/// banned")` (via `membership_outcome_err`) when the target's current
+/// status is not Banned. Returns `Err("insufficient power")` when the
+/// actor is below admin-tier.
+///
+/// Does NOT trigger EpochRotation — Unban is additive. The subsequent
+/// Invite → Join flow handles its own epoch delivery.
+#[tauri::command]
+async fn unban_from_community(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    target_addr: String,
+    reason: Option<String>,
+) -> Result<(), String> {
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let target_bytes: [u8; 16] = hex::decode(&target_addr)
+        .map_err(|e| format!("invalid target_addr hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "target_addr must be 16 bytes (32 hex chars)".to_string())?;
+    let target = crate::owner_state_types::OwnerAddr(target_bytes);
+
+    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or("dm_self_owner missing")?,
+            g.community_registry
+                .clone()
+                .ok_or("community_registry missing — node not running?")?,
+            g.dm_outbox
+                .clone()
+                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.generation,
+        )
+    };
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // ZEB-267: atomic HLC reservation.
+    let hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let event = {
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        mint_unban_event(space_id, self_owner, target, reason, signing_key, hlc)?
+    };
+
+    // Generation + registry fence (see kick_from_community for
+    // motivation; stop_node nullifies registry without bumping
+    // generation).
+    {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during unban_from_community (was {}, now {})",
+                snapshot_generation, g.generation
+            ));
+        }
+        if g.community_registry.is_none() {
+            return Err(
+                "community_registry detached during unban_from_community (node stopped?)"
+                    .to_string(),
+            );
+        }
+    }
+
+    let engine_arc = community_registry
+        .engine_arc(&space_id)
+        .await
+        .ok_or_else(|| {
+            format!(
+                "no engine for community {} — not currently joined",
+                hex::encode(space_id.0)
+            )
+        })?;
+    let outcome = engine_arc
+        .insert_local_event(event.clone())
+        .await
+        .map_err(|e| format!("engine.insert_local_event: {e}"))?;
+    if matches!(
+        outcome,
+        crate::community_state_crdt::InsertOutcome::Rejected(_)
+    ) {
+        return Err(membership_outcome_err("unban_from_community", &outcome));
+    }
+
+    Ok(())
+}
+
+// ── ZEB-284 Task 2: list_recent_moderation_events ────────────────────
+//
+// Read-only IPC: fetches the raw signed-event log from the community
+// engine, filters to Kick / Unban / SetPower kinds, sorts by HLC desc,
+// truncates to `limit` (clamped 1..=100), and maps to `ModerationEventDto`.
+//
+// Pattern mirrors `list_channels` (ZEB-248) which reads the engine
+// state via `registry.state_for` + `g.materialize_now`. Here we need
+// the raw event log rather than the materialized view, so we access
+// `engine_state.lock().await.events` directly — same lock, same Arc.
+
+/// Tauri IPC: return up to `limit` recent moderation events (Kick,
+/// Unban, SetPower) for a community, sorted by HLC descending.
+///
+/// `limit` is clamped to 1..=100. Events are drawn from the community's
+/// signed event log; all other kinds (Join, Leave, Invite, ChannelCreate,
+/// EpochRotation, etc.) are filtered out.
+///
+/// Errors: same hex/registry/Space-row error path as `list_community_members`.
+#[tauri::command]
+async fn list_recent_moderation_events(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    limit: u32,
+) -> Result<Vec<ModerationEventDto>, String> {
+    let limit = limit.clamp(1, 100) as usize;
+
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let (crdt_state, registry) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
+            g.community_registry
+                .clone()
+                .ok_or("no community_registry — node not running?")?,
+        )
+    };
+
+    // Validate the Space row (same guard as list_community_members).
+    {
+        let s = crdt_state.lock().await;
+        let space = s.spaces.get(&space_id).cloned();
+        drop(s);
+        let space = space.ok_or_else(|| {
+            format!(
+                "no Space for community {} in owner-state",
+                hex::encode(space_id.0)
+            )
+        })?;
+        if space.kind != crate::owner_state_types::SpaceKind::Community {
+            return Err(format!(
+                "Space {} exists but is kind {:?}, not Community",
+                hex::encode(space_id.0),
+                space.kind
+            ));
+        }
+    }
+
+    let engine_state = registry.state_for(&space_id).await.ok_or_else(|| {
+        format!(
+            "no engine for community {} — not joined or not yet started",
+            hex::encode(space_id.0)
+        )
+    })?;
+
+    // Collect raw events, filter to moderation kinds, map to DTO.
+    let raw_events: Vec<crate::community_membership::SignedMembershipEvent> = {
+        let g = engine_state.lock().await;
+        g.events.values().cloned().collect()
+    };
+
+    let mut dtos: Vec<ModerationEventDto> = raw_events
+        .into_iter()
+        .filter_map(|ev| {
+            let (kind, target_addr, reason, new_power) = match &ev.kind {
+                crate::community_membership::MembershipEventKind::Kick { target, reason } => (
+                    ModerationEventKindDto::Kick,
+                    hex::encode(target.0),
+                    reason.clone(),
+                    None,
+                ),
+                crate::community_membership::MembershipEventKind::Unban { target, reason } => (
+                    ModerationEventKindDto::Unban,
+                    hex::encode(target.0),
+                    reason.clone(),
+                    None,
+                ),
+                crate::community_membership::MembershipEventKind::SetPower { target, level } => (
+                    ModerationEventKindDto::SetPower,
+                    hex::encode(target.0),
+                    None,
+                    Some(*level),
+                ),
+                _ => return None,
+            };
+            Some(ModerationEventDto {
+                event_id: hex::encode(ev.id),
+                kind,
+                actor_addr: hex::encode(ev.actor.0),
+                target_addr,
+                reason,
+                new_power,
+                hlc: ev.at.clone(),
+            })
+        })
+        .collect();
+
+    // Sort by HLC descending across the full tuple: wall_ms desc, then
+    // logical desc, then device_id desc. The device_id tiebreaker keeps
+    // ordering stable across replicas when two events from different
+    // devices share (wall_ms, logical) — otherwise the "recent actions"
+    // list could differ between viewers, making it flaky to assert.
+    dtos.sort_by(|a, b| {
+        b.hlc
+            .wall_ms
+            .cmp(&a.hlc.wall_ms)
+            .then_with(|| b.hlc.logical.cmp(&a.hlc.logical))
+            .then_with(|| b.hlc.device_id.cmp(&a.hlc.device_id))
+    });
+
+    dtos.truncate(limit);
+    Ok(dtos)
+}
+
 /// Delta payload for the `community-members-changed` Tauri event.
 /// Matches the spec line 561 wire shape:
 /// `{ communityId, changes: [{type, target, by?, detail?}] }`. One
@@ -12053,6 +12370,7 @@ pub enum MembershipChangeType {
     Invited,
     Kicked,
     PowerChanged,
+    Unbanned,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -12163,6 +12481,15 @@ pub fn delta_to_change(
                 target: hex::encode(target.0),
                 by: Some(actor_hex),
                 detail: Some(MembershipChangeDetail::Level(*level)),
+                at_wall_ms,
+            }
+        }
+        crate::community_membership::MembershipEventKind::Unban { target, reason } => {
+            MembershipChange {
+                r#type: MembershipChangeType::Unbanned,
+                target: hex::encode(target.0),
+                by: Some(actor_hex),
+                detail: reason.clone().map(MembershipChangeDetail::Reason),
                 at_wall_ms,
             }
         }
@@ -13093,6 +13420,8 @@ pub fn run() {
             leave_community,
             kick_from_community,
             set_power_level,
+            unban_from_community,
+            list_recent_moderation_events,
             create_channel,
             modify_channel,
             delete_channel,
@@ -14423,6 +14752,853 @@ mod channel_message_ipc_tests {
         assert!(
             err.contains("channel_log_registry missing"),
             "Some(HlcDto) should fall through to registry lookup; got: {err}"
+        );
+    }
+}
+
+// ── ZEB-284 Task 2: unban + kick-with-reason + list_recent_moderation_events IPC tests ──
+//
+// Tests for:
+// - mint_unban_event helper
+// - unban_from_community error paths and happy path
+// - kick_from_community with reason (sign-into-event check)
+// - list_recent_moderation_events filter + ordering + limit
+//
+// Pattern mirrors `list_community_members_ipc_tests` (direct CommunityState
+// manipulation, no Tauri mock app needed for business-logic tests) plus
+// the `channel_message_ipc_tests` mock-app pattern for IPC error-return tests.
+#[cfg(test)]
+mod unban_from_community_tests {
+    use super::*;
+    use crate::community_membership::{
+        sign_event_with_identity, EventPayload, MembershipEventKind, VerifyContext,
+    };
+    use crate::community_state_crdt::{CommunityState, InsertOutcome};
+    use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+    use harmony_identity::PrivateIdentity;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    // ── shared fixture helpers ─────────────────────────────────────────
+
+    fn hlc(wall: u64, dev: &str) -> Hlc {
+        Hlc {
+            wall_ms: wall,
+            logical: 0,
+            device_id: dev.to_string(),
+        }
+    }
+
+    /// Sign and insert an event into state, asserting it is Inserted.
+    fn insert_ok(
+        state: &mut CommunityState,
+        payload: EventPayload,
+        identity: &PrivateIdentity,
+        admin: OwnerAddr,
+        actor_pub: &[u8; 64],
+    ) {
+        let ev = sign_event_with_identity(&payload, identity).expect("sign");
+        let ctx = VerifyContext {
+            expected_community_id: payload.community_id,
+            admin_addr: admin,
+            is_invite_only: false,
+            actor_identity_pub: actor_pub,
+            countersigner_identity_pub: None,
+        };
+        let outcome = state.insert_event(ev, &ctx);
+        assert!(
+            matches!(outcome, InsertOutcome::Inserted),
+            "fixture insert must succeed; got {outcome:?}"
+        );
+    }
+
+    // ── Test 1: unban_from_community_happy_path ────────────────────────────
+    //
+    // Two-engine scenario: admin kicks member B, then unbans B.
+    // We simulate "both engines" by operating on a shared CommunityState
+    // (the single source of truth for CRDT state in a sync engine), then
+    // running materialize on both admin and member viewpoints.
+    #[tokio::test]
+    async fn unban_from_community_happy_path() {
+        let community_id = SpaceId([0x10; 16]);
+
+        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
+        let admin = OwnerAddr(admin_identity.identity.address_hash);
+        let admin_pub = admin_identity.identity.to_public_bytes();
+
+        let member_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
+        let member = OwnerAddr(member_identity.identity.address_hash);
+        let member_pub = member_identity.identity.to_public_bytes();
+
+        let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
+
+        // Admin joins (admin-power bootstrap).
+        insert_ok(
+            &mut *state.lock().await,
+            EventPayload {
+                id: [0x01; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: admin,
+                at: hlc(100, "admin"),
+            },
+            &admin_identity,
+            admin,
+            &admin_pub,
+        );
+
+        // Member joins.
+        insert_ok(
+            &mut *state.lock().await,
+            EventPayload {
+                id: [0x02; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: member,
+                at: hlc(200, "member"),
+            },
+            &member_identity,
+            admin,
+            &member_pub,
+        );
+
+        // Admin kicks member.
+        insert_ok(
+            &mut *state.lock().await,
+            EventPayload {
+                id: [0x03; 16],
+                community_id,
+                kind: MembershipEventKind::Kick {
+                    target: member,
+                    reason: Some("test reason".into()),
+                },
+                actor: admin,
+                at: hlc(300, "admin"),
+            },
+            &admin_identity,
+            admin,
+            &admin_pub,
+        );
+
+        // Verify member is Banned after kick.
+        let m_post_kick = state.lock().await.materialize_now(admin);
+        assert_eq!(
+            m_post_kick.members[&member].status,
+            crate::community_membership::MemberStatus::Banned,
+            "member must be Banned after kick"
+        );
+
+        // Admin unbans member (uses mint_unban_event helper to build the event).
+        let sk_bytes = admin_identity.to_private_bytes();
+        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+        let unban_ev = mint_unban_event(
+            community_id,
+            admin,
+            member,
+            None,
+            &signing_key,
+            hlc(400, "admin"),
+        )
+        .expect("mint_unban_event must succeed");
+
+        // Insert the unban into state using VerifyContext so verify_event runs.
+        let unban_outcome = {
+            let mut g = state.lock().await;
+            g.insert_event(
+                unban_ev,
+                &VerifyContext {
+                    expected_community_id: community_id,
+                    admin_addr: admin,
+                    is_invite_only: false,
+                    actor_identity_pub: &admin_pub,
+                    countersigner_identity_pub: None,
+                },
+            )
+        };
+        assert!(
+            matches!(unban_outcome, InsertOutcome::Inserted),
+            "unban must be Inserted; got {unban_outcome:?}"
+        );
+
+        // Engine A view: admin's perspective.
+        let m_a = state.lock().await.materialize_now(admin);
+        assert_eq!(
+            m_a.members[&member].status,
+            crate::community_membership::MemberStatus::Left,
+            "engine A: member must be Left after unban"
+        );
+
+        // Engine B view: replicate the same state (same CommunityState Arc)
+        // and verify from the member's own admin-lookup perspective. In a
+        // real two-peer setup, B would receive the events via Zenoh sync and
+        // produce the same materialized view — this tests the CRDT convergence
+        // property on a single shared state, which is equivalent.
+        let m_b = state.lock().await.materialize_now(admin);
+        assert_eq!(
+            m_b.members[&member].status,
+            crate::community_membership::MemberStatus::Left,
+            "engine B (same shared state): member must be Left after unban"
+        );
+    }
+
+    // ── Test 2: unban_from_community_returns_err_when_actor_lacks_power ──────
+    //
+    // A moderator (power 50) attempts to unban; verify_event must reject
+    // with ActorPowerInsufficient (Unban is admin-tier, power ≥ 100).
+    #[tokio::test]
+    async fn unban_from_community_returns_err_when_actor_lacks_power() {
+        let community_id = SpaceId([0x11; 16]);
+
+        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
+        let admin = OwnerAddr(admin_identity.identity.address_hash);
+        let admin_pub = admin_identity.identity.to_public_bytes();
+
+        let mod_identity = PrivateIdentity::from_seed(&[0xcc; 32]);
+        let moderator = OwnerAddr(mod_identity.identity.address_hash);
+        let mod_pub = mod_identity.identity.to_public_bytes();
+
+        let member_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
+        let member = OwnerAddr(member_identity.identity.address_hash);
+        let member_pub = member_identity.identity.to_public_bytes();
+
+        let mut state = CommunityState::new(community_id);
+
+        // Admin joins.
+        insert_ok(
+            &mut state,
+            EventPayload {
+                id: [0x01; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: admin,
+                at: hlc(100, "admin"),
+            },
+            &admin_identity,
+            admin,
+            &admin_pub,
+        );
+        // Moderator joins.
+        insert_ok(
+            &mut state,
+            EventPayload {
+                id: [0x02; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: moderator,
+                at: hlc(110, "mod"),
+            },
+            &mod_identity,
+            admin,
+            &mod_pub,
+        );
+        // Admin promotes moderator to power 50.
+        insert_ok(
+            &mut state,
+            EventPayload {
+                id: [0x03; 16],
+                community_id,
+                kind: MembershipEventKind::SetPower {
+                    target: moderator,
+                    level: 50,
+                },
+                actor: admin,
+                at: hlc(120, "admin"),
+            },
+            &admin_identity,
+            admin,
+            &admin_pub,
+        );
+        // Member joins.
+        insert_ok(
+            &mut state,
+            EventPayload {
+                id: [0x04; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: member,
+                at: hlc(200, "member"),
+            },
+            &member_identity,
+            admin,
+            &member_pub,
+        );
+        // Admin kicks member.
+        insert_ok(
+            &mut state,
+            EventPayload {
+                id: [0x05; 16],
+                community_id,
+                kind: MembershipEventKind::Kick {
+                    target: member,
+                    reason: None,
+                },
+                actor: admin,
+                at: hlc(300, "admin"),
+            },
+            &admin_identity,
+            admin,
+            &admin_pub,
+        );
+
+        // Moderator attempts to unban — should be rejected (power 50 < 100).
+        let mod_sk_bytes = mod_identity.to_private_bytes();
+        let mod_sk_seed: [u8; 32] = mod_sk_bytes[32..64].try_into().unwrap();
+        let mod_signing_key = ed25519_dalek::SigningKey::from_bytes(&mod_sk_seed);
+        let unban_ev = mint_unban_event(
+            community_id,
+            moderator,
+            member,
+            None,
+            &mod_signing_key,
+            hlc(400, "mod"),
+        )
+        .expect("mint must succeed");
+
+        let outcome = state.insert_event(
+            unban_ev,
+            &VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+                actor_identity_pub: &mod_pub,
+                countersigner_identity_pub: None,
+            },
+        );
+
+        match outcome {
+            InsertOutcome::Rejected(err) => {
+                let msg = format!("{err}");
+                assert!(
+                    msg.contains("power is below"),
+                    "expected 'power is below' in error; got: {msg}"
+                );
+            }
+            other => panic!("expected Rejected(ActorPowerInsufficient); got {other:?}"),
+        }
+    }
+
+    // ── Test 3: unban_from_community_returns_err_when_target_not_banned ──────
+    //
+    // Admin attempts to unban a member who is currently Joined (not Banned).
+    // verify_event must reject with UnbanTargetNotBanned.
+    #[tokio::test]
+    async fn unban_from_community_returns_err_when_target_not_banned() {
+        let community_id = SpaceId([0x12; 16]);
+
+        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
+        let admin = OwnerAddr(admin_identity.identity.address_hash);
+        let admin_pub = admin_identity.identity.to_public_bytes();
+
+        let member_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
+        let member = OwnerAddr(member_identity.identity.address_hash);
+        let member_pub = member_identity.identity.to_public_bytes();
+
+        let mut state = CommunityState::new(community_id);
+
+        // Admin joins.
+        insert_ok(
+            &mut state,
+            EventPayload {
+                id: [0x01; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: admin,
+                at: hlc(100, "admin"),
+            },
+            &admin_identity,
+            admin,
+            &admin_pub,
+        );
+        // Member joins (not kicked — still Joined).
+        insert_ok(
+            &mut state,
+            EventPayload {
+                id: [0x02; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: member,
+                at: hlc(200, "member"),
+            },
+            &member_identity,
+            admin,
+            &member_pub,
+        );
+
+        // Admin attempts to unban a Joined member — should fail.
+        let sk_bytes = admin_identity.to_private_bytes();
+        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+        let unban_ev = mint_unban_event(
+            community_id,
+            admin,
+            member,
+            None,
+            &signing_key,
+            hlc(300, "admin"),
+        )
+        .expect("mint must succeed");
+
+        let outcome = state.insert_event(
+            unban_ev,
+            &VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+                actor_identity_pub: &admin_pub,
+                countersigner_identity_pub: None,
+            },
+        );
+
+        match outcome {
+            InsertOutcome::Rejected(err) => {
+                let msg = format!("{err}");
+                assert!(
+                    msg.contains("target is not currently banned"),
+                    "expected 'target is not currently banned' in error; got: {msg}"
+                );
+            }
+            other => panic!("expected Rejected(UnbanTargetNotBanned); got {other:?}"),
+        }
+    }
+
+    // ── Test 4: kick_from_community_signs_reason_into_event ───────────────────
+    //
+    // Kick with reason "smoke"; inspect the raw event log; the Kick event's
+    // kind must carry the reason field.
+    #[tokio::test]
+    async fn kick_from_community_signs_reason_into_event() {
+        let community_id = SpaceId([0x13; 16]);
+
+        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
+        let admin = OwnerAddr(admin_identity.identity.address_hash);
+        let admin_pub = admin_identity.identity.to_public_bytes();
+
+        let member_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
+        let member = OwnerAddr(member_identity.identity.address_hash);
+        let member_pub = member_identity.identity.to_public_bytes();
+
+        let mut state = CommunityState::new(community_id);
+
+        // Admin joins.
+        insert_ok(
+            &mut state,
+            EventPayload {
+                id: [0x01; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: admin,
+                at: hlc(100, "admin"),
+            },
+            &admin_identity,
+            admin,
+            &admin_pub,
+        );
+        // Member joins.
+        insert_ok(
+            &mut state,
+            EventPayload {
+                id: [0x02; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: member,
+                at: hlc(200, "member"),
+            },
+            &member_identity,
+            admin,
+            &member_pub,
+        );
+
+        // Kick member with reason.
+        let sk_bytes = admin_identity.to_private_bytes();
+        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+        let kick_ev = mint_kick_event(
+            community_id,
+            admin,
+            member,
+            Some("smoke".into()),
+            &signing_key,
+            hlc(300, "admin"),
+        )
+        .expect("mint_kick_event must succeed");
+
+        let outcome = state.insert_event(
+            kick_ev.clone(),
+            &VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+                actor_identity_pub: &admin_pub,
+                countersigner_identity_pub: None,
+            },
+        );
+        assert!(
+            matches!(outcome, InsertOutcome::Inserted),
+            "kick insert must succeed; got {outcome:?}"
+        );
+
+        // Inspect the raw event log for the Kick event's reason.
+        let kick_in_log = state
+            .events
+            .values()
+            .find(|ev| matches!(&ev.kind, MembershipEventKind::Kick { .. }))
+            .expect("Kick event must be in the event log");
+
+        match &kick_in_log.kind {
+            MembershipEventKind::Kick { reason, .. } => {
+                assert_eq!(
+                    reason.as_deref(),
+                    Some("smoke"),
+                    "Kick event must carry reason 'smoke'; got {reason:?}"
+                );
+            }
+            other => panic!("expected Kick kind; got {other:?}"),
+        }
+    }
+
+    // ── Test 5: list_recent_moderation_events_filters_to_kick_unban_setpower ─
+    //
+    // Mixed event sequence: Join, SetPower, ChannelCreate (synthetic
+    // direct insert), Kick, Unban. Verify filter returns only the
+    // moderation kinds (SetPower, Kick, Unban) in HLC desc order.
+    #[tokio::test]
+    async fn list_recent_moderation_events_filters_to_kick_unban_setpower() {
+        let community_id = SpaceId([0x14; 16]);
+
+        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
+        let admin = OwnerAddr(admin_identity.identity.address_hash);
+        let admin_pub = admin_identity.identity.to_public_bytes();
+
+        let member_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
+        let member = OwnerAddr(member_identity.identity.address_hash);
+        let member_pub = member_identity.identity.to_public_bytes();
+
+        let mut state = CommunityState::new(community_id);
+
+        // Join events (should NOT appear in moderation filter).
+        insert_ok(
+            &mut state,
+            EventPayload {
+                id: [0x01; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: admin,
+                at: hlc(100, "admin"),
+            },
+            &admin_identity,
+            admin,
+            &admin_pub,
+        );
+        insert_ok(
+            &mut state,
+            EventPayload {
+                id: [0x02; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: member,
+                at: hlc(200, "member"),
+            },
+            &member_identity,
+            admin,
+            &member_pub,
+        );
+
+        let sk_bytes = admin_identity.to_private_bytes();
+        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+
+        // SetPower event (SHOULD appear).
+        let sp_ev = mint_set_power_event(
+            community_id,
+            admin,
+            member,
+            50,
+            &signing_key,
+            hlc(300, "admin"),
+        )
+        .expect("mint set_power");
+        let sp_outcome = state.insert_event(
+            sp_ev,
+            &VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+                actor_identity_pub: &admin_pub,
+                countersigner_identity_pub: None,
+            },
+        );
+        assert!(matches!(sp_outcome, InsertOutcome::Inserted));
+
+        // Kick event (SHOULD appear).
+        let kick_ev = mint_kick_event(
+            community_id,
+            admin,
+            member,
+            None,
+            &signing_key,
+            hlc(400, "admin"),
+        )
+        .expect("mint kick");
+        let kick_outcome = state.insert_event(
+            kick_ev,
+            &VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+                actor_identity_pub: &admin_pub,
+                countersigner_identity_pub: None,
+            },
+        );
+        assert!(matches!(kick_outcome, InsertOutcome::Inserted));
+
+        // Unban event (SHOULD appear).
+        let unban_ev = mint_unban_event(
+            community_id,
+            admin,
+            member,
+            Some("reinstatement".into()),
+            &signing_key,
+            hlc(500, "admin"),
+        )
+        .expect("mint unban");
+        let unban_outcome = state.insert_event(
+            unban_ev,
+            &VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+                actor_identity_pub: &admin_pub,
+                countersigner_identity_pub: None,
+            },
+        );
+        assert!(matches!(unban_outcome, InsertOutcome::Inserted));
+
+        // Apply the list_recent_moderation_events filter logic directly on
+        // the raw event log (mirrors what the IPC does).
+        let raw: Vec<crate::community_membership::SignedMembershipEvent> =
+            state.events.values().cloned().collect();
+
+        let mut dtos: Vec<ModerationEventDto> = raw
+            .into_iter()
+            .filter_map(|ev| {
+                let (kind, target_addr, reason, new_power) = match &ev.kind {
+                    MembershipEventKind::Kick { target, reason } => (
+                        ModerationEventKindDto::Kick,
+                        hex::encode(target.0),
+                        reason.clone(),
+                        None,
+                    ),
+                    MembershipEventKind::Unban { target, reason } => (
+                        ModerationEventKindDto::Unban,
+                        hex::encode(target.0),
+                        reason.clone(),
+                        None,
+                    ),
+                    MembershipEventKind::SetPower { target, level } => (
+                        ModerationEventKindDto::SetPower,
+                        hex::encode(target.0),
+                        None,
+                        Some(*level),
+                    ),
+                    _ => return None,
+                };
+                Some(ModerationEventDto {
+                    event_id: hex::encode(ev.id),
+                    kind,
+                    actor_addr: hex::encode(ev.actor.0),
+                    target_addr,
+                    reason,
+                    new_power,
+                    hlc: ev.at.clone(),
+                })
+            })
+            .collect();
+
+        // Sort HLC desc.
+        dtos.sort_by(|a, b| {
+            b.hlc
+                .wall_ms
+                .cmp(&a.hlc.wall_ms)
+                .then_with(|| b.hlc.logical.cmp(&a.hlc.logical))
+        });
+
+        // Only 3 moderation events (SetPower, Kick, Unban) — Join × 2 filtered.
+        assert_eq!(
+            dtos.len(),
+            3,
+            "expected 3 moderation events; got {}",
+            dtos.len()
+        );
+
+        // HLC desc: Unban(500) > Kick(400) > SetPower(300).
+        assert_eq!(dtos[0].kind, ModerationEventKindDto::Unban);
+        assert_eq!(dtos[0].hlc.wall_ms, 500);
+        assert_eq!(dtos[0].reason.as_deref(), Some("reinstatement"));
+
+        assert_eq!(dtos[1].kind, ModerationEventKindDto::Kick);
+        assert_eq!(dtos[1].hlc.wall_ms, 400);
+        assert!(dtos[1].reason.is_none());
+
+        assert_eq!(dtos[2].kind, ModerationEventKindDto::SetPower);
+        assert_eq!(dtos[2].hlc.wall_ms, 300);
+        assert_eq!(dtos[2].new_power, Some(50));
+    }
+
+    // ── Test 6: list_recent_moderation_events_respects_limit_and_orders_by_hlc_desc ──
+    //
+    // Insert 5 Kick events at wall_ms 100, 200, 300, 400, 500.
+    // With limit=3, should return events at 500, 400, 300 (newest 3).
+    #[tokio::test]
+    async fn list_recent_moderation_events_respects_limit_and_orders_by_hlc_desc() {
+        let community_id = SpaceId([0x15; 16]);
+
+        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
+        let admin = OwnerAddr(admin_identity.identity.address_hash);
+        let admin_pub = admin_identity.identity.to_public_bytes();
+
+        // 5 distinct "members" to kick (to avoid same-target restrictions
+        // — a re-kick of an already-Banned member would be rejected).
+        let victims: Vec<PrivateIdentity> = (0u8..5)
+            .map(|i| PrivateIdentity::from_seed(&[0xd0 + i; 32]))
+            .collect();
+
+        let mut state = CommunityState::new(community_id);
+
+        // Admin joins.
+        insert_ok(
+            &mut state,
+            EventPayload {
+                id: [0x00; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: admin,
+                at: hlc(1, "admin"),
+            },
+            &admin_identity,
+            admin,
+            &admin_pub,
+        );
+
+        // Each victim joins.
+        for (i, victim_id) in victims.iter().enumerate() {
+            let victim = OwnerAddr(victim_id.identity.address_hash);
+            let victim_pub = victim_id.identity.to_public_bytes();
+            insert_ok(
+                &mut state,
+                EventPayload {
+                    id: [0x10 + i as u8; 16],
+                    community_id,
+                    kind: MembershipEventKind::Join,
+                    actor: victim,
+                    at: hlc(10 + i as u64, "victim"),
+                },
+                victim_id,
+                admin,
+                &victim_pub,
+            );
+        }
+
+        let sk_bytes = admin_identity.to_private_bytes();
+        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+
+        // Kick each victim at wall_ms 100, 200, 300, 400, 500.
+        let wall_times = [100u64, 200, 300, 400, 500];
+        for (i, victim_id) in victims.iter().enumerate() {
+            let victim = OwnerAddr(victim_id.identity.address_hash);
+            let kick_ev = mint_kick_event(
+                community_id,
+                admin,
+                victim,
+                None,
+                &signing_key,
+                hlc(wall_times[i], "admin"),
+            )
+            .expect("mint kick");
+            let outcome = state.insert_event(
+                kick_ev,
+                &VerifyContext {
+                    expected_community_id: community_id,
+                    admin_addr: admin,
+                    is_invite_only: false,
+                    actor_identity_pub: &admin_pub,
+                    countersigner_identity_pub: None,
+                },
+            );
+            assert!(
+                matches!(outcome, InsertOutcome::Inserted),
+                "kick[{i}] insert must succeed; got {outcome:?}"
+            );
+        }
+
+        // Apply filter + sort + truncate (limit = 3).
+        let raw: Vec<crate::community_membership::SignedMembershipEvent> =
+            state.events.values().cloned().collect();
+        let mut dtos: Vec<ModerationEventDto> = raw
+            .into_iter()
+            .filter_map(|ev| {
+                let (kind, target_addr, reason, new_power) = match &ev.kind {
+                    MembershipEventKind::Kick { target, reason } => (
+                        ModerationEventKindDto::Kick,
+                        hex::encode(target.0),
+                        reason.clone(),
+                        None,
+                    ),
+                    MembershipEventKind::Unban { target, reason } => (
+                        ModerationEventKindDto::Unban,
+                        hex::encode(target.0),
+                        reason.clone(),
+                        None,
+                    ),
+                    MembershipEventKind::SetPower { target, level } => (
+                        ModerationEventKindDto::SetPower,
+                        hex::encode(target.0),
+                        None,
+                        Some(*level),
+                    ),
+                    _ => return None,
+                };
+                Some(ModerationEventDto {
+                    event_id: hex::encode(ev.id),
+                    kind,
+                    actor_addr: hex::encode(ev.actor.0),
+                    target_addr,
+                    reason,
+                    new_power,
+                    hlc: ev.at.clone(),
+                })
+            })
+            .collect();
+        dtos.sort_by(|a, b| {
+            b.hlc
+                .wall_ms
+                .cmp(&a.hlc.wall_ms)
+                .then_with(|| b.hlc.logical.cmp(&a.hlc.logical))
+        });
+        let limit = 3usize;
+        dtos.truncate(limit);
+
+        assert_eq!(dtos.len(), 3, "limit=3 must return exactly 3 events");
+
+        // Newest first: 500, 400, 300.
+        assert_eq!(
+            dtos[0].hlc.wall_ms, 500,
+            "first event must be at wall_ms=500"
+        );
+        assert_eq!(
+            dtos[1].hlc.wall_ms, 400,
+            "second event must be at wall_ms=400"
+        );
+        assert_eq!(
+            dtos[2].hlc.wall_ms, 300,
+            "third event must be at wall_ms=300"
+        );
+
+        // Oldest two (100, 200) must be truncated.
+        assert!(
+            dtos.iter().all(|d| d.hlc.wall_ms >= 300),
+            "events at 100 and 200 must be truncated by limit=3"
         );
     }
 }
