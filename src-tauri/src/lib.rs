@@ -3669,8 +3669,28 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
         // the tombstone's, breaking the monotonicity guarantee send_dm preserves.
         // Read the HLC from state_g (single source of truth — same approach as
         // send_dm reading the OutboxEntry HLC).
+        //
+        // Two guards are required before advancing our tracker lane:
+        // (a) device_id match: outbox_tombstones may already hold a tombstone
+        //     synced in via CRDT from a paired device. Writing a remote device's
+        //     HLC into our tracker lane is a category error.
+        // (b) strictly-newer check: the tombstone HLC is minted
+        //     strictly-newer-than the entry's created_at, but NOT necessarily
+        //     newer than the tracker's current value. A send_dm that executed
+        //     between entry creation and this delete may have already advanced
+        //     the tracker past this tombstone; an unconditional insert would
+        //     regress it. Also catches idempotent re-deletes (tombstone was
+        //     written by a prior call, not the one just executed).
         if let Some(tomb_hlc) = state_g.outbox_tombstones.get(&outbox_entry_id).cloned() {
-            tracker_g.insert(device_id.clone(), tomb_hlc);
+            if tomb_hlc.device_id == device_id {
+                let should_update = match tracker_g.get(&device_id) {
+                    Some(curr) => tomb_hlc.is_strictly_newer_than(curr),
+                    None => true,
+                };
+                if should_update {
+                    tracker_g.insert(device_id.clone(), tomb_hlc);
+                }
+            }
         }
 
         outcome
