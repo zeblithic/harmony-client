@@ -429,6 +429,36 @@ fn descriptor_canonical_json_pinned() {
         "}",
     );
     assert_eq!(actual, expected, "descriptor wire format drifted");
+
+    // ── ALSO pin the None-case wire format ────────────────────────
+    // The struct uses #[serde(skip_serializing_if = "Option::is_none")]
+    // on `title` and `reshare_of`, so a descriptor with both as None
+    // serializes WITHOUT those fields (not as `"title":null`). If a
+    // future change drops the attribute, the JSON shape changes silently
+    // and peer interop breaks.
+    let d_no_opts = make_descriptor(
+        "vine-fixture-2",
+        "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+        "Fixture Alice",
+        "cid-1234abcd",
+        None,
+        None,
+        1_700_000_000,
+    );
+    let actual_no_opts = String::from_utf8(serde_json::to_vec(&d_no_opts).unwrap()).unwrap();
+    let expected_no_opts = concat!(
+        "{",
+        r#""id":"vine-fixture-2","#,
+        r#""creatorAddress":"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a","#,
+        r#""creatorName":"Fixture Alice","#,
+        r#""createdAt":1700000000,"#,
+        r#""videoCid":"cid-1234abcd""#,
+        "}",
+    );
+    assert_eq!(
+        actual_no_opts, expected_no_opts,
+        "descriptor wire format (None fields) drifted — Option::is_none skip invariant broken"
+    );
 }
 
 /// CHANGE-DETECTION TEST: see `descriptor_canonical_json_pinned`.
