@@ -279,12 +279,12 @@ describe('MessageService DM events', () => {
     expect(svc.onChange).toHaveBeenCalled();
   });
 
-  it('transitions self-Message to delivered on dm-delivered', async () => {
+  it('transitions self-Message to delivered on dm-delivered (ZEB-231)', async () => {
     const { adapter, emit } = createMockAdapter();
     await svc.connectAdapter(adapter);
 
     svc.messages = [{
-      id: 'optimistic-id',
+      id: 'cid-delivered',
       messageId: 'mid1',
       sender: { address: 'self', displayName: 'You' },
       text: 'pending',
@@ -295,17 +295,21 @@ describe('MessageService DM events', () => {
       deliveryState: 'sending',
     }];
 
-    emit('dm-delivered', { messageId: 'mid1', recipient: 'bob-hex-address' });
+    emit('dm-delivered', {
+      spaceId: 'aabbccdd',
+      messageCid: 'cid-delivered',
+      recipientOwnerAddr: 'bob-hex-address',
+    });
 
     expect(svc.messages[0].deliveryState).toBe('delivered');
   });
 
-  it('transitions self-Message to expired on dm-expired', async () => {
+  it('transitions self-Message to expired on dm-expired (ZEB-231)', async () => {
     const { adapter, emit } = createMockAdapter();
     await svc.connectAdapter(adapter);
 
     svc.messages = [{
-      id: 'optimistic-id',
+      id: 'cid-expired',
       messageId: 'mid-exp',
       sender: { address: 'self', displayName: 'You' },
       text: 'pending',
@@ -316,7 +320,10 @@ describe('MessageService DM events', () => {
       deliveryState: 'sending',
     }];
 
-    emit('dm-expired', { messageId: 'mid-exp' });
+    emit('dm-expired', {
+      spaceId: 'aabbccdd',
+      messageCid: 'cid-expired',
+    });
 
     expect(svc.messages[0].deliveryState).toBe('expired');
   });
@@ -426,12 +433,12 @@ describe('MessageService DM events', () => {
     expect(svc.messages).toHaveLength(0);
   });
 
-  it('dm-delivered with unknown messageId is a no-op', async () => {
+  it('dm-delivered with unknown (spaceId, messageCid) is a no-op (ZEB-231)', async () => {
     const { adapter, emit } = createMockAdapter();
     await svc.connectAdapter(adapter);
 
     svc.messages = [{
-      id: 'optimistic-id',
+      id: 'cid-known',
       messageId: 'mid1',
       sender: { address: 'self', displayName: 'You' },
       text: 'pending',
@@ -442,7 +449,11 @@ describe('MessageService DM events', () => {
       deliveryState: 'sending',
     }];
 
-    emit('dm-delivered', { messageId: 'unknown', recipient: 'bob' });
+    emit('dm-delivered', {
+      spaceId: 'aabbccdd',
+      messageCid: 'cid-unknown',
+      recipientOwnerAddr: 'bob',
+    });
 
     expect(svc.messages[0].deliveryState).toBe('sending');
   });

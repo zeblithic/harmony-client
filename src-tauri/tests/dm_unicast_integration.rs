@@ -456,7 +456,9 @@ async fn dm_full_round_trip_through_unicast_channel() {
         1,
         "Alice should have one newly-delivered entry"
     );
-    let (entry_id, recipient) = alice_ack_outcome.newly_delivered[0];
+    // ZEB-231: newly_delivered tuples are now (space_id, message_cid, recipient).
+    let (delivered_space_id, delivered_message_cid, recipient) =
+        alice_ack_outcome.newly_delivered[0];
     assert_eq!(
         recipient, bob_owner,
         "delivered recipient must be bob_owner"
@@ -465,7 +467,8 @@ async fn dm_full_round_trip_through_unicast_channel() {
         let alice_g = alice_state.lock().await;
         let entry = alice_g
             .outbox
-            .get(&entry_id)
+            .values()
+            .find(|e| e.space_id == delivered_space_id && e.message_cid == delivered_message_cid)
             .expect("OutboxEntry must still exist");
         assert!(
             entry.delivered_to.contains(&bob_owner),
@@ -755,11 +758,17 @@ async fn dm_offline_recipient_then_online_delivers() {
             .expect("Alice's handle_unicast(Ack) ok")
     };
     assert_eq!(alice_ack_outcome.newly_delivered.len(), 1);
-    let (entry_id, recipient) = alice_ack_outcome.newly_delivered[0];
+    // ZEB-231: newly_delivered tuples are now (space_id, message_cid, recipient).
+    let (delivered_space_id, delivered_message_cid, recipient) =
+        alice_ack_outcome.newly_delivered[0];
     assert_eq!(recipient, bob_owner);
     {
         let alice_g = alice_state.lock().await;
-        let entry = alice_g.outbox.get(&entry_id).unwrap();
+        let entry = alice_g
+            .outbox
+            .values()
+            .find(|e| e.space_id == delivered_space_id && e.message_cid == delivered_message_cid)
+            .expect("OutboxEntry must still exist");
         assert!(entry.delivered_to.contains(&bob_owner));
     }
 }

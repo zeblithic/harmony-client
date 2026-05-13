@@ -2080,20 +2080,22 @@ async fn handle_runtime_action_or_dispatch<R: Runtime>(
                                     }),
                                 );
                             }
-                            for (entry_id, recipient) in outcome.newly_delivered {
+                            for (space_id, message_cid, recipient) in outcome.newly_delivered {
                                 let _ = app.emit(
                                     "dm-delivered",
                                     serde_json::json!({
-                                        "messageId": hex::encode(entry_id.0),
-                                        "recipient": hex::encode(recipient.0),
+                                        "spaceId": hex::encode(space_id.0),
+                                        "messageCid": hex::encode(message_cid.to_bytes()),
+                                        "recipientOwnerAddr": hex::encode(recipient.0),
                                     }),
                                 );
                             }
-                            for entry_id in outcome.newly_expired {
+                            for (space_id, message_cid) in outcome.newly_expired {
                                 let _ = app.emit(
                                     "dm-expired",
                                     serde_json::json!({
-                                        "messageId": hex::encode(entry_id.0),
+                                        "spaceId": hex::encode(space_id.0),
+                                        "messageCid": hex::encode(message_cid.to_bytes()),
                                     }),
                                 );
                             }

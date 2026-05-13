@@ -141,10 +141,19 @@ export class MessageService {
     this.unlisteners.push(unlistenDmRx);
 
     const unlistenDmDelivered = await adapter.listen('dm-delivered', (event) => {
-      const { messageId } = event.payload as { messageId: string; recipient: string };
+      // ZEB-231: spec-compliant payload (space_id, message_cid,
+      // recipient_owner_addr). Match by (channel === spaceId &&
+      // id === messageCid) — `m.id` is set to messageCid by
+      // replaceOptimisticId after send_dm returns, which always
+      // completes before this ack-driven event fires.
+      const { spaceId, messageCid } = event.payload as {
+        spaceId: string;
+        messageCid: string;
+        recipientOwnerAddr: string;
+      };
       let changed = false;
       this.messages = this.messages.map((m) => {
-        if (m.messageId !== messageId) return m;
+        if (m.channel !== spaceId || m.id !== messageCid) return m;
         changed = true;
         return { ...m, deliveryState: 'delivered' as const };
       });
@@ -153,10 +162,15 @@ export class MessageService {
     this.unlisteners.push(unlistenDmDelivered);
 
     const unlistenDmExpired = await adapter.listen('dm-expired', (event) => {
-      const { messageId } = event.payload as { messageId: string };
+      // ZEB-231: spec-compliant payload (space_id, message_cid).
+      // Same matcher pattern as dm-delivered.
+      const { spaceId, messageCid } = event.payload as {
+        spaceId: string;
+        messageCid: string;
+      };
       let changed = false;
       this.messages = this.messages.map((m) => {
-        if (m.messageId !== messageId) return m;
+        if (m.channel !== spaceId || m.id !== messageCid) return m;
         changed = true;
         return { ...m, deliveryState: 'expired' as const };
       });
