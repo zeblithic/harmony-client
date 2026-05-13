@@ -284,6 +284,20 @@ impl VineFeedCache {
         ReactionSummary { count, liked_by_me }
     }
 
+    /// Mark a vine viewed by this local peer. Local-only in this PR —
+    /// cross-device sync deferred to ZEB-147.
+    ///
+    /// Returns `true` if the vine was newly added to the viewed set,
+    /// `false` if it was already viewed. Matches `FollowManager::follow`'s
+    /// "did this change anything" convention.
+    ///
+    /// Safe to call before the descriptor arrives — `list_descriptors`
+    /// joins viewed-state at query time, so the order of `mark_viewed`
+    /// + `on_descriptor_sample` does not matter.
+    pub fn mark_viewed(&mut self, vine_id: String) -> bool {
+        self.viewed.insert(vine_id)
+    }
+
     /// Number of cached descriptors. Test helper.
     #[allow(dead_code)]
     pub fn len_descriptors(&self) -> usize {
@@ -659,5 +673,80 @@ mod tests {
         let summary = cache.get_reaction("vine-1", "alice-addr");
         assert_eq!(summary.count, 1);
         assert!(!summary.liked_by_me);
+    }
+
+    #[test]
+    fn mark_viewed_idempotent_and_local_only() {
+        let mut cache = VineFeedCache::new();
+        let payload =
+            canonical_descriptor_bytes("vine-1", "alice-addr", "Alice", "cid", None, None, 100);
+        let followed = followed_set_with(&["alice-addr"]);
+        cache.on_descriptor_sample("harmony/vines/alice-addr", &payload, &followed, 0);
+        assert_eq!(cache.len_descriptors(), 1);
+
+        // First mark — newly added
+        let first = cache.mark_viewed("vine-1".to_string());
+        assert!(first);
+        assert!(cache.is_viewed("vine-1"));
+
+        // Second mark — already viewed
+        let second = cache.mark_viewed("vine-1".to_string());
+        assert!(!second);
+
+        // Descriptor count unchanged (mark_viewed must NOT touch descriptors)
+        assert_eq!(cache.len_descriptors(), 1);
+
+        // list_descriptors reflects viewed=true
+        let dtos = cache.list_descriptors();
+        assert_eq!(dtos.len(), 1);
+        assert!(dtos[0].viewed);
+    }
+
+    #[test]
+    fn viewed_state_survives_descriptor_insertion_order() {
+        let mut cache = VineFeedCache::new();
+        let followed = followed_set_with(&["alice-addr"]);
+
+        // Mark viewed BEFORE descriptor arrives (off-order)
+        let first = cache.mark_viewed("vine-future".to_string());
+        assert!(first);
+        assert!(cache.is_viewed("vine-future"));
+
+        // Descriptor arrives later
+        let payload = canonical_descriptor_bytes(
+            "vine-future",
+            "alice-addr",
+            "Alice",
+            "cid",
+            None,
+            None,
+            500,
+        );
+        cache.on_descriptor_sample("harmony/vines/alice-addr", &payload, &followed, 0);
+
+        // list_descriptors must show viewed=true even though the mark
+        // happened before insert
+        let dtos = cache.list_descriptors();
+        assert_eq!(dtos.len(), 1);
+        assert_eq!(dtos[0].id, "vine-future");
+        assert!(dtos[0].viewed);
+    }
+
+    #[test]
+    fn mark_viewed_for_unknown_vine_id_is_still_tracked() {
+        let mut cache = VineFeedCache::new();
+
+        // No descriptor exists yet
+        let first = cache.mark_viewed("vine-ghost".to_string());
+        assert!(first);
+        assert!(cache.is_viewed("vine-ghost"));
+
+        // No descriptors are created by mark_viewed
+        assert_eq!(cache.len_descriptors(), 0);
+
+        // list_descriptors is empty because no descriptor was ever
+        // inserted — viewed-state alone does not synthesize a DTO
+        let dtos = cache.list_descriptors();
+        assert_eq!(dtos.len(), 0);
     }
 }
