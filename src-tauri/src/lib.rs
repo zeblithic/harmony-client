@@ -3049,8 +3049,20 @@ async fn check_dm_send_fence(
 /// Extracted into a standalone async function so it can be unit-tested without
 /// standing up a full `NodeState` fixture (parallel to `check_dm_send_fence`).
 async fn drain_dm_send_fence(sem: std::sync::Arc<tokio::sync::Semaphore>) {
-    let _drain = sem.acquire_many(DM_SEND_FENCE_CAPACITY as u32).await;
-    // `_drain` is dropped immediately — permits are released.
+    // Acquire all permits to block until every in-flight send_dm / delete_outbox_entry
+    // has returned its permit. The permits are dropped immediately — we only need the
+    // blocking effect. On Err (semaphore closed), log-and-continue: degraded shutdown
+    // is better than deadlock. Mirrors the ephemeral-runtime build-failure warn in
+    // stop_inner.
+    if let Err(e) = sem.acquire_many(DM_SEND_FENCE_CAPACITY as u32).await {
+        tracing::warn!(
+            error = ?e,
+            "ZEB-234: drain_dm_send_fence: acquire_many failed; \
+            proceeding with shutdown (semaphore was closed — \
+            in-flight send_dm may produce duplicates)"
+        );
+    }
+    // Permits returned / dropped immediately on the Ok path.
 }
 
 /// ZEB-225 Sub-B Phase 2: send a DM into a direct/group-DM Space.
@@ -3592,7 +3604,7 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
     // Snapshot handles under the sync mutex; release before any .await.
     // Same pattern as send_dm — NodeState's sync mutex must not span
     // .await boundaries.
-    let (dm_outbox, crdt_state, dm_send_inflight, dm_send_stopping) = {
+    let (dm_outbox, crdt_state, hlc_tracker, device_id, dm_send_inflight, dm_send_stopping) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -3601,6 +3613,8 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
                 .clone()
                 .ok_or("node not running or no owner identity")?,
             g.crdt_state.clone().ok_or("crdt_state missing")?,
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             // ZEB-234: snapshot the fence handles so delete_outbox_entry
             // holds a permit for the duration of its outbox mutation,
             // preventing stop_inner's drain from racing a mid-delete
@@ -3639,14 +3653,27 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
         .unwrap_or_default()
         .as_millis() as u64;
 
-    // Lock order: dm_outbox → crdt_state. Mirrors send_dm to avoid
-    // deadlock against any concurrent send/drain.
+    // Lock order: dm_outbox → crdt_state → hlc_tracker. Mirrors send_dm to
+    // avoid deadlock against any concurrent send/drain.
     let outcome = {
         let mut outbox_g = dm_outbox.lock().await;
         let mut state_g = crdt_state.lock().await;
-        outbox_g
+        let mut tracker_g = hlc_tracker.lock().await;
+        let outcome = outbox_g
             .delete_dm_outbox_entry(&mut state_g, outbox_entry_id, wall_now_ms)
-            .map_err(|e| format!("delete_dm_outbox_entry: {e}"))?
+            .map_err(|e| format!("delete_dm_outbox_entry: {e}"))?;
+
+        // ZEB-234/ZEB-243: advance hlc_tracker after writing the tombstone HLC,
+        // mirroring send_dm's analogous write-back. Without this, a subsequent
+        // local mutation in the same wall-millisecond could mint an HLC equal to
+        // the tombstone's, breaking the monotonicity guarantee send_dm preserves.
+        // Read the HLC from state_g (single source of truth — same approach as
+        // send_dm reading the OutboxEntry HLC).
+        if let Some(tomb_hlc) = state_g.outbox_tombstones.get(&outbox_entry_id).cloned() {
+            tracker_g.insert(device_id.clone(), tomb_hlc);
+        }
+
+        outcome
     };
 
     // Locks dropped (block scope ended). No post-check needed: _fence_permit
