@@ -4,15 +4,15 @@
   import type { CommunityMember } from '../types';
   import MemberRow from './MemberRow.svelte';
   import type { KebabAction } from './MemberRow.svelte';
+  import ModerationReasonDialog from './ModerationReasonDialog.svelte';
 
   let {
     communityId,
-    communityName: _communityName,
+    communityName,
     communityService,
     ownAddress,
   }: {
     communityId: string;
-    /** Used in dialog titles in Task 5. */
     communityName: string;
     communityService: CommunityService;
     ownAddress: string;
@@ -23,6 +23,11 @@
   let error: string | null = $state(null);
   let searchQuery = $state('');
   let bannedExpanded = $state(false);
+
+  // Dialog state for kick / unban actions
+  let dialogOpen = $state(false);
+  let dialogAction = $state<'kick' | 'unban'>('kick');
+  let dialogTarget = $state<CommunityMember | null>(null);
 
   // Snapshot the prior onMembersChanged so we can restore it on destroy,
   // following the same chaining pattern used by CommunityView for
@@ -76,8 +81,46 @@
     }
   }
 
-  function onMemberAction(_detail: { action: KebabAction; member: CommunityMember }) {
-    // Wired in Task 5 — dialogs not yet present
+  async function onMemberAction(detail: { action: KebabAction; member: CommunityMember }) {
+    const { action, member } = detail;
+    try {
+      if (action === 'kick') {
+        dialogAction = 'kick';
+        dialogTarget = member;
+        dialogOpen = true;
+      } else if (action === 'unban') {
+        dialogAction = 'unban';
+        dialogTarget = member;
+        dialogOpen = true;
+      } else if (action === 'promote-mod') {
+        await communityService.setPowerLevel(communityId, member.address, 50);
+      } else if (action === 'promote-admin') {
+        await communityService.setPowerLevel(communityId, member.address, 100);
+      } else if (action === 'demote-mod') {
+        // Last-admin guard wires in Task 6
+        await communityService.setPowerLevel(communityId, member.address, 50);
+      } else if (action === 'demote-member') {
+        await communityService.setPowerLevel(communityId, member.address, 0);
+      }
+    } catch (e) {
+      // Surface IPC errors inline on the panel. Toast service is not
+      // present in this project; use local error state.
+      error = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  async function onDialogConfirm(reason: string | null): Promise<void> {
+    if (!dialogTarget) return;
+    if (dialogAction === 'kick') {
+      await communityService.kickFromCommunity(communityId, dialogTarget.address, reason ?? undefined);
+    } else {
+      await communityService.unbanFromCommunity(communityId, dialogTarget.address, reason ?? undefined);
+    }
+    // Refresh is triggered by communityService.onMembersChanged callback automatically
+  }
+
+  function onDialogCancel() {
+    dialogTarget = null;
   }
 
   onMount(() => {
@@ -142,6 +185,15 @@
     {/if}
   {/if}
 </section>
+
+<ModerationReasonDialog
+  bind:open={dialogOpen}
+  action={dialogAction}
+  targetName={dialogTarget?.displayName ?? dialogTarget?.address.slice(0, 8) ?? ''}
+  {communityName}
+  onConfirm={onDialogConfirm}
+  onCancel={onDialogCancel}
+/>
 
 <style>
   .community-members-panel {
