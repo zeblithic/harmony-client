@@ -2707,28 +2707,39 @@ mod tests {
         fix.engine.shutdown().await.expect("shutdown");
     }
 
-    /// Shutdown must complete via the closing_notify wakeup path
-    /// rather than the previous 1s closing-flag-poll. Asserts that
-    /// Ok(()) means background loops have exited (or are about to).
-    /// Also removes a known source of TempDir-cleanup test flakiness.
+    /// Shutdown and loop teardown must complete without advancing
+    /// tokio's virtual clock. The receive + flush loops are designed
+    /// to wake via `closing_notify` — a regression to sleep-based
+    /// polling (the prior 1s closing-flag-poll path) would put
+    /// `tokio::time::sleep` back in the select arms, and paused-time
+    /// auto-advance would push the virtual clock forward by up to
+    /// 1s when those sleeps fire. We assert virtual elapsed stays
+    /// near zero, catching the regression deterministically.
     ///
-    /// 1000ms matches the regression threshold this test exists to
-    /// detect — the prior poll path took up to 1s. Wall-clock
-    /// budgets can't reliably distinguish "few ms" from "few hundred
-    /// ms" on shared CI runners; widening rather than tightening
-    /// avoids flagging on runner jitter (ZEB-282).
-    /// The flush loop's inner sliding-debounce can still hold up
-    /// shutdown if it's mid-debounce, but with no dirty events here
-    /// that path never enters.
-    #[tokio::test]
+    /// Wall-clock-independent: the prior 200ms wall-clock budget
+    /// flaked under CI runner jitter (ZEB-282). Logical time has no
+    /// jitter — the test is now jitter-immune AND a strictly tighter
+    /// regression detector than any wall-clock budget could be.
+    #[tokio::test(start_paused = true)]
     async fn shutdown_completes_promptly() {
         let fix = build_engine_fixture(8, 250, 1000).await;
-        let start = std::time::Instant::now();
+        let v_start = tokio::time::Instant::now();
         fix.engine.shutdown().await.expect("shutdown");
-        let elapsed = start.elapsed();
+        // Let the receive + flush loops actually exit. yield_now()
+        // exhausts ready tasks; once everything is parked, paused-
+        // time auto-advance fires for the next pending sleep wake
+        // — only relevant under regression. 50 yields is comfortably
+        // more than needed for two loops to break out of their
+        // selects via closing_notify.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        let v_elapsed = v_start.elapsed();
         assert!(
-            elapsed < std::time::Duration::from_millis(1000),
-            "shutdown took {elapsed:?}, expected < 1000ms"
+            v_elapsed < std::time::Duration::from_millis(10),
+            "shutdown + loop teardown advanced virtual time by \
+             {v_elapsed:?} — implies tokio::time::sleep-based wakeup \
+             regression in the receive/flush loops"
         );
     }
 
