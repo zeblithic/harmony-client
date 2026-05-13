@@ -546,6 +546,11 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         tombstones,
         owner_device_cache,
         libraries,
+        // ZEB-243: outbox_tombstones merge (tombstone-first ordering +
+        // LWW sweep of local outbox entries) is implemented in Task 6.
+        // Destructured here to keep the pattern exhaustive after the
+        // field was added to OwnerState in Task 4.
+        outbox_tombstones: _remote_outbox_tombstones,
     } = remote;
     for (_, space) in spaces {
         local.apply_space_with_canonicalization(space);
