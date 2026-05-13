@@ -3631,13 +3631,21 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
         .map_err(|_| format!("message_id must be 16 bytes, got {}", id_bytes.len()))?;
     let outbox_entry_id = crate::owner_state_types::OutboxEntryId(id_arr);
 
+    // Capture wall time before entering the lock so the tombstone HLC is
+    // sourced from a single consistent wall reading (matches send_dm's
+    // own wall_now_ms pattern). Cheap: one syscall, no lock held.
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
     // Lock order: dm_outbox → crdt_state. Mirrors send_dm to avoid
     // deadlock against any concurrent send/drain.
     let outcome = {
         let mut outbox_g = dm_outbox.lock().await;
         let mut state_g = crdt_state.lock().await;
         outbox_g
-            .delete_dm_outbox_entry(&mut state_g, outbox_entry_id)
+            .delete_dm_outbox_entry(&mut state_g, outbox_entry_id, wall_now_ms)
             .map_err(|e| format!("delete_dm_outbox_entry: {e}"))?
     };
 

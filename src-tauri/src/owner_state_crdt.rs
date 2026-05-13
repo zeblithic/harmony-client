@@ -304,6 +304,17 @@ impl OwnerState {
     /// both sets and `delivery_status` recomputes from the union.
     /// OutboxEntries are NEVER GC'd in v1 — chat history.
     pub fn apply_outbox(&mut self, incoming: OutboxEntry) -> ApplyOutcome {
+        // ZEB-243: tombstone gate. Strict-greater-than semantics —
+        // tombstone wins iff its HLC is strictly newer than the entry's
+        // `created_at`. Equal HLCs (theoretically impossible since
+        // tombstones are written after entries on the same device via the
+        // same monotone tracker) fall through — not rejected.
+        if let Some(tombstone_hlc) = self.outbox_tombstones.get(&incoming.id) {
+            if tombstone_hlc.is_strictly_newer_than(&incoming.created_at) {
+                return ApplyOutcome::Rejected(RejectionReason::OutboxEntryTombstoned);
+            }
+        }
+
         // Validate that every ack in delivered_to is for an actual
         // recipient. A non-recipient ack inflates the set, has no
         // semantic meaning, and would persist on the wire — reject
@@ -2039,6 +2050,66 @@ mod apply_outbox_tests {
             outcome,
             ApplyOutcome::Rejected(RejectionReason::InvariantFail(_))
         ));
+    }
+
+    /// ZEB-243: an incoming OutboxEntry whose created_at HLC is strictly
+    /// older than a matching tombstone in outbox_tombstones must be
+    /// rejected with OutboxEntryTombstoned and must NOT be inserted.
+    #[test]
+    fn apply_outbox_rejects_entry_older_than_tombstone() {
+        let mut state = OwnerState::default();
+        let id = OutboxEntryId([0x11; 16]);
+        let entry_hlc = hlc(1_000); // T1 — older
+        let tomb_hlc = hlc(2_000); // T2 — newer (strictly)
+                                   // Pre-load a tombstone for this id with the newer HLC.
+        state.outbox_tombstones.insert(id, tomb_hlc);
+
+        // Build an OutboxEntry for the same id with created_at = T1.
+        let mut e = entry(0x11, vec![10], vec![]);
+        e.created_at = entry_hlc;
+        let outcome = state.apply_outbox(e);
+
+        assert!(
+            matches!(
+                outcome,
+                ApplyOutcome::Rejected(RejectionReason::OutboxEntryTombstoned)
+            ),
+            "expected OutboxEntryTombstoned rejection, got {:?}",
+            outcome
+        );
+        // Entry must NOT have been inserted.
+        assert!(
+            !state.outbox.contains_key(&id),
+            "tombstoned entry must not appear in outbox"
+        );
+    }
+
+    /// ZEB-243: an incoming OutboxEntry whose created_at HLC is strictly
+    /// newer than the matching tombstone falls through (tombstone does NOT
+    /// win when the entry is newer). The entry must be accepted + inserted.
+    #[test]
+    fn apply_outbox_accepts_entry_newer_than_tombstone() {
+        let mut state = OwnerState::default();
+        let id = OutboxEntryId([0x22; 16]);
+        let tomb_hlc = hlc(1_000); // T1 — older tombstone
+        let entry_hlc = hlc(2_000); // T2 — newer entry
+                                    // Pre-load a tombstone for this id with the older HLC.
+        state.outbox_tombstones.insert(id, tomb_hlc);
+
+        // Build an OutboxEntry for the same id with created_at = T2.
+        let mut e = entry(0x22, vec![10], vec![]);
+        e.created_at = entry_hlc;
+        let outcome = state.apply_outbox(e);
+
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Inserted,
+            "entry newer than tombstone must be accepted"
+        );
+        assert!(
+            state.outbox.contains_key(&id),
+            "accepted entry must appear in outbox"
+        );
     }
 }
 
