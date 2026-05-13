@@ -43,7 +43,7 @@ pub mod profile_broadcast;
 pub mod recovery_cli;
 pub mod recovery_policy;
 mod save_dialog;
-mod vine_feed_cache;
+pub mod vine_feed_cache;
 pub mod voice;
 
 /// ZEB-262 Phase 4 Task 9: production impl of
@@ -1010,7 +1010,7 @@ async fn start_node(
     // ZEB-286: in-memory VineFeedCache shared between event loop and IPCs.
     let vine_feed_cache =
         std::sync::Arc::new(std::sync::Mutex::new(vine_feed_cache::VineFeedCache::new()));
-    let _vine_feed_cache_clone = vine_feed_cache.clone();
+    let vine_feed_cache_clone = vine_feed_cache.clone();
 
     // MailManager will be initialized after identity loading (needs owner address).
     // Placeholder — set below once we have our_addr_bytes.
@@ -2465,6 +2465,7 @@ async fn start_node(
                         voice_rx,
                         voice_channel_rx,
                         followed_set_clone,
+                        vine_feed_cache_clone,
                         mail_mgr_clone,
                         Some(mail_sync_for_loop),
                         mail_refresh_rx,

@@ -281,6 +281,7 @@ pub async fn run<R: Runtime>(
     mut voice_rx: mpsc::Receiver<crate::voice::VoiceOutbound>,
     mut voice_channel_rx: mpsc::Receiver<crate::voice::VoiceChannelRequest>,
     followed_set: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    vine_feed_cache: std::sync::Arc<std::sync::Mutex<crate::vine_feed_cache::VineFeedCache>>,
     mail_mgr: std::sync::Arc<std::sync::Mutex<crate::mail::MailManager>>,
     mail_sync: Option<Arc<crate::mail_sync::MailSync<R>>>,
     mut refresh_rx: mpsc::Receiver<crate::mail_sync::RefreshRequest>,
@@ -1406,6 +1407,7 @@ pub async fn run<R: Runtime>(
                             &payload,
                             hop_distance,
                             &followed_set,
+                            &vine_feed_cache,
                             &mail_mgr,
                             &own_mail_key,
                             &own_root_key,
@@ -2721,6 +2723,7 @@ fn emit_frontend_event<R: Runtime>(
     payload: &[u8],
     hop_distance: Option<u8>,
     followed_set: &std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    vine_feed_cache: &std::sync::Arc<std::sync::Mutex<crate::vine_feed_cache::VineFeedCache>>,
     mail_mgr: &std::sync::Arc<std::sync::Mutex<crate::mail::MailManager>>,
     own_mail_key: &str,
     own_root_key: &str,
@@ -2741,29 +2744,46 @@ fn emit_frontend_event<R: Runtime>(
         }
     } else if key_expr.starts_with("harmony/vines/") {
         if key_expr.contains("/reactions/") {
-            // Vine reaction event — emit directly to frontend.
-            if let Ok(reaction) = serde_json::from_slice::<crate::VineReactionPayload>(payload) {
-                let _ = app.emit("vine-reaction-received", &reaction);
+            // ZEB-286: route reaction through the cache. Re-emit to the
+            // frontend ONLY on Inserted or UpdatedNewer (stale/duplicate
+            // re-arrivals are absorbed silently). The cache's per-LWW
+            // dedupe replaces the previous naive every-sample emit.
+            let outcome = vine_feed_cache
+                .lock()
+                .unwrap()
+                .on_reaction_sample(key_expr, payload);
+            if matches!(
+                outcome,
+                Some(
+                    crate::vine_feed_cache::ReactionOutcome::Inserted
+                        | crate::vine_feed_cache::ReactionOutcome::UpdatedNewer
+                )
+            ) {
+                if let Ok(reaction) = serde_json::from_slice::<crate::VineReactionPayload>(payload)
+                {
+                    let _ = app.emit("vine-reaction-received", &reaction);
+                }
             }
         } else {
-            // Vine descriptor — deserialize as typed payload first to reject malformed data,
-            // then re-serialize with the source tag injected.
-            if let Ok(vine) = serde_json::from_slice::<crate::VineDescriptorPayload>(payload) {
-                let is_followed = {
-                    let set = followed_set.lock().unwrap();
-                    set.contains(vine.creator_address.as_str())
-                };
-                let source = if is_followed { "followed" } else { "discover" };
-                // Re-serialize to Value so we can inject the source field
-                if let Ok(mut val) = serde_json::to_value(&vine) {
-                    if let Some(obj) = val.as_object_mut() {
-                        obj.insert(
-                            "source".to_string(),
-                            serde_json::Value::String(source.to_string()),
-                        );
-                    }
-                    let _ = app.emit("vine-received", &val);
-                }
+            // ZEB-286: route descriptor through the cache. Source-tag
+            // (Followed vs Discover) is decided by the cache once at
+            // first insert; re-arrivals are absorbed. The cache returns
+            // the ready-to-emit VineVideoDtoWithSource so we do not have
+            // to re-parse + re-mutate JSON here.
+            let now_ms = u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0),
+            )
+            .unwrap_or(u64::MAX);
+            let outcome = {
+                let mut cache = vine_feed_cache.lock().unwrap();
+                let set = followed_set.lock().unwrap();
+                cache.on_descriptor_sample(key_expr, payload, &set, now_ms)
+            };
+            if let Some(crate::vine_feed_cache::DescriptorOutcome::Inserted { dto }) = outcome {
+                let _ = app.emit("vine-received", &dto);
             }
         }
     } else if key_expr.starts_with("harmony/announce/") {

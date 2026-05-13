@@ -166,6 +166,9 @@ async fn spawn_test_runtime() -> Option<TestHarness> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let followed_set = Arc::new(Mutex::new(std::collections::HashSet::<String>::default()));
+    let vine_feed_cache = Arc::new(Mutex::new(
+        harmony_app::vine_feed_cache::VineFeedCache::new(),
+    ));
     let mail_mgr = Arc::new(Mutex::new(harmony_app::mail::MailManager::load(
         &app_data_dir.join("mail"),
         [0u8; 16],
@@ -240,6 +243,7 @@ async fn spawn_test_runtime() -> Option<TestHarness> {
                     voice_rx,
                     voice_ch_rx,
                     followed_set,
+                    vine_feed_cache,
                     mail_mgr,
                     None,
                     refresh_rx,
