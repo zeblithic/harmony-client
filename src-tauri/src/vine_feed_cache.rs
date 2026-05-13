@@ -244,12 +244,16 @@ impl VineFeedCache {
                 Some(ReactionOutcome::Inserted)
             }
             Some(existing) => {
-                if reaction.timestamp < existing.timestamp {
-                    // Strictly older: stale, no-op.
-                    // Same-timestamp is treated as UpdatedNewer so that
-                    // rapid toggles within one second (publish_vine_reaction
-                    // uses SystemTime::now().as_secs()) are not silently
-                    // dropped.
+                // Stale if strictly older, OR if same-timestamp AND the
+                // liked-state is unchanged (exact duplicate redelivery).
+                // Same-timestamp with CHANGED liked-state is treated as
+                // UpdatedNewer so that rapid toggles within one second
+                // (publish_vine_reaction uses SystemTime::now().as_secs()
+                // second-resolution) are not silently dropped.
+                if reaction.timestamp < existing.timestamp
+                    || (reaction.timestamp == existing.timestamp
+                        && reaction.liked == existing.liked)
+                {
                     return Some(ReactionOutcome::Stale);
                 }
                 self.reactions.insert(

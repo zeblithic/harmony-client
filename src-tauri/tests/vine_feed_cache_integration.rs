@@ -299,6 +299,35 @@ fn same_second_toggle_overwrites_not_dropped() {
     assert!(!summary.liked_by_me);
 }
 
+#[test]
+fn same_timestamp_same_liked_is_stale_no_reemit() {
+    // Regression test for CodeRabbit Major on commit d6c7792.
+    // Exact-duplicate Zenoh redelivery (same timestamp AND same liked
+    // value) must be classified as Stale, NOT UpdatedNewer — otherwise
+    // every duplicate sample re-emits to the frontend.
+    let mut cache = VineFeedCache::new();
+    let like1 = make_reaction("vine-1", "alice-addr", "Alice", true, 100);
+    // Identical second sample (Zenoh redelivery)
+    let like2 = make_reaction("vine-1", "alice-addr", "Alice", true, 100);
+
+    let r1 = cache.on_reaction_sample(
+        "harmony/vines/creator-addr/reactions/vine-1/alice-addr",
+        &reaction_bytes(&like1),
+    );
+    let r2 = cache.on_reaction_sample(
+        "harmony/vines/creator-addr/reactions/vine-1/alice-addr",
+        &reaction_bytes(&like2),
+    );
+
+    assert_eq!(r1, Some(ReactionOutcome::Inserted));
+    // Exact-duplicate redelivery: Stale (no overwrite, no re-emit)
+    assert_eq!(r2, Some(ReactionOutcome::Stale));
+
+    let summary = cache.get_reaction("vine-1", "alice-addr");
+    assert_eq!(summary.count, 1);
+    assert!(summary.liked_by_me);
+}
+
 // ── Category 3: Reshare wire path ───────────────────────────────────
 
 #[test]
