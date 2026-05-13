@@ -180,7 +180,7 @@ impl VineFeedCache {
                 viewed: self.viewed.contains(&cv.descriptor.id),
             })
             .collect();
-        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        out.sort_by_key(|v| std::cmp::Reverse(v.created_at));
         out
     }
 
@@ -332,10 +332,17 @@ mod tests {
         assert_eq!(second, Some(DescriptorOutcome::AlreadyPresent));
         assert_eq!(cache.len_descriptors(), 1);
 
-        // Source decision from first arrival is preserved (Followed),
-        // not flipped to Discover by the second-arrival empty followed_set.
-        let dtos = cache.list_descriptors();
-        assert_eq!(dtos.len(), 1);
+        // Third arrival: alice is now followed again. The cache must
+        // still report AlreadyPresent (i.e., source decision is frozen
+        // at first insert and CANNOT be flipped by re-arrival, regardless
+        // of current followed_set membership). If the cache ever decided
+        // to re-insert based on a "now followed" signal, this third call
+        // would return Inserted{Followed}.
+        let followed3 = followed_set_with(&["alice-addr"]);
+        let third =
+            cache.on_descriptor_sample("harmony/vines/alice-addr", &payload, &followed3, 5_000);
+        assert_eq!(third, Some(DescriptorOutcome::AlreadyPresent));
+        assert_eq!(cache.len_descriptors(), 1);
     }
 
     #[test]
