@@ -1023,6 +1023,12 @@ async fn start_node(
     let old_profile_broadcast_publisher: Option<
         std::sync::Arc<crate::profile_broadcast::ProfileBroadcastPublisher>,
     >;
+    // ZEB-234: outer-scope bindings for the old fence handles. Taken
+    // inside the lock (below) and drained outside after the lock is
+    // released — mirrors stop_inner's pattern. Declared here so they
+    // outlive the lock scope and can be used in the drain block.
+    let old_dm_send_inflight: Option<std::sync::Arc<tokio::sync::Semaphore>>;
+    let old_dm_send_stopping: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>;
     let (
         old_shutdown,
         old_thread,
@@ -1047,6 +1053,11 @@ async fn start_node(
         old_unicast_send_tx,
     ) = {
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+        // ZEB-234: take fence handles before releasing the lock so any
+        // concurrent send_dm / delete_outbox_entry that snapshots from
+        // NodeState after this point finds None and rejects immediately.
+        old_dm_send_inflight = guard.dm_send_inflight.take();
+        old_dm_send_stopping = guard.dm_send_stopping.take();
         let tup = (
             guard.shutdown_tx.take(),
             guard.thread.take(),
@@ -1127,6 +1138,22 @@ async fn start_node(
     // sees its receiver close after the publish channel is gone — same
     // ordering as stop_inner.
     drop(old_pairing_handle);
+    // ZEB-234: signal the old stopping flag so any concurrent send_dm /
+    // delete_outbox_entry that already cloned the old fence handles fast-
+    // rejects without queuing a new permit. Then drain the semaphore —
+    // acquire_many(CAPACITY) blocks until every outstanding permit has
+    // been returned, ensuring no in-flight DM mutation is mid-critical-
+    // section when the old SyncEngine's final flush runs below.
+    //
+    // We're already in async context (start_node is async), so we can
+    // .await directly — no thread::scope + ephemeral-runtime needed here
+    // (unlike stop_inner, which is sync).
+    if let Some(ref stopping) = old_dm_send_stopping {
+        stopping.store(true, std::sync::atomic::Ordering::Release);
+    }
+    if let Some(sem) = old_dm_send_inflight {
+        drain_dm_send_fence(sem).await;
+    }
     // ZEB-281 Sub-D Phase 4: explicitly await the previous identity's
     // profile-broadcast publisher shutdown BEFORE dropping the prior
     // publish channels. The publisher's background task may otherwise
@@ -3610,7 +3637,7 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
     // stop+restart racing through this command. See send_dm for the
     // full rationale on why both `generation` and handle-attachment
     // need to be re-verified.
-    let (dm_outbox, crdt_state, snapshot_generation) = {
+    let (dm_outbox, crdt_state, snapshot_generation, dm_send_inflight, dm_send_stopping) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -3620,8 +3647,23 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
                 .ok_or("node not running or no owner identity")?,
             g.crdt_state.clone().ok_or("crdt_state missing")?,
             g.generation,
+            // ZEB-234: snapshot the fence handles so delete_outbox_entry
+            // holds a permit for the duration of its outbox mutation,
+            // preventing stop_inner's drain from racing a mid-delete
+            // tombstone write. Mirrors send_dm's fence pattern.
+            g.dm_send_inflight
+                .clone()
+                .ok_or("node not running (no fence)")?,
+            g.dm_send_stopping
+                .clone()
+                .ok_or("node not running (no fence)")?,
         )
     };
+
+    // ZEB-234: acquire the shutdown fence before any outbox mutation.
+    // Pre-check + acquire a permit that blocks stop_inner's drain until
+    // this IPC returns. Mirrors send_dm's fence pattern exactly.
+    let _fence_permit = check_dm_send_fence(&dm_send_stopping, dm_send_inflight).await?;
 
     // Decode message_id from hex → OutboxEntryId.
     let id_bytes = hex::decode(&message_id).map_err(|e| format!("message_id hex: {e}"))?;

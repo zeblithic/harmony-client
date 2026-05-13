@@ -677,12 +677,18 @@ impl DmOutbox {
         // same device_id and the caller-supplied wall_now_ms. There is no
         // prior tombstone for this id (the entry existed, so no tombstone
         // was present — outbox_tombstones and outbox are mutually
-        // exclusive for any given id under the intended invariant). The
-        // tombstone's HLC is guaranteed >= entry.created_at because
-        // wall_now_ms is sourced at IPC-dispatch time, after the entry
-        // was originally minted; the monotone next_hlc function
-        // additionally ensures logical advancement on wall-clock ties.
-        let tombstone_hlc = next_hlc(None, wall_now_ms, &self.device_id);
+        // exclusive for any given id under the intended invariant).
+        //
+        // Pass Some(&outbox_entry.created_at) as the previous HLC so the
+        // monotone advance is threaded through next_hlc even when
+        // wall_now_ms equals created_at.wall_ms (same-millisecond delete)
+        // or rolls backward (clock skew). next_hlc bumps the logical
+        // component in both cases, guaranteeing tombstone_hlc is
+        // strictly newer than created_at. Passing None would discard
+        // prior HLC info and could produce tombstone_hlc == created_at on
+        // a same-millisecond delete, causing apply_outbox's strict-newer-
+        // than gate to fail to block a peer resurrection.
+        let tombstone_hlc = next_hlc(Some(&outbox_entry.created_at), wall_now_ms, &self.device_id);
         state.outbox_tombstones.insert(message_id, tombstone_hlc);
 
         // Clear in-flight + backoff caches across all recipients of this
@@ -5435,9 +5441,15 @@ mod tests {
         assert!(state.outbox.contains_key(&msg_id));
         assert!(!state.outbox_tombstones.contains_key(&msg_id));
 
-        // Act: delete at a strictly-later wall time so the tombstone HLC
-        // is guaranteed strictly newer than created_at.
-        let wall_delete_ms = 2_000u64;
+        // Act: delete at the SAME wall-clock millisecond as the entry's
+        // created_at so we exercise the fixed monotone-advance path.
+        // Pre-fix (next_hlc(None, ...)), this would produce a tombstone
+        // with logical=0 at the same wall_ms — equal to or less than
+        // created_at if created_at.logical > 0 — which would fail the
+        // strict-newer-than gate in apply_outbox. Post-fix (next_hlc with
+        // Some(&entry.created_at)), the logical component is bumped even
+        // on same-millisecond deletion, guaranteeing strict-newer-than.
+        let wall_delete_ms = created_at.wall_ms; // same ms as entry creation
         o.delete_dm_outbox_entry(&mut state, msg_id, wall_delete_ms)
             .expect("delete_dm_outbox_entry ok");
 
@@ -5447,14 +5459,16 @@ mod tests {
             "OutboxEntry must be removed after delete"
         );
 
-        // Assert: tombstone was written with HLC >= entry.created_at.
+        // Assert: tombstone was written with HLC strictly newer than entry.created_at.
+        // (same-millisecond delete must still advance the logical component.)
         let tombstone_hlc = state
             .outbox_tombstones
             .get(&msg_id)
             .expect("outbox_tombstones must contain the deleted msg_id");
         assert!(
-            tombstone_hlc.is_strictly_newer_than(&created_at) || tombstone_hlc == &created_at,
-            "tombstone HLC must be >= entry.created_at (got {:?} vs {:?})",
+            tombstone_hlc.is_strictly_newer_than(&created_at),
+            "tombstone HLC must be strictly newer than entry.created_at \
+             even on same-millisecond delete (got {:?} vs {:?})",
             tombstone_hlc,
             created_at
         );
