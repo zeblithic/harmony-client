@@ -109,10 +109,14 @@ describe('CommunitySettingsPanel', () => {
     expect(queryByPlaceholderText(/Type community name/i)).toBeNull();
   });
 
-  it('Leave as only admin opens tier-3 typed-confirmation', async () => {
-    const { getByText, getByPlaceholderText } = render(CommunitySettingsPanel, { props: baseProps });
+  it('Leave as only admin opens LastAdminWarningDialog with LEAVE token requirement', async () => {
+    const { getByText, getByLabelText } = render(CommunitySettingsPanel, { props: baseProps });
     await fireEvent.click(getByText(/Leave community/i));
-    expect(getByPlaceholderText(/Type community name/i)).toBeTruthy();
+    // LastAdminWarningDialog renders a label "To proceed, type LEAVE below:"
+    // and an input bound to it via aria-describedby / id.
+    expect(getByLabelText(/To proceed, type/i)).toBeTruthy();
+    // The warning title should mention "last admin"
+    expect(getByText(/last admin/i)).toBeTruthy();
   });
 
   it('renders a search input in the Members section', () => {

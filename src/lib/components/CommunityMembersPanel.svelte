@@ -5,6 +5,7 @@
   import MemberRow from './MemberRow.svelte';
   import type { KebabAction } from './MemberRow.svelte';
   import ModerationReasonDialog from './ModerationReasonDialog.svelte';
+  import LastAdminWarningDialog from './LastAdminWarningDialog.svelte';
 
   let {
     communityId,
@@ -28,6 +29,11 @@
   let dialogOpen = $state(false);
   let dialogAction = $state<'kick' | 'unban'>('kick');
   let dialogTarget = $state<CommunityMember | null>(null);
+
+  // Last-admin warning dialog state
+  let lastAdminDialogOpen = $state(false);
+  let lastAdminDialogAction = $state<'demote' | 'leave'>('demote');
+  let lastAdminDialogPendingPower = $state<number>(0);
 
   // Snapshot the prior onMembersChanged so we can restore it on destroy,
   // following the same chaining pattern used by CommunityView for
@@ -96,11 +102,16 @@
         await communityService.setPowerLevel(communityId, member.address, 50);
       } else if (action === 'promote-admin') {
         await communityService.setPowerLevel(communityId, member.address, 100);
-      } else if (action === 'demote-mod') {
-        // Last-admin guard wires in Task 6
-        await communityService.setPowerLevel(communityId, member.address, 50);
-      } else if (action === 'demote-member') {
-        await communityService.setPowerLevel(communityId, member.address, 0);
+      } else if (action === 'demote-mod' || action === 'demote-member') {
+        const isSelf = member.address === viewer.addr;
+        const newPower = action === 'demote-mod' ? 50 : 0;
+        if (isSelf && viewer.isLastAdmin) {
+          lastAdminDialogAction = 'demote';
+          lastAdminDialogPendingPower = newPower;
+          lastAdminDialogOpen = true;
+          return;
+        }
+        await communityService.setPowerLevel(communityId, member.address, newPower);
       }
     } catch (e) {
       // Surface IPC errors inline on the panel. Toast service is not
@@ -121,6 +132,16 @@
 
   function onDialogCancel() {
     dialogTarget = null;
+  }
+
+  async function onLastAdminDialogConfirm() {
+    if (lastAdminDialogAction === 'demote' && ownAddress) {
+      await communityService.setPowerLevel(communityId, ownAddress, lastAdminDialogPendingPower);
+    }
+  }
+
+  function onLastAdminDialogCancel() {
+    // no-op; dialog resets and closes itself
   }
 
   onMount(() => {
@@ -193,6 +214,14 @@
   {communityName}
   onConfirm={onDialogConfirm}
   onCancel={onDialogCancel}
+/>
+
+<LastAdminWarningDialog
+  bind:open={lastAdminDialogOpen}
+  action={lastAdminDialogAction}
+  {communityName}
+  onConfirm={onLastAdminDialogConfirm}
+  onCancel={onLastAdminDialogCancel}
 />
 
 <style>

@@ -2,8 +2,8 @@
   import { trapFocus } from '../actions/trap-focus';
   import { POWER_THRESHOLDS, powerToRole, type CommunityMember } from '../types';
   import ConfirmationModal from './ConfirmationModal.svelte';
-  import TypedConfirmationModal from './TypedConfirmationModal.svelte';
   import SetPowerDialog from './SetPowerDialog.svelte';
+  import LastAdminWarningDialog from './LastAdminWarningDialog.svelte';
   import InviteLinkManager from './InviteLinkManager.svelte';
 
   let {
@@ -51,6 +51,7 @@
   // than ceremonial.
   let pendingAdminChange = $state<{ target: CommunityMember; newPower: number } | null>(null);
   let leaveOpen = $state(false);
+  let lastAdminLeaveDialogOpen = $state(false);
   const titleId = `community-settings-title-${Math.random().toString(36).slice(2)}`;
 
   function crossesAdminThreshold(currentPower: number, newPower: number): boolean {
@@ -237,7 +238,13 @@
 
     <div class="section">
       <div class="section-label">Danger zone</div>
-      <button class="leave-btn" onclick={() => (leaveOpen = true)}>Leave community</button>
+      <button class="leave-btn" onclick={() => {
+        if (amOnlyAdmin) {
+          lastAdminLeaveDialogOpen = true;
+        } else {
+          leaveOpen = true;
+        }
+      }}>Leave community</button>
       {#if amOnlyAdmin}
         <p class="hint">As the only admin, leaving will leave the community without an admin until another member is promoted.</p>
       {/if}
@@ -287,16 +294,15 @@
   />
 {/if}
 
-{#if leaveOpen && amOnlyAdmin}
-  <TypedConfirmationModal
-    title={`Leave ${communityName} (you're the only admin)`}
-    description="If you leave, no one can promote new admins, kick disruptive members, or generate new invite links. The community CRDT will persist on the network but become permanently ungoverned. Promote another member to admin first if you want to hand off control."
-    requiredText={communityName}
-    confirmLabel="Leave anyway"
-    onConfirm={() => { onLeave(); leaveOpen = false; }}
-    onCancel={() => (leaveOpen = false)}
-  />
-{:else if leaveOpen}
+<LastAdminWarningDialog
+  bind:open={lastAdminLeaveDialogOpen}
+  action="leave"
+  {communityName}
+  onConfirm={async () => { onLeave(); }}
+  onCancel={() => {}}
+/>
+
+{#if leaveOpen}
   <ConfirmationModal
     title={`Leave ${communityName}?`}
     description="You will lose access. You can rejoin via invite later if available."
