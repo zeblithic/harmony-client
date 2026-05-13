@@ -12053,6 +12053,7 @@ pub enum MembershipChangeType {
     Invited,
     Kicked,
     PowerChanged,
+    Unbanned,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -12163,6 +12164,15 @@ pub fn delta_to_change(
                 target: hex::encode(target.0),
                 by: Some(actor_hex),
                 detail: Some(MembershipChangeDetail::Level(*level)),
+                at_wall_ms,
+            }
+        }
+        crate::community_membership::MembershipEventKind::Unban { target, reason } => {
+            MembershipChange {
+                r#type: MembershipChangeType::Unbanned,
+                target: hex::encode(target.0),
+                by: Some(actor_hex),
+                detail: reason.clone().map(MembershipChangeDetail::Reason),
                 at_wall_ms,
             }
         }
