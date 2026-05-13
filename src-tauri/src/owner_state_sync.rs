@@ -528,8 +528,8 @@ impl IncomingOutcome {
 
 /// Merge each entry from a decoded remote `OwnerState` snapshot into
 /// `local`, in the load-bearing order documented inside (see the
-/// "outbox_tombstones → spaces → outbox → inbox → markers →
-/// tombstones → owner_device_cache" comment).
+/// "spaces first → outbox → inbox → markers → tombstones →
+/// owner_device_cache" comment).
 ///
 /// Extracted from `handle_incoming_publish` so the merge invariants
 /// (in particular, that tombstone application clears any matching
@@ -546,42 +546,7 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         tombstones,
         owner_device_cache,
         libraries,
-        outbox_tombstones,
     } = remote;
-
-    // ZEB-243: apply remote outbox tombstones FIRST. LWW per id by HLC;
-    // sweep matching local outbox entries whose created_at is strictly
-    // older than the merged tombstone HLC. Must precede the outbox merge
-    // loop below — without this ordering, a remote entry that is also
-    // tombstoned on the remote could re-insert via apply_outbox before the
-    // tombstone has a chance to gate it.
-    for (id, remote_hlc) in outbox_tombstones {
-        // Local tombstone wins iff it is strictly newer than the remote.
-        // "strictly newer" is the only safe comparator — Hlc doesn't
-        // derive PartialOrd.
-        if local
-            .outbox_tombstones
-            .get(&id)
-            .is_none_or(|existing| remote_hlc.is_strictly_newer_than(existing))
-        {
-            local.outbox_tombstones.insert(id, remote_hlc);
-        }
-        // Sweep local outbox entry if its created_at HLC is strictly older
-        // than the merged (winning) tombstone HLC. Re-borrow after the
-        // potential insert above; split-borrow from outbox is fine.
-        let merged_hlc: &Hlc = local
-            .outbox_tombstones
-            .get(&id)
-            .expect("just ensured present");
-        if local
-            .outbox
-            .get(&id)
-            .is_some_and(|e| merged_hlc.is_strictly_newer_than(&e.created_at))
-        {
-            local.outbox.remove(&id);
-        }
-    }
-
     for (_, space) in spaces {
         local.apply_space_with_canonicalization(space);
     }
@@ -2035,145 +2000,6 @@ mod integration_tests {
         assert!(
             !local.spaces.contains_key(&space_id),
             "live Space must be cleared even when remote snapshot carries both spaces[id] and tombstones[id]"
-        );
-    }
-
-    /// ZEB-243: a remote tombstone with HLC strictly newer than the
-    /// matching local outbox entry must sweep that entry out of
-    /// `local.outbox` and record the tombstone's HLC into
-    /// `local.outbox_tombstones`.
-    #[test]
-    fn merge_remote_tombstones_sweep_local_outbox() {
-        use crate::owner_state_types::{
-            ContentId, DeliveryStatus, OutboxEntry, OutboxEntryId, OwnerAddr,
-        };
-
-        let mut local = OwnerState::default();
-        let id = OutboxEntryId([0x22; 16]);
-        let entry_hlc = Hlc {
-            wall_ms: 1_000,
-            logical: 0,
-            device_id: "a".into(),
-        };
-        let tomb_hlc = Hlc {
-            wall_ms: 2_000,
-            logical: 0,
-            device_id: "b".into(),
-        };
-
-        // Seed local with an outbox entry.
-        local.outbox.insert(
-            id,
-            OutboxEntry {
-                id,
-                space_id: SpaceId([0x01; 16]),
-                recipient_owners: vec![OwnerAddr([0x02; 16])],
-                message_cid: ContentId::from_bytes([0x03; 32]),
-                created_at: entry_hlc.clone(),
-                delivered_to: Default::default(),
-                delivery_status: DeliveryStatus::Pending,
-            },
-        );
-
-        // Remote carries only a tombstone for the same id with HLC > entry.
-        let mut remote = OwnerState::default();
-        remote.outbox_tombstones.insert(id, tomb_hlc.clone());
-
-        merge_remote_into_local(&mut local, remote);
-
-        assert!(
-            !local.outbox.contains_key(&id),
-            "local entry must be swept by the remote tombstone"
-        );
-        assert_eq!(
-            local.outbox_tombstones.get(&id),
-            Some(&tomb_hlc),
-            "merged tombstone HLC must equal the remote tombstone HLC"
-        );
-    }
-
-    /// ZEB-243: full create-sync-delete-sync convergence scenario.
-    /// A creates an OutboxEntry; B receives it via sync. B then deletes
-    /// it (records a tombstone with HLC > entry.created_at). A merges B's
-    /// state — both devices end with empty outbox and matching tombstone.
-    /// Idempotent: merging B←A again must produce no change.
-    #[test]
-    fn merge_remote_into_local_convergence_after_create_and_delete() {
-        use crate::owner_state_types::{
-            ContentId, DeliveryStatus, OutboxEntry, OutboxEntryId, OwnerAddr,
-        };
-
-        let id = OutboxEntryId([0x33; 16]);
-        let entry_hlc = Hlc {
-            wall_ms: 1_000,
-            logical: 0,
-            device_id: "device-a".into(),
-        };
-        // Tombstone HLC is strictly newer than entry.
-        let tomb_hlc = Hlc {
-            wall_ms: 2_000,
-            logical: 0,
-            device_id: "device-b".into(),
-        };
-
-        let make_entry = || OutboxEntry {
-            id,
-            space_id: SpaceId([0x0a; 16]),
-            recipient_owners: vec![OwnerAddr([0x0b; 16])],
-            message_cid: ContentId::from_bytes([0x0c; 32]),
-            created_at: entry_hlc.clone(),
-            delivered_to: Default::default(),
-            delivery_status: DeliveryStatus::Pending,
-        };
-
-        // --- Device A creates the entry. ---
-        let mut a = OwnerState::default();
-        a.outbox.insert(id, make_entry());
-
-        // --- Sync A → B: B receives A's entry. ---
-        let mut b = OwnerState::default();
-        b.outbox.insert(id, make_entry());
-
-        // Sanity: both now have the entry.
-        assert!(a.outbox.contains_key(&id));
-        assert!(b.outbox.contains_key(&id));
-
-        // --- B "deletes" it: removes from outbox + records tombstone. ---
-        b.outbox.remove(&id);
-        b.outbox_tombstones.insert(id, tomb_hlc.clone());
-
-        // --- A merges B's state: tombstone must sweep A's local entry. ---
-        let b_snapshot_for_a = b.clone();
-        merge_remote_into_local(&mut a, b_snapshot_for_a);
-
-        assert!(
-            !a.outbox.contains_key(&id),
-            "A's outbox entry must be swept after receiving B's tombstone"
-        );
-        assert_eq!(
-            a.outbox_tombstones.get(&id),
-            Some(&tomb_hlc),
-            "A must record B's tombstone HLC"
-        );
-
-        // --- Both states now agree: empty outbox, tombstone present. ---
-        assert!(b.outbox.is_empty(), "B's outbox must be empty");
-        assert_eq!(
-            a.outbox_tombstones, b.outbox_tombstones,
-            "tombstones must converge"
-        );
-
-        // --- Idempotency: merge B←A again → no change. ---
-        let a_snapshot_for_b = a.clone();
-        let b_tombstones_before = b.outbox_tombstones.clone();
-        merge_remote_into_local(&mut b, a_snapshot_for_b);
-        assert!(
-            b.outbox.is_empty(),
-            "B's outbox must remain empty after idempotent merge"
-        );
-        assert_eq!(
-            b.outbox_tombstones, b_tombstones_before,
-            "B's tombstones must be unchanged by idempotent merge (A has same tombstone)"
         );
     }
 

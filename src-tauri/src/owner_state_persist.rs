@@ -104,13 +104,6 @@ struct CrdtFileV2 {
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     libraries:
         BTreeMap<crate::owner_state_types::OwnerAddr, crate::owner_state_types::LibraryEntry>,
-    /// ZEB-243: persisted outbox tombstones. Absent in pre-ZEB-243 V2
-    /// files; `serde(default)` loads those as an empty map for backward
-    /// compatibility. `skip_serializing_if` omits the field when empty
-    /// so existing file shapes stay compact.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
-    outbox_tombstones:
-        BTreeMap<crate::owner_state_types::OutboxEntryId, crate::owner_state_types::Hlc>,
 }
 
 impl From<&OwnerState> for CrdtFileV2 {
@@ -123,7 +116,6 @@ impl From<&OwnerState> for CrdtFileV2 {
             tombstones: s.tombstones.clone(),
             owner_device_cache: s.owner_device_cache.clone(),
             libraries: s.libraries.clone(),
-            outbox_tombstones: s.outbox_tombstones.clone(),
         }
     }
 }
@@ -138,7 +130,6 @@ impl From<CrdtFileV2> for OwnerState {
             tombstones: f.tombstones,
             owner_device_cache: f.owner_device_cache,
             libraries: f.libraries,
-            outbox_tombstones: f.outbox_tombstones,
         }
     }
 }

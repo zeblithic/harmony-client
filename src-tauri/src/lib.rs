@@ -173,13 +173,6 @@ pub fn chunk_and_bundle(
 
 // ── Managed Tauri state ──────────────────────────────────────────────────
 
-/// ZEB-234: shutdown-fence permit count for `send_dm`. Practical
-/// "unbounded" for typical IPC concurrency; exhaustion awaits rather
-/// than rejects. `stop_inner` drains all permits via `acquire_many`
-/// to guarantee no in-flight `send_dm` is mid-write when
-/// `SyncEngine::shutdown` runs.
-pub const DM_SEND_FENCE_CAPACITY: usize = 1024;
-
 pub struct NodeState {
     /// Background thread running the event loop (NodeRuntime is !Send).
     thread: Option<thread::JoinHandle<()>>,
@@ -272,17 +265,6 @@ pub struct NodeState {
     /// store SyncEngine uses for state-root publishes (RuntimeContentStore
     /// in production, InMemoryStub in some tests).
     content_store: Option<std::sync::Arc<dyn crate::content_store::ContentStore>>,
-    /// ZEB-234: shutdown fence. `send_dm` and `delete_outbox_entry`
-    /// each acquire a permit for the duration of their outbox mutation;
-    /// `stop_inner` sets `stopping` then drains all permits before
-    /// `SyncEngine::shutdown`, ensuring no in-flight mutation races
-    /// the flush. `Some(_)` while running, `None` after stop.
-    dm_send_inflight: Option<std::sync::Arc<tokio::sync::Semaphore>>,
-    /// ZEB-234: paired stopping flag. Set synchronously in
-    /// `stop_inner` BEFORE the permit drain so newly-arriving
-    /// `send_dm` calls early-reject. Cleared (None'd) in symmetry
-    /// with `dm_send_inflight`.
-    dm_send_stopping: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// ZEB-227 Path B: outbound DM unicast channel sender.
     /// `RuntimeUnicastTransport` (Task 6) holds a clone; `event_loop` drains
     /// the receiver and forwards each `UnicastSendRequest` as
@@ -397,8 +379,6 @@ impl Default for NodeState {
             dm_device_id: None,
             dm_self_owner: None,
             content_store: None,
-            dm_send_inflight: None,
-            dm_send_stopping: None,
             unicast_send_tx: None,
             dm_identity_pub_64: None,
             community_adapter_request_tx: None,
@@ -600,8 +580,6 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         dm_self_owner,
         content_store,
         unicast_send_tx,
-        dm_send_inflight,
-        dm_send_stopping,
     ) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
@@ -642,10 +620,6 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             guard.dm_self_owner.take(),
             guard.content_store.take(),
             guard.unicast_send_tx.take(),
-            // ZEB-234: take fence handles so we can set the stopping flag
-            // and drain in-flight send_dm calls outside the lock scope.
-            guard.dm_send_inflight.take(),
-            guard.dm_send_stopping.take(),
         );
         // ZEB-228 Phase 4: clear our cached identity_pub so a restart
         // can't accidentally ship the prior identity's pub on a new
@@ -685,14 +659,6 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     };
 
     let had_node = shutdown_tx.is_some() || thread.is_some();
-    // ZEB-234: signal stopping synchronously so any send_dm currently
-    // in its pre-acquire pre-check fast-rejects without queuing a new
-    // permit. Must happen after the lock is released (the flag is an
-    // Arc<AtomicBool> taken out of the NodeState above) and before the
-    // drain below.
-    if let Some(ref stopping) = dm_send_stopping {
-        stopping.store(true, std::sync::atomic::Ordering::Release);
-    }
     // ZEB-281 Sub-D Phase 4: abort the profile-broadcast publisher BEFORE
     // dropping `publish_tx`. `shutdown()` calls `JoinHandle::abort()` on
     // the publisher's background task — ordering this before the
@@ -839,34 +805,6 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     // already been released. The consumer task's receiver then observes
     // a closed channel and exits cleanly.
     drop(community_delta_tx);
-    // ZEB-234: drain in-flight send_dm permits before SyncEngine final
-    // flush. `acquire_many(CAPACITY)` blocks until every outstanding
-    // permit has been returned — guaranteeing no send_dm is
-    // mid-mutation when the flush runs. Mirror the existing
-    // `thread::scope` + ephemeral-runtime pattern used by the registry
-    // shutdowns above — `stop_inner` is sync and cannot `.await`.
-    if let Some(sem) = dm_send_inflight {
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => {
-                        rt.block_on(drain_dm_send_fence(sem));
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "ZEB-234: failed to build drain runtime; \
-                             proceeding with shutdown (in-flight \
-                             send_dm may produce duplicates)"
-                        );
-                    }
-                }
-            });
-        });
-    }
     // Phase 3a: explicitly shut down the SyncEngine before joining the
     // event-loop thread. This flushes any pending debounced publish and
     // runs the final persist pass. Must run before stop_handles so the
@@ -1024,12 +962,6 @@ async fn start_node(
     let old_profile_broadcast_publisher: Option<
         std::sync::Arc<crate::profile_broadcast::ProfileBroadcastPublisher>,
     >;
-    // ZEB-234: outer-scope bindings for the old fence handles. Taken
-    // inside the lock (below) and drained outside after the lock is
-    // released — mirrors stop_inner's pattern. Declared here so they
-    // outlive the lock scope and can be used in the drain block.
-    let old_dm_send_inflight: Option<std::sync::Arc<tokio::sync::Semaphore>>;
-    let old_dm_send_stopping: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>;
     let (
         old_shutdown,
         old_thread,
@@ -1054,11 +986,6 @@ async fn start_node(
         old_unicast_send_tx,
     ) = {
         let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
-        // ZEB-234: take fence handles before releasing the lock so any
-        // concurrent send_dm / delete_outbox_entry that snapshots from
-        // NodeState after this point finds None and rejects immediately.
-        old_dm_send_inflight = guard.dm_send_inflight.take();
-        old_dm_send_stopping = guard.dm_send_stopping.take();
         let tup = (
             guard.shutdown_tx.take(),
             guard.thread.take(),
@@ -1139,22 +1066,6 @@ async fn start_node(
     // sees its receiver close after the publish channel is gone — same
     // ordering as stop_inner.
     drop(old_pairing_handle);
-    // ZEB-234: signal the old stopping flag so any concurrent send_dm /
-    // delete_outbox_entry that already cloned the old fence handles fast-
-    // rejects without queuing a new permit. Then drain the semaphore —
-    // acquire_many(CAPACITY) blocks until every outstanding permit has
-    // been returned, ensuring no in-flight DM mutation is mid-critical-
-    // section when the old SyncEngine's final flush runs below.
-    //
-    // We're already in async context (start_node is async), so we can
-    // .await directly — no thread::scope + ephemeral-runtime needed here
-    // (unlike stop_inner, which is sync).
-    if let Some(ref stopping) = old_dm_send_stopping {
-        stopping.store(true, std::sync::atomic::Ordering::Release);
-    }
-    if let Some(sem) = old_dm_send_inflight {
-        drain_dm_send_fence(sem).await;
-    }
     // ZEB-281 Sub-D Phase 4: explicitly await the previous identity's
     // profile-broadcast publisher shutdown BEFORE dropping the prior
     // publish channels. The publisher's background task may otherwise
@@ -2525,16 +2436,6 @@ async fn start_node(
                 guard.dm_device_id = device_id_for_state.clone();
                 guard.dm_self_owner = self_owner_for_state;
                 guard.content_store = content_store_for_state.clone();
-                // ZEB-234: initialize the shutdown fence. Semaphore starts
-                // at DM_SEND_FENCE_CAPACITY permits (one per concurrent
-                // send_dm); stopping flag starts false. Both cleared in
-                // stop_inner after the permit drain.
-                guard.dm_send_inflight = Some(std::sync::Arc::new(tokio::sync::Semaphore::new(
-                    DM_SEND_FENCE_CAPACITY,
-                )));
-                guard.dm_send_stopping = Some(std::sync::Arc::new(
-                    std::sync::atomic::AtomicBool::new(false),
-                ));
                 // ZEB-227 Path B: store the outbound unicast sender so
                 // Task 11's RuntimeUnicastTransport instantiation in
                 // start_node can clone it. The receiver was moved into
@@ -3006,65 +2907,6 @@ pub struct SendDmResult {
     pub message_cid: String,
 }
 
-/// ZEB-234: shutdown fence helper for `send_dm`.
-///
-/// Pre-checks the `stopping` flag; acquires one owned permit from `sem`;
-/// re-checks `stopping` after acquire (the flag can be set in the `await`
-/// window). Returns the permit so the caller holds it until IPC return,
-/// guaranteeing `stop_inner`'s `acquire_many(CAPACITY)` drain blocks until
-/// every in-flight `send_dm` has completed its mutation.
-///
-/// Extracted into a standalone function so it can be unit-tested without
-/// standing up a full `NodeState` fixture.
-async fn check_dm_send_fence(
-    stopping: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    sem: std::sync::Arc<tokio::sync::Semaphore>,
-) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
-    use std::sync::atomic::Ordering;
-    if stopping.load(Ordering::Acquire) {
-        return Err("node stopping; operation rejected".into());
-    }
-    let permit = sem
-        .acquire_owned()
-        .await
-        .map_err(|_| "node stopping (semaphore closed)".to_string())?;
-    if stopping.load(Ordering::Acquire) {
-        return Err("node stopping; operation rejected".into());
-    }
-    Ok(permit)
-}
-
-/// ZEB-234: drain all in-flight `send_dm` permits before `SyncEngine::shutdown`.
-///
-/// Acquires all `DM_SEND_FENCE_CAPACITY` permits from the semaphore in one
-/// `acquire_many` call. This blocks until every outstanding
-/// `check_dm_send_fence` permit (held by an in-flight `send_dm`) has been
-/// returned. The permit-set is immediately dropped — we only need the blocking
-/// effect, not the permits themselves.
-///
-/// Called by `stop_inner` inside a `thread::scope` + ephemeral current-thread
-/// runtime (mirroring the pattern at the `SyncEngine::shutdown` block) because
-/// `stop_inner` is sync and cannot `.await` directly.
-///
-/// Extracted into a standalone async function so it can be unit-tested without
-/// standing up a full `NodeState` fixture (parallel to `check_dm_send_fence`).
-async fn drain_dm_send_fence(sem: std::sync::Arc<tokio::sync::Semaphore>) {
-    // Acquire all permits to block until every in-flight send_dm / delete_outbox_entry
-    // has returned its permit. The permits are dropped immediately — we only need the
-    // blocking effect. On Err (semaphore closed), log-and-continue: degraded shutdown
-    // is better than deadlock. Mirrors the ephemeral-runtime build-failure warn in
-    // stop_inner.
-    if let Err(e) = sem.acquire_many(DM_SEND_FENCE_CAPACITY as u32).await {
-        tracing::warn!(
-            error = ?e,
-            "ZEB-234: drain_dm_send_fence: acquire_many failed; \
-            proceeding with shutdown (semaphore was closed — \
-            in-flight send_dm may produce duplicates)"
-        );
-    }
-    // Permits returned / dropped immediately on the Ok path.
-}
-
 /// ZEB-225 Sub-B Phase 2: send a DM into a direct/group-DM Space.
 ///
 /// Snapshots the DmOutbox/CRDT/HLC/ContentStore handles under the NodeState
@@ -3094,6 +2936,12 @@ async fn send_dm(
     let space_id_hex = space_id;
     // Snapshot all handles under the sync mutex; release it before any await.
     // (Per ZEB-225 spec: NodeState sync-mutex must not be held across `.await`.)
+    //
+    // We also capture `generation` paired-atomically with the Arcs. If
+    // stop_inner detaches the Arcs (sets to None) and start_node bumps the
+    // generation while the work below is in flight, the Arcs we hold are
+    // orphaned: they'll write into a `crdt_state` the new node never reads
+    // from. The post-check at the bottom catches that and surfaces Err.
     let (
         dm_outbox,
         _dm_transport,
@@ -3102,8 +2950,7 @@ async fn send_dm(
         device_id,
         _self_owner,
         cas,
-        dm_send_inflight,
-        dm_send_stopping,
+        snapshot_generation,
     ) = {
         let g = state_lock
             .lock()
@@ -3118,30 +2965,9 @@ async fn send_dm(
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
             g.content_store.clone().ok_or("content_store missing")?,
-            g.dm_send_inflight
-                .clone()
-                .ok_or("node not running (no fence)")?,
-            g.dm_send_stopping
-                .clone()
-                .ok_or("node not running (no fence)")?,
+            g.generation,
         )
     };
-
-    // ZEB-234: shutdown fence. Pre-check the stopping flag — if set,
-    // short-circuit before any work. Then acquire a permit for the
-    // duration of mutation; stop_inner's acquire_many drain blocks on
-    // this permit, preventing SyncEngine::shutdown from racing the
-    // flush. Re-check stopping after acquire (could have been set
-    // during the await).
-    //
-    // While _fence_permit is held, stop_inner CANNOT complete its
-    // SyncEngine::shutdown — it is blocked waiting for the drain.
-    // This makes the old generation/handle post-checks that formerly
-    // followed the mutation unnecessary and harmful (they would return
-    // Err after a successful fenced write, driving a retry that mints
-    // a second OutboxEntry → duplicate DM). Those post-checks were
-    // removed by ZEB-234 (this PR).
-    let _fence_permit = check_dm_send_fence(&dm_send_stopping, dm_send_inflight).await?;
 
     let space_bytes = hex::decode(&space_id_hex).map_err(|e| format!("space_id hex: {e}"))?;
     let space_arr: [u8; 16] = space_bytes
@@ -3187,12 +3013,52 @@ async fn send_dm(
         .ok_or("send_dm minted entry not in outbox (apply_outbox rejected?)")?;
     tracker_g.insert(device_id, next_hlc);
 
-    // Drop the per-handle locks. No post-check needed: _fence_permit guarantees
-    // stop_inner cannot complete SyncEngine::shutdown while this permit is held,
-    // so the mutation above is always visible to the live node. (ZEB-234)
+    // Drop the per-handle locks before re-acquiring NodeState's sync mutex.
     drop(tracker_g);
     drop(state_g);
     drop(outbox_g);
+
+    // Post-check: the work above mutated crdt_state via the cloned Arcs. If
+    // a stop+restart fired during the .await chain, our crdt_state may now
+    // be detached from the live NodeState — the new node won't see this
+    // entry. Surface as Err so the caller can retry against the live node.
+    //
+    // KNOWN RACE (ZEB-234, deferred to pre-Phase-4): the mutation already
+    // happened when this check runs. If stop_inner's SyncEngine::shutdown()
+    // flushes the cloned crdt_state between apply_outbox and this post-check,
+    // the entry is persisted + broadcast even though we report Err. A retry
+    // against the new node mints a second OutboxEntry → recipient sees a
+    // duplicate DM. The proper fix is a shutdown fence (in-flight permit
+    // shared between send_dm and stop_inner). Phase 2 ships with this race
+    // unaddressed because no UI flow concurrently triggers stop+send;
+    // ZEB-234 lands the fence before Phase 4 frontend does.
+    //
+    // Residual TOCTOU within this code: a stop+restart between this post-
+    // check and the IPC return still produces apparent success with an
+    // orphaned entry. Same fix (ZEB-234) closes this window too.
+    {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during send_dm (was {}, now {}); \
+                 entry was written to a detached crdt_state and won't be \
+                 drained — retry against the live node",
+                snapshot_generation, g.generation
+            ));
+        }
+        // stop_inner clears DM handles (dm_outbox, crdt_state, etc → None)
+        // WITHOUT bumping `generation`. So a stop_node alone (no subsequent
+        // start) leaves generation unchanged but handles None. The
+        // generation-only check above misses that case; verify the handles
+        // are still present too.
+        if g.dm_outbox.is_none() {
+            return Err("node was stopped during send_dm; entry was written to a \
+                 detached crdt_state and won't be drained"
+                .to_string());
+        }
+    }
 
     Ok(SendDmResult {
         message_id: hex::encode(msg_id.0),
@@ -3604,7 +3470,13 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
     // Snapshot handles under the sync mutex; release before any .await.
     // Same pattern as send_dm — NodeState's sync mutex must not span
     // .await boundaries.
-    let (dm_outbox, crdt_state, hlc_tracker, device_id, dm_send_inflight, dm_send_stopping) = {
+    //
+    // ZEB-245 (PR #81 round 6): capture `generation` paired-atomically
+    // with the Arcs so the post-stop check below can detect a
+    // stop+restart racing through this command. See send_dm for the
+    // full rationale on why both `generation` and handle-attachment
+    // need to be re-verified.
+    let (dm_outbox, crdt_state, snapshot_generation) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -3613,29 +3485,9 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
                 .clone()
                 .ok_or("node not running or no owner identity")?,
             g.crdt_state.clone().ok_or("crdt_state missing")?,
-            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
-            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            // ZEB-234: snapshot the fence handles so delete_outbox_entry
-            // holds a permit for the duration of its outbox mutation,
-            // preventing stop_inner's drain from racing a mid-delete
-            // tombstone write. Mirrors send_dm's fence pattern.
-            g.dm_send_inflight
-                .clone()
-                .ok_or("node not running (no fence)")?,
-            g.dm_send_stopping
-                .clone()
-                .ok_or("node not running (no fence)")?,
+            g.generation,
         )
     };
-
-    // ZEB-234: acquire the shutdown fence before any outbox mutation.
-    // Pre-check + acquire a permit that blocks stop_inner's drain until
-    // this IPC returns. While _fence_permit is held, stop_inner cannot
-    // complete SyncEngine::shutdown — making the old post-check guards
-    // obsolete and harmful (they would Err after a successful fenced
-    // write, driving a retry that could mint a second OutboxEntry).
-    // Those post-checks were removed by ZEB-234 (this PR).
-    let _fence_permit = check_dm_send_fence(&dm_send_stopping, dm_send_inflight).await?;
 
     // Decode message_id from hex → OutboxEntryId.
     let id_bytes = hex::decode(&message_id).map_err(|e| format!("message_id hex: {e}"))?;
@@ -3645,61 +3497,51 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
         .map_err(|_| format!("message_id must be 16 bytes, got {}", id_bytes.len()))?;
     let outbox_entry_id = crate::owner_state_types::OutboxEntryId(id_arr);
 
-    // Capture wall time before entering the lock so the tombstone HLC is
-    // sourced from a single consistent wall reading (matches send_dm's
-    // own wall_now_ms pattern). Cheap: one syscall, no lock held.
-    let wall_now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
-    // Lock order: dm_outbox → crdt_state → hlc_tracker. Mirrors send_dm to
-    // avoid deadlock against any concurrent send/drain.
+    // Lock order: dm_outbox → crdt_state. Mirrors send_dm to avoid
+    // deadlock against any concurrent send/drain.
     let outcome = {
         let mut outbox_g = dm_outbox.lock().await;
         let mut state_g = crdt_state.lock().await;
-        let mut tracker_g = hlc_tracker.lock().await;
-        let outcome = outbox_g
-            .delete_dm_outbox_entry(&mut state_g, outbox_entry_id, wall_now_ms)
-            .map_err(|e| format!("delete_dm_outbox_entry: {e}"))?;
-
-        // ZEB-234/ZEB-243: advance hlc_tracker after writing the tombstone HLC,
-        // mirroring send_dm's analogous write-back. Without this, a subsequent
-        // local mutation in the same wall-millisecond could mint an HLC equal to
-        // the tombstone's, breaking the monotonicity guarantee send_dm preserves.
-        // Read the HLC from state_g (single source of truth — same approach as
-        // send_dm reading the OutboxEntry HLC).
-        //
-        // Two guards are required before advancing our tracker lane:
-        // (a) device_id match: outbox_tombstones may already hold a tombstone
-        //     synced in via CRDT from a paired device. Writing a remote device's
-        //     HLC into our tracker lane is a category error.
-        // (b) strictly-newer check: the tombstone HLC is minted
-        //     strictly-newer-than the entry's created_at, but NOT necessarily
-        //     newer than the tracker's current value. A send_dm that executed
-        //     between entry creation and this delete may have already advanced
-        //     the tracker past this tombstone; an unconditional insert would
-        //     regress it. Also catches idempotent re-deletes (tombstone was
-        //     written by a prior call, not the one just executed).
-        if let Some(tomb_hlc) = state_g.outbox_tombstones.get(&outbox_entry_id).cloned() {
-            if tomb_hlc.device_id == device_id {
-                let should_update = match tracker_g.get(&device_id) {
-                    Some(curr) => tomb_hlc.is_strictly_newer_than(curr),
-                    None => true,
-                };
-                if should_update {
-                    tracker_g.insert(device_id.clone(), tomb_hlc);
-                }
-            }
-        }
-
-        outcome
+        outbox_g
+            .delete_dm_outbox_entry(&mut state_g, outbox_entry_id)
+            .map_err(|e| format!("delete_dm_outbox_entry: {e}"))?
     };
 
-    // Locks dropped (block scope ended). No post-check needed: _fence_permit
-    // guarantees stop_inner cannot complete SyncEngine::shutdown while this
-    // permit is held, so the deletion above is always visible to the live
-    // node. (ZEB-234)
+    // Locks dropped (block scope ended).
+    //
+    // ZEB-245 (PR #81 round 6): post-stop check before emitting
+    // dm-deleted. If a stop+restart fired during the .await chain
+    // above, our cloned `crdt_state` Arc is now detached from the
+    // live NodeState — the deletion landed in an orphan that won't
+    // be persisted. Emitting dm-deleted in that case would prune the
+    // message from the UI even though it'll reappear on next start.
+    // Surface as Err instead so the caller (App.svelte's deleteDm)
+    // can re-show the message + retry against the live node.
+    //
+    // Mirrors send_dm's fence (lib.rs ~1762): same residual TOCTOU
+    // applies — a stop_inner that flushes the cloned crdt_state
+    // between mutate and post-check still persists the deletion, so
+    // ZEB-234's shutdown fence is the real fix. This guard closes the
+    // common case (stop_node alone, no flush) which is the only
+    // detach path Phase 4 UI can actually trigger.
+    {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during delete_outbox_entry (was {}, now {}); \
+                 deletion was applied to a detached crdt_state and won't be persisted — \
+                 retry against the live node",
+                snapshot_generation, g.generation
+            ));
+        }
+        if g.dm_outbox.is_none() {
+            return Err("node was stopped during delete_outbox_entry; deletion was \
+                applied to a detached crdt_state and won't be persisted"
+                .to_string());
+        }
+    }
 
     // Emit IPC event only if something actually changed (idempotent
     // missing-id is no-op).
@@ -14423,127 +14265,6 @@ mod channel_message_ipc_tests {
         assert!(
             err.contains("channel_log_registry missing"),
             "Some(HlcDto) should fall through to registry lookup; got: {err}"
-        );
-    }
-}
-
-// ── ZEB-234: shutdown fence unit tests ──────────────────────────────────────
-// These tests exercise the `check_dm_send_fence` helper directly, without
-// requiring a full NodeState fixture (which would need all DM handles
-// populated). This is the approach from the plan's "lighter test" alternative:
-// test the helper that `send_dm` delegates to.
-#[cfg(test)]
-mod dm_send_fence_tests {
-    use super::*;
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    };
-
-    #[tokio::test]
-    async fn send_dm_rejects_after_stopping_flag_set() {
-        let stopping = Arc::new(AtomicBool::new(true)); // flag already set
-        let sem = Arc::new(tokio::sync::Semaphore::new(DM_SEND_FENCE_CAPACITY));
-
-        let result = check_dm_send_fence(&stopping, sem).await;
-        let err = result.expect_err("must reject when stopping flag is set");
-        assert!(
-            err.contains("node stopping"),
-            "error should mention 'node stopping'; got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn check_dm_send_fence_rejects_when_semaphore_closed() {
-        let stopping = Arc::new(AtomicBool::new(false));
-        let sem = Arc::new(tokio::sync::Semaphore::new(DM_SEND_FENCE_CAPACITY));
-
-        // Close the semaphore to simulate stop_inner draining it.
-        // stopping flag is NOT set so the pre-check passes and we exercise
-        // the acquire_owned().await error path.
-        sem.close();
-
-        let result = check_dm_send_fence(&stopping, sem).await;
-        let err = result.expect_err("must reject when semaphore is closed");
-        assert!(
-            err.contains("semaphore closed"),
-            "error should mention 'semaphore closed'; got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn send_dm_permit_acquired_when_not_stopping() {
-        let stopping = Arc::new(AtomicBool::new(false)); // not stopping
-        let sem = Arc::new(tokio::sync::Semaphore::new(DM_SEND_FENCE_CAPACITY));
-        let sem_clone = sem.clone();
-
-        let permit = check_dm_send_fence(&stopping, sem)
-            .await
-            .expect("must succeed when not stopping");
-
-        // Verify a permit was consumed (available_permits is CAPACITY - 1).
-        assert_eq!(
-            sem_clone.available_permits(),
-            DM_SEND_FENCE_CAPACITY - 1,
-            "one permit should be held"
-        );
-        drop(permit);
-        assert_eq!(
-            sem_clone.available_permits(),
-            DM_SEND_FENCE_CAPACITY,
-            "permit should be returned on drop"
-        );
-    }
-
-    /// ZEB-234: drain blocks until all in-flight permits are returned.
-    ///
-    /// Scenario: one permit is held (simulating an in-flight `send_dm`).
-    /// `drain_dm_send_fence` is called — it must block until the permit
-    /// is dropped, then return.
-    #[tokio::test]
-    async fn drain_dm_send_fence_blocks_until_inflight_completes() {
-        let stopping = Arc::new(AtomicBool::new(false));
-        let sem = Arc::new(tokio::sync::Semaphore::new(DM_SEND_FENCE_CAPACITY));
-
-        // Acquire one permit to simulate an in-flight send_dm.
-        let _inflight_permit = sem
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("should acquire permit");
-
-        // Set the stopping flag (mirrors stop_inner ordering).
-        stopping.store(true, Ordering::Release);
-
-        // Spawn the drain concurrently. It should block until we drop
-        // the in-flight permit.
-        let sem_clone = sem.clone();
-        let drain_handle = tokio::spawn(async move {
-            drain_dm_send_fence(sem_clone).await;
-        });
-
-        // The drain should NOT have completed yet (permit still held).
-        // A brief yield confirms it's blocked.
-        tokio::task::yield_now().await;
-        assert!(
-            !drain_handle.is_finished(),
-            "drain must block while permit held"
-        );
-
-        // Drop the in-flight permit — drain should unblock.
-        drop(_inflight_permit);
-
-        // Now the drain should complete promptly.
-        tokio::time::timeout(std::time::Duration::from_secs(5), drain_handle)
-            .await
-            .expect("drain should complete within timeout")
-            .expect("drain task should not panic");
-
-        // All permits must be back (drain acquired + immediately dropped them).
-        assert_eq!(
-            sem.available_permits(),
-            DM_SEND_FENCE_CAPACITY,
-            "all permits should be returned after drain"
         );
     }
 }

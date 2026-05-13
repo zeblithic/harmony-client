@@ -644,7 +644,6 @@ impl DmOutbox {
         &mut self,
         state: &mut OwnerState,
         message_id: OutboxEntryId,
-        wall_now_ms: u64,
     ) -> Result<DeleteDmOutboxOutcome, DeleteDmError> {
         // Peek before removing so a Complete entry doesn't get unconditionally
         // wiped. Idempotent miss → Ok(default()); Complete hit → Err so the
@@ -671,25 +670,6 @@ impl DmOutbox {
         // device's CidNotify could have raced ahead and the InboxEntry
         // could have been GC'd). Either way, idempotent removal.
         let _removed_inbox = state.delete_inbox_entry(inbox_key);
-
-        // ZEB-243: write a tombstone so paired-device sync cannot
-        // resurrect this entry via apply_outbox. HLC is minted with the
-        // same device_id and the caller-supplied wall_now_ms. There is no
-        // prior tombstone for this id (the entry existed, so no tombstone
-        // was present — outbox_tombstones and outbox are mutually
-        // exclusive for any given id under the intended invariant).
-        //
-        // Pass Some(&outbox_entry.created_at) as the previous HLC so the
-        // monotone advance is threaded through next_hlc even when
-        // wall_now_ms equals created_at.wall_ms (same-millisecond delete)
-        // or rolls backward (clock skew). next_hlc bumps the logical
-        // component in both cases, guaranteeing tombstone_hlc is
-        // strictly newer than created_at. Passing None would discard
-        // prior HLC info and could produce tombstone_hlc == created_at on
-        // a same-millisecond delete, causing apply_outbox's strict-newer-
-        // than gate to fail to block a peer resurrection.
-        let tombstone_hlc = next_hlc(Some(&outbox_entry.created_at), wall_now_ms, &self.device_id);
-        state.outbox_tombstones.insert(message_id, tombstone_hlc);
 
         // Clear in-flight + backoff caches across all recipients of this
         // message so a stale entry can't resurface on a future drain.
@@ -5277,7 +5257,7 @@ mod tests {
 
         // Act.
         let outcome = o
-            .delete_dm_outbox_entry(&mut state, msg_id, 2_000)
+            .delete_dm_outbox_entry(&mut state, msg_id)
             .expect("delete_dm_outbox_entry ok");
 
         // Assert: OutboxEntry gone.
@@ -5318,7 +5298,7 @@ mod tests {
 
         // Act.
         let outcome = o
-            .delete_dm_outbox_entry(&mut state, fake_id, 1_000)
+            .delete_dm_outbox_entry(&mut state, fake_id)
             .expect("idempotent: no error on missing");
 
         // Assert: all-None outcome, no error.
@@ -5375,7 +5355,7 @@ mod tests {
 
         // Act: must err.
         let err = o
-            .delete_dm_outbox_entry(&mut state, msg_id, 2_000)
+            .delete_dm_outbox_entry(&mut state, msg_id)
             .expect_err("Complete entries must not be deletable");
         match err {
             DeleteDmError::AlreadyDelivered(id) => assert_eq!(id, msg_id),
@@ -5389,88 +5369,6 @@ mod tests {
         assert!(
             state.inbox.contains_key(&inbox_key),
             "self-InboxEntry must remain — delivered history is preserved"
-        );
-    }
-
-    // ── ZEB-243: delete_dm_outbox_entry writes tombstone ─────────────────
-    //
-    // Deletion must write an outbox_tombstone alongside removing the
-    // OutboxEntry so that paired-device sync cannot resurrect the deleted
-    // message via apply_outbox. The tombstone HLC must be >= the entry's
-    // created_at HLC (and is guaranteed strictly-greater because it's
-    // minted from the same monotone wall-clock tracker on the same device
-    // immediately after the entry's created_at was recorded).
-
-    #[tokio::test]
-    async fn delete_dm_outbox_entry_writes_tombstone() {
-        // Arrange: build a DM Space, send a DM, verify the outbox entry
-        // exists. Then call delete_dm_outbox_entry and assert:
-        //   - outbox is empty for that msg_id
-        //   - outbox_tombstones contains the msg_id with HLC >= entry.created_at
-        let mut state = OwnerState::default();
-        let alice = OwnerAddr([0x01; 16]);
-        let bob = OwnerAddr([0x02; 16]);
-        let sp = make_dm_space(8, vec![alice, bob]);
-        let space_id = sp.id;
-        install_space(&mut state, sp);
-
-        let cas = InMemoryStub::default();
-        let mut o = make_outbox_synthetic("dev", alice);
-        let (msg_id, _msg_cid) = o
-            .send_dm(
-                &mut state,
-                &cas,
-                space_id,
-                b"tombstone me".to_vec(),
-                "text/plain".into(),
-                1_000,
-                None,
-            )
-            .await
-            .expect("send_dm ok");
-
-        // Capture the entry's created_at before deletion.
-        let created_at = state
-            .outbox
-            .get(&msg_id)
-            .expect("outbox entry must exist before delete")
-            .created_at
-            .clone();
-
-        // Pre-condition: outbox is populated, no tombstone yet.
-        assert!(state.outbox.contains_key(&msg_id));
-        assert!(!state.outbox_tombstones.contains_key(&msg_id));
-
-        // Act: delete at the SAME wall-clock millisecond as the entry's
-        // created_at so we exercise the fixed monotone-advance path.
-        // Pre-fix (next_hlc(None, ...)), this would produce a tombstone
-        // with logical=0 at the same wall_ms — equal to or less than
-        // created_at if created_at.logical > 0 — which would fail the
-        // strict-newer-than gate in apply_outbox. Post-fix (next_hlc with
-        // Some(&entry.created_at)), the logical component is bumped even
-        // on same-millisecond deletion, guaranteeing strict-newer-than.
-        let wall_delete_ms = created_at.wall_ms; // same ms as entry creation
-        o.delete_dm_outbox_entry(&mut state, msg_id, wall_delete_ms)
-            .expect("delete_dm_outbox_entry ok");
-
-        // Assert: outbox entry is gone.
-        assert!(
-            !state.outbox.contains_key(&msg_id),
-            "OutboxEntry must be removed after delete"
-        );
-
-        // Assert: tombstone was written with HLC strictly newer than entry.created_at.
-        // (same-millisecond delete must still advance the logical component.)
-        let tombstone_hlc = state
-            .outbox_tombstones
-            .get(&msg_id)
-            .expect("outbox_tombstones must contain the deleted msg_id");
-        assert!(
-            tombstone_hlc.is_strictly_newer_than(&created_at),
-            "tombstone HLC must be strictly newer than entry.created_at \
-             even on same-millisecond delete (got {:?} vs {:?})",
-            tombstone_hlc,
-            created_at
         );
     }
 
