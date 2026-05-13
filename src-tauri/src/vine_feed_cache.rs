@@ -749,4 +749,26 @@ mod tests {
         let dtos = cache.list_descriptors();
         assert_eq!(dtos.len(), 0);
     }
+
+    #[test]
+    fn vine_feed_cache_round_trip_through_arc_mutex_works() {
+        use std::sync::{Arc, Mutex};
+        let cache = Arc::new(Mutex::new(VineFeedCache::new()));
+
+        // Independent borrow + mutation through the lock — same pattern
+        // as event_loop's emit_frontend_event will use in Task 5.
+        {
+            let mut guard = cache.lock().unwrap();
+            guard.mark_viewed("v-1".to_string());
+        }
+        {
+            let guard = cache.lock().unwrap();
+            assert!(guard.is_viewed("v-1"));
+        }
+
+        // Two Arc clones can both read without deadlock
+        let c2 = cache.clone();
+        let len = c2.lock().unwrap().len_descriptors();
+        assert_eq!(len, 0);
+    }
 }
