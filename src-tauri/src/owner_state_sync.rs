@@ -528,7 +528,7 @@ impl IncomingOutcome {
 
 /// Merge each entry from a decoded remote `OwnerState` snapshot into
 /// `local`, in the load-bearing order documented inside (see the
-/// "spaces first → outbox_tombstones → outbox → inbox → markers →
+/// "outbox_tombstones → spaces → outbox → inbox → markers →
 /// tombstones → owner_device_cache" comment).
 ///
 /// Extracted from `handle_incoming_publish` so the merge invariants
@@ -556,18 +556,23 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
     // tombstoned on the remote could re-insert via apply_outbox before the
     // tombstone has a chance to gate it.
     for (id, remote_hlc) in outbox_tombstones {
-        let merged_hlc = match local.outbox_tombstones.get(&id) {
-            // Local tombstone wins iff it is strictly newer than the remote.
-            // "strictly newer" is the only safe comparator — Hlc doesn't
-            // derive PartialOrd.
-            Some(existing) if !remote_hlc.is_strictly_newer_than(existing) => existing.clone(),
-            _ => {
-                local.outbox_tombstones.insert(id, remote_hlc.clone());
-                remote_hlc
-            }
-        };
+        // Local tombstone wins iff it is strictly newer than the remote.
+        // "strictly newer" is the only safe comparator — Hlc doesn't
+        // derive PartialOrd.
+        if local
+            .outbox_tombstones
+            .get(&id)
+            .is_none_or(|existing| remote_hlc.is_strictly_newer_than(existing))
+        {
+            local.outbox_tombstones.insert(id, remote_hlc);
+        }
         // Sweep local outbox entry if its created_at HLC is strictly older
-        // than the merged (winning) tombstone HLC.
+        // than the merged (winning) tombstone HLC. Re-borrow after the
+        // potential insert above; split-borrow from outbox is fine.
+        let merged_hlc: &Hlc = local
+            .outbox_tombstones
+            .get(&id)
+            .expect("just ensured present");
         if local
             .outbox
             .get(&id)
