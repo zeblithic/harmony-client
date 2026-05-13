@@ -43,6 +43,7 @@ pub mod profile_broadcast;
 pub mod recovery_cli;
 pub mod recovery_policy;
 mod save_dialog;
+mod vine_feed_cache;
 pub mod voice;
 
 /// ZEB-262 Phase 4 Task 9: production impl of

@@ -2993,9 +2993,7 @@ mod tests {
         let prior = materialize(&[admin_join, target_join], admin_addr);
 
         // Build a reason with exactly MAX_MODERATION_REASON_CHARS+1 codepoints.
-        let oversized: String = std::iter::repeat('a')
-            .take(MAX_MODERATION_REASON_CHARS + 1)
-            .collect();
+        let oversized: String = "a".repeat(MAX_MODERATION_REASON_CHARS + 1);
         let kick_payload = EventPayload {
             id: [0x10; 16],
             community_id,
@@ -3040,9 +3038,7 @@ mod tests {
         let prior = materialize(&[admin_join, target_join, kick], admin_addr);
         assert_eq!(prior.members[&target_addr].status, MemberStatus::Banned);
 
-        let oversized: String = std::iter::repeat('z')
-            .take(MAX_MODERATION_REASON_CHARS + 1)
-            .collect();
+        let oversized: String = "z".repeat(MAX_MODERATION_REASON_CHARS + 1);
         let unban_payload = EventPayload {
             id: [0x20; 16],
             community_id,
