@@ -4479,10 +4479,23 @@ async fn publish_vine_reaction(
         .map_err(|_| "event loop dropped publish request".to_string())?
 }
 
+/// Return all vines currently in the local cache, sorted by
+/// `created_at` descending (newest first). `viewed` field reflects
+/// local-only `mark_vine_viewed` state.
+///
+/// Returns `Err("not connected")` if the node is not running.
+/// ZEB-147 will extend this with disk persistence.
 #[tauri::command]
-fn list_vine_videos() -> Vec<VineVideoDto> {
-    // Future: return cached/persisted vines. Real data flows via vine-received events.
-    Vec::new()
+fn list_vine_videos(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<VineVideoDto>, String> {
+    let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+    let cache = guard
+        .vine_feed_cache
+        .as_ref()
+        .ok_or_else(|| "not connected".to_string())?;
+    let result = cache.lock().unwrap().list_descriptors();
+    Ok(result)
 }
 
 #[tauri::command]
@@ -4565,11 +4578,23 @@ fn list_followed(
         .collect())
 }
 
+/// Mark a vine viewed by the local peer. Returns `Ok(true)` if newly
+/// marked viewed, `Ok(false)` if already viewed.
+///
+/// Returns `Err("not connected")` if the node is not running.
+/// Local-only in this PR; cross-device sync deferred to ZEB-147.
 #[tauri::command]
-fn mark_vine_viewed(vine_id: String) -> bool {
-    // Future: persist viewed state + publish to network for cross-device sync.
-    let _ = vine_id;
-    true
+fn mark_vine_viewed(
+    vine_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<bool, String> {
+    let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+    let cache = guard
+        .vine_feed_cache
+        .as_ref()
+        .ok_or_else(|| "not connected".to_string())?;
+    let result = cache.lock().unwrap().mark_viewed(vine_id);
+    Ok(result)
 }
 
 // ── Content announcement types and file manager stubs ───────────────────

@@ -771,4 +771,45 @@ mod tests {
         let len = c2.lock().unwrap().len_descriptors();
         assert_eq!(len, 0);
     }
+
+    #[test]
+    fn list_descriptors_returns_dto_with_viewed_state_set() {
+        // Test the full DTO shape exposed to the IPC, including the
+        // viewed flag joining correctly and reshare_of preservation.
+        let mut cache = VineFeedCache::new();
+        let payload = canonical_descriptor_bytes(
+            "vine-1",
+            "alice-addr",
+            "Alice",
+            "cid-a",
+            Some("title-a"),
+            None,
+            500,
+        );
+        let payload2 = canonical_descriptor_bytes(
+            "vine-2",
+            "alice-addr",
+            "Alice",
+            "cid-b",
+            None,
+            Some("vine-1"), // reshare
+            600,
+        );
+        let followed = followed_set_with(&["alice-addr"]);
+
+        cache.on_descriptor_sample("harmony/vines/alice-addr", &payload, &followed, 0);
+        cache.on_descriptor_sample("harmony/vines/alice-addr", &payload2, &followed, 0);
+        cache.mark_viewed("vine-1".to_string());
+
+        let dtos = cache.list_descriptors();
+        assert_eq!(dtos.len(), 2);
+        // sorted by created_at DESC: vine-2 (600) first
+        assert_eq!(dtos[0].id, "vine-2");
+        assert_eq!(dtos[0].reshare_of.as_deref(), Some("vine-1"));
+        assert!(!dtos[0].viewed);
+        // vine-1 second, marked viewed
+        assert_eq!(dtos[1].id, "vine-1");
+        assert_eq!(dtos[1].title.as_deref(), Some("title-a"));
+        assert!(dtos[1].viewed);
+    }
 }
