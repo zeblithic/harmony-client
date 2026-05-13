@@ -49,6 +49,19 @@ pub struct OwnerState {
     /// semantics; tombstones retained (see `LibraryEntry::is_effective`).
     #[serde(rename = "lb", skip_serializing_if = "BTreeMap::is_empty", default)]
     pub libraries: BTreeMap<OwnerAddr, LibraryEntry>,
+    /// ZEB-243: tombstones for deleted OutboxEntries. Maps each
+    /// `OutboxEntryId` to the HLC at which the delete was applied
+    /// locally. LWW semantics on merge: the tombstone with the
+    /// strictly-greater HLC wins. `apply_outbox` rejects any incoming
+    /// entry whose `created_at` HLC is strictly older than its matching
+    /// tombstone HLC.
+    ///
+    /// ULIDs are unique per send; collisions across honest peers are
+    /// impossible. The HLC comparison is defensive against clock skew.
+    /// No GC in this PR — outbox is bounded by the 30-day expiration
+    /// timer, so tombstone growth remains low. See spec §4.1 + §8.
+    #[serde(rename = "ot", skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub outbox_tombstones: BTreeMap<OutboxEntryId, Hlc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +87,15 @@ pub enum RejectionReason {
         kind: &'static str,
         device_id: String,
     },
+    /// ZEB-243: incoming OutboxEntry has a matching tombstone whose HLC
+    /// is strictly greater than the entry's `created_at` HLC. The
+    /// tombstone was written by `delete_dm_outbox_entry` on some device
+    /// and replicated via `merge_remote_into_local`. Equal HLCs are
+    /// theoretically impossible (tombstone is always written after the
+    /// entry, so its HLC is strictly newer on the same device); if they
+    /// occur due to clock skew the entry falls through (not rejected).
+    #[error("OutboxEntry has a matching tombstone with strictly-newer HLC")]
+    OutboxEntryTombstoned,
 }
 
 impl OwnerState {
@@ -282,6 +304,17 @@ impl OwnerState {
     /// both sets and `delivery_status` recomputes from the union.
     /// OutboxEntries are NEVER GC'd in v1 — chat history.
     pub fn apply_outbox(&mut self, incoming: OutboxEntry) -> ApplyOutcome {
+        // ZEB-243: tombstone gate. Strict-greater-than semantics —
+        // tombstone wins iff its HLC is strictly newer than the entry's
+        // `created_at`. Equal HLCs (theoretically impossible since
+        // tombstones are written after entries on the same device via the
+        // same monotone tracker) fall through — not rejected.
+        if let Some(tombstone_hlc) = self.outbox_tombstones.get(&incoming.id) {
+            if tombstone_hlc.is_strictly_newer_than(&incoming.created_at) {
+                return ApplyOutcome::Rejected(RejectionReason::OutboxEntryTombstoned);
+            }
+        }
+
         // Validate that every ack in delivered_to is for an actual
         // recipient. A non-recipient ack inflates the set, has no
         // semantic meaning, and would persist on the wire — reject
@@ -2018,6 +2051,66 @@ mod apply_outbox_tests {
             ApplyOutcome::Rejected(RejectionReason::InvariantFail(_))
         ));
     }
+
+    /// ZEB-243: an incoming OutboxEntry whose created_at HLC is strictly
+    /// older than a matching tombstone in outbox_tombstones must be
+    /// rejected with OutboxEntryTombstoned and must NOT be inserted.
+    #[test]
+    fn apply_outbox_rejects_entry_older_than_tombstone() {
+        let mut state = OwnerState::default();
+        let id = OutboxEntryId([0x11; 16]);
+        let entry_hlc = hlc(1_000); // T1 — older
+        let tomb_hlc = hlc(2_000); // T2 — newer (strictly)
+                                   // Pre-load a tombstone for this id with the newer HLC.
+        state.outbox_tombstones.insert(id, tomb_hlc);
+
+        // Build an OutboxEntry for the same id with created_at = T1.
+        let mut e = entry(0x11, vec![10], vec![]);
+        e.created_at = entry_hlc;
+        let outcome = state.apply_outbox(e);
+
+        assert!(
+            matches!(
+                outcome,
+                ApplyOutcome::Rejected(RejectionReason::OutboxEntryTombstoned)
+            ),
+            "expected OutboxEntryTombstoned rejection, got {:?}",
+            outcome
+        );
+        // Entry must NOT have been inserted.
+        assert!(
+            !state.outbox.contains_key(&id),
+            "tombstoned entry must not appear in outbox"
+        );
+    }
+
+    /// ZEB-243: an incoming OutboxEntry whose created_at HLC is strictly
+    /// newer than the matching tombstone falls through (tombstone does NOT
+    /// win when the entry is newer). The entry must be accepted + inserted.
+    #[test]
+    fn apply_outbox_accepts_entry_newer_than_tombstone() {
+        let mut state = OwnerState::default();
+        let id = OutboxEntryId([0x22; 16]);
+        let tomb_hlc = hlc(1_000); // T1 — older tombstone
+        let entry_hlc = hlc(2_000); // T2 — newer entry
+                                    // Pre-load a tombstone for this id with the older HLC.
+        state.outbox_tombstones.insert(id, tomb_hlc);
+
+        // Build an OutboxEntry for the same id with created_at = T2.
+        let mut e = entry(0x22, vec![10], vec![]);
+        e.created_at = entry_hlc;
+        let outcome = state.apply_outbox(e);
+
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Inserted,
+            "entry newer than tombstone must be accepted"
+        );
+        assert!(
+            state.outbox.contains_key(&id),
+            "accepted entry must appear in outbox"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3659,5 +3752,61 @@ mod dm_crypto_integration_tests {
         let recovered_b = decrypt_dm_message(merged_ck, merged_prior, &aad_merged, &blob_b)
             .expect("blob_b must decrypt under the merged Space's prior_content_keys (loser side)");
         assert_eq!(recovered_b, payload_b);
+    }
+}
+
+#[cfg(test)]
+mod outbox_tombstones_tests {
+    use super::*;
+    use crate::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
+    use crate::owner_state_types::{Hlc, OutboxEntryId};
+
+    fn hlc(w: u64, device: &str) -> Hlc {
+        Hlc {
+            wall_ms: w,
+            logical: 0,
+            device_id: device.into(),
+        }
+    }
+
+    /// ZEB-243: OwnerState with a non-empty outbox_tombstones map must
+    /// round-trip through canonical CBOR encode + decode, preserving
+    /// the tombstone entry exactly. `#[serde(default)]` ensures legacy
+    /// snapshots without the field decode as empty map.
+    #[test]
+    fn outbox_tombstones_round_trip_via_canonical_cbor() {
+        let mut state = OwnerState::default();
+        let id = OutboxEntryId([0x42; 16]);
+        let ts_hlc = hlc(1_000, "dev-a");
+        state.outbox_tombstones.insert(id, ts_hlc.clone());
+
+        // Encode via the same canonical-CBOR path the rest of OwnerState uses.
+        let bytes = canonical_cbor_encode(&state).expect("encode should succeed");
+        let recovered: OwnerState = canonical_cbor_decode(&bytes).expect("decode should succeed");
+
+        assert_eq!(
+            recovered.outbox_tombstones.get(&id),
+            Some(&ts_hlc),
+            "tombstone entry must survive canonical-CBOR round-trip"
+        );
+        assert_eq!(
+            recovered.outbox_tombstones.len(),
+            1,
+            "no extra tombstone entries after round-trip"
+        );
+    }
+
+    /// ZEB-243: legacy OwnerState snapshot (no outbox_tombstones field)
+    /// decodes to empty map via #[serde(default)]. Simulate by encoding
+    /// a state with no tombstones and asserting the map is empty.
+    #[test]
+    fn outbox_tombstones_defaults_to_empty_on_legacy_decode() {
+        let state = OwnerState::default();
+        let bytes = canonical_cbor_encode(&state).expect("encode");
+        let recovered: OwnerState = canonical_cbor_decode(&bytes).expect("decode");
+        assert!(
+            recovered.outbox_tombstones.is_empty(),
+            "fresh OwnerState must have empty outbox_tombstones"
+        );
     }
 }
