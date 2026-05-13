@@ -2936,6 +2936,34 @@ pub struct SendDmResult {
     pub message_cid: String,
 }
 
+/// ZEB-234: shutdown fence helper for `send_dm`.
+///
+/// Pre-checks the `stopping` flag; acquires one owned permit from `sem`;
+/// re-checks `stopping` after acquire (the flag can be set in the `await`
+/// window). Returns the permit so the caller holds it until IPC return,
+/// guaranteeing `stop_inner`'s `acquire_many(CAPACITY)` drain blocks until
+/// every in-flight `send_dm` has completed its mutation.
+///
+/// Extracted into a standalone function so it can be unit-tested without
+/// standing up a full `NodeState` fixture.
+async fn check_dm_send_fence(
+    stopping: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    sem: std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+    use std::sync::atomic::Ordering;
+    if stopping.load(Ordering::Acquire) {
+        return Err("node stopping; send_dm rejected".into());
+    }
+    let permit = sem
+        .acquire_owned()
+        .await
+        .map_err(|_| "node stopping (semaphore closed)".to_string())?;
+    if stopping.load(Ordering::Acquire) {
+        return Err("node stopping; send_dm rejected".into());
+    }
+    Ok(permit)
+}
+
 /// ZEB-225 Sub-B Phase 2: send a DM into a direct/group-DM Space.
 ///
 /// Snapshots the DmOutbox/CRDT/HLC/ContentStore handles under the NodeState
@@ -2980,6 +3008,8 @@ async fn send_dm(
         _self_owner,
         cas,
         snapshot_generation,
+        dm_send_inflight,
+        dm_send_stopping,
     ) = {
         let g = state_lock
             .lock()
@@ -2995,8 +3025,22 @@ async fn send_dm(
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
             g.content_store.clone().ok_or("content_store missing")?,
             g.generation,
+            g.dm_send_inflight
+                .clone()
+                .ok_or("node not running (no fence)")?,
+            g.dm_send_stopping
+                .clone()
+                .ok_or("node not running (no fence)")?,
         )
     };
+
+    // ZEB-234: shutdown fence. Pre-check the stopping flag — if set,
+    // short-circuit before any work. Then acquire a permit for the
+    // duration of mutation + post-check; stop_inner's acquire_many
+    // drain blocks on this permit, preventing it from racing the
+    // flush. Re-check stopping after acquire (could have been set
+    // during the await).
+    let _fence_permit = check_dm_send_fence(&dm_send_stopping, dm_send_inflight).await?;
 
     let space_bytes = hex::decode(&space_id_hex).map_err(|e| format!("space_id hex: {e}"))?;
     let space_arr: [u8; 16] = space_bytes
@@ -14294,6 +14338,75 @@ mod channel_message_ipc_tests {
         assert!(
             err.contains("channel_log_registry missing"),
             "Some(HlcDto) should fall through to registry lookup; got: {err}"
+        );
+    }
+}
+
+// ── ZEB-234: shutdown fence unit tests ──────────────────────────────────────
+// These tests exercise the `check_dm_send_fence` helper directly, without
+// requiring a full NodeState fixture (which would need all DM handles
+// populated). This is the approach from the plan's "lighter test" alternative:
+// test the helper that `send_dm` delegates to.
+#[cfg(test)]
+mod dm_send_fence_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    #[tokio::test]
+    async fn send_dm_rejects_after_stopping_flag_set() {
+        let stopping = Arc::new(AtomicBool::new(true)); // flag already set
+        let sem = Arc::new(tokio::sync::Semaphore::new(DM_SEND_FENCE_CAPACITY));
+
+        let result = check_dm_send_fence(&stopping, sem).await;
+        let err = result.expect_err("must reject when stopping flag is set");
+        assert!(
+            err.contains("node stopping"),
+            "error should mention 'node stopping'; got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_dm_rejects_when_semaphore_closed_and_stopping() {
+        let stopping = Arc::new(AtomicBool::new(false));
+        let sem = Arc::new(tokio::sync::Semaphore::new(DM_SEND_FENCE_CAPACITY));
+
+        // Close the semaphore to simulate stop_inner draining it.
+        sem.close();
+        // Set stopping flag (mirrors what stop_inner does).
+        stopping.store(true, Ordering::Release);
+
+        let result = check_dm_send_fence(&stopping, sem).await;
+        let err = result.expect_err("must reject when semaphore is closed");
+        assert!(
+            err.contains("node stopping"),
+            "error should mention 'node stopping'; got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_dm_permit_acquired_when_not_stopping() {
+        let stopping = Arc::new(AtomicBool::new(false)); // not stopping
+        let sem = Arc::new(tokio::sync::Semaphore::new(DM_SEND_FENCE_CAPACITY));
+        let sem_clone = sem.clone();
+
+        let permit = check_dm_send_fence(&stopping, sem)
+            .await
+            .expect("must succeed when not stopping");
+
+        // Verify a permit was consumed (available_permits is CAPACITY - 1).
+        assert_eq!(
+            sem_clone.available_permits(),
+            DM_SEND_FENCE_CAPACITY - 1,
+            "one permit should be held"
+        );
+        drop(permit);
+        assert_eq!(
+            sem_clone.available_permits(),
+            DM_SEND_FENCE_CAPACITY,
+            "permit should be returned on drop"
         );
     }
 }
