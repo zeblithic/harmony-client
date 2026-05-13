@@ -126,6 +126,25 @@ describe('MemberRow kebab-matrix', () => {
     expect(queryByRole('menuitem', { name: 'Kick' })).toBeNull();
   });
 
+  it('Moderator viewer on OWN row: NO kebab button (cannot self-demote — backend admin-only)', () => {
+    // Regression test for the self-demote gate (Cursor finding on commit ccba30f).
+    // Backend `verify_event` for SetPower requires actor_power >= 100. A mod
+    // (viewerPower=50) cannot issue setPowerLevel; the UI must not surface a
+    // self-demote option that would always be rejected. Mods who want to step
+    // down should use the community-leave flow instead.
+    const selfMod = makeMember(50, 'joined', VIEWER_ADDR);
+    const { queryByRole } = render(MemberRow, {
+      props: {
+        member: selfMod,
+        viewer: { addr: VIEWER_ADDR, power: 50, isLastAdmin: false },
+        onaction: vi.fn(),
+      },
+    });
+
+    // Empty action list → no kebab affordance at all
+    expect(queryByRole('button', { name: 'Member actions' })).toBeNull();
+  });
+
   it("Admin viewer on own row when last admin: sees Demote to Moderator action", async () => {
     const selfMember = makeMember(100, 'joined', VIEWER_ADDR);
     const { getByRole } = render(MemberRow, {

@@ -39,9 +39,16 @@
       return viewerPower >= 100 ? ['unban'] : [];
     }
     if (isSelf) {
+      // Self-demote requires SetPower privilege (backend check:
+      // actor_power >= POWER_THRESHOLDS.set_power == 100). A moderator
+      // cannot self-demote via this UI — the backend would reject the
+      // setPowerLevel call with "insufficient power". Mods who want to
+      // step down should use the community-leave flow instead.
       const actions: KebabAction[] = [];
-      if (viewerPower === 100) actions.push('demote-mod');
-      if (viewerPower >= 50) actions.push('demote-member');
+      if (viewerPower >= 100) {
+        actions.push('demote-mod');
+        actions.push('demote-member');
+      }
       return actions;
     }
     // Acting on another member.
