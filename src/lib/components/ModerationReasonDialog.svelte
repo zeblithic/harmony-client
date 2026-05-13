@@ -28,6 +28,13 @@
   let actionLabelProgressive = $derived(action === 'kick' ? 'Kicking' : 'Unbanning');
 
   async function handleConfirm() {
+    // Guard against double-click / rapid re-trigger: if a submission is
+    // already in-flight, the button's `disabled={submitting}` re-render may
+    // not have propagated yet when a second click event fires. Without this
+    // early-return, two `onConfirm` calls could race and duplicate the
+    // kick/unban IPC. `LastAdminWarningDialog` gets the same protection via
+    // its `canProceed && !submitting` derived gate.
+    if (submitting) return;
     submitting = true;
     submitError = null;
     try {
