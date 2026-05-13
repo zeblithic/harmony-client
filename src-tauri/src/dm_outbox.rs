@@ -20,7 +20,7 @@ use crate::dm_crypto::{compute_aad, encrypt_dm_message, DmEncryptError};
 use crate::dm_envelope::MessagePayload;
 use crate::owner_state_crdt::{ApplyOutcome, OwnerState, RejectionReason};
 use crate::owner_state_types::{
-    DeliveryStatus, DeviceIdentityHash, Hlc, OutboxEntry, OutboxEntryId, OwnerAddr,
+    ContentId, DeliveryStatus, DeviceIdentityHash, Hlc, OutboxEntry, OutboxEntryId, OwnerAddr,
     OwnerDeviceCache, SpaceId, SpaceKind,
 };
 use async_trait::async_trait;
@@ -306,13 +306,15 @@ pub const EXPIRATION_MS: u64 = 30 * 24 * 60 * 60 * 1_000; // 30 days
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct DrainOutcome {
-    /// (entry_id, recipient) pairs whose `delivered_to` was just set this tick.
-    /// Phase 2 stub never produces these (acks come via separate handle_ack
-    /// calls); Phase 3b will populate when handle_unicast's DmAck arm dispatches
-    /// through the same path. Caller emits `dm-delivered` IPC events.
-    pub newly_delivered: Vec<(OutboxEntryId, OwnerAddr)>,
-    /// Entries that transitioned to Expired this tick.
-    pub newly_expired: Vec<OutboxEntryId>,
+    /// `(space_id, message_cid, recipient_owner_addr)` triples whose
+    /// `delivered_to` was just set this tick. Caller emits
+    /// `dm-delivered` IPC events with this exact field set (ZEB-231:
+    /// spec-compliant identifier is `(space_id, message_cid)`, not
+    /// the internal `OutboxEntryId`).
+    pub newly_delivered: Vec<(SpaceId, ContentId, OwnerAddr)>,
+    /// `(space_id, message_cid)` pairs for entries that transitioned
+    /// to Expired this tick. Caller emits `dm-expired` IPC events.
+    pub newly_expired: Vec<(SpaceId, ContentId)>,
     /// Phase 4: ReceivedMessage bundles written by `handle_cidnotify_lifted` for
     /// which `apply_inbox` returned `ApplyOutcome::Inserted` (NOT
     /// `Merged`/NoOp). The caller emits `dm-received` IPC events from this
@@ -912,8 +914,8 @@ impl DmOutbox {
         }
 
         // 3. Expiration sweep.
-        let mut expired: Vec<OutboxEntryId> = Vec::new();
-        for (id, entry) in state.outbox.iter_mut() {
+        let mut expired: Vec<(SpaceId, ContentId)> = Vec::new();
+        for (_id, entry) in state.outbox.iter_mut() {
             if !matches!(
                 entry.delivery_status,
                 DeliveryStatus::Pending | DeliveryStatus::Partial
@@ -928,7 +930,7 @@ impl DmOutbox {
                     .all(|r| entry.delivered_to.contains(*r));
                 if !all_acked {
                     entry.delivery_status = DeliveryStatus::Expired;
-                    expired.push(*id);
+                    expired.push((entry.space_id, entry.message_cid));
                 }
             }
         }
@@ -1727,9 +1729,14 @@ impl DmOutbox {
         // the entries in newly_delivered.
         let mut drain_outcome = DrainOutcome::default();
         if self.mark_ack_delivered(state, entry_id, resolved_owner) {
-            drain_outcome
-                .newly_delivered
-                .push((entry_id, resolved_owner));
+            // ZEB-231: emit (space_id, message_cid, recipient) per
+            // spec — internal OutboxEntryId is not part of the IPC
+            // contract.
+            drain_outcome.newly_delivered.push((
+                signed.space_id,
+                signed.message_cid,
+                resolved_owner,
+            ));
         }
         Ok(drain_outcome)
     }
@@ -1911,16 +1918,18 @@ pub async fn drain_lifted<R: tauri::Runtime>(
         // Drop locks before emitting IPC events.
         drop(s_g);
         drop(o_g);
-        for (entry_id, recipient) in outcome.newly_delivered {
+        for (space_id, message_cid, recipient) in outcome.newly_delivered {
             let payload = serde_json::json!({
-                "messageId": hex::encode(entry_id.0),
-                "recipient": hex::encode(recipient.0),
+                "spaceId": hex::encode(space_id.0),
+                "messageCid": hex::encode(message_cid.to_bytes()),
+                "recipientOwnerAddr": hex::encode(recipient.0),
             });
             let _ = app.emit("dm-delivered", payload);
         }
-        for entry_id in outcome.newly_expired {
+        for (space_id, message_cid) in outcome.newly_expired {
             let payload = serde_json::json!({
-                "messageId": hex::encode(entry_id.0),
+                "spaceId": hex::encode(space_id.0),
+                "messageCid": hex::encode(message_cid.to_bytes()),
             });
             let _ = app.emit("dm-expired", payload);
         }
@@ -3232,6 +3241,8 @@ mod tests {
         let bob = OwnerAddr([0xbb; 16]);
         let entry = entry_with_age(7, vec![bob], 1_000);
         let entry_id = entry.id;
+        let entry_space_id = entry.space_id;
+        let entry_message_cid = entry.message_cid;
         install_outbox_entry(&mut state, entry);
 
         let transport = StubTransport::new();
@@ -3240,7 +3251,10 @@ mod tests {
         let wall_now = 1_000 + EXPIRATION_MS + 1_000;
         let outcome = o.drain(&mut state, &transport, wall_now).await;
 
-        assert_eq!(outcome.newly_expired, vec![entry_id]);
+        assert_eq!(
+            outcome.newly_expired,
+            vec![(entry_space_id, entry_message_cid)]
+        );
         let stored = state.outbox.get(&entry_id).unwrap();
         assert!(matches!(stored.delivery_status, DeliveryStatus::Expired));
         assert!(
@@ -4774,8 +4788,8 @@ mod tests {
 
         assert_eq!(
             outcome.newly_delivered,
-            vec![(entry_id, bob)],
-            "newly_delivered must contain (entry_id, bob) on first ack"
+            vec![(space_id, message_cid, bob)],
+            "newly_delivered must contain (space_id, message_cid, bob) on first ack"
         );
         let stored = state.outbox.get(&entry_id).unwrap();
         assert!(stored.delivered_to.contains(&bob));
