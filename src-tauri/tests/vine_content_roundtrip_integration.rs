@@ -111,6 +111,11 @@ struct EventLoopHandles {
     /// All unused sender halves — kept alive so the event loop select arms
     /// don't see immediate channel close.
     _unused: UnusedSenders,
+    /// Keeps the test's app_data_dir alive across the event loop thread's
+    /// lifetime. Without this, the TempDir destructor deletes the
+    /// directory as soon as `spawn_event_loop` returns, even though
+    /// the spawned thread continues to read/write under it.
+    _tmp: tempfile::TempDir,
 }
 
 #[allow(dead_code)]
@@ -121,6 +126,10 @@ struct UnusedSenders {
     voice_tx: mpsc::Sender<harmony_app::voice::VoiceOutbound>,
     voice_ch_tx: mpsc::Sender<harmony_app::voice::VoiceChannelRequest>,
     refresh_tx: mpsc::Sender<harmony_app::mail_sync::RefreshRequest>,
+    /// Disconnected dummy sender. The real `fetch_completion_tx` was
+    /// moved into `event_loop::run`; this field exists only as a slot
+    /// keeping `UnusedSenders` symmetric with the event_loop's
+    /// channel set. Sending on it succeeds but the bytes go nowhere.
     fetch_completion_tx: mpsc::Sender<[u8; 32]>,
 }
 
@@ -231,6 +240,7 @@ fn spawn_event_loop(
         cas_op_tx,
         ready_rx,
         _shutdown_tx: shutdown_tx,
+        _tmp: tmp,
         _unused: UnusedSenders {
             publish_tx,
             fetch_tx,
