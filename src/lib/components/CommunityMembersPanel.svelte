@@ -23,7 +23,13 @@
   let members: CommunityMember[] = $state([]);
   let recentEvents = $state<ModerationEvent[]>([]);
   let loading = $state(true);
-  let error: string | null = $state(null);
+  // Two separate error surfaces so an action failure (promote/demote IPC
+  // rejected) does NOT hide the member list. `loadError` blocks the panel
+  // when the initial member-list fetch fails (no list to show); `actionError`
+  // renders as a transient banner above the list so the user can see what
+  // failed AND still interact with the panel.
+  let loadError: string | null = $state(null);
+  let actionError: string | null = $state(null);
   let searchQuery = $state('');
   let bannedExpanded = $state(false);
 
@@ -81,9 +87,12 @@
     loading = true;
     try {
       members = await communityService.listCommunityMembers(communityId);
-      error = null;
+      loadError = null;
+      // A successful refresh implies whatever world-state caused the prior
+      // action error may have changed; clear it.
+      actionError = null;
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      loadError = e instanceof Error ? e.message : String(e);
     } finally {
       loading = false;
     }
@@ -123,9 +132,10 @@
         await communityService.setPowerLevel(communityId, member.address, newPower);
       }
     } catch (e) {
-      // Surface IPC errors inline on the panel. Toast service is not
-      // present in this project; use local error state.
-      error = e instanceof Error ? e.message : String(e);
+      // Surface IPC errors as a transient banner above the member list —
+      // NOT in `loadError` which would hide the list entirely. Cleared
+      // by the next successful refresh (see `refresh`).
+      actionError = e instanceof Error ? e.message : String(e);
     }
   }
 
@@ -183,9 +193,20 @@
 
   {#if loading}
     <p class="loading">Loading members...</p>
-  {:else if error}
-    <p class="error" role="alert">{error}</p>
+  {:else if loadError}
+    <p class="error" role="alert">{loadError}</p>
   {:else}
+    {#if actionError}
+      <p class="error action-error" role="alert">
+        {actionError}
+        <button
+          type="button"
+          class="dismiss-action-error"
+          aria-label="Dismiss error"
+          onclick={() => (actionError = null)}
+        >&times;</button>
+      </p>
+    {/if}
     <RecentActionsBadge events={recentEvents} />
     <ul class="member-list" aria-label="Active members">
       {#each joined as member (member.address)}

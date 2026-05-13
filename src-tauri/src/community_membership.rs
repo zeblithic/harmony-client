@@ -433,6 +433,12 @@ pub enum VerifyError {
     /// Reject so the IPC layer can surface "target is not currently banned"
     /// rather than silently no-op.
     UnbanTargetNotBanned,
+    /// Unban event targets an addr that has no member record at all in this
+    /// community. Distinct from `KickTargetNotMember` so the error message
+    /// surfaced to the user references the actual operation they performed
+    /// (an unban) rather than "kick target has no member record" which is
+    /// misleading from a UI perspective.
+    UnbanTargetNotMember,
     /// SetPower assigned a level above POWER_THRESHOLDS.max. Even an
     /// authorized actor cannot grant a power higher than the cap, since
     /// that would create a member admin can no longer kick (admin's own
@@ -550,6 +556,12 @@ impl std::fmt::Display for VerifyError {
             }
             VerifyError::UnbanTargetNotBanned => {
                 write!(f, "unban target is not currently banned")
+            }
+            VerifyError::UnbanTargetNotMember => {
+                write!(
+                    f,
+                    "unban target has no member record in this community"
+                )
             }
             VerifyError::PowerLevelOutOfRange => {
                 write!(f, "power level exceeds POWER_THRESHOLDS.max")
@@ -1639,9 +1651,11 @@ pub fn verify_event(
             if actor_power < POWER_THRESHOLDS.set_power {
                 return Err(VerifyError::ActorPowerInsufficient);
             }
-            // Target must have a member record.
+            // Target must have a member record. Use the Unban-specific
+            // variant so the surfaced error message references "unban" not
+            // "kick" when the user is performing an unban.
             let Some(target_state) = prior_state.members.get(target) else {
-                return Err(VerifyError::KickTargetNotMember);
+                return Err(VerifyError::UnbanTargetNotMember);
             };
             // Target must currently be Banned.
             if target_state.status != MemberStatus::Banned {
@@ -2883,7 +2897,8 @@ mod tests {
     }
 
     /// Unban targeting an OwnerAddr with no member record (never joined)
-    /// must be rejected with KickTargetNotMember.
+    /// must be rejected with UnbanTargetNotMember (the Unban-specific
+    /// variant so the surfaced message references "unban" not "kick").
     #[test]
     fn unban_event_rejected_when_target_is_unknown() {
         let community_id = SpaceId([0xc0; 16]);
@@ -2919,8 +2934,8 @@ mod tests {
         };
         assert_eq!(
             verify_event(&unban, &prior, &ctx),
-            Err(VerifyError::KickTargetNotMember),
-            "unban of unknown target must return KickTargetNotMember"
+            Err(VerifyError::UnbanTargetNotMember),
+            "unban of unknown target must return UnbanTargetNotMember"
         );
     }
 
