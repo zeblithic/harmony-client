@@ -599,6 +599,8 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         dm_self_owner,
         content_store,
         unicast_send_tx,
+        dm_send_inflight,
+        dm_send_stopping,
     ) = {
         let mut guard = match state.lock() {
             Ok(g) => g,
@@ -639,6 +641,10 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             guard.dm_self_owner.take(),
             guard.content_store.take(),
             guard.unicast_send_tx.take(),
+            // ZEB-234: take fence handles so we can set the stopping flag
+            // and drain in-flight send_dm calls outside the lock scope.
+            guard.dm_send_inflight.take(),
+            guard.dm_send_stopping.take(),
         );
         // ZEB-228 Phase 4: clear our cached identity_pub so a restart
         // can't accidentally ship the prior identity's pub on a new
@@ -678,6 +684,14 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     };
 
     let had_node = shutdown_tx.is_some() || thread.is_some();
+    // ZEB-234: signal stopping synchronously so any send_dm currently
+    // in its pre-acquire pre-check fast-rejects without queuing a new
+    // permit. Must happen after the lock is released (the flag is an
+    // Arc<AtomicBool> taken out of the NodeState above) and before the
+    // drain below.
+    if let Some(ref stopping) = dm_send_stopping {
+        stopping.store(true, std::sync::atomic::Ordering::Release);
+    }
     // ZEB-281 Sub-D Phase 4: abort the profile-broadcast publisher BEFORE
     // dropping `publish_tx`. `shutdown()` calls `JoinHandle::abort()` on
     // the publisher's background task — ordering this before the
@@ -824,6 +838,34 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     // already been released. The consumer task's receiver then observes
     // a closed channel and exits cleanly.
     drop(community_delta_tx);
+    // ZEB-234: drain in-flight send_dm permits before SyncEngine final
+    // flush. `acquire_many(CAPACITY)` blocks until every outstanding
+    // permit has been returned — guaranteeing no send_dm is
+    // mid-mutation when the flush runs. Mirror the existing
+    // `thread::scope` + ephemeral-runtime pattern used by the registry
+    // shutdowns above — `stop_inner` is sync and cannot `.await`.
+    if let Some(sem) = dm_send_inflight {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => {
+                        rt.block_on(drain_dm_send_fence(sem));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "ZEB-234: failed to build drain runtime; \
+                             proceeding with shutdown (in-flight \
+                             send_dm may produce duplicates)"
+                        );
+                    }
+                }
+            });
+        });
+    }
     // Phase 3a: explicitly shut down the SyncEngine before joining the
     // event-loop thread. This flushes any pending debounced publish and
     // runs the final persist pass. Must run before stop_handles so the
@@ -2962,6 +3004,25 @@ async fn check_dm_send_fence(
         return Err("node stopping; send_dm rejected".into());
     }
     Ok(permit)
+}
+
+/// ZEB-234: drain all in-flight `send_dm` permits before `SyncEngine::shutdown`.
+///
+/// Acquires all `DM_SEND_FENCE_CAPACITY` permits from the semaphore in one
+/// `acquire_many` call. This blocks until every outstanding
+/// `check_dm_send_fence` permit (held by an in-flight `send_dm`) has been
+/// returned. The permit-set is immediately dropped — we only need the blocking
+/// effect, not the permits themselves.
+///
+/// Called by `stop_inner` inside a `thread::scope` + ephemeral current-thread
+/// runtime (mirroring the pattern at the `SyncEngine::shutdown` block) because
+/// `stop_inner` is sync and cannot `.await` directly.
+///
+/// Extracted into a standalone async function so it can be unit-tested without
+/// standing up a full `NodeState` fixture (parallel to `check_dm_send_fence`).
+async fn drain_dm_send_fence(sem: std::sync::Arc<tokio::sync::Semaphore>) {
+    let _drain = sem.acquire_many(DM_SEND_FENCE_CAPACITY as u32).await;
+    // `_drain` is dropped immediately — permits are released.
 }
 
 /// ZEB-225 Sub-B Phase 2: send a DM into a direct/group-DM Space.
@@ -14407,6 +14468,58 @@ mod dm_send_fence_tests {
             sem_clone.available_permits(),
             DM_SEND_FENCE_CAPACITY,
             "permit should be returned on drop"
+        );
+    }
+
+    /// ZEB-234: drain blocks until all in-flight permits are returned.
+    ///
+    /// Scenario: one permit is held (simulating an in-flight `send_dm`).
+    /// `drain_dm_send_fence` is called — it must block until the permit
+    /// is dropped, then return.
+    #[tokio::test]
+    async fn drain_dm_send_fence_blocks_until_inflight_completes() {
+        let stopping = Arc::new(AtomicBool::new(false));
+        let sem = Arc::new(tokio::sync::Semaphore::new(DM_SEND_FENCE_CAPACITY));
+
+        // Acquire one permit to simulate an in-flight send_dm.
+        let _inflight_permit = sem
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("should acquire permit");
+
+        // Set the stopping flag (mirrors stop_inner ordering).
+        stopping.store(true, Ordering::Release);
+
+        // Spawn the drain concurrently. It should block until we drop
+        // the in-flight permit.
+        let sem_clone = sem.clone();
+        let drain_handle = tokio::spawn(async move {
+            drain_dm_send_fence(sem_clone).await;
+        });
+
+        // The drain should NOT have completed yet (permit still held).
+        // A brief yield confirms it's blocked.
+        tokio::task::yield_now().await;
+        assert!(
+            !drain_handle.is_finished(),
+            "drain must block while permit held"
+        );
+
+        // Drop the in-flight permit — drain should unblock.
+        drop(_inflight_permit);
+
+        // Now the drain should complete promptly.
+        tokio::time::timeout(std::time::Duration::from_secs(5), drain_handle)
+            .await
+            .expect("drain should complete within timeout")
+            .expect("drain task should not panic");
+
+        // All permits must be back (drain acquired + immediately dropped them).
+        assert_eq!(
+            sem.available_permits(),
+            DM_SEND_FENCE_CAPACITY,
+            "all permits should be returned after drain"
         );
     }
 }
