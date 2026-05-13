@@ -173,6 +173,13 @@ pub fn chunk_and_bundle(
 
 // ── Managed Tauri state ──────────────────────────────────────────────────
 
+/// ZEB-234: shutdown-fence permit count for `send_dm`. Practical
+/// "unbounded" for typical IPC concurrency; exhaustion awaits rather
+/// than rejects. `stop_inner` drains all permits via `acquire_many`
+/// to guarantee no in-flight `send_dm` is mid-write when
+/// `SyncEngine::shutdown` runs.
+pub const DM_SEND_FENCE_CAPACITY: usize = 1024;
+
 pub struct NodeState {
     /// Background thread running the event loop (NodeRuntime is !Send).
     thread: Option<thread::JoinHandle<()>>,
@@ -265,6 +272,16 @@ pub struct NodeState {
     /// store SyncEngine uses for state-root publishes (RuntimeContentStore
     /// in production, InMemoryStub in some tests).
     content_store: Option<std::sync::Arc<dyn crate::content_store::ContentStore>>,
+    /// ZEB-234: shutdown fence. `send_dm` acquires a permit for the
+    /// duration of mutation + post-check; `stop_inner` sets `stopping`
+    /// then drains all permits before `SyncEngine::shutdown`.
+    /// `Some(_)` while running, `None` after stop.
+    dm_send_inflight: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    /// ZEB-234: paired stopping flag. Set synchronously in
+    /// `stop_inner` BEFORE the permit drain so newly-arriving
+    /// `send_dm` calls early-reject. Cleared (None'd) in symmetry
+    /// with `dm_send_inflight`.
+    dm_send_stopping: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// ZEB-227 Path B: outbound DM unicast channel sender.
     /// `RuntimeUnicastTransport` (Task 6) holds a clone; `event_loop` drains
     /// the receiver and forwards each `UnicastSendRequest` as
@@ -379,6 +396,8 @@ impl Default for NodeState {
             dm_device_id: None,
             dm_self_owner: None,
             content_store: None,
+            dm_send_inflight: None,
+            dm_send_stopping: None,
             unicast_send_tx: None,
             dm_identity_pub_64: None,
             community_adapter_request_tx: None,
@@ -2436,6 +2455,16 @@ async fn start_node(
                 guard.dm_device_id = device_id_for_state.clone();
                 guard.dm_self_owner = self_owner_for_state;
                 guard.content_store = content_store_for_state.clone();
+                // ZEB-234: initialize the shutdown fence. Semaphore starts
+                // at DM_SEND_FENCE_CAPACITY permits (one per concurrent
+                // send_dm); stopping flag starts false. Both cleared in
+                // stop_inner after the permit drain.
+                guard.dm_send_inflight = Some(std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    DM_SEND_FENCE_CAPACITY,
+                )));
+                guard.dm_send_stopping = Some(std::sync::Arc::new(
+                    std::sync::atomic::AtomicBool::new(false),
+                ));
                 // ZEB-227 Path B: store the outbound unicast sender so
                 // Task 11's RuntimeUnicastTransport instantiation in
                 // start_node can clone it. The receiver was moved into
