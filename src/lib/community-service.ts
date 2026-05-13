@@ -1,5 +1,5 @@
 import type { TauriAdapter } from './zenoh-service';
-import { POWER_THRESHOLDS, type CommunityMember } from './types';
+import { POWER_THRESHOLDS, type CommunityMember, type ModerationEvent } from './types';
 
 interface MembersChangedPayload { communityId: string; }
 interface DegradedPayload { communityId: string; degraded: boolean; }
@@ -181,8 +181,28 @@ export class CommunityService {
     await this.invoke<void>('leave_community', { communityId });
   }
 
-  async kickMember(communityId: string, targetAddr: string): Promise<void> {
-    await this.invoke<void>('kick_from_community', { communityId, targetAddr });
+  async kickFromCommunity(
+    communityId: string,
+    targetAddr: string,
+    reason?: string,
+  ): Promise<void> {
+    await this.invoke<void>('kick_from_community', {
+      communityId,
+      targetAddr,
+      reason: reason ?? null,
+    });
+  }
+
+  async unbanFromCommunity(
+    communityId: string,
+    targetAddr: string,
+    reason?: string,
+  ): Promise<void> {
+    await this.invoke<void>('unban_from_community', {
+      communityId,
+      targetAddr,
+      reason: reason ?? null,
+    });
   }
 
   async setPowerLevel(communityId: string, targetAddr: string, newPower: number): Promise<void> {
@@ -259,6 +279,16 @@ export class CommunityService {
     const fresh = dtos.map(dtoToMember);
     this.memberCache.set(communityId, fresh);
     return fresh;
+  }
+
+  async listRecentModerationEvents(
+    communityId: string,
+    limit: number = 10,
+  ): Promise<ModerationEvent[]> {
+    return await this.invoke<ModerationEvent[]>('list_recent_moderation_events', {
+      communityId,
+      limit,
+    });
   }
 
   isDegraded(communityId: string): boolean {

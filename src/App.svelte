@@ -1222,10 +1222,10 @@
         onKickMember={async (target) => {
           if (!selectedCommunityId) return;
           try {
-            await communityService.kickMember(selectedCommunityId, target);
+            await communityService.kickFromCommunity(selectedCommunityId, target);
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e);
-            console.error('kickMember failed:', msg);
+            console.error('kickFromCommunity failed:', msg);
           }
         }}
         onSetPowerLevel={async (target, power) => {
