@@ -3021,14 +3021,14 @@ async fn check_dm_send_fence(
 ) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
     use std::sync::atomic::Ordering;
     if stopping.load(Ordering::Acquire) {
-        return Err("node stopping; send_dm rejected".into());
+        return Err("node stopping; operation rejected".into());
     }
     let permit = sem
         .acquire_owned()
         .await
         .map_err(|_| "node stopping (semaphore closed)".to_string())?;
     if stopping.load(Ordering::Acquire) {
-        return Err("node stopping; send_dm rejected".into());
+        return Err("node stopping; operation rejected".into());
     }
     Ok(permit)
 }
@@ -14480,20 +14480,20 @@ mod dm_send_fence_tests {
     }
 
     #[tokio::test]
-    async fn send_dm_rejects_when_semaphore_closed_and_stopping() {
+    async fn check_dm_send_fence_rejects_when_semaphore_closed() {
         let stopping = Arc::new(AtomicBool::new(false));
         let sem = Arc::new(tokio::sync::Semaphore::new(DM_SEND_FENCE_CAPACITY));
 
         // Close the semaphore to simulate stop_inner draining it.
+        // stopping flag is NOT set so the pre-check passes and we exercise
+        // the acquire_owned().await error path.
         sem.close();
-        // Set stopping flag (mirrors what stop_inner does).
-        stopping.store(true, Ordering::Release);
 
         let result = check_dm_send_fence(&stopping, sem).await;
         let err = result.expect_err("must reject when semaphore is closed");
         assert!(
-            err.contains("node stopping"),
-            "error should mention 'node stopping'; got: {err}"
+            err.contains("semaphore closed"),
+            "error should mention 'semaphore closed'; got: {err}"
         );
     }
 
