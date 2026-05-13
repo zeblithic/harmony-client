@@ -555,8 +555,7 @@ impl std::fmt::Display for VerifyError {
             VerifyError::InviteTargetBanned => {
                 write!(
                     f,
-                    "invite target is currently Banned (admin must unban first; \
-                     not yet implemented in v1)"
+                    "invite target is currently Banned (admin must unban first)"
                 )
             }
             VerifyError::UnbanTargetNotBanned => {
