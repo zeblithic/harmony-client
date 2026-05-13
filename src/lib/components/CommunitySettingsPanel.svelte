@@ -21,6 +21,7 @@
     onSetPower,
     onLeave,
     onGenerateInvite,
+    onOpenMembersPanel,
   }: {
     communityId: string;
     communityName: string;
@@ -36,6 +37,11 @@
     onSetPower: (targetAddr: string, newPower: number) => void;
     onLeave: () => void;
     onGenerateInvite: () => Promise<string>;
+    /** Optional: if provided, a "Manage members" button appears in the Members
+     *  section that opens the full CommunityMembersPanel overlay (with recent
+     *  moderation history). Callers that don't yet thread through communityService
+     *  can omit this to keep the inline member list. */
+    onOpenMembersPanel?: () => void;
   } = $props();
 
   let kickTarget = $state<CommunityMember | null>(null);
@@ -227,6 +233,11 @@
           </div>
         {/each}
       </div>
+      {#if onOpenMembersPanel}
+        <button class="manage-members-btn" onclick={onOpenMembersPanel}>
+          Manage members &amp; moderation history →
+        </button>
+      {/if}
     </div>
 
     {#if myPower >= POWER_THRESHOLDS.invite}
@@ -436,6 +447,27 @@
     font-size: 0.7rem;
     color: var(--text-secondary);
     margin: 8px 0 0 0;
+  }
+  .manage-members-btn {
+    display: block;
+    margin-top: 10px;
+    padding: 6px 10px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+    cursor: pointer;
+    text-align: left;
+    width: 100%;
+  }
+  .manage-members-btn:hover {
+    color: var(--text-primary);
+    border-color: var(--accent, #5865f2);
+  }
+  .manage-members-btn:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 1px;
   }
   .member-search { margin-bottom: 12px; }
   .search-input {

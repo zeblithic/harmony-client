@@ -1,11 +1,12 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import type { CommunityService } from '../community-service';
-  import type { CommunityMember } from '../types';
+  import type { CommunityMember, ModerationEvent } from '../types';
   import MemberRow from './MemberRow.svelte';
   import type { KebabAction } from './MemberRow.svelte';
   import ModerationReasonDialog from './ModerationReasonDialog.svelte';
   import LastAdminWarningDialog from './LastAdminWarningDialog.svelte';
+  import RecentActionsBadge from './RecentActionsBadge.svelte';
 
   let {
     communityId,
@@ -20,6 +21,7 @@
   } = $props();
 
   let members: CommunityMember[] = $state([]);
+  let recentEvents = $state<ModerationEvent[]>([]);
   let loading = $state(true);
   let error: string | null = $state(null);
   let searchQuery = $state('');
@@ -84,6 +86,13 @@
       error = e instanceof Error ? e.message : String(e);
     } finally {
       loading = false;
+    }
+    // Moderation events are non-critical — fetch after members so a
+    // failure here doesn't block the panel from loading.
+    try {
+      recentEvents = await communityService.listRecentModerationEvents(communityId, 10);
+    } catch (e) {
+      console.error('failed to load moderation events', e instanceof Error ? e.message : String(e));
     }
   }
 
@@ -177,6 +186,7 @@
   {:else if error}
     <p class="error" role="alert">{error}</p>
   {:else}
+    <RecentActionsBadge events={recentEvents} />
     <ul class="member-list" aria-label="Active members">
       {#each joined as member (member.address)}
         <MemberRow
