@@ -43,6 +43,7 @@ pub mod profile_broadcast;
 pub mod recovery_cli;
 pub mod recovery_policy;
 mod save_dialog;
+pub mod vine_feed_cache;
 pub mod voice;
 
 /// ZEB-262 Phase 4 Task 9: production impl of
@@ -203,6 +204,10 @@ pub struct NodeState {
     follow_mgr: Option<follows::FollowManager>,
     /// Shared set of followed addresses (read by the event loop for source tagging).
     followed_set: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
+    /// In-memory Vine feed cache (ZEB-286). Updated by the event loop on
+    /// receive; read by list_vine_videos / mark_vine_viewed IPCs.
+    /// Disk persistence deferred to ZEB-147.
+    vine_feed_cache: Option<std::sync::Arc<std::sync::Mutex<vine_feed_cache::VineFeedCache>>>,
     /// Shared mail manager (read/written by event loop on receive, by commands for queries).
     mail_mgr: Option<std::sync::Arc<std::sync::Mutex<mail::MailManager>>>,
     /// Shared mail sync (walker + lazy body fetch). Stored here so Tauri
@@ -379,6 +384,7 @@ impl Default for NodeState {
             voice_channel_tx: None,
             follow_mgr: None,
             followed_set: None,
+            vine_feed_cache: None,
             mail_mgr: None,
             mail_sync: None,
             content_index: std::sync::Arc::new(std::sync::Mutex::new(
@@ -587,6 +593,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         voice_channel_tx,
         _follow_mgr,
         _followed_set,
+        _vine_feed_cache,
         _mail_sync,
         pairing_handle,
         sync_engine,
@@ -625,6 +632,7 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             guard.voice_channel_tx.take(),
             guard.follow_mgr.take(),
             guard.followed_set.take(),
+            guard.vine_feed_cache.take(),
             // Drop mail_sync so refresh_mail / fetch_mail_body can't reach
             // a closed fetch_tx / refresh_tx after stop. Channels are
             // already gone above; the MailSync handle would just yield
@@ -999,6 +1007,11 @@ async fn start_node(
 
     let followed_set_clone = followed_set.clone();
 
+    // ZEB-286: in-memory VineFeedCache shared between event loop and IPCs.
+    let vine_feed_cache =
+        std::sync::Arc::new(std::sync::Mutex::new(vine_feed_cache::VineFeedCache::new()));
+    let vine_feed_cache_clone = vine_feed_cache.clone();
+
     // MailManager will be initialized after identity loading (needs owner address).
     // Placeholder — set below once we have our_addr_bytes.
     let mail_mgr: std::sync::Arc<std::sync::Mutex<mail::MailManager>>;
@@ -1097,6 +1110,7 @@ async fn start_node(
         );
         let _old_follow_mgr = guard.follow_mgr.take();
         let _old_followed_set = guard.followed_set.take();
+        let _old_vine_feed_cache = guard.vine_feed_cache.take();
         let _old_mail_mgr = guard.mail_mgr.take();
         let _old_mail_sync = guard.mail_sync.take();
         // ZEB-228 Phase 4: clear our cached identity_pub so a restart
@@ -2451,6 +2465,7 @@ async fn start_node(
                         voice_rx,
                         voice_channel_rx,
                         followed_set_clone,
+                        vine_feed_cache_clone,
                         mail_mgr_clone,
                         Some(mail_sync_for_loop),
                         mail_refresh_rx,
@@ -2502,6 +2517,7 @@ async fn start_node(
                 guard.voice_channel_tx = Some(voice_channel_tx);
                 guard.follow_mgr = Some(follow_mgr);
                 guard.followed_set = Some(followed_set);
+                guard.vine_feed_cache = Some(vine_feed_cache);
                 guard.mail_mgr = Some(mail_mgr);
                 guard.mail_sync = Some(mail_sync);
                 guard.node_addr = node_addr_for_state;
@@ -4463,10 +4479,28 @@ async fn publish_vine_reaction(
         .map_err(|_| "event loop dropped publish request".to_string())?
 }
 
+/// Return all vines currently in the local cache, sorted by
+/// `created_at` descending (newest first). `viewed` field reflects
+/// local-only `mark_vine_viewed` state.
+///
+/// Returns `Err("not connected")` if the node is not running.
+/// ZEB-147 will extend this with disk persistence.
 #[tauri::command]
-fn list_vine_videos() -> Vec<VineVideoDto> {
-    // Future: return cached/persisted vines. Real data flows via vine-received events.
-    Vec::new()
+fn list_vine_videos(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<VineVideoDto>, String> {
+    let cache = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .vine_feed_cache
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    let result = cache
+        .lock()
+        .map_err(|e| format!("vine_feed_cache lock: {e}"))?
+        .list_descriptors();
+    Ok(result)
 }
 
 #[tauri::command]
@@ -4549,11 +4583,28 @@ fn list_followed(
         .collect())
 }
 
+/// Mark a vine viewed by the local peer. Returns `Ok(true)` if newly
+/// marked viewed, `Ok(false)` if already viewed.
+///
+/// Returns `Err("not connected")` if the node is not running.
+/// Local-only in this PR; cross-device sync deferred to ZEB-147.
 #[tauri::command]
-fn mark_vine_viewed(vine_id: String) -> bool {
-    // Future: persist viewed state + publish to network for cross-device sync.
-    let _ = vine_id;
-    true
+fn mark_vine_viewed(
+    vine_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<bool, String> {
+    let cache = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .vine_feed_cache
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    let result = cache
+        .lock()
+        .map_err(|e| format!("vine_feed_cache lock: {e}"))?
+        .mark_viewed(vine_id);
+    Ok(result)
 }
 
 // ── Content announcement types and file manager stubs ───────────────────

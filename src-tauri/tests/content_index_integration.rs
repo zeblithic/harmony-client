@@ -49,6 +49,9 @@ async fn ingest_list_pin_burn_roundtrip() {
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let followed_set = Arc::new(Mutex::new(std::collections::HashSet::<String>::default()));
+    let vine_feed_cache = Arc::new(Mutex::new(
+        harmony_app::vine_feed_cache::VineFeedCache::new(),
+    ));
     let mail_mgr = Arc::new(Mutex::new(harmony_app::mail::MailManager::load(
         &app_data_dir.join("mail"),
         [0u8; 16],
@@ -131,6 +134,7 @@ async fn ingest_list_pin_burn_roundtrip() {
                     voice_rx,
                     voice_ch_rx,
                     followed_set,
+                    vine_feed_cache,
                     mail_mgr,
                     None, // mail_sync — not exercised in this test
                     refresh_rx,
@@ -325,6 +329,9 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let followed_set = Arc::new(Mutex::new(std::collections::HashSet::<String>::default()));
+    let vine_feed_cache = Arc::new(Mutex::new(
+        harmony_app::vine_feed_cache::VineFeedCache::new(),
+    ));
     let mail_mgr = Arc::new(Mutex::new(harmony_app::mail::MailManager::load(
         &app_data_dir.join("mail"),
         [0u8; 16],
@@ -402,6 +409,7 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
                     voice_rx,
                     voice_ch_rx,
                     followed_set,
+                    vine_feed_cache,
                     mail_mgr,
                     None,
                     refresh_rx,
@@ -676,6 +684,9 @@ async fn fetch_complete_arm_pins_root_in_intent() {
     let fetch_completion_tx_for_test = fetch_completion_tx.clone();
 
     let followed_set = Arc::new(Mutex::new(std::collections::HashSet::<String>::default()));
+    let vine_feed_cache = Arc::new(Mutex::new(
+        harmony_app::vine_feed_cache::VineFeedCache::new(),
+    ));
     let mail_mgr = Arc::new(Mutex::new(harmony_app::mail::MailManager::load(
         &app_data_dir.join("mail"),
         [0u8; 16],
@@ -751,6 +762,7 @@ async fn fetch_complete_arm_pins_root_in_intent() {
                     voice_rx,
                     voice_ch_rx,
                     followed_set,
+                    vine_feed_cache,
                     mail_mgr,
                     None,
                     refresh_rx,
