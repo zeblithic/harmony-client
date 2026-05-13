@@ -272,10 +272,11 @@ pub struct NodeState {
     /// store SyncEngine uses for state-root publishes (RuntimeContentStore
     /// in production, InMemoryStub in some tests).
     content_store: Option<std::sync::Arc<dyn crate::content_store::ContentStore>>,
-    /// ZEB-234: shutdown fence. `send_dm` acquires a permit for the
-    /// duration of mutation + post-check; `stop_inner` sets `stopping`
-    /// then drains all permits before `SyncEngine::shutdown`.
-    /// `Some(_)` while running, `None` after stop.
+    /// ZEB-234: shutdown fence. `send_dm` and `delete_outbox_entry`
+    /// each acquire a permit for the duration of their outbox mutation;
+    /// `stop_inner` sets `stopping` then drains all permits before
+    /// `SyncEngine::shutdown`, ensuring no in-flight mutation races
+    /// the flush. `Some(_)` while running, `None` after stop.
     dm_send_inflight: Option<std::sync::Arc<tokio::sync::Semaphore>>,
     /// ZEB-234: paired stopping flag. Set synchronously in
     /// `stop_inner` BEFORE the permit drain so newly-arriving
@@ -3081,12 +3082,6 @@ async fn send_dm(
     let space_id_hex = space_id;
     // Snapshot all handles under the sync mutex; release it before any await.
     // (Per ZEB-225 spec: NodeState sync-mutex must not be held across `.await`.)
-    //
-    // We also capture `generation` paired-atomically with the Arcs. If
-    // stop_inner detaches the Arcs (sets to None) and start_node bumps the
-    // generation while the work below is in flight, the Arcs we hold are
-    // orphaned: they'll write into a `crdt_state` the new node never reads
-    // from. The post-check at the bottom catches that and surfaces Err.
     let (
         dm_outbox,
         _dm_transport,
@@ -3095,7 +3090,6 @@ async fn send_dm(
         device_id,
         _self_owner,
         cas,
-        snapshot_generation,
         dm_send_inflight,
         dm_send_stopping,
     ) = {
@@ -3112,7 +3106,6 @@ async fn send_dm(
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
             g.content_store.clone().ok_or("content_store missing")?,
-            g.generation,
             g.dm_send_inflight
                 .clone()
                 .ok_or("node not running (no fence)")?,
@@ -3124,10 +3117,18 @@ async fn send_dm(
 
     // ZEB-234: shutdown fence. Pre-check the stopping flag — if set,
     // short-circuit before any work. Then acquire a permit for the
-    // duration of mutation + post-check; stop_inner's acquire_many
-    // drain blocks on this permit, preventing it from racing the
+    // duration of mutation; stop_inner's acquire_many drain blocks on
+    // this permit, preventing SyncEngine::shutdown from racing the
     // flush. Re-check stopping after acquire (could have been set
     // during the await).
+    //
+    // While _fence_permit is held, stop_inner CANNOT complete its
+    // SyncEngine::shutdown — it is blocked waiting for the drain.
+    // This makes the old generation/handle post-checks that formerly
+    // followed the mutation unnecessary and harmful (they would return
+    // Err after a successful fenced write, driving a retry that mints
+    // a second OutboxEntry → duplicate DM). Those post-checks were
+    // removed by ZEB-234 (this PR).
     let _fence_permit = check_dm_send_fence(&dm_send_stopping, dm_send_inflight).await?;
 
     let space_bytes = hex::decode(&space_id_hex).map_err(|e| format!("space_id hex: {e}"))?;
@@ -3174,52 +3175,12 @@ async fn send_dm(
         .ok_or("send_dm minted entry not in outbox (apply_outbox rejected?)")?;
     tracker_g.insert(device_id, next_hlc);
 
-    // Drop the per-handle locks before re-acquiring NodeState's sync mutex.
+    // Drop the per-handle locks. No post-check needed: _fence_permit guarantees
+    // stop_inner cannot complete SyncEngine::shutdown while this permit is held,
+    // so the mutation above is always visible to the live node. (ZEB-234)
     drop(tracker_g);
     drop(state_g);
     drop(outbox_g);
-
-    // Post-check: the work above mutated crdt_state via the cloned Arcs. If
-    // a stop+restart fired during the .await chain, our crdt_state may now
-    // be detached from the live NodeState — the new node won't see this
-    // entry. Surface as Err so the caller can retry against the live node.
-    //
-    // KNOWN RACE (ZEB-234, deferred to pre-Phase-4): the mutation already
-    // happened when this check runs. If stop_inner's SyncEngine::shutdown()
-    // flushes the cloned crdt_state between apply_outbox and this post-check,
-    // the entry is persisted + broadcast even though we report Err. A retry
-    // against the new node mints a second OutboxEntry → recipient sees a
-    // duplicate DM. The proper fix is a shutdown fence (in-flight permit
-    // shared between send_dm and stop_inner). Phase 2 ships with this race
-    // unaddressed because no UI flow concurrently triggers stop+send;
-    // ZEB-234 lands the fence before Phase 4 frontend does.
-    //
-    // Residual TOCTOU within this code: a stop+restart between this post-
-    // check and the IPC return still produces apparent success with an
-    // orphaned entry. Same fix (ZEB-234) closes this window too.
-    {
-        let g = state_lock
-            .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        if g.generation != snapshot_generation {
-            return Err(format!(
-                "node generation changed during send_dm (was {}, now {}); \
-                 entry was written to a detached crdt_state and won't be \
-                 drained — retry against the live node",
-                snapshot_generation, g.generation
-            ));
-        }
-        // stop_inner clears DM handles (dm_outbox, crdt_state, etc → None)
-        // WITHOUT bumping `generation`. So a stop_node alone (no subsequent
-        // start) leaves generation unchanged but handles None. The
-        // generation-only check above misses that case; verify the handles
-        // are still present too.
-        if g.dm_outbox.is_none() {
-            return Err("node was stopped during send_dm; entry was written to a \
-                 detached crdt_state and won't be drained"
-                .to_string());
-        }
-    }
 
     Ok(SendDmResult {
         message_id: hex::encode(msg_id.0),
@@ -3631,13 +3592,7 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
     // Snapshot handles under the sync mutex; release before any .await.
     // Same pattern as send_dm — NodeState's sync mutex must not span
     // .await boundaries.
-    //
-    // ZEB-245 (PR #81 round 6): capture `generation` paired-atomically
-    // with the Arcs so the post-stop check below can detect a
-    // stop+restart racing through this command. See send_dm for the
-    // full rationale on why both `generation` and handle-attachment
-    // need to be re-verified.
-    let (dm_outbox, crdt_state, snapshot_generation, dm_send_inflight, dm_send_stopping) = {
+    let (dm_outbox, crdt_state, dm_send_inflight, dm_send_stopping) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -3646,7 +3601,6 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
                 .clone()
                 .ok_or("node not running or no owner identity")?,
             g.crdt_state.clone().ok_or("crdt_state missing")?,
-            g.generation,
             // ZEB-234: snapshot the fence handles so delete_outbox_entry
             // holds a permit for the duration of its outbox mutation,
             // preventing stop_inner's drain from racing a mid-delete
@@ -3662,7 +3616,11 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
 
     // ZEB-234: acquire the shutdown fence before any outbox mutation.
     // Pre-check + acquire a permit that blocks stop_inner's drain until
-    // this IPC returns. Mirrors send_dm's fence pattern exactly.
+    // this IPC returns. While _fence_permit is held, stop_inner cannot
+    // complete SyncEngine::shutdown — making the old post-check guards
+    // obsolete and harmful (they would Err after a successful fenced
+    // write, driving a retry that could mint a second OutboxEntry).
+    // Those post-checks were removed by ZEB-234 (this PR).
     let _fence_permit = check_dm_send_fence(&dm_send_stopping, dm_send_inflight).await?;
 
     // Decode message_id from hex → OutboxEntryId.
@@ -3691,41 +3649,10 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
             .map_err(|e| format!("delete_dm_outbox_entry: {e}"))?
     };
 
-    // Locks dropped (block scope ended).
-    //
-    // ZEB-245 (PR #81 round 6): post-stop check before emitting
-    // dm-deleted. If a stop+restart fired during the .await chain
-    // above, our cloned `crdt_state` Arc is now detached from the
-    // live NodeState — the deletion landed in an orphan that won't
-    // be persisted. Emitting dm-deleted in that case would prune the
-    // message from the UI even though it'll reappear on next start.
-    // Surface as Err instead so the caller (App.svelte's deleteDm)
-    // can re-show the message + retry against the live node.
-    //
-    // Mirrors send_dm's fence (lib.rs ~1762): same residual TOCTOU
-    // applies — a stop_inner that flushes the cloned crdt_state
-    // between mutate and post-check still persists the deletion, so
-    // ZEB-234's shutdown fence is the real fix. This guard closes the
-    // common case (stop_node alone, no flush) which is the only
-    // detach path Phase 4 UI can actually trigger.
-    {
-        let g = state_lock
-            .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        if g.generation != snapshot_generation {
-            return Err(format!(
-                "node generation changed during delete_outbox_entry (was {}, now {}); \
-                 deletion was applied to a detached crdt_state and won't be persisted — \
-                 retry against the live node",
-                snapshot_generation, g.generation
-            ));
-        }
-        if g.dm_outbox.is_none() {
-            return Err("node was stopped during delete_outbox_entry; deletion was \
-                applied to a detached crdt_state and won't be persisted"
-                .to_string());
-        }
-    }
+    // Locks dropped (block scope ended). No post-check needed: _fence_permit
+    // guarantees stop_inner cannot complete SyncEngine::shutdown while this
+    // permit is held, so the deletion above is always visible to the live
+    // node. (ZEB-234)
 
     // Emit IPC event only if something actually changed (idempotent
     // missing-id is no-op).
