@@ -2708,21 +2708,31 @@ mod tests {
     }
 
     /// Shutdown and loop teardown must complete without advancing
-    /// tokio's virtual clock. The receive + flush loops are designed
-    /// to wake via `closing_notify` — a regression to sleep-based
-    /// polling (the prior 1s closing-flag-poll path) would put
-    /// `tokio::time::sleep` back in the select arms, and paused-time
-    /// auto-advance would push the virtual clock forward by up to
-    /// 1s when those sleeps fire. We assert virtual elapsed stays
-    /// near zero, catching the regression deterministically.
+    /// tokio's virtual clock. The receive + flush loops wake via
+    /// `closing_notify`; a regression to `tokio::time::sleep`-based
+    /// polling would auto-advance the paused clock when those
+    /// sleeps fire. We also assert the receive loop actually
+    /// exited (its `subscriber_rx` was dropped), catching parked-
+    /// forever regressions the virtual-time check alone wouldn't
+    /// see. Flush-loop termination has no test-side observable;
+    /// the virtual-time check covers its sleep-regression class.
     ///
-    /// Wall-clock-independent: the prior 200ms wall-clock budget
-    /// flaked under CI runner jitter (ZEB-282). Logical time has no
-    /// jitter — the test is now jitter-immune AND a strictly tighter
-    /// regression detector than any wall-clock budget could be.
+    /// Logical-time-based, so wall-clock jitter on shared CI
+    /// runners is irrelevant (ZEB-282).
     #[tokio::test(start_paused = true)]
     async fn shutdown_completes_promptly() {
         let fix = build_engine_fixture(8, 250, 1000).await;
+        // Let the freshly-spawned receive + flush loops register on
+        // `closing_notify`. `Notify::notify_waiters` only wakes
+        // already-registered waiters (no permit stored for future
+        // waiters); without this pre-yield, shutdown's notify call
+        // would find no waiters and the loops would park. In
+        // production, rt-multi-thread + non-zero wall-clock between
+        // engine construction and shutdown makes this register-
+        // before-notify ordering implicit.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
         let v_start = tokio::time::Instant::now();
         fix.engine.shutdown().await.expect("shutdown");
         // Let the receive + flush loops actually exit. yield_now()
@@ -2740,6 +2750,16 @@ mod tests {
             "shutdown + loop teardown advanced virtual time by \
              {v_elapsed:?} — implies tokio::time::sleep-based wakeup \
              regression in the receive/flush loops"
+        );
+        // Observable receive-loop termination: the loop owns
+        // `subscriber_rx`; once it breaks out of its select, the
+        // rx is dropped and the fixture-side sender reports
+        // closed. Catches a "loop parks forever" regression that
+        // virtual-time alone wouldn't see.
+        assert!(
+            fix.subscriber_tx.is_closed(),
+            "subscriber_tx should be closed after shutdown — implies \
+             receive loop did not exit"
         );
     }
 
