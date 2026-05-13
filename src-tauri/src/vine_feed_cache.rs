@@ -13,7 +13,7 @@
 // into NodeState and Tauri IPCs lands later in this PR.
 #![allow(dead_code)]
 
-use crate::{VineDescriptorPayload, VineVideoDto};
+use crate::{VineDescriptorPayload, VineReactionPayload, VineVideoDto};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
@@ -203,6 +203,78 @@ impl VineFeedCache {
             viewed: self.viewed.contains(&descriptor.id),
             source,
         }
+    }
+
+    /// Parse + insert/LWW-update a reaction.
+    ///
+    /// Returns `None` if `key_expr` is not a vine-reaction topic.
+    /// LWW per (vine_id, reactor_addr) by `timestamp`. Stale samples
+    /// (timestamp older than existing entry) return `Stale` and do
+    /// NOT mutate the cache.
+    pub fn on_reaction_sample(
+        &mut self,
+        key_expr: &str,
+        payload: &[u8],
+    ) -> Option<ReactionOutcome> {
+        if !(key_expr.starts_with("harmony/vines/") && key_expr.contains("/reactions/")) {
+            return None;
+        }
+
+        let reaction: VineReactionPayload = match serde_json::from_slice(payload) {
+            Ok(r) => r,
+            Err(_) => return Some(ReactionOutcome::Rejected),
+        };
+
+        let key = (reaction.vine_id.clone(), reaction.reactor_address.clone());
+        match self.reactions.get(&key) {
+            None => {
+                self.reactions.insert(
+                    key,
+                    CachedReaction {
+                        liked: reaction.liked,
+                        timestamp: reaction.timestamp,
+                        reactor_name: reaction.reactor_name,
+                    },
+                );
+                Some(ReactionOutcome::Inserted)
+            }
+            Some(existing) => {
+                if reaction.timestamp <= existing.timestamp {
+                    // Stale (or duplicate same-timestamp): no-op
+                    return Some(ReactionOutcome::Stale);
+                }
+                self.reactions.insert(
+                    key,
+                    CachedReaction {
+                        liked: reaction.liked,
+                        timestamp: reaction.timestamp,
+                        reactor_name: reaction.reactor_name,
+                    },
+                );
+                Some(ReactionOutcome::UpdatedNewer)
+            }
+        }
+    }
+
+    /// Aggregate reaction state for `vine_id` from the local viewer's
+    /// perspective. `count` is the number of `liked == true` reactions
+    /// across all reactors; `liked_by_me` is true iff `viewer_addr` has
+    /// a `liked == true` entry for this vine.
+    pub fn get_reaction(&self, vine_id: &str, viewer_addr: &str) -> ReactionSummary {
+        let mut count = 0usize;
+        let mut liked_by_me = false;
+        for ((vid, reactor), r) in &self.reactions {
+            if vid != vine_id {
+                continue;
+            }
+            if r.liked {
+                count += 1;
+                if reactor == viewer_addr {
+                    liked_by_me = true;
+                }
+            }
+        }
+        ReactionSummary { count, liked_by_me }
     }
 
     /// Number of cached descriptors. Test helper.
@@ -402,5 +474,153 @@ mod tests {
         assert_eq!(dtos[0].id, "v-300");
         assert_eq!(dtos[1].id, "v-200");
         assert_eq!(dtos[2].id, "v-100");
+    }
+
+    fn canonical_reaction_bytes(
+        vine_id: &str,
+        reactor_address: &str,
+        reactor_name: &str,
+        liked: bool,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let v = crate::VineReactionPayload {
+            vine_id: vine_id.to_string(),
+            reactor_address: reactor_address.to_string(),
+            reactor_name: reactor_name.to_string(),
+            liked,
+            timestamp,
+        };
+        serde_json::to_vec(&v).unwrap()
+    }
+
+    #[test]
+    fn two_reactors_like_same_vine_count_is_two() {
+        let mut cache = VineFeedCache::new();
+        let alice_likes = canonical_reaction_bytes("vine-1", "alice-addr", "Alice", true, 100);
+        let bob_likes = canonical_reaction_bytes("vine-1", "bob-addr", "Bob", true, 110);
+
+        let r1 = cache.on_reaction_sample(
+            "harmony/vines/creator-addr/reactions/vine-1/alice-addr",
+            &alice_likes,
+        );
+        let r2 = cache.on_reaction_sample(
+            "harmony/vines/creator-addr/reactions/vine-1/bob-addr",
+            &bob_likes,
+        );
+
+        assert_eq!(r1, Some(ReactionOutcome::Inserted));
+        assert_eq!(r2, Some(ReactionOutcome::Inserted));
+
+        let summary = cache.get_reaction("vine-1", "anyone-addr");
+        assert_eq!(summary.count, 2);
+        assert!(!summary.liked_by_me);
+    }
+
+    #[test]
+    fn same_reactor_unlike_then_like_lww_wins() {
+        let mut cache = VineFeedCache::new();
+        // First: alice unlikes at t=100
+        let alice_unlikes = canonical_reaction_bytes("vine-1", "alice-addr", "Alice", false, 100);
+        // Then: alice likes at t=200 (newer, so LWW wins)
+        let alice_likes = canonical_reaction_bytes("vine-1", "alice-addr", "Alice", true, 200);
+
+        cache.on_reaction_sample(
+            "harmony/vines/creator-addr/reactions/vine-1/alice-addr",
+            &alice_unlikes,
+        );
+        let r2 = cache.on_reaction_sample(
+            "harmony/vines/creator-addr/reactions/vine-1/alice-addr",
+            &alice_likes,
+        );
+        assert_eq!(r2, Some(ReactionOutcome::UpdatedNewer));
+
+        let summary = cache.get_reaction("vine-1", "alice-addr");
+        assert_eq!(summary.count, 1);
+        assert!(summary.liked_by_me);
+    }
+
+    #[test]
+    fn stale_reaction_does_not_overwrite_newer() {
+        let mut cache = VineFeedCache::new();
+        // First: like at t=200
+        let alice_likes = canonical_reaction_bytes("vine-1", "alice-addr", "Alice", true, 200);
+        cache.on_reaction_sample(
+            "harmony/vines/creator-addr/reactions/vine-1/alice-addr",
+            &alice_likes,
+        );
+
+        // Stale unlike at t=100 (lower timestamp, must be rejected)
+        let stale_unlike = canonical_reaction_bytes("vine-1", "alice-addr", "Alice", false, 100);
+        let outcome = cache.on_reaction_sample(
+            "harmony/vines/creator-addr/reactions/vine-1/alice-addr",
+            &stale_unlike,
+        );
+        assert_eq!(outcome, Some(ReactionOutcome::Stale));
+
+        // Newer like still wins
+        let summary = cache.get_reaction("vine-1", "alice-addr");
+        assert_eq!(summary.count, 1);
+        assert!(summary.liked_by_me);
+    }
+
+    #[test]
+    fn liked_by_me_reflects_viewer_addr() {
+        let mut cache = VineFeedCache::new();
+        let alice_likes = canonical_reaction_bytes("vine-1", "alice-addr", "Alice", true, 100);
+        let bob_likes = canonical_reaction_bytes("vine-1", "bob-addr", "Bob", true, 110);
+
+        cache.on_reaction_sample(
+            "harmony/vines/creator-addr/reactions/vine-1/alice-addr",
+            &alice_likes,
+        );
+        cache.on_reaction_sample(
+            "harmony/vines/creator-addr/reactions/vine-1/bob-addr",
+            &bob_likes,
+        );
+
+        // From Alice's perspective: liked_by_me=true (she liked it)
+        let a = cache.get_reaction("vine-1", "alice-addr");
+        assert_eq!(a.count, 2);
+        assert!(a.liked_by_me);
+
+        // From Carol's perspective: she did not react
+        let c = cache.get_reaction("vine-1", "carol-addr");
+        assert_eq!(c.count, 2);
+        assert!(!c.liked_by_me);
+    }
+
+    #[test]
+    fn on_reaction_sample_wrong_topic_returns_none() {
+        let mut cache = VineFeedCache::new();
+        let payload = canonical_reaction_bytes("vine-1", "alice-addr", "Alice", true, 100);
+
+        // Descriptor topic — must NOT match the reaction branch
+        let outcome = cache.on_reaction_sample("harmony/vines/creator-addr", &payload);
+        assert_eq!(outcome, None);
+
+        // Unrelated topic
+        let outcome2 = cache.on_reaction_sample("harmony/profile/alice-addr", &payload);
+        assert_eq!(outcome2, None);
+    }
+
+    #[test]
+    fn on_reaction_sample_malformed_payload_rejected() {
+        let mut cache = VineFeedCache::new();
+        let bad = b"{{{not json";
+
+        let outcome = cache.on_reaction_sample(
+            "harmony/vines/creator-addr/reactions/vine-1/alice-addr",
+            bad,
+        );
+        assert_eq!(outcome, Some(ReactionOutcome::Rejected));
+        assert_eq!(cache.len_reactions(), 0);
+    }
+
+    #[test]
+    fn get_reaction_for_unknown_vine_id_returns_zero() {
+        let cache = VineFeedCache::new();
+        let summary = cache.get_reaction("nonexistent-vine", "anyone-addr");
+        assert_eq!(summary.count, 0);
+        assert!(!summary.liked_by_me);
     }
 }
