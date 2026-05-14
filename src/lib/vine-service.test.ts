@@ -716,70 +716,45 @@ describe('VineService.getReshareCount', () => {
   });
 });
 
-// ── publish: self-reshare prevention ────────────────────────────────
+// ── publish: self-reshare prevention is the CALLER's job ───────────
 //
-// Belt-and-suspenders backstop: the UI hides the reshare button on
-// own-origin vines (Task 6), but the guard here ensures a stale or
-// programmatic caller cannot accidentally publish a self-reshare. The
-// caller (App.svelte::handleVineReshare) is responsible for resolving
-// the true chain origin before calling publish — the guard only checks
-// `originalCreatorAddress` against the local identity.
-describe('VineService self-reshare prevention', () => {
+// Earlier rounds put a self-reshare guard inside `publish()` keyed on
+// `originalCreatorAddress`. That over-blocks the spec-allowed case
+// "reshare of someone else's reshare of your content" — where the
+// resolved true origin DOES map to us but the user is legitimately
+// resharing a different vine. The load-bearing signal lives on the
+// SOURCE vine (its `creatorAddress` + whether it has a `reshareOf`),
+// which `publish()` doesn't see. The guard now lives in
+// `App.svelte::handleVineReshare`; this test pins that `publish()` no
+// longer over-blocks based on resolved attribution.
+describe('VineService publish does not over-block self-attributed reshares', () => {
   let svc: VineService;
 
   beforeEach(() => {
     svc = new VineService();
   });
 
-  it('publish silently no-ops when resharing own original (creatorAddress === "self")', async () => {
+  it('publishes a reshare whose resolved originalCreatorAddress is "self"', async () => {
+    // Carol resharing Bob's reshare of Alice's vine where the true
+    // origin maps to us. The caller-level guard (App.svelte) allows
+    // this through because the SOURCE vine is not our own original.
+    // `publish()` must NOT block on the resolved attribution.
     const { adapter } = createMockAdapter();
     await svc.connectAdapter(adapter);
-    const before = svc.vines.length;
-    // Reshare with originalCreatorAddress === 'self' should be rejected silently.
-    // The JSDoc on publish() promises "no IPC invoke, no offline fallback,
-    // no onChange" — all three are asserted below.
     svc.onChange = vi.fn();
-    await svc.publish('cid-x', 'My title', 'orig-1', 'self', 'You');
-    expect(adapter.invoke).not.toHaveBeenCalledWith('publish_vine', expect.anything());
-    expect(svc.vines.length).toBe(before);
-    expect(svc.onChange).not.toHaveBeenCalled();
+    await svc.publish('cid-x', 'My title', 'reshare-of-1', 'self', 'You');
+    expect(adapter.invoke).toHaveBeenCalledWith('publish_vine', expect.objectContaining({
+      vine: expect.objectContaining({ originalCreatorAddress: 'self' }),
+    }));
   });
 
-  it('publish silently no-ops when originalCreatorAddress === ownAddress (hex form)', async () => {
+  it('publishes a reshare whose resolved originalCreatorAddress matches ownAddress (hex form)', async () => {
     const { adapter } = createMockAdapter();
     svc.ownAddress = 'a1b2c3d4';
     await svc.connectAdapter(adapter);
-    const before = svc.vines.length;
-    svc.onChange = vi.fn();
-    await svc.publish('cid-x', 'My title', 'orig-1', 'a1b2c3d4', 'You');
-    expect(adapter.invoke).not.toHaveBeenCalledWith('publish_vine', expect.anything());
-    expect(svc.vines.length).toBe(before);
-    expect(svc.onChange).not.toHaveBeenCalled();
-  });
-
-  it("publish allows resharing someone else's reshare of your content", async () => {
-    // Carol resharing Bob's reshare of Alice's vine. The originalCreator
-    // *of the vine Carol is resharing* is Bob, even though Carol's content
-    // ultimately traces to Alice's original. But the spec says: trace to
-    // true origin. So if true origin === self, no-op. Here true origin is
-    // someone else, so it goes through.
-    //
-    // The implementer's responsibility: the GUARD checks
-    // originalCreatorAddress against ownAddress/'self'. The CALLER
-    // (App.svelte handleVineReshare) is responsible for resolving the
-    // true origin before calling publish.
-    const { adapter } = createMockAdapter();
-    svc.ownAddress = 'self-addr';
-    await svc.connectAdapter(adapter);
-    await svc.publish('cid-x', 'Title', 'reshare-of-1', 'other-addr', 'Other');
-    expect(adapter.invoke).toHaveBeenCalledWith('publish_vine', expect.anything());
-  });
-
-  it('publish allows non-reshare originals (no reshareOf, no original creator fields)', async () => {
-    const { adapter } = createMockAdapter();
-    svc.ownAddress = 'self-addr';
-    await svc.connectAdapter(adapter);
-    await svc.publish('cid-x', 'Original title');
-    expect(adapter.invoke).toHaveBeenCalledWith('publish_vine', expect.anything());
+    await svc.publish('cid-x', 'My title', 'reshare-of-1', 'a1b2c3d4', 'You');
+    expect(adapter.invoke).toHaveBeenCalledWith('publish_vine', expect.objectContaining({
+      vine: expect.objectContaining({ originalCreatorAddress: 'a1b2c3d4' }),
+    }));
   });
 });

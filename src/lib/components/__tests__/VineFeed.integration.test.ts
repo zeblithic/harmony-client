@@ -305,10 +305,14 @@ describe('VineFeed Integration', () => {
   //   intermediate resharer's `creatorAddress`.
 
   describe('App-level reshare wiring', () => {
-    function setupPublishSpy() {
+    function setupPublishSpy(ownAddress: string | null = null) {
       const publish = vi.fn().mockResolvedValue(undefined);
-      // Mirror of App.svelte's handleVineReshare.
+      // Mirror of App.svelte's handleVineReshare (including the
+      // caller-level self-reshare guard — see FIX 1 in PR #120 round 1).
       const onReshare = async (vine: VineVideo) => {
+        const isOwn = vine.creatorAddress === 'self'
+          || (ownAddress != null && vine.creatorAddress === ownAddress);
+        if (isOwn && !vine.reshareOf) return;
         const { originalCreatorAddress, originalCreatorName } =
           resolveOriginalCreator(vine);
         await publish(
@@ -356,6 +360,74 @@ describe('VineFeed Integration', () => {
         'v2',
         'b2',   // Bob's address (source creator → origin)
         'Bob',  // Bob's name
+      );
+    });
+
+    // ── Self-reshare prevention (caller-level guard) ──────────────
+    //
+    // Pin the guard's two cases directly on the App-mirror helper
+    // (see `setupPublishSpy`). The UI hides the Reshare button on own
+    // originals, but the guard must still fire to defend against
+    // programmatic callers and the late-ownAddress race the UI used
+    // to expose (see FIX 2 below).
+
+    it('guard: own ORIGINAL ("self", no reshareOf) → publish NOT called', async () => {
+      const { publish, onReshare } = setupPublishSpy();
+      const ownOriginal: VineVideo = {
+        id: 'v-mine-orig',
+        creatorAddress: 'self',
+        creatorName: 'You',
+        createdAt: vineBase + 1000,
+        videoCid: 'cid-mine',
+        title: 'My original',
+        viewed: true,
+      };
+      await onReshare(ownOriginal);
+      expect(publish).not.toHaveBeenCalled();
+    });
+
+    it('guard: own ORIGINAL by hex ownAddress (no reshareOf) → publish NOT called', async () => {
+      const ownAddress = 'a1b2c3d4';
+      const { publish, onReshare } = setupPublishSpy(ownAddress);
+      const ownOriginal: VineVideo = {
+        id: 'v-mine-hex',
+        creatorAddress: ownAddress,
+        creatorName: 'You',
+        createdAt: vineBase + 1000,
+        videoCid: 'cid-mine-hex',
+        title: 'My hex-addressed original',
+        viewed: true,
+      };
+      await onReshare(ownOriginal);
+      expect(publish).not.toHaveBeenCalled();
+    });
+
+    it("guard: reshare of someone-else's reshare-of-mine → publish IS called with self attribution", async () => {
+      // Alice's vine → Bob reshares → I reshare Bob's reshare.
+      // The source vine here is Bob's reshare; its `creatorAddress`
+      // is Bob (not me), so the guard MUST allow this through.
+      // The resolved `originalCreator*` correctly points at me
+      // (the true origin), which is spec-allowed.
+      const { publish, onReshare } = setupPublishSpy();
+      const bobsReshareOfMine: VineVideo = {
+        id: 'v-bob-of-me',
+        creatorAddress: 'addr-bob',
+        creatorName: 'Bob',
+        createdAt: vineBase + 2000,
+        videoCid: 'cid-of-mine',
+        title: 'My original (Bob reshare)',
+        reshareOf: 'v-mine-orig',
+        originalCreatorAddress: 'self',
+        originalCreatorName: 'You',
+        viewed: false,
+      };
+      await onReshare(bobsReshareOfMine);
+      expect(publish).toHaveBeenCalledWith(
+        'cid-of-mine',
+        'My original (Bob reshare)',
+        'v-bob-of-me',
+        'self',
+        'You',
       );
     });
 

@@ -131,6 +131,18 @@
   }
 
   async function handleVineReshare(vine: import('./lib/types').VineVideo) {
+    // Self-reshare prevention (spec §Edge Cases → Self-reshare prevention):
+    // silently no-op when the SOURCE vine is our OWN ORIGINAL
+    // (creatorAddress identifies us AND `reshareOf` is unset). Resharing
+    // someone else's reshare of our content is explicitly allowed — the
+    // resolved `originalCreatorAddress` in that case still maps to us,
+    // which is why this check must live at the caller (with full access
+    // to the source vine's identity), not inside `vineService.publish()`.
+    const isOwn = vine.creatorAddress === 'self'
+      || (vineService.ownAddress != null && vine.creatorAddress === vineService.ownAddress);
+    if (isOwn && !vine.reshareOf) {
+      return;
+    }
     try {
       // Resolve the true origin. If `vine` is itself a reshare, the
       // helper propagates its `originalCreator*` fields (transitive —

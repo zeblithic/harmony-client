@@ -134,17 +134,13 @@ export class VineService {
    * before passing (typically `vine.originalCreator* ?? vine.creator*`,
    * done in `App.svelte::handleVineReshare`).
    *
-   * **Self-reshare guard:** when `reshareOf` is set AND
-   * `originalCreatorAddress` identifies the local node (either the magic
-   * value `'self'` or matches `this.ownAddress`), the call silently
-   * no-ops — no IPC invoke, no offline fallback, no `onChange`. This is a
-   * belt-and-suspenders backstop; the UI hides the reshare button on
-   * own-origin vines, but the guard ensures a stale or programmatic caller
-   * cannot accidentally publish a self-reshare. The guard does NOT fire
-   * for non-reshare originals (no `reshareOf`) or when the immediate
-   * `reshareOf` traces to someone else's content — chain-origin
-   * resolution is the caller's responsibility (see
-   * `App.svelte::handleVineReshare`).
+   * Self-reshare prevention lives at the caller layer
+   * (`App.svelte::handleVineReshare`) because the load-bearing signal is
+   * the SOURCE vine's identity (`creatorAddress === 'self'/ownAddress`
+   * AND `!reshareOf`), not the resolved `originalCreatorAddress`. A
+   * reshare of someone else's reshare of our content correctly has
+   * `originalCreatorAddress === 'self'` and MUST be allowed through (spec
+   * §Edge Cases → Self-reshare prevention).
    */
   async publish(
     videoCid: string,
@@ -153,14 +149,6 @@ export class VineService {
     originalCreatorAddress?: string,
     originalCreatorName?: string,
   ): Promise<void> {
-    // Self-reshare prevention: silently drop reshares whose resolved
-    // origin is us. See JSDoc above for caller-vs-guard responsibility.
-    const isSelfOrigin = originalCreatorAddress === 'self'
-      || (this.ownAddress != null && originalCreatorAddress === this.ownAddress);
-    if (reshareOf && isSelfOrigin) {
-      return;
-    }
-
     if (this.adapter) {
       try {
         await this.adapter.invoke('publish_vine', {
