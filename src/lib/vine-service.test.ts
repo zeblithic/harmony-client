@@ -646,7 +646,7 @@ describe('VineService.findVine', () => {
       id: 'vine-d', creatorAddress: 'a', creatorName: 'A',
       createdAt: 1, videoCid: 'cid', viewed: false,
     };
-    svc.discoverVines = [...svc.discoverVines, vine];
+    svc.discoverVines = [vine];
     expect(svc.findVine('vine-d')).toBe(vine);
   });
 
@@ -662,7 +662,7 @@ describe('VineService.findVine', () => {
     };
     const dVine: VineVideo = { ...fVine, creatorName: 'D' };
     svc.followedVines = [fVine];
-    svc.discoverVines = [...svc.discoverVines, dVine];
+    svc.discoverVines = [dVine];
     expect(svc.findVine('dup')).toBe(fVine);
   });
 });
@@ -693,7 +693,7 @@ describe('VineService.getReshareCount', () => {
       createdAt: 1, videoCid: 'c', viewed: false, reshareOf: origId,
     };
     svc.followedVines = [r1, r2];
-    svc.discoverVines = [...svc.discoverVines, r3];
+    svc.discoverVines = [r3];
     expect(svc.getReshareCount(origId)).toBe(3);
   });
 

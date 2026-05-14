@@ -278,14 +278,10 @@ export class VineService {
    * Computed on demand — no separate state map kept.
    */
   getReshareCount(vineId: string): number {
-    let count = 0;
-    for (const v of this.followedVines) {
-      if (v.reshareOf === vineId) count++;
-    }
-    for (const v of this.discoverVines) {
-      if (v.reshareOf === vineId) count++;
-    }
-    return count;
+    return (
+      this.followedVines.filter(v => v.reshareOf === vineId).length
+      + this.discoverVines.filter(v => v.reshareOf === vineId).length
+    );
   }
 
   /** Get reaction state for a vine. Returns zero state if no reactions tracked. */
