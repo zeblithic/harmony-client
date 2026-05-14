@@ -1861,11 +1861,13 @@ pub fn verify_event(
             // Power threshold 0 — same as Leave. Non-mutating: doesn't
             // affect membership/power/channels, doesn't trigger EpochRotation.
             // Membership check already performed in the joined-membership
-            // block above (ActorNotJoined gate). No additional power check
-            // needed — POWER_THRESHOLDS.invite == 0, so all joined members
-            // qualify. No additional shape validation required: fork_space_id
-            // is a self-reported value from the forker; receivers don't (and
-            // can't) verify the fork's existence on the forker's device.
+            // block above (ActorNotJoined gate). No additional shape
+            // validation required: fork_space_id is a self-reported value
+            // from the forker; receivers don't (and can't) verify the fork's
+            // existence on the forker's device.
+            if actor_power < POWER_THRESHOLDS.invite {
+                return Err(VerifyError::ActorPowerInsufficient);
+            }
         }
     }
 
