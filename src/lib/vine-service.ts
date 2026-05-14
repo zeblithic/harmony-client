@@ -125,7 +125,15 @@ export class VineService {
     this.unlisteners.push(unlistenReaction);
   }
 
-  /** Publish a vine via Tauri command. */
+  /**
+   * Publish a vine via Tauri command.
+   *
+   * `originalCreatorAddress` / `originalCreatorName` carry attribution for
+   * reshares. See `VineVideo.originalCreatorAddress` for the "always traces
+   * to true origin" semantics — callers must resolve the chain origin
+   * before passing (typically `vine.originalCreator* ?? vine.creator*`,
+   * done in `App.svelte::handleVineReshare`).
+   */
   async publish(
     videoCid: string,
     title?: string,

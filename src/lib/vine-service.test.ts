@@ -169,10 +169,7 @@ describe('VineService', () => {
     const { adapter } = createMockAdapter();
     await svc.connectAdapter(adapter);
     await svc.publish('cid-pub', 'Title', 'reshare-of-1', 'addr-original', 'Original');
-    const publishCall = (adapter.invoke as ReturnType<typeof vi.fn>).mock.calls
-      .find(([cmd]) => cmd === 'publish_vine');
-    expect(publishCall).toBeTruthy();
-    expect(publishCall![1]).toEqual({
+    expect(adapter.invoke).toHaveBeenCalledWith('publish_vine', {
       vine: {
         videoCid: 'cid-pub',
         title: 'Title',
@@ -188,12 +185,19 @@ describe('VineService', () => {
     const { adapter } = createMockAdapter();
     await svc.connectAdapter(adapter);
     await svc.publish('cid-pub', 'Title');
-    const publishCall = (adapter.invoke as ReturnType<typeof vi.fn>).mock.calls
-      .find(([cmd]) => cmd === 'publish_vine');
-    expect(publishCall).toBeTruthy();
-    const vine = (publishCall![1] as { vine: Record<string, unknown> }).vine;
-    expect(vine.originalCreatorAddress).toBeUndefined();
-    expect(vine.originalCreatorName).toBeUndefined();
+    // Vitest's toEqual treats {a:1, b:undefined} as equal to {a:1},
+    // so omitting these keys here also matches when publish passes
+    // them as undefined.
+    expect(adapter.invoke).toHaveBeenCalledWith('publish_vine', {
+      vine: {
+        videoCid: 'cid-pub',
+        title: 'Title',
+        reshareOf: undefined,
+        creatorName: 'You',
+        originalCreatorAddress: undefined,
+        originalCreatorName: undefined,
+      },
+    });
   });
 
   it('falls back to local vine when no adapter', async () => {
