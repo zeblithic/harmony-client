@@ -204,10 +204,14 @@ fn load(data_dir):
     file.reactions.retain(|r| surviving_vine_ids.contains(&r.vine_id))
 
     # Capacity-trim (in case persisted state already over cap;
-    # defensive — production write path enforces cap on insert)
+    # defensive — production write path enforces cap on insert).
+    # Mirrors §6 runtime trim: sort ASC by (created_at, id), drain
+    # oldest from the front. Symmetric tie-break ensures load and
+    # runtime retain the same set on `created_at` ties.
     if file.descriptors.len() > MAX_DESCRIPTORS:
-        file.descriptors.sort_by_key(|d| Reverse(d.created_at))
-        file.descriptors.truncate(MAX_DESCRIPTORS)
+        file.descriptors.sort_by_key(|d| (d.created_at, d.id.clone()))
+        drop_count = file.descriptors.len() - MAX_DESCRIPTORS
+        file.descriptors.drain(0..drop_count)
         kept = file.descriptors.iter().map(|d| d.id).collect::<HashSet>()
         file.reactions.retain(|r| kept.contains(&r.vine_id))
 
@@ -326,7 +330,7 @@ drops the Arc; persistence is already on disk.
 
 ### 9.2 New integration test (`src-tauri/tests/vine_feed_persistence_integration.rs`)
 
-7. `cache_survives_reload` — `tempdir`-backed cache via
+1. `cache_survives_reload` — `tempdir`-backed cache via
    `VineFeedCache::load(&tempdir)`, insert descriptor + reaction +
    `mark_viewed`, drop the cache, re-`load(&tempdir)`, assert all three
    pieces present.
