@@ -102,6 +102,29 @@ describe('VinePlayer', () => {
     expect(onReshare).not.toHaveBeenCalled();
   });
 
+  it('suspends Arrow/Escape hotkeys while reshare confirm dialog is open', async () => {
+    // FIX 3 (PR #120 round 1): the window keydown listener still fired
+    // while the modal was visible, so ArrowLeft/Right would navigate
+    // the underlying feed and Escape would close the player behind
+    // the modal — leaving a stale active vine for the subsequent
+    // confirm-click.
+    const onNext = vi.fn();
+    const onPrevious = vi.fn();
+    const onClose = vi.fn();
+    render(VinePlayer, {
+      props: { vine, onClose, onNext, onPrevious, onReshare: vi.fn() },
+    });
+    // Open the confirm dialog.
+    await fireEvent.click(screen.getByLabelText('Reshare vine'));
+    // Hotkeys must NOT fire while the dialog is up.
+    await fireEvent.keyDown(window, { key: 'ArrowRight' });
+    await fireEvent.keyDown(window, { key: 'ArrowLeft' });
+    await fireEvent.keyDown(window, { key: 'Escape' });
+    expect(onNext).not.toHaveBeenCalled();
+    expect(onPrevious).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
   it('hides Reshare button on own original vines', () => {
     const ownOriginal: VineVideo = { ...vine, creatorAddress: 'self', reshareOf: undefined };
     render(VinePlayer, {

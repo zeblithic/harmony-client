@@ -112,6 +112,11 @@
   }
 
   function handleKeyDown(e: KeyboardEvent) {
+    // Suspend player hotkeys while the reshare confirmation dialog is
+    // open — otherwise Arrow keys would navigate the underlying feed
+    // and Escape would close the player behind the modal, letting a
+    // subsequent confirm run against the wrong active vine.
+    if (showReshareConfirm) return;
     if (e.key === 'Escape') onClose();
     else if (e.key === 'ArrowRight' && onNext) { e.preventDefault(); onNext(); }
     else if (e.key === 'ArrowLeft' && onPrevious) { e.preventDefault(); onPrevious(); }
