@@ -41,6 +41,8 @@ export class NavService {
   private unlisteners: Array<() => void> = [];
 
   constructor() {
+    // Seed with mock data for browser/dev mode — `connectAdapter()` clears
+    // these before subscribing to real events (ZEB-209).
     this.nodes = [...mockNavNodes];
     this.profiles = new Map(mockProfileStore);
   }
@@ -64,6 +66,15 @@ export class NavService {
   async connectAdapter(adapter: TauriAdapter): Promise<void> {
     if (this.adapter) return;
     this.adapter = adapter;
+
+    // ZEB-209: clear mock-seeded state before subscribing to real events.
+    // The constructor seeds mockNavNodes + mockProfileStore for browser/
+    // dev mode (no adapter connects). In production the adapter always
+    // wires in, so the mocks must go to avoid mock channels/DMs that are
+    // uninhabitable (no real Zenoh state behind them).
+    this.nodes = [];
+    this.profiles = new Map();
+    this.onChange?.();
 
     const unlistenProfile = await adapter.listen(
       'profile-update',
