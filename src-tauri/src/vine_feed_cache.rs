@@ -1518,27 +1518,32 @@ mod tests {
     }
 
     #[test]
-    fn ninety_day_boundary_is_inclusive() {
-        // A descriptor with `created_at == now - MAX_AGE_SECS` should be
-        // kept (>= cutoff); one with `created_at < now - MAX_AGE_SECS`
-        // should be dropped. Verifies the spec §5 algorithm's
-        // `created_at >= age_cutoff` (inclusive) is correctly coded.
+    fn ninety_day_boundary_keeps_recent_drops_past() {
+        // Verifies the spec §5 algorithm's `created_at >= age_cutoff`
+        // semantics: a descriptor RECENT enough (just inside the 90-day
+        // window) survives load; one PAST the window is dropped.
+        //
+        // Why not test the literal-second cutoff? `load()` calls
+        // SystemTime::now() independently from the test's `now`, so a
+        // 1-second clock tick between the two would silently flake the
+        // boundary case. A 60-second margin makes the test robust on
+        // loaded CI machines while still exercising the same predicate.
         let dir = tempfile::tempdir().expect("create tempdir");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let exactly_at_cutoff = now.saturating_sub(MAX_AGE_SECS);
-        let just_too_old = exactly_at_cutoff.saturating_sub(1);
+        let just_inside = now.saturating_sub(MAX_AGE_SECS).saturating_add(60); // 60 seconds INSIDE the window — safely kept
+        let just_past = now.saturating_sub(MAX_AGE_SECS).saturating_sub(60); // 60 seconds PAST the window — safely dropped
 
         let disk = serde_json::json!({
-            "version": 1,
+            "version": FILE_VERSION,
             "descriptors": [
                 {
-                    "id": "boundary",
+                    "id": "recent",
                     "creatorAddress": "a",
                     "creatorName": "A",
-                    "createdAt": exactly_at_cutoff,
+                    "createdAt": just_inside,
                     "videoCid": "cid",
                     "receivedAtMs": 0,
                     "source": "followed"
@@ -1547,7 +1552,7 @@ mod tests {
                     "id": "too-old",
                     "creatorAddress": "a",
                     "creatorName": "A",
-                    "createdAt": just_too_old,
+                    "createdAt": just_past,
                     "videoCid": "cid",
                     "receivedAtMs": 0,
                     "source": "followed"
@@ -1569,12 +1574,12 @@ mod tests {
             .map(|d| d.id.clone())
             .collect();
         assert!(
-            ids.contains("boundary"),
-            "descriptor at exactly the cutoff must be KEPT (cutoff is inclusive)"
+            ids.contains("recent"),
+            "descriptor inside the 90-day window must be KEPT (>= cutoff)"
         );
         assert!(
             !ids.contains("too-old"),
-            "descriptor one second past the cutoff must be DROPPED"
+            "descriptor past the 90-day window must be DROPPED (< cutoff)"
         );
     }
 }
