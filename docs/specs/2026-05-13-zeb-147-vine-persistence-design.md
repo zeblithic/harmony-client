@@ -324,7 +324,7 @@ drops the Arc; persistence is already on disk.
    increasing `created_at`). Assert `len_descriptors() == MAX_DESCRIPTORS`,
    and the oldest (created_at = 0) is no longer present.
 
-### 9.2 New integration test (`src-tauri/tests/vine_persistence_integration.rs`)
+### 9.2 New integration test (`src-tauri/tests/vine_feed_persistence_integration.rs`)
 
 7. `cache_survives_reload` — `tempdir`-backed cache via
    `VineFeedCache::load(&tempdir)`, insert descriptor + reaction +

@@ -239,13 +239,17 @@ impl VineFeedCache {
         // on insert, but persisted state from a future version with a
         // higher cap could exceed ours).
         if descriptors.len() > MAX_DESCRIPTORS {
-            // Sort by created_at DESC, ties by id ASC (deterministic).
+            // Match runtime trim: sort oldest-first by created_at ASC,
+            // ties by id ASC, drop from the front. Symmetric with the
+            // runtime path in on_descriptor_sample so a restart retains
+            // exactly the same descriptor set as live mutation would.
             descriptors.sort_by(|a, b| {
-                b.created_at
-                    .cmp(&a.created_at)
+                a.created_at
+                    .cmp(&b.created_at)
                     .then_with(|| a.id.cmp(&b.id))
             });
-            descriptors.truncate(MAX_DESCRIPTORS);
+            let drop_count = descriptors.len() - MAX_DESCRIPTORS;
+            descriptors.drain(0..drop_count);
         }
 
         // Build the surviving vine-id set for orphan-pruning reactions.
@@ -1654,6 +1658,108 @@ mod tests {
         assert!(
             !ids.contains("too-old"),
             "descriptor past the 90-day window must be DROPPED (< cutoff)"
+        );
+    }
+
+    #[test]
+    fn load_and_runtime_capacity_trim_use_same_tiebreak() {
+        // Cross-replica determinism: when multiple descriptors share a
+        // created_at and the cap is exceeded, LOAD and RUNTIME must both
+        // retain the same set. Without symmetric tiebreaks, a restart
+        // could retain a different subset than live mutation would.
+        //
+        // Strategy: build a state with MAX_DESCRIPTORS + 1 descriptors
+        // all sharing the same created_at, and unique ids "a", "b", ...
+        // Both code paths should drop the SAME id.
+
+        // === Phase 1: RUNTIME path ===
+        let mut runtime_cache = VineFeedCache::new();
+        let followed = followed_set_with(&["alice-addr"]);
+        // Use a timestamp well inside the 90-day window so the load-path
+        // age filter does not silently discard everything before
+        // capacity-trim has a chance to run.
+        let shared_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_sub(MAX_AGE_SECS)
+            .saturating_add(86_400); // 1 day inside the window
+        let total = MAX_DESCRIPTORS + 1;
+        for i in 0..total {
+            // Fixed-width zero-padded ids so lexicographic ordering
+            // matches numerical ordering.
+            let id = format!("v-{i:08}");
+            let payload = canonical_descriptor_bytes(
+                &id,
+                "alice-addr",
+                "Alice",
+                "cid",
+                None,
+                None,
+                shared_ts,
+            );
+            runtime_cache.on_descriptor_sample("harmony/vines/alice-addr", &payload, &followed, 0);
+        }
+        // The runtime trim should have dropped exactly one descriptor.
+        assert_eq!(runtime_cache.len_descriptors(), MAX_DESCRIPTORS);
+        let runtime_ids: HashSet<String> = runtime_cache
+            .list_descriptors()
+            .iter()
+            .map(|d| d.id.clone())
+            .collect();
+
+        // === Phase 2: LOAD path ===
+        // Construct the same input as an on-disk envelope, load it.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mut disk_descriptors = Vec::with_capacity(total);
+        for i in 0..total {
+            let id = format!("v-{i:08}");
+            disk_descriptors.push(serde_json::json!({
+                "id": id,
+                "creatorAddress": "alice-addr",
+                "creatorName": "Alice",
+                "createdAt": shared_ts,
+                "videoCid": "cid",
+                "receivedAtMs": 0,
+                "source": "followed",
+            }));
+        }
+        let disk = serde_json::json!({
+            "version": FILE_VERSION,
+            "descriptors": disk_descriptors,
+            "reactions": [],
+            "viewed": []
+        });
+        std::fs::write(
+            dir.path().join(VINE_FEED_FILE),
+            serde_json::to_vec_pretty(&disk).unwrap(),
+        )
+        .unwrap();
+
+        let load_cache = VineFeedCache::load(dir.path());
+        assert_eq!(load_cache.len_descriptors(), MAX_DESCRIPTORS);
+        let load_ids: HashSet<String> = load_cache
+            .list_descriptors()
+            .iter()
+            .map(|d| d.id.clone())
+            .collect();
+
+        // === Phase 3: assert the two retained sets match ===
+        assert_eq!(
+            runtime_ids, load_ids,
+            "load and runtime capacity-trim must retain the same descriptor set on ties"
+        );
+
+        // Also verify the specific dropped id is the lexicographically
+        // smallest one (defensive: locks in the actual tiebreak direction).
+        let dropped = format!("v-{:08}", 0); // "v-00000000"
+        assert!(
+            !runtime_ids.contains(&dropped),
+            "runtime should drop the smallest id on tie; got: {runtime_ids:?}"
+        );
+        assert!(
+            !load_ids.contains(&dropped),
+            "load should drop the smallest id on tie; got: {load_ids:?}"
         );
     }
 }
