@@ -358,12 +358,6 @@
     margin: 0 0 4px;
   }
 
-  .reshare-label {
-    color: var(--text-muted);
-    font-size: 0.8rem;
-    margin: 0;
-  }
-
   .attribution-link {
     background: none;
     border: none;
