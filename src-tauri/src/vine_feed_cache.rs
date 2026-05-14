@@ -35,8 +35,6 @@ const FILE_VERSION: u32 = 1;
 /// On-disk envelope. Versioned at the top level for forward-compat.
 /// `version != 1` on `load()` causes the file to be ignored (treat as
 /// missing). v1 is the only version that exists today.
-#[allow(dead_code)]
-// save() (dead) serializes this; Task 3 will deserialize on load. Remove when save() is wired in Task 4.
 #[derive(Debug, Serialize, Deserialize)]
 struct VineFeedDiskV1 {
     version: u32,
@@ -47,7 +45,6 @@ struct VineFeedDiskV1 {
 
 /// On-disk descriptor row. Mirrors the in-memory `CachedVine` plus the
 /// `source` tag (decided at first arrival; preserved across reloads).
-#[allow(dead_code)] // Deserialize path used by ZEB-147 Task 3 (load)
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DescriptorOnDisk {
@@ -66,7 +63,6 @@ struct DescriptorOnDisk {
 
 /// On-disk reaction row. Flat — `vine_id` and `reactor_address` join
 /// back to the in-memory `HashMap<(String, String), CachedReaction>` key.
-#[allow(dead_code)] // Deserialize path used by ZEB-147 Task 3 (load)
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReactionOnDisk {
@@ -182,16 +178,117 @@ impl VineFeedCache {
 
     /// Load from `data_dir/vine_feed.json`. Returns an empty cache (with
     /// `path` set so subsequent mutations persist) when the file is
-    /// missing or unreadable.
-    ///
-    /// ZEB-147 Task 3 will add the actual file IO + age-prune + capacity-trim.
-    /// For Task 1, this is a stub that just sets `path` so the rest of
-    /// the API can be built against it.
+    /// missing, unreadable, malformed JSON, or has an unrecognized
+    /// `version`. Applies the age cutoff and capacity cap on load so
+    /// the in-memory state mirrors what `on_descriptor_sample` would
+    /// enforce going forward.
     pub fn load(data_dir: &Path) -> Self {
-        Self {
-            path: Some(data_dir.join(VINE_FEED_FILE)),
-            ..Default::default()
+        let path = data_dir.join(VINE_FEED_FILE);
+        let mut cache = Self {
+            descriptors: HashMap::new(),
+            reactions: HashMap::new(),
+            viewed: HashSet::new(),
+            path: Some(path.clone()),
+        };
+        Self::populate_from_disk(&mut cache, &path);
+        cache
+    }
+
+    /// Read `path` (if it exists) and populate `cache`. Errors / version
+    /// mismatch / malformed JSON all silently produce an empty cache —
+    /// matches `follows.rs::FollowManager::load`'s graceful-degrade.
+    fn populate_from_disk(cache: &mut Self, path: &Path) {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => return, // file missing or unreadable — treat as empty
+        };
+        let file: VineFeedDiskV1 = match serde_json::from_slice(&bytes) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    "vine_feed_cache: load() ignoring malformed vine_feed.json",
+                );
+                return;
+            }
+        };
+        if file.version != FILE_VERSION {
+            tracing::warn!(
+                version = file.version,
+                expected = FILE_VERSION,
+                "vine_feed_cache: load() ignoring vine_feed.json with unexpected version",
+            );
+            return;
         }
+
+        // Age-prune (one-shot on load).
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let age_cutoff = now_secs.saturating_sub(MAX_AGE_SECS);
+        let mut descriptors: Vec<DescriptorOnDisk> = file
+            .descriptors
+            .into_iter()
+            .filter(|d| d.created_at >= age_cutoff)
+            .collect();
+
+        // Capacity-trim (defensive — production write path enforces cap
+        // on insert, but persisted state from a future version with a
+        // higher cap could exceed ours).
+        if descriptors.len() > MAX_DESCRIPTORS {
+            // Sort by created_at DESC, ties by id ASC (deterministic).
+            descriptors.sort_by(|a, b| {
+                b.created_at
+                    .cmp(&a.created_at)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            descriptors.truncate(MAX_DESCRIPTORS);
+        }
+
+        // Build the surviving vine-id set for orphan-pruning reactions.
+        let surviving_ids: HashSet<String> = descriptors.iter().map(|d| d.id.clone()).collect();
+
+        // Reactions: drop orphans (where the parent descriptor was pruned).
+        for r in file.reactions {
+            if !surviving_ids.contains(&r.vine_id) {
+                continue;
+            }
+            cache.reactions.insert(
+                (r.vine_id, r.reactor_address),
+                CachedReaction {
+                    liked: r.liked,
+                    timestamp: r.timestamp,
+                    reactor_name: r.reactor_name,
+                },
+            );
+        }
+
+        // Descriptors: populate the cache from the (possibly pruned) list.
+        for d in descriptors {
+            let descriptor = VineDescriptorPayload {
+                id: d.id.clone(),
+                creator_address: d.creator_address,
+                creator_name: d.creator_name,
+                created_at: d.created_at,
+                video_cid: d.video_cid,
+                title: d.title,
+                reshare_of: d.reshare_of,
+            };
+            cache.descriptors.insert(
+                d.id,
+                CachedVine {
+                    descriptor,
+                    received_at_ms: d.received_at_ms,
+                    source: d.source,
+                },
+            );
+        }
+
+        // Viewed: passes through unmodified (low byte cost; not pruned
+        // even when the associated descriptor age-prunes — see spec §11
+        // out-of-scope on viewed-set GC).
+        cache.viewed = file.viewed.into_iter().collect();
     }
 
     /// Parse + insert a vine descriptor.
@@ -1008,6 +1105,96 @@ mod tests {
         assert_eq!(cache.len_descriptors(), 0);
         assert_eq!(cache.len_reactions(), 0);
         assert!(!cache.is_viewed("anything"));
+    }
+
+    #[test]
+    fn load_round_trip_preserves_descriptors_reactions_viewed() {
+        // Use a created_at that won't be age-pruned on reload.
+        // now_secs - 1 is always within the 90-day window.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let recent_created_at = now_secs - 1;
+
+        // Phase 1: build + save state
+        let dir = tempfile::tempdir().expect("create tempdir");
+        {
+            let mut cache = VineFeedCache::load(dir.path());
+            let followed = followed_set_with(&["alice-addr"]);
+            let desc = canonical_descriptor_bytes(
+                "vine-rt",
+                "alice-addr",
+                "Alice",
+                "cid-x",
+                Some("title-x"),
+                None,
+                recent_created_at,
+            );
+            let out =
+                cache.on_descriptor_sample("harmony/vines/alice-addr", &desc, &followed, 1_000);
+            assert!(matches!(out, Some(DescriptorOutcome::Inserted { .. })));
+
+            let react =
+                canonical_reaction_bytes("vine-rt", "bob-addr", "Bob", true, recent_created_at + 1);
+            let out2 = cache.on_reaction_sample(
+                "harmony/vines/alice-addr/reactions/vine-rt/bob-addr",
+                &react,
+            );
+            assert_eq!(out2, Some(ReactionOutcome::Inserted));
+
+            assert!(cache.mark_viewed("vine-rt".to_string()));
+            cache.save_for_test();
+        }
+        // Phase 2: reload from same dir, assert state survived
+        let cache2 = VineFeedCache::load(dir.path());
+        assert_eq!(cache2.len_descriptors(), 1);
+        assert_eq!(cache2.len_reactions(), 1);
+        assert!(cache2.is_viewed("vine-rt"));
+
+        // Verify DTO is correctly reconstructed
+        let dtos = cache2.list_descriptors();
+        assert_eq!(dtos.len(), 1);
+        assert_eq!(dtos[0].id, "vine-rt");
+        assert_eq!(dtos[0].creator_address, "alice-addr");
+        assert_eq!(dtos[0].title.as_deref(), Some("title-x"));
+        assert!(dtos[0].viewed);
+
+        // Verify reaction is correctly reconstructed (count + liked_by_me)
+        let summary = cache2.get_reaction("vine-rt", "bob-addr");
+        assert_eq!(summary.count, 1);
+        assert!(summary.liked_by_me);
+    }
+
+    #[test]
+    fn load_rejects_wrong_version() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join(VINE_FEED_FILE);
+        // Write a v999 envelope
+        let json = serde_json::json!({
+            "version": 999,
+            "descriptors": [],
+            "reactions": [],
+            "viewed": ["v-ignored"]
+        });
+        std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+
+        // load() must treat wrong-version as "missing file" — empty cache
+        let cache = VineFeedCache::load(dir.path());
+        assert_eq!(cache.len_descriptors(), 0);
+        assert_eq!(cache.len_reactions(), 0);
+        assert!(!cache.is_viewed("v-ignored"));
+    }
+
+    #[test]
+    fn load_corrupt_json_returns_empty_cache() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join(VINE_FEED_FILE);
+        std::fs::write(&path, b"{ this is not valid json").unwrap();
+
+        let cache = VineFeedCache::load(dir.path());
+        assert_eq!(cache.len_descriptors(), 0);
+        assert_eq!(cache.len_reactions(), 0);
     }
 
     #[test]
