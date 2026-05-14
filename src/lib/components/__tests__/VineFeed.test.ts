@@ -1,4 +1,4 @@
-import { render, screen, fireEvent } from '@testing-library/svelte';
+import { render, screen, fireEvent, within } from '@testing-library/svelte';
 import { describe, it, expect, vi } from 'vitest';
 import VineFeed from '../VineFeed.svelte';
 import type { VineVideo } from '../../types';
@@ -293,11 +293,13 @@ describe('VineFeed', () => {
     // Open the player by clicking the card
     await fireEvent.click(screen.getByLabelText(/Untitled vine by Alice/));
     // Player exposes its own attribution button — there will be two matches now
-    // (one on the card behind, one in the dialog). Pick the one inside the dialog.
+    // (one on the card behind, one in the dialog). Scope to the dialog with
+    // `within` so the lookup throws on absence rather than returning null.
     const dialog = screen.getByRole('dialog', { name: 'Vine player' });
-    const playerLink = dialog.querySelector('button[aria-label*="originally by PlayerOrig"]');
-    expect(playerLink).toBeTruthy();
-    await fireEvent.click(playerLink as HTMLButtonElement);
+    const playerLink = within(dialog).getByRole('button', {
+      name: /originally by PlayerOrig/i,
+    });
+    await fireEvent.click(playerLink);
     expect(onViewOriginal).toHaveBeenCalledWith('orig-2');
   });
 });
