@@ -121,6 +121,30 @@ describe('VinePlayer', () => {
     expect(screen.getByLabelText('Reshare vine')).toBeTruthy();
   });
 
+  it('hides Reshare button when creatorAddress matches ownAddress (hex form, no "self" remap yet)', () => {
+    // FIX 2 (PR #120 round 1): vines that arrive on the wire before
+    // `vineService.ownAddress` is set don't get remapped to the magic
+    // `'self'` value by `wireToVine`. Without the ownAddress prop, the
+    // 'self'-only check missed those vines, and the Reshare button
+    // showed — letting the user accidentally self-reshare via the
+    // bot-discovered-then-removed publish() guard.
+    const myAddress = '0xabcdef0123';
+    const ownHexOriginal: VineVideo = {
+      ...vine,
+      creatorAddress: myAddress,
+      reshareOf: undefined,
+    };
+    render(VinePlayer, {
+      props: {
+        vine: ownHexOriginal,
+        onClose: vi.fn(),
+        onReshare: vi.fn(),
+        ownAddress: myAddress,
+      },
+    });
+    expect(screen.queryByLabelText('Reshare vine')).toBeNull();
+  });
+
   it('calls onClose when close button is clicked', async () => {
     const onClose = vi.fn();
     render(VinePlayer, { props: { vine, onClose } });

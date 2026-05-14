@@ -5,7 +5,7 @@
   import ReshareConfirmDialog from './ReshareConfirmDialog.svelte';
   import { relativeTime } from '../file-utils';
 
-  let { vine, onClose, onNext, onPrevious, onReshare, resolveVideo, onToggleLike, reactionCount = 0, likedByMe = false, onViewOriginal }: {
+  let { vine, onClose, onNext, onPrevious, onReshare, resolveVideo, onToggleLike, reactionCount = 0, likedByMe = false, onViewOriginal, ownAddress }: {
     vine: VineVideo;
     onClose: () => void;
     onNext?: () => void;
@@ -16,6 +16,16 @@
     reactionCount?: number;
     likedByMe?: boolean;
     onViewOriginal?: (vineId: string) => void;
+    /**
+     * Local node's hex address — when supplied, hex-keyed self-authored
+     * vines (those whose `creatorAddress` matches `ownAddress` but
+     * weren't remapped to the magic `'self'` value by `wireToVine`,
+     * typically because they arrived before `ownAddress` was set on
+     * the service) also hide the Reshare button. Without this prop,
+     * the `'self'` magic value is the only signal — see FIX 2 in
+     * PR #120 round 1.
+     */
+    ownAddress?: string;
   } = $props();
 
   let overlayEl: HTMLDivElement;
@@ -24,7 +34,12 @@
   let reshareGeneration = 0;
   let showReshareConfirm = $state(false);
 
-  let isOwnOriginal = $derived(vine.creatorAddress === 'self' && !vine.reshareOf);
+  let isOwnOriginal = $derived(
+    !vine.reshareOf && (
+      vine.creatorAddress === 'self'
+      || (ownAddress != null && vine.creatorAddress === ownAddress)
+    )
+  );
   let canReshare = $derived(!!onReshare && !isOwnOriginal);
 
   // ── Video resolution state ──────────────────────────────────────────

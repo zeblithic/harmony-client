@@ -1411,6 +1411,7 @@
       playTarget={viewOriginalTarget}
       onPlayTargetConsumed={() => { viewOriginalTarget = null; }}
       resolveVideo={resolveVideoFn}
+      ownAddress={myAddress || undefined}
     />
     {#if showVinePublish}
       <VinePublishDialog onPublish={handleVinePublish} onClose={() => showVinePublish = false} />

@@ -25,6 +25,7 @@
     onViewOriginal,
     playTarget = null,
     onPlayTargetConsumed,
+    ownAddress,
   }: {
     followedVines?: VineVideo[];
     discoverVines?: VineVideo[];
@@ -56,6 +57,14 @@
      */
     playTarget?: VineVideo | null;
     onPlayTargetConsumed?: () => void;
+    /**
+     * Local node's hex address. Forwarded to VinePlayer so it can
+     * suppress the Reshare button on self-authored vines that arrived
+     * before `vineService.ownAddress` was set (and so weren't remapped
+     * to the magic `'self'` value by `wireToVine`). See FIX 2 in
+     * PR #120 round 1.
+     */
+    ownAddress?: string;
   } = $props();
 
   let activeVine = $state<VineVideo | null>(null);
@@ -208,6 +217,7 @@
     likedByMe={getReaction?.(activeVine.id)?.likedByMe ?? false}
     {onToggleLike}
     {onViewOriginal}
+    {ownAddress}
   />
 {/if}
 
