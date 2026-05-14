@@ -319,6 +319,24 @@ export class CommunityService {
     return this.knownKinds.get(communityId) ?? 'unknown';
   }
 
+  /**
+   * ZEB-285 Phase 1 Task 10: fetch fork lineage metadata for the Settings panel.
+   * Returns null when the community is not a fork (no pre_fork_snapshot.bin).
+   * Mirrors the `CommunityLineageDto` returned by the `get_community_lineage` IPC.
+   */
+  async getCommunityLineage(communityId: string): Promise<{
+    originalCommunityName: string;
+    forkedAtMs: number;
+    snapshotMessageCount: number;
+  } | null> {
+    const dto = await this.invoke<{
+      originalCommunityName: string;
+      forkedAtMs: number;
+      snapshotMessageCount: number;
+    } | null>('get_community_lineage', { communityId });
+    return dto ?? null;
+  }
+
   destroy(): void {
     for (const fn of this.unlisteners) fn();
     this.unlisteners = [];

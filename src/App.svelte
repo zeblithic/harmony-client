@@ -1272,6 +1272,11 @@
         {communityService}
         {channelMessageService}
         {trustService}
+        {navService}
+        onForkSuccess={(forkSpaceId) => {
+          // ZEB-285: navigate to the newly created fork community.
+          changeSelectedCommunity(forkSpaceId);
+        }}
         onKickMember={async (target) => {
           if (!selectedCommunityId) return;
           try {

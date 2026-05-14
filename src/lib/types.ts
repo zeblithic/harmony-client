@@ -110,6 +110,9 @@ export interface NavNode {
   unreadLevel: UnreadLevel;
   lastActivity?: number;
   peer?: Peer;
+  /** ZEB-285: hex SpaceId of the original community this node was forked from.
+   *  Present only for community nodes created via fork_community. */
+  forkedFrom?: string;
 }
 
 /** Mirrors harmony-content VineDescriptor on the TypeScript side. */

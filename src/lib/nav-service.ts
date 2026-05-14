@@ -19,6 +19,8 @@ export interface NavUpdatedPayload {
   name: string;
   members?: string[];
   parentId?: string | null;
+  /** ZEB-285: hex SpaceId of the original community, present only for forked communities. */
+  forkedFrom?: string;
 }
 
 /**
@@ -171,7 +173,7 @@ export class NavService {
    * Phase 5 (ZEB-263) extends this to handle `community` kind.
    */
   addOrUpdateNavSpace(payload: NavUpdatedPayload): void {
-    const { action, spaceId, kind, name, members, parentId } = payload;
+    const { action, spaceId, kind, name, members, parentId, forkedFrom } = payload;
 
     if (kind === 'community') {
       if (action === 'removed') {
@@ -190,6 +192,9 @@ export class NavService {
         unreadCount: 0,
         unreadLevel: 'none',
         peer: undefined,
+        // ZEB-285: carry fork lineage through to the NavNode so the
+        // nav-tree can render the ↳ glyph + tooltip.
+        forkedFrom,
       };
 
       if (action === 'added') {
@@ -197,6 +202,8 @@ export class NavService {
         if (existing) {
           // Preserve user-applied state on duplicate add (cold-replay):
           // parentId (folder placement), expanded, and unread counters.
+          // Preserve forkedFrom from the new payload if provided (a
+          // cold-replay "added" for a fork should carry lineage).
           this.nodes = this.nodes.map((n) =>
             n.id === spaceId
               ? {
@@ -205,6 +212,7 @@ export class NavService {
                   expanded: existing.expanded,
                   unreadCount: existing.unreadCount,
                   unreadLevel: existing.unreadLevel,
+                  forkedFrom: forkedFrom ?? existing.forkedFrom,
                 }
               : n
           );
@@ -216,7 +224,8 @@ export class NavService {
         this.nodes = this.nodes.map((n) => {
           if (n.id !== spaceId) return n;
           found = true;
-          return { ...n, name }; // preserve existing parentId/expanded/unread state
+          // Preserve existing forkedFrom unless the payload supplies one.
+          return { ...n, name, forkedFrom: forkedFrom ?? n.forkedFrom };
         });
         if (!found) this.nodes = [...this.nodes, newNode];
       }
@@ -315,6 +324,18 @@ export class NavService {
       }
     }
     this.onChange?.();
+  }
+
+  /**
+   * ZEB-285: resolve the display name of a fork's parent community for
+   * the fork-glyph tooltip. Returns the parent's name if the user is
+   * still a member of the original (i.e. the original's NavNode is
+   * present in this.nodes), or null if the parent isn't in the nav
+   * (e.g. the user left the original via `also_leave` at fork time).
+   */
+  resolveForkParentName(originalId: string): string | null {
+    const node = this.nodes.find((n) => n.id === originalId);
+    return node?.name ?? null;
   }
 
   /** Look up a peer's status text by address. */

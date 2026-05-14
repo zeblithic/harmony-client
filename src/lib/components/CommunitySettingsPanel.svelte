@@ -5,9 +5,10 @@
   import SetPowerDialog from './SetPowerDialog.svelte';
   import LastAdminWarningDialog from './LastAdminWarningDialog.svelte';
   import InviteLinkManager from './InviteLinkManager.svelte';
+  import ForkConfirmDialog from './ForkConfirmDialog.svelte';
 
   let {
-    communityId: _communityId,
+    communityId,
     communityName,
     communityKind,
     members,
@@ -22,6 +23,8 @@
     onLeave,
     onGenerateInvite,
     onOpenMembersPanel,
+    onFork,
+    lineage,
   }: {
     communityId: string;
     communityName: string;
@@ -42,10 +45,23 @@
      *  moderation history). Callers that don't yet thread through communityService
      *  can omit this to keep the inline member list. */
     onOpenMembersPanel?: () => void;
+    /** ZEB-285: if provided, the "Fork this community" button is wired to this
+     *  callback which handles the actual IPC call + nav transition. */
+    onFork?: (opts: { name: string; silent: boolean; alsoLeave: boolean }) => Promise<void>;
+    /** ZEB-285: fork lineage metadata — present when this community was forked
+     *  from another. Populated by the caller via get_community_lineage IPC. */
+    lineage?: {
+      originalCommunityName: string | null;
+      forkedAtMs: number;
+      snapshotMessageCount: number;
+    } | null;
   } = $props();
 
   let kickTarget = $state<CommunityMember | null>(null);
   let setPowerTarget = $state<CommunityMember | null>(null);
+  // ZEB-285: fork dialog state
+  let forkDialogOpen = $state(false);
+  let forkError = $state<string | null>(null);
   // Holds an admin-threshold-crossing power change pending tier-2
   // confirmation. Populated by SetPowerDialog onSubmit when the new
   // power crosses POWER_THRESHOLDS.setPower in either direction; the
@@ -247,6 +263,35 @@
       </div>
     {/if}
 
+    {#if lineage}
+      <div class="section">
+        <div class="section-label">Lineage</div>
+        <dl class="lineage-grid">
+          <dt>Forked from</dt>
+          <dd>{lineage.originalCommunityName ?? 'another community'}</dd>
+          <dt>Forked at</dt>
+          <dd>{new Date(lineage.forkedAtMs).toUTCString()}</dd>
+          <dt>Snapshot</dt>
+          <dd>{lineage.snapshotMessageCount} messages bundled</dd>
+        </dl>
+      </div>
+    {/if}
+
+    {#if onFork}
+      <div class="section">
+        <div class="section-label">Fork</div>
+        <button class="fork-btn" onclick={() => { forkDialogOpen = true; forkError = null; }}>
+          Fork this community
+        </button>
+        <p class="toggle-help">
+          Creates a new community with a frozen copy of the history you can see here.
+        </p>
+        {#if forkError}
+          <p class="fork-error">{forkError}</p>
+        {/if}
+      </div>
+    {/if}
+
     <div class="section">
       <div class="section-label">Danger zone</div>
       <button class="leave-btn" onclick={() => {
@@ -321,6 +366,23 @@
     danger={true}
     onConfirm={() => { onLeave(); leaveOpen = false; }}
     onCancel={() => (leaveOpen = false)}
+  />
+{/if}
+
+{#if forkDialogOpen && onFork}
+  <ForkConfirmDialog
+    originalName={communityName}
+    messageCount={lineage?.snapshotMessageCount ?? 0}
+    onConfirm={async (opts) => {
+      try {
+        await onFork(opts);
+        forkDialogOpen = false;
+        forkError = null;
+      } catch (e) {
+        forkError = e instanceof Error ? e.message : String(e);
+      }
+    }}
+    onCancel={() => { forkDialogOpen = false; forkError = null; }}
   />
 {/if}
 
@@ -506,5 +568,41 @@
     font-size: 0.7rem;
     color: var(--text-secondary);
     margin: 4px 0 0;
+  }
+  .lineage-grid {
+    display: grid;
+    grid-template-columns: 120px 1fr;
+    gap: 8px 16px;
+    font-size: 0.8rem;
+    margin: 0;
+  }
+  .lineage-grid dt {
+    color: var(--text-secondary);
+  }
+  .lineage-grid dd {
+    color: var(--text-primary);
+    margin: 0;
+  }
+  .fork-btn {
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    padding: 6px 14px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.8rem;
+  }
+  .fork-btn:hover {
+    color: var(--text-primary);
+    border-color: var(--accent, #5865f2);
+  }
+  .fork-btn:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 1px;
+  }
+  .fork-error {
+    font-size: 0.7rem;
+    color: #cc7a7a;
+    margin: 8px 0 0;
   }
 </style>

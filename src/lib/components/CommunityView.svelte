@@ -4,6 +4,7 @@
   import type { ChannelMessageService } from '../channel-message-service';
   import type { CommunityMember } from '../types';
   import type { TrustService } from '../trust-service';
+  import type { NavService } from '../nav-service';
   import ChannelSubSidebar from './ChannelSubSidebar.svelte';
   import ChannelMessageFeed from './ChannelMessageFeed.svelte';
   import ChannelMembersPanel from './ChannelMembersPanel.svelte';
@@ -25,11 +26,13 @@
     communityService,
     channelMessageService,
     trustService,
+    navService,
     onLeave,
     onKickMember,
     onSetPowerLevel,
     onGenerateInvite,
     onToggleSharedInProfile,
+    onForkSuccess,
   }: {
     communityId: string;
     communityName: string;
@@ -42,11 +45,15 @@
     communityService: CommunityService;
     channelMessageService: ChannelMessageService;
     trustService?: TrustService;
+    /** ZEB-285: NavService ref for fork-parent name resolution in the Lineage block. */
+    navService?: NavService;
     onLeave: () => Promise<void>;
     onKickMember: (addr: string) => Promise<void>;
     onSetPowerLevel: (addr: string, power: number) => Promise<void>;
     onGenerateInvite: () => Promise<string>;
     onToggleSharedInProfile: (shared: boolean) => Promise<void>;
+    /** ZEB-285: called after a successful fork with the new fork community ID. */
+    onForkSuccess?: (forkSpaceId: string) => void;
   } = $props();
 
   let channels = $state<ChannelInfo[]>([]);
@@ -58,6 +65,12 @@
   let deleteConfirmChannel = $state<ChannelInfo | null>(null);
   let membersPanelCollapsed = $state(false);
   let prevOnChannelConfigChanged: typeof communityService.onChannelConfigChanged;
+  // ZEB-285: fork lineage — loaded lazily when the settings modal first opens.
+  let lineage = $state<{
+    originalCommunityName: string | null;
+    forkedAtMs: number;
+    snapshotMessageCount: number;
+  } | null | undefined>(undefined); // undefined = not yet fetched
 
   let activeChannel = $derived(channels.find((c) => c.channelId === activeChannelId) ?? null);
 
@@ -188,7 +201,25 @@
         type="button"
         class="settings-btn"
         aria-label="Open community settings"
-        onclick={() => { settingsModalOpen = true; }}
+        onclick={() => {
+          settingsModalOpen = true;
+          // ZEB-285: lazily load lineage metadata on first open (or when community changes).
+          if (lineage === undefined) {
+            void communityService.getCommunityLineage(communityId).then((dto) => {
+              if (dto === null) {
+                lineage = null; // not a fork
+              } else {
+                lineage = {
+                  originalCommunityName: dto.originalCommunityName,
+                  forkedAtMs: dto.forkedAtMs,
+                  snapshotMessageCount: dto.snapshotMessageCount,
+                };
+              }
+            }).catch(() => {
+              lineage = null; // on error, hide lineage block
+            });
+          }
+        }}
       >⚙️</button>
     </div>
   </header>
@@ -250,6 +281,22 @@
     onLeave={onLeave}
     onGenerateInvite={onGenerateInvite}
     onOpenMembersPanel={() => { communityMembersPanelOpen = true; }}
+    lineage={lineage ?? null}
+    onFork={async (opts) => {
+      const result = await communityService.forkCommunity(communityId, opts);
+      // Add the fork to the nav tree with forkedFrom lineage.
+      navService?.addOrUpdateNavSpace({
+        action: 'added',
+        spaceId: result.forkSpaceId,
+        kind: 'community',
+        name: opts.name,
+        members: [],
+        parentId: null,
+        forkedFrom: communityId,
+      });
+      settingsModalOpen = false;
+      onForkSuccess?.(result.forkSpaceId);
+    }}
   />
 {/if}
 

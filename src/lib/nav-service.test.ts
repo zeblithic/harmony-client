@@ -575,3 +575,24 @@ describe('NavService mock-clear policy (ZEB-209)', () => {
     nav.destroy();
   });
 });
+
+describe('NavService.resolveForkParentName (ZEB-285)', () => {
+  it('returns parent community name when forker is still a member', () => {
+    const svc = new NavService();
+    // Replace mock-seeded nodes with controlled fixture.
+    svc.nodes = [
+      { id: 'original-id', name: 'Cool Community', type: 'community', parentId: null, expanded: true, unreadCount: 0, unreadLevel: 'none' },
+      { id: 'fork-id', name: 'Cool Community (fork)', type: 'community', parentId: null, expanded: true, unreadCount: 0, unreadLevel: 'none', forkedFrom: 'original-id' },
+    ];
+    expect(svc.resolveForkParentName('original-id')).toBe('Cool Community');
+  });
+
+  it('returns null when forker is no longer a member of the original', () => {
+    const svc = new NavService();
+    // Only the fork is present — user left the original (alsoLeave=true).
+    svc.nodes = [
+      { id: 'fork-id', name: 'Cool Community (fork)', type: 'community', parentId: null, expanded: true, unreadCount: 0, unreadLevel: 'none', forkedFrom: 'original-id' },
+    ];
+    expect(svc.resolveForkParentName('original-id')).toBe(null);
+  });
+});

@@ -11467,6 +11467,65 @@ mod library_directory_lww_tests {
 /// Mints a self-Leave event, looks up the per-community engine via
 /// `community_registry.engine_arc`, and inserts the event through
 /// `engine.insert_local_event` so the debounced publish loop pushes
+/// ZEB-285 Phase 1 Task 10: read fork lineage metadata for the Settings panel.
+///
+/// Returns `Some(CommunityLineageDto)` when `pre_fork_snapshot.bin` exists
+/// in the community's data directory, `None` when the community is not a fork
+/// (file absent). Reads and decodes the snapshot on every call — suitable for
+/// the settings panel (opened rarely) but callers should not call this in a
+/// hot path. The full snapshot body (channel events) is decoded then dropped;
+/// only the lightweight header fields are returned.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommunityLineageDto {
+    /// Display name of the original community at fork time.
+    pub original_community_name: String,
+    /// Wall-clock milliseconds from the forked_at HLC.
+    pub forked_at_ms: u64,
+    /// Total message count captured in the snapshot (after §4.2 trim).
+    pub snapshot_message_count: usize,
+}
+
+#[tauri::command]
+async fn get_community_lineage(
+    community_id: String,
+) -> Result<Option<CommunityLineageDto>, String> {
+    let identity_dir = crate::owner_commands::resolve_identity_dir()
+        .map_err(|e| format!("get_community_lineage: resolve identity_dir: {e}"))?;
+    let snapshot_path = identity_dir
+        .join("communities")
+        .join(&community_id)
+        .join("pre_fork_snapshot.bin");
+
+    let bytes = match std::fs::read(&snapshot_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(format!(
+                "get_community_lineage: read pre_fork_snapshot.bin: {e}"
+            ))
+        }
+    };
+
+    let snapshot = crate::owner_state_crypto::canonical_cbor_decode::<
+        crate::community_invite::PreForkSnapshot,
+    >(&bytes)
+    .map_err(|e| format!("get_community_lineage: decode snapshot: {e}"))?;
+
+    let snapshot_message_count: usize = snapshot
+        .channel_log
+        .per_channel
+        .values()
+        .map(|v| v.len())
+        .sum();
+
+    Ok(Some(CommunityLineageDto {
+        original_community_name: snapshot.original_community_name,
+        forked_at_ms: snapshot.forked_at.wall_ms,
+        snapshot_message_count,
+    }))
+}
+
 /// it to peers. Advances the local HLC tracker on success.
 ///
 /// Owner-state Space NOT mutated (per spec line 514): the Space row
@@ -13763,6 +13822,7 @@ pub fn run() {
             leave_community,
             kick_from_community,
             community_fork::fork_community,
+            get_community_lineage,
             set_power_level,
             unban_from_community,
             list_recent_moderation_events,
