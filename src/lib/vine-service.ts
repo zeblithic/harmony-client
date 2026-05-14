@@ -11,6 +11,10 @@ export interface VineDescriptorEvent {
   videoCid: string;
   title?: string;
   reshareOf?: string;
+  /** See VineVideo.originalCreatorAddress. */
+  originalCreatorAddress?: string;
+  /** See VineVideo.originalCreatorName. */
+  originalCreatorName?: string;
   source?: 'followed' | 'discover';
 }
 
@@ -126,11 +130,20 @@ export class VineService {
     videoCid: string,
     title?: string,
     reshareOf?: string,
+    originalCreatorAddress?: string,
+    originalCreatorName?: string,
   ): Promise<void> {
     if (this.adapter) {
       try {
         await this.adapter.invoke('publish_vine', {
-          vine: { videoCid, title, reshareOf, creatorName: this.ownDisplayName },
+          vine: {
+            videoCid,
+            title,
+            reshareOf,
+            creatorName: this.ownDisplayName,
+            originalCreatorAddress,
+            originalCreatorName,
+          },
         });
         return; // Backend will echo via subscription → vine-received event
       } catch (err: unknown) {
@@ -154,6 +167,8 @@ export class VineService {
       videoCid,
       title,
       reshareOf,
+      originalCreatorAddress,
+      originalCreatorName,
       viewed: true,
     };
     this.discoverVines = [...this.discoverVines, vine];
@@ -321,6 +336,8 @@ export class VineService {
       videoCid: wire.videoCid,
       title: wire.title,
       reshareOf: wire.reshareOf,
+      originalCreatorAddress: wire.originalCreatorAddress,
+      originalCreatorName: wire.originalCreatorName,
       viewed: isSelf,
     };
   }

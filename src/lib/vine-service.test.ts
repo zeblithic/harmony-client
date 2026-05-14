@@ -135,6 +135,25 @@ describe('VineService', () => {
     expect(vine.reshareOf).toBe('orig-1');
   });
 
+  it('preserves original creator attribution on incoming wire vines', async () => {
+    const { adapter, emit } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    emit('vine-received', {
+      id: 'vine-resh',
+      creatorAddress: 'addr-resharer',
+      creatorName: 'Resharer',
+      createdAt: 1,
+      videoCid: 'cid-r',
+      reshareOf: 'orig-1',
+      originalCreatorAddress: 'addr-original',
+      originalCreatorName: 'Original',
+    } satisfies VineDescriptorEvent);
+    const vine = svc.vines.find(v => v.id === 'vine-resh')!;
+    expect(vine.reshareOf).toBe('orig-1');
+    expect(vine.originalCreatorAddress).toBe('addr-original');
+    expect(vine.originalCreatorName).toBe('Original');
+  });
+
   // ── publish ────────────────────────────────────────────────────────
 
   it('invokes publish_vine on the adapter', async () => {
@@ -144,6 +163,37 @@ describe('VineService', () => {
     expect(adapter.invoke).toHaveBeenCalledWith('publish_vine', {
       vine: { videoCid: 'cid-pub', title: 'Title', reshareOf: 'reshare-of-1', creatorName: 'You' },
     });
+  });
+
+  it('publish forwards original creator fields to adapter', async () => {
+    const { adapter } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    await svc.publish('cid-pub', 'Title', 'reshare-of-1', 'addr-original', 'Original');
+    const publishCall = (adapter.invoke as ReturnType<typeof vi.fn>).mock.calls
+      .find(([cmd]) => cmd === 'publish_vine');
+    expect(publishCall).toBeTruthy();
+    expect(publishCall![1]).toEqual({
+      vine: {
+        videoCid: 'cid-pub',
+        title: 'Title',
+        reshareOf: 'reshare-of-1',
+        creatorName: 'You',
+        originalCreatorAddress: 'addr-original',
+        originalCreatorName: 'Original',
+      },
+    });
+  });
+
+  it('publish omits original creator fields when not provided', async () => {
+    const { adapter } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    await svc.publish('cid-pub', 'Title');
+    const publishCall = (adapter.invoke as ReturnType<typeof vi.fn>).mock.calls
+      .find(([cmd]) => cmd === 'publish_vine');
+    expect(publishCall).toBeTruthy();
+    const vine = (publishCall![1] as { vine: Record<string, unknown> }).vine;
+    expect(vine.originalCreatorAddress).toBeUndefined();
+    expect(vine.originalCreatorName).toBeUndefined();
   });
 
   it('falls back to local vine when no adapter', async () => {
