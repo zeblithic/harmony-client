@@ -758,6 +758,29 @@ pub fn decode_invite_url(url: &str) -> Result<CommunityInvitePayload, InviteUrlE
         payload.is_invite_only,
         payload.epoch_snapshot.sealed_epoch_key.len(),
     )?;
+    // ZEB-285 INVARIANT: forked_from and pre_fork_snapshot must both be
+    // Some or both be None. An invite with one set but not the other is
+    // malformed — reject it so joiners never enter a half-fork state.
+    // Additionally, when both are Some, the snapshot's original_community_id
+    // must match forked_from. (Fix: PR #122 round-2 bot review — CodeRabbit
+    // Major.)
+    match (&payload.forked_from, &payload.pre_fork_snapshot) {
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(InviteUrlError::Cbor(
+                "malformed fork-invite: forked_from and pre_fork_snapshot must both be present \
+                 or both absent"
+                    .to_string(),
+            ));
+        }
+        (Some(ff), Some(snap)) if *ff != snap.original_community_id => {
+            return Err(InviteUrlError::Cbor(
+                "malformed fork-invite: forked_from does not match \
+                 pre_fork_snapshot.original_community_id"
+                    .to_string(),
+            ));
+        }
+        _ => {} // (None, None) or matching (Some, Some) — valid
+    }
     Ok(payload)
 }
 

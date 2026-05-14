@@ -71,7 +71,11 @@ pub fn build_snapshot(
             .map(|k| capped[k].len() * SNAPSHOT_TOTAL_CAP / total)
             .collect();
 
-        // Assign remainder to the channel with the largest current slice.
+        // Assign remainder to the channel with the largest current slice,
+        // then cap that allocation at min(allocation, actual_slice_len) to
+        // prevent over-allocation when the largest-slice channel's slice is
+        // smaller than its proportional share plus the remainder.
+        // (Fix: PR #122 round-2 bot review — Cursor Low.)
         let allocated_sum: usize = allocations.iter().sum();
         let remainder = SNAPSHOT_TOTAL_CAP - allocated_sum;
         if remainder > 0 {
@@ -82,6 +86,11 @@ pub fn build_snapshot(
                 .map(|(i, _)| i)
                 .unwrap_or(0);
             allocations[max_idx] += remainder;
+            // Cap: don't allocate more than the slice actually contains.
+            let slice_len = capped[&keys[max_idx]].len();
+            if allocations[max_idx] > slice_len {
+                allocations[max_idx] = slice_len;
+            }
         }
 
         for (k, alloc) in keys.iter().zip(allocations) {
@@ -125,6 +134,7 @@ fn hlc_cmp(
 
 /// Caller-supplied options for `fork_community`.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ForkCommunityOpts {
     /// Display name for the new fork community.
     pub name: String,
@@ -140,6 +150,7 @@ pub struct ForkCommunityOpts {
 
 /// Result returned to the frontend on success.
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ForkCommunityResult {
     /// Hex-encoded SpaceId of the newly created fork community.
     pub fork_space_id: String,
@@ -290,38 +301,19 @@ pub async fn fork_community(
         (name, events, mat)
     };
 
-    // Step 2: Collect identity_pubs from the identity resolver for all
-    // signing actors in the snapshot.
-    //
+    // Step 2a: Start building the signer address set from membership events.
     // CORRECTNESS: build the signer set from membership_events, NOT from
     // materialized.members. The bootstrap admin may have no explicit Join
     // event and therefore no entry in materialized.members, but they DO sign
     // other events (e.g., Invite, Kick, SetPower). Omitting their pubkey here
     // would cause verify_snapshot_event to return UnknownSigner for any event
     // they authored. (Bot review finding: PR #122 CodeRabbit / Qodo.)
-    let resolver = community_registry.identity_resolver();
     let mut signer_addrs = std::collections::BTreeSet::new();
     for event in &original_events_vec {
         signer_addrs.insert(event.actor);
         // Also include any countersigner (invite-only Join vouchers).
         if let Some(ref cs) = event.countersig {
             signer_addrs.insert(cs.signer);
-        }
-    }
-    let mut identity_pubs: std::collections::BTreeMap<
-        crate::owner_state_types::OwnerAddr,
-        [u8; 64],
-    > = std::collections::BTreeMap::new();
-    for addr in &signer_addrs {
-        if let Some(pub64) = resolver.resolve(addr).await {
-            identity_pubs.insert(*addr, pub64);
-        } else {
-            tracing::warn!(
-                signer = %hex::encode(addr.0),
-                original_id = %hex::encode(original_id.0),
-                "fork_community: cannot resolve identity_pub for snapshot signer; \
-                 snapshot events from this actor will fail verification at display time"
-            );
         }
     }
 
@@ -348,6 +340,38 @@ pub async fn fork_community(
             if !events.is_empty() {
                 raw_channel_events.insert(*channel_id, events);
             }
+        }
+    }
+
+    // Step 2b: Extend the signer set with channel-log event authors.
+    // Channel-log events are signed by their `author` field (OwnerAddr), which
+    // may differ from membership-event actors. Without their pubkeys in
+    // identity_pubs, verify_snapshot_event would return UnknownSigner on those
+    // events. Channel events (SignedChannelEvent::Post) have no countersig.
+    // (Fix: PR #122 round-2 bot review — CodeRabbit Major.)
+    for log_events in raw_channel_events.values() {
+        for event in log_events {
+            let crate::community_channel_log::SignedChannelEvent::Post { author, .. } = event;
+            signer_addrs.insert(*author);
+        }
+    }
+
+    // Step 2c: Resolve identity_pubs for all snapshot signers.
+    let resolver = community_registry.identity_resolver();
+    let mut identity_pubs: std::collections::BTreeMap<
+        crate::owner_state_types::OwnerAddr,
+        [u8; 64],
+    > = std::collections::BTreeMap::new();
+    for addr in &signer_addrs {
+        if let Some(pub64) = resolver.resolve(addr).await {
+            identity_pubs.insert(*addr, pub64);
+        } else {
+            tracing::warn!(
+                signer = %hex::encode(addr.0),
+                original_id = %hex::encode(original_id.0),
+                "fork_community: cannot resolve identity_pub for snapshot signer; \
+                 snapshot events from this actor will fail verification at display time"
+            );
         }
     }
 
@@ -619,9 +643,10 @@ pub async fn fork_community(
         // RELIABILITY: wrap mint_fork_event in a match so a signing failure
         // after the fork is durably committed does not propagate via `?` and
         // surface as an IPC error (which would mislead the caller into thinking
-        // the fork itself failed). Warn and set visible=false instead.
-        // (Fix: PR #122 bot review.)
-        let fork_event = {
+        // the fork itself failed). Warn and set visible=false instead, then
+        // continue to the also_leave + frontend-emit steps.
+        // (Fix: PR #122 round-2 bot review — early return was wrong.)
+        let maybe_fork_event = {
             let outbox_g = dm_outbox.lock().await;
             match mint_fork_event(
                 original_id,
@@ -630,7 +655,7 @@ pub async fn fork_community(
                 outbox_g.signing_key.as_ref(),
                 fork_event_hlc,
             ) {
-                Ok(e) => e,
+                Ok(e) => Some(e),
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
@@ -640,87 +665,85 @@ pub async fn fork_community(
                          skipping Fork event publish"
                     );
                     visible = false;
-                    return Ok(ForkCommunityResult {
-                        fork_space_id: fork_space_id_hex.clone(),
-                        visible,
-                        snapshot_message_count,
-                    });
+                    None
                 }
             }
         };
 
-        // Generation + registry fence before inserting Fork event into the
-        // original engine. Extract verdict under the std lock, drop the guard,
-        // then act on the verdict. Pattern mirrors kick_from_community's
-        // post-mint fence (lib.rs:11826-11842).
-        enum ForkPublishFence {
-            Proceed,
-            GenerationChanged,
-            RegistryGone,
-        }
-        let fork_publish_fence = {
-            let g = state_lock
-                .lock()
-                .map_err(|e| format!("NodeState poisoned: {e}"))?;
-            if g.generation != snapshot_generation {
-                ForkPublishFence::GenerationChanged
-            } else if g.community_registry.is_none() {
-                ForkPublishFence::RegistryGone
-            } else {
-                ForkPublishFence::Proceed
+        if let Some(fork_event) = maybe_fork_event {
+            // Generation + registry fence before inserting Fork event into the
+            // original engine. Extract verdict under the std lock, drop the guard,
+            // then act on the verdict. Pattern mirrors kick_from_community's
+            // post-mint fence (lib.rs:11826-11842).
+            enum ForkPublishFence {
+                Proceed,
+                GenerationChanged,
+                RegistryGone,
             }
-        }; // std lock guard dropped here.
+            let fork_publish_fence = {
+                let g = state_lock
+                    .lock()
+                    .map_err(|e| format!("NodeState poisoned: {e}"))?;
+                if g.generation != snapshot_generation {
+                    ForkPublishFence::GenerationChanged
+                } else if g.community_registry.is_none() {
+                    ForkPublishFence::RegistryGone
+                } else {
+                    ForkPublishFence::Proceed
+                }
+            }; // std lock guard dropped here.
 
-        match fork_publish_fence {
-            ForkPublishFence::GenerationChanged => {
-                tracing::warn!(
-                    original_id = %hex::encode(original_id.0),
-                    fork_space_id = %fork_space_id_hex,
-                    "ZEB-285 fork_community: node generation changed before Fork event publish; skipping"
-                );
-                visible = false;
-            }
-            ForkPublishFence::RegistryGone => {
-                tracing::warn!(
-                    original_id = %hex::encode(original_id.0),
-                    fork_space_id = %fork_space_id_hex,
-                    "ZEB-285 fork_community: community_registry detached before Fork event publish; skipping"
-                );
-                visible = false;
-            }
-            ForkPublishFence::Proceed => {
-                match original_engine.insert_local_event(fork_event).await {
-                    Ok(outcome) => {
-                        if !matches!(
-                            outcome,
-                            crate::community_state_crdt::InsertOutcome::Inserted
-                                | crate::community_state_crdt::InsertOutcome::AlreadyKnown
-                        ) {
+            match fork_publish_fence {
+                ForkPublishFence::GenerationChanged => {
+                    tracing::warn!(
+                        original_id = %hex::encode(original_id.0),
+                        fork_space_id = %fork_space_id_hex,
+                        "ZEB-285 fork_community: node generation changed before Fork event publish; skipping"
+                    );
+                    visible = false;
+                }
+                ForkPublishFence::RegistryGone => {
+                    tracing::warn!(
+                        original_id = %hex::encode(original_id.0),
+                        fork_space_id = %fork_space_id_hex,
+                        "ZEB-285 fork_community: community_registry detached before Fork event publish; skipping"
+                    );
+                    visible = false;
+                }
+                ForkPublishFence::Proceed => {
+                    match original_engine.insert_local_event(fork_event).await {
+                        Ok(outcome) => {
+                            if !matches!(
+                                outcome,
+                                crate::community_state_crdt::InsertOutcome::Inserted
+                                    | crate::community_state_crdt::InsertOutcome::AlreadyKnown
+                            ) {
+                                tracing::warn!(
+                                    original_id = %hex::encode(original_id.0),
+                                    "fork_community: Fork event rejected by original engine: {outcome:?}"
+                                );
+                                // Per spec §5.2: a Rejected outcome means the Fork event did not
+                                // land in the original's log — treat as not-visible so the caller
+                                // knows the announce did not take effect. (Fix: PR #122 bot review.)
+                                visible = false;
+                            }
+                        }
+                        Err(e) => {
+                            // Per spec §5.2: transport/IO failure publishing Fork event must not
+                            // tear down the fork (already on disk). Log + set visible=false so the
+                            // caller knows the announce did not land; forker can retry from settings.
                             tracing::warn!(
+                                error = ?e,
                                 original_id = %hex::encode(original_id.0),
-                                "fork_community: Fork event rejected by original engine: {outcome:?}"
+                                fork_space_id = %fork_space_id_hex,
+                                "ZEB-285: failed to publish Fork event to original; fork is still on disk locally"
                             );
-                            // Per spec §5.2: a Rejected outcome means the Fork event did not
-                            // land in the original's log — treat as not-visible so the caller
-                            // knows the announce did not take effect. (Fix: PR #122 bot review.)
                             visible = false;
                         }
                     }
-                    Err(e) => {
-                        // Per spec §5.2: transport/IO failure publishing Fork event must not
-                        // tear down the fork (already on disk). Log + set visible=false so the
-                        // caller knows the announce did not land; forker can retry from settings.
-                        tracing::warn!(
-                            error = ?e,
-                            original_id = %hex::encode(original_id.0),
-                            fork_space_id = %fork_space_id_hex,
-                            "ZEB-285: failed to publish Fork event to original; fork is still on disk locally"
-                        );
-                        visible = false;
-                    }
                 }
             }
-        }
+        } // end if let Some(fork_event) = maybe_fork_event
     }
 
     // Step 8: if also_leave, mint + publish Leave event in the original.
@@ -731,8 +754,9 @@ pub async fn fork_community(
         // RELIABILITY: wrap mint_leave_event in a match so a signing failure
         // does not propagate via `?` after the fork is durably committed.
         // Leave is a best-effort courtesy event; warn and skip on failure.
-        // (Fix: PR #122 bot review.)
-        let leave_event = {
+        // Use Option-binding (not early return) so the frontend-event-emit
+        // in Step 9 still runs. (Fix: PR #122 round-2 bot review.)
+        let maybe_leave_event = {
             let outbox_g = dm_outbox.lock().await;
             match crate::mint_leave_event(
                 original_id,
@@ -740,45 +764,43 @@ pub async fn fork_community(
                 outbox_g.signing_key.as_ref(),
                 leave_hlc,
             ) {
-                Ok(e) => e,
+                Ok(e) => Some(e),
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
                         original_id = %hex::encode(original_id.0),
                         "ZEB-285 fork_community: mint_leave_event failed; skipping Leave publish"
                     );
-                    return Ok(ForkCommunityResult {
-                        fork_space_id: fork_space_id_hex.clone(),
-                        visible,
-                        snapshot_message_count,
-                    });
+                    None
                 }
             }
         };
-        match original_engine.insert_local_event(leave_event).await {
-            Ok(outcome) => {
-                if matches!(
-                    outcome,
-                    crate::community_state_crdt::InsertOutcome::Rejected(_)
-                ) {
+        if let Some(leave_event) = maybe_leave_event {
+            match original_engine.insert_local_event(leave_event).await {
+                Ok(outcome) => {
+                    if matches!(
+                        outcome,
+                        crate::community_state_crdt::InsertOutcome::Rejected(_)
+                    ) {
+                        tracing::warn!(
+                            original_id = %hex::encode(original_id.0),
+                            "fork_community: also_leave Leave event rejected by original engine: {outcome:?}"
+                        );
+                    }
+                }
+                Err(e) => {
+                    // Per spec §5.2: transport/IO failure publishing Leave event must not tear down
+                    // the fork (already on disk). Log + continue; original community membership
+                    // remains unchanged locally. Forker can retry leave from settings.
                     tracing::warn!(
+                        error = ?e,
                         original_id = %hex::encode(original_id.0),
-                        "fork_community: also_leave Leave event rejected by original engine: {outcome:?}"
+                        "ZEB-285: failed to publish Leave event; fork still on disk, \
+                         original community membership unchanged locally"
                     );
                 }
             }
-            Err(e) => {
-                // Per spec §5.2: transport/IO failure publishing Leave event must not tear down
-                // the fork (already on disk). Log + continue; original community membership
-                // remains unchanged locally. Forker can retry leave from settings.
-                tracing::warn!(
-                    error = ?e,
-                    original_id = %hex::encode(original_id.0),
-                    "ZEB-285: failed to publish Leave event; fork still on disk, \
-                     original community membership unchanged locally"
-                );
-            }
-        }
+        } // end if let Some(leave_event) = maybe_leave_event
     }
 
     // Step 9: emit `community-forked` frontend event (non-fatal if it fails).

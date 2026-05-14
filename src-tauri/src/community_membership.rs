@@ -1959,7 +1959,23 @@ pub fn verify_snapshot_event(
     // equals event.actor, then verify_strict-checks the sig over the
     // canonical-CBOR EventPayload bytes. Rejects with ActorPubkeyMismatch
     // if the address doesn't match, SignatureInvalid if the sig is bad.
-    verify_signature(event, signer_pub)
+    verify_signature(event, signer_pub)?;
+
+    // Step 3: if the event carries a countersig (invite-only Join voucher),
+    // verify it too against snapshot.identity_pubs. Every signature on the
+    // event must be verifiable against the snapshot's recorded pubkeys.
+    // verify_countersig covers both the pubkey→signer binding and the
+    // Ed25519 sig check (same EventPayload body the actor signed).
+    // (Fix: PR #122 round-2 bot review — CodeRabbit Major.)
+    if let Some(ref cs) = event.countersig {
+        let countersigner_pub = snapshot
+            .identity_pubs
+            .get(&cs.signer)
+            .ok_or(VerifyError::UnknownSigner { signer: cs.signer })?;
+        verify_countersig(event, countersigner_pub)?;
+    }
+
+    Ok(())
 
     // NOTE (Phase 2): reconstruct prior-state by replaying
     // snapshot.membership_events in HLC ascending order and invoke

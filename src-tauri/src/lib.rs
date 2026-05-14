@@ -7774,7 +7774,22 @@ async fn generate_invite(
                     }
                 }
             })();
-            (Some(original_id), snapshot)
+            // INVARIANT: forked_from and pre_fork_snapshot must be paired —
+            // both Some or both None. When the snapshot couldn't be loaded
+            // (file missing, decode failure, identity_dir unavailable), clear
+            // forked_from too so the invite doesn't arrive with forked_from
+            // set but no snapshot, which would leave joiners in a half-fork
+            // state. (Fix: PR #122 round-2 bot review — CodeRabbit Major.)
+            if snapshot.is_none() {
+                tracing::warn!(
+                    community_id = %hex::encode(space_id.0),
+                    "ZEB-285 generate_invite: pre_fork_snapshot unavailable; \
+                     clearing forked_from to preserve forked_from↔pre_fork_snapshot invariant"
+                );
+                (None, None)
+            } else {
+                (Some(original_id), snapshot)
+            }
         } else {
             (None, None)
         }
