@@ -1474,4 +1474,107 @@ mod tests {
         assert_eq!(dtos[1].title.as_deref(), Some("title-a"));
         assert!(dtos[1].viewed);
     }
+
+    #[test]
+    fn capacity_trim_on_insert_drops_oldest_when_over_max() {
+        // Insert MAX_DESCRIPTORS + 5 descriptors with strictly increasing
+        // created_at. After all inserts, exactly MAX_DESCRIPTORS remain,
+        // and the oldest 5 (created_at 0..4) are gone — only created_at
+        // 5..MAX_DESCRIPTORS+5 should remain.
+        let mut cache = VineFeedCache::new();
+        let followed = followed_set_with(&["alice-addr"]);
+        let total = MAX_DESCRIPTORS + 5;
+        for i in 0..total {
+            let id = format!("v-{i:05}");
+            let payload = canonical_descriptor_bytes(
+                &id,
+                "alice-addr",
+                "Alice",
+                "cid",
+                None,
+                None,
+                i as u64, // created_at = i
+            );
+            cache.on_descriptor_sample("harmony/vines/alice-addr", &payload, &followed, 0);
+        }
+        assert_eq!(cache.len_descriptors(), MAX_DESCRIPTORS);
+
+        // The 5 oldest (created_at 0..4) must be gone
+        let dtos = cache.list_descriptors();
+        let ids: HashSet<&str> = dtos.iter().map(|d| d.id.as_str()).collect();
+        for i in 0..5 {
+            let dropped = format!("v-{i:05}");
+            assert!(
+                !ids.contains(dropped.as_str()),
+                "v-{i:05} (oldest) should have been trimmed"
+            );
+        }
+        // The newest one (v-MAX_DESCRIPTORS+4) must be present
+        let newest = format!("v-{:05}", total - 1);
+        assert!(
+            ids.contains(newest.as_str()),
+            "newest descriptor should remain"
+        );
+    }
+
+    #[test]
+    fn ninety_day_boundary_is_inclusive() {
+        // A descriptor with `created_at == now - MAX_AGE_SECS` should be
+        // kept (>= cutoff); one with `created_at < now - MAX_AGE_SECS`
+        // should be dropped. Verifies the spec §5 algorithm's
+        // `created_at >= age_cutoff` (inclusive) is correctly coded.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let exactly_at_cutoff = now.saturating_sub(MAX_AGE_SECS);
+        let just_too_old = exactly_at_cutoff.saturating_sub(1);
+
+        let disk = serde_json::json!({
+            "version": 1,
+            "descriptors": [
+                {
+                    "id": "boundary",
+                    "creatorAddress": "a",
+                    "creatorName": "A",
+                    "createdAt": exactly_at_cutoff,
+                    "videoCid": "cid",
+                    "receivedAtMs": 0,
+                    "source": "followed"
+                },
+                {
+                    "id": "too-old",
+                    "creatorAddress": "a",
+                    "creatorName": "A",
+                    "createdAt": just_too_old,
+                    "videoCid": "cid",
+                    "receivedAtMs": 0,
+                    "source": "followed"
+                }
+            ],
+            "reactions": [],
+            "viewed": []
+        });
+        std::fs::write(
+            dir.path().join(VINE_FEED_FILE),
+            serde_json::to_vec_pretty(&disk).unwrap(),
+        )
+        .unwrap();
+
+        let cache = VineFeedCache::load(dir.path());
+        let ids: HashSet<String> = cache
+            .list_descriptors()
+            .iter()
+            .map(|d| d.id.clone())
+            .collect();
+        assert!(
+            ids.contains("boundary"),
+            "descriptor at exactly the cutoff must be KEPT (cutoff is inclusive)"
+        );
+        assert!(
+            !ids.contains("too-old"),
+            "descriptor one second past the cutoff must be DROPPED"
+        );
+    }
 }
