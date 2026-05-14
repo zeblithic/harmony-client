@@ -80,12 +80,28 @@ export class NavService {
     if (this.adapter || this.connecting) return; // already wired or in-progress; prevent duplicate listeners
     this.connecting = true;
 
+    // ── R3: Selective clear FIRST so handlers see clean state ──
+    // Preserves locally-created entries from pre-connect-window calls (e.g.
+    // handleDmCreate calling addOrUpdateNavSpace before the adapter wires in).
+    // By the time any listener handler can possibly fire, mock node ids and
+    // profile keys are already removed, and mockNodeIds/mockProfileKeys are
+    // empty — no mock-vs-real collision is possible. On listen failure the
+    // service is in a clean-but-unconnected state; this.adapter is still null
+    // so a retry is allowed, and the selective clear is idempotent.
+    this.nodes = this.nodes.filter((n) => !this.mockNodeIds.has(n.id));
+    for (const key of this.mockProfileKeys) this.profiles.delete(key);
+    this.mockNodeIds = new Set();
+    this.mockProfileKeys = new Set();
+    this.onChange?.();
+
     // ZEB-209 bot-feedback round 1: register listeners FIRST so a partial-init
     // failure doesn't wedge the service. Adapter and unlisteners are committed
     // only after all listens succeed; on failure we tear down partial work and
     // rethrow so the caller (App.svelte tryConnect) can retry.
     // ZEB-209 bot-feedback round 2: `connecting` sentinel (above) prevents a
     // concurrent caller from passing the guard while awaits are in flight.
+    // ZEB-209 bot-feedback round 3: selective clear moved above listener
+    // registration so handlers see clean state between successive awaits.
     const localUnlisteners: Array<() => void> = [];
     try { // outer try — releases connecting sentinel in finally on any exit path
     try {
@@ -127,21 +143,18 @@ export class NavService {
       }));
     } catch (err) {
       for (const fn of localUnlisteners) fn();
+      // Note: mocks are already cleared and user-created entries preserved.
+      // On listen failure the service is in a clean but unconnected state —
+      // the App.svelte tryConnect wrapper logs. A retry is allowed
+      // (this.adapter is still null), and the selective clear is idempotent
+      // (mockNodeIds/mockProfileKeys are now empty, so filters are no-ops).
       throw err;
     }
 
-    // Commit: assign adapter, register unlisteners, then selectively clear
-    // mock-seeded state (preserving any locally-created entries from a
-    // pre-connect-window addOrUpdateNavSpace / profiles.set call).
+    // Commit: assign adapter and register unlisteners.
+    // (Selective clear was moved before listener registration per R3.)
     this.adapter = adapter;
     this.unlisteners.push(...localUnlisteners);
-
-    // Selective clear: drop only constructor-seeded mock entries.
-    this.nodes = this.nodes.filter((n) => !this.mockNodeIds.has(n.id));
-    for (const key of this.mockProfileKeys) this.profiles.delete(key);
-    this.mockNodeIds = new Set();
-    this.mockProfileKeys = new Set();
-    this.onChange?.();
     } finally {
       this.connecting = false;
     }
