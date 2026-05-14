@@ -44,11 +44,12 @@ describe('resolveOriginalCreator', () => {
     });
   });
 
-  it('falls back per-field when originalCreator fields are partially set', () => {
-    // Defensive: a malformed wire payload could land with only one of
-    // the two fields populated. The helper falls back per-field rather
-    // than treating "partial" as "absent" — matches the `??` semantics
-    // documented in vine-utils.ts.
+  it('falls back to creator PAIR when originalCreator fields are only partially set (address only)', () => {
+    // FIX 4 (PR #120 round 1): a malformed wire payload could land
+    // with only one of the two fields populated. Per-field fallback
+    // would produce a mismatched pair (e.g. addr-alice + name "Bob").
+    // The atomic "both or neither" rule treats partial as "absent"
+    // and falls back to the source vine's creator pair instead.
     const v = vine({
       creatorAddress: 'addr-bob',
       creatorName: 'Bob',
@@ -57,7 +58,22 @@ describe('resolveOriginalCreator', () => {
       // originalCreatorName missing
     });
     expect(resolveOriginalCreator(v)).toEqual({
-      originalCreatorAddress: 'addr-alice',
+      originalCreatorAddress: 'addr-bob',
+      originalCreatorName: 'Bob',
+    });
+  });
+
+  it('falls back to creator PAIR when originalCreator fields are only partially set (name only)', () => {
+    // Symmetric to the address-only case: the same atomic rule applies.
+    const v = vine({
+      creatorAddress: 'addr-bob',
+      creatorName: 'Bob',
+      reshareOf: 'orig',
+      // originalCreatorAddress missing
+      originalCreatorName: 'Alice',
+    });
+    expect(resolveOriginalCreator(v)).toEqual({
+      originalCreatorAddress: 'addr-bob',
       originalCreatorName: 'Bob',
     });
   });

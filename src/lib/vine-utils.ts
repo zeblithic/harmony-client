@@ -11,25 +11,34 @@ import type { VineVideo } from './types';
  *
  * Rule (matches §Edge Cases → Resharing a reshare):
  *
- * - If `vine` is itself a reshare, its `originalCreatorAddress` /
- *   `originalCreatorName` already trace to the *true* origin (set by
- *   whichever client first reshared it). Propagate them as-is — this is
- *   the transitive case (Alice → Bob reshares → Carol reshares Bob's =
- *   Carol's reshare credits Alice).
+ * - If `vine` is itself a reshare AND both `originalCreatorAddress` and
+ *   `originalCreatorName` are set, they already trace to the *true*
+ *   origin (set by whichever client first reshared it). Propagate them
+ *   as a PAIR — this is the transitive case (Alice → Bob reshares →
+ *   Carol reshares Bob's = Carol's reshare credits Alice).
  *
- * - Otherwise `vine` IS the origin — use its `creatorAddress` /
- *   `creatorName` so the downstream reshare credits this creator.
+ * - Otherwise (no `originalCreator*` fields, OR only one of the two is
+ *   set — a malformed/partial wire payload) fall back to the source
+ *   vine's `creatorAddress` / `creatorName` as a PAIR.
  *
- * Returns `undefined` fields only when the source vine itself is missing
- * the corresponding field (shouldn't happen for valid VineVideos, but the
- * helper stays total to avoid surprising callers).
+ * The atomic "both or neither" rule (vs. the earlier per-field
+ * fallback) avoids mixing an `originalCreatorAddress` from the
+ * resharer's attribution with a `creatorName` from the source vine,
+ * which would credit one identity by address and a different one by
+ * display name. See FIX 4 in PR #120 round 1.
  */
 export function resolveOriginalCreator(vine: VineVideo): {
-  originalCreatorAddress: string | undefined;
-  originalCreatorName: string | undefined;
+  originalCreatorAddress: string;
+  originalCreatorName: string;
 } {
+  if (vine.originalCreatorAddress != null && vine.originalCreatorName != null) {
+    return {
+      originalCreatorAddress: vine.originalCreatorAddress,
+      originalCreatorName: vine.originalCreatorName,
+    };
+  }
   return {
-    originalCreatorAddress: vine.originalCreatorAddress ?? vine.creatorAddress,
-    originalCreatorName: vine.originalCreatorName ?? vine.creatorName,
+    originalCreatorAddress: vine.creatorAddress,
+    originalCreatorName: vine.creatorName,
   };
 }
