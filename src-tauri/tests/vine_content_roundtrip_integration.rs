@@ -89,6 +89,8 @@ fn make_vine_descriptor(vine_id: &str, creator_addr: &str, video_cid_hex: &str) 
         video_cid: video_cid_hex.to_string(),
         title: Some("Test Vine".to_string()),
         reshare_of: None,
+        original_creator_address: None,
+        original_creator_name: None,
     };
     serde_json::to_vec(&payload).expect("descriptor serialization")
 }

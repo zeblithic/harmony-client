@@ -57,6 +57,10 @@ struct DescriptorOnDisk {
     title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     reshare_of: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_creator_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_creator_name: Option<String>,
     received_at_ms: u64,
     source: VineSource,
 }
@@ -132,6 +136,12 @@ pub struct VineVideoDtoWithSource {
     pub reshare_of: Option<String>,
     pub viewed: bool,
     pub source: VineSource,
+    /// See VineDescriptorPayload::original_creator_address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_creator_address: Option<String>,
+    /// See VineDescriptorPayload::original_creator_name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_creator_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -286,6 +296,8 @@ impl VineFeedCache {
                 video_cid: d.video_cid,
                 title: d.title,
                 reshare_of: d.reshare_of,
+                original_creator_address: d.original_creator_address,
+                original_creator_name: d.original_creator_name,
             };
             cache.descriptors.insert(
                 d.id,
@@ -403,6 +415,8 @@ impl VineFeedCache {
                 title: cv.descriptor.title.clone(),
                 reshare_of: cv.descriptor.reshare_of.clone(),
                 viewed: self.viewed.contains(&cv.descriptor.id),
+                original_creator_address: cv.descriptor.original_creator_address.clone(),
+                original_creator_name: cv.descriptor.original_creator_name.clone(),
             })
             .collect();
         out.sort_by_key(|v| std::cmp::Reverse(v.created_at));
@@ -427,6 +441,8 @@ impl VineFeedCache {
             reshare_of: descriptor.reshare_of.clone(),
             viewed: self.viewed.contains(&descriptor.id),
             source,
+            original_creator_address: descriptor.original_creator_address.clone(),
+            original_creator_name: descriptor.original_creator_name.clone(),
         }
     }
 
@@ -561,6 +577,8 @@ impl VineFeedCache {
                     video_cid: cv.descriptor.video_cid.clone(),
                     title: cv.descriptor.title.clone(),
                     reshare_of: cv.descriptor.reshare_of.clone(),
+                    original_creator_address: cv.descriptor.original_creator_address.clone(),
+                    original_creator_name: cv.descriptor.original_creator_name.clone(),
                     received_at_ms: cv.received_at_ms,
                     source: cv.source,
                 })
@@ -662,6 +680,8 @@ mod tests {
             video_cid: video_cid.to_string(),
             title: title.map(String::from),
             reshare_of: reshare_of.map(String::from),
+            original_creator_address: None,
+            original_creator_name: None,
         };
         serde_json::to_vec(&v).unwrap()
     }
@@ -1453,6 +1473,54 @@ mod tests {
         }
         let cache2 = VineFeedCache::load(dir.path());
         assert!(cache2.is_viewed("v-mv"));
+    }
+
+    #[test]
+    fn cached_descriptor_round_trips_original_creator_fields_through_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        // First boot: insert a reshare with full attribution, drop the cache.
+        {
+            let mut cache = VineFeedCache::load(dir.path());
+            let payload = VineDescriptorPayload {
+                id: "vine-reshare".to_string(),
+                creator_address: "addr-resharer".to_string(),
+                creator_name: "Resharer".to_string(),
+                created_at: now_secs.saturating_sub(1),
+                video_cid: "cid-r".to_string(),
+                title: None,
+                reshare_of: Some("vine-orig".to_string()),
+                original_creator_address: Some("addr-original".to_string()),
+                original_creator_name: Some("Original".to_string()),
+            };
+            let bytes = serde_json::to_vec(&payload).expect("encode");
+            let followed = followed_set_with(&["addr-resharer"]);
+            let outcome =
+                cache.on_descriptor_sample("harmony/vines/addr-resharer", &bytes, &followed, 1_000);
+            assert!(
+                matches!(outcome, Some(DescriptorOutcome::Inserted { .. })),
+                "expected Inserted, got {outcome:?}"
+            );
+        }
+
+        // Second boot: reload, verify attribution survived.
+        {
+            let cache = VineFeedCache::load(dir.path());
+            let dtos = cache.list_descriptors();
+            let dto = dtos
+                .iter()
+                .find(|d| d.id == "vine-reshare")
+                .expect("reshare should survive reload");
+            assert_eq!(
+                dto.original_creator_address.as_deref(),
+                Some("addr-original")
+            );
+            assert_eq!(dto.original_creator_name.as_deref(), Some("Original"));
+        }
     }
 
     #[test]
