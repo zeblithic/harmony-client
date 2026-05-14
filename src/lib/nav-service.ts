@@ -37,6 +37,7 @@ export class NavService {
   ownAddress: string | null = null;
 
   private adapter: TauriAdapter | null = null;
+  private connecting = false;
   private avatarResolver: AvatarResolver | null = null;
   private unlisteners: Array<() => void> = [];
   /** IDs of constructor-seeded mock nav nodes — used to selectively clear
@@ -76,13 +77,17 @@ export class NavService {
 
   /** Connect a Tauri adapter and start listening for profile + nav updates. */
   async connectAdapter(adapter: TauriAdapter): Promise<void> {
-    if (this.adapter) return;
+    if (this.adapter || this.connecting) return; // already wired or in-progress; prevent duplicate listeners
+    this.connecting = true;
 
     // ZEB-209 bot-feedback round 1: register listeners FIRST so a partial-init
     // failure doesn't wedge the service. Adapter and unlisteners are committed
     // only after all listens succeed; on failure we tear down partial work and
     // rethrow so the caller (App.svelte tryConnect) can retry.
+    // ZEB-209 bot-feedback round 2: `connecting` sentinel (above) prevents a
+    // concurrent caller from passing the guard while awaits are in flight.
     const localUnlisteners: Array<() => void> = [];
+    try { // outer try — releases connecting sentinel in finally on any exit path
     try {
       localUnlisteners.push(await adapter.listen(
         'profile-update',
@@ -137,6 +142,9 @@ export class NavService {
     this.mockNodeIds = new Set();
     this.mockProfileKeys = new Set();
     this.onChange?.();
+    } finally {
+      this.connecting = false;
+    }
   }
 
   /**

@@ -48,6 +48,7 @@ export class VineService {
   private likePending = new Set<string>();
 
   private adapter: TauriAdapter | null = null;
+  private connecting = false;
   private unlisteners: Array<() => void> = [];
   private seenIds = new Set<string>();
   /** IDs of constructor-seeded mock vines — used to selectively clear
@@ -70,13 +71,17 @@ export class VineService {
 
   /** Connect a Tauri adapter and start listening for vine descriptors. */
   async connectAdapter(adapter: TauriAdapter): Promise<void> {
-    if (this.adapter) return; // already wired; prevent duplicate listeners
+    if (this.adapter || this.connecting) return; // already wired or in-progress; prevent duplicate listeners
+    this.connecting = true;
 
     // ZEB-209 bot-feedback round 1: register listeners FIRST so a partial-init
     // failure doesn't wedge the service. Adapter and unlisteners are committed
     // only after all listens succeed; on failure we tear down partial work and
     // rethrow so the caller (App.svelte tryConnect) can retry.
+    // ZEB-209 bot-feedback round 2: `connecting` sentinel (above) prevents a
+    // concurrent caller from passing the guard while awaits are in flight.
     const localUnlisteners: Array<() => void> = [];
+    try { // outer try — releases connecting sentinel in finally on any exit path
     try {
       localUnlisteners.push(await adapter.listen(
         'vine-received',
@@ -158,6 +163,9 @@ export class VineService {
     this.mockSeededIds = new Set();
     // likePending is short-lived (set by user click), never mock-seeded — leave it alone.
     this.onChange?.();
+    } finally {
+      this.connecting = false;
+    }
   }
 
   /**

@@ -55,6 +55,7 @@ export class MessageService {
   ownDisplayName = 'You';
 
   private adapter: TauriAdapter | null = null;
+  private connecting = false;
   private unlisteners: Array<() => void> = [];
   private seenIds = new Set<string>();
   /** IDs of constructor-seeded mock messages — used to selectively clear
@@ -84,13 +85,17 @@ export class MessageService {
 
   /** Connect a Tauri adapter and start listening for network messages. */
   async connectAdapter(adapter: TauriAdapter): Promise<void> {
-    if (this.adapter) return; // already wired; prevent duplicate listeners
+    if (this.adapter || this.connecting) return; // already wired or in-progress; prevent duplicate listeners
+    this.connecting = true;
 
     // ZEB-209 bot-feedback round 1: register listeners FIRST so a partial-init
     // failure doesn't wedge the service. Adapter and unlisteners are committed
     // only after all listens succeed; on failure we tear down partial work and
     // rethrow so the caller (App.svelte tryConnect) can retry.
+    // ZEB-209 bot-feedback round 2: `connecting` sentinel (above) prevents a
+    // concurrent caller from passing the guard while awaits are in flight.
     const localUnlisteners: Array<() => void> = [];
+    try { // outer try — releases connecting sentinel in finally on any exit path
     try {
       localUnlisteners.push(await adapter.listen(
         'message-received',
@@ -229,6 +234,9 @@ export class MessageService {
     for (const id of this.mockSeededIds) this.seenIds.delete(id);
     this.mockSeededIds = new Set();
     this.onChange?.();
+    } finally {
+      this.connecting = false;
+    }
   }
 
   /** Send a channel message via Tauri command. */
