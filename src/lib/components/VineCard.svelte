@@ -116,7 +116,7 @@
           <span class="card-like-count">{reactionCount}</span>
         {/if}
         {#if showReshareCount}
-          <span class="reshare-count" aria-label="reshare count">
+          <span class="reshare-count" aria-label="reshare count {reshareCount}">
             <span aria-hidden="true">↗</span> {reshareCount}
           </span>
         {/if}

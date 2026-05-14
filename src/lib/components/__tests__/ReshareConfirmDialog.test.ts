@@ -31,6 +31,11 @@ describe('ReshareConfirmDialog', () => {
       title: 'Cool vine',
       viewed: false,
       reshareOf: 'vine-1',
+      // Per the atomic resolver: both original fields must be set
+      // (and `reshareOf` must be present) for attribution to bind
+      // to the original. Real wire payloads from the network always
+      // carry both — set in lockstep at first-reshare time.
+      originalCreatorAddress: 'addr-alice',
       originalCreatorName: 'Alice',
     };
     render(ReshareConfirmDialog, {

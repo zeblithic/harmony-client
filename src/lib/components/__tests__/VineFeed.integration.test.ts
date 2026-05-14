@@ -335,6 +335,7 @@ describe('VineFeed Integration', () => {
           viewedIds: new Set<string>(),
           activeTab: 'following' as const,
           followedAddresses: new Set<string>(),
+          onMarkViewed: vi.fn(),
           onReshare,
         },
       });
@@ -459,6 +460,7 @@ describe('VineFeed Integration', () => {
           viewedIds: new Set<string>(),
           activeTab: 'following' as const,
           followedAddresses: new Set<string>(),
+          onMarkViewed: vi.fn(),
           onReshare,
         },
       });

@@ -1,6 +1,7 @@
 <script lang="ts">
   import Modal from './Modal.svelte';
   import type { VineVideo } from '../types';
+  import { resolveOriginalCreator } from '../vine-utils';
 
   let {
     vine,
@@ -14,13 +15,12 @@
 
   const titleId = `reshare-confirm-title-${Math.random().toString(36).slice(2)}`;
 
-  // For a reshare-of-a-reshare, the original creator name is the true origin;
-  // for an original vine, the creator IS the origin. For a legacy reshare
-  // where `reshareOf` is set but `originalCreatorName` is missing, fall back
-  // to the immediate creator rather than rendering "undefined".
-  let attribution = $derived(
-    vine.originalCreatorName ?? vine.creatorName
-  );
+  // Use the shared resolver so the attribution displayed here matches
+  // what `publish()` will actually attach to the new reshare descriptor.
+  // For a reshare-of-a-reshare with full originalCreator* fields, this
+  // surfaces the true origin; for an original vine or a partial/legacy
+  // reshare payload, it falls back to the immediate creator name.
+  let attribution = $derived(resolveOriginalCreator(vine).originalCreatorName);
 </script>
 
 <Modal {onCancel} ariaLabelledby={titleId} canDismissOnBackdrop={true}>
