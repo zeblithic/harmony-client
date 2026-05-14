@@ -1374,7 +1374,46 @@ mod tests {
         // The final reaction value should be liked=false at recent+20
         let summary = cache2.get_reaction("vine-r1", "bob-addr");
         assert_eq!(summary.count, 0); // liked=false → not counted
-        assert!(!summary.liked_by_me);
+    }
+
+    #[test]
+    fn reaction_insert_persists_to_disk_without_update() {
+        // Regression guard: ensures the Inserted save path stands on its
+        // own. `reaction_update_persists_to_disk` mutates the same key
+        // twice, so the final UpdatedNewer save would mask a missing
+        // save() on the Inserted path. This test inserts ONCE.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let recent = now_secs.saturating_sub(60);
+        {
+            let mut cache = VineFeedCache::load(dir.path());
+            let followed = followed_set_with(&["alice-addr"]);
+            let desc = canonical_descriptor_bytes(
+                "vine-ri",
+                "alice-addr",
+                "Alice",
+                "cid",
+                None,
+                None,
+                recent,
+            );
+            cache.on_descriptor_sample("harmony/vines/alice-addr", &desc, &followed, 1_000);
+            let react = canonical_reaction_bytes("vine-ri", "bob-addr", "Bob", true, recent + 10);
+            let out = cache.on_reaction_sample(
+                "harmony/vines/alice-addr/reactions/vine-ri/bob-addr",
+                &react,
+            );
+            assert_eq!(out, Some(ReactionOutcome::Inserted));
+            // No further mutations — the Inserted save must be sufficient.
+        }
+        let cache2 = VineFeedCache::load(dir.path());
+        assert_eq!(cache2.len_reactions(), 1);
+        let summary = cache2.get_reaction("vine-ri", "bob-addr");
+        assert_eq!(summary.count, 1);
+        assert!(summary.liked_by_me);
     }
 
     #[test]
