@@ -536,6 +536,14 @@ pub enum VerifyError {
     /// in materialize. This is a fast-path rejection that prevents
     /// unauthorized epoch events from entering the CRDT log.
     EpochEventUnauthorized,
+
+    /// ZEB-285: the event's signer (event.actor) has no entry in the
+    /// PreForkSnapshot.identity_pubs map. The snapshot is authoritative
+    /// for the original community's keyset — a signer not in the map
+    /// cannot be verified and must be rejected.
+    UnknownSigner {
+        signer: OwnerAddr,
+    },
 }
 
 impl std::fmt::Display for VerifyError {
@@ -638,6 +646,9 @@ impl std::fmt::Display for VerifyError {
                 "EpochRotation/EpochCatchup rejected at verify_event: issuer lacks admin power, \
                  is not the cooperative leaver, or the event shape is obviously malformed"
             ),
+            VerifyError::UnknownSigner { signer } => {
+                write!(f, "snapshot signer {:?} not in identity_pubs", signer)
+            }
         }
     }
 }
@@ -1872,6 +1883,55 @@ pub fn verify_event(
     }
 
     Ok(())
+}
+
+/// ZEB-285: verify a single signed event against a frozen pre-fork
+/// snapshot's `identity_pubs` map. Used by the fork's UI when loading
+/// pre-fork history for display — fork members are not necessarily
+/// members of the original community, so the live OwnerDeviceCache
+/// won't have the original's signers cached.
+///
+/// **Phase 1 scope**: performs Ed25519 signature verification via the
+/// snapshot's `identity_pubs` keyset (including the pubkey→actor address
+/// binding check inside `verify_signature`). Power-rule and membership-
+/// state replay is deferred to Phase 2 hardening because `PreForkSnapshot`
+/// does not carry an explicit `admin_addr` (required by `materialize`
+/// to seed the bootstrap power level). Phase 1 invokes this lazily at
+/// display time only against a snapshot from a trusted inviter; eagerly
+/// verifying every event at redeem time is a Phase 2 concern.
+///
+/// Returns `Ok(())` when the signature is valid and the signer is in
+/// `snapshot.identity_pubs`. Returns `Err(VerifyError::UnknownSigner)`
+/// when the signer is absent; returns `Err(VerifyError::SignatureInvalid)`
+/// (or `ActorPubkeyMismatch`) when the signature or address binding fails.
+///
+/// See spec §4.3.
+pub fn verify_snapshot_event(
+    event: &SignedMembershipEvent,
+    snapshot: &crate::community_invite::PreForkSnapshot,
+) -> Result<(), VerifyError> {
+    // Step 1: signer must be recorded in identity_pubs.
+    let signer_pub =
+        snapshot
+            .identity_pubs
+            .get(&event.actor)
+            .ok_or(VerifyError::UnknownSigner {
+                signer: event.actor,
+            })?;
+
+    // Step 2: Ed25519 signature verification + pubkey→actor address binding.
+    // verify_signature derives address_hash from signer_pub and checks it
+    // equals event.actor, then verify_strict-checks the sig over the
+    // canonical-CBOR EventPayload bytes. Rejects with ActorPubkeyMismatch
+    // if the address doesn't match, SignatureInvalid if the sig is bad.
+    verify_signature(event, signer_pub)
+
+    // NOTE (Phase 2): reconstruct prior-state by replaying
+    // snapshot.membership_events in HLC ascending order and invoke
+    // verify_event with the materialized context. Deferred because
+    // PreForkSnapshot does not carry admin_addr (needed by materialize
+    // for the bootstrap power-100 seed). Phase 2 will add admin_addr
+    // to PreForkSnapshot or derive it from the earliest Join event.
 }
 
 /// True iff `addr` is currently a Joined member in `state`. Pure
@@ -3566,6 +3626,158 @@ mod tests {
         assert!(
             m.pending_rotation_for.is_empty(),
             "no pending rotation should exist after a Fork event"
+        );
+    }
+
+    // ── ZEB-285 Task 5: verify_snapshot_event dual-keyset verifier ────────────
+
+    /// ZEB-285 Task 5: verify_snapshot_event should accept events whose signer
+    /// is present in snapshot.identity_pubs, verified against the real
+    /// Ed25519 key (not the live OwnerDeviceCache).
+    #[test]
+    fn verify_snapshot_event_uses_snapshot_identity_pubs() {
+        use crate::community_invite::{BoundedChannelLogSnapshot, PreForkSnapshot};
+        use std::collections::BTreeMap;
+
+        let original_id = SpaceId([0xa0; 16]);
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xaa);
+        let (regular_priv, regular_pub, regular_addr) = make_identity(0xbb);
+
+        // Bootstrap: admin joins, then regular joins, then admin promotes regular.
+        let admin_join = sign_with_identity(
+            EventPayload {
+                id: [0x01; 16],
+                community_id: original_id,
+                kind: MembershipEventKind::Join,
+                actor: admin_addr,
+                at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &admin_priv,
+        );
+        let regular_join = sign_with_identity(
+            EventPayload {
+                id: [0x02; 16],
+                community_id: original_id,
+                kind: MembershipEventKind::Join,
+                actor: regular_addr,
+                at: Hlc {
+                    wall_ms: 2,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &regular_priv,
+        );
+        let set_power = sign_with_identity(
+            EventPayload {
+                id: [0x03; 16],
+                community_id: original_id,
+                kind: MembershipEventKind::SetPower {
+                    target: regular_addr,
+                    level: 50,
+                },
+                actor: admin_addr,
+                at: Hlc {
+                    wall_ms: 3,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &admin_priv,
+        );
+
+        let mut identity_pubs = BTreeMap::new();
+        identity_pubs.insert(admin_addr, admin_pub);
+        identity_pubs.insert(regular_addr, regular_pub);
+
+        let snapshot = PreForkSnapshot {
+            original_community_id: original_id,
+            original_community_name: "Original".to_string(),
+            membership_events: vec![admin_join.clone(), regular_join.clone(), set_power.clone()],
+            channel_log: BoundedChannelLogSnapshot::default(),
+            identity_pubs,
+            forked_at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        };
+
+        // Every event in the snapshot should verify against the snapshot's
+        // identity_pubs, even though the fork's live OwnerDeviceCache has
+        // neither admin_addr nor regular_addr as members.
+        for event in &snapshot.membership_events {
+            verify_snapshot_event(event, &snapshot)
+                .expect("snapshot event should verify against identity_pubs");
+        }
+    }
+
+    /// ZEB-285 Task 5: verify_snapshot_event must reject a signer not
+    /// recorded in snapshot.identity_pubs with UnknownSigner.
+    #[test]
+    fn verify_snapshot_event_rejects_unknown_signer() {
+        use crate::community_invite::{BoundedChannelLogSnapshot, PreForkSnapshot};
+        use std::collections::BTreeMap;
+
+        let original_id = SpaceId([0xa0; 16]);
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xaa);
+        let (unknown_priv, _unknown_pub, unknown_addr) = make_identity(0xff);
+
+        let admin_join = sign_with_identity(
+            EventPayload {
+                id: [0x01; 16],
+                community_id: original_id,
+                kind: MembershipEventKind::Join,
+                actor: admin_addr,
+                at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &admin_priv,
+        );
+        // Signed by `unknown_addr` — but identity_pubs has no entry for them.
+        let unknown_event = sign_with_identity(
+            EventPayload {
+                id: [0x02; 16],
+                community_id: original_id,
+                kind: MembershipEventKind::Leave,
+                actor: unknown_addr,
+                at: Hlc {
+                    wall_ms: 2,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &unknown_priv,
+        );
+
+        let mut identity_pubs = BTreeMap::new();
+        identity_pubs.insert(admin_addr, admin_pub);
+        // No entry for unknown_addr — intentionally missing.
+
+        let snapshot = PreForkSnapshot {
+            original_community_id: original_id,
+            original_community_name: "Original".to_string(),
+            membership_events: vec![admin_join, unknown_event.clone()],
+            channel_log: BoundedChannelLogSnapshot::default(),
+            identity_pubs,
+            forked_at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        };
+
+        let result = verify_snapshot_event(&unknown_event, &snapshot);
+        assert!(
+            matches!(result, Err(VerifyError::UnknownSigner { .. })),
+            "verify_snapshot_event should reject signer not in identity_pubs; got {result:?}"
         );
     }
 }
