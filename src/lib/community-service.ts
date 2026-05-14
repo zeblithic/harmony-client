@@ -181,6 +181,21 @@ export class CommunityService {
     await this.invoke<void>('leave_community', { communityId });
   }
 
+  async forkCommunity(
+    communityId: string,
+    opts: { name: string; silent: boolean; alsoLeave: boolean },
+  ): Promise<{ forkSpaceId: string; visible: boolean; snapshotMessageCount: number }> {
+    try {
+      return await this.invoke<{
+        forkSpaceId: string;
+        visible: boolean;
+        snapshotMessageCount: number;
+      }>('fork_community', { communityId, opts });
+    } catch (e) {
+      throw new Error(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   async kickFromCommunity(
     communityId: string,
     targetAddr: string,

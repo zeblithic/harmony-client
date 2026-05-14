@@ -10,6 +10,7 @@ use tauri::{AppHandle, Emitter};
 
 pub mod community_channel_log;
 pub mod community_channel_log_engine;
+pub mod community_fork;
 pub mod community_invite;
 pub mod community_membership;
 pub mod community_state_crdt;
@@ -13506,6 +13507,7 @@ pub fn run() {
             join_open_community,
             leave_community,
             kick_from_community,
+            community_fork::fork_community,
             set_power_level,
             unban_from_community,
             list_recent_moderation_events,
