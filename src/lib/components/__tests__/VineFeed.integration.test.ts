@@ -349,18 +349,19 @@ describe('VineFeed Integration', () => {
       const confirmBtn = screen.getByRole('button', { name: /^reshare$/i });
       await fireEvent.click(confirmBtn);
 
-      // The handler awaits publish — let the microtask flush before
-      // asserting (vi.waitFor would also work but is overkill here).
-      await Promise.resolve();
-      await Promise.resolve();
-
-      expect(publish).toHaveBeenCalledWith(
-        'cid-v2',
-        'Mesh routing',
-        'v2',
-        'b2',   // Bob's address (source creator → origin)
-        'Bob',  // Bob's name
-      );
+      // The handler awaits publish — `vi.waitFor` polls until the
+      // assertion passes, robust against any macrotasks in the chain
+      // (FIX 7 in PR #120 round 1). Two `await Promise.resolve()`
+      // ticks only flushed microtasks and could race a real publish.
+      await vi.waitFor(() => {
+        expect(publish).toHaveBeenCalledWith(
+          'cid-v2',
+          'Mesh routing',
+          'v2',
+          'b2',   // Bob's address (source creator → origin)
+          'Bob',  // Bob's name
+        );
+      });
     });
 
     // ── Self-reshare prevention (caller-level guard) ──────────────
@@ -472,16 +473,16 @@ describe('VineFeed Integration', () => {
       const confirmBtn = screen.getByRole('button', { name: /^reshare$/i });
       await fireEvent.click(confirmBtn);
 
-      await Promise.resolve();
-      await Promise.resolve();
-
-      expect(publish).toHaveBeenCalledWith(
-        'cid-alice-orig',
-        'Alice original',
-        'v-bob-reshare',
-        'addr-alice',  // ← origin, NOT Bob
-        'Alice',       // ← origin, NOT Bob
-      );
+      // See FIX 7 note on the sibling case above.
+      await vi.waitFor(() => {
+        expect(publish).toHaveBeenCalledWith(
+          'cid-alice-orig',
+          'Alice original',
+          'v-bob-reshare',
+          'addr-alice',  // ← origin, NOT Bob
+          'Alice',       // ← origin, NOT Bob
+        );
+      });
     });
   });
 });
