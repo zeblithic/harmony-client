@@ -500,15 +500,48 @@ pub async fn fork_community(
         .await
         .map_err(|e| format!("registry.spawn_engine_with_guard: {e}"))?;
 
+    // Helper: best-effort cleanup of disk artifacts written before engine spawn.
+    // Called on early-return paths between snapshot write and guard commit.
+    let snapshot_path_for_cleanup = crate::owner_commands::resolve_identity_dir()
+        .map(|d| {
+            d.join("communities")
+                .join(&fork_space_id_hex)
+                .join("pre_fork_snapshot.bin")
+        })
+        .unwrap_or_else(|_| std::path::PathBuf::from("<identity_dir unavailable>"));
+    let cleanup_disk_artifacts = || {
+        let parent_dir = snapshot_path_for_cleanup.parent();
+        if let Err(e) = std::fs::remove_file(&snapshot_path_for_cleanup) {
+            tracing::warn!(
+                error = ?e,
+                path = %snapshot_path_for_cleanup.display(),
+                "ZEB-285 fork_community: failed to remove orphaned pre_fork_snapshot.bin during rollback"
+            );
+        }
+        if let Some(parent) = parent_dir {
+            if let Err(e) = std::fs::remove_dir(parent) {
+                tracing::debug!(
+                    error = ?e,
+                    path = %parent.display(),
+                    "ZEB-285 fork_community: didn't remove orphaned community dir during rollback (likely non-empty or in use)"
+                );
+            }
+        }
+    };
+
     // Insert bootstrap Join.
     let bootstrap_outcome = engine_arc
         .insert_local_event(minted.bootstrap_join.clone())
         .await
-        .map_err(|e| format!("engine.insert_local_event (bootstrap_join): {e}"))?;
+        .map_err(|e| {
+            cleanup_disk_artifacts();
+            format!("engine.insert_local_event (bootstrap_join): {e}")
+        })?;
     if !matches!(
         bootstrap_outcome,
         crate::community_state_crdt::InsertOutcome::Inserted
     ) {
+        cleanup_disk_artifacts();
         return Err(format!(
             "fork bootstrap Join not inserted (got {bootstrap_outcome:?})"
         ));
@@ -547,11 +580,15 @@ pub async fn fork_community(
     let default_channel_outcome = engine_arc
         .insert_local_event(default_channel_signed)
         .await
-        .map_err(|e| format!("engine.insert_local_event (fork default channel): {e}"))?;
+        .map_err(|e| {
+            cleanup_disk_artifacts();
+            format!("engine.insert_local_event (fork default channel): {e}")
+        })?;
     if !matches!(
         default_channel_outcome,
         crate::community_state_crdt::InsertOutcome::Inserted
     ) {
+        cleanup_disk_artifacts();
         return Err(format!(
             "fork default-channel ChannelCreate not inserted (got {default_channel_outcome:?})"
         ));
@@ -570,38 +607,21 @@ pub async fn fork_community(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         if g.generation != snapshot_generation {
-            let snapshot_path = crate::owner_commands::resolve_identity_dir()
-                .map(|d| {
-                    d.join("communities")
-                        .join(&fork_space_id_hex)
-                        .join("pre_fork_snapshot.bin")
-                })
-                .unwrap_or_else(|_| std::path::PathBuf::from("<identity_dir unavailable>"));
+            cleanup_disk_artifacts();
             return Err(format!(
                 "ZEB-285 fork_community: node generation changed after engine spawn and snapshot \
-                 write (was {}, now {}); fork has been rolled back by engine guard, but disk \
-                 artifacts at {} are orphaned and will persist (no startup-cleanup exists in \
-                 Phase 1; manual cleanup or Phase 2 reclamation follow-up required); original \
-                 community untouched",
-                snapshot_generation,
-                g.generation,
-                snapshot_path.display()
+                 write; engine rolled back by guard; best-effort cleanup of disk artifacts at {} \
+                 attempted; original community untouched",
+                snapshot_path_for_cleanup.display()
             ));
         }
         if g.community_registry.is_none() {
-            let snapshot_path = crate::owner_commands::resolve_identity_dir()
-                .map(|d| {
-                    d.join("communities")
-                        .join(&fork_space_id_hex)
-                        .join("pre_fork_snapshot.bin")
-                })
-                .unwrap_or_else(|_| std::path::PathBuf::from("<identity_dir unavailable>"));
+            cleanup_disk_artifacts();
             return Err(format!(
                 "ZEB-285 fork_community: community_registry was torn down after engine spawn and \
-                 snapshot write; fork has been rolled back by engine guard, but disk artifacts at \
-                 {} are orphaned and will persist (no startup-cleanup exists in Phase 1; manual \
-                 cleanup or Phase 2 reclamation follow-up required); original community untouched",
-                snapshot_path.display()
+                 snapshot write; engine rolled back by guard; best-effort cleanup of disk \
+                 artifacts at {} attempted; original community untouched",
+                snapshot_path_for_cleanup.display()
             ));
         }
     }
@@ -750,59 +770,100 @@ pub async fn fork_community(
 
     // Step 8: if also_leave, mint + publish Leave event in the original.
     if opts.also_leave {
-        let leave_hlc =
-            crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms)
-                .await;
-        // RELIABILITY: wrap mint_leave_event in a match so a signing failure
-        // does not propagate via `?` after the fork is durably committed.
-        // Leave is a best-effort courtesy event; warn and skip on failure.
-        // Use Option-binding (not early return) so the frontend-event-emit
-        // in Step 9 still runs. (Fix: PR #122 round-2 bot review.)
-        let maybe_leave_event = {
-            let outbox_g = dm_outbox.lock().await;
-            match crate::mint_leave_event(
-                original_id,
-                self_owner,
-                outbox_g.signing_key.as_ref(),
-                leave_hlc,
-            ) {
-                Ok(e) => Some(e),
+        // Generation + registry fence before inserting Leave event — mirrors
+        // Step 7's Fork-event fence. If generation changed or registry is gone,
+        // the fork is already durably committed; Leave failure is a degraded
+        // outcome but not fatal — log and skip rather than returning Err.
+        let leave_generation_ok = {
+            match state_lock.lock() {
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
                         original_id = %hex::encode(original_id.0),
-                        "ZEB-285 fork_community: mint_leave_event failed; skipping Leave publish"
+                        "ZEB-285 fork_community: NodeState poisoned before Leave fence; skipping Leave publish"
                     );
-                    None
+                    false
                 }
-            }
-        };
-        if let Some(leave_event) = maybe_leave_event {
-            match original_engine.insert_local_event(leave_event).await {
-                Ok(outcome) => {
-                    if matches!(
-                        outcome,
-                        crate::community_state_crdt::InsertOutcome::Rejected(_)
-                    ) {
+                Ok(g) => {
+                    if g.generation != snapshot_generation {
                         tracing::warn!(
                             original_id = %hex::encode(original_id.0),
-                            "fork_community: also_leave Leave event rejected by original engine: {outcome:?}"
+                            fork_space_id = %fork_space_id_hex,
+                            "ZEB-285 fork_community: node generation changed before Leave event publish; skipping"
+                        );
+                        false
+                    } else if g.community_registry.is_none() {
+                        tracing::warn!(
+                            original_id = %hex::encode(original_id.0),
+                            fork_space_id = %fork_space_id_hex,
+                            "ZEB-285 fork_community: community_registry detached before Leave event publish; skipping"
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                }
+            }
+        }; // std lock guard dropped here.
+
+        if leave_generation_ok {
+            let leave_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+                &hlc_tracker,
+                &device_id,
+                wall_now_ms,
+            )
+            .await;
+            // RELIABILITY: wrap mint_leave_event in a match so a signing failure
+            // does not propagate via `?` after the fork is durably committed.
+            // Leave is a best-effort courtesy event; warn and skip on failure.
+            // Use Option-binding (not early return) so the frontend-event-emit
+            // in Step 9 still runs. (Fix: PR #122 round-2 bot review.)
+            let maybe_leave_event = {
+                let outbox_g = dm_outbox.lock().await;
+                match crate::mint_leave_event(
+                    original_id,
+                    self_owner,
+                    outbox_g.signing_key.as_ref(),
+                    leave_hlc,
+                ) {
+                    Ok(e) => Some(e),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            original_id = %hex::encode(original_id.0),
+                            "ZEB-285 fork_community: mint_leave_event failed; skipping Leave publish"
+                        );
+                        None
+                    }
+                }
+            };
+            if let Some(leave_event) = maybe_leave_event {
+                match original_engine.insert_local_event(leave_event).await {
+                    Ok(outcome) => {
+                        if matches!(
+                            outcome,
+                            crate::community_state_crdt::InsertOutcome::Rejected(_)
+                        ) {
+                            tracing::warn!(
+                                original_id = %hex::encode(original_id.0),
+                                "fork_community: also_leave Leave event rejected by original engine: {outcome:?}"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        // Per spec §5.2: transport/IO failure publishing Leave event must not tear down
+                        // the fork (already on disk). Log + continue; original community membership
+                        // remains unchanged locally. Forker can retry leave from settings.
+                        tracing::warn!(
+                            error = ?e,
+                            original_id = %hex::encode(original_id.0),
+                            "ZEB-285: failed to publish Leave event; fork still on disk, \
+                             original community membership unchanged locally"
                         );
                     }
                 }
-                Err(e) => {
-                    // Per spec §5.2: transport/IO failure publishing Leave event must not tear down
-                    // the fork (already on disk). Log + continue; original community membership
-                    // remains unchanged locally. Forker can retry leave from settings.
-                    tracing::warn!(
-                        error = ?e,
-                        original_id = %hex::encode(original_id.0),
-                        "ZEB-285: failed to publish Leave event; fork still on disk, \
-                         original community membership unchanged locally"
-                    );
-                }
-            }
-        } // end if let Some(leave_event) = maybe_leave_event
+            } // end if let Some(leave_event) = maybe_leave_event
+        } // end if leave_generation_ok
     }
 
     // Step 9: emit `community-forked` frontend event (non-fatal if it fails).
