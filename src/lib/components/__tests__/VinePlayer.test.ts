@@ -20,15 +20,105 @@ describe('VinePlayer', () => {
     expect(screen.getByText('Demo vine')).toBeTruthy();
   });
 
-  it('shows reshare label when vine is a reshare', () => {
-    const resharedVine = { ...vine, reshareOf: 'vine-00' };
+  it('does not show legacy "Reshared" label anymore (replaced by attribution row)', () => {
+    const resharedVine: VineVideo = {
+      ...vine,
+      reshareOf: 'vine-00',
+      originalCreatorName: 'Original',
+    };
     render(VinePlayer, { props: { vine: resharedVine, onClose: vi.fn() } });
-    expect(screen.getByText('Reshared')).toBeTruthy();
+    // "Reshared" by itself should no longer appear; attribution row replaces it.
+    expect(screen.queryByText(/^Reshared$/)).toBeNull();
   });
 
-  it('does not show reshare label for original vines', () => {
+  it('shows attribution row when vine is a reshare', () => {
+    const resharedVine: VineVideo = {
+      ...vine,
+      reshareOf: 'vine-00',
+      originalCreatorName: 'Original Person',
+    };
+    render(VinePlayer, {
+      props: { vine: resharedVine, onClose: vi.fn() },
+    });
+    expect(screen.getByText(/originally by Original Person/i)).toBeTruthy();
+  });
+
+  it('attribution row is clickable when onViewOriginal is provided', async () => {
+    const onViewOriginal = vi.fn();
+    const resharedVine: VineVideo = {
+      ...vine,
+      reshareOf: 'vine-00',
+      originalCreatorName: 'Original Person',
+    };
+    render(VinePlayer, {
+      props: {
+        vine: resharedVine,
+        onClose: vi.fn(),
+        onViewOriginal,
+      },
+    });
+    const link = screen.getByRole('button', { name: /originally by Original Person/i });
+    await fireEvent.click(link);
+    expect(onViewOriginal).toHaveBeenCalledWith('vine-00');
+  });
+
+  it('does not render attribution row for non-reshare original vines', () => {
     render(VinePlayer, { props: { vine, onClose: vi.fn() } });
-    expect(screen.queryByText('Reshared')).toBeNull();
+    expect(screen.queryByText(/originally by/i)).toBeNull();
+  });
+
+  // ── Reshare confirmation flow ─────────────────────────────────────
+
+  it('opens confirmation dialog when Reshare button is clicked', async () => {
+    render(VinePlayer, {
+      props: { vine, onClose: vi.fn(), onReshare: vi.fn() },
+    });
+    await fireEvent.click(screen.getByLabelText('Reshare vine'));
+    // Dialog should now be visible.
+    expect(screen.getByText(/reshare this vine\?/i)).toBeTruthy();
+  });
+
+  it('calls onReshare only after dialog confirm', async () => {
+    const onReshare = vi.fn().mockResolvedValue(undefined);
+    render(VinePlayer, {
+      props: { vine, onClose: vi.fn(), onReshare },
+    });
+    await fireEvent.click(screen.getByLabelText('Reshare vine'));
+    expect(onReshare).not.toHaveBeenCalled();
+    // The dialog's confirm button has the bare label "Reshare" (the player's
+    // button is labelled "↗ Reshare" or "↗ Resharing…"), so /^reshare$/i
+    // disambiguates to the dialog's confirm button.
+    await fireEvent.click(screen.getByRole('button', { name: /^reshare$/i }));
+    expect(onReshare).toHaveBeenCalledWith(vine);
+  });
+
+  it('does not call onReshare on dialog cancel', async () => {
+    const onReshare = vi.fn();
+    render(VinePlayer, {
+      props: { vine, onClose: vi.fn(), onReshare },
+    });
+    await fireEvent.click(screen.getByLabelText('Reshare vine'));
+    await fireEvent.click(screen.getByRole('button', { name: /cancel/i }));
+    expect(onReshare).not.toHaveBeenCalled();
+  });
+
+  it('hides Reshare button on own original vines', () => {
+    const ownOriginal: VineVideo = { ...vine, creatorAddress: 'self', reshareOf: undefined };
+    render(VinePlayer, {
+      props: { vine: ownOriginal, onClose: vi.fn(), onReshare: vi.fn() },
+    });
+    expect(screen.queryByLabelText('Reshare vine')).toBeNull();
+  });
+
+  it("shows Reshare button on own reshare of someone else's vine", () => {
+    // Edge: I reshared someone else's vine. I should still be able to
+    // re-reshare (or unshare → reshare). The hide rule is "own ORIGINAL",
+    // not "anything I published".
+    const ownReshare: VineVideo = { ...vine, creatorAddress: 'self', reshareOf: 'vine-orig' };
+    render(VinePlayer, {
+      props: { vine: ownReshare, onClose: vi.fn(), onReshare: vi.fn() },
+    });
+    expect(screen.getByLabelText('Reshare vine')).toBeTruthy();
   });
 
   it('calls onClose when close button is clicked', async () => {

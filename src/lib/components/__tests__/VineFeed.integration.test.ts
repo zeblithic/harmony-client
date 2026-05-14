@@ -223,15 +223,25 @@ describe('VineFeed Integration', () => {
     expect(screen.getByLabelText('Reshare vine')).toBeTruthy();
   });
 
-  it('calls onReshare when reshare button is clicked', async () => {
+  it('calls onReshare when reshare is confirmed via dialog', async () => {
     const { callbacks } = renderFeed();
     callbacks.onReshare.mockResolvedValue(undefined);
 
     const card = screen.getByLabelText('Transport demo by Alice');
     await fireEvent.click(card);
 
+    // Player's reshare button opens the confirmation dialog.
     const reshareBtn = screen.getByLabelText('Reshare vine');
     await fireEvent.click(reshareBtn);
+
+    // onReshare must not fire until the dialog is confirmed.
+    expect(callbacks.onReshare).not.toHaveBeenCalled();
+
+    // The dialog's confirm button has the bare label "Reshare"
+    // (the player's button uses aria-label "Reshare vine"), so
+    // /^reshare$/i disambiguates to the dialog's confirm button.
+    const confirmBtn = screen.getByRole('button', { name: /^reshare$/i });
+    await fireEvent.click(confirmBtn);
 
     expect(callbacks.onReshare).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'v1' })
