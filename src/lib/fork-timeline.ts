@@ -51,9 +51,43 @@ export function buildUnifiedTimeline(
     return merged;
   }
 
-  // Find the transition index: the first live row after at least one pre-fork row.
-  const dividerIndex = merged.findIndex((row, i) => i > 0 && !row.isPreFork);
+  // Find the divider position: the first live row that comes AFTER the last
+  // pre-fork row in the merged (HLC-sorted) stream.
+  //
+  // Naively matching "first live row after index 0" is incorrect when some
+  // live messages sort earlier than some pre-fork messages by HLC — the
+  // divider would land inside a live-only prefix rather than at the true
+  // pre→live boundary.
+  //
+  // Correct approach:
+  //   1. Find the index of the LAST pre-fork row.
+  //   2. The divider goes immediately before the next live row after it.
+  //   3. If no live row follows the last pre-fork row (all live messages sort
+  //      earlier than all pre-fork messages), there is no clean post-fork
+  //      section to separate — skip the divider in that case.
+  let lastPreForkIdx = -1;
+  for (let i = merged.length - 1; i >= 0; i--) {
+    if (merged[i].isPreFork) {
+      lastPreForkIdx = i;
+      break;
+    }
+  }
+  if (lastPreForkIdx === -1) {
+    // All rows are live (pre.length > 0 check above guarantees pre is non-empty,
+    // so this branch is unreachable in practice, but guard for safety).
+    return merged;
+  }
+  // Find the first live row strictly after the last pre-fork row.
+  let dividerIndex = -1;
+  for (let i = lastPreForkIdx + 1; i < merged.length; i++) {
+    if (!merged[i].isPreFork) {
+      dividerIndex = i;
+      break;
+    }
+  }
   if (dividerIndex === -1) {
+    // No live row follows the last pre-fork row — all live messages sort
+    // earlier than all pre-fork messages. No divider to insert.
     return merged;
   }
 

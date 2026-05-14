@@ -573,14 +573,14 @@ New file `src/lib/components/__tests__/ForkConfirmDialog.test.ts`, mirroring `Re
 
 | Test | Verifies |
 |------|----------|
-| Renders heading + name input + checkboxes + snapshot count |
-| Default name = `"{originalName} (fork)"` prefilled into the input |
-| "Fork silently" checkbox toggles `silent` flag |
-| "Also leave" checkbox toggles `alsoLeave` flag |
-| `onConfirm` called with `{ name, silent, alsoLeave }` payload on Create button click (`also_leave === false` path) |
-| `also_leave === true` path opens second-stage typed-confirm modal; `onConfirm` only fires after typing `"leave"` exactly |
-| `onCancel` called on Cancel button / Escape key / backdrop click |
-| Create button is `disabled` when `name` is empty or whitespace-only |
+| `renders_heading_inputs_checkboxes_snapshot_count` | Heading, name input, both checkboxes, and snapshot message count all present in DOM |
+| `default_name_prefilled` | Name input is pre-populated with `"{originalName} (fork)"` |
+| `fork_silently_checkbox_toggles_silent_flag` | Toggling "Fork silently" updates the `silent` flag in the outgoing payload |
+| `also_leave_checkbox_toggles_alsoLeave_flag` | Toggling "Also leave" updates the `alsoLeave` flag in the outgoing payload |
+| `onConfirm_called_with_payload_silent_false_path` | `onConfirm` fires with `{ name, silent, alsoLeave }` on Create click when `also_leave === false` |
+| `also_leave_true_opens_typed_confirm_modal` | `also_leave === true` path opens second-stage typed-confirm; `onConfirm` only fires after typing `"leave"` exactly |
+| `onCancel_called_on_cancel_escape_backdrop` | `onCancel` called on Cancel button / Escape key / backdrop click |
+| `create_button_disabled_when_name_empty_or_whitespace` | Create button is `disabled` when name is empty or whitespace-only |
 
 ### 7.7 Smoke test (manual, documented in PR body)
 

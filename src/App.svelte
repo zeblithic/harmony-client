@@ -1274,8 +1274,10 @@
         {trustService}
         {navService}
         onForkSuccess={(forkSpaceId) => {
-          // ZEB-285: navigate to the newly created fork community.
+          // ZEB-285: navigate to the newly created fork community and
+          // refresh its member roster (matching create/join/redeem flows).
           changeSelectedCommunity(forkSpaceId);
+          void refreshCommunityMembers(forkSpaceId);
         }}
         onKickMember={async (target) => {
           if (!selectedCommunityId) return;
