@@ -25,10 +25,18 @@ pub const MAX_DESCRIPTORS: usize = 5000;
 /// along with their reactions. Runtime mutations do not re-age-prune.
 pub const MAX_AGE_SECS: u64 = 90 * 86_400;
 
+/// On-disk filename for the cached Vine feed. Lives under `app_data_dir`.
+const VINE_FEED_FILE: &str = "vine_feed.json";
+
+/// On-disk schema version. Bump only on a breaking format change; `load()`
+/// rejects `version != FILE_VERSION` (treat as missing).
+const FILE_VERSION: u32 = 1;
+
 /// On-disk envelope. Versioned at the top level for forward-compat.
 /// `version != 1` on `load()` causes the file to be ignored (treat as
 /// missing). v1 is the only version that exists today.
-#[allow(dead_code)] // Deserialize path used by ZEB-147 Task 3 (load); Serialize by save()
+#[allow(dead_code)]
+// save() (dead) serializes this; Task 3 will deserialize on load. Remove when save() is wired in Task 4.
 #[derive(Debug, Serialize, Deserialize)]
 struct VineFeedDiskV1 {
     version: u32,
@@ -181,7 +189,7 @@ impl VineFeedCache {
     /// the API can be built against it.
     pub fn load(data_dir: &Path) -> Self {
         Self {
-            path: Some(data_dir.join("vine_feed.json")),
+            path: Some(data_dir.join(VINE_FEED_FILE)),
             ..Default::default()
         }
     }
@@ -397,7 +405,7 @@ impl VineFeedCache {
         };
 
         let file = VineFeedDiskV1 {
-            version: 1,
+            version: FILE_VERSION,
             descriptors: self
                 .descriptors
                 .values()
@@ -430,7 +438,7 @@ impl VineFeedCache {
         let json = match serde_json::to_vec_pretty(&file) {
             Ok(j) => j,
             Err(e) => {
-                tracing::warn!("vine_feed_cache: serialize failed: {e}");
+                tracing::warn!(err = %e, "vine_feed_cache: serialize failed; changes not persisted");
                 return;
             }
         };
@@ -443,17 +451,17 @@ impl VineFeedCache {
 
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             if let Err(e) = std::fs::create_dir_all(parent) {
-                tracing::warn!("vine_feed_cache: create_dir_all failed: {e}");
+                tracing::warn!(err = %e, "vine_feed_cache: create_dir_all failed; changes not persisted");
                 return;
             }
         }
 
         if let Err(e) = std::fs::write(&tmp_path, &json) {
-            tracing::warn!("vine_feed_cache: write tmp failed: {e}");
+            tracing::warn!(err = %e, "vine_feed_cache: write tmp failed; changes not persisted");
             return;
         }
         if let Err(e) = std::fs::rename(&tmp_path, path) {
-            tracing::warn!("vine_feed_cache: rename failed: {e}");
+            tracing::warn!(err = %e, "vine_feed_cache: rename failed; tmp file may be stale");
         }
     }
 
@@ -953,15 +961,18 @@ mod tests {
 
     #[test]
     fn save_is_noop_when_path_is_none() {
-        // VineFeedCache::new() has path = None. save() must not panic
-        // and must not create any side effect.
+        // VineFeedCache::new() leaves path = None. Calling save_for_test()
+        // must not panic and must not create vine_feed.json anywhere on
+        // disk. We verify the negative by ensuring the in-memory cache
+        // remains usable AND no file appears in a freshly-created tempdir
+        // (which the cache has no knowledge of — that's the point).
+        let dir = tempfile::tempdir().expect("create tempdir");
         let mut cache = VineFeedCache::new();
         cache.mark_viewed("v-1".to_string());
-        // save() is private; we observe its no-op-ness indirectly via
-        // the public mark_viewed (which Task 4 will wire to save()).
-        // For now, just assert mark_viewed returns true and the cache
-        // remains usable.
+        cache.save_for_test(); // must be a no-op (path is None)
         assert!(cache.is_viewed("v-1"));
+        // The tempdir was never told to the cache; nothing should appear.
+        assert!(!dir.path().join(VINE_FEED_FILE).exists());
     }
 
     #[test]
@@ -975,12 +986,12 @@ mod tests {
         cache.mark_viewed("v-saved".to_string());
         cache.save_for_test();
 
-        let path = dir.path().join("vine_feed.json");
+        let path = dir.path().join(VINE_FEED_FILE);
         assert!(path.exists(), "vine_feed.json must exist after save");
         let bytes = std::fs::read(&path).expect("read saved file");
         let json: serde_json::Value =
             serde_json::from_slice(&bytes).expect("file must be valid JSON");
-        assert_eq!(json["version"], 1);
+        assert_eq!(json["version"], FILE_VERSION);
         assert!(
             json["viewed"]
                 .as_array()
