@@ -39,12 +39,24 @@ export class NavService {
   private adapter: TauriAdapter | null = null;
   private avatarResolver: AvatarResolver | null = null;
   private unlisteners: Array<() => void> = [];
+  /** IDs of constructor-seeded mock nav nodes — used to selectively clear
+   *  mocks on `connectAdapter()` while preserving any locally-created
+   *  entries from pre-connect-window calls (e.g. handleDmCreate calling
+   *  addOrUpdateNavSpace before the adapter wires in) (ZEB-209 bot R1). */
+  private mockNodeIds = new Set<string>();
+  /** Keys of constructor-seeded mock profiles — used to selectively clear
+   *  mocks on `connectAdapter()` while preserving any locally-added
+   *  profiles from the pre-connect window (ZEB-209 bot R1). */
+  private mockProfileKeys = new Set<string>();
 
   constructor() {
     // Seed with mock data for browser/dev mode — `connectAdapter()` clears
-    // these before subscribing to real events (ZEB-209).
+    // these (selectively, preserving any locally-created entries from the
+    // pre-connect window) before subscribing to real events (ZEB-209).
     this.nodes = [...mockNavNodes];
     this.profiles = new Map(mockProfileStore);
+    this.mockNodeIds = new Set(mockNavNodes.map((n) => n.id));
+    this.mockProfileKeys = new Set(mockProfileStore.keys());
   }
 
   /** Attach an avatar resolver for CID → blob URL resolution. */
@@ -65,55 +77,66 @@ export class NavService {
   /** Connect a Tauri adapter and start listening for profile + nav updates. */
   async connectAdapter(adapter: TauriAdapter): Promise<void> {
     if (this.adapter) return;
+
+    // ZEB-209 bot-feedback round 1: register listeners FIRST so a partial-init
+    // failure doesn't wedge the service. Adapter and unlisteners are committed
+    // only after all listens succeed; on failure we tear down partial work and
+    // rethrow so the caller (App.svelte tryConnect) can retry.
+    const localUnlisteners: Array<() => void> = [];
+    try {
+      localUnlisteners.push(await adapter.listen(
+        'profile-update',
+        (event) => {
+          const wire = event.payload as ProfilePayload;
+          // Filter own profile echoes
+          if (this.ownAddress && wire.address === this.ownAddress) return;
+          const avatarUrl = this.resolveAvatarUrl(wire);
+          this.profiles.set(wire.address, {
+            address: wire.address,
+            displayName: wire.displayName,
+            statusText: wire.statusText,
+            avatarUrl,
+            avatarCid: wire.avatarCid,
+            avatarMiniCid: wire.avatarMiniCid,
+          });
+          // Update DM nodes to match latest peer profile
+          let nodeChanged = false;
+          const updated = this.nodes.map((n) => {
+            if (n.peer?.address !== wire.address) return n;
+            const peerChanged = n.name !== wire.displayName || n.peer.avatarUrl !== avatarUrl;
+            if (!peerChanged) return n;
+            nodeChanged = true;
+            return {
+              ...n,
+              name: wire.displayName,
+              peer: { ...n.peer, displayName: wire.displayName, avatarUrl },
+            };
+          });
+          if (nodeChanged) this.nodes = updated;
+          this.onChange?.();
+        },
+      ));
+
+      localUnlisteners.push(await adapter.listen('nav-updated', (event) => {
+        this.addOrUpdateNavSpace(event.payload as NavUpdatedPayload);
+      }));
+    } catch (err) {
+      for (const fn of localUnlisteners) fn();
+      throw err;
+    }
+
+    // Commit: assign adapter, register unlisteners, then selectively clear
+    // mock-seeded state (preserving any locally-created entries from a
+    // pre-connect-window addOrUpdateNavSpace / profiles.set call).
     this.adapter = adapter;
+    this.unlisteners.push(...localUnlisteners);
 
-    // ZEB-209: clear mock-seeded state before subscribing to real events.
-    // The constructor seeds mockNavNodes + mockProfileStore for browser/
-    // dev mode (no adapter connects). In production the adapter always
-    // wires in, so the mocks must go to avoid mock channels/DMs that are
-    // uninhabitable (no real Zenoh state behind them).
-    this.nodes = [];
-    this.profiles = new Map();
+    // Selective clear: drop only constructor-seeded mock entries.
+    this.nodes = this.nodes.filter((n) => !this.mockNodeIds.has(n.id));
+    for (const key of this.mockProfileKeys) this.profiles.delete(key);
+    this.mockNodeIds = new Set();
+    this.mockProfileKeys = new Set();
     this.onChange?.();
-
-    const unlistenProfile = await adapter.listen(
-      'profile-update',
-      (event) => {
-        const wire = event.payload as ProfilePayload;
-        // Filter own profile echoes
-        if (this.ownAddress && wire.address === this.ownAddress) return;
-        const avatarUrl = this.resolveAvatarUrl(wire);
-        this.profiles.set(wire.address, {
-          address: wire.address,
-          displayName: wire.displayName,
-          statusText: wire.statusText,
-          avatarUrl,
-          avatarCid: wire.avatarCid,
-          avatarMiniCid: wire.avatarMiniCid,
-        });
-        // Update DM nodes to match latest peer profile
-        let nodeChanged = false;
-        const updated = this.nodes.map((n) => {
-          if (n.peer?.address !== wire.address) return n;
-          const peerChanged = n.name !== wire.displayName || n.peer.avatarUrl !== avatarUrl;
-          if (!peerChanged) return n;
-          nodeChanged = true;
-          return {
-            ...n,
-            name: wire.displayName,
-            peer: { ...n.peer, displayName: wire.displayName, avatarUrl },
-          };
-        });
-        if (nodeChanged) this.nodes = updated;
-        this.onChange?.();
-      },
-    );
-    this.unlisteners.push(unlistenProfile);
-
-    const unlistenNav = await adapter.listen('nav-updated', (event) => {
-      this.addOrUpdateNavSpace(event.payload as NavUpdatedPayload);
-    });
-    this.unlisteners.push(unlistenNav);
   }
 
   /**
