@@ -24,15 +24,18 @@ describe('VineService', () => {
     }
   });
 
-  it('populates seenIds so mock vines are deduped', async () => {
+  it('deduplicates network vines by seenIds after connect', async () => {
+    // After ZEB-209, connectAdapter clears mock-seeded state. seenIds
+    // still deduplicates genuine network duplicates (same id sent twice).
     const { adapter, emit } = createMockAdapter();
     await svc.connectAdapter(adapter);
-    const existingId = mockVines[0].id;
-    emit('vine-received', {
-      id: existingId, creatorAddress: 'x', creatorName: 'X',
+    const wire: VineDescriptorEvent = {
+      id: 'net-dup-1', creatorAddress: 'x', creatorName: 'X',
       createdAt: 1, videoCid: 'cid-dup',
-    } satisfies VineDescriptorEvent);
-    expect(svc.vines.length).toBe(mockVines.length);
+    };
+    emit('vine-received', wire);
+    emit('vine-received', wire); // second emit should be ignored
+    expect(svc.vines.filter(v => v.id === 'net-dup-1').length).toBe(1);
   });
 
   // ── connectAdapter ────────────────────────────────────────────────
@@ -54,12 +57,13 @@ describe('VineService', () => {
   it('appends incoming wire vines', async () => {
     const { adapter, emit } = createMockAdapter();
     await svc.connectAdapter(adapter);
+    // After ZEB-209 clear, feed starts empty; each network vine adds 1.
     const wire: VineDescriptorEvent = {
       id: 'net-v1', creatorAddress: 'abc123', creatorName: 'Peer',
       createdAt: 1700000500, videoCid: 'cid-new',
     };
     emit('vine-received', wire);
-    expect(svc.vines.length).toBe(mockVines.length + 1);
+    expect(svc.vines.length).toBe(1);
     expect(svc.vines.at(-1)!.videoCid).toBe('cid-new');
   });
 
@@ -79,6 +83,9 @@ describe('VineService', () => {
     const { adapter, emit } = createMockAdapter();
     svc.onChange = vi.fn();
     await svc.connectAdapter(adapter);
+    // ZEB-209: connectAdapter calls onChange once for the clear; reset so
+    // the assertion below only counts the vine-driven notification.
+    (svc.onChange as ReturnType<typeof vi.fn>).mockClear();
     emit('vine-received', {
       id: 'notify-v1', creatorAddress: 'x', creatorName: 'X',
       createdAt: 1, videoCid: 'cid-y',
@@ -298,44 +305,48 @@ describe('VineService', () => {
   it('routes "followed" vines to followedVines', async () => {
     const { adapter, emit } = createMockAdapter();
     await svc.connectAdapter(adapter);
+    // After ZEB-209 clear, discoverVines starts empty.
     emit('vine-received', {
       id: 'fv-1', creatorAddress: 'aabb', creatorName: 'Alice',
       createdAt: 1, videoCid: 'cid-f1', source: 'followed',
     });
     expect(svc.followedVines.length).toBe(1);
-    expect(svc.discoverVines.length).toBe(mockVines.length);
+    expect(svc.discoverVines.length).toBe(0);
   });
 
   it('routes "discover" vines to discoverVines', async () => {
     const { adapter, emit } = createMockAdapter();
     await svc.connectAdapter(adapter);
+    // After ZEB-209 clear, discoverVines starts empty; network vine adds 1.
     emit('vine-received', {
       id: 'dv-1', creatorAddress: 'ccdd', creatorName: 'Bob',
       createdAt: 1, videoCid: 'cid-d1', source: 'discover',
     });
-    expect(svc.discoverVines.length).toBe(mockVines.length + 1);
+    expect(svc.discoverVines.length).toBe(1);
     expect(svc.followedVines.length).toBe(0);
   });
 
   it('treats vines without source as discover', async () => {
     const { adapter, emit } = createMockAdapter();
     await svc.connectAdapter(adapter);
+    // After ZEB-209 clear, discoverVines starts empty; network vine adds 1.
     emit('vine-received', {
       id: 'ns-1', creatorAddress: 'eeff', creatorName: 'Carol',
       createdAt: 1, videoCid: 'cid-ns',
     });
-    expect(svc.discoverVines.length).toBe(mockVines.length + 1);
+    expect(svc.discoverVines.length).toBe(1);
   });
 
   it('follow moves existing vines from discover to followed', async () => {
     const { adapter, emit } = createMockAdapter();
     (adapter.invoke as ReturnType<typeof vi.fn>).mockResolvedValue(true);
     await svc.connectAdapter(adapter);
+    // After ZEB-209 clear, discoverVines starts empty; network vine adds 1.
     emit('vine-received', {
       id: 'mv-1', creatorAddress: 'aabb', creatorName: 'Alice',
       createdAt: 1, videoCid: 'cid-mv1', source: 'discover',
     });
-    expect(svc.discoverVines.length).toBe(mockVines.length + 1);
+    expect(svc.discoverVines.length).toBe(1);
     await svc.follow('aabb', 'Alice');
     expect(svc.discoverVines.find(v => v.id === 'mv-1')).toBeFalsy();
     expect(svc.followedVines.find(v => v.id === 'mv-1')).toBeTruthy();
@@ -507,14 +518,21 @@ describe('VineService', () => {
   it('incoming reaction increments count', async () => {
     const { adapter, emit } = createMockAdapter();
     await svc.connectAdapter(adapter);
+    // ZEB-209: mocks are cleared; emit a real vine first so the reaction
+    // handler considers it "known".
+    const testVineId = 'react-vine-1';
+    emit('vine-received', {
+      id: testVineId, creatorAddress: 'peer-abc', creatorName: 'Peer',
+      createdAt: 1, videoCid: 'cid-rv1',
+    });
     emit('vine-reaction-received', {
-      vineId: mockVines[0].id,
+      vineId: testVineId,
       reactorAddress: 'peer-abc',
       reactorName: 'Peer',
       liked: true,
       timestamp: 1700000500,
     });
-    const r = svc.getReaction(mockVines[0].id);
+    const r = svc.getReaction(testVineId);
     expect(r.count).toBe(1);
     expect(r.likedByMe).toBe(false);
   });
@@ -522,8 +540,15 @@ describe('VineService', () => {
   it('incoming reaction deduplicates by reactor address', async () => {
     const { adapter, emit } = createMockAdapter();
     await svc.connectAdapter(adapter);
+    // ZEB-209: mocks are cleared; emit a real vine first so the reaction
+    // handler considers it "known".
+    const testVineId = 'react-vine-2';
+    emit('vine-received', {
+      id: testVineId, creatorAddress: 'peer-abc', creatorName: 'Peer',
+      createdAt: 1, videoCid: 'cid-rv2',
+    });
     const event = {
-      vineId: mockVines[0].id,
+      vineId: testVineId,
       reactorAddress: 'peer-abc',
       reactorName: 'Peer',
       liked: true,
@@ -531,27 +556,34 @@ describe('VineService', () => {
     };
     emit('vine-reaction-received', event);
     emit('vine-reaction-received', event);
-    expect(svc.getReaction(mockVines[0].id).count).toBe(1);
+    expect(svc.getReaction(testVineId).count).toBe(1);
   });
 
   it('incoming unlike decrements count', async () => {
     const { adapter, emit } = createMockAdapter();
     await svc.connectAdapter(adapter);
+    // ZEB-209: mocks are cleared; emit a real vine first so the reaction
+    // handler considers it "known".
+    const testVineId = 'react-vine-3';
+    emit('vine-received', {
+      id: testVineId, creatorAddress: 'peer-abc', creatorName: 'Peer',
+      createdAt: 1, videoCid: 'cid-rv3',
+    });
     emit('vine-reaction-received', {
-      vineId: mockVines[0].id,
+      vineId: testVineId,
       reactorAddress: 'peer-abc',
       reactorName: 'Peer',
       liked: true,
       timestamp: 1700000500,
     });
     emit('vine-reaction-received', {
-      vineId: mockVines[0].id,
+      vineId: testVineId,
       reactorAddress: 'peer-abc',
       reactorName: 'Peer',
       liked: false,
       timestamp: 1700000600,
     });
-    expect(svc.getReaction(mockVines[0].id).count).toBe(0);
+    expect(svc.getReaction(testVineId).count).toBe(0);
   });
 
   it('skips self-echo reactions', async () => {
@@ -590,9 +622,16 @@ describe('VineService', () => {
     const { adapter, emit } = createMockAdapter();
     svc.onChange = vi.fn();
     await svc.connectAdapter(adapter);
+    // ZEB-209: mocks are cleared; emit a real vine first so the reaction
+    // handler considers it "known". Reset onChange after setup.
+    const testVineId = 'react-vine-4';
+    emit('vine-received', {
+      id: testVineId, creatorAddress: 'peer-xyz', creatorName: 'Peer',
+      createdAt: 1, videoCid: 'cid-rv4',
+    });
     (svc.onChange as ReturnType<typeof vi.fn>).mockClear();
     emit('vine-reaction-received', {
-      vineId: mockVines[0].id,
+      vineId: testVineId,
       reactorAddress: 'peer-xyz',
       reactorName: 'Peer',
       liked: true,
@@ -622,6 +661,47 @@ describe('VineService', () => {
     await svc.loadFollowed();
     expect(svc.discoverVines.find(v => v.id === 'recon-1')).toBeFalsy();
     expect(svc.followedVines.find(v => v.id === 'recon-1')).toBeTruthy();
+  });
+
+  // ── ZEB-209: clear-on-connect ─────────────────────────────────
+
+  it('clears mock-seeded vines on connectAdapter (ZEB-209)', async () => {
+    const svc = new VineService();
+    // Sanity: constructor seeds from mockVines so the UI is never empty
+    // in browser/dev mode (no adapter connects).
+    expect(svc.discoverVines.length).toBeGreaterThan(0);
+    const { adapter } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    expect(svc.discoverVines).toEqual([]);
+    expect(svc.followedVines).toEqual([]);
+    expect(svc.viewedIds.size).toBe(0);
+  });
+
+  it('fires onChange once after clearing mocks (ZEB-209)', async () => {
+    const svc = new VineService();
+    let calls = 0;
+    svc.onChange = () => { calls++; };
+    const { adapter } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    expect(calls).toBeGreaterThanOrEqual(1);
+  });
+
+  it('no longer dedupes events whose id collided with a former mock vine (ZEB-209)', async () => {
+    const svc = new VineService();
+    const collidingId = svc.discoverVines[0]!.id;
+    const { adapter, emit } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    emit('vine-received', {
+      id: collidingId,
+      creatorAddress: 'bb'.repeat(32),
+      creatorName: 'Real Creator',
+      createdAt: 1700000000,
+      videoCid: 'real-cid',
+      source: 'discover',
+    });
+    // The mock vine is gone; a real event with the same id is now accepted.
+    const found = svc.discoverVines.find((v) => v.id === collidingId);
+    expect(found?.creatorName).toBe('Real Creator');
   });
 });
 

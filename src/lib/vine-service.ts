@@ -52,7 +52,8 @@ export class VineService {
   private seenIds = new Set<string>();
 
   constructor() {
-    // Seed with mock data — real vines append on top.
+    // Seed with mock data for browser/dev mode — `connectAdapter()` clears
+    // these before subscribing to real events (ZEB-209).
     this.discoverVines = [...mockVines];
     for (const v of this.discoverVines) {
       this.seenIds.add(v.id);
@@ -64,6 +65,20 @@ export class VineService {
   async connectAdapter(adapter: TauriAdapter): Promise<void> {
     if (this.adapter) return; // already wired; prevent duplicate listeners
     this.adapter = adapter;
+
+    // ZEB-209: clear mock-seeded state before subscribing to real events.
+    // The constructor seeds mockVines for browser/dev mode (no adapter
+    // connects). In production the adapter always wires in, so the mocks
+    // must go to avoid hybrid real+fictional state (fictional CIDs lead
+    // to dead-end UI clicks).
+    this.discoverVines = [];
+    this.followedVines = [];
+    this.seenIds = new Set();
+    this.viewedIds = new Set();
+    this.reactionMap = new Map();
+    this.likePending = new Set();
+    this.onChange?.();
+
     const unlisten = await adapter.listen(
       'vine-received',
       (event) => {
