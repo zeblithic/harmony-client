@@ -7728,7 +7728,18 @@ async fn generate_invite(
         if let Some(original_id) = fork_origin {
             // Read pre_fork_snapshot.bin from the fork's data dir.
             let snapshot: Option<crate::community_invite::PreForkSnapshot> = (|| {
-                let identity_dir = crate::owner_commands::resolve_identity_dir().ok()?;
+                let identity_dir = match crate::owner_commands::resolve_identity_dir() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = ?e,
+                            community_id = %hex::encode(space_id.0),
+                            "ZEB-285 generate_invite: failed to resolve identity_dir; \
+                             fork-invite will be minted without snapshot bundled"
+                        );
+                        return None;
+                    }
+                };
                 let snapshot_path = identity_dir
                     .join("communities")
                     .join(hex::encode(space_id.0))
@@ -9617,6 +9628,8 @@ where
                         }
                         Err(e) => {
                             tracing::warn!(
+                                community_id = %hex::encode(minted.community_id.0),
+                                path = %snapshot_path.display(),
                                 error = %e,
                                 "redeem_invite_inner: encode pre_fork_snapshot failed; \
                                  snapshot not written"
