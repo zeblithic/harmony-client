@@ -21,6 +21,8 @@
     resolveVideo,
     getReaction,
     onToggleLike,
+    getReshareCount,
+    onViewOriginal,
   }: {
     followedVines?: VineVideo[];
     discoverVines?: VineVideo[];
@@ -36,6 +38,8 @@
     resolveVideo?: (cid: string) => Promise<string>;
     getReaction?: (vineId: string) => { count: number; likedByMe: boolean };
     onToggleLike?: (vine: VineVideo) => void;
+    getReshareCount?: (vineId: string) => number;
+    onViewOriginal?: (vineId: string) => void;
   } = $props();
 
   let activeVine = $state<VineVideo | null>(null);
@@ -149,6 +153,8 @@
             reactionCount={reaction?.count ?? 0}
             likedByMe={reaction?.likedByMe ?? false}
             {onToggleLike}
+            reshareCount={getReshareCount?.(vine.id) ?? 0}
+            {onViewOriginal}
           />
         </div>
       {/each}
@@ -167,6 +173,7 @@
     reactionCount={getReaction?.(activeVine.id)?.count ?? 0}
     likedByMe={getReaction?.(activeVine.id)?.likedByMe ?? false}
     {onToggleLike}
+    {onViewOriginal}
   />
 {/if}
 

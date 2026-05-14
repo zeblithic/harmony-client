@@ -221,4 +221,83 @@ describe('VineFeed', () => {
     await fireEvent.click(likeBtn);
     expect(onToggleLike).toHaveBeenCalled();
   });
+
+  it('invokes getReshareCount for each rendered vine and renders the count', () => {
+    const orig: VineVideo = {
+      id: 'vine-orig',
+      creatorAddress: 'origAddr',
+      creatorName: 'OrigCreator',
+      createdAt: 1700001000,
+      videoCid: 'cid-orig',
+      viewed: false,
+    };
+    const getReshareCount = vi.fn((id: string) => (id === 'vine-orig' ? 3 : 0));
+    render(VineFeed, { props: {
+      followedVines: [],
+      discoverVines: [orig],
+      viewedIds: new Set(),
+      activeTab: 'discover',
+      followedAddresses: new Set(),
+      getReshareCount,
+    } });
+    expect(getReshareCount).toHaveBeenCalledWith('vine-orig');
+    // The "3" count is rendered in the social stats row on the originals card
+    expect(screen.getByText('3')).toBeTruthy();
+  });
+
+  it('forwards onViewOriginal to VineCard attribution link', async () => {
+    const onViewOriginal = vi.fn();
+    const reshared: VineVideo = {
+      id: 'vine-r',
+      creatorAddress: 'a1b2c3d4',
+      creatorName: 'Alice',
+      createdAt: 1700002000,
+      videoCid: 'cid-r',
+      reshareOf: 'orig-1',
+      originalCreatorName: 'OrigName',
+      viewed: false,
+    };
+    render(VineFeed, { props: {
+      followedVines: [],
+      discoverVines: [reshared],
+      viewedIds: new Set(),
+      activeTab: 'discover',
+      followedAddresses: new Set(),
+      onViewOriginal,
+    } });
+    const link = screen.getByRole('button', { name: /originally by OrigName/i });
+    await fireEvent.click(link);
+    expect(onViewOriginal).toHaveBeenCalledWith('orig-1');
+  });
+
+  it('forwards onViewOriginal to VinePlayer attribution link', async () => {
+    const onViewOriginal = vi.fn();
+    const reshared: VineVideo = {
+      id: 'vine-r2',
+      creatorAddress: 'a1b2c3d4',
+      creatorName: 'Alice',
+      createdAt: 1700003000,
+      videoCid: 'cid-r2',
+      reshareOf: 'orig-2',
+      originalCreatorName: 'PlayerOrig',
+      viewed: false,
+    };
+    render(VineFeed, { props: {
+      followedVines: [],
+      discoverVines: [reshared],
+      viewedIds: new Set(),
+      activeTab: 'discover',
+      followedAddresses: new Set(),
+      onViewOriginal,
+    } });
+    // Open the player by clicking the card
+    await fireEvent.click(screen.getByLabelText(/Untitled vine by Alice/));
+    // Player exposes its own attribution button — there will be two matches now
+    // (one on the card behind, one in the dialog). Pick the one inside the dialog.
+    const dialog = screen.getByRole('dialog', { name: 'Vine player' });
+    const playerLink = dialog.querySelector('button[aria-label*="originally by PlayerOrig"]');
+    expect(playerLink).toBeTruthy();
+    await fireEvent.click(playerLink as HTMLButtonElement);
+    expect(onViewOriginal).toHaveBeenCalledWith('orig-2');
+  });
 });
