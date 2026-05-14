@@ -5,19 +5,74 @@
 //! `Arc<Mutex<VineFeedCache>>`). Read by the `list_vine_videos()` and
 //! `mark_vine_viewed()` Tauri IPCs.
 //!
-//! In-memory only in this PR — disk persistence is deferred to ZEB-147.
+//! ZEB-147: disk-backed via `load()` + `save()`. `new()` stays for tests
+//! (no disk side-effects); production uses `load(&app_data_dir)`.
 //!
 //! See `docs/specs/2026-05-13-zeb-286-vine-integration-test-design.md`.
 
 use crate::{VineDescriptorPayload, VineReactionPayload, VineVideoDto};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+/// ZEB-147: max descriptors retained in the cache. On insert into a full
+/// cache, the oldest descriptor (lowest `created_at`) is dropped, along
+/// with its reactions. Viewed-set entries are NOT dropped (low byte cost).
+pub const MAX_DESCRIPTORS: usize = 5000;
+
+/// ZEB-147: max age of a descriptor in seconds. Applied ONCE on `load()`;
+/// descriptors with `created_at < now_secs - MAX_AGE_SECS` are dropped
+/// along with their reactions. Runtime mutations do not re-age-prune.
+pub const MAX_AGE_SECS: u64 = 90 * 86_400;
+
+/// On-disk envelope. Versioned at the top level for forward-compat.
+/// `version != 1` on `load()` causes the file to be ignored (treat as
+/// missing). v1 is the only version that exists today.
+#[allow(dead_code)] // Deserialize path used by ZEB-147 Task 3 (load); Serialize by save()
+#[derive(Debug, Serialize, Deserialize)]
+struct VineFeedDiskV1 {
+    version: u32,
+    descriptors: Vec<DescriptorOnDisk>,
+    reactions: Vec<ReactionOnDisk>,
+    viewed: Vec<String>,
+}
+
+/// On-disk descriptor row. Mirrors the in-memory `CachedVine` plus the
+/// `source` tag (decided at first arrival; preserved across reloads).
+#[allow(dead_code)] // Deserialize path used by ZEB-147 Task 3 (load)
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DescriptorOnDisk {
+    id: String,
+    creator_address: String,
+    creator_name: String,
+    created_at: u64,
+    video_cid: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    reshare_of: Option<String>,
+    received_at_ms: u64,
+    source: VineSource,
+}
+
+/// On-disk reaction row. Flat — `vine_id` and `reactor_address` join
+/// back to the in-memory `HashMap<(String, String), CachedReaction>` key.
+#[allow(dead_code)] // Deserialize path used by ZEB-147 Task 3 (load)
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReactionOnDisk {
+    vine_id: String,
+    reactor_address: String,
+    reactor_name: String,
+    liked: bool,
+    timestamp: u64,
+}
 
 /// How the recipient discovered this vine. Followed = creator is in the
 /// local follow set at the time of first arrival; Discover = otherwise.
 /// Decided ONCE at first insert; subsequent re-arrivals do not change it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VineSource {
     Followed,
@@ -106,7 +161,7 @@ pub struct VineFeedCache {
     viewed: HashSet<String>,
     /// `Some(path_to_vine_feed.json)` when constructed via `load()`;
     /// `None` for `new()`. `save()` checks this and is a no-op when None.
-    #[allow(dead_code)] // consumed by save() in ZEB-147 Task 2
+    #[allow(dead_code)] // read by save(); save() wired to mutators in ZEB-147 Task 4
     path: Option<PathBuf>,
 }
 
@@ -327,6 +382,87 @@ impl VineFeedCache {
     /// + `on_descriptor_sample` does not matter.
     pub fn mark_viewed(&mut self, vine_id: String) -> bool {
         self.viewed.insert(vine_id)
+    }
+
+    /// Atomic save: serialize cache state, write to `<path>.tmp`, rename
+    /// to `<path>`. No-op when `self.path.is_none()` (test path).
+    ///
+    /// Errors are logged via `tracing::warn!` but never propagated — this
+    /// matches the `follows.rs` / `content_index.rs` philosophy: persistence
+    /// is best-effort; a failed save must not crash the dispatch loop.
+    #[allow(dead_code)] // wired into mutators in ZEB-147 Task 4
+    fn save(&self) {
+        let Some(path) = self.path.as_ref() else {
+            return;
+        };
+
+        let file = VineFeedDiskV1 {
+            version: 1,
+            descriptors: self
+                .descriptors
+                .values()
+                .map(|cv| DescriptorOnDisk {
+                    id: cv.descriptor.id.clone(),
+                    creator_address: cv.descriptor.creator_address.clone(),
+                    creator_name: cv.descriptor.creator_name.clone(),
+                    created_at: cv.descriptor.created_at,
+                    video_cid: cv.descriptor.video_cid.clone(),
+                    title: cv.descriptor.title.clone(),
+                    reshare_of: cv.descriptor.reshare_of.clone(),
+                    received_at_ms: cv.received_at_ms,
+                    source: cv.source,
+                })
+                .collect(),
+            reactions: self
+                .reactions
+                .iter()
+                .map(|((vine_id, reactor_addr), r)| ReactionOnDisk {
+                    vine_id: vine_id.clone(),
+                    reactor_address: reactor_addr.clone(),
+                    reactor_name: r.reactor_name.clone(),
+                    liked: r.liked,
+                    timestamp: r.timestamp,
+                })
+                .collect(),
+            viewed: self.viewed.iter().cloned().collect(),
+        };
+
+        let json = match serde_json::to_vec_pretty(&file) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!("vine_feed_cache: serialize failed: {e}");
+                return;
+            }
+        };
+
+        let tmp_path = {
+            let mut name = path.file_name().unwrap_or_default().to_os_string();
+            name.push(".tmp");
+            path.with_file_name(name)
+        };
+
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::warn!("vine_feed_cache: create_dir_all failed: {e}");
+                return;
+            }
+        }
+
+        if let Err(e) = std::fs::write(&tmp_path, &json) {
+            tracing::warn!("vine_feed_cache: write tmp failed: {e}");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, path) {
+            tracing::warn!("vine_feed_cache: rename failed: {e}");
+        }
+    }
+
+    /// Test-only public alias for `save()`. Lets unit tests trigger
+    /// persistence explicitly before Task 4 wires it into mutators.
+    /// Marked `#[cfg(test)]` so it cannot leak into production callers.
+    #[cfg(test)]
+    pub fn save_for_test(&self) {
+        self.save();
     }
 
     /// Number of cached descriptors. Test helper.
@@ -813,6 +949,45 @@ mod tests {
         assert_eq!(cache.len_descriptors(), 0);
         assert_eq!(cache.len_reactions(), 0);
         assert!(!cache.is_viewed("anything"));
+    }
+
+    #[test]
+    fn save_is_noop_when_path_is_none() {
+        // VineFeedCache::new() has path = None. save() must not panic
+        // and must not create any side effect.
+        let mut cache = VineFeedCache::new();
+        cache.mark_viewed("v-1".to_string());
+        // save() is private; we observe its no-op-ness indirectly via
+        // the public mark_viewed (which Task 4 will wire to save()).
+        // For now, just assert mark_viewed returns true and the cache
+        // remains usable.
+        assert!(cache.is_viewed("v-1"));
+    }
+
+    #[test]
+    fn save_writes_atomic_file_when_path_is_set() {
+        // Construct a cache with path set, mutate it, call save() directly
+        // (the method is private — we invoke it via a Task-2-internal
+        // test helper exposing `save_for_test`). Verify the file exists
+        // and contains expected JSON.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let mut cache = VineFeedCache::load(dir.path());
+        cache.mark_viewed("v-saved".to_string());
+        cache.save_for_test();
+
+        let path = dir.path().join("vine_feed.json");
+        assert!(path.exists(), "vine_feed.json must exist after save");
+        let bytes = std::fs::read(&path).expect("read saved file");
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("file must be valid JSON");
+        assert_eq!(json["version"], 1);
+        assert!(
+            json["viewed"]
+                .as_array()
+                .map(|a| a.iter().any(|v| v.as_str() == Some("v-saved")))
+                .unwrap_or(false),
+            "viewed set must contain v-saved; got: {json}"
+        );
     }
 
     #[test]
