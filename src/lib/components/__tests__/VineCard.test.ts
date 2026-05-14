@@ -77,7 +77,7 @@ describe('VineCard', () => {
   it('calls onPlay with vine when clicked', async () => {
     const onPlay = vi.fn();
     render(VineCard, { props: { vine, onPlay } });
-    const card = screen.getByRole('button');
+    const card = screen.getByRole('button', { name: /Demo vine by Alice/i });
     await fireEvent.click(card);
     expect(onPlay).toHaveBeenCalledWith(vine);
   });
@@ -85,7 +85,7 @@ describe('VineCard', () => {
   it('calls onPlay on Enter key', async () => {
     const onPlay = vi.fn();
     render(VineCard, { props: { vine, onPlay } });
-    const card = screen.getByRole('button');
+    const card = screen.getByRole('button', { name: /Demo vine by Alice/i });
     await fireEvent.keyDown(card, { key: 'Enter' });
     expect(onPlay).toHaveBeenCalledWith(vine);
   });
@@ -93,21 +93,21 @@ describe('VineCard', () => {
   it('calls onPlay on Space key', async () => {
     const onPlay = vi.fn();
     render(VineCard, { props: { vine, onPlay } });
-    const card = screen.getByRole('button');
+    const card = screen.getByRole('button', { name: /Demo vine by Alice/i });
     await fireEvent.keyDown(card, { key: ' ' });
     expect(onPlay).toHaveBeenCalledWith(vine);
   });
 
   it('has accessible label with title and creator', () => {
     render(VineCard, { props: { vine, onPlay: vi.fn() } });
-    const card = screen.getByRole('button');
+    const card = screen.getByRole('button', { name: /Demo vine by Alice/i });
     expect(card.getAttribute('aria-label')).toBe('Demo vine by Alice');
   });
 
   it('uses Untitled for vines without title in aria-label', () => {
     const untitled = { ...vine, title: undefined };
     render(VineCard, { props: { vine: untitled, onPlay: vi.fn() } });
-    const card = screen.getByRole('button');
+    const card = screen.getByRole('button', { name: /Untitled vine by Alice/i });
     expect(card.getAttribute('aria-label')).toBe('Untitled vine by Alice');
   });
 
