@@ -164,6 +164,22 @@ pub enum MembershipEventKind {
         #[serde(rename = "rc")]
         recipient_ciphertexts: Vec<RecipientCiphertext>,
     },
+
+    /// ZEB-285: a joined member declares they have forked this community
+    /// into a new community with `fork_space_id` as its SpaceId. Non-mutating
+    /// — does NOT change materialized membership/power/channels, does NOT
+    /// trigger EpochRotation. Other members materialize it as visible
+    /// fork-lineage history. Verify rule: signer must be Joined at the
+    /// event's HLC (power threshold = 0, "any joined member, any time").
+    ///
+    /// Variant tag "x" (1-char value, lowercase, unused before this).
+    /// Inner field key "fs" (2-char) per same-length-keys invariant at this
+    /// nesting level. See `docs/specs/2026-05-14-zeb-285-phase1-community-forking-design.md` §3.1.
+    #[serde(rename = "x")]
+    Fork {
+        #[serde(rename = "fs")]
+        fork_space_id: SpaceId,
+    },
 }
 
 impl CanonicalPayloadSealed for MembershipEventKind {}
@@ -1295,6 +1311,12 @@ pub fn materialize(
                     m.pending_catchup_for.remove(&rc.recipient);
                 }
             }
+            MembershipEventKind::Fork { .. } => {
+                // ZEB-285: non-mutating. Fork events are recorded in the event
+                // log for historical/audit visibility but do not change the
+                // materialized membership/power/channels view. They are
+                // surfaced separately via settings-panel listings.
+            }
         }
     }
 
@@ -1603,6 +1625,15 @@ pub fn verify_event(
             // must be a Join, target must be in recipients, issuer
             // must have admin power) are enforced in materialize. Spec §4.6.
         }
+        MembershipEventKind::Fork { .. } => {
+            // ZEB-285: Fork requires the actor to be currently Joined.
+            // Any joined non-Banned member may fork at any time (power
+            // threshold = 0), but non-members and Banned members are
+            // rejected here before the per-kind power-rules block.
+            if !is_joined_member(prior_state, &event.actor) {
+                return Err(VerifyError::ActorNotJoined);
+            }
+        }
     }
 
     // 5. Per-kind power rules.
@@ -1824,6 +1855,17 @@ pub fn verify_event(
             if *epoch != current_epoch {
                 return Err(VerifyError::EpochEventUnauthorized);
             }
+        }
+        MembershipEventKind::Fork { .. } => {
+            // ZEB-285: any joined non-Banned member can fork at any time.
+            // Power threshold 0 — same as Leave. Non-mutating: doesn't
+            // affect membership/power/channels, doesn't trigger EpochRotation.
+            // Membership check already performed in the joined-membership
+            // block above (ActorNotJoined gate). No additional power check
+            // needed — POWER_THRESHOLDS.invite == 0, so all joined members
+            // qualify. No additional shape validation required: fork_space_id
+            // is a self-reported value from the forker; receivers don't (and
+            // can't) verify the fork's existence on the forker's device.
         }
     }
 
@@ -3164,6 +3206,364 @@ mod tests {
         assert!(
             m.pending_catchup_for.contains(&carol),
             "Invited→Joined after epoch rotation must mark carol for catchup (M9 regression)"
+        );
+    }
+
+    // ── ZEB-285: Fork variant tests ───────────────────────────────────────────
+
+    /// ZEB-285 Step 1/4: CBOR roundtrip for the Fork variant, verifying
+    /// tag "x" and inner key "fs" on the wire.
+    #[test]
+    fn fork_event_cbor_roundtrip() {
+        use crate::owner_state_crypto::canonical_cbor_encode;
+
+        let fork_space_id = SpaceId([0xfa; 16]);
+        let event = MembershipEventKind::Fork { fork_space_id };
+
+        let bytes = canonical_cbor_encode(&event).expect("encode");
+        let decoded: MembershipEventKind = ciborium::de::from_reader(&bytes[..]).expect("decode");
+
+        assert_eq!(event, decoded);
+
+        // Verify the variant tag is "x" and inner key is "fs" by inspecting
+        // the CBOR encoding directly. Wire form: { "tg": "x", "vl": { "fs": <16-byte bstr> } }.
+        let value: ciborium::Value =
+            ciborium::de::from_reader(&bytes[..]).expect("re-decode as value");
+        let map = value.as_map().expect("outer is map");
+        let tg = map
+            .iter()
+            .find_map(|(k, v): &(ciborium::Value, ciborium::Value)| {
+                if k.as_text() == Some("tg") {
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+            .expect("tg key");
+        assert_eq!(tg.as_text(), Some("x"));
+
+        let vl = map
+            .iter()
+            .find_map(|(k, v): &(ciborium::Value, ciborium::Value)| {
+                if k.as_text() == Some("vl") {
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+            .expect("vl key");
+        let inner = vl.as_map().expect("vl is map");
+        assert!(
+            inner
+                .iter()
+                .any(|(k, _): &(ciborium::Value, ciborium::Value)| k.as_text() == Some("fs")),
+            "inner has fs key"
+        );
+    }
+
+    /// ZEB-285 Step 5: all MembershipEventKind variants round-trip through
+    /// canonical CBOR, including the new Fork variant.
+    #[test]
+    fn all_variants_cbor_roundtrip() {
+        use crate::owner_state_crypto::canonical_cbor_encode;
+
+        let admin = OwnerAddr([0xaa; 16]);
+        let target = OwnerAddr([0xbb; 16]);
+        let channel_id = ChannelId([0xcc; 16]);
+
+        let variants: Vec<MembershipEventKind> = vec![
+            MembershipEventKind::Join,
+            MembershipEventKind::Leave,
+            MembershipEventKind::Invite { target },
+            MembershipEventKind::Kick {
+                target,
+                reason: None,
+            },
+            MembershipEventKind::SetPower { target, level: 50 },
+            MembershipEventKind::Unban {
+                target,
+                reason: None,
+            },
+            MembershipEventKind::ChannelCreate {
+                channel_id,
+                name: "test".into(),
+                write_power: 0,
+            },
+            MembershipEventKind::ChannelModify {
+                channel_id,
+                name: Some("renamed".into()),
+                write_power: None,
+            },
+            MembershipEventKind::ChannelDelete { channel_id },
+            MembershipEventKind::EpochRotation {
+                prior_epoch: 0,
+                triggered_by: [0xde; 16],
+                recipient_ciphertexts: vec![RecipientCiphertext {
+                    recipient: admin,
+                    sealed: vec![0u8; 92],
+                }],
+            },
+            MembershipEventKind::EpochCatchup {
+                epoch: 1,
+                triggered_by: [0xef; 16],
+                recipient_ciphertexts: vec![RecipientCiphertext {
+                    recipient: admin,
+                    sealed: vec![0u8; 92],
+                }],
+            },
+            MembershipEventKind::Fork {
+                fork_space_id: SpaceId([0xfa; 16]),
+            },
+        ];
+
+        for variant in &variants {
+            let bytes = canonical_cbor_encode(variant)
+                .unwrap_or_else(|e| panic!("encode failed for {variant:?}: {e}"));
+            let decoded: MembershipEventKind = ciborium::de::from_reader(&bytes[..])
+                .unwrap_or_else(|e| panic!("decode failed for {variant:?}: {e}"));
+            assert_eq!(variant, &decoded, "roundtrip mismatch for {variant:?}");
+        }
+    }
+
+    /// ZEB-285 Step 6/9: verify_event allows a Fork from any joined member
+    /// (power 0 = regular member, not just admin).
+    #[test]
+    fn verify_event_fork_allows_any_joined_member() {
+        let community_id = SpaceId([0xc0; 16]);
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (regular_priv, regular_pub, regular_addr) = make_identity(0xb1);
+
+        // Admin joins (power 100 from bootstrap).
+        let admin_join = sign_with_identity(
+            EventPayload {
+                id: [0x01; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: admin_addr,
+                at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &admin_priv,
+        );
+        // Regular member joins (power 0).
+        let regular_join = sign_with_identity(
+            EventPayload {
+                id: [0x02; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: regular_addr,
+                at: Hlc {
+                    wall_ms: 2,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &regular_priv,
+        );
+
+        let prior = materialize(&[admin_join, regular_join.clone()], admin_addr);
+
+        // Regular (power 0) signs a Fork. Should verify cleanly.
+        let fork_event = sign_with_identity(
+            EventPayload {
+                id: [0x03; 16],
+                community_id,
+                kind: MembershipEventKind::Fork {
+                    fork_space_id: SpaceId([0xfe; 16]),
+                },
+                actor: regular_addr,
+                at: Hlc {
+                    wall_ms: 3,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &regular_priv,
+        );
+
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &regular_pub,
+            countersigner_identity_pub: None,
+        };
+        assert_eq!(
+            verify_event(&fork_event, &prior, &ctx),
+            Ok(()),
+            "fork by a regular joined member (power 0) must be accepted"
+        );
+
+        // Also verify admin (power 100) can fork.
+        let admin_fork = sign_with_identity(
+            EventPayload {
+                id: [0x04; 16],
+                community_id,
+                kind: MembershipEventKind::Fork {
+                    fork_space_id: SpaceId([0xfe; 16]),
+                },
+                actor: admin_addr,
+                at: Hlc {
+                    wall_ms: 4,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &admin_priv,
+        );
+        let admin_ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+        };
+        assert_eq!(
+            verify_event(&admin_fork, &prior, &admin_ctx),
+            Ok(()),
+            "fork by admin (power 100) must also be accepted"
+        );
+    }
+
+    /// ZEB-285 Step 10: verify_event rejects a Fork from a non-member
+    /// (never joined) with ActorNotJoined.
+    #[test]
+    fn verify_event_fork_rejects_non_member() {
+        let community_id = SpaceId([0xc0; 16]);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
+        let (outsider_priv, outsider_pub, outsider_addr) = make_identity(0xcc);
+
+        let admin_join = sign_with_identity(
+            EventPayload {
+                id: [0x01; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: admin_addr,
+                at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &admin_priv,
+        );
+        let prior = materialize(std::slice::from_ref(&admin_join), admin_addr);
+
+        // Outsider (never joined) tries to Fork. Should reject.
+        let fork = sign_with_identity(
+            EventPayload {
+                id: [0x02; 16],
+                community_id,
+                kind: MembershipEventKind::Fork {
+                    fork_space_id: SpaceId([0xfe; 16]),
+                },
+                actor: outsider_addr,
+                at: Hlc {
+                    wall_ms: 2,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &outsider_priv,
+        );
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &outsider_pub,
+            countersigner_identity_pub: None,
+        };
+        assert_eq!(
+            verify_event(&fork, &prior, &ctx),
+            Err(VerifyError::ActorNotJoined),
+            "fork by non-member should reject with ActorNotJoined"
+        );
+    }
+
+    /// ZEB-285 Step 11/14: materialize Fork is non-mutating — members,
+    /// power_levels, and channels are unchanged by a Fork event.
+    #[test]
+    fn materialize_fork_is_non_mutating() {
+        let community_id = SpaceId([0xc0; 16]);
+        let admin = OwnerAddr([0xa1; 16]);
+
+        let admin_join = make_join_event(0x01, admin, 1);
+        let before = materialize(std::slice::from_ref(&admin_join), admin);
+
+        let fork = SignedMembershipEvent {
+            id: [0x02; 16],
+            community_id,
+            kind: MembershipEventKind::Fork {
+                fork_space_id: SpaceId([0xfe; 16]),
+            },
+            actor: admin,
+            at: Hlc {
+                wall_ms: 2,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+        };
+        let after = materialize(&[admin_join, fork], admin);
+
+        // Materialized view should be unchanged by the Fork event.
+        assert_eq!(
+            before.members, after.members,
+            "members should be unchanged after Fork"
+        );
+        assert_eq!(
+            before.power_levels, after.power_levels,
+            "power_levels should be unchanged after Fork"
+        );
+        assert_eq!(
+            before.channels, after.channels,
+            "channels should be unchanged after Fork"
+        );
+        assert_eq!(
+            before.current_epoch, after.current_epoch,
+            "current_epoch should be unchanged after Fork"
+        );
+    }
+
+    /// ZEB-285 Step 15/16: a Fork event does NOT auto-trigger an EpochRotation.
+    /// Contrast with Kick and Leave which do trigger rotation synthesis.
+    #[test]
+    fn fork_does_not_trigger_epoch_rotation() {
+        let community_id = SpaceId([0xc0; 16]);
+        let admin = OwnerAddr([0xa1; 16]);
+
+        let admin_join = make_join_event(0x01, admin, 1);
+        let fork = SignedMembershipEvent {
+            id: [0x02; 16],
+            community_id,
+            kind: MembershipEventKind::Fork {
+                fork_space_id: SpaceId([0xfe; 16]),
+            },
+            actor: admin,
+            at: Hlc {
+                wall_ms: 2,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+        };
+
+        let m = materialize(&[admin_join, fork], admin);
+
+        // After Fork: no epoch rotation should have been triggered.
+        // current_epoch stays None (no Kick/Leave = no rotation).
+        assert_eq!(
+            m.current_epoch, None,
+            "Fork should NOT advance epoch (contrast with Kick/Leave)"
+        );
+        assert!(
+            m.pending_rotation_for.is_empty(),
+            "no pending rotation should exist after a Fork event"
         );
     }
 }

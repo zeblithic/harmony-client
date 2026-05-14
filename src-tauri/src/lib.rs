@@ -12580,7 +12580,12 @@ pub fn delta_to_change(
         | crate::community_membership::MembershipEventKind::ChannelModify { .. }
         | crate::community_membership::MembershipEventKind::ChannelDelete { .. }
         | crate::community_membership::MembershipEventKind::EpochRotation { .. }
-        | crate::community_membership::MembershipEventKind::EpochCatchup { .. } => return None,
+        | crate::community_membership::MembershipEventKind::EpochCatchup { .. }
+        // ZEB-285: Fork is non-mutating membership-wise; no MembershipChange
+        // is projected for it. Fork events are surfaced via a separate
+        // fork-lineage listing path (Task 7+), not via the membership-changed
+        // Tauri event stream.
+        | crate::community_membership::MembershipEventKind::Fork { .. } => return None,
     };
     Some((cid_hex, change))
 }
