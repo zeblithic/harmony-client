@@ -7723,6 +7723,8 @@ async fn generate_invite(
         invite_token: None,
         admin_bootstrap: None,
         admin_identity_pub: None,
+        forked_from: None,
+        pre_fork_snapshot: None,
     };
     build_open_invite_url(&payload)
 }
@@ -10118,6 +10120,8 @@ mod redeem_invite_inner_tests {
             invite_token: None,
             admin_bootstrap: None,
             admin_identity_pub: None,
+            forked_from: None,
+            pre_fork_snapshot: None,
         };
 
         let invite_url =
@@ -10185,6 +10189,8 @@ mod redeem_invite_inner_tests {
             invite_token: None,
             admin_bootstrap: None,
             admin_identity_pub: None,
+            forked_from: None,
+            pre_fork_snapshot: None,
         };
 
         let device_id = "joiner-dev";
@@ -10248,6 +10254,8 @@ mod join_open_community_tests {
             invite_token: None,
             admin_bootstrap: None,
             admin_identity_pub: None,
+            forked_from: None,
+            pre_fork_snapshot: None,
         };
         let invite_url = encode_invite_url(&payload).expect("encode open url");
         let entry = LibraryDirectoryEntry {
@@ -14348,6 +14356,8 @@ mod generate_invite_helper_tests {
             invite_token: None,
             admin_bootstrap: None,
             admin_identity_pub: None,
+            forked_from: None,
+            pre_fork_snapshot: None,
         };
         let url = build_open_invite_url(&payload).expect("url");
         let decoded = decode_invite_url(&url).expect("decode");

@@ -289,6 +289,8 @@ async fn open_community_create_redeem_leave_round_trip() {
         invite_token: None,
         admin_bootstrap: None,
         admin_identity_pub: None,
+        forked_from: None,
+        pre_fork_snapshot: None,
     };
 
     let minted_b = mint_redemption(
@@ -604,6 +606,8 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         invite_token: None,
         admin_bootstrap: None,
         admin_identity_pub: None,
+        forked_from: None,
+        pre_fork_snapshot: None,
     };
 
     let minted_b1 = mint_redemption(

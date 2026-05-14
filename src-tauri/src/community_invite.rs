@@ -145,6 +145,23 @@ pub struct CommunityInvitePayload {
         deserialize_with = "deserialize_admin_identity_pub_from_bstr"
     )]
     pub admin_identity_pub: Option<[u8; 64]>,
+
+    /// ZEB-285: SpaceId of the community this one was forked from.
+    /// Mirrors CommunityState.forked_from; carried in the invite so
+    /// joiners can mirror it into their local CommunityState during
+    /// redeem_invite_inner. None for non-fork invites. Byte-compatible
+    /// with pre-ZEB-285 invites when None.
+    #[serde(rename = "ff", skip_serializing_if = "Option::is_none", default)]
+    pub forked_from: Option<SpaceId>,
+
+    /// ZEB-285: frozen snapshot of the forker's pre-fork view of the
+    /// ORIGINAL community. Present only on fork-invites (None for normal
+    /// community invites). Bounded by snapshot policy (§4.2). Joiner
+    /// stores the snapshot in the fork's data dir keyed by the original
+    /// SpaceId for dual-keyset verification of pre-fork events.
+    /// Byte-compatible with pre-ZEB-285 invites when None.
+    #[serde(rename = "fs", skip_serializing_if = "Option::is_none", default)]
+    pub pre_fork_snapshot: Option<PreForkSnapshot>,
 }
 
 /// The inviter's pre-signed authorization, embedded in the invite link
@@ -1619,6 +1636,8 @@ mod tests {
             invite_token: None,
             admin_bootstrap: None,
             admin_identity_pub: None,
+            forked_from: None,
+            pre_fork_snapshot: None,
         }
     }
 
@@ -1672,6 +1691,8 @@ mod tests {
             }),
             admin_bootstrap: Some(admin_bootstrap),
             admin_identity_pub: Some([0u8; 64]),
+            forked_from: None,
+            pre_fork_snapshot: None,
         }
     }
 
@@ -1855,5 +1876,115 @@ mod tests {
                 expected
             );
         }
+    }
+
+    // ── ZEB-285 Phase 1 Task 4: CommunityInvitePayload fork-lineage fields ─
+
+    #[test]
+    fn invite_payload_without_pre_fork_snapshot_byte_compat() {
+        // ZEB-285: a CommunityInvitePayload with both forked_from = None
+        // AND pre_fork_snapshot = None must encode byte-identical to
+        // pre-ZEB-285 wire form (no "ff" or "fs" keys emitted).
+        let cid = SpaceId([0xc0; 16]);
+        let admin = OwnerAddr([0xaa; 16]);
+        let payload = CommunityInvitePayload {
+            community_id: cid,
+            epoch_snapshot: InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: vec![0u8; 32],
+                state_snapshot: MaterializedCommunityState::default(),
+            },
+            admin_addr: admin,
+            community_name: "test".to_string(),
+            is_invite_only: false,
+            expires_at: None,
+            invite_token: None,
+            admin_bootstrap: None,
+            admin_identity_pub: None,
+            forked_from: None,
+            pre_fork_snapshot: None,
+        };
+
+        let bytes = canonical_cbor_encode(&payload).expect("encode");
+        let value: ciborium::Value =
+            ciborium::de::from_reader(&bytes[..]).expect("decode as value");
+        let map = value.as_map().expect("outer is map");
+
+        assert!(
+            !map.iter()
+                .any(|(k, _): &(ciborium::Value, ciborium::Value)| { k.as_text() == Some("ff") }),
+            "forked_from=None should be omitted"
+        );
+        assert!(
+            !map.iter()
+                .any(|(k, _): &(ciborium::Value, ciborium::Value)| { k.as_text() == Some("fs") }),
+            "pre_fork_snapshot=None should be omitted"
+        );
+    }
+
+    #[test]
+    fn invite_payload_with_pre_fork_snapshot_roundtrip() {
+        use crate::community_membership::{MembershipEventKind, SignedMembershipEvent};
+        use crate::owner_state_types::Hlc;
+        use std::collections::BTreeMap;
+
+        let cid = SpaceId([0xc0; 16]);
+        let original_id = SpaceId([0xa0; 16]);
+        let admin = OwnerAddr([0xaa; 16]);
+
+        let admin_join = SignedMembershipEvent {
+            id: [0x01; 16],
+            community_id: original_id,
+            kind: MembershipEventKind::Join,
+            actor: admin,
+            at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "t".to_string(),
+            },
+            sig: [0u8; 64],
+            countersig: None,
+        };
+
+        let mut identity_pubs: BTreeMap<OwnerAddr, [u8; 64]> = BTreeMap::new();
+        identity_pubs.insert(admin, [0xbb; 64]);
+
+        let snapshot = PreForkSnapshot {
+            original_community_id: original_id,
+            original_community_name: "Original".to_string(),
+            membership_events: vec![admin_join],
+            channel_log: BoundedChannelLogSnapshot::default(),
+            identity_pubs,
+            forked_at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "t".to_string(),
+            },
+        };
+
+        let payload = CommunityInvitePayload {
+            community_id: cid,
+            epoch_snapshot: InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: vec![0u8; 32],
+                state_snapshot: MaterializedCommunityState::default(),
+            },
+            admin_addr: admin,
+            community_name: "fork".to_string(),
+            is_invite_only: false,
+            expires_at: None,
+            invite_token: None,
+            admin_bootstrap: None,
+            admin_identity_pub: None,
+            forked_from: Some(original_id),
+            pre_fork_snapshot: Some(snapshot.clone()),
+        };
+
+        let bytes = canonical_cbor_encode(&payload).expect("encode");
+        let decoded: CommunityInvitePayload =
+            ciborium::de::from_reader(&bytes[..]).expect("decode");
+
+        assert_eq!(decoded.forked_from, Some(original_id));
+        assert_eq!(decoded.pre_fork_snapshot, Some(snapshot));
     }
 }
