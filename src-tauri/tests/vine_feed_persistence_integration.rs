@@ -29,6 +29,8 @@ fn canonical_descriptor_bytes(
         video_cid: video_cid.to_string(),
         title: title.map(String::from),
         reshare_of: reshare_of.map(String::from),
+        original_creator_address: None,
+        original_creator_name: None,
     };
     serde_json::to_vec(&v).unwrap()
 }

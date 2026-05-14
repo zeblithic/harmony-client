@@ -21,6 +21,10 @@
     resolveVideo,
     getReaction,
     onToggleLike,
+    onViewOriginal,
+    playTarget = null,
+    onPlayTargetConsumed,
+    ownAddress,
   }: {
     followedVines?: VineVideo[];
     discoverVines?: VineVideo[];
@@ -36,12 +40,53 @@
     resolveVideo?: (cid: string) => Promise<string>;
     getReaction?: (vineId: string) => { count: number; likedByMe: boolean };
     onToggleLike?: (vine: VineVideo) => void;
+    onViewOriginal?: (vineId: string) => void;
+    /**
+     * Parent-controlled "open this vine in the player" request.
+     *
+     * Used by App.svelte's `handleViewOriginal` to drive the player
+     * from outside the feed (e.g., when the user clicks an attribution
+     * link and we resolve the original via `vineService.findVine`).
+     * VineFeed watches this via `$effect`, calls its internal
+     * `openPlayer` when it transitions to non-null, and notifies the
+     * parent via `onPlayTargetConsumed` so the parent can null it back
+     * out for the next click. The deliberate clear+microtask dance in
+     * App keeps two clicks in a row from being a no-op.
+     */
+    playTarget?: VineVideo | null;
+    onPlayTargetConsumed?: () => void;
+    /**
+     * Local node's hex address. Forwarded to VinePlayer so it can
+     * suppress the Reshare button on self-authored vines that arrived
+     * before `vineService.ownAddress` was set (and so weren't remapped
+     * to the magic `'self'` value by `wireToVine`). See FIX 2 in
+     * PR #120 round 1.
+     */
+    ownAddress?: string;
   } = $props();
 
   let activeVine = $state<VineVideo | null>(null);
   let feedFilter = $state<FeedFilter>('all');
   let playerList = $state<VineVideo[]>([]);
   let activeIndex = $state(-1);
+
+  // Parent-driven open: when `playTarget` transitions to a vine, open
+  // it in the player. The seed playerList is the entire concat'd feed
+  // because the original might live in either followedVines or
+  // discoverVines (and the user may currently be on the other tab).
+  // After consuming, we notify the parent so it can null the slot —
+  // we never read `playTarget` for navigation, only for triggering the
+  // open.
+  $effect(() => {
+    if (playTarget) {
+      const target = playTarget;
+      playerList = [...followedVines, ...discoverVines];
+      activeIndex = playerList.findIndex(v => v.id === target.id);
+      activeVine = target;
+      onMarkViewed?.(target.id);
+      onPlayTargetConsumed?.();
+    }
+  });
 
   let activeVines = $derived(
     activeTab === 'following' ? followedVines : discoverVines
@@ -60,6 +105,22 @@
   let unviewedCount = $derived(
     followedVines.filter(v => !viewedIds.has(v.id)).length
   );
+
+  // Single-pass reshare-count index over both feeds. Per-card lookup
+  // (`reshareCountMap.get(vine.id) ?? 0`) is O(1), so the full feed
+  // render is O(N) total instead of the O(N²) it would be if each
+  // card called `getReshareCount` and re-filtered both arrays.
+  // See FIX 5 in PR #120 round 1.
+  let reshareCountMap = $derived.by(() => {
+    const map = new Map<string, number>();
+    for (const v of followedVines) {
+      if (v.reshareOf) map.set(v.reshareOf, (map.get(v.reshareOf) ?? 0) + 1);
+    }
+    for (const v of discoverVines) {
+      if (v.reshareOf) map.set(v.reshareOf, (map.get(v.reshareOf) ?? 0) + 1);
+    }
+    return map;
+  });
 
   function openPlayer(vine: VineVideo) {
     if (!activeVine) {
@@ -149,6 +210,8 @@
             reactionCount={reaction?.count ?? 0}
             likedByMe={reaction?.likedByMe ?? false}
             {onToggleLike}
+            reshareCount={reshareCountMap.get(vine.id) ?? 0}
+            {onViewOriginal}
           />
         </div>
       {/each}
@@ -167,6 +230,8 @@
     reactionCount={getReaction?.(activeVine.id)?.count ?? 0}
     likedByMe={getReaction?.(activeVine.id)?.likedByMe ?? false}
     {onToggleLike}
+    {onViewOriginal}
+    {ownAddress}
   />
 {/if}
 

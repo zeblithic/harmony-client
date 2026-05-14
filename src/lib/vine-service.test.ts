@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { VineService, type VineDescriptorEvent } from './vine-service';
 import { vineVideos as mockVines } from './mock-data';
 import { createMockAdapter } from './test-utils';
+import type { VineVideo } from './types';
 
 describe('VineService', () => {
   let svc: VineService;
@@ -135,6 +136,25 @@ describe('VineService', () => {
     expect(vine.reshareOf).toBe('orig-1');
   });
 
+  it('preserves original creator attribution on incoming wire vines', async () => {
+    const { adapter, emit } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    emit('vine-received', {
+      id: 'vine-resh',
+      creatorAddress: 'addr-resharer',
+      creatorName: 'Resharer',
+      createdAt: 1,
+      videoCid: 'cid-r',
+      reshareOf: 'orig-1',
+      originalCreatorAddress: 'addr-original',
+      originalCreatorName: 'Original',
+    } satisfies VineDescriptorEvent);
+    const vine = svc.vines.find(v => v.id === 'vine-resh')!;
+    expect(vine.reshareOf).toBe('orig-1');
+    expect(vine.originalCreatorAddress).toBe('addr-original');
+    expect(vine.originalCreatorName).toBe('Original');
+  });
+
   // ── publish ────────────────────────────────────────────────────────
 
   it('invokes publish_vine on the adapter', async () => {
@@ -143,6 +163,41 @@ describe('VineService', () => {
     await svc.publish('cid-pub', 'Title', 'reshare-of-1');
     expect(adapter.invoke).toHaveBeenCalledWith('publish_vine', {
       vine: { videoCid: 'cid-pub', title: 'Title', reshareOf: 'reshare-of-1', creatorName: 'You' },
+    });
+  });
+
+  it('publish forwards original creator fields to adapter', async () => {
+    const { adapter } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    await svc.publish('cid-pub', 'Title', 'reshare-of-1', 'addr-original', 'Original');
+    expect(adapter.invoke).toHaveBeenCalledWith('publish_vine', {
+      vine: {
+        videoCid: 'cid-pub',
+        title: 'Title',
+        reshareOf: 'reshare-of-1',
+        creatorName: 'You',
+        originalCreatorAddress: 'addr-original',
+        originalCreatorName: 'Original',
+      },
+    });
+  });
+
+  it('publish omits original creator fields when not provided', async () => {
+    const { adapter } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    await svc.publish('cid-pub', 'Title');
+    // Vitest's toEqual treats {a:1, b:undefined} as equal to {a:1},
+    // so omitting these keys here also matches when publish passes
+    // them as undefined.
+    expect(adapter.invoke).toHaveBeenCalledWith('publish_vine', {
+      vine: {
+        videoCid: 'cid-pub',
+        title: 'Title',
+        reshareOf: undefined,
+        creatorName: 'You',
+        originalCreatorAddress: undefined,
+        originalCreatorName: undefined,
+      },
     });
   });
 
@@ -567,5 +622,139 @@ describe('VineService', () => {
     await svc.loadFollowed();
     expect(svc.discoverVines.find(v => v.id === 'recon-1')).toBeFalsy();
     expect(svc.followedVines.find(v => v.id === 'recon-1')).toBeTruthy();
+  });
+});
+
+describe('VineService.findVine', () => {
+  let svc: VineService;
+
+  beforeEach(() => {
+    svc = new VineService();
+  });
+
+  it('returns vine from followedVines by id', () => {
+    const vine: VineVideo = {
+      id: 'vine-f', creatorAddress: 'a', creatorName: 'A',
+      createdAt: 1, videoCid: 'cid', viewed: false,
+    };
+    svc.followedVines = [vine];
+    expect(svc.findVine('vine-f')).toBe(vine);
+  });
+
+  it('returns vine from discoverVines by id', () => {
+    const vine: VineVideo = {
+      id: 'vine-d', creatorAddress: 'a', creatorName: 'A',
+      createdAt: 1, videoCid: 'cid', viewed: false,
+    };
+    svc.discoverVines = [vine];
+    expect(svc.findVine('vine-d')).toBe(vine);
+  });
+
+  it('returns undefined when no vine matches', () => {
+    expect(svc.findVine('nonexistent-id')).toBeUndefined();
+  });
+
+  it('searches followedVines before discoverVines (order tie-break)', () => {
+    // Same id in both feeds shouldn't happen, but if it does, followed wins.
+    const fVine: VineVideo = {
+      id: 'dup', creatorAddress: 'a', creatorName: 'F',
+      createdAt: 1, videoCid: 'cid', viewed: false,
+    };
+    const dVine: VineVideo = { ...fVine, creatorName: 'D' };
+    svc.followedVines = [fVine];
+    svc.discoverVines = [dVine];
+    expect(svc.findVine('dup')).toBe(fVine);
+  });
+});
+
+describe('VineService.getReshareCount', () => {
+  let svc: VineService;
+
+  beforeEach(() => {
+    svc = new VineService();
+  });
+
+  it('returns 0 when no vines reshare the id', () => {
+    expect(svc.getReshareCount('vine-none')).toBe(0);
+  });
+
+  it('counts reshares across both feeds', () => {
+    const origId = 'vine-orig';
+    const r1: VineVideo = {
+      id: 'r1', creatorAddress: 'a', creatorName: 'A',
+      createdAt: 1, videoCid: 'c', viewed: false, reshareOf: origId,
+    };
+    const r2: VineVideo = {
+      id: 'r2', creatorAddress: 'b', creatorName: 'B',
+      createdAt: 1, videoCid: 'c', viewed: false, reshareOf: origId,
+    };
+    const r3: VineVideo = {
+      id: 'r3', creatorAddress: 'c', creatorName: 'C',
+      createdAt: 1, videoCid: 'c', viewed: false, reshareOf: origId,
+    };
+    svc.followedVines = [r1, r2];
+    svc.discoverVines = [r3];
+    expect(svc.getReshareCount(origId)).toBe(3);
+  });
+
+  it('does not count vines that are not reshares', () => {
+    const orig: VineVideo = {
+      id: 'vine-orig', creatorAddress: 'a', creatorName: 'A',
+      createdAt: 1, videoCid: 'c', viewed: false,
+    };
+    svc.followedVines = [orig];
+    expect(svc.getReshareCount('vine-orig')).toBe(0);
+  });
+
+  it('does not count reshares of a different id', () => {
+    const reshareOfOther: VineVideo = {
+      id: 'r1', creatorAddress: 'a', creatorName: 'A',
+      createdAt: 1, videoCid: 'c', viewed: false, reshareOf: 'different-orig',
+    };
+    svc.followedVines = [reshareOfOther];
+    expect(svc.getReshareCount('target-orig')).toBe(0);
+  });
+});
+
+// ── publish: self-reshare prevention is the CALLER's job ───────────
+//
+// Earlier rounds put a self-reshare guard inside `publish()` keyed on
+// `originalCreatorAddress`. That over-blocks the spec-allowed case
+// "reshare of someone else's reshare of your content" — where the
+// resolved true origin DOES map to us but the user is legitimately
+// resharing a different vine. The load-bearing signal lives on the
+// SOURCE vine (its `creatorAddress` + whether it has a `reshareOf`),
+// which `publish()` doesn't see. The guard now lives in
+// `App.svelte::handleVineReshare`; this test pins that `publish()` no
+// longer over-blocks based on resolved attribution.
+describe('VineService publish does not over-block self-attributed reshares', () => {
+  let svc: VineService;
+
+  beforeEach(() => {
+    svc = new VineService();
+  });
+
+  it('publishes a reshare whose resolved originalCreatorAddress is "self"', async () => {
+    // Carol resharing Bob's reshare of Alice's vine where the true
+    // origin maps to us. The caller-level guard (App.svelte) allows
+    // this through because the SOURCE vine is not our own original.
+    // `publish()` must NOT block on the resolved attribution.
+    const { adapter } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    svc.onChange = vi.fn();
+    await svc.publish('cid-x', 'My title', 'reshare-of-1', 'self', 'You');
+    expect(adapter.invoke).toHaveBeenCalledWith('publish_vine', expect.objectContaining({
+      vine: expect.objectContaining({ originalCreatorAddress: 'self' }),
+    }));
+  });
+
+  it('publishes a reshare whose resolved originalCreatorAddress matches ownAddress (hex form)', async () => {
+    const { adapter } = createMockAdapter();
+    svc.ownAddress = 'a1b2c3d4';
+    await svc.connectAdapter(adapter);
+    await svc.publish('cid-x', 'My title', 'reshare-of-1', 'a1b2c3d4', 'You');
+    expect(adapter.invoke).toHaveBeenCalledWith('publish_vine', expect.objectContaining({
+      vine: expect.objectContaining({ originalCreatorAddress: 'a1b2c3d4' }),
+    }));
   });
 });

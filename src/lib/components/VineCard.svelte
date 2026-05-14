@@ -3,7 +3,7 @@
   import Avatar from './Avatar.svelte';
   import { relativeTime } from '../file-utils';
 
-  let { vine, onPlay, isViewed, showFollowButton = false, isFollowed = false, onFollow, onUnfollow, reactionCount = 0, likedByMe = false, onToggleLike }: {
+  let { vine, onPlay, isViewed, showFollowButton = false, isFollowed = false, onFollow, onUnfollow, reactionCount = 0, likedByMe = false, onToggleLike, reshareCount = 0, onViewOriginal }: {
     vine: VineVideo;
     onPlay: (vine: VineVideo) => void;
     isViewed?: boolean;
@@ -14,9 +14,12 @@
     reactionCount?: number;
     likedByMe?: boolean;
     onToggleLike?: (vine: VineVideo) => void;
+    reshareCount?: number;
+    onViewOriginal?: (vineId: string) => void;
   } = $props();
 
   let viewed = $derived(isViewed ?? vine.viewed);
+  let showReshareCount = $derived(!vine.reshareOf && reshareCount > 0);
 
   let timeStr = $derived(relativeTime(vine.createdAt * 1000));
 
@@ -73,7 +76,20 @@
       <p class="vine-title">{vine.title}</p>
     {/if}
     {#if vine.reshareOf}
-      <span class="reshare-badge">reshare</span>
+      {#if onViewOriginal}
+        <button
+          type="button"
+          class="attribution-link"
+          onclick={(e) => { e.stopPropagation(); onViewOriginal?.(vine.reshareOf!); }}
+          aria-label="originally by {vine.originalCreatorName ?? vine.creatorName}"
+        >
+          <span aria-hidden="true">↗</span> originally by {vine.originalCreatorName ?? vine.creatorName}
+        </button>
+      {:else}
+        <span class="attribution-row">
+          <span aria-hidden="true">↗</span> originally by {vine.originalCreatorName ?? vine.creatorName}
+        </span>
+      {/if}
     {/if}
     {#if showFollowButton}
       <button
@@ -86,17 +102,24 @@
         {isFollowed ? 'Following' : 'Follow'}
       </button>
     {/if}
-    {#if reactionCount > 0 || likedByMe}
+    {#if reactionCount > 0 || likedByMe || showReshareCount}
       <div class="card-like-row">
-        <button
-          type="button"
-          class="card-heart"
-          onclick={handleLikeClick}
-          aria-label={likedByMe ? `Unlike ${vine.title ?? 'vine'}` : `Like ${vine.title ?? 'vine'}`}
-        >
-          {likedByMe ? '❤️' : '🤍'}
-        </button>
-        <span class="card-like-count">{reactionCount}</span>
+        {#if reactionCount > 0 || likedByMe}
+          <button
+            type="button"
+            class="card-heart"
+            onclick={handleLikeClick}
+            aria-label={likedByMe ? `Unlike ${vine.title ?? 'vine'}` : `Like ${vine.title ?? 'vine'}`}
+          >
+            {likedByMe ? '❤️' : '🤍'}
+          </button>
+          <span class="card-like-count">{reactionCount}</span>
+        {/if}
+        {#if showReshareCount}
+          <span class="reshare-count" aria-label="reshare count {reshareCount}">
+            <span aria-hidden="true">↗</span> {reshareCount}
+          </span>
+        {/if}
       </div>
     {/if}
   </div>
@@ -182,14 +205,37 @@
     white-space: nowrap;
   }
 
-  .reshare-badge {
-    display: inline-block;
-    color: var(--text-muted);
-    font-size: 0.7rem;
-    background: var(--bg-secondary);
-    padding: 1px 6px;
-    border-radius: 4px;
+  .attribution-link {
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    color: var(--accent);
+    font-size: 0.75rem;
+    cursor: pointer;
+    text-decoration: underline;
+    text-align: left;
     width: fit-content;
+  }
+
+  .attribution-link:hover {
+    opacity: 0.85;
+  }
+
+  .attribution-link:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .attribution-row {
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+  }
+
+  .reshare-count {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    font-weight: 500;
   }
 
   .follow-btn {

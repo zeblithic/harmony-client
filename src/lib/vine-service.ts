@@ -11,6 +11,10 @@ export interface VineDescriptorEvent {
   videoCid: string;
   title?: string;
   reshareOf?: string;
+  /** See VineVideo.originalCreatorAddress. */
+  originalCreatorAddress?: string;
+  /** See VineVideo.originalCreatorName. */
+  originalCreatorName?: string;
   source?: 'followed' | 'discover';
 }
 
@@ -121,16 +125,41 @@ export class VineService {
     this.unlisteners.push(unlistenReaction);
   }
 
-  /** Publish a vine via Tauri command. */
+  /**
+   * Publish a vine via Tauri command.
+   *
+   * `originalCreatorAddress` / `originalCreatorName` carry attribution for
+   * reshares. See `VineVideo.originalCreatorAddress` for the "always traces
+   * to true origin" semantics — callers must resolve the chain origin
+   * before passing (typically `vine.originalCreator* ?? vine.creator*`,
+   * done in `App.svelte::handleVineReshare`).
+   *
+   * Self-reshare prevention lives at the caller layer
+   * (`App.svelte::handleVineReshare`) because the load-bearing signal is
+   * the SOURCE vine's identity (`creatorAddress === 'self'/ownAddress`
+   * AND `!reshareOf`), not the resolved `originalCreatorAddress`. A
+   * reshare of someone else's reshare of our content correctly has
+   * `originalCreatorAddress === 'self'` and MUST be allowed through (spec
+   * §Edge Cases → Self-reshare prevention).
+   */
   async publish(
     videoCid: string,
     title?: string,
     reshareOf?: string,
+    originalCreatorAddress?: string,
+    originalCreatorName?: string,
   ): Promise<void> {
     if (this.adapter) {
       try {
         await this.adapter.invoke('publish_vine', {
-          vine: { videoCid, title, reshareOf, creatorName: this.ownDisplayName },
+          vine: {
+            videoCid,
+            title,
+            reshareOf,
+            creatorName: this.ownDisplayName,
+            originalCreatorAddress,
+            originalCreatorName,
+          },
         });
         return; // Backend will echo via subscription → vine-received event
       } catch (err: unknown) {
@@ -154,6 +183,8 @@ export class VineService {
       videoCid,
       title,
       reshareOf,
+      originalCreatorAddress,
+      originalCreatorName,
       viewed: true,
     };
     this.discoverVines = [...this.discoverVines, vine];
@@ -229,6 +260,36 @@ export class VineService {
 
   isFollowed(address: string): boolean {
     return this.followedAddresses.has(address);
+  }
+
+  /**
+   * Find a vine by id, searching followedVines then discoverVines.
+   * Returns the first match or undefined.
+   *
+   * Used by the UI when the user clicks an attribution link to navigate
+   * to the original vine. If the original isn't in the local feed (e.g.,
+   * creator isn't followed and the original wasn't surfaced in discover),
+   * the click is silently ignored.
+   */
+  findVine(vineId: string): VineVideo | undefined {
+    return (
+      this.followedVines.find(v => v.id === vineId)
+      ?? this.discoverVines.find(v => v.id === vineId)
+    );
+  }
+
+  /**
+   * Count how many vines in the local feed reshare the given vine id.
+   *
+   * Only meaningful for original vines (where the caller's vine has no
+   * `reshareOf` itself). Counts across both followed and discover feeds.
+   * Computed on demand — no separate state map kept.
+   */
+  getReshareCount(vineId: string): number {
+    return (
+      this.followedVines.filter(v => v.reshareOf === vineId).length
+      + this.discoverVines.filter(v => v.reshareOf === vineId).length
+    );
   }
 
   /** Get reaction state for a vine. Returns zero state if no reactions tracked. */
@@ -321,6 +382,8 @@ export class VineService {
       videoCid: wire.videoCid,
       title: wire.title,
       reshareOf: wire.reshareOf,
+      originalCreatorAddress: wire.originalCreatorAddress,
+      originalCreatorName: wire.originalCreatorName,
       viewed: isSelf,
     };
   }

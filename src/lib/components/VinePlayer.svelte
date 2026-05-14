@@ -2,9 +2,10 @@
   import { onMount } from 'svelte';
   import type { VineVideo } from '../types';
   import Avatar from './Avatar.svelte';
+  import ReshareConfirmDialog from './ReshareConfirmDialog.svelte';
   import { relativeTime } from '../file-utils';
 
-  let { vine, onClose, onNext, onPrevious, onReshare, resolveVideo, onToggleLike, reactionCount = 0, likedByMe = false }: {
+  let { vine, onClose, onNext, onPrevious, onReshare, resolveVideo, onToggleLike, reactionCount = 0, likedByMe = false, onViewOriginal, ownAddress }: {
     vine: VineVideo;
     onClose: () => void;
     onNext?: () => void;
@@ -14,12 +15,32 @@
     onToggleLike?: (vine: VineVideo) => void;
     reactionCount?: number;
     likedByMe?: boolean;
+    onViewOriginal?: (vineId: string) => void;
+    /**
+     * Local node's hex address — when supplied, hex-keyed self-authored
+     * vines (those whose `creatorAddress` matches `ownAddress` but
+     * weren't remapped to the magic `'self'` value by `wireToVine`,
+     * typically because they arrived before `ownAddress` was set on
+     * the service) also hide the Reshare button. Without this prop,
+     * the `'self'` magic value is the only signal — see FIX 2 in
+     * PR #120 round 1.
+     */
+    ownAddress?: string;
   } = $props();
 
   let overlayEl: HTMLDivElement;
   let resharing = $state(false);
   let reshareError = $state('');
   let reshareGeneration = 0;
+  let showReshareConfirm = $state(false);
+
+  let isOwnOriginal = $derived(
+    !vine.reshareOf && (
+      vine.creatorAddress === 'self'
+      || (ownAddress != null && vine.creatorAddress === ownAddress)
+    )
+  );
+  let canReshare = $derived(!!onReshare && !isOwnOriginal);
 
   // ── Video resolution state ──────────────────────────────────────────
   let videoUrl = $state<string | null>(null);
@@ -64,13 +85,19 @@
 
   onMount(() => overlayEl?.focus());
 
-  async function handleReshare() {
+  function handleReshare() {
     if (resharing) return;
+    showReshareConfirm = true;
+  }
+
+  async function confirmReshare() {
+    showReshareConfirm = false;
+    if (!onReshare || resharing) return;
     resharing = true;
     reshareError = '';
     const generation = ++reshareGeneration;
     try {
-      await onReshare?.(vine);
+      await onReshare(vine);
     } catch (err) {
       if (generation === reshareGeneration) {
         reshareError = err instanceof Error ? err.message : 'Reshare failed';
@@ -80,7 +107,16 @@
     }
   }
 
+  function cancelReshare() {
+    showReshareConfirm = false;
+  }
+
   function handleKeyDown(e: KeyboardEvent) {
+    // Suspend player hotkeys while the reshare confirmation dialog is
+    // open — otherwise Arrow keys would navigate the underlying feed
+    // and Escape would close the player behind the modal, letting a
+    // subsequent confirm run against the wrong active vine.
+    if (showReshareConfirm) return;
     if (e.key === 'Escape') onClose();
     else if (e.key === 'ArrowRight' && onNext) { e.preventDefault(); onNext(); }
     else if (e.key === 'ArrowLeft' && onPrevious) { e.preventDefault(); onPrevious(); }
@@ -147,7 +183,20 @@
       <p class="vine-title">{vine.title}</p>
     {/if}
     {#if vine.reshareOf}
-      <p class="reshare-label">Reshared</p>
+      {#if onViewOriginal}
+        <button
+          type="button"
+          class="attribution-link"
+          onclick={() => onViewOriginal?.(vine.reshareOf!)}
+          aria-label="originally by {vine.originalCreatorName ?? vine.creatorName}"
+        >
+          <span aria-hidden="true">↗</span> originally by {vine.originalCreatorName ?? vine.creatorName}
+        </button>
+      {:else}
+        <p class="attribution-row">
+          <span aria-hidden="true">↗</span> originally by {vine.originalCreatorName ?? vine.creatorName}
+        </p>
+      {/if}
     {/if}
     <div class="footer-actions">
       {#if onToggleLike}
@@ -164,7 +213,7 @@
           {/if}
         </button>
       {/if}
-      {#if onReshare}
+      {#if canReshare}
         <button type="button" class="action-btn" onclick={handleReshare} disabled={resharing} aria-label="Reshare vine">
           <span aria-hidden="true">↗</span> {resharing ? 'Resharing\u2026' : 'Reshare'}
         </button>
@@ -174,6 +223,14 @@
       {/if}
     </div>
   </div>
+
+  {#if showReshareConfirm}
+    <ReshareConfirmDialog
+      {vine}
+      onConfirm={confirmReshare}
+      onCancel={cancelReshare}
+    />
+  {/if}
 </div>
 
 <style>
@@ -321,9 +378,24 @@
     margin: 0 0 4px;
   }
 
-  .reshare-label {
-    color: var(--text-muted);
-    font-size: 0.8rem;
+  .attribution-link {
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    color: var(--accent);
+    font-size: 0.875rem;
+    cursor: pointer;
+    text-decoration: underline;
+  }
+  .attribution-link:hover { opacity: 0.85; }
+  .attribution-link:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .attribution-row {
+    color: var(--text-secondary);
+    font-size: 0.875rem;
     margin: 0;
   }
 

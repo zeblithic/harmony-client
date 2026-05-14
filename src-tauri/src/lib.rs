@@ -4298,6 +4298,14 @@ pub struct VineDescriptorPayload {
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reshare_of: Option<String>,
+    /// If this vine is a reshare, the hex-encoded address of the original creator.
+    /// Always traces to the true origin — if Alice reshares Bob's reshare of Carol's vine,
+    /// the field carries Carol's address. None for non-reshare originals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_creator_address: Option<String>,
+    /// Display name of the original creator (snapshot at reshare time). See above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_creator_name: Option<String>,
 }
 
 /// Vine descriptor sent from the frontend to publish.
@@ -4312,6 +4320,12 @@ pub struct PublishVinePayload {
     /// Creator's display name (included so receivers can display it).
     #[serde(default)]
     pub creator_name: String,
+    /// See VineDescriptorPayload::original_creator_address.
+    #[serde(default)]
+    pub original_creator_address: Option<String>,
+    /// See VineDescriptorPayload::original_creator_name.
+    #[serde(default)]
+    pub original_creator_name: Option<String>,
 }
 
 /// Vine video descriptor returned to the frontend (includes local viewed state).
@@ -4326,6 +4340,10 @@ pub struct VineVideoDto {
     pub title: Option<String>,
     pub reshare_of: Option<String>,
     pub viewed: bool,
+    /// See VineDescriptorPayload::original_creator_address.
+    pub original_creator_address: Option<String>,
+    /// See VineDescriptorPayload::original_creator_name.
+    pub original_creator_name: Option<String>,
 }
 
 /// Response returned by list_followed — one entry per followed address.
@@ -4404,6 +4422,8 @@ async fn publish_vine(
         video_cid: vine.video_cid,
         title: vine.title,
         reshare_of: vine.reshare_of,
+        original_creator_address: vine.original_creator_address,
+        original_creator_name: vine.original_creator_name,
     };
 
     let key_expr = format!("harmony/vines/{}", node_addr);
@@ -13757,6 +13777,8 @@ mod tests {
             video_cid: "aa".repeat(32),
             title: Some("Demo vine".to_string()),
             reshare_of: None,
+            original_creator_address: None,
+            original_creator_name: None,
         };
         let json = serde_json::to_vec(&vine).unwrap();
         let parsed: VineDescriptorPayload = serde_json::from_slice(&json).unwrap();
@@ -13778,6 +13800,8 @@ mod tests {
             video_cid: "bb".to_string(),
             title: None,
             reshare_of: Some("vine-0".to_string()),
+            original_creator_address: None,
+            original_creator_name: None,
         };
         let json = String::from_utf8(serde_json::to_vec(&vine).unwrap()).unwrap();
         assert!(
@@ -13797,6 +13821,82 @@ mod tests {
             !json.contains("\"title\""),
             "None title should be skipped: {json}"
         );
+    }
+
+    #[test]
+    fn vine_descriptor_payload_serializes_original_creator_fields_as_camel_case() {
+        let payload = VineDescriptorPayload {
+            id: "vine-1".to_string(),
+            creator_address: "addr-resharer".to_string(),
+            creator_name: "Resharer".to_string(),
+            created_at: 100,
+            video_cid: "cid-1".to_string(),
+            title: None,
+            reshare_of: Some("vine-0".to_string()),
+            original_creator_address: Some("addr-original".to_string()),
+            original_creator_name: Some("Original Creator".to_string()),
+        };
+        let json = serde_json::to_string(&payload).expect("serialize");
+        assert!(
+            json.contains("\"originalCreatorAddress\":\"addr-original\""),
+            "originalCreatorAddress should be present in camelCase: {json}"
+        );
+        assert!(
+            json.contains("\"originalCreatorName\":\"Original Creator\""),
+            "originalCreatorName should be present in camelCase: {json}"
+        );
+
+        // Round-trip.
+        let parsed: VineDescriptorPayload = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            parsed.original_creator_address.as_deref(),
+            Some("addr-original")
+        );
+        assert_eq!(
+            parsed.original_creator_name.as_deref(),
+            Some("Original Creator")
+        );
+    }
+
+    #[test]
+    fn vine_descriptor_payload_omits_original_creator_fields_when_none() {
+        let payload = VineDescriptorPayload {
+            id: "vine-1".to_string(),
+            creator_address: "addr-1".to_string(),
+            creator_name: "Alice".to_string(),
+            created_at: 100,
+            video_cid: "cid-1".to_string(),
+            title: None,
+            reshare_of: None,
+            original_creator_address: None,
+            original_creator_name: None,
+        };
+        let json = serde_json::to_string(&payload).expect("serialize");
+        assert!(
+            !json.contains("originalCreatorAddress"),
+            "should omit originalCreatorAddress when None: {json}"
+        );
+        assert!(
+            !json.contains("originalCreatorName"),
+            "should omit originalCreatorName when None: {json}"
+        );
+    }
+
+    #[test]
+    fn vine_descriptor_payload_deserializes_legacy_wire_without_original_creator_fields() {
+        let legacy = r#"{
+            "id": "vine-1",
+            "creatorAddress": "addr-1",
+            "creatorName": "Alice",
+            "createdAt": 100,
+            "videoCid": "cid-1",
+            "reshareOf": "vine-0"
+        }"#;
+        let parsed: VineDescriptorPayload =
+            serde_json::from_str(legacy).expect("legacy wire must deserialize");
+        assert_eq!(parsed.reshare_of.as_deref(), Some("vine-0"));
+        assert!(parsed.original_creator_address.is_none());
+        assert!(parsed.original_creator_name.is_none());
     }
 
     #[test]

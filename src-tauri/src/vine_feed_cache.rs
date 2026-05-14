@@ -53,10 +53,14 @@ struct DescriptorOnDisk {
     creator_name: String,
     created_at: u64,
     video_cid: String,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     reshare_of: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_creator_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_creator_name: Option<String>,
     received_at_ms: u64,
     source: VineSource,
 }
@@ -130,8 +134,14 @@ pub struct VineVideoDtoWithSource {
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reshare_of: Option<String>,
-    pub viewed: bool,
     pub source: VineSource,
+    pub viewed: bool,
+    /// See VineDescriptorPayload::original_creator_address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_creator_address: Option<String>,
+    /// See VineDescriptorPayload::original_creator_name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_creator_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -286,6 +296,8 @@ impl VineFeedCache {
                 video_cid: d.video_cid,
                 title: d.title,
                 reshare_of: d.reshare_of,
+                original_creator_address: d.original_creator_address,
+                original_creator_name: d.original_creator_name,
             };
             cache.descriptors.insert(
                 d.id,
@@ -403,6 +415,8 @@ impl VineFeedCache {
                 title: cv.descriptor.title.clone(),
                 reshare_of: cv.descriptor.reshare_of.clone(),
                 viewed: self.viewed.contains(&cv.descriptor.id),
+                original_creator_address: cv.descriptor.original_creator_address.clone(),
+                original_creator_name: cv.descriptor.original_creator_name.clone(),
             })
             .collect();
         out.sort_by_key(|v| std::cmp::Reverse(v.created_at));
@@ -427,6 +441,8 @@ impl VineFeedCache {
             reshare_of: descriptor.reshare_of.clone(),
             viewed: self.viewed.contains(&descriptor.id),
             source,
+            original_creator_address: descriptor.original_creator_address.clone(),
+            original_creator_name: descriptor.original_creator_name.clone(),
         }
     }
 
@@ -561,6 +577,8 @@ impl VineFeedCache {
                     video_cid: cv.descriptor.video_cid.clone(),
                     title: cv.descriptor.title.clone(),
                     reshare_of: cv.descriptor.reshare_of.clone(),
+                    original_creator_address: cv.descriptor.original_creator_address.clone(),
+                    original_creator_name: cv.descriptor.original_creator_name.clone(),
                     received_at_ms: cv.received_at_ms,
                     source: cv.source,
                 })
@@ -645,6 +663,7 @@ mod tests {
     ///
     /// Mirrors the bytes that production `publish_vine` produces (the same
     /// `VineDescriptorPayload` serde::Serialize shape).
+    #[allow(clippy::too_many_arguments)] // test helper — readable named-positional args beat a struct here
     fn canonical_descriptor_bytes(
         vine_id: &str,
         creator_address: &str,
@@ -653,6 +672,8 @@ mod tests {
         title: Option<&str>,
         reshare_of: Option<&str>,
         created_at: u64,
+        original_creator_address: Option<&str>,
+        original_creator_name: Option<&str>,
     ) -> Vec<u8> {
         let v = crate::VineDescriptorPayload {
             id: vine_id.to_string(),
@@ -662,6 +683,8 @@ mod tests {
             video_cid: video_cid.to_string(),
             title: title.map(String::from),
             reshare_of: reshare_of.map(String::from),
+            original_creator_address: original_creator_address.map(String::from),
+            original_creator_name: original_creator_name.map(String::from),
         };
         serde_json::to_vec(&v).unwrap()
     }
@@ -681,6 +704,8 @@ mod tests {
             Some("hello"),
             None,
             1700000000,
+            None,
+            None,
         );
         let followed = followed_set_with(&["alice-addr"]);
 
@@ -703,7 +728,7 @@ mod tests {
     fn on_descriptor_sample_unfollowed_creator_inserts_with_discover_source() {
         let mut cache = VineFeedCache::new();
         let payload = canonical_descriptor_bytes(
-            "vine-2", "bob-addr", "Bob", "cid-bbb", None, None, 1700000100,
+            "vine-2", "bob-addr", "Bob", "cid-bbb", None, None, 1700000100, None, None,
         );
         let followed = followed_set_with(&["someone-else"]);
 
@@ -729,6 +754,8 @@ mod tests {
             None,
             None,
             1700000200,
+            None,
+            None,
         );
         let followed = followed_set_with(&["alice-addr"]);
 
@@ -775,8 +802,17 @@ mod tests {
     #[test]
     fn on_descriptor_sample_wrong_topic_returns_none() {
         let mut cache = VineFeedCache::new();
-        let payload =
-            canonical_descriptor_bytes("vine-9", "alice-addr", "Alice", "cid", None, None, 1);
+        let payload = canonical_descriptor_bytes(
+            "vine-9",
+            "alice-addr",
+            "Alice",
+            "cid",
+            None,
+            None,
+            1,
+            None,
+            None,
+        );
         let followed = followed_set_with(&[]);
 
         // The descriptor branch must NOT match reaction topics (they
@@ -803,8 +839,17 @@ mod tests {
 
         // Insert in mixed order: created_at 100, 300, 200
         for (id, t) in [("v-100", 100u64), ("v-300", 300), ("v-200", 200)] {
-            let payload =
-                canonical_descriptor_bytes(id, "alice-addr", "Alice", "cid", None, None, t);
+            let payload = canonical_descriptor_bytes(
+                id,
+                "alice-addr",
+                "Alice",
+                "cid",
+                None,
+                None,
+                t,
+                None,
+                None,
+            );
             cache.on_descriptor_sample("harmony/vines/alice-addr", &payload, &followed, 1_000);
         }
 
@@ -997,8 +1042,17 @@ mod tests {
     #[test]
     fn mark_viewed_idempotent_and_local_only() {
         let mut cache = VineFeedCache::new();
-        let payload =
-            canonical_descriptor_bytes("vine-1", "alice-addr", "Alice", "cid", None, None, 100);
+        let payload = canonical_descriptor_bytes(
+            "vine-1",
+            "alice-addr",
+            "Alice",
+            "cid",
+            None,
+            None,
+            100,
+            None,
+            None,
+        );
         let followed = followed_set_with(&["alice-addr"]);
         cache.on_descriptor_sample("harmony/vines/alice-addr", &payload, &followed, 0);
         assert_eq!(cache.len_descriptors(), 1);
@@ -1040,6 +1094,8 @@ mod tests {
             None,
             None,
             500,
+            None,
+            None,
         );
         cache.on_descriptor_sample("harmony/vines/alice-addr", &payload, &followed, 0);
 
@@ -1177,6 +1233,8 @@ mod tests {
                 Some("title-x"),
                 None,
                 recent_created_at,
+                None,
+                None,
             );
             let out =
                 cache.on_descriptor_sample("harmony/vines/alice-addr", &desc, &followed, 1_000);
@@ -1336,7 +1394,9 @@ mod tests {
                 "cid-1",
                 None,
                 None,
-                now_secs.saturating_sub(60), // recent (within age cutoff)
+                now_secs.saturating_sub(60), // recent (within age cutoff),
+                None,
+                None,
             );
             let out =
                 cache.on_descriptor_sample("harmony/vines/alice-addr", &desc, &followed, 1_000);
@@ -1370,6 +1430,8 @@ mod tests {
                 None,
                 None,
                 recent,
+                None,
+                None,
             );
             cache.on_descriptor_sample("harmony/vines/alice-addr", &desc, &followed, 1_000);
 
@@ -1420,6 +1482,8 @@ mod tests {
                 None,
                 None,
                 recent,
+                None,
+                None,
             );
             cache.on_descriptor_sample("harmony/vines/alice-addr", &desc, &followed, 1_000);
             let react = canonical_reaction_bytes("vine-ri", "bob-addr", "Bob", true, recent + 10);
@@ -1456,6 +1520,57 @@ mod tests {
     }
 
     #[test]
+    fn cached_descriptor_round_trips_original_creator_fields_through_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        // First boot: insert a reshare with full attribution, drop the cache.
+        {
+            let mut cache = VineFeedCache::load(dir.path());
+            let payload = canonical_descriptor_bytes(
+                "vine-reshare",
+                "addr-resharer",
+                "Resharer",
+                "cid-r",
+                None,
+                Some("vine-orig"),
+                now_secs.saturating_sub(1),
+                Some("addr-original"),
+                Some("Original"),
+            );
+            let followed = followed_set_with(&["addr-resharer"]);
+            let outcome = cache.on_descriptor_sample(
+                "harmony/vines/addr-resharer",
+                &payload,
+                &followed,
+                1_000,
+            );
+            assert!(
+                matches!(outcome, Some(DescriptorOutcome::Inserted { .. })),
+                "expected Inserted, got {outcome:?}"
+            );
+        }
+
+        // Second boot: reload, verify attribution survived.
+        {
+            let cache = VineFeedCache::load(dir.path());
+            let dtos = cache.list_descriptors();
+            let dto = dtos
+                .iter()
+                .find(|d| d.id == "vine-reshare")
+                .expect("reshare should survive reload");
+            assert_eq!(
+                dto.original_creator_address.as_deref(),
+                Some("addr-original")
+            );
+            assert_eq!(dto.original_creator_name.as_deref(), Some("Original"));
+        }
+    }
+
+    #[test]
     fn list_descriptors_returns_dto_with_viewed_state_set() {
         // Test the full DTO shape exposed to the IPC, including the
         // viewed flag joining correctly and reshare_of preservation.
@@ -1468,6 +1583,8 @@ mod tests {
             Some("title-a"),
             None,
             500,
+            None,
+            None,
         );
         let payload2 = canonical_descriptor_bytes(
             "vine-2",
@@ -1477,6 +1594,8 @@ mod tests {
             None,
             Some("vine-1"), // reshare
             600,
+            None,
+            None,
         );
         let followed = followed_set_with(&["alice-addr"]);
 
@@ -1514,7 +1633,9 @@ mod tests {
                 "cid",
                 None,
                 None,
-                i as u64, // created_at = i
+                i as u64, // created_at = i,
+                None,
+                None,
             );
             cache.on_descriptor_sample("harmony/vines/alice-addr", &payload, &followed, 0);
         }
@@ -1561,6 +1682,8 @@ mod tests {
                 None,
                 None,
                 (i + 1_000) as u64,
+                None,
+                None,
             );
             cache.on_descriptor_sample("harmony/vines/alice-addr", &payload, &followed, 0);
         }
@@ -1574,7 +1697,9 @@ mod tests {
             "cid",
             None,
             None,
-            0, // older than every entry in the cache
+            0, // older than every entry in the cache,
+            None,
+            None,
         );
         let outcome =
             cache.on_descriptor_sample("harmony/vines/alice-addr", &old_payload, &followed, 0);
@@ -1703,6 +1828,8 @@ mod tests {
                 None,
                 None,
                 shared_ts,
+                None,
+                None,
             );
             runtime_cache.on_descriptor_sample("harmony/vines/alice-addr", &payload, &followed, 0);
         }

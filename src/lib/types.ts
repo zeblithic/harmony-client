@@ -128,6 +128,14 @@ export interface VineVideo {
   title?: string;
   /** If this vine is a reshare, the hex-encoded CID of the original. */
   reshareOf?: string;
+  /**
+   * If this vine is a reshare, the address of the original creator
+   * (always the true origin — traces through reshare-of-reshare chains).
+   * Undefined for non-reshare originals.
+   */
+  originalCreatorAddress?: string;
+  /** Display name of the original creator (snapshot at reshare time). */
+  originalCreatorName?: string;
   /** Whether the current user has viewed this vine. */
   viewed: boolean;
 }

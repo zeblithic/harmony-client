@@ -1,4 +1,4 @@
-import { render, screen, fireEvent } from '@testing-library/svelte';
+import { render, screen, fireEvent, within } from '@testing-library/svelte';
 import { describe, it, expect, vi } from 'vitest';
 import VineFeed from '../VineFeed.svelte';
 import type { VineVideo } from '../../types';
@@ -220,5 +220,99 @@ describe('VineFeed', () => {
     const likeBtn = screen.getAllByLabelText(/Like/)[0];
     await fireEvent.click(likeBtn);
     expect(onToggleLike).toHaveBeenCalled();
+  });
+
+  it('renders reshare counts derived from the local feed (single-pass index)', () => {
+    // FIX 5 (PR #120 round 1): VineFeed no longer takes a
+    // `getReshareCount` prop — it computes the count internally from
+    // both vine arrays in a single pass (`reshareCountMap` derived).
+    // Wire three reshares of `vine-orig` across both feeds and pin
+    // that the count surfaces on the original's card. Use the
+    // `reshare count` aria-label to disambiguate from unrelated
+    // numeric text (see FIX 6).
+    const orig: VineVideo = {
+      id: 'vine-orig',
+      creatorAddress: 'origAddr',
+      creatorName: 'OrigCreator',
+      createdAt: 1700001000,
+      videoCid: 'cid-orig',
+      viewed: false,
+    };
+    const reshare = (suffix: string, reshareOf: string): VineVideo => ({
+      id: `r-${suffix}`,
+      creatorAddress: `addr-${suffix}`,
+      creatorName: `Resharer ${suffix}`,
+      createdAt: 1700001100,
+      videoCid: `cid-${suffix}`,
+      reshareOf,
+      viewed: false,
+    });
+    render(VineFeed, { props: {
+      followedVines: [reshare('a', 'vine-orig'), reshare('b', 'vine-orig')],
+      discoverVines: [orig, reshare('c', 'vine-orig')],
+      viewedIds: new Set(),
+      activeTab: 'discover',
+      followedAddresses: new Set(),
+    } });
+    const countEl = screen.getByLabelText(/reshare count/i);
+    expect(countEl.textContent).toMatch(/3/);
+  });
+
+  it('forwards onViewOriginal to VineCard attribution link', async () => {
+    const onViewOriginal = vi.fn();
+    const reshared: VineVideo = {
+      id: 'vine-r',
+      creatorAddress: 'a1b2c3d4',
+      creatorName: 'Alice',
+      createdAt: 1700002000,
+      videoCid: 'cid-r',
+      reshareOf: 'orig-1',
+      originalCreatorName: 'OrigName',
+      viewed: false,
+    };
+    render(VineFeed, { props: {
+      followedVines: [],
+      discoverVines: [reshared],
+      viewedIds: new Set(),
+      activeTab: 'discover',
+      followedAddresses: new Set(),
+      onViewOriginal,
+    } });
+    const link = screen.getByRole('button', { name: /originally by OrigName/i });
+    await fireEvent.click(link);
+    expect(onViewOriginal).toHaveBeenCalledWith('orig-1');
+  });
+
+  it('forwards onViewOriginal to VinePlayer attribution link', async () => {
+    const onViewOriginal = vi.fn();
+    const reshared: VineVideo = {
+      id: 'vine-r2',
+      creatorAddress: 'a1b2c3d4',
+      creatorName: 'Alice',
+      createdAt: 1700003000,
+      videoCid: 'cid-r2',
+      reshareOf: 'orig-2',
+      originalCreatorName: 'PlayerOrig',
+      viewed: false,
+    };
+    render(VineFeed, { props: {
+      followedVines: [],
+      discoverVines: [reshared],
+      viewedIds: new Set(),
+      activeTab: 'discover',
+      followedAddresses: new Set(),
+      onViewOriginal,
+    } });
+    // Open the player by clicking the card
+    await fireEvent.click(screen.getByLabelText(/Untitled vine by Alice/));
+    // Player exposes its own attribution button — there will be two matches now
+    // (one on the card behind, one in the dialog). Scope to the dialog with
+    // `within` so the lookup throws on absence rather than returning null.
+    const dialog = screen.getByRole('dialog', { name: 'Vine player' });
+    const playerLink = within(dialog).getByRole('button', {
+      name: /originally by PlayerOrig/i,
+    });
+    await fireEvent.click(playerLink);
+    expect(onViewOriginal).toHaveBeenCalledWith('orig-2');
   });
 });
