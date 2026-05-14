@@ -1929,12 +1929,13 @@ mod tests {
         use std::collections::BTreeMap;
 
         let cid = SpaceId([0xc0; 16]);
-        let original_id = SpaceId([0xa0; 16]);
+        let forked_from_id = SpaceId([0xa0; 16]);
+        let snapshot_original_id = SpaceId([0xa1; 16]);
         let admin = OwnerAddr([0xaa; 16]);
 
         let admin_join = SignedMembershipEvent {
             id: [0x01; 16],
-            community_id: original_id,
+            community_id: snapshot_original_id,
             kind: MembershipEventKind::Join,
             actor: admin,
             at: Hlc {
@@ -1950,7 +1951,7 @@ mod tests {
         identity_pubs.insert(admin, [0xbb; 64]);
 
         let snapshot = PreForkSnapshot {
-            original_community_id: original_id,
+            original_community_id: snapshot_original_id,
             original_community_name: "Original".to_string(),
             membership_events: vec![admin_join],
             channel_log: BoundedChannelLogSnapshot::default(),
@@ -1976,7 +1977,7 @@ mod tests {
             invite_token: None,
             admin_bootstrap: None,
             admin_identity_pub: None,
-            forked_from: Some(original_id),
+            forked_from: Some(forked_from_id),
             pre_fork_snapshot: Some(snapshot.clone()),
         };
 
@@ -1984,7 +1985,15 @@ mod tests {
         let decoded: CommunityInvitePayload =
             ciborium::de::from_reader(&bytes[..]).expect("decode");
 
-        assert_eq!(decoded.forked_from, Some(original_id));
+        assert_eq!(decoded.forked_from, Some(forked_from_id));
+        assert_eq!(
+            decoded
+                .pre_fork_snapshot
+                .as_ref()
+                .unwrap()
+                .original_community_id,
+            snapshot_original_id
+        );
         assert_eq!(decoded.pre_fork_snapshot, Some(snapshot));
     }
 }
