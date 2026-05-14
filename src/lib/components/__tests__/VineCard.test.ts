@@ -31,15 +31,47 @@ describe('VineCard', () => {
     expect(screen.queryByLabelText('Unviewed')).toBeNull();
   });
 
-  it('shows reshare badge when vine is a reshare', () => {
-    const reshared = { ...vine, reshareOf: 'vine-00' };
+  it('shows attribution row when vine is a reshare', () => {
+    const reshared = {
+      ...vine,
+      reshareOf: 'vine-00',
+      originalCreatorName: 'Original Person',
+    };
     render(VineCard, { props: { vine: reshared, onPlay: vi.fn() } });
-    expect(screen.getByText('reshare')).toBeTruthy();
+    expect(screen.getByText(/originally by Original Person/i)).toBeTruthy();
   });
 
-  it('does not show reshare badge for original vines', () => {
+  it('does not show attribution row for original vines', () => {
     render(VineCard, { props: { vine, onPlay: vi.fn() } });
-    expect(screen.queryByText('reshare')).toBeNull();
+    expect(screen.queryByText(/originally by/i)).toBeNull();
+  });
+
+  it('attribution row is clickable when onViewOriginal is provided', async () => {
+    const onViewOriginal = vi.fn();
+    const reshared = {
+      ...vine,
+      reshareOf: 'vine-00',
+      originalCreatorName: 'Original Person',
+    };
+    render(VineCard, { props: { vine: reshared, onPlay: vi.fn(), onViewOriginal } });
+    const link = screen.getByRole('button', { name: /originally by Original Person/i });
+    await fireEvent.click(link);
+    expect(onViewOriginal).toHaveBeenCalledWith('vine-00');
+  });
+
+  it('clicking attribution row does not also trigger onPlay (stops propagation)', async () => {
+    const onPlay = vi.fn();
+    const onViewOriginal = vi.fn();
+    const reshared = {
+      ...vine,
+      reshareOf: 'vine-00',
+      originalCreatorName: 'Original Person',
+    };
+    render(VineCard, { props: { vine: reshared, onPlay, onViewOriginal } });
+    const link = screen.getByRole('button', { name: /originally by Original Person/i });
+    await fireEvent.click(link);
+    expect(onViewOriginal).toHaveBeenCalled();
+    expect(onPlay).not.toHaveBeenCalled();
   });
 
   it('calls onPlay with vine when clicked', async () => {
@@ -143,5 +175,26 @@ describe('VineCard', () => {
     render(VineCard, { props: { vine, onPlay, reactionCount: 1, likedByMe: false, onToggleLike } });
     await fireEvent.click(screen.getByLabelText('Like Demo vine'));
     expect(onPlay).not.toHaveBeenCalled();
+  });
+
+  it('shows reshare count for originals when count > 0', () => {
+    render(VineCard, { props: { vine, onPlay: vi.fn(), reshareCount: 3 } });
+    expect(screen.getByLabelText(/reshare count/i)).toBeTruthy();
+    expect(screen.getByLabelText(/reshare count/i).textContent).toMatch(/3/);
+  });
+
+  it('hides reshare count when zero', () => {
+    render(VineCard, { props: { vine, onPlay: vi.fn(), reshareCount: 0 } });
+    expect(screen.queryByLabelText(/reshare count/i)).toBeNull();
+  });
+
+  it('does not show reshare count for reshares (counts only meaningful on originals)', () => {
+    const reshared = {
+      ...vine,
+      reshareOf: 'vine-00',
+      originalCreatorName: 'Original',
+    };
+    render(VineCard, { props: { vine: reshared, onPlay: vi.fn(), reshareCount: 5 } });
+    expect(screen.queryByLabelText(/reshare count/i)).toBeNull();
   });
 });

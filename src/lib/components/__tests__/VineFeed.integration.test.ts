@@ -92,9 +92,9 @@ describe('VineFeed Integration', () => {
     expect(screen.getByText('Cache explained')).toBeTruthy();
   });
 
-  it('shows reshare badge for reshared vines', () => {
+  it('shows attribution row for reshared vines', () => {
     renderFeed();
-    expect(screen.getByText('reshare')).toBeTruthy();
+    expect(screen.getByText(/originally by/i)).toBeTruthy();
   });
 
   // ── 2. Unviewed count ─────────────────────────────────────────────
