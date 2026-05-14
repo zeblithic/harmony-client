@@ -222,6 +222,9 @@ impl VineFeedCache {
         }
 
         // Age-prune (one-shot on load).
+        // Broken clock fallback: now_secs = 0 → age_cutoff = 0 → all
+        // descriptors kept. Prefer keeping stale data over silently losing
+        // the entire cache when the system clock is bad.
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -1115,7 +1118,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let recent_created_at = now_secs - 1;
+        let recent_created_at = now_secs.saturating_sub(1);
 
         // Phase 1: build + save state
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -1195,6 +1198,81 @@ mod tests {
         let cache = VineFeedCache::load(dir.path());
         assert_eq!(cache.len_descriptors(), 0);
         assert_eq!(cache.len_reactions(), 0);
+    }
+
+    #[test]
+    fn age_prune_on_load_drops_old_descriptors_and_their_reactions() {
+        // Write a vine_feed.json containing one old descriptor (created_at
+        // = epoch, well past the 90d cutoff) and one recent (created_at =
+        // now - 1d). Add a reaction for each. After load(), only the
+        // recent descriptor and its reaction should survive.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let recent_ts = now.saturating_sub(86_400); // 1 day old
+        let old_ts = 0u64; // epoch — definitely older than 90 days
+
+        let disk = serde_json::json!({
+            "version": 1,
+            "descriptors": [
+                {
+                    "id": "vine-old",
+                    "creatorAddress": "alice-addr",
+                    "creatorName": "Alice",
+                    "createdAt": old_ts,
+                    "videoCid": "cid-old",
+                    "receivedAtMs": 0,
+                    "source": "followed"
+                },
+                {
+                    "id": "vine-new",
+                    "creatorAddress": "alice-addr",
+                    "creatorName": "Alice",
+                    "createdAt": recent_ts,
+                    "videoCid": "cid-new",
+                    "receivedAtMs": 0,
+                    "source": "followed"
+                }
+            ],
+            "reactions": [
+                {
+                    "vineId": "vine-old",
+                    "reactorAddress": "bob-addr",
+                    "reactorName": "Bob",
+                    "liked": true,
+                    "timestamp": old_ts
+                },
+                {
+                    "vineId": "vine-new",
+                    "reactorAddress": "bob-addr",
+                    "reactorName": "Bob",
+                    "liked": true,
+                    "timestamp": recent_ts
+                }
+            ],
+            "viewed": []
+        });
+        std::fs::write(
+            dir.path().join(VINE_FEED_FILE),
+            serde_json::to_vec_pretty(&disk).unwrap(),
+        )
+        .unwrap();
+
+        let cache = VineFeedCache::load(dir.path());
+        assert_eq!(
+            cache.len_descriptors(),
+            1,
+            "old descriptor must be age-pruned; only vine-new survives"
+        );
+        let dtos = cache.list_descriptors();
+        assert_eq!(dtos[0].id, "vine-new");
+        // The orphan reaction for vine-old must be gone; vine-new's
+        // reaction must survive.
+        assert_eq!(cache.len_reactions(), 1);
+        let summary = cache.get_reaction("vine-new", "bob-addr");
+        assert_eq!(summary.count, 1);
     }
 
     #[test]
