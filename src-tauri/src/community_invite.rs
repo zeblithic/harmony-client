@@ -274,8 +274,8 @@ fn serialize_identity_pubs_map<S: serde::Serializer>(
 ) -> Result<S::Ok, S::Error> {
     use serde::ser::SerializeMap;
 
-    /// Local newtype that serializes any byte slice as a CBOR bstr
-    /// via `Serializer::serialize_bytes`, without requiring serde_bytes.
+    /// Local newtype that serializes a byte slice as CBOR bstr without
+    /// requiring the `serde_bytes` dep. Used by `serialize_identity_pubs_map`.
     struct BstrBytes<'a>(&'a [u8]);
     impl serde::Serialize for BstrBytes<'_> {
         fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
@@ -1796,7 +1796,7 @@ mod tests {
     // ── ZEB-285 Phase 1: PreForkSnapshot + BoundedChannelLogSnapshot ────
 
     #[test]
-    fn pre_fork_snapshot_canonical_cbor_pinned() {
+    fn pre_fork_snapshot_canonical_cbor_roundtrip_and_keys() {
         use crate::community_membership::{MembershipEventKind, SignedMembershipEvent};
         use crate::owner_state_types::Hlc;
         use std::collections::BTreeMap;
@@ -1816,6 +1816,8 @@ mod tests {
                 logical: 0,
                 device_id: "t".to_string(),
             },
+            // Stub event with zeroed sig — this test exercises CBOR roundtrip only,
+            // not crypto verification.
             sig: [0u8; 64],
             countersig: None,
         };
