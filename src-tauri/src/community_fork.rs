@@ -71,21 +71,26 @@ pub fn build_snapshot(
             .map(|k| capped[k].len() * SNAPSHOT_TOTAL_CAP / total)
             .collect();
 
-        // Assign remainder to the channel with the largest current slice,
-        // then cap that allocation at min(allocation, actual_slice_len) to
-        // prevent over-allocation when the largest-slice channel's slice is
-        // smaller than its proportional share plus the remainder.
-        // (Fix: PR #122 round-2 bot review — Cursor Low.)
+        // Distribute remainder across channels in order of descending available
+        // capacity (slice_len - current_allocation), giving each at most its
+        // remaining capacity until remainder reaches 0.
+        // (Fix: PR #122 round-4 bot review — CodeRabbit inline.)
         let allocated_sum: usize = allocations.iter().sum();
-        let remainder = SNAPSHOT_TOTAL_CAP - allocated_sum;
+        let mut remainder = SNAPSHOT_TOTAL_CAP.saturating_sub(allocated_sum);
         if remainder > 0 {
-            let max_idx = keys
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, k)| capped[k].len())
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            allocations[max_idx] += remainder;
+            let mut by_capacity: Vec<usize> = (0..keys.len()).collect();
+            by_capacity.sort_by_key(|&i| {
+                std::cmp::Reverse(capped[&keys[i]].len().saturating_sub(allocations[i]))
+            });
+            for &i in &by_capacity {
+                if remainder == 0 {
+                    break;
+                }
+                let available = capped[&keys[i]].len().saturating_sub(allocations[i]);
+                let take = available.min(remainder);
+                allocations[i] += take;
+                remainder -= take;
+            }
         }
 
         for (k, alloc) in keys.iter().zip(allocations) {

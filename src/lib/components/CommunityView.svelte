@@ -157,8 +157,11 @@
     // captured its last-viewed channel into the service map, so switching
     // back will restore from there.
     activeChannelId = null;
-    // Reset snapshot state on community switch.
+    // Reset snapshot and lineage state on community switch so stale data from
+    // the previous community never briefly shows for the new one.
+    // (Fix: PR #122 round-4, CodeRabbit inline — lineage was not cleared.)
     preForkSnapshot = undefined;
+    lineage = undefined; // undefined = not yet fetched for this community
 
     void (async () => {
       try {
@@ -223,7 +226,12 @@
           settingsModalOpen = true;
           // ZEB-285: lazily load lineage metadata on first open (or when community changes).
           if (lineage === undefined) {
-            void communityService.getCommunityLineage(communityId).then((dto) => {
+            const requestedCommunityId = communityId;
+            void communityService.getCommunityLineage(requestedCommunityId).then((dto) => {
+              // Guard: only apply if we're still on the same community; a late-arriving
+              // response from a previous community must not overwrite the new one's state.
+              // (Fix: PR #122 round-4, CodeRabbit inline.)
+              if (communityId !== requestedCommunityId) return;
               if (dto === null) {
                 lineage = null; // not a fork
               } else {
@@ -234,6 +242,7 @@
                 };
               }
             }).catch(() => {
+              if (communityId !== requestedCommunityId) return;
               lineage = null; // on error, hide lineage block
             });
           }

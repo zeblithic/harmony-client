@@ -11659,29 +11659,36 @@ async fn get_pre_fork_snapshot(community_id: String) -> Result<Option<PreForkSna
         use crate::community_channel_log::SignedChannelEvent;
         let mut dtos: Vec<crate::community_channel_log_engine::ChannelMessageDto> = events
             .iter()
-            .map(|ev| {
-                let SignedChannelEvent::Post {
-                    id,
-                    author,
-                    at,
-                    body,
-                    reply_to,
-                    community_id: ev_community_id,
-                    channel_id: ev_channel_id,
-                    ..
-                } = ev;
-                crate::community_channel_log_engine::ChannelMessageDto {
-                    message_id: hex::encode(id.0),
-                    community_id: hex::encode(ev_community_id.0),
-                    channel_id: hex::encode(ev_channel_id.0),
-                    author: hex::encode(author.0),
-                    at: crate::community_channel_log_engine::HlcDto {
-                        wall_ms: at.wall_ms,
-                        logical: at.logical,
-                        device_id: at.device_id.clone(),
-                    },
-                    body: body.as_bytes().to_vec(),
-                    reply_to: reply_to.map(|m| hex::encode(m.0)),
+            .filter_map(|ev| {
+                // Pattern match on Post only — forward-compatible when
+                // SignedChannelEvent gains new variants (Edit, Delete, etc.).
+                // The `_ => None` arm is unreachable today but will be
+                // load-bearing once additional variants land.
+                #[allow(unreachable_patterns)]
+                match ev {
+                    SignedChannelEvent::Post {
+                        id,
+                        author,
+                        at,
+                        body,
+                        reply_to,
+                        community_id: ev_community_id,
+                        channel_id: ev_channel_id,
+                        ..
+                    } => Some(crate::community_channel_log_engine::ChannelMessageDto {
+                        message_id: hex::encode(id.0),
+                        community_id: hex::encode(ev_community_id.0),
+                        channel_id: hex::encode(ev_channel_id.0),
+                        author: hex::encode(author.0),
+                        at: crate::community_channel_log_engine::HlcDto {
+                            wall_ms: at.wall_ms,
+                            logical: at.logical,
+                            device_id: at.device_id.clone(),
+                        },
+                        body: body.as_bytes().to_vec(),
+                        reply_to: reply_to.map(|m| hex::encode(m.0)),
+                    }),
+                    _ => None,
                 }
             })
             .collect();

@@ -669,7 +669,13 @@ pub enum InviteUrlError {
 ///
 /// Greptile P2 on PR #87 round 2 flagged that the prior name "BYTES"
 /// misled. See `InviteUrlError::TooLarge`.
-pub const MAX_INVITE_BODY_B64_CHARS: usize = 85_333; // ≈ 64 KiB decoded
+///
+/// Phase 1 cap targets ~2 MiB decoded payload (≈ 2_800_000 base64url chars).
+/// Sized to fit realistic 5000-message snapshots inline. Phase 2 will
+/// add content-addressed snapshot delivery via Zenoh BLOB transfer so
+/// large snapshots ride out-of-band and this cap can return to a
+/// stricter URL-friendly value.
+pub const MAX_INVITE_BODY_B64_CHARS: usize = 2_800_000; // ≈ 2 MiB decoded (Phase 1)
 
 /// CR Minor (PR #106 R6): shared helper for the `sealed_epoch_key` byte-length
 /// contract enforced at both the encode and decode boundary. Centralises the
