@@ -137,10 +137,7 @@ pub struct VineVideoDtoWithSource {
 #[derive(Debug, Clone)]
 struct CachedVine {
     descriptor: VineDescriptorPayload,
-    #[allow(dead_code)] // recorded for future use (ZEB-147 may surface received-at in UI)
     received_at_ms: u64,
-    #[allow(dead_code)]
-    // source decision is preserved here for future use; emit returns it via DTO
     source: VineSource,
 }
 
@@ -148,7 +145,6 @@ struct CachedVine {
 struct CachedReaction {
     liked: bool,
     timestamp: u64,
-    #[allow(dead_code)] // recorded for future UI surfacing (reactor display name)
     reactor_name: String,
 }
 
@@ -193,13 +189,23 @@ impl VineFeedCache {
         cache
     }
 
-    /// Read `path` (if it exists) and populate `cache`. Errors / version
-    /// mismatch / malformed JSON all silently produce an empty cache —
-    /// matches `follows.rs::FollowManager::load`'s graceful-degrade.
+    /// Read `path` (if it exists) and populate `cache`. A missing file
+    /// (`NotFound`) silently produces an empty cache — the expected first-run
+    /// path. Other IO errors (permissions, etc.), version mismatches, and
+    /// malformed JSON log a `tracing::warn!` and fall back to an empty cache,
+    /// matching `follows.rs::FollowManager::load`'s graceful-degrade.
     fn populate_from_disk(cache: &mut Self, path: &Path) {
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
-            Err(_) => return, // file missing or unreadable — treat as empty
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    path = %path.display(),
+                    "vine_feed_cache: load() failed; starting with empty cache",
+                );
+                return;
+            }
         };
         let file: VineFeedDiskV1 = match serde_json::from_slice(&bytes) {
             Ok(f) => f,
