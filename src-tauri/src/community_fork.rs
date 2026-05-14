@@ -124,7 +124,7 @@ fn hlc_cmp(
 }
 
 /// Caller-supplied options for `fork_community`.
-#[derive(serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct ForkCommunityOpts {
     /// Display name for the new fork community.
     pub name: String,
@@ -139,7 +139,7 @@ pub struct ForkCommunityOpts {
 }
 
 /// Result returned to the frontend on success.
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ForkCommunityResult {
     /// Hex-encoded SpaceId of the newly created fork community.
     pub fork_space_id: String,
@@ -524,17 +524,37 @@ pub async fn fork_community(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         if g.generation != snapshot_generation {
+            let snapshot_path = crate::owner_commands::resolve_identity_dir()
+                .map(|d| {
+                    d.join("communities")
+                        .join(&fork_space_id_hex)
+                        .join("pre_fork_snapshot.bin")
+                })
+                .unwrap_or_else(|_| std::path::PathBuf::from("<identity_dir unavailable>"));
             return Err(format!(
-                "node generation changed during fork_community (was {}, now {}); \
-                 fork minted on a detached crdt_state — engine spawn suppressed",
-                snapshot_generation, g.generation
+                "ZEB-285 fork_community: node generation changed after engine spawn and snapshot \
+                 write (was {}, now {}); fork has been rolled back by engine guard (disk snapshot \
+                 at {} is orphaned and will be cleaned up by next start); original community \
+                 untouched",
+                snapshot_generation,
+                g.generation,
+                snapshot_path.display()
             ));
         }
         if g.community_registry.is_none() {
-            return Err(
-                "community_registry was torn down during fork_community — engine spawn suppressed"
-                    .to_string(),
-            );
+            let snapshot_path = crate::owner_commands::resolve_identity_dir()
+                .map(|d| {
+                    d.join("communities")
+                        .join(&fork_space_id_hex)
+                        .join("pre_fork_snapshot.bin")
+                })
+                .unwrap_or_else(|_| std::path::PathBuf::from("<identity_dir unavailable>"));
+            return Err(format!(
+                "ZEB-285 fork_community: community_registry was torn down after engine spawn and \
+                 snapshot write; fork has been rolled back by engine guard (disk snapshot at {} is \
+                 orphaned and will be cleaned up by next start); original community untouched",
+                snapshot_path.display()
+            ));
         }
     }
 
@@ -610,13 +630,19 @@ pub async fn fork_community(
         match fork_publish_fence {
             ForkPublishFence::GenerationChanged => {
                 tracing::warn!(
-                    "fork_community: node generation changed before Fork event publish; skipping"
+                    original_id = %hex::encode(original_id.0),
+                    fork_space_id = %fork_space_id_hex,
+                    "ZEB-285 fork_community: node generation changed before Fork event publish; skipping"
                 );
+                visible = false;
             }
             ForkPublishFence::RegistryGone => {
                 tracing::warn!(
-                    "fork_community: community_registry detached before Fork event publish; skipping"
+                    original_id = %hex::encode(original_id.0),
+                    fork_space_id = %fork_space_id_hex,
+                    "ZEB-285 fork_community: community_registry detached before Fork event publish; skipping"
                 );
+                visible = false;
             }
             ForkPublishFence::Proceed => {
                 match original_engine.insert_local_event(fork_event).await {

@@ -183,7 +183,7 @@ export class CommunityService {
 
   async forkCommunity(
     communityId: string,
-    opts: { name: string; silent: boolean; alsoLeave: boolean },
+    opts: { name: string; silent?: boolean; alsoLeave?: boolean },
   ): Promise<{ forkSpaceId: string; visible: boolean; snapshotMessageCount: number }> {
     try {
       return await this.invoke<{
