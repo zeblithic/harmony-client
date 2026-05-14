@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import type { CommunityService, ChannelInfo } from '../community-service';
+  import type { CommunityService, ChannelInfo, PreForkSnapshotDto } from '../community-service';
   import type { ChannelMessageService } from '../channel-message-service';
   import type { CommunityMember } from '../types';
   import type { TrustService } from '../trust-service';
@@ -71,6 +71,10 @@
     forkedAtMs: number;
     snapshotMessageCount: number;
   } | null | undefined>(undefined); // undefined = not yet fetched
+
+  // ZEB-285 Task 11: pre-fork snapshot for unified timeline rendering.
+  // Loaded once per community view. null = non-fork community; undefined = not yet loaded.
+  let preForkSnapshot = $state<PreForkSnapshotDto | null | undefined>(undefined);
 
   let activeChannel = $derived(channels.find((c) => c.channelId === activeChannelId) ?? null);
 
@@ -149,9 +153,19 @@
     // captured its last-viewed channel into the service map, so switching
     // back will restore from there.
     activeChannelId = null;
+    // Reset snapshot state on community switch.
+    preForkSnapshot = undefined;
 
     void (async () => {
       try {
+        // ZEB-285 Task 11: load pre-fork snapshot for unified timeline.
+        // Fire-and-forget; result flows into snapshotMessages prop on ChannelMessageFeed.
+        communityService.getPreForkSnapshot(cid).then((snapshot) => {
+          if (!cancelled) preForkSnapshot = snapshot;
+        }).catch(() => {
+          if (!cancelled) preForkSnapshot = null;
+        });
+
         // Capture persisted before refresh so the post-refresh validation
         // sees the most recent stored value.
         const persisted = communityService.getSelectedChannel(cid);
@@ -243,6 +257,9 @@
         {ownAddress}
         {trustService}
         {myPower}
+        snapshotMessages={preForkSnapshot?.channelLog?.[activeChannel.channelId] ?? []}
+        originalCommunityName={preForkSnapshot?.originalCommunityName ?? ''}
+        forkedAtMs={preForkSnapshot?.forkedAtMs ?? 0}
       />
     {:else}
       <div class="empty-channels">

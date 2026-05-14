@@ -1,5 +1,6 @@
 import type { TauriAdapter } from './zenoh-service';
 import { POWER_THRESHOLDS, type CommunityMember, type ModerationEvent } from './types';
+import type { ChannelMessageDto } from './channel-message-service';
 
 interface MembersChangedPayload { communityId: string; }
 interface DegradedPayload { communityId: string; degraded: boolean; }
@@ -23,6 +24,17 @@ export interface ChannelInfo {
   writePower: number;
   createdAt: { wallMs: number; logical: number; deviceId: string };
   deletedAt?: { wallMs: number; logical: number; deviceId: string };
+}
+
+/**
+ * ZEB-285 Phase 1 Task 11: mirrors `PreForkSnapshotDto` from src-tauri/src/lib.rs.
+ * channelLog keys are channel-ID hex strings (32 chars); values are
+ * HLC-ascending sorted ChannelMessageDto arrays (same shape as live messages).
+ */
+export interface PreForkSnapshotDto {
+  originalCommunityName: string;
+  forkedAtMs: number;
+  channelLog: Record<string, ChannelMessageDto[]>;
 }
 
 /** Action discriminator on the `channel-config-updated` Tauri event.
@@ -317,6 +329,25 @@ export class CommunityService {
    *  this not being 'unknown' rather than assuming a default. */
   getKind(communityId: string): 'open' | 'invite-only' | 'unknown' {
     return this.knownKinds.get(communityId) ?? 'unknown';
+  }
+
+  /**
+   * ZEB-285 Phase 1 Task 11: fetch the full channel-log snapshot for a forked
+   * community so the unified timeline can merge pre-fork + live messages.
+   * Returns null when the community is not a fork (no pre_fork_snapshot.bin).
+   * Mirrors `PreForkSnapshotDto` from src-tauri/src/lib.rs.
+   */
+  async getPreForkSnapshot(communityId: string): Promise<PreForkSnapshotDto | null> {
+    try {
+      const dto = await this.invoke<PreForkSnapshotDto | null>('get_pre_fork_snapshot', {
+        communityId,
+      });
+      return dto ?? null;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn(`getPreForkSnapshot failed for ${communityId}: ${msg}`);
+      return null;
+    }
   }
 
   /**
