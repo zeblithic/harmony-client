@@ -165,7 +165,6 @@ pub struct VineFeedCache {
     viewed: HashSet<String>,
     /// `Some(path_to_vine_feed.json)` when constructed via `load()`;
     /// `None` for `new()`. `save()` checks this and is a no-op when None.
-    #[allow(dead_code)] // read by save(); save() wired to mutators in ZEB-147 Task 4
     path: Option<PathBuf>,
 }
 
@@ -345,6 +344,25 @@ impl VineFeedCache {
             },
         );
 
+        // Runtime capacity-trim: if insert exceeded the cap, drop the
+        // oldest descriptor(s) by `created_at` ascending (ties broken by
+        // id ascending for cross-replica determinism), and drop their
+        // reactions. Single-pass; runs only when len > MAX_DESCRIPTORS.
+        if self.descriptors.len() > MAX_DESCRIPTORS {
+            let mut entries: Vec<(u64, String)> = self
+                .descriptors
+                .iter()
+                .map(|(id, cv)| (cv.descriptor.created_at, id.clone()))
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            let drop_count = self.descriptors.len() - MAX_DESCRIPTORS;
+            for (_, id) in entries.into_iter().take(drop_count) {
+                self.descriptors.remove(&id);
+                self.reactions.retain(|(vid, _), _| vid != &id);
+            }
+        }
+
+        self.save();
         Some(DescriptorOutcome::Inserted { dto })
     }
 
@@ -429,6 +447,7 @@ impl VineFeedCache {
                         reactor_name: reaction.reactor_name,
                     },
                 );
+                self.save();
                 Some(ReactionOutcome::Inserted)
             }
             Some(existing) => {
@@ -452,6 +471,7 @@ impl VineFeedCache {
                         reactor_name: reaction.reactor_name,
                     },
                 );
+                self.save();
                 Some(ReactionOutcome::UpdatedNewer)
             }
         }
@@ -489,7 +509,11 @@ impl VineFeedCache {
     /// joins viewed-state at query time, so the order of `mark_viewed`
     /// + `on_descriptor_sample` does not matter.
     pub fn mark_viewed(&mut self, vine_id: String) -> bool {
-        self.viewed.insert(vine_id)
+        let newly_added = self.viewed.insert(vine_id);
+        if newly_added {
+            self.save();
+        }
+        newly_added
     }
 
     /// Atomic save: serialize cache state, write to `<path>.tmp`, rename
@@ -498,7 +522,6 @@ impl VineFeedCache {
     /// Errors are logged via `tracing::warn!` but never propagated — this
     /// matches the `follows.rs` / `content_index.rs` philosophy: persistence
     /// is best-effort; a failed save must not crash the dispatch loop.
-    #[allow(dead_code)] // wired into mutators in ZEB-147 Task 4
     fn save(&self) {
         let Some(path) = self.path.as_ref() else {
             return;
@@ -1273,6 +1296,103 @@ mod tests {
         assert_eq!(cache.len_reactions(), 1);
         let summary = cache.get_reaction("vine-new", "bob-addr");
         assert_eq!(summary.count, 1);
+    }
+
+    #[test]
+    fn descriptor_insert_persists_to_disk() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        {
+            let mut cache = VineFeedCache::load(dir.path());
+            let followed = followed_set_with(&["alice-addr"]);
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let desc = canonical_descriptor_bytes(
+                "vine-p1",
+                "alice-addr",
+                "Alice",
+                "cid-1",
+                None,
+                None,
+                now_secs.saturating_sub(60), // recent (within age cutoff)
+            );
+            let out =
+                cache.on_descriptor_sample("harmony/vines/alice-addr", &desc, &followed, 1_000);
+            assert!(matches!(out, Some(DescriptorOutcome::Inserted { .. })));
+            // No explicit save_for_test() call — Task 4 wires save() into
+            // on_descriptor_sample, so the disk must already reflect this.
+        }
+        let cache2 = VineFeedCache::load(dir.path());
+        assert_eq!(cache2.len_descriptors(), 1);
+        assert_eq!(cache2.list_descriptors()[0].id, "vine-p1");
+    }
+
+    #[test]
+    fn reaction_update_persists_to_disk() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let recent = now_secs.saturating_sub(60);
+        {
+            let mut cache = VineFeedCache::load(dir.path());
+            let followed = followed_set_with(&["alice-addr"]);
+            // Need a descriptor first (otherwise reaction is orphaned and
+            // load() drops it).
+            let desc = canonical_descriptor_bytes(
+                "vine-r1",
+                "alice-addr",
+                "Alice",
+                "cid",
+                None,
+                None,
+                recent,
+            );
+            cache.on_descriptor_sample("harmony/vines/alice-addr", &desc, &followed, 1_000);
+
+            // Insert reaction
+            let react = canonical_reaction_bytes("vine-r1", "bob-addr", "Bob", true, recent + 10);
+            let out = cache.on_reaction_sample(
+                "harmony/vines/alice-addr/reactions/vine-r1/bob-addr",
+                &react,
+            );
+            assert_eq!(out, Some(ReactionOutcome::Inserted));
+
+            // Update reaction (LWW newer timestamp)
+            let react2 = canonical_reaction_bytes("vine-r1", "bob-addr", "Bob", false, recent + 20);
+            let out2 = cache.on_reaction_sample(
+                "harmony/vines/alice-addr/reactions/vine-r1/bob-addr",
+                &react2,
+            );
+            assert_eq!(out2, Some(ReactionOutcome::UpdatedNewer));
+        }
+        // Reload — both descriptor and updated reaction must be persisted
+        let cache2 = VineFeedCache::load(dir.path());
+        assert_eq!(cache2.len_reactions(), 1);
+        // The final reaction value should be liked=false at recent+20
+        let summary = cache2.get_reaction("vine-r1", "bob-addr");
+        assert_eq!(summary.count, 0); // liked=false → not counted
+        assert!(!summary.liked_by_me);
+    }
+
+    #[test]
+    fn mark_viewed_persists_to_disk() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        {
+            let mut cache = VineFeedCache::load(dir.path());
+            let first = cache.mark_viewed("v-mv".to_string());
+            assert!(first);
+            // Second call returns false; the disk write side-effect must
+            // be skipped on the no-op path (we can't directly observe
+            // "no write happened" from this test, but the next reload
+            // confirms the viewed set has exactly the one entry).
+            let second = cache.mark_viewed("v-mv".to_string());
+            assert!(!second);
+        }
+        let cache2 = VineFeedCache::load(dir.path());
+        assert!(cache2.is_viewed("v-mv"));
     }
 
     #[test]
