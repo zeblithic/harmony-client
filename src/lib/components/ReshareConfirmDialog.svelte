@@ -23,7 +23,7 @@
   );
 </script>
 
-<Modal {onCancel} ariaLabelledby={titleId}>
+<Modal {onCancel} ariaLabelledby={titleId} canDismissOnBackdrop={true}>
   <h3 class="modal-title" id={titleId}>Reshare this vine?</h3>
   <p class="modal-description">
     {#if vine.title}

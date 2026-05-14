@@ -138,4 +138,28 @@ describe('ReshareConfirmDialog', () => {
     await fireEvent.keyDown(dialog, { key: 'Escape' });
     expect(onCancel).toHaveBeenCalled();
   });
+
+  it('calls onCancel on backdrop click', async () => {
+    // Spec §UI Components → ReshareConfirmDialog: "Dismissible with Escape
+    // key or clicking the backdrop." We pass canDismissOnBackdrop={true}
+    // to Modal so a click on .modal-overlay (outside the dialog body)
+    // fires onCancel. Confirmed not to fire on inner clicks via Modal's
+    // own test for target-check gating.
+    const vine: VineVideo = {
+      id: 'vine-1',
+      creatorAddress: 'addr-1',
+      creatorName: 'Alice',
+      createdAt: 1700000000,
+      videoCid: 'cid-abc',
+      title: 'Cool vine',
+      viewed: false,
+    };
+    const onCancel = vi.fn();
+    const { container } = render(ReshareConfirmDialog, {
+      props: { vine, onConfirm: vi.fn(), onCancel },
+    });
+    const overlay = container.querySelector('.modal-overlay') as HTMLElement;
+    await fireEvent.click(overlay);
+    expect(onCancel).toHaveBeenCalledTimes(1);
+  });
 });
