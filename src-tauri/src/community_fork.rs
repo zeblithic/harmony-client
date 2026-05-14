@@ -130,9 +130,11 @@ pub struct ForkCommunityOpts {
     pub name: String,
     /// If `true`, do NOT mint/publish a Fork event in the original.
     /// The fork is "silent" — original members won't see a fork annotation.
+    #[serde(default)]
     pub silent: bool,
     /// If `true`, additionally mint/publish a Leave event in the original
     /// after creating the fork.
+    #[serde(default)]
     pub also_leave: bool,
 }
 
@@ -565,7 +567,9 @@ pub async fn fork_community(
     }
 
     // Step 7: if !silent, mint + publish Fork event in the original.
-    let visible = !opts.silent;
+    // Per spec §5.2: transport-level failures here must warn-and-continue with
+    // visible=false; the fork is already durably on disk.
+    let mut visible = !opts.silent;
     if visible {
         let fork_event_hlc =
             crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms)
@@ -615,19 +619,31 @@ pub async fn fork_community(
                 );
             }
             ForkPublishFence::Proceed => {
-                let outcome = original_engine
-                    .insert_local_event(fork_event)
-                    .await
-                    .map_err(|e| format!("engine.insert_local_event (Fork): {e}"))?;
-                if !matches!(
-                    outcome,
-                    crate::community_state_crdt::InsertOutcome::Inserted
-                        | crate::community_state_crdt::InsertOutcome::AlreadyKnown
-                ) {
-                    tracing::warn!(
-                        original_id = %hex::encode(original_id.0),
-                        "fork_community: Fork event rejected by original engine: {outcome:?}"
-                    );
+                match original_engine.insert_local_event(fork_event).await {
+                    Ok(outcome) => {
+                        if !matches!(
+                            outcome,
+                            crate::community_state_crdt::InsertOutcome::Inserted
+                                | crate::community_state_crdt::InsertOutcome::AlreadyKnown
+                        ) {
+                            tracing::warn!(
+                                original_id = %hex::encode(original_id.0),
+                                "fork_community: Fork event rejected by original engine: {outcome:?}"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        // Per spec §5.2: transport/IO failure publishing Fork event must not
+                        // tear down the fork (already on disk). Log + set visible=false so the
+                        // caller knows the announce did not land; forker can retry from settings.
+                        tracing::warn!(
+                            error = ?e,
+                            original_id = %hex::encode(original_id.0),
+                            fork_space_id = %fork_space_id_hex,
+                            "ZEB-285: failed to publish Fork event to original; fork is still on disk locally"
+                        );
+                        visible = false;
+                    }
                 }
             }
         }
@@ -647,18 +663,29 @@ pub async fn fork_community(
                 leave_hlc,
             )?
         };
-        let outcome = original_engine
-            .insert_local_event(leave_event)
-            .await
-            .map_err(|e| format!("engine.insert_local_event (Leave): {e}"))?;
-        if matches!(
-            outcome,
-            crate::community_state_crdt::InsertOutcome::Rejected(_)
-        ) {
-            tracing::warn!(
-                original_id = %hex::encode(original_id.0),
-                "fork_community: also_leave Leave event rejected by original engine: {outcome:?}"
-            );
+        match original_engine.insert_local_event(leave_event).await {
+            Ok(outcome) => {
+                if matches!(
+                    outcome,
+                    crate::community_state_crdt::InsertOutcome::Rejected(_)
+                ) {
+                    tracing::warn!(
+                        original_id = %hex::encode(original_id.0),
+                        "fork_community: also_leave Leave event rejected by original engine: {outcome:?}"
+                    );
+                }
+            }
+            Err(e) => {
+                // Per spec §5.2: transport/IO failure publishing Leave event must not tear down
+                // the fork (already on disk). Log + continue; original community membership
+                // remains unchanged locally. Forker can retry leave from settings.
+                tracing::warn!(
+                    error = ?e,
+                    original_id = %hex::encode(original_id.0),
+                    "ZEB-285: failed to publish Leave event; fork still on disk, \
+                     original community membership unchanged locally"
+                );
+            }
         }
     }
 
