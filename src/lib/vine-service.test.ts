@@ -736,9 +736,13 @@ describe('VineService self-reshare prevention', () => {
     await svc.connectAdapter(adapter);
     const before = svc.vines.length;
     // Reshare with originalCreatorAddress === 'self' should be rejected silently.
+    // The JSDoc on publish() promises "no IPC invoke, no offline fallback,
+    // no onChange" — all three are asserted below.
+    svc.onChange = vi.fn();
     await svc.publish('cid-x', 'My title', 'orig-1', 'self', 'You');
     expect(adapter.invoke).not.toHaveBeenCalledWith('publish_vine', expect.anything());
     expect(svc.vines.length).toBe(before);
+    expect(svc.onChange).not.toHaveBeenCalled();
   });
 
   it('publish silently no-ops when originalCreatorAddress === ownAddress (hex form)', async () => {
@@ -746,9 +750,11 @@ describe('VineService self-reshare prevention', () => {
     svc.ownAddress = 'a1b2c3d4';
     await svc.connectAdapter(adapter);
     const before = svc.vines.length;
+    svc.onChange = vi.fn();
     await svc.publish('cid-x', 'My title', 'orig-1', 'a1b2c3d4', 'You');
     expect(adapter.invoke).not.toHaveBeenCalledWith('publish_vine', expect.anything());
     expect(svc.vines.length).toBe(before);
+    expect(svc.onChange).not.toHaveBeenCalled();
   });
 
   it("publish allows resharing someone else's reshare of your content", async () => {
