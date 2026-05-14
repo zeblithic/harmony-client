@@ -537,6 +537,7 @@ pub enum VerifyError {
     /// unauthorized epoch events from entering the CRDT log.
     EpochEventUnauthorized,
 
+    // ── ZEB-285 fork verifier ──
     /// ZEB-285: the event's signer (event.actor) has no entry in the
     /// PreForkSnapshot.identity_pubs map. The snapshot is authoritative
     /// for the original community's keyset — a signer not in the map
@@ -647,7 +648,11 @@ impl std::fmt::Display for VerifyError {
                  is not the cooperative leaver, or the event shape is obviously malformed"
             ),
             VerifyError::UnknownSigner { signer } => {
-                write!(f, "snapshot signer {:?} not in identity_pubs", signer)
+                write!(
+                    f,
+                    "signer {} is not present in PreForkSnapshot.identity_pubs",
+                    hex::encode(signer.0)
+                )
             }
         }
     }
@@ -3725,7 +3730,7 @@ mod tests {
 
         let original_id = SpaceId([0xa0; 16]);
         let (admin_priv, admin_pub, admin_addr) = make_identity(0xaa);
-        let (unknown_priv, _unknown_pub, unknown_addr) = make_identity(0xff);
+        let (outsider_priv, _outsider_pub, outsider_addr) = make_identity(0xff);
 
         let admin_join = sign_with_identity(
             EventPayload {
@@ -3741,30 +3746,30 @@ mod tests {
             },
             &admin_priv,
         );
-        // Signed by `unknown_addr` — but identity_pubs has no entry for them.
-        let unknown_event = sign_with_identity(
+        // Signed by `outsider_addr` — a valid keypair never part of the original community.
+        let outsider_event = sign_with_identity(
             EventPayload {
                 id: [0x02; 16],
                 community_id: original_id,
                 kind: MembershipEventKind::Leave,
-                actor: unknown_addr,
+                actor: outsider_addr,
                 at: Hlc {
                     wall_ms: 2,
                     logical: 0,
                     device_id: "t".into(),
                 },
             },
-            &unknown_priv,
+            &outsider_priv,
         );
 
         let mut identity_pubs = BTreeMap::new();
         identity_pubs.insert(admin_addr, admin_pub);
-        // No entry for unknown_addr — intentionally missing.
+        // No entry for outsider_addr — intentionally missing.
 
         let snapshot = PreForkSnapshot {
             original_community_id: original_id,
             original_community_name: "Original".to_string(),
-            membership_events: vec![admin_join, unknown_event.clone()],
+            membership_events: vec![admin_join, outsider_event.clone()],
             channel_log: BoundedChannelLogSnapshot::default(),
             identity_pubs,
             forked_at: Hlc {
@@ -3774,10 +3779,15 @@ mod tests {
             },
         };
 
-        let result = verify_snapshot_event(&unknown_event, &snapshot);
-        assert!(
-            matches!(result, Err(VerifyError::UnknownSigner { .. })),
-            "verify_snapshot_event should reject signer not in identity_pubs; got {result:?}"
-        );
+        let result = verify_snapshot_event(&outsider_event, &snapshot);
+        match result {
+            Err(VerifyError::UnknownSigner { signer }) => {
+                assert_eq!(
+                    signer, outsider_addr,
+                    "error should carry the actual offending address"
+                );
+            }
+            other => panic!("expected UnknownSigner, got {:?}", other),
+        }
     }
 }
