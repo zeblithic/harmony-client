@@ -24,9 +24,12 @@ use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
 use harmony_identity::PrivateIdentity;
 use rand::RngCore;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
+
+static EVENT_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ── Harness helpers ─────────────────────────────────────────────────────────
 
@@ -98,8 +101,11 @@ fn make_join_event(
     seq: u32,
     device: &str,
 ) -> harmony_app::community_membership::SignedMembershipEvent {
+    let id_seq = EVENT_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut id_bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut id_bytes);
+    id_bytes[..8].copy_from_slice(&id_seq.to_be_bytes());
+    // First 8 bytes count up deterministically; last 8 stay zero
+    // (sufficient for test determinism without colliding within a test run).
     let payload = EventPayload {
         id: id_bytes,
         community_id,
@@ -282,7 +288,13 @@ async fn run_fork_inner(
                     visible = false;
                 }
             }
-            Err(_) => visible = false,
+            Err(e) => {
+                eprintln!(
+                    "run_fork_inner: insert_local_event_with_pubs failed for Fork event: {:?}",
+                    e
+                );
+                visible = false;
+            }
         }
     }
 
@@ -307,9 +319,15 @@ async fn run_fork_inner(
             .engine_arc(&original_community_id)
             .await
             .expect("original engine arc");
-        let _ = original_engine
+        if let Err(e) = original_engine
             .insert_local_event_with_pubs(leave_event, forker_pub, None)
-            .await;
+            .await
+        {
+            eprintln!(
+                "run_fork_inner: insert_local_event_with_pubs failed for Leave event: {:?}",
+                e
+            );
+        }
     }
 
     ForkResult {
@@ -358,8 +376,11 @@ impl PairedEngines {
         let b_addr = OwnerAddr(id_b.identity.address_hash);
         let b_signing = signing_key_from(&id_b);
 
+        let b_pub = id_b.identity.to_public_bytes();
+
         let mut resolver_map = std::collections::HashMap::new();
         resolver_map.insert(a_addr, a_pub);
+        resolver_map.insert(b_addr, b_pub);
         let resolver: Arc<dyn IdentityResolver> = Arc::new(StaticResolver { map: resolver_map });
 
         let mut mk_bytes = [0u8; 32];
