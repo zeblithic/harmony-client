@@ -37,12 +37,27 @@ export class NavService {
   ownAddress: string | null = null;
 
   private adapter: TauriAdapter | null = null;
+  private connecting = false;
   private avatarResolver: AvatarResolver | null = null;
   private unlisteners: Array<() => void> = [];
+  /** IDs of constructor-seeded mock nav nodes — used to selectively clear
+   *  mocks on `connectAdapter()` while preserving any locally-created
+   *  entries from pre-connect-window calls (e.g. handleDmCreate calling
+   *  addOrUpdateNavSpace before the adapter wires in) (ZEB-209 bot R1). */
+  private mockNodeIds = new Set<string>();
+  /** Keys of constructor-seeded mock profiles — used to selectively clear
+   *  mocks on `connectAdapter()` while preserving any locally-added
+   *  profiles from the pre-connect window (ZEB-209 bot R1). */
+  private mockProfileKeys = new Set<string>();
 
   constructor() {
+    // Seed with mock data for browser/dev mode — `connectAdapter()` clears
+    // these (selectively, preserving any locally-created entries from the
+    // pre-connect window) before subscribing to real events (ZEB-209).
     this.nodes = [...mockNavNodes];
     this.profiles = new Map(mockProfileStore);
+    this.mockNodeIds = new Set(mockNavNodes.map((n) => n.id));
+    this.mockProfileKeys = new Set(mockProfileStore.keys());
   }
 
   /** Attach an avatar resolver for CID → blob URL resolution. */
@@ -62,47 +77,87 @@ export class NavService {
 
   /** Connect a Tauri adapter and start listening for profile + nav updates. */
   async connectAdapter(adapter: TauriAdapter): Promise<void> {
-    if (this.adapter) return;
+    if (this.adapter || this.connecting) return; // already wired or in-progress; prevent duplicate listeners
+    this.connecting = true;
+
+    // ── R3: Selective clear FIRST so handlers see clean state ──
+    // Preserves locally-created entries from pre-connect-window calls (e.g.
+    // handleDmCreate calling addOrUpdateNavSpace before the adapter wires in).
+    // By the time any listener handler can possibly fire, mock node ids and
+    // profile keys are already removed, and mockNodeIds/mockProfileKeys are
+    // empty — no mock-vs-real collision is possible. On listen failure the
+    // service is in a clean-but-unconnected state; this.adapter is still null
+    // so a retry is allowed, and the selective clear is idempotent.
+    this.nodes = this.nodes.filter((n) => !this.mockNodeIds.has(n.id));
+    for (const key of this.mockProfileKeys) this.profiles.delete(key);
+    this.mockNodeIds = new Set();
+    this.mockProfileKeys = new Set();
+    this.onChange?.();
+
+    // ZEB-209 bot-feedback round 1: register listeners FIRST so a partial-init
+    // failure doesn't wedge the service. Adapter and unlisteners are committed
+    // only after all listens succeed; on failure we tear down partial work and
+    // rethrow so the caller (App.svelte tryConnect) can retry.
+    // ZEB-209 bot-feedback round 2: `connecting` sentinel (above) prevents a
+    // concurrent caller from passing the guard while awaits are in flight.
+    // ZEB-209 bot-feedback round 3: selective clear moved above listener
+    // registration so handlers see clean state between successive awaits.
+    const localUnlisteners: Array<() => void> = [];
+    try { // outer try — releases connecting sentinel in finally on any exit path
+    try {
+      localUnlisteners.push(await adapter.listen(
+        'profile-update',
+        (event) => {
+          const wire = event.payload as ProfilePayload;
+          // Filter own profile echoes
+          if (this.ownAddress && wire.address === this.ownAddress) return;
+          const avatarUrl = this.resolveAvatarUrl(wire);
+          this.profiles.set(wire.address, {
+            address: wire.address,
+            displayName: wire.displayName,
+            statusText: wire.statusText,
+            avatarUrl,
+            avatarCid: wire.avatarCid,
+            avatarMiniCid: wire.avatarMiniCid,
+          });
+          // Update DM nodes to match latest peer profile
+          let nodeChanged = false;
+          const updated = this.nodes.map((n) => {
+            if (n.peer?.address !== wire.address) return n;
+            const peerChanged = n.name !== wire.displayName || n.peer.avatarUrl !== avatarUrl;
+            if (!peerChanged) return n;
+            nodeChanged = true;
+            return {
+              ...n,
+              name: wire.displayName,
+              peer: { ...n.peer, displayName: wire.displayName, avatarUrl },
+            };
+          });
+          if (nodeChanged) this.nodes = updated;
+          this.onChange?.();
+        },
+      ));
+
+      localUnlisteners.push(await adapter.listen('nav-updated', (event) => {
+        this.addOrUpdateNavSpace(event.payload as NavUpdatedPayload);
+      }));
+    } catch (err) {
+      for (const fn of localUnlisteners) fn();
+      // Note: mocks are already cleared and user-created entries preserved.
+      // On listen failure the service is in a clean but unconnected state —
+      // the App.svelte tryConnect wrapper logs. A retry is allowed
+      // (this.adapter is still null), and the selective clear is idempotent
+      // (mockNodeIds/mockProfileKeys are now empty, so filters are no-ops).
+      throw err;
+    }
+
+    // Commit: assign adapter and register unlisteners.
+    // (Selective clear was moved before listener registration per R3.)
     this.adapter = adapter;
-
-    const unlistenProfile = await adapter.listen(
-      'profile-update',
-      (event) => {
-        const wire = event.payload as ProfilePayload;
-        // Filter own profile echoes
-        if (this.ownAddress && wire.address === this.ownAddress) return;
-        const avatarUrl = this.resolveAvatarUrl(wire);
-        this.profiles.set(wire.address, {
-          address: wire.address,
-          displayName: wire.displayName,
-          statusText: wire.statusText,
-          avatarUrl,
-          avatarCid: wire.avatarCid,
-          avatarMiniCid: wire.avatarMiniCid,
-        });
-        // Update DM nodes to match latest peer profile
-        let nodeChanged = false;
-        const updated = this.nodes.map((n) => {
-          if (n.peer?.address !== wire.address) return n;
-          const peerChanged = n.name !== wire.displayName || n.peer.avatarUrl !== avatarUrl;
-          if (!peerChanged) return n;
-          nodeChanged = true;
-          return {
-            ...n,
-            name: wire.displayName,
-            peer: { ...n.peer, displayName: wire.displayName, avatarUrl },
-          };
-        });
-        if (nodeChanged) this.nodes = updated;
-        this.onChange?.();
-      },
-    );
-    this.unlisteners.push(unlistenProfile);
-
-    const unlistenNav = await adapter.listen('nav-updated', (event) => {
-      this.addOrUpdateNavSpace(event.payload as NavUpdatedPayload);
-    });
-    this.unlisteners.push(unlistenNav);
+    this.unlisteners.push(...localUnlisteners);
+    } finally {
+      this.connecting = false;
+    }
   }
 
   /**

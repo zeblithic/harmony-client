@@ -48,12 +48,21 @@ export class VineService {
   private likePending = new Set<string>();
 
   private adapter: TauriAdapter | null = null;
+  private connecting = false;
   private unlisteners: Array<() => void> = [];
   private seenIds = new Set<string>();
+  /** IDs of constructor-seeded mock vines — used to selectively clear
+   *  mocks on `connectAdapter()` while preserving any locally-created
+   *  entries from offline-fallback `publish()` calls during the pre-connect
+   *  window (ZEB-209 bot R1). */
+  private mockSeededIds = new Set<string>();
 
   constructor() {
-    // Seed with mock data — real vines append on top.
+    // Seed with mock data for browser/dev mode — `connectAdapter()` clears
+    // these (selectively, preserving any locally-created entries from the
+    // pre-connect window) before subscribing to real events (ZEB-209).
     this.discoverVines = [...mockVines];
+    this.mockSeededIds = new Set(mockVines.map((v) => v.id));
     for (const v of this.discoverVines) {
       this.seenIds.add(v.id);
       if (v.viewed) this.viewedIds.add(v.id);
@@ -62,67 +71,113 @@ export class VineService {
 
   /** Connect a Tauri adapter and start listening for vine descriptors. */
   async connectAdapter(adapter: TauriAdapter): Promise<void> {
-    if (this.adapter) return; // already wired; prevent duplicate listeners
+    if (this.adapter || this.connecting) return; // already wired or in-progress; prevent duplicate listeners
+    this.connecting = true;
+
+    // ── R3: Selective clear FIRST so handlers see clean state ──
+    // Preserves locally-created entries from offline-fallback publish() calls
+    // during the pre-connect window. By the time any listener handler can
+    // possibly fire, mock ids are already removed from seenIds and the feed
+    // arrays, and mockSeededIds is empty — no mock-vs-real dedup collision
+    // is possible. On listen failure the service is in a clean-but-unconnected
+    // state; this.adapter is still null so a retry is allowed, and the
+    // selective clear is idempotent (mockSeededIds is now empty).
+    this.discoverVines = this.discoverVines.filter((v) => !this.mockSeededIds.has(v.id));
+    this.followedVines = this.followedVines.filter((v) => !this.mockSeededIds.has(v.id));
+    for (const id of this.mockSeededIds) {
+      this.seenIds.delete(id);
+      this.viewedIds.delete(id);
+      this.reactionMap.delete(id);
+    }
+    this.mockSeededIds = new Set();
+    // likePending is short-lived (set by user click), never mock-seeded — leave it alone.
+    this.onChange?.();
+
+    // ZEB-209 bot-feedback round 1: register listeners FIRST so a partial-init
+    // failure doesn't wedge the service. Adapter and unlisteners are committed
+    // only after all listens succeed; on failure we tear down partial work and
+    // rethrow so the caller (App.svelte tryConnect) can retry.
+    // ZEB-209 bot-feedback round 2: `connecting` sentinel (above) prevents a
+    // concurrent caller from passing the guard while awaits are in flight.
+    // ZEB-209 bot-feedback round 3: selective clear moved above listener
+    // registration so handlers see clean state between successive awaits.
+    const localUnlisteners: Array<() => void> = [];
+    try { // outer try — releases connecting sentinel in finally on any exit path
+    try {
+      localUnlisteners.push(await adapter.listen(
+        'vine-received',
+        (event) => {
+          const wire = event.payload as VineDescriptorEvent;
+          if (this.seenIds.has(wire.id)) return;
+          this.seenIds.add(wire.id);
+          const vine = this.wireToVine(wire);
+          if (vine.viewed) this.viewedIds = new Set([...this.viewedIds, vine.id]);
+          if (wire.source === 'followed') {
+            this.followedVines = [...this.followedVines, vine];
+          } else {
+            this.discoverVines = [...this.discoverVines, vine];
+          }
+          this.onChange?.();
+        },
+      ));
+
+      localUnlisteners.push(await adapter.listen(
+        'vine-reaction-received',
+        (event) => {
+          const wire = event.payload as {
+            vineId: string;
+            reactorAddress: string;
+            reactorName: string;
+            liked: boolean;
+            timestamp: number;
+          };
+
+          // Skip self-echo — already applied optimistically
+          if (wire.reactorAddress === 'self' || (this.ownAddress && wire.reactorAddress === this.ownAddress)) {
+            return;
+          }
+
+          // Ignore reactions for vines not in our feed
+          const known = this.followedVines.some(v => v.id === wire.vineId)
+            || this.discoverVines.some(v => v.id === wire.vineId);
+          if (!known) return;
+
+          const entry = this.reactionMap.get(wire.vineId)
+            ?? { count: 0, likedByMe: false, reactors: new Set<string>() };
+
+          const alreadyTracked = entry.reactors.has(wire.reactorAddress);
+
+          if (wire.liked) {
+            if (alreadyTracked) return; // Already counted
+            entry.reactors.add(wire.reactorAddress);
+            entry.count += 1;
+          } else {
+            if (!alreadyTracked) return; // Nothing to remove
+            entry.reactors.delete(wire.reactorAddress);
+            entry.count = Math.max(0, entry.count - 1);
+          }
+
+          this.reactionMap.set(wire.vineId, entry);
+          this.onChange?.();
+        },
+      ));
+    } catch (err) {
+      for (const fn of localUnlisteners) fn();
+      // Note: mocks are already cleared and user-created entries preserved.
+      // On listen failure the service is in a clean but unconnected state —
+      // the App.svelte tryConnect wrapper logs. A retry is allowed
+      // (this.adapter is still null), and the selective clear is idempotent
+      // (mockSeededIds is now empty, so the filters are no-ops).
+      throw err;
+    }
+
+    // Commit: assign adapter and register unlisteners.
+    // (Selective clear was moved before listener registration per R3.)
     this.adapter = adapter;
-    const unlisten = await adapter.listen(
-      'vine-received',
-      (event) => {
-        const wire = event.payload as VineDescriptorEvent;
-        if (this.seenIds.has(wire.id)) return;
-        this.seenIds.add(wire.id);
-        const vine = this.wireToVine(wire);
-        if (vine.viewed) this.viewedIds = new Set([...this.viewedIds, vine.id]);
-        if (wire.source === 'followed') {
-          this.followedVines = [...this.followedVines, vine];
-        } else {
-          this.discoverVines = [...this.discoverVines, vine];
-        }
-        this.onChange?.();
-      },
-    );
-    this.unlisteners.push(unlisten);
-
-    const unlistenReaction = await adapter.listen(
-      'vine-reaction-received',
-      (event) => {
-        const wire = event.payload as {
-          vineId: string;
-          reactorAddress: string;
-          reactorName: string;
-          liked: boolean;
-          timestamp: number;
-        };
-
-        // Skip self-echo — already applied optimistically
-        if (wire.reactorAddress === 'self' || (this.ownAddress && wire.reactorAddress === this.ownAddress)) {
-          return;
-        }
-
-        // Ignore reactions for vines not in our feed
-        const known = this.followedVines.some(v => v.id === wire.vineId)
-          || this.discoverVines.some(v => v.id === wire.vineId);
-        if (!known) return;
-
-        const entry = this.reactionMap.get(wire.vineId)
-          ?? { count: 0, likedByMe: false, reactors: new Set<string>() };
-
-        const alreadyTracked = entry.reactors.has(wire.reactorAddress);
-
-        if (wire.liked) {
-          if (alreadyTracked) return; // Already counted
-          entry.reactors.add(wire.reactorAddress);
-          entry.count += 1;
-        } else {
-          if (!alreadyTracked) return; // Nothing to remove
-          entry.reactors.delete(wire.reactorAddress);
-          entry.count = Math.max(0, entry.count - 1);
-        }
-
-        this.reactionMap.set(wire.vineId, entry);
-        this.onChange?.();
-      },
-    );
-    this.unlisteners.push(unlistenReaction);
+    this.unlisteners.push(...localUnlisteners);
+    } finally {
+      this.connecting = false;
+    }
   }
 
   /**

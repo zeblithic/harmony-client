@@ -469,6 +469,9 @@ describe('NavService — community kind via nav-updated listener (ZEB-265)', () 
   // leave_community. Once the listener path is live, App.svelte stops
   // synthesizing community NavNodes locally — these tests cover the
   // listener path that replaces the synthesis.
+  //
+  // ZEB-209: connectAdapter now clears mock-seeded state, so the
+  // explicit `nav.nodes = []` below is redundant but kept for clarity.
   let nav: NavService;
   let mock: ReturnType<typeof createMockAdapter>;
 
@@ -545,5 +548,30 @@ describe('NavService — community kind via nav-updated listener (ZEB-265)', () 
       parentId: null,
     });
     expect(onChange).toHaveBeenCalled();
+  });
+});
+
+describe('NavService mock-clear policy (ZEB-209)', () => {
+  it('clears mock-seeded nodes and profiles on connectAdapter', async () => {
+    const nav = new NavService();
+    // Sanity: constructor seeds from mockNavNodes + mockProfileStore so
+    // the UI is never empty in browser/dev mode (no adapter connects).
+    expect(nav.nodes.length).toBeGreaterThan(0);
+    expect(nav.profiles.size).toBeGreaterThan(0);
+    const { adapter } = createMockAdapter();
+    await nav.connectAdapter(adapter);
+    expect(nav.nodes).toEqual([]);
+    expect(nav.profiles.size).toBe(0);
+    nav.destroy();
+  });
+
+  it('fires onChange once after clearing mocks', async () => {
+    const nav = new NavService();
+    let calls = 0;
+    nav.onChange = () => { calls++; };
+    const { adapter } = createMockAdapter();
+    await nav.connectAdapter(adapter);
+    expect(calls).toBeGreaterThanOrEqual(1);
+    nav.destroy();
   });
 });

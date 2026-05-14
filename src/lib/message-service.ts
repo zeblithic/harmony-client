@@ -55,8 +55,14 @@ export class MessageService {
   ownDisplayName = 'You';
 
   private adapter: TauriAdapter | null = null;
+  private connecting = false;
   private unlisteners: Array<() => void> = [];
   private seenIds = new Set<string>();
+  /** IDs of constructor-seeded mock messages — used to selectively clear
+   *  mocks on `connectAdapter()` while preserving any locally-created
+   *  entries from offline-fallback `send()` calls during the pre-connect
+   *  window (ZEB-209 bot R1). */
+  private mockSeededIds = new Set<string>();
   /** Per-channel pagination cursor for `loadDmThread` — tracks the
    *  oldest `received_at.wall_ms` we've fetched so the next page-up
    *  call can ask for entries strictly older than this. */
@@ -69,142 +75,182 @@ export class MessageService {
   private loadedDmSpaces = new Set<string>();
 
   constructor() {
-    // Seed with mock data — real messages append on top.
+    // Seed with mock data for browser/dev mode — `connectAdapter()` clears
+    // these (selectively, preserving any locally-created entries from the
+    // pre-connect window) before subscribing to real events (ZEB-209).
     this.messages = [...mockMessages];
+    this.mockSeededIds = new Set(mockMessages.map((m) => m.id));
     for (const m of this.messages) this.seenIds.add(m.id);
   }
 
   /** Connect a Tauri adapter and start listening for network messages. */
   async connectAdapter(adapter: TauriAdapter): Promise<void> {
-    if (this.adapter) return; // already wired; prevent duplicate listeners
-    this.adapter = adapter;
-    const unlisten = await adapter.listen(
-      'message-received',
-      (event) => {
-        const wire = event.payload as ChannelMessageEvent;
-        if (this.seenIds.has(wire.id)) return;
-        this.seenIds.add(wire.id);
-        const msg = this.wireToMessage(wire);
+    if (this.adapter || this.connecting) return; // already wired or in-progress; prevent duplicate listeners
+    this.connecting = true;
+
+    // ── R3: Selective clear FIRST so handlers see clean state ──
+    // Preserves locally-created entries from offline-fallback send() calls
+    // during the pre-connect window. By the time any listener handler can
+    // possibly fire, mock ids are already removed from seenIds and messages,
+    // and mockSeededIds is empty — no mock-vs-real dedup collision is possible.
+    // On listen failure the service is in a clean-but-unconnected state;
+    // this.adapter is still null so a retry is allowed, and the selective
+    // clear is idempotent (mockSeededIds is now empty, so the filter is a no-op).
+    this.messages = this.messages.filter((m) => !this.mockSeededIds.has(m.id));
+    for (const id of this.mockSeededIds) this.seenIds.delete(id);
+    this.mockSeededIds = new Set();
+    this.onChange?.();
+
+    // ZEB-209 bot-feedback round 1: register listeners FIRST so a partial-init
+    // failure doesn't wedge the service. Adapter and unlisteners are committed
+    // only after all listens succeed; on failure we tear down partial work and
+    // rethrow so the caller (App.svelte tryConnect) can retry.
+    // ZEB-209 bot-feedback round 2: `connecting` sentinel (above) prevents a
+    // concurrent caller from passing the guard while awaits are in flight.
+    // ZEB-209 bot-feedback round 3: selective clear moved above listener
+    // registration so handlers see clean state between successive awaits.
+    const localUnlisteners: Array<() => void> = [];
+    try { // outer try — releases connecting sentinel in finally on any exit path
+    try {
+      localUnlisteners.push(await adapter.listen(
+        'message-received',
+        (event) => {
+          const wire = event.payload as ChannelMessageEvent;
+          if (this.seenIds.has(wire.id)) return;
+          this.seenIds.add(wire.id);
+          const msg = this.wireToMessage(wire);
+          this.messages = [...this.messages, msg];
+          this.onChange?.();
+        },
+      ));
+
+      // ── Phase 4 (ZEB-228) — DM lifecycle subscriptions ──────────────
+      //
+      // The DM transport uses a separate IPC channel from channel pub/sub.
+      // `dm-received` carries hex-encoded body bytes (UTF-8 text payloads
+      // for now). The lifecycle events (`dm-delivered`/`dm-expired`/
+      // `dm-deleted`) correlate to a self-Message via `messageId` (hex
+      // OutboxEntryId set on send). `channel` on a DM Message is the
+      // SpaceId hex, matching `NavNode.id` from Task 8.
+
+      localUnlisteners.push(await adapter.listen('dm-received', (event) => {
+        const payload = event.payload as {
+          spaceId: string;
+          messageCid: string;
+          from: string;
+          sentAt: number;
+          receivedAt: number;
+          body: string;
+          mimeType: string;
+        };
+        // Dedupe across reconnect/cold-start replay (messageCid is content-addressed).
+        if (this.seenIds.has(payload.messageCid)) return;
+        this.seenIds.add(payload.messageCid);
+
+        const text = hexToUtf8(payload.body);
+        const sender = (this.ownAddress && payload.from === this.ownAddress)
+          ? { address: 'self', displayName: 'You' }
+          : {
+              address: payload.from,
+              displayName: payload.from.slice(0, 8),
+            };
+        const msg: Message = {
+          id: payload.messageCid,
+          sender,
+          text,
+          timestamp: payload.sentAt,
+          media: [],
+          priority: 'standard',
+          channel: payload.spaceId,
+          // App.svelte's feed filter checks `m.hub === activeHub`. Top-level
+          // DMs live with activeHub='' (findNearestFolder returns null).
+          // Without `hub:''` here the filter compares '' === undefined and
+          // DM messages never render. (Fix A from PR #81 review.)
+          hub: '',
+        };
         this.messages = [...this.messages, msg];
         this.onChange?.();
-      },
-    );
-    this.unlisteners.push(unlisten);
+      }));
 
-    // ── Phase 4 (ZEB-228) — DM lifecycle subscriptions ──────────────
-    //
-    // The DM transport uses a separate IPC channel from channel pub/sub.
-    // `dm-received` carries hex-encoded body bytes (UTF-8 text payloads
-    // for now). The lifecycle events (`dm-delivered`/`dm-expired`/
-    // `dm-deleted`) correlate to a self-Message via `messageId` (hex
-    // OutboxEntryId set on send). `channel` on a DM Message is the
-    // SpaceId hex, matching `NavNode.id` from Task 8.
+      localUnlisteners.push(await adapter.listen('dm-delivered', (event) => {
+        // ZEB-231: spec-compliant payload (space_id, message_cid,
+        // recipient_owner_addr). Match by (channel === spaceId &&
+        // id === messageCid) — `m.id` is set to messageCid by
+        // replaceOptimisticId after send_dm returns, which always
+        // completes before this ack-driven event fires.
+        const { spaceId, messageCid } = event.payload as {
+          spaceId: string;
+          messageCid: string;
+          recipientOwnerAddr: string;
+        };
+        let changed = false;
+        this.messages = this.messages.map((m) => {
+          if (m.channel !== spaceId || m.id !== messageCid) return m;
+          changed = true;
+          return { ...m, deliveryState: 'delivered' as const };
+        });
+        if (changed) this.onChange?.();
+      }));
 
-    const unlistenDmRx = await adapter.listen('dm-received', (event) => {
-      const payload = event.payload as {
-        spaceId: string;
-        messageCid: string;
-        from: string;
-        sentAt: number;
-        receivedAt: number;
-        body: string;
-        mimeType: string;
-      };
-      // Dedupe across reconnect/cold-start replay (messageCid is content-addressed).
-      if (this.seenIds.has(payload.messageCid)) return;
-      this.seenIds.add(payload.messageCid);
+      localUnlisteners.push(await adapter.listen('dm-expired', (event) => {
+        // ZEB-231: spec-compliant payload (space_id, message_cid).
+        // Same matcher pattern as dm-delivered.
+        const { spaceId, messageCid } = event.payload as {
+          spaceId: string;
+          messageCid: string;
+        };
+        let changed = false;
+        this.messages = this.messages.map((m) => {
+          if (m.channel !== spaceId || m.id !== messageCid) return m;
+          changed = true;
+          return { ...m, deliveryState: 'expired' as const };
+        });
+        if (changed) this.onChange?.();
+      }));
 
-      const text = hexToUtf8(payload.body);
-      const sender = (this.ownAddress && payload.from === this.ownAddress)
-        ? { address: 'self', displayName: 'You' }
-        : {
-            address: payload.from,
-            displayName: payload.from.slice(0, 8),
-          };
-      const msg: Message = {
-        id: payload.messageCid,
-        sender,
-        text,
-        timestamp: payload.sentAt,
-        media: [],
-        priority: 'standard',
-        channel: payload.spaceId,
-        // App.svelte's feed filter checks `m.hub === activeHub`. Top-level
-        // DMs live with activeHub='' (findNearestFolder returns null).
-        // Without `hub:''` here the filter compares '' === undefined and
-        // DM messages never render. (Fix A from PR #81 review.)
-        hub: '',
-      };
-      this.messages = [...this.messages, msg];
-      this.onChange?.();
-    });
-    this.unlisteners.push(unlistenDmRx);
+      localUnlisteners.push(await adapter.listen('dm-deleted', (event) => {
+        const { spaceId, messageCid, messageId } = event.payload as {
+          messageId?: string;
+          spaceId: string;
+          messageCid: string;
+        };
+        const before = this.messages.length;
+        // Fix C from PR #81 review: match either id (messageCid for
+        // scrollback / post-replaceOptimisticId shapes) or messageId (the
+        // pre-swap optimistic placeholder still keyed by OutboxEntryId).
+        // Either alone leaves orphaned bubbles in one of the two paths.
+        this.messages = this.messages.filter(
+          (m) =>
+            !(
+              m.channel === spaceId &&
+              (m.id === messageCid ||
+                (messageId !== undefined && m.messageId === messageId))
+            ),
+        );
+        if (this.messages.length !== before) {
+          // Drop from seenIds so a re-arrival of the same CID (e.g. peer
+          // resends after we manually deleted a stuck entry) isn't deduped.
+          this.seenIds.delete(messageCid);
+          this.onChange?.();
+        }
+      }));
+    } catch (err) {
+      for (const fn of localUnlisteners) fn();
+      // Note: mocks are already cleared and user-created entries preserved.
+      // On listen failure the service is in a clean but unconnected state —
+      // the App.svelte tryConnect wrapper logs. A retry is allowed
+      // (this.adapter is still null), and the selective clear is idempotent
+      // (mockSeededIds is now empty, so the filter is a no-op).
+      throw err;
+    }
 
-    const unlistenDmDelivered = await adapter.listen('dm-delivered', (event) => {
-      // ZEB-231: spec-compliant payload (space_id, message_cid,
-      // recipient_owner_addr). Match by (channel === spaceId &&
-      // id === messageCid) — `m.id` is set to messageCid by
-      // replaceOptimisticId after send_dm returns, which always
-      // completes before this ack-driven event fires.
-      const { spaceId, messageCid } = event.payload as {
-        spaceId: string;
-        messageCid: string;
-        recipientOwnerAddr: string;
-      };
-      let changed = false;
-      this.messages = this.messages.map((m) => {
-        if (m.channel !== spaceId || m.id !== messageCid) return m;
-        changed = true;
-        return { ...m, deliveryState: 'delivered' as const };
-      });
-      if (changed) this.onChange?.();
-    });
-    this.unlisteners.push(unlistenDmDelivered);
-
-    const unlistenDmExpired = await adapter.listen('dm-expired', (event) => {
-      // ZEB-231: spec-compliant payload (space_id, message_cid).
-      // Same matcher pattern as dm-delivered.
-      const { spaceId, messageCid } = event.payload as {
-        spaceId: string;
-        messageCid: string;
-      };
-      let changed = false;
-      this.messages = this.messages.map((m) => {
-        if (m.channel !== spaceId || m.id !== messageCid) return m;
-        changed = true;
-        return { ...m, deliveryState: 'expired' as const };
-      });
-      if (changed) this.onChange?.();
-    });
-    this.unlisteners.push(unlistenDmExpired);
-
-    const unlistenDmDeleted = await adapter.listen('dm-deleted', (event) => {
-      const { spaceId, messageCid, messageId } = event.payload as {
-        messageId?: string;
-        spaceId: string;
-        messageCid: string;
-      };
-      const before = this.messages.length;
-      // Fix C from PR #81 review: match either id (messageCid for
-      // scrollback / post-replaceOptimisticId shapes) or messageId (the
-      // pre-swap optimistic placeholder still keyed by OutboxEntryId).
-      // Either alone leaves orphaned bubbles in one of the two paths.
-      this.messages = this.messages.filter(
-        (m) =>
-          !(
-            m.channel === spaceId &&
-            (m.id === messageCid ||
-              (messageId !== undefined && m.messageId === messageId))
-          ),
-      );
-      if (this.messages.length !== before) {
-        // Drop from seenIds so a re-arrival of the same CID (e.g. peer
-        // resends after we manually deleted a stuck entry) isn't deduped.
-        this.seenIds.delete(messageCid);
-        this.onChange?.();
-      }
-    });
-    this.unlisteners.push(unlistenDmDeleted);
+    // Commit: assign adapter and register unlisteners.
+    // (Selective clear was moved before listener registration per R3.)
+    this.adapter = adapter;
+    this.unlisteners.push(...localUnlisteners);
+    } finally {
+      this.connecting = false;
+    }
   }
 
   /** Send a channel message via Tauri command. */
