@@ -23,6 +23,8 @@
     onToggleLike,
     getReshareCount,
     onViewOriginal,
+    playTarget = null,
+    onPlayTargetConsumed,
   }: {
     followedVines?: VineVideo[];
     discoverVines?: VineVideo[];
@@ -40,12 +42,44 @@
     onToggleLike?: (vine: VineVideo) => void;
     getReshareCount?: (vineId: string) => number;
     onViewOriginal?: (vineId: string) => void;
+    /**
+     * Parent-controlled "open this vine in the player" request.
+     *
+     * Used by App.svelte's `handleViewOriginal` to drive the player
+     * from outside the feed (e.g., when the user clicks an attribution
+     * link and we resolve the original via `vineService.findVine`).
+     * VineFeed watches this via `$effect`, calls its internal
+     * `openPlayer` when it transitions to non-null, and notifies the
+     * parent via `onPlayTargetConsumed` so the parent can null it back
+     * out for the next click. The deliberate clear+microtask dance in
+     * App keeps two clicks in a row from being a no-op.
+     */
+    playTarget?: VineVideo | null;
+    onPlayTargetConsumed?: () => void;
   } = $props();
 
   let activeVine = $state<VineVideo | null>(null);
   let feedFilter = $state<FeedFilter>('all');
   let playerList = $state<VineVideo[]>([]);
   let activeIndex = $state(-1);
+
+  // Parent-driven open: when `playTarget` transitions to a vine, open
+  // it in the player. The seed playerList is the entire concat'd feed
+  // because the original might live in either followedVines or
+  // discoverVines (and the user may currently be on the other tab).
+  // After consuming, we notify the parent so it can null the slot —
+  // we never read `playTarget` for navigation, only for triggering the
+  // open.
+  $effect(() => {
+    if (playTarget) {
+      const target = playTarget;
+      playerList = [...followedVines, ...discoverVines];
+      activeIndex = playerList.findIndex(v => v.id === target.id);
+      activeVine = target;
+      onMarkViewed?.(target.id);
+      onPlayTargetConsumed?.();
+    }
+  });
 
   let activeVines = $derived(
     activeTab === 'following' ? followedVines : discoverVines

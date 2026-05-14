@@ -40,6 +40,7 @@
   import { MessageService } from './lib/message-service';
   import { MailService } from './lib/mail-service';
   import { VineService } from './lib/vine-service';
+  import { resolveOriginalCreator } from './lib/vine-utils';
   import { NavService } from './lib/nav-service';
   import { AvatarResolver } from './lib/avatar-resolver';
   import type { AppMode, Message, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier, MailFolderKind, MailMessageDetail, ContentItem, CleanupRecommendation } from './lib/types';
@@ -89,6 +90,21 @@
   let vineGetReaction = $state<(vineId: string) => { count: number; likedByMe: boolean }>(
     (vineId: string) => vineService.getReaction(vineId)
   );
+  // Mirrors `vineGetReaction` but for reshare counts (computed on demand
+  // from both vine arrays — see `VineService.getReshareCount`). Re-bound
+  // on every `onChange` so the VineFeed re-renders when a new reshare
+  // arrives. The wrapper layer (closure-over-`vineService`) is what makes
+  // it reactive — Svelte tracks the `$state` slot, not the method call.
+  let vineGetReshareCount = $state<(vineId: string) => number>(
+    (vineId: string) => vineService.getReshareCount(vineId)
+  );
+  // Target vine to open in VineFeed's internal player. Set by
+  // `handleViewOriginal` after resolving via `vineService.findVine`;
+  // VineFeed watches this via `$effect` and clears the state slot back
+  // to null once it has opened the player. The slot-clear handler lives
+  // here so we keep the "VineFeed owns the player" contract intact (we
+  // don't have an App-level player state to reuse).
+  let viewOriginalTarget = $state<import('./lib/types').VineVideo | null>(null);
 
   vineService.onChange = () => {
     followedVines = [...vineService.followedVines];
@@ -96,6 +112,7 @@
     vineViewedIds = new Set(vineService.viewedIds);
     followedAddresses = new Set(vineService.followedAddresses);
     vineGetReaction = (vineId: string) => vineService.getReaction(vineId);
+    vineGetReshareCount = (vineId: string) => vineService.getReshareCount(vineId);
   };
 
   function handleMarkVineViewed(id: string) {
@@ -115,11 +132,44 @@
 
   async function handleVineReshare(vine: import('./lib/types').VineVideo) {
     try {
-      await vineService.publish(vine.videoCid, vine.title, vine.id);
+      // Resolve the true origin. If `vine` is itself a reshare, the
+      // helper propagates its `originalCreator*` fields (transitive —
+      // points at the true creator, not the intermediate resharer).
+      // Otherwise `vine` IS the origin, so the helper falls back to
+      // its own creator. See `vine-utils.ts` and §Edge Cases →
+      // Resharing a reshare.
+      const { originalCreatorAddress, originalCreatorName } =
+        resolveOriginalCreator(vine);
+      await vineService.publish(
+        vine.videoCid,
+        vine.title,
+        vine.id,
+        originalCreatorAddress,
+        originalCreatorName,
+      );
     } catch (err) {
       console.error('Vine reshare failed', err);
       throw err;
     }
+  }
+
+  function handleViewOriginal(vineId: string) {
+    // Resolve the original vine from the local feed (followed or
+    // discover). If it's not in the local feed — e.g., creator isn't
+    // followed and the original wasn't surfaced via Discover — we
+    // silently no-op per spec §Edge Cases → Original not in feed. No
+    // toast: a network-discovery probe is the right long-term path,
+    // but emitting "the original isn't on your network" every time
+    // would be a noisy UX for what's a common state.
+    const original = vineService.findVine(vineId);
+    if (!original) return;
+    // VineFeed owns the player; toggling its `playTarget` prop is how
+    // we trigger its internal `openPlayer`. We re-assign on every
+    // click (even to the same vine) by clearing first so VineFeed's
+    // `$effect` re-runs — otherwise clicking the attribution link
+    // twice in a row would be a no-op on the second click.
+    viewOriginalTarget = null;
+    queueMicrotask(() => { viewOriginalTarget = original; });
   }
 
   async function handleVineFollow(address: string, name: string) {
@@ -1343,7 +1393,11 @@
       onFollow={handleVineFollow}
       onUnfollow={handleVineUnfollow}
       getReaction={vineGetReaction}
+      getReshareCount={vineGetReshareCount}
       onToggleLike={handleVineToggleLike}
+      onViewOriginal={handleViewOriginal}
+      playTarget={viewOriginalTarget}
+      onPlayTargetConsumed={() => { viewOriginalTarget = null; }}
       resolveVideo={resolveVideoFn}
     />
     {#if showVinePublish}

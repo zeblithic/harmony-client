@@ -12,6 +12,7 @@ import { render, screen, fireEvent, cleanup } from '@testing-library/svelte';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import VineFeed from '../VineFeed.svelte';
 import type { VineVideo } from '../../types';
+import { resolveOriginalCreator } from '../../vine-utils';
 
 afterEach(cleanup);
 
@@ -277,5 +278,132 @@ describe('VineFeed Integration', () => {
     await fireEvent.keyDown(card, { key: 'Enter' });
 
     expect(callbacks.onMarkViewed).toHaveBeenCalledWith('v1');
+  });
+
+  // ── 8. App.svelte wiring smoke (handleVineReshare attribution) ────
+  //
+  // Verifies the end-to-end shape that App.svelte's `handleVineReshare`
+  // produces when a user clicks Reshare → confirms in the dialog. The
+  // test wires VineFeed's `onReshare` to a publish-spy that mirrors
+  // App.svelte exactly (call `resolveOriginalCreator` and forward to
+  // `vineService.publish`). A full App.svelte mount is too heavy
+  // (Layout, all services, Tauri adapter, …) for this single assertion;
+  // the helper extraction keeps the asserted logic pure and the
+  // VineFeed→VineCard→VinePlayer wiring real.
+  //
+  // Two cases:
+  // - Resharing a non-reshare → publish payload credits the source
+  //   vine's own creator as the origin.
+  // - Resharing a reshare → publish payload credits the *true origin*
+  //   (the source vine's `originalCreator*` fields), NOT the
+  //   intermediate resharer's `creatorAddress`.
+
+  describe('App-level reshare wiring', () => {
+    function setupPublishSpy() {
+      const publish = vi.fn().mockResolvedValue(undefined);
+      // Mirror of App.svelte's handleVineReshare.
+      const onReshare = async (vine: VineVideo) => {
+        const { originalCreatorAddress, originalCreatorName } =
+          resolveOriginalCreator(vine);
+        await publish(
+          vine.videoCid,
+          vine.title,
+          vine.id,
+          originalCreatorAddress,
+          originalCreatorName,
+        );
+      };
+      return { publish, onReshare };
+    }
+
+    it('reshares an original vine: publish payload credits the source creator', async () => {
+      const { publish, onReshare } = setupPublishSpy();
+      render(VineFeed, {
+        props: {
+          followedVines: VINES,
+          discoverVines: [],
+          viewedIds: new Set<string>(),
+          activeTab: 'following' as const,
+          followedAddresses: new Set<string>(),
+          onReshare,
+        },
+      });
+
+      // Open Bob's non-reshare original (v2) in the player.
+      const card = screen.getByLabelText('Mesh routing by Bob');
+      await fireEvent.click(card);
+
+      const reshareBtn = screen.getByLabelText('Reshare vine');
+      await fireEvent.click(reshareBtn);
+
+      const confirmBtn = screen.getByRole('button', { name: /^reshare$/i });
+      await fireEvent.click(confirmBtn);
+
+      // The handler awaits publish — let the microtask flush before
+      // asserting (vi.waitFor would also work but is overkill here).
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(publish).toHaveBeenCalledWith(
+        'cid-v2',
+        'Mesh routing',
+        'v2',
+        'b2',   // Bob's address (source creator → origin)
+        'Bob',  // Bob's name
+      );
+    });
+
+    it('reshares a reshare: publish payload propagates the true origin (transitive)', async () => {
+      const { publish, onReshare } = setupPublishSpy();
+      // Carol reshares Bob's reshare of Alice's vine. The transitive
+      // rule: the originalCreator* fields on Carol's input vine point
+      // at Alice (the true origin), not Bob. resolveOriginalCreator
+      // must propagate Alice through to publish — re-crediting Bob
+      // would lose the origin chain on the third hop.
+      const reshareOfReshare: VineVideo = {
+        id: 'v-bob-reshare',
+        creatorAddress: 'addr-bob',
+        creatorName: 'Bob',
+        createdAt: vineBase + 900,
+        videoCid: 'cid-alice-orig',
+        title: 'Alice original',
+        reshareOf: 'v-alice-orig',
+        originalCreatorAddress: 'addr-alice',
+        originalCreatorName: 'Alice',
+        viewed: false,
+      };
+
+      render(VineFeed, {
+        props: {
+          followedVines: [reshareOfReshare],
+          discoverVines: [],
+          viewedIds: new Set<string>(),
+          activeTab: 'following' as const,
+          followedAddresses: new Set<string>(),
+          onReshare,
+        },
+      });
+
+      // Open the player on the reshare-of-reshare.
+      const card = screen.getByLabelText('Alice original by Bob');
+      await fireEvent.click(card);
+
+      const reshareBtn = screen.getByLabelText('Reshare vine');
+      await fireEvent.click(reshareBtn);
+
+      const confirmBtn = screen.getByRole('button', { name: /^reshare$/i });
+      await fireEvent.click(confirmBtn);
+
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(publish).toHaveBeenCalledWith(
+        'cid-alice-orig',
+        'Alice original',
+        'v-bob-reshare',
+        'addr-alice',  // ← origin, NOT Bob
+        'Alice',       // ← origin, NOT Bob
+      );
+    });
   });
 });
