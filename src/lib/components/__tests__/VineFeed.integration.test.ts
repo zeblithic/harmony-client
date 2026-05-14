@@ -37,9 +37,15 @@ const VINES: VineVideo[] = [
     viewed: false,
   },
   {
+    // Alice's reshare of v2 (Bob's vine). On the real wire, the client
+    // doing the first reshare populates originalCreator* — without these
+    // fields a downstream test that reshares v4 would see Alice credited
+    // as the true origin instead of Bob, a silent false-positive.
     id: 'v4', creatorAddress: 'a1', creatorName: 'Alice',
     createdAt: vineBase + 600, videoCid: 'cid-v4',
-    title: 'Cache explained', reshareOf: 'v2', viewed: false,
+    title: 'Cache explained', reshareOf: 'v2',
+    originalCreatorAddress: 'b2', originalCreatorName: 'Bob',
+    viewed: false,
   },
 ];
 
