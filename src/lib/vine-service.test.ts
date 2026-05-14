@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { VineService, type VineDescriptorEvent } from './vine-service';
 import { vineVideos as mockVines } from './mock-data';
 import { createMockAdapter } from './test-utils';
+import type { VineVideo } from './types';
 
 describe('VineService', () => {
   let svc: VineService;
@@ -621,5 +622,96 @@ describe('VineService', () => {
     await svc.loadFollowed();
     expect(svc.discoverVines.find(v => v.id === 'recon-1')).toBeFalsy();
     expect(svc.followedVines.find(v => v.id === 'recon-1')).toBeTruthy();
+  });
+});
+
+describe('VineService.findVine', () => {
+  let svc: VineService;
+
+  beforeEach(() => {
+    svc = new VineService();
+  });
+
+  it('returns vine from followedVines by id', () => {
+    const vine: VineVideo = {
+      id: 'vine-f', creatorAddress: 'a', creatorName: 'A',
+      createdAt: 1, videoCid: 'cid', viewed: false,
+    };
+    svc.followedVines = [vine];
+    expect(svc.findVine('vine-f')).toBe(vine);
+  });
+
+  it('returns vine from discoverVines by id', () => {
+    const vine: VineVideo = {
+      id: 'vine-d', creatorAddress: 'a', creatorName: 'A',
+      createdAt: 1, videoCid: 'cid', viewed: false,
+    };
+    svc.discoverVines = [...svc.discoverVines, vine];
+    expect(svc.findVine('vine-d')).toBe(vine);
+  });
+
+  it('returns undefined when no vine matches', () => {
+    expect(svc.findVine('nonexistent-id')).toBeUndefined();
+  });
+
+  it('searches followedVines before discoverVines (order tie-break)', () => {
+    // Same id in both feeds shouldn't happen, but if it does, followed wins.
+    const fVine: VineVideo = {
+      id: 'dup', creatorAddress: 'a', creatorName: 'F',
+      createdAt: 1, videoCid: 'cid', viewed: false,
+    };
+    const dVine: VineVideo = { ...fVine, creatorName: 'D' };
+    svc.followedVines = [fVine];
+    svc.discoverVines = [...svc.discoverVines, dVine];
+    expect(svc.findVine('dup')).toBe(fVine);
+  });
+});
+
+describe('VineService.getReshareCount', () => {
+  let svc: VineService;
+
+  beforeEach(() => {
+    svc = new VineService();
+  });
+
+  it('returns 0 when no vines reshare the id', () => {
+    expect(svc.getReshareCount('vine-none')).toBe(0);
+  });
+
+  it('counts reshares across both feeds', () => {
+    const origId = 'vine-orig';
+    const r1: VineVideo = {
+      id: 'r1', creatorAddress: 'a', creatorName: 'A',
+      createdAt: 1, videoCid: 'c', viewed: false, reshareOf: origId,
+    };
+    const r2: VineVideo = {
+      id: 'r2', creatorAddress: 'b', creatorName: 'B',
+      createdAt: 1, videoCid: 'c', viewed: false, reshareOf: origId,
+    };
+    const r3: VineVideo = {
+      id: 'r3', creatorAddress: 'c', creatorName: 'C',
+      createdAt: 1, videoCid: 'c', viewed: false, reshareOf: origId,
+    };
+    svc.followedVines = [r1, r2];
+    svc.discoverVines = [...svc.discoverVines, r3];
+    expect(svc.getReshareCount(origId)).toBe(3);
+  });
+
+  it('does not count vines that are not reshares', () => {
+    const orig: VineVideo = {
+      id: 'vine-orig', creatorAddress: 'a', creatorName: 'A',
+      createdAt: 1, videoCid: 'c', viewed: false,
+    };
+    svc.followedVines = [orig];
+    expect(svc.getReshareCount('vine-orig')).toBe(0);
+  });
+
+  it('does not count reshares of a different id', () => {
+    const reshareOfOther: VineVideo = {
+      id: 'r1', creatorAddress: 'a', creatorName: 'A',
+      createdAt: 1, videoCid: 'c', viewed: false, reshareOf: 'different-orig',
+    };
+    svc.followedVines = [reshareOfOther];
+    expect(svc.getReshareCount('target-orig')).toBe(0);
   });
 });

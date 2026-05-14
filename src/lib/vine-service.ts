@@ -254,6 +254,40 @@ export class VineService {
     return this.followedAddresses.has(address);
   }
 
+  /**
+   * Find a vine by id, searching followedVines then discoverVines.
+   * Returns the first match or undefined.
+   *
+   * Used by the UI when the user clicks an attribution link to navigate
+   * to the original vine. If the original isn't in the local feed (e.g.,
+   * creator isn't followed and the original wasn't surfaced in discover),
+   * the click is silently ignored.
+   */
+  findVine(vineId: string): VineVideo | undefined {
+    return (
+      this.followedVines.find(v => v.id === vineId)
+      ?? this.discoverVines.find(v => v.id === vineId)
+    );
+  }
+
+  /**
+   * Count how many vines in the local feed reshare the given vine id.
+   *
+   * Only meaningful for original vines (where the caller's vine has no
+   * `reshareOf` itself). Counts across both followed and discover feeds.
+   * Computed on demand — no separate state map kept.
+   */
+  getReshareCount(vineId: string): number {
+    let count = 0;
+    for (const v of this.followedVines) {
+      if (v.reshareOf === vineId) count++;
+    }
+    for (const v of this.discoverVines) {
+      if (v.reshareOf === vineId) count++;
+    }
+    return count;
+  }
+
   /** Get reaction state for a vine. Returns zero state if no reactions tracked. */
   getReaction(vineId: string): { count: number; likedByMe: boolean } {
     const entry = this.reactionMap.get(vineId);
