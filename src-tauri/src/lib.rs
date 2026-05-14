@@ -7733,7 +7733,20 @@ async fn generate_invite(
                     .join("communities")
                     .join(hex::encode(space_id.0))
                     .join("pre_fork_snapshot.bin");
-                let bytes = std::fs::read(&snapshot_path).ok()?;
+                let bytes = match std::fs::read(&snapshot_path) {
+                    Ok(b) => b,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = ?e,
+                            path = %snapshot_path.display(),
+                            community_id = %hex::encode(space_id.0),
+                            "generate_invite: failed to read pre_fork_snapshot.bin; \
+                             fork invite will be sent without snapshot (degraded experience)"
+                        );
+                        return None;
+                    }
+                };
                 match crate::owner_state_crypto::canonical_cbor_decode::<
                     crate::community_invite::PreForkSnapshot,
                 >(&bytes)
