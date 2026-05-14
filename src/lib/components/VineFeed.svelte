@@ -21,7 +21,6 @@
     resolveVideo,
     getReaction,
     onToggleLike,
-    getReshareCount,
     onViewOriginal,
     playTarget = null,
     onPlayTargetConsumed,
@@ -41,7 +40,6 @@
     resolveVideo?: (cid: string) => Promise<string>;
     getReaction?: (vineId: string) => { count: number; likedByMe: boolean };
     onToggleLike?: (vine: VineVideo) => void;
-    getReshareCount?: (vineId: string) => number;
     onViewOriginal?: (vineId: string) => void;
     /**
      * Parent-controlled "open this vine in the player" request.
@@ -107,6 +105,22 @@
   let unviewedCount = $derived(
     followedVines.filter(v => !viewedIds.has(v.id)).length
   );
+
+  // Single-pass reshare-count index over both feeds. Per-card lookup
+  // (`reshareCountMap.get(vine.id) ?? 0`) is O(1), so the full feed
+  // render is O(N) total instead of the O(N²) it would be if each
+  // card called `getReshareCount` and re-filtered both arrays.
+  // See FIX 5 in PR #120 round 1.
+  let reshareCountMap = $derived.by(() => {
+    const map = new Map<string, number>();
+    for (const v of followedVines) {
+      if (v.reshareOf) map.set(v.reshareOf, (map.get(v.reshareOf) ?? 0) + 1);
+    }
+    for (const v of discoverVines) {
+      if (v.reshareOf) map.set(v.reshareOf, (map.get(v.reshareOf) ?? 0) + 1);
+    }
+    return map;
+  });
 
   function openPlayer(vine: VineVideo) {
     if (!activeVine) {
@@ -196,7 +210,7 @@
             reactionCount={reaction?.count ?? 0}
             likedByMe={reaction?.likedByMe ?? false}
             {onToggleLike}
-            reshareCount={getReshareCount?.(vine.id) ?? 0}
+            reshareCount={reshareCountMap.get(vine.id) ?? 0}
             {onViewOriginal}
           />
         </div>

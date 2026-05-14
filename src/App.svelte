@@ -90,14 +90,6 @@
   let vineGetReaction = $state<(vineId: string) => { count: number; likedByMe: boolean }>(
     (vineId: string) => vineService.getReaction(vineId)
   );
-  // Mirrors `vineGetReaction` but for reshare counts (computed on demand
-  // from both vine arrays — see `VineService.getReshareCount`). Re-bound
-  // on every `onChange` so the VineFeed re-renders when a new reshare
-  // arrives. The wrapper layer (closure-over-`vineService`) is what makes
-  // it reactive — Svelte tracks the `$state` slot, not the method call.
-  let vineGetReshareCount = $state<(vineId: string) => number>(
-    (vineId: string) => vineService.getReshareCount(vineId)
-  );
   // Target vine to open in VineFeed's internal player. Set by
   // `handleViewOriginal` after resolving via `vineService.findVine`;
   // VineFeed watches this via `$effect` and clears the state slot back
@@ -112,7 +104,6 @@
     vineViewedIds = new Set(vineService.viewedIds);
     followedAddresses = new Set(vineService.followedAddresses);
     vineGetReaction = (vineId: string) => vineService.getReaction(vineId);
-    vineGetReshareCount = (vineId: string) => vineService.getReshareCount(vineId);
   };
 
   function handleMarkVineViewed(id: string) {
@@ -1405,7 +1396,6 @@
       onFollow={handleVineFollow}
       onUnfollow={handleVineUnfollow}
       getReaction={vineGetReaction}
-      getReshareCount={vineGetReshareCount}
       onToggleLike={handleVineToggleLike}
       onViewOriginal={handleViewOriginal}
       playTarget={viewOriginalTarget}

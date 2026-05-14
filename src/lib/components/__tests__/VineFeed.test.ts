@@ -222,7 +222,14 @@ describe('VineFeed', () => {
     expect(onToggleLike).toHaveBeenCalled();
   });
 
-  it('invokes getReshareCount for each rendered vine and renders the count', () => {
+  it('renders reshare counts derived from the local feed (single-pass index)', () => {
+    // FIX 5 (PR #120 round 1): VineFeed no longer takes a
+    // `getReshareCount` prop — it computes the count internally from
+    // both vine arrays in a single pass (`reshareCountMap` derived).
+    // Wire three reshares of `vine-orig` across both feeds and pin
+    // that the count surfaces on the original's card. Use the
+    // `reshare count` aria-label to disambiguate from unrelated
+    // numeric text (see FIX 6).
     const orig: VineVideo = {
       id: 'vine-orig',
       creatorAddress: 'origAddr',
@@ -231,18 +238,24 @@ describe('VineFeed', () => {
       videoCid: 'cid-orig',
       viewed: false,
     };
-    const getReshareCount = vi.fn((id: string) => (id === 'vine-orig' ? 3 : 0));
+    const reshare = (suffix: string, reshareOf: string): VineVideo => ({
+      id: `r-${suffix}`,
+      creatorAddress: `addr-${suffix}`,
+      creatorName: `Resharer ${suffix}`,
+      createdAt: 1700001100,
+      videoCid: `cid-${suffix}`,
+      reshareOf,
+      viewed: false,
+    });
     render(VineFeed, { props: {
-      followedVines: [],
-      discoverVines: [orig],
+      followedVines: [reshare('a', 'vine-orig'), reshare('b', 'vine-orig')],
+      discoverVines: [orig, reshare('c', 'vine-orig')],
       viewedIds: new Set(),
       activeTab: 'discover',
       followedAddresses: new Set(),
-      getReshareCount,
     } });
-    expect(getReshareCount).toHaveBeenCalledWith('vine-orig');
-    // The "3" count is rendered in the social stats row on the originals card
-    expect(screen.getByText('3')).toBeTruthy();
+    const countEl = screen.getByLabelText(/reshare count/i);
+    expect(countEl.textContent).toMatch(/3/);
   });
 
   it('forwards onViewOriginal to VineCard attribution link', async () => {
