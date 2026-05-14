@@ -1008,8 +1008,11 @@ async fn start_node(
     let followed_set_clone = followed_set.clone();
 
     // ZEB-286: in-memory VineFeedCache shared between event loop and IPCs.
-    let vine_feed_cache =
-        std::sync::Arc::new(std::sync::Mutex::new(vine_feed_cache::VineFeedCache::new()));
+    // ZEB-147: load() reads vine_feed.json (if any) and arms save() so
+    // every mutating outcome persists to disk atomically.
+    let vine_feed_cache = std::sync::Arc::new(std::sync::Mutex::new(
+        vine_feed_cache::VineFeedCache::load(&app_data_dir),
+    ));
     let vine_feed_cache_clone = vine_feed_cache.clone();
 
     // MailManager will be initialized after identity loading (needs owner address).
