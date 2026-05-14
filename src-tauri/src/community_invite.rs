@@ -258,6 +258,167 @@ pub struct CommunityInviteSigned {
 impl CanonicalPayloadSealed for CommunityInviteSigned {}
 impl CanonicalPayload for CommunityInviteSigned {}
 
+// =====================================================================
+// ZEB-285 Phase 1 — PreForkSnapshot + BoundedChannelLogSnapshot
+//
+// Frozen history bundle carried in fork-invites. See
+// docs/specs/2026-05-14-zeb-285-phase1-community-forking-design.md §3.4.
+// =====================================================================
+
+/// ZEB-285: serialize BTreeMap<OwnerAddr, [u8; 64]> as a CBOR map
+/// where keys are bstr(16) (OwnerAddr) and values are bstr(64).
+/// Called via serde's `serialize_with` on `PreForkSnapshot.identity_pubs`.
+fn serialize_identity_pubs_map<S: serde::Serializer>(
+    map: &std::collections::BTreeMap<OwnerAddr, [u8; 64]>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+
+    /// Local newtype that serializes any byte slice as a CBOR bstr
+    /// via `Serializer::serialize_bytes`, without requiring serde_bytes.
+    struct BstrBytes<'a>(&'a [u8]);
+    impl serde::Serialize for BstrBytes<'_> {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_bytes(self.0)
+        }
+    }
+
+    let mut m = serializer.serialize_map(Some(map.len()))?;
+    for (addr, pub_bytes) in map {
+        m.serialize_entry(&BstrBytes(&addr.0), &BstrBytes(pub_bytes))?;
+    }
+    m.end()
+}
+
+/// ZEB-285: deserialize CBOR map of bstr(16) → bstr(64) into
+/// `BTreeMap<OwnerAddr, [u8; 64]>`. Paired with `serialize_identity_pubs_map`.
+fn deserialize_identity_pubs_map<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<std::collections::BTreeMap<OwnerAddr, [u8; 64]>, D::Error> {
+    use serde::de::{MapAccess, Visitor};
+
+    /// DeserializeSeed that reads a bstr of exactly N bytes into `[u8; N]`.
+    struct BytesSeed<const N: usize>;
+    impl<'de, const N: usize> serde::de::DeserializeSeed<'de> for BytesSeed<N> {
+        type Value = [u8; N];
+        fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<[u8; N], D::Error> {
+            struct Vis<const N: usize>;
+            impl<'de, const N: usize> Visitor<'de> for Vis<N> {
+                type Value = [u8; N];
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    write!(f, "a {N}-byte CBOR byte string")
+                }
+                fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<[u8; N], E> {
+                    v.try_into()
+                        .map_err(|_| E::custom(format!("expected {N}-byte bstr, got {}", v.len())))
+                }
+                fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<[u8; N], E> {
+                    self.visit_bytes(&v)
+                }
+            }
+            d.deserialize_bytes(Vis::<N>)
+        }
+    }
+
+    struct MapVisitor;
+    impl<'de> Visitor<'de> for MapVisitor {
+        type Value = std::collections::BTreeMap<OwnerAddr, [u8; 64]>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "a CBOR map of bstr(16) -> bstr(64)")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+            let mut result = std::collections::BTreeMap::new();
+            while let Some(key_bytes) = access.next_key_seed(BytesSeed::<16>)? {
+                let val: [u8; 64] = access.next_value_seed(BytesSeed::<64>)?;
+                result.insert(OwnerAddr(key_bytes), val);
+            }
+            Ok(result)
+        }
+    }
+    deserializer.deserialize_map(MapVisitor)
+}
+
+/// ZEB-285: bounded snapshot of an original community's channel-log
+/// state at fork time. Wire format: 1-key CBOR map keyed by ChannelId.
+/// Per-channel value is a Vec<SignedChannelEvent> bounded by the
+/// snapshot policy (§4.2 of spec):
+/// - most-recent N=500 messages per channel by HLC descending
+/// - total capped at M=5000 messages across all channels with
+///   proportional trim
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct BoundedChannelLogSnapshot {
+    /// Per-channel signed log events, frozen at fork time. Empty for
+    /// channels with no posts (or omitted entirely if no channels
+    /// have any posts). BTreeMap (not HashMap) for canonical-CBOR
+    /// deterministic ordering.
+    #[serde(rename = "pc")]
+    pub per_channel: std::collections::BTreeMap<
+        crate::community_membership::ChannelId,
+        Vec<crate::community_channel_log::SignedChannelEvent>,
+    >,
+}
+
+impl CanonicalPayloadSealed for BoundedChannelLogSnapshot {}
+impl CanonicalPayload for BoundedChannelLogSnapshot {}
+
+/// ZEB-285: frozen snapshot of an original community's history,
+/// bundled into fork-invites so fork-invitees can see pre-fork
+/// context. Self-contained for verification: `identity_pubs` carries
+/// the owner-pubkeys needed to verify every signer in
+/// `membership_events` and `channel_log`, so joiners do NOT need to
+/// query profile-broadcast to verify the snapshot.
+///
+/// Wire format: 6-key CBOR map. Field codes 2-char per same-length-
+/// keys at this nesting level. See spec §3.4.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreForkSnapshot {
+    /// The original community's SpaceId. Signed pre-fork events
+    /// reference this SpaceId in their bodies; the dual-keyset
+    /// verifier dispatches by this value.
+    #[serde(rename = "oi")]
+    pub original_community_id: SpaceId,
+
+    /// Display name of the original community at fork time. Used for
+    /// the fork's Lineage UI ("Forked from {name}").
+    #[serde(rename = "on")]
+    pub original_community_name: String,
+
+    /// Membership-CRDT events from the original, signed against the
+    /// original's keyset. Replayed at display time against
+    /// `identity_pubs` for verification; not inserted into the fork's
+    /// own CommunityState event log.
+    #[serde(rename = "ev")]
+    pub membership_events: Vec<crate::community_membership::SignedMembershipEvent>,
+
+    /// Bounded channel-log snapshot per §4.2 policy.
+    #[serde(rename = "cl")]
+    pub channel_log: BoundedChannelLogSnapshot,
+
+    /// Map from every OwnerAddr that signs any event in this snapshot
+    /// to their 64-byte identity public bytes (X25519_pub(32) ||
+    /// Ed25519_pub(32) matching Identity::to_public_bytes()).
+    /// Required because fork members are NOT necessarily members of
+    /// the original community, so OwnerDeviceCache won't have signers
+    /// cached. Bundled inline so verification needs no external lookup.
+    #[serde(
+        rename = "ip",
+        serialize_with = "serialize_identity_pubs_map",
+        deserialize_with = "deserialize_identity_pubs_map"
+    )]
+    pub identity_pubs: std::collections::BTreeMap<OwnerAddr, [u8; 64]>,
+
+    /// Forker's local HLC at fork time. Informational — used to
+    /// render the "Fork point" divider in the fork's unified timeline.
+    /// NOT used for any verification or ordering decision.
+    #[serde(rename = "ts")]
+    pub forked_at: Hlc,
+}
+
+impl CanonicalPayloadSealed for PreForkSnapshot {}
+impl CanonicalPayload for PreForkSnapshot {}
+
 /// ZEB-262 Phase 4: Path B app-sig wrapper around CommunityInviteSigned.
 /// Wire layout: `[u8 disc=0x10][CBOR(signed)][64 raw signature bytes]`.
 /// The signature is 64 raw bytes appended after the CBOR body — same
@@ -1630,5 +1791,67 @@ mod tests {
             ),
             "unexpected err: {err}"
         );
+    }
+
+    // ── ZEB-285 Phase 1: PreForkSnapshot + BoundedChannelLogSnapshot ────
+
+    #[test]
+    fn pre_fork_snapshot_canonical_cbor_pinned() {
+        use crate::community_membership::{MembershipEventKind, SignedMembershipEvent};
+        use crate::owner_state_types::Hlc;
+        use std::collections::BTreeMap;
+
+        let original_id = SpaceId([0xa0; 16]);
+        let admin = OwnerAddr([0xaa; 16]);
+
+        // Construct a stub signed Join event (sig is all-zeros, no crypto needed
+        // for the roundtrip test — only structure matters).
+        let admin_join = SignedMembershipEvent {
+            id: [0x01; 16],
+            community_id: original_id,
+            kind: MembershipEventKind::Join,
+            actor: admin,
+            at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "t".to_string(),
+            },
+            sig: [0u8; 64],
+            countersig: None,
+        };
+
+        let mut identity_pubs: BTreeMap<OwnerAddr, [u8; 64]> = BTreeMap::new();
+        identity_pubs.insert(admin, [0xbb; 64]);
+
+        let snapshot = PreForkSnapshot {
+            original_community_id: original_id,
+            original_community_name: "Test Community".to_string(),
+            membership_events: vec![admin_join],
+            channel_log: BoundedChannelLogSnapshot::default(),
+            identity_pubs,
+            forked_at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "t".to_string(),
+            },
+        };
+
+        let bytes = canonical_cbor_encode(&snapshot).expect("encode");
+        let decoded: PreForkSnapshot = ciborium::de::from_reader(&bytes[..]).expect("decode");
+        assert_eq!(snapshot, decoded);
+
+        // Verify top-level field keys: oi, on, ev, cl, ip, ts (all 2-char).
+        let value: ciborium::Value = ciborium::de::from_reader(&bytes[..]).expect("re-decode");
+        let map = value.as_map().expect("outer is map");
+        for expected in &["oi", "on", "ev", "cl", "ip", "ts"] {
+            assert!(
+                map.iter()
+                    .any(|(k, _): &(ciborium::Value, ciborium::Value)| {
+                        k.as_text() == Some(*expected)
+                    }),
+                "expected key {} in snapshot encoding",
+                expected
+            );
+        }
     }
 }
