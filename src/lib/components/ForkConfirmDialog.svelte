@@ -87,7 +87,13 @@
       </label>
     </div>
 
-    <p class="snapshot-count">Snapshot will include ~{messageCount} messages.</p>
+    <p class="snapshot-count">
+      {#if messageCount > 0}
+        Snapshot will include ~{messageCount} messages.
+      {:else}
+        Snapshot will include your accessible message history (up to 5000 messages).
+      {/if}
+    </p>
 
     <div class="action-row">
       <button class="confirm-btn" disabled={!nameValid} onclick={handleCreateFork}>

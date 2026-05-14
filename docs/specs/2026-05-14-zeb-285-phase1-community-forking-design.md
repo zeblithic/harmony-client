@@ -236,7 +236,7 @@ The Fork event lives in `CommunityState.events` (and is byte-identical across re
 
 A fork has the same on-disk layout as a normal community (it IS a community) PLUS one extra read-only artifact:
 
-```
+```text
 app_data_dir/communities/{fork_space_id}/
 ├── community_state.bin       # Fork's CommunityState (live, post-fork events)
 ├── channel_log_{ch_id}.bin   # Per-channel logs (live, post-fork posts)
@@ -289,6 +289,8 @@ The fork's **live** event stream uses the existing `verify_event` path unchanged
 ### 4.4 Lazy vs eager verification
 
 **Phase 1 verifies snapshot events lazily** (at UI display time, only for events actually rendered). Rationale: a malicious forker could ship forged signatures regardless — they had the plaintext, so the signatures' authenticity is partly an honesty signal rather than a cryptographic guarantee for downstream-only readers. Lazy verification keeps redemption cheap.
+
+**Phase 1 verifies membership events only; channel events in `BoundedChannelLogSnapshot` are rendered without per-message signature verification.** Phase 2 adds eager + channel-event verification.
 
 **Phase 2 will eagerly verify snapshot events at redemption** time (replay all `membership_events` + sample-verify channel-log events) so a known-malicious forker can be detected before snapshot bytes hit disk. Filed as a follow-up after Phase 1 merges.
 
@@ -421,7 +423,7 @@ New component, triggered from `CommunitySettingsPanel.svelte` via a new "Fork th
 
 Layout (text mockup):
 
-```
+```text
 ┌─ Fork this community ──────────────────────────┐
 │                                                 │
 │  This creates a new community with a frozen    │
@@ -458,7 +460,7 @@ The `silent` checkbox does NOT change the tier — silent vs visible is symmetri
 
 `NavService` renders communities with `forked_from: Some(_)` with a small fork-glyph prefix in the nav-tree node label:
 
-```
+```text
 ↳ Cool Community (fork)
 ```
 
@@ -473,7 +475,7 @@ Resolution happens via a new `NavService.resolveForkParentName(forkedFromId)` he
 
 For forked communities (`forked_from: Some(_)`), `CommunitySettingsPanel.svelte` renders a new "Lineage" section:
 
-```
+```text
 Lineage
 ─────────────────────────────────────
 Forked from: Cool Community
@@ -492,7 +494,7 @@ When displaying channel messages in a forked community, the channel-view compone
 
 Merge by HLC ascending; render a non-interactive divider row at the boundary:
 
-```
+```text
 ─── Forked from Cool Community on 2026-05-14 13:42 UTC ───
 ```
 
@@ -506,7 +508,7 @@ Merge by HLC ascending; render a non-interactive divider row at the boundary:
 
 `CommunitySettingsPanel.svelte` gains a new button in the existing actions area (likely below the Member panel link):
 
-```
+```text
 [ Fork this community ]
 ```
 

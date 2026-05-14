@@ -7725,7 +7725,7 @@ async fn generate_invite(
             None
         };
 
-        if let Some(original_id) = fork_origin {
+        if fork_origin.is_some() {
             // Read pre_fork_snapshot.bin from the fork's data dir.
             let snapshot: Option<crate::community_invite::PreForkSnapshot> = (|| {
                 let identity_dir = match crate::owner_commands::resolve_identity_dir() {
@@ -7780,15 +7780,23 @@ async fn generate_invite(
             // forked_from too so the invite doesn't arrive with forked_from
             // set but no snapshot, which would leave joiners in a half-fork
             // state. (Fix: PR #122 round-2 bot review — CodeRabbit Major.)
-            if snapshot.is_none() {
+            //
+            // Bind forked_from to snapshot.original_community_id, not to
+            // CommunityState.forked_from. If the two diverge (should not
+            // happen in practice, but could in theory via corrupt state),
+            // the invite reflects the snapshot's value — the disk artifact
+            // is the authoritative source for fork lineage metadata.
+            // (Fix: PR #122 round-3 bot review — CodeRabbit Major.)
+            if let Some(s) = snapshot {
+                let original_id = s.original_community_id;
+                (Some(original_id), Some(s))
+            } else {
                 tracing::warn!(
                     community_id = %hex::encode(space_id.0),
                     "ZEB-285 generate_invite: pre_fork_snapshot unavailable; \
                      clearing forked_from to preserve forked_from↔pre_fork_snapshot invariant"
                 );
                 (None, None)
-            } else {
-                (Some(original_id), snapshot)
             }
         } else {
             (None, None)

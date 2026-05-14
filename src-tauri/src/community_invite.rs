@@ -364,6 +364,13 @@ fn deserialize_identity_pubs_map<'de, D: serde::Deserializer<'de>>(
 /// - most-recent N=500 messages per channel by HLC descending
 /// - total capped at M=5000 messages across all channels with
 ///   proportional trim
+///
+/// **Phase 1 NOTE**: Channel events stored here are NOT signature-verified
+/// at redemption time. They are rendered with a muted pre-fork treatment
+/// under the trust assumption that the forker bundled honest history.
+/// Phase 2 will add per-message signature verification via a
+/// `verify_snapshot_channel_event` function (sibling to
+/// `verify_snapshot_event` in `community_membership.rs`). See spec §4.4.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct BoundedChannelLogSnapshot {
     /// Per-channel signed log events, frozen at fork time. Empty for

@@ -45,8 +45,12 @@
     communityService: CommunityService;
     channelMessageService: ChannelMessageService;
     trustService?: TrustService;
-    /** ZEB-285: NavService ref for fork-parent name resolution in the Lineage block. */
-    navService?: NavService;
+    /** ZEB-285: NavService ref for fork-parent name resolution in the Lineage block and
+     *  for adding the new fork to the sidebar after fork_community succeeds. Required —
+     *  the fork nav-visibility path (navService.addOrUpdateNavSpace) silently no-ops if
+     *  navService is absent, leaving the fork invisible in the sidebar. Making it required
+     *  surfaces the dependency at the type level. (Fix: PR #122 round-3, Greptile P2.) */
+    navService: NavService;
     onLeave: () => Promise<void>;
     onKickMember: (addr: string) => Promise<void>;
     onSetPowerLevel: (addr: string, power: number) => Promise<void>;
@@ -302,7 +306,7 @@
     onFork={async (opts) => {
       const result = await communityService.forkCommunity(communityId, opts);
       // Add the fork to the nav tree with forkedFrom lineage.
-      navService?.addOrUpdateNavSpace({
+      navService.addOrUpdateNavSpace({
         action: 'added',
         spaceId: result.forkSpaceId,
         kind: 'community',

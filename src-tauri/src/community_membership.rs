@@ -1923,6 +1923,14 @@ pub fn verify_event(
 /// display time only against a snapshot from a trusted inviter; eagerly
 /// verifying every event at redeem time is a Phase 2 concern.
 ///
+/// **Phase 1 NOTE**: This function verifies `SignedMembershipEvent` only.
+/// Channel events from `PreForkSnapshot.channel_log` are NOT
+/// signature-verified by Phase 1; they are rendered with the same
+/// muted treatment as other pre-fork content under the trust assumption
+/// that the forker bundled honest history. Phase 2 will add channel-event
+/// verification via a `verify_snapshot_channel_event` sibling function.
+/// See spec §4.4 for the broader Phase 1 lazy-verification rationale.
+///
 /// Returns `Ok(())` when the signature is valid and the signer is in
 /// `snapshot.identity_pubs`. Returns `Err(VerifyError::UnknownSigner)`
 /// when the signer is absent; returns `Err(VerifyError::SignatureInvalid)`

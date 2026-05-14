@@ -86,11 +86,6 @@ pub fn build_snapshot(
                 .map(|(i, _)| i)
                 .unwrap_or(0);
             allocations[max_idx] += remainder;
-            // Cap: don't allocate more than the slice actually contains.
-            let slice_len = capped[&keys[max_idx]].len();
-            if allocations[max_idx] > slice_len {
-                allocations[max_idx] = slice_len;
-            }
         }
 
         for (k, alloc) in keys.iter().zip(allocations) {
@@ -579,9 +574,10 @@ pub async fn fork_community(
                 .unwrap_or_else(|_| std::path::PathBuf::from("<identity_dir unavailable>"));
             return Err(format!(
                 "ZEB-285 fork_community: node generation changed after engine spawn and snapshot \
-                 write (was {}, now {}); fork has been rolled back by engine guard (disk snapshot \
-                 at {} is orphaned and will be cleaned up by next start); original community \
-                 untouched",
+                 write (was {}, now {}); fork has been rolled back by engine guard, but disk \
+                 artifacts at {} are orphaned and will persist (no startup-cleanup exists in \
+                 Phase 1; manual cleanup or Phase 2 reclamation follow-up required); original \
+                 community untouched",
                 snapshot_generation,
                 g.generation,
                 snapshot_path.display()
@@ -597,8 +593,9 @@ pub async fn fork_community(
                 .unwrap_or_else(|_| std::path::PathBuf::from("<identity_dir unavailable>"));
             return Err(format!(
                 "ZEB-285 fork_community: community_registry was torn down after engine spawn and \
-                 snapshot write; fork has been rolled back by engine guard (disk snapshot at {} is \
-                 orphaned and will be cleaned up by next start); original community untouched",
+                 snapshot write; fork has been rolled back by engine guard, but disk artifacts at \
+                 {} are orphaned and will persist (no startup-cleanup exists in Phase 1; manual \
+                 cleanup or Phase 2 reclamation follow-up required); original community untouched",
                 snapshot_path.display()
             ));
         }

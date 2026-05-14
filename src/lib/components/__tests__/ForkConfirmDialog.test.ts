@@ -16,7 +16,14 @@ describe('ForkConfirmDialog', () => {
     expect(screen.getByLabelText(/name/i)).toBeTruthy();
     expect(screen.getByLabelText(/fork silently/i)).toBeTruthy();
     expect(screen.getByLabelText(/also leave/i)).toBeTruthy();
+    // messageCount=1247 (>0): shows the "~N messages" form.
     expect(screen.getByText(/1247 messages/)).toBeTruthy();
+  });
+
+  it('shows generic history message when messageCount is 0 (non-fork community)', () => {
+    render(ForkConfirmDialog, { props: { ...baseProps, messageCount: 0 } });
+    expect(screen.getByText(/accessible message history \(up to 5000 messages\)/i)).toBeTruthy();
+    expect(screen.queryByText(/~0 messages/)).toBeNull();
   });
 
   it('prefills name as "{originalName} (fork)"', () => {
