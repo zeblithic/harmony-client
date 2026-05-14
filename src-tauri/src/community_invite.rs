@@ -662,7 +662,7 @@ pub enum InviteUrlError {
 ///
 /// Greptile P2 on PR #87 round 2 flagged that the prior name "BYTES"
 /// misled. See `InviteUrlError::TooLarge`.
-const MAX_INVITE_BODY_B64_CHARS: usize = 85_333; // ≈ 64 KiB decoded
+pub const MAX_INVITE_BODY_B64_CHARS: usize = 85_333; // ≈ 64 KiB decoded
 
 /// CR Minor (PR #106 R6): shared helper for the `sealed_epoch_key` byte-length
 /// contract enforced at both the encode and decode boundary. Centralises the

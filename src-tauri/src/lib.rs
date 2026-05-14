@@ -7780,7 +7780,7 @@ async fn generate_invite(
         }
     };
 
-    let payload = crate::community_invite::CommunityInvitePayload {
+    let mut payload = crate::community_invite::CommunityInvitePayload {
         community_id: space_id,
         epoch_snapshot,
         admin_addr: admin,
@@ -7793,7 +7793,36 @@ async fn generate_invite(
         forked_from,
         pre_fork_snapshot,
     };
-    build_open_invite_url(&payload)
+
+    // RELIABILITY: if the encoded invite payload would exceed the URL cap
+    // (MAX_INVITE_BODY_B64_CHARS ≈ 64 KiB), a snapshot-bundled fork-invite
+    // will fail. Fall back to no-snapshot mode: the forker still gets a
+    // working invite URL; fork-invitees joining via that URL will see the fork
+    // community starting empty (no pre-fork history). Phase 2 will add
+    // content-addressed delivery (Zenoh BLOB) for large snapshots.
+    // Both forked_from and pre_fork_snapshot are cleared together to maintain
+    // the invariant that forked_from is None iff pre_fork_snapshot is None.
+    // (Fix: PR #122 bot review — CodeAnt invariant + size cap issue.)
+    match crate::community_invite::encode_invite_url(&payload) {
+        Ok(url) => Ok(url),
+        Err(crate::community_invite::InviteUrlError::TooLarge(actual_len))
+            if payload.pre_fork_snapshot.is_some() =>
+        {
+            tracing::warn!(
+                community_id = %hex::encode(space_id.0),
+                actual_b64_len = actual_len,
+                cap = crate::community_invite::MAX_INVITE_BODY_B64_CHARS,
+                "ZEB-285 generate_invite: fork-invite payload exceeds URL cap; \
+                 falling back to no-snapshot mode. Fork-invitees joining via this \
+                 URL will see no pre-fork history. Phase 2 will add content-addressed \
+                 delivery for large snapshots."
+            );
+            payload.forked_from = None;
+            payload.pre_fork_snapshot = None;
+            build_open_invite_url(&payload)
+        }
+        Err(e) => Err(format!("encode invite URL: {e}")),
+    }
 }
 
 // ── ZEB-217 Sub-C Phase 3 Task 9: create_community ───────────────────
@@ -11490,11 +11519,22 @@ pub struct CommunityLineageDto {
 async fn get_community_lineage(
     community_id: String,
 ) -> Result<Option<CommunityLineageDto>, String> {
+    // SECURITY: parse community_id as a typed SpaceId (16 raw bytes, 32 hex chars)
+    // before using it as a path component. Rejects `../../etc/passwd` and other
+    // path-traversal payloads at the boundary. (Fix: PR #122 bot review.)
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("get_community_lineage: invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "get_community_lineage: community_id must be 16 bytes (32 hex chars)".to_string()
+        })?;
+    let safe_community_id = hex::encode(id_bytes); // canonical hex, no path components
     let identity_dir = crate::owner_commands::resolve_identity_dir()
         .map_err(|e| format!("get_community_lineage: resolve identity_dir: {e}"))?;
     let snapshot_path = identity_dir
         .join("communities")
-        .join(&community_id)
+        .join(&safe_community_id)
         .join("pre_fork_snapshot.bin");
 
     let bytes = match std::fs::read(&snapshot_path) {
@@ -11551,11 +11591,22 @@ pub struct PreForkSnapshotDto {
 
 #[tauri::command]
 async fn get_pre_fork_snapshot(community_id: String) -> Result<Option<PreForkSnapshotDto>, String> {
+    // SECURITY: parse community_id as a typed SpaceId (16 raw bytes, 32 hex chars)
+    // before using it as a path component. Rejects path-traversal payloads at the
+    // boundary. (Fix: PR #122 bot review.)
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("get_pre_fork_snapshot: invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "get_pre_fork_snapshot: community_id must be 16 bytes (32 hex chars)".to_string()
+        })?;
+    let safe_community_id = hex::encode(id_bytes); // canonical hex, no path components
     let identity_dir = crate::owner_commands::resolve_identity_dir()
         .map_err(|e| format!("get_pre_fork_snapshot: resolve identity_dir: {e}"))?;
     let snapshot_path = identity_dir
         .join("communities")
-        .join(&community_id)
+        .join(&safe_community_id)
         .join("pre_fork_snapshot.bin");
 
     let bytes = match std::fs::read(&snapshot_path) {

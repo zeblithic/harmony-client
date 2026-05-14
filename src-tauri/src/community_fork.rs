@@ -292,14 +292,36 @@ pub async fn fork_community(
 
     // Step 2: Collect identity_pubs from the identity resolver for all
     // signing actors in the snapshot.
+    //
+    // CORRECTNESS: build the signer set from membership_events, NOT from
+    // materialized.members. The bootstrap admin may have no explicit Join
+    // event and therefore no entry in materialized.members, but they DO sign
+    // other events (e.g., Invite, Kick, SetPower). Omitting their pubkey here
+    // would cause verify_snapshot_event to return UnknownSigner for any event
+    // they authored. (Bot review finding: PR #122 CodeRabbit / Qodo.)
     let resolver = community_registry.identity_resolver();
+    let mut signer_addrs = std::collections::BTreeSet::new();
+    for event in &original_events_vec {
+        signer_addrs.insert(event.actor);
+        // Also include any countersigner (invite-only Join vouchers).
+        if let Some(ref cs) = event.countersig {
+            signer_addrs.insert(cs.signer);
+        }
+    }
     let mut identity_pubs: std::collections::BTreeMap<
         crate::owner_state_types::OwnerAddr,
         [u8; 64],
     > = std::collections::BTreeMap::new();
-    for addr in materialized.members.keys() {
+    for addr in &signer_addrs {
         if let Some(pub64) = resolver.resolve(addr).await {
             identity_pubs.insert(*addr, pub64);
+        } else {
+            tracing::warn!(
+                signer = %hex::encode(addr.0),
+                original_id = %hex::encode(original_id.0),
+                "fork_community: cannot resolve identity_pub for snapshot signer; \
+                 snapshot events from this actor will fail verification at display time"
+            );
         }
     }
 
@@ -594,15 +616,37 @@ pub async fn fork_community(
         let fork_event_hlc =
             crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms)
                 .await;
+        // RELIABILITY: wrap mint_fork_event in a match so a signing failure
+        // after the fork is durably committed does not propagate via `?` and
+        // surface as an IPC error (which would mislead the caller into thinking
+        // the fork itself failed). Warn and set visible=false instead.
+        // (Fix: PR #122 bot review.)
         let fork_event = {
             let outbox_g = dm_outbox.lock().await;
-            mint_fork_event(
+            match mint_fork_event(
                 original_id,
                 self_owner,
                 fork_space_id,
                 outbox_g.signing_key.as_ref(),
                 fork_event_hlc,
-            )?
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        original_id = %hex::encode(original_id.0),
+                        fork_space_id = %fork_space_id_hex,
+                        "ZEB-285 fork_community: mint_fork_event failed after fork commit; \
+                         skipping Fork event publish"
+                    );
+                    visible = false;
+                    return Ok(ForkCommunityResult {
+                        fork_space_id: fork_space_id_hex.clone(),
+                        visible,
+                        snapshot_message_count,
+                    });
+                }
+            }
         };
 
         // Generation + registry fence before inserting Fork event into the
@@ -656,6 +700,10 @@ pub async fn fork_community(
                                 original_id = %hex::encode(original_id.0),
                                 "fork_community: Fork event rejected by original engine: {outcome:?}"
                             );
+                            // Per spec §5.2: a Rejected outcome means the Fork event did not
+                            // land in the original's log — treat as not-visible so the caller
+                            // knows the announce did not take effect. (Fix: PR #122 bot review.)
+                            visible = false;
                         }
                     }
                     Err(e) => {
@@ -680,14 +728,32 @@ pub async fn fork_community(
         let leave_hlc =
             crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms)
                 .await;
+        // RELIABILITY: wrap mint_leave_event in a match so a signing failure
+        // does not propagate via `?` after the fork is durably committed.
+        // Leave is a best-effort courtesy event; warn and skip on failure.
+        // (Fix: PR #122 bot review.)
         let leave_event = {
             let outbox_g = dm_outbox.lock().await;
-            crate::mint_leave_event(
+            match crate::mint_leave_event(
                 original_id,
                 self_owner,
                 outbox_g.signing_key.as_ref(),
                 leave_hlc,
-            )?
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        original_id = %hex::encode(original_id.0),
+                        "ZEB-285 fork_community: mint_leave_event failed; skipping Leave publish"
+                    );
+                    return Ok(ForkCommunityResult {
+                        fork_space_id: fork_space_id_hex.clone(),
+                        visible,
+                        snapshot_message_count,
+                    });
+                }
+            }
         };
         match original_engine.insert_local_event(leave_event).await {
             Ok(outcome) => {

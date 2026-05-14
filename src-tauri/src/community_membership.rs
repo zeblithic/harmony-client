@@ -545,6 +545,16 @@ pub enum VerifyError {
     UnknownSigner {
         signer: OwnerAddr,
     },
+
+    /// ZEB-285: the event's community_id does not match the snapshot's
+    /// original_community_id. A validly-signed event from a different
+    /// community must be rejected even when the same OwnerAddr is a member
+    /// of both communities — without this check, cross-community event
+    /// injection could pass signature verification. (Fix: PR #122 bot review.)
+    CommunityIdMismatch {
+        expected: SpaceId,
+        actual: SpaceId,
+    },
 }
 
 impl std::fmt::Display for VerifyError {
@@ -652,6 +662,14 @@ impl std::fmt::Display for VerifyError {
                     f,
                     "signer {} is not present in PreForkSnapshot.identity_pubs",
                     hex::encode(signer.0)
+                )
+            }
+            VerifyError::CommunityIdMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "event.community_id {} does not match snapshot.original_community_id {}",
+                    hex::encode(actual.0),
+                    hex::encode(expected.0)
                 )
             }
         }
@@ -1915,6 +1933,18 @@ pub fn verify_snapshot_event(
     event: &SignedMembershipEvent,
     snapshot: &crate::community_invite::PreForkSnapshot,
 ) -> Result<(), VerifyError> {
+    // Step 0: community_id binding check. A validly-signed event from a
+    // DIFFERENT community must be rejected even when the same OwnerAddr is a
+    // member of both communities — without this check, an attacker could inject
+    // events from another community whose signer happens to appear in
+    // snapshot.identity_pubs. (Fix: PR #122 security finding.)
+    if event.community_id != snapshot.original_community_id {
+        return Err(VerifyError::CommunityIdMismatch {
+            expected: snapshot.original_community_id,
+            actual: event.community_id,
+        });
+    }
+
     // Step 1: signer must be recorded in identity_pubs.
     let signer_pub =
         snapshot
@@ -3788,6 +3818,70 @@ mod tests {
                 );
             }
             other => panic!("expected UnknownSigner, got {:?}", other),
+        }
+    }
+
+    /// ZEB-285 (security fix): verify_snapshot_event must reject an event
+    /// whose community_id does not match snapshot.original_community_id, even
+    /// when the signer is present in identity_pubs and the Ed25519 signature
+    /// is valid. This prevents cross-community event injection by an actor who
+    /// is a member of two communities and whose pubkey appears in both snapshots.
+    #[test]
+    fn verify_snapshot_event_rejects_wrong_community_id() {
+        use crate::community_invite::{BoundedChannelLogSnapshot, PreForkSnapshot};
+        use std::collections::BTreeMap;
+
+        let original_id = SpaceId([0xa0; 16]);
+        let other_community_id = SpaceId([0xbb; 16]); // different community
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xaa);
+
+        // Event is validly signed by admin_addr but references a DIFFERENT community.
+        let wrong_community_event = sign_with_identity(
+            EventPayload {
+                id: [0x10; 16],
+                community_id: other_community_id, // wrong community
+                kind: MembershipEventKind::Join,
+                actor: admin_addr,
+                at: Hlc {
+                    wall_ms: 5,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &admin_priv,
+        );
+
+        // The snapshot's identity_pubs includes admin_addr — signature would
+        // verify if we didn't check community_id first.
+        let mut identity_pubs = BTreeMap::new();
+        identity_pubs.insert(admin_addr, admin_pub);
+
+        let snapshot = PreForkSnapshot {
+            original_community_id: original_id,
+            original_community_name: "Original".to_string(),
+            membership_events: vec![],
+            channel_log: BoundedChannelLogSnapshot::default(),
+            identity_pubs,
+            forked_at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        };
+
+        let result = verify_snapshot_event(&wrong_community_event, &snapshot);
+        match result {
+            Err(VerifyError::CommunityIdMismatch { expected, actual }) => {
+                assert_eq!(
+                    expected, original_id,
+                    "expected should be snapshot's original_community_id"
+                );
+                assert_eq!(
+                    actual, other_community_id,
+                    "actual should be the event's community_id"
+                );
+            }
+            other => panic!("expected CommunityIdMismatch, got {:?}", other),
         }
     }
 }
