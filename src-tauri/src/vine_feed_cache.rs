@@ -336,7 +336,7 @@ impl VineFeedCache {
         let vine_id = descriptor.id.clone();
         let dto = self.build_dto(&descriptor, source);
         self.descriptors.insert(
-            vine_id,
+            vine_id.clone(),
             CachedVine {
                 descriptor,
                 received_at_ms: now_ms,
@@ -360,6 +360,17 @@ impl VineFeedCache {
                 self.descriptors.remove(&id);
                 self.reactions.retain(|(vid, _), _| vid != &id);
             }
+        }
+
+        // If the capacity-trim removed the descriptor we just inserted
+        // (older than every existing entry), the cache state is identical
+        // to pre-insert. Return Rejected so the event loop does NOT emit
+        // `vine-received` for a vine that isn't actually retained.
+        // Skip save() — no net state change to persist.
+        if !self.descriptors.contains_key(&vine_id) {
+            return Some(DescriptorOutcome::Rejected(format!(
+                "descriptor {vine_id} older than cache window (capacity-trim victim)"
+            )));
         }
 
         self.save();
@@ -1514,6 +1525,69 @@ mod tests {
         assert!(
             ids.contains(newest.as_str()),
             "newest descriptor should remain"
+        );
+    }
+
+    #[test]
+    fn descriptor_older_than_cache_window_is_rejected_when_at_capacity() {
+        // Regression for Qodo PR #119 finding: if the cache is at
+        // MAX_DESCRIPTORS and a new descriptor arrives with `created_at`
+        // older than every existing entry, the capacity-trim will drop
+        // the just-inserted vine. The outcome must be Rejected (NOT
+        // Inserted), so the event loop does not emit vine-received to
+        // the frontend for a vine that wasn't actually retained.
+        let mut cache = VineFeedCache::new();
+        let followed = followed_set_with(&["alice-addr"]);
+
+        // Fill cache to capacity with strictly increasing created_at
+        // starting at 1_000 (so created_at = 0 is reliably older).
+        for i in 0..MAX_DESCRIPTORS {
+            let id = format!("v-{i:05}");
+            let payload = canonical_descriptor_bytes(
+                &id,
+                "alice-addr",
+                "Alice",
+                "cid",
+                None,
+                None,
+                (i + 1_000) as u64,
+            );
+            cache.on_descriptor_sample("harmony/vines/alice-addr", &payload, &followed, 0);
+        }
+        assert_eq!(cache.len_descriptors(), MAX_DESCRIPTORS);
+
+        // Now insert one with created_at = 0 (older than all existing).
+        let old_payload = canonical_descriptor_bytes(
+            "v-ancient",
+            "alice-addr",
+            "Alice",
+            "cid",
+            None,
+            None,
+            0, // older than every entry in the cache
+        );
+        let outcome =
+            cache.on_descriptor_sample("harmony/vines/alice-addr", &old_payload, &followed, 0);
+
+        // Must NOT be Inserted — the vine was trimmed away before
+        // persistence. Must be Rejected so the event loop does not emit.
+        match outcome {
+            Some(DescriptorOutcome::Rejected(reason)) => {
+                assert!(
+                    reason.contains("v-ancient"),
+                    "rejection reason should name the dropped vine; got: {reason}"
+                );
+            }
+            other => panic!("expected Rejected (capacity-trim victim), got {:?}", other),
+        }
+
+        // Cache state is unchanged: still at capacity, v-ancient absent.
+        assert_eq!(cache.len_descriptors(), MAX_DESCRIPTORS);
+        let dtos = cache.list_descriptors();
+        let ids: HashSet<&str> = dtos.iter().map(|d| d.id.as_str()).collect();
+        assert!(
+            !ids.contains("v-ancient"),
+            "v-ancient must not be in the cache (was capacity-trimmed)"
         );
     }
 
