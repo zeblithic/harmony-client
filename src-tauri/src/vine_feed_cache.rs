@@ -12,6 +12,7 @@
 use crate::{VineDescriptorPayload, VineReactionPayload, VineVideoDto};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 /// How the recipient discovered this vine. Followed = creator is in the
 /// local follow set at the time of first arrival; Discover = otherwise.
@@ -94,16 +95,40 @@ struct CachedReaction {
 
 /// In-memory, single-peer view of the Vine network. Owned by NodeState;
 /// updated by the event loop on receive; queried by IPCs.
+///
+/// ZEB-147: `path` is set by `load(data_dir)` (production path) and is
+/// `None` after `new()` (test path). When `None`, `save()` is a no-op,
+/// so unit tests can mutate the cache freely without touching disk.
 #[derive(Debug, Default)]
 pub struct VineFeedCache {
     descriptors: HashMap<String, CachedVine>,
     reactions: HashMap<(String, String), CachedReaction>,
     viewed: HashSet<String>,
+    /// `Some(path_to_vine_feed.json)` when constructed via `load()`;
+    /// `None` for `new()`. `save()` checks this and is a no-op when None.
+    #[allow(dead_code)] // consumed by save() in ZEB-147 Task 2
+    path: Option<PathBuf>,
 }
 
 impl VineFeedCache {
+    /// In-memory only. No persistence path; `save()` is a no-op.
+    /// Used by tests and any caller that explicitly wants ephemeral state.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Load from `data_dir/vine_feed.json`. Returns an empty cache (with
+    /// `path` set so subsequent mutations persist) when the file is
+    /// missing or unreadable.
+    ///
+    /// ZEB-147 Task 3 will add the actual file IO + age-prune + capacity-trim.
+    /// For Task 1, this is a stub that just sets `path` so the rest of
+    /// the API can be built against it.
+    pub fn load(data_dir: &Path) -> Self {
+        Self {
+            path: Some(data_dir.join("vine_feed.json")),
+            ..Default::default()
+        }
     }
 
     /// Parse + insert a vine descriptor.
@@ -776,6 +801,27 @@ mod tests {
         let c2 = cache.clone();
         let len = c2.lock().unwrap().len_descriptors();
         assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn new_leaves_path_unset() {
+        let cache = VineFeedCache::new();
+        // `path` is private; we observe it indirectly: save() must be a
+        // no-op when path is None. Since save() is wired in Task 2, this
+        // test asserts the constructor contract via the public API.
+        // For now, just assert the cache is empty and constructable.
+        assert_eq!(cache.len_descriptors(), 0);
+        assert_eq!(cache.len_reactions(), 0);
+        assert!(!cache.is_viewed("anything"));
+    }
+
+    #[test]
+    fn load_empty_dir_returns_empty_cache() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let cache = VineFeedCache::load(dir.path());
+        assert_eq!(cache.len_descriptors(), 0);
+        assert_eq!(cache.len_reactions(), 0);
+        assert!(!cache.is_viewed("anything"));
     }
 
     #[test]
