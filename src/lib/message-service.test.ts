@@ -16,13 +16,17 @@ describe('MessageService', () => {
     expect(svc.messages.length).toBe(mockMessages.length);
   });
 
-  it('populates seenIds from mock data', async () => {
-    // A second message with an existing ID should be deduped
+  it('populates seenIds from incoming events (dedup)', async () => {
+    // ZEB-209: mock IDs are cleared on connectAdapter, so post-connect
+    // dedup must be tested with a real (network-arrived) ID, not a mock one.
     const { adapter, emit } = createMockAdapter();
     await svc.connectAdapter(adapter);
-    const existingId = mockMessages[0].id;
-    emit('message-received', { id: existingId, senderAddress: 'x', senderName: 'X', channel: 'c', hub: 'h', text: 'dup', timestamp: 1, priority: 'standard' } satisfies ChannelMessageEvent);
-    expect(svc.messages.length).toBe(mockMessages.length);
+    const wire = { id: 'real-id-1', senderAddress: 'x', senderName: 'X', channel: 'c', hub: 'h', text: 'first', timestamp: 1, priority: 'standard' } satisfies ChannelMessageEvent;
+    emit('message-received', wire);
+    // Emit the same id again — must be deduped.
+    emit('message-received', { ...wire, text: 'dup' });
+    expect(svc.messages.length).toBe(1);
+    expect(svc.messages[0].text).toBe('first');
   });
 
   // ── connectAdapter ────────────────────────────────────────────────
@@ -42,6 +46,8 @@ describe('MessageService', () => {
   });
 
   it('appends incoming wire messages', async () => {
+    // ZEB-209: mock messages are cleared on connectAdapter; the first
+    // real message becomes the only message in the list.
     const { adapter, emit } = createMockAdapter();
     await svc.connectAdapter(adapter);
     const wire: ChannelMessageEvent = {
@@ -49,7 +55,7 @@ describe('MessageService', () => {
       channel: 'general', hub: 'main', text: 'hello', timestamp: Date.now(), priority: 'standard',
     };
     emit('message-received', wire);
-    expect(svc.messages.length).toBe(mockMessages.length + 1);
+    expect(svc.messages.length).toBe(1);
     expect(svc.messages.at(-1)!.text).toBe('hello');
   });
 
@@ -66,6 +72,9 @@ describe('MessageService', () => {
   });
 
   it('calls onChange when a new message arrives', async () => {
+    // ZEB-209: connectAdapter fires onChange once for the clear-on-connect,
+    // then the incoming message fires it again. Set onChange before
+    // connectAdapter so both calls are counted.
     const { adapter, emit } = createMockAdapter();
     svc.onChange = vi.fn();
     await svc.connectAdapter(adapter);
@@ -73,7 +82,8 @@ describe('MessageService', () => {
       id: 'notify-1', senderAddress: 'x', senderName: 'X',
       channel: 'c', hub: 'h', text: 'hi', timestamp: 1, priority: 'standard',
     } satisfies ChannelMessageEvent);
-    expect(svc.onChange).toHaveBeenCalledOnce();
+    // Called at least twice: once for the mock-clear, once for the new message.
+    expect(svc.onChange).toHaveBeenCalledTimes(2);
   });
 
   // ── wireToMessage ─────────────────────────────────────────────────
@@ -161,6 +171,50 @@ describe('MessageService', () => {
     svc.onChange = vi.fn();
     await svc.send('local', 'standard', 'c', 'h');
     expect(svc.onChange).toHaveBeenCalledOnce();
+  });
+
+  // ── ZEB-209: clear-on-connect ─────────────────────────────────
+
+  it('clears mock-seeded messages on connectAdapter (ZEB-209)', async () => {
+    const svc = new MessageService();
+    // Sanity: constructor seeds from mockMessages so the UI is never empty
+    // in browser/dev mode (no adapter connects).
+    expect(svc.messages.length).toBeGreaterThan(0);
+    const { adapter } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    expect(svc.messages).toEqual([]);
+  });
+
+  it('fires onChange once after clearing mocks (ZEB-209)', async () => {
+    const svc = new MessageService();
+    let calls = 0;
+    svc.onChange = () => { calls++; };
+    const { adapter } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    // At least one onChange — listener setup is async but the clear is
+    // synchronous so the post-clear notification fires before any event.
+    expect(calls).toBeGreaterThanOrEqual(1);
+  });
+
+  it('no longer dedupes events whose id collided with a former mock (ZEB-209)', async () => {
+    const svc = new MessageService();
+    // Pick any mock id — it was seeded into seenIds in the constructor.
+    const collidingId = svc.messages[0]!.id;
+    const { adapter, emit } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    // A real event with the same id should now be accepted (post-clear
+    // seenIds no longer contains the mock id).
+    emit('message-received', {
+      id: collidingId,
+      senderAddress: 'aa'.repeat(32),
+      senderName: 'Real Sender',
+      channel: 'channel-1',
+      hub: 'hub-1',
+      text: 'real',
+      timestamp: 1700000000000,
+      priority: 'standard',
+    } satisfies ChannelMessageEvent);
+    expect(svc.messages.find((m) => m.id === collidingId)?.text).toBe('real');
   });
 
   // ── destroy / addUnlisten ─────────────────────────────────────────
@@ -635,10 +689,13 @@ describe('MessageService loadDmThread', () => {
   });
 
   it('returns early when results are empty (no cursor update, no onChange)', async () => {
+    // ZEB-209: set onChange AFTER connectAdapter so the clear-on-connect
+    // notification doesn't pollute the loadDmThread onChange assertion.
+    // The test intent is: loadDmThread with empty results must NOT call onChange.
     const { adapter } = createMockAdapter();
     (adapter.invoke as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-    svc.onChange = vi.fn();
     await svc.connectAdapter(adapter);
+    svc.onChange = vi.fn();
     await svc.loadDmThread('aabbcc');
 
     expect(svc.messages).toHaveLength(0);

@@ -69,7 +69,8 @@ export class MessageService {
   private loadedDmSpaces = new Set<string>();
 
   constructor() {
-    // Seed with mock data — real messages append on top.
+    // Seed with mock data for browser/dev mode — `connectAdapter()` clears
+    // these before subscribing to real events (ZEB-209).
     this.messages = [...mockMessages];
     for (const m of this.messages) this.seenIds.add(m.id);
   }
@@ -78,6 +79,15 @@ export class MessageService {
   async connectAdapter(adapter: TauriAdapter): Promise<void> {
     if (this.adapter) return; // already wired; prevent duplicate listeners
     this.adapter = adapter;
+
+    // ZEB-209: clear mock-seeded state before subscribing to real events.
+    // The constructor seeds mockMessages for browser/dev mode (no adapter
+    // connects). In production the adapter always wires in, so the mocks
+    // must go to avoid hybrid real+fictional state.
+    this.messages = [];
+    this.seenIds = new Set();
+    this.onChange?.();
+
     const unlisten = await adapter.listen(
       'message-received',
       (event) => {
