@@ -2754,6 +2754,7 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         Arc::clone(&dm_outbox),
         channel_log_registry,
         || Ok(()),
+        None,
     )
     .await;
 

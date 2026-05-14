@@ -859,6 +859,7 @@ async fn click_to_join_redeem_invite_smoke() {
         Arc::clone(&dm_outbox),
         Arc::clone(&channel_log_registry),
         || Ok(()),
+        None,
     )
     .await;
 
