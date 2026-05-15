@@ -657,7 +657,10 @@ fn pin_intent_survives_reload() {
 ///
 /// ZEB-159 made the real fetch_rx → cache-admission → completion path
 /// work end-to-end (the spawned fetch task now admits each fetched CID
-/// via CasOp::PutLocal { reply: None } before signaling completion).
+/// via a synchronous CasOp::PutLocal { reply: Some(_) } round-trip per
+/// CID before signaling completion — the synchronous ordering is the
+/// R1 fix for the Cursor + Qodo race finding that fire-and-forget
+/// admission would let the completion arm walk a partial cache).
 /// This test continues to exercise the cascade arm directly by injecting
 /// completion synthetically — the synthetic path remains valuable as a
 /// unit-style assertion that does not require a live Zenoh peer.

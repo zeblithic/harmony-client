@@ -1452,10 +1452,13 @@ pub async fn run<R: Runtime>(
                 // task can notify the main loop after a successful fetch.
                 let completion_tx = fetch_completion_tx.clone();
                 // ZEB-159: clone cas_op_tx so the wrapped fetch_one can
-                // fire-and-forget-admit each fetched CID's bytes to the
-                // StorageTier cache. Without this, the ZEB-155 fetch-
-                // completion arm walks an empty cache for freshly-
-                // fetched roots and pin_content is a no-op.
+                // admit each fetched CID's bytes to the StorageTier
+                // cache synchronously (round-tripping through a
+                // PutLocal reply oneshot per CID). Without admission
+                // ordered before the completion signal, the ZEB-155
+                // fetch-completion arm races the PutLocal arm and
+                // walks a partial cache for freshly-fetched roots
+                // (Cursor + Qodo R1).
                 let cas_op_tx_for_fetch = cas_op_tx.clone();
                 tokio::spawn(async move {
                     // Parse hex → 32-byte CID. Reply with an error if malformed.
@@ -1483,9 +1486,17 @@ pub async fn run<R: Runtime>(
                     };
                     // ZEB-159: wrap fetch_one so each successful fetch
                     // also admits the bytes to the local cache. The
-                    // wrapper fire-and-forget-sends CasOp::PutLocal
-                    // { reply: None } per CID — mirrors the GetOrFetch
-                    // admit-hop pattern at event_loop.rs:1625.
+                    // wrapper sends CasOp::PutLocal { reply: Some(...) }
+                    // per CID and awaits the reply, so by the time
+                    // fetch_recursive returns Ok, every admission has
+                    // been processed by the event-loop's PutLocal arm
+                    // (which calls runtime.tick() before signaling).
+                    // This synchronous round-trip is load-bearing for
+                    // ordering: the fetch_completion_tx signal below
+                    // depends on the cache being populated, so a
+                    // fire-and-forget admit (as GetOrFetch uses at
+                    // event_loop.rs:1625) would race the completion
+                    // arm and walk a partial cache (Cursor + Qodo R1).
                     let fetch_one_with_admit =
                         wrap_fetch_one_with_admission(fetch_one, cas_op_tx_for_fetch);
 
@@ -1750,13 +1761,16 @@ pub async fn run<R: Runtime>(
             // ── Fetch-completion replay hook (ZEB-155 + ZEB-159) ──
             // Spawned fetch tasks send on fetch_completion_tx after
             // fetch_recursive returns Ok. The spawned task admits every
-            // fetched CID's bytes via a CasOp::PutLocal { reply: None }
-            // fire-and-forget hop (ZEB-159), so by the time this arm
-            // runs, the bundle tree is in the cache. If pin_intent
-            // contains the root, walk all descendants currently in the
-            // cache and pin them. This re-engages runtime-side eviction
-            // protection that was lost when the previous node stopped
-            // and its in-memory pinned-set went with it.
+            // fetched CID's bytes via synchronous CasOp::PutLocal hops
+            // (ZEB-159) — each per-CID admission awaits its reply
+            // oneshot before fetch_recursive proceeds, and the
+            // CasOp::PutLocal handler ticks the runtime BEFORE sending
+            // the reply, so by the time this arm runs, the bundle tree
+            // is in the cache. If pin_intent contains the root, walk
+            // all descendants currently in the cache and pin them.
+            // This re-engages runtime-side eviction protection that
+            // was lost when the previous node stopped and its
+            // in-memory pinned-set went with it.
             Some(root_bytes) = fetch_completion_rx.recv() => {
                 if pin_intent.contains(&root_bytes) {
                     let root = ContentId::from_bytes(root_bytes);
