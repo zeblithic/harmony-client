@@ -1,0 +1,255 @@
+//! Last-backup tracking + 14-day staleness logic.
+//!
+//! Backs the GUI staleness banner. See spec §"Staleness warning".
+
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+
+use crate::owner_state_crdt::OwnerState;
+use crate::owner_state_types::Hlc;
+
+/// 14 days in milliseconds. Trigger threshold for the staleness banner.
+pub const STALENESS_THRESHOLD_MS: u64 = 14 * 86_400_000;
+
+/// Schema for `~/.harmony/last_backup.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastBackup {
+    /// HLC at which the last successful `export recovery-file` ran.
+    pub at: Hlc,
+    /// Whether the last export included a state sidecar.
+    pub include_state: bool,
+    /// Absolute path of the last export's HRMR file (for UX, not security).
+    pub out_path: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BackupStateError {
+    #[error("I/O: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("JSON decode: {0}")]
+    JsonDecode(#[from] serde_json::Error),
+}
+
+/// Read `last_backup.json` from disk. Returns `Ok(None)` if the file
+/// doesn't exist (fresh install or no backups yet).
+pub fn load_last_backup(path: &Path) -> Result<Option<LastBackup>, BackupStateError> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let parsed: LastBackup = serde_json::from_slice(&bytes)?;
+            Ok(Some(parsed))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Atomically replace `last_backup.json` with the supplied record.
+pub fn save_last_backup(path: &Path, record: &LastBackup) -> Result<(), BackupStateError> {
+    let bytes = serde_json::to_vec_pretty(record)?;
+    crate::owner_state_persist::save_atomically(path, &bytes)
+        .map_err(|e| BackupStateError::Io(std::io::Error::other(e.to_string())))
+}
+
+/// Find the maximum `wall_ms` across all mutating entries in an owner-state.
+/// Returns 0 if the state is empty.
+pub fn last_mutation_wall_ms(state: &OwnerState) -> u64 {
+    let mut max_ms = 0u64;
+    for s in state.spaces.values() {
+        max_ms = max_ms.max(s.updated_at.wall_ms);
+    }
+    for o in state.outbox.values() {
+        max_ms = max_ms.max(o.created_at.wall_ms);
+    }
+    for i in state.inbox.values() {
+        max_ms = max_ms.max(i.received_at.wall_ms);
+    }
+    for m in state.markers.values() {
+        max_ms = max_ms.max(m.last_read_at.wall_ms);
+    }
+    max_ms
+}
+
+/// Trigger result returned to the IPC layer + GUI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StalenessResult {
+    pub is_stale: bool,
+    /// Whole days since the last backup. 0 if no `last_backup.json` exists
+    /// AND no CRDT mutations happened.
+    pub days_since: u32,
+}
+
+/// Decide whether the staleness banner should appear.
+///
+/// `now_wall_ms` is the system wall-clock for the comparison (caller injects;
+/// production wires `std::time::SystemTime::now()`).
+/// `dismiss_until_wall_ms` is the localStorage-tracked dismissal expiry
+/// (or `None` if the user has never dismissed). When `Some(t)` and `t >
+/// now_wall_ms`, suppress the banner regardless of staleness.
+pub fn should_warn_about_stale_backup(
+    now_wall_ms: u64,
+    last_backup: Option<&LastBackup>,
+    state: &OwnerState,
+    dismiss_until_wall_ms: Option<u64>,
+) -> StalenessResult {
+    if let Some(until) = dismiss_until_wall_ms {
+        if until > now_wall_ms {
+            return StalenessResult {
+                is_stale: false,
+                days_since: 0,
+            };
+        }
+    }
+
+    let last_mutation = last_mutation_wall_ms(state);
+    match last_backup {
+        None => {
+            // No backup ever taken. Only nag if CRDT mutations exist.
+            let stale = last_mutation > 0;
+            let days = if stale {
+                ((now_wall_ms.saturating_sub(last_mutation)) / 86_400_000) as u32
+            } else {
+                0
+            };
+            StalenessResult {
+                is_stale: stale,
+                days_since: days,
+            }
+        }
+        Some(b) => {
+            // Stale iff there have been mutations since the last backup
+            // AND those mutations are older than 14 days ago.
+            let last_backup_ms = b.at.wall_ms;
+            let stale = last_mutation > last_backup_ms
+                && now_wall_ms > last_backup_ms + STALENESS_THRESHOLD_MS;
+            let days = ((now_wall_ms.saturating_sub(last_backup_ms)) / 86_400_000) as u32;
+            StalenessResult {
+                is_stale: stale,
+                days_since: days,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::owner_state_types::{Space, SpaceId, SpaceKind};
+
+    fn hlc(w: u64) -> Hlc {
+        Hlc {
+            wall_ms: w,
+            logical: 0,
+            device_id: "test".into(),
+        }
+    }
+
+    fn state_with_mutation_at(wall_ms: u64) -> OwnerState {
+        let mut s = OwnerState::default();
+        if wall_ms > 0 {
+            let sp = Space {
+                id: SpaceId([1; 16]),
+                kind: SpaceKind::Folder,
+                parent: None,
+                community_id: None,
+                name: "x".into(),
+                transport: None,
+                members: vec![],
+                custom_name: None,
+                notification_pref: None,
+                left_at: None,
+                created_at: hlc(wall_ms),
+                updated_at: hlc(wall_ms),
+                content_key: None,
+                prior_content_keys: vec![],
+                current_epoch: None,
+                current_epoch_key: None,
+                old_epoch_keys: std::collections::BTreeMap::new(),
+                admin_addr: None,
+                is_invite_only: None,
+                shared_in_profile: false,
+            };
+            s.spaces.insert(sp.id, sp);
+        }
+        s
+    }
+
+    #[test]
+    fn staleness_warning_triggers_after_14_days() {
+        let now_ms = 100 * 86_400_000;
+        let backup_at = 80 * 86_400_000; // 20 days ago
+        let mutation_at = 85 * 86_400_000; // 15 days ago, after the backup
+        let last = LastBackup {
+            at: hlc(backup_at),
+            include_state: true,
+            out_path: "/tmp/recovery.bin".into(),
+        };
+        let state = state_with_mutation_at(mutation_at);
+        let r = should_warn_about_stale_backup(now_ms, Some(&last), &state, None);
+        assert!(r.is_stale, "should warn: {r:?}");
+        assert_eq!(r.days_since, 20);
+
+        // 13 days ago: not yet stale.
+        let now_ms = 80 * 86_400_000 + 13 * 86_400_000;
+        let r = should_warn_about_stale_backup(now_ms, Some(&last), &state, None);
+        assert!(!r.is_stale, "13d should not warn: {r:?}");
+    }
+
+    #[test]
+    fn staleness_warning_handles_missing_file() {
+        let now_ms = 1_000_000_000;
+        // No `last_backup.json`, no mutations: don't nag.
+        let empty = OwnerState::default();
+        let r = should_warn_about_stale_backup(now_ms, None, &empty, None);
+        assert!(!r.is_stale, "fresh install, no mutations -> no warn");
+
+        // No `last_backup.json`, but the user has been making changes:
+        // do nag.
+        let active = state_with_mutation_at(now_ms - 86_400_000);
+        let r = should_warn_about_stale_backup(now_ms, None, &active, None);
+        assert!(r.is_stale, "mutations + no backup -> warn");
+    }
+
+    #[test]
+    fn dismiss_window_suppresses_warning() {
+        let now_ms = 100 * 86_400_000;
+        let last = LastBackup {
+            at: hlc(80 * 86_400_000),
+            include_state: true,
+            out_path: "/tmp/r.bin".into(),
+        };
+        let state = state_with_mutation_at(85 * 86_400_000);
+
+        // Dismiss until 5 days from now → suppressed.
+        let dismiss = Some(now_ms + 5 * 86_400_000);
+        let r = should_warn_about_stale_backup(now_ms, Some(&last), &state, dismiss);
+        assert!(!r.is_stale, "dismiss window active -> no warn");
+
+        // Dismiss expired 1 day ago → re-appears.
+        let dismiss = Some(now_ms - 86_400_000);
+        let r = should_warn_about_stale_backup(now_ms, Some(&last), &state, dismiss);
+        assert!(r.is_stale, "dismiss expired -> warn again");
+    }
+
+    #[test]
+    fn last_backup_json_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("last_backup.json");
+        let record = LastBackup {
+            at: hlc(1_700_000_000),
+            include_state: true,
+            out_path: "/tmp/recovery.bin".into(),
+        };
+        save_last_backup(&path, &record).unwrap();
+        let loaded = load_last_backup(&path).unwrap().expect("present");
+        assert_eq!(loaded, record);
+    }
+
+    #[test]
+    fn load_last_backup_missing_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never_written.json");
+        let r = load_last_backup(&path).unwrap();
+        assert!(r.is_none());
+    }
+}

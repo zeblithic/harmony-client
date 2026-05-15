@@ -8,6 +8,7 @@ use harmony_runtime::{NodeConfig, NodeRuntime};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
+pub mod backup_state;
 pub mod community_channel_log;
 pub mod community_channel_log_engine;
 pub mod community_fork;
