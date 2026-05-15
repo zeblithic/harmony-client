@@ -87,22 +87,24 @@ KDF parameters (m=64 MiB, t=3, p=1) and AEAD primitive (XChaCha20-Poly1305) are 
 
 ```text
 OwnerStateSnapshot = {
-  "v":    uint,                                // = 1; bump if snapshot shape changes
-  "addr": bstr(16),                            // owner address; binds snapshot to one identity
-  "at":   HLC,                                 // export-time HLC; drives GUI staleness UI
-  "tree": canonical-CBOR(OwnerState),          // exactly owner_state_persist::canonicalize() output
+  "vn": uint,                                  // = 1; bump if snapshot shape changes
+  "oa": bstr(16),                              // owner address; binds snapshot to one identity
+  "at": HLC,                                   // export-time HLC; drives GUI staleness UI
+  "tr": canonical-CBOR(OwnerState),            // exactly owner_state_persist::canonicalize() output
 }
 
-HLC = { "wall_ms": uint, "logical": uint, "device_id": tstr }
+HLC = { "w": uint, "l": uint, "d": tstr }      // same as existing wire format (see owner_state_types.rs)
 ```
 
 Canonical CBOR rules (RFC 8949 §4.2): bytewise-sorted map keys, shortest-form integers, definite-length collections, no tags, no floats.
 
+**Same-length-keys invariant** (project convention used in `community_*` and `dm_envelope` modules): all four top-level keys are 2 characters so they all encode to CBOR `text(2)` (0x62 + 2 bytes). Keeps the sort logic trivial — bytewise lexicographic order on the 2-char ASCII collapses to plain ASCII order. The HLC's `w` / `l` / `d` keys all encode to `text(1)` for the same reason at the nested level.
+
 ### Bindings load-bearing
 
-- **`addr`**: bound at export time, verified at restore time against the HRMR-derived identity. Prevents accidentally pairing one user's HRMR with another's HRSS sidecar (or a deliberately-mismatched malicious pair).
+- **`oa`**: owner address bound at export time, verified at restore time against the HRMR-derived identity. Prevents accidentally pairing one user's HRMR with another's HRSS sidecar (or a deliberately-mismatched malicious pair).
 - **`at`**: drives the GUI staleness warning by comparing against the current owner-state's most-recent `updated_at` HLC.
-- **`v`**: snapshot format version. Lets the inner shape evolve (e.g., add fields, change CBOR layout) without bumping the envelope magic.
+- **`vn`**: snapshot format version number. Lets the inner shape evolve (e.g., add fields, change CBOR layout) without bumping the envelope magic.
 
 ### Backwards compatibility
 
@@ -141,12 +143,12 @@ harmony-app restore mnemonic --mnemonic-file PATH [--force]
 
 | Condition | Behavior |
 |---|---|
-| `PATH.state` exists, `--ignore-state` NOT passed | Read HRMR → restore seed. Read HRSS → AEAD-verify → CBOR-decode → verify `addr` matches restored identity → write `tree` to `~/.harmony/owner_state.cbor` atomically. Stderr: `restored identity-hash: <hex>\nowner-state snapshot: N spaces, exported <ago>` |
+| `PATH.state` exists, `--ignore-state` NOT passed | Read HRMR → restore seed. Read HRSS → AEAD-verify → CBOR-decode → verify `oa` (owner-addr) matches restored identity → write `tr` (tree) to `~/.harmony/owner_state.cbor` atomically. Stderr: `restored identity-hash: <hex>\nowner-state snapshot: N spaces, exported <ago>` |
 | `PATH.state` exists, `--ignore-state` passed | Restore identity only; warn `state sidecar found but ignored per flag` |
 | `PATH.state` does NOT exist | Restore identity only; stderr: `no state sidecar found at <PATH.state>; nav tree will be empty post-restore (or sync from surviving peers)` |
-| HRSS `addr` does not match HRMR-derived identity | **Hard fail.** `Error: state sidecar identity mismatch — HRSS addr <X> != restored identity <Y>` |
+| HRSS `oa` does not match HRMR-derived identity | **Hard fail.** `Error: state sidecar identity mismatch — HRSS addr <X> != restored identity <Y>` |
 | HRSS decrypts but CBOR is malformed | **Hard fail.** Operator-actionable; should not silently degrade. |
-| HRSS `v` field is unknown (future version) | **Hard fail.** `state snapshot format version N not supported; please update harmony-app` |
+| HRSS `vn` field is unknown (future version) | **Hard fail.** `state snapshot format version N not supported; please update harmony-app` |
 | HRSS wrong passphrase | AEAD tag rejected. Same error idiom as HRMR (no fingerprinting). |
 | `~/.harmony/owner_state.cbor` already exists and `--force` NOT passed | Refuse with same idiom as HRMR refusal. `--force` overwrites atomically. |
 
@@ -241,9 +243,9 @@ The HRSS envelope uses the **same** passphrase as HRMR — resolved via `HARMONY
 |---|---|
 | HRSS file missing at `PATH.state` | Restore identity only. Engine boots with empty owner-state. Flow A may populate if surviving peers exist; otherwise user starts fresh nav-tree. |
 | HRSS present but wrong passphrase | AEAD tag rejected. Same error idiom as HRMR: `wrong passphrase or corrupted recovery file`. Restore aborts before any disk write. |
-| HRSS `addr` field doesn't match HRMR-derived identity | Hard fail. Prevents accidentally pairing HRMR + HRSS from different owners. |
+| HRSS `oa` field doesn't match HRMR-derived identity | Hard fail. Prevents accidentally pairing HRMR + HRSS from different owners. |
 | HRSS CBOR malformed after decrypt | Hard fail with actionable diagnostic. Indicates upstream corruption or wrong-version sidecar. |
-| HRSS `v` field is unknown (future version) | Hard fail: `state snapshot format version N not supported; please update harmony-app` |
+| HRSS `vn` field is unknown (future version) | Hard fail: `state snapshot format version N not supported; please update harmony-app` |
 | HRSS snapshot HLC older than newly-published peer state | No special handling. Flow A's CRDT merge resolves naturally. |
 | Owner-state file already exists at `~/.harmony/owner_state.cbor` (operator re-running restore) and `--force` NOT passed | Refuse with same idiom as HRMR refusal. `--force` overwrites. |
 | Export attempted but no owner-state file on disk | Emit HRMR only + stderr note. Operator-actionable; non-fatal. |
@@ -290,7 +292,7 @@ The HRSS envelope uses the **same** passphrase as HRMR — resolved via `HARMONY
 `src-tauri/src/state_snapshot.rs`:
 
 1. `hrss_envelope_round_trip` — encode + decode a small `OwnerStateSnapshot` with known seed/passphrase → assert byte-identical state after decode.
-2. `hrss_addr_binding_rejects_cross_identity` — encode HRSS for owner A, attempt to decode under restored identity B → AEAD verify succeeds (passphrase is right) but `addr` check rejects.
+2. `hrss_addr_binding_rejects_cross_identity` — encode HRSS for owner A, attempt to decode under restored identity B → AEAD verify succeeds (passphrase is right) but `oa` (owner-addr) check rejects.
 3. `hrss_wrong_passphrase` — encode HRSS, decode with different passphrase → AEAD tag rejected.
 4. `hrss_unknown_version_rejected` — synthesize an HRSS with `v: 99` → decode fails with version-unsupported error.
 5. `hrss_canonical_cbor_stability` — encode the same `OwnerState` value twice (deterministic-nonce variant for the fixture), assert byte-identical HRSS output.
@@ -350,8 +352,8 @@ The HRSS envelope uses the **same** passphrase as HRMR — resolved via `HARMONY
 3. `harmony-app restore recovery-file --in PATH` auto-detects `PATH.state` and restores both identity and owner-state.
 4. `harmony-app restore recovery-file --in PATH --ignore-state` restores identity only even if sidecar exists.
 5. Round-trip: export pair → wipe identity + owner-state → restore pair → derived identity_hash matches original AND `owner_state.cbor` byte-identical.
-6. HRSS `addr` mismatch with restored identity hard-fails with actionable error.
-7. HRSS unknown version (`v != 1`) hard-fails with actionable error.
+6. HRSS `oa` (owner-addr) mismatch with restored identity hard-fails with actionable error.
+7. HRSS unknown version (`vn != 1`) hard-fails with actionable error.
 8. HRSS wrong passphrase fails with the same idiom as HRMR (no fingerprinting).
 9. Pre-ZEB-213 HRMR-only files restore successfully with empty owner-state (backwards compat).
 10. GUI Export wizard offers "Include nav tree + DM history" toggle, default ON; completion screen lists both artifacts with sizes.
