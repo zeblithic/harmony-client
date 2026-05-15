@@ -122,14 +122,35 @@ pub fn encode_snapshot(
     use rand::RngCore;
     rand::thread_rng().fill_bytes(&mut salt);
     rand::thread_rng().fill_bytes(&mut nonce);
-    encode_snapshot_with_params(passphrase, addr, at, state, &salt, &nonce)
+    encode_snapshot_inner(passphrase, addr, at, state, &salt, &nonce)
 }
 
 /// Deterministic variant — same crypto, caller-supplied salt + nonce.
 /// Used by `test-fixtures` for byte-pinning. Production code must call
 /// `encode_snapshot` to ensure fresh entropy.
+///
+/// **Security**: gated behind `#[cfg(any(test, feature = "test-fixtures"))]`
+/// so production builds cannot link this symbol. Catastrophic
+/// nonce-reuse on XChaCha20-Poly1305 leaks the keystream and
+/// authentication key — production code MUST NOT have access to this
+/// helper. Round-1 bot finding C4 (Qodo High Severity).
+#[cfg(any(test, feature = "test-fixtures"))]
 #[doc(hidden)]
 pub fn encode_snapshot_with_params(
+    passphrase: &[u8],
+    addr: OwnerAddr,
+    at: Hlc,
+    state: &OwnerState,
+    salt: &[u8; SALT_LEN],
+    nonce: &[u8; NONCE_LEN],
+) -> Result<Vec<u8>, SnapshotError> {
+    encode_snapshot_inner(passphrase, addr, at, state, salt, nonce)
+}
+
+/// Internal shared implementation. Crate-private — production callers
+/// reach it only through [`encode_snapshot`] (random salt/nonce); test
+/// fixtures reach it through [`encode_snapshot_with_params`].
+fn encode_snapshot_inner(
     passphrase: &[u8],
     addr: OwnerAddr,
     at: Hlc,

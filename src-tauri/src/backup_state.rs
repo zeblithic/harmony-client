@@ -111,6 +111,14 @@ pub struct StalenessResult {
 /// `dismiss_until_wall_ms` is the localStorage-tracked dismissal expiry
 /// (or `None` if the user has never dismissed). When `Some(t)` and `t >
 /// now_wall_ms`, suppress the banner regardless of staleness.
+///
+/// **`include_state` semantics** — a `LastBackup` record with
+/// `include_state == false` reflects an identity-only export (HRMR only;
+/// `--no-state` or GUI toggle off). Those backups DO NOT reset
+/// state-staleness because they didn't back up owner-state. The function
+/// treats them as if no backup had been taken for staleness purposes
+/// (falling through to the `None` branch's last-mutation-baseline logic).
+/// Bots: C1 (Qodo/CodeAnt/CodeRabbit/Cursor, 4-way agreement).
 pub fn should_warn_about_stale_backup(
     now_wall_ms: u64,
     last_backup: Option<&LastBackup>,
@@ -127,13 +135,19 @@ pub fn should_warn_about_stale_backup(
     }
 
     let last_mutation = last_mutation_wall_ms(state);
-    match last_backup {
+    // An identity-only backup (include_state == false) does NOT reset
+    // state-staleness — owner-state was not backed up, so the staleness
+    // baseline remains the last mutation (just like the `None` branch).
+    // See C1 in the round-1 bot findings.
+    let effective_backup = last_backup.filter(|b| b.include_state);
+    match effective_backup {
         None => {
-            // No backup ever taken. Apply the same 14-day grace window as
-            // the `Some` branch — a fresh-install user only gets the
-            // banner after their mutations have been unbacked-up for
-            // ≥14 days. Without this symmetry, the first DM would
-            // trigger an immediate "BACKUP NOW" banner on day-0 installs.
+            // No state-backup baseline. Apply the 14-day grace window
+            // against the last mutation — a fresh-install user (or a
+            // user whose only backups were identity-only) gets the banner
+            // when their mutations have been unbacked-up for ≥14 days.
+            // Without this grace, the first DM would trigger an immediate
+            // "BACKUP NOW" banner on day-0 installs.
             let stale = last_mutation > 0 && now_wall_ms > last_mutation + STALENESS_THRESHOLD_MS;
             let days = if last_mutation > 0 {
                 ((now_wall_ms.saturating_sub(last_mutation)) / 86_400_000) as u32
@@ -324,5 +338,51 @@ mod tests {
         let path = dir.path().join("never_written.json");
         let r = load_last_backup(&path).unwrap();
         assert!(r.is_none());
+    }
+
+    /// Round-1 bot finding C1: a `LastBackup` record with
+    /// `include_state == false` (identity-only export) must NOT suppress
+    /// the state-staleness banner — owner-state was never backed up, so
+    /// the staleness baseline is the last mutation, not `b.at`.
+    ///
+    /// 4-way bot agreement (Qodo + CodeAnt + CodeRabbit + Cursor).
+    #[test]
+    fn staleness_with_identity_only_backup_does_not_suppress_banner() {
+        let now_ms = 100 * 86_400_000;
+        // Recent identity-only "backup" 1 day ago. Under the pre-fix
+        // behavior, this would suppress staleness because `b.at` was
+        // less than 14 days old. Under the fix, the `include_state ==
+        // false` flag makes the function treat this as "no state-backup
+        // baseline" and fall through to the last-mutation logic.
+        let last = LastBackup {
+            at: hlc(now_ms - 86_400_000), // 1 day ago — RECENT
+            include_state: false,
+            out_path: "/tmp/r.bin".into(),
+        };
+        // Mutations from 20 days ago — older than the 14-day staleness
+        // threshold. Should produce `is_stale: true`.
+        let state = state_with_mutation_at(now_ms - 20 * 86_400_000);
+        let r = should_warn_about_stale_backup(now_ms, Some(&last), &state, None);
+        assert!(
+            r.is_stale,
+            "identity-only backup must NOT reset state-staleness; got: {r:?}"
+        );
+        assert_eq!(
+            r.days_since, 20,
+            "days_since must reflect last-mutation baseline (20d), not last-backup baseline (1d)"
+        );
+
+        // Sanity: same setup but `include_state: true` — backup IS the
+        // baseline and the banner is suppressed (1 day old < 14 days).
+        let last_with_state = LastBackup {
+            at: hlc(now_ms - 86_400_000),
+            include_state: true,
+            out_path: "/tmp/r.bin".into(),
+        };
+        let r = should_warn_about_stale_backup(now_ms, Some(&last_with_state), &state, None);
+        assert!(
+            !r.is_stale,
+            "state-inclusive backup 1 day ago should suppress; got: {r:?}"
+        );
     }
 }

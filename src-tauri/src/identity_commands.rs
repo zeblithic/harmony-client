@@ -415,22 +415,35 @@ pub fn restore_mnemonic_from_words_helper(
 /// this out explicitly: `preview_recovery_state_sidecar` is informational
 /// only (space count for UX); the actual sidecar restore happens here
 /// and is verified for addr-binding against the cached seed's owner-addr.
-/// A swap of the `.state` file between preview and commit therefore fails
-/// the addr-binding check and cleanly hard-fails AFTER the identity has
-/// already been written (acceptable: identity restore is the primary goal
-/// of the operation and is TOCTOU-bound; state restore is secondary).
+///
+/// **Order of operations** (round-1 bot finding C2 — Cursor High):
+/// 1. Sidecar decode + AEAD verify (CBOR + key check)
+/// 2. Sidecar addr-binding verify against cached seed's owner-addr
+/// 3. Identity write
+/// 4. owner-state write
+///
+/// Identity must NOT be written before sidecar verification — otherwise
+/// a corrupt/swapped sidecar produces a partial-write state where the
+/// identity is restored but owner-state silently fails. This mirrors
+/// `recovery_cli::restore_recovery_file_pair_with_keychain` (which
+/// already does sidecar metadata before identity write).
 ///
 /// Errors:
 /// - **invalid token** (unknown UUID, expired, or already consumed): the
 ///   on-disk identity is untouched. The GUI will surface this and ask the
 ///   user to re-pick the recovery file.
-/// - **disk write failure**: the cache entry has already been consumed
-///   (we cannot tell whether the partial write succeeded), so the user
-///   must re-preview before retrying. Identity may be partially written;
-///   retry with the same backup is safe (`force=true`).
-/// - **sidecar failure** (missing/corrupt/addr-mismatch): identity has
-///   already been written successfully. The error message makes the
-///   partial-success state explicit per `metadata-before-irreversible-write`.
+/// - **sidecar decode/verify failure** (missing-after-preview / corrupt /
+///   addr-mismatch): on-disk identity is untouched. Error message tells
+///   the operator what failed (no partial-success language since identity
+///   wasn't written yet).
+/// - **identity write failure**: cache entry already consumed (token is
+///   single-use); identity may be partially written; retry with the same
+///   backup is safe (`force=true`).
+/// - **owner-state write failure** (only reachable AFTER identity is
+///   already written): error prefixed with
+///   `"identity restored but owner-state ..."` — operator-actionable
+///   partial-success per `metadata-before-irreversible-write`. Round-1
+///   bot finding C3.
 pub fn restore_recovery_from_preview_token_helper(
     plaintext_path: &Path,
     preview_token: &str,
@@ -445,6 +458,44 @@ pub fn restore_recovery_from_preview_token_helper(
         "preview expired or already used; re-pick the recovery file to continue".to_string()
     })?;
 
+    // Sidecar restore path (ZEB-213). Mirrors the sidecar block in
+    // `recovery_cli::restore_recovery_file_pair_with_keychain` — the
+    // `.state` file IS re-read here, but BEFORE the identity write so
+    // an addr-mismatch (or corrupt sidecar) cannot leave the user with
+    // a partial restore (identity rewritten, owner-state untouched).
+    //
+    // Decoded snapshot stash for the post-identity-write step. `None`
+    // when ignore_state is true or no sidecar exists.
+    let harmony_dir = plaintext_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let snapshot: Option<crate::state_snapshot::OwnerStateSnapshot> = if !ignore_state {
+        let sidecar = recovery_cli::sidecar_path(&in_path);
+        if sidecar.exists() {
+            let snap = crate::state_snapshot::decode_snapshot_file(
+                passphrase.expose_secret().as_bytes(),
+                &sidecar,
+            )
+            .map_err(|e| format!("state sidecar: {e}"))?;
+            let addr = recovery_cli::derive_owner_addr_from_seed(&seed);
+            crate::state_snapshot::verify_snapshot_addr(&snap, &addr.0)
+                .map_err(|e| format!("state sidecar: {e}"))?;
+            Some(snap)
+        } else {
+            // sidecar absent + !ignore_state: silent success — identity-only
+            // restore. The GUI's "Restore both?" prompt would only have
+            // offered ignore_state=false when a sidecar was present at
+            // preview-time, but we don't error if it disappeared between
+            // preview and commit (a missing sidecar is indistinguishable
+            // from the legacy HRMR-only case).
+            None
+        }
+    } else {
+        None
+    };
+
+    // All sidecar metadata is verified — now safe to write identity.
     // force=true: caller has obtained explicit user confirmation via TypeToConfirmDialog.
     identity::write_seed_to_disk_with_keychain(
         plaintext_path,
@@ -454,52 +505,20 @@ pub fn restore_recovery_from_preview_token_helper(
     )
     .map_err(|e| e.to_string())?;
 
-    // Sidecar restore path (ZEB-213). Mirrors the sidecar block in
-    // `recovery_cli::restore_recovery_file_pair_with_keychain` but uses
-    // the token-cached seed for addr-binding (so TOCTOU on HRMR is
-    // preserved: identity comes from the cached seed, not from re-reading
-    // the recovery file).
-    //
-    // The `.state` file IS re-read here — this is by design. The plan
-    // accepts that the sidecar is informational at preview and authoritative
-    // at commit; addr-binding catches the swap case (the verification
-    // hard-fails after identity is already written).
-    if !ignore_state {
-        let sidecar = recovery_cli::sidecar_path(&in_path);
-        if sidecar.exists() {
-            // harmony_dir = plaintext_path.parent() (production wires
-            // <harmony>/identity.key; matches `export_recovery_file_to_path_helper`).
-            let harmony_dir = plaintext_path
-                .parent()
-                .map(std::path::Path::to_path_buf)
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            let state_path = recovery_cli::owner_state_path(&harmony_dir);
-
-            let snap = crate::state_snapshot::decode_snapshot_file(
-                passphrase.expose_secret().as_bytes(),
-                &sidecar,
-            )
-            .map_err(|e| format!("state sidecar: {e}"))?;
-            let addr = recovery_cli::derive_owner_addr_from_seed(&seed);
-            crate::state_snapshot::verify_snapshot_addr(&snap, &addr.0)
-                .map_err(|e| format!("state sidecar: {e}"))?;
-
-            // force=true: same gate as the identity write above (user
-            // already passed TypeToConfirmDialog). save_atomically writes
-            // the canonical bytes verbatim — load_crdt parses that same
-            // shape, mirroring the pair-helper's tempfile composition.
-            if let Err(e) = crate::owner_state_persist::save_atomically(&state_path, &snap.tree) {
-                return Err(format!(
-                    "identity restored but owner-state write failed: {e}"
-                ));
-            }
+    // Identity is now on disk. The owner-state write below is the only
+    // operation that can leave a partial-success state; its error must
+    // be prefixed accordingly so the operator knows identity DID land.
+    if let Some(snap) = snapshot {
+        let state_path = recovery_cli::owner_state_path(&harmony_dir);
+        // force=true: same gate as the identity write above (user
+        // already passed TypeToConfirmDialog). save_atomically writes
+        // the canonical bytes verbatim — load_crdt parses that same
+        // shape, mirroring the pair-helper's tempfile composition.
+        if let Err(e) = crate::owner_state_persist::save_atomically(&state_path, &snap.tree) {
+            return Err(format!(
+                "identity restored but owner-state write failed: {e}"
+            ));
         }
-        // sidecar absent + !ignore_state: silent success — identity-only
-        // restore. The GUI's "Restore both?" prompt would only have
-        // offered ignore_state=false when a sidecar was present at
-        // preview-time, but we don't error if it disappeared between
-        // preview and commit (a missing sidecar is indistinguishable
-        // from the legacy HRMR-only case).
     }
 
     Ok(info)
@@ -1311,6 +1330,106 @@ mod tests {
         assert!(
             err.contains("invalid preview token"),
             "error must say invalid token; got: {err}"
+        );
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    /// Round-1 bot finding C2 (Cursor High Severity):
+    /// `metadata-before-irreversible-write` requires the sidecar
+    /// addr-binding check to happen BEFORE the identity is written. A
+    /// mismatched sidecar (HRMR for seed A, HRSS for seed B, picked
+    /// during the preview step somehow) must leave the on-disk identity
+    /// untouched — not produce a partial-success state where identity
+    /// got overwritten before the addr check failed.
+    ///
+    /// The setup:
+    /// - Plant identity B on disk.
+    /// - Synthesize a recovery file encrypting seed A.
+    /// - Synthesize a sidecar bound to seed B's owner-addr.
+    /// - Preview → cache seed A under a token.
+    /// - Commit by token → sidecar's `oa` is B's, cached seed is A's → mismatch.
+    /// - Assert identity B is still on disk byte-for-byte.
+    #[test]
+    #[serial]
+    fn token_restore_addr_mismatch_leaves_identity_untouched() {
+        use crate::owner_state_crdt::OwnerState;
+        use crate::state_snapshot::encode_snapshot;
+        use harmony_owner::lifecycle::RecoveryArtifact;
+        use harmony_owner::recovery::RecoveryMetadata;
+        use secrecy::SecretString;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let recovery_path = dir.path().join("rec.bin");
+        let sidecar_path = recovery_cli::sidecar_path(&recovery_path);
+        let harmony_dir = plaintext_path.parent().unwrap();
+        let state_path = recovery_cli::owner_state_path(harmony_dir);
+
+        std::env::set_var("HARMONY_PASSPHRASE", "addr-mismatch-test");
+
+        // Plant identity B (this is what's on disk before the restore attempt).
+        let seed_b = [0xBBu8; 32];
+        plant_seed(&plaintext_path, &seed_b);
+        let enc_path = plaintext_path.with_file_name("identity.enc");
+        let identity_b_bytes = std::fs::read(&enc_path).expect("read identity B");
+
+        // Sanity: no owner-state file at start.
+        let _ = std::fs::remove_file(&state_path);
+
+        clear_preview_cache();
+
+        // Synthesize a recovery file for seed A — DIFFERENT from B.
+        let seed_a = [0xAAu8; 32];
+        let artifact_a = RecoveryArtifact::from_seed(seed_a);
+        let pass = SecretString::from("pass".to_string());
+        let bytes_a = artifact_a
+            .to_encrypted_file(&pass, &RecoveryMetadata::default())
+            .unwrap();
+        std::fs::write(&recovery_path, &bytes_a).unwrap();
+
+        // Synthesize an HRSS sidecar bound to B's owner-addr, encrypted
+        // with the same passphrase. Decode + addr-verify will pass the
+        // CBOR/AEAD layer but fail the addr-binding check against the
+        // CACHED seed (A's owner-addr).
+        let addr_b = recovery_cli::derive_owner_addr_from_seed(&seed_b);
+        let state = OwnerState::default();
+        let hrss = encode_snapshot(
+            b"pass",
+            addr_b,
+            crate::owner_state_types::Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            &state,
+        )
+        .expect("encode HRSS for B");
+        std::fs::write(&sidecar_path, &hrss).unwrap();
+
+        // Preview A. The cache now holds A's seed.
+        let preview = preview_recovery_file_helper(&recovery_path, "pass").expect("preview");
+
+        // Commit by token. The sidecar's `oa` is B's, the cached seed is
+        // A's → addr-binding mismatch. Must fail BEFORE writing identity.
+        let err = restore_recovery_from_preview_token_helper(
+            &plaintext_path,
+            &preview.preview_token,
+            /*ignore_state=*/ false,
+            None,
+        )
+        .expect_err("addr mismatch must fail");
+        assert!(
+            err.contains("state sidecar") && err.contains("identity mismatch"),
+            "error must surface the addr-binding failure; got: {err}"
+        );
+
+        // Load-bearing assertion: identity B is still on disk byte-for-byte.
+        // Pre-fix (identity written before sidecar verify), this would be A.
+        let after = std::fs::read(&enc_path).expect("read after");
+        assert_eq!(
+            after, identity_b_bytes,
+            "identity must NOT be overwritten when sidecar addr-binding fails"
         );
 
         std::env::remove_var("HARMONY_PASSPHRASE");
