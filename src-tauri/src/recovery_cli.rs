@@ -305,7 +305,9 @@ pub fn export_recovery_file_pair_with_keychain(
             include_state: false,
             out_path: out.display().to_string(),
         };
-        let _ = save_last_backup(&last_backup_path(harmony_dir), &last);
+        if let Err(e) = save_last_backup(&last_backup_path(harmony_dir), &last) {
+            tracing::warn!("failed to persist last_backup.json: {e}");
+        }
         return Ok(ExportResult {
             hrmr_path: out.to_path_buf(),
             hrss_path: None,
@@ -315,12 +317,20 @@ pub fn export_recovery_file_pair_with_keychain(
     }
 
     // 3. Build snapshot + write HRSS.
-    let state = load_crdt(&state_path).map_err(|e| {
-        format!(
-            "failed to load owner-state from {}: {e}",
-            state_path.display()
-        )
-    })?;
+    // Mirror the encode/write rollback paths: a load_crdt failure here
+    // (e.g. a TOCTOU race where the state file is removed between the
+    // exists() check above and this read) must roll back the just-written
+    // HRMR so the operator isn't stranded with a mismatched half-pair.
+    let state = match load_crdt(&state_path) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = std::fs::remove_file(out);
+            return Err(format!(
+                "failed to load owner-state from {} (HRMR rolled back): {e}",
+                state_path.display()
+            ));
+        }
+    };
     use secrecy::ExposeSecret;
     let addr = derive_owner_addr_from_seed(&seed);
     let at = now_hlc();
@@ -333,7 +343,7 @@ pub fn export_recovery_file_pair_with_keychain(
     .map_err(|e| {
         // HRSS encode failure — best-effort cleanup of HRMR.
         let _ = std::fs::remove_file(out);
-        format!("failed to encode state sidecar: {e}")
+        format!("failed to encode state sidecar: {e} (HRMR rolled back)")
     })?;
 
     if let Err(e) = crate::identity::write_atomic_0600(&sidecar, &hrss_bytes) {
@@ -349,7 +359,9 @@ pub fn export_recovery_file_pair_with_keychain(
         include_state: true,
         out_path: out.display().to_string(),
     };
-    let _ = save_last_backup(&last_backup_path(harmony_dir), &last);
+    if let Err(e) = save_last_backup(&last_backup_path(harmony_dir), &last) {
+        tracing::warn!("failed to persist last_backup.json: {e}");
+    }
 
     Ok(ExportResult {
         hrmr_path: out.to_path_buf(),
@@ -421,11 +433,14 @@ pub fn restore_recovery_file_pair_with_keychain(
         ));
     }
 
-    // Stash the snapshot's at.wall_ms before the snapshot is consumed by the
-    // save_atomically call below. The stderr report sources from this value,
-    // NOT from last_backup.json — on a fresh-machine restore (the canonical
-    // happy path) last_backup.json is absent and would yield 0.
-    let snap_at_wall_ms = snapshot.as_ref().map(|s| s.at.wall_ms);
+    // Stash the snapshot's full HLC before the snapshot is consumed by the
+    // save_atomically call below. The stderr report's wall_ms sources from
+    // this value, NOT from last_backup.json — on a fresh-machine restore
+    // (the canonical happy path) last_backup.json is absent and would
+    // yield 0. The full HLC (logical + device_id) is preserved in
+    // RestoreResult for future GUI callers (Task 9) that may want to
+    // surface "exported from device X".
+    let snap_at: Option<Hlc> = snapshot.as_ref().map(|s| s.at.clone());
 
     // Now safe to write identity.
     identity::write_seed_to_disk_with_keychain(plaintext_path, &seed_bytes, force, keychain)?;
@@ -436,19 +451,34 @@ pub fn restore_recovery_file_pair_with_keychain(
         // canonicalize() returns [schema_v2, ...cbor]; load_crdt parses
         // that same shape — so we route through a tempfile of the
         // exact bytes rather than re-deserialize the tree via ciborium.
-        crate::owner_state_persist::save_atomically(&state_path, &snap.tree)
-            .map_err(|e| format!("failed to write {}: {e}", state_path.display()))?;
-        // Reload to count Spaces for the confirmation message.
-        let state = load_crdt(&state_path).map_err(|e| e.to_string())?;
-        state.spaces.len()
+        //
+        // Per the metadata-before-irreversible-write rule, identity has
+        // ALREADY been written by this point. A save failure here is a
+        // genuine error, but the message must make the partial-success
+        // state explicit so the operator can recover (their identity is
+        // restored; only the state sidecar didn't land).
+        if let Err(e) = crate::owner_state_persist::save_atomically(&state_path, &snap.tree) {
+            return Err(format!(
+                "identity restored but owner-state write failed: {e}"
+            ));
+        }
+        // Best-effort reload to count Spaces for the confirmation message.
+        // A reload failure here MUST NOT convert a successful state save
+        // into surfaced Err (per metadata-before-irreversible-write); we
+        // degrade gracefully to "0 spaces" in the stderr report.
+        load_crdt(&state_path)
+            .ok()
+            .map(|s| s.spaces.len())
+            .unwrap_or(0)
     } else {
         0
     };
 
     eprintln!("restored identity-hash: {}", hex::encode(id_hash));
-    if let Some(wall_ms) = snap_at_wall_ms {
+    if let Some(ref hlc) = snap_at {
         eprintln!(
-            "owner-state snapshot: {spaces_restored} spaces, exported {wall_ms} ms wall-clock"
+            "owner-state snapshot: {spaces_restored} spaces, exported {} ms wall-clock",
+            hlc.wall_ms
         );
     } else if sidecar.exists() && ignore_state {
         eprintln!("state sidecar found but ignored per flag");
@@ -463,7 +493,7 @@ pub fn restore_recovery_file_pair_with_keychain(
         identity_hash: id_hash,
         spaces_restored,
         sidecar_present: want_sidecar,
-        snapshot_at_wall_ms: snap_at_wall_ms,
+        snapshot_at: snap_at,
     })
 }
 
@@ -472,7 +502,11 @@ pub struct RestoreResult {
     pub identity_hash: [u8; 16],
     pub spaces_restored: usize,
     pub sidecar_present: bool,
-    pub snapshot_at_wall_ms: Option<u64>,
+    /// Full export-time HLC from the snapshot (when a sidecar was
+    /// restored). Preserves `logical` + `device_id` in addition to
+    /// `wall_ms` so callers (Task 9 GUI) can surface "exported from
+    /// device X at time T". CLI stderr surfaces only `wall_ms`.
+    pub snapshot_at: Option<Hlc>,
 }
 
 /// Derive the 16-byte owner address from a 32-byte seed.
@@ -1466,8 +1500,10 @@ mod tests {
         .expect("restore");
         assert!(result.sidecar_present);
         let reported = result
-            .snapshot_at_wall_ms
-            .expect("restore result must carry snapshot wall_ms when sidecar restored");
+            .snapshot_at
+            .as_ref()
+            .expect("restore result must carry snapshot HLC when sidecar restored")
+            .wall_ms;
         // Must be the actual snapshot's at.wall_ms — a NONZERO sane value, NOT 0.
         assert!(
             reported > 0,
