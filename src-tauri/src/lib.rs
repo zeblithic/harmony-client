@@ -13372,6 +13372,254 @@ async fn list_recent_moderation_events(
     Ok(dtos)
 }
 
+// ── ZEB-254 Task 12: list_pending_joins + list_recent_counter_signs ──────────
+//
+// Admin audit feed IPCs. Both read the raw signed event log from the
+// community engine (same Arc<Mutex<CommunityState>> as list_recent_
+// moderation_events), apply lightweight filter+sort in-process, and
+// return DTOs. No state mutation.
+
+/// DTO returned by `list_pending_joins`. One entry per PendingJoin event
+/// that has no matching JoinCountersign and is within the 30-day window.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingJoinDto {
+    /// Hex-encoded EventId of the PendingJoin (16 bytes → 32 hex chars).
+    pub event_id: String,
+    /// Hex-encoded OwnerAddr of the joiner (16 bytes → 32 hex chars).
+    pub joiner_addr: String,
+    /// HLC at which the joiner published the PendingJoin.
+    pub pending_at_hlc: crate::community_channel_log_engine::HlcDto,
+    /// Optional invitee_hint from the InviteToken, hex-encoded if present.
+    pub invitee_hint: Option<String>,
+}
+
+/// ZEB-254: admin audit feed — pending joins awaiting counter-sign.
+/// Returns PendingJoin events without a matching JoinCountersign AND
+/// within the 30-day expiry window. Sorted by pending_at_hlc ascending.
+///
+/// Errors: same hex/registry/Space-row path as `list_community_members`.
+#[tauri::command]
+async fn list_pending_joins(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+) -> Result<Vec<PendingJoinDto>, String> {
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let registry = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.community_registry
+            .clone()
+            .ok_or("no community_registry — node not running?")?
+    };
+
+    let engine_state = registry.state_for(&space_id).await.ok_or_else(|| {
+        format!(
+            "no engine for community {} — not joined or not yet started",
+            hex::encode(space_id.0)
+        )
+    })?;
+
+    let raw_events: Vec<crate::community_membership::SignedMembershipEvent> = {
+        let g = engine_state.lock().await;
+        g.events.values().cloned().collect()
+    };
+
+    Ok(filter_pending_joins(&raw_events))
+}
+
+/// Pure filter: given the raw event log, return PendingJoin DTOs that
+/// have no matching JoinCountersign and are within the 30-day window.
+/// Sorted oldest-first by (wall_ms, logical).
+///
+/// Extracted so unit tests can exercise the logic without a full NodeState.
+pub fn filter_pending_joins(
+    events: &[crate::community_membership::SignedMembershipEvent],
+) -> Vec<PendingJoinDto> {
+    // Use the maximum wall_ms in the log as "current time" (same approach
+    // as materialize in community_membership.rs).
+    let max_wall_ms: u64 = events.iter().map(|e| e.at.wall_ms).max().unwrap_or(0);
+    let expiry_threshold =
+        max_wall_ms.saturating_sub(crate::community_membership::MATERIALIZE_PENDING_EXPIRY_MS);
+
+    // Collect target_event_ids of all JoinCountersign events.
+    let countersigned: std::collections::HashSet<crate::community_membership::EventId> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            crate::community_membership::MembershipEventKind::JoinCountersign {
+                target_event_id,
+            } => Some(*target_event_id),
+            _ => None,
+        })
+        .collect();
+
+    let mut out: Vec<PendingJoinDto> = events
+        .iter()
+        .filter_map(|e| {
+            let invite_token = match &e.kind {
+                crate::community_membership::MembershipEventKind::PendingJoin {
+                    invite_token,
+                    ..
+                } => invite_token,
+                _ => return None,
+            };
+            // Skip if already countersigned.
+            if countersigned.contains(&e.id) {
+                return None;
+            }
+            // Skip if outside the 30-day expiry window.
+            if e.at.wall_ms < expiry_threshold {
+                return None;
+            }
+            Some(PendingJoinDto {
+                event_id: hex::encode(e.id),
+                joiner_addr: hex::encode(e.actor.0),
+                pending_at_hlc: crate::community_channel_log_engine::HlcDto {
+                    wall_ms: e.at.wall_ms,
+                    logical: e.at.logical,
+                    device_id: e.at.device_id.clone(),
+                },
+                invitee_hint: invite_token.invitee_hint.as_ref().map(|h| hex::encode(h.0)),
+            })
+        })
+        .collect();
+
+    out.sort_by_key(|p| (p.pending_at_hlc.wall_ms, p.pending_at_hlc.logical));
+    out
+}
+
+/// DTO returned by `list_recent_counter_signs`. One entry per self-authored
+/// JoinCountersign event, sorted recent-first, capped at `limit`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CounterSignDto {
+    /// Hex-encoded target_event_id (16 bytes → 32 hex chars).
+    pub join_event_id: String,
+    /// Hex-encoded OwnerAddr of the joiner (resolved from the PendingJoin
+    /// event; `"(unknown target)"` if the PendingJoin is missing from log).
+    pub joiner_addr: String,
+    /// HLC at which this JoinCountersign was signed.
+    pub countersigned_at_hlc: crate::community_channel_log_engine::HlcDto,
+}
+
+/// ZEB-254: admin audit feed — recent self-authored counter-signs.
+/// Sorted by countersigned_at_hlc descending. Pass limit=0 for default 20.
+///
+/// Errors: same hex/registry path as `list_recent_moderation_events`.
+#[tauri::command]
+async fn list_recent_counter_signs(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    limit: u32,
+) -> Result<Vec<CounterSignDto>, String> {
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+    let cap = if limit == 0 { 20 } else { limit as usize };
+
+    let (registry, self_owner) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.community_registry
+                .clone()
+                .ok_or("no community_registry — node not running?")?,
+            g.dm_self_owner
+                .ok_or("dm_self_owner missing — no owner identity?")?,
+        )
+    };
+
+    let engine_state = registry.state_for(&space_id).await.ok_or_else(|| {
+        format!(
+            "no engine for community {} — not joined or not yet started",
+            hex::encode(space_id.0)
+        )
+    })?;
+
+    let raw_events: Vec<crate::community_membership::SignedMembershipEvent> = {
+        let g = engine_state.lock().await;
+        g.events.values().cloned().collect()
+    };
+
+    Ok(filter_recent_counter_signs(&raw_events, self_owner, cap))
+}
+
+/// Pure filter: given the raw event log and the local owner's address,
+/// return `CounterSignDto`s for JoinCountersign events authored by
+/// `self_owner`, sorted by countersigned_at_hlc descending, truncated to
+/// `cap`.
+///
+/// Extracted so unit tests can exercise the logic without a full NodeState.
+pub fn filter_recent_counter_signs(
+    events: &[crate::community_membership::SignedMembershipEvent],
+    self_owner: crate::owner_state_types::OwnerAddr,
+    cap: usize,
+) -> Vec<CounterSignDto> {
+    // Build event_id → joiner_addr lookup from PendingJoin events.
+    let pending_actors: std::collections::HashMap<
+        crate::community_membership::EventId,
+        crate::owner_state_types::OwnerAddr,
+    > = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            crate::community_membership::MembershipEventKind::PendingJoin { .. } => {
+                Some((e.id, e.actor))
+            }
+            _ => None,
+        })
+        .collect();
+
+    let mut out: Vec<CounterSignDto> = events
+        .iter()
+        .filter(|e| e.actor == self_owner)
+        .filter_map(|e| {
+            let target_event_id = match &e.kind {
+                crate::community_membership::MembershipEventKind::JoinCountersign {
+                    target_event_id,
+                } => target_event_id,
+                _ => return None,
+            };
+            let joiner_addr = pending_actors
+                .get(target_event_id)
+                .map(|a| hex::encode(a.0))
+                .unwrap_or_else(|| "(unknown target)".into());
+            Some(CounterSignDto {
+                join_event_id: hex::encode(target_event_id),
+                joiner_addr,
+                countersigned_at_hlc: crate::community_channel_log_engine::HlcDto {
+                    wall_ms: e.at.wall_ms,
+                    logical: e.at.logical,
+                    device_id: e.at.device_id.clone(),
+                },
+            })
+        })
+        .collect();
+
+    out.sort_by(|a, b| {
+        b.countersigned_at_hlc
+            .wall_ms
+            .cmp(&a.countersigned_at_hlc.wall_ms)
+            .then_with(|| {
+                b.countersigned_at_hlc
+                    .logical
+                    .cmp(&a.countersigned_at_hlc.logical)
+            })
+    });
+    out.truncate(cap);
+    out
+}
+
 /// Delta payload for the `community-members-changed` Tauri event.
 /// Matches the spec line 561 wire shape:
 /// `{ communityId, changes: [{type, target, by?, detail?}] }`. One
@@ -14603,6 +14851,8 @@ pub fn run() {
             set_power_level,
             unban_from_community,
             list_recent_moderation_events,
+            list_pending_joins,
+            list_recent_counter_signs,
             create_channel,
             modify_channel,
             delete_channel,
@@ -16946,6 +17196,348 @@ mod unban_from_community_tests {
             dtos.iter().all(|d| d.hlc.wall_ms >= 300),
             "events at 100 and 200 must be truncated by limit=3"
         );
+    }
+}
+
+// ── ZEB-254 Task 12: list_pending_joins + list_recent_counter_signs unit tests ─
+//
+// These tests exercise the pure `filter_pending_joins` and
+// `filter_recent_counter_signs` helpers directly, bypassing the Tauri IPC
+// layer and NodeState. Events are inserted directly into a raw Vec so we can
+// control timestamps precisely without needing valid crypto signatures.
+// (End-to-end IPC coverage is deferred to Task 15.)
+#[cfg(test)]
+mod pending_join_audit_feed_tests {
+    use super::*;
+    use crate::community_invite::InviteToken;
+    use crate::community_membership::{MembershipEventKind, SignedMembershipEvent};
+    use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+
+    /// Build a minimal unsigned SignedMembershipEvent for filter testing.
+    /// Signature bytes are zeroed — the filter helpers never check sigs.
+    fn make_event(
+        id: [u8; 16],
+        actor: OwnerAddr,
+        wall_ms: u64,
+        kind: MembershipEventKind,
+        community_id: SpaceId,
+    ) -> SignedMembershipEvent {
+        SignedMembershipEvent {
+            id,
+            community_id,
+            kind,
+            actor,
+            at: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "test-device".into(),
+            },
+            sig: [0u8; 64],
+            countersig: None,
+        }
+    }
+
+    /// Build a minimal InviteToken for PendingJoin events in tests.
+    fn make_token(inviter: OwnerAddr, invitee_hint: Option<OwnerAddr>) -> InviteToken {
+        InviteToken {
+            inviter,
+            invitee_hint,
+            minted_at: Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "admin".into(),
+            },
+            expires_at: None,
+            sig: [0u8; 64],
+        }
+    }
+
+    // ── Test 1: list_pending_joins_returns_pending_only ───────────────────
+    //
+    // Seed four events:
+    //   A) PendingJoin, no countersign, within 30-day window → should appear
+    //   B) PendingJoin + JoinCountersign → should NOT appear (countersigned)
+    //   C) PendingJoin, expired (>30d before max_wall_ms) → should NOT appear
+    //   D) Join (plain) → should NOT appear (wrong kind)
+    //
+    // max_wall_ms is event A's wall_ms. Expiry threshold = max − 30d.
+    // Event C is placed at (max − 31d) so it falls outside the window.
+    #[tokio::test]
+    async fn list_pending_joins_returns_pending_only() {
+        let community_id = SpaceId([0xde; 16]);
+        let admin = OwnerAddr([0xaa; 16]);
+        let joiner_a = OwnerAddr([0x01; 16]);
+        let joiner_b = OwnerAddr([0x02; 16]);
+        let joiner_c = OwnerAddr([0x03; 16]);
+        let joiner_d = OwnerAddr([0x04; 16]);
+
+        // max_wall_ms will be this value (event A is the "newest").
+        const MAX_MS: u64 = 1_000_000_000_000;
+        const THIRTY_DAYS_MS: u64 = 30 * 86_400_000;
+        const EXPIRED_MS: u64 = MAX_MS - THIRTY_DAYS_MS - 1; // one ms past expiry
+
+        // A: un-countersigned, recent.
+        let ev_a = make_event(
+            [0x0a; 16],
+            joiner_a,
+            MAX_MS,
+            MembershipEventKind::PendingJoin {
+                invite_token: make_token(admin, None),
+                joiner_identity_pub: [0u8; 64],
+            },
+            community_id,
+        );
+
+        // B: PendingJoin that will be countersigned.
+        let ev_b = make_event(
+            [0x0b; 16],
+            joiner_b,
+            MAX_MS - 1_000,
+            MembershipEventKind::PendingJoin {
+                invite_token: make_token(admin, None),
+                joiner_identity_pub: [0u8; 64],
+            },
+            community_id,
+        );
+        // JoinCountersign targeting ev_b.
+        let ev_b_cs = make_event(
+            [0xb0; 16],
+            admin,
+            MAX_MS - 500,
+            MembershipEventKind::JoinCountersign {
+                target_event_id: [0x0b; 16],
+            },
+            community_id,
+        );
+
+        // C: expired PendingJoin (no countersign).
+        let ev_c = make_event(
+            [0x0c; 16],
+            joiner_c,
+            EXPIRED_MS,
+            MembershipEventKind::PendingJoin {
+                invite_token: make_token(admin, None),
+                joiner_identity_pub: [0u8; 64],
+            },
+            community_id,
+        );
+
+        // D: plain Join (should be filtered out by kind).
+        let ev_d = make_event(
+            [0x0d; 16],
+            joiner_d,
+            MAX_MS - 2_000,
+            MembershipEventKind::Join,
+            community_id,
+        );
+
+        let events = vec![ev_a, ev_b, ev_b_cs, ev_c, ev_d];
+        let result = filter_pending_joins(&events);
+
+        assert_eq!(
+            result.len(),
+            1,
+            "expected exactly 1 pending join; got {}: {result:?}",
+            result.len()
+        );
+        assert_eq!(
+            result[0].event_id,
+            hex::encode([0x0a; 16]),
+            "the single result must be event A"
+        );
+        assert_eq!(
+            result[0].joiner_addr,
+            hex::encode(joiner_a.0),
+            "joiner_addr must match joiner_a"
+        );
+        assert_eq!(
+            result[0].pending_at_hlc.wall_ms, MAX_MS,
+            "pending_at_hlc.wall_ms must be MAX_MS"
+        );
+        assert!(
+            result[0].invitee_hint.is_none(),
+            "invitee_hint must be None (token had no hint)"
+        );
+    }
+
+    // ── Test 2: list_pending_joins_invitee_hint_is_hex_encoded ───────────
+    //
+    // PendingJoin with invitee_hint set → result must carry the hex-encoded
+    // hint.
+    #[tokio::test]
+    async fn list_pending_joins_invitee_hint_is_hex_encoded() {
+        let community_id = SpaceId([0xef; 16]);
+        let admin = OwnerAddr([0xaa; 16]);
+        let hint_addr = OwnerAddr([0x42; 16]);
+        let joiner = OwnerAddr([0x01; 16]);
+
+        let ev = make_event(
+            [0x01; 16],
+            joiner,
+            1_000,
+            MembershipEventKind::PendingJoin {
+                invite_token: make_token(admin, Some(hint_addr)),
+                joiner_identity_pub: [0u8; 64],
+            },
+            community_id,
+        );
+
+        let result = filter_pending_joins(&[ev]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].invitee_hint.as_deref(),
+            Some(hex::encode(hint_addr.0).as_str()),
+            "invitee_hint must be hex-encoded OwnerAddr"
+        );
+    }
+
+    // ── Test 3: list_recent_counter_signs_returns_self_authored ──────────
+    //
+    // Seed: 2 JoinCountersigns by self_owner, 1 by another admin, 1 PendingJoin.
+    // Call filter_recent_counter_signs with cap=10.
+    // Expect: exactly 2 entries (only self-authored JoinCountersigns).
+    #[tokio::test]
+    async fn list_recent_counter_signs_returns_self_authored() {
+        let community_id = SpaceId([0xca; 16]);
+        let self_owner = OwnerAddr([0xaa; 16]);
+        let other_admin = OwnerAddr([0xbb; 16]);
+        let joiner_1 = OwnerAddr([0x01; 16]);
+        let joiner_2 = OwnerAddr([0x02; 16]);
+        let joiner_3 = OwnerAddr([0x03; 16]);
+
+        // Three PendingJoin events (targets for countersigns).
+        let pj_1 = make_event(
+            [0x10; 16],
+            joiner_1,
+            100,
+            MembershipEventKind::PendingJoin {
+                invite_token: make_token(self_owner, None),
+                joiner_identity_pub: [0u8; 64],
+            },
+            community_id,
+        );
+        let pj_2 = make_event(
+            [0x20; 16],
+            joiner_2,
+            200,
+            MembershipEventKind::PendingJoin {
+                invite_token: make_token(self_owner, None),
+                joiner_identity_pub: [0u8; 64],
+            },
+            community_id,
+        );
+        let pj_3 = make_event(
+            [0x30; 16],
+            joiner_3,
+            300,
+            MembershipEventKind::PendingJoin {
+                invite_token: make_token(other_admin, None),
+                joiner_identity_pub: [0u8; 64],
+            },
+            community_id,
+        );
+
+        // self_owner counter-signs pj_1 and pj_2.
+        let cs_self_1 = make_event(
+            [0xa1; 16],
+            self_owner,
+            500,
+            MembershipEventKind::JoinCountersign {
+                target_event_id: [0x10; 16],
+            },
+            community_id,
+        );
+        let cs_self_2 = make_event(
+            [0xa2; 16],
+            self_owner,
+            600,
+            MembershipEventKind::JoinCountersign {
+                target_event_id: [0x20; 16],
+            },
+            community_id,
+        );
+
+        // other_admin counter-signs pj_3 (should NOT appear).
+        let cs_other = make_event(
+            [0xb1; 16],
+            other_admin,
+            700,
+            MembershipEventKind::JoinCountersign {
+                target_event_id: [0x30; 16],
+            },
+            community_id,
+        );
+
+        let events = vec![pj_1, pj_2, pj_3, cs_self_1, cs_self_2, cs_other];
+        let result = filter_recent_counter_signs(&events, self_owner, 10);
+
+        assert_eq!(
+            result.len(),
+            2,
+            "expected 2 self-authored counter-signs; got {}: {result:?}",
+            result.len()
+        );
+
+        // Sorted descending by wall_ms: cs_self_2 (600) then cs_self_1 (500).
+        assert_eq!(
+            result[0].countersigned_at_hlc.wall_ms, 600,
+            "first result must be the more-recent countersign"
+        );
+        assert_eq!(
+            result[0].join_event_id,
+            hex::encode([0x20u8; 16]),
+            "first result must target pj_2"
+        );
+        assert_eq!(
+            result[0].joiner_addr,
+            hex::encode(joiner_2.0),
+            "joiner_addr must be resolved from pj_2"
+        );
+
+        assert_eq!(
+            result[1].countersigned_at_hlc.wall_ms, 500,
+            "second result must be the earlier countersign"
+        );
+        assert_eq!(
+            result[1].join_event_id,
+            hex::encode([0x10u8; 16]),
+            "second result must target pj_1"
+        );
+        assert_eq!(
+            result[1].joiner_addr,
+            hex::encode(joiner_1.0),
+            "joiner_addr must be resolved from pj_1"
+        );
+    }
+
+    // ── Test 4: list_recent_counter_signs_respects_cap ───────────────────
+    //
+    // 5 self-authored JoinCountersigns; cap=3. Expect 3 newest.
+    #[tokio::test]
+    async fn list_recent_counter_signs_respects_cap() {
+        let community_id = SpaceId([0xcb; 16]);
+        let self_owner = OwnerAddr([0xaa; 16]);
+
+        let events: Vec<SignedMembershipEvent> = (0u8..5)
+            .map(|i| {
+                make_event(
+                    [0xa0 + i; 16],
+                    self_owner,
+                    (i as u64 + 1) * 100,
+                    MembershipEventKind::JoinCountersign {
+                        target_event_id: [0x10 + i; 16],
+                    },
+                    community_id,
+                )
+            })
+            .collect();
+
+        let result = filter_recent_counter_signs(&events, self_owner, 3);
+        assert_eq!(result.len(), 3, "cap=3 must return exactly 3 entries");
+        // Sorted descending: wall_ms 500, 400, 300.
+        assert_eq!(result[0].countersigned_at_hlc.wall_ms, 500);
+        assert_eq!(result[1].countersigned_at_hlc.wall_ms, 400);
+        assert_eq!(result[2].countersigned_at_hlc.wall_ms, 300);
     }
 }
 
