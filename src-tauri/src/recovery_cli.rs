@@ -1443,6 +1443,7 @@ mod tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         state.spaces.insert(sp.id, sp);
         crate::owner_state_persist::save_crdt(&super::owner_state_path(dir.path()), &state)

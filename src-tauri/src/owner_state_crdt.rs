@@ -974,6 +974,10 @@ fn lww_merge_space(a: &Space, b: &Space) -> Space {
         // §2 — Device A opting in could be silently overwritten by a
         // stale Device B replay. Newer `updated_at` wins.
         shared_in_profile: newer.shared_in_profile,
+        // pending_join_at is LWW — the newer updated_at wins, covering
+        // both None→Some (PendingJoin minted) and Some→None (countersign
+        // received) transitions. ZEB-254 §"CRDT merge".
+        pending_join_at: newer.pending_join_at.clone(),
     }
 }
 
@@ -1012,6 +1016,7 @@ mod apply_space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         }
     }
 
@@ -1042,6 +1047,7 @@ mod apply_space_tests {
             admin_addr: Some(admin_addr),
             is_invite_only: Some(invite_only),
             shared_in_profile: false,
+            pending_join_at: None,
         }
     }
 
@@ -1070,6 +1076,7 @@ mod apply_space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         }
     }
 
@@ -1341,6 +1348,7 @@ mod apply_space_tests {
             admin_addr: Some(original_admin),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            pending_join_at: None,
         };
         let attacker_replay = Space {
             id: SpaceId([7; 16]),
@@ -1363,6 +1371,7 @@ mod apply_space_tests {
             admin_addr: Some(OwnerAddr([99u8; 16])), // hostile admin takeover
             is_invite_only: Some(true),              // hostile flip to private
             shared_in_profile: false,
+            pending_join_at: None,
         };
 
         let merged = lww_merge_space(&earlier, &attacker_replay);
@@ -1433,6 +1442,7 @@ mod apply_space_tests {
             admin_addr: Some(OwnerAddr([1u8; 16])),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            pending_join_at: None,
         };
         // Newer (Device A): opted IN — user just flipped the toggle.
         let newer = Space {
@@ -1456,6 +1466,7 @@ mod apply_space_tests {
             admin_addr: Some(OwnerAddr([1u8; 16])),
             is_invite_only: Some(false),
             shared_in_profile: true,
+            pending_join_at: None,
         };
 
         // Merge in both orderings; the LWW winner is `newer` regardless
@@ -1514,6 +1525,7 @@ mod apply_space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         let b = Space {
             id: SpaceId([1; 16]),
@@ -1538,6 +1550,7 @@ mod apply_space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
 
         // Order-independent: both call orderings yield the same merged prior.
@@ -1682,6 +1695,7 @@ mod apply_space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         assert_eq!(s.apply_space(channel), ApplyOutcome::Inserted);
         // Same SpaceId, kind swapped to GroupDm — dedupe_key still
@@ -1710,6 +1724,7 @@ mod apply_space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         let outcome = s.apply_space(group_dm);
         assert!(
@@ -2422,6 +2437,7 @@ mod canonicalization_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         }
     }
 
@@ -2720,6 +2736,7 @@ mod crypto_integration_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         }
     }
 
@@ -2815,6 +2832,7 @@ mod crypto_integration_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         // Sanity: invariant check must pass for a well-formed DM.
         dm.validate_invariants().expect("DM invariants");
@@ -3503,6 +3521,7 @@ mod merge_prior_content_keys_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         }
     }
 
@@ -3665,6 +3684,7 @@ mod dm_crypto_integration_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         }
     }
 

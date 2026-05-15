@@ -1172,6 +1172,7 @@ mod subscriber_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         }
     }
 
@@ -1594,6 +1595,7 @@ mod integration_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         }
     }
 

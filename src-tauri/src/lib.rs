@@ -4102,6 +4102,7 @@ pub fn add_space_dm_inner(
         admin_addr: None,
         is_invite_only: None,
         shared_in_profile: false,
+        pending_join_at: None,
     };
 
     // Validate invariants up front — catches programmer error before we
@@ -8143,6 +8144,7 @@ pub fn mint_community_creation(
         admin_addr: Some(self_owner),
         is_invite_only: Some(is_invite_only),
         shared_in_profile: false,
+        pending_join_at: None,
     };
 
     Ok(MintedCommunity {
@@ -9327,6 +9329,7 @@ pub fn mint_redemption(
         // silently reject the redemption Space if these disagreed).
         is_invite_only: Some(payload.is_invite_only),
         shared_in_profile: false,
+        pending_join_at: None,
     };
 
     Ok(MintedCommunity {

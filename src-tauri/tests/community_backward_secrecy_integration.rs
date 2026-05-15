@@ -52,6 +52,7 @@ fn make_space_with_epoch(
         admin_addr: Some(admin_addr),
         is_invite_only: Some(false),
         shared_in_profile: false,
+        pending_join_at: None,
     }
 }
 

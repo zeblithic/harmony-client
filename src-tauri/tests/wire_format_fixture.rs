@@ -98,6 +98,7 @@ fn space_shared_in_profile_default_false_byte_identical_to_pre_phase4() {
         admin_addr: Some(OwnerAddr([3u8; 16])),
         is_invite_only: Some(false),
         shared_in_profile: false, // The Phase 4 field, default
+        pending_join_at: None,
     };
 
     let bytes = canonical_cbor_encode(&space).expect("encode");
@@ -157,6 +158,7 @@ fn space_shared_in_profile_true_emits_sp_key() {
         admin_addr: Some(OwnerAddr([3u8; 16])),
         is_invite_only: Some(false),
         shared_in_profile: true,
+        pending_join_at: None,
     };
 
     let bytes = canonical_cbor_encode(&space).expect("encode");
