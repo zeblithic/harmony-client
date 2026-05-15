@@ -164,6 +164,22 @@ pub enum MembershipEventKind {
         #[serde(rename = "rc")]
         recipient_ciphertexts: Vec<RecipientCiphertext>,
     },
+
+    /// ZEB-285: a joined member declares they have forked this community
+    /// into a new community with `fork_space_id` as its SpaceId. Non-mutating
+    /// — does NOT change materialized membership/power/channels, does NOT
+    /// trigger EpochRotation. Other members materialize it as visible
+    /// fork-lineage history. Verify rule: signer must be Joined at the
+    /// event's HLC (power threshold = 0, "any joined member, any time").
+    ///
+    /// Variant tag "x" (1-char value, lowercase, unused before this).
+    /// Inner field key "fs" (2-char) per same-length-keys invariant at this
+    /// nesting level. See `docs/specs/2026-05-14-zeb-285-phase1-community-forking-design.md` §3.1.
+    #[serde(rename = "x")]
+    Fork {
+        #[serde(rename = "fs")]
+        fork_space_id: SpaceId,
+    },
 }
 
 impl CanonicalPayloadSealed for MembershipEventKind {}
@@ -520,6 +536,25 @@ pub enum VerifyError {
     /// in materialize. This is a fast-path rejection that prevents
     /// unauthorized epoch events from entering the CRDT log.
     EpochEventUnauthorized,
+
+    // ── ZEB-285 fork verifier ──
+    /// ZEB-285: the event's signer (event.actor) has no entry in the
+    /// PreForkSnapshot.identity_pubs map. The snapshot is authoritative
+    /// for the original community's keyset — a signer not in the map
+    /// cannot be verified and must be rejected.
+    UnknownSigner {
+        signer: OwnerAddr,
+    },
+
+    /// ZEB-285: the event's community_id does not match the snapshot's
+    /// original_community_id. A validly-signed event from a different
+    /// community must be rejected even when the same OwnerAddr is a member
+    /// of both communities — without this check, cross-community event
+    /// injection could pass signature verification. (Fix: PR #122 bot review.)
+    CommunityIdMismatch {
+        expected: SpaceId,
+        actual: SpaceId,
+    },
 }
 
 impl std::fmt::Display for VerifyError {
@@ -622,6 +657,21 @@ impl std::fmt::Display for VerifyError {
                 "EpochRotation/EpochCatchup rejected at verify_event: issuer lacks admin power, \
                  is not the cooperative leaver, or the event shape is obviously malformed"
             ),
+            VerifyError::UnknownSigner { signer } => {
+                write!(
+                    f,
+                    "signer {} is not present in PreForkSnapshot.identity_pubs",
+                    hex::encode(signer.0)
+                )
+            }
+            VerifyError::CommunityIdMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "event.community_id {} does not match snapshot.original_community_id {}",
+                    hex::encode(actual.0),
+                    hex::encode(expected.0)
+                )
+            }
         }
     }
 }
@@ -1295,6 +1345,12 @@ pub fn materialize(
                     m.pending_catchup_for.remove(&rc.recipient);
                 }
             }
+            MembershipEventKind::Fork { .. } => {
+                // ZEB-285: non-mutating. Fork events are recorded in the event
+                // log for historical/audit visibility but do not change the
+                // materialized membership/power/channels view. They are
+                // surfaced separately via settings-panel listings.
+            }
         }
     }
 
@@ -1603,6 +1659,15 @@ pub fn verify_event(
             // must be a Join, target must be in recipients, issuer
             // must have admin power) are enforced in materialize. Spec §4.6.
         }
+        MembershipEventKind::Fork { .. } => {
+            // ZEB-285: Fork requires the actor to be currently Joined.
+            // Any joined non-Banned member may fork at any time (power
+            // threshold = 0), but non-members and Banned members are
+            // rejected here before the per-kind power-rules block.
+            if !is_joined_member(prior_state, &event.actor) {
+                return Err(VerifyError::ActorNotJoined);
+            }
+        }
     }
 
     // 5. Per-kind power rules.
@@ -1825,9 +1890,107 @@ pub fn verify_event(
                 return Err(VerifyError::EpochEventUnauthorized);
             }
         }
+        MembershipEventKind::Fork { .. } => {
+            // ZEB-285: any joined non-Banned member can fork at any time.
+            // Power threshold 0 — same as Leave. Non-mutating: doesn't
+            // affect membership/power/channels, doesn't trigger EpochRotation.
+            // Membership check already performed in the joined-membership
+            // block above (ActorNotJoined gate). No additional shape
+            // validation required: fork_space_id is a self-reported value
+            // from the forker; receivers don't (and can't) verify the fork's
+            // existence on the forker's device.
+            if actor_power < POWER_THRESHOLDS.invite {
+                return Err(VerifyError::ActorPowerInsufficient);
+            }
+        }
     }
 
     Ok(())
+}
+
+/// ZEB-285: verify a single signed event against a frozen pre-fork
+/// snapshot's `identity_pubs` map. Used by the fork's UI when loading
+/// pre-fork history for display — fork members are not necessarily
+/// members of the original community, so the live OwnerDeviceCache
+/// won't have the original's signers cached.
+///
+/// **Phase 1 scope**: performs Ed25519 signature verification via the
+/// snapshot's `identity_pubs` keyset (including the pubkey→actor address
+/// binding check inside `verify_signature`). Power-rule and membership-
+/// state replay is deferred to Phase 2 hardening because `PreForkSnapshot`
+/// does not carry an explicit `admin_addr` (required by `materialize`
+/// to seed the bootstrap power level). Phase 1 invokes this lazily at
+/// display time only against a snapshot from a trusted inviter; eagerly
+/// verifying every event at redeem time is a Phase 2 concern.
+///
+/// **Phase 1 NOTE**: This function verifies `SignedMembershipEvent` only.
+/// Channel events from `PreForkSnapshot.channel_log` are NOT
+/// signature-verified by Phase 1; they are rendered with the same
+/// muted treatment as other pre-fork content under the trust assumption
+/// that the forker bundled honest history. Phase 2 will add channel-event
+/// verification via a `verify_snapshot_channel_event` sibling function.
+/// See spec §4.4 for the broader Phase 1 lazy-verification rationale.
+///
+/// Returns `Ok(())` when the signature is valid and the signer is in
+/// `snapshot.identity_pubs`. Returns `Err(VerifyError::UnknownSigner)`
+/// when the signer is absent; returns `Err(VerifyError::SignatureInvalid)`
+/// (or `ActorPubkeyMismatch`) when the signature or address binding fails.
+///
+/// See spec §4.3.
+pub fn verify_snapshot_event(
+    event: &SignedMembershipEvent,
+    snapshot: &crate::community_invite::PreForkSnapshot,
+) -> Result<(), VerifyError> {
+    // Step 0: community_id binding check. A validly-signed event from a
+    // DIFFERENT community must be rejected even when the same OwnerAddr is a
+    // member of both communities — without this check, an attacker could inject
+    // events from another community whose signer happens to appear in
+    // snapshot.identity_pubs. (Fix: PR #122 security finding.)
+    if event.community_id != snapshot.original_community_id {
+        return Err(VerifyError::CommunityIdMismatch {
+            expected: snapshot.original_community_id,
+            actual: event.community_id,
+        });
+    }
+
+    // Step 1: signer must be recorded in identity_pubs.
+    let signer_pub =
+        snapshot
+            .identity_pubs
+            .get(&event.actor)
+            .ok_or(VerifyError::UnknownSigner {
+                signer: event.actor,
+            })?;
+
+    // Step 2: Ed25519 signature verification + pubkey→actor address binding.
+    // verify_signature derives address_hash from signer_pub and checks it
+    // equals event.actor, then verify_strict-checks the sig over the
+    // canonical-CBOR EventPayload bytes. Rejects with ActorPubkeyMismatch
+    // if the address doesn't match, SignatureInvalid if the sig is bad.
+    verify_signature(event, signer_pub)?;
+
+    // Step 3: if the event carries a countersig (invite-only Join voucher),
+    // verify it too against snapshot.identity_pubs. Every signature on the
+    // event must be verifiable against the snapshot's recorded pubkeys.
+    // verify_countersig covers both the pubkey→signer binding and the
+    // Ed25519 sig check (same EventPayload body the actor signed).
+    // (Fix: PR #122 round-2 bot review — CodeRabbit Major.)
+    if let Some(ref cs) = event.countersig {
+        let countersigner_pub = snapshot
+            .identity_pubs
+            .get(&cs.signer)
+            .ok_or(VerifyError::UnknownSigner { signer: cs.signer })?;
+        verify_countersig(event, countersigner_pub)?;
+    }
+
+    Ok(())
+
+    // NOTE (Phase 2): reconstruct prior-state by replaying
+    // snapshot.membership_events in HLC ascending order and invoke
+    // verify_event with the materialized context. Deferred because
+    // PreForkSnapshot does not carry admin_addr (needed by materialize
+    // for the bootstrap power-100 seed). Phase 2 will add admin_addr
+    // to PreForkSnapshot or derive it from the earliest Join event.
 }
 
 /// True iff `addr` is currently a Joined member in `state`. Pure
@@ -3165,5 +3328,584 @@ mod tests {
             m.pending_catchup_for.contains(&carol),
             "Invited→Joined after epoch rotation must mark carol for catchup (M9 regression)"
         );
+    }
+
+    // ── ZEB-285: Fork variant tests ───────────────────────────────────────────
+
+    /// ZEB-285 Step 1/4: CBOR roundtrip for the Fork variant, verifying
+    /// tag "x" and inner key "fs" on the wire.
+    #[test]
+    fn fork_event_cbor_roundtrip() {
+        use crate::owner_state_crypto::canonical_cbor_encode;
+
+        let fork_space_id = SpaceId([0xfa; 16]);
+        let event = MembershipEventKind::Fork { fork_space_id };
+
+        let bytes = canonical_cbor_encode(&event).expect("encode");
+        let decoded: MembershipEventKind = ciborium::de::from_reader(&bytes[..]).expect("decode");
+
+        assert_eq!(event, decoded);
+
+        // Verify the variant tag is "x" and inner key is "fs" by inspecting
+        // the CBOR encoding directly. Wire form: { "tg": "x", "vl": { "fs": <16-byte bstr> } }.
+        let value: ciborium::Value =
+            ciborium::de::from_reader(&bytes[..]).expect("re-decode as value");
+        let map = value.as_map().expect("outer is map");
+        let tg = map
+            .iter()
+            .find_map(|(k, v): &(ciborium::Value, ciborium::Value)| {
+                if k.as_text() == Some("tg") {
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+            .expect("tg key");
+        assert_eq!(tg.as_text(), Some("x"));
+
+        let vl = map
+            .iter()
+            .find_map(|(k, v): &(ciborium::Value, ciborium::Value)| {
+                if k.as_text() == Some("vl") {
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+            .expect("vl key");
+        let inner = vl.as_map().expect("vl is map");
+        assert!(
+            inner
+                .iter()
+                .any(|(k, _): &(ciborium::Value, ciborium::Value)| k.as_text() == Some("fs")),
+            "inner has fs key"
+        );
+    }
+
+    /// ZEB-285 Step 5: all MembershipEventKind variants round-trip through
+    /// canonical CBOR, including the new Fork variant.
+    #[test]
+    fn all_variants_cbor_roundtrip() {
+        use crate::owner_state_crypto::canonical_cbor_encode;
+
+        let admin = OwnerAddr([0xaa; 16]);
+        let target = OwnerAddr([0xbb; 16]);
+        let channel_id = ChannelId([0xcc; 16]);
+
+        let variants: Vec<MembershipEventKind> = vec![
+            MembershipEventKind::Join,
+            MembershipEventKind::Leave,
+            MembershipEventKind::Invite { target },
+            MembershipEventKind::Kick {
+                target,
+                reason: None,
+            },
+            MembershipEventKind::SetPower { target, level: 50 },
+            MembershipEventKind::Unban {
+                target,
+                reason: None,
+            },
+            MembershipEventKind::ChannelCreate {
+                channel_id,
+                name: "test".into(),
+                write_power: 0,
+            },
+            MembershipEventKind::ChannelModify {
+                channel_id,
+                name: Some("renamed".into()),
+                write_power: None,
+            },
+            MembershipEventKind::ChannelDelete { channel_id },
+            MembershipEventKind::EpochRotation {
+                prior_epoch: 0,
+                triggered_by: [0xde; 16],
+                recipient_ciphertexts: vec![RecipientCiphertext {
+                    recipient: admin,
+                    sealed: vec![0u8; 92],
+                }],
+            },
+            MembershipEventKind::EpochCatchup {
+                epoch: 1,
+                triggered_by: [0xef; 16],
+                recipient_ciphertexts: vec![RecipientCiphertext {
+                    recipient: admin,
+                    sealed: vec![0u8; 92],
+                }],
+            },
+            MembershipEventKind::Fork {
+                fork_space_id: SpaceId([0xfa; 16]),
+            },
+        ];
+
+        for variant in &variants {
+            let bytes = canonical_cbor_encode(variant)
+                .unwrap_or_else(|e| panic!("encode failed for {variant:?}: {e}"));
+            let decoded: MembershipEventKind = ciborium::de::from_reader(&bytes[..])
+                .unwrap_or_else(|e| panic!("decode failed for {variant:?}: {e}"));
+            assert_eq!(variant, &decoded, "roundtrip mismatch for {variant:?}");
+        }
+    }
+
+    /// ZEB-285 Step 6/9: verify_event allows a Fork from any joined member
+    /// (power 0 = regular member, not just admin).
+    #[test]
+    fn verify_event_fork_allows_any_joined_member() {
+        let community_id = SpaceId([0xc0; 16]);
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (regular_priv, regular_pub, regular_addr) = make_identity(0xb1);
+
+        // Admin joins (power 100 from bootstrap).
+        let admin_join = sign_with_identity(
+            EventPayload {
+                id: [0x01; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: admin_addr,
+                at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &admin_priv,
+        );
+        // Regular member joins (power 0).
+        let regular_join = sign_with_identity(
+            EventPayload {
+                id: [0x02; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: regular_addr,
+                at: Hlc {
+                    wall_ms: 2,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &regular_priv,
+        );
+
+        let prior = materialize(&[admin_join, regular_join.clone()], admin_addr);
+
+        // Regular (power 0) signs a Fork. Should verify cleanly.
+        let fork_event = sign_with_identity(
+            EventPayload {
+                id: [0x03; 16],
+                community_id,
+                kind: MembershipEventKind::Fork {
+                    fork_space_id: SpaceId([0xfe; 16]),
+                },
+                actor: regular_addr,
+                at: Hlc {
+                    wall_ms: 3,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &regular_priv,
+        );
+
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &regular_pub,
+            countersigner_identity_pub: None,
+        };
+        assert_eq!(
+            verify_event(&fork_event, &prior, &ctx),
+            Ok(()),
+            "fork by a regular joined member (power 0) must be accepted"
+        );
+
+        // Also verify admin (power 100) can fork.
+        let admin_fork = sign_with_identity(
+            EventPayload {
+                id: [0x04; 16],
+                community_id,
+                kind: MembershipEventKind::Fork {
+                    fork_space_id: SpaceId([0xfe; 16]),
+                },
+                actor: admin_addr,
+                at: Hlc {
+                    wall_ms: 4,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &admin_priv,
+        );
+        let admin_ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+        };
+        assert_eq!(
+            verify_event(&admin_fork, &prior, &admin_ctx),
+            Ok(()),
+            "fork by admin (power 100) must also be accepted"
+        );
+    }
+
+    /// ZEB-285 Step 10: verify_event rejects a Fork from a non-member
+    /// (never joined) with ActorNotJoined.
+    #[test]
+    fn verify_event_fork_rejects_non_member() {
+        let community_id = SpaceId([0xc0; 16]);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
+        let (outsider_priv, outsider_pub, outsider_addr) = make_identity(0xcc);
+
+        let admin_join = sign_with_identity(
+            EventPayload {
+                id: [0x01; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: admin_addr,
+                at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &admin_priv,
+        );
+        let prior = materialize(std::slice::from_ref(&admin_join), admin_addr);
+
+        // Outsider (never joined) tries to Fork. Should reject.
+        let fork = sign_with_identity(
+            EventPayload {
+                id: [0x02; 16],
+                community_id,
+                kind: MembershipEventKind::Fork {
+                    fork_space_id: SpaceId([0xfe; 16]),
+                },
+                actor: outsider_addr,
+                at: Hlc {
+                    wall_ms: 2,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &outsider_priv,
+        );
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &outsider_pub,
+            countersigner_identity_pub: None,
+        };
+        assert_eq!(
+            verify_event(&fork, &prior, &ctx),
+            Err(VerifyError::ActorNotJoined),
+            "fork by non-member should reject with ActorNotJoined"
+        );
+    }
+
+    /// ZEB-285 Step 11/14: materialize Fork is non-mutating — members,
+    /// power_levels, and channels are unchanged by a Fork event.
+    #[test]
+    fn materialize_fork_is_non_mutating() {
+        let community_id = SpaceId([0xc0; 16]);
+        let admin = OwnerAddr([0xa1; 16]);
+
+        let admin_join = make_join_event(0x01, admin, 1);
+        let before = materialize(std::slice::from_ref(&admin_join), admin);
+
+        let fork = SignedMembershipEvent {
+            id: [0x02; 16],
+            community_id,
+            kind: MembershipEventKind::Fork {
+                fork_space_id: SpaceId([0xfe; 16]),
+            },
+            actor: admin,
+            at: Hlc {
+                wall_ms: 2,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+        };
+        let after = materialize(&[admin_join, fork], admin);
+
+        // Materialized view should be unchanged by the Fork event.
+        assert_eq!(
+            before.members, after.members,
+            "members should be unchanged after Fork"
+        );
+        assert_eq!(
+            before.power_levels, after.power_levels,
+            "power_levels should be unchanged after Fork"
+        );
+        assert_eq!(
+            before.channels, after.channels,
+            "channels should be unchanged after Fork"
+        );
+        assert_eq!(
+            before.current_epoch, after.current_epoch,
+            "current_epoch should be unchanged after Fork"
+        );
+    }
+
+    /// ZEB-285 Step 15/16: a Fork event does NOT auto-trigger an EpochRotation.
+    /// Contrast with Kick and Leave which do trigger rotation synthesis.
+    #[test]
+    fn fork_does_not_trigger_epoch_rotation() {
+        let community_id = SpaceId([0xc0; 16]);
+        let admin = OwnerAddr([0xa1; 16]);
+
+        let admin_join = make_join_event(0x01, admin, 1);
+        let fork = SignedMembershipEvent {
+            id: [0x02; 16],
+            community_id,
+            kind: MembershipEventKind::Fork {
+                fork_space_id: SpaceId([0xfe; 16]),
+            },
+            actor: admin,
+            at: Hlc {
+                wall_ms: 2,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+        };
+
+        let m = materialize(&[admin_join, fork], admin);
+
+        // After Fork: no epoch rotation should have been triggered.
+        // current_epoch stays None (no Kick/Leave = no rotation).
+        assert_eq!(
+            m.current_epoch, None,
+            "Fork should NOT advance epoch (contrast with Kick/Leave)"
+        );
+        assert!(
+            m.pending_rotation_for.is_empty(),
+            "no pending rotation should exist after a Fork event"
+        );
+    }
+
+    // ── ZEB-285 Task 5: verify_snapshot_event dual-keyset verifier ────────────
+
+    /// ZEB-285 Task 5: verify_snapshot_event should accept events whose signer
+    /// is present in snapshot.identity_pubs, verified against the real
+    /// Ed25519 key (not the live OwnerDeviceCache).
+    #[test]
+    fn verify_snapshot_event_uses_snapshot_identity_pubs() {
+        use crate::community_invite::{BoundedChannelLogSnapshot, PreForkSnapshot};
+        use std::collections::BTreeMap;
+
+        let original_id = SpaceId([0xa0; 16]);
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xaa);
+        let (regular_priv, regular_pub, regular_addr) = make_identity(0xbb);
+
+        // Bootstrap: admin joins, then regular joins, then admin promotes regular.
+        let admin_join = sign_with_identity(
+            EventPayload {
+                id: [0x01; 16],
+                community_id: original_id,
+                kind: MembershipEventKind::Join,
+                actor: admin_addr,
+                at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &admin_priv,
+        );
+        let regular_join = sign_with_identity(
+            EventPayload {
+                id: [0x02; 16],
+                community_id: original_id,
+                kind: MembershipEventKind::Join,
+                actor: regular_addr,
+                at: Hlc {
+                    wall_ms: 2,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &regular_priv,
+        );
+        let set_power = sign_with_identity(
+            EventPayload {
+                id: [0x03; 16],
+                community_id: original_id,
+                kind: MembershipEventKind::SetPower {
+                    target: regular_addr,
+                    level: 50,
+                },
+                actor: admin_addr,
+                at: Hlc {
+                    wall_ms: 3,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &admin_priv,
+        );
+
+        let mut identity_pubs = BTreeMap::new();
+        identity_pubs.insert(admin_addr, admin_pub);
+        identity_pubs.insert(regular_addr, regular_pub);
+
+        let snapshot = PreForkSnapshot {
+            original_community_id: original_id,
+            original_community_name: "Original".to_string(),
+            membership_events: vec![admin_join.clone(), regular_join.clone(), set_power.clone()],
+            channel_log: BoundedChannelLogSnapshot::default(),
+            identity_pubs,
+            forked_at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        };
+
+        // Every event in the snapshot should verify against the snapshot's
+        // identity_pubs, even though the fork's live OwnerDeviceCache has
+        // neither admin_addr nor regular_addr as members.
+        for event in &snapshot.membership_events {
+            verify_snapshot_event(event, &snapshot)
+                .expect("snapshot event should verify against identity_pubs");
+        }
+    }
+
+    /// ZEB-285 Task 5: verify_snapshot_event must reject a signer not
+    /// recorded in snapshot.identity_pubs with UnknownSigner.
+    #[test]
+    fn verify_snapshot_event_rejects_unknown_signer() {
+        use crate::community_invite::{BoundedChannelLogSnapshot, PreForkSnapshot};
+        use std::collections::BTreeMap;
+
+        let original_id = SpaceId([0xa0; 16]);
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xaa);
+        let (outsider_priv, _outsider_pub, outsider_addr) = make_identity(0xff);
+
+        let admin_join = sign_with_identity(
+            EventPayload {
+                id: [0x01; 16],
+                community_id: original_id,
+                kind: MembershipEventKind::Join,
+                actor: admin_addr,
+                at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &admin_priv,
+        );
+        // Signed by `outsider_addr` — a valid keypair never part of the original community.
+        let outsider_event = sign_with_identity(
+            EventPayload {
+                id: [0x02; 16],
+                community_id: original_id,
+                kind: MembershipEventKind::Leave,
+                actor: outsider_addr,
+                at: Hlc {
+                    wall_ms: 2,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &outsider_priv,
+        );
+
+        let mut identity_pubs = BTreeMap::new();
+        identity_pubs.insert(admin_addr, admin_pub);
+        // No entry for outsider_addr — intentionally missing.
+
+        let snapshot = PreForkSnapshot {
+            original_community_id: original_id,
+            original_community_name: "Original".to_string(),
+            membership_events: vec![admin_join, outsider_event.clone()],
+            channel_log: BoundedChannelLogSnapshot::default(),
+            identity_pubs,
+            forked_at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        };
+
+        let result = verify_snapshot_event(&outsider_event, &snapshot);
+        match result {
+            Err(VerifyError::UnknownSigner { signer }) => {
+                assert_eq!(
+                    signer, outsider_addr,
+                    "error should carry the actual offending address"
+                );
+            }
+            other => panic!("expected UnknownSigner, got {:?}", other),
+        }
+    }
+
+    /// ZEB-285 (security fix): verify_snapshot_event must reject an event
+    /// whose community_id does not match snapshot.original_community_id, even
+    /// when the signer is present in identity_pubs and the Ed25519 signature
+    /// is valid. This prevents cross-community event injection by an actor who
+    /// is a member of two communities and whose pubkey appears in both snapshots.
+    #[test]
+    fn verify_snapshot_event_rejects_wrong_community_id() {
+        use crate::community_invite::{BoundedChannelLogSnapshot, PreForkSnapshot};
+        use std::collections::BTreeMap;
+
+        let original_id = SpaceId([0xa0; 16]);
+        let other_community_id = SpaceId([0xbb; 16]); // different community
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xaa);
+
+        // Event is validly signed by admin_addr but references a DIFFERENT community.
+        let wrong_community_event = sign_with_identity(
+            EventPayload {
+                id: [0x10; 16],
+                community_id: other_community_id, // wrong community
+                kind: MembershipEventKind::Join,
+                actor: admin_addr,
+                at: Hlc {
+                    wall_ms: 5,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &admin_priv,
+        );
+
+        // The snapshot's identity_pubs includes admin_addr — signature would
+        // verify if we didn't check community_id first.
+        let mut identity_pubs = BTreeMap::new();
+        identity_pubs.insert(admin_addr, admin_pub);
+
+        let snapshot = PreForkSnapshot {
+            original_community_id: original_id,
+            original_community_name: "Original".to_string(),
+            membership_events: vec![],
+            channel_log: BoundedChannelLogSnapshot::default(),
+            identity_pubs,
+            forked_at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        };
+
+        let result = verify_snapshot_event(&wrong_community_event, &snapshot);
+        match result {
+            Err(VerifyError::CommunityIdMismatch { expected, actual }) => {
+                assert_eq!(
+                    expected, original_id,
+                    "expected should be snapshot's original_community_id"
+                );
+                assert_eq!(
+                    actual, other_community_id,
+                    "actual should be the event's community_id"
+                );
+            }
+            other => panic!("expected CommunityIdMismatch, got {:?}", other),
+        }
     }
 }

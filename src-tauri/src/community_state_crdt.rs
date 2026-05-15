@@ -33,6 +33,14 @@ pub struct CommunityState {
     #[serde(rename = "ci")]
     pub community_id: SpaceId,
 
+    /// ZEB-285: SpaceId of the community this one was forked from, or
+    /// None for a top-level (non-fork) community. Persisted in wire form
+    /// so a fork's lineage survives round-trips and is visible to anyone
+    /// who decodes the state. Set once at fork creation, never mutated.
+    /// Byte-compatible with pre-ZEB-285 blobs (omitted when None).
+    #[serde(rename = "ff", skip_serializing_if = "Option::is_none", default)]
+    pub forked_from: Option<SpaceId>,
+
     /// Append-only signed event log, keyed by EventId. BTreeMap (not
     /// HashMap) so iteration order is deterministic across replicas —
     /// canonical CBOR encoding requires a stable order.
@@ -87,6 +95,7 @@ impl Clone for CommunityState {
     fn clone(&self) -> Self {
         Self {
             community_id: self.community_id,
+            forked_from: self.forked_from,
             events: self.events.clone(),
             cache: std::sync::Mutex::new(MaterializedCache::default()),
             bootstrap_hint: std::sync::Mutex::new(
@@ -98,7 +107,9 @@ impl Clone for CommunityState {
 
 impl PartialEq for CommunityState {
     fn eq(&self, other: &Self) -> bool {
-        self.community_id == other.community_id && self.events == other.events
+        self.community_id == other.community_id
+            && self.forked_from == other.forked_from
+            && self.events == other.events
     }
 }
 impl Eq for CommunityState {}
@@ -126,6 +137,7 @@ impl CommunityState {
     pub fn new(community_id: SpaceId) -> Self {
         Self {
             community_id,
+            forked_from: None,
             events: BTreeMap::new(),
             cache: std::sync::Mutex::new(MaterializedCache::default()),
             bootstrap_hint: std::sync::Mutex::new(None),
@@ -256,5 +268,57 @@ impl CommunityState {
     pub fn materialize_now(&self, admin_addr: OwnerAddr) -> MaterializedMembership {
         let log: Vec<SignedMembershipEvent> = self.events.values().cloned().collect();
         materialize(&log, admin_addr)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::owner_state_crypto::canonical_cbor_encode;
+
+    #[test]
+    fn community_state_forked_from_cbor_skip() {
+        // ZEB-285: a CommunityState with forked_from = None must encode
+        // byte-identical to pre-ZEB-285 wire form (no "ff" key emitted).
+        let cid = SpaceId([0xc0; 16]);
+        let state = CommunityState::new(cid);
+
+        let bytes = canonical_cbor_encode(&state).expect("encode");
+        let value: ciborium::Value =
+            ciborium::de::from_reader(&bytes[..]).expect("decode as value");
+        let map = value.as_map().expect("outer is map");
+
+        // Top-level keys should NOT include "ff" when forked_from is None.
+        assert!(
+            !map.iter()
+                .any(|(k, _): &(ciborium::Value, ciborium::Value)| k.as_text() == Some("ff")),
+            "forked_from=None should be omitted from CBOR encoding"
+        );
+    }
+
+    #[test]
+    fn community_state_forked_from_some_roundtrip() {
+        // ZEB-285: with forked_from = Some(_), the "ff" key appears and
+        // round-trips correctly.
+        let cid = SpaceId([0xc0; 16]);
+        let original_id = SpaceId([0xa0; 16]);
+
+        let mut state = CommunityState::new(cid);
+        state.forked_from = Some(original_id);
+
+        let bytes = canonical_cbor_encode(&state).expect("encode");
+        let decoded: CommunityState = ciborium::de::from_reader(&bytes[..]).expect("decode");
+
+        assert_eq!(decoded.community_id, cid);
+        assert_eq!(decoded.forked_from, Some(original_id));
+
+        let value: ciborium::Value =
+            ciborium::de::from_reader(&bytes[..]).expect("re-decode as value");
+        let map = value.as_map().expect("outer is map");
+        assert!(
+            map.iter()
+                .any(|(k, _): &(ciborium::Value, ciborium::Value)| k.as_text() == Some("ff")),
+            "forked_from=Some should appear in CBOR encoding"
+        );
     }
 }

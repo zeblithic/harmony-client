@@ -3,6 +3,7 @@ import { render, fireEvent, waitFor } from '@testing-library/svelte';
 import CommunityView from '../CommunityView.svelte';
 import { CommunityService } from '../../community-service';
 import { ChannelMessageService } from '../../channel-message-service';
+import { NavService } from '../../nav-service';
 import type { TauriAdapter } from '../../zenoh-service';
 import type { CommunityMember } from '../../types';
 
@@ -48,6 +49,7 @@ async function setup(channelList: any[] = [general, announcements], propOverride
   await communityService.connectAdapter(adapter);
   const channelMessageService = new ChannelMessageService();
   await channelMessageService.connectAdapter(adapter);
+  const navService = new NavService();
   const props = {
     communityId: 'aa'.repeat(16),
     communityName: 'Test Community',
@@ -59,6 +61,7 @@ async function setup(channelList: any[] = [general, announcements], propOverride
     sharedInProfile: false,
     communityService,
     channelMessageService,
+    navService,
     onLeave: vi.fn(),
     onKickMember: vi.fn(),
     onSetPowerLevel: vi.fn(),
@@ -67,7 +70,7 @@ async function setup(channelList: any[] = [general, announcements], propOverride
     ...propOverrides,
   };
   const renderResult = render(CommunityView, { props });
-  return { adapter, communityService, channelMessageService, props, ...renderResult };
+  return { adapter, communityService, channelMessageService, navService, props, ...renderResult };
 }
 
 describe('CommunityView', () => {

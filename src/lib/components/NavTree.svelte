@@ -35,6 +35,7 @@
   {@const ancestry = getColorAncestry(nodes, child.id)}
   {@const dm = getInheritedDisplayMode(nodes, child.id)}
   {@const isLast = i === sortedChildren.length - 1 && ancestry.length > 0}
+  {@const forkParentNode = child.forkedFrom != null ? nodes.find((n) => n.id === child.forkedFrom) : undefined}
 
   <NavNodeRow
     node={child}
@@ -43,6 +44,7 @@
     isLastChild={isLast}
     active={activeNodeId === child.id}
     statusText={child.peer && profileLookup ? profileLookup(child.peer.address) : undefined}
+    forkParentName={forkParentNode?.name ?? null}
     {onToggle}
     {onClick}
     {onDisplayModeChange}

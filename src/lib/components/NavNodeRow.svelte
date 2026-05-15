@@ -27,6 +27,7 @@
     onDisplayModeChange,
     onSortOrderChange,
     statusText,
+    forkParentName,
   }: {
     node: NavNode;
     colorAncestry: number[];
@@ -38,6 +39,10 @@
     onDisplayModeChange?: (nodeId: string, mode: DisplayMode) => void;
     onSortOrderChange?: (nodeId: string, order: SortOrder) => void;
     statusText?: string;
+    /** ZEB-285: resolved display name of the parent community for the fork
+     *  glyph tooltip. Passed by NavTree when the parent is in the user's nav;
+     *  null / undefined when the parent is absent (user left the original). */
+    forkParentName?: string | null;
   } = $props();
 
   let showSortMenu = $state(false);
@@ -142,8 +147,15 @@
       {#if (node.type === 'dm' || node.type === 'group-chat') && node.peer}
         <Avatar address={node.peer.address} displayName={node.peer.displayName} avatarUrl={node.peer.avatarUrl} size={20} />
       {/if}
-      <span class="node-name">
-        <span class="name-text">{node.name}</span>
+      <span
+        class="node-name"
+        title={node.forkedFrom != null
+          ? `Forked from ${forkParentName ?? 'another community'}`
+          : undefined}
+      >
+        <span class="name-text">
+          {#if node.forkedFrom != null}<span class="fork-glyph" aria-hidden="true">↳ </span>{/if}{node.name}
+        </span>
         {#if statusText}
           <span class="status-text">{statusText}</span>
         {/if}
@@ -273,6 +285,11 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .fork-glyph {
+    color: var(--text-muted);
+    font-size: 0.85em;
   }
 
   .icon-cell {

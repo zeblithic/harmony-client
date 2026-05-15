@@ -4,6 +4,7 @@
   import type { ChannelMessageService } from '../channel-message-service';
   import type { TrustService } from '../trust-service';
   import Avatar from './Avatar.svelte';
+  import { buildUnifiedTimeline, type TimelineRow } from '../fork-timeline';
 
   let {
     communityId,
@@ -14,6 +15,12 @@
     trustService,
     myPower,
     enableVirtualization = true,
+    /** ZEB-285 Task 11: pre-fork snapshot messages for this channel (HLC-ascending). */
+    snapshotMessages = [],
+    /** ZEB-285 Task 11: display name of the original community at fork time. */
+    originalCommunityName = '',
+    /** ZEB-285 Task 11: wall-clock ms of the fork point (for the divider label). */
+    forkedAtMs = 0,
   }: {
     communityId: string;
     channelId: string;
@@ -24,10 +31,19 @@
     myPower: number;
     /** Disable for jsdom tests where IntersectionObserver isn't reliable. */
     enableVirtualization?: boolean;
+    snapshotMessages?: ChannelMessageDto[];
+    originalCommunityName?: string;
+    forkedAtMs?: number;
   } = $props();
 
   // Local mirror of service.byChannel cache for this channel.
   let messages = $state<ChannelMessageDto[]>([]);
+
+  // Unified timeline: snapshot (pre-fork) + live messages merged HLC-ascending.
+  // Re-derived whenever messages or snapshotMessages change.
+  let timeline = $derived<TimelineRow[]>(
+    buildUnifiedTimeline(snapshotMessages, messages, originalCommunityName, forkedAtMs),
+  );
   let scrollAtBottom = $state(true);
   let scrollAtTop = $state(false);
   let backfillInFlight = $state(false);
@@ -252,19 +268,37 @@
         <button type="button" class="retry-btn" onclick={retryLoad}>Retry</button>
       </div>
     {/if}
-    {#each messages as msg (msg.messageId)}
-      <article class="channel-message" class:self={isSelf(msg.author)}>
-        <div class="avatar-col">
-          <Avatar address={msg.author} {trustService} size={32} />
+    {#each timeline as row}
+      {#if 'kind' in row && row.kind === 'fork-divider'}
+        <div
+          class="fork-divider"
+          role="separator"
+          aria-label="Forked from {row.originalCommunityName}"
+        >
+          ───── Forked from {row.originalCommunityName} on {new Date(row.forkedAtMs).toLocaleDateString()} ─────
         </div>
-        <div class="content-col">
-          <header class="msg-meta">
-            <span class="author">{msg.author.slice(0, 8)}</span>
-            <time class="ts" datetime={new Date(msg.at.wallMs).toISOString()}>{formatTimestamp(msg.at)}</time>
-          </header>
-          <p class="body">{bodyToText(msg.body)}</p>
-        </div>
-      </article>
+      {:else if 'msg' in row}
+        {@const msg = row.msg}
+        <article
+          class="channel-message"
+          class:self={isSelf(msg.author)}
+          class:pre-fork={row.isPreFork}
+        >
+          <div class="avatar-col">
+            <Avatar address={msg.author} {trustService} size={32} />
+          </div>
+          <div class="content-col">
+            <header class="msg-meta">
+              <span class="author">{msg.author.slice(0, 8)}</span>
+              <time class="ts" datetime={new Date(msg.at.wallMs).toISOString()}>{formatTimestamp(msg.at)}</time>
+              {#if row.isPreFork}
+                <span class="pre-fork-badge" aria-label="From original community">from {originalCommunityName}</span>
+              {/if}
+            </header>
+            <p class="body">{bodyToText(msg.body)}</p>
+          </div>
+        </article>
+      {/if}
     {/each}
   </div>
 
@@ -378,5 +412,31 @@
     cursor: pointer;
     font-size: 0.8rem;
     margin-left: auto;
+  }
+  /* ZEB-285 Task 11: fork-point divider */
+  .fork-divider {
+    text-align: center;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    padding: 10px 16px;
+    margin: 4px 16px;
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    user-select: none;
+  }
+  /* Pre-fork messages rendered with muted opacity to visually distinguish
+   * them from live post-fork messages per spec §6.4. */
+  .channel-message.pre-fork {
+    opacity: 0.65;
+  }
+  .pre-fork-badge {
+    font-size: 0.68rem;
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 0 4px;
+    margin-left: 4px;
+    white-space: nowrap;
   }
 </style>

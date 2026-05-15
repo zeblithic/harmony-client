@@ -10,6 +10,7 @@ use tauri::{AppHandle, Emitter};
 
 pub mod community_channel_log;
 pub mod community_channel_log_engine;
+pub mod community_fork;
 pub mod community_invite;
 pub mod community_membership;
 pub mod community_state_crdt;
@@ -7713,7 +7714,96 @@ async fn generate_invite(
         state_snapshot,
     };
 
-    let payload = crate::community_invite::CommunityInvitePayload {
+    // ZEB-285: if this community is a fork, bundle forked_from + pre_fork_snapshot
+    // into the invite so joiners can mirror the fork lineage locally.
+    let (forked_from, pre_fork_snapshot) = {
+        let state_arc = community_registry.state_for(&space_id).await;
+        let fork_origin: Option<crate::owner_state_types::SpaceId> = if let Some(arc) = state_arc {
+            let g = arc.lock().await;
+            g.forked_from
+        } else {
+            None
+        };
+
+        if fork_origin.is_some() {
+            // Read pre_fork_snapshot.bin from the fork's data dir.
+            let snapshot: Option<crate::community_invite::PreForkSnapshot> = (|| {
+                let identity_dir = match crate::owner_commands::resolve_identity_dir() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = ?e,
+                            community_id = %hex::encode(space_id.0),
+                            "ZEB-285 generate_invite: failed to resolve identity_dir; \
+                             fork-invite will be minted without snapshot bundled"
+                        );
+                        return None;
+                    }
+                };
+                let snapshot_path = identity_dir
+                    .join("communities")
+                    .join(hex::encode(space_id.0))
+                    .join("pre_fork_snapshot.bin");
+                let bytes = match std::fs::read(&snapshot_path) {
+                    Ok(b) => b,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = ?e,
+                            path = %snapshot_path.display(),
+                            community_id = %hex::encode(space_id.0),
+                            "generate_invite: failed to read pre_fork_snapshot.bin; \
+                             fork invite will be sent without snapshot (degraded experience)"
+                        );
+                        return None;
+                    }
+                };
+                match crate::owner_state_crypto::canonical_cbor_decode::<
+                    crate::community_invite::PreForkSnapshot,
+                >(&bytes)
+                {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        tracing::warn!(
+                            community_id = %hex::encode(space_id.0),
+                            error = %e,
+                            "generate_invite: failed to decode pre_fork_snapshot.bin; \
+                             fork invite will be sent without snapshot (degraded experience)"
+                        );
+                        None
+                    }
+                }
+            })();
+            // INVARIANT: forked_from and pre_fork_snapshot must be paired —
+            // both Some or both None. When the snapshot couldn't be loaded
+            // (file missing, decode failure, identity_dir unavailable), clear
+            // forked_from too so the invite doesn't arrive with forked_from
+            // set but no snapshot, which would leave joiners in a half-fork
+            // state. (Fix: PR #122 round-2 bot review — CodeRabbit Major.)
+            //
+            // Bind forked_from to snapshot.original_community_id, not to
+            // CommunityState.forked_from. If the two diverge (should not
+            // happen in practice, but could in theory via corrupt state),
+            // the invite reflects the snapshot's value — the disk artifact
+            // is the authoritative source for fork lineage metadata.
+            // (Fix: PR #122 round-3 bot review — CodeRabbit Major.)
+            if let Some(s) = snapshot {
+                let original_id = s.original_community_id;
+                (Some(original_id), Some(s))
+            } else {
+                tracing::warn!(
+                    community_id = %hex::encode(space_id.0),
+                    "ZEB-285 generate_invite: pre_fork_snapshot unavailable; \
+                     clearing forked_from to preserve forked_from↔pre_fork_snapshot invariant"
+                );
+                (None, None)
+            }
+        } else {
+            (None, None)
+        }
+    };
+
+    let mut payload = crate::community_invite::CommunityInvitePayload {
         community_id: space_id,
         epoch_snapshot,
         admin_addr: admin,
@@ -7723,8 +7813,39 @@ async fn generate_invite(
         invite_token: None,
         admin_bootstrap: None,
         admin_identity_pub: None,
+        forked_from,
+        pre_fork_snapshot,
     };
-    build_open_invite_url(&payload)
+
+    // RELIABILITY: if the encoded invite payload would exceed the URL cap
+    // (MAX_INVITE_BODY_B64_CHARS ≈ 64 KiB), a snapshot-bundled fork-invite
+    // will fail. Fall back to no-snapshot mode: the forker still gets a
+    // working invite URL; fork-invitees joining via that URL will see the fork
+    // community starting empty (no pre-fork history). Phase 2 will add
+    // content-addressed delivery (Zenoh BLOB) for large snapshots.
+    // Both forked_from and pre_fork_snapshot are cleared together to maintain
+    // the invariant that forked_from is None iff pre_fork_snapshot is None.
+    // (Fix: PR #122 bot review — CodeAnt invariant + size cap issue.)
+    match crate::community_invite::encode_invite_url(&payload) {
+        Ok(url) => Ok(url),
+        Err(crate::community_invite::InviteUrlError::TooLarge(actual_len))
+            if payload.pre_fork_snapshot.is_some() =>
+        {
+            tracing::warn!(
+                community_id = %hex::encode(space_id.0),
+                actual_b64_len = actual_len,
+                cap = crate::community_invite::MAX_INVITE_BODY_B64_CHARS,
+                "ZEB-285 generate_invite: fork-invite payload exceeds URL cap; \
+                 falling back to no-snapshot mode. Fork-invitees joining via this \
+                 URL will see no pre-fork history. Phase 2 will add content-addressed \
+                 delivery for large snapshots."
+            );
+            payload.forked_from = None;
+            payload.pre_fork_snapshot = None;
+            build_open_invite_url(&payload)
+        }
+        Err(e) => Err(format!("encode invite URL: {e}")),
+    }
 }
 
 // ── ZEB-217 Sub-C Phase 3 Task 9: create_community ───────────────────
@@ -9065,6 +9186,11 @@ pub async fn redeem_invite_inner<R: tauri::Runtime, F>(
         crate::community_channel_log_engine::ChannelLogRegistry<R>,
     >,
     fence_check: F,
+    // ZEB-285: identity_dir used to write pre_fork_snapshot.bin for fork invites.
+    // None suppresses the snapshot write (e.g., when resolve_identity_dir fails).
+    // Write failure is always non-fatal — the join proceeds; the user just won't
+    // see pre-fork history.
+    identity_dir: Option<std::path::PathBuf>,
 ) -> Result<RedeemInviteResultDto, String>
 where
     F: Fn() -> Result<(), String>,
@@ -9502,6 +9628,76 @@ where
     // spec §8 #4: community_sync_guard.commit() FIRST, then channel_log_tx.
     community_sync_guard.commit();
 
+    // ZEB-285: mirror fork lineage from invite payload into the joiner's
+    // local CommunityState. Done POST-commit so we never set fork state on
+    // a rolled-back join. Both operations are non-fatal on failure — the join
+    // is already durable; the user simply won't see pre-fork history.
+    if let Some(original_id) = payload.forked_from {
+        // Set CommunityState.forked_from on the joiner's engine.
+        if let Some(state_arc) = community_registry.state_for(&minted.community_id).await {
+            let mut state_g = state_arc.lock().await;
+            state_g.forked_from = Some(original_id);
+        } else {
+            tracing::warn!(
+                community_id = %hex::encode(minted.community_id.0),
+                "redeem_invite_inner: could not set forked_from — engine state not found"
+            );
+        }
+
+        // Write pre_fork_snapshot.bin to the fork's data dir if present.
+        if let Some(snapshot) = payload.pre_fork_snapshot.as_ref() {
+            if let Some(ref id_dir) = identity_dir {
+                let fork_dir = id_dir
+                    .join("communities")
+                    .join(hex::encode(minted.community_id.0));
+                // Ensure the directory exists (create_community_inner also calls
+                // create_dir_all, but we want a belt-and-suspenders guarantee).
+                if let Err(e) = std::fs::create_dir_all(&fork_dir) {
+                    tracing::warn!(
+                        path = %fork_dir.display(),
+                        error = %e,
+                        "redeem_invite_inner: create fork dir failed; pre_fork_snapshot not written"
+                    );
+                } else {
+                    let snapshot_path = fork_dir.join("pre_fork_snapshot.bin");
+                    let tmp_path = fork_dir.join("pre_fork_snapshot.bin.tmp");
+                    match crate::owner_state_crypto::canonical_cbor_encode(snapshot) {
+                        Ok(bytes) => {
+                            if let Err(e) = std::fs::write(&tmp_path, &bytes) {
+                                tracing::warn!(
+                                    path = %tmp_path.display(),
+                                    error = %e,
+                                    "redeem_invite_inner: write pre_fork_snapshot.bin.tmp failed"
+                                );
+                            } else if let Err(e) = std::fs::rename(&tmp_path, &snapshot_path) {
+                                tracing::warn!(
+                                    from = %tmp_path.display(),
+                                    to = %snapshot_path.display(),
+                                    error = %e,
+                                    "redeem_invite_inner: rename pre_fork_snapshot.bin.tmp failed"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                community_id = %hex::encode(minted.community_id.0),
+                                path = %snapshot_path.display(),
+                                error = %e,
+                                "redeem_invite_inner: encode pre_fork_snapshot failed; \
+                                 snapshot not written"
+                            );
+                        }
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    community_id = %hex::encode(minted.community_id.0),
+                    "redeem_invite_inner: identity_dir not available; pre_fork_snapshot not written"
+                );
+            }
+        }
+    }
+
     // ZEB-271: post-durable-commit drain. apply_space above is the LAST
     // PERSISTENT step — the redemption Space is committed. If commit()
     // fails, log and continue: the deferred channel-log spawns from
@@ -9696,6 +9892,7 @@ async fn redeem_invite(
         dm_outbox,
         channel_log_registry,
         fence_check,
+        crate::owner_commands::resolve_identity_dir().ok(),
     )
     .await?;
 
@@ -9774,6 +9971,7 @@ where
         dm_outbox,
         channel_log_registry,
         fence_check,
+        crate::owner_commands::resolve_identity_dir().ok(),
     )
     .await
 }
@@ -10118,6 +10316,8 @@ mod redeem_invite_inner_tests {
             invite_token: None,
             admin_bootstrap: None,
             admin_identity_pub: None,
+            forked_from: None,
+            pre_fork_snapshot: None,
         };
 
         let invite_url =
@@ -10136,6 +10336,7 @@ mod redeem_invite_inner_tests {
             std::sync::Arc::clone(&fixture.dm_outbox),
             std::sync::Arc::clone(&fixture.channel_log_registry),
             || Ok(()),
+            None, // identity_dir: no fork fields in this test
         )
         .await;
 
@@ -10185,6 +10386,8 @@ mod redeem_invite_inner_tests {
             invite_token: None,
             admin_bootstrap: None,
             admin_identity_pub: None,
+            forked_from: None,
+            pre_fork_snapshot: None,
         };
 
         let device_id = "joiner-dev";
@@ -10213,6 +10416,117 @@ mod redeem_invite_inner_tests {
         // the engine's verify_event runs the same check on insert.
         crate::community_membership::verify_signature(&minted.bootstrap_join, &identity_pub)
             .expect("self-join signature must verify against joiner identity_pub");
+    }
+
+    // ── ZEB-285 Task 7: fork-invite carry tests ────────────────────────────────
+
+    /// ZEB-285 Task 7: `redeem_invite_inner` with `forked_from` + `pre_fork_snapshot`
+    /// in the payload must:
+    ///   1. Set `CommunityState.forked_from` on the joiner's engine.
+    ///   2. Write `pre_fork_snapshot.bin` to `{identity_dir}/communities/{hex_id}/`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redeem_invite_writes_snapshot_to_data_dir() {
+        let fixture = build_redeem_invite_test_fixture().await;
+        let tmp = tempfile::TempDir::new().expect("tempdir for identity_dir");
+
+        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
+        let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
+
+        let original_id = SpaceId([0xab; 16]);
+        let community_id = SpaceId([0xf2; 16]);
+        let membership_key = EpochKey::new([0x42; 32]);
+
+        // Build a minimal PreForkSnapshot.
+        let snapshot = crate::community_invite::PreForkSnapshot {
+            original_community_id: original_id,
+            original_community_name: "OriginalCom".into(),
+            membership_events: vec![],
+            channel_log: crate::community_invite::BoundedChannelLogSnapshot {
+                per_channel: std::collections::BTreeMap::new(),
+            },
+            identity_pubs: std::collections::BTreeMap::new(),
+            forked_at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "fork-dev".into(),
+            },
+        };
+
+        let invite_payload = CommunityInvitePayload {
+            community_id,
+            epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: membership_key.as_bytes().to_vec(),
+                state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
+            },
+            admin_addr,
+            community_name: "ForkCom".into(),
+            is_invite_only: false,
+            expires_at: None,
+            invite_token: None,
+            admin_bootstrap: None,
+            admin_identity_pub: None,
+            forked_from: Some(original_id),
+            pre_fork_snapshot: Some(snapshot.clone()),
+        };
+
+        let invite_url =
+            crate::community_invite::encode_invite_url(&invite_payload).expect("encode invite url");
+
+        let result = redeem_invite_inner(
+            invite_url,
+            std::sync::Arc::clone(&fixture.crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            fixture.unicast_send_tx.clone(),
+            std::sync::Arc::clone(&fixture.dm_outbox),
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            || Ok(()),
+            Some(tmp.path().to_path_buf()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "fork-invite redeem must succeed: {:?}",
+            result
+        );
+
+        // Assert 1: pre_fork_snapshot.bin was written.
+        let snapshot_path = tmp
+            .path()
+            .join("communities")
+            .join(hex::encode(community_id.0))
+            .join("pre_fork_snapshot.bin");
+        assert!(
+            snapshot_path.exists(),
+            "pre_fork_snapshot.bin must be written to data dir: {}",
+            snapshot_path.display()
+        );
+
+        // Assert 2: decoded bytes match the input snapshot.
+        let bytes = std::fs::read(&snapshot_path).expect("read snapshot file");
+        let decoded: crate::community_invite::PreForkSnapshot =
+            crate::owner_state_crypto::canonical_cbor_decode(&bytes)
+                .expect("decode pre_fork_snapshot.bin");
+        assert_eq!(decoded, snapshot, "decoded snapshot must match input");
+
+        // Assert 3: CommunityState.forked_from is set on the engine.
+        let state_arc = fixture
+            .community_registry
+            .state_for(&community_id)
+            .await
+            .expect("engine state must exist after redeem");
+        let state_g = state_arc.lock().await;
+        assert_eq!(
+            state_g.forked_from,
+            Some(original_id),
+            "CommunityState.forked_from must mirror the invite's forked_from"
+        );
     }
 }
 
@@ -10248,6 +10562,8 @@ mod join_open_community_tests {
             invite_token: None,
             admin_bootstrap: None,
             admin_identity_pub: None,
+            forked_from: None,
+            pre_fork_snapshot: None,
         };
         let invite_url = encode_invite_url(&payload).expect("encode open url");
         let entry = LibraryDirectoryEntry {
@@ -11203,6 +11519,198 @@ mod library_directory_lww_tests {
 /// Mints a self-Leave event, looks up the per-community engine via
 /// `community_registry.engine_arc`, and inserts the event through
 /// `engine.insert_local_event` so the debounced publish loop pushes
+/// ZEB-285 Phase 1 Task 10: read fork lineage metadata for the Settings panel.
+///
+/// Returns `Some(CommunityLineageDto)` when `pre_fork_snapshot.bin` exists
+/// in the community's data directory, `None` when the community is not a fork
+/// (file absent). Reads and decodes the snapshot on every call — suitable for
+/// the settings panel (opened rarely) but callers should not call this in a
+/// hot path. The full snapshot body (channel events) is decoded then dropped;
+/// only the lightweight header fields are returned.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommunityLineageDto {
+    /// Display name of the original community at fork time.
+    pub original_community_name: String,
+    /// Wall-clock milliseconds from the forked_at HLC.
+    pub forked_at_ms: u64,
+    /// Total message count captured in the snapshot (after §4.2 trim).
+    pub snapshot_message_count: usize,
+}
+
+#[tauri::command]
+async fn get_community_lineage(
+    community_id: String,
+) -> Result<Option<CommunityLineageDto>, String> {
+    // SECURITY: parse community_id as a typed SpaceId (16 raw bytes, 32 hex chars)
+    // before using it as a path component. Rejects `../../etc/passwd` and other
+    // path-traversal payloads at the boundary. (Fix: PR #122 bot review.)
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("get_community_lineage: invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "get_community_lineage: community_id must be 16 bytes (32 hex chars)".to_string()
+        })?;
+    let safe_community_id = hex::encode(id_bytes); // canonical hex, no path components
+    let identity_dir = crate::owner_commands::resolve_identity_dir()
+        .map_err(|e| format!("get_community_lineage: resolve identity_dir: {e}"))?;
+    let snapshot_path = identity_dir
+        .join("communities")
+        .join(&safe_community_id)
+        .join("pre_fork_snapshot.bin");
+
+    let bytes = match std::fs::read(&snapshot_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(format!(
+                "get_community_lineage: read pre_fork_snapshot.bin: {e}"
+            ))
+        }
+    };
+
+    let snapshot = crate::owner_state_crypto::canonical_cbor_decode::<
+        crate::community_invite::PreForkSnapshot,
+    >(&bytes)
+    .map_err(|e| format!("get_community_lineage: decode snapshot: {e}"))?;
+
+    let snapshot_message_count: usize = snapshot
+        .channel_log
+        .per_channel
+        .values()
+        .map(|v| v.len())
+        .sum();
+
+    Ok(Some(CommunityLineageDto {
+        original_community_name: snapshot.original_community_name,
+        forked_at_ms: snapshot.forked_at.wall_ms,
+        snapshot_message_count,
+    }))
+}
+
+/// ZEB-285 Phase 1 Task 11: return the full channel-log from the pre-fork
+/// snapshot so the frontend can render a unified timeline.
+///
+/// Returns `Some(PreForkSnapshotDto)` when `pre_fork_snapshot.bin` exists,
+/// `None` when the community is not a fork. The DTO carries only the channel
+/// log (as per-channel `Vec<ChannelMessageDto>`) plus the header fields
+/// needed to render the fork-point divider.
+///
+/// The per-channel map is keyed by the channel-ID hex string so TypeScript
+/// consumers can index directly by `channelId`.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreForkSnapshotDto {
+    pub original_community_name: String,
+    pub forked_at_ms: u64,
+    /// Per-channel snapshot messages. Key = channel-id hex (32 chars),
+    /// value = messages sorted HLC ascending.
+    pub channel_log: std::collections::BTreeMap<
+        String,
+        Vec<crate::community_channel_log_engine::ChannelMessageDto>,
+    >,
+}
+
+#[tauri::command]
+async fn get_pre_fork_snapshot(community_id: String) -> Result<Option<PreForkSnapshotDto>, String> {
+    // SECURITY: parse community_id as a typed SpaceId (16 raw bytes, 32 hex chars)
+    // before using it as a path component. Rejects path-traversal payloads at the
+    // boundary. (Fix: PR #122 bot review.)
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("get_pre_fork_snapshot: invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "get_pre_fork_snapshot: community_id must be 16 bytes (32 hex chars)".to_string()
+        })?;
+    let safe_community_id = hex::encode(id_bytes); // canonical hex, no path components
+    let identity_dir = crate::owner_commands::resolve_identity_dir()
+        .map_err(|e| format!("get_pre_fork_snapshot: resolve identity_dir: {e}"))?;
+    let snapshot_path = identity_dir
+        .join("communities")
+        .join(&safe_community_id)
+        .join("pre_fork_snapshot.bin");
+
+    let bytes = match std::fs::read(&snapshot_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(format!(
+                "get_pre_fork_snapshot: read pre_fork_snapshot.bin: {e}"
+            ))
+        }
+    };
+
+    let snapshot = crate::owner_state_crypto::canonical_cbor_decode::<
+        crate::community_invite::PreForkSnapshot,
+    >(&bytes)
+    .map_err(|e| format!("get_pre_fork_snapshot: decode snapshot: {e}"))?;
+
+    // Convert per-channel SignedChannelEvents → ChannelMessageDto.
+    // Events are already stored HLC-ascending in BoundedChannelLogSnapshot
+    // (insertion-ordered during fork capture); sort defensively here.
+    let mut channel_log = std::collections::BTreeMap::<
+        String,
+        Vec<crate::community_channel_log_engine::ChannelMessageDto>,
+    >::new();
+
+    for (channel_id, events) in &snapshot.channel_log.per_channel {
+        use crate::community_channel_log::SignedChannelEvent;
+        let mut dtos: Vec<crate::community_channel_log_engine::ChannelMessageDto> = events
+            .iter()
+            .filter_map(|ev| {
+                // Pattern match on Post only — forward-compatible when
+                // SignedChannelEvent gains new variants (Edit, Delete, etc.).
+                // The `_ => None` arm is unreachable today but will be
+                // load-bearing once additional variants land.
+                #[allow(unreachable_patterns)]
+                match ev {
+                    SignedChannelEvent::Post {
+                        id,
+                        author,
+                        at,
+                        body,
+                        reply_to,
+                        community_id: ev_community_id,
+                        channel_id: ev_channel_id,
+                        ..
+                    } => Some(crate::community_channel_log_engine::ChannelMessageDto {
+                        message_id: hex::encode(id.0),
+                        community_id: hex::encode(ev_community_id.0),
+                        channel_id: hex::encode(ev_channel_id.0),
+                        author: hex::encode(author.0),
+                        at: crate::community_channel_log_engine::HlcDto {
+                            wall_ms: at.wall_ms,
+                            logical: at.logical,
+                            device_id: at.device_id.clone(),
+                        },
+                        body: body.as_bytes().to_vec(),
+                        reply_to: reply_to.map(|m| hex::encode(m.0)),
+                    }),
+                    _ => None,
+                }
+            })
+            .collect();
+
+        // Sort HLC ascending: wall_ms → logical → device_id.
+        dtos.sort_by(|a, b| {
+            a.at.wall_ms
+                .cmp(&b.at.wall_ms)
+                .then(a.at.logical.cmp(&b.at.logical))
+                .then(a.at.device_id.cmp(&b.at.device_id))
+        });
+
+        channel_log.insert(hex::encode(channel_id.0), dtos);
+    }
+
+    Ok(Some(PreForkSnapshotDto {
+        original_community_name: snapshot.original_community_name,
+        forked_at_ms: snapshot.forked_at.wall_ms,
+        channel_log,
+    }))
+}
+
 /// it to peers. Advances the local HLC tracker on success.
 ///
 /// Owner-state Space NOT mutated (per spec line 514): the Space row
@@ -12580,7 +13088,12 @@ pub fn delta_to_change(
         | crate::community_membership::MembershipEventKind::ChannelModify { .. }
         | crate::community_membership::MembershipEventKind::ChannelDelete { .. }
         | crate::community_membership::MembershipEventKind::EpochRotation { .. }
-        | crate::community_membership::MembershipEventKind::EpochCatchup { .. } => return None,
+        | crate::community_membership::MembershipEventKind::EpochCatchup { .. }
+        // ZEB-285: Fork is non-mutating membership-wise; no MembershipChange
+        // is projected for it. Fork events are surfaced via a separate
+        // fork-lineage listing path (Task 7+), not via the membership-changed
+        // Tauri event stream.
+        | crate::community_membership::MembershipEventKind::Fork { .. } => return None,
     };
     Some((cid_hex, change))
 }
@@ -13493,6 +14006,9 @@ pub fn run() {
             join_open_community,
             leave_community,
             kick_from_community,
+            community_fork::fork_community,
+            get_community_lineage,
+            get_pre_fork_snapshot,
             set_power_level,
             unban_from_community,
             list_recent_moderation_events,
@@ -14325,7 +14841,7 @@ mod list_community_members_ipc_tests {
 mod generate_invite_helper_tests {
     use super::*;
     use crate::community_invite::{decode_invite_url, CommunityInvitePayload};
-    use crate::owner_state_types::{EpochKey, OwnerAddr, SpaceId};
+    use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
 
     #[test]
     fn build_open_invite_payload_round_trips_via_url() {
@@ -14343,6 +14859,8 @@ mod generate_invite_helper_tests {
             invite_token: None,
             admin_bootstrap: None,
             admin_identity_pub: None,
+            forked_from: None,
+            pre_fork_snapshot: None,
         };
         let url = build_open_invite_url(&payload).expect("url");
         let decoded = decode_invite_url(&url).expect("decode");
@@ -14350,6 +14868,79 @@ mod generate_invite_helper_tests {
         assert!(
             decoded.invite_token.is_none(),
             "open path must be token-less"
+        );
+    }
+
+    /// ZEB-285 Task 7: a fork-community invite payload round-trips through
+    /// `build_open_invite_url` / `decode_invite_url` with `forked_from` and
+    /// `pre_fork_snapshot` fields intact.
+    ///
+    /// This validates the **encoding path** that `generate_invite` uses when it
+    /// detects `CommunityState.forked_from.is_some()` and bundles the snapshot.
+    /// The registry/disk-reading portion is exercised by
+    /// `redeem_invite_inner_tests::redeem_invite_writes_snapshot_to_data_dir`.
+    #[test]
+    fn mint_invite_for_fork_bundles_snapshot() {
+        let original_id = SpaceId([0xab; 16]);
+        let fork_id = SpaceId([0xf3; 16]);
+
+        let snapshot = crate::community_invite::PreForkSnapshot {
+            original_community_id: original_id,
+            original_community_name: "OriginalCom".into(),
+            membership_events: vec![],
+            channel_log: crate::community_invite::BoundedChannelLogSnapshot {
+                per_channel: std::collections::BTreeMap::new(),
+            },
+            identity_pubs: std::collections::BTreeMap::new(),
+            forked_at: Hlc {
+                wall_ms: 1_700_000_001_000,
+                logical: 0,
+                device_id: "fork-dev".into(),
+            },
+        };
+
+        let payload = CommunityInvitePayload {
+            community_id: fork_id,
+            epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: EpochKey::new([0x42; 32]).as_bytes().to_vec(),
+                state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
+            },
+            admin_addr: OwnerAddr([0x11; 16]),
+            community_name: "ForkCom".into(),
+            is_invite_only: false,
+            expires_at: None,
+            invite_token: None,
+            admin_bootstrap: None,
+            admin_identity_pub: None,
+            forked_from: Some(original_id),
+            pre_fork_snapshot: Some(snapshot.clone()),
+        };
+
+        let url = build_open_invite_url(&payload).expect("encode fork-invite url");
+        let decoded = decode_invite_url(&url).expect("decode fork-invite url");
+
+        assert_eq!(
+            decoded.forked_from,
+            Some(original_id),
+            "forked_from must survive URL encode/decode"
+        );
+        assert!(
+            decoded.pre_fork_snapshot.is_some(),
+            "pre_fork_snapshot must survive URL encode/decode"
+        );
+        let decoded_snapshot = decoded.pre_fork_snapshot.unwrap();
+        assert_eq!(
+            decoded_snapshot.original_community_id, original_id,
+            "decoded snapshot original_community_id must match"
+        );
+        assert_eq!(
+            decoded_snapshot.original_community_name, "OriginalCom",
+            "decoded snapshot original_community_name must match"
+        );
+        assert_eq!(
+            decoded_snapshot.forked_at.wall_ms, 1_700_000_001_000,
+            "decoded snapshot forked_at.wall_ms must match"
         );
     }
 }

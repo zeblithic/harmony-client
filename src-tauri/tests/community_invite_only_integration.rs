@@ -372,6 +372,8 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         invite_token: Some(invite_token),
         admin_bootstrap: Some(alice_minted.bootstrap_join.clone()),
         admin_identity_pub: Some(alice.identity.to_public_bytes()),
+        forked_from: None,
+        pre_fork_snapshot: None,
     })
     .expect("encode URL");
 
@@ -478,6 +480,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         Arc::clone(&bob_dm_outbox),
         bob_channel_log_registry,
         || Ok(()),
+        None,
     )
     .await;
 
@@ -612,6 +615,8 @@ async fn community_invite_only_tampered_admin_bootstrap_rejects() {
         }),
         admin_bootstrap: Some(alice_bootstrap),
         admin_identity_pub: Some(alice_identity.identity.to_public_bytes()),
+        forked_from: None,
+        pre_fork_snapshot: None,
     })
     .expect("encode URL");
 
