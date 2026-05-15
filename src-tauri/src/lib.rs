@@ -44,6 +44,7 @@ pub mod profile_broadcast;
 pub mod recovery_cli;
 pub mod recovery_policy;
 mod save_dialog;
+pub mod state_snapshot;
 pub mod vine_feed_cache;
 pub mod voice;
 
