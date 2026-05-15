@@ -20,7 +20,7 @@ If other harmony clients later grow an owner-state CRDT, they can adopt HRSS via
 
 Sidecar pair, both encrypted at rest with the same passphrase (`HARMONY_RECOVERY_PASSPHRASE` / `HARMONY_RECOVERY_PASSPHRASE_FILE`, shared with HRMR).
 
-```
+```text
 recovery.bin          HRMR envelope    ~101 bytes
   └─ payload: 32-byte master seed                  (unchanged — ZEB-176)
 
@@ -61,21 +61,27 @@ recovery.bin.state    HRSS envelope    ~5–50 MB typical
 ### HRSS envelope byte layout
 
 Mirrors HRMR (same primitives, distinct magic for domain separation).
+The implementation is in `src-tauri/src/state_snapshot.rs`; constants:
+`HEADER_LEN=13`, `SALT_LEN=16`, `NONCE_LEN=24` (XChaCha20-Poly1305 takes
+a 192-bit nonce), `TAG_LEN=16`. Plaintext prefix = 13 + 16 + 24 = 53 bytes.
 
-```
+```text
 ┌────────────────────────────────────────────────────────────────┐
-│ HEADER (37 bytes, plaintext)                                   │
+│ PLAINTEXT PREFIX (53 bytes)                                    │
 ├────────────────────────────────────────────────────────────────┤
 │  4   "HRSS"                magic                               │
 │  1   0x01                  envelope version (HRSS-v1)          │
+│  1   0x01                  kdf_id (Argon2id)                   │
+│  4   <u32 BE>              m_kib (= 65536, i.e. 64 MiB)        │
+│  2   <u16 BE>              t (= 3)                             │
+│  1   <u8>                  p (= 1)                             │
 │ 16   <random>              Argon2id salt                       │
-│ 12   <random>              XChaCha20-Poly1305 nonce            │
-│  4   <u32 BE>              KDF params marker (m=64MiB,t=3,p=1) │
+│ 24   <random>              XChaCha20-Poly1305 nonce            │
 ├────────────────────────────────────────────────────────────────┤
-│ CIPHERTEXT (variable, AEAD-encrypted)                          │
+│ CIPHERTEXT + TAG (variable, AEAD-encrypted)                    │
 ├────────────────────────────────────────────────────────────────┤
-│      canonical-CBOR(OwnerStateSnapshot)                        │
-│      └─ Poly1305 tag appended by AEAD                          │
+│      canonical-CBOR(OwnerStateSnapshot)  (variable)            │
+│      Poly1305 tag                        (16 bytes)            │
 └────────────────────────────────────────────────────────────────┘
 
 AAD passed to AEAD: b"harmony-owner-state-snapshot-v1"
@@ -177,7 +183,7 @@ The HRSS envelope uses the **same** passphrase as HRMR — resolved via `HARMONY
 
 ### Staleness warning (new — surfaces in Settings → Backup section)
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │  ⚠ Your backup is 23 days old                                │
 │                                                              │
@@ -270,15 +276,16 @@ The HRSS envelope uses the **same** passphrase as HRMR — resolved via `HARMONY
 
 ### Modified Rust modules
 
-- **`src-tauri/src/recovery_cli.rs`** (existing — ZEB-176): extend `export_recovery_file_cli` and `restore_recovery_file_cli` signatures to accept `include_state: bool` / `ignore_state: bool` flags. Add `export_state_sidecar` and `restore_state_sidecar` helper functions (delegate to `state_snapshot.rs`).
-- **`src-tauri/src/main.rs`** (existing): add `--no-state` flag to the `Export::RecoveryFile` subcommand and `--ignore-state` flag to the `Restore::RecoveryFile` subcommand. Wire to `recovery_cli` helpers.
-- **`src-tauri/src/lib.rs`**: register the two new modules; add Tauri IPCs `get_backup_staleness() -> { is_stale: bool, days_since: u32 }` and `mark_backup_dismissed_for_days(days: u32)` for the GUI staleness warning.
+- **`src-tauri/src/recovery_cli.rs`** (existing — ZEB-176): `export_recovery_file_pair_with_keychain` and `restore_recovery_file_pair_with_keychain` (new helpers added in ZEB-213) handle paired HRMR+HRSS emit/restore with `include_state` / `ignore_state` flags. Both delegate the envelope crypto to `state_snapshot.rs`. `sidecar_path(out)` returns `<out>.state`. As of round-1 bot finding C5, the export helper does an overwrite-safe `.bak` dance when `force=true`.
+- **`src-tauri/src/main.rs`** (existing): `--no-state` flag on `Export::RecoveryFile`; `--ignore-state` flag on `Restore::RecoveryFile`. Wired to `recovery_cli` helpers.
+- **`src-tauri/src/lib.rs`**: registers `state_snapshot`, `backup_state`, `identity_commands`. Exposes Tauri IPC `get_backup_staleness(dismissUntilMs?: u64) -> { isStale: bool, daysSince: u32 }`. **There is no `mark_backup_dismissed_for_days` IPC** — dismissal is handled entirely frontend-side via `localStorage` (see frontend section below) so the wizard doesn't need a roundtrip for a UX-only flag.
 - **`src-tauri/src/identity.rs`** (existing — ZEB-176): no changes; the seed read/write API is reused.
+- **`src-tauri/src/identity_commands.rs`** (existing — ZEB-194): paired-export and token-cached restore commands gained an `includeState` / `ignoreState` parameter and (round-1 bot finding C2) reorder sidecar verification BEFORE the identity write.
 
 ### New frontend modules
 
-- **`src/lib/components/BackupStalenessWarning.svelte`** (new): the banner. Subscribes to a derived store fed by `get_backup_staleness()` IPC. Renders only when `is_stale` AND not dismissed.
-- **`src/lib/backup-service.ts`** (new): thin TS wrapper over the two new IPCs. Mirrors the service pattern in `community-service.ts`. Always extract errors via `e instanceof Error ? e.message : String(e)` per Tauri convention.
+- **`src/lib/components/BackupStalenessWarning.svelte`** (new): the banner. On mount, calls `getBackupStaleness()` (passing the localStorage-tracked `dismissUntilMs` to the backend) and renders only when `isStale` AND not dismissed. Local "Dismiss for 7 days" click writes `localStorage[BACKUP_DISMISS_KEY]`.
+- **`src/lib/backup-service.ts`** (new): thin TS wrapper around the single `get_backup_staleness` IPC. Provides `getBackupStaleness()`, `dismissForDays(days)`, `clearDismiss()`, and `readDismissUntilMs()` (round-1 bot finding M6: explicit `undefined` for missing/empty/non-numeric/Infinity/negative/zero). Always extracts errors via `e instanceof Error ? e.message : String(e)` per Tauri convention.
 
 ### Modified frontend components
 

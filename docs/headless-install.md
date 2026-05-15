@@ -178,7 +178,7 @@ harmony-app restore recovery-file --in /mnt/usb/recovery.bin --force
 # owner-state snapshot: 47 spaces, exported 1715600000000 ms wall-clock
 ```
 
-If `--in PATH.state` exists, it's auto-detected and restored alongside.
+If a `PATH.state` sidecar (derived from the recovery file passed as `--in PATH`) exists, it is auto-detected and restored alongside the main recovery file.
 
 ### Identity-only restore (ignore sidecar)
 
