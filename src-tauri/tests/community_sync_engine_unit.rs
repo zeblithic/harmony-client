@@ -270,6 +270,7 @@ async fn engine_receives_remote_publish_and_merges_event() {
                 is_invite_only: false,
                 actor_identity_pub: &identity_a_pub,
                 countersigner_identity_pub: None,
+                admin_identity_pub: None,
             },
         );
         assert!(matches!(
@@ -306,6 +307,7 @@ async fn engine_receives_remote_publish_and_merges_event() {
                 is_invite_only: false,
                 actor_identity_pub: &identity_a_pub,
                 countersigner_identity_pub: None,
+                admin_identity_pub: None,
             },
         );
         assert!(matches!(
@@ -540,6 +542,7 @@ async fn engine_emits_membership_delta_on_remote_insert() {
                 is_invite_only: false,
                 actor_identity_pub: &identity_a_pub,
                 countersigner_identity_pub: None,
+                admin_identity_pub: None,
             },
         );
         assert!(
@@ -557,6 +560,7 @@ async fn engine_emits_membership_delta_on_remote_insert() {
                 is_invite_only: false,
                 actor_identity_pub: &identity_a_pub,
                 countersigner_identity_pub: None,
+                admin_identity_pub: None,
             },
         );
         assert!(
@@ -581,6 +585,7 @@ async fn engine_emits_membership_delta_on_remote_insert() {
                 is_invite_only: false,
                 actor_identity_pub: &identity_a_pub,
                 countersigner_identity_pub: None,
+                admin_identity_pub: None,
             },
         );
         assert!(matches!(
@@ -1115,6 +1120,7 @@ async fn spoofed_publisher_addr_rejected_with_publisher_sig_invalid() {
                 is_invite_only: false,
                 actor_identity_pub: &alice_pub,
                 countersigner_identity_pub: None,
+                admin_identity_pub: None,
             },
         );
         assert_eq!(
@@ -1303,6 +1309,7 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
                 is_invite_only: false,
                 actor_identity_pub: actor_pub,
                 countersigner_identity_pub: None,
+                admin_identity_pub: None,
             },
         );
         assert_eq!(
@@ -1523,6 +1530,7 @@ async fn cold_cache_publish_rejected_then_succeeds_after_propagation() {
                 is_invite_only: false,
                 actor_identity_pub: &alice_pub,
                 countersigner_identity_pub: None,
+                admin_identity_pub: None,
             },
         );
         assert_eq!(

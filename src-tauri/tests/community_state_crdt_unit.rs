@@ -57,6 +57,7 @@ fn insert_rejects_event_with_wrong_community() {
             is_invite_only: false,
             actor_identity_pub: &identity_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         },
     );
 
@@ -94,6 +95,7 @@ fn insert_accepts_admin_self_join_in_open_community() {
             is_invite_only: false,
             actor_identity_pub: &identity_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         },
     );
 
@@ -123,6 +125,7 @@ fn insert_is_idempotent_on_duplicate_event_id() {
         is_invite_only: false,
         actor_identity_pub: &identity_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
     assert_eq!(
         state.insert_event(event.clone(), &ctx),
@@ -154,6 +157,7 @@ fn state_with_admin_self_join(seed: u8, community_id: SpaceId) -> (CommunityStat
             is_invite_only: false,
             actor_identity_pub: &identity_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         },
     );
     assert_eq!(outcome, InsertOutcome::Inserted);
@@ -205,6 +209,7 @@ fn materialized_cache_returns_same_object_until_insert() {
             is_invite_only: false,
             actor_identity_pub: &identity_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         },
     );
 

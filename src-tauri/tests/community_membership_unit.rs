@@ -1238,6 +1238,7 @@ fn verify_event_accepts_valid_join_in_open_community() {
         is_invite_only: false,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     verify_event(&event, &prior_state, &ctx).expect("must accept");
@@ -1269,6 +1270,7 @@ fn verify_event_rejects_invite_only_join_without_countersig() {
         is_invite_only: true,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -1305,6 +1307,7 @@ fn verify_event_accepts_admin_self_join_in_invite_only_community_without_counter
         is_invite_only: true,
         actor_identity_pub: &admin_id_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     verify_event(&event, &prior_state, &ctx).expect("admin self-Join must bootstrap");
@@ -1343,6 +1346,7 @@ fn verify_event_rejects_admin_invite_only_join_with_spurious_countersig() {
         is_invite_only: true,
         actor_identity_pub: &admin_id_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -1379,6 +1383,7 @@ fn verify_event_accepts_invite_only_join_with_valid_countersig() {
         is_invite_only: true,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: Some(&admin_id_pub),
+        admin_identity_pub: None,
     };
 
     verify_event(&event, &prior_state, &ctx).expect("must accept");
@@ -1421,6 +1426,7 @@ fn verify_event_rejects_kick_when_actor_power_below_threshold() {
         is_invite_only: false,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -1468,6 +1474,7 @@ fn verify_event_rejects_kick_on_target_who_never_joined() {
         is_invite_only: false,
         actor_identity_pub: &admin_id_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -1546,6 +1553,7 @@ fn verify_event_accepts_kick_on_left_member() {
         is_invite_only: false,
         actor_identity_pub: &admin_id_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     verify_event(&event, &prior_state, &ctx).expect("must accept Left → Banned");
@@ -1595,6 +1603,7 @@ fn verify_event_rejects_kick_when_target_power_equals_actor() {
         is_invite_only: false,
         actor_identity_pub: &admin_id_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -1637,6 +1646,7 @@ fn verify_event_rejects_setpower_when_actor_power_insufficient() {
         is_invite_only: false,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -1725,6 +1735,7 @@ fn verify_event_rejects_invite_targeting_banned_member() {
         is_invite_only: false,
         actor_identity_pub: &admin_id_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -1765,6 +1776,7 @@ fn verify_event_rejects_invite_from_non_joined_actor() {
         is_invite_only: false,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -1819,6 +1831,7 @@ fn verify_event_rejects_kick_from_non_joined_actor() {
         is_invite_only: false,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -1870,6 +1883,7 @@ fn verify_event_rejects_setpower_from_non_joined_actor() {
         is_invite_only: false,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -1924,6 +1938,7 @@ fn verify_event_rejects_invite_only_join_with_non_joined_countersigner() {
         is_invite_only: true,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: Some(&outsider_id_pub),
+        admin_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -2004,6 +2019,7 @@ fn verify_event_rejects_leave_from_banned_actor() {
         is_invite_only: false,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -2234,6 +2250,7 @@ fn verify_event_rejects_join_replay_after_kick() {
         is_invite_only: false,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -2279,6 +2296,7 @@ fn verify_event_rejects_setpower_when_level_exceeds_max() {
         is_invite_only: false,
         actor_identity_pub: &admin_id_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -2321,6 +2339,7 @@ fn verify_event_accepts_setpower_at_max_boundary() {
         is_invite_only: false,
         actor_identity_pub: &admin_id_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     verify_event(&event, &prior_state, &ctx).expect("must accept level == max");
@@ -2362,6 +2381,7 @@ fn verify_event_rejects_countersig_on_open_community_join() {
         is_invite_only: false, // OPEN community
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -2400,6 +2420,7 @@ fn verify_event_rejects_countersig_on_invite_event() {
         is_invite_only: false,
         actor_identity_pub: &admin_id_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -2446,6 +2467,7 @@ fn verify_event_rejects_event_for_wrong_community() {
         is_invite_only: false,
         actor_identity_pub: &alice_id_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -2492,6 +2514,7 @@ fn verify_event_rejects_when_actor_pubkey_doesnt_bind_to_actor() {
         is_invite_only: false,
         actor_identity_pub: &bob_id_pub, // wrong identity for actor=alice
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -2540,6 +2563,7 @@ fn kick_self_rejected_with_kick_target_power_not_lower() {
         is_invite_only: false,
         actor_identity_pub: &admin_id_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -2577,6 +2601,7 @@ fn set_power_out_of_range_rejected() {
         is_invite_only: false,
         actor_identity_pub: &admin_id_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     let err = verify_event(&event, &prior_state, &ctx).expect_err("must reject");
@@ -2619,6 +2644,7 @@ fn set_power_admin_self_demote_inserts() {
         is_invite_only: false,
         actor_identity_pub: &admin_id_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
     verify_event(&event, &prior_state, &ctx)
         .expect("admin self-demote must verify (foot-gun is allowed)");
@@ -2945,6 +2971,7 @@ fn verify_event_channel_create_succeeds_for_admin_at_bootstrap_power() {
         is_invite_only: false,
         actor_identity_pub: &admin_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     assert_eq!(verify_event(&event, &prior_state, &ctx), Ok(()));
@@ -3010,6 +3037,7 @@ fn verify_event_channel_create_rejects_below_mod_power() {
         is_invite_only: false,
         actor_identity_pub: &sub_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     assert_eq!(
@@ -3093,6 +3121,7 @@ fn verify_event_channel_create_accepts_at_kick_threshold() {
         is_invite_only: false,
         actor_identity_pub: &mod_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     assert_eq!(verify_event(&event, &prior_state, &ctx), Ok(()));
@@ -3199,6 +3228,7 @@ fn verify_event_channel_create_rejects_empty_name() {
         is_invite_only: false,
         actor_identity_pub: &admin_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     assert_eq!(
@@ -3249,6 +3279,7 @@ fn verify_event_channel_create_rejects_oversized_name() {
         is_invite_only: false,
         actor_identity_pub: &admin_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     assert_eq!(
@@ -3298,6 +3329,7 @@ fn verify_event_channel_create_rejects_write_power_above_max() {
         is_invite_only: false,
         actor_identity_pub: &admin_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     assert_eq!(
@@ -3337,6 +3369,7 @@ fn verify_event_channel_modify_rejects_all_none() {
         is_invite_only: false,
         actor_identity_pub: &admin_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     assert_eq!(
@@ -3388,6 +3421,7 @@ fn verify_event_channel_modify_allows_unknown_channel_id() {
         is_invite_only: false,
         actor_identity_pub: &admin_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     assert_eq!(verify_event(&event, &prior_state, &ctx), Ok(()));
@@ -3470,6 +3504,7 @@ fn verify_event_channel_delete_allows_already_tombstoned_for_replica_convergence
         is_invite_only: false,
         actor_identity_pub: &admin_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     assert_eq!(verify_event(&second_delete, &prior_state, &ctx), Ok(()));
@@ -3544,6 +3579,7 @@ fn verify_event_channel_modify_allows_value_matching_for_replica_convergence() {
         is_invite_only: false,
         actor_identity_pub: &admin_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     assert_eq!(verify_event(&modify, &prior_state, &ctx), Ok(()));
@@ -3612,6 +3648,7 @@ fn verify_event_channel_modify_accepts_partial_change() {
         is_invite_only: false,
         actor_identity_pub: &admin_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     assert_eq!(verify_event(&modify, &prior_state, &ctx), Ok(()));
@@ -3661,6 +3698,7 @@ fn verify_event_channel_delete_allows_unknown_channel_for_dag_sync_safety() {
         is_invite_only: false,
         actor_identity_pub: &admin_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     assert_eq!(verify_event(&delete, &prior_state, &ctx), Ok(()));
@@ -3735,6 +3773,7 @@ fn verify_event_channel_create_allows_duplicate_channel_id_for_replica_convergen
         is_invite_only: false,
         actor_identity_pub: &admin_pub,
         countersigner_identity_pub: None,
+        admin_identity_pub: None,
     };
 
     assert_eq!(verify_event(&second_create, &prior_state, &ctx), Ok(()));

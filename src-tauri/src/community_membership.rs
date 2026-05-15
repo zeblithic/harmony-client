@@ -588,6 +588,30 @@ pub enum VerifyError {
         expected: SpaceId,
         actual: SpaceId,
     },
+
+    /// ZEB-254: PendingJoin's InviteToken.inviter != ctx.admin_addr, OR
+    /// invitee_hint does not match the joiner's actor, OR the token's
+    /// signature does not verify against the admin's identity_pub.
+    PendingJoinTokenInvalid,
+
+    /// ZEB-254: PendingJoin's InviteToken has an `expires_at` value that
+    /// is at or before the event's wall_ms.
+    PendingJoinTokenExpired,
+
+    /// ZEB-254: PendingJoin's joiner_identity_pub does not hash (via
+    /// SHA-256[..16]) to the event's actor address.
+    PendingJoinJoinerPubMismatch,
+
+    /// ZEB-254: PendingJoin actor's prior state is Joined or Banned (or
+    /// Invited) — cannot accept a pending Join for an already-engaged member.
+    PendingJoinAlreadyMember,
+
+    /// ZEB-254: JoinCountersign actor is not currently Joined in the
+    /// community.
+    JoinCountersignActorNotJoined,
+
+    /// ZEB-254: JoinCountersign actor's power is below invite_threshold.
+    JoinCountersignActorPowerInsufficient,
 }
 
 impl std::fmt::Display for VerifyError {
@@ -705,6 +729,12 @@ impl std::fmt::Display for VerifyError {
                     hex::encode(expected.0)
                 )
             }
+            VerifyError::PendingJoinTokenInvalid => write!(f, "ZEB-254 PendingJoin InviteToken invalid (inviter/invitee_hint/sig)"),
+            VerifyError::PendingJoinTokenExpired => write!(f, "ZEB-254 PendingJoin InviteToken expired"),
+            VerifyError::PendingJoinJoinerPubMismatch => write!(f, "ZEB-254 PendingJoin joiner_identity_pub hash != actor"),
+            VerifyError::PendingJoinAlreadyMember => write!(f, "ZEB-254 PendingJoin actor's prior state is already-engaged"),
+            VerifyError::JoinCountersignActorNotJoined => write!(f, "ZEB-254 JoinCountersign actor is not Joined"),
+            VerifyError::JoinCountersignActorPowerInsufficient => write!(f, "ZEB-254 JoinCountersign actor power < invite_threshold"),
         }
     }
 }
@@ -1510,6 +1540,12 @@ pub struct VerifyContext<'a> {
     pub is_invite_only: bool,
     pub actor_identity_pub: &'a [u8; 64],
     pub countersigner_identity_pub: Option<&'a [u8; 64]>,
+    /// ZEB-254: admin's identity_pub (X25519_pub || Ed25519_pub). Required
+    /// when verifying PendingJoin events because the verify gate needs to
+    /// check the InviteToken's signature against the admin's known pub.
+    /// For legacy paths (open community, legacy Join with countersig), this
+    /// field can be None; the existing verify paths don't reference it.
+    pub admin_identity_pub: Option<&'a [u8; 64]>,
 }
 
 /// Full membership-event verification per ZEB-217 spec §"Verification".
@@ -1716,8 +1752,58 @@ pub fn verify_event(
                 return Err(VerifyError::ActorNotJoined);
             }
         }
-        MembershipEventKind::PendingJoin { .. } | MembershipEventKind::JoinCountersign { .. } => {
-            // ZEB-254: verify wiring ships in Task 2.
+        MembershipEventKind::PendingJoin {
+            invite_token,
+            joiner_identity_pub,
+        } => {
+            // P1: joiner_identity_pub must hash to event.actor.
+            // Use harmony_identity::Identity::from_public_bytes which derives
+            // address_hash = SHA256(X25519_pub || Ed25519_pub)[..16].
+            let identity = harmony_identity::Identity::from_public_bytes(joiner_identity_pub)
+                .map_err(|_| VerifyError::PendingJoinJoinerPubMismatch)?;
+            if identity.address_hash != event.actor.0 {
+                return Err(VerifyError::PendingJoinJoinerPubMismatch);
+            }
+
+            // P2: invite_token.inviter must equal ctx.admin_addr.
+            if invite_token.inviter != ctx.admin_addr {
+                return Err(VerifyError::PendingJoinTokenInvalid);
+            }
+
+            // P3: invite_token.invitee_hint must match actor (if hint present).
+            if let Some(hint) = invite_token.invitee_hint {
+                if hint != event.actor {
+                    return Err(VerifyError::PendingJoinTokenInvalid);
+                }
+            }
+
+            // P4: invite_token.expires_at must be strictly greater than
+            // event.at.wall_ms (token must not have expired at event time).
+            if let Some(exp) = invite_token.expires_at {
+                if event.at.wall_ms >= exp {
+                    return Err(VerifyError::PendingJoinTokenExpired);
+                }
+            }
+
+            // P5: invite_token signature verifies against admin's identity_pub.
+            let admin_pub = ctx
+                .admin_identity_pub
+                .ok_or(VerifyError::PendingJoinTokenInvalid)?;
+            if crate::community_invite::verify_invite_token_signature(invite_token, admin_pub)
+                .is_err()
+            {
+                return Err(VerifyError::PendingJoinTokenInvalid);
+            }
+
+            // P6: prior state must be None | Some(Left).
+            let prior_status = prior_state.members.get(&event.actor).map(|m| m.status);
+            match prior_status {
+                None | Some(MemberStatus::Left) => { /* ok */ }
+                _ => return Err(VerifyError::PendingJoinAlreadyMember),
+            }
+        }
+        MembershipEventKind::JoinCountersign { .. } => {
+            // ZEB-254: JoinCountersign verify wiring ships in Task 3.
         }
     }
 
@@ -1954,8 +2040,12 @@ pub fn verify_event(
                 return Err(VerifyError::ActorPowerInsufficient);
             }
         }
-        MembershipEventKind::PendingJoin { .. } | MembershipEventKind::JoinCountersign { .. } => {
-            // ZEB-254: power-rule verify wiring ships in Task 2.
+        MembershipEventKind::PendingJoin { .. } => {
+            // All PendingJoin gates are handled in the joined-membership block
+            // above (P1–P6). No separate power rule needed.
+        }
+        MembershipEventKind::JoinCountersign { .. } => {
+            // ZEB-254: JoinCountersign power-rule verify wiring ships in Task 3.
         }
     }
 
@@ -2666,6 +2756,7 @@ mod tests {
             is_invite_only: false,
             actor_identity_pub: &attacker_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         };
         let result = verify_event(&rotation_event, &prior, &ctx);
         assert!(
@@ -2738,6 +2829,7 @@ mod tests {
             is_invite_only: false,
             actor_identity_pub: &bob_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         };
         let result = verify_event(&catchup_event, &prior, &ctx);
         assert!(
@@ -3031,6 +3123,7 @@ mod tests {
             is_invite_only: false,
             actor_identity_pub: &admin_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         };
         let result = verify_event(&unban, &prior, &ctx);
         assert!(
@@ -3102,6 +3195,7 @@ mod tests {
             is_invite_only: false,
             actor_identity_pub: &mod_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&unban, &prior, &ctx),
@@ -3145,6 +3239,7 @@ mod tests {
             is_invite_only: false,
             actor_identity_pub: &admin_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&unban, &prior, &ctx),
@@ -3188,6 +3283,7 @@ mod tests {
             is_invite_only: false,
             actor_identity_pub: &admin_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&unban, &prior, &ctx),
@@ -3232,6 +3328,7 @@ mod tests {
             is_invite_only: false,
             actor_identity_pub: &admin_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&kick, &prior, &ctx),
@@ -3277,6 +3374,7 @@ mod tests {
             is_invite_only: false,
             actor_identity_pub: &admin_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&unban, &prior, &ctx),
@@ -3565,6 +3663,7 @@ mod tests {
             is_invite_only: false,
             actor_identity_pub: &regular_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&fork_event, &prior, &ctx),
@@ -3595,6 +3694,7 @@ mod tests {
             is_invite_only: false,
             actor_identity_pub: &admin_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&admin_fork, &prior, &admin_ctx),
@@ -3650,6 +3750,7 @@ mod tests {
             is_invite_only: false,
             actor_identity_pub: &outsider_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&fork, &prior, &ctx),
@@ -4006,5 +4107,366 @@ mod tests {
         let encoded = crate::owner_state_crypto::canonical_cbor_encode(&status).expect("encode");
         let decoded: MemberStatus = ciborium::from_reader(&mut encoded.as_slice()).expect("decode");
         assert_eq!(status, decoded);
+    }
+}
+
+// ── ZEB-254 PendingJoin verify_event unit tests ───────────────────────────────
+
+#[cfg(test)]
+mod zeb_254_pending_join_verify_tests {
+    use super::*;
+    use crate::community_invite::InviteToken;
+
+    /// Build a test identity from a seed byte.
+    /// Returns (PrivateIdentity, identity_pub [u8; 64], OwnerAddr).
+    fn make_identity(seed_byte: u8) -> (harmony_identity::PrivateIdentity, [u8; 64], OwnerAddr) {
+        let seed = [seed_byte; 32];
+        let private = harmony_identity::PrivateIdentity::from_seed(&seed);
+        let public = private.public_identity();
+        let identity_pub = public.to_public_bytes();
+        let addr = OwnerAddr(public.address_hash);
+        (private, identity_pub, addr)
+    }
+
+    /// Build a signed InviteToken using the admin's identity.
+    fn make_invite_token(
+        admin_private: &harmony_identity::PrivateIdentity,
+        admin_addr: OwnerAddr,
+        invitee_hint: Option<OwnerAddr>,
+        expires_at: Option<u64>,
+    ) -> InviteToken {
+        use crate::community_invite::canonical_invite_token_bytes;
+
+        let mut tok = InviteToken {
+            inviter: admin_addr,
+            invitee_hint,
+            minted_at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "admin-device".into(),
+            },
+            expires_at,
+            sig: [0u8; 64],
+        };
+        // Sign canonical bytes via the admin's PrivateIdentity.
+        let bytes = canonical_invite_token_bytes(&tok).expect("encode token");
+        tok.sig = admin_private.sign(&bytes);
+        tok
+    }
+
+    /// Build a signed PendingJoin event for the given joiner.
+    fn make_pending_join_event(
+        joiner_private: &harmony_identity::PrivateIdentity,
+        joiner_addr: OwnerAddr,
+        joiner_pub: [u8; 64],
+        community_id: SpaceId,
+        token: InviteToken,
+    ) -> SignedMembershipEvent {
+        let payload = EventPayload {
+            id: [9u8; 16],
+            community_id,
+            kind: MembershipEventKind::PendingJoin {
+                invite_token: token,
+                joiner_identity_pub: joiner_pub,
+            },
+            actor: joiner_addr,
+            at: Hlc {
+                wall_ms: 1_700_000_001_000,
+                logical: 0,
+                device_id: "joiner-device".into(),
+            },
+        };
+        sign_event_with_identity(&payload, joiner_private).expect("sign PendingJoin")
+    }
+
+    #[test]
+    fn pending_join_event_signs_and_verifies() {
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+        let community_id = SpaceId([7u8; 16]);
+        let token = make_invite_token(
+            &admin_priv,
+            admin_addr,
+            Some(joiner_addr),
+            Some(1_700_000_100_000),
+        );
+        let event =
+            make_pending_join_event(&joiner_priv, joiner_addr, joiner_pub, community_id, token);
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: true,
+            actor_identity_pub: &joiner_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: Some(&admin_pub),
+        };
+        let mat = MaterializedMembership::default();
+        let result = verify_event(&event, &mat, &ctx);
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+    }
+
+    #[test]
+    fn pending_join_rejected_when_token_invitee_not_actor() {
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+        let community_id = SpaceId([7u8; 16]);
+        // Hint addresses someone else, not the joiner.
+        let token = make_invite_token(
+            &admin_priv,
+            admin_addr,
+            Some(OwnerAddr([99u8; 16])),
+            Some(1_700_000_100_000),
+        );
+        let event =
+            make_pending_join_event(&joiner_priv, joiner_addr, joiner_pub, community_id, token);
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: true,
+            actor_identity_pub: &joiner_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: Some(&admin_pub),
+        };
+        let mat = MaterializedMembership::default();
+        assert!(
+            matches!(
+                verify_event(&event, &mat, &ctx),
+                Err(VerifyError::PendingJoinTokenInvalid)
+            ),
+            "wrong invitee_hint must yield PendingJoinTokenInvalid"
+        );
+    }
+
+    #[test]
+    fn pending_join_rejected_when_token_expired() {
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+        let community_id = SpaceId([7u8; 16]);
+        // expires_at is BEFORE the event's wall_ms (1_700_000_001_000).
+        let token = make_invite_token(
+            &admin_priv,
+            admin_addr,
+            Some(joiner_addr),
+            Some(1_700_000_000_500),
+        );
+        let event =
+            make_pending_join_event(&joiner_priv, joiner_addr, joiner_pub, community_id, token);
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: true,
+            actor_identity_pub: &joiner_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: Some(&admin_pub),
+        };
+        let mat = MaterializedMembership::default();
+        assert!(
+            matches!(
+                verify_event(&event, &mat, &ctx),
+                Err(VerifyError::PendingJoinTokenExpired)
+            ),
+            "expired token must yield PendingJoinTokenExpired"
+        );
+    }
+
+    #[test]
+    fn pending_join_rejected_when_token_inviter_not_admin() {
+        let (rogue_priv, _rogue_pub, rogue_addr) = make_identity(0xc1);
+        let (_admin2_priv, admin2_pub, admin2_addr) = make_identity(0xa2);
+        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+        let community_id = SpaceId([7u8; 16]);
+        // Token is signed by rogue, not admin2.
+        let token = make_invite_token(
+            &rogue_priv,
+            rogue_addr,
+            Some(joiner_addr),
+            Some(1_700_000_100_000),
+        );
+        let event =
+            make_pending_join_event(&joiner_priv, joiner_addr, joiner_pub, community_id, token);
+        // ctx uses admin2 as admin — rogue != admin2, so P2 (inviter != admin) fires.
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr: admin2_addr,
+            is_invite_only: true,
+            actor_identity_pub: &joiner_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: Some(&admin2_pub),
+        };
+        let mat = MaterializedMembership::default();
+        let result = verify_event(&event, &mat, &ctx);
+        assert!(
+            matches!(result, Err(VerifyError::PendingJoinTokenInvalid)),
+            "token from non-admin inviter must yield PendingJoinTokenInvalid; got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn pending_join_rejected_when_actor_already_joined() {
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+        let community_id = SpaceId([7u8; 16]);
+        let token = make_invite_token(
+            &admin_priv,
+            admin_addr,
+            Some(joiner_addr),
+            Some(1_700_000_100_000),
+        );
+        let event =
+            make_pending_join_event(&joiner_priv, joiner_addr, joiner_pub, community_id, token);
+        let mut mat = MaterializedMembership::default();
+        mat.members.insert(
+            joiner_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                left_at: None,
+            },
+        );
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: true,
+            actor_identity_pub: &joiner_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: Some(&admin_pub),
+        };
+        assert!(
+            matches!(
+                verify_event(&event, &mat, &ctx),
+                Err(VerifyError::PendingJoinAlreadyMember)
+            ),
+            "already-Joined actor must yield PendingJoinAlreadyMember"
+        );
+    }
+
+    #[test]
+    fn pending_join_rejected_when_actor_banned() {
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+        let community_id = SpaceId([7u8; 16]);
+        let token = make_invite_token(
+            &admin_priv,
+            admin_addr,
+            Some(joiner_addr),
+            Some(1_700_000_100_000),
+        );
+        let event =
+            make_pending_join_event(&joiner_priv, joiner_addr, joiner_pub, community_id, token);
+        let mut mat = MaterializedMembership::default();
+        mat.members.insert(
+            joiner_addr,
+            MemberState {
+                status: MemberStatus::Banned,
+                joined_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                left_at: None,
+            },
+        );
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: true,
+            actor_identity_pub: &joiner_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: Some(&admin_pub),
+        };
+        assert!(
+            matches!(
+                verify_event(&event, &mat, &ctx),
+                Err(VerifyError::PendingJoinAlreadyMember)
+            ),
+            "Banned actor must yield PendingJoinAlreadyMember"
+        );
+    }
+
+    #[test]
+    fn pending_join_accepted_when_actor_was_left() {
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+        let community_id = SpaceId([7u8; 16]);
+        let token = make_invite_token(
+            &admin_priv,
+            admin_addr,
+            Some(joiner_addr),
+            Some(1_700_000_100_000),
+        );
+        let event =
+            make_pending_join_event(&joiner_priv, joiner_addr, joiner_pub, community_id, token);
+        let mut mat = MaterializedMembership::default();
+        mat.members.insert(
+            joiner_addr,
+            MemberState {
+                status: MemberStatus::Left,
+                joined_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                left_at: Some(Hlc {
+                    wall_ms: 500,
+                    logical: 0,
+                    device_id: "t".into(),
+                }),
+            },
+        );
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: true,
+            actor_identity_pub: &joiner_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: Some(&admin_pub),
+        };
+        assert!(
+            verify_event(&event, &mat, &ctx).is_ok(),
+            "Left actor should be allowed to PendingJoin again"
+        );
+    }
+
+    #[test]
+    fn pending_join_rejected_when_identity_pub_does_not_hash_to_actor() {
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+        let community_id = SpaceId([7u8; 16]);
+        let token = make_invite_token(
+            &admin_priv,
+            admin_addr,
+            Some(joiner_addr),
+            Some(1_700_000_100_000),
+        );
+        // Embed a wrong pub — it won't hash to joiner_addr.
+        let wrong_pub = [0x55u8; 64];
+        // The event itself is signed with the real joiner key, but the embedded
+        // joiner_identity_pub in the PendingJoin payload is wrong.
+        let event =
+            make_pending_join_event(&joiner_priv, joiner_addr, wrong_pub, community_id, token);
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: true,
+            actor_identity_pub: &joiner_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: Some(&admin_pub),
+        };
+        let mat = MaterializedMembership::default();
+        let result = verify_event(&event, &mat, &ctx);
+        // Either PendingJoinJoinerPubMismatch (pub doesn't hash to actor) OR
+        // SignatureInvalid / InvalidIdentityPub (all-0x55 pub may fail key parsing).
+        assert!(
+            matches!(result, Err(VerifyError::PendingJoinJoinerPubMismatch))
+                || matches!(result, Err(VerifyError::SignatureInvalid))
+                || matches!(result, Err(VerifyError::InvalidIdentityPub)),
+            "wrong identity_pub must be rejected; got {:?}",
+            result
+        );
     }
 }

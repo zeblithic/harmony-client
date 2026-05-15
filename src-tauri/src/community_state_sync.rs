@@ -1188,6 +1188,7 @@ impl CommunitySyncEngine {
             is_invite_only: self.is_invite_only,
             actor_identity_pub: &actor_pub,
             countersigner_identity_pub: countersigner_pub.as_ref(),
+            admin_identity_pub: None,
         };
 
         let outcome = {
@@ -1308,6 +1309,7 @@ impl CommunitySyncEngine {
             is_invite_only: self.is_invite_only,
             actor_identity_pub: &first_actor_pub,
             countersigner_identity_pub: first_countersigner_pub.as_ref(),
+            admin_identity_pub: None,
         };
         let second_ctx = crate::community_membership::VerifyContext {
             expected_community_id: self.community_id,
@@ -1315,6 +1317,7 @@ impl CommunitySyncEngine {
             is_invite_only: self.is_invite_only,
             actor_identity_pub: &second_actor_pub,
             countersigner_identity_pub: second_countersigner_pub.as_ref(),
+            admin_identity_pub: None,
         };
 
         // C5: pre-validate BOTH events before any state mutation.
@@ -2547,6 +2550,7 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
                 is_invite_only: ctx.is_invite_only,
                 actor_identity_pub: &actor_pub,
                 countersigner_identity_pub: cs_pub_ref,
+                admin_identity_pub: None,
             };
             // Clone before `insert_event` consumes the event so we can
             // surface the delta if the outcome is `Inserted`. The clone

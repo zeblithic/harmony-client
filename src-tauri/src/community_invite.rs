@@ -1413,6 +1413,34 @@ pub fn verify_envelope_sig(
         .map_err(|_| CommunityInviteVerifyError::EnvelopeSigInvalid)
 }
 
+/// ZEB-254: pure helper for verifying an InviteToken's signature against
+/// a known admin identity_pub. Extracted for use by `verify_event` on
+/// `PendingJoin` events, where the admin's identity_pub is available in
+/// `VerifyContext` but we don't have a `PrivateIdentity` to call
+/// `verify_packet_pure` with.
+///
+/// Verifies that `token.sig` covers the canonical token bytes (as produced
+/// by `canonical_invite_token_bytes`) and was produced by the Ed25519 key
+/// embedded in `admin_identity_pub[32..]`.
+///
+/// Returns `Err(CommunityInviteVerifyError::InviteTokenSigInvalid)` on any
+/// failure (malformed pub, bad signature).
+pub fn verify_invite_token_signature(
+    token: &InviteToken,
+    admin_identity_pub: &[u8; 64],
+) -> Result<(), CommunityInviteVerifyError> {
+    let token_canonical = canonical_invite_token_bytes(token)
+        .map_err(|_| CommunityInviteVerifyError::InviteTokenSigInvalid)?;
+    use ed25519_dalek::Signature;
+    let identity = harmony_identity::Identity::from_public_bytes(admin_identity_pub)
+        .map_err(|_| CommunityInviteVerifyError::InviteTokenSigInvalid)?;
+    let sig = Signature::from_bytes(&token.sig);
+    identity
+        .verifying_key
+        .verify_strict(&token_canonical, &sig)
+        .map_err(|_| CommunityInviteVerifyError::InviteTokenSigInvalid)
+}
+
 // =====================================================================
 // ZEB-262 Phase 4 Task 9 — receive-side dispatch
 // =====================================================================

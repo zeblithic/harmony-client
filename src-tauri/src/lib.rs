@@ -15147,6 +15147,7 @@ mod list_community_members_ipc_tests {
                     is_invite_only: false,
                     actor_identity_pub: &identity_pub,
                     countersigner_identity_pub: None,
+                    admin_identity_pub: None,
                 },
             );
             assert!(
@@ -15878,6 +15879,7 @@ mod unban_from_community_tests {
             is_invite_only: false,
             actor_identity_pub: actor_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         };
         let outcome = state.insert_event(ev, &ctx);
         assert!(
@@ -15987,6 +15989,7 @@ mod unban_from_community_tests {
                     is_invite_only: false,
                     actor_identity_pub: &admin_pub,
                     countersigner_identity_pub: None,
+                    admin_identity_pub: None,
                 },
             )
         };
@@ -16137,6 +16140,7 @@ mod unban_from_community_tests {
                 is_invite_only: false,
                 actor_identity_pub: &mod_pub,
                 countersigner_identity_pub: None,
+                admin_identity_pub: None,
             },
         );
 
@@ -16221,6 +16225,7 @@ mod unban_from_community_tests {
                 is_invite_only: false,
                 actor_identity_pub: &admin_pub,
                 countersigner_identity_pub: None,
+                admin_identity_pub: None,
             },
         );
 
@@ -16305,6 +16310,7 @@ mod unban_from_community_tests {
                 is_invite_only: false,
                 actor_identity_pub: &admin_pub,
                 countersigner_identity_pub: None,
+                admin_identity_pub: None,
             },
         );
         assert!(
@@ -16400,6 +16406,7 @@ mod unban_from_community_tests {
                 is_invite_only: false,
                 actor_identity_pub: &admin_pub,
                 countersigner_identity_pub: None,
+                admin_identity_pub: None,
             },
         );
         assert!(matches!(sp_outcome, InsertOutcome::Inserted));
@@ -16422,6 +16429,7 @@ mod unban_from_community_tests {
                 is_invite_only: false,
                 actor_identity_pub: &admin_pub,
                 countersigner_identity_pub: None,
+                admin_identity_pub: None,
             },
         );
         assert!(matches!(kick_outcome, InsertOutcome::Inserted));
@@ -16444,6 +16452,7 @@ mod unban_from_community_tests {
                 is_invite_only: false,
                 actor_identity_pub: &admin_pub,
                 countersigner_identity_pub: None,
+                admin_identity_pub: None,
             },
         );
         assert!(matches!(unban_outcome, InsertOutcome::Inserted));
@@ -16598,6 +16607,7 @@ mod unban_from_community_tests {
                     is_invite_only: false,
                     actor_identity_pub: &admin_pub,
                     countersigner_identity_pub: None,
+                    admin_identity_pub: None,
                 },
             );
             assert!(
