@@ -13820,6 +13820,69 @@ pub async fn run_community_degraded_consumer<F, Fut>(
     }
 }
 
+/// Result of `get_backup_staleness` — payload for the GUI staleness banner.
+///
+/// Wire shape (camelCase): `{ isStale: bool, daysSince: u32 }`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupStaleness {
+    pub is_stale: bool,
+    pub days_since: u32,
+}
+
+/// Tauri IPC: compute the backup-staleness banner state.
+///
+/// Reads `owner_state.cbor` + `last_backup.json` from `app_data_dir()` and
+/// runs `crate::backup_state::should_warn_about_stale_backup` with the
+/// current wall clock. `dismiss_until_ms` is the localStorage-backed
+/// dismissal expiry passed from the frontend — when `Some(t)` and `t >
+/// now_wall_ms`, the banner is suppressed regardless of staleness.
+///
+/// Missing `owner_state.cbor` (fresh install before any owner-state writes)
+/// defaults to an empty `OwnerState` — `should_warn_about_stale_backup`
+/// then returns `is_stale: false` for the "no backup, no mutations" case,
+/// which is what we want for a brand-new user.
+///
+/// Missing `last_backup.json` returns `Ok(None)` from `load_last_backup`;
+/// the 14-day grace window is still applied via `last_mutation_wall_ms`.
+///
+/// Rust keeps NO mutable dismiss state — the frontend owns it in
+/// localStorage. See `src/lib/backup-service.ts`.
+#[tauri::command]
+async fn get_backup_staleness(
+    app: tauri::AppHandle,
+    dismiss_until_ms: Option<u64>,
+) -> Result<BackupStaleness, String> {
+    use tauri::Manager;
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app_data_dir: {e}"))?;
+    let state_path = app_data_dir.join("owner_state.cbor");
+    let last_path = app_data_dir.join("last_backup.json");
+
+    crate::identity_commands::run_blocking(move || {
+        let state = crate::owner_state_persist::load_crdt(&state_path)
+            .unwrap_or_else(|_| crate::owner_state_crdt::OwnerState::default());
+        let last = crate::backup_state::load_last_backup(&last_path).unwrap_or(None);
+        let now_wall_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let r = crate::backup_state::should_warn_about_stale_backup(
+            now_wall_ms,
+            last.as_ref(),
+            &state,
+            dismiss_until_ms,
+        );
+        Ok(BackupStaleness {
+            is_stale: r.is_stale,
+            days_since: r.days_since,
+        })
+    })
+    .await
+}
+
 // ── App entry point ──────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -13994,6 +14057,7 @@ pub fn run() {
             owner_commands::mint_owner_identity,
             owner_commands::export_owner_recovery_file_to_path,
             owner_commands::issue_owner_recovery_token,
+            get_backup_staleness,
             save_dialog::request_export_save_path,
             pairing_commands::start_inviter_pairing,
             pairing_commands::start_joiner_pairing,
