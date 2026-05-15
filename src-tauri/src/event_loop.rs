@@ -2637,31 +2637,47 @@ where
             // admission, and `collect_descendants` would walk a partial
             // cache.
             //
-            // On `cas_op_tx.send()` failure (event loop dropped during
-            // shutdown), skip the await — the admission won't happen
-            // and the completion signal won't be processed either, so
-            // there's nothing left to order. The fetch still returns
-            // Ok(bytes) for the caller.
+            // Both awaits are bounded by `ADMISSION_TIMEOUT` (CodeRabbit
+            // R2): a stalled event-loop arm or a saturated CAS channel
+            // must not pin a successful fetch behind an unbounded wait.
+            // On timeout OR `cas_op_tx.send()` failure (event loop
+            // dropped during shutdown), skip the rest — admission is
+            // best-effort with respect to the cache but ordered with
+            // respect to the completion signal; if the event loop isn't
+            // responding within 2s, the completion arm wouldn't be
+            // running either, so ordering is moot.
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            if cas_op_tx
-                .send(crate::content_store::CasOp::PutLocal {
+            let send_result = tokio::time::timeout(
+                ADMISSION_TIMEOUT,
+                cas_op_tx.send(crate::content_store::CasOp::PutLocal {
                     cid,
                     blob: bytes.clone(),
                     reply: Some(reply_tx),
-                })
-                .await
-                .is_ok()
-            {
+                }),
+            )
+            .await;
+            if matches!(send_result, Ok(Ok(()))) {
                 // Discard the reply result. The cache may silently
                 // reject under W-TinyLFU pressure; we don't propagate
                 // that to the fetch caller (admission is best-effort,
                 // not load-bearing for the fetch's own correctness).
-                let _ = reply_rx.await;
+                // A timeout here is equivalent to silent rejection.
+                let _ = tokio::time::timeout(ADMISSION_TIMEOUT, reply_rx).await;
             }
             Ok(bytes)
         })
     }
 }
+
+/// Per-CID admission timeout in `wrap_fetch_one_with_admission`. Bounds
+/// both `cas_op_tx.send()` and the reply-oneshot await so a stalled or
+/// saturated event-loop CAS arm cannot pin a successful fetch behind an
+/// unbounded wait. 2 seconds is generous for a local mpsc round-trip
+/// (the PutLocal arm itself ticks the runtime — typically microseconds
+/// — and sends the reply); a 2s timeout indicates real trouble
+/// elsewhere, in which case best-effort skip-the-admit is the right
+/// behavior. See CodeRabbit R2 on PR #125.
+const ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[cfg(test)]
 mod descendants_tests {
@@ -2959,8 +2975,8 @@ mod fetch_one_wrapper_tests {
     #[tokio::test]
     async fn admit_failure_does_not_fail_fetch() {
         // cas_op channel is closed (receiver dropped). The wrapper's
-        // try_send returns Err but the wrapper must NOT propagate that
-        // — the caller still gets the fetched bytes.
+        // synchronous send returns Err but the wrapper must NOT
+        // propagate that — the caller still gets the fetched bytes.
         let bytes = b"payload".to_vec();
         let cid = ContentId::for_book(&bytes, ContentFlags::default()).unwrap();
         let bytes_for_fetcher = bytes.clone();
@@ -2970,13 +2986,55 @@ mod fetch_one_wrapper_tests {
         };
 
         let (cas_op_tx, cas_op_rx) = mpsc::channel::<CasOp>(1);
-        drop(cas_op_rx); // close the receiver — every try_send will Err.
+        drop(cas_op_rx); // close the receiver — every send will Err.
         let wrapped = wrap_fetch_one_with_admission(fetcher, cas_op_tx);
 
         let result = wrapped(cid).await;
         assert!(
             result.is_ok(),
             "admission failure must not propagate to fetch caller; got {:?}",
+            result
+        );
+        assert_eq!(result.unwrap(), bytes);
+    }
+
+    /// R2 (CodeRabbit): the wrapper bounds both `cas_op_tx.send` and
+    /// `reply_rx.await` by `ADMISSION_TIMEOUT`. If the event-loop CAS
+    /// arm is stalled (we simulate this by receiving the PutLocal but
+    /// never replying), the wrapper must time out and still return
+    /// Ok(bytes) — admission is best-effort, not load-bearing for the
+    /// fetch caller. Uses `start_paused = true` so virtual time
+    /// auto-advances when the runtime is idle, keeping wall-clock test
+    /// time near-zero per the project's wall-clock-regression rule.
+    #[tokio::test(start_paused = true)]
+    async fn admission_timeout_does_not_fail_fetch() {
+        let bytes = b"payload".to_vec();
+        let cid = ContentId::for_book(&bytes, ContentFlags::default()).unwrap();
+        let bytes_for_fetcher = bytes.clone();
+        let fetcher = move |_cid: ContentId| {
+            let b = bytes_for_fetcher.clone();
+            std::future::ready(Ok::<Vec<u8>, String>(b))
+        };
+
+        let (cas_op_tx, mut cas_op_rx) = mpsc::channel::<CasOp>(1);
+        let wrapped = wrap_fetch_one_with_admission(fetcher, cas_op_tx);
+
+        // Receiver pulls the PutLocal but parks forever, holding the
+        // PutLocal (and its reply_tx) in scope so the wrapper's
+        // reply_rx never resolves naturally. The wrapper's
+        // `tokio::time::timeout(ADMISSION_TIMEOUT, reply_rx)` must
+        // fire and let the wrapper return Ok.
+        let receiver = tokio::spawn(async move {
+            let _op = cas_op_rx.recv().await.expect("expected a PutLocal");
+            std::future::pending::<()>().await;
+        });
+
+        let result = wrapped(cid).await;
+        receiver.abort();
+
+        assert!(
+            result.is_ok(),
+            "admission timeout must not propagate to fetch caller; got {:?}",
             result
         );
         assert_eq!(result.unwrap(), bytes);
