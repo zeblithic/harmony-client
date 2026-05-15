@@ -134,13 +134,24 @@
     }
   }
 
-  onMount(async () => {
+  // ZEB-213 M2 (CodeAnt): Svelte's onMount with an async function returns
+  // a Promise — the runtime treats that as a no-op for teardown, so any
+  // `return () => {...}` cleanup inside an async onMount NEVER fires. The
+  // fix is to register the listener synchronously and run async work
+  // inside, returning a SYNCHRONOUS cleanup that Svelte will actually invoke.
+  onMount(() => {
     window.addEventListener('harmony:backup-export-requested', handleBackupExportRequested);
-    try {
-      fullHash = await invoke<string>('current_identity_hash');
-    } catch (e) {
-      loadError = `Could not read identity store: ${e}. The wizard cannot continue.`;
-    }
+    // Fire-and-forget the async identity-hash fetch. The component lives
+    // for the panel's lifetime, so a late-arriving response that finds
+    // the component unmounted is harmless (we'd just write into a state
+    // ref that nobody reads).
+    void (async () => {
+      try {
+        fullHash = await invoke<string>('current_identity_hash');
+      } catch (e) {
+        loadError = `Could not read identity store: ${e}. The wizard cannot continue.`;
+      }
+    })();
     return () => {
       window.removeEventListener('harmony:backup-export-requested', handleBackupExportRequested);
     };

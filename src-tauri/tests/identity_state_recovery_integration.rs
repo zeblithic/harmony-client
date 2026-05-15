@@ -2,6 +2,9 @@
 
 #![cfg(feature = "test-fixtures")]
 
+mod common;
+
+use common::set_env;
 use harmony_app::backup_state;
 use harmony_app::identity;
 use harmony_app::owner_state_crdt::OwnerState;
@@ -59,7 +62,7 @@ fn mnemonic_round_trip_still_works_unchanged() {
     let dir = setup_machine();
     let plaintext_path = dir.path().join("identity.key");
     let mnemonic_path = dir.path().join("m.txt");
-    std::env::set_var("HARMONY_PASSPHRASE", "rt");
+    let _at_rest = set_env("HARMONY_PASSPHRASE", "rt");
     let original = harmony_owner::lifecycle::RecoveryArtifact::from_seed([0xEF; 32]);
     std::fs::write(&mnemonic_path, original.to_mnemonic().as_str()).unwrap();
     let original_id = original.master_pubkey_bundle().identity_hash();
@@ -68,7 +71,6 @@ fn mnemonic_round_trip_still_works_unchanged() {
     let reloaded = identity::read_seed_from_disk_with_keychain(&plaintext_path, None).unwrap();
     let restored = harmony_owner::lifecycle::RecoveryArtifact::from_seed(*reloaded);
     assert_eq!(restored.master_pubkey_bundle().identity_hash(), original_id);
-    std::env::remove_var("HARMONY_PASSPHRASE");
 }
 
 #[test]
@@ -78,8 +80,8 @@ fn recovery_file_round_trip_with_state() {
     let plaintext_path = dir.path().join("identity.key");
     let out = dir.path().join("recovery.bin");
 
-    std::env::set_var("HARMONY_PASSPHRASE", "rt-at-rest");
-    std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "rt-recovery");
+    let _at_rest = set_env("HARMONY_PASSPHRASE", "rt-at-rest");
+    let _recov = set_env("HARMONY_RECOVERY_PASSPHRASE", "rt-recovery");
 
     identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0x12; 32], true, None).unwrap();
     let original_state = plant_state(dir.path());
@@ -115,9 +117,6 @@ fn recovery_file_round_trip_with_state() {
         restored_bytes, original_bytes,
         "owner-state must round-trip byte-equal"
     );
-
-    std::env::remove_var("HARMONY_PASSPHRASE");
-    std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
 }
 
 #[test]
@@ -127,8 +126,8 @@ fn legacy_hrmr_only_restores_with_empty_state() {
     let plaintext_path = dir.path().join("identity.key");
     let out = dir.path().join("legacy.bin");
 
-    std::env::set_var("HARMONY_PASSPHRASE", "rt-legacy");
-    std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "rt-legacy-rec");
+    let _at_rest = set_env("HARMONY_PASSPHRASE", "rt-legacy");
+    let _recov = set_env("HARMONY_RECOVERY_PASSPHRASE", "rt-legacy-rec");
 
     // Plant a pre-ZEB-213 HRMR by calling export with include_state=false
     // (no sidecar emitted).
@@ -162,9 +161,6 @@ fn legacy_hrmr_only_restores_with_empty_state() {
     .unwrap();
     assert!(!result.sidecar_present);
     assert_eq!(result.spaces_restored, 0);
-
-    std::env::remove_var("HARMONY_PASSPHRASE");
-    std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
 }
 
 #[test]
@@ -176,8 +172,8 @@ fn cross_machine_state_restore() {
     let plaintext_path_a = machine_a.path().join("identity.key");
     let out = machine_a.path().join("recovery.bin");
 
-    std::env::set_var("HARMONY_PASSPHRASE", "rt-cm-rest");
-    std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "rt-cm-rec");
+    let _at_rest = set_env("HARMONY_PASSPHRASE", "rt-cm-rest");
+    let _recov = set_env("HARMONY_RECOVERY_PASSPHRASE", "rt-cm-rec");
 
     identity::write_seed_to_disk_with_keychain(&plaintext_path_a, &[0x55; 32], true, None).unwrap();
     let original_state = plant_state(machine_a.path());
@@ -217,9 +213,6 @@ fn cross_machine_state_restore() {
 
     let restored = std::fs::read(recovery_cli::owner_state_path(machine_b.path())).unwrap();
     assert_eq!(restored, original_bytes);
-
-    std::env::remove_var("HARMONY_PASSPHRASE");
-    std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
 }
 
 #[test]
@@ -229,8 +222,8 @@ fn last_backup_record_drives_staleness() {
     let plaintext_path = dir.path().join("identity.key");
     let out = dir.path().join("recovery.bin");
 
-    std::env::set_var("HARMONY_PASSPHRASE", "rt-stale");
-    std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "rt-stale-rec");
+    let _at_rest = set_env("HARMONY_PASSPHRASE", "rt-stale");
+    let _recov = set_env("HARMONY_RECOVERY_PASSPHRASE", "rt-stale-rec");
 
     identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0x77; 32], true, None).unwrap();
     plant_state(dir.path());
@@ -278,7 +271,4 @@ fn last_backup_record_drives_staleness() {
     );
     assert!(r.is_stale, "30d-late mutation + 30d wall clock → stale");
     assert_eq!(r.days_since, 30);
-
-    std::env::remove_var("HARMONY_PASSPHRASE");
-    std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
 }
