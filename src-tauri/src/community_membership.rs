@@ -1805,7 +1805,8 @@ pub fn verify_event(
             }
         }
         MembershipEventKind::JoinCountersign { .. } => {
-            // ZEB-254: JoinCountersign verify wiring ships in Task 3.
+            // ZEB-254: actor joined-membership check handled in the
+            // per-kind power-rules block below (step 5).
         }
     }
 
@@ -2046,8 +2047,22 @@ pub fn verify_event(
             // All PendingJoin gates are handled in the joined-membership block
             // above (P1–P6). No separate power rule needed.
         }
-        MembershipEventKind::JoinCountersign { .. } => {
-            // ZEB-254: JoinCountersign power-rule verify wiring ships in Task 3.
+        MembershipEventKind::JoinCountersign { target_event_id: _ } => {
+            // ZEB-254: actor must be Joined + power >= invite_threshold.
+            // Target event existence is a materialize concern (allow
+            // out-of-order delivery — JoinCountersign can land before
+            // its target PendingJoin on Zenoh state-root sync).
+            if !is_joined_member(prior_state, &event.actor) {
+                return Err(VerifyError::JoinCountersignActorNotJoined);
+            }
+            let actor_power = prior_state
+                .power_levels
+                .get(&event.actor)
+                .copied()
+                .unwrap_or(0);
+            if actor_power < POWER_THRESHOLDS.invite {
+                return Err(VerifyError::JoinCountersignActorPowerInsufficient);
+            }
         }
     }
 
@@ -4514,6 +4529,149 @@ mod zeb_254_pending_join_verify_tests {
                 || matches!(result, Err(VerifyError::InvalidIdentityPub)),
             "wrong identity_pub must be rejected; got {:?}",
             result
+        );
+    }
+}
+
+#[cfg(test)]
+mod zeb_254_join_countersign_verify_tests {
+    use super::*;
+
+    /// Build a test identity from a seed byte.
+    /// Returns (PrivateIdentity, identity_pub [u8; 64], OwnerAddr).
+    fn make_identity(seed_byte: u8) -> (harmony_identity::PrivateIdentity, [u8; 64], OwnerAddr) {
+        let seed = [seed_byte; 32];
+        let private = harmony_identity::PrivateIdentity::from_seed(&seed);
+        let public = private.public_identity();
+        let identity_pub = public.to_public_bytes();
+        let addr = OwnerAddr(public.address_hash);
+        (private, identity_pub, addr)
+    }
+
+    fn make_join_countersign_event(
+        admin_private: &harmony_identity::PrivateIdentity,
+        admin_addr: OwnerAddr,
+        community_id: SpaceId,
+        target_event_id: [u8; 16],
+    ) -> SignedMembershipEvent {
+        let payload = EventPayload {
+            id: [88u8; 16],
+            community_id,
+            kind: MembershipEventKind::JoinCountersign { target_event_id },
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 1_700_000_002_000,
+                logical: 0,
+                device_id: "admin-device".into(),
+            },
+        };
+        sign_event_with_identity(&payload, admin_private).expect("sign JoinCountersign")
+    }
+
+    #[test]
+    fn join_countersign_event_signs_and_verifies() {
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let community_id = SpaceId([7u8; 16]);
+        let target = [9u8; 16];
+        let event = make_join_countersign_event(&admin_priv, admin_addr, community_id, target);
+        let mut mat = MaterializedMembership::default();
+        mat.members.insert(
+            admin_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                left_at: None,
+            },
+        );
+        mat.power_levels.insert(admin_addr, POWER_THRESHOLDS.invite);
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: true,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: Some(&admin_pub),
+        };
+        let result = verify_event(&event, &mat, &ctx);
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+    }
+
+    #[test]
+    fn join_countersign_rejected_when_actor_not_joined() {
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let community_id = SpaceId([7u8; 16]);
+        let target = [9u8; 16];
+        let event = make_join_countersign_event(&admin_priv, admin_addr, community_id, target);
+        let mat = MaterializedMembership::default(); // actor not in members map
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: true,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: Some(&admin_pub),
+        };
+        let result = verify_event(&event, &mat, &ctx);
+        assert!(
+            matches!(result, Err(VerifyError::JoinCountersignActorNotJoined)),
+            "expected JoinCountersignActorNotJoined, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn join_countersign_accepted_when_target_missing() {
+        // Out-of-order delivery — JoinCountersign arrives before its
+        // target PendingJoin. Verify MUST accept it (target existence
+        // is a materialize-time concern, not verify-time).
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let community_id = SpaceId([7u8; 16]);
+        let target = [0xDEu8; 16]; // does not exist in prior state
+        let event = make_join_countersign_event(&admin_priv, admin_addr, community_id, target);
+        let mut mat = MaterializedMembership::default();
+        mat.members.insert(
+            admin_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                left_at: None,
+            },
+        );
+        mat.power_levels.insert(admin_addr, POWER_THRESHOLDS.invite);
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: true,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: Some(&admin_pub),
+        };
+        let result = verify_event(&event, &mat, &ctx);
+        assert!(
+            result.is_ok(),
+            "expected Ok (out-of-order delivery), got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn join_countersign_structural_power_check_documented() {
+        // POWER_THRESHOLDS.invite is 0 in v1 — there's no way for a
+        // Joined member to have insufficient power in v1. The check is
+        // structurally present and will become firable in ZEB-251 when
+        // per-community thresholds ship.
+        assert_eq!(
+            POWER_THRESHOLDS.invite, 0,
+            "ZEB-254 v1: invite_threshold is 0; JoinCountersignActorPowerInsufficient \
+             is structurally present but cannot fire under v1 thresholds"
         );
     }
 }
