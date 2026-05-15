@@ -8,6 +8,7 @@ use harmony_runtime::{NodeConfig, NodeRuntime};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
+pub mod backup_state;
 pub mod community_channel_log;
 pub mod community_channel_log_engine;
 pub mod community_fork;
@@ -44,6 +45,7 @@ pub mod profile_broadcast;
 pub mod recovery_cli;
 pub mod recovery_policy;
 mod save_dialog;
+pub mod state_snapshot;
 pub mod vine_feed_cache;
 pub mod voice;
 
@@ -13818,6 +13820,127 @@ pub async fn run_community_degraded_consumer<F, Fut>(
     }
 }
 
+/// Result of `get_backup_staleness` — payload for the GUI staleness banner.
+///
+/// Wire shape (camelCase): `{ isStale: bool, daysSince: u32 }`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupStaleness {
+    pub is_stale: bool,
+    pub days_since: u32,
+}
+
+/// Tauri IPC: compute the backup-staleness banner state.
+///
+/// Reads `owner_state_crdt.cbor` + `last_backup.json` from `app_data_dir()`
+/// and runs `crate::backup_state::should_warn_about_stale_backup` with the
+/// current wall clock. `dismiss_until_ms` is the localStorage-backed
+/// dismissal expiry passed from the frontend — when `Some(t)` and `t >
+/// now_wall_ms`, the banner is suppressed regardless of staleness.
+///
+/// Missing `owner_state_crdt.cbor` (fresh install before any owner-state
+/// writes) defaults to an empty `OwnerState` — `should_warn_about_stale_backup`
+/// then returns `is_stale: false` for the "no backup, no mutations" case,
+/// which is what we want for a brand-new user.
+///
+/// Missing `last_backup.json` returns `Ok(None)` from `load_last_backup`;
+/// the 14-day grace window is still applied via `last_mutation_wall_ms`.
+///
+/// Rust keeps NO mutable dismiss state — the frontend owns it in
+/// localStorage. See `src/lib/backup-service.ts`.
+#[tauri::command]
+async fn get_backup_staleness(
+    app: tauri::AppHandle,
+    dismiss_until_ms: Option<u64>,
+) -> Result<BackupStaleness, String> {
+    use tauri::Manager;
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app_data_dir: {e}"))?;
+    // Single source of truth for the CRDT path — same file the engine
+    // boots from and the same file the backup export sidecar reads.
+    let state_path = crate::recovery_cli::owner_state_path(&app_data_dir);
+    let last_path = app_data_dir.join("last_backup.json");
+
+    crate::identity_commands::run_blocking(move || {
+        let state = crate::owner_state_persist::load_crdt(&state_path)
+            .unwrap_or_else(|_| crate::owner_state_crdt::OwnerState::default());
+        let last = crate::backup_state::load_last_backup(&last_path).unwrap_or(None);
+        let now_wall_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let r = crate::backup_state::should_warn_about_stale_backup(
+            now_wall_ms,
+            last.as_ref(),
+            &state,
+            dismiss_until_ms,
+        );
+        Ok(BackupStaleness {
+            is_stale: r.is_stale,
+            days_since: r.days_since,
+        })
+    })
+    .await
+}
+
+/// ZEB-213 — informational preview of the `.state` sidecar next to a
+/// recovery file the user picked.
+///
+/// Wire shape (camelCase): `{ present: bool, spaceCount: Option<u32> }`.
+///
+/// Returns `present: false` when no sidecar exists at `<in_path>.state`.
+/// Otherwise decodes the sidecar with the supplied passphrase (the same
+/// one the user just typed for `preview_recovery_file`), loads the
+/// resulting tree into a temp file, and counts the Spaces so the GUI can
+/// show "Found owner-state snapshot — NN spaces. Restore both?".
+///
+/// **TOCTOU**: this IPC does NOT cache anything — it is purely
+/// informational. The authoritative sidecar restore happens inside
+/// `restore_recovery_from_preview_token_helper`, which uses the cached
+/// preview seed for addr-binding verification. A swap of the sidecar
+/// file between this preview and the actual commit would fail
+/// addr-binding at commit time.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SidecarPreview {
+    pub present: bool,
+    pub space_count: Option<u32>,
+}
+
+#[tauri::command]
+async fn preview_recovery_state_sidecar(
+    in_path: String,
+    passphrase: String,
+) -> Result<SidecarPreview, String> {
+    crate::identity_commands::run_blocking(move || {
+        let p = std::path::PathBuf::from(in_path);
+        let sidecar = crate::recovery_cli::sidecar_path(&p);
+        if !sidecar.exists() {
+            return Ok(SidecarPreview {
+                present: false,
+                space_count: None,
+            });
+        }
+        let snap = crate::state_snapshot::decode_snapshot_file(passphrase.as_bytes(), &sidecar)
+            .map_err(|e| e.to_string())?;
+        // Count Spaces by reloading the inner tree bytes via a tempfile.
+        // load_crdt parses the same canonicalize() output that
+        // save_atomically writes — matches the pattern in
+        // recovery_cli::restore_recovery_file_pair_with_keychain.
+        let tmp = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
+        crate::owner_state_persist::save_atomically(tmp.path(), &snap.tree)
+            .map_err(|e| e.to_string())?;
+        let state = crate::owner_state_persist::load_crdt(tmp.path()).map_err(|e| e.to_string())?;
+        Ok(SidecarPreview {
+            present: true,
+            space_count: Some(state.spaces.len() as u32),
+        })
+    })
+    .await
+}
+
 // ── App entry point ──────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -13985,6 +14108,7 @@ pub fn run() {
             identity_commands::export_mnemonic_words,
             identity_commands::preview_mnemonic_identity,
             identity_commands::preview_recovery_file,
+            preview_recovery_state_sidecar,
             identity_commands::export_recovery_file_to_path,
             identity_commands::restore_mnemonic_from_words,
             identity_commands::restore_recovery_from_preview_token,
@@ -13992,6 +14116,7 @@ pub fn run() {
             owner_commands::mint_owner_identity,
             owner_commands::export_owner_recovery_file_to_path,
             owner_commands::issue_owner_recovery_token,
+            get_backup_staleness,
             save_dialog::request_export_save_path,
             pairing_commands::start_inviter_pairing,
             pairing_commands::start_joiner_pairing,

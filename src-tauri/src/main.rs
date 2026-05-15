@@ -39,6 +39,10 @@ enum Command {
         /// Overwrite an existing identity (destructive).
         #[arg(long, global = true)]
         force: bool,
+
+        /// Skip auto-detection of the `<PATH>.state` sidecar (identity-only restore).
+        #[arg(long, global = true)]
+        ignore_state: bool,
     },
 }
 
@@ -53,6 +57,9 @@ enum ExportFormat {
         out: PathBuf,
         #[arg(long, value_name = "STRING")]
         comment: Option<String>,
+        /// Skip the owner-state sidecar (identity-only backup).
+        #[arg(long)]
+        no_state: bool,
     },
 }
 
@@ -110,13 +117,17 @@ fn main() {
                     ExportFormat::Mnemonic => {
                         harmony_app::recovery_cli::export_mnemonic_cli(&plaintext_path)
                     }
-                    ExportFormat::RecoveryFile { out, comment } => {
-                        harmony_app::recovery_cli::export_recovery_file_cli(
-                            &plaintext_path,
-                            &out,
-                            comment.as_deref(),
-                        )
-                    }
+                    ExportFormat::RecoveryFile {
+                        out,
+                        comment,
+                        no_state,
+                    } => harmony_app::recovery_cli::export_recovery_file_cli(
+                        &plaintext_path,
+                        &out,
+                        comment.as_deref(),
+                        /*include_state=*/ !no_state,
+                        /*force=*/ false,
+                    ),
                 };
                 match result {
                     Ok(()) => std::process::exit(0),
@@ -126,7 +137,11 @@ fn main() {
                     }
                 }
             }
-            Some(Command::Restore { format, force }) => {
+            Some(Command::Restore {
+                format,
+                force,
+                ignore_state,
+            }) => {
                 init_tracing();
                 let plaintext_path = match harmony_app::identity::resolve_path(None) {
                     Ok(p) => p,
@@ -148,6 +163,7 @@ fn main() {
                             &plaintext_path,
                             &in_path,
                             force,
+                            ignore_state,
                         )
                     }
                 };

@@ -10,6 +10,9 @@
 //! All calls use the `_with_keychain(None)` injected variants so the tests
 //! never read or write the developer's real OS keychain entry.
 
+mod common;
+
+use common::set_env;
 use harmony_app::{identity, identity_commands, recovery_cli};
 use harmony_owner::lifecycle::RecoveryArtifact;
 use serial_test::serial;
@@ -31,7 +34,7 @@ fn mnemonic_round_trip_preserves_identity_hash() {
     let plaintext_path = dir.path().join("identity.key");
     let mnemonic_path = dir.path().join("mnemonic.txt");
 
-    std::env::set_var("HARMONY_PASSPHRASE", "mnemonic-rt");
+    let _at_rest = set_env("HARMONY_PASSPHRASE", "mnemonic-rt");
 
     let original_seed = [0xA1u8; 32];
     plant_seed(&plaintext_path, &original_seed);
@@ -55,8 +58,6 @@ fn mnemonic_round_trip_preserves_identity_hash() {
         .master_pubkey_bundle()
         .identity_hash();
     assert_eq!(reloaded_id, original_id);
-
-    std::env::remove_var("HARMONY_PASSPHRASE");
 }
 
 #[test]
@@ -66,8 +67,8 @@ fn recovery_file_round_trip_preserves_identity_hash() {
     let plaintext_path = dir.path().join("identity.key");
     let recovery_path = dir.path().join("recovery.bin");
 
-    std::env::set_var("HARMONY_PASSPHRASE", "recovery-rt");
-    std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "rt-pass");
+    let _at_rest = set_env("HARMONY_PASSPHRASE", "recovery-rt");
+    let _recov = set_env("HARMONY_RECOVERY_PASSPHRASE", "rt-pass");
 
     let original_seed = [0xB2u8; 32];
     plant_seed(&plaintext_path, &original_seed);
@@ -94,9 +95,6 @@ fn recovery_file_round_trip_preserves_identity_hash() {
         .master_pubkey_bundle()
         .identity_hash();
     assert_eq!(reloaded_id, original_id);
-
-    std::env::remove_var("HARMONY_PASSPHRASE");
-    std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
 }
 
 #[test]
@@ -105,7 +103,7 @@ fn export_mnemonic_words_returns_24_words() {
     let dir = tempfile::tempdir().unwrap();
     let plaintext_path = dir.path().join("identity.key");
 
-    std::env::set_var("HARMONY_PASSPHRASE", "words-test");
+    let _at_rest = set_env("HARMONY_PASSPHRASE", "words-test");
 
     let original_seed = [0xD4u8; 32];
     plant_seed(&plaintext_path, &original_seed);
@@ -127,8 +125,6 @@ fn export_mnemonic_words_returns_24_words() {
         reparsed.master_pubkey_bundle().identity_hash(),
         "returned hash must match artifact derived from words"
     );
-
-    std::env::remove_var("HARMONY_PASSPHRASE");
 }
 
 #[test]
@@ -137,7 +133,7 @@ fn restore_mnemonic_from_words_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let plaintext_path = dir.path().join("identity.key");
 
-    std::env::set_var("HARMONY_PASSPHRASE", "words-rt");
+    let _at_rest = set_env("HARMONY_PASSPHRASE", "words-rt");
 
     let original_seed = [0xD5u8; 32];
     plant_seed(&plaintext_path, &original_seed);
@@ -162,8 +158,6 @@ fn restore_mnemonic_from_words_round_trip() {
         .master_pubkey_bundle()
         .identity_hash();
     assert_eq!(reloaded_id, original_id);
-
-    std::env::remove_var("HARMONY_PASSPHRASE");
 }
 
 #[test]
@@ -174,8 +168,8 @@ fn cross_encoding_equivalence_via_cli() {
     let mnemonic_path = dir.path().join("mnemonic.txt");
     let recovery_path = dir.path().join("recovery.bin");
 
-    std::env::set_var("HARMONY_PASSPHRASE", "cross-rt");
-    std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "rt-cross");
+    let _at_rest = set_env("HARMONY_PASSPHRASE", "cross-rt");
+    let _recov = set_env("HARMONY_RECOVERY_PASSPHRASE", "rt-cross");
 
     let original_seed = [0xC3u8; 32];
     plant_seed(&plaintext_path, &original_seed);
@@ -225,9 +219,6 @@ fn cross_encoding_equivalence_via_cli() {
         id_via_f, original_id,
         "recovery-file restore preserves identity_hash"
     );
-
-    std::env::remove_var("HARMONY_PASSPHRASE");
-    std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
 }
 
 /// GUI helper exports mnemonic words → CLI restores from a word file.
@@ -240,7 +231,7 @@ fn gui_export_mnemonic_restored_via_cli_preserves_identity_hash() {
     let plaintext_path = dir.path().join("identity.key");
     let mnemonic_path = dir.path().join("mnemonic.txt");
 
-    std::env::set_var("HARMONY_PASSPHRASE", "gui-export-cli-restore");
+    let _at_rest = set_env("HARMONY_PASSPHRASE", "gui-export-cli-restore");
 
     let original_seed = [0xE1u8; 32];
     plant_seed(&plaintext_path, &original_seed);
@@ -270,8 +261,6 @@ fn gui_export_mnemonic_restored_via_cli_preserves_identity_hash() {
         reloaded_id, original_id,
         "identity hash must survive gui-export → cli-restore round-trip"
     );
-
-    std::env::remove_var("HARMONY_PASSPHRASE");
 }
 
 /// CLI exports mnemonic words → GUI helper restores from the word array.
@@ -283,7 +272,7 @@ fn cli_export_mnemonic_restored_via_gui_preserves_identity_hash() {
     let dir = tempfile::tempdir().unwrap();
     let plaintext_path = dir.path().join("identity.key");
 
-    std::env::set_var("HARMONY_PASSPHRASE", "cli-export-gui-restore");
+    let _at_rest = set_env("HARMONY_PASSPHRASE", "cli-export-gui-restore");
 
     let original_seed = [0xE2u8; 32];
     plant_seed(&plaintext_path, &original_seed);
@@ -317,6 +306,4 @@ fn cli_export_mnemonic_restored_via_gui_preserves_identity_hash() {
         hex::encode(original_id),
         "helper return value must match on-disk identity hash"
     );
-
-    std::env::remove_var("HARMONY_PASSPHRASE");
 }

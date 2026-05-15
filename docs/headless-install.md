@@ -139,6 +139,57 @@ HARMONY_RECOVERY_PASSPHRASE_FILE=/run/secrets/harmony-recovery \
     harmony-app restore recovery-file --in /mnt/usb/identity.harmony
 ```
 
+### Paired export (identity + owner-state)
+
+```bash
+export HARMONY_PASSPHRASE="$(cat at-rest.passphrase)"
+export HARMONY_RECOVERY_PASSPHRASE="$(cat recovery.passphrase)"
+harmony-app export recovery-file --out /mnt/usb/recovery.bin --comment "2026-05-14 paired"
+
+# Output (stderr):
+# wrote /mnt/usb/recovery.bin (101 bytes)
+# wrote /mnt/usb/recovery.bin.state (12345678 bytes)
+# identity-hash: 1a2b3c4d...
+```
+
+The `recovery.bin.state` sidecar carries the encrypted owner-state CRDT
+(your nav tree + DM history metadata + read markers). Store both files
+together.
+
+### Identity-only export
+
+```bash
+harmony-app export recovery-file --out /mnt/usb/identity-only.bin --no-state
+```
+
+Emits only `identity-only.bin`. No sidecar. Equivalent to the pre-ZEB-213
+behavior. Useful when sharing an identity backup with a trusted operator
+who shouldn't see your nav tree.
+
+### Paired restore
+
+```bash
+export HARMONY_PASSPHRASE="$(cat at-rest.passphrase)"
+export HARMONY_RECOVERY_PASSPHRASE="$(cat recovery.passphrase)"
+harmony-app restore recovery-file --in /mnt/usb/recovery.bin --force
+
+# Output (stderr):
+# restored identity-hash: 1a2b3c4d...
+# owner-state snapshot: 47 spaces, exported 1715600000000 ms wall-clock
+```
+
+If a `PATH.state` sidecar (derived from the recovery file passed as `--in PATH`) exists, it is auto-detected and restored alongside the main recovery file.
+
+### Identity-only restore (ignore sidecar)
+
+```bash
+harmony-app restore recovery-file --in /mnt/usb/recovery.bin --ignore-state --force
+```
+
+Skips the sidecar even if present. The restored device starts with an
+empty owner-state; Flow A (Zenoh state-root sync) will populate it from
+any surviving bound device of the same owner.
+
 ### Recovery passphrase env vars
 
 | Var | Format |
