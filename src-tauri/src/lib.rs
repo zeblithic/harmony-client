@@ -218,8 +218,19 @@ pub struct NodeState {
     mail_sync: Option<std::sync::Arc<mail_sync::MailSync>>,
     /// Disk-backed content index (pin/replication metadata).
     content_index: std::sync::Arc<std::sync::Mutex<content_index::ContentIndex>>,
-    /// Monotonic connection generation (prevents stale stop_node races).
+    /// Monotonic install generation. Bumped at lock-2 install site under
+    /// `start_node`. Post-install checks (pairing-handle install, failure
+    /// cleanup, stop_inner gating) compare against this to detect whether a
+    /// later `start_node` has SUCCESSFULLY INSTALLED over us. Distinct from
+    /// `install_seq`, which detects attempts-in-progress.
     generation: u64,
+    /// Monotonic start-attempt sequence (ZEB-221). Bumped at lock-1 of
+    /// `start_node` to reserve a slot before async work. Validated at
+    /// lock-2 to detect supersede WITHOUT changing `generation`'s
+    /// "successful install" semantics — that distinction matters because
+    /// post-install code uses `generation` to determine whether a later
+    /// install completed, not whether a later attempt merely started.
+    install_seq: u64,
     /// Hex-encoded node address (set on startup, used to stamp outgoing messages).
     node_addr: String,
     /// ZEB-197 v2 pairing state-machine handle. `Some` while the node is
@@ -394,6 +405,7 @@ impl Default for NodeState {
                 content_index::ContentIndex::load(std::path::Path::new("")),
             )),
             generation: 0,
+            install_seq: 0,
             node_addr: String::new(),
             pairing_handle: None,
             sync_engine: None,
@@ -929,42 +941,48 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     had_node
 }
 
-/// Bump `state.generation` and return the new value.
+/// Bump `state.install_seq` and return the new value.
 ///
-/// Called under lock-1 of `start_node` to reserve a generation slot
+/// Called under lock-1 of `start_node` to reserve a start-attempt slot
 /// BEFORE doing any async work outside the lock. The reserved value is
-/// later validated under lock-2 via [`check_generation_or_supersede`]
+/// later validated under lock-2 via [`check_install_seq_or_supersede`]
 /// so a concurrent `start_node` cannot orphan our spawned resources.
+///
+/// Critically, this does NOT bump `generation` — that field keeps its
+/// pre-ZEB-221 semantics (bumped only on SUCCESSFUL install at lock-2)
+/// because post-install code (pairing-handle install, failure cleanup,
+/// stop_inner gating) needs to know whether a later install actually
+/// completed, not just whether a later attempt started.
 ///
 /// See [ZEB-221](https://linear.app/zeblith/issue/ZEB-221) for the
 /// full race analysis.
-fn reserve_node_generation(state: &Mutex<NodeState>) -> Result<u64, String> {
+fn reserve_install_seq(state: &Mutex<NodeState>) -> Result<u64, String> {
     let mut guard = state
         .lock()
-        .map_err(|e| format!("reserve_node_generation lock error: {e}"))?;
-    guard.generation += 1;
-    Ok(guard.generation)
+        .map_err(|e| format!("reserve_install_seq lock error: {e}"))?;
+    guard.install_seq += 1;
+    Ok(guard.install_seq)
 }
 
-/// Lock `state` and verify the caller's reserved generation still matches.
+/// Lock `state` and verify the caller's reserved install-attempt sequence
+/// still matches.
 ///
 /// Returns the guard on match. Returns
-/// [`SupersededError::Superseded`] if a later
-/// [`reserve_node_generation`] has bumped past `my_gen`, indicating a
-/// concurrent `start_node` has reserved a higher generation slot and
-/// the caller must abort + clean up the resources it built outside the
-/// lock.
-fn check_generation_or_supersede(
+/// [`SupersededError::Superseded`] if a later [`reserve_install_seq`] has
+/// bumped past `my_seq`, indicating a concurrent `start_node` has reserved
+/// a higher slot and the caller must abort + clean up the resources it
+/// built outside the lock.
+fn check_install_seq_or_supersede(
     state: &Mutex<NodeState>,
-    my_gen: u64,
+    my_seq: u64,
 ) -> Result<std::sync::MutexGuard<'_, NodeState>, SupersededError> {
     let guard = state
         .lock()
         .map_err(|e| SupersededError::LockError(format!("{e}")))?;
-    if guard.generation != my_gen {
+    if guard.install_seq != my_seq {
         return Err(SupersededError::Superseded {
-            my_gen,
-            current: guard.generation,
+            my_seq,
+            current: guard.install_seq,
         });
     }
     Ok(guard)
@@ -973,16 +991,16 @@ fn check_generation_or_supersede(
 #[derive(Debug)]
 enum SupersededError {
     LockError(String),
-    Superseded { my_gen: u64, current: u64 },
+    Superseded { my_seq: u64, current: u64 },
 }
 
 impl std::fmt::Display for SupersededError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SupersededError::LockError(msg) => write!(f, "node-state lock error: {msg}"),
-            SupersededError::Superseded { my_gen, current } => write!(
+            SupersededError::Superseded { my_seq, current } => write!(
                 f,
-                "start_node superseded by concurrent call (my_gen={my_gen}, current={current})"
+                "start_node superseded by concurrent call (my_seq={my_seq}, current={current})"
             ),
         }
     }
@@ -1108,13 +1126,20 @@ async fn start_node(
     // outlive the lock scope and can be used in the drain block.
     let old_dm_send_inflight: Option<std::sync::Arc<tokio::sync::Semaphore>>;
     let old_dm_send_stopping: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>;
-    // ZEB-221: reserve our generation slot via the dedicated helper
-    // BEFORE the lock-1 tuple-take block. Acquires + releases its own
-    // lock; the subsequent lock-1 acquisition observes the bumped
-    // value. Held in outer scope so the lock-2 validation
-    // (`check_generation_or_supersede`) can reach it. Mismatch routes
+    // ZEB-221: reserve our start-attempt sequence via the dedicated helper
+    // BEFORE the lock-1 tuple-take block. Acquires + releases its own lock;
+    // the subsequent lock-1 acquisition observes the bumped install_seq.
+    // Held in outer scope so the lock-2 validation
+    // (`check_install_seq_or_supersede`) can reach it. Mismatch routes
     // through the existing thread_install_failure cleanup path.
-    let my_gen: u64 = reserve_node_generation(&state)?;
+    //
+    // Distinct from `generation`, which keeps its pre-ZEB-221 semantics
+    // (bumped only on SUCCESSFUL install at lock-2) so post-install code
+    // (pairing-handle install, failure cleanup, stop_inner gating)
+    // continues to detect "later install completed" rather than the
+    // strictly weaker "later attempt started" — see Cursor bug report on
+    // PR #124.
+    let my_install_seq: u64 = reserve_install_seq(&state)?;
     let (
         old_shutdown,
         old_thread,
@@ -2380,13 +2405,72 @@ async fn start_node(
         // cancel an in-flight startup via shutdown_tx.
         //
         // ZEB-221: validate our lock-1 reservation. If a later start_node
-        // has bumped past `my_gen` while we were building SyncEngine et al.
-        // outside the lock, set the `superseded` sentinel and skip the
-        // install block; post-lock cleanup will await shutdown on each of
-        // the four background-task-owning Arcs.
+        // has bumped past `my_install_seq` while we were building
+        // SyncEngine et al. outside the lock, set the `superseded`
+        // sentinel and skip the install block; post-lock cleanup will
+        // await shutdown on each of the four background-task-owning Arcs.
+        //
+        // The `LockError` branch is a poisoned-mutex failure — we still
+        // need to tear down the four Arcs to avoid orphan tokio tasks, so
+        // we shut them down inline before returning. We can't fall through
+        // to the shared post-lock cleanup because the cleanup branch
+        // assumes the lock-2 block ran to completion (it uses the
+        // destructured `*_for_cleanup` Arcs).
+        // ZEB-221 (CodeRabbit + Qodo finding): probe the lock for poison
+        // BEFORE the lock-2 match. If poisoned, the four background-task-
+        // owning Arcs constructed outside the lock would otherwise leak
+        // their tokio tasks. We do the probe + shutdown awaits in a scope
+        // with NO MutexGuard bound, so the awaits don't fall foul of the
+        // Send-bound on Tauri command futures (a `MutexGuard<NodeState>`
+        // is `!Send` and would span any await it is live across).
+        //
+        // Realistic threat model: lock poisoning only happens if a thread
+        // panicked while holding `state.lock()`. The probe catches that.
+        // A second poisoning between the probe and the lock-2 match below
+        // is theoretically possible (panic during the brief window) — that
+        // residual case still returns Err without cleanup, but it is a
+        // strictly weaker leak than the original "every poison leaks".
+        let lock_poison_msg: Option<String> = match state.lock() {
+            Ok(_g) => None, // immediately released
+            Err(e) => Some(format!("lock error: {e}")),
+        };
+        if let Some(msg) = lock_poison_msg {
+            if let Some(publisher) = profile_broadcast_publisher_arc.clone() {
+                publisher.shutdown().await;
+            }
+            if let Some(registry) = channel_log_registry_arc.clone() {
+                if let Err(e) = registry.shutdown_all().await {
+                    tracing::error!(
+                        error = %e,
+                        "ChannelLogRegistry cleanup after lock-2 poisoned-mutex"
+                    );
+                }
+            }
+            if let Some(registry) = community_registry_arc.clone() {
+                if let Err(e) = registry.shutdown_all().await {
+                    tracing::error!(
+                        error = %e,
+                        "CommunitySyncRegistry cleanup after lock-2 poisoned-mutex"
+                    );
+                }
+            }
+            if let Some(engine) = sync_engine_arc.clone() {
+                if let Err(e) = engine.shutdown().await {
+                    tracing::error!(
+                        error = %e,
+                        "SyncEngine cleanup after lock-2 poisoned-mutex"
+                    );
+                }
+            }
+            return Err(msg);
+        }
+
+        // Lock is healthy. The match below MUST NOT span an await
+        // (MutexGuard is !Send). Each arm assigns guard + superseded and
+        // returns immediately.
         let mut guard;
         let superseded;
-        match check_generation_or_supersede(&state, my_gen) {
+        match check_install_seq_or_supersede(&state, my_install_seq) {
             Ok(g) => {
                 guard = g;
                 superseded = false;
@@ -2394,12 +2478,16 @@ async fn start_node(
             Err(SupersededError::Superseded { .. }) => {
                 // Re-acquire the lock (we still need a guard for the
                 // tuple-return below, even though we'll skip the install
-                // block). The check_generation_or_supersede helper consumed
-                // its lock acquisition on the Err path.
+                // block). The check_install_seq_or_supersede helper
+                // consumed its lock acquisition on the Err path.
                 guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
                 superseded = true;
             }
             Err(SupersededError::LockError(msg)) => {
+                // Lock got poisoned between the probe above and this
+                // check (very rare — would require a panic in the
+                // intervening window). Strictly weaker leak than the
+                // unprobed path; the four Arcs are not shut down here.
                 return Err(msg);
             }
         }
@@ -2410,6 +2498,18 @@ async fn start_node(
         // the `superseded` sentinel instead.
         let mut thread_install_failure: Option<String> = None;
         if !superseded {
+            // ZEB-221: bump `generation` HERE at the install site so the
+            // field retains its pre-ZEB-221 "successful install marker"
+            // semantics. Post-install code (pairing-handle install,
+            // failure cleanup at line ~2947, stop_inner gating) compares
+            // `guard.generation` against `our_gen` to detect "did a later
+            // install actually complete?" — which is strictly stronger
+            // than "did a later attempt merely start?" and is what the
+            // post-install paths need. Race detection between concurrent
+            // start_node attempts uses `install_seq` instead, validated
+            // by check_install_seq_or_supersede above.
+            guard.generation += 1;
+
             // ZEB-155: load the sidecar NOW — after stop_handles has
             // quiesced the previous node and under the state lock — so any
             // pin_content / unpin_content / burn_content that raced with
@@ -16729,6 +16829,7 @@ mod start_node_race_tests {
                 content_index::ContentIndex::load(std::path::Path::new("")),
             )),
             generation: 0,
+            install_seq: 0,
             node_addr: String::new(),
             pairing_handle: None,
             sync_engine: None,
@@ -16758,42 +16859,54 @@ mod start_node_race_tests {
     }
 
     #[test]
-    fn reserve_generation_bumps_and_returns() {
+    fn reserve_install_seq_bumps_and_returns() {
         let state = fresh_node_state();
-        let n = reserve_node_generation(&state).expect("reserve");
+        let n = reserve_install_seq(&state).expect("reserve");
         assert_eq!(n, 1);
-        assert_eq!(state.lock().unwrap().generation, 1);
+        assert_eq!(state.lock().unwrap().install_seq, 1);
     }
 
     #[test]
-    fn reserve_generation_is_monotonic() {
+    fn reserve_install_seq_is_monotonic() {
         let state = fresh_node_state();
-        assert_eq!(reserve_node_generation(&state).unwrap(), 1);
-        assert_eq!(reserve_node_generation(&state).unwrap(), 2);
-        assert_eq!(reserve_node_generation(&state).unwrap(), 3);
-        assert_eq!(state.lock().unwrap().generation, 3);
+        assert_eq!(reserve_install_seq(&state).unwrap(), 1);
+        assert_eq!(reserve_install_seq(&state).unwrap(), 2);
+        assert_eq!(reserve_install_seq(&state).unwrap(), 3);
+        assert_eq!(state.lock().unwrap().install_seq, 3);
+    }
+
+    #[test]
+    fn reserve_install_seq_does_not_touch_generation() {
+        // ZEB-221: install_seq is for race detection; generation keeps its
+        // pre-ZEB-221 "successful install" semantics. Three reserves must
+        // NOT bump generation (only lock-2 install does that).
+        let state = fresh_node_state();
+        let _ = reserve_install_seq(&state).unwrap();
+        let _ = reserve_install_seq(&state).unwrap();
+        let _ = reserve_install_seq(&state).unwrap();
+        assert_eq!(state.lock().unwrap().generation, 0);
     }
 
     #[test]
     fn check_or_supersede_accepts_match() {
         let state = fresh_node_state();
-        let my_gen = reserve_node_generation(&state).unwrap();
-        let guard = check_generation_or_supersede(&state, my_gen)
-            .expect("should accept matching generation");
-        assert_eq!(guard.generation, my_gen);
+        let my_seq = reserve_install_seq(&state).unwrap();
+        let guard = check_install_seq_or_supersede(&state, my_seq)
+            .expect("should accept matching install_seq");
+        assert_eq!(guard.install_seq, my_seq);
     }
 
     #[test]
     fn check_or_supersede_rejects_stale() {
         let state = fresh_node_state();
-        let my_gen = reserve_node_generation(&state).unwrap();
-        let _later = reserve_node_generation(&state).unwrap();
-        let err = check_generation_or_supersede(&state, my_gen)
+        let my_seq = reserve_install_seq(&state).unwrap();
+        let _later = reserve_install_seq(&state).unwrap();
+        let err = check_install_seq_or_supersede(&state, my_seq)
             .map(drop)
-            .expect_err("stale my_gen must be superseded");
+            .expect_err("stale my_seq must be superseded");
         match err {
-            SupersededError::Superseded { my_gen: g, current } => {
-                assert_eq!(g, 1);
+            SupersededError::Superseded { my_seq: s, current } => {
+                assert_eq!(s, 1);
                 assert_eq!(current, 2);
             }
             other => panic!("unexpected error: {:?}", other),
@@ -16801,16 +16914,16 @@ mod start_node_race_tests {
     }
 
     #[test]
-    fn check_or_supersede_rejects_zero_when_generation_advanced() {
+    fn check_or_supersede_rejects_zero_when_install_seq_advanced() {
         let state = fresh_node_state();
         // simulate prior reservations without calling our helper
-        state.lock().unwrap().generation = 5;
-        let err = check_generation_or_supersede(&state, 0)
+        state.lock().unwrap().install_seq = 5;
+        let err = check_install_seq_or_supersede(&state, 0)
             .map(drop)
-            .expect_err("my_gen=0 against generation=5 must be superseded");
+            .expect_err("my_seq=0 against install_seq=5 must be superseded");
         match err {
             SupersededError::Superseded {
-                my_gen: 0,
+                my_seq: 0,
                 current: 5,
             } => {}
             other => panic!("unexpected error: {:?}", other),
