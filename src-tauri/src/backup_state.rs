@@ -53,6 +53,19 @@ pub fn save_last_backup(path: &Path, record: &LastBackup) -> Result<(), BackupSt
 
 /// Find the maximum `wall_ms` across all mutating entries in an owner-state.
 /// Returns 0 if the state is empty.
+///
+/// Scans every HLC-bearing collection on `OwnerState`:
+/// - `spaces` (Space.updated_at)
+/// - `outbox` (OutboxEntry.created_at)
+/// - `inbox` (InboxEntry.received_at)
+/// - `markers` (ReadMarker.last_read_at)
+/// - `owner_device_cache.devices` (OwnerDeviceEntry.learned_at)
+/// - `libraries` (LibraryEntry.added_at, plus removed_at if Some)
+/// - `outbox_tombstones` (values are Hlc directly)
+///
+/// Missing a collection here causes false-negative staleness for users
+/// whose only recent mutations were in that collection (e.g. "added a
+/// library" or "rotated a bound device").
 pub fn last_mutation_wall_ms(state: &OwnerState) -> u64 {
     let mut max_ms = 0u64;
     for s in state.spaces.values() {
@@ -66,6 +79,18 @@ pub fn last_mutation_wall_ms(state: &OwnerState) -> u64 {
     }
     for m in state.markers.values() {
         max_ms = max_ms.max(m.last_read_at.wall_ms);
+    }
+    for entry in state.owner_device_cache.devices.values() {
+        max_ms = max_ms.max(entry.learned_at.wall_ms);
+    }
+    for lib in state.libraries.values() {
+        max_ms = max_ms.max(lib.added_at.wall_ms);
+        if let Some(rm) = lib.removed_at.as_ref() {
+            max_ms = max_ms.max(rm.wall_ms);
+        }
+    }
+    for hlc in state.outbox_tombstones.values() {
+        max_ms = max_ms.max(hlc.wall_ms);
     }
     max_ms
 }
@@ -104,9 +129,13 @@ pub fn should_warn_about_stale_backup(
     let last_mutation = last_mutation_wall_ms(state);
     match last_backup {
         None => {
-            // No backup ever taken. Only nag if CRDT mutations exist.
-            let stale = last_mutation > 0;
-            let days = if stale {
+            // No backup ever taken. Apply the same 14-day grace window as
+            // the `Some` branch — a fresh-install user only gets the
+            // banner after their mutations have been unbacked-up for
+            // ≥14 days. Without this symmetry, the first DM would
+            // trigger an immediate "BACKUP NOW" banner on day-0 installs.
+            let stale = last_mutation > 0 && now_wall_ms > last_mutation + STALENESS_THRESHOLD_MS;
+            let days = if last_mutation > 0 {
                 ((now_wall_ms.saturating_sub(last_mutation)) / 86_400_000) as u32
             } else {
                 0
@@ -134,7 +163,9 @@ pub fn should_warn_about_stale_backup(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::owner_state_types::{Space, SpaceId, SpaceKind};
+    use crate::owner_state_types::{
+        LibraryEntry, OutboxEntryId, OwnerAddr, Space, SpaceId, SpaceKind,
+    };
 
     fn hlc(w: u64) -> Hlc {
         Hlc {
@@ -197,17 +228,26 @@ mod tests {
 
     #[test]
     fn staleness_warning_handles_missing_file() {
-        let now_ms = 1_000_000_000;
+        // 100 days expressed in ms — comfortably past the 14-day window
+        // so the subtractions below don't underflow.
+        let now_ms = 100 * 86_400_000;
         // No `last_backup.json`, no mutations: don't nag.
         let empty = OwnerState::default();
         let r = should_warn_about_stale_backup(now_ms, None, &empty, None);
         assert!(!r.is_stale, "fresh install, no mutations -> no warn");
 
-        // No `last_backup.json`, but the user has been making changes:
-        // do nag.
-        let active = state_with_mutation_at(now_ms - 86_400_000);
-        let r = should_warn_about_stale_backup(now_ms, None, &active, None);
-        assert!(r.is_stale, "mutations + no backup -> warn");
+        // No `last_backup.json`, mutations 1 day ago: not yet 14 days stale.
+        let recent = state_with_mutation_at(now_ms - 86_400_000);
+        let r = should_warn_about_stale_backup(now_ms, None, &recent, None);
+        assert!(
+            !r.is_stale,
+            "1-day-old mutation, no backup, still under 14d threshold"
+        );
+
+        // No `last_backup.json`, mutations 15 days ago: NOW warn.
+        let stale = state_with_mutation_at(now_ms - 15 * 86_400_000);
+        let r = should_warn_about_stale_backup(now_ms, None, &stale, None);
+        assert!(r.is_stale, "15-day-old mutation, no backup -> warn");
     }
 
     #[test]
@@ -243,6 +283,39 @@ mod tests {
         save_last_backup(&path, &record).unwrap();
         let loaded = load_last_backup(&path).unwrap().expect("present");
         assert_eq!(loaded, record);
+    }
+
+    #[test]
+    fn last_mutation_includes_libraries_and_tombstones() {
+        // Start from a state with NO spaces/outbox/inbox/markers mutations
+        // but a library added 100ms ago.
+        let mut state = OwnerState::default();
+        let addr = OwnerAddr([7u8; 16]);
+        let library_at = 100u64;
+        state.libraries.insert(
+            addr,
+            LibraryEntry {
+                address: addr,
+                added_at: hlc(library_at),
+                removed_at: None,
+            },
+        );
+        assert_eq!(
+            last_mutation_wall_ms(&state),
+            library_at,
+            "library add should drive last_mutation_wall_ms"
+        );
+
+        // A later outbox_tombstone should now win.
+        let tomb_at = 500u64;
+        state
+            .outbox_tombstones
+            .insert(OutboxEntryId([9u8; 16]), hlc(tomb_at));
+        assert_eq!(
+            last_mutation_wall_ms(&state),
+            tomb_at,
+            "later outbox_tombstone HLC should dominate library add"
+        );
     }
 
     #[test]
