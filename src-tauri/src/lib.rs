@@ -6609,6 +6609,8 @@ pub enum MemberStatusDto {
     Left,
     Invited,
     Banned,
+    /// ZEB-254: joiner has minted a PendingJoin awaiting admin counter-sign.
+    PendingJoin,
 }
 
 impl From<crate::community_membership::MemberStatus> for MemberStatusDto {
@@ -6619,6 +6621,8 @@ impl From<crate::community_membership::MemberStatus> for MemberStatusDto {
             MemberStatus::Left => Self::Left,
             MemberStatus::Invited => Self::Invited,
             MemberStatus::Banned => Self::Banned,
+            // ZEB-254: wired in Task 4 (IPC).
+            MemberStatus::PendingJoin => Self::PendingJoin,
         }
     }
 }
@@ -13291,7 +13295,11 @@ pub fn delta_to_change(
         // is projected for it. Fork events are surfaced via a separate
         // fork-lineage listing path (Task 7+), not via the membership-changed
         // Tauri event stream.
-        | crate::community_membership::MembershipEventKind::Fork { .. } => return None,
+        | crate::community_membership::MembershipEventKind::Fork { .. }
+        // ZEB-254: PendingJoin and JoinCountersign project to MembershipChange
+        // in Task 4 (IPC wiring). Until then, emit no Tauri event.
+        | crate::community_membership::MembershipEventKind::PendingJoin { .. }
+        | crate::community_membership::MembershipEventKind::JoinCountersign { .. } => return None,
     };
     Some((cid_hex, change))
 }

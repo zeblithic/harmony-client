@@ -180,6 +180,39 @@ pub enum MembershipEventKind {
         #[serde(rename = "fs")]
         fork_space_id: SpaceId,
     },
+
+    /// ZEB-254: joiner-signed pending join for invite-only communities.
+    /// Distributed via the community CRDT (Zenoh) so admins who were
+    /// offline at redemption time can counter-sign asynchronously.
+    /// Variant code "g" (gate / guest, unused before this). Inner field
+    /// keys are 2-char per same-length-keys invariant.
+    /// See spec `docs/specs/2026-05-15-zeb-254-pending-join-crdt-design.md` §3.
+    #[serde(rename = "g")]
+    PendingJoin {
+        #[serde(rename = "it")]
+        invite_token: crate::community_invite::InviteToken,
+        /// 64-byte concatenation of X25519_pub || Ed25519_pub matching
+        /// `harmony_identity::Identity::to_public_bytes()`. Same shape
+        /// as `CommunityInviteSigned.joiner_identity_pub` (community_invite.rs:258).
+        #[serde(
+            rename = "jp",
+            serialize_with = "serialize_bytes_as_bstr",
+            deserialize_with = "deserialize_bytes_from_bstr"
+        )]
+        joiner_identity_pub: [u8; 64],
+    },
+
+    /// ZEB-254: admin-signed counter-sign approving a PendingJoin.
+    /// Pairs by `target_event_id`. Variant code "y" (yes / approve).
+    #[serde(rename = "y")]
+    JoinCountersign {
+        #[serde(
+            rename = "tg",
+            serialize_with = "serialize_bytes_as_bstr",
+            deserialize_with = "deserialize_bytes_from_bstr"
+        )]
+        target_event_id: EventId,
+    },
 }
 
 impl CanonicalPayloadSealed for MembershipEventKind {}
@@ -866,6 +899,11 @@ pub enum MemberStatus {
     Left,
     #[serde(rename = "b")]
     Banned,
+    /// ZEB-254: joiner has minted a PendingJoin but no JoinCountersign
+    /// has yet paired with it. Transitions to Joined when a matching
+    /// JoinCountersign is materialized.
+    #[serde(rename = "p")]
+    PendingJoin,
 }
 
 /// Materialized state for one channel in a community. Built by
@@ -985,7 +1023,10 @@ pub fn materialize(
                 //     before the Ban arrived)
                 let prior_status = m.members.get(&event.actor).map(|s| s.status);
                 let should_refresh = match prior_status {
-                    None | Some(MemberStatus::Invited) | Some(MemberStatus::Left) => true,
+                    None
+                    | Some(MemberStatus::Invited)
+                    | Some(MemberStatus::Left)
+                    | Some(MemberStatus::PendingJoin) => true,
                     Some(MemberStatus::Joined) | Some(MemberStatus::Banned) => false,
                 };
                 if should_refresh {
@@ -1067,7 +1108,8 @@ pub fn materialize(
                     None | Some(MemberStatus::Left) => true,
                     Some(MemberStatus::Invited)
                     | Some(MemberStatus::Joined)
-                    | Some(MemberStatus::Banned) => false,
+                    | Some(MemberStatus::Banned)
+                    | Some(MemberStatus::PendingJoin) => false,
                 };
                 if should_refresh {
                     m.members.insert(
@@ -1350,6 +1392,12 @@ pub fn materialize(
                 // log for historical/audit visibility but do not change the
                 // materialized membership/power/channels view. They are
                 // surfaced separately via settings-panel listings.
+            }
+            MembershipEventKind::PendingJoin { .. } => {
+                // ZEB-254: materialize wiring ships in Task 3.
+            }
+            MembershipEventKind::JoinCountersign { .. } => {
+                // ZEB-254: materialize wiring ships in Task 3.
             }
         }
     }
@@ -1668,6 +1716,9 @@ pub fn verify_event(
                 return Err(VerifyError::ActorNotJoined);
             }
         }
+        MembershipEventKind::PendingJoin { .. } | MembershipEventKind::JoinCountersign { .. } => {
+            // ZEB-254: verify wiring ships in Task 2.
+        }
     }
 
     // 5. Per-kind power rules.
@@ -1902,6 +1953,9 @@ pub fn verify_event(
             if actor_power < POWER_THRESHOLDS.invite {
                 return Err(VerifyError::ActorPowerInsufficient);
             }
+        }
+        MembershipEventKind::PendingJoin { .. } | MembershipEventKind::JoinCountersign { .. } => {
+            // ZEB-254: power-rule verify wiring ships in Task 2.
         }
     }
 
@@ -3907,5 +3961,50 @@ mod tests {
             }
             other => panic!("expected CommunityIdMismatch, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn pending_join_variant_canonical_cbor_round_trip() {
+        use crate::community_invite::InviteToken;
+
+        let token = InviteToken {
+            inviter: OwnerAddr([1u8; 16]),
+            invitee_hint: Some(OwnerAddr([2u8; 16])),
+            minted_at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            expires_at: Some(1_700_000_000_000 + 7 * 86_400_000),
+            sig: [3u8; 64],
+        };
+        let kind = MembershipEventKind::PendingJoin {
+            invite_token: token,
+            joiner_identity_pub: [4u8; 64],
+        };
+
+        let encoded = crate::owner_state_crypto::canonical_cbor_encode(&kind).expect("encode");
+        let decoded: MembershipEventKind =
+            ciborium::from_reader(&mut encoded.as_slice()).expect("decode");
+        assert_eq!(kind, decoded);
+    }
+
+    #[test]
+    fn join_countersign_variant_canonical_cbor_round_trip() {
+        let kind = MembershipEventKind::JoinCountersign {
+            target_event_id: [42u8; 16],
+        };
+        let encoded = crate::owner_state_crypto::canonical_cbor_encode(&kind).expect("encode");
+        let decoded: MembershipEventKind =
+            ciborium::from_reader(&mut encoded.as_slice()).expect("decode");
+        assert_eq!(kind, decoded);
+    }
+
+    #[test]
+    fn member_status_pending_join_canonical_cbor_round_trip() {
+        let status = MemberStatus::PendingJoin;
+        let encoded = crate::owner_state_crypto::canonical_cbor_encode(&status).expect("encode");
+        let decoded: MemberStatus = ciborium::from_reader(&mut encoded.as_slice()).expect("decode");
+        assert_eq!(status, decoded);
     }
 }
