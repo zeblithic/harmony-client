@@ -94,6 +94,34 @@ describe('CommunityService', () => {
     expect(service.getKind('eeff0011')).toBe('invite-only');
   });
 
+  // ZEB-254: pending flag on RedeemInviteResultDto
+  it('redeemInvite returns pending: true when admin was offline (fast-path timeout)', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue({
+      communityId: 'aabb1122',
+      communityName: 'Secret Club',
+      isInviteOnly: true,
+      pending: true,
+    });
+    const dto = await service.redeemInvite('harmony://invite/v1?ci=pending');
+    expect(dto.pending).toBe(true);
+    // Kind is still recorded regardless of pending state.
+    expect(service.getKind('aabb1122')).toBe('invite-only');
+  });
+
+  it('redeemInvite returns pending: false for open communities', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue({
+      communityId: 'cc334455',
+      communityName: 'Open Crew',
+      isInviteOnly: false,
+      pending: false,
+    });
+    const dto = await service.redeemInvite('harmony://invite/v1?ci=open');
+    expect(dto.pending).toBe(false);
+    expect(service.getKind('cc334455')).toBe('open');
+  });
+
   it('joinOpenCommunity returns the DTO and learns the community kind', async () => {
     await service.connectAdapter(adapter);
     (adapter.invoke as any).mockResolvedValue({

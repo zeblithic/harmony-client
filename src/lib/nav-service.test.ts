@@ -596,3 +596,148 @@ describe('NavService.resolveForkParentName (ZEB-285)', () => {
     expect(svc.resolveForkParentName('original-id')).toBe(null);
   });
 });
+
+describe('NavService — pending community (ZEB-254)', () => {
+  it('community with pending=true in payload creates a NavNode with pending: true', () => {
+    const svc = new NavService();
+    svc.nodes = [];
+    svc.addOrUpdateNavSpace({
+      action: 'added',
+      spaceId: 'pending-community-id',
+      kind: 'community',
+      name: 'Secret Crew',
+      parentId: null,
+      pending: true,
+    });
+
+    const node = svc.nodes.find((n) => n.id === 'pending-community-id');
+    expect(node).toBeDefined();
+    expect(node!.pending).toBe(true);
+  });
+
+  it('community without pending field creates a NavNode with pending: undefined', () => {
+    const svc = new NavService();
+    svc.nodes = [];
+    svc.addOrUpdateNavSpace({
+      action: 'added',
+      spaceId: 'open-community-id',
+      kind: 'community',
+      name: 'Open Crew',
+      parentId: null,
+    });
+
+    const node = svc.nodes.find((n) => n.id === 'open-community-id');
+    expect(node).toBeDefined();
+    expect(node!.pending).toBeUndefined();
+  });
+
+  it('nav-updated { action: modified, pending: false } clears pending state', async () => {
+    const svc = new NavService();
+    svc.nodes = [];
+
+    // Start as pending.
+    svc.addOrUpdateNavSpace({
+      action: 'added',
+      spaceId: 'pending-community-id',
+      kind: 'community',
+      name: 'Secret Crew',
+      parentId: null,
+      pending: true,
+    });
+    expect(svc.nodes.find((n) => n.id === 'pending-community-id')!.pending).toBe(true);
+
+    // Countersign arrives — backend emits modified { pending: false }.
+    svc.addOrUpdateNavSpace({
+      action: 'modified',
+      spaceId: 'pending-community-id',
+      kind: 'community',
+      name: 'Secret Crew',
+      pending: false,
+    });
+
+    const node = svc.nodes.find((n) => n.id === 'pending-community-id');
+    expect(node).toBeDefined();
+    expect(node!.pending).toBe(false);
+  });
+
+  it('nav-updated { action: modified } without pending field preserves existing pending', () => {
+    const svc = new NavService();
+    svc.nodes = [];
+
+    svc.addOrUpdateNavSpace({
+      action: 'added',
+      spaceId: 'pending-community-id',
+      kind: 'community',
+      name: 'Secret Crew',
+      parentId: null,
+      pending: true,
+    });
+
+    // A name-only modified (no pending field) should not clear pending.
+    svc.addOrUpdateNavSpace({
+      action: 'modified',
+      spaceId: 'pending-community-id',
+      kind: 'community',
+      name: 'Secret Crew (renamed)',
+    });
+
+    const node = svc.nodes.find((n) => n.id === 'pending-community-id');
+    expect(node!.pending).toBe(true);
+    expect(node!.name).toBe('Secret Crew (renamed)');
+  });
+
+  it('nav-updated modified pending=false fires onChange', () => {
+    const svc = new NavService();
+    svc.nodes = [];
+    svc.addOrUpdateNavSpace({
+      action: 'added',
+      spaceId: 'p-id',
+      kind: 'community',
+      name: 'Crew',
+      pending: true,
+    });
+
+    const onChange = vi.fn();
+    svc.onChange = onChange;
+    svc.addOrUpdateNavSpace({
+      action: 'modified',
+      spaceId: 'p-id',
+      kind: 'community',
+      name: 'Crew',
+      pending: false,
+    });
+
+    expect(onChange).toHaveBeenCalled();
+  });
+
+  it('nav-updated listener: pending=false via event ungreys the node', async () => {
+    const svc = new NavService();
+    svc.nodes = [];
+    const mock = createMockAdapter();
+    await svc.connectAdapter(mock.adapter);
+
+    // Seed a pending community directly (simulating a synthesized nav node
+    // added before the adapter wired in).
+    svc.addOrUpdateNavSpace({
+      action: 'added',
+      spaceId: 'listen-pending-id',
+      kind: 'community',
+      name: 'Invite Crew',
+      pending: true,
+    });
+    expect(svc.nodes.find((n) => n.id === 'listen-pending-id')!.pending).toBe(true);
+
+    // Backend fires nav-updated { pending: false } when countersign lands.
+    mock.emit('nav-updated', {
+      action: 'modified',
+      spaceId: 'listen-pending-id',
+      kind: 'community',
+      name: 'Invite Crew',
+      pending: false,
+    });
+
+    const node = svc.nodes.find((n) => n.id === 'listen-pending-id');
+    expect(node!.pending).toBe(false);
+    svc.destroy();
+  });
+});

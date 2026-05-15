@@ -223,6 +223,9 @@
   let redeemPending = $state(false);
   let redeemError = $state<string | null>(null);
   let redeemUrl = $state('');
+  /** ZEB-254: transient status message shown after a successful redeem.
+   *  Empty string = no message displayed. Auto-cleared after 6 s. */
+  let redeemStatusMsg = $state('');
 
   // ── ZEB-218 Sub-D Phase 1: library directory browser modal ─────────
   // The adapter is constructed inside the Tauri-init IIFE below; we
@@ -1700,6 +1703,8 @@
         // backend emits nav-updated but events aren't buffered for
         // late listeners. dto.communityName carries the real name so
         // there's no placeholder regression vs the listener path.
+        // ZEB-254: carry the pending flag so the nav node starts greyed
+        // when the invite-only join countersign hasn't arrived yet.
         navService.addOrUpdateNavSpace({
           action: 'added',
           spaceId: dto.communityId,
@@ -1707,9 +1712,15 @@
           name: dto.communityName,
           members: [],
           parentId: null,
+          pending: dto.pending ? true : undefined,
         });
         showRedeemInvite = false;
         redeemUrl = '';
+        // ZEB-254: show a transient status message; auto-clear after 6 s.
+        redeemStatusMsg = dto.pending
+          ? `Join request sent. "${dto.communityName}" will unlock once an admin approves.`
+          : `You're in "${dto.communityName}"!`;
+        setTimeout(() => { redeemStatusMsg = ''; }, 6000);
         changeSelectedCommunity(dto.communityId);
         await refreshCommunityMembers(dto.communityId);
       } catch (e) {
@@ -1724,6 +1735,13 @@
       redeemError = null;
     }}
   />
+{/if}
+
+{#if redeemStatusMsg}
+  <!-- ZEB-254: transient join-status banner; auto-clears after 6 s. -->
+  <div class="redeem-status-banner" role="status" aria-live="polite">
+    {redeemStatusMsg}
+  </div>
 {/if}
 
 {#if libraryDirectoryOpen && libraryDirectoryService && tauriAdapter}
@@ -1844,6 +1862,23 @@
     background: var(--bg-secondary, #222);
     border-radius: 8px;
     box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
+  }
+
+  /* ZEB-254: transient join-status banner (pending vs joined). */
+  .redeem-status-banner {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--bg-tertiary, #2a2a2a);
+    border: 1px solid var(--border, #444);
+    border-radius: 6px;
+    padding: 10px 18px;
+    color: var(--text-primary, #fff);
+    font-size: 0.875rem;
+    z-index: 1000;
+    pointer-events: none;
+    white-space: nowrap;
   }
 
 </style>
