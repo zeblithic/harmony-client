@@ -929,6 +929,68 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     had_node
 }
 
+/// Bump `state.generation` and return the new value.
+///
+/// Called under lock-1 of `start_node` to reserve a generation slot
+/// BEFORE doing any async work outside the lock. The reserved value is
+/// later validated under lock-2 via [`check_generation_or_supersede`]
+/// so a concurrent `start_node` cannot orphan our spawned resources.
+///
+/// See [ZEB-221](https://linear.app/zeblith/issue/ZEB-221) for the
+/// full race analysis.
+#[allow(dead_code)] // wired into start_node by ZEB-221 Task 2
+fn reserve_node_generation(state: &Mutex<NodeState>) -> Result<u64, String> {
+    let mut guard = state
+        .lock()
+        .map_err(|e| format!("reserve_node_generation lock error: {e}"))?;
+    guard.generation += 1;
+    Ok(guard.generation)
+}
+
+/// Lock `state` and verify the caller's reserved generation still matches.
+///
+/// Returns the guard on match. Returns
+/// [`SupersededError::Superseded`] if a later
+/// [`reserve_node_generation`] has bumped past `my_gen`, indicating a
+/// concurrent `start_node` has reserved a higher generation slot and
+/// the caller must abort + clean up the resources it built outside the
+/// lock.
+#[allow(dead_code)] // wired into start_node by ZEB-221 Task 2
+fn check_generation_or_supersede(
+    state: &Mutex<NodeState>,
+    my_gen: u64,
+) -> Result<std::sync::MutexGuard<'_, NodeState>, SupersededError> {
+    let guard = state
+        .lock()
+        .map_err(|e| SupersededError::LockError(format!("{e}")))?;
+    if guard.generation != my_gen {
+        return Err(SupersededError::Superseded {
+            my_gen,
+            current: guard.generation,
+        });
+    }
+    Ok(guard)
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // wired into start_node by ZEB-221 Task 2
+enum SupersededError {
+    LockError(String),
+    Superseded { my_gen: u64, current: u64 },
+}
+
+impl std::fmt::Display for SupersededError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SupersededError::LockError(msg) => write!(f, "node-state lock error: {msg}"),
+            SupersededError::Superseded { my_gen, current } => write!(
+                f,
+                "start_node superseded by concurrent call (my_gen={my_gen}, current={current})"
+            ),
+        }
+    }
+}
+
 /// Start the harmony node with an embedded NodeRuntime.
 ///
 /// Generates/loads identity, creates the runtime, and spawns the event loop
@@ -16591,5 +16653,121 @@ mod dm_send_fence_tests {
             DM_SEND_FENCE_CAPACITY,
             "all permits should be returned after drain"
         );
+    }
+}
+
+#[cfg(test)]
+mod start_node_race_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Build a minimal `NodeState` for race-helper tests. Only `generation`
+    /// is meaningful; everything else is default / None / empty.
+    fn fresh_node_state() -> Mutex<NodeState> {
+        Mutex::new(NodeState {
+            thread: None,
+            shutdown_tx: None,
+            publish_tx: None,
+            fetch_tx: None,
+            ingest_tx: None,
+            content_verb_tx: None,
+            follow_tx: None,
+            voice_tx: None,
+            voice_channel_tx: None,
+            follow_mgr: None,
+            followed_set: None,
+            vine_feed_cache: None,
+            mail_mgr: None,
+            mail_sync: None,
+            content_index: std::sync::Arc::new(std::sync::Mutex::new(
+                content_index::ContentIndex::load(std::path::Path::new("")),
+            )),
+            generation: 0,
+            node_addr: String::new(),
+            pairing_handle: None,
+            sync_engine: None,
+            community_registry: None,
+            community_delta_tx: None,
+            dm_outbox: None,
+            dm_transport: None,
+            crdt_state: None,
+            hlc_tracker: None,
+            dm_device_id: None,
+            dm_self_owner: None,
+            content_store: None,
+            unicast_send_tx: None,
+            dm_send_inflight: None,
+            dm_send_stopping: None,
+            dm_identity_pub_64: None,
+            community_adapter_request_tx: None,
+            channel_log_registry: None,
+            library_directory: None,
+            profile_broadcast_publisher: None,
+            profile_broadcast_cache: None,
+            profile_broadcast_request_tx: None,
+            profile_broadcast_next_subscription_id: std::sync::Arc::new(
+                std::sync::atomic::AtomicU64::new(1),
+            ),
+        })
+    }
+
+    #[test]
+    fn reserve_generation_bumps_and_returns() {
+        let state = fresh_node_state();
+        let n = reserve_node_generation(&state).expect("reserve");
+        assert_eq!(n, 1);
+        assert_eq!(state.lock().unwrap().generation, 1);
+    }
+
+    #[test]
+    fn reserve_generation_is_monotonic() {
+        let state = fresh_node_state();
+        assert_eq!(reserve_node_generation(&state).unwrap(), 1);
+        assert_eq!(reserve_node_generation(&state).unwrap(), 2);
+        assert_eq!(reserve_node_generation(&state).unwrap(), 3);
+        assert_eq!(state.lock().unwrap().generation, 3);
+    }
+
+    #[test]
+    fn check_or_supersede_accepts_match() {
+        let state = fresh_node_state();
+        let my_gen = reserve_node_generation(&state).unwrap();
+        let guard = check_generation_or_supersede(&state, my_gen)
+            .expect("should accept matching generation");
+        assert_eq!(guard.generation, my_gen);
+    }
+
+    #[test]
+    fn check_or_supersede_rejects_stale() {
+        let state = fresh_node_state();
+        let my_gen = reserve_node_generation(&state).unwrap();
+        let _later = reserve_node_generation(&state).unwrap();
+        let err = check_generation_or_supersede(&state, my_gen)
+            .map(drop)
+            .expect_err("stale my_gen must be superseded");
+        match err {
+            SupersededError::Superseded { my_gen: g, current } => {
+                assert_eq!(g, 1);
+                assert_eq!(current, 2);
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn check_or_supersede_rejects_zero_when_generation_advanced() {
+        let state = fresh_node_state();
+        // simulate prior reservations without calling our helper
+        state.lock().unwrap().generation = 5;
+        let err = check_generation_or_supersede(&state, 0)
+            .map(drop)
+            .expect_err("my_gen=0 against generation=5 must be superseded");
+        match err {
+            SupersededError::Superseded {
+                my_gen: 0,
+                current: 5,
+            } => {}
+            other => panic!("unexpected error: {:?}", other),
+        }
     }
 }
