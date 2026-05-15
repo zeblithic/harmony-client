@@ -313,32 +313,31 @@ pub fn export_recovery_file_pair_with_keychain(
     //
     // Random suffix mirrors the tempfile idiom in identity::write_atomic_0600
     // so two concurrent exports can't collide on a single `.bak` name.
-    fn move_aside(p: &Path) -> Option<PathBuf> {
+    fn move_aside(p: &Path) -> Result<Option<PathBuf>, String> {
         if !p.exists() {
-            return None;
+            return Ok(None);
         }
         let suffix = format!(".{:016x}.bak", rand::random::<u64>());
         let mut bak = p.as_os_str().to_owned();
         bak.push(&suffix);
         let bak = PathBuf::from(bak);
-        // Best-effort: a rename failure shouldn't block the export; we
-        // simply lose the rollback safety net for this file and proceed
-        // as the pre-fix code would have. Log a warning.
+        // R2-1: a rename failure here means we'd lose the rollback
+        // safety net for this file. Subsequent failures on the
+        // HRMR/HRSS write would then leave the operator stranded with
+        // a destroyed pre-existing artifact and no .bak to restore.
+        // Abort before any irreversible write.
         match std::fs::rename(p, &bak) {
-            Ok(()) => Some(bak),
-            Err(e) => {
-                tracing::warn!(
-                    "could not back up existing {} before overwrite: {e}",
-                    p.display()
-                );
-                None
-            }
+            Ok(()) => Ok(Some(bak)),
+            Err(e) => Err(format!(
+                "failed to back up existing {} before overwrite: {e}",
+                p.display()
+            )),
         }
     }
 
-    let hrmr_bak: Option<PathBuf> = if force { move_aside(out) } else { None };
+    let hrmr_bak: Option<PathBuf> = if force { move_aside(out)? } else { None };
     let hrss_bak: Option<PathBuf> = if force && want_sidecar {
-        move_aside(&sidecar)
+        move_aside(&sidecar)?
     } else {
         None
     };
@@ -403,6 +402,28 @@ pub fn export_recovery_file_pair_with_keychain(
     // 2. If no sidecar wanted, we're done. Delete the HRMR backup
     // (overwrite succeeded). No HRSS backup exists on this branch.
     if !want_sidecar {
+        // R2-2: clean up any stale `.state` sidecar BEFORE recording
+        // last_backup.json — failure here must hard-fail the export
+        // and roll back the just-written HRMR. Otherwise we'd return
+        // success with a stale HRSS bound to a previous identity still
+        // on disk; the next restore would auto-detect it and either
+        // hard-fail with addr-mismatch or (worse) silently succeed
+        // against a stale tree.
+        //
+        // M1: identity-only export must clean up any stale `.state` sidecar
+        // at the same path. See bot finding M1.
+        if sidecar.exists() {
+            if let Err(e) = std::fs::remove_file(&sidecar) {
+                let _ = std::fs::remove_file(out);
+                if let Some(b) = hrmr_bak.as_deref() {
+                    restore_bak(out, b);
+                }
+                return Err(format!(
+                    "failed to remove stale state sidecar at {}: {e}",
+                    sidecar.display()
+                ));
+            }
+        }
         if let Some(b) = hrmr_bak.as_deref() {
             let _ = std::fs::remove_file(b);
         }
@@ -413,18 +434,6 @@ pub fn export_recovery_file_pair_with_keychain(
         };
         if let Err(e) = save_last_backup(&last_backup_path(harmony_dir), &last) {
             tracing::warn!("failed to persist last_backup.json: {e}");
-        }
-        // M1: identity-only export must clean up any stale `.state` sidecar
-        // at the same path. The next restore would otherwise auto-detect
-        // an HRSS bound to a previous identity and hard-fail (or worse,
-        // succeed against a stale tree). See bot finding M1.
-        if sidecar.exists() {
-            if let Err(e) = std::fs::remove_file(&sidecar) {
-                tracing::warn!(
-                    "failed to remove stale state sidecar at {}: {e}",
-                    sidecar.display()
-                );
-            }
         }
         return Ok(ExportResult {
             hrmr_path: out.to_path_buf(),
