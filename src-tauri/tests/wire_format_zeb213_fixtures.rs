@@ -53,7 +53,7 @@ fn hrss_envelope_byte_pinned() {
     let state = deterministic_state();
     let addr = OwnerAddr([0xAA; 16]);
     let at = Hlc {
-        wall_ms: 1_700_000_000,
+        wall_ms: 1_700_000_000_000,
         logical: 0,
         device_id: "d".into(),
     };
@@ -63,11 +63,8 @@ fn hrss_envelope_byte_pinned() {
     let bytes =
         encode_snapshot_with_params(b"pp", addr, at, &state, &salt, &nonce).expect("encode");
 
-    // Pin the header bytes. The full ciphertext+tag varies with the
-    // CBOR payload size + Argon2 output, which we DON'T re-pin here
-    // (the Argon2 KDF output is deterministic, but ciborium's encoder
-    // output is the relevant byte-stability surface — see the second
-    // test below).
+    // Field-by-field assertions for diagnostic clarity: when the full-hex
+    // pin below fails, these help localize which surface changed.
     //
     // Pinned: magic + version + kdf_id + m_kib + t + p + salt + nonce
     assert_eq!(&bytes[..4], b"HRSS", "magic");
@@ -78,6 +75,36 @@ fn hrss_envelope_byte_pinned() {
     assert_eq!(bytes[12], 1, "p");
     assert_eq!(&bytes[13..29], &salt, "salt offset 13..29");
     assert_eq!(&bytes[29..53], &nonce, "nonce offset 29..53");
+
+    // Full-envelope hex pin. Argon2id + XChaCha20-Poly1305 + ciborium are
+    // all deterministic on identical inputs, so the entire envelope
+    // (header + ciphertext + tag) is byte-stable across runs. Pinning the
+    // full hex catches surfaces the prefix assertions miss:
+    //   - AEAD cipher-suite drift (e.g. swap to AES-GCM-SIV)
+    //   - AAD constant drift (HRSS_AAD change)
+    //   - Argon2 output-format drift inside cipher-key derivation
+    //   - Struct field-order or CBOR-shape drift in the inner payload
+    //
+    // ANY change to AEAD, KDF, AAD, or struct field ordering will break
+    // this — which is the desired behavior for a wire-format pin.
+    //
+    // To recapture after an intentional wire-format change:
+    //   eprintln!("{}", hex::encode(&bytes));
+    // then run the test, copy the printed hex into the literal below.
+    let expected_hex = "4852535301010001000000030111111111111111111111111111111111\
+                        222222222222222222222222222222222222222222222222\
+                        741ca0a6b8b21b6c532e671394f910109fd9fe071d1d96efd972b82ae8e88f19\
+                        4e524369db6b5c98d645c4227c45dcc5c3315931dd9f1ae43f4607e1f12e93de\
+                        be0e15270b27bd71e3f001923e3fe5965145020fb9f8fe65eee44fe4aba95c60\
+                        cfb119b606fcc69468f5bb22a6ec895fd884889a565624d75267d99a6097421a\
+                        09fa70eb4b3bc6cae80014f54071da741e876c4a19f5f3f69f7265e6878f4d86\
+                        22d7abdfe5a5660e7faf99dba892306e9ec39de9193383d60faa7e5ff6ff78b4\
+                        ee178989271a8a9fe075cf4853023db57201a4a5d82c8032c55b";
+    assert_eq!(
+        hex::encode(&bytes),
+        expected_hex,
+        "full envelope hex (header + ciphertext + tag)"
+    );
 
     // Roundtripping the WHOLE envelope must also work — confirms the
     // pinned bytes match what the live decoder accepts.
@@ -93,7 +120,7 @@ fn owner_state_snapshot_canonical_cbor_byte_pinned() {
         version: 1,
         owner_addr: OwnerAddr([0xAA; 16]),
         at: Hlc {
-            wall_ms: 1_700_000_000,
+            wall_ms: 1_700_000_000_000,
             logical: 0,
             device_id: "d".into(),
         },
@@ -103,14 +130,18 @@ fn owner_state_snapshot_canonical_cbor_byte_pinned() {
     let mut cbor = Vec::new();
     ciborium::into_writer(&snapshot, &mut cbor).unwrap();
 
-    // Same-length-keys invariant: each top-level key is 2 chars, so
-    // CBOR encoding uses text(2) (length byte 0x62) for every key.
-    // The CBOR map is `bf` (definite-length) — actually `a4` for a
-    // 4-entry definite-length map. ciborium emits definite-length by
-    // default for structs with sorted keys (lexicographic).
+    // ciborium with serde-derive emits struct fields in DECLARATION order
+    // (vn, oa, at, tr), NOT bytewise-sorted RFC 8949 §4.2 order (which
+    // would be at, oa, tr, vn). The encoder is not yet canonical —
+    // tracked as ZEB-220 (see owner_state_crypto.rs lines 405-412).
+    // What we pin here is map shape (4-entry definite-length) plus
+    // encoder determinism, not RFC-canonical ordering. A wire-format
+    // change that reorders the struct field declarations WILL break
+    // downstream parsers — the determinism check below and the
+    // offset-dependent fixtures in Task 11 would catch that indirectly.
     //
-    // Pinned check: the first byte is `0xa4` (map of 4 entries) and
-    // each key is `0x62 'X' 'Y'` (text(2)).
+    // Outer map header for a 4-entry definite-length map = 0xa4
+    // (CBOR major type 5 = map, count 4).
     assert_eq!(cbor[0], 0xa4, "outer map must be 4-entry definite-length");
 
     // Decode it back; the snapshot must equal what we encoded.
