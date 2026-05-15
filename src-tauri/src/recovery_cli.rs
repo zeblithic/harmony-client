@@ -408,18 +408,30 @@ pub fn restore_recovery_file_pair_with_keychain(
         None
     };
 
+    // Pre-flight: if a sidecar is being restored AND owner_state.cbor exists,
+    // refuse here (before any irreversible write) per
+    // metadata-before-irreversible-write rule. The check is pure metadata —
+    // it only consults the filesystem and the function arguments — so it can
+    // run before the seed write.
+    let state_path = owner_state_path(harmony_dir);
+    if snapshot.is_some() && state_path.exists() && !force {
+        return Err(format!(
+            "owner-state file already exists at {}; pass --force to overwrite",
+            state_path.display()
+        ));
+    }
+
+    // Stash the snapshot's at.wall_ms before the snapshot is consumed by the
+    // save_atomically call below. The stderr report sources from this value,
+    // NOT from last_backup.json — on a fresh-machine restore (the canonical
+    // happy path) last_backup.json is absent and would yield 0.
+    let snap_at_wall_ms = snapshot.as_ref().map(|s| s.at.wall_ms);
+
     // Now safe to write identity.
     identity::write_seed_to_disk_with_keychain(plaintext_path, &seed_bytes, force, keychain)?;
 
     // Then write owner-state if present.
-    let state_path = owner_state_path(harmony_dir);
     let spaces_restored = if let Some(snap) = snapshot {
-        if state_path.exists() && !force {
-            return Err(format!(
-                "owner-state file already exists at {}; pass --force to overwrite",
-                state_path.display()
-            ));
-        }
         // Reconstruct OwnerState from the tree bytes and persist.
         // canonicalize() returns [schema_v2, ...cbor]; load_crdt parses
         // that same shape — so we route through a tempfile of the
@@ -434,11 +446,9 @@ pub fn restore_recovery_file_pair_with_keychain(
     };
 
     eprintln!("restored identity-hash: {}", hex::encode(id_hash));
-    if want_sidecar {
+    if let Some(wall_ms) = snap_at_wall_ms {
         eprintln!(
-            "owner-state snapshot: {} spaces, exported {} ms wall-clock",
-            spaces_restored,
-            snapshot_at_or_zero(harmony_dir)
+            "owner-state snapshot: {spaces_restored} spaces, exported {wall_ms} ms wall-clock"
         );
     } else if sidecar.exists() && ignore_state {
         eprintln!("state sidecar found but ignored per flag");
@@ -453,6 +463,7 @@ pub fn restore_recovery_file_pair_with_keychain(
         identity_hash: id_hash,
         spaces_restored,
         sidecar_present: want_sidecar,
+        snapshot_at_wall_ms: snap_at_wall_ms,
     })
 }
 
@@ -461,15 +472,7 @@ pub struct RestoreResult {
     pub identity_hash: [u8; 16],
     pub spaces_restored: usize,
     pub sidecar_present: bool,
-}
-
-fn snapshot_at_or_zero(harmony_dir: &Path) -> u64 {
-    use crate::backup_state::load_last_backup;
-    load_last_backup(&last_backup_path(harmony_dir))
-        .ok()
-        .flatten()
-        .map(|b| b.at.wall_ms)
-        .unwrap_or(0)
+    pub snapshot_at_wall_ms: Option<u64>,
 }
 
 /// Derive the 16-byte owner address from a 32-byte seed.
@@ -1351,6 +1354,125 @@ mod tests {
             .expect("last_backup.json must be written");
         assert!(last.include_state);
         assert_eq!(last.out_path, out.display().to_string());
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+        std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn restore_refuses_state_overwrite_without_force_leaves_identity_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let out = dir.path().join("recovery.bin");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
+        std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
+
+        // Plant identity A + state.
+        identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0xAA; 32], true, None)
+            .unwrap();
+        plant_owner_state(dir.path());
+        super::export_recovery_file_pair_with_keychain(
+            &plaintext_path,
+            dir.path(),
+            &out,
+            None,
+            None,
+            true,
+            true,
+            None,
+        )
+        .unwrap();
+
+        // Pre-existing identity B installed (different seed), and a pre-existing
+        // owner_state.cbor that would block the sidecar restore.
+        identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0xBB; 32], true, None)
+            .unwrap();
+        let identity_before =
+            identity::read_seed_from_disk_with_keychain(&plaintext_path, None).unwrap();
+        // owner_state.cbor still exists from plant_owner_state above.
+
+        // Restore without --force -- must refuse and leave identity B untouched.
+        let err = super::restore_recovery_file_pair_with_keychain(
+            &plaintext_path,
+            dir.path(),
+            &out,
+            /*force=*/ false,
+            /*ignore_state=*/ false,
+            None,
+        )
+        .expect_err("must refuse when owner_state.cbor exists without --force");
+        assert!(
+            err.contains("owner-state file already exists") && err.contains("--force"),
+            "expected metadata refusal: {err}"
+        );
+
+        // Identity B's seed must still be on disk — NOT overwritten with A's seed.
+        let identity_after =
+            identity::read_seed_from_disk_with_keychain(&plaintext_path, None).unwrap();
+        assert_eq!(
+            &*identity_before, &*identity_after,
+            "identity must be untouched after the metadata-refusal path"
+        );
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+        std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn restore_reports_snapshot_export_wall_ms_not_last_backup_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let out = dir.path().join("recovery.bin");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
+        std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
+
+        // Plant + export from this dir.
+        identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0xCC; 32], true, None)
+            .unwrap();
+        plant_owner_state(dir.path());
+        let export_result = super::export_recovery_file_pair_with_keychain(
+            &plaintext_path,
+            dir.path(),
+            &out,
+            None,
+            None,
+            true,
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(export_result.hrss_path.is_some());
+
+        // Simulate fresh-machine restore: copy the artifacts into a SECOND tempdir
+        // that has NO last_backup.json.
+        let fresh = tempfile::tempdir().unwrap();
+        let fresh_plaintext = fresh.path().join("identity.key");
+        let fresh_out = fresh.path().join("recovery.bin");
+        std::fs::copy(&out, &fresh_out).unwrap();
+        std::fs::copy(super::sidecar_path(&out), super::sidecar_path(&fresh_out)).unwrap();
+
+        let result = super::restore_recovery_file_pair_with_keychain(
+            &fresh_plaintext,
+            fresh.path(),
+            &fresh_out,
+            true,
+            false,
+            None,
+        )
+        .expect("restore");
+        assert!(result.sidecar_present);
+        let reported = result
+            .snapshot_at_wall_ms
+            .expect("restore result must carry snapshot wall_ms when sidecar restored");
+        // Must be the actual snapshot's at.wall_ms — a NONZERO sane value, NOT 0.
+        assert!(
+            reported > 0,
+            "snapshot wall_ms must be the snapshot's own export-time HLC, not last_backup.json (which is absent on fresh machine)"
+        );
 
         std::env::remove_var("HARMONY_PASSPHRASE");
         std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
