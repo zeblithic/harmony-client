@@ -226,13 +226,17 @@ pub fn export_recovery_file_with_keychain(
     Ok(())
 }
 
-/// Owner-state directory + filename convention.
+/// Owner-state CRDT directory + filename convention.
 ///
-/// Production wires this to `~/.harmony/`. Tests pass a tempdir-rooted path.
-/// The owner-state file is the SAME path the production engine reads at
-/// boot (`lib.rs` uses `app_data_dir.join("owner_state.cbor")`).
+/// Production wires this to `~/.harmony/owner_state_crdt.cbor`. Tests
+/// pass a tempdir-rooted path. This is the SAME file the production
+/// engine reads at boot (`lib.rs:1449`'s `crdt_path`).
+///
+/// NOT to be confused with `~/.harmony/owner_state_crdt.cbor` (owned by
+/// `owner_state.rs`) which stores per-owner pairing/identity state
+/// — a different file entirely.
 pub fn owner_state_path(harmony_dir: &Path) -> PathBuf {
-    harmony_dir.join("owner_state.cbor")
+    harmony_dir.join("owner_state_crdt.cbor")
 }
 
 pub fn last_backup_path(harmony_dir: &Path) -> PathBuf {
@@ -420,7 +424,7 @@ pub fn restore_recovery_file_pair_with_keychain(
         None
     };
 
-    // Pre-flight: if a sidecar is being restored AND owner_state.cbor exists,
+    // Pre-flight: if a sidecar is being restored AND owner_state_crdt.cbor exists,
     // refuse here (before any irreversible write) per
     // metadata-before-irreversible-write rule. The check is pure metadata —
     // it only consults the filesystem and the function arguments — so it can
@@ -949,7 +953,7 @@ mod tests {
 
     use crate::owner_state_crdt::OwnerState;
 
-    /// Plant a usable owner-state file at `harmony_dir/owner_state.cbor`.
+    /// Plant a usable owner-state file at `harmony_dir/owner_state_crdt.cbor`.
     fn plant_owner_state(harmony_dir: &Path) {
         let state = OwnerState::default();
         let state_path = super::owner_state_path(harmony_dir);
@@ -1001,7 +1005,7 @@ mod tests {
         std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
         identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0xCA; 32], true, None)
             .unwrap();
-        // No plant_owner_state — owner_state.cbor absent.
+        // No plant_owner_state — owner_state_crdt.cbor absent.
 
         let result = super::export_recovery_file_pair_with_keychain(
             &plaintext_path,
@@ -1241,7 +1245,7 @@ mod tests {
         )
         .unwrap();
 
-        // Plant a different owner_state.cbor to force a "exists" collision.
+        // Plant a different owner_state_crdt.cbor to force a "exists" collision.
         let mut state = OwnerState::default();
         let sp = crate::owner_state_types::Space {
             id: crate::owner_state_types::SpaceId([0x99; 16]),
@@ -1420,12 +1424,12 @@ mod tests {
         .unwrap();
 
         // Pre-existing identity B installed (different seed), and a pre-existing
-        // owner_state.cbor that would block the sidecar restore.
+        // owner_state_crdt.cbor that would block the sidecar restore.
         identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0xBB; 32], true, None)
             .unwrap();
         let identity_before =
             identity::read_seed_from_disk_with_keychain(&plaintext_path, None).unwrap();
-        // owner_state.cbor still exists from plant_owner_state above.
+        // owner_state_crdt.cbor still exists from plant_owner_state above.
 
         // Restore without --force -- must refuse and leave identity B untouched.
         let err = super::restore_recovery_file_pair_with_keychain(
@@ -1436,7 +1440,7 @@ mod tests {
             /*ignore_state=*/ false,
             None,
         )
-        .expect_err("must refuse when owner_state.cbor exists without --force");
+        .expect_err("must refuse when owner_state_crdt.cbor exists without --force");
         assert!(
             err.contains("owner-state file already exists") && err.contains("--force"),
             "expected metadata refusal: {err}"

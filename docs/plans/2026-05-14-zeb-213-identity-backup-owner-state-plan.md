@@ -1126,7 +1126,7 @@ EOF
 - Modify: `src-tauri/src/recovery_cli.rs:277-305` (restore helpers) — extend `restore_recovery_file_cli` + `restore_recovery_file_with_keychain`.
 - Modify: `src-tauri/src/recovery_cli.rs` tests module — add 10 new tests at the bottom.
 
-**Goal:** Wire `state_snapshot` into the CLI export/restore path with atomic-pair semantics. Reads `~/.harmony/owner_state.cbor` for export; writes it for restore. Cleanup HRMR on HRSS-write failure.
+**Goal:** Wire `state_snapshot` into the CLI export/restore path with atomic-pair semantics. Reads `~/.harmony/owner_state_crdt.cbor` for export; writes it for restore. Cleanup HRMR on HRSS-write failure.
 
 - [ ] **Step 1: Add helper signatures + impl in `recovery_cli.rs`**
 
@@ -1152,13 +1152,17 @@ use harmony_owner::lifecycle::RecoveryArtifact as _RecoveryArtifactAlias; // alr
 After `export_recovery_file_with_keychain` (ends at line 194), add this new function:
 
 ```rust
-/// Owner-state directory + filename convention.
+/// Owner-state CRDT directory + filename convention.
 ///
-/// Production wires this to `~/.harmony/`. Tests pass a tempdir-rooted path.
-/// The owner-state file is the SAME path the production engine reads at
-/// boot (`lib.rs` uses `app_data_dir.join("owner_state.cbor")`).
+/// Production wires this to `~/.harmony/owner_state_crdt.cbor`. Tests
+/// pass a tempdir-rooted path. This is the SAME file the production
+/// engine reads at boot (`lib.rs:1449`'s `crdt_path`).
+///
+/// NOT to be confused with `~/.harmony/owner_state.cbor` (owned by
+/// `owner_state.rs`) which stores per-owner pairing/identity state
+/// — a different file entirely.
 pub fn owner_state_path(harmony_dir: &Path) -> PathBuf {
-    harmony_dir.join("owner_state.cbor")
+    harmony_dir.join("owner_state_crdt.cbor")
 }
 
 pub fn last_backup_path(harmony_dir: &Path) -> PathBuf {
@@ -1507,7 +1511,7 @@ Append inside the `#[cfg(test)] mod tests` block (after `export_mnemonic_writes_
 ```rust
     use crate::owner_state_crdt::OwnerState;
 
-    /// Plant a usable owner-state file at `harmony_dir/owner_state.cbor`.
+    /// Plant a usable owner-state file at `harmony_dir/owner_state_crdt.cbor`.
     fn plant_owner_state(harmony_dir: &Path) {
         let state = OwnerState::default();
         let state_path = super::owner_state_path(harmony_dir);
@@ -1559,7 +1563,7 @@ Append inside the `#[cfg(test)] mod tests` block (after `export_mnemonic_writes_
         std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
         identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0xCA; 32], true, None)
             .unwrap();
-        // No plant_owner_state — owner_state.cbor absent.
+        // No plant_owner_state — owner_state_crdt.cbor absent.
 
         let result = super::export_recovery_file_pair_with_keychain(
             &plaintext_path,
@@ -1800,7 +1804,7 @@ Append inside the `#[cfg(test)] mod tests` block (after `export_mnemonic_writes_
         )
         .unwrap();
 
-        // Plant a different owner_state.cbor to force a "exists" collision.
+        // Plant a different owner_state_crdt.cbor to force a "exists" collision.
         let mut state = OwnerState::default();
         let sp = crate::owner_state_types::Space {
             id: crate::owner_state_types::SpaceId([0x99; 16]),
@@ -1983,7 +1987,7 @@ Extends recovery_cli with state-sidecar (HRSS) emission and verification:
   HRSS write fails, HRMR is best-effort cleaned up
 - restore_recovery_file_pair_with_keychain: addr-binding check runs
   BEFORE any irreversible write (metadata-before-write rule); --force
-  needed to overwrite an existing owner_state.cbor
+  needed to overwrite an existing owner_state_crdt.cbor
 - export_recovery_file_cli / restore_recovery_file_cli updated to
   accept include_state / ignore_state / force flags
 - last_backup.json written on every successful export
@@ -2177,7 +2181,9 @@ pub async fn get_backup_staleness(
         .path()
         .app_data_dir()
         .map_err(|e| format!("app_data_dir: {e}"))?;
-    let state_path = app_data_dir.join("owner_state.cbor");
+    // Single source of truth for the CRDT path — same file the engine
+    // boots from and the same file the backup export sidecar reads.
+    let state_path = crate::recovery_cli::owner_state_path(&app_data_dir);
     let last_path = app_data_dir.join("last_backup.json");
 
     run_blocking(move || {
@@ -2229,7 +2235,7 @@ git add src-tauri/src/lib.rs
 git commit -m "$(cat <<'EOF'
 feat(zeb-213): get_backup_staleness Tauri IPC
 
-Reads owner_state.cbor + last_backup.json from app_data_dir and runs
+Reads owner_state_crdt.cbor + last_backup.json from app_data_dir and runs
 backup_state::should_warn_about_stale_backup. Returns
 { isStale, daysSince } via camelCase serde.
 
@@ -2996,7 +3002,7 @@ fn legacy_hrmr_only_restores_with_empty_state() {
     // Plant a pre-ZEB-213 HRMR by calling export with include_state=false
     // (no sidecar emitted).
     identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0x34; 32], true, None).unwrap();
-    // No plant_state — owner_state.cbor absent.
+    // No plant_state — owner_state_crdt.cbor absent.
     recovery_cli::export_recovery_file_pair_with_keychain(
         &plaintext_path,
         dir.path(),

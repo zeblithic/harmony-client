@@ -134,7 +134,7 @@ harmony-app restore mnemonic --mnemonic-file PATH [--force]
 | Condition | Behavior |
 |---|---|
 | `--no-state` passed | Emit `PATH` (HRMR) only. Identity-only. |
-| Owner-state file exists at `~/.harmony/owner_state.cbor` | Emit `PATH` (HRMR) + `PATH.state` (HRSS). Both written atomically (tmp→rename). |
+| Owner-state file exists at `~/.harmony/owner_state_crdt.cbor` | Emit `PATH` (HRMR) + `PATH.state` (HRSS). Both written atomically (tmp→rename). |
 | Owner-state file does NOT exist (fresh install, no nav-tree activity yet) | Emit `PATH` only + stderr note: `no owner-state to bundle; emitted identity-only backup` |
 | `PATH.state` already exists and `--force` NOT passed | Refuse: `Error: state sidecar already exists at <PATH.state>; pass --force to overwrite` |
 | HRSS write fails after HRMR succeeded | Best-effort cleanup of HRMR; report both errors. Atomic-pair semantics (both succeed or neither persists). |
@@ -143,14 +143,14 @@ harmony-app restore mnemonic --mnemonic-file PATH [--force]
 
 | Condition | Behavior |
 |---|---|
-| `PATH.state` exists, `--ignore-state` NOT passed | Read HRMR → restore seed. Read HRSS → AEAD-verify → CBOR-decode → verify `oa` (owner-addr) matches restored identity → write `tr` (tree) to `~/.harmony/owner_state.cbor` atomically. Stderr: `restored identity-hash: <hex>\nowner-state snapshot: N spaces, exported <ago>` |
+| `PATH.state` exists, `--ignore-state` NOT passed | Read HRMR → restore seed. Read HRSS → AEAD-verify → CBOR-decode → verify `oa` (owner-addr) matches restored identity → write `tr` (tree) to `~/.harmony/owner_state_crdt.cbor` atomically. Stderr: `restored identity-hash: <hex>\nowner-state snapshot: N spaces, exported <ago>` |
 | `PATH.state` exists, `--ignore-state` passed | Restore identity only; warn `state sidecar found but ignored per flag` |
 | `PATH.state` does NOT exist | Restore identity only; stderr: `no state sidecar found at <PATH.state>; nav tree will be empty post-restore (or sync from surviving peers)` |
 | HRSS `oa` does not match HRMR-derived identity | **Hard fail.** `Error: state sidecar identity mismatch — HRSS addr <X> != restored identity <Y>` |
 | HRSS decrypts but CBOR is malformed | **Hard fail.** Operator-actionable; should not silently degrade. |
 | HRSS `vn` field is unknown (future version) | **Hard fail.** `state snapshot format version N not supported; please update harmony-app` |
 | HRSS wrong passphrase | AEAD tag rejected. Same error idiom as HRMR (no fingerprinting). |
-| `~/.harmony/owner_state.cbor` already exists and `--force` NOT passed | Refuse with same idiom as HRMR refusal. `--force` overwrites atomically. |
+| `~/.harmony/owner_state_crdt.cbor` already exists and `--force` NOT passed | Refuse with same idiom as HRMR refusal. `--force` overwrites atomically. |
 
 ### Error reporting
 
@@ -211,11 +211,11 @@ The HRSS envelope uses the **same** passphrase as HRMR — resolved via `HARMONY
 4. CLI detects /usb/recovery.bin.state → reads HRSS
 5. HRSS AEAD-verifies + AEAD-decrypts using HARMONY_RECOVERY_PASSPHRASE
 6. CBOR-deserializes OwnerStateSnapshot → verifies addr matches restored identity
-7. Writes tree blob to ~/.harmony/owner_state.cbor (atomic tmp→rename)
+7. Writes tree blob to ~/.harmony/owner_state_crdt.cbor (atomic tmp→rename)
 8. Stderr: "restored identity-hash: <hex>
             owner-state snapshot: 47 spaces, exported 3 days ago"
 9. User launches harmony-app GUI.
-10. Engine boots, loads owner_state.cbor → NavService sees 47 spaces.
+10. Engine boots, loads owner_state_crdt.cbor → NavService sees 47 spaces.
 11. Engine subscribes to harmony/owner/{addr}/state-root-v1 — if any
     surviving device of this owner is publishing, Flow A merges in
     newer state within seconds (CRDT semantics handle conflicts).
@@ -247,7 +247,7 @@ The HRSS envelope uses the **same** passphrase as HRMR — resolved via `HARMONY
 | HRSS CBOR malformed after decrypt | Hard fail with actionable diagnostic. Indicates upstream corruption or wrong-version sidecar. |
 | HRSS `vn` field is unknown (future version) | Hard fail: `state snapshot format version N not supported; please update harmony-app` |
 | HRSS snapshot HLC older than newly-published peer state | No special handling. Flow A's CRDT merge resolves naturally. |
-| Owner-state file already exists at `~/.harmony/owner_state.cbor` (operator re-running restore) and `--force` NOT passed | Refuse with same idiom as HRMR refusal. `--force` overwrites. |
+| Owner-state file already exists at `~/.harmony/owner_state_crdt.cbor` (operator re-running restore) and `--force` NOT passed | Refuse with same idiom as HRMR refusal. `--force` overwrites. |
 | Export attempted but no owner-state file on disk | Emit HRMR only + stderr note. Operator-actionable; non-fatal. |
 | Export size > soft-warning threshold (100 MB) | Emit normally. Stderr: `warning: snapshot is N MB; consider exporting to local disk before USB stick`. No hard cap. |
 | HRSS write fails mid-pair (HRMR already written) | Best-effort cleanup of HRMR. Atomic-pair semantics. |
@@ -310,16 +310,16 @@ The HRSS envelope uses the **same** passphrase as HRMR — resolved via `HARMONY
 11. `export_no_state_flag_skips_sidecar` — owner-state exists but `--no-state` passed → HRMR only.
 12. `export_refuses_when_sidecar_exists_without_force` — `recovery.bin.state` already exists → errors with refusal.
 13. `export_hrss_write_fails_cleans_up_hrmr` — simulate HRSS write failure → HRMR is cleaned up, both errors reported.
-14. `restore_emits_pair_round_trip` — full pipeline: generate seed + state → export pair → wipe both → restore pair → identity hash matches AND `owner_state.cbor` byte-identical.
+14. `restore_emits_pair_round_trip` — full pipeline: generate seed + state → export pair → wipe both → restore pair → identity hash matches AND `owner_state_crdt.cbor` byte-identical.
 15. `restore_ignores_missing_sidecar` — only HRMR present → restore succeeds with empty state, stderr warning shown.
-16. `restore_ignore_state_flag_skips_sidecar` — both files present but `--ignore-state` passed → state file untouched, `owner_state.cbor` empty.
-17. `restore_force_overwrites_existing_state_file` — `owner_state.cbor` already exists → without `--force` refuses, with `--force` overwrites atomically.
+16. `restore_ignore_state_flag_skips_sidecar` — both files present but `--ignore-state` passed → state file untouched, `owner_state_crdt.cbor` empty.
+17. `restore_force_overwrites_existing_state_file` — `owner_state_crdt.cbor` already exists → without `--force` refuses, with `--force` overwrites atomically.
 18. `restore_addr_mismatch_hard_fails` — pair HRMR for owner A with HRSS for owner B → restore aborts before writing anything.
 
 ### Integration tests (`src-tauri/tests/identity_state_recovery_integration.rs`)
 
 1. `mnemonic_round_trip_still_works_unchanged` — regression: ZEB-176 mnemonic flow byte-identical with ZEB-213 in place.
-2. `recovery_file_round_trip_with_state` — full export+restore pair preserves identity_hash + `owner_state.cbor` byte-equality.
+2. `recovery_file_round_trip_with_state` — full export+restore pair preserves identity_hash + `owner_state_crdt.cbor` byte-equality.
 3. `legacy_hrmr_only_restores_with_empty_state` — synthesize a pre-ZEB-213 HRMR file → restore succeeds with empty owner-state (backwards compat).
 4. `cross_machine_state_restore` — emit HRMR + HRSS on one tempdir-rooted "machine", restore on a fresh tempdir → engine boots and owner-state matches.
 5. `partial_loss_merges_with_peer` — two paired engines using the existing `PairedEngines::bootstrap` fixture pattern (per ZEB-285 integration test scaffolding); one snapshots + restores fresh, the other publishes newer HLC → restored device merges via Flow A within bounded latency. If the existing fixture cannot reach the state-root publish path within Phase 1 scope (verified during planning), the test is split out as a Phase 2 follow-up ticket — but Phase 1 must attempt the integration. The other four integration tests are non-negotiable.
@@ -351,7 +351,7 @@ The HRSS envelope uses the **same** passphrase as HRMR — resolved via `HARMONY
 2. `harmony-app export recovery-file --out PATH --no-state` emits only `PATH` (HRMR).
 3. `harmony-app restore recovery-file --in PATH` auto-detects `PATH.state` and restores both identity and owner-state.
 4. `harmony-app restore recovery-file --in PATH --ignore-state` restores identity only even if sidecar exists.
-5. Round-trip: export pair → wipe identity + owner-state → restore pair → derived identity_hash matches original AND `owner_state.cbor` byte-identical.
+5. Round-trip: export pair → wipe identity + owner-state → restore pair → derived identity_hash matches original AND `owner_state_crdt.cbor` byte-identical.
 6. HRSS `oa` (owner-addr) mismatch with restored identity hard-fails with actionable error.
 7. HRSS unknown version (`vn != 1`) hard-fails with actionable error.
 8. HRSS wrong passphrase fails with the same idiom as HRMR (no fingerprinting).

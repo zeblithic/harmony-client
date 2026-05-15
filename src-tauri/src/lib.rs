@@ -13832,14 +13832,14 @@ pub struct BackupStaleness {
 
 /// Tauri IPC: compute the backup-staleness banner state.
 ///
-/// Reads `owner_state.cbor` + `last_backup.json` from `app_data_dir()` and
-/// runs `crate::backup_state::should_warn_about_stale_backup` with the
+/// Reads `owner_state_crdt.cbor` + `last_backup.json` from `app_data_dir()`
+/// and runs `crate::backup_state::should_warn_about_stale_backup` with the
 /// current wall clock. `dismiss_until_ms` is the localStorage-backed
 /// dismissal expiry passed from the frontend — when `Some(t)` and `t >
 /// now_wall_ms`, the banner is suppressed regardless of staleness.
 ///
-/// Missing `owner_state.cbor` (fresh install before any owner-state writes)
-/// defaults to an empty `OwnerState` — `should_warn_about_stale_backup`
+/// Missing `owner_state_crdt.cbor` (fresh install before any owner-state
+/// writes) defaults to an empty `OwnerState` — `should_warn_about_stale_backup`
 /// then returns `is_stale: false` for the "no backup, no mutations" case,
 /// which is what we want for a brand-new user.
 ///
@@ -13858,7 +13858,9 @@ async fn get_backup_staleness(
         .path()
         .app_data_dir()
         .map_err(|e| format!("app_data_dir: {e}"))?;
-    let state_path = app_data_dir.join("owner_state.cbor");
+    // Single source of truth for the CRDT path — same file the engine
+    // boots from and the same file the backup export sidecar reads.
+    let state_path = crate::recovery_cli::owner_state_path(&app_data_dir);
     let last_path = app_data_dir.join("last_backup.json");
 
     crate::identity_commands::run_blocking(move || {
