@@ -1337,15 +1337,11 @@ where
     crate::community_membership::verify_signature(&signed.join_event, &signed.joiner_identity_pub)
         .map_err(|_| CommunityInviteVerifyError::JoinSigInvalid)?;
 
-    // 6. InviteToken sig.
-    let token_canonical = canonical_invite_token_bytes(&signed.invite_token)
-        .map_err(|_| CommunityInviteVerifyError::InviteTokenSigInvalid)?;
-    use ed25519_dalek::Signature;
-    let sig = Signature::from_bytes(&signed.invite_token.sig);
-    self_identity
-        .identity
-        .verifying_key
-        .verify_strict(&token_canonical, &sig)
+    // 6. InviteToken sig — delegate to the shared helper so this path
+    //    stays in sync with `verify_event`'s P5 gate without duplicating
+    //    the canonical-encode + Signature::from_bytes + verify_strict logic.
+    let admin_identity_pub = self_identity.identity.to_public_bytes();
+    verify_invite_token_signature(&signed.invite_token, &admin_identity_pub)
         .map_err(|_| CommunityInviteVerifyError::InviteTokenSigInvalid)?;
 
     Ok(signed.join_event.clone())

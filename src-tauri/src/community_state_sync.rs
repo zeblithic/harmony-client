@@ -834,6 +834,17 @@ pub struct CommunitySyncEngineConfig {
     /// the owner-state lock is released before the community-state merge
     /// lock is acquired.
     pub crdt_state: Option<Arc<Mutex<crate::owner_state_crdt::OwnerState>>>,
+
+    /// ZEB-254: 64-byte composite identity pub of the community admin
+    /// (`X25519_pub || Ed25519_pub`). Required for the P5 gate in
+    /// `verify_event` — PendingJoin events carry an InviteToken signed by
+    /// the admin's Ed25519 key; without this field the gate unconditionally
+    /// fails with `PendingJoinTokenInvalid`. `None` for engines that will
+    /// never see PendingJoin events (non-joiner engines, legacy tests).
+    /// The joiner side populates this from
+    /// `CommunityInvitePayload.admin_identity_pub` at spawn time (see
+    /// `redeem_invite_inner`).
+    pub admin_identity_pub: Option<[u8; 64]>,
 }
 
 /// Per-community state-CRDT sync engine. Owns a tokio task that
@@ -913,6 +924,18 @@ pub struct CommunitySyncEngine {
     /// own clone via `InternalCtx`). `None` for engines spawned
     /// without a registry, e.g. legacy unit tests.
     pending_redemptions: Option<PendingRedemptionMap>,
+    /// ZEB-254: 64-byte composite identity pub of the community admin.
+    /// Shared with the spawned `InternalCtx` task via `Arc<OnceLock>` so
+    /// both the engine's `insert_local_event*` path and the task's
+    /// `handle_incoming_publish` path can read the same binding.
+    ///
+    /// Set at construction when `CommunitySyncEngineConfig.admin_identity_pub`
+    /// is `Some`, or by calling `bind_admin_identity_pub` after spawn (the
+    /// joiner path: `redeem_invite_inner` knows the admin pub only after
+    /// parsing the invite URL, which happens before the engine spawn).
+    /// Unset for non-joiner engines (admin's own `create_community`, boot
+    /// reconcile); those engines never process PendingJoin events.
+    admin_identity_pub: Arc<std::sync::OnceLock<[u8; 64]>>,
 }
 
 impl CommunitySyncEngine {
@@ -952,6 +975,19 @@ impl CommunitySyncEngine {
         // epoch key. The engine struct itself doesn't need the reference —
         // only the task does.
         let crdt_state_for_task = cfg.crdt_state;
+        // ZEB-254: admin_identity_pub is shared between the engine (for
+        // insert_local_event* VerifyContext) and the spawned task (for
+        // handle_incoming_publish VerifyContext). Both get an Arc clone of
+        // the same OnceLock so `bind_admin_identity_pub` sets it for both
+        // paths atomically. Populated now if the config carries a value;
+        // otherwise left unset for non-joiner engines.
+        let admin_pub_lock: Arc<std::sync::OnceLock<[u8; 64]>> =
+            Arc::new(std::sync::OnceLock::new());
+        if let Some(pub_bytes) = cfg.admin_identity_pub {
+            // OnceLock::set always succeeds on a fresh lock.
+            let _ = admin_pub_lock.set(pub_bytes);
+        }
+        let admin_pub_lock_for_task = Arc::clone(&admin_pub_lock);
 
         let task = tokio::spawn(internal_task(InternalCtx {
             community_id: cfg.community_id,
@@ -977,6 +1013,7 @@ impl CommunitySyncEngine {
             delta_tx: cfg.delta_tx,
             pending_redemptions: cfg.pending_redemptions,
             crdt_state: crdt_state_for_task,
+            admin_identity_pub: admin_pub_lock_for_task,
         }));
 
         Self {
@@ -994,6 +1031,7 @@ impl CommunitySyncEngine {
             is_invite_only: is_invite_only_for_engine,
             delta_tx: delta_tx_for_engine,
             pending_redemptions: pending_redemptions_for_engine,
+            admin_identity_pub: admin_pub_lock,
         }
     }
 
@@ -1027,6 +1065,24 @@ impl CommunitySyncEngine {
     #[doc(hidden)]
     pub fn admin_addr(&self) -> OwnerAddr {
         self.admin_addr
+    }
+
+    /// ZEB-254: bind the admin identity pub AFTER engine construction.
+    ///
+    /// The joiner path (`redeem_invite_inner`) decodes the admin pub from the
+    /// invite URL before spawning the engine, then calls this method on the
+    /// freshly-spawned engine so the P5 gate in `verify_event` can validate
+    /// PendingJoin events' InviteToken signatures. The binding is shared with
+    /// the spawned internal task (`InternalCtx`) via `Arc<OnceLock>`, so
+    /// `handle_incoming_publish`'s `VerifyContext` also sees it.
+    ///
+    /// No-op if already set (OnceLock::set returns Err on the second call).
+    /// Returns `true` if the binding was set by this call, `false` if it was
+    /// already set (which is not an error — the engine may have been
+    /// constructed with a pre-populated binding via `CommunitySyncEngineConfig
+    /// .admin_identity_pub`).
+    pub fn bind_admin_identity_pub(&self, pub_bytes: [u8; 64]) -> bool {
+        self.admin_identity_pub.set(pub_bytes).is_ok()
     }
 
     /// Returns this engine's per-community symmetric `EpochKey`.
@@ -1188,7 +1244,7 @@ impl CommunitySyncEngine {
             is_invite_only: self.is_invite_only,
             actor_identity_pub: &actor_pub,
             countersigner_identity_pub: countersigner_pub.as_ref(),
-            admin_identity_pub: None,
+            admin_identity_pub: self.admin_identity_pub.get(),
         };
 
         let outcome = {
@@ -1309,7 +1365,7 @@ impl CommunitySyncEngine {
             is_invite_only: self.is_invite_only,
             actor_identity_pub: &first_actor_pub,
             countersigner_identity_pub: first_countersigner_pub.as_ref(),
-            admin_identity_pub: None,
+            admin_identity_pub: self.admin_identity_pub.get(),
         };
         let second_ctx = crate::community_membership::VerifyContext {
             expected_community_id: self.community_id,
@@ -1317,7 +1373,7 @@ impl CommunitySyncEngine {
             is_invite_only: self.is_invite_only,
             actor_identity_pub: &second_actor_pub,
             countersigner_identity_pub: second_countersigner_pub.as_ref(),
-            admin_identity_pub: None,
+            admin_identity_pub: self.admin_identity_pub.get(),
         };
 
         // C5: pre-validate BOTH events before any state mutation.
@@ -1487,6 +1543,13 @@ struct InternalCtx {
     /// key lookup. `None` for tests that use the spawn-time fallback.
     /// See `CommunitySyncEngineConfig.crdt_state` for the lock-order contract.
     crdt_state: Option<Arc<Mutex<crate::owner_state_crdt::OwnerState>>>,
+    /// ZEB-254: shared binding (Arc<OnceLock>) for the admin identity pub.
+    /// Shared with the engine struct so `bind_admin_identity_pub` sets it
+    /// for both the IPC-path (`insert_local_event*`) and this task path
+    /// (`handle_incoming_publish`) at once. `get()` returns `None` until
+    /// it is set, which leaves P5 failing for non-joiner engines (correct
+    /// — they don't receive PendingJoin events).
+    admin_identity_pub: Arc<std::sync::OnceLock<[u8; 64]>>,
 }
 
 /// Internal task: `select!` loop multiplexing dirty signals, the
@@ -2550,7 +2613,7 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
                 is_invite_only: ctx.is_invite_only,
                 actor_identity_pub: &actor_pub,
                 countersigner_identity_pub: cs_pub_ref,
-                admin_identity_pub: None,
+                admin_identity_pub: ctx.admin_identity_pub.get(),
             };
             // Clone before `insert_event` consumes the event so we can
             // surface the delta if the outcome is `Inserted`. The clone
@@ -3454,6 +3517,11 @@ impl CommunitySyncRegistry {
             // ZEB-249 §10.6 (Phase A): pass the live owner-state CRDT
             // so the engine can read current_epoch_key dynamically.
             crdt_state: self.crdt_state.as_ref().map(Arc::clone),
+            // ZEB-254: default None at spawn time; joiner-side engines
+            // are patched via engine.bind_admin_identity_pub() right after
+            // spawn_engine_with_guard returns, before any PendingJoin
+            // events can land. Non-joiner engines leave this None.
+            admin_identity_pub: None,
         }));
 
         engines.insert(community_id, engine);

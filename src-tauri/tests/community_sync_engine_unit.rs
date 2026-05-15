@@ -95,6 +95,7 @@ async fn engine_constructs_and_shuts_down_cleanly() {
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: None,
+        admin_identity_pub: None,
     });
 
     // Shutdown without ever sending dirty — clean path.
@@ -159,6 +160,7 @@ async fn flush_now_publishes_one_root_publish() {
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: None,
+        admin_identity_pub: None,
     });
 
     engine.flush_now().await.expect("flush_now");
@@ -342,6 +344,7 @@ async fn engine_receives_remote_publish_and_merges_event() {
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: None,
+        admin_identity_pub: None,
     });
 
     // B needs an OwnerDeviceCache-style lookup that returns
@@ -379,6 +382,7 @@ async fn engine_receives_remote_publish_and_merges_event() {
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: None,
+        admin_identity_pub: None,
     });
 
     // Trigger A's publish. B's subscriber arm should fire and merge.
@@ -620,6 +624,7 @@ async fn engine_emits_membership_delta_on_remote_insert() {
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: None,
+        admin_identity_pub: None,
     });
 
     struct SingleIdentityResolver {
@@ -668,6 +673,7 @@ async fn engine_emits_membership_delta_on_remote_insert() {
         delta_tx: Some(delta_tx),
         pending_redemptions: None,
         crdt_state: None,
+        admin_identity_pub: None,
     });
 
     engine_a.flush_now().await.expect("flush_now");
@@ -768,6 +774,7 @@ async fn engine_insert_local_event_emits_delta_and_notifies_publish() {
         delta_tx: Some(delta_tx),
         pending_redemptions: None,
         crdt_state: None,
+        admin_identity_pub: None,
     });
 
     let payload = EventPayload {
@@ -921,6 +928,7 @@ async fn engine_accepts_self_owner_and_signing_key_in_config() {
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: None,
+        admin_identity_pub: None,
     });
     engine.shutdown().await.expect("shutdown");
 }
@@ -995,6 +1003,7 @@ async fn publish_carries_valid_publisher_sig() {
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: None,
+        admin_identity_pub: None,
     });
 
     engine.flush_now().await.expect("flush_now");
@@ -1204,6 +1213,7 @@ async fn spoofed_publisher_addr_rejected_with_publisher_sig_invalid() {
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: None,
+        admin_identity_pub: None,
     });
 
     in_tx.send(wire).await.expect("inject wire");
@@ -1426,6 +1436,7 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: None,
+        admin_identity_pub: None,
     });
 
     in_tx.send(wire).await.expect("inject wire");
@@ -1606,6 +1617,7 @@ async fn cold_cache_publish_rejected_then_succeeds_after_propagation() {
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: None,
+        admin_identity_pub: None,
     });
 
     // 1. Cold cache: resolver empty → first delivery rejected.

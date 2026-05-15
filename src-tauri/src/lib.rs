@@ -9493,6 +9493,17 @@ where
         .await
         .map_err(|e| format!("registry.spawn_engine_with_guard: {e}"))?;
 
+    // ZEB-254: bind admin identity pub to the engine so the P5 gate in
+    // verify_event can validate PendingJoin InviteToken signatures. Must
+    // happen before any event insert (including the bootstrap admin Join
+    // below) so the shared OnceLock is populated before the task's
+    // handle_incoming_publish path could race it. Invite-only payloads
+    // always carry admin_identity_pub; open-community payloads carry None
+    // (no PendingJoin events possible → no binding needed).
+    if let Some(pub_bytes) = payload.admin_identity_pub {
+        engine_arc.bind_admin_identity_pub(pub_bytes);
+    }
+
     // ZEB-249 Task 6 spec §5.2: seed the bootstrap hint BEFORE the first
     // insert_local_event so the guard (version == 0 && events.is_empty())
     // in CommunityState::materialized() can actually return the hint.

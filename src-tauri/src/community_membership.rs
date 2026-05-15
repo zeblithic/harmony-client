@@ -602,8 +602,10 @@ pub enum VerifyError {
     /// SHA-256[..16]) to the event's actor address.
     PendingJoinJoinerPubMismatch,
 
-    /// ZEB-254: PendingJoin actor's prior state is Joined or Banned (or
-    /// Invited) — cannot accept a pending Join for an already-engaged member.
+    /// ZEB-254 P6: PendingJoin actor's prior state is `Joined | Banned |
+    /// Invited | PendingJoin` — cannot accept a pending Join for an
+    /// already-engaged member. Rule: reject if prior state is any of those
+    /// four; allow only `None` (never joined) or `Some(Left)`.
     PendingJoinAlreadyMember,
 
     /// ZEB-254: JoinCountersign actor is not currently Joined in the
@@ -4385,6 +4387,51 @@ mod zeb_254_pending_join_verify_tests {
                 Err(VerifyError::PendingJoinAlreadyMember)
             ),
             "Banned actor must yield PendingJoinAlreadyMember"
+        );
+    }
+
+    #[test]
+    fn pending_join_rejected_when_actor_already_pending() {
+        // P6 gate: PendingJoin prior state is itself PendingJoin — must
+        // reject because the actor is already-engaged (queue slot taken).
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+        let community_id = SpaceId([7u8; 16]);
+        let token = make_invite_token(
+            &admin_priv,
+            admin_addr,
+            Some(joiner_addr),
+            Some(1_700_000_100_000),
+        );
+        let event =
+            make_pending_join_event(&joiner_priv, joiner_addr, joiner_pub, community_id, token);
+        let mut mat = MaterializedMembership::default();
+        mat.members.insert(
+            joiner_addr,
+            MemberState {
+                status: MemberStatus::PendingJoin,
+                joined_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                left_at: None,
+            },
+        );
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: true,
+            actor_identity_pub: &joiner_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: Some(&admin_pub),
+        };
+        assert!(
+            matches!(
+                verify_event(&event, &mat, &ctx),
+                Err(VerifyError::PendingJoinAlreadyMember)
+            ),
+            "actor already in PendingJoin state must yield PendingJoinAlreadyMember"
         );
     }
 

@@ -2244,6 +2244,7 @@ mod task3_kick_setpower_round_trip {
             delta_tx: Some(delta_a_tx),
             pending_redemptions: None,
             crdt_state: None,
+            admin_identity_pub: None,
         });
         let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
             community_id,
@@ -2268,6 +2269,7 @@ mod task3_kick_setpower_round_trip {
             delta_tx: Some(delta_b_tx),
             pending_redemptions: None,
             crdt_state: None,
+            admin_identity_pub: None,
         });
 
         // Step 1: A inserts its bootstrap Join.
