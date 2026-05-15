@@ -815,6 +815,7 @@ async fn stale_invite_catchup_unlocks_decryption_end_to_end() {
         self_owner: admin_addr,
         signing_key: Arc::clone(&admin_signing_key),
         crdt_state: None,
+        nav_emitter: None,
     }));
 
     let (pub_tx, _pub_rx) = mpsc::channel(8);

@@ -189,6 +189,7 @@ async fn two_members_dag_sync_full_event_log() {
         self_owner: admin,
         signing_key: Arc::clone(&admin_signing),
         crdt_state: None,
+        nav_emitter: None,
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "b-dev".into(),
@@ -203,6 +204,7 @@ async fn two_members_dag_sync_full_event_log() {
         self_owner: b_owner,
         signing_key: Arc::clone(&b_signing),
         crdt_state: None,
+        nav_emitter: None,
     });
 
     // B's publisher and A's subscriber are unused in this one-way
@@ -403,6 +405,7 @@ async fn forged_signature_event_is_rejected_on_receive() {
         self_owner: admin,
         signing_key: Arc::clone(&admin_signing),
         crdt_state: None,
+        nav_emitter: None,
     });
 
     // We need direct access to B's subscriber channel sender to
@@ -625,6 +628,7 @@ async fn malformed_wire_packet_does_not_panic_engine() {
         self_owner: admin,
         signing_key: Arc::clone(&admin_signing),
         crdt_state: None,
+        nav_emitter: None,
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "b-dev".into(),
@@ -639,6 +643,7 @@ async fn malformed_wire_packet_does_not_panic_engine() {
         self_owner: admin,
         signing_key: Arc::clone(&admin_signing),
         crdt_state: None,
+        nav_emitter: None,
     });
 
     let (b_pub_tx, _b_pub_rx) = mpsc::channel(8);
@@ -828,6 +833,7 @@ async fn replay_of_same_root_publish_is_idempotent() {
         self_owner: admin,
         signing_key: Arc::clone(&admin_signing),
         crdt_state: None,
+        nav_emitter: None,
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "b-dev".into(),
@@ -842,6 +848,7 @@ async fn replay_of_same_root_publish_is_idempotent() {
         self_owner: admin,
         signing_key: Arc::clone(&admin_signing),
         crdt_state: None,
+        nav_emitter: None,
     });
 
     let (b_pub_tx, _b_pub_rx) = mpsc::channel(8);
@@ -1132,6 +1139,7 @@ async fn spoofed_publish_does_not_block_real_publisher() {
         self_owner: alice_addr,
         signing_key: Arc::clone(&alice_signing),
         crdt_state: None,
+        nav_emitter: None,
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "b-dev".into(),
@@ -1150,6 +1158,7 @@ async fn spoofed_publish_does_not_block_real_publisher() {
         self_owner: bob_addr,
         signing_key: Arc::clone(&bob_signing),
         crdt_state: None,
+        nav_emitter: None,
     });
 
     // B's publisher and A's subscriber are unused in this one-way sync
@@ -1595,6 +1604,7 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
         self_owner: alice_addr,
         signing_key: Arc::clone(&alice_signing),
         crdt_state: None,
+        nav_emitter: None,
     });
     let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
         device_id: "b-dev".into(),
@@ -1607,6 +1617,7 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
         self_owner: b_owner,
         signing_key: Arc::clone(&b_signing),
         crdt_state: None,
+        nav_emitter: None,
     });
 
     // B never publishes, A never receives — but spawn_engine requires
@@ -1952,6 +1963,7 @@ async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
         self_owner,
         signing_key: Arc::clone(&signing_key),
         crdt_state: None,
+        nav_emitter: None,
     }));
 
     // ZEB-271: ChannelLogRegistry required by the new create_community_inner
@@ -2245,6 +2257,7 @@ mod task3_kick_setpower_round_trip {
             pending_redemptions: None,
             crdt_state: None,
             admin_identity_pub: None,
+            nav_emitter: None,
         });
         let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
             community_id,
@@ -2270,6 +2283,7 @@ mod task3_kick_setpower_round_trip {
             pending_redemptions: None,
             crdt_state: None,
             admin_identity_pub: None,
+            nav_emitter: None,
         });
 
         // Step 1: A inserts its bootstrap Join.
@@ -2694,6 +2708,7 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         self_owner: bob_addr,
         signing_key: Arc::clone(&bob_signing_key),
         crdt_state: None,
+        nav_emitter: None,
     }));
 
     let crdt_state = Arc::new(Mutex::new(OwnerState::default()));

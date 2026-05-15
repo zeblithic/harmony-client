@@ -1721,6 +1721,34 @@ async fn start_node(
                             // so every spawned engine reads the current epoch key
                             // dynamically rather than using its spawn-time capture.
                             crdt_state: Some(std::sync::Arc::clone(&crdt_state)),
+                            // ZEB-254 Task 11: joiner-side pending-clear hook. Emits
+                            // nav-updated { pending: false } when a JoinCountersign
+                            // targeting a self-authored PendingJoin lands in the engine.
+                            nav_emitter: Some(std::sync::Arc::new({
+                                let app_handle_for_emitter = app.clone();
+                                move |community_id: crate::owner_state_types::SpaceId,
+                                      space_name: String| {
+                                    use tauri::Emitter as _;
+                                    let space_id_hex = hex::encode(community_id.0);
+                                    if let Err(e) = app_handle_for_emitter.emit(
+                                        "nav-updated",
+                                        &NavUpdatedPayload {
+                                            action: "modified",
+                                            space_id: space_id_hex,
+                                            kind: "community",
+                                            name: space_name,
+                                            members: None,
+                                            parent_id: None,
+                                            pending: Some(false),
+                                        },
+                                    ) {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "ZEB-254 pending-clear: nav-updated emit failed"
+                                        );
+                                    }
+                                }
+                            })),
                         };
                         std::sync::Arc::new(
                             crate::community_state_sync::CommunitySyncRegistry::new(cfg),
@@ -8587,6 +8615,7 @@ async fn create_community(
             name: name_for_emit,
             members: None,
             parent_id: None,
+            pending: None,
         },
     ) {
         tracing::warn!(error = %e, "create_community: nav-updated emit failed");
@@ -8738,6 +8767,7 @@ mod create_community_inner_tests {
                 self_owner,
                 signing_key: std::sync::Arc::clone(&signing_key),
                 crdt_state: None,
+                nav_emitter: None,
             }));
 
         // Community adapter channel — receiver kept alive so try_send
@@ -9224,6 +9254,13 @@ pub struct NavUpdatedPayload {
     pub members: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
+    /// ZEB-254 Task 11: emitted with `action = "modified"` when the
+    /// joiner-side pending-clear hook fires. `None` means "not relevant
+    /// to this payload" (the frontend skips the pending field on
+    /// `"added"` / `"removed"` actions). `Some(false)` means the pending
+    /// state just cleared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending: Option<bool>,
 }
 
 /// Pure function: builds the joiner-side `MintedCommunity` from an
@@ -10182,6 +10219,7 @@ async fn redeem_invite(
             name: dto.community_name.clone(),
             members: None,
             parent_id: None,
+            pending: None,
         },
     ) {
         tracing::warn!(error = %e, "redeem_invite: nav-updated emit failed");
@@ -10371,6 +10409,7 @@ async fn join_open_community(
             name: dto.community_name.clone(),
             members: None,
             parent_id: None,
+            pending: None,
         },
     ) {
         tracing::warn!(error = %e, "join_open_community: nav-updated emit failed");
@@ -10501,6 +10540,7 @@ mod redeem_invite_inner_tests {
                 self_owner,
                 signing_key: std::sync::Arc::clone(&signing_key),
                 crdt_state: None,
+                nav_emitter: None,
             }));
 
         let (community_adapter_tx, _community_adapter_rx) =
@@ -12418,6 +12458,7 @@ async fn leave_community(
             name: String::new(),
             members: None,
             parent_id: None,
+            pending: None,
         },
     ) {
         tracing::warn!(error = %e, "leave_community: nav-updated emit failed");

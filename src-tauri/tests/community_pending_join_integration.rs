@@ -133,6 +133,7 @@ async fn pending_join_accepted_via_engine_insert_after_bind_admin_identity_pub()
         pending_redemptions: None,
         crdt_state: None,
         admin_identity_pub: None, // starts unset — bind_admin_identity_pub sets it below
+        nav_emitter: None,
     });
 
     // ZEB-254 R1 fix: bind the admin identity pub so the engine's P5 gate
@@ -270,6 +271,7 @@ fn build_engine_with_resolver(
         pending_redemptions: None,
         crdt_state: None,
         admin_identity_pub: admin_pub,
+        nav_emitter: None,
     });
     engine
 }
@@ -560,5 +562,218 @@ async fn admin_engine_idempotent_no_duplicate_counter_sign() {
     assert_eq!(count, 1, "expected exactly 1 JoinCountersign, got {count}");
 
     drop(g);
+    engine.shutdown().await.expect("shutdown");
+}
+
+/// ZEB-254 Task 11: joiner-side pending-clear hook.
+///
+/// When a `JoinCountersign` targeting a self-authored `PendingJoin` is
+/// inserted into a joiner engine that carries a `crdt_state` (owner-state
+/// CRDT) with `Space.pending_join_at = Some(...)`, the hook must:
+///   1. Set `Space.pending_join_at = None` in the owner-state CRDT.
+///   2. Call the `nav_emitter` callback with the community SpaceId + name.
+#[tokio::test]
+async fn joiner_engine_clears_pending_join_at_on_countersign() {
+    use harmony_app::owner_state_crdt::OwnerState;
+    use harmony_app::owner_state_types::{Space, SpaceKind};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let community_id = SpaceId([0xC1; 16]);
+
+    // Admin (counter-signer).
+    let (admin_priv, admin_pub, admin_addr) = make_identity(0xAA);
+    let _admin_signing = signing_key_from(&admin_priv);
+
+    // Joiner (self_owner for the engine).
+    let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xBB);
+    let joiner_signing = signing_key_from(&joiner_priv);
+
+    let mk = EpochKey::new([0x42; 32]);
+
+    // ── Community state (engine's local membership CRDT) ───────────────
+    let community_state = Arc::new(Mutex::new(CommunityState::new(community_id)));
+    let tracker = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+
+    // ── Owner-state CRDT: seed a Space with pending_join_at = Some ─────
+    let mut owner_state_inner = OwnerState::default();
+    let pending_hlc = Hlc {
+        wall_ms: 1_700_000_000_000,
+        logical: 0,
+        device_id: "joiner-dev".into(),
+    };
+    let space = Space {
+        id: community_id,
+        kind: SpaceKind::Community,
+        parent: None,
+        community_id: None,
+        name: "TestCommunity".to_string(),
+        transport: None,
+        members: vec![],
+        custom_name: None,
+        notification_pref: None,
+        left_at: None,
+        created_at: pending_hlc.clone(),
+        updated_at: pending_hlc.clone(),
+        content_key: None,
+        prior_content_keys: vec![],
+        current_epoch: Some(0),
+        current_epoch_key: Some(mk.clone()),
+        old_epoch_keys: Default::default(),
+        admin_addr: Some(admin_addr),
+        is_invite_only: Some(true),
+        shared_in_profile: false,
+        pending_join_at: Some(pending_hlc.clone()),
+    };
+    owner_state_inner.apply_space_with_canonicalization(space);
+    let crdt_state = Arc::new(Mutex::new(owner_state_inner));
+
+    // ── nav_emitter: record that the callback fires ────────────────────
+    let emitter_fired = Arc::new(AtomicBool::new(false));
+    let emitter_fired_clone = Arc::clone(&emitter_fired);
+    let nav_cb: harmony_app::community_state_sync::NavPendingClearEmitter =
+        Arc::new(move |_cid, _name| {
+            emitter_fired_clone.store(true, Ordering::SeqCst);
+        });
+
+    let cs = make_cas();
+    let (pub_tx, _pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_sub_tx, sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // Joiner's engine: self_owner = joiner_addr, crdt_state = Some, nav_emitter = Some.
+    let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        community_id,
+        membership_key: mk,
+        admin_addr,
+        is_invite_only: true,
+        device_id: "joiner-dev".into(),
+        self_owner: joiner_addr,
+        signing_key: Arc::new(joiner_signing.clone()),
+        state: Arc::clone(&community_state),
+        tracker: Arc::clone(&tracker),
+        content_store: cs,
+        publisher_tx: pub_tx,
+        subscriber_rx: sub_rx,
+        paths: PersistPaths {
+            crdt: tmp.path().join("crdt.cbor"),
+            replay: tmp.path().join("replay.cbor"),
+        },
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        identity_resolver: None,
+        error_tx: None,
+        delta_tx: None,
+        pending_redemptions: None,
+        crdt_state: Some(Arc::clone(&crdt_state)),
+        admin_identity_pub: Some(admin_pub),
+        nav_emitter: Some(Arc::clone(&nav_cb)),
+    });
+
+    // Step 1: insert admin's bootstrap Join (so admin is Joined in the
+    // community state — required for the JoinCountersign verify gate).
+    let admin_join_payload = EventPayload {
+        id: [0xAA; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: admin_addr,
+        at: Hlc {
+            wall_ms: 1_700_000_001_000,
+            logical: 0,
+            device_id: "admin-dev".into(),
+        },
+    };
+    let admin_join =
+        sign_event_with_identity(&admin_join_payload, &admin_priv).expect("sign admin join");
+    let outcome = engine
+        .insert_local_event_with_pubs(admin_join, admin_pub, None)
+        .await
+        .expect("admin join insert");
+    assert!(
+        matches!(
+            outcome,
+            InsertOutcome::Inserted | InsertOutcome::AlreadyKnown
+        ),
+        "admin join must land: {:?}",
+        outcome
+    );
+
+    // Step 2: insert the joiner's PendingJoin.
+    let invite_token = make_signed_token(&admin_priv, admin_addr, Some(joiner_addr), None);
+    let pending_join_id = [0xBB; 16];
+    let pending_join_payload = EventPayload {
+        id: pending_join_id,
+        community_id,
+        kind: MembershipEventKind::PendingJoin {
+            invite_token: invite_token.clone(),
+            joiner_identity_pub: joiner_pub,
+        },
+        actor: joiner_addr,
+        at: Hlc {
+            wall_ms: 1_700_000_002_000,
+            logical: 0,
+            device_id: "joiner-dev".into(),
+        },
+    };
+    let pending_join =
+        sign_event_with_identity(&pending_join_payload, &joiner_priv).expect("sign pending join");
+    let outcome = engine
+        .insert_local_event_with_pubs(pending_join, joiner_pub, None)
+        .await
+        .expect("PendingJoin insert");
+    assert!(
+        matches!(outcome, InsertOutcome::Inserted),
+        "PendingJoin must be Inserted: {:?}",
+        outcome
+    );
+
+    // Step 3: insert a JoinCountersign from admin targeting the PendingJoin.
+    let countersign_payload = EventPayload {
+        id: [0xCC; 16],
+        community_id,
+        kind: MembershipEventKind::JoinCountersign {
+            target_event_id: pending_join_id,
+        },
+        actor: admin_addr,
+        at: Hlc {
+            wall_ms: 1_700_000_003_000,
+            logical: 0,
+            device_id: "admin-dev".into(),
+        },
+    };
+    let countersign =
+        sign_event_with_identity(&countersign_payload, &admin_priv).expect("sign countersign");
+    let outcome = engine
+        .insert_local_event_with_pubs(countersign, admin_pub, None)
+        .await
+        .expect("JoinCountersign insert");
+    assert!(
+        matches!(outcome, InsertOutcome::Inserted),
+        "JoinCountersign must be Inserted: {:?}",
+        outcome
+    );
+
+    // Step 4: wait for the spawned clear task to complete.
+    // The hook is fire-and-forget; poll with a timeout.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let g = crdt_state.lock().await;
+        let space = g.spaces.get(&community_id);
+        if let Some(s) = space {
+            if s.pending_join_at.is_none() {
+                break;
+            }
+        }
+        drop(g);
+        if std::time::Instant::now() > deadline {
+            panic!("Space.pending_join_at was not cleared within 2s");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // Step 5: nav_emitter callback must have fired.
+    assert!(
+        emitter_fired.load(Ordering::SeqCst),
+        "nav_emitter must have been called"
+    );
+
     engine.shutdown().await.expect("shutdown");
 }
