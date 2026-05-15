@@ -58,8 +58,6 @@ pub enum SnapshotError {
     UnsupportedEnvelopeVersion(u8),
     #[error("unsupported KDF id: {0:#04x}")]
     UnsupportedKdfId(u8),
-    #[error("HRSS KDF parameters mismatch — refuse to allocate attacker-controlled memory")]
-    BadKdfParams,
     #[error("HRSS could not be decrypted: wrong passphrase or corrupted file")]
     WrongPassphraseOrCorrupt,
     #[error("HRSS CBOR payload malformed: {0}")]
@@ -68,10 +66,10 @@ pub enum SnapshotError {
     CborEncode(String),
     #[error("state snapshot format version {0} not supported; please update harmony-app")]
     UnsupportedSnapshotVersion(u32),
-    #[error("state sidecar identity mismatch — HRSS addr {} != restored identity {}", hex::encode(.expected), hex::encode(.actual))]
+    #[error("state sidecar identity mismatch — HRSS addr {} != restored identity {}", hex::encode(.snapshot_addr), hex::encode(.expected_addr))]
     AddrMismatch {
-        expected: [u8; 16],
-        actual: [u8; 16],
+        snapshot_addr: [u8; 16],
+        expected_addr: [u8; 16],
     },
     #[error("Argon2 derivation failed: {0}")]
     Argon2Fail(String),
@@ -234,14 +232,13 @@ pub fn decode_snapshot(
     let t = u16::from_be_bytes(bytes[T_OFF..T_OFF + 2].try_into().unwrap()) as u32;
     let p = bytes[P_OFF] as u32;
     if m_kib != KDF_M_KIB || t != KDF_T as u32 || p != KDF_P as u32 {
-        return Err(SnapshotError::BadKdfParams);
+        return Err(SnapshotError::WrongPassphraseOrCorrupt);
     }
     let salt: &[u8; SALT_LEN] = bytes[SALT_OFF..NONCE_OFF].try_into().unwrap();
     let nonce: &[u8; NONCE_LEN] = bytes[NONCE_OFF..CIPHER_OFF].try_into().unwrap();
     let ciphertext_with_tag = &bytes[CIPHER_OFF..];
 
-    let params = Params::new(m_kib, t, p, Some(KDF_OUT_LEN))
-        .map_err(|_| SnapshotError::WrongPassphraseOrCorrupt)?;
+    let params = Params::new(m_kib, t, p, Some(KDF_OUT_LEN)).expect("KDF params hardcoded valid");
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut key = Zeroizing::new([0u8; KDF_OUT_LEN]);
     argon
@@ -276,8 +273,8 @@ pub fn verify_snapshot_addr(
 ) -> Result<(), SnapshotError> {
     if &snapshot.owner_addr.0 != expected {
         return Err(SnapshotError::AddrMismatch {
-            expected: snapshot.owner_addr.0,
-            actual: *expected,
+            snapshot_addr: snapshot.owner_addr.0,
+            expected_addr: *expected,
         });
     }
     Ok(())
@@ -361,10 +358,16 @@ mod tests {
         let bytes = encode_snapshot(b"pp", addr_a, hlc(1), &state).unwrap();
         let snapshot = decode_snapshot(b"pp", &bytes).unwrap();
         let err = verify_snapshot_addr(&snapshot, &addr_b.0).expect_err("must reject");
-        assert!(
-            matches!(err, SnapshotError::AddrMismatch { .. }),
-            "got: {err:?}"
-        );
+        match err {
+            SnapshotError::AddrMismatch {
+                snapshot_addr,
+                expected_addr,
+            } => {
+                assert_eq!(snapshot_addr, addr_a.0, "snapshot_addr must hold A");
+                assert_eq!(expected_addr, addr_b.0, "expected_addr must hold B");
+            }
+            other => panic!("expected AddrMismatch, got {other:?}"),
+        }
     }
 
     #[test]
@@ -391,18 +394,6 @@ mod tests {
         };
         let mut cbor = Vec::new();
         into_writer(&snapshot, &mut cbor).unwrap();
-        // Confirm the test scaffolding is sane: a normal v=1 envelope
-        // decodes successfully under our test passphrase.
-        let bytes = encode_snapshot_with_params(
-            b"pp",
-            sample_owner_addr(),
-            hlc(1),
-            &state,
-            &[0; SALT_LEN],
-            &[0; NONCE_LEN],
-        )
-        .unwrap();
-        let _ = decode_snapshot(b"pp", &bytes).unwrap();
 
         // Build a fresh envelope where the inner CBOR carries v=99. We
         // do this by re-running the AEAD over the v=99 cbor manually.
