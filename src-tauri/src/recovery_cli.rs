@@ -389,10 +389,17 @@ pub struct ExportResult {
 /// `<in_path>.state`. addr-binding hard-fails on mismatch. Unknown
 /// snapshot version hard-fails. Wrong passphrase fails with the same
 /// idiom as HRMR.
+///
+/// `passphrase == Some(p)` overrides env-var resolution — the Tauri GUI
+/// path passes the user-typed passphrase directly (env vars are unsafe
+/// to set from a multithreaded process). Mirrors the
+/// [`export_recovery_file_pair_with_keychain`] override channel.
+#[allow(clippy::too_many_arguments)]
 pub fn restore_recovery_file_pair_with_keychain(
     plaintext_path: &Path,
     harmony_dir: &Path,
     in_path: &Path,
+    passphrase: Option<&SecretString>,
     force: bool,
     ignore_state: bool,
     keychain: Option<KeychainStore>,
@@ -400,7 +407,10 @@ pub fn restore_recovery_file_pair_with_keychain(
     // Restore identity first — same as today's path.
     let bytes =
         std::fs::read(in_path).map_err(|e| format!("failed to read {}: {e}", in_path.display()))?;
-    let passphrase = resolve_recovery_passphrase()?;
+    let passphrase: SecretString = match passphrase {
+        Some(p) => p.clone(),
+        None => resolve_recovery_passphrase()?,
+    };
     let restored =
         RecoveryArtifact::from_encrypted_file(&bytes, &passphrase).map_err(|e| e.to_string())?;
     let artifact = restored.into_artifact();
@@ -631,6 +641,7 @@ pub fn restore_recovery_file_cli(
         plaintext_path,
         &harmony_dir,
         in_path,
+        None,
         force,
         ignore_state,
         KeychainStore::new().ok(),
@@ -1121,6 +1132,7 @@ mod tests {
             &plaintext_path,
             dir.path(),
             &out,
+            None,
             /*force=*/ true,
             /*ignore_state=*/ false,
             None,
@@ -1167,6 +1179,7 @@ mod tests {
             &plaintext_path,
             dir.path(),
             &out,
+            None,
             true,
             false,
             None,
@@ -1209,6 +1222,7 @@ mod tests {
             &plaintext_path,
             dir.path(),
             &out,
+            None,
             true,
             /*ignore_state=*/ true,
             None,
@@ -1286,6 +1300,7 @@ mod tests {
             &plaintext_path,
             dir.path(),
             &out,
+            None,
             true,
             false,
             None,
@@ -1349,6 +1364,7 @@ mod tests {
             &plaintext_path_a,
             dir.path(),
             &out_a,
+            None,
             true,
             false,
             None,
@@ -1436,6 +1452,7 @@ mod tests {
             &plaintext_path,
             dir.path(),
             &out,
+            None,
             /*force=*/ false,
             /*ignore_state=*/ false,
             None,
@@ -1497,6 +1514,7 @@ mod tests {
             &fresh_plaintext,
             fresh.path(),
             &fresh_out,
+            None,
             true,
             false,
             None,

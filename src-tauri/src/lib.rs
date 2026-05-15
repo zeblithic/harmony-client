@@ -13885,6 +13885,62 @@ async fn get_backup_staleness(
     .await
 }
 
+/// ZEB-213 — informational preview of the `.state` sidecar next to a
+/// recovery file the user picked.
+///
+/// Wire shape (camelCase): `{ present: bool, spaceCount: Option<u32> }`.
+///
+/// Returns `present: false` when no sidecar exists at `<in_path>.state`.
+/// Otherwise decodes the sidecar with the supplied passphrase (the same
+/// one the user just typed for `preview_recovery_file`), loads the
+/// resulting tree into a temp file, and counts the Spaces so the GUI can
+/// show "Found owner-state snapshot — NN spaces. Restore both?".
+///
+/// **TOCTOU**: this IPC does NOT cache anything — it is purely
+/// informational. The authoritative sidecar restore happens inside
+/// `restore_recovery_from_preview_token_helper`, which uses the cached
+/// preview seed for addr-binding verification. A swap of the sidecar
+/// file between this preview and the actual commit would fail
+/// addr-binding at commit time.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SidecarPreview {
+    pub present: bool,
+    pub space_count: Option<u32>,
+}
+
+#[tauri::command]
+async fn preview_recovery_state_sidecar(
+    in_path: String,
+    passphrase: String,
+) -> Result<SidecarPreview, String> {
+    crate::identity_commands::run_blocking(move || {
+        let p = std::path::PathBuf::from(in_path);
+        let sidecar = crate::recovery_cli::sidecar_path(&p);
+        if !sidecar.exists() {
+            return Ok(SidecarPreview {
+                present: false,
+                space_count: None,
+            });
+        }
+        let snap = crate::state_snapshot::decode_snapshot_file(passphrase.as_bytes(), &sidecar)
+            .map_err(|e| e.to_string())?;
+        // Count Spaces by reloading the inner tree bytes via a tempfile.
+        // load_crdt parses the same canonicalize() output that
+        // save_atomically writes — matches the pattern in
+        // recovery_cli::restore_recovery_file_pair_with_keychain.
+        let tmp = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
+        crate::owner_state_persist::save_atomically(tmp.path(), &snap.tree)
+            .map_err(|e| e.to_string())?;
+        let state = crate::owner_state_persist::load_crdt(tmp.path()).map_err(|e| e.to_string())?;
+        Ok(SidecarPreview {
+            present: true,
+            space_count: Some(state.spaces.len() as u32),
+        })
+    })
+    .await
+}
+
 // ── App entry point ──────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -14052,6 +14108,7 @@ pub fn run() {
             identity_commands::export_mnemonic_words,
             identity_commands::preview_mnemonic_identity,
             identity_commands::preview_recovery_file,
+            preview_recovery_state_sidecar,
             identity_commands::export_recovery_file_to_path,
             identity_commands::restore_mnemonic_from_words,
             identity_commands::restore_recovery_from_preview_token,

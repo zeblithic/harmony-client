@@ -10,9 +10,10 @@
 //! would otherwise stall the async executor and starve other tasks
 //! (zenoh sync, IPC, UI events).
 
+use secrecy::SecretString;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -86,6 +87,13 @@ struct PreviewEntry {
     created_at: Instant,
     seed: Zeroizing<[u8; 32]>,
     info: RestoreInfo,
+    /// Path the user picked. Stored so commit can re-read the sidecar
+    /// (TOCTOU-OK because the cached `seed` remains the source of truth
+    /// for the identity write — see [`restore_recovery_from_preview_token_helper`]).
+    in_path: PathBuf,
+    /// Passphrase the user typed at preview. Stored so commit can decrypt
+    /// the sidecar without re-prompting. `SecretString` is zeroized on drop.
+    passphrase: SecretString,
 }
 
 const PREVIEW_TTL: Duration = Duration::from_secs(300);
@@ -101,7 +109,12 @@ fn preview_cache_lock() -> std::sync::MutexGuard<'static, HashMap<Uuid, PreviewE
 /// Insert a freshly-decrypted seed into the preview cache and return the
 /// generated token. Evicts expired entries first; if still over capacity,
 /// drops the single oldest entry.
-fn insert_preview(seed: Zeroizing<[u8; 32]>, info: RestoreInfo) -> Uuid {
+fn insert_preview(
+    seed: Zeroizing<[u8; 32]>,
+    info: RestoreInfo,
+    in_path: PathBuf,
+    passphrase: SecretString,
+) -> Uuid {
     let mut cache = preview_cache_lock();
     cache.retain(|_, entry| entry.created_at.elapsed() < PREVIEW_TTL);
     if cache.len() >= MAX_PREVIEW_ENTRIES {
@@ -120,6 +133,8 @@ fn insert_preview(seed: Zeroizing<[u8; 32]>, info: RestoreInfo) -> Uuid {
             created_at: Instant::now(),
             seed,
             info,
+            in_path,
+            passphrase,
         },
     );
     token
@@ -127,10 +142,12 @@ fn insert_preview(seed: Zeroizing<[u8; 32]>, info: RestoreInfo) -> Uuid {
 
 /// Remove and return a cached preview by token. Returns `None` if the token
 /// is unknown or the entry has expired (eviction is performed first).
-fn take_preview(token: Uuid) -> Option<(Zeroizing<[u8; 32]>, RestoreInfo)> {
+fn take_preview(token: Uuid) -> Option<(Zeroizing<[u8; 32]>, RestoreInfo, PathBuf, SecretString)> {
     let mut cache = preview_cache_lock();
     cache.retain(|_, entry| entry.created_at.elapsed() < PREVIEW_TTL);
-    cache.remove(&token).map(|e| (e.seed, e.info))
+    cache
+        .remove(&token)
+        .map(|e| (e.seed, e.info, e.in_path, e.passphrase))
 }
 
 /// Clear the preview cache. Used by tests to keep state isolated; production
@@ -256,7 +273,6 @@ pub fn preview_recovery_file_helper(
     passphrase: &str,
 ) -> Result<PreviewedRecovery, String> {
     use harmony_owner::lifecycle::RecoveryArtifact;
-    use secrecy::SecretString;
 
     let bytes = read_recovery_file(in_path)?;
     let pass = SecretString::from(passphrase.to_string());
@@ -271,9 +287,14 @@ pub fn preview_recovery_file_helper(
 
     // Cache the seed (zeroized on drop) and mint a token that the GUI will
     // pass back on commit. The seed never leaves this process.
+    //
+    // Also cache `in_path` + `passphrase` so the commit step can re-read
+    // the `.state` sidecar (ZEB-213) without re-prompting the user. The
+    // cached `seed` remains the source of truth for the identity write,
+    // so the previously-pinned TOCTOU property still holds for the HRMR.
     let artifact = restored.into_artifact();
     let seed: Zeroizing<[u8; 32]> = Zeroizing::new(*artifact.as_bytes());
-    let token = insert_preview(seed, info.clone());
+    let token = insert_preview(seed, info.clone(), in_path.to_path_buf(), pass);
 
     Ok(PreviewedRecovery {
         preview_token: token.to_string(),
@@ -374,20 +395,30 @@ pub fn restore_mnemonic_from_words_helper(
     Ok(hex::encode(artifact.master_pubkey_bundle().identity_hash()))
 }
 
-/// Commit the seed cached under `preview_token` to disk.
+/// Commit the seed cached under `preview_token` to disk, and (unless
+/// `ignore_state == true`) restore the `<in_path>.state` sidecar that
+/// the user picked during preview.
 ///
 /// `force` is always `true` on this path: the GUI has already shown the
 /// user a `TypeToConfirmDialog` and received explicit acknowledgement that
 /// the current identity will be overwritten.
 ///
-/// **No re-read.** The seed written here was decrypted during
+/// **HRMR has no re-read** — the seed written here was decrypted during
 /// [`preview_recovery_file_helper`] and held in [`PREVIEW_CACHE`] until
-/// commit. `in_path` is not consulted at all on this code path — the
-/// preview-and-commit pair is bound through the token, not the filename.
-/// A swap of the recovery file between IPCs cannot affect what gets
-/// restored (CodeRabbit Critical, round 4). The token is single-use:
-/// [`take_preview`] removes it from the cache, so a successful or partial
-/// commit cannot be replayed.
+/// commit. The identity write is bound through the token, not the
+/// filename: a swap of the recovery file between IPCs cannot affect the
+/// identity that gets restored (CodeRabbit Critical, round 4). The token
+/// is single-use: [`take_preview`] removes it from the cache, so a
+/// successful or partial commit cannot be replayed.
+///
+/// **The sidecar IS re-read at commit time** (ZEB-213). The plan calls
+/// this out explicitly: `preview_recovery_state_sidecar` is informational
+/// only (space count for UX); the actual sidecar restore happens here
+/// and is verified for addr-binding against the cached seed's owner-addr.
+/// A swap of the `.state` file between preview and commit therefore fails
+/// the addr-binding check and cleanly hard-fails AFTER the identity has
+/// already been written (acceptable: identity restore is the primary goal
+/// of the operation and is TOCTOU-bound; state restore is secondary).
 ///
 /// Errors:
 /// - **invalid token** (unknown UUID, expired, or already consumed): the
@@ -397,14 +428,20 @@ pub fn restore_mnemonic_from_words_helper(
 ///   (we cannot tell whether the partial write succeeded), so the user
 ///   must re-preview before retrying. Identity may be partially written;
 ///   retry with the same backup is safe (`force=true`).
+/// - **sidecar failure** (missing/corrupt/addr-mismatch): identity has
+///   already been written successfully. The error message makes the
+///   partial-success state explicit per `metadata-before-irreversible-write`.
 pub fn restore_recovery_from_preview_token_helper(
     plaintext_path: &Path,
     preview_token: &str,
+    ignore_state: bool,
     keychain: Option<KeychainStore>,
 ) -> Result<RestoreInfo, String> {
+    use secrecy::ExposeSecret;
+
     let token = Uuid::parse_str(preview_token)
         .map_err(|_| "invalid preview token (re-pick the recovery file)".to_string())?;
-    let (seed, info) = take_preview(token).ok_or_else(|| {
+    let (seed, info, in_path, passphrase) = take_preview(token).ok_or_else(|| {
         "preview expired or already used; re-pick the recovery file to continue".to_string()
     })?;
 
@@ -416,6 +453,54 @@ pub fn restore_recovery_from_preview_token_helper(
         keychain,
     )
     .map_err(|e| e.to_string())?;
+
+    // Sidecar restore path (ZEB-213). Mirrors the sidecar block in
+    // `recovery_cli::restore_recovery_file_pair_with_keychain` but uses
+    // the token-cached seed for addr-binding (so TOCTOU on HRMR is
+    // preserved: identity comes from the cached seed, not from re-reading
+    // the recovery file).
+    //
+    // The `.state` file IS re-read here — this is by design. The plan
+    // accepts that the sidecar is informational at preview and authoritative
+    // at commit; addr-binding catches the swap case (the verification
+    // hard-fails after identity is already written).
+    if !ignore_state {
+        let sidecar = recovery_cli::sidecar_path(&in_path);
+        if sidecar.exists() {
+            // harmony_dir = plaintext_path.parent() (production wires
+            // <harmony>/identity.key; matches `export_recovery_file_to_path_helper`).
+            let harmony_dir = plaintext_path
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let state_path = recovery_cli::owner_state_path(&harmony_dir);
+
+            let snap = crate::state_snapshot::decode_snapshot_file(
+                passphrase.expose_secret().as_bytes(),
+                &sidecar,
+            )
+            .map_err(|e| format!("state sidecar: {e}"))?;
+            let addr = recovery_cli::derive_owner_addr_from_seed(&seed);
+            crate::state_snapshot::verify_snapshot_addr(&snap, &addr.0)
+                .map_err(|e| format!("state sidecar: {e}"))?;
+
+            // force=true: same gate as the identity write above (user
+            // already passed TypeToConfirmDialog). save_atomically writes
+            // the canonical bytes verbatim — load_crdt parses that same
+            // shape, mirroring the pair-helper's tempfile composition.
+            if let Err(e) = crate::owner_state_persist::save_atomically(&state_path, &snap.tree) {
+                return Err(format!(
+                    "identity restored but owner-state write failed: {e}"
+                ));
+            }
+        }
+        // sidecar absent + !ignore_state: silent success — identity-only
+        // restore. The GUI's "Restore both?" prompt would only have
+        // offered ignore_state=false when a sidecar was present at
+        // preview-time, but we don't error if it disappeared between
+        // preview and commit (a missing sidecar is indistinguishable
+        // from the legacy HRMR-only case).
+    }
 
     Ok(info)
 }
@@ -610,10 +695,16 @@ pub async fn restore_mnemonic_from_words(
 /// IPC call; see [`restore_recovery_from_preview_token_helper`] for the
 /// TOCTOU rationale.
 ///
+/// `ignore_state == true` skips the `.state` sidecar restore even when
+/// one is present next to the recovery file (ZEB-213). The GUI sets this
+/// based on the user's "Restore both" / "Identity only" choice after
+/// `preview_recovery_state_sidecar` reports whether a sidecar exists.
+///
 /// Refuses while the node is running — see [`require_node_stopped`].
 #[tauri::command]
 pub async fn restore_recovery_from_preview_token(
     preview_token: String,
+    ignore_state: bool,
     state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
 ) -> Result<RestoreInfo, String> {
     require_node_stopped(&state)?;
@@ -622,6 +713,7 @@ pub async fn restore_recovery_from_preview_token(
         restore_recovery_from_preview_token_helper(
             &plaintext_path,
             &preview_token,
+            ignore_state,
             KeychainStore::new().ok(),
         )
     })
@@ -1099,9 +1191,12 @@ mod tests {
 
         // Step 3: commit by token. Backend must use the cached A seed; it
         // must NEVER re-read recovery_path, so B's contents are irrelevant.
+        // ignore_state=true skips the sidecar (none exists here anyway —
+        // this test pins identity TOCTOU, not sidecar TOCTOU).
         let info = restore_recovery_from_preview_token_helper(
             &plaintext_path,
             &preview.preview_token,
+            /*ignore_state=*/ true,
             None,
         )
         .expect("restore by token");
@@ -1150,12 +1245,18 @@ mod tests {
 
         let preview = preview_recovery_file_helper(&recovery_path, "pass").expect("preview");
         // First commit: succeeds.
-        restore_recovery_from_preview_token_helper(&plaintext_path, &preview.preview_token, None)
-            .expect("first commit");
+        restore_recovery_from_preview_token_helper(
+            &plaintext_path,
+            &preview.preview_token,
+            /*ignore_state=*/ true,
+            None,
+        )
+        .expect("first commit");
         // Second commit with the SAME token: fails — the entry was consumed.
         let err = restore_recovery_from_preview_token_helper(
             &plaintext_path,
             &preview.preview_token,
+            /*ignore_state=*/ true,
             None,
         )
         .expect_err("second commit must fail");
@@ -1183,8 +1284,13 @@ mod tests {
 
         // Random UUID that was never issued.
         let bogus = Uuid::new_v4().to_string();
-        let err = restore_recovery_from_preview_token_helper(&plaintext_path, &bogus, None)
-            .expect_err("unknown token must fail");
+        let err = restore_recovery_from_preview_token_helper(
+            &plaintext_path,
+            &bogus,
+            /*ignore_state=*/ true,
+            None,
+        )
+        .expect_err("unknown token must fail");
         assert!(!err.is_empty(), "error must be non-empty; got: {err}");
 
         // Identity untouched.
@@ -1195,8 +1301,13 @@ mod tests {
         );
 
         // Non-UUID garbage is also rejected.
-        let err = restore_recovery_from_preview_token_helper(&plaintext_path, "not-a-uuid", None)
-            .expect_err("malformed token must fail");
+        let err = restore_recovery_from_preview_token_helper(
+            &plaintext_path,
+            "not-a-uuid",
+            /*ignore_state=*/ true,
+            None,
+        )
+        .expect_err("malformed token must fail");
         assert!(
             err.contains("invalid preview token"),
             "error must say invalid token; got: {err}"

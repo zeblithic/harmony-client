@@ -57,12 +57,21 @@
     | { phase: 'fileSaved'; savedPath: string; sidecarPath?: string; sidecarBytes?: number }                              // step 3b success
     | { phase: 'fileSaveError'; error: string; passphrase: string; passphraseConfirm: string; comment: string; includeState: boolean };          // step 3b error — carries prior input so Back can restore the form
 
+  // ZEB-213: file-restore phases also carry sidecar-detection state so the
+  // GUI can prompt "Restore both?" before the typed-prefix confirm.
+  // - `sidecarPresent`: true if `<pendingFilePath>.state` exists (detected
+  //   by the `preview_recovery_state_sidecar` IPC right after decrypt).
+  // - `sidecarSpaceCount`: nav-tree Space count for UX ("NN spaces"). When
+  //   undefined the GUI degrades to "Restore both?" without a count.
+  // - `restorePair`: user's choice — true ⇒ restore identity + owner-state;
+  //   false ⇒ restore identity only (passed as `ignoreState: true` to commit).
+  //   Defaults to `true` when a sidecar is present (recommended path).
   type RestoreStep =
     | { phase: 'pickSource' }                                                                                             // step 1
     | { phase: 'mnemonicEntry'; input: string; validationError: string | null }                                          // step 2a
     | { phase: 'fileEntry'; pendingFilePath: string; passphrase: string; showPass: boolean; restoreError: string | null }  // step 2b before decrypt
-    | { phase: 'fileDecrypted'; pendingFilePath: string; restoreCandidate: RestoreCandidate }                              // step 2b after decrypt — no passphrase: token replaces it
-    | { phase: 'confirm'; restoreSource: 'mnemonic' | 'file'; pendingWords: string[]; pendingFilePath?: string; restoreCandidate: RestoreCandidate; typedPrefix: string }  // step 3 — no passphrase: commit goes through previewToken
+    | { phase: 'fileDecrypted'; pendingFilePath: string; restoreCandidate: RestoreCandidate; sidecarPresent: boolean; sidecarSpaceCount?: number; restorePair: boolean }                              // step 2b after decrypt — no passphrase: token replaces it
+    | { phase: 'confirm'; restoreSource: 'mnemonic' | 'file'; pendingWords: string[]; pendingFilePath?: string; restoreCandidate: RestoreCandidate; typedPrefix: string; sidecarPresent: boolean; sidecarSpaceCount?: number; restorePair: boolean }  // step 3 — no passphrase: commit goes through previewToken
     | { phase: 'commitError'; error: string }                                                                             // step 3 error
     | { phase: 'done'; postRestoreHash: string };                                                                         // step 4
 
@@ -390,6 +399,11 @@
         pendingWords: words,
         restoreCandidate: { identityHash: candidateHash },
         typedPrefix: '',
+        // Mnemonic restore has no sidecar concept — leave the fields at
+        // their no-op defaults so the confirm screen renders the
+        // "identity only" message and the commit sends ignoreState=true.
+        sidecarPresent: false,
+        restorePair: false,
       },
     };
   }
@@ -471,6 +485,32 @@
     }
 
     if (wizardState !== epoch) return;
+
+    // ZEB-213: probe for a `<file>.state` sidecar so we can prompt
+    // "Restore both?" before the typed-prefix confirm. This IPC is
+    // informational only — the authoritative sidecar restore happens
+    // inside `restore_recovery_from_preview_token` at commit time,
+    // verified against the preview-cached seed's owner-addr.
+    //
+    // If the sidecar probe FAILS (corrupt sidecar, wrong key version,
+    // etc.) we degrade gracefully: treat the sidecar as absent so the
+    // user can still complete an identity-only restore. The error is
+    // not surfaced (per-spec: this is a UX probe, not the commit path).
+    let sidecarPresent = false;
+    let sidecarSpaceCount: number | undefined;
+    try {
+      const sidecar = await invoke<{ present: boolean; spaceCount?: number }>(
+        'preview_recovery_state_sidecar',
+        { inPath: step.pendingFilePath, passphrase: step.passphrase },
+      );
+      if (wizardState !== epoch) return;
+      sidecarPresent = sidecar.present;
+      sidecarSpaceCount = sidecar.spaceCount;
+    } catch {
+      // Treat probe errors as "no sidecar" — keeps the flow unblocked.
+      if (wizardState !== epoch) return;
+    }
+
     // The passphrase is intentionally NOT carried into fileDecrypted: once
     // preview returns a token, the commit IPC takes only the token. Keeping
     // the passphrase in reactive state would prolong secret retention with
@@ -481,6 +521,13 @@
         phase: 'fileDecrypted',
         pendingFilePath: step.pendingFilePath,
         restoreCandidate: candidate,
+        sidecarPresent,
+        sidecarSpaceCount,
+        // Default-on: "Restore both" is the recommended action when a
+        // sidecar exists. When absent the value is meaningless (the
+        // commit path branches on sidecarPresent anyway), but keep it
+        // false to be explicit.
+        restorePair: sidecarPresent,
       },
     };
   }
@@ -497,6 +544,12 @@
         pendingFilePath: step.pendingFilePath,
         restoreCandidate: step.restoreCandidate,
         typedPrefix: '',
+        // Carry the sidecar fields through so the confirm screen can
+        // surface "Restoring: identity + N spaces" / "identity only"
+        // and commit can pass the matching ignoreState to the backend.
+        sidecarPresent: step.sidecarPresent,
+        sidecarSpaceCount: step.sidecarSpaceCount,
+        restorePair: step.restorePair,
       },
     };
   }
@@ -535,8 +588,14 @@
       if (step.restoreSource === 'mnemonic') {
         postRestoreHash = await invoke<string>('restore_mnemonic_from_words', { words: step.pendingWords });
       } else {
+        // ZEB-213: `ignoreState` reflects the user's "Restore both" /
+        // "Identity only" choice surfaced on the fileDecrypted screen.
+        // Mnemonic-restore never carries a sidecar, so its step.restorePair
+        // defaults to false and ignoreState lands true (correct: there is
+        // no sidecar to restore in that path).
         const info = await invoke<{ identityHash: string }>('restore_recovery_from_preview_token', {
           previewToken: step.restoreCandidate.previewToken,
+          ignoreState: !step.restorePair,
         });
         postRestoreHash = info.identityHash;
       }
@@ -923,6 +982,43 @@
           <p class="meta-row">Comment: {wizardState.step.restoreCandidate.comment}</p>
         {/if}
       </div>
+      {#if wizardState.step.sidecarPresent}
+        <div class="sidecar-prompt">
+          <p>
+            Found an owner-state snapshot at <code>{wizardState.step.pendingFilePath}.state</code>{#if wizardState.step.sidecarSpaceCount !== undefined}
+              ({wizardState.step.sidecarSpaceCount} {wizardState.step.sidecarSpaceCount === 1 ? 'space' : 'spaces'}){/if}.
+          </p>
+          <p>Restore both, or identity only?</p>
+          <div class="actions sidecar-choice">
+            <button
+              type="button"
+              class:selected={wizardState.step.restorePair}
+              aria-pressed={wizardState.step.restorePair}
+              onclick={() => {
+                if (wizardState.kind === 'restore' && wizardState.step.phase === 'fileDecrypted') {
+                  wizardState = {
+                    kind: 'restore',
+                    step: { ...wizardState.step, restorePair: true },
+                  };
+                }
+              }}
+            >Restore both (recommended)</button>
+            <button
+              type="button"
+              class:selected={!wizardState.step.restorePair}
+              aria-pressed={!wizardState.step.restorePair}
+              onclick={() => {
+                if (wizardState.kind === 'restore' && wizardState.step.phase === 'fileDecrypted') {
+                  wizardState = {
+                    kind: 'restore',
+                    step: { ...wizardState.step, restorePair: false },
+                  };
+                }
+              }}
+            >Identity only</button>
+          </div>
+        </div>
+      {/if}
       <div class="actions">
         <button onclick={resetToIdle}>Cancel</button>
         <button onclick={advanceFromFileDecrypted}>Continue</button>
@@ -942,6 +1038,16 @@
         <span class="hash-diff-label">Restored</span>
         <span class="hash-diff-value hash-diff-new">0x{wizardState.step.restoreCandidate.identityHash.slice(0, 8)}…</span>
       </div>
+      <p class="restore-scope">
+        {#if wizardState.step.restorePair && wizardState.step.sidecarSpaceCount !== undefined}
+          Restoring: identity + {wizardState.step.sidecarSpaceCount}
+          {wizardState.step.sidecarSpaceCount === 1 ? 'space' : 'spaces'}
+        {:else if wizardState.step.restorePair}
+          Restoring: identity + owner-state
+        {:else}
+          Restoring: identity only
+        {/if}
+      </p>
       <label class="field-label">
         Type the first 8 chars of your CURRENT identity hash to proceed: ({currentPrefix})
         <input
@@ -1143,5 +1249,25 @@
     cursor: pointer;
     color: var(--text-primary);
     font-size: 0.9em;
+  }
+  /* ZEB-213: "Restore both?" prompt on the fileDecrypted screen. */
+  .sidecar-prompt {
+    margin: 12px 0;
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    font-size: 0.9em;
+  }
+  .sidecar-prompt p { margin: 4px 0; }
+  .sidecar-choice { margin-top: 8px; }
+  .sidecar-choice button[aria-pressed='true'] {
+    border: 1px solid var(--accent);
+  }
+  .restore-scope {
+    color: var(--text-secondary);
+    font-size: 0.9em;
+    margin: 8px 0;
   }
 </style>
