@@ -6,6 +6,7 @@
   import LastAdminWarningDialog from './LastAdminWarningDialog.svelte';
   import InviteLinkManager from './InviteLinkManager.svelte';
   import ForkConfirmDialog from './ForkConfirmDialog.svelte';
+  import PendingJoinsPanel from './PendingJoinsPanel.svelte';
 
   let {
     communityId,
@@ -100,6 +101,7 @@
     joinedMembers.some((m) => m.address === myAddress && m.power >= POWER_THRESHOLDS.setPower)
   );
   let myRole = $derived(powerToRole(myPower));
+  let canModerate = $derived(myPower >= POWER_THRESHOLDS.setPower);
 
   let search = $state('');
   let filteredMembers = $derived(
@@ -260,6 +262,13 @@
       <div class="section">
         <div class="section-label">Invites</div>
         <InviteLinkManager kind={communityKind} onGenerate={onGenerateInvite} />
+      </div>
+    {/if}
+
+    {#if canModerate}
+      <div class="section">
+        <div class="section-label">Join requests</div>
+        <PendingJoinsPanel {communityId} {canModerate} />
       </div>
     {/if}
 
