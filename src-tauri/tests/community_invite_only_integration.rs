@@ -132,13 +132,13 @@ impl Drop for RedeemTimeoutGuard {
 /// counter-signed Join converges on both engines, Alice's CRDT shows
 /// Bob as Joined.
 ///
-/// ZEB-254 Task 7 note: `mint_redemption` now produces a `PendingJoin`
-/// event on the invite-only path instead of `Join`. The complete round-
-/// trip (PendingJoin → CRDT broadcast → admin JoinCountersign → Joined)
-/// is Task 8's responsibility. This test will be re-enabled and updated
-/// in Task 8 once `handle_unicast` and `redeem_invite_inner` are updated
-/// to handle PendingJoin events correctly.
-#[ignore = "ZEB-254 Task 8: pending path wired; full round-trip (handle_unicast countersign) requires Task 9"]
+/// ZEB-254 Task 9 note: `handle_unicast` now accepts the PendingJoin shape
+/// and inserts it into the admin's engine AS-IS. The complete round-trip
+/// (PendingJoin → admin inserts → post-Inserted hook auto-emits
+/// JoinCountersign → joiner becomes Joined) requires Task 10's
+/// post-Inserted hook to ship the auto-emit logic. This test will be
+/// re-enabled and updated in Task 10 / Task 15.
+#[ignore = "ZEB-254 Task 10: admin inserts PendingJoin (Task 9 done); auto-emit JoinCountersign hook required for full round-trip"]
 #[tokio::test]
 async fn alice_redeems_invite_only_against_bob_admin() {
     // Short timeout: the round-trip is bounded by debounce_ms + a few

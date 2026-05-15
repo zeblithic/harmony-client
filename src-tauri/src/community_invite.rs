@@ -1605,66 +1605,122 @@ pub async fn handle_unicast<H: AppHandleEmit>(
         return Err(e);
     }
 
-    // 6. Attach countersig with our identity.
-    let counter_signed = match crate::community_membership::attach_countersig_with_identity(
-        &join_event,
-        self_private_identity.as_ref(),
-    ) {
-        Ok(e) => e,
-        Err(err) => {
-            tracing::warn!(error = %err, "attach_countersig_with_identity failed");
-            let e = CommunityInviteVerifyError::CounterSignAttachFailed;
-            emit_degraded(app, &signed.community_id, e.reason_tag());
-            return Err(e);
-        }
-    };
-
-    // 7. Insert via engine using `insert_local_event_with_pubs` — the
-    //    joiner's `joiner_identity_pub` was already verified in
-    //    `verify_packet_pure` step 5 (Path B app-sig binding), and the
-    //    receiver's own identity_pub is known locally. The production
-    //    `OwnerDeviceCacheResolver` won't have the joiner yet (this IS
-    //    the bootstrap that would populate the cache), so we MUST
-    //    bypass it. Skipping the resolver here is the load-bearing fix
-    //    for the bootstrap-by-design case: a counter-signed Join lands
-    //    LOCALLY here regardless of whether the resolver knows the
-    //    joiner; the publish-back path then carries the full
-    //    counter-signed event to peers, who do their own membership-
-    //    state verify against their resolver caches as those caches
-    //    populate.
+    // ZEB-254: Two-event flow for invite-only counter-sign.
     //
-    //    The engine's post-Inserted hook
-    //    (`notify_pending_redemption_in_map`) fires
-    //    `pending_redemptions[event_id]` for the joiner side — this
-    //    wakes the redeemer's `redeem_invite_inner` oneshot wait once
-    //    the counter-signed Join propagates back via Phase 2's
-    //    state-root publish.
-    let countersigner_pub = self_private_identity.identity.to_public_bytes();
-    match engine_arc
-        .insert_local_event_with_pubs(
-            counter_signed,
-            signed.joiner_identity_pub,
-            Some(countersigner_pub),
-        )
-        .await
-    {
-        Ok(crate::community_state_crdt::InsertOutcome::Inserted) => Ok(()),
-        Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => {
-            // Idempotent retransmit (Reticulum can deliver duplicates).
-            // Treat as success — we've already counter-signed this id.
-            Ok(())
+    // New ZEB-254 path: joiner's PendingJoin event enters the engine
+    // via insert_local_event_with_pubs. The post-Inserted hook (Task 10)
+    // detects PendingJoin + self-has-power and emits a JoinCountersign
+    // automatically.
+    //
+    // LEGACY pre-ZEB-254 path: joiners on stale clients still send
+    // SignedMembershipEvent { kind: Join, countersig: None }. We
+    // continue to attach_countersig + insert the counter-signed Join
+    // so those joiners can still join.
+    let is_pending_join_shape = matches!(
+        join_event.kind,
+        crate::community_membership::MembershipEventKind::PendingJoin { .. }
+    );
+
+    if is_pending_join_shape {
+        // 6+7 (ZEB-254 new shape). Insert PendingJoin AS-IS — no
+        // countersig append here. The joiner's `joiner_identity_pub`
+        // was already verified in `verify_packet_pure` step 5 (Path B
+        // app-sig binding). The production `OwnerDeviceCacheResolver`
+        // won't have the joiner yet (bootstrap-by-design), so we bypass
+        // it via `insert_local_event_with_pubs` which accepts explicit
+        // pubs.
+        //
+        // The post-Inserted hook (Task 10) detects PendingJoin +
+        // self-has-power and auto-emits JoinCountersign.
+        let joiner_identity_pub = match &join_event.kind {
+            crate::community_membership::MembershipEventKind::PendingJoin {
+                joiner_identity_pub,
+                ..
+            } => *joiner_identity_pub,
+            // Safety: is_pending_join_shape already confirmed the arm.
+            _ => unreachable!("is_pending_join_shape mismatch"),
+        };
+        match engine_arc
+            .insert_local_event_with_pubs(join_event, joiner_identity_pub, None)
+            .await
+        {
+            Ok(crate::community_state_crdt::InsertOutcome::Inserted) => Ok(()),
+            Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => Ok(()),
+            Ok(crate::community_state_crdt::InsertOutcome::Rejected(verr)) => {
+                tracing::warn!(error = ?verr, "ZEB-254 handle_unicast: PendingJoin rejected by engine");
+                let e = CommunityInviteVerifyError::EngineRejected;
+                emit_degraded(app, &signed.community_id, e.reason_tag());
+                Err(e)
+            }
+            Err(local_err) => {
+                tracing::warn!(error = %local_err, "ZEB-254 handle_unicast: insert PendingJoin failed");
+                let e = CommunityInviteVerifyError::EngineLocalError;
+                emit_degraded(app, &signed.community_id, e.reason_tag());
+                Err(e)
+            }
         }
-        Ok(crate::community_state_crdt::InsertOutcome::Rejected(verr)) => {
-            tracing::warn!(error = ?verr, "counter-signed Join rejected by engine");
-            let e = CommunityInviteVerifyError::EngineRejected;
-            emit_degraded(app, &signed.community_id, e.reason_tag());
-            Err(e)
-        }
-        Err(local_err) => {
-            tracing::warn!(error = %local_err, "engine.insert_local_event_with_pubs errored");
-            let e = CommunityInviteVerifyError::EngineLocalError;
-            emit_degraded(app, &signed.community_id, e.reason_tag());
-            Err(e)
+    } else {
+        // 6. LEGACY path: Attach countersig with our identity.
+        let counter_signed = match crate::community_membership::attach_countersig_with_identity(
+            &join_event,
+            self_private_identity.as_ref(),
+        ) {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::warn!(error = %err, "attach_countersig_with_identity failed");
+                let e = CommunityInviteVerifyError::CounterSignAttachFailed;
+                emit_degraded(app, &signed.community_id, e.reason_tag());
+                return Err(e);
+            }
+        };
+
+        // 7. LEGACY path: Insert via engine using `insert_local_event_with_pubs` — the
+        //    joiner's `joiner_identity_pub` was already verified in
+        //    `verify_packet_pure` step 5 (Path B app-sig binding), and the
+        //    receiver's own identity_pub is known locally. The production
+        //    `OwnerDeviceCacheResolver` won't have the joiner yet (this IS
+        //    the bootstrap that would populate the cache), so we MUST
+        //    bypass it. Skipping the resolver here is the load-bearing fix
+        //    for the bootstrap-by-design case: a counter-signed Join lands
+        //    LOCALLY here regardless of whether the resolver knows the
+        //    joiner; the publish-back path then carries the full
+        //    counter-signed event to peers, who do their own membership-
+        //    state verify against their resolver caches as those caches
+        //    populate.
+        //
+        //    The engine's post-Inserted hook
+        //    (`notify_pending_redemption_in_map`) fires
+        //    `pending_redemptions[event_id]` for the joiner side — this
+        //    wakes the redeemer's `redeem_invite_inner` oneshot wait once
+        //    the counter-signed Join propagates back via Phase 2's
+        //    state-root publish.
+        let countersigner_pub = self_private_identity.identity.to_public_bytes();
+        match engine_arc
+            .insert_local_event_with_pubs(
+                counter_signed,
+                signed.joiner_identity_pub,
+                Some(countersigner_pub),
+            )
+            .await
+        {
+            Ok(crate::community_state_crdt::InsertOutcome::Inserted) => Ok(()),
+            Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => {
+                // Idempotent retransmit (Reticulum can deliver duplicates).
+                // Treat as success — we've already counter-signed this id.
+                Ok(())
+            }
+            Ok(crate::community_state_crdt::InsertOutcome::Rejected(verr)) => {
+                tracing::warn!(error = ?verr, "counter-signed Join rejected by engine");
+                let e = CommunityInviteVerifyError::EngineRejected;
+                emit_degraded(app, &signed.community_id, e.reason_tag());
+                Err(e)
+            }
+            Err(local_err) => {
+                tracing::warn!(error = %local_err, "engine.insert_local_event_with_pubs errored");
+                let e = CommunityInviteVerifyError::EngineLocalError;
+                emit_degraded(app, &signed.community_id, e.reason_tag());
+                Err(e)
+            }
         }
     }
 }
