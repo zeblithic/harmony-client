@@ -9294,10 +9294,37 @@ pub fn mint_redemption(
     let mut event_id_bytes = [0u8; 16];
     rng.fill_bytes(&mut event_id_bytes);
 
+    // ZEB-254: invite-only redemptions mint a PendingJoin event carrying
+    // the InviteToken (admin-signed bearer credential) + the joiner's
+    // full identity_pub. Distributed via the community CRDT so admins
+    // who were offline at redemption time can counter-sign asynchronously.
+    let event_kind = if payload.is_invite_only {
+        use crate::dm_signing::ed25519_priv_to_x25519;
+        let x25519_priv = ed25519_priv_to_x25519(signing_key);
+        let x25519_pub =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*x25519_priv));
+        let ed25519_pub_bytes = signing_key.verifying_key().to_bytes();
+        let mut identity_pub = [0u8; 64];
+        identity_pub[..32].copy_from_slice(x25519_pub.as_bytes());
+        identity_pub[32..].copy_from_slice(&ed25519_pub_bytes);
+
+        let invite_token = payload
+            .invite_token
+            .clone()
+            .ok_or_else(|| "invite-only payload is missing invite_token".to_string())?;
+
+        MembershipEventKind::PendingJoin {
+            invite_token,
+            joiner_identity_pub: identity_pub,
+        }
+    } else {
+        MembershipEventKind::Join
+    };
+
     let join_payload = EventPayload {
         id: event_id_bytes,
         community_id: payload.community_id,
-        kind: MembershipEventKind::Join,
+        kind: event_kind,
         actor: self_owner,
         at: join_hlc.clone(),
     };
@@ -10743,6 +10770,155 @@ mod redeem_invite_inner_tests {
             Some(original_id),
             "CommunityState.forked_from must mirror the invite's forked_from"
         );
+    }
+
+    // ── ZEB-254 Task 7: mint_redemption event-kind tests ──────────────────────
+
+    #[test]
+    fn mint_redemption_open_path_still_produces_join() {
+        use crate::community_invite::{
+            InviteEpochSnapshot, InviteToken, MaterializedCommunityState,
+        };
+        use crate::community_membership::MembershipEventKind;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let admin_addr = OwnerAddr([0x11; 16]);
+        let community_id = SpaceId([0x33; 16]);
+        let joiner_sk = SigningKey::generate(&mut OsRng);
+        let joiner_addr = OwnerAddr([0x22; 16]);
+
+        let token = InviteToken {
+            inviter: admin_addr,
+            invitee_hint: None,
+            minted_at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "admin".into(),
+            },
+            expires_at: None,
+            sig: [0; 64],
+        };
+
+        let payload = CommunityInvitePayload {
+            community_id,
+            epoch_snapshot: InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: EpochKey::new([0x42; 32]).as_bytes().to_vec(),
+                state_snapshot: MaterializedCommunityState::default(),
+            },
+            admin_addr,
+            community_name: "Open Test".into(),
+            is_invite_only: false,
+            expires_at: None,
+            invite_token: Some(token),
+            admin_bootstrap: None,
+            admin_identity_pub: None,
+            forked_from: None,
+            pre_fork_snapshot: None,
+        };
+
+        let hlc = Hlc {
+            wall_ms: 1_700_000_001_000,
+            logical: 0,
+            device_id: "joiner".into(),
+        };
+        let minted = mint_redemption(&payload, joiner_addr, &joiner_sk, hlc).expect("mint open");
+
+        assert!(
+            matches!(minted.bootstrap_join.kind, MembershipEventKind::Join),
+            "open path must produce Join kind, got {:?}",
+            minted.bootstrap_join.kind
+        );
+    }
+
+    #[test]
+    fn mint_redemption_invite_only_path_produces_pending_join() {
+        use crate::community_invite::{
+            InviteEpochSnapshot, InviteToken, MaterializedCommunityState,
+        };
+        use crate::community_membership::MembershipEventKind;
+        use crate::dm_signing::{ed25519_priv_to_x25519, seal_to_owner};
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let admin_addr = OwnerAddr([0x11; 16]);
+        let community_id = SpaceId([0x33; 16]);
+        let joiner_sk = SigningKey::generate(&mut OsRng);
+        let joiner_addr = OwnerAddr([0x22; 16]);
+
+        // Derive joiner's X25519 pub for the seal.
+        let joiner_x25519_priv = ed25519_priv_to_x25519(&joiner_sk);
+        let joiner_x25519_pub =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*joiner_x25519_priv));
+
+        // Seal a 32-byte epoch key to the joiner's X25519 pub.
+        let raw_key = [0xEEu8; 32];
+        let sealed = seal_to_owner(joiner_x25519_pub.as_bytes(), &raw_key).expect("seal");
+        assert_eq!(sealed.len(), 92, "sealed envelope must be 92 bytes");
+
+        let token = InviteToken {
+            inviter: admin_addr,
+            invitee_hint: Some(joiner_addr),
+            minted_at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "admin".into(),
+            },
+            expires_at: None,
+            sig: [0; 64],
+        };
+
+        let payload = CommunityInvitePayload {
+            community_id,
+            epoch_snapshot: InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: sealed,
+                state_snapshot: MaterializedCommunityState::default(),
+            },
+            admin_addr,
+            community_name: "Invite-only Test".into(),
+            is_invite_only: true,
+            expires_at: None,
+            invite_token: Some(token),
+            admin_bootstrap: None,
+            admin_identity_pub: None,
+            forked_from: None,
+            pre_fork_snapshot: None,
+        };
+
+        let hlc = Hlc {
+            wall_ms: 1_700_000_001_000,
+            logical: 0,
+            device_id: "joiner".into(),
+        };
+        let minted =
+            mint_redemption(&payload, joiner_addr, &joiner_sk, hlc).expect("mint invite-only");
+
+        match &minted.bootstrap_join.kind {
+            MembershipEventKind::PendingJoin {
+                invite_token: t,
+                joiner_identity_pub,
+            } => {
+                assert_eq!(
+                    t.inviter, admin_addr,
+                    "InviteToken should be carried through"
+                );
+                assert_eq!(
+                    joiner_identity_pub.len(),
+                    64,
+                    "joiner_identity_pub must be 64 bytes"
+                );
+                // The Ed25519 half (bytes 32-64) MUST match the signing_key's verifying key.
+                let ed_pub = joiner_sk.verifying_key().to_bytes();
+                assert_eq!(
+                    &joiner_identity_pub[32..],
+                    &ed_pub,
+                    "Ed25519 half must match"
+                );
+            }
+            other => panic!("expected PendingJoin kind, got {:?}", other),
+        }
     }
 }
 
