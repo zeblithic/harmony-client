@@ -2047,7 +2047,7 @@ pub fn verify_event(
             // All PendingJoin gates are handled in the joined-membership block
             // above (P1–P6). No separate power rule needed.
         }
-        MembershipEventKind::JoinCountersign { target_event_id: _ } => {
+        MembershipEventKind::JoinCountersign { .. } => {
             // ZEB-254: actor must be Joined + power >= invite_threshold.
             // Target event existence is a materialize concern (allow
             // out-of-order delivery — JoinCountersign can land before
@@ -2055,11 +2055,6 @@ pub fn verify_event(
             if !is_joined_member(prior_state, &event.actor) {
                 return Err(VerifyError::JoinCountersignActorNotJoined);
             }
-            let actor_power = prior_state
-                .power_levels
-                .get(&event.actor)
-                .copied()
-                .unwrap_or(0);
             if actor_power < POWER_THRESHOLDS.invite {
                 return Err(VerifyError::JoinCountersignActorPowerInsufficient);
             }
