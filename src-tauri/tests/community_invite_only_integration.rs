@@ -138,7 +138,7 @@ impl Drop for RedeemTimeoutGuard {
 /// is Task 8's responsibility. This test will be re-enabled and updated
 /// in Task 8 once `handle_unicast` and `redeem_invite_inner` are updated
 /// to handle PendingJoin events correctly.
-#[ignore = "ZEB-254 Task 7: flow updated to PendingJoin; full round-trip test updated in Task 8"]
+#[ignore = "ZEB-254 Task 8: pending path wired; full round-trip (handle_unicast countersign) requires Task 9"]
 #[tokio::test]
 async fn alice_redeems_invite_only_against_bob_admin() {
     // Short timeout: the round-trip is bounded by debounce_ms + a few
@@ -500,6 +500,12 @@ async fn alice_redeems_invite_only_against_bob_admin() {
     assert_eq!(dto.community_id, hex::encode(community_id.0));
     assert_eq!(dto.community_name, "InviteOnly");
     assert!(dto.is_invite_only);
+    // ZEB-254 Task 8: counter-sign came back within 5s (fast-path hit)
+    // so pending must be false.
+    assert!(
+        !dto.pending,
+        "counter-sign landed in time; pending must be false"
+    );
 
     // Alice's engine has admin Join + counter-signed Bob Join. Bob
     // materializes as Joined on Alice's side (counter-sig completes

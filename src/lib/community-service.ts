@@ -14,6 +14,14 @@ export interface RedeemInviteResultDto {
   communityId: string;
   communityName: string;
   isInviteOnly: boolean;
+  /**
+   * ZEB-254: true if the redemption returned before a JoinCountersign
+   * landed locally (admin was offline; the 5s fast-path timeout fired).
+   * The community appears in nav greyed; ungreys when JoinCountersign
+   * arrives via state-root sync. false for open communities or when
+   * counter-sign came back within 5s.
+   */
+  pending: boolean;
 }
 
 /** Mirrors `ChannelInfoDto` in src-tauri/src/lib.rs (ZEB-266 Phase 1).

@@ -9199,6 +9199,13 @@ pub struct RedeemInviteResultDto {
     pub community_id: String,
     pub community_name: String,
     pub is_invite_only: bool,
+    /// ZEB-254: true if the redemption returned before a JoinCountersign
+    /// landed locally (admin was offline; the 5s fast-path timeout
+    /// fired). The community appears in nav greyed; ungreys when
+    /// JoinCountersign arrives via state-root sync. false if either
+    /// (a) fast-path counter-sign came back within 5s, or (b) community
+    /// is open (no countersign required).
+    pub pending: bool,
 }
 
 /// Wire shape of the `nav-updated` IPC event. Mirrors the frontend
@@ -9385,7 +9392,7 @@ pub fn mint_redemption(
 ///        - 7c. resolve inviter Reticulum dest(s); send packet via
 ///          `unicast_send_tx`
 ///        - 7d. await oneshot ≤ T (env
-///          `HARMONY_REDEEM_INVITE_TIMEOUT_MS`, default 15s)
+///          `HARMONY_REDEEM_INVITE_TIMEOUT_MS`, default 5s)
 ///   8. fence_check (generation guard via closure)
 ///   9. COMMIT owner-state Space (LAST step — ZEB-258 reorder)
 ///  10. return `Ok(hex(community_id))`
@@ -9557,6 +9564,10 @@ where
     }
 
     // 7. Branch on payload.is_invite_only.
+    // ZEB-254: tracks whether the invite-only fast-path 5s timeout fired
+    // without a counter-sign landing. Always false for open communities.
+    // Set inside the invite-only branch by the timeout match arm.
+    let mut pending_redemption_timed_out: bool = false;
     if !payload.is_invite_only {
         // OPEN: insert bootstrap_join via the engine. The engine's
         // `insert_local_event` runs verify_event (which authorizes the
@@ -9704,6 +9715,31 @@ where
             }
         };
 
+        // ZEB-254: insert PendingJoin into local engine FIRST so the
+        // engine's state-root publisher picks it up — the wire path
+        // (Zenoh CRDT) is the durable channel; the unicast below is
+        // just the fast-path optimization for when an admin device is
+        // online at this moment.
+        match engine_arc
+            .insert_local_event(minted.bootstrap_join.clone())
+            .await
+        {
+            Ok(crate::community_state_crdt::InsertOutcome::Inserted)
+            | Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => {}
+            Ok(crate::community_state_crdt::InsertOutcome::Rejected(verify_err)) => {
+                // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
+                return Err(format!(
+                    "engine rejected local PendingJoin insert: {verify_err}"
+                ));
+            }
+            Err(insert_err) => {
+                // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
+                return Err(format!(
+                    "engine.insert_local_event (PendingJoin): {insert_err}"
+                ));
+            }
+        }
+
         // 7c. Resolve inviter's Reticulum destination(s) and send.
         let inviter_addr = payload.admin_addr;
         let destinations = resolve_destinations_for_owner(crdt_state.as_ref(), inviter_addr).await;
@@ -9763,10 +9799,16 @@ where
         }
 
         // 7d. Await oneshot ≤ T (env-overridable for tests).
+        // ZEB-254: 5s fast-path timeout (down from 15s). On timeout,
+        // redeem_invite_inner does NOT roll back — it proceeds to commit
+        // the Space with pending_join_at = Some and returns Ok { pending:
+        // true }. The PendingJoin event is already on the wire via the
+        // engine's state-root publisher; admins counter-sign whenever
+        // they next come online.
         let timeout_ms: u64 = std::env::var("HARMONY_REDEEM_INVITE_TIMEOUT_MS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(15_000);
+            .unwrap_or(5_000);
 
         match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), notify_rx).await {
             Ok(Ok(())) => {
@@ -9780,44 +9822,27 @@ where
                 return Err("invite-only redemption oneshot closed unexpectedly".into());
             }
             Err(_elapsed) => {
-                // Race-window fix (CodeRabbit P0): the timeout future
-                // and the engine's notify hook can both observe the
-                // deadline near-simultaneously. The hook's
-                // `notify_pending_redemption_in_map` removes the map
-                // entry BEFORE calling `tx.send`, so use the entry's
-                // presence as the atomic synchronization point:
+                // ZEB-254: 5s fast-path timeout fired. Two sub-cases:
                 //
-                //   take_pending_redemption() → Some(tx) ⇒ we won the
-                //   race; the notifier hadn't run; genuine timeout —
-                //   roll back.
+                //   (A) take_pending_redemption returns Some(tx) — we won
+                //       the race; the notifier hadn't run; genuine
+                //       timeout → set pending_redemption_timed_out = true
+                //       and fall through to commit with pending = true.
                 //
-                //   take_pending_redemption() → None ⇒ the notifier
-                //   already removed it (and tried `tx.send` to a
-                //   dropped rx, which it swallowed). The
-                //   counter-signed Join is in our engine because
-                //   insert_local_event returned Ok before the hook
-                //   fired — treat as a success that landed exactly
-                //   at the deadline. DO NOT tear down the engine.
+                //   (B) take_pending_redemption returns None — notifier
+                //       won the race and already ingested the counter-
+                //       signed event → treat as success; commit with
+                //       pending = false.
                 //
-                // This narrows but does not entirely eliminate the
-                // race: an engine.insert_local_event that races with
-                // take_pending_redemption (notifier hasn't yet
-                // removed the entry) still ends in Some-claimed →
-                // rollback. That window is sub-microsecond and the
-                // peer's view stays consistent (the counter-signed
-                // Join is in their persistence; only OUR local engine
-                // is torn down). A complete fix would require a
-                // "completed" sentinel in the map (deferred — see
-                // PR #89 follow-up notes).
+                // CRITICAL: do NOT roll back. The PendingJoin event is
+                // already on the wire via the engine's state-root publish.
+                // Admins counter-sign whenever they come online.
                 match community_registry
                     .take_pending_redemption(&minted.bootstrap_join.id)
                     .await
                 {
                     Some(_tx) => {
-                        // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
-                        return Err(format!(
-                            "invite-only redemption timed out after {timeout_ms}ms"
-                        ));
+                        pending_redemption_timed_out = true;
                     }
                     None => {
                         // Notifier won the race; treat as success.
@@ -9825,9 +9850,7 @@ where
                         tracing::debug!(
                             community_id = %hex::encode(minted.community_id.0),
                             event_id = %hex::encode(minted.bootstrap_join.id),
-                            "redeem_invite timeout fired but notifier had already \
-                             consumed the pending entry — counter-signed Join is in \
-                             the engine; treating as success"
+                            "ZEB-254: 5s timeout fired but counter-sign arrived just in time"
                         );
                     }
                 }
@@ -9851,7 +9874,14 @@ where
     //    is owner-state-only.
     {
         let mut state_g = crdt_state.lock().await;
-        let outcome = state_g.apply_space_with_canonicalization(minted.space.clone());
+        // ZEB-254: set pending_join_at if the invite-only fast-path
+        // timed out (admin offline). For non-invite-only or
+        // counter-signed-in-time paths, pending_join_at stays None.
+        let mut space_to_commit = minted.space.clone();
+        if pending_redemption_timed_out {
+            space_to_commit.pending_join_at = Some(minted.space.created_at.clone());
+        }
+        let outcome = state_g.apply_space_with_canonicalization(space_to_commit);
         if matches!(outcome, crate::owner_state_crdt::ApplyOutcome::Rejected(_)) {
             // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
             // state_g drops at this block's scope end (before the function-
@@ -9965,6 +9995,7 @@ where
         community_id: hex::encode(minted.community_id.0),
         community_name: payload.community_name.clone(),
         is_invite_only: payload.is_invite_only,
+        pending: pending_redemption_timed_out,
     })
 }
 
