@@ -218,8 +218,19 @@ pub struct NodeState {
     mail_sync: Option<std::sync::Arc<mail_sync::MailSync>>,
     /// Disk-backed content index (pin/replication metadata).
     content_index: std::sync::Arc<std::sync::Mutex<content_index::ContentIndex>>,
-    /// Monotonic connection generation (prevents stale stop_node races).
+    /// Monotonic install generation. Bumped at lock-2 install site under
+    /// `start_node`. Post-install checks (pairing-handle install, failure
+    /// cleanup, stop_inner gating) compare against this to detect whether a
+    /// later `start_node` has SUCCESSFULLY INSTALLED over us. Distinct from
+    /// `install_seq`, which detects attempts-in-progress.
     generation: u64,
+    /// Monotonic start-attempt sequence (ZEB-221). Bumped at lock-1 of
+    /// `start_node` to reserve a slot before async work. Validated at
+    /// lock-2 to detect supersede WITHOUT changing `generation`'s
+    /// "successful install" semantics — that distinction matters because
+    /// post-install code uses `generation` to determine whether a later
+    /// install completed, not whether a later attempt merely started.
+    install_seq: u64,
     /// Hex-encoded node address (set on startup, used to stamp outgoing messages).
     node_addr: String,
     /// ZEB-197 v2 pairing state-machine handle. `Some` while the node is
@@ -394,6 +405,7 @@ impl Default for NodeState {
                 content_index::ContentIndex::load(std::path::Path::new("")),
             )),
             generation: 0,
+            install_seq: 0,
             node_addr: String::new(),
             pairing_handle: None,
             sync_engine: None,
@@ -929,6 +941,71 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     had_node
 }
 
+/// Bump `state.install_seq` and return the new value.
+///
+/// Called under lock-1 of `start_node` to reserve a start-attempt slot
+/// BEFORE doing any async work outside the lock. The reserved value is
+/// later validated under lock-2 via [`check_install_seq_or_supersede`]
+/// so a concurrent `start_node` cannot orphan our spawned resources.
+///
+/// Critically, this does NOT bump `generation` — that field keeps its
+/// pre-ZEB-221 semantics (bumped only on SUCCESSFUL install at lock-2)
+/// because post-install code (pairing-handle install, failure cleanup,
+/// stop_inner gating) needs to know whether a later install actually
+/// completed, not just whether a later attempt started.
+///
+/// See [ZEB-221](https://linear.app/zeblith/issue/ZEB-221) for the
+/// full race analysis.
+fn reserve_install_seq(state: &Mutex<NodeState>) -> Result<u64, String> {
+    let mut guard = state
+        .lock()
+        .map_err(|e| format!("reserve_install_seq lock error: {e}"))?;
+    guard.install_seq += 1;
+    Ok(guard.install_seq)
+}
+
+/// Lock `state` and verify the caller's reserved install-attempt sequence
+/// still matches.
+///
+/// Returns the guard on match. Returns
+/// [`SupersededError::Superseded`] if a later [`reserve_install_seq`] has
+/// bumped past `my_seq`, indicating a concurrent `start_node` has reserved
+/// a higher slot and the caller must abort + clean up the resources it
+/// built outside the lock.
+fn check_install_seq_or_supersede(
+    state: &Mutex<NodeState>,
+    my_seq: u64,
+) -> Result<std::sync::MutexGuard<'_, NodeState>, SupersededError> {
+    let guard = state
+        .lock()
+        .map_err(|e| SupersededError::LockError(format!("{e}")))?;
+    if guard.install_seq != my_seq {
+        return Err(SupersededError::Superseded {
+            my_seq,
+            current: guard.install_seq,
+        });
+    }
+    Ok(guard)
+}
+
+#[derive(Debug)]
+enum SupersededError {
+    LockError(String),
+    Superseded { my_seq: u64, current: u64 },
+}
+
+impl std::fmt::Display for SupersededError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SupersededError::LockError(msg) => write!(f, "node-state lock error: {msg}"),
+            SupersededError::Superseded { my_seq, current } => write!(
+                f,
+                "start_node superseded by concurrent call (my_seq={my_seq}, current={current})"
+            ),
+        }
+    }
+}
+
 /// Start the harmony node with an embedded NodeRuntime.
 ///
 /// Generates/loads identity, creates the runtime, and spawns the event loop
@@ -1049,6 +1126,20 @@ async fn start_node(
     // outlive the lock scope and can be used in the drain block.
     let old_dm_send_inflight: Option<std::sync::Arc<tokio::sync::Semaphore>>;
     let old_dm_send_stopping: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>;
+    // ZEB-221: reserve our start-attempt sequence via the dedicated helper
+    // BEFORE the lock-1 tuple-take block. Acquires + releases its own lock;
+    // the subsequent lock-1 acquisition observes the bumped install_seq.
+    // Held in outer scope so the lock-2 validation
+    // (`check_install_seq_or_supersede`) can reach it. Mismatch routes
+    // through the existing thread_install_failure cleanup path.
+    //
+    // Distinct from `generation`, which keeps its pre-ZEB-221 semantics
+    // (bumped only on SUCCESSFUL install at lock-2) so post-install code
+    // (pairing-handle install, failure cleanup, stop_inner gating)
+    // continues to detect "later install completed" rather than the
+    // strictly weaker "later attempt started" — see Cursor bug report on
+    // PR #124.
+    let my_install_seq: u64 = reserve_install_seq(&state)?;
     let (
         old_shutdown,
         old_thread,
@@ -2312,308 +2403,398 @@ async fn start_node(
         // Re-acquire lock and atomically register the new node.
         // Handles are stored BEFORE awaiting ready_rx so stop_node can
         // cancel an in-flight startup via shutdown_tx.
-        let mut guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
-        guard.generation += 1;
-
-        // ZEB-155: load the sidecar NOW — after stop_handles has
-        // quiesced the previous node and under the state lock — so any
-        // pin_content / unpin_content / burn_content that raced with
-        // the stop path has already durably written to disk. Concurrent
-        // command handlers are blocked on state.lock(), so they cannot
-        // slip a write between this load and the Arc install below.
         //
-        // A narrower window remains: a mutation command that cloned
-        // the OLD Arc before stop_handles and is still mid-set_pinned
-        // when the NEW Arc is installed will orphan its disk write
-        // (the next NEW-Arc save() overwrites). That end-to-end
-        // serialization is ZEB-160's territory.
-        let content_index = std::sync::Arc::new(std::sync::Mutex::new(
-            content_index::ContentIndex::load(&app_data_dir),
-        ));
-        let pin_intent: std::collections::HashSet<[u8; 32]> = {
-            let idx = content_index
-                .lock()
-                .map_err(|e| format!("content_index lock on startup: {e}"))?;
-            // ZEB-164: multiple sidecar entries can pin the same CID. The
-            // runtime pin_intent set is CID-keyed, so we dedupe here —
-            // collecting into a HashSet drops duplicates without effect.
-            // (Functionally identical to the pre-ZEB-164 path; the dedupe
-            // is just made explicit so debug logs don't show repeated
-            // restores for the same CID.)
-            idx.entries().filter(|e| e.pinned).map(|e| e.cid).collect()
-        };
+        // ZEB-221: validate our lock-1 reservation. If a later start_node
+        // has bumped past `my_install_seq` while we were building
+        // SyncEngine et al. outside the lock, set the `superseded`
+        // sentinel and skip the install block; post-lock cleanup will
+        // await shutdown on each of the four background-task-owning Arcs.
+        //
+        // ZEB-221 (CodeRabbit R3): every lock-poison failure mode — the
+        // check helper's own lock acquisition AND the supersede re-lock —
+        // must converge on the same post-block cleanup. Early-returning
+        // from a poison failure would orphan the four background-task-
+        // owning Arcs constructed outside the lock. The labeled
+        // `'install_or_skip` block below routes every poison case through
+        // `lock_failure_msg`; the post-block cleanup branch then awaits
+        // `shutdown()` on each Arc uniformly (the std `MutexGuard` has
+        // gone out of scope by that point, so the `!Send` guard does not
+        // cross the awaits).
+        let mut lock_failure_msg: Option<String> = None;
+        let mut current_generation: u64 = 0;
+        let mut superseded = false;
+        // ZEB-221: declared outside the `if !superseded` block so the
+        // tuple-return below sees it regardless of which branch ran.
+        // On the supersede path it stays `None` — cleanup is driven by
+        // the `superseded` sentinel instead.
+        let mut thread_install_failure: Option<String> = None;
+        'install_or_skip: {
+            // The match below MUST NOT span an await (`MutexGuard` is
+            // `!Send`). Each arm either assigns `guard` synchronously or
+            // breaks the labeled block with `lock_failure_msg` set.
+            let mut guard;
+            match check_install_seq_or_supersede(&state, my_install_seq) {
+                Ok(g) => {
+                    guard = g;
+                }
+                Err(SupersededError::Superseded { .. }) => {
+                    // Re-acquire the lock for the install-skip path so the
+                    // post-block tuple captures the current generation.
+                    // The check_install_seq_or_supersede helper consumed
+                    // its lock acquisition on the Err path. Lock-poison
+                    // in this narrow window routes through
+                    // `lock_failure_msg` → post-block cleanup.
+                    match state.lock() {
+                        Ok(g) => {
+                            guard = g;
+                            superseded = true;
+                        }
+                        Err(e) => {
+                            lock_failure_msg = Some(format!("lock error: {e}"));
+                            break 'install_or_skip;
+                        }
+                    }
+                }
+                Err(SupersededError::LockError(msg)) => {
+                    // Poison in the check helper's own lock acquisition.
+                    // Same routing as the supersede re-lock failure above.
+                    lock_failure_msg = Some(msg);
+                    break 'install_or_skip;
+                }
+            }
 
-        let ep_clone = endpoint.clone();
-        let app_clone = app.clone();
-        let mail_mgr_clone = mail_mgr.clone();
-        let mail_sync_for_loop = std::sync::Arc::clone(&mail_sync);
-        let cas_op_tx_for_loop = cas_op_tx.clone();
-        let sync_handles_for_loop = sync_handles_opt;
-        let dm_outbox_for_loop = dm_outbox_arc.clone();
-        let dm_transport_for_loop = dm_transport_arc.clone();
-        let crdt_state_for_loop = crdt_state_for_state.clone();
-        // ZEB-227 Path B Task 11: extra handles for the
-        // RuntimeAction::UnicastReceived interception block in event_loop.
-        // cas_handle: handle_cidnotify_lifted does a 500ms-timeout cas.get; reuse
-        //   the same RuntimeContentStore the SyncEngine consumes.
-        // unicast_send_tx_for_loop: handle_cidnotify_lifted pushes DmAck fan-out
-        //   into the same channel the production transport uses for
-        //   outbound CidNotify. Same channel, both directions push.
-        let cas_handle_for_loop = content_store_for_state.clone();
-        let unicast_send_tx_for_loop = Some(unicast_send_tx.clone());
-        // ZEB-217 Sub-C Phase 2: per-community Zenoh adapter requests.
-        // Move (not clone) — the Vec carries Receiver halves the engines
-        // already own the matching Sender / other-half for; only the
-        // event loop reads from this Vec, no other consumer.
-        let community_adapter_requests_for_loop = std::mem::take(&mut community_adapter_requests);
-        // ZEB-217 Sub-C Phase 3 Task 9: on-demand adapter request channel.
-        // The IPC `create_community` (and Phase 4's `redeem_invite`)
-        // dispatch a `CommunityAdapterRequest` here; the event loop's
-        // `select!` drains the rx and binds the per-community channel
-        // halves to a Zenoh adapter against the live session. Capacity
-        // 32 is sized to match peak join-burst load — one request per
-        // create/redeem; full-channel falls back to a clear Err on the
-        // IPC side rather than blocking under contention.
-        let (community_adapter_request_tx, community_adapter_request_rx) =
-            tokio::sync::mpsc::channel::<crate::event_loop::CommunityAdapterRequest>(32);
-        // ZEB-262 Phase 4 Task 9: clone the community_registry handle
-        // for event_loop::run BEFORE the closure capture below moves
-        // `community_registry_arc` (the post-spawn `guard.community_registry`
-        // assignment still needs the original handle).
-        let community_registry_for_loop = community_registry_arc.clone();
-        // ZEB-218 Sub-D Phase 1: thread the pre-built `LibraryDirectory`
-        // handle + request rx (constructed + populated above the
-        // std::sync::MutexGuard scope) into event_loop::run.
-        let library_directory_for_loop = Some(std::sync::Arc::clone(&library_directory_arc));
-        let library_request_rx_for_loop = Some(library_request_rx);
-        // ZEB-281 Sub-D Phase 4: thread the profile-broadcast cache +
-        // request rx into event_loop::run. The cache is shared with the
-        // NodeState (so IPC handlers can register/drop subscriptions
-        // synchronously); the rx is moved into the consumer task.
-        let profile_broadcast_cache_for_loop =
-            Some(std::sync::Arc::clone(&profile_broadcast_cache_arc));
-        let profile_broadcast_request_rx_for_loop = Some(profile_broadcast_request_rx);
-        let thread_result = thread::Builder::new()
-            .name("harmony-runtime".to_string())
-            // Windows debug builds overflow the default ~2 MiB stack inside
-            // Zenoh session setup; match the 8 MiB used throughout identity.rs.
-            .stack_size(8 * 1024 * 1024)
-            .spawn(move || {
-                // Zenoh's `.wait()` (used by its `IntoFuture` impl) calls
-                // ZRuntime::block_in_place, which panics on a current-thread
-                // scheduler. A single-worker multi-thread runtime is the
-                // minimum Zenoh supports.
+            if !superseded {
+                // ZEB-221 (CodeRabbit R2 finding): the `generation` bump is
+                // INSIDE the `Ok(thread)` arm of `match thread_result` below,
+                // NOT here. Bumping pre-spawn would consume a generation even
+                // when thread::Builder::spawn fails (OOM, ulimit), violating
+                // the documented "successful install only" semantics that
+                // post-install checks rely on (pairing-handle install at
+                // ~2799-2806, failure cleanup at ~2945-2948, stop_inner
+                // gating). Race detection between concurrent start_node
+                // attempts uses `install_seq` (already validated by
+                // check_install_seq_or_supersede above), so this site no
+                // longer needs to bump anything.
+
+                // ZEB-155: load the sidecar NOW — after stop_handles has
+                // quiesced the previous node and under the state lock — so any
+                // pin_content / unpin_content / burn_content that raced with
+                // the stop path has already durably written to disk. Concurrent
+                // command handlers are blocked on state.lock(), so they cannot
+                // slip a write between this load and the Arc install below.
                 //
-                // `.thread_stack_size(8 MiB)` covers Tokio's own worker
-                // threads independently of RUST_MIN_STACK — important
-                // because Cargo's `[env]` block in .cargo/config.toml only
-                // propagates to binaries Cargo launches (e.g. cargo run /
-                // tauri dev), not to release binaries run directly. Without
-                // this call, a `tauri build` artifact would silently regress
-                // to the 2 MiB default on Windows.
-                let rt = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(1)
-                    .thread_stack_size(8 * 1024 * 1024)
-                    .enable_all()
-                    .build()
-                    .expect("failed to create tokio runtime for harmony-runtime");
-                rt.block_on(async move {
-                    let (mut runtime, startup_actions) =
-                        NodeRuntime::new(config, MemoryBookStore::new());
-
-                    // ZEB-227 Path B: register our DM destination so inbound
-                    // packets to it surface as RuntimeAction::UnicastReceived.
-                    // Without this registration, every inbound DmInvite /
-                    // DmCidNotify / DmAck would drop in the runtime as
-                    // NoLocalDestination before reaching
-                    // dm_outbox::handle_unicast.
-                    //
-                    // Our DM destination hash is computed from our local
-                    // Reticulum identity hash via the same
-                    // SHA256(SHA256("harmony.dm")[:10] || identity)[:16]
-                    // scheme that DmOutbox::drain uses to resolve outbound
-                    // destinations from OwnerDeviceCache (so a peer's
-                    // outbound dest_hash for us == our registered
-                    // dest_hash for ourselves).
-                    //
-                    // Unconditional: every node has a Reticulum identity
-                    // (loaded above via identity::load_or_generate, before
-                    // owner-loading). DMs themselves only flow once the owner
-                    // identity is loaded (which gates DmOutbox /
-                    // RuntimeUnicastTransport construction above), but the
-                    // raw destination registration is harmless when no owner
-                    // is loaded — it just means inbound packets surface but
-                    // event_loop's UnicastReceived arm has no DmOutbox to
-                    // dispatch to (and logs the drop).
-                    let our_identity_hash = runtime.local_identity_hash();
-                    let our_dm_dest =
-                        crate::dm_signing::compute_dm_destination_hash(our_identity_hash);
-                    runtime.register_local_destination(our_dm_dest);
-                    tracing::info!(
-                        dm_dest = hex::encode(our_dm_dest),
-                        "registered DM destination for inbound DmInvite/DmCidNotify/DmAck"
-                    );
-
-                    event_loop::run(
-                        runtime,
-                        startup_actions,
-                        app_clone,
-                        ep_clone,
-                        ready_tx,
-                        shutdown_rx,
-                        publish_rx,
-                        fetch_rx,
-                        ingest_rx,
-                        content_verb_rx,
-                        cas_op_tx_for_loop,
-                        cas_op_rx,
-                        follow_rx,
-                        voice_rx,
-                        voice_channel_rx,
-                        followed_set_clone,
-                        vine_feed_cache_clone,
-                        mail_mgr_clone,
-                        Some(mail_sync_for_loop),
-                        mail_refresh_rx,
-                        pin_intent,
-                        fetch_completion_tx,
-                        fetch_completion_rx,
-                        Some(pairing_in_tx),
-                        sync_handles_for_loop,
-                        dm_outbox_for_loop,
-                        dm_transport_for_loop,
-                        crdt_state_for_loop,
-                        Some(unicast_send_rx),
-                        cas_handle_for_loop,
-                        unicast_send_tx_for_loop,
-                        community_adapter_requests_for_loop,
-                        community_adapter_request_rx,
-                        community_registry_for_loop,
-                        channel_log_adapter_request_rx_for_loop,
-                        library_directory_for_loop,
-                        library_request_rx_for_loop,
-                        profile_broadcast_cache_for_loop,
-                        profile_broadcast_request_rx_for_loop,
-                    )
-                    .await;
-                });
-            });
-
-        // If the runtime-thread spawn fails (rare — typically only on
-        // OOM / kernel-thread limits), the SyncEngine constructed
-        // above has ALREADY spawned its background tokio task. We
-        // can't drop the Arc<SyncEngine> here without first calling
-        // `shutdown()` — that would orphan the task and silently lose
-        // the final-flush path. The await must happen OUTSIDE this
-        // lock-held block (the std `MutexGuard` is `!Send` across an
-        // await point), so we capture the failure into a sentinel
-        // and clean up below.
-        let thread_install_failure: Option<String>;
-        match thread_result {
-            Ok(thread) => {
-                guard.thread = Some(thread);
-                guard.shutdown_tx = Some(shutdown_tx);
-                guard.publish_tx = Some(publish_tx);
-                guard.fetch_tx = Some(fetch_tx);
-                guard.ingest_tx = Some(ingest_tx);
-                guard.content_verb_tx = Some(content_verb_tx);
-                guard.content_index = content_index;
-                guard.follow_tx = Some(follow_tx);
-                guard.voice_tx = Some(voice_tx);
-                guard.voice_channel_tx = Some(voice_channel_tx);
-                guard.follow_mgr = Some(follow_mgr);
-                guard.followed_set = Some(followed_set);
-                guard.vine_feed_cache = Some(vine_feed_cache);
-                guard.mail_mgr = Some(mail_mgr);
-                guard.mail_sync = Some(mail_sync);
-                guard.node_addr = node_addr_for_state;
-                guard.sync_engine = sync_engine_arc.clone();
-                // ZEB-217 Sub-C Phase 2: stash the per-community engine
-                // registry on NodeState so Phase 3 IPC handlers can
-                // reach it. Cloned (Arc bump) — `community_registry_arc`
-                // is also held by the failure-cleanup tuple below.
-                guard.community_registry = community_registry_arc.clone();
-                // ZEB-217 Sub-C Phase 3 Task 8: store the start_node-held
-                // delta sender so stop_node / restart can drop it after
-                // `registry.shutdown_all()` and the consumer task winds
-                // down cleanly.
-                guard.community_delta_tx = community_delta_tx_for_state.clone();
-                // ZEB-225 Sub-B Phase 2: store DM outbox + per-identity
-                // handles on NodeState for send_dm IPC + (T7) drain tick.
-                guard.dm_outbox = dm_outbox_arc.clone();
-                guard.dm_transport = dm_transport_arc.clone();
-                guard.crdt_state = crdt_state_for_state.clone();
-                guard.hlc_tracker = tracker_for_state.clone();
-                guard.dm_device_id = device_id_for_state.clone();
-                guard.dm_self_owner = self_owner_for_state;
-                guard.content_store = content_store_for_state.clone();
-                // ZEB-234: initialize the shutdown fence. Semaphore starts
-                // at DM_SEND_FENCE_CAPACITY permits (one per concurrent
-                // send_dm); stopping flag starts false. Both cleared in
-                // stop_inner after the permit drain.
-                guard.dm_send_inflight = Some(std::sync::Arc::new(tokio::sync::Semaphore::new(
-                    DM_SEND_FENCE_CAPACITY,
-                )));
-                guard.dm_send_stopping = Some(std::sync::Arc::new(
-                    std::sync::atomic::AtomicBool::new(false),
+                // A narrower window remains: a mutation command that cloned
+                // the OLD Arc before stop_handles and is still mid-set_pinned
+                // when the NEW Arc is installed will orphan its disk write
+                // (the next NEW-Arc save() overwrites). That end-to-end
+                // serialization is ZEB-160's territory.
+                let content_index = std::sync::Arc::new(std::sync::Mutex::new(
+                    content_index::ContentIndex::load(&app_data_dir),
                 ));
-                // ZEB-227 Path B: store the outbound unicast sender so
-                // Task 11's RuntimeUnicastTransport instantiation in
-                // start_node can clone it. The receiver was moved into
-                // event_loop above; the sender remains unused-by-production
-                // until Task 11 wires it to the real transport.
-                guard.unicast_send_tx = Some(unicast_send_tx.clone());
-                // ZEB-228 Phase 4: store our 64-byte combined identity_pub
-                // so add_space can ship it as the bootstrap pubkey on
-                // outbound DmInvite packets. Captured above before the
-                // ed25519 PrivateIdentity was dropped.
-                guard.dm_identity_pub_64 = Some(identity_pub_64);
-                // ZEB-217 Sub-C Phase 3 Task 9: store the adapter-
-                // request sender so create_community / Phase 4
-                // redeem_invite can dispatch on-demand
-                // `CommunityAdapterRequest`s into the event loop. The
-                // matching rx was moved into event_loop::run above.
-                guard.community_adapter_request_tx = Some(community_adapter_request_tx);
-                // ZEB-270 Phase 3 Task 4.5: store the channel-log
-                // registry handle so stop_inner can flip every
-                // per-channel `closing` flag and run final flushes
-                // before the event loop tears down. `None` here when
-                // no owner identity is loaded — the registry is gated
-                // on owner-load above.
-                guard.channel_log_registry = channel_log_registry_arc.clone();
-                // ZEB-218 Sub-D Phase 1: stash the library_directory Arc
-                // so future IPC handlers (Task 4) can reach `request_tx`
-                // to add / remove libraries. The matching rx was moved
-                // into event_loop above.
-                guard.library_directory = Some(library_directory_arc.clone());
-                // ZEB-281 Sub-D Phase 4: stash the publisher, cache,
-                // request channel + subscription-id allocator on
-                // NodeState. The publisher Arc is None when no owner
-                // identity was loaded (publisher.spawn is gated inside
-                // the if-let-Some(seed) block above) — without an owner
-                // identity, set_space_shared_in_profile IPC will still
-                // fail with "publisher missing" so the absence is fine.
-                guard.profile_broadcast_publisher = profile_broadcast_publisher_arc.clone();
-                guard.profile_broadcast_cache =
+                let pin_intent: std::collections::HashSet<[u8; 32]> = {
+                    let idx = content_index
+                        .lock()
+                        .map_err(|e| format!("content_index lock on startup: {e}"))?;
+                    // ZEB-164: multiple sidecar entries can pin the same CID. The
+                    // runtime pin_intent set is CID-keyed, so we dedupe here —
+                    // collecting into a HashSet drops duplicates without effect.
+                    // (Functionally identical to the pre-ZEB-164 path; the dedupe
+                    // is just made explicit so debug logs don't show repeated
+                    // restores for the same CID.)
+                    idx.entries().filter(|e| e.pinned).map(|e| e.cid).collect()
+                };
+
+                let ep_clone = endpoint.clone();
+                let app_clone = app.clone();
+                let mail_mgr_clone = mail_mgr.clone();
+                let mail_sync_for_loop = std::sync::Arc::clone(&mail_sync);
+                let cas_op_tx_for_loop = cas_op_tx.clone();
+                let sync_handles_for_loop = sync_handles_opt;
+                let dm_outbox_for_loop = dm_outbox_arc.clone();
+                let dm_transport_for_loop = dm_transport_arc.clone();
+                let crdt_state_for_loop = crdt_state_for_state.clone();
+                // ZEB-227 Path B Task 11: extra handles for the
+                // RuntimeAction::UnicastReceived interception block in event_loop.
+                // cas_handle: handle_cidnotify_lifted does a 500ms-timeout cas.get; reuse
+                //   the same RuntimeContentStore the SyncEngine consumes.
+                // unicast_send_tx_for_loop: handle_cidnotify_lifted pushes DmAck fan-out
+                //   into the same channel the production transport uses for
+                //   outbound CidNotify. Same channel, both directions push.
+                let cas_handle_for_loop = content_store_for_state.clone();
+                let unicast_send_tx_for_loop = Some(unicast_send_tx.clone());
+                // ZEB-217 Sub-C Phase 2: per-community Zenoh adapter requests.
+                // Move (not clone) — the Vec carries Receiver halves the engines
+                // already own the matching Sender / other-half for; only the
+                // event loop reads from this Vec, no other consumer.
+                let community_adapter_requests_for_loop =
+                    std::mem::take(&mut community_adapter_requests);
+                // ZEB-217 Sub-C Phase 3 Task 9: on-demand adapter request channel.
+                // The IPC `create_community` (and Phase 4's `redeem_invite`)
+                // dispatch a `CommunityAdapterRequest` here; the event loop's
+                // `select!` drains the rx and binds the per-community channel
+                // halves to a Zenoh adapter against the live session. Capacity
+                // 32 is sized to match peak join-burst load — one request per
+                // create/redeem; full-channel falls back to a clear Err on the
+                // IPC side rather than blocking under contention.
+                let (community_adapter_request_tx, community_adapter_request_rx) =
+                    tokio::sync::mpsc::channel::<crate::event_loop::CommunityAdapterRequest>(32);
+                // ZEB-262 Phase 4 Task 9: clone the community_registry handle
+                // for event_loop::run BEFORE the closure capture below moves
+                // `community_registry_arc` (the post-spawn `guard.community_registry`
+                // assignment still needs the original handle).
+                let community_registry_for_loop = community_registry_arc.clone();
+                // ZEB-218 Sub-D Phase 1: thread the pre-built `LibraryDirectory`
+                // handle + request rx (constructed + populated above the
+                // std::sync::MutexGuard scope) into event_loop::run.
+                let library_directory_for_loop =
+                    Some(std::sync::Arc::clone(&library_directory_arc));
+                let library_request_rx_for_loop = Some(library_request_rx);
+                // ZEB-281 Sub-D Phase 4: thread the profile-broadcast cache +
+                // request rx into event_loop::run. The cache is shared with the
+                // NodeState (so IPC handlers can register/drop subscriptions
+                // synchronously); the rx is moved into the consumer task.
+                let profile_broadcast_cache_for_loop =
                     Some(std::sync::Arc::clone(&profile_broadcast_cache_arc));
-                guard.profile_broadcast_request_tx = Some(profile_broadcast_request_tx);
-                guard.profile_broadcast_next_subscription_id =
-                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
-                thread_install_failure = None;
-            }
-            Err(e) => {
-                thread_install_failure = Some(format!("failed to spawn runtime thread: {e}"));
-            }
-        }
-        // The third + fourth tuple elements carry the SyncEngine + the
-        // CommunitySyncRegistry Arcs back out of the block so the
-        // failure-cleanup path below can await `shutdown()` on each
-        // without holding the std `MutexGuard` across an await (the
-        // guard is `!Send`). On success these Arcs are discarded;
-        // NodeState already owns its own clone of each.
+                let profile_broadcast_request_rx_for_loop = Some(profile_broadcast_request_rx);
+                let thread_result = thread::Builder::new()
+                    .name("harmony-runtime".to_string())
+                    // Windows debug builds overflow the default ~2 MiB stack inside
+                    // Zenoh session setup; match the 8 MiB used throughout identity.rs.
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn(move || {
+                        // Zenoh's `.wait()` (used by its `IntoFuture` impl) calls
+                        // ZRuntime::block_in_place, which panics on a current-thread
+                        // scheduler. A single-worker multi-thread runtime is the
+                        // minimum Zenoh supports.
+                        //
+                        // `.thread_stack_size(8 MiB)` covers Tokio's own worker
+                        // threads independently of RUST_MIN_STACK — important
+                        // because Cargo's `[env]` block in .cargo/config.toml only
+                        // propagates to binaries Cargo launches (e.g. cargo run /
+                        // tauri dev), not to release binaries run directly. Without
+                        // this call, a `tauri build` artifact would silently regress
+                        // to the 2 MiB default on Windows.
+                        let rt = tokio::runtime::Builder::new_multi_thread()
+                            .worker_threads(1)
+                            .thread_stack_size(8 * 1024 * 1024)
+                            .enable_all()
+                            .build()
+                            .expect("failed to create tokio runtime for harmony-runtime");
+                        rt.block_on(async move {
+                            let (mut runtime, startup_actions) =
+                                NodeRuntime::new(config, MemoryBookStore::new());
+
+                            // ZEB-227 Path B: register our DM destination so inbound
+                            // packets to it surface as RuntimeAction::UnicastReceived.
+                            // Without this registration, every inbound DmInvite /
+                            // DmCidNotify / DmAck would drop in the runtime as
+                            // NoLocalDestination before reaching
+                            // dm_outbox::handle_unicast.
+                            //
+                            // Our DM destination hash is computed from our local
+                            // Reticulum identity hash via the same
+                            // SHA256(SHA256("harmony.dm")[:10] || identity)[:16]
+                            // scheme that DmOutbox::drain uses to resolve outbound
+                            // destinations from OwnerDeviceCache (so a peer's
+                            // outbound dest_hash for us == our registered
+                            // dest_hash for ourselves).
+                            //
+                            // Unconditional: every node has a Reticulum identity
+                            // (loaded above via identity::load_or_generate, before
+                            // owner-loading). DMs themselves only flow once the owner
+                            // identity is loaded (which gates DmOutbox /
+                            // RuntimeUnicastTransport construction above), but the
+                            // raw destination registration is harmless when no owner
+                            // is loaded — it just means inbound packets surface but
+                            // event_loop's UnicastReceived arm has no DmOutbox to
+                            // dispatch to (and logs the drop).
+                            let our_identity_hash = runtime.local_identity_hash();
+                            let our_dm_dest =
+                                crate::dm_signing::compute_dm_destination_hash(our_identity_hash);
+                            runtime.register_local_destination(our_dm_dest);
+                            tracing::info!(
+                                dm_dest = hex::encode(our_dm_dest),
+                                "registered DM destination for inbound DmInvite/DmCidNotify/DmAck"
+                            );
+
+                            event_loop::run(
+                                runtime,
+                                startup_actions,
+                                app_clone,
+                                ep_clone,
+                                ready_tx,
+                                shutdown_rx,
+                                publish_rx,
+                                fetch_rx,
+                                ingest_rx,
+                                content_verb_rx,
+                                cas_op_tx_for_loop,
+                                cas_op_rx,
+                                follow_rx,
+                                voice_rx,
+                                voice_channel_rx,
+                                followed_set_clone,
+                                vine_feed_cache_clone,
+                                mail_mgr_clone,
+                                Some(mail_sync_for_loop),
+                                mail_refresh_rx,
+                                pin_intent,
+                                fetch_completion_tx,
+                                fetch_completion_rx,
+                                Some(pairing_in_tx),
+                                sync_handles_for_loop,
+                                dm_outbox_for_loop,
+                                dm_transport_for_loop,
+                                crdt_state_for_loop,
+                                Some(unicast_send_rx),
+                                cas_handle_for_loop,
+                                unicast_send_tx_for_loop,
+                                community_adapter_requests_for_loop,
+                                community_adapter_request_rx,
+                                community_registry_for_loop,
+                                channel_log_adapter_request_rx_for_loop,
+                                library_directory_for_loop,
+                                library_request_rx_for_loop,
+                                profile_broadcast_cache_for_loop,
+                                profile_broadcast_request_rx_for_loop,
+                            )
+                            .await;
+                        });
+                    });
+
+                // If the runtime-thread spawn fails (rare — typically only on
+                // OOM / kernel-thread limits), the SyncEngine constructed
+                // above has ALREADY spawned its background tokio task. We
+                // can't drop the Arc<SyncEngine> here without first calling
+                // `shutdown()` — that would orphan the task and silently lose
+                // the final-flush path. The await must happen OUTSIDE this
+                // lock-held block (the std `MutexGuard` is `!Send` across an
+                // await point), so we capture the failure into a sentinel
+                // and clean up below.
+                match thread_result {
+                    Ok(thread) => {
+                        // ZEB-221 (CodeRabbit R2): bump generation ONLY here,
+                        // inside the Ok(thread) arm, so the field reflects
+                        // "successful install" — never advanced on thread-
+                        // spawn failure. Post-install checks (pairing-handle
+                        // install, failure cleanup, stop_inner gating) compare
+                        // `guard.generation` against `our_gen` and rely on
+                        // this invariant.
+                        guard.generation += 1;
+                        guard.thread = Some(thread);
+                        guard.shutdown_tx = Some(shutdown_tx);
+                        guard.publish_tx = Some(publish_tx);
+                        guard.fetch_tx = Some(fetch_tx);
+                        guard.ingest_tx = Some(ingest_tx);
+                        guard.content_verb_tx = Some(content_verb_tx);
+                        guard.content_index = content_index;
+                        guard.follow_tx = Some(follow_tx);
+                        guard.voice_tx = Some(voice_tx);
+                        guard.voice_channel_tx = Some(voice_channel_tx);
+                        guard.follow_mgr = Some(follow_mgr);
+                        guard.followed_set = Some(followed_set);
+                        guard.vine_feed_cache = Some(vine_feed_cache);
+                        guard.mail_mgr = Some(mail_mgr);
+                        guard.mail_sync = Some(mail_sync);
+                        guard.node_addr = node_addr_for_state;
+                        guard.sync_engine = sync_engine_arc.clone();
+                        // ZEB-217 Sub-C Phase 2: stash the per-community engine
+                        // registry on NodeState so Phase 3 IPC handlers can
+                        // reach it. Cloned (Arc bump) — `community_registry_arc`
+                        // is also held by the failure-cleanup tuple below.
+                        guard.community_registry = community_registry_arc.clone();
+                        // ZEB-217 Sub-C Phase 3 Task 8: store the start_node-held
+                        // delta sender so stop_node / restart can drop it after
+                        // `registry.shutdown_all()` and the consumer task winds
+                        // down cleanly.
+                        guard.community_delta_tx = community_delta_tx_for_state.clone();
+                        // ZEB-225 Sub-B Phase 2: store DM outbox + per-identity
+                        // handles on NodeState for send_dm IPC + (T7) drain tick.
+                        guard.dm_outbox = dm_outbox_arc.clone();
+                        guard.dm_transport = dm_transport_arc.clone();
+                        guard.crdt_state = crdt_state_for_state.clone();
+                        guard.hlc_tracker = tracker_for_state.clone();
+                        guard.dm_device_id = device_id_for_state.clone();
+                        guard.dm_self_owner = self_owner_for_state;
+                        guard.content_store = content_store_for_state.clone();
+                        // ZEB-234: initialize the shutdown fence. Semaphore starts
+                        // at DM_SEND_FENCE_CAPACITY permits (one per concurrent
+                        // send_dm); stopping flag starts false. Both cleared in
+                        // stop_inner after the permit drain.
+                        guard.dm_send_inflight = Some(std::sync::Arc::new(
+                            tokio::sync::Semaphore::new(DM_SEND_FENCE_CAPACITY),
+                        ));
+                        guard.dm_send_stopping = Some(std::sync::Arc::new(
+                            std::sync::atomic::AtomicBool::new(false),
+                        ));
+                        // ZEB-227 Path B: store the outbound unicast sender so
+                        // Task 11's RuntimeUnicastTransport instantiation in
+                        // start_node can clone it. The receiver was moved into
+                        // event_loop above; the sender remains unused-by-production
+                        // until Task 11 wires it to the real transport.
+                        guard.unicast_send_tx = Some(unicast_send_tx.clone());
+                        // ZEB-228 Phase 4: store our 64-byte combined identity_pub
+                        // so add_space can ship it as the bootstrap pubkey on
+                        // outbound DmInvite packets. Captured above before the
+                        // ed25519 PrivateIdentity was dropped.
+                        guard.dm_identity_pub_64 = Some(identity_pub_64);
+                        // ZEB-217 Sub-C Phase 3 Task 9: store the adapter-
+                        // request sender so create_community / Phase 4
+                        // redeem_invite can dispatch on-demand
+                        // `CommunityAdapterRequest`s into the event loop. The
+                        // matching rx was moved into event_loop::run above.
+                        guard.community_adapter_request_tx = Some(community_adapter_request_tx);
+                        // ZEB-270 Phase 3 Task 4.5: store the channel-log
+                        // registry handle so stop_inner can flip every
+                        // per-channel `closing` flag and run final flushes
+                        // before the event loop tears down. `None` here when
+                        // no owner identity is loaded — the registry is gated
+                        // on owner-load above.
+                        guard.channel_log_registry = channel_log_registry_arc.clone();
+                        // ZEB-218 Sub-D Phase 1: stash the library_directory Arc
+                        // so future IPC handlers (Task 4) can reach `request_tx`
+                        // to add / remove libraries. The matching rx was moved
+                        // into event_loop above.
+                        guard.library_directory = Some(library_directory_arc.clone());
+                        // ZEB-281 Sub-D Phase 4: stash the publisher, cache,
+                        // request channel + subscription-id allocator on
+                        // NodeState. The publisher Arc is None when no owner
+                        // identity was loaded (publisher.spawn is gated inside
+                        // the if-let-Some(seed) block above) — without an owner
+                        // identity, set_space_shared_in_profile IPC will still
+                        // fail with "publisher missing" so the absence is fine.
+                        guard.profile_broadcast_publisher = profile_broadcast_publisher_arc.clone();
+                        guard.profile_broadcast_cache =
+                            Some(std::sync::Arc::clone(&profile_broadcast_cache_arc));
+                        guard.profile_broadcast_request_tx = Some(profile_broadcast_request_tx);
+                        guard.profile_broadcast_next_subscription_id =
+                            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+                        thread_install_failure = None;
+                    }
+                    Err(e) => {
+                        thread_install_failure =
+                            Some(format!("failed to spawn runtime thread: {e}"));
+                    }
+                }
+            } // end `if !superseded`
+              // Capture the generation BEFORE the labeled block ends — once
+              // it ends, `guard` is dropped and inaccessible. On lock-poison
+              // break paths above, `current_generation` stays at its default
+              // `0` (unread because the post-block cleanup branch returns
+              // before any code checks generation).
+            current_generation = guard.generation;
+        } // end `'install_or_skip` labeled block (guard dropped here)
+          // The Arc clones carry the SyncEngine + registries + publisher
+          // back out of the block so the failure-cleanup path below can
+          // await `shutdown()` on each without holding the std
+          // `MutexGuard` across an await (the guard is `!Send`). On
+          // success these Arcs are discarded; NodeState already owns its
+          // own clone of each.
         (
-            guard.generation,
+            current_generation,
             thread_install_failure,
+            superseded,
+            lock_failure_msg,
             sync_engine_arc.clone(),
             community_registry_arc.clone(),
             channel_log_registry_arc.clone(),
@@ -2623,13 +2804,28 @@ async fn start_node(
     let (
         our_gen,
         thread_spawn_failure,
+        superseded,
+        lock_failure_msg,
         engine_for_cleanup,
         registry_for_cleanup,
         channel_log_registry_for_cleanup,
         profile_broadcast_publisher_for_cleanup,
     ) = our_gen;
 
-    if let Some(msg) = thread_spawn_failure {
+    // ZEB-221 + thread-spawn-failure cleanup + lock-poison cleanup: all
+    // three paths require the same shutdown-then-drop sequence on the
+    // four background-task-owning Arcs built outside the lock. Priority
+    // order: lock-poison message wins over supersede over thread spawn
+    // (lock failure is the most specific root cause; supersede is the
+    // next-most-specific; thread spawn failure is the fallback).
+    let cleanup_msg: Option<String> = if let Some(msg) = lock_failure_msg {
+        Some(msg)
+    } else if superseded {
+        Some("start_node superseded by concurrent call".to_string())
+    } else {
+        thread_spawn_failure
+    };
+    if let Some(msg) = cleanup_msg {
         // ZEB-281 Sub-D Phase 4: abort the profile-broadcast publisher
         // FIRST — its background task holds a clone of `publish_tx`
         // (now orphaned because the runtime thread never spawned), so
@@ -2646,7 +2842,7 @@ async fn start_node(
             if let Err(e) = registry.shutdown_all().await {
                 tracing::error!(
                     error = %e,
-                    "ChannelLogRegistry cleanup after runtime-thread spawn failure"
+                    "ChannelLogRegistry cleanup after start_node failure"
                 );
             }
         }
@@ -2657,7 +2853,7 @@ async fn start_node(
             if let Err(e) = registry.shutdown_all().await {
                 tracing::error!(
                     error = %e,
-                    "CommunitySyncRegistry cleanup after runtime-thread spawn failure"
+                    "CommunitySyncRegistry cleanup after start_node failure"
                 );
             }
         }
@@ -2665,7 +2861,7 @@ async fn start_node(
             if let Err(e) = engine.shutdown().await {
                 tracing::error!(
                     error = %e,
-                    "SyncEngine cleanup after runtime-thread spawn failure"
+                    "SyncEngine cleanup after start_node failure"
                 );
             }
         }
@@ -16591,5 +16787,134 @@ mod dm_send_fence_tests {
             DM_SEND_FENCE_CAPACITY,
             "all permits should be returned after drain"
         );
+    }
+}
+
+#[cfg(test)]
+mod start_node_race_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Build a minimal `NodeState` for race-helper tests. Only `generation`
+    /// is meaningful; everything else is default / None / empty.
+    fn fresh_node_state() -> Mutex<NodeState> {
+        Mutex::new(NodeState {
+            thread: None,
+            shutdown_tx: None,
+            publish_tx: None,
+            fetch_tx: None,
+            ingest_tx: None,
+            content_verb_tx: None,
+            follow_tx: None,
+            voice_tx: None,
+            voice_channel_tx: None,
+            follow_mgr: None,
+            followed_set: None,
+            vine_feed_cache: None,
+            mail_mgr: None,
+            mail_sync: None,
+            content_index: std::sync::Arc::new(std::sync::Mutex::new(
+                content_index::ContentIndex::load(std::path::Path::new("")),
+            )),
+            generation: 0,
+            install_seq: 0,
+            node_addr: String::new(),
+            pairing_handle: None,
+            sync_engine: None,
+            community_registry: None,
+            community_delta_tx: None,
+            dm_outbox: None,
+            dm_transport: None,
+            crdt_state: None,
+            hlc_tracker: None,
+            dm_device_id: None,
+            dm_self_owner: None,
+            content_store: None,
+            unicast_send_tx: None,
+            dm_send_inflight: None,
+            dm_send_stopping: None,
+            dm_identity_pub_64: None,
+            community_adapter_request_tx: None,
+            channel_log_registry: None,
+            library_directory: None,
+            profile_broadcast_publisher: None,
+            profile_broadcast_cache: None,
+            profile_broadcast_request_tx: None,
+            profile_broadcast_next_subscription_id: std::sync::Arc::new(
+                std::sync::atomic::AtomicU64::new(1),
+            ),
+        })
+    }
+
+    #[test]
+    fn reserve_install_seq_bumps_and_returns() {
+        let state = fresh_node_state();
+        let n = reserve_install_seq(&state).expect("reserve");
+        assert_eq!(n, 1);
+        assert_eq!(state.lock().unwrap().install_seq, 1);
+    }
+
+    #[test]
+    fn reserve_install_seq_is_monotonic() {
+        let state = fresh_node_state();
+        assert_eq!(reserve_install_seq(&state).unwrap(), 1);
+        assert_eq!(reserve_install_seq(&state).unwrap(), 2);
+        assert_eq!(reserve_install_seq(&state).unwrap(), 3);
+        assert_eq!(state.lock().unwrap().install_seq, 3);
+    }
+
+    #[test]
+    fn reserve_install_seq_does_not_touch_generation() {
+        // ZEB-221: install_seq is for race detection; generation keeps its
+        // pre-ZEB-221 "successful install" semantics. Three reserves must
+        // NOT bump generation (only lock-2 install does that).
+        let state = fresh_node_state();
+        let _ = reserve_install_seq(&state).unwrap();
+        let _ = reserve_install_seq(&state).unwrap();
+        let _ = reserve_install_seq(&state).unwrap();
+        assert_eq!(state.lock().unwrap().generation, 0);
+    }
+
+    #[test]
+    fn check_or_supersede_accepts_match() {
+        let state = fresh_node_state();
+        let my_seq = reserve_install_seq(&state).unwrap();
+        let guard = check_install_seq_or_supersede(&state, my_seq)
+            .expect("should accept matching install_seq");
+        assert_eq!(guard.install_seq, my_seq);
+    }
+
+    #[test]
+    fn check_or_supersede_rejects_stale() {
+        let state = fresh_node_state();
+        let my_seq = reserve_install_seq(&state).unwrap();
+        let _later = reserve_install_seq(&state).unwrap();
+        let err = check_install_seq_or_supersede(&state, my_seq)
+            .map(drop)
+            .expect_err("stale my_seq must be superseded");
+        match err {
+            SupersededError::Superseded { my_seq: s, current } => {
+                assert_eq!(s, 1);
+                assert_eq!(current, 2);
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn check_or_supersede_rejects_zero_when_install_seq_advanced() {
+        let state = fresh_node_state();
+        // simulate prior reservations without calling our helper
+        state.lock().unwrap().install_seq = 5;
+        let err = check_install_seq_or_supersede(&state, 0)
+            .map(drop)
+            .expect_err("my_seq=0 against install_seq=5 must be superseded");
+        match err {
+            SupersededError::Superseded {
+                my_seq: 0,
+                current: 5,
+            } => {}
+            other => panic!("unexpected error: {:?}", other),
+        }
     }
 }
