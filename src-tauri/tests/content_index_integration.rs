@@ -650,10 +650,20 @@ fn pin_intent_survives_reload() {
     );
 }
 
-/// ZEB-155: when the fetch-completion arm receives a root CID that's in
-/// pin_intent, the cascade pins the root (and any descendants) in the
-/// runtime cache. Injected via a test-owned fetch_completion_tx clone so
-/// we don't need a real peer to answer a fetch_rx request.
+/// ZEB-155 + ZEB-159: when the fetch-completion arm receives a root CID
+/// that's in pin_intent, the cascade pins the root (and any descendants)
+/// in the runtime cache. Injected via a test-owned fetch_completion_tx
+/// clone so we don't need a real peer to answer a fetch_rx request.
+///
+/// ZEB-159 made the real fetch_rx → cache-admission → completion path
+/// work end-to-end (the spawned fetch task now admits each fetched CID
+/// via a synchronous CasOp::PutLocal { reply: Some(_) } round-trip per
+/// CID before signaling completion — the synchronous ordering is the
+/// R1 fix for the Cursor + Qodo race finding that fire-and-forget
+/// admission would let the completion arm walk a partial cache).
+/// This test continues to exercise the cascade arm directly by injecting
+/// completion synthetically — the synthetic path remains valuable as a
+/// unit-style assertion that does not require a live Zenoh peer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fetch_complete_arm_pins_root_in_intent() {
     use std::collections::HashSet;

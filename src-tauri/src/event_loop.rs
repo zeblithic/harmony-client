@@ -1451,6 +1451,15 @@ pub async fn run<R: Runtime>(
                 // ZEB-155: clone the completion sender so the spawned
                 // task can notify the main loop after a successful fetch.
                 let completion_tx = fetch_completion_tx.clone();
+                // ZEB-159: clone cas_op_tx so the wrapped fetch_one can
+                // admit each fetched CID's bytes to the StorageTier
+                // cache synchronously (round-tripping through a
+                // PutLocal reply oneshot per CID). Without admission
+                // ordered before the completion signal, the ZEB-155
+                // fetch-completion arm races the PutLocal arm and
+                // walks a partial cache for freshly-fetched roots
+                // (Cursor + Qodo R1).
+                let cas_op_tx_for_fetch = cas_op_tx.clone();
                 tokio::spawn(async move {
                     // Parse hex → 32-byte CID. Reply with an error if malformed.
                     let cid_bytes = match hex::decode(&cid_hex)
@@ -1475,8 +1484,23 @@ pub async fn run<R: Runtime>(
                             fetch_via_zenoh(&session, &key).await
                         }
                     };
+                    // ZEB-159: wrap fetch_one so each successful fetch
+                    // also admits the bytes to the local cache. The
+                    // wrapper sends CasOp::PutLocal { reply: Some(...) }
+                    // per CID and awaits the reply, so by the time
+                    // fetch_recursive returns Ok, every admission has
+                    // been processed by the event-loop's PutLocal arm
+                    // (which calls runtime.tick() before signaling).
+                    // This synchronous round-trip is load-bearing for
+                    // ordering: the fetch_completion_tx signal below
+                    // depends on the cache being populated, so a
+                    // fire-and-forget admit (as GetOrFetch uses at
+                    // event_loop.rs:1625) would race the completion
+                    // arm and walk a partial cache (Cursor + Qodo R1).
+                    let fetch_one_with_admit =
+                        wrap_fetch_one_with_admission(fetch_one, cas_op_tx_for_fetch);
 
-                    let result = fetch_recursive(fetch_one, root).await;
+                    let result = fetch_recursive(fetch_one_with_admit, root).await;
                     // ZEB-155: reply to the fetch caller FIRST so a full
                     // completion channel never delays the fetch reply.
                     // Then best-effort-notify via try_send. If the
@@ -1734,19 +1758,19 @@ pub async fn run<R: Runtime>(
                 }
             }
 
-            // ── Fetch-completion replay hook (ZEB-155) ─────────────
+            // ── Fetch-completion replay hook (ZEB-155 + ZEB-159) ──
             // Spawned fetch tasks send on fetch_completion_tx after
-            // fetch_recursive returns Ok. If pin_intent contains the
-            // root, re-run the pin cascade now that bytes are resident.
-            //
-            // NOTE: today's fetch_rx path does NOT admit fetched bytes
-            // into ContentStore — it returns them to the Tauri caller.
-            // So in production this cascade walks an empty cache for the
-            // fetched CID and pin_content is a no-op. The hook is
-            // architecturally correct and test-proven in isolation (see
-            // fetch_complete_arm_pins_root_in_intent), but its practical
-            // reach depends on ZEB-159, which will wire fetch success
-            // to cache admission.
+            // fetch_recursive returns Ok. The spawned task admits every
+            // fetched CID's bytes via synchronous CasOp::PutLocal hops
+            // (ZEB-159) — each per-CID admission awaits its reply
+            // oneshot before fetch_recursive proceeds, and the
+            // CasOp::PutLocal handler ticks the runtime BEFORE sending
+            // the reply, so by the time this arm runs, the bundle tree
+            // is in the cache. If pin_intent contains the root, walk
+            // all descendants currently in the cache and pin them.
+            // This re-engages runtime-side eviction protection that
+            // was lost when the previous node stopped and its
+            // in-memory pinned-set went with it.
             Some(root_bytes) = fetch_completion_rx.recv() => {
                 if pin_intent.contains(&root_bytes) {
                     let root = ContentId::from_bytes(root_bytes);
@@ -2547,6 +2571,114 @@ where
     Ok(out)
 }
 
+/// ZEB-159: wraps a per-CID fetch closure so each successful fetch
+/// admits the bytes to the local StorageTier cache via `cas_op_tx`
+/// BEFORE returning to the caller. Each admission round-trips through
+/// a `Some(reply)` oneshot so by the time `fetch_recursive` returns,
+/// every fetched CID has been processed by the event-loop's
+/// `CasOp::PutLocal` arm (which calls `runtime.tick()` before signaling
+/// the reply). This is the load-bearing ordering for the
+/// `fetch_completion_rx` cascade: without the synchronous round-trip,
+/// the completion arm can race ahead of the PutLocal arm and walk a
+/// partial cache (Cursor + Qodo R1, 2026-05-15).
+///
+/// Mirrors the GetOrFetch admit-hop pattern at `event_loop.rs:1625` in
+/// shape, but differs in synchronization: GetOrFetch is fire-and-forget
+/// because its caller has no downstream channel-ordered dependency on
+/// admission completion. The fetch_rx path DOES — it signals
+/// `fetch_completion_tx` after `fetch_recursive` returns — so the
+/// admission must be ordered before the signal.
+///
+/// On `fetch_one` failure (Err), no admission is attempted for that
+/// CID. On `cas_op_tx.send()` failure (event-loop shutting down), the
+/// admission is skipped silently and the fetch still returns Ok —
+/// admission is best-effort with respect to the cache, but ordered
+/// with respect to the completion signal.
+//
+// `clippy::type_complexity` allow: the return type is intentionally
+// explicit (`impl Fn(...) -> Pin<Box<dyn Future>> + Clone + Send +
+// 'static`) because the wrapped closure must be `Send + 'static` to be
+// captured into `tokio::spawn(async move { ... })` in the `fetch_rx`
+// arm, and the returned future must be `Send` so the spawned task is
+// `Send` (Tauri command futures require this). Factoring into a `type`
+// alias would either (a) require a trait-alias nightly feature or
+// (b) hide the load-bearing bounds behind a name and force readers to
+// chase the alias to understand the contract.
+#[allow(clippy::type_complexity)]
+pub(crate) fn wrap_fetch_one_with_admission<F, Fut>(
+    fetch_one: F,
+    cas_op_tx: tokio::sync::mpsc::Sender<crate::content_store::CasOp>,
+) -> impl Fn(
+    ContentId,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>>
+       + Clone
+       + Send
+       + 'static
+where
+    F: Fn(ContentId) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Result<Vec<u8>, String>> + Send + 'static,
+{
+    move |cid: ContentId| {
+        let inner = fetch_one.clone();
+        let cas_op_tx = cas_op_tx.clone();
+        Box::pin(async move {
+            let bytes = inner(cid).await?;
+            // Synchronous round-trip through the event loop's PutLocal
+            // arm. `bytes.clone()` is load-bearing: `CasOp::PutLocal.blob`
+            // consumes the bytes, but the caller (and `fetch_recursive`'s
+            // bundle parser) needs them too.
+            //
+            // `reply: Some(...)` + `reply_rx.await` is the fix for the
+            // Cursor + Qodo R1 race: the PutLocal handler ticks the
+            // runtime BEFORE sending the reply, so when reply_rx
+            // resolves, the cache contains this CID. Without this fence,
+            // the fetch_completion_rx arm in the event loop could be
+            // picked by `select!` before the PutLocal arm processes our
+            // admission, and `collect_descendants` would walk a partial
+            // cache.
+            //
+            // Both awaits are bounded by `ADMISSION_TIMEOUT` (CodeRabbit
+            // R2): a stalled event-loop arm or a saturated CAS channel
+            // must not pin a successful fetch behind an unbounded wait.
+            // On timeout OR `cas_op_tx.send()` failure (event loop
+            // dropped during shutdown), skip the rest — admission is
+            // best-effort with respect to the cache but ordered with
+            // respect to the completion signal; if the event loop isn't
+            // responding within 2s, the completion arm wouldn't be
+            // running either, so ordering is moot.
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let send_result = tokio::time::timeout(
+                ADMISSION_TIMEOUT,
+                cas_op_tx.send(crate::content_store::CasOp::PutLocal {
+                    cid,
+                    blob: bytes.clone(),
+                    reply: Some(reply_tx),
+                }),
+            )
+            .await;
+            if matches!(send_result, Ok(Ok(()))) {
+                // Discard the reply result. The cache may silently
+                // reject under W-TinyLFU pressure; we don't propagate
+                // that to the fetch caller (admission is best-effort,
+                // not load-bearing for the fetch's own correctness).
+                // A timeout here is equivalent to silent rejection.
+                let _ = tokio::time::timeout(ADMISSION_TIMEOUT, reply_rx).await;
+            }
+            Ok(bytes)
+        })
+    }
+}
+
+/// Per-CID admission timeout in `wrap_fetch_one_with_admission`. Bounds
+/// both `cas_op_tx.send()` and the reply-oneshot await so a stalled or
+/// saturated event-loop CAS arm cannot pin a successful fetch behind an
+/// unbounded wait. 2 seconds is generous for a local mpsc round-trip
+/// (the PutLocal arm itself ticks the runtime — typically microseconds
+/// — and sends the reply); a 2s timeout indicates real trouble
+/// elsewhere, in which case best-effort skip-the-admit is the right
+/// behavior. See CodeRabbit R2 on PR #125.
+const ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[cfg(test)]
 mod descendants_tests {
     use super::collect_descendants;
@@ -2692,6 +2824,220 @@ mod fetch_recursive_tests {
 
         let err = fetch_recursive(fetcher, root).await.unwrap_err();
         assert!(err.contains("missing cid"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod fetch_one_wrapper_tests {
+    use super::{fetch_recursive, wrap_fetch_one_with_admission};
+    use crate::content_store::CasOp;
+    use harmony_content::bundle::BundleBuilder;
+    use harmony_content::cid::{ContentFlags, ContentId};
+    use std::collections::HashMap;
+    use tokio::sync::mpsc;
+
+    /// Drain whatever's still queued in `cas_op_rx` after a test has
+    /// finished its fetch_recursive call. Used by tests that expect
+    /// ZERO admits (e.g. fetch failure path); the synchronous-admission
+    /// tests use `responder_collect_admits` instead.
+    ///
+    /// R1 (Cursor + Qodo): admissions are now synchronous (reply
+    /// `Some(...)`), so this helper accepts either reply variant. Tests
+    /// that assert empty queues don't care about reply shape.
+    fn drain_admits(rx: &mut mpsc::Receiver<CasOp>) -> Vec<(ContentId, Vec<u8>)> {
+        let mut out = Vec::new();
+        while let Ok(op) = rx.try_recv() {
+            match op {
+                CasOp::PutLocal { cid, blob, .. } => {
+                    out.push((cid, blob));
+                }
+                CasOp::GetOrFetch { .. } => {
+                    panic!("wrapper must not send GetOrFetch");
+                }
+            }
+        }
+        out
+    }
+
+    /// Spawned-task helper: ACKs each PutLocal so the synchronous
+    /// wrapper can proceed, and collects (cid, blob) per admission.
+    /// The task exits when all senders are dropped (`recv()` returns
+    /// None) — which happens when `fetch_recursive` consumes the
+    /// wrapped closure and returns, releasing the last `cas_op_tx`.
+    async fn responder_collect_admits(mut rx: mpsc::Receiver<CasOp>) -> Vec<(ContentId, Vec<u8>)> {
+        let mut admits: Vec<(ContentId, Vec<u8>)> = Vec::new();
+        while let Some(op) = rx.recv().await {
+            match op {
+                CasOp::PutLocal { cid, blob, reply } => {
+                    admits.push((cid, blob));
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Ok(()));
+                    }
+                }
+                CasOp::GetOrFetch { .. } => {
+                    panic!("wrapper must not send GetOrFetch");
+                }
+            }
+        }
+        admits
+    }
+
+    #[tokio::test]
+    async fn admits_each_fetched_cid_for_a_bundle_tree() {
+        // Bundle tree: root → [a, b, c]
+        let a_bytes = b"aaa".to_vec();
+        let b_bytes = b"bbbb".to_vec();
+        let c_bytes = b"ccccc".to_vec();
+        let a = ContentId::for_book(&a_bytes, ContentFlags::default()).unwrap();
+        let b = ContentId::for_book(&b_bytes, ContentFlags::default()).unwrap();
+        let c = ContentId::for_book(&c_bytes, ContentFlags::default()).unwrap();
+
+        let mut builder = BundleBuilder::new();
+        builder.add(a).add(b).add(c);
+        let (payload, root) = builder.build_with_flags(ContentFlags::default()).unwrap();
+
+        let mut store: HashMap<ContentId, Vec<u8>> = HashMap::new();
+        store.insert(a, a_bytes.clone());
+        store.insert(b, b_bytes.clone());
+        store.insert(c, c_bytes.clone());
+        store.insert(root, payload.clone());
+
+        let fetcher = move |cid: ContentId| {
+            let bytes = store.get(&cid).cloned();
+            std::future::ready(bytes.ok_or_else(|| format!("missing cid: {cid:?}")))
+        };
+
+        let (cas_op_tx, cas_op_rx) = mpsc::channel::<CasOp>(16);
+        let wrapped = wrap_fetch_one_with_admission(fetcher, cas_op_tx);
+
+        // R1 (Cursor + Qodo): the wrapper now uses synchronous
+        // admission, so each per-CID call blocks awaiting a PutLocal
+        // reply. Drive a responder concurrent with fetch_recursive
+        // that ACKs each PutLocal and collects (cid, blob). The
+        // responder finishes when fetch_recursive returns and the
+        // wrapped closure is dropped, releasing the last cas_op_tx.
+        let responder = tokio::spawn(responder_collect_admits(cas_op_rx));
+
+        // Drive through fetch_recursive — every per-CID call goes through
+        // the wrapper, so every successful fetch must produce a PutLocal.
+        let got = fetch_recursive(wrapped, root).await.unwrap();
+        let admits = responder.await.unwrap();
+
+        // fetch_recursive's output is the concatenated leaves (existing
+        // contract; we don't break it).
+        let mut expected_concat = a_bytes.clone();
+        expected_concat.extend_from_slice(&b_bytes);
+        expected_concat.extend_from_slice(&c_bytes);
+        assert_eq!(got, expected_concat);
+
+        // Admission: every CID encountered (root bundle + 3 leaves).
+        assert_eq!(admits.len(), 4, "expected 4 admissions, got {:?}", admits);
+
+        // Each admission carries the correct bytes for its CID.
+        let admit_map: HashMap<ContentId, Vec<u8>> = admits.into_iter().collect();
+        assert_eq!(admit_map.get(&root), Some(&payload));
+        assert_eq!(admit_map.get(&a), Some(&a_bytes));
+        assert_eq!(admit_map.get(&b), Some(&b_bytes));
+        assert_eq!(admit_map.get(&c), Some(&c_bytes));
+    }
+
+    #[tokio::test]
+    async fn skips_admit_on_fetch_failure() {
+        // fetch_one returns Err for the requested CID. Verify no
+        // CasOp::PutLocal was sent.
+        let cid = ContentId::for_book(b"missing", ContentFlags::default()).unwrap();
+        let fetcher = |_cid: ContentId| {
+            std::future::ready(Err::<Vec<u8>, String>(
+                "synthetic fetch failure".to_string(),
+            ))
+        };
+
+        let (cas_op_tx, mut cas_op_rx) = mpsc::channel::<CasOp>(4);
+        let wrapped = wrap_fetch_one_with_admission(fetcher, cas_op_tx);
+
+        let result = wrapped(cid).await;
+        assert!(
+            result.is_err(),
+            "expected Err propagation; got {:?}",
+            result
+        );
+        assert!(result.unwrap_err().contains("synthetic fetch failure"));
+
+        // No admission should have been sent.
+        let admits = drain_admits(&mut cas_op_rx);
+        assert!(
+            admits.is_empty(),
+            "wrapper must not admit on fetch failure; got {:?}",
+            admits
+        );
+    }
+
+    #[tokio::test]
+    async fn admit_failure_does_not_fail_fetch() {
+        // cas_op channel is closed (receiver dropped). The wrapper's
+        // synchronous send returns Err but the wrapper must NOT
+        // propagate that — the caller still gets the fetched bytes.
+        let bytes = b"payload".to_vec();
+        let cid = ContentId::for_book(&bytes, ContentFlags::default()).unwrap();
+        let bytes_for_fetcher = bytes.clone();
+        let fetcher = move |_cid: ContentId| {
+            let b = bytes_for_fetcher.clone();
+            std::future::ready(Ok::<Vec<u8>, String>(b))
+        };
+
+        let (cas_op_tx, cas_op_rx) = mpsc::channel::<CasOp>(1);
+        drop(cas_op_rx); // close the receiver — every send will Err.
+        let wrapped = wrap_fetch_one_with_admission(fetcher, cas_op_tx);
+
+        let result = wrapped(cid).await;
+        assert!(
+            result.is_ok(),
+            "admission failure must not propagate to fetch caller; got {:?}",
+            result
+        );
+        assert_eq!(result.unwrap(), bytes);
+    }
+
+    /// R2 (CodeRabbit): the wrapper bounds both `cas_op_tx.send` and
+    /// `reply_rx.await` by `ADMISSION_TIMEOUT`. If the event-loop CAS
+    /// arm is stalled (we simulate this by receiving the PutLocal but
+    /// never replying), the wrapper must time out and still return
+    /// Ok(bytes) — admission is best-effort, not load-bearing for the
+    /// fetch caller. Uses `start_paused = true` so virtual time
+    /// auto-advances when the runtime is idle, keeping wall-clock test
+    /// time near-zero per the project's wall-clock-regression rule.
+    #[tokio::test(start_paused = true)]
+    async fn admission_timeout_does_not_fail_fetch() {
+        let bytes = b"payload".to_vec();
+        let cid = ContentId::for_book(&bytes, ContentFlags::default()).unwrap();
+        let bytes_for_fetcher = bytes.clone();
+        let fetcher = move |_cid: ContentId| {
+            let b = bytes_for_fetcher.clone();
+            std::future::ready(Ok::<Vec<u8>, String>(b))
+        };
+
+        let (cas_op_tx, mut cas_op_rx) = mpsc::channel::<CasOp>(1);
+        let wrapped = wrap_fetch_one_with_admission(fetcher, cas_op_tx);
+
+        // Receiver pulls the PutLocal but parks forever, holding the
+        // PutLocal (and its reply_tx) in scope so the wrapper's
+        // reply_rx never resolves naturally. The wrapper's
+        // `tokio::time::timeout(ADMISSION_TIMEOUT, reply_rx)` must
+        // fire and let the wrapper return Ok.
+        let receiver = tokio::spawn(async move {
+            let _op = cas_op_rx.recv().await.expect("expected a PutLocal");
+            std::future::pending::<()>().await;
+        });
+
+        let result = wrapped(cid).await;
+        receiver.abort();
+
+        assert!(
+            result.is_ok(),
+            "admission timeout must not propagate to fetch caller; got {:?}",
+            result
+        );
+        assert_eq!(result.unwrap(), bytes);
     }
 }
 
