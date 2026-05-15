@@ -8,14 +8,20 @@
 //! (`HARMONY_PASSPHRASE` / `HARMONY_PASSPHRASE_FILE`) — neither variable
 //! falls back to the other.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use harmony_owner::lifecycle::RecoveryArtifact;
 use harmony_owner::recovery::RecoveryMetadata;
 use secrecy::SecretString;
 use zeroize::Zeroizing;
 
+use crate::backup_state::{save_last_backup, LastBackup};
 use crate::identity::{self, KeychainStore};
+use crate::owner_state_persist::load_crdt;
+use crate::owner_state_types::{Hlc, OwnerAddr};
+use crate::state_snapshot::{
+    decode_snapshot, encode_snapshot, verify_snapshot_addr, OwnerStateSnapshot,
+};
 
 /// Resolve the recovery passphrase from `HARMONY_RECOVERY_PASSPHRASE` or
 /// `HARMONY_RECOVERY_PASSPHRASE_FILE`. Hard-fails if neither is set, with
@@ -137,14 +143,41 @@ pub fn export_recovery_file_cli(
     plaintext_path: &Path,
     out: &Path,
     comment: Option<&str>,
+    include_state: bool,
+    force: bool,
 ) -> Result<(), String> {
-    export_recovery_file_with_keychain(
+    let harmony_dir = plaintext_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let result = export_recovery_file_pair_with_keychain(
         plaintext_path,
+        &harmony_dir,
         out,
         comment,
-        /*passphrase=*/ None,
+        None,
+        include_state,
+        force,
         KeychainStore::new().ok(),
-    )
+    )?;
+    eprintln!(
+        "wrote {} ({} bytes)",
+        result.hrmr_path.display(),
+        std::fs::metadata(&result.hrmr_path)
+            .map(|m| m.len())
+            .unwrap_or(0)
+    );
+    if let Some(p) = result.hrss_path {
+        eprintln!(
+            "wrote {} ({} bytes)",
+            p.display(),
+            result.snapshot_bytes_written
+        );
+    } else if include_state {
+        eprintln!("no owner-state to bundle; emitted identity-only backup");
+    }
+    eprintln!("identity-hash: {}", hex::encode(result.identity_hash));
+    Ok(())
 }
 
 /// Inner entry point — accepts an injected keychain so tests can stay
@@ -191,6 +224,275 @@ pub fn export_recovery_file_with_keychain(
     eprintln!("wrote {} ({} bytes)", out.display(), bytes.len());
     eprintln!("identity-hash: {}", hex::encode(id_hash));
     Ok(())
+}
+
+/// Owner-state directory + filename convention.
+///
+/// Production wires this to `~/.harmony/`. Tests pass a tempdir-rooted path.
+/// The owner-state file is the SAME path the production engine reads at
+/// boot (`lib.rs` uses `app_data_dir.join("owner_state.cbor")`).
+pub fn owner_state_path(harmony_dir: &Path) -> PathBuf {
+    harmony_dir.join("owner_state.cbor")
+}
+
+pub fn last_backup_path(harmony_dir: &Path) -> PathBuf {
+    harmony_dir.join("last_backup.json")
+}
+
+/// Compose the sidecar HRSS path next to `out`. Matches the spec
+/// convention `<HRMR_PATH>.state`.
+pub fn sidecar_path(out: &Path) -> PathBuf {
+    let mut s = out.as_os_str().to_owned();
+    s.push(".state");
+    PathBuf::from(s)
+}
+
+/// Export the master seed + (optionally) an owner-state sidecar.
+///
+/// `include_state == true` AND owner-state file exists ⇒ emit pair.
+/// `include_state == false` OR owner-state file absent ⇒ emit HRMR only.
+/// Refuses if the sidecar destination exists and `force == false`.
+/// On HRSS-write failure, best-effort removes the just-written HRMR
+/// so the operator isn't stranded with a mismatched half-pair.
+#[allow(clippy::too_many_arguments)]
+pub fn export_recovery_file_pair_with_keychain(
+    plaintext_path: &Path,
+    harmony_dir: &Path,
+    out: &Path,
+    comment: Option<&str>,
+    passphrase: Option<&SecretString>,
+    include_state: bool,
+    force: bool,
+    keychain: Option<KeychainStore>,
+) -> Result<ExportResult, String> {
+    // Resolve passphrase first — same atomic-rollback rationale as the
+    // existing export_recovery_file_with_keychain.
+    let passphrase: SecretString = match passphrase {
+        Some(p) => p.clone(),
+        None => resolve_recovery_passphrase()?,
+    };
+
+    let state_path = owner_state_path(harmony_dir);
+    let state_exists = state_path.exists();
+    let want_sidecar = include_state && state_exists;
+
+    let sidecar = sidecar_path(out);
+    if want_sidecar && sidecar.exists() && !force {
+        return Err(format!(
+            "state sidecar already exists at {}; pass --force to overwrite",
+            sidecar.display()
+        ));
+    }
+
+    // 1. Read seed + write HRMR (same as today's flow).
+    let seed = identity::read_seed_from_disk_with_keychain(plaintext_path, keychain)?;
+    let artifact = RecoveryArtifact::from_seed(*seed);
+    let metadata = RecoveryMetadata {
+        mint_at: None,
+        comment: comment.map(str::to_string),
+    };
+    let bytes = artifact
+        .to_encrypted_file(&passphrase, &metadata)
+        .map_err(|e| e.to_string())?;
+    let id_hash = artifact.master_pubkey_bundle().identity_hash();
+    crate::identity::write_atomic_0600(out, &bytes)
+        .map_err(|e| format!("failed to write {}: {e}", out.display()))?;
+
+    // 2. If no sidecar wanted, we're done.
+    if !want_sidecar {
+        let last = LastBackup {
+            at: now_hlc(),
+            include_state: false,
+            out_path: out.display().to_string(),
+        };
+        let _ = save_last_backup(&last_backup_path(harmony_dir), &last);
+        return Ok(ExportResult {
+            hrmr_path: out.to_path_buf(),
+            hrss_path: None,
+            identity_hash: id_hash,
+            snapshot_bytes_written: 0,
+        });
+    }
+
+    // 3. Build snapshot + write HRSS.
+    let state = load_crdt(&state_path).map_err(|e| {
+        format!(
+            "failed to load owner-state from {}: {e}",
+            state_path.display()
+        )
+    })?;
+    use secrecy::ExposeSecret;
+    let addr = derive_owner_addr_from_seed(&seed);
+    let at = now_hlc();
+    let hrss_bytes = encode_snapshot(
+        passphrase.expose_secret().as_bytes(),
+        addr,
+        at.clone(),
+        &state,
+    )
+    .map_err(|e| {
+        // HRSS encode failure — best-effort cleanup of HRMR.
+        let _ = std::fs::remove_file(out);
+        format!("failed to encode state sidecar: {e}")
+    })?;
+
+    if let Err(e) = crate::identity::write_atomic_0600(&sidecar, &hrss_bytes) {
+        let _ = std::fs::remove_file(out);
+        return Err(format!(
+            "failed to write {}: {e} (HRMR rolled back)",
+            sidecar.display()
+        ));
+    }
+
+    let last = LastBackup {
+        at,
+        include_state: true,
+        out_path: out.display().to_string(),
+    };
+    let _ = save_last_backup(&last_backup_path(harmony_dir), &last);
+
+    Ok(ExportResult {
+        hrmr_path: out.to_path_buf(),
+        hrss_path: Some(sidecar.clone()),
+        identity_hash: id_hash,
+        snapshot_bytes_written: hrss_bytes.len(),
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct ExportResult {
+    pub hrmr_path: PathBuf,
+    pub hrss_path: Option<PathBuf>,
+    pub identity_hash: [u8; 16],
+    pub snapshot_bytes_written: usize,
+}
+
+/// Restore identity + (optionally) owner-state sidecar.
+///
+/// `ignore_state == true` skips sidecar lookup. Otherwise auto-detects
+/// `<in_path>.state`. addr-binding hard-fails on mismatch. Unknown
+/// snapshot version hard-fails. Wrong passphrase fails with the same
+/// idiom as HRMR.
+pub fn restore_recovery_file_pair_with_keychain(
+    plaintext_path: &Path,
+    harmony_dir: &Path,
+    in_path: &Path,
+    force: bool,
+    ignore_state: bool,
+    keychain: Option<KeychainStore>,
+) -> Result<RestoreResult, String> {
+    // Restore identity first — same as today's path.
+    let bytes =
+        std::fs::read(in_path).map_err(|e| format!("failed to read {}: {e}", in_path.display()))?;
+    let passphrase = resolve_recovery_passphrase()?;
+    let restored =
+        RecoveryArtifact::from_encrypted_file(&bytes, &passphrase).map_err(|e| e.to_string())?;
+    let artifact = restored.into_artifact();
+    let seed_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*artifact.as_bytes());
+    let id_hash = artifact.master_pubkey_bundle().identity_hash();
+    let addr_bytes = derive_owner_addr_from_seed(&seed_bytes);
+
+    // BEFORE writing identity, peek at the sidecar to fail-fast on
+    // addr-binding mismatch (metadata before irreversible write).
+    let sidecar = sidecar_path(in_path);
+    let want_sidecar = !ignore_state && sidecar.exists();
+    let snapshot: Option<OwnerStateSnapshot> = if want_sidecar {
+        use secrecy::ExposeSecret;
+        let s_bytes = std::fs::read(&sidecar)
+            .map_err(|e| format!("failed to read {}: {e}", sidecar.display()))?;
+        let snap = decode_snapshot(passphrase.expose_secret().as_bytes(), &s_bytes)
+            .map_err(|e| format!("state sidecar: {e}"))?;
+        verify_snapshot_addr(&snap, &addr_bytes.0).map_err(|e| format!("state sidecar: {e}"))?;
+        Some(snap)
+    } else {
+        None
+    };
+
+    // Now safe to write identity.
+    identity::write_seed_to_disk_with_keychain(plaintext_path, &seed_bytes, force, keychain)?;
+
+    // Then write owner-state if present.
+    let state_path = owner_state_path(harmony_dir);
+    let spaces_restored = if let Some(snap) = snapshot {
+        if state_path.exists() && !force {
+            return Err(format!(
+                "owner-state file already exists at {}; pass --force to overwrite",
+                state_path.display()
+            ));
+        }
+        // Reconstruct OwnerState from the tree bytes and persist.
+        // canonicalize() returns [schema_v2, ...cbor]; load_crdt parses
+        // that same shape — so we route through a tempfile of the
+        // exact bytes rather than re-deserialize the tree via ciborium.
+        crate::owner_state_persist::save_atomically(&state_path, &snap.tree)
+            .map_err(|e| format!("failed to write {}: {e}", state_path.display()))?;
+        // Reload to count Spaces for the confirmation message.
+        let state = load_crdt(&state_path).map_err(|e| e.to_string())?;
+        state.spaces.len()
+    } else {
+        0
+    };
+
+    eprintln!("restored identity-hash: {}", hex::encode(id_hash));
+    if want_sidecar {
+        eprintln!(
+            "owner-state snapshot: {} spaces, exported {} ms wall-clock",
+            spaces_restored,
+            snapshot_at_or_zero(harmony_dir)
+        );
+    } else if sidecar.exists() && ignore_state {
+        eprintln!("state sidecar found but ignored per flag");
+    } else if !sidecar.exists() && !ignore_state {
+        eprintln!(
+            "no state sidecar found at {}; nav tree will be empty post-restore",
+            sidecar.display()
+        );
+    }
+
+    Ok(RestoreResult {
+        identity_hash: id_hash,
+        spaces_restored,
+        sidecar_present: want_sidecar,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct RestoreResult {
+    pub identity_hash: [u8; 16],
+    pub spaces_restored: usize,
+    pub sidecar_present: bool,
+}
+
+fn snapshot_at_or_zero(harmony_dir: &Path) -> u64 {
+    use crate::backup_state::load_last_backup;
+    load_last_backup(&last_backup_path(harmony_dir))
+        .ok()
+        .flatten()
+        .map(|b| b.at.wall_ms)
+        .unwrap_or(0)
+}
+
+/// Derive the 16-byte owner address from a 32-byte seed.
+/// Mirrors `lib.rs`'s `OwnerAddr(ed25519.public_identity().address_hash)`
+/// pattern.
+pub fn derive_owner_addr_from_seed(seed: &[u8; 32]) -> OwnerAddr {
+    let ed = harmony_identity::PrivateIdentity::from_seed(seed);
+    OwnerAddr(ed.public_identity().address_hash)
+}
+
+/// Current HLC suitable for export-time `at`. Uses system wall-clock;
+/// `logical = 0`; `device_id = "harmony-app"` (the CLI is single-device
+/// per invocation).
+pub fn now_hlc() -> Hlc {
+    let wall_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    Hlc {
+        wall_ms,
+        logical: 0,
+        device_id: "harmony-app".into(),
+    }
 }
 
 /// Restore the master seed from a 24-word mnemonic file.
@@ -278,8 +580,21 @@ pub fn restore_recovery_file_cli(
     plaintext_path: &Path,
     in_path: &Path,
     force: bool,
+    ignore_state: bool,
 ) -> Result<(), String> {
-    restore_recovery_file_with_keychain(plaintext_path, in_path, force, KeychainStore::new().ok())
+    let harmony_dir = plaintext_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    restore_recovery_file_pair_with_keychain(
+        plaintext_path,
+        &harmony_dir,
+        in_path,
+        force,
+        ignore_state,
+        KeychainStore::new().ok(),
+    )
+    .map(|_| ())
 }
 
 /// Inner entry point — accepts an injected keychain so tests can stay
@@ -593,5 +908,451 @@ mod tests {
         );
 
         std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    use crate::owner_state_crdt::OwnerState;
+
+    /// Plant a usable owner-state file at `harmony_dir/owner_state.cbor`.
+    fn plant_owner_state(harmony_dir: &Path) {
+        let state = OwnerState::default();
+        let state_path = super::owner_state_path(harmony_dir);
+        crate::owner_state_persist::save_crdt(&state_path, &state).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn export_emits_pair_when_state_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let out = dir.path().join("recovery.bin");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
+        std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
+        identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0xCA; 32], true, None)
+            .unwrap();
+        plant_owner_state(dir.path());
+
+        let result = super::export_recovery_file_pair_with_keychain(
+            &plaintext_path,
+            dir.path(),
+            &out,
+            Some("rt"),
+            None,
+            /*include_state=*/ true,
+            /*force=*/ false,
+            None,
+        )
+        .expect("export");
+        assert!(result.hrss_path.is_some());
+        assert!(out.exists());
+        let sidecar = super::sidecar_path(&out);
+        assert!(sidecar.exists());
+        assert!(result.snapshot_bytes_written > 0);
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+        std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn export_emits_solo_when_no_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let out = dir.path().join("recovery.bin");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
+        std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
+        identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0xCA; 32], true, None)
+            .unwrap();
+        // No plant_owner_state — owner_state.cbor absent.
+
+        let result = super::export_recovery_file_pair_with_keychain(
+            &plaintext_path,
+            dir.path(),
+            &out,
+            None,
+            None,
+            /*include_state=*/ true, // requested but file is missing
+            /*force=*/ false,
+            None,
+        )
+        .expect("export");
+        assert!(result.hrss_path.is_none(), "no sidecar when state missing");
+        assert!(out.exists());
+        assert!(!super::sidecar_path(&out).exists());
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+        std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn export_no_state_flag_skips_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let out = dir.path().join("recovery.bin");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
+        std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
+        identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0xCA; 32], true, None)
+            .unwrap();
+        plant_owner_state(dir.path());
+
+        let result = super::export_recovery_file_pair_with_keychain(
+            &plaintext_path,
+            dir.path(),
+            &out,
+            None,
+            None,
+            /*include_state=*/ false, // explicit opt-out
+            /*force=*/ false,
+            None,
+        )
+        .expect("export");
+        assert!(result.hrss_path.is_none(), "opt-out must skip sidecar");
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+        std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn export_refuses_when_sidecar_exists_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let out = dir.path().join("recovery.bin");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
+        std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
+        identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0xCA; 32], true, None)
+            .unwrap();
+        plant_owner_state(dir.path());
+        std::fs::write(super::sidecar_path(&out), b"stale").unwrap();
+
+        let err = super::export_recovery_file_pair_with_keychain(
+            &plaintext_path,
+            dir.path(),
+            &out,
+            None,
+            None,
+            true,
+            /*force=*/ false,
+            None,
+        )
+        .expect_err("must refuse");
+        assert!(
+            err.contains("already exists") && err.contains("--force"),
+            "error must direct to --force: {err}"
+        );
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+        std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn restore_pair_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let out = dir.path().join("recovery.bin");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
+        std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
+        let seed = [0xCA; 32];
+        identity::write_seed_to_disk_with_keychain(&plaintext_path, &seed, true, None).unwrap();
+        plant_owner_state(dir.path());
+        super::export_recovery_file_pair_with_keychain(
+            &plaintext_path,
+            dir.path(),
+            &out,
+            None,
+            None,
+            true,
+            true,
+            None,
+        )
+        .unwrap();
+
+        // Wipe identity + owner-state, then restore.
+        let _ = std::fs::remove_file(&plaintext_path);
+        let _ = std::fs::remove_file(super::owner_state_path(dir.path()));
+        let result = super::restore_recovery_file_pair_with_keychain(
+            &plaintext_path,
+            dir.path(),
+            &out,
+            /*force=*/ true,
+            /*ignore_state=*/ false,
+            None,
+        )
+        .expect("restore");
+        assert!(result.sidecar_present);
+        // Identity round-trip.
+        let reloaded = identity::read_seed_from_disk_with_keychain(&plaintext_path, None).unwrap();
+        assert_eq!(&*reloaded, &seed);
+        // Owner-state file restored.
+        assert!(super::owner_state_path(dir.path()).exists());
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+        std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn restore_ignores_missing_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let out = dir.path().join("recovery.bin");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
+        std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
+        identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0x42; 32], true, None)
+            .unwrap();
+        // Skip plant_owner_state — HRSS will not be emitted.
+        super::export_recovery_file_pair_with_keychain(
+            &plaintext_path,
+            dir.path(),
+            &out,
+            None,
+            None,
+            true,
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(!super::sidecar_path(&out).exists());
+
+        let _ = std::fs::remove_file(&plaintext_path);
+        let result = super::restore_recovery_file_pair_with_keychain(
+            &plaintext_path,
+            dir.path(),
+            &out,
+            true,
+            false,
+            None,
+        )
+        .expect("restore identity-only ok");
+        assert!(!result.sidecar_present);
+        assert_eq!(result.spaces_restored, 0);
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+        std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn restore_ignore_state_flag_skips_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let out = dir.path().join("recovery.bin");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
+        std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
+        identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0x42; 32], true, None)
+            .unwrap();
+        plant_owner_state(dir.path());
+        super::export_recovery_file_pair_with_keychain(
+            &plaintext_path,
+            dir.path(),
+            &out,
+            None,
+            None,
+            true,
+            true,
+            None,
+        )
+        .unwrap();
+
+        let _ = std::fs::remove_file(&plaintext_path);
+        let _ = std::fs::remove_file(super::owner_state_path(dir.path()));
+        let result = super::restore_recovery_file_pair_with_keychain(
+            &plaintext_path,
+            dir.path(),
+            &out,
+            true,
+            /*ignore_state=*/ true,
+            None,
+        )
+        .expect("restore");
+        assert!(!result.sidecar_present);
+        assert!(!super::owner_state_path(dir.path()).exists());
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+        std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn restore_force_overwrites_existing_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let out = dir.path().join("recovery.bin");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
+        std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
+        identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0x42; 32], true, None)
+            .unwrap();
+        plant_owner_state(dir.path());
+        super::export_recovery_file_pair_with_keychain(
+            &plaintext_path,
+            dir.path(),
+            &out,
+            None,
+            None,
+            true,
+            true,
+            None,
+        )
+        .unwrap();
+
+        // Plant a different owner_state.cbor to force a "exists" collision.
+        let mut state = OwnerState::default();
+        let sp = crate::owner_state_types::Space {
+            id: crate::owner_state_types::SpaceId([0x99; 16]),
+            kind: crate::owner_state_types::SpaceKind::Folder,
+            parent: None,
+            community_id: None,
+            name: "different".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: crate::owner_state_types::Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "x".into(),
+            },
+            updated_at: crate::owner_state_types::Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "x".into(),
+            },
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: false,
+        };
+        state.spaces.insert(sp.id, sp);
+        crate::owner_state_persist::save_crdt(&super::owner_state_path(dir.path()), &state)
+            .unwrap();
+
+        // force=true overwrites.
+        super::restore_recovery_file_pair_with_keychain(
+            &plaintext_path,
+            dir.path(),
+            &out,
+            true,
+            false,
+            None,
+        )
+        .expect("force restore succeeds");
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+        std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn restore_addr_mismatch_hard_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path_a = dir.path().join("a.key");
+        let plaintext_path_b = dir.path().join("b.key");
+        let out_a = dir.path().join("a.bin");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
+        std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
+
+        // Build owner A's identity + state + sidecar.
+        identity::write_seed_to_disk_with_keychain(&plaintext_path_a, &[0xAA; 32], true, None)
+            .unwrap();
+        plant_owner_state(dir.path());
+        super::export_recovery_file_pair_with_keychain(
+            &plaintext_path_a,
+            dir.path(),
+            &out_a,
+            None,
+            None,
+            true,
+            true,
+            None,
+        )
+        .unwrap();
+
+        // Build owner B's identity (different seed).
+        identity::write_seed_to_disk_with_keychain(&plaintext_path_b, &[0xBB; 32], true, None)
+            .unwrap();
+        // Now overwrite a.bin's HRMR with B's identity but keep A's HRSS.
+        // Easiest: emit B's identity-only backup at out_a, then keep A's
+        // sidecar at out_a.state.
+        let out_b = dir.path().join("b.bin");
+        super::export_recovery_file_pair_with_keychain(
+            &plaintext_path_b,
+            dir.path(),
+            &out_b,
+            None,
+            None,
+            false, // identity-only for B
+            true,
+            None,
+        )
+        .unwrap();
+        std::fs::copy(&out_b, &out_a).unwrap(); // a.bin = B's identity
+                                                // a.bin.state is still A's sidecar (untouched).
+
+        let _ = std::fs::remove_file(&plaintext_path_a);
+        let err = super::restore_recovery_file_pair_with_keychain(
+            &plaintext_path_a,
+            dir.path(),
+            &out_a,
+            true,
+            false,
+            None,
+        )
+        .expect_err("addr mismatch must fail");
+        assert!(
+            err.contains("state sidecar identity mismatch") || err.contains("AddrMismatch"),
+            "expected addr-mismatch in: {err}"
+        );
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+        std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn export_state_persists_last_backup_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("identity.key");
+        let out = dir.path().join("recovery.bin");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "at-rest");
+        std::env::set_var("HARMONY_RECOVERY_PASSPHRASE", "recovery");
+        identity::write_seed_to_disk_with_keychain(&plaintext_path, &[0xCA; 32], true, None)
+            .unwrap();
+        plant_owner_state(dir.path());
+        super::export_recovery_file_pair_with_keychain(
+            &plaintext_path,
+            dir.path(),
+            &out,
+            None,
+            None,
+            true,
+            true,
+            None,
+        )
+        .unwrap();
+
+        let last = crate::backup_state::load_last_backup(&super::last_backup_path(dir.path()))
+            .unwrap()
+            .expect("last_backup.json must be written");
+        assert!(last.include_state);
+        assert_eq!(last.out_path, out.display().to_string());
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+        std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
     }
 }

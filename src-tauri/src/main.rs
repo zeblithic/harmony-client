@@ -115,6 +115,8 @@ fn main() {
                             &plaintext_path,
                             &out,
                             comment.as_deref(),
+                            /*include_state=*/ true,
+                            /*force=*/ false,
                         )
                     }
                 };
@@ -148,6 +150,7 @@ fn main() {
                             &plaintext_path,
                             &in_path,
                             force,
+                            /*ignore_state=*/ false,
                         )
                     }
                 };
