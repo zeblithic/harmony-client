@@ -1451,6 +1451,12 @@ pub async fn run<R: Runtime>(
                 // ZEB-155: clone the completion sender so the spawned
                 // task can notify the main loop after a successful fetch.
                 let completion_tx = fetch_completion_tx.clone();
+                // ZEB-159: clone cas_op_tx so the wrapped fetch_one can
+                // fire-and-forget-admit each fetched CID's bytes to the
+                // StorageTier cache. Without this, the ZEB-155 fetch-
+                // completion arm walks an empty cache for freshly-
+                // fetched roots and pin_content is a no-op.
+                let cas_op_tx_for_fetch = cas_op_tx.clone();
                 tokio::spawn(async move {
                     // Parse hex → 32-byte CID. Reply with an error if malformed.
                     let cid_bytes = match hex::decode(&cid_hex)
@@ -1475,8 +1481,15 @@ pub async fn run<R: Runtime>(
                             fetch_via_zenoh(&session, &key).await
                         }
                     };
+                    // ZEB-159: wrap fetch_one so each successful fetch
+                    // also admits the bytes to the local cache. The
+                    // wrapper fire-and-forget-sends CasOp::PutLocal
+                    // { reply: None } per CID — mirrors the GetOrFetch
+                    // admit-hop pattern at event_loop.rs:1625.
+                    let fetch_one_with_admit =
+                        wrap_fetch_one_with_admission(fetch_one, cas_op_tx_for_fetch);
 
-                    let result = fetch_recursive(fetch_one, root).await;
+                    let result = fetch_recursive(fetch_one_with_admit, root).await;
                     // ZEB-155: reply to the fetch caller FIRST so a full
                     // completion channel never delays the fetch reply.
                     // Then best-effort-notify via try_send. If the
@@ -1734,19 +1747,16 @@ pub async fn run<R: Runtime>(
                 }
             }
 
-            // ── Fetch-completion replay hook (ZEB-155) ─────────────
+            // ── Fetch-completion replay hook (ZEB-155 + ZEB-159) ──
             // Spawned fetch tasks send on fetch_completion_tx after
-            // fetch_recursive returns Ok. If pin_intent contains the
-            // root, re-run the pin cascade now that bytes are resident.
-            //
-            // NOTE: today's fetch_rx path does NOT admit fetched bytes
-            // into ContentStore — it returns them to the Tauri caller.
-            // So in production this cascade walks an empty cache for the
-            // fetched CID and pin_content is a no-op. The hook is
-            // architecturally correct and test-proven in isolation (see
-            // fetch_complete_arm_pins_root_in_intent), but its practical
-            // reach depends on ZEB-159, which will wire fetch success
-            // to cache admission.
+            // fetch_recursive returns Ok. The spawned task admits every
+            // fetched CID's bytes via a CasOp::PutLocal { reply: None }
+            // fire-and-forget hop (ZEB-159), so by the time this arm
+            // runs, the bundle tree is in the cache. If pin_intent
+            // contains the root, walk all descendants currently in the
+            // cache and pin them. This re-engages runtime-side eviction
+            // protection that was lost when the previous node stopped
+            // and its in-memory pinned-set went with it.
             Some(root_bytes) = fetch_completion_rx.recv() => {
                 if pin_intent.contains(&root_bytes) {
                     let root = ContentId::from_bytes(root_bytes);
@@ -2558,13 +2568,6 @@ where
 /// gets the bytes; only the per-CID cache population is best-effort.
 /// On `fetch_one` failure (Err), no admission is sent for that CID.
 //
-// `dead_code` allow: Task 1 of the ZEB-159 plan introduces this helper
-// in isolation (TDD-shaped). The production wiring lands in Task 2 (the
-// next commit on this branch), which wires the wrapper into the
-// `fetch_rx` arm of `run_event_loop`. The unit tests below
-// (`mod fetch_one_wrapper_tests`) are `#[cfg(test)]` and don't count
-// against the non-test lib build.
-//
 // `clippy::type_complexity` allow: the return type is intentionally
 // explicit (`impl Fn(...) -> Pin<Box<dyn Future>> + Clone + Send +
 // 'static`) because the wrapped closure must be `Send + 'static` to be
@@ -2574,7 +2577,6 @@ where
 // alias would either (a) require a trait-alias nightly feature or
 // (b) hide the load-bearing bounds behind a name and force readers to
 // chase the alias to understand the contract.
-#[allow(dead_code)]
 #[allow(clippy::type_complexity)]
 pub(crate) fn wrap_fetch_one_with_admission<F, Fut>(
     fetch_one: F,
