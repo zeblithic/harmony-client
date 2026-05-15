@@ -53,9 +53,9 @@
   type BackupStep =
     | { phase: 'pickType' }                                                                                               // step 1
     | { phase: 'mnemonicReveal'; words: string[]; revealed: boolean; storedSafely: boolean; loadError: string | null }   // step 2a
-    | { phase: 'fileEntry'; passphrase: string; passphraseConfirm: string; comment: string; showPass: boolean }          // step 2b
-    | { phase: 'fileSaved'; savedPath: string }                                                                           // step 3b success
-    | { phase: 'fileSaveError'; error: string; passphrase: string; passphraseConfirm: string; comment: string };          // step 3b error — carries prior input so Back can restore the form
+    | { phase: 'fileEntry'; passphrase: string; passphraseConfirm: string; comment: string; showPass: boolean; includeState: boolean }          // step 2b
+    | { phase: 'fileSaved'; savedPath: string; sidecarPath?: string; sidecarBytes?: number }                              // step 3b success
+    | { phase: 'fileSaveError'; error: string; passphrase: string; passphraseConfirm: string; comment: string; includeState: boolean };          // step 3b error — carries prior input so Back can restore the form
 
   type RestoreStep =
     | { phase: 'pickSource' }                                                                                             // step 1
@@ -113,12 +113,28 @@
   // Transient UI state for pickType step (not yet committed to wizardState)
   let selectedBackupType = $state<'mnemonic' | 'file' | null>(null);
 
+  // ZEB-213: BackupStalenessWarning (mounted from App.svelte) dispatches
+  // 'harmony:backup-export-requested' on window when the user clicks the
+  // staleness banner's CTA. We jump straight into the backup wizard so the
+  // user doesn't have to scroll back to the identity panel to start.
+  // Only takes effect while the wizard is idle — interrupting a partial
+  // backup or restore mid-flow would be hostile UX.
+  function handleBackupExportRequested(): void {
+    if (wizardState.kind === 'idle') {
+      wizardState = { kind: 'backup', step: { phase: 'pickType' } };
+    }
+  }
+
   onMount(async () => {
+    window.addEventListener('harmony:backup-export-requested', handleBackupExportRequested);
     try {
       fullHash = await invoke<string>('current_identity_hash');
     } catch (e) {
       loadError = `Could not read identity store: ${e}. The wizard cannot continue.`;
     }
+    return () => {
+      window.removeEventListener('harmony:backup-export-requested', handleBackupExportRequested);
+    };
   });
 
   async function copyText(s: string): Promise<void> {
@@ -174,7 +190,7 @@
       // No await on this path — direct transition is safe.
       wizardState = {
         kind: 'backup',
-        step: { phase: 'fileEntry', passphrase: '', passphraseConfirm: '', comment: '', showPass: false },
+        step: { phase: 'fileEntry', passphrase: '', passphraseConfirm: '', comment: '', showPass: false, includeState: true },
       };
     }
   }
@@ -187,7 +203,7 @@
     // the DOM. Mirrors the existing guard in commitRestore.
     // (CodeRabbit, PR #66 review.)
     if (backupInFlight) return;
-    const { passphrase, passphraseConfirm, comment } = wizardState.step;
+    const { passphrase, passphraseConfirm, comment, includeState } = wizardState.step;
     if (!passphrase || passphrase !== passphraseConfirm) return;
 
     // ZEB-202: enforce passphrase length floor BEFORE opening the OS
@@ -204,6 +220,7 @@
           passphrase,
           passphraseConfirm,
           comment,
+          includeState,
         },
       };
       return;
@@ -243,6 +260,7 @@
             passphrase,
             passphraseConfirm,
             comment,
+            includeState,
           },
         };
         return;
@@ -258,20 +276,33 @@
       const epoch2 = wizardState;
 
       try {
-        // NOTE: this IPC returns `String` (the saved path), NOT `ExportInfo`.
-        // The owner-export sibling (`export_owner_recovery_file_to_path`)
-        // returns `ExportInfo { identityHash, byteLen, path }` because
-        // DevicesPanel's success banner uses the metadata fields. This
-        // wizard only needs the path, so the IPC stays a bare String —
-        // see Task 4 of `docs/plans/2026-04-29-zeb-194-export-path-capability-token-plan.md`.
-        const savedPath = await invoke<string>('export_recovery_file_to_path', {
-          pathToken,
-          passphrase,
-          comment: comment || null,
-        });
+        // ZEB-213: this IPC now returns RecoveryFileExportInfo
+        // { savedPath, sidecarPath?, sidecarBytes } — the sidecar fields
+        // are populated when `includeState == true` AND the owner-state
+        // CRDT exists on disk. The completion screen surfaces both files.
+        // (Previously a bare `String`; the wider shape matches the
+        // owner-export sibling now that the wizard needs to display
+        // multi-file output.)
+        const info = await invoke<{ savedPath: string; sidecarPath: string | null; sidecarBytes: number }>(
+          'export_recovery_file_to_path',
+          {
+            pathToken,
+            passphrase,
+            comment: comment || null,
+            includeState,
+          },
+        );
 
         if (wizardState !== epoch2) return;
-        wizardState = { kind: 'backup', step: { phase: 'fileSaved', savedPath } };
+        wizardState = {
+          kind: 'backup',
+          step: {
+            phase: 'fileSaved',
+            savedPath: info.savedPath,
+            sidecarPath: info.sidecarPath ?? undefined,
+            sidecarBytes: info.sidecarBytes,
+          },
+        };
       } catch (e) {
         if (wizardState !== epoch2) return;
         // Carry the form input forward so Back returns the user to a populated
@@ -284,6 +315,7 @@
             passphrase,
             passphraseConfirm,
             comment,
+            includeState,
           },
         };
       }
@@ -711,6 +743,21 @@
           placeholder="laptop-2026-04-15"
         />
       </label>
+      <label class="include-state-toggle">
+        <input
+          type="checkbox"
+          checked={wizardState.step.includeState}
+          onchange={(e) => {
+            if (wizardState.kind === 'backup' && wizardState.step.phase === 'fileEntry') {
+              wizardState = {
+                kind: 'backup',
+                step: { ...wizardState.step, includeState: (e.currentTarget as HTMLInputElement).checked },
+              };
+            }
+          }}
+        />
+        Include nav tree + DM history (recommended)
+      </label>
       <div class="actions">
         <button disabled={backupInFlight} onclick={resetToIdle}>Cancel</button>
         <button
@@ -724,6 +771,14 @@
       <h3 class="section-title">Recovery file saved</h3>
       <p class="hash-anchor">Backing up identity {displayHash}</p>
       <p>✓ Wrote recovery file to <code>{wizardState.step.savedPath}</code></p>
+      {#if wizardState.step.sidecarPath}
+        <p>
+          ✓ Wrote state sidecar to <code>{wizardState.step.sidecarPath}</code>
+          {#if wizardState.step.sidecarBytes !== undefined}
+            ({Math.max(1, Math.round(wizardState.step.sidecarBytes / 1024))} KB)
+          {/if}
+        </p>
+      {/if}
       <div class="actions">
         <button onclick={resetToIdle}>Done</button>
       </div>
@@ -735,10 +790,10 @@
       <div class="actions">
         <button onclick={() => {
           if (wizardState.kind === 'backup' && wizardState.step.phase === 'fileSaveError') {
-            const { passphrase, passphraseConfirm, comment } = wizardState.step;
+            const { passphrase, passphraseConfirm, comment, includeState } = wizardState.step;
             wizardState = {
               kind: 'backup',
-              step: { phase: 'fileEntry', passphrase, passphraseConfirm, comment, showPass: false },
+              step: { phase: 'fileEntry', passphrase, passphraseConfirm, comment, showPass: false, includeState },
             };
           }
         }}>Back</button>
@@ -1079,5 +1134,14 @@
     font-size: 0.85em;
     margin: 2px 0;
     padding-left: 8px;
+  }
+  .include-state-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 12px 0;
+    cursor: pointer;
+    color: var(--text-primary);
+    font-size: 0.9em;
   }
 </style>

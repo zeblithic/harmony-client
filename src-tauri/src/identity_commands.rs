@@ -281,27 +281,35 @@ pub fn preview_recovery_file_helper(
     })
 }
 
-/// Export the master seed as a passphrase-encrypted recovery file at `out_path`.
+/// Export the master seed (and optionally an owner-state sidecar) as a
+/// passphrase-encrypted recovery file at `out_path`.
 ///
 /// The GUI calls this after the user has chosen an output path and typed a
 /// passphrase in the file-backup wizard. The `comment` field is stored in
 /// the backup metadata and shown back to the user on restore.
 ///
+/// `include_state == true` AND a sibling `owner_state_crdt.cbor` exists ⇒
+/// also emit the `<out_path>.state` HRSS sidecar with nav-tree + DM history.
+/// `include_state == false` OR no owner-state file ⇒ HRMR-only export
+/// (atomic; HRMR is removed on sidecar-write failure so the operator
+/// never sees a mismatched half-pair).
+///
 /// The passphrase is threaded directly into
-/// [`recovery_cli::export_recovery_file_with_keychain`] as a `SecretString`
-/// — never via process-global env vars. `std::env::set_var` is unsafe in a
-/// multithreaded program (per Rust docs: another thread reading
-/// `getenv` concurrently can race), so a Tauri GUI process must not touch
-/// it from a command handler (CodeRabbit round 5). `secrecy::SecretString`
-/// also zeroizes the heap allocation on drop, which a `String` env var
-/// does not.
+/// [`recovery_cli::export_recovery_file_pair_with_keychain`] as a
+/// `SecretString` — never via process-global env vars. `std::env::set_var`
+/// is unsafe in a multithreaded program (per Rust docs: another thread
+/// reading `getenv` concurrently can race), so a Tauri GUI process must
+/// not touch it from a command handler (CodeRabbit round 5).
+/// `secrecy::SecretString` also zeroizes the heap allocation on drop,
+/// which a `String` env var does not.
 pub fn export_recovery_file_to_path_helper(
     plaintext_path: &Path,
     out_path: &Path,
     passphrase: &str,
     comment: Option<String>,
+    include_state: bool,
     keychain: Option<KeychainStore>,
-) -> Result<(), String> {
+) -> Result<recovery_cli::ExportResult, String> {
     use secrecy::SecretString;
 
     // Reject oversized comments before any I/O — the inner write would
@@ -316,12 +324,24 @@ pub fn export_recovery_file_to_path_helper(
         }
     }
 
+    // The harmony dir hosts the owner-state CRDT and the last_backup.json
+    // metadata file. Production wires plaintext_path = <harmony>/identity.key,
+    // so plaintext_path.parent() is the harmony dir. Mirrors the CLI helper
+    // `export_recovery_file_cli`.
+    let harmony_dir = plaintext_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
     let pass = SecretString::from(passphrase.to_string());
-    recovery_cli::export_recovery_file_with_keychain(
+    recovery_cli::export_recovery_file_pair_with_keychain(
         plaintext_path,
+        &harmony_dir,
         out_path,
         comment.as_deref(),
         Some(&pass),
+        include_state,
+        /*force=*/ true,
         keychain,
     )
 }
@@ -453,19 +473,45 @@ pub async fn preview_recovery_file(
     run_blocking(move || preview_recovery_file_helper(Path::new(&in_path), &passphrase)).await
 }
 
-/// Export the master seed as a passphrase-encrypted recovery file at the
-/// path the user confirmed via `request_export_save_path`. The renderer
-/// passes back the opaque token from that dialog command — it never names
-/// the path directly.
+/// Successful return shape for [`export_recovery_file_to_path`].
 ///
-/// Returns the path that was actually written to, so the renderer (which
-/// no longer knows the path) can display "saved to X" feedback.
+/// The renderer no longer knows the absolute path (single-use save-path
+/// token replaced it), and as of ZEB-213 also doesn't know whether a
+/// `.state` sidecar was emitted (depends on whether owner-state existed
+/// on disk). Both pieces of information are surfaced so the success
+/// screen can list both files with sizes.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryFileExportInfo {
+    /// Absolute path of the HRMR (identity) recovery file that was written.
+    pub saved_path: String,
+    /// Absolute path of the HRSS state sidecar, when emitted. `None` when
+    /// `include_state == false` or no owner-state CRDT existed on disk.
+    pub sidecar_path: Option<String>,
+    /// Bytes written to the sidecar (`0` when no sidecar was emitted).
+    /// Surfaced so the GUI can display a "(NN KB)" hint next to the path.
+    pub sidecar_bytes: usize,
+}
+
+/// Export the master seed (and optionally an owner-state sidecar) as a
+/// passphrase-encrypted recovery file at the path the user confirmed via
+/// `request_export_save_path`. The renderer passes back the opaque token
+/// from that dialog command — it never names the path directly.
+///
+/// `include_state == true` AND a sibling owner-state CRDT exists ⇒ the
+/// `<path>.state` sidecar is also written atomically (see
+/// [`recovery_cli::export_recovery_file_pair_with_keychain`]).
+///
+/// Returns the paths that were actually written to and the sidecar byte
+/// count, so the renderer (which no longer knows the path) can display
+/// "saved to X / wrote sidecar Y (NN KB)" feedback.
 #[tauri::command]
 pub async fn export_recovery_file_to_path(
     path_token: String,
     passphrase: String,
     comment: Option<String>,
-) -> Result<String, String> {
+    include_state: bool,
+) -> Result<RecoveryFileExportInfo, String> {
     // ZEB-202: reject under-length passphrases BEFORE any I/O or
     // token consumption. Codepoint count (`.chars().count()`)
     // matches the JS frontend's `[...str].length` check so
@@ -498,14 +544,19 @@ pub async fn export_recovery_file_to_path(
         let out_path = crate::owner_state::take_path_token(&path_uuid).ok_or_else(|| {
             "Save path token expired or invalid. Please re-trigger backup.".to_string()
         })?;
-        export_recovery_file_to_path_helper(
+        let result = export_recovery_file_to_path_helper(
             &plaintext_path,
             &out_path,
             &passphrase,
             comment,
+            include_state,
             KeychainStore::new().ok(),
         )?;
-        Ok(out_path.display().to_string())
+        Ok(RecoveryFileExportInfo {
+            saved_path: result.hrmr_path.display().to_string(),
+            sidecar_path: result.hrss_path.map(|p| p.display().to_string()),
+            sidecar_bytes: result.snapshot_bytes_written,
+        })
     })
     .await
 }
@@ -863,6 +914,7 @@ mod tests {
             &recovery_path,
             "any-pass",
             Some(too_long),
+            /*include_state=*/ false,
             None,
         )
         .expect_err("oversized comment must be rejected");
@@ -882,6 +934,7 @@ mod tests {
             &recovery_path,
             "any-pass",
             Some(max_ok),
+            /*include_state=*/ false,
             None,
         )
         .expect("comment at exactly the cap is allowed");
@@ -904,6 +957,7 @@ mod tests {
             bogus.to_string(),
             "passphrase-12+".into(),
             None,
+            /*include_state=*/ false,
         ));
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -939,6 +993,7 @@ mod tests {
             token.to_string(),
             "short-pass".into(), // 10 codepoints, < MIN_RECOVERY_PASSPHRASE_LEN
             None,
+            /*include_state=*/ false,
         ));
         let err = result.expect_err("under-length passphrase must be rejected");
         assert!(

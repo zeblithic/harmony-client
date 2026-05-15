@@ -572,11 +572,13 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
         return 'path-tok';
       }
       if (cmd === 'export_recovery_file_to_path') {
-        const a = args as { pathToken: string; passphrase: string; comment: string | null };
+        const a = args as { pathToken: string; passphrase: string; comment: string | null; includeState: boolean };
         expect(a.pathToken).toBe('path-tok');
         expect(a.passphrase).toBe('long-enough-pass');
         expect(a.comment).toBe('laptop-2026-04-15');
-        return savePath;
+        // ZEB-213: includeState defaults to true (recommended).
+        expect(a.includeState).toBe(true);
+        return { savedPath: savePath, sidecarPath: null, sidecarBytes: 0 };
       }
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -602,7 +604,7 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
       if (cmd === 'request_export_save_path') return 'path-tok';
       if (cmd === 'export_recovery_file_to_path') {
         capturedComment = (args as { comment: string | null }).comment;
-        return savePath;
+        return { savedPath: savePath, sidecarPath: null, sidecarBytes: 0 };
       }
       throw new Error(`unexpected: ${cmd}`);
     });
@@ -623,7 +625,7 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
     mockInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'current_identity_hash') return 'a'.repeat(32);
       if (cmd === 'request_export_save_path') return 'path-tok';
-      if (cmd === 'export_recovery_file_to_path') return savePath;
+      if (cmd === 'export_recovery_file_to_path') return { savedPath: savePath, sidecarPath: null, sidecarBytes: 0 };
       throw new Error(`unexpected: ${cmd}`);
     });
 
@@ -763,8 +765,9 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
   it('cancel button is disabled while file write is pending', async () => {
     const savePath = '/tmp/identity.recovery';
 
-    let resolveWrite!: (path: string) => void;
-    const writePromise = new Promise<string>((resolve) => { resolveWrite = resolve; });
+    type ExportInfo = { savedPath: string; sidecarPath: string | null; sidecarBytes: number };
+    let resolveWrite!: (info: ExportInfo) => void;
+    const writePromise = new Promise<ExportInfo>((resolve) => { resolveWrite = resolve; });
 
     mockInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === 'current_identity_hash') return 'a'.repeat(32);
@@ -787,7 +790,7 @@ describe('Backup wizard — step 3b (save recovery file)', () => {
     expect(screen.getByRole('button', { name: /cancel/i })).toBeDisabled();
 
     // Resolve the pending write — wizard transitions to the success state.
-    resolveWrite(savePath);
+    resolveWrite({ savedPath: savePath, sidecarPath: null, sidecarBytes: 0 });
     await screen.findByText(/recovery file saved/i);
   });
 
