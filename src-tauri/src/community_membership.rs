@@ -1394,10 +1394,10 @@ pub fn materialize(
                 // surfaced separately via settings-panel listings.
             }
             MembershipEventKind::PendingJoin { .. } => {
-                // ZEB-254: materialize wiring ships in Task 3.
+                // ZEB-254: materialize wiring ships in Task 4.
             }
             MembershipEventKind::JoinCountersign { .. } => {
-                // ZEB-254: materialize wiring ships in Task 3.
+                // ZEB-254: materialize wiring ships in Task 4.
             }
         }
     }
