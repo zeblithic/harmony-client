@@ -10,6 +10,7 @@
   import NotificationSettingsPanel from './lib/components/NotificationSettingsPanel.svelte';
   import ProfileEditor from './lib/components/ProfileEditor.svelte';
   import IdentityPanel from './lib/components/IdentityPanel.svelte';
+  import BackupStalenessWarning from './lib/components/BackupStalenessWarning.svelte';
   import DevicesPanel from './lib/components/DevicesPanel.svelte';
   import SpellbookMode from './lib/components/SpellbookMode.svelte';
   import FlashcardStats from './lib/components/FlashcardStats.svelte';
@@ -1217,9 +1218,17 @@
     }
     return [...peerMap.values()];
   });
+
+  function handleExportRequested() {
+    // Surface the existing IdentityPanel backup flow via an event bus.
+    // IdentityPanel listens for this on window in its onMount.
+    window.dispatchEvent(new CustomEvent('harmony:backup-export-requested'));
+  }
 </script>
 
 <svelte:window bind:innerWidth />
+
+<BackupStalenessWarning onExportRequested={handleExportRequested} />
 
 <Layout {collapsed} {showSettings} mode={appMode} mailSelected={selectedMailCid !== null}>
   {#snippet nav()}
