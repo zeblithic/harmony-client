@@ -2547,6 +2547,68 @@ where
     Ok(out)
 }
 
+/// ZEB-159: wraps a per-CID fetch closure so each successful fetch
+/// fire-and-forget-admits the bytes to the local StorageTier cache via
+/// `cas_op_tx`. Mirrors the GetOrFetch admit-hop pattern at
+/// `event_loop.rs:1625` so fetched bundle trees populate the cache
+/// before `fetch_completion_rx`'s pin cascade walks them.
+///
+/// Admission is fire-and-forget: cache rejection (W-TinyLFU policy)
+/// or channel saturation does NOT fail the fetch — the caller still
+/// gets the bytes; only the per-CID cache population is best-effort.
+/// On `fetch_one` failure (Err), no admission is sent for that CID.
+//
+// `dead_code` allow: Task 1 of the ZEB-159 plan introduces this helper
+// in isolation (TDD-shaped). The production wiring lands in Task 2 (the
+// next commit on this branch), which wires the wrapper into the
+// `fetch_rx` arm of `run_event_loop`. The unit tests below
+// (`mod fetch_one_wrapper_tests`) are `#[cfg(test)]` and don't count
+// against the non-test lib build.
+//
+// `clippy::type_complexity` allow: the return type is intentionally
+// explicit (`impl Fn(...) -> Pin<Box<dyn Future>> + Clone + Send +
+// 'static`) because the wrapped closure must be `Send + 'static` to be
+// captured into `tokio::spawn(async move { ... })` in the `fetch_rx`
+// arm, and the returned future must be `Send` so the spawned task is
+// `Send` (Tauri command futures require this). Factoring into a `type`
+// alias would either (a) require a trait-alias nightly feature or
+// (b) hide the load-bearing bounds behind a name and force readers to
+// chase the alias to understand the contract.
+#[allow(dead_code)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn wrap_fetch_one_with_admission<F, Fut>(
+    fetch_one: F,
+    cas_op_tx: tokio::sync::mpsc::Sender<crate::content_store::CasOp>,
+) -> impl Fn(
+    ContentId,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>>
+       + Clone
+       + Send
+       + 'static
+where
+    F: Fn(ContentId) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Result<Vec<u8>, String>> + Send + 'static,
+{
+    move |cid: ContentId| {
+        let inner = fetch_one.clone();
+        let cas_op_tx = cas_op_tx.clone();
+        Box::pin(async move {
+            let bytes = inner(cid).await?;
+            // Fire-and-forget. `bytes.clone()` is load-bearing:
+            // `CasOp::PutLocal.blob` consumes the bytes, but the caller
+            // (and `fetch_recursive`'s bundle parser) needs them too.
+            // `reply: None` signals fire-and-forget intent — the
+            // PutLocal handler skips its reply.send when reply is None.
+            let _ = cas_op_tx.try_send(crate::content_store::CasOp::PutLocal {
+                cid,
+                blob: bytes.clone(),
+                reply: None,
+            });
+            Ok(bytes)
+        })
+    }
+}
+
 #[cfg(test)]
 mod descendants_tests {
     use super::collect_descendants;
@@ -2692,6 +2754,146 @@ mod fetch_recursive_tests {
 
         let err = fetch_recursive(fetcher, root).await.unwrap_err();
         assert!(err.contains("missing cid"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod fetch_one_wrapper_tests {
+    use super::{fetch_recursive, wrap_fetch_one_with_admission};
+    use crate::content_store::CasOp;
+    use harmony_content::bundle::BundleBuilder;
+    use harmony_content::cid::{ContentFlags, ContentId};
+    use std::collections::HashMap;
+    use tokio::sync::mpsc;
+
+    /// Drain the cas_op receiver into a Vec of (ContentId, Vec<u8>) for
+    /// assertions. Each iteration matches `CasOp::PutLocal { reply: None }`
+    /// — `GetOrFetch` should never appear in these test scenarios.
+    fn drain_admits(rx: &mut mpsc::Receiver<CasOp>) -> Vec<(ContentId, Vec<u8>)> {
+        let mut out = Vec::new();
+        while let Ok(op) = rx.try_recv() {
+            match op {
+                CasOp::PutLocal { cid, blob, reply } => {
+                    assert!(
+                        reply.is_none(),
+                        "wrapper must use fire-and-forget reply: None"
+                    );
+                    out.push((cid, blob));
+                }
+                CasOp::GetOrFetch { .. } => {
+                    panic!("wrapper must not send GetOrFetch");
+                }
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn admits_each_fetched_cid_for_a_bundle_tree() {
+        // Bundle tree: root → [a, b, c]
+        let a_bytes = b"aaa".to_vec();
+        let b_bytes = b"bbbb".to_vec();
+        let c_bytes = b"ccccc".to_vec();
+        let a = ContentId::for_book(&a_bytes, ContentFlags::default()).unwrap();
+        let b = ContentId::for_book(&b_bytes, ContentFlags::default()).unwrap();
+        let c = ContentId::for_book(&c_bytes, ContentFlags::default()).unwrap();
+
+        let mut builder = BundleBuilder::new();
+        builder.add(a).add(b).add(c);
+        let (payload, root) = builder.build_with_flags(ContentFlags::default()).unwrap();
+
+        let mut store: HashMap<ContentId, Vec<u8>> = HashMap::new();
+        store.insert(a, a_bytes.clone());
+        store.insert(b, b_bytes.clone());
+        store.insert(c, c_bytes.clone());
+        store.insert(root, payload.clone());
+
+        let fetcher = move |cid: ContentId| {
+            let bytes = store.get(&cid).cloned();
+            std::future::ready(bytes.ok_or_else(|| format!("missing cid: {cid:?}")))
+        };
+
+        let (cas_op_tx, mut cas_op_rx) = mpsc::channel::<CasOp>(16);
+        let wrapped = wrap_fetch_one_with_admission(fetcher, cas_op_tx);
+
+        // Drive through fetch_recursive — every per-CID call goes through
+        // the wrapper, so every successful fetch must produce a PutLocal.
+        let got = fetch_recursive(wrapped, root).await.unwrap();
+
+        // fetch_recursive's output is the concatenated leaves (existing
+        // contract; we don't break it).
+        let mut expected_concat = a_bytes.clone();
+        expected_concat.extend_from_slice(&b_bytes);
+        expected_concat.extend_from_slice(&c_bytes);
+        assert_eq!(got, expected_concat);
+
+        // Admission: every CID encountered (root bundle + 3 leaves).
+        let admits = drain_admits(&mut cas_op_rx);
+        assert_eq!(admits.len(), 4, "expected 4 admissions, got {:?}", admits);
+
+        // Each admission carries the correct bytes for its CID.
+        let admit_map: HashMap<ContentId, Vec<u8>> = admits.into_iter().collect();
+        assert_eq!(admit_map.get(&root), Some(&payload));
+        assert_eq!(admit_map.get(&a), Some(&a_bytes));
+        assert_eq!(admit_map.get(&b), Some(&b_bytes));
+        assert_eq!(admit_map.get(&c), Some(&c_bytes));
+    }
+
+    #[tokio::test]
+    async fn skips_admit_on_fetch_failure() {
+        // fetch_one returns Err for the requested CID. Verify no
+        // CasOp::PutLocal was sent.
+        let cid = ContentId::for_book(b"missing", ContentFlags::default()).unwrap();
+        let fetcher = |_cid: ContentId| {
+            std::future::ready(Err::<Vec<u8>, String>(
+                "synthetic fetch failure".to_string(),
+            ))
+        };
+
+        let (cas_op_tx, mut cas_op_rx) = mpsc::channel::<CasOp>(4);
+        let wrapped = wrap_fetch_one_with_admission(fetcher, cas_op_tx);
+
+        let result = wrapped(cid).await;
+        assert!(
+            result.is_err(),
+            "expected Err propagation; got {:?}",
+            result
+        );
+        assert!(result.unwrap_err().contains("synthetic fetch failure"));
+
+        // No admission should have been sent.
+        let admits = drain_admits(&mut cas_op_rx);
+        assert!(
+            admits.is_empty(),
+            "wrapper must not admit on fetch failure; got {:?}",
+            admits
+        );
+    }
+
+    #[tokio::test]
+    async fn admit_failure_does_not_fail_fetch() {
+        // cas_op channel is closed (receiver dropped). The wrapper's
+        // try_send returns Err but the wrapper must NOT propagate that
+        // — the caller still gets the fetched bytes.
+        let bytes = b"payload".to_vec();
+        let cid = ContentId::for_book(&bytes, ContentFlags::default()).unwrap();
+        let bytes_for_fetcher = bytes.clone();
+        let fetcher = move |_cid: ContentId| {
+            let b = bytes_for_fetcher.clone();
+            std::future::ready(Ok::<Vec<u8>, String>(b))
+        };
+
+        let (cas_op_tx, cas_op_rx) = mpsc::channel::<CasOp>(1);
+        drop(cas_op_rx); // close the receiver — every try_send will Err.
+        let wrapped = wrap_fetch_one_with_admission(fetcher, cas_op_tx);
+
+        let result = wrapped(cid).await;
+        assert!(
+            result.is_ok(),
+            "admission failure must not propagate to fetch caller; got {:?}",
+            result
+        );
+        assert_eq!(result.unwrap(), bytes);
     }
 }
 
