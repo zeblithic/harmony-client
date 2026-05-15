@@ -2498,17 +2498,17 @@ async fn start_node(
         // the `superseded` sentinel instead.
         let mut thread_install_failure: Option<String> = None;
         if !superseded {
-            // ZEB-221: bump `generation` HERE at the install site so the
-            // field retains its pre-ZEB-221 "successful install marker"
-            // semantics. Post-install code (pairing-handle install,
-            // failure cleanup at line ~2947, stop_inner gating) compares
-            // `guard.generation` against `our_gen` to detect "did a later
-            // install actually complete?" — which is strictly stronger
-            // than "did a later attempt merely start?" and is what the
-            // post-install paths need. Race detection between concurrent
-            // start_node attempts uses `install_seq` instead, validated
-            // by check_install_seq_or_supersede above.
-            guard.generation += 1;
+            // ZEB-221 (CodeRabbit R2 finding): the `generation` bump is
+            // INSIDE the `Ok(thread)` arm of `match thread_result` below,
+            // NOT here. Bumping pre-spawn would consume a generation even
+            // when thread::Builder::spawn fails (OOM, ulimit), violating
+            // the documented "successful install only" semantics that
+            // post-install checks rely on (pairing-handle install at
+            // ~2799-2806, failure cleanup at ~2945-2948, stop_inner
+            // gating). Race detection between concurrent start_node
+            // attempts uses `install_seq` (already validated by
+            // check_install_seq_or_supersede above), so this site no
+            // longer needs to bump anything.
 
             // ZEB-155: load the sidecar NOW — after stop_handles has
             // quiesced the previous node and under the state lock — so any
@@ -2706,6 +2706,14 @@ async fn start_node(
             // and clean up below.
             match thread_result {
                 Ok(thread) => {
+                    // ZEB-221 (CodeRabbit R2): bump generation ONLY here,
+                    // inside the Ok(thread) arm, so the field reflects
+                    // "successful install" — never advanced on thread-
+                    // spawn failure. Post-install checks (pairing-handle
+                    // install, failure cleanup, stop_inner gating) compare
+                    // `guard.generation` against `our_gen` and rely on
+                    // this invariant.
+                    guard.generation += 1;
                     guard.thread = Some(thread);
                     guard.shutdown_tx = Some(shutdown_tx);
                     guard.publish_tx = Some(publish_tx);
