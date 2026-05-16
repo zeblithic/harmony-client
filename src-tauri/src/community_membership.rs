@@ -1476,9 +1476,31 @@ pub fn materialize_with_now(
 
                 // M1: triggered_by lookup restricted to causal prefix (events
                 // before this catchup in the sorted replay).
+                //
+                // ZEB-254 R5-1: accept BOTH legacy `Join` AND countersigned
+                // `PendingJoin` as a valid catchup trigger. The PendingJoin
+                // arm below enqueues a joiner into `pending_catchup_for`
+                // when they're admitted via countersign in a rotated epoch
+                // (line ~1578); without accepting PendingJoin here, that
+                // entry can never be cleared by an EpochCatchup pointing
+                // at the PendingJoin event — admins would have to mint a
+                // legacy `Join` (which they never do for this path), leaving
+                // the joiner permanently flagged for catchup.
+                //
+                // Uncountersigned PendingJoin is intentionally NOT accepted:
+                // a still-pending joiner is not yet a member, and no admin
+                // would (or should) issue a catchup for them. The
+                // countersigned-ness check uses the same Pre-Pass set
+                // (`countersigned_pending_ids`) consumed by the PendingJoin
+                // materialize arm, so the two paths stay consistent.
                 let triggered_event = sorted[..idx].iter().find(|e| e.id == *triggered_by);
                 let join_actor = match triggered_event.map(|e| &e.kind) {
                     Some(MembershipEventKind::Join) => triggered_event.map(|e| e.actor),
+                    Some(MembershipEventKind::PendingJoin { .. })
+                        if countersigned_pending_ids.contains(triggered_by) =>
+                    {
+                        triggered_event.map(|e| e.actor)
+                    }
                     _ => None,
                 };
                 let Some(target) = join_actor else {
@@ -5470,6 +5492,259 @@ mod zeb_254_materialize_tests {
             mat.pending_rotation_for.contains(&member_addr),
             "kick of an established Joined member MUST mark them for \
              EpochRotation (ZEB-249 invariant preserved by R4-1 guard)"
+        );
+    }
+
+    /// ZEB-254 R5-1: EpochCatchup with `triggered_by` pointing to a
+    /// countersigned PendingJoin (not a legacy Join) MUST clear that
+    /// joiner from `pending_catchup_for`.
+    ///
+    /// Repro: In a community whose epoch has already rotated, a joiner
+    /// admitted via PendingJoin + JoinCountersign gets enqueued into
+    /// `pending_catchup_for` (mirrors the legacy Join arm's catchup
+    /// invariant). Before R5-1, the EpochCatchup arm only accepted
+    /// `triggered_by` pointing to a legacy `Join`, so the natural
+    /// catchup event (issued by an admin pointing at the PendingJoin)
+    /// matched no triggering event and silently no-op'd — leaving the
+    /// member permanently flagged for catchup.
+    #[test]
+    fn epoch_catchup_clears_pending_catchup_for_pending_join_admission() {
+        let community = SpaceId([7u8; 16]);
+        let (admin_priv, admin_addr, _) = synth_identity(2);
+        let (joiner_priv, joiner_addr, joiner_pub) = synth_identity(1);
+        // Bob is an existing member who will Leave to give us a valid
+        // EpochRotation trigger (rotation requires triggered_by to be a
+        // Kick or Leave per the rotation arm at line ~1376).
+        let (bob_priv, bob_addr, _) = synth_identity(3);
+
+        // 1. Bootstrap admin Join. Admin gets power=100 via the bootstrap
+        //    rule in materialize (line ~1081).
+        let admin_join =
+            synth_legacy_join(&admin_priv, admin_addr, community, 1_700_000_000_000, 10);
+
+        // 2. Bob joins so we have someone to remove.
+        let bob_join = synth_legacy_join(&bob_priv, bob_addr, community, 1_700_000_000_500, 11);
+
+        // 3. Bob leaves. This becomes the rotation trigger.
+        let bob_leave = synth_leave(&bob_priv, bob_addr, community, 1_700_000_001_000, 12);
+
+        // 4. EpochRotation 0→1 issued by admin, triggered_by=bob_leave.
+        //    recipient_ciphertexts must include all remaining
+        //    Joined/Invited members EXCEPT the target (bob); after
+        //    bob_leave, only admin is Joined, so recipients = [admin].
+        let rotation_payload = EventPayload {
+            id: [20; 16],
+            community_id: community,
+            kind: MembershipEventKind::EpochRotation {
+                prior_epoch: 0,
+                triggered_by: bob_leave.id,
+                recipient_ciphertexts: vec![RecipientCiphertext {
+                    recipient: admin_addr,
+                    sealed: vec![0u8; 92],
+                }],
+            },
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 1_700_000_001_500,
+                logical: 0,
+                device_id: "admin".into(),
+            },
+        };
+        let rotation =
+            sign_event_with_identity(&rotation_payload, &admin_priv).expect("sign rotation");
+
+        // 5. Joiner mints PendingJoin (epoch already at 1 by this point).
+        let pending = synth_pending_join(
+            &joiner_priv,
+            joiner_addr,
+            joiner_pub,
+            community,
+            1_700_000_002_000,
+            30,
+        );
+
+        // 6. Admin counter-signs the PendingJoin. Materializer now treats
+        //    joiner as Joined AND, because current_epoch=1, enqueues them
+        //    into pending_catchup_for (PendingJoin arm at line ~1578).
+        let countersign = synth_join_countersign(
+            &admin_priv,
+            admin_addr,
+            community,
+            pending.id,
+            1_700_000_003_000,
+            40,
+        );
+
+        // Sanity-check the precondition: after PendingJoin + countersign,
+        // joiner IS in pending_catchup_for.
+        {
+            let mat_pre = materialize(
+                &[
+                    admin_join.clone(),
+                    bob_join.clone(),
+                    bob_leave.clone(),
+                    rotation.clone(),
+                    pending.clone(),
+                    countersign.clone(),
+                ],
+                admin_addr,
+            );
+            assert_eq!(
+                mat_pre.current_epoch,
+                Some(1),
+                "EpochRotation must advance current_epoch to 1"
+            );
+            assert_eq!(
+                mat_pre.members.get(&joiner_addr).map(|m| m.status),
+                Some(MemberStatus::Joined),
+                "joiner must be Joined after countersign"
+            );
+            assert!(
+                mat_pre.pending_catchup_for.contains(&joiner_addr),
+                "PRECONDITION: countersigned PendingJoin in rotated epoch \
+                 MUST enqueue joiner into pending_catchup_for"
+            );
+        }
+
+        // 7. Admin issues EpochCatchup at epoch=1, triggered_by=PendingJoin
+        //    event id, recipient=joiner. Pre-R5-1 this was a silent no-op
+        //    (only Join-kind triggered_by was accepted); post-R5-1 the
+        //    countersigned-PendingJoin lookup must succeed and clear the
+        //    joiner from pending_catchup_for.
+        let catchup_payload = EventPayload {
+            id: [50; 16],
+            community_id: community,
+            kind: MembershipEventKind::EpochCatchup {
+                epoch: 1,
+                triggered_by: pending.id,
+                recipient_ciphertexts: vec![RecipientCiphertext {
+                    recipient: joiner_addr,
+                    sealed: vec![0u8; 92],
+                }],
+            },
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 1_700_000_004_000,
+                logical: 0,
+                device_id: "admin".into(),
+            },
+        };
+        let catchup =
+            sign_event_with_identity(&catchup_payload, &admin_priv).expect("sign catchup");
+
+        let mat = materialize(
+            &[
+                admin_join,
+                bob_join,
+                bob_leave,
+                rotation,
+                pending,
+                countersign,
+                catchup,
+            ],
+            admin_addr,
+        );
+
+        assert_eq!(
+            mat.current_epoch,
+            Some(1),
+            "current_epoch must still be 1 after catchup"
+        );
+        assert_eq!(
+            mat.members.get(&joiner_addr).map(|m| m.status),
+            Some(MemberStatus::Joined),
+            "joiner remains Joined after catchup"
+        );
+        assert!(
+            !mat.pending_catchup_for.contains(&joiner_addr),
+            "POST-R5-1: EpochCatchup with triggered_by=PendingJoin MUST clear \
+             joiner from pending_catchup_for (regression for unbounded catchup-pending state)"
+        );
+    }
+
+    /// ZEB-254 R5-1 negative: an EpochCatchup whose `triggered_by` points
+    /// to an UNCOUNTERSIGNED PendingJoin must be a no-op. A still-pending
+    /// joiner is not a member; no admin would (or should) issue catchup
+    /// keys to them. This guards against widening the trigger contract
+    /// past the intent of R5-1.
+    #[test]
+    fn epoch_catchup_ignores_uncountersigned_pending_join_trigger() {
+        let community = SpaceId([7u8; 16]);
+        let (admin_priv, admin_addr, _) = synth_identity(2);
+        let (joiner_priv, joiner_addr, joiner_pub) = synth_identity(1);
+        let (bob_priv, bob_addr, _) = synth_identity(3);
+
+        let admin_join =
+            synth_legacy_join(&admin_priv, admin_addr, community, 1_700_000_000_000, 10);
+        let bob_join = synth_legacy_join(&bob_priv, bob_addr, community, 1_700_000_000_500, 11);
+        let bob_leave = synth_leave(&bob_priv, bob_addr, community, 1_700_000_001_000, 12);
+        let rotation_payload = EventPayload {
+            id: [20; 16],
+            community_id: community,
+            kind: MembershipEventKind::EpochRotation {
+                prior_epoch: 0,
+                triggered_by: bob_leave.id,
+                recipient_ciphertexts: vec![RecipientCiphertext {
+                    recipient: admin_addr,
+                    sealed: vec![0u8; 92],
+                }],
+            },
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 1_700_000_001_500,
+                logical: 0,
+                device_id: "admin".into(),
+            },
+        };
+        let rotation =
+            sign_event_with_identity(&rotation_payload, &admin_priv).expect("sign rotation");
+        let pending = synth_pending_join(
+            &joiner_priv,
+            joiner_addr,
+            joiner_pub,
+            community,
+            1_700_000_002_000,
+            30,
+        );
+        // NOTE: no countersign event.
+        let catchup_payload = EventPayload {
+            id: [50; 16],
+            community_id: community,
+            kind: MembershipEventKind::EpochCatchup {
+                epoch: 1,
+                triggered_by: pending.id,
+                recipient_ciphertexts: vec![RecipientCiphertext {
+                    recipient: joiner_addr,
+                    sealed: vec![0u8; 92],
+                }],
+            },
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 1_700_000_004_000,
+                logical: 0,
+                device_id: "admin".into(),
+            },
+        };
+        let catchup =
+            sign_event_with_identity(&catchup_payload, &admin_priv).expect("sign catchup");
+
+        let mat = materialize(
+            &[admin_join, bob_join, bob_leave, rotation, pending, catchup],
+            admin_addr,
+        );
+
+        // Joiner is PendingJoin (uncountersigned, within expiry window).
+        assert_eq!(
+            mat.members.get(&joiner_addr).map(|m| m.status),
+            Some(MemberStatus::PendingJoin),
+            "uncountersigned PendingJoin within expiry window materializes as PendingJoin"
+        );
+        // pending_catchup_for is NOT populated for this joiner (only the
+        // countersigned-PendingJoin path enqueues), and the catchup itself
+        // would not clear anything regardless.
+        assert!(
+            !mat.pending_catchup_for.contains(&joiner_addr),
+            "uncountersigned PendingJoin must NOT be in pending_catchup_for"
         );
     }
 }

@@ -2118,7 +2118,12 @@ fn maybe_spawn_pending_join_clear(
 
     tokio::spawn(async move {
         // Check eligibility: is the target a self-authored PendingJoin?
-        {
+        // ZEB-254 R5-6: capture the target PendingJoin's HLC so we can
+        // verify it matches the Space's `pending_join_at` before clearing.
+        // Without this, a late JoinCountersign for an OLDER attempt could
+        // clear a NEWER pending state and hide a still-pending redemption
+        // (symmetric to R4-5 which fixed the boot-heal case).
+        let target_pending_at = {
             let state_g = community_state.lock().await;
             let target = match state_g.events.get(&target_event_id) {
                 Some(t) => t,
@@ -2138,7 +2143,8 @@ fn maybe_spawn_pending_join_clear(
             if !matches!(&target.kind, MembershipEventKind::PendingJoin { .. }) {
                 return;
             }
-        } // community_state lock released
+            target.at.clone()
+        }; // community_state lock released
 
         let wall_now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2159,8 +2165,32 @@ fn maybe_spawn_pending_join_clear(
         };
 
         // Already cleared — nothing to do (idempotent).
-        if existing.pending_join_at.is_none() {
-            return;
+        // ZEB-254 R5-6: also bail if pending_join_at points to a
+        // DIFFERENT attempt than the JoinCountersign's target. Compare
+        // full HLC equality — `Space.pending_join_at` is set to the
+        // PendingJoin event's `at` HLC at mint time (lib.rs:
+        // redeem_invite_inner), so equality on (wall_ms, logical,
+        // device_id) is the canonical "same attempt" check (mirrors
+        // R4-5's boot-heal full-HLC match at lib.rs:2424).
+        // If the user retried redemption (new PendingJoin with newer
+        // HLC) and a stale countersign for the OLDER attempt lands
+        // now, we must NOT clear the newer pending marker.
+        match existing.pending_join_at.as_ref() {
+            None => return,
+            Some(existing_at) if existing_at != &target_pending_at => {
+                tracing::debug!(
+                    community_id = ?community_id,
+                    target_event_id = ?target_event_id,
+                    existing_at = ?existing_at,
+                    target_at = ?target_pending_at,
+                    "ZEB-254 R5-6: pending-clear target HLC differs from Space.pending_join_at — \
+                     stale countersign for older attempt, skipping clear"
+                );
+                return;
+            }
+            Some(_) => {
+                // Matches — proceed to clear.
+            }
         }
 
         // Use monotonic HLC arithmetic: if wall_now_ms is strictly after

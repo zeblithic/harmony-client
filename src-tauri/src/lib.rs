@@ -10161,6 +10161,40 @@ where
     // ZEB-274: rollback on Err collapses into community_sync_guard Drop.
     fence_check()?;
 
+    // ZEB-254 R5-2: FINAL TOCTOU recheck before commit. The R3 (C2)
+    // recheck above narrows but does not close the window between the
+    // `take_pending_redemption` decision and this commit. A
+    // `JoinCountersign` can still land via state-root sync in that gap;
+    // its post-Inserted clear hook will run before `pending_join_at`
+    // exists, leaving this commit to write a stale `Some(...)` that
+    // greys the community until restart heal. Re-scan the engine
+    // immediately before acquiring the owner-state lock; if a
+    // countersign is now present, drop the timed-out flag so the
+    // commit below writes pending_join_at = None.
+    if pending_redemption_timed_out {
+        let already_countersigned = {
+            let state = engine_arc.state();
+            let g = state.lock().await;
+            g.events.values().any(|e| {
+                matches!(
+                    &e.kind,
+                    crate::community_membership::MembershipEventKind::JoinCountersign {
+                        target_event_id,
+                    } if *target_event_id == minted.bootstrap_join.id
+                )
+            })
+        };
+        if already_countersigned {
+            tracing::debug!(
+                community_id = %hex::encode(minted.community_id.0),
+                event_id = %hex::encode(minted.bootstrap_join.id),
+                "ZEB-254 R5-2: final pre-commit recheck found JoinCountersign — \
+                 dropping pending_redemption_timed_out so commit writes pending_join_at = None"
+            );
+            pending_redemption_timed_out = false;
+        }
+    }
+
     // 9. COMMIT owner-state Space as the LAST persistent step
     //    (ZEB-258 reorder). Pre-ZEB-267 this block also held the
     //    tracker_g guard to advance the tracker atomically with the

@@ -106,12 +106,24 @@
     // shape; the project hasn't moved to runes yet for this component.
     let lastWatchedCanModerate: boolean | undefined = undefined;
     let lastWatchedCommunityId: string | undefined = undefined;
+    // R5-3: monotonic token for watchDeps() invocations, separate from
+    // latestCallId. Each watchDeps() call captures `myWatchId =
+    // ++latestWatchId` at entry and re-checks it after every `await`
+    // boundary. If a newer watchDeps() invocation has started while we
+    // were awaiting (because canModerate or communityId changed mid-
+    // flight), the stale invocation bails out without registering a
+    // listener for the OLD community / overwriting convergedUnlisten.
+    // Without this, an `await refresh()` can resume after a newer
+    // deps-change has occurred, and the listener registered next would
+    // refresh the wrong panel on later converge events.
+    let latestWatchId = 0;
     $: void watchDeps(canModerate, communityId);
 
     async function watchDeps(canMod: boolean, cid: string) {
         if (canMod === lastWatchedCanModerate && cid === lastWatchedCommunityId) {
             return;
         }
+        const myWatchId = ++latestWatchId;
         lastWatchedCanModerate = canMod;
         lastWatchedCommunityId = cid;
         // Tear down any prior listener before re-registering.
@@ -138,13 +150,45 @@
             return;
         }
         await refresh();
+        // R5-3: post-refresh stale-check. If a newer watchDeps()
+        // invocation has started while refresh() was awaiting (e.g.,
+        // user switched community or canModerate flipped), abandon
+        // listener registration for the OLD community. The newer
+        // invocation owns convergedUnlisten now.
+        if (
+            myWatchId !== latestWatchId ||
+            cid !== communityId ||
+            canMod !== canModerate ||
+            !canModerate
+        ) {
+            return;
+        }
         try {
-            convergedUnlisten = await listen('community-state-sync-converged', async (evt) => {
+            const unlisten = await listen('community-state-sync-converged', async (evt) => {
                 const payload = evt.payload as { communityId?: string };
                 if (payload?.communityId === cid) {
                     await refresh();
                 }
             });
+            // R5-3: post-listen stale-check. Even after a successful
+            // refresh, the `await listen(...)` itself can race a deps
+            // change. If we are no longer the latest watch, tear down
+            // the listener we just registered (without overwriting
+            // convergedUnlisten — that belongs to the newer invocation).
+            if (
+                myWatchId !== latestWatchId ||
+                cid !== communityId ||
+                canMod !== canModerate ||
+                !canModerate
+            ) {
+                try {
+                    unlisten();
+                } catch {
+                    /* ignore */
+                }
+                return;
+            }
+            convergedUnlisten = unlisten;
         } catch (e) {
             // Event listener registration may fail in some test environments —
             // that's OK; manual refresh still works.

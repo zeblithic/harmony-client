@@ -595,9 +595,23 @@ async fn joiner_engine_clears_pending_join_at_on_countersign() {
     let tracker = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
 
     // ── Owner-state CRDT: seed a Space with pending_join_at = Some ─────
+    // ZEB-254 R5-6: `pending_join_at` MUST equal the PendingJoin event's
+    // `at` HLC (that's what redeem_invite_inner writes at mint time). The
+    // live pending-clear hook checks full-HLC equality before clearing
+    // (so a stale countersign for an older attempt cannot clear a newer
+    // pending marker). Use the same HLC as the PendingJoin event below
+    // (wall_ms = 1_700_000_002_000, device_id = "joiner-dev"). The Space's
+    // `created_at` / `updated_at` are kept at an earlier HLC to keep
+    // their narrative meaning ("Space was created first, then a pending
+    // join arrived later").
     let mut owner_state_inner = OwnerState::default();
-    let pending_hlc = Hlc {
+    let space_hlc = Hlc {
         wall_ms: 1_700_000_000_000,
+        logical: 0,
+        device_id: "joiner-dev".into(),
+    };
+    let pending_join_hlc = Hlc {
+        wall_ms: 1_700_000_002_000,
         logical: 0,
         device_id: "joiner-dev".into(),
     };
@@ -612,8 +626,8 @@ async fn joiner_engine_clears_pending_join_at_on_countersign() {
         custom_name: None,
         notification_pref: None,
         left_at: None,
-        created_at: pending_hlc.clone(),
-        updated_at: pending_hlc.clone(),
+        created_at: space_hlc.clone(),
+        updated_at: space_hlc.clone(),
         content_key: None,
         prior_content_keys: vec![],
         current_epoch: Some(0),
@@ -622,7 +636,7 @@ async fn joiner_engine_clears_pending_join_at_on_countersign() {
         admin_addr: Some(admin_addr),
         is_invite_only: Some(true),
         shared_in_profile: false,
-        pending_join_at: Some(pending_hlc.clone()),
+        pending_join_at: Some(pending_join_hlc.clone()),
     };
     owner_state_inner.apply_space_with_canonicalization(space);
     let crdt_state = Arc::new(Mutex::new(owner_state_inner));
