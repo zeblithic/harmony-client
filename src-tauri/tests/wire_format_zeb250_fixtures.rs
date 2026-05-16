@@ -11,11 +11,16 @@
 //! cryptographic validity — they pin BYTE LAYOUT only.
 
 use harmony_app::community_membership::{MembershipEventKind, ProposalKind};
+use harmony_app::community_state_crdt::CommunityState;
 use harmony_app::owner_state_crypto::canonical_cbor_encode;
-use harmony_app::owner_state_types::OwnerAddr;
+use harmony_app::owner_state_types::{OwnerAddr, SpaceId};
 
 const FIXTURE_TARGET_ADDR: OwnerAddr = OwnerAddr([0x11; 16]);
 const FIXTURE_TARGET_EVENT_ID: [u8; 16] = [0x66; 16];
+const FIXTURE_COMMUNITY_ID: SpaceId = SpaceId([0x77; 16]);
+
+const EXPECTED_COMMUNITY_STATE_WITH_ADMIN_QUORUM_HEX: &str =
+    "a3626369507777777777777777777777777777777762617103626576a0";
 
 // EXPECTED_*_HEX constants are populated by running the test once with
 // "FILL_AFTER" as the value; the panic message prints the actual hex
@@ -174,5 +179,48 @@ fn admin_countersign_canonical_cbor() {
     assert!(
         inner_map.iter().any(|(k, _)| k.as_text() == Some("ti")),
         "AdminCountersign inner map missing \"ti\" key"
+    );
+}
+
+#[test]
+fn community_state_with_admin_quorum_canonical_cbor() {
+    let mut state = CommunityState::new(FIXTURE_COMMUNITY_ID);
+    state.admin_quorum = 3;
+    let encoded = canonical_cbor_encode(&state).expect("encode");
+    let actual_hex = hex::encode(&encoded);
+    if EXPECTED_COMMUNITY_STATE_WITH_ADMIN_QUORUM_HEX.contains("FILL_AFTER") {
+        panic!(
+            "REGENERATE EXPECTED_COMMUNITY_STATE_WITH_ADMIN_QUORUM_HEX = \"{}\";",
+            actual_hex
+        );
+    }
+    assert_eq!(
+        actual_hex, EXPECTED_COMMUNITY_STATE_WITH_ADMIN_QUORUM_HEX,
+        "CommunityState with admin_quorum != 1 wire format changed"
+    );
+
+    // Structural sanity: the "aq" key must appear when admin_quorum != 1.
+    let value: ciborium::Value = ciborium::de::from_reader(&encoded[..]).expect("decode as value");
+    let map = value.as_map().expect("outer is map");
+    assert!(
+        map.iter().any(|(k, _)| k.as_text() == Some("aq")),
+        "CommunityState with non-default admin_quorum should emit 'aq' key"
+    );
+}
+
+#[test]
+fn community_state_default_quorum_omits_aq_key() {
+    // Byte-compat with pre-ZEB-250 communities: admin_quorum == 1 must
+    // NOT emit the "aq" key. Encoding is byte-identical to a state
+    // serialized before ZEB-250 existed.
+    let state = CommunityState::new(FIXTURE_COMMUNITY_ID);
+    assert_eq!(state.admin_quorum, 1, "default admin_quorum must be 1");
+
+    let encoded = canonical_cbor_encode(&state).expect("encode");
+    let value: ciborium::Value = ciborium::de::from_reader(&encoded[..]).expect("decode as value");
+    let map = value.as_map().expect("outer is map");
+    assert!(
+        !map.iter().any(|(k, _)| k.as_text() == Some("aq")),
+        "CommunityState with default admin_quorum=1 must omit 'aq' key (byte-compat)"
     );
 }

@@ -951,7 +951,7 @@ pub fn verify_countersig(
 /// the call site (Phase 2's CommunityState owns the cache + version
 /// counter, mirroring the inbox_entries_for_space pattern from
 /// owner_state_crdt.rs).
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaterializedMembership {
     pub members: BTreeMap<OwnerAddr, MemberState>,
     /// Per-actor power level. Unset key = 0 = default. The community
@@ -994,6 +994,47 @@ pub struct MaterializedMembership {
     /// events. Spec §4.6.
     #[serde(default)]
     pub pending_catchup_for: BTreeSet<OwnerAddr>,
+
+    /// ZEB-250: number of admin-tier signatures required for an
+    /// admin-affecting action (SetPower to/from 100, Kick of an admin,
+    /// or change of admin_quorum itself). Default 1 (current
+    /// single-admin behavior); communities opt into multi-sig by
+    /// raising it via a successful ChangeQuorum proposal.
+    ///
+    /// Materialized from events: the materialize pass walks
+    /// AdminProposal events in HLC order and updates this field
+    /// when a ChangeQuorum proposal reaches quorum (single-pass-with-
+    /// running-state, spec §5.2). Byte-compat with pre-ZEB-250 cached
+    /// snapshots — the `default = "default_admin_quorum"` decode
+    /// produces 1.
+    #[serde(
+        rename = "aq",
+        default = "default_admin_quorum",
+        skip_serializing_if = "is_default_admin_quorum"
+    )]
+    pub admin_quorum: u8,
+}
+
+impl Default for MaterializedMembership {
+    fn default() -> Self {
+        Self {
+            members: BTreeMap::new(),
+            power_levels: BTreeMap::new(),
+            channels: BTreeMap::new(),
+            current_epoch: None,
+            pending_rotation_for: BTreeSet::new(),
+            pending_catchup_for: BTreeSet::new(),
+            admin_quorum: 1,
+        }
+    }
+}
+
+pub(crate) fn default_admin_quorum() -> u8 {
+    1
+}
+
+pub(crate) fn is_default_admin_quorum(q: &u8) -> bool {
+    *q == 1
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

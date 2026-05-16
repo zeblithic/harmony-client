@@ -10682,6 +10682,7 @@ where
             current_epoch: Some(payload.epoch_snapshot.epoch),
             pending_rotation_for: std::collections::BTreeSet::new(),
             pending_catchup_for: std::collections::BTreeSet::new(),
+            admin_quorum: 1,
         };
         if let Some(state_arc) = community_registry.state_for(&minted.community_id).await {
             let state_g = state_arc.lock().await;
@@ -16193,6 +16194,7 @@ mod community_member_dto_tests {
             current_epoch: None,
             pending_rotation_for: std::collections::BTreeSet::new(),
             pending_catchup_for: std::collections::BTreeSet::new(),
+            admin_quorum: 1,
         };
         let dto = member_info_for(&materialized);
 
@@ -16235,6 +16237,7 @@ mod community_member_dto_tests {
             current_epoch: None,
             pending_rotation_for: std::collections::BTreeSet::new(),
             pending_catchup_for: std::collections::BTreeSet::new(),
+            admin_quorum: 1,
         };
         let dto = member_info_for(&materialized);
         assert_eq!(dto.len(), 2);
