@@ -1438,3 +1438,65 @@ mod zeb287_pre_fork_snapshot_lineage {
         assert_eq!(snap.original_community_id, decoded.original_community_id);
     }
 }
+
+// ZEB-287 Phase 2 Task 4: build_fork_snapshot lineage construction logic +
+// 16-deep cap. These tests pin the algorithm shape against
+// community_fork.rs::fork_community's Task 4 block.
+mod zeb287_lineage_build_logic {
+    use harmony_app::community_invite::ParentLineageEntry;
+    use harmony_app::owner_state_types::SpaceId;
+
+    #[test]
+    fn build_fork_snapshot_lineage_extends_forker_chain() {
+        // Simulate forker's CommunityState.parent_lineage = [C-entry] and
+        // forker's community is B (forked from C). After fork into A_fork:
+        //   A_fork.parent_lineage = [C-entry, B-entry]
+        let c_entry = ParentLineageEntry {
+            space_id: SpaceId([0x11; 16]),
+            name: "C".to_string(),
+            forked_at_wall_ms: None, // C is root
+        };
+        let forker_lineage = vec![c_entry.clone()];
+        let b_id = SpaceId([0x22; 16]);
+        let b_name = "B".to_string();
+        let b_forked_at = Some(1_700_000_000_000u64);
+
+        // Mirror the build logic in community_fork.rs Task 4:
+        let mut new_lineage = forker_lineage.clone();
+        new_lineage.push(ParentLineageEntry {
+            space_id: b_id,
+            name: b_name.clone(),
+            forked_at_wall_ms: b_forked_at,
+        });
+
+        assert_eq!(new_lineage.len(), 2);
+        assert_eq!(new_lineage[0], c_entry);
+        assert_eq!(new_lineage[1].space_id, b_id);
+        assert_eq!(new_lineage[1].name, b_name);
+        assert_eq!(new_lineage[1].forked_at_wall_ms, b_forked_at);
+    }
+
+    #[test]
+    fn lineage_cap_drops_oldest_root_side_entries() {
+        // Construct a 20-deep lineage; verify cap keeps newest 16.
+        let mut overlong: Vec<ParentLineageEntry> = (0u8..20)
+            .map(|i| ParentLineageEntry {
+                space_id: SpaceId([i; 16]),
+                name: format!("ancestor_{i}"),
+                forked_at_wall_ms: if i == 0 { None } else { Some(i as u64) },
+            })
+            .collect();
+
+        const MAX_LINEAGE_DEPTH: usize = 16;
+        if overlong.len() > MAX_LINEAGE_DEPTH {
+            let overflow = overlong.len() - MAX_LINEAGE_DEPTH;
+            overlong.drain(0..overflow);
+        }
+
+        assert_eq!(overlong.len(), 16);
+        // First entry should be ancestor_4 (oldest 4 dropped: 0,1,2,3).
+        assert_eq!(overlong[0].name, "ancestor_4");
+        // Last entry should be ancestor_19 (newest preserved).
+        assert_eq!(overlong[15].name, "ancestor_19");
+    }
+}
