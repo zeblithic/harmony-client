@@ -15274,7 +15274,11 @@ pub fn delta_to_change(
         // ZEB-254: PendingJoin and JoinCountersign project to MembershipChange
         // in Task 4 (IPC wiring). Until then, emit no Tauri event.
         | crate::community_membership::MembershipEventKind::PendingJoin { .. }
-        | crate::community_membership::MembershipEventKind::JoinCountersign { .. } => return None,
+        | crate::community_membership::MembershipEventKind::JoinCountersign { .. }
+        // ZEB-250: AdminProposal and AdminCountersign are governance events;
+        // projection to MembershipChange is deferred to Task 8 (IPC wiring).
+        | crate::community_membership::MembershipEventKind::AdminProposal { .. }
+        | crate::community_membership::MembershipEventKind::AdminCountersign { .. } => return None,
     };
     Some((cid_hex, change))
 }

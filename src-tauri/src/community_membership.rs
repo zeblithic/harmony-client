@@ -34,6 +34,44 @@ pub struct RecipientCiphertext {
 impl CanonicalPayloadSealed for RecipientCiphertext {}
 impl CanonicalPayload for RecipientCiphertext {}
 
+/// ZEB-250: shape of the proposed admin-affecting action wrapped by
+/// [`MembershipEventKind::AdminProposal`]. Mirrors existing
+/// single-signed event variants but gated through M-of-N quorum
+/// approval.
+///
+/// Same-length-keys invariant: 1-char variant tags (`s`/`k`/`c`),
+/// 2-char inner-field keys. Tagged-union representation with `kd`
+/// (kind) discriminator + `bd` (body) container so the CBOR encoding
+/// has explicit discriminator + body keys at the ProposalKind level.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kd", content = "bd")]
+pub enum ProposalKind {
+    /// SetPower whose target IS currently an admin (level was 100) OR
+    /// whose new level IS 100 (promoting to admin).
+    #[serde(rename = "s")]
+    SetPower {
+        #[serde(rename = "tg")]
+        target: OwnerAddr,
+        #[serde(rename = "lv")]
+        level: u8,
+    },
+    /// Kick of a target who is currently an admin (level == 100).
+    #[serde(rename = "k")]
+    Kick {
+        #[serde(rename = "tg")]
+        target: OwnerAddr,
+        #[serde(rename = "rs", skip_serializing_if = "Option::is_none", default)]
+        reason: Option<String>,
+    },
+    /// Change `CommunityState.admin_quorum`. `new_quorum >= 1`,
+    /// practical cap enforced at verify_event AP5.
+    #[serde(rename = "c")]
+    ChangeQuorum {
+        #[serde(rename = "nq")]
+        new_quorum: u8,
+    },
+}
+
 /// The five membership event kinds. Adjacently tagged so the wire
 /// format is `{ "tg": "<variant>", "vl": <body> }` — both keys are
 /// 2-char to satisfy the same-length-keys CBOR invariant at this
@@ -218,6 +256,37 @@ pub enum MembershipEventKind {
             serialize_with = "serialize_bytes_as_bstr",
             deserialize_with = "deserialize_bytes_from_bstr"
         )]
+        target_event_id: EventId,
+    },
+
+    /// ZEB-250: a power-100 admin proposes an admin-affecting action.
+    /// Becomes effective only when the proposal accumulates >=
+    /// admin_quorum total admin signatures (proposer counts as 1;
+    /// remainder come from AdminCountersign events targeting this
+    /// event_id).
+    ///
+    /// 30-day expiry: if quorum isn't reached within 30 days of the
+    /// proposal's HLC wall_ms, the proposal is dead (pure-function
+    /// check at materialize time). Late countersigns to expired
+    /// proposals are no-ops.
+    ///
+    /// Variant tag "q" (1-char value, lowercase, unused before this).
+    /// Inner field key "pk" (proposal_kind) per same-length-keys
+    /// invariant.
+    #[serde(rename = "q")]
+    AdminProposal {
+        #[serde(rename = "pk")]
+        proposal_kind: ProposalKind,
+    },
+
+    /// ZEB-250: admin-tier countersignature on a target AdminProposal.
+    /// Lenient forward-ref — verify_event doesn't require target to be
+    /// present yet. Pairing happens at materialize time.
+    ///
+    /// Variant tag "n" (1-char value, lowercase, unused before this).
+    #[serde(rename = "n")]
+    AdminCountersign {
+        #[serde(rename = "ti")]
         target_event_id: EventId,
     },
 }
@@ -1619,6 +1688,11 @@ pub fn materialize_with_now(
                 // countersigned_pending_ids, then consumed during the
                 // PendingJoin arm above. No direct state mutation here.
             }
+            MembershipEventKind::AdminProposal { .. }
+            | MembershipEventKind::AdminCountersign { .. } => {
+                // ZEB-250 Task 4 / Task 5 will replace this stub with the
+                // real verify gates.
+            }
         }
     }
 
@@ -2007,6 +2081,11 @@ pub fn verify_event(
             // ZEB-254: actor joined-membership check handled in the
             // per-kind power-rules block below (step 5).
         }
+        MembershipEventKind::AdminProposal { .. }
+        | MembershipEventKind::AdminCountersign { .. } => {
+            // ZEB-250 Task 4 / Task 5 will replace this stub with the
+            // real verify gates.
+        }
     }
 
     // 5. Per-kind power rules.
@@ -2257,6 +2336,11 @@ pub fn verify_event(
             if actor_power < POWER_THRESHOLDS.invite {
                 return Err(VerifyError::JoinCountersignActorPowerInsufficient);
             }
+        }
+        MembershipEventKind::AdminProposal { .. }
+        | MembershipEventKind::AdminCountersign { .. } => {
+            // ZEB-250 Task 4 / Task 5 will replace this stub with the
+            // real verify gates.
         }
     }
 
@@ -5749,5 +5833,55 @@ mod zeb_254_materialize_tests {
             !mat.pending_catchup_for.contains(&joiner_addr),
             "uncountersigned PendingJoin must NOT be in pending_catchup_for"
         );
+    }
+
+    #[test]
+    fn admin_proposal_setpower_roundtrip() {
+        use crate::owner_state_crypto::canonical_cbor_encode;
+        let kind = MembershipEventKind::AdminProposal {
+            proposal_kind: ProposalKind::SetPower {
+                target: OwnerAddr([0x11; 16]),
+                level: 100,
+            },
+        };
+        let bytes = canonical_cbor_encode(&kind).expect("encode");
+        let decoded: MembershipEventKind = ciborium::de::from_reader(&bytes[..]).expect("decode");
+        assert_eq!(decoded, kind);
+    }
+
+    #[test]
+    fn admin_proposal_kick_roundtrip() {
+        use crate::owner_state_crypto::canonical_cbor_encode;
+        let kind = MembershipEventKind::AdminProposal {
+            proposal_kind: ProposalKind::Kick {
+                target: OwnerAddr([0x22; 16]),
+                reason: Some("breach".to_string()),
+            },
+        };
+        let bytes = canonical_cbor_encode(&kind).expect("encode");
+        let decoded: MembershipEventKind = ciborium::de::from_reader(&bytes[..]).expect("decode");
+        assert_eq!(decoded, kind);
+    }
+
+    #[test]
+    fn admin_proposal_change_quorum_roundtrip() {
+        use crate::owner_state_crypto::canonical_cbor_encode;
+        let kind = MembershipEventKind::AdminProposal {
+            proposal_kind: ProposalKind::ChangeQuorum { new_quorum: 3 },
+        };
+        let bytes = canonical_cbor_encode(&kind).expect("encode");
+        let decoded: MembershipEventKind = ciborium::de::from_reader(&bytes[..]).expect("decode");
+        assert_eq!(decoded, kind);
+    }
+
+    #[test]
+    fn admin_countersign_roundtrip() {
+        use crate::owner_state_crypto::canonical_cbor_encode;
+        let kind = MembershipEventKind::AdminCountersign {
+            target_event_id: [0x33; 16],
+        };
+        let bytes = canonical_cbor_encode(&kind).expect("encode");
+        let decoded: MembershipEventKind = ciborium::de::from_reader(&bytes[..]).expect("decode");
+        assert_eq!(decoded, kind);
     }
 }
