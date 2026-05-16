@@ -37,6 +37,7 @@
     descendants = [],
     localNavIds = new Set<string>(),
     onForkLineageNavigate,
+    resolveLocalCommunityName,
   }: {
     communityId: string;
     communityName: string;

@@ -262,7 +262,9 @@ describe('ForkLineageTree', () => {
     // Not-known descendant → still truncated hex (locallyKnown: false suppresses resolution)
     expect(getByText(/0x44444444…/)).toBeTruthy();
     // The full hex for the known fork must NOT appear (spec §5.2 — names not hex when known)
-    expect(queryByText(/33{16}/)).toBeNull();
+    // R4-2: previous regex `/33{16}/` meant "3 then exactly 16 more 3s" (17 total),
+    // not the intended 32-char hex string. Use the explicit repetition count.
+    expect(queryByText(/3{32}/)).toBeNull();
     // Resolver was called only for the locally-known descendant
     expect(resolver).toHaveBeenCalledWith('33'.repeat(16));
   });
