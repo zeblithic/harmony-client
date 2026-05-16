@@ -7208,6 +7208,261 @@ async fn list_community_forks(
     build_fork_descendants(&events_snapshot, &materialized, &locally_known, self_owner)
 }
 
+// ── ZEB-287 Phase 2: get_community_lineage IPC ────────────────────────
+//
+// Exposes the lineage fields from CommunityState behind a tight DTO so
+// the frontend can render the ForkLineageTree without leaking the full
+// CommunityState wire shape. Authorized behind a Joined gate. Phase 2
+// spec §4.2 + §4.4.
+
+/// ZEB-287 Phase 2: one entry in the ancestor-chain DTO returned by
+/// `get_community_lineage`. Mirrors `community_invite::ParentLineageEntry`
+/// but with hex-encoded SpaceId for IPC boundary cleanliness.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParentLineageDto {
+    /// Hex-encoded SpaceId of this ancestor.
+    pub space_id: String,
+    /// Frozen display name of this ancestor at the time it was added
+    /// to the chain. May be empty for legacy/corrupted snapshots.
+    pub name: String,
+    /// wall_ms of this ancestor's fork-from-parent event; None for the
+    /// root of the chain.
+    pub forked_at_wall_ms: Option<u64>,
+}
+
+/// ZEB-287 Phase 2: lineage metadata returned by `get_community_lineage`
+/// IPC. Carries enough state for `ForkLineageTree.svelte` to render
+/// ancestors + "you are here" + descendants without a second IPC.
+///
+/// Note: Phase 1's `CommunityLineageDto` was renamed to
+/// `ForkSnapshotMetadataDto` to free this name for Phase 2 semantics.
+/// To minimize confusion at the call site, this Phase 2 type uses the
+/// `PhaseTwoCommunityLineageDto` Rust name even though it serializes as
+/// `CommunityLineageDto`-shaped JSON for the frontend (via camelCase
+/// renames matching `CommunityLineageDto` interface in TS).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhaseTwoCommunityLineageDto {
+    /// Phase 1 field: hex-encoded SpaceId of the immediate parent, or
+    /// None for top-level (non-fork) communities.
+    pub forked_from: Option<String>,
+    /// Phase 2 field: wall_ms of THIS community's Fork event from its
+    /// parent. None for top-level communities and Phase 1 forks.
+    pub forked_at_wall_ms: Option<u64>,
+    /// Phase 2 field: ordered ancestor chain (root → above the immediate
+    /// parent), excluding the immediate parent (that's `forked_from`).
+    /// Empty for top-level communities and Phase 1 forks.
+    pub parent_lineage: Vec<ParentLineageDto>,
+    /// This community's own SpaceId (hex) — convenience so frontend can
+    /// render "you are here" without a second IPC.
+    pub self_space_id: String,
+    /// This community's own display name.
+    pub self_name: String,
+}
+
+/// Pure helper: project Phase 2 `CommunityState` lineage data into the
+/// IPC DTO. Extracted to enable unit testing without standing up a
+/// full NodeState fixture.
+pub fn build_community_lineage_dto(
+    self_space_id: crate::owner_state_types::SpaceId,
+    self_name: String,
+    forked_from: Option<crate::owner_state_types::SpaceId>,
+    forked_at_wall_ms: Option<u64>,
+    parent_lineage: &[crate::community_invite::ParentLineageEntry],
+) -> PhaseTwoCommunityLineageDto {
+    PhaseTwoCommunityLineageDto {
+        forked_from: forked_from.map(|s| hex::encode(s.0)),
+        forked_at_wall_ms,
+        parent_lineage: parent_lineage
+            .iter()
+            .map(|e| ParentLineageDto {
+                space_id: hex::encode(e.space_id.0),
+                name: e.name.clone(),
+                forked_at_wall_ms: e.forked_at_wall_ms,
+            })
+            .collect(),
+        self_space_id: hex::encode(self_space_id.0),
+        self_name,
+    }
+}
+
+/// Tauri IPC: read lineage fields from CommunityState behind a tight DTO.
+/// Caller must be Joined in the community.
+///
+/// Errors:
+/// - `Err("invalid community_id hex: ...")` — couldn't parse hex.
+/// - `Err("community_id must be 16 bytes (32 hex chars)")` — wrong length.
+/// - `Err("crdt_state missing — node not running?")` — node not started.
+/// - `Err("no community_registry — node not running?")` — registry missing.
+/// - `Err("no Space for community {hex} in owner-state")` — community absent.
+/// - `Err("no engine for community {hex} — not joined or not yet started")` —
+///   engine absent.
+/// - `Err("not a member")` — caller is not currently Joined.
+#[tauri::command]
+async fn get_community_lineage(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+) -> Result<PhaseTwoCommunityLineageDto, String> {
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let (crdt_state, registry, self_owner) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        let self_owner = g
+            .dm_self_owner
+            .ok_or("self_owner missing — node not running?")?;
+        (
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
+            g.community_registry
+                .clone()
+                .ok_or("no community_registry — node not running?")?,
+            self_owner,
+        )
+    };
+
+    let (admin_addr, self_name) = {
+        let s = crdt_state.lock().await;
+        let space = s.spaces.get(&space_id).cloned();
+        drop(s);
+        let space = space.ok_or_else(|| {
+            format!(
+                "no Space for community {} in owner-state",
+                hex::encode(space_id.0)
+            )
+        })?;
+        if space.kind != crate::owner_state_types::SpaceKind::Community {
+            return Err(format!(
+                "Space {} exists but is kind {:?}, not Community",
+                hex::encode(space_id.0),
+                space.kind
+            ));
+        }
+        let admin = space
+            .admin_addr
+            .ok_or("community Space missing admin_addr (corrupt row?)")?;
+        (admin, space.name)
+    };
+
+    let engine_state = registry.state_for(&space_id).await.ok_or_else(|| {
+        format!(
+            "no engine for community {} — not joined or not yet started",
+            hex::encode(space_id.0)
+        )
+    })?;
+
+    let (forked_from, forked_at_wall_ms, parent_lineage_clone, materialized) = {
+        let g = engine_state.lock().await;
+        let mat = g.materialize_now(admin_addr);
+        (
+            g.forked_from,
+            g.forked_at_wall_ms,
+            g.parent_lineage.clone(),
+            mat,
+        )
+    };
+
+    // Authorize: caller must be Joined.
+    match materialized.members.get(&self_owner).map(|m| m.status) {
+        Some(crate::community_membership::MemberStatus::Joined) => {}
+        _ => return Err("not a member".to_string()),
+    }
+
+    Ok(build_community_lineage_dto(
+        space_id,
+        self_name,
+        forked_from,
+        forked_at_wall_ms,
+        &parent_lineage_clone,
+    ))
+}
+
+#[cfg(test)]
+mod get_community_lineage_tests {
+    use super::*;
+    use crate::community_invite::ParentLineageEntry;
+    use crate::owner_state_types::SpaceId;
+
+    #[test]
+    fn build_community_lineage_dto_returns_phase1_state_with_default_phase2_fields() {
+        // Phase 1-shape: no Phase 2 lineage data.
+        let self_id = SpaceId([0x77; 16]);
+        let parent_id = SpaceId([0x33; 16]);
+
+        let dto = build_community_lineage_dto(
+            self_id,
+            "Self".into(),
+            Some(parent_id),
+            None,
+            &[], // empty parent_lineage = Phase 1 shape
+        );
+
+        assert_eq!(dto.self_space_id, hex::encode(self_id.0));
+        assert_eq!(dto.self_name, "Self");
+        assert_eq!(dto.forked_from, Some(hex::encode(parent_id.0)));
+        assert_eq!(dto.forked_at_wall_ms, None);
+        assert!(dto.parent_lineage.is_empty());
+    }
+
+    #[test]
+    fn build_community_lineage_dto_returns_phase2_chain() {
+        // Phase 2-shape: 2-entry chain.
+        let self_id = SpaceId([0x77; 16]);
+        let parent_id = SpaceId([0x33; 16]);
+        let lineage = vec![
+            ParentLineageEntry {
+                space_id: SpaceId([0x11; 16]),
+                name: "Root".into(),
+                forked_at_wall_ms: None,
+            },
+            ParentLineageEntry {
+                space_id: SpaceId([0x22; 16]),
+                name: "Middle".into(),
+                forked_at_wall_ms: Some(1_700_000_000_000),
+            },
+        ];
+
+        let dto = build_community_lineage_dto(
+            self_id,
+            "MyFork".into(),
+            Some(parent_id),
+            Some(1_710_000_000_000),
+            &lineage,
+        );
+
+        assert_eq!(dto.self_space_id, hex::encode(self_id.0));
+        assert_eq!(dto.forked_from, Some(hex::encode(parent_id.0)));
+        assert_eq!(dto.forked_at_wall_ms, Some(1_710_000_000_000));
+        assert_eq!(dto.parent_lineage.len(), 2);
+        assert_eq!(dto.parent_lineage[0].name, "Root");
+        assert_eq!(dto.parent_lineage[0].forked_at_wall_ms, None);
+        assert_eq!(dto.parent_lineage[1].name, "Middle");
+        assert_eq!(
+            dto.parent_lineage[1].forked_at_wall_ms,
+            Some(1_700_000_000_000)
+        );
+    }
+
+    #[test]
+    fn build_community_lineage_dto_top_level_community() {
+        let self_id = SpaceId([0x88; 16]);
+        let dto = build_community_lineage_dto(self_id, "Top".into(), None, None, &[]);
+
+        assert_eq!(dto.forked_from, None);
+        assert_eq!(dto.forked_at_wall_ms, None);
+        assert!(dto.parent_lineage.is_empty());
+        assert_eq!(dto.self_name, "Top");
+    }
+}
+
 #[cfg(test)]
 mod list_community_forks_tests {
     use super::*;
@@ -15917,6 +16172,7 @@ pub fn run() {
             kick_from_community,
             community_fork::fork_community,
             list_community_forks,
+            get_community_lineage,
             get_fork_snapshot_metadata,
             get_pre_fork_snapshot,
             set_power_level,
