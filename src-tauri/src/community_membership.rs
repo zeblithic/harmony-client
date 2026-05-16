@@ -699,6 +699,21 @@ pub enum VerifyError {
     /// a forward-compatibility placeholder for ZEB-251 per-community threshold
     /// customisation where invite_threshold may be set above 0.
     JoinCountersignActorPowerInsufficient,
+
+    /// ZEB-250 AP1: AdminProposal actor is not currently Joined.
+    AdminProposalActorNotJoined,
+    /// ZEB-250 AP2: AdminProposal actor's power is below 100.
+    AdminProposalActorNotAdmin,
+    /// ZEB-250 AP3: proposal_kind is malformed (target absent, level
+    /// out of range, reason empty-string, etc.).
+    AdminProposalKindInvalid,
+    /// ZEB-250 AP4: proposal_kind is well-formed but doesn't qualify
+    /// as admin-affecting per §4.3 — wrapping a routine SetPower or
+    /// Kick in AdminProposal is a category error.
+    AdminProposalNotAdminAffecting,
+    /// ZEB-250 AP5: ChangeQuorum new_quorum is < 1 or exceeds current
+    /// admin count.
+    AdminProposalQuorumOutOfRange,
 }
 
 impl std::fmt::Display for VerifyError {
@@ -822,6 +837,21 @@ impl std::fmt::Display for VerifyError {
             VerifyError::PendingJoinAlreadyMember => write!(f, "ZEB-254 PendingJoin actor's prior state is already-engaged"),
             VerifyError::JoinCountersignActorNotJoined => write!(f, "ZEB-254 JoinCountersign actor is not Joined"),
             VerifyError::JoinCountersignActorPowerInsufficient => write!(f, "ZEB-254 JoinCountersign actor power < invite_threshold"),
+            VerifyError::AdminProposalActorNotJoined => {
+                write!(f, "ZEB-250 AdminProposal actor is not Joined")
+            }
+            VerifyError::AdminProposalActorNotAdmin => {
+                write!(f, "ZEB-250 AdminProposal actor power < 100 (admin tier)")
+            }
+            VerifyError::AdminProposalKindInvalid => {
+                write!(f, "ZEB-250 AdminProposal proposal_kind is malformed")
+            }
+            VerifyError::AdminProposalNotAdminAffecting => {
+                write!(f, "ZEB-250 AdminProposal proposal_kind is not admin-affecting")
+            }
+            VerifyError::AdminProposalQuorumOutOfRange => {
+                write!(f, "ZEB-250 AdminProposal ChangeQuorum new_quorum out of range [1, admin_count]")
+            }
         }
     }
 }
@@ -2126,10 +2156,80 @@ pub fn verify_event(
             // ZEB-254: actor joined-membership check handled in the
             // per-kind power-rules block below (step 5).
         }
-        MembershipEventKind::AdminProposal { .. }
-        | MembershipEventKind::AdminCountersign { .. } => {
-            // ZEB-250 Task 4 / Task 5 will replace this stub with the
-            // real verify gates.
+        MembershipEventKind::AdminProposal { proposal_kind } => {
+            // ZEB-250 §4.1 — five gates AP1-AP5.
+
+            // AP1: actor Joined.
+            let actor_state = prior_state.members.get(&event.actor);
+            if !matches!(actor_state.map(|s| s.status), Some(MemberStatus::Joined)) {
+                return Err(VerifyError::AdminProposalActorNotJoined);
+            }
+            // AP2: actor power >= 100.
+            let actor_power_ap = prior_state
+                .power_levels
+                .get(&event.actor)
+                .copied()
+                .unwrap_or(0);
+            if actor_power_ap < 100 {
+                return Err(VerifyError::AdminProposalActorNotAdmin);
+            }
+            // AP3 + AP4: well-formedness + admin-affecting check.
+            match proposal_kind {
+                ProposalKind::SetPower { target, level } => {
+                    // AP3: target exists, level in range.
+                    if !prior_state.members.contains_key(target) {
+                        return Err(VerifyError::AdminProposalKindInvalid);
+                    }
+                    if *level > POWER_THRESHOLDS.max {
+                        return Err(VerifyError::AdminProposalKindInvalid);
+                    }
+                    // AP4: admin-affecting iff level == 100 OR target was admin.
+                    let target_power = prior_state.power_levels.get(target).copied().unwrap_or(0);
+                    let admin_affecting = *level == 100 || target_power == 100;
+                    if !admin_affecting {
+                        return Err(VerifyError::AdminProposalNotAdminAffecting);
+                    }
+                }
+                ProposalKind::Kick { target, reason } => {
+                    // AP3 part 1: target exists.
+                    let target_state = prior_state.members.get(target);
+                    if target_state.is_none() {
+                        return Err(VerifyError::AdminProposalKindInvalid);
+                    }
+                    // AP3 part 2: target is Joined.
+                    if !matches!(target_state.map(|s| s.status), Some(MemberStatus::Joined)) {
+                        return Err(VerifyError::AdminProposalKindInvalid);
+                    }
+                    // AP3 part 3: reason is None or non-empty.
+                    if matches!(reason, Some(r) if r.is_empty()) {
+                        return Err(VerifyError::AdminProposalKindInvalid);
+                    }
+                    // AP4: admin-affecting iff target is admin.
+                    let target_power = prior_state.power_levels.get(target).copied().unwrap_or(0);
+                    if target_power != 100 {
+                        return Err(VerifyError::AdminProposalNotAdminAffecting);
+                    }
+                }
+                ProposalKind::ChangeQuorum { new_quorum } => {
+                    // AP3: new_quorum >= 1.
+                    if *new_quorum < 1 {
+                        return Err(VerifyError::AdminProposalKindInvalid);
+                    }
+                    // AP5: new_quorum <= current admin count.
+                    let admin_count = prior_state
+                        .power_levels
+                        .values()
+                        .filter(|p| **p == 100)
+                        .count() as u32;
+                    if (*new_quorum as u32) > admin_count {
+                        return Err(VerifyError::AdminProposalQuorumOutOfRange);
+                    }
+                    // ChangeQuorum is always admin-affecting; no AP4 distinction.
+                }
+            }
+        }
+        MembershipEventKind::AdminCountersign { .. } => {
+            // Task 5 will replace this stub with the real AC1-AC3 gates.
         }
     }
 
@@ -2382,10 +2482,12 @@ pub fn verify_event(
                 return Err(VerifyError::JoinCountersignActorPowerInsufficient);
             }
         }
-        MembershipEventKind::AdminProposal { .. }
-        | MembershipEventKind::AdminCountersign { .. } => {
-            // ZEB-250 Task 4 / Task 5 will replace this stub with the
-            // real verify gates.
+        MembershipEventKind::AdminProposal { .. } => {
+            // All AdminProposal gates (AP1-AP5) are handled in the
+            // joined-membership block above. No separate power rule needed.
+        }
+        MembershipEventKind::AdminCountersign { .. } => {
+            // Task 5 will add AC1-AC3 gates here.
         }
     }
 
@@ -5928,5 +6030,517 @@ mod zeb_254_materialize_tests {
         let bytes = canonical_cbor_encode(&kind).expect("encode");
         let decoded: MembershipEventKind = ciborium::de::from_reader(&bytes[..]).expect("decode");
         assert_eq!(decoded, kind);
+    }
+}
+
+// ── ZEB-250 Task 4: AdminProposal verify_event gate tests ─────────────────
+
+#[cfg(test)]
+mod zeb_250_admin_proposal_verify_tests {
+    use super::*;
+
+    fn make_identity(seed_byte: u8) -> (harmony_identity::PrivateIdentity, [u8; 64], OwnerAddr) {
+        let seed = [seed_byte; 32];
+        let private = harmony_identity::PrivateIdentity::from_seed(&seed);
+        let public = private.public_identity();
+        let identity_pub = public.to_public_bytes();
+        let addr = OwnerAddr(public.address_hash);
+        (private, identity_pub, addr)
+    }
+
+    fn sign_with_identity(
+        payload: EventPayload,
+        private: &harmony_identity::PrivateIdentity,
+    ) -> SignedMembershipEvent {
+        sign_event_with_identity(&payload, private).expect("sign_event_with_identity must succeed")
+    }
+
+    fn make_admin_proposal_event(
+        id: [u8; 16],
+        actor_priv: &harmony_identity::PrivateIdentity,
+        actor_addr: OwnerAddr,
+        proposal_kind: ProposalKind,
+        at_wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        let payload = EventPayload {
+            id,
+            community_id: SpaceId([0xc0; 16]),
+            kind: MembershipEventKind::AdminProposal { proposal_kind },
+            actor: actor_addr,
+            at: Hlc {
+                wall_ms: at_wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+        };
+        sign_with_identity(payload, actor_priv)
+    }
+
+    #[test]
+    fn admin_proposal_accepted_when_actor_admin() {
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (_, _, other_addr) = make_identity(0x02);
+        let mut prior = MaterializedMembership::default();
+        prior.members.insert(
+            admin_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "a".into(),
+                },
+                left_at: None,
+            },
+        );
+        prior.members.insert(
+            other_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "o".into(),
+                },
+                left_at: None,
+            },
+        );
+        prior.power_levels.insert(admin_addr, 100);
+        prior.power_levels.insert(other_addr, 0);
+        let evt = make_admin_proposal_event(
+            [0x10; 16],
+            &admin_priv,
+            admin_addr,
+            ProposalKind::SetPower {
+                target: other_addr,
+                level: 100,
+            },
+            1_000,
+        );
+        let ctx = VerifyContext {
+            expected_community_id: SpaceId([0xc0; 16]),
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: None,
+        };
+        assert_eq!(verify_event(&evt, &prior, &ctx), Ok(()));
+    }
+
+    #[test]
+    fn admin_proposal_rejected_when_actor_not_joined() {
+        let (actor_priv, actor_pub, actor_addr) = make_identity(0x01);
+        let prior = MaterializedMembership::default();
+        let evt = make_admin_proposal_event(
+            [0x10; 16],
+            &actor_priv,
+            actor_addr,
+            ProposalKind::SetPower {
+                target: OwnerAddr([0x02; 16]),
+                level: 100,
+            },
+            1_000,
+        );
+        let ctx = VerifyContext {
+            expected_community_id: SpaceId([0xc0; 16]),
+            admin_addr: actor_addr,
+            is_invite_only: false,
+            actor_identity_pub: &actor_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: None,
+        };
+        assert_eq!(
+            verify_event(&evt, &prior, &ctx),
+            Err(VerifyError::AdminProposalActorNotJoined)
+        );
+    }
+
+    #[test]
+    fn admin_proposal_rejected_when_actor_power_below_100() {
+        let (actor_priv, actor_pub, actor_addr) = make_identity(0x01);
+        let (_, _, target_addr) = make_identity(0x02);
+        let mut prior = MaterializedMembership::default();
+        prior.members.insert(
+            actor_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "a".into(),
+                },
+                left_at: None,
+            },
+        );
+        prior.members.insert(
+            target_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                left_at: None,
+            },
+        );
+        prior.power_levels.insert(actor_addr, 50);
+        prior.power_levels.insert(target_addr, 0);
+        let evt = make_admin_proposal_event(
+            [0x10; 16],
+            &actor_priv,
+            actor_addr,
+            ProposalKind::SetPower {
+                target: target_addr,
+                level: 100,
+            },
+            1_000,
+        );
+        let ctx = VerifyContext {
+            expected_community_id: SpaceId([0xc0; 16]),
+            admin_addr: actor_addr,
+            is_invite_only: false,
+            actor_identity_pub: &actor_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: None,
+        };
+        assert_eq!(
+            verify_event(&evt, &prior, &ctx),
+            Err(VerifyError::AdminProposalActorNotAdmin)
+        );
+    }
+
+    #[test]
+    fn admin_proposal_setpower_rejected_when_target_not_in_members() {
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (_, _, ghost_addr) = make_identity(0xfe);
+        let mut prior = MaterializedMembership::default();
+        prior.members.insert(
+            admin_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "a".into(),
+                },
+                left_at: None,
+            },
+        );
+        prior.power_levels.insert(admin_addr, 100);
+        let evt = make_admin_proposal_event(
+            [0x10; 16],
+            &admin_priv,
+            admin_addr,
+            ProposalKind::SetPower {
+                target: ghost_addr,
+                level: 100,
+            },
+            1_000,
+        );
+        let ctx = VerifyContext {
+            expected_community_id: SpaceId([0xc0; 16]),
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: None,
+        };
+        assert_eq!(
+            verify_event(&evt, &prior, &ctx),
+            Err(VerifyError::AdminProposalKindInvalid)
+        );
+    }
+
+    #[test]
+    fn admin_proposal_setpower_rejected_when_level_out_of_range() {
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (_, _, target_addr) = make_identity(0x02);
+        let mut prior = MaterializedMembership::default();
+        prior.members.insert(
+            admin_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "a".into(),
+                },
+                left_at: None,
+            },
+        );
+        prior.members.insert(
+            target_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                left_at: None,
+            },
+        );
+        prior.power_levels.insert(admin_addr, 100);
+        prior.power_levels.insert(target_addr, 100);
+        let evt = make_admin_proposal_event(
+            [0x10; 16],
+            &admin_priv,
+            admin_addr,
+            ProposalKind::SetPower {
+                target: target_addr,
+                level: 200,
+            },
+            1_000,
+        );
+        let ctx = VerifyContext {
+            expected_community_id: SpaceId([0xc0; 16]),
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: None,
+        };
+        assert_eq!(
+            verify_event(&evt, &prior, &ctx),
+            Err(VerifyError::AdminProposalKindInvalid)
+        );
+    }
+
+    #[test]
+    fn admin_proposal_setpower_rejected_when_not_admin_affecting() {
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (_, _, regular_addr) = make_identity(0x02);
+        let mut prior = MaterializedMembership::default();
+        prior.members.insert(
+            admin_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "a".into(),
+                },
+                left_at: None,
+            },
+        );
+        prior.members.insert(
+            regular_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "r".into(),
+                },
+                left_at: None,
+            },
+        );
+        prior.power_levels.insert(admin_addr, 100);
+        prior.power_levels.insert(regular_addr, 0);
+        let evt = make_admin_proposal_event(
+            [0x10; 16],
+            &admin_priv,
+            admin_addr,
+            ProposalKind::SetPower {
+                target: regular_addr,
+                level: 50,
+            },
+            1_000,
+        );
+        let ctx = VerifyContext {
+            expected_community_id: SpaceId([0xc0; 16]),
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: None,
+        };
+        assert_eq!(
+            verify_event(&evt, &prior, &ctx),
+            Err(VerifyError::AdminProposalNotAdminAffecting)
+        );
+    }
+
+    #[test]
+    fn admin_proposal_kick_rejected_when_target_not_admin() {
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (_, _, mod_addr) = make_identity(0x02);
+        let mut prior = MaterializedMembership::default();
+        prior.members.insert(
+            admin_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "a".into(),
+                },
+                left_at: None,
+            },
+        );
+        prior.members.insert(
+            mod_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "m".into(),
+                },
+                left_at: None,
+            },
+        );
+        prior.power_levels.insert(admin_addr, 100);
+        prior.power_levels.insert(mod_addr, 50);
+        let evt = make_admin_proposal_event(
+            [0x10; 16],
+            &admin_priv,
+            admin_addr,
+            ProposalKind::Kick {
+                target: mod_addr,
+                reason: None,
+            },
+            1_000,
+        );
+        let ctx = VerifyContext {
+            expected_community_id: SpaceId([0xc0; 16]),
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: None,
+        };
+        assert_eq!(
+            verify_event(&evt, &prior, &ctx),
+            Err(VerifyError::AdminProposalNotAdminAffecting)
+        );
+    }
+
+    #[test]
+    fn admin_proposal_change_quorum_rejected_when_below_one() {
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let mut prior = MaterializedMembership::default();
+        prior.members.insert(
+            admin_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "a".into(),
+                },
+                left_at: None,
+            },
+        );
+        prior.power_levels.insert(admin_addr, 100);
+        let evt = make_admin_proposal_event(
+            [0x10; 16],
+            &admin_priv,
+            admin_addr,
+            ProposalKind::ChangeQuorum { new_quorum: 0 },
+            1_000,
+        );
+        let ctx = VerifyContext {
+            expected_community_id: SpaceId([0xc0; 16]),
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: None,
+        };
+        assert_eq!(
+            verify_event(&evt, &prior, &ctx),
+            Err(VerifyError::AdminProposalKindInvalid)
+        );
+    }
+
+    #[test]
+    fn admin_proposal_change_quorum_rejected_when_exceeds_admin_count() {
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let mut prior = MaterializedMembership::default();
+        prior.members.insert(
+            admin_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "a".into(),
+                },
+                left_at: None,
+            },
+        );
+        prior.power_levels.insert(admin_addr, 100);
+        // Only 1 admin → new_quorum = 2 exceeds.
+        let evt = make_admin_proposal_event(
+            [0x10; 16],
+            &admin_priv,
+            admin_addr,
+            ProposalKind::ChangeQuorum { new_quorum: 2 },
+            1_000,
+        );
+        let ctx = VerifyContext {
+            expected_community_id: SpaceId([0xc0; 16]),
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: None,
+        };
+        assert_eq!(
+            verify_event(&evt, &prior, &ctx),
+            Err(VerifyError::AdminProposalQuorumOutOfRange)
+        );
+    }
+
+    #[test]
+    fn admin_proposal_change_quorum_accepted_when_equals_admin_count() {
+        let (admin1_priv, admin1_pub, admin1_addr) = make_identity(0x01);
+        let (_, _, admin2_addr) = make_identity(0x02);
+        let mut prior = MaterializedMembership::default();
+        prior.members.insert(
+            admin1_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "a1".into(),
+                },
+                left_at: None,
+            },
+        );
+        prior.members.insert(
+            admin2_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "a2".into(),
+                },
+                left_at: None,
+            },
+        );
+        prior.power_levels.insert(admin1_addr, 100);
+        prior.power_levels.insert(admin2_addr, 100);
+        let evt = make_admin_proposal_event(
+            [0x10; 16],
+            &admin1_priv,
+            admin1_addr,
+            ProposalKind::ChangeQuorum { new_quorum: 2 },
+            1_000,
+        );
+        let ctx = VerifyContext {
+            expected_community_id: SpaceId([0xc0; 16]),
+            admin_addr: admin1_addr,
+            is_invite_only: false,
+            actor_identity_pub: &admin1_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: None,
+        };
+        assert_eq!(verify_event(&evt, &prior, &ctx), Ok(()));
     }
 }
