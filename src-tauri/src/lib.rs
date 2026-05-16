@@ -10239,6 +10239,15 @@ where
         if let Some(state_arc) = community_registry.state_for(&minted.community_id).await {
             let mut state_g = state_arc.lock().await;
             state_g.forked_from = Some(original_id);
+            // ZEB-287 Phase 2 spec §3.5: when redeeming a fork-invite,
+            // mirror the snapshot's lineage data into the new fork's
+            // CommunityState. Phase 1 fork-invites have `parent_lineage`
+            // default-empty (skip-if-empty); their `forked_at` Hlc has
+            // always existed, so wall_ms is filled even for legacy invites.
+            if let Some(snapshot) = payload.pre_fork_snapshot.as_ref() {
+                state_g.forked_at_wall_ms = Some(snapshot.forked_at.wall_ms);
+                state_g.parent_lineage = snapshot.parent_lineage.clone();
+            }
         } else {
             tracing::warn!(
                 community_id = %hex::encode(minted.community_id.0),
@@ -11137,6 +11146,214 @@ mod redeem_invite_inner_tests {
             state_g.forked_from,
             Some(original_id),
             "CommunityState.forked_from must mirror the invite's forked_from"
+        );
+    }
+
+    /// ZEB-287 Phase 2 spec §3.5: when redeeming a fork-invite, the new
+    /// CommunityState must pick up `forked_at_wall_ms` and `parent_lineage`
+    /// from the snapshot. Phase 1 fork-invites with empty `parent_lineage`
+    /// still get `forked_at_wall_ms` populated from `snapshot.forked_at`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redeem_fork_invite_wires_parent_lineage_into_community_state() {
+        let fixture = build_redeem_invite_test_fixture().await;
+        let tmp = tempfile::TempDir::new().expect("tempdir for identity_dir");
+
+        let admin_identity = PrivateIdentity::from_seed(&[0xab; 32]);
+        let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
+
+        let original_id = SpaceId([0xac; 16]);
+        let community_id = SpaceId([0xf4; 16]);
+        let membership_key = EpochKey::new([0x43; 32]);
+
+        // Phase 2 snapshot: carries a 2-entry parent_lineage representing
+        // a grandparent (C) and a parent-of-parent (B) ancestor chain.
+        let c_entry = crate::community_invite::ParentLineageEntry {
+            space_id: SpaceId([0xc0; 16]),
+            name: "Grandparent C".into(),
+            forked_at_wall_ms: None, // C is root of the chain
+        };
+        let b_entry = crate::community_invite::ParentLineageEntry {
+            space_id: SpaceId([0xb0; 16]),
+            name: "Parent-of-parent B".into(),
+            forked_at_wall_ms: Some(1_650_000_000_000),
+        };
+
+        let snapshot = crate::community_invite::PreForkSnapshot {
+            original_community_id: original_id,
+            original_community_name: "OriginalCom".into(),
+            membership_events: vec![],
+            channel_log: crate::community_invite::BoundedChannelLogSnapshot {
+                per_channel: std::collections::BTreeMap::new(),
+            },
+            identity_pubs: std::collections::BTreeMap::new(),
+            forked_at: Hlc {
+                wall_ms: 1_715_000_000_000,
+                logical: 0,
+                device_id: "fork-dev".into(),
+            },
+            parent_lineage: vec![c_entry.clone(), b_entry.clone()],
+        };
+
+        let invite_payload = CommunityInvitePayload {
+            community_id,
+            epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: membership_key.as_bytes().to_vec(),
+                state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
+            },
+            admin_addr,
+            community_name: "ForkCom".into(),
+            is_invite_only: false,
+            expires_at: None,
+            invite_token: None,
+            admin_bootstrap: None,
+            admin_identity_pub: None,
+            forked_from: Some(original_id),
+            pre_fork_snapshot: Some(snapshot.clone()),
+        };
+
+        let invite_url =
+            crate::community_invite::encode_invite_url(&invite_payload).expect("encode invite url");
+
+        let result = redeem_invite_inner(
+            invite_url,
+            std::sync::Arc::clone(&fixture.crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            fixture.unicast_send_tx.clone(),
+            std::sync::Arc::clone(&fixture.dm_outbox),
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            || Ok(()),
+            Some(tmp.path().to_path_buf()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "fork-invite redeem must succeed: {:?}",
+            result
+        );
+
+        // Assert: CommunityState.forked_at_wall_ms + parent_lineage carry through.
+        let state_arc = fixture
+            .community_registry
+            .state_for(&community_id)
+            .await
+            .expect("engine state must exist after redeem");
+        let state_g = state_arc.lock().await;
+        assert_eq!(
+            state_g.forked_from,
+            Some(original_id),
+            "Phase 1 forked_from must still be wired"
+        );
+        assert_eq!(
+            state_g.forked_at_wall_ms,
+            Some(1_715_000_000_000),
+            "ZEB-287: forked_at_wall_ms must come from snapshot.forked_at.wall_ms"
+        );
+        assert_eq!(
+            state_g.parent_lineage,
+            vec![c_entry, b_entry],
+            "ZEB-287: parent_lineage must mirror snapshot.parent_lineage"
+        );
+    }
+
+    /// ZEB-287 Phase 2 spec §6.2: a Phase 1-shape fork-invite (whose
+    /// snapshot.parent_lineage is empty — Phase 1 wire compat default)
+    /// must still redeem cleanly. The resulting CommunityState has
+    /// `parent_lineage: []` (the correct "ancestry beyond immediate parent
+    /// unknown" state) and `forked_at_wall_ms: Some(...)` (Phase 1's
+    /// existing Hlc has wall_ms regardless of Phase 2).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redeem_phase1_fork_invite_yields_empty_lineage_with_forked_at_set() {
+        let fixture = build_redeem_invite_test_fixture().await;
+        let tmp = tempfile::TempDir::new().expect("tempdir for identity_dir");
+
+        let admin_identity = PrivateIdentity::from_seed(&[0xae; 32]);
+        let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
+
+        let original_id = SpaceId([0xad; 16]);
+        let community_id = SpaceId([0xf5; 16]);
+        let membership_key = EpochKey::new([0x44; 32]);
+
+        // Phase 1-shape snapshot: parent_lineage defaults empty.
+        let snapshot = crate::community_invite::PreForkSnapshot {
+            original_community_id: original_id,
+            original_community_name: "Phase1OriginalCom".into(),
+            membership_events: vec![],
+            channel_log: crate::community_invite::BoundedChannelLogSnapshot {
+                per_channel: std::collections::BTreeMap::new(),
+            },
+            identity_pubs: std::collections::BTreeMap::new(),
+            forked_at: Hlc {
+                wall_ms: 1_710_000_000_000,
+                logical: 0,
+                device_id: "phase1-dev".into(),
+            },
+            parent_lineage: Vec::new(), // Phase 1 default
+        };
+
+        let invite_payload = CommunityInvitePayload {
+            community_id,
+            epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: membership_key.as_bytes().to_vec(),
+                state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
+            },
+            admin_addr,
+            community_name: "Phase1ForkCom".into(),
+            is_invite_only: false,
+            expires_at: None,
+            invite_token: None,
+            admin_bootstrap: None,
+            admin_identity_pub: None,
+            forked_from: Some(original_id),
+            pre_fork_snapshot: Some(snapshot.clone()),
+        };
+
+        let invite_url =
+            crate::community_invite::encode_invite_url(&invite_payload).expect("encode invite url");
+
+        let result = redeem_invite_inner(
+            invite_url,
+            std::sync::Arc::clone(&fixture.crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            fixture.unicast_send_tx.clone(),
+            std::sync::Arc::clone(&fixture.dm_outbox),
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            || Ok(()),
+            Some(tmp.path().to_path_buf()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "Phase 1-shape fork-invite redeem must succeed: {:?}",
+            result
+        );
+
+        let state_arc = fixture
+            .community_registry
+            .state_for(&community_id)
+            .await
+            .expect("engine state must exist after redeem");
+        let state_g = state_arc.lock().await;
+        assert_eq!(state_g.forked_from, Some(original_id));
+        // Phase 2 still fills forked_at_wall_ms from Phase 1's existing forked_at Hlc.
+        assert_eq!(state_g.forked_at_wall_ms, Some(1_710_000_000_000));
+        // parent_lineage stays empty — "ancestry beyond immediate parent unknown".
+        assert!(
+            state_g.parent_lineage.is_empty(),
+            "Phase 1 fork's parent_lineage must remain empty"
         );
     }
 
