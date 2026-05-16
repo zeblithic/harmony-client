@@ -777,3 +777,652 @@ async fn joiner_engine_clears_pending_join_at_on_countersign() {
 
     engine.shutdown().await.expect("shutdown");
 }
+
+// ── ZEB-254 Task 15: two-engine integration tests ────────────────────────────
+
+use harmony_app::community_membership::{
+    attach_countersig_with_identity, MemberStatus, SignedMembershipEvent,
+};
+
+/// Drain all events from `from_state` that are not yet in `to_engine`
+/// and insert them into `to_engine` using the given `actor_pub`. Simulates
+/// one-way state-root sync between two engines.
+async fn sync_one_way(
+    from_state: &Arc<Mutex<CommunityState>>,
+    to_engine: &CommunitySyncEngine,
+    actor_pub: [u8; 64],
+) {
+    let events: Vec<SignedMembershipEvent> = {
+        let g = from_state.lock().await;
+        g.events.values().cloned().collect()
+    };
+    for ev in events {
+        // Ignore errors — AlreadyKnown and verify errors for out-of-order
+        // events are expected during sync simulation.
+        let _ = to_engine
+            .insert_local_event_with_pubs(ev, actor_pub, None)
+            .await;
+    }
+}
+
+/// ZEB-254 Task 15 — backward-compat: a pre-ZEB-254 client sends a legacy
+/// `Join` event with `countersig=Some(...)` directly. The engine must accept
+/// it and materialize as `Joined`.
+///
+/// This exercises the original invite-only wire shape where the countersig was
+/// embedded directly in the `Join` event, rather than being a separate
+/// `JoinCountersign` event added by ZEB-254.
+#[tokio::test]
+async fn legacy_invite_only_join_with_countersig_still_accepted() {
+    let community_id = SpaceId([0xD0u8; 16]);
+    let (admin_priv, admin_pub, admin_addr) = make_identity(0xA5);
+    let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xB5);
+    let admin_signing = signing_key_from(&admin_priv);
+
+    let mut resolver_map = HashMap::new();
+    resolver_map.insert(admin_addr, admin_pub);
+    resolver_map.insert(joiner_addr, joiner_pub);
+    let resolver: Arc<dyn IdentityResolver> = Arc::new(StaticResolver { map: resolver_map });
+
+    let cs = make_cas();
+    let (pub_tx, _pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_sub_tx, sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let engine = build_engine_with_resolver(
+        community_id,
+        admin_addr,
+        admin_addr, // self == admin
+        admin_signing,
+        pub_tx,
+        sub_rx,
+        cs,
+        &tmp,
+        Some(resolver),
+        Some(admin_pub),
+    );
+
+    // Admin bootstrap Join (exempt from countersig requirement).
+    let admin_join_payload = EventPayload {
+        id: [0xA5u8; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: admin_addr,
+        at: Hlc {
+            wall_ms: 1_700_000_001_000,
+            logical: 0,
+            device_id: "test-dev".into(),
+        },
+    };
+    let admin_join =
+        sign_event_with_identity(&admin_join_payload, &admin_priv).expect("sign admin join");
+    let outcome = engine
+        .insert_local_event_with_pubs(admin_join, admin_pub, None)
+        .await
+        .expect("admin join insert");
+    assert!(
+        matches!(outcome, InsertOutcome::Inserted),
+        "admin join: {:?}",
+        outcome
+    );
+
+    // Joiner's legacy Join — sign as joiner, then admin attaches countersig.
+    let joiner_join_payload = EventPayload {
+        id: [0xB5u8; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: joiner_addr,
+        at: Hlc {
+            wall_ms: 1_700_000_002_000,
+            logical: 0,
+            device_id: "joiner-dev".into(),
+        },
+    };
+    let joiner_join_unsigned =
+        sign_event_with_identity(&joiner_join_payload, &joiner_priv).expect("sign joiner join");
+
+    // Admin attaches countersig (legacy invite-only wire shape).
+    let joiner_join_with_cs = attach_countersig_with_identity(&joiner_join_unsigned, &admin_priv)
+        .expect("attach countersig");
+
+    // Insert through the engine — countersigner_identity_pub = Some(admin_pub).
+    let outcome = engine
+        .insert_local_event_with_pubs(joiner_join_with_cs, joiner_pub, Some(admin_pub))
+        .await
+        .expect("joiner join insert");
+    assert!(
+        matches!(outcome, InsertOutcome::Inserted),
+        "legacy Join with countersig must be Inserted; got {:?}",
+        outcome
+    );
+
+    // Materialize: joiner must be Joined.
+    let engine_state = engine.state();
+    let mat = {
+        let g = engine_state.lock().await;
+        g.materialize_now(admin_addr)
+    };
+    assert_eq!(
+        mat.members.get(&joiner_addr).map(|m| m.status),
+        Some(MemberStatus::Joined),
+        "legacy countersig'd Join must materialize as Joined"
+    );
+
+    engine.shutdown().await.expect("shutdown");
+}
+
+/// ZEB-254 Task 15 — cancellation: joiner inserts PendingJoin then Leave.
+/// Leave supersedes PendingJoin in HLC order. Materialize must yield `Left`.
+#[tokio::test]
+async fn pending_join_cancellation_via_leave() {
+    let community_id = SpaceId([0xD1u8; 16]);
+    let (admin_priv, admin_pub, admin_addr) = make_identity(0xA6);
+    let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xB6);
+    let joiner_signing = signing_key_from(&joiner_priv);
+
+    // Joiner engine — self_owner = joiner; no auto-counter-sign fires
+    // (self != admin).
+    let mut resolver_map = HashMap::new();
+    resolver_map.insert(admin_addr, admin_pub);
+    resolver_map.insert(joiner_addr, joiner_pub);
+    let resolver: Arc<dyn IdentityResolver> = Arc::new(StaticResolver { map: resolver_map });
+
+    let cs = make_cas();
+    let (pub_tx, _pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_sub_tx, sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let engine = build_engine_with_resolver(
+        community_id,
+        admin_addr,
+        joiner_addr, // self == joiner (not admin — no auto-countersign)
+        joiner_signing,
+        pub_tx,
+        sub_rx,
+        cs,
+        &tmp,
+        Some(resolver),
+        Some(admin_pub),
+    );
+
+    // Admin bootstrap Join so admin appears Joined in the community state
+    // (mirrors realistic state; also guards against future verify changes).
+    let admin_join_payload = EventPayload {
+        id: [0xA6u8; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: admin_addr,
+        at: Hlc {
+            wall_ms: 1_700_000_001_000,
+            logical: 0,
+            device_id: "admin-dev".into(),
+        },
+    };
+    let admin_join =
+        sign_event_with_identity(&admin_join_payload, &admin_priv).expect("sign admin join");
+    engine
+        .insert_local_event_with_pubs(admin_join, admin_pub, None)
+        .await
+        .expect("admin join");
+
+    // Joiner PendingJoin.
+    let token = make_signed_token(
+        &admin_priv,
+        admin_addr,
+        Some(joiner_addr),
+        Some(1_700_000_100_000),
+    );
+    let pending_payload = EventPayload {
+        id: [0xB6u8; 16],
+        community_id,
+        kind: MembershipEventKind::PendingJoin {
+            invite_token: token,
+            joiner_identity_pub: joiner_pub,
+        },
+        actor: joiner_addr,
+        at: Hlc {
+            wall_ms: 1_700_000_002_000,
+            logical: 0,
+            device_id: "joiner-dev".into(),
+        },
+    };
+    let pending_join =
+        sign_event_with_identity(&pending_payload, &joiner_priv).expect("sign PendingJoin");
+    let o1 = engine
+        .insert_local_event_with_pubs(pending_join, joiner_pub, None)
+        .await
+        .expect("PendingJoin insert");
+    assert!(
+        matches!(o1, InsertOutcome::Inserted),
+        "PendingJoin must be Inserted; got {:?}",
+        o1
+    );
+
+    // Joiner Leave — wall_ms after PendingJoin so it sorts later and the
+    // materialize terminal-state guard (Left supersedes PendingJoin) fires.
+    let leave_payload = EventPayload {
+        id: [0xC6u8; 16],
+        community_id,
+        kind: MembershipEventKind::Leave,
+        actor: joiner_addr,
+        at: Hlc {
+            wall_ms: 1_700_000_003_000,
+            logical: 0,
+            device_id: "joiner-dev".into(),
+        },
+    };
+    let leave = sign_event_with_identity(&leave_payload, &joiner_priv).expect("sign Leave");
+    let o2 = engine
+        .insert_local_event_with_pubs(leave, joiner_pub, None)
+        .await
+        .expect("Leave insert");
+    assert!(
+        matches!(o2, InsertOutcome::Inserted),
+        "Leave must be Inserted; got {:?}",
+        o2
+    );
+
+    // Materialize: joiner must be Left.
+    let engine_state = engine.state();
+    let mat = {
+        let g = engine_state.lock().await;
+        g.materialize_now(admin_addr)
+    };
+    assert_eq!(
+        mat.members.get(&joiner_addr).map(|m| m.status),
+        Some(MemberStatus::Left),
+        "Leave after PendingJoin must materialize as Left"
+    );
+
+    engine.shutdown().await.expect("shutdown");
+}
+
+/// ZEB-254 Task 15 — two-admin race: joiner inserts PendingJoin; two Joined
+/// members (the canonical admin and a second Joined member) both author
+/// JoinCountersign events targeting the same PendingJoin. All three events
+/// end up in the joiner's engine state. Materialize: status is `Joined` and
+/// both JoinCountersigns are present in the log.
+///
+/// Implementation note: the "race" is simulated by directly constructing
+/// both JoinCountersigns and inserting them into the joiner's engine rather
+/// than via two independent auto-sign engines. The auto-sign hook is already
+/// covered by `admin_engine_auto_counter_signs_on_pending_join_insert`; this
+/// test focuses on the materialize + state-CRDT invariant.
+#[tokio::test]
+async fn pending_join_resolves_under_two_admin_race() {
+    let community_id = SpaceId([0xD2u8; 16]);
+
+    // Canonical admin (admin1).
+    let (admin1_priv, admin1_pub, admin1_addr) = make_identity(0xA7);
+    let _admin1_signing = signing_key_from(&admin1_priv);
+
+    // Second Joined member who also counter-signs (admin2).
+    let (admin2_priv, admin2_pub, admin2_addr) = make_identity(0xA8);
+
+    // Joiner.
+    let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xB7);
+    let joiner_signing = signing_key_from(&joiner_priv);
+
+    let mut resolver_map = HashMap::new();
+    resolver_map.insert(admin1_addr, admin1_pub);
+    resolver_map.insert(admin2_addr, admin2_pub);
+    resolver_map.insert(joiner_addr, joiner_pub);
+    let resolver: Arc<dyn IdentityResolver> = Arc::new(StaticResolver { map: resolver_map });
+
+    // ── Single joiner-side engine ────────────────────────────────────────────
+    let (pub_tx, _pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_sub_tx, sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let joiner_engine = build_engine_with_resolver(
+        community_id,
+        admin1_addr,
+        joiner_addr,
+        joiner_signing,
+        pub_tx,
+        sub_rx,
+        make_cas(),
+        &tmp,
+        Some(resolver),
+        Some(admin1_pub),
+    );
+
+    // ── Admin1 bootstrap Join ────────────────────────────────────────────────
+    let admin1_join_payload = EventPayload {
+        id: [0xA7u8; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: admin1_addr,
+        at: Hlc {
+            wall_ms: 1_700_000_001_000,
+            logical: 0,
+            device_id: "admin1-dev".into(),
+        },
+    };
+    let admin1_join =
+        sign_event_with_identity(&admin1_join_payload, &admin1_priv).expect("sign admin1 join");
+    joiner_engine
+        .insert_local_event_with_pubs(admin1_join, admin1_pub, None)
+        .await
+        .expect("admin1 join");
+
+    // ── Admin2 bootstrap Join (countersig'd by admin1 — invite-only community) ──
+    let admin2_join_payload = EventPayload {
+        id: [0xA8u8; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: admin2_addr,
+        at: Hlc {
+            wall_ms: 1_700_000_001_500,
+            logical: 0,
+            device_id: "admin2-dev".into(),
+        },
+    };
+    let admin2_join_unsigned =
+        sign_event_with_identity(&admin2_join_payload, &admin2_priv).expect("sign admin2 join");
+    let admin2_join_with_cs = attach_countersig_with_identity(&admin2_join_unsigned, &admin1_priv)
+        .expect("admin1 countersigs admin2 join");
+    joiner_engine
+        .insert_local_event_with_pubs(admin2_join_with_cs, admin2_pub, Some(admin1_pub))
+        .await
+        .expect("admin2 join");
+
+    // ── Joiner PendingJoin ───────────────────────────────────────────────────
+    let token = make_signed_token(
+        &admin1_priv,
+        admin1_addr,
+        Some(joiner_addr),
+        Some(1_700_000_100_000),
+    );
+    let pending_payload = EventPayload {
+        id: [0xB7u8; 16],
+        community_id,
+        kind: MembershipEventKind::PendingJoin {
+            invite_token: token,
+            joiner_identity_pub: joiner_pub,
+        },
+        actor: joiner_addr,
+        at: Hlc {
+            wall_ms: 1_700_000_002_000,
+            logical: 0,
+            device_id: "joiner-dev".into(),
+        },
+    };
+    let pending_join =
+        sign_event_with_identity(&pending_payload, &joiner_priv).expect("sign PendingJoin");
+    let pending_id = pending_join.id;
+
+    let o = joiner_engine
+        .insert_local_event_with_pubs(pending_join, joiner_pub, None)
+        .await
+        .expect("PendingJoin insert");
+    assert!(
+        matches!(o, InsertOutcome::Inserted),
+        "joiner PendingJoin: {:?}",
+        o
+    );
+
+    // ── Two concurrent JoinCountersigns from both admins ─────────────────────
+    // Construct both directly (simulating the "two admin engines both auto-signed
+    // and their outputs are synced here").
+    let cs1_payload = EventPayload {
+        id: [0xC7u8; 16],
+        community_id,
+        kind: MembershipEventKind::JoinCountersign {
+            target_event_id: pending_id,
+        },
+        actor: admin1_addr,
+        at: Hlc {
+            wall_ms: 1_700_000_003_000,
+            logical: 0,
+            device_id: "admin1-dev".into(),
+        },
+    };
+    let cs1 = sign_event_with_identity(&cs1_payload, &admin1_priv).expect("sign cs1");
+
+    let cs2_payload = EventPayload {
+        id: [0xC8u8; 16],
+        community_id,
+        kind: MembershipEventKind::JoinCountersign {
+            target_event_id: pending_id,
+        },
+        actor: admin2_addr,
+        at: Hlc {
+            wall_ms: 1_700_000_003_500,
+            logical: 0,
+            device_id: "admin2-dev".into(),
+        },
+    };
+    let cs2 = sign_event_with_identity(&cs2_payload, &admin2_priv).expect("sign cs2");
+
+    // Deliver both to the joiner's engine.
+    let r1 = joiner_engine
+        .insert_local_event_with_pubs(cs1, admin1_pub, None)
+        .await
+        .expect("cs1 insert");
+    assert!(
+        matches!(r1, InsertOutcome::Inserted),
+        "cs1 must be Inserted; got {:?}",
+        r1
+    );
+    let r2 = joiner_engine
+        .insert_local_event_with_pubs(cs2, admin2_pub, None)
+        .await
+        .expect("cs2 insert");
+    assert!(
+        matches!(r2, InsertOutcome::Inserted),
+        "cs2 must be Inserted; got {:?}",
+        r2
+    );
+
+    // Materialize from joiner's state.
+    let joiner_state_arc = joiner_engine.state();
+    let mat = {
+        let g = joiner_state_arc.lock().await;
+        g.materialize_now(admin1_addr)
+    };
+    assert_eq!(
+        mat.members.get(&joiner_addr).map(|m| m.status),
+        Some(MemberStatus::Joined),
+        "joiner must be Joined after both counter-signs land"
+    );
+
+    // Both JoinCountersigns must be present in the joiner's event log.
+    let cs_count = {
+        let g = joiner_state_arc.lock().await;
+        g.events
+            .values()
+            .filter(|e| {
+                matches!(
+                    &e.kind,
+                    MembershipEventKind::JoinCountersign { target_event_id }
+                    if *target_event_id == pending_id
+                )
+            })
+            .count()
+    };
+    assert_eq!(
+        cs_count, 2,
+        "both admin JoinCountersigns must be present in joiner's log; got {cs_count}"
+    );
+
+    joiner_engine.shutdown().await.expect("joiner shutdown");
+}
+
+/// ZEB-254 Task 15 — delayed admin: joiner inserts PendingJoin first; admin
+/// engine starts later; state-root sync delivers PendingJoin to admin; admin
+/// auto-counter-signs; JoinCountersign synced back to joiner; joiner
+/// materializes as `Joined`.
+#[tokio::test]
+async fn pending_join_resolves_when_admin_comes_online() {
+    let community_id = SpaceId([0xD3u8; 16]);
+    let (admin_priv, admin_pub, admin_addr) = make_identity(0xA9);
+    let admin_signing = signing_key_from(&admin_priv);
+    let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xB9);
+    let joiner_signing = signing_key_from(&joiner_priv);
+
+    let mut resolver_map = HashMap::new();
+    resolver_map.insert(admin_addr, admin_pub);
+    resolver_map.insert(joiner_addr, joiner_pub);
+    let make_resolver = || -> Arc<dyn IdentityResolver> {
+        Arc::new(StaticResolver {
+            map: resolver_map.clone(),
+        })
+    };
+
+    // ── Joiner engine (starts first, admin offline) ──────────────────────────
+    let (pub_tx_j, _pub_rx_j) = mpsc::channel::<Vec<u8>>(8);
+    let (_sub_tx_j, sub_rx_j) = mpsc::channel::<Vec<u8>>(8);
+    let tmp_j = tempfile::tempdir().expect("tempdir_j");
+    let joiner_engine = build_engine_with_resolver(
+        community_id,
+        admin_addr,
+        joiner_addr,
+        joiner_signing,
+        pub_tx_j,
+        sub_rx_j,
+        make_cas(),
+        &tmp_j,
+        Some(make_resolver()),
+        Some(admin_pub),
+    );
+
+    // Admin bootstrap Join in joiner's engine (so joiner knows admin is Joined
+    // — required for the JoinCountersign verify gate when it arrives later).
+    let admin_join_payload = EventPayload {
+        id: [0xA9u8; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: admin_addr,
+        at: Hlc {
+            wall_ms: 1_700_000_001_000,
+            logical: 0,
+            device_id: "admin-dev".into(),
+        },
+    };
+    let admin_join =
+        sign_event_with_identity(&admin_join_payload, &admin_priv).expect("sign admin join");
+    joiner_engine
+        .insert_local_event_with_pubs(admin_join.clone(), admin_pub, None)
+        .await
+        .expect("admin join in joiner");
+
+    // Joiner inserts PendingJoin while admin is offline.
+    let token = make_signed_token(
+        &admin_priv,
+        admin_addr,
+        Some(joiner_addr),
+        Some(1_700_000_100_000),
+    );
+    let pending_payload = EventPayload {
+        id: [0xB9u8; 16],
+        community_id,
+        kind: MembershipEventKind::PendingJoin {
+            invite_token: token,
+            joiner_identity_pub: joiner_pub,
+        },
+        actor: joiner_addr,
+        at: Hlc {
+            wall_ms: 1_700_000_002_000,
+            logical: 0,
+            device_id: "joiner-dev".into(),
+        },
+    };
+    let pending_join =
+        sign_event_with_identity(&pending_payload, &joiner_priv).expect("sign PendingJoin");
+    let pending_id = pending_join.id;
+
+    let o = joiner_engine
+        .insert_local_event_with_pubs(pending_join.clone(), joiner_pub, None)
+        .await
+        .expect("PendingJoin insert");
+    assert!(matches!(o, InsertOutcome::Inserted), "PendingJoin: {:?}", o);
+
+    // ── Admin engine comes online ─────────────────────────────────────────────
+    let (pub_tx_a, _pub_rx_a) = mpsc::channel::<Vec<u8>>(8);
+    let (_sub_tx_a, sub_rx_a) = mpsc::channel::<Vec<u8>>(8);
+    let tmp_a = tempfile::tempdir().expect("tempdir_a");
+    let admin_engine = build_engine_with_resolver(
+        community_id,
+        admin_addr,
+        admin_addr, // self == admin → auto-counter-sign fires
+        admin_signing,
+        pub_tx_a,
+        sub_rx_a,
+        make_cas(),
+        &tmp_a,
+        Some(make_resolver()),
+        Some(admin_pub),
+    );
+
+    // Admin's own bootstrap Join in the admin engine.
+    admin_engine
+        .insert_local_event_with_pubs(admin_join, admin_pub, None)
+        .await
+        .expect("admin join in admin_engine");
+
+    // Sync joiner → admin (delivers PendingJoin).
+    let joiner_state = joiner_engine.state();
+    sync_one_way(&joiner_state, &admin_engine, joiner_pub).await;
+
+    // Wait for admin to produce the JoinCountersign.
+    let admin_state = admin_engine.state();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let done = {
+                let g = admin_state.lock().await;
+                g.events.values().any(|e| {
+                    matches!(
+                        &e.kind,
+                        MembershipEventKind::JoinCountersign { target_event_id }
+                        if *target_event_id == pending_id
+                    )
+                })
+            };
+            if done {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for admin JoinCountersign");
+
+    // Sync admin → joiner (delivers JoinCountersign back).
+    sync_one_way(&admin_state, &joiner_engine, admin_pub).await;
+
+    // Materialize from joiner's state.
+    let joiner_state_final = joiner_engine.state();
+    let mat = {
+        let g = joiner_state_final.lock().await;
+        g.materialize_now(admin_addr)
+    };
+    assert_eq!(
+        mat.members.get(&joiner_addr).map(|m| m.status),
+        Some(MemberStatus::Joined),
+        "joiner must be Joined after admin comes online and counter-signs"
+    );
+
+    joiner_engine.shutdown().await.expect("joiner shutdown");
+    admin_engine.shutdown().await.expect("admin shutdown");
+}
+
+// SKIP: pending_join_30d_expiry_hides_joiner
+//
+// This integration test would be redundant with the unit tests already in
+// community_membership.rs (Task 4):
+//   - `materialize_pending_join_older_than_30d_hidden`
+//   - `materialize_pending_join_countersign_resurrects_expired_pending`
+// Both exercise the exact `materialize()` code path. The engine-level path
+// calls `materialize_now()` which calls `materialize()` identically — there
+// is no new code path to exercise at the engine layer. Deferred as a future
+// follow-up if end-to-end expiry via real HLC advancement is needed.
+
+// SKIP: pending_join_survives_joiner_restart
+//
+// The current `CommunitySyncEngine` test construction in
+// `build_engine_with_resolver` creates fresh in-memory state on each call;
+// the `PersistPaths` tempfiles are not loaded on startup in the test
+// configuration. A restart test requires disk-backed state round-trip
+// (reading crdt.cbor on engine init), which is not yet exposed to integration
+// tests. Deferred to a follow-up ticket once persistence round-trip helpers
+// are available.
