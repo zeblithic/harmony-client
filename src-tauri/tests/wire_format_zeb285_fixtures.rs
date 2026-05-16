@@ -11,9 +11,11 @@
 
 use harmony_app::community_invite::{
     BoundedChannelLogSnapshot, CommunityInvitePayload, InviteEpochSnapshot,
-    MaterializedCommunityState, PreForkSnapshot,
+    MaterializedCommunityState, ParentLineageEntry, PreForkSnapshot,
 };
 use harmony_app::community_membership::{MembershipEventKind, SignedMembershipEvent};
+use harmony_app::community_state_crdt::CommunityState;
+use harmony_app::owner_state_crypto::canonical_cbor_decode;
 use harmony_app::owner_state_crypto::canonical_cbor_encode;
 use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
 use std::collections::BTreeMap;
@@ -130,5 +132,156 @@ fn community_invite_with_fork_fields_pinned() {
     assert_eq!(
         hex, expected_hex,
         "CommunityInvitePayload with fork fields wire format changed"
+    );
+}
+
+// ── ZEB-287 Phase 2 wire-format fixtures ─────────────────────────────
+//
+// Pin the canonical CBOR bytes for the new Phase 2 types
+// (ParentLineageEntry) and the Phase 2 extensions on existing types
+// (PreForkSnapshot.parent_lineage, CommunityState.parent_lineage +
+// forked_at_wall_ms). Includes a Phase 1 byte-compat fixture that
+// asserts Phase 1-shape blobs decode under Phase 2 types as defaults
+// and re-encode byte-identically.
+//
+// To regenerate after an intentional wire change: replace the
+// expected_hex with the eprintln!-emitted value, then re-run.
+
+/// Fixture 4: ParentLineageEntry with all fields populated.
+#[test]
+fn parent_lineage_entry_canonical_cbor() {
+    let entry = ParentLineageEntry {
+        space_id: SpaceId([0x42; 16]),
+        name: "Cool Community".to_string(),
+        forked_at_wall_ms: Some(1_715_811_234_567),
+    };
+    let bytes = canonical_cbor_encode(&entry).expect("encode");
+    let hex = hex::encode(&bytes);
+    eprintln!("parent_lineage_entry_canonical_cbor hex: {hex}");
+
+    let expected_hex = "a36273695042424242424242424242424242424242626e6d6e436f6f6c20436f6d6d756e6974796261741b0000018f7e51b307";
+    assert_eq!(hex, expected_hex, "ParentLineageEntry wire format changed");
+}
+
+/// Fixture 5: ParentLineageEntry with forked_at_wall_ms = None (root entry).
+/// Asserts the `at` key is omitted (skip-if-none).
+#[test]
+fn parent_lineage_entry_root_omits_at_canonical_cbor() {
+    let entry = ParentLineageEntry {
+        space_id: SpaceId([0x11; 16]),
+        name: "Root".to_string(),
+        forked_at_wall_ms: None,
+    };
+    let bytes = canonical_cbor_encode(&entry).expect("encode");
+    let hex = hex::encode(&bytes);
+    eprintln!("parent_lineage_entry_root_omits_at_canonical_cbor hex: {hex}");
+
+    let expected_hex = "a26273695011111111111111111111111111111111626e6d64526f6f74";
+    assert_eq!(hex, expected_hex, "Root ParentLineageEntry changed");
+    assert!(
+        !bytes.windows(2).any(|w| w == b"at"),
+        "root entry must omit `at` key"
+    );
+}
+
+/// Fixture 6: PreForkSnapshot carrying a 2-entry parent_lineage chain.
+#[test]
+fn pre_fork_snapshot_with_parent_lineage_canonical_cbor() {
+    let snapshot = PreForkSnapshot {
+        original_community_id: SpaceId([0xa0; 16]),
+        original_community_name: "Pinned".to_string(),
+        membership_events: vec![],
+        channel_log: BoundedChannelLogSnapshot::default(),
+        identity_pubs: BTreeMap::new(),
+        forked_at: fixture_hlc(),
+        parent_lineage: vec![
+            ParentLineageEntry {
+                space_id: SpaceId([0x11; 16]),
+                name: "Root".to_string(),
+                forked_at_wall_ms: None,
+            },
+            ParentLineageEntry {
+                space_id: SpaceId([0x22; 16]),
+                name: "Mid".to_string(),
+                forked_at_wall_ms: Some(1_650_000_000_000),
+            },
+        ],
+    };
+
+    let bytes = canonical_cbor_encode(&snapshot).expect("encode");
+    let hex = hex::encode(&bytes);
+    eprintln!("pre_fork_snapshot_with_parent_lineage_canonical_cbor hex: {hex}");
+
+    let expected_hex = "a7626f6950a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0626f6e6650696e6e65646265768062636ca1627063a0626970a0627473a361771b0000018bcfe56800616c0061646b746573742d64657669636562706c82a26273695011111111111111111111111111111111626e6d64526f6f74a36273695022222222222222222222222222222222626e6d634d69646261741b000001802ba9f400";
+    // Spec note: the chain is encoded as a 2-element CBOR array;
+    // skip-if-empty guarantees byte-identity to Phase 1 when chain empty.
+    assert_eq!(
+        hex, expected_hex,
+        "PreForkSnapshot with parent_lineage wire format changed"
+    );
+    assert!(
+        bytes.windows(2).any(|w| w == b"pl"),
+        "non-empty parent_lineage must produce `pl` key"
+    );
+}
+
+/// Fixture 7: CommunityState carrying parent_lineage + forked_at_wall_ms.
+#[test]
+fn community_state_with_parent_lineage_canonical_cbor() {
+    let mut state = CommunityState::new(SpaceId([0xa0; 16]));
+    state.forked_from = Some(SpaceId([0xb0; 16]));
+    state.forked_at_wall_ms = Some(1_715_000_000_000);
+    state.parent_lineage = vec![ParentLineageEntry {
+        space_id: SpaceId([0x11; 16]),
+        name: "Root".to_string(),
+        forked_at_wall_ms: None,
+    }];
+
+    let bytes = canonical_cbor_encode(&state).expect("encode");
+    let hex = hex::encode(&bytes);
+    eprintln!("community_state_with_parent_lineage_canonical_cbor hex: {hex}");
+
+    let expected_hex = "a562636950a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a062666650b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b06266611b0000018f4df73e0062666c81a26273695011111111111111111111111111111111626e6d64526f6f74626576a0";
+    // Spec §3.3: `ff` (forked_from), `fa` (forked_at_wall_ms), and `fl`
+    // (parent_lineage) are all 2-char keys at this nesting level.
+    // `ev` (events) is an empty BTreeMap → `a0`. `ci` is community_id.
+    assert_eq!(
+        hex, expected_hex,
+        "CommunityState with parent_lineage wire format changed"
+    );
+    assert!(bytes.windows(2).any(|w| w == b"fa"));
+    assert!(bytes.windows(2).any(|w| w == b"fl"));
+}
+
+/// Fixture 8: Phase 1 wire-form (no `fa`, no `fl`) decodes under Phase 2
+/// types as defaults (None, empty Vec) and re-encodes byte-identically.
+/// Locks the backwards-compat guarantee per spec §6.1.
+#[test]
+fn phase1_community_state_decodes_under_phase2_types() {
+    // Construct a Phase 1-shape CommunityState via the public constructor
+    // (cache + bootstrap_hint fields are private — by design, they're
+    // skipped from CBOR anyway, so this is the canonical construction
+    // path). Then patch only the public Phase-1-relevant fields.
+    let mut phase1_state = CommunityState::new(SpaceId([0xaa; 16]));
+    phase1_state.forked_from = Some(SpaceId([0xbb; 16]));
+    // forked_at_wall_ms stays at None (Phase 2 default — Phase 1 shape)
+    // parent_lineage stays empty (Phase 2 default — Phase 1 shape)
+
+    let bytes = canonical_cbor_encode(&phase1_state).expect("encode");
+    let decoded: CommunityState = canonical_cbor_decode(&bytes).expect("decode");
+
+    assert_eq!(decoded.parent_lineage, Vec::<ParentLineageEntry>::new());
+    assert_eq!(decoded.forked_at_wall_ms, None);
+    assert_eq!(decoded.forked_from, Some(SpaceId([0xbb; 16])));
+    assert_eq!(decoded.community_id, SpaceId([0xaa; 16]));
+
+    // Byte-compat: the encoded form must NOT contain the Phase 2 keys.
+    assert!(
+        !bytes.windows(2).any(|w| w == b"fa"),
+        "Phase 1-shape CommunityState must omit `fa` key"
+    );
+    assert!(
+        !bytes.windows(2).any(|w| w == b"fl"),
+        "Phase 1-shape CommunityState must omit `fl` key"
     );
 }
