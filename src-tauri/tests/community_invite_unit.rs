@@ -1337,3 +1337,41 @@ mod verify_admin_bootstrap_tests {
         );
     }
 }
+
+// ZEB-287 Phase 2: ParentLineageEntry roundtrip tests
+mod zeb287_parent_lineage_entry {
+    use harmony_app::community_invite::ParentLineageEntry;
+    use harmony_app::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
+    use harmony_app::owner_state_types::SpaceId;
+
+    #[test]
+    fn parent_lineage_entry_roundtrip_with_forked_at() {
+        let entry = ParentLineageEntry {
+            space_id: SpaceId([0x42; 16]),
+            name: "Cool Community".to_string(),
+            forked_at_wall_ms: Some(1_715_811_234_567),
+        };
+        let bytes = canonical_cbor_encode(&entry).expect("encode");
+        let decoded: ParentLineageEntry = canonical_cbor_decode(&bytes).expect("decode");
+        assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn parent_lineage_entry_roundtrip_root_omits_at() {
+        let entry = ParentLineageEntry {
+            space_id: SpaceId([0x11; 16]),
+            name: "Project Cool".to_string(),
+            forked_at_wall_ms: None,
+        };
+        let bytes_no_at = canonical_cbor_encode(&entry).expect("encode");
+        let decoded: ParentLineageEntry = canonical_cbor_decode(&bytes_no_at).expect("decode");
+        assert_eq!(entry, decoded);
+
+        // The serialized form must NOT contain the bytes for key "at" since
+        // the field is skip-if-none.
+        assert!(
+            !bytes_no_at.windows(2).any(|w| w == b"at"),
+            "skip_serializing_if = Option::is_none failed to drop the `at` key"
+        );
+    }
+}

@@ -387,6 +387,34 @@ pub struct BoundedChannelLogSnapshot {
 impl CanonicalPayloadSealed for BoundedChannelLogSnapshot {}
 impl CanonicalPayload for BoundedChannelLogSnapshot {}
 
+/// ZEB-287 Phase 2: one entry in a fork's ancestor chain. Frozen at the
+/// time it was added to a fork's lineage; ancestor renames after this
+/// do not propagate to descendants. Bundled into
+/// `PreForkSnapshot.parent_lineage` and persisted in
+/// `CommunityState.parent_lineage`.
+///
+/// Same-length-keys invariant: CBOR keys at this nesting level are all
+/// 2-char (`si`, `nm`, `at`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParentLineageEntry {
+    /// SpaceId of this ancestor community.
+    #[serde(rename = "si")]
+    pub space_id: SpaceId,
+
+    /// Display name of this ancestor at the time it was frozen.
+    #[serde(rename = "nm")]
+    pub name: String,
+
+    /// wall_ms component of the Fork event that created THIS ancestor
+    /// from its predecessor in the chain. `None` for the root (top of
+    /// the chain — never forked, has no predecessor).
+    #[serde(rename = "at", skip_serializing_if = "Option::is_none", default)]
+    pub forked_at_wall_ms: Option<u64>,
+}
+
+impl CanonicalPayloadSealed for ParentLineageEntry {}
+impl CanonicalPayload for ParentLineageEntry {}
+
 /// ZEB-285: frozen snapshot of an original community's history,
 /// bundled into fork-invites so fork-invitees can see pre-fork
 /// context. Self-contained for verification: `identity_pubs` carries
@@ -394,8 +422,9 @@ impl CanonicalPayload for BoundedChannelLogSnapshot {}
 /// `membership_events` and `channel_log`, so joiners do NOT need to
 /// query profile-broadcast to verify the snapshot.
 ///
-/// Wire format: 6-key CBOR map. Field codes 2-char per same-length-
-/// keys at this nesting level. See spec §3.4.
+/// Wire format: 6-key CBOR map (7th `pl` key added in ZEB-287 Phase 2,
+/// skipped when empty). Field codes 2-char per same-length-keys at this
+/// nesting level. See spec §3.4 (Phase 1) and §3.2 (Phase 2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreForkSnapshot {
     /// The original community's SpaceId. Signed pre-fork events
