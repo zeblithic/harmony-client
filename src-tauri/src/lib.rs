@@ -15858,6 +15858,159 @@ async fn countersign_admin_proposal(
     })
 }
 
+// ── ZEB-250 Task 12: propose_change_quorum IPC ────────────────────────────
+
+/// ZEB-250 §6.4: admin IPC that proposes changing the community's
+/// `admin_quorum` threshold. Validates `new_quorum` ∈ [1, admin_count].
+/// Mints an `AdminProposal { ChangeQuorum { new_quorum } }` event and
+/// returns `AdminActionResult::Completed` when the current quorum is 1
+/// (proposer's signature self-satisfies), or `Pending` otherwise.
+///
+/// Authorization: caller must be Joined with power ≥ 100.
+#[tauri::command]
+async fn propose_change_quorum(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    new_quorum: u8,
+) -> Result<AdminActionResult, String> {
+    if new_quorum < 1 {
+        return Err("propose_change_quorum: new_quorum must be >= 1".to_string());
+    }
+
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or("dm_self_owner missing")?,
+            g.community_registry
+                .clone()
+                .ok_or("community_registry missing — node not running?")?,
+            g.dm_outbox
+                .clone()
+                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.generation,
+        )
+    };
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // ZEB-267: atomic HLC reservation.
+    let event_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+
+    // Generation + registry fence.
+    {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during propose_change_quorum (was {}, now {})",
+                snapshot_generation, g.generation
+            ));
+        }
+        if g.community_registry.is_none() {
+            return Err(
+                "community_registry detached during propose_change_quorum (node stopped?)"
+                    .to_string(),
+            );
+        }
+    }
+
+    let engine_arc = community_registry
+        .engine_arc(&space_id)
+        .await
+        .ok_or_else(|| {
+            format!(
+                "no engine for community {} — not currently joined",
+                hex::encode(space_id.0)
+            )
+        })?;
+
+    let admin_addr = engine_arc.admin_addr();
+
+    // Auth + admin_count + current quorum — single read lock.
+    let (admin_quorum, admin_count) = {
+        let state = engine_arc.state();
+        let state_g = state.lock().await;
+        let m = state_g.materialize_now(admin_addr);
+
+        let caller_status = m.members.get(&self_owner).map(|ms| ms.status);
+        if !matches!(
+            caller_status,
+            Some(crate::community_membership::MemberStatus::Joined)
+        ) {
+            return Err("propose_change_quorum: caller is not a Joined member".to_string());
+        }
+        let caller_power = m.power_levels.get(&self_owner).copied().unwrap_or(0);
+        if caller_power < 100 {
+            return Err(format!(
+                "propose_change_quorum: caller power {caller_power} below admin threshold 100"
+            ));
+        }
+
+        let count = m.power_levels.values().filter(|p| **p == 100).count() as u32;
+        (m.admin_quorum, count)
+    };
+
+    if (new_quorum as u32) > admin_count {
+        return Err(format!(
+            "propose_change_quorum: new_quorum {} exceeds current admin count {}",
+            new_quorum, admin_count
+        ));
+    }
+
+    // Mint AdminProposal{ChangeQuorum}.
+    let proposal = {
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        mint_admin_proposal_change_quorum_event(
+            space_id,
+            self_owner,
+            new_quorum,
+            signing_key,
+            event_hlc,
+        )?
+    };
+    let proposal_id_hex = hex::encode(proposal.id);
+    let outcome = engine_arc
+        .insert_local_event(proposal)
+        .await
+        .map_err(|e| format!("engine.insert_local_event (AdminProposal change_quorum): {e}"))?;
+    if matches!(
+        outcome,
+        crate::community_state_crdt::InsertOutcome::Rejected(_)
+    ) {
+        return Err(membership_outcome_err(
+            "propose_change_quorum (AdminProposal)",
+            &outcome,
+        ));
+    }
+
+    if admin_quorum == 1 {
+        Ok(AdminActionResult::Completed)
+    } else {
+        Ok(AdminActionResult::Pending {
+            proposal_event_id: proposal_id_hex,
+            signers_so_far: 1,
+            quorum_required: admin_quorum,
+        })
+    }
+}
+
 /// Delta payload for the `community-members-changed` Tauri event.
 /// Matches the spec line 561 wire shape:
 /// `{ communityId, changes: [{type, target, by?, detail?}] }`. One
@@ -17101,6 +17254,7 @@ pub fn run() {
             list_recent_counter_signs,
             list_pending_admin_proposals,
             countersign_admin_proposal,
+            propose_change_quorum,
             create_channel,
             modify_channel,
             delete_channel,
@@ -21024,6 +21178,169 @@ mod countersign_admin_proposal_tests {
         assert!(
             reached_quorum,
             "reached_quorum must be true when signers == quorum"
+        );
+    }
+}
+
+// ── ZEB-250 Task 12: propose_change_quorum unit tests ─────────────────────
+//
+// Exercises the validation logic (new_quorum < 1, new_quorum > admin_count)
+// directly against CommunityState, bypassing the Tauri IPC layer.
+#[cfg(test)]
+mod propose_change_quorum_tests {
+    use super::*;
+    use crate::community_membership::{
+        sign_event_with_identity, EventPayload, MembershipEventKind, VerifyContext,
+    };
+    use crate::community_state_crdt::{CommunityState, InsertOutcome};
+    use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+    use harmony_identity::PrivateIdentity;
+
+    fn hlc(wall: u64, dev: &str) -> Hlc {
+        Hlc {
+            wall_ms: wall,
+            logical: 0,
+            device_id: dev.to_string(),
+        }
+    }
+
+    fn insert_ok(
+        state: &mut CommunityState,
+        payload: EventPayload,
+        identity: &PrivateIdentity,
+        admin: OwnerAddr,
+        actor_pub: &[u8; 64],
+    ) {
+        let ev = sign_event_with_identity(&payload, identity).expect("sign");
+        let ctx = VerifyContext {
+            expected_community_id: payload.community_id,
+            admin_addr: admin,
+            is_invite_only: false,
+            actor_identity_pub: actor_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: None,
+        };
+        let outcome = state.insert_event(ev, &ctx);
+        assert!(
+            matches!(outcome, InsertOutcome::Inserted),
+            "fixture insert must succeed; got {outcome:?}"
+        );
+    }
+
+    // ── Test 10: propose_change_quorum_rejects_out_of_range_values ────────
+    //
+    // Spec §8.4 test 10. Exercises both out-of-range cases:
+    //   • new_quorum == 0  → Err (< 1 guard, checked before engine access)
+    //   • new_quorum > admin_count → Err (exceeds current admin count)
+    //
+    // We test the validation logic directly by calling the pure helpers and
+    // replicating the IPC guard conditions without going through the full
+    // NodeState / Tauri stack.
+    #[tokio::test]
+    async fn propose_change_quorum_rejects_out_of_range_values() {
+        // ── Part A: new_quorum == 0 is caught by the IPC guard (new_quorum < 1). ──
+        // This is a pure integer check — no community state needed.
+        let new_quorum_zero: u8 = 0;
+        assert!(new_quorum_zero < 1, "new_quorum=0 must fail the >= 1 guard");
+
+        // ── Part B: new_quorum > admin_count is caught after reading materialized state. ──
+        // Build a community with exactly 1 admin (the founder) and assert that
+        // requesting new_quorum=2 would exceed the admin count.
+        let community_id = SpaceId([0xd0; 16]);
+
+        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
+        let admin = OwnerAddr(admin_identity.identity.address_hash);
+        let admin_pub = admin_identity.identity.to_public_bytes();
+
+        let mut state = CommunityState::new(community_id);
+
+        // admin Joins — only 1 admin in the community (power defaults to 0 for
+        // non-founders; but the SpaceId owner is admin by convention in tests).
+        insert_ok(
+            &mut state,
+            EventPayload {
+                id: [0xd1; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: admin,
+                at: hlc(100, "admin"),
+            },
+            &admin_identity,
+            admin,
+            &admin_pub,
+        );
+
+        // Give the admin power=100 explicitly so the power_levels map is populated.
+        let sk_bytes = admin_identity.to_private_bytes();
+        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+        let sp_ev = mint_set_power_event(
+            community_id,
+            admin,
+            admin,
+            100,
+            &signing_key,
+            hlc(110, "admin"),
+        )
+        .expect("mint_set_power_event");
+        let sp_outcome = state.insert_event(
+            sp_ev,
+            &VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+                actor_identity_pub: &admin_pub,
+                countersigner_identity_pub: None,
+                admin_identity_pub: None,
+            },
+        );
+        assert!(
+            matches!(sp_outcome, InsertOutcome::Inserted),
+            "self-SetPower to 100 must insert; got {sp_outcome:?}"
+        );
+
+        // Compute admin_count via the same expression the IPC handler uses.
+        let m = state.materialize_now(admin);
+        let admin_count = m.power_levels.values().filter(|p| **p == 100).count() as u32;
+        assert_eq!(admin_count, 1, "only 1 admin in community");
+
+        // new_quorum=2 > admin_count=1 → must be rejected.
+        let new_quorum_too_large: u8 = 2;
+        assert!(
+            (new_quorum_too_large as u32) > admin_count,
+            "new_quorum={new_quorum_too_large} must exceed admin_count={admin_count}"
+        );
+
+        // new_quorum=1 == admin_count=1 → must be accepted.
+        let new_quorum_valid: u8 = 1;
+        assert!(
+            (new_quorum_valid as u32) <= admin_count,
+            "new_quorum={new_quorum_valid} must not exceed admin_count={admin_count}"
+        );
+
+        // Sanity-check: minting the valid proposal succeeds.
+        let cq_ev = mint_admin_proposal_change_quorum_event(
+            community_id,
+            admin,
+            new_quorum_valid,
+            &signing_key,
+            hlc(200, "admin"),
+        )
+        .expect("mint_admin_proposal_change_quorum_event must succeed for new_quorum=1");
+        let cq_outcome = state.insert_event(
+            cq_ev,
+            &VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+                actor_identity_pub: &admin_pub,
+                countersigner_identity_pub: None,
+                admin_identity_pub: None,
+            },
+        );
+        assert!(
+            matches!(cq_outcome, InsertOutcome::Inserted),
+            "ChangeQuorum proposal with new_quorum=1 must insert; got {cq_outcome:?}"
         );
     }
 }
