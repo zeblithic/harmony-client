@@ -113,6 +113,13 @@ export interface NavNode {
   /** ZEB-285: hex SpaceId of the original community this node was forked from.
    *  Present only for community nodes created via fork_community. */
   forkedFrom?: string;
+  /**
+   * ZEB-254: true when the join countersign has not yet arrived from the admin
+   * (invite-only community, admin was offline at redeem time). The community
+   * appears in nav greyed/italic until the backend emits nav-updated
+   * { pending: false } once the JoinCountersign lands.
+   */
+  pending?: boolean;
 }
 
 /** Mirrors harmony-content VineDescriptor on the TypeScript side. */

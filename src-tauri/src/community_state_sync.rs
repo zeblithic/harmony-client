@@ -469,6 +469,14 @@ pub type PendingRedemptionMap = std::sync::Arc<
     >,
 >;
 
+/// ZEB-254 Task 11: callback emitted when a `JoinCountersign` targeting a
+/// self-authored `PendingJoin` lands in the joiner's engine. Receives the
+/// community `SpaceId` (for routing) and the community name (for the
+/// `nav-updated` payload). Production wires a closure that calls
+/// `app.emit("nav-updated", ...)` on the Tauri `AppHandle`; tests pass
+/// `None` (no-op).
+pub type NavPendingClearEmitter = std::sync::Arc<dyn Fn(SpaceId, String) + Send + Sync>;
+
 /// Fire any oneshot registered against `event_id` in `pending`.
 /// No-op if no registration exists. Lock is held only across `remove`;
 /// the `send(())` happens after the guard is dropped.
@@ -834,6 +842,24 @@ pub struct CommunitySyncEngineConfig {
     /// the owner-state lock is released before the community-state merge
     /// lock is acquired.
     pub crdt_state: Option<Arc<Mutex<crate::owner_state_crdt::OwnerState>>>,
+
+    /// ZEB-254: 64-byte composite identity pub of the community admin
+    /// (`X25519_pub || Ed25519_pub`). Required for the P5 gate in
+    /// `verify_event` — PendingJoin events carry an InviteToken signed by
+    /// the admin's Ed25519 key; without this field the gate unconditionally
+    /// fails with `PendingJoinTokenInvalid`. `None` for engines that will
+    /// never see PendingJoin events (non-joiner engines, legacy tests).
+    /// The joiner side populates this from
+    /// `CommunityInvitePayload.admin_identity_pub` at spawn time (see
+    /// `redeem_invite_inner`).
+    pub admin_identity_pub: Option<[u8; 64]>,
+
+    /// ZEB-254 Task 11: callback fired when a `JoinCountersign` targeting a
+    /// self-authored `PendingJoin` lands (joiner-side clear hook). Production
+    /// wires a `tauri::AppHandle` closure that emits `nav-updated { pending:
+    /// false }`. `None` for admin engines and for tests that don't assert on
+    /// IPC events.
+    pub nav_emitter: Option<NavPendingClearEmitter>,
 }
 
 /// Per-community state-CRDT sync engine. Owns a tokio task that
@@ -913,6 +939,41 @@ pub struct CommunitySyncEngine {
     /// own clone via `InternalCtx`). `None` for engines spawned
     /// without a registry, e.g. legacy unit tests.
     pending_redemptions: Option<PendingRedemptionMap>,
+    /// ZEB-254: 64-byte composite identity pub of the community admin.
+    /// Shared with the spawned `InternalCtx` task via `Arc<OnceLock>` so
+    /// both the engine's `insert_local_event*` path and the task's
+    /// `handle_incoming_publish` path can read the same binding.
+    ///
+    /// Set at construction when `CommunitySyncEngineConfig.admin_identity_pub`
+    /// is `Some`, or by calling `bind_admin_identity_pub` after spawn (the
+    /// joiner path: `redeem_invite_inner` knows the admin pub only after
+    /// parsing the invite URL, which happens before the engine spawn).
+    /// Unset for non-joiner engines (admin's own `create_community`, boot
+    /// reconcile); those engines never process PendingJoin events.
+    admin_identity_pub: Arc<std::sync::OnceLock<[u8; 64]>>,
+    /// ZEB-254 Task 10: owner address of the local member, retained so
+    /// `maybe_spawn_auto_counter_sign` can check self-eligibility and
+    /// sign JoinCountersign events without reaching back into NodeState.
+    self_owner: crate::owner_state_types::OwnerAddr,
+    /// ZEB-254 Task 10: local Ed25519 signing key, retained so the
+    /// auto-counter-sign spawned task can sign JoinCountersign events.
+    signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    /// ZEB-254 Task 10: stable device identifier, used as the `device_id`
+    /// field in the auto-minted JoinCountersign event's HLC.
+    device_id: String,
+
+    /// ZEB-254 Task 11: callback for the joiner-side Space-pending-clear hook.
+    /// Shared between the engine struct (for `insert_local_event` path) and
+    /// the spawned `InternalCtx` task (for `handle_incoming_publish` path).
+    /// `None` for admin engines and tests that don't assert on IPC events.
+    nav_emitter: Option<NavPendingClearEmitter>,
+
+    /// ZEB-254 Task 11: owner-state CRDT handle, retained on the engine so
+    /// the `insert_local_event` path's pending-clear hook can update
+    /// `Space.pending_join_at`. Mirrors the same Arc held by `InternalCtx`.
+    /// `None` for engines that were spawned without a CRDT reference (tests
+    /// and pre-ZEB-249 call sites).
+    crdt_state: Option<Arc<Mutex<crate::owner_state_crdt::OwnerState>>>,
 }
 
 impl CommunitySyncEngine {
@@ -949,9 +1010,36 @@ impl CommunitySyncEngine {
         let membership_key_for_engine = cfg.membership_key.clone();
         // ZEB-249 §10.6: pass crdt_state to the spawned task (InternalCtx)
         // so publish_root_now / handle_incoming_publish can read the live
-        // epoch key. The engine struct itself doesn't need the reference —
-        // only the task does.
+        // epoch key. ZEB-254 Task 11: the engine struct also retains a clone
+        // so the insert_local_event path can fire the pending-clear hook.
+        let crdt_state_for_engine = cfg.crdt_state.as_ref().map(Arc::clone);
         let crdt_state_for_task = cfg.crdt_state;
+        // ZEB-254: admin_identity_pub is shared between the engine (for
+        // insert_local_event* VerifyContext) and the spawned task (for
+        // handle_incoming_publish VerifyContext). Both get an Arc clone of
+        // the same OnceLock so `bind_admin_identity_pub` sets it for both
+        // paths atomically. Populated now if the config carries a value;
+        // otherwise left unset for non-joiner engines.
+        let admin_pub_lock: Arc<std::sync::OnceLock<[u8; 64]>> =
+            Arc::new(std::sync::OnceLock::new());
+        if let Some(pub_bytes) = cfg.admin_identity_pub {
+            // OnceLock::set always succeeds on a fresh lock.
+            let _ = admin_pub_lock.set(pub_bytes);
+        }
+        let admin_pub_lock_for_task = Arc::clone(&admin_pub_lock);
+
+        // ZEB-254 Task 10: clone self-identity fields before moving cfg
+        // into InternalCtx — the engine struct retains its own copies
+        // for `maybe_spawn_auto_counter_sign`.
+        let self_owner_for_engine = cfg.self_owner;
+        let signing_key_for_engine = Arc::clone(&cfg.signing_key);
+        let device_id_for_engine = cfg.device_id.clone();
+        // ZEB-254 Task 11: nav_emitter is shared between the engine struct
+        // (insert_local_event path) and the InternalCtx task
+        // (handle_incoming_publish path). Clone the Arc so both share the
+        // same callback; `None` for admin engines and tests.
+        let nav_emitter_for_engine = cfg.nav_emitter.clone();
+        let nav_emitter_for_task = cfg.nav_emitter;
 
         let task = tokio::spawn(internal_task(InternalCtx {
             community_id: cfg.community_id,
@@ -977,6 +1065,8 @@ impl CommunitySyncEngine {
             delta_tx: cfg.delta_tx,
             pending_redemptions: cfg.pending_redemptions,
             crdt_state: crdt_state_for_task,
+            admin_identity_pub: admin_pub_lock_for_task,
+            nav_emitter: nav_emitter_for_task,
         }));
 
         Self {
@@ -994,6 +1084,17 @@ impl CommunitySyncEngine {
             is_invite_only: is_invite_only_for_engine,
             delta_tx: delta_tx_for_engine,
             pending_redemptions: pending_redemptions_for_engine,
+            admin_identity_pub: admin_pub_lock,
+            // ZEB-254 Task 10: retain self_owner / signing_key / device_id on
+            // the engine so `maybe_spawn_auto_counter_sign` can build +
+            // sign JoinCountersign events without back-referencing NodeState.
+            self_owner: self_owner_for_engine,
+            signing_key: signing_key_for_engine,
+            device_id: device_id_for_engine,
+            // ZEB-254 Task 11: retain nav_emitter for the insert_local_event path.
+            nav_emitter: nav_emitter_for_engine,
+            // ZEB-254 Task 11: retain crdt_state for the insert_local_event pending-clear hook.
+            crdt_state: crdt_state_for_engine,
         }
     }
 
@@ -1027,6 +1128,143 @@ impl CommunitySyncEngine {
     #[doc(hidden)]
     pub fn admin_addr(&self) -> OwnerAddr {
         self.admin_addr
+    }
+
+    /// ZEB-254: bind the admin identity pub AFTER engine construction.
+    ///
+    /// The joiner path (`redeem_invite_inner`) decodes the admin pub from the
+    /// invite URL before spawning the engine, then calls this method on the
+    /// freshly-spawned engine so the P5 gate in `verify_event` can validate
+    /// PendingJoin events' InviteToken signatures. The binding is shared with
+    /// the spawned internal task (`InternalCtx`) via `Arc<OnceLock>`, so
+    /// `handle_incoming_publish`'s `VerifyContext` also sees it.
+    ///
+    /// No-op if already set (OnceLock::set returns Err on the second call).
+    /// Returns `true` if the binding was set by this call, `false` if it was
+    /// already set (which is not an error — the engine may have been
+    /// constructed with a pre-populated binding via `CommunitySyncEngineConfig
+    /// .admin_identity_pub`).
+    pub fn bind_admin_identity_pub(&self, pub_bytes: [u8; 64]) -> bool {
+        self.admin_identity_pub.set(pub_bytes).is_ok()
+    }
+
+    /// R4-4: engine-internal counterpart to R3-C1's registry-time pre-bind.
+    ///
+    /// At startup, if the engine's `admin_identity_pub` OnceLock is still
+    /// unset (the spawn-time `resolver.resolve(&admin_addr)` in R3-C1
+    /// returned `None`, e.g., the joiner crashed before OwnerDeviceCache
+    /// learned the admin) AND the persisted CRDT contains admin-authored
+    /// events (proof we've at least heard from the admin once), try the
+    /// resolver again. After restart, owner_state has finished loading
+    /// from disk and the cache may now hold the admin entry that was
+    /// missing at engine-spawn time.
+    ///
+    /// This is the engine-internal complement to R3-C3's restart heal
+    /// pass for `Space.pending_join_at`: both close the same crash-window
+    /// gap (the post-verify side-effect didn't run because the events
+    /// returned `AlreadyKnown` on the reconcile insert).
+    ///
+    /// Best-effort + idempotent. Returns `true` if the bind was newly
+    /// committed, `false` if either the lock was already set or the
+    /// resolver still misses. Caller need not await — the engine remains
+    /// functional with `None`; this just promotes the binding to
+    /// guarantee P5 validation on the FIRST incoming PendingJoin instead
+    /// of relying on the opportunistic bind in
+    /// `insert_event_with_resolved_pubs` / the merge path.
+    pub async fn try_rehydrate_admin_identity_pub(&self) -> bool {
+        // Already bound — nothing to do.
+        if self.admin_identity_pub.get().is_some() {
+            return false;
+        }
+        // Need a resolver to retry. (Tests / non-IPC engines may omit
+        // it; in those cases we cannot recover.)
+        let resolver = match self.identity_resolver.as_ref() {
+            Some(r) => r,
+            None => return false,
+        };
+        // Check the persisted CRDT for at least one admin-authored event.
+        // Without this, an engine that was spawned but never received
+        // anything from the admin would still trigger a resolver call
+        // (cheap but adds boot-time work for engines that have no
+        // admin history yet).
+        let admin_seen_in_log = {
+            let g = self.state.lock().await;
+            g.events.values().any(|e| e.actor == self.admin_addr)
+        };
+        if !admin_seen_in_log {
+            return false;
+        }
+        // Retry the resolver. If owner_state has populated the cache
+        // since spawn-time, this now hits.
+        match resolver.resolve(&self.admin_addr).await {
+            Some(p) => self.admin_identity_pub.set(p).is_ok(),
+            None => false,
+        }
+    }
+
+    /// ZEB-254 Task 10: when a `PendingJoin` event is freshly inserted,
+    /// check self-eligibility and — if eligible — spawn a task that
+    /// signs + inserts a `JoinCountersign` event.
+    ///
+    /// Eligibility conditions (all must hold):
+    ///   1. The freshly-inserted event is a `PendingJoin`.
+    ///   2. Self is currently `Joined` in the materialized state.
+    ///   3. Self's power level ≥ `POWER_THRESHOLDS.invite`.
+    ///   4. No self-authored `JoinCountersign` targeting this `PendingJoin`
+    ///      already exists in the log (idempotency guard).
+    ///
+    /// Called from BOTH the local-insert path (`insert_event_with_resolved_pubs`)
+    /// and the state-root-merge path (`handle_incoming_publish` via
+    /// `maybe_spawn_auto_counter_sign_for_ctx`). Spawns asynchronously so
+    /// it never blocks the insert caller.
+    ///
+    /// The spawned task inserts the `JoinCountersign` directly into the
+    /// shared `CommunityState` Mutex rather than calling `insert_local_event`
+    /// — this avoids an `Arc<Self>` back-reference on the engine and keeps
+    /// the plumbing cycle-free (same pattern as `PendingRedemptionMap`).
+    fn maybe_spawn_auto_counter_sign(
+        &self,
+        pending_event: &crate::community_membership::SignedMembershipEvent,
+    ) {
+        // Only act on PendingJoin.
+        if !matches!(
+            &pending_event.kind,
+            crate::community_membership::MembershipEventKind::PendingJoin { .. }
+        ) {
+            return;
+        }
+
+        let pending_id = pending_event.id;
+        let community_id = self.community_id;
+        let self_owner = self.self_owner;
+        let admin_addr = self.admin_addr;
+        let signing_key = Arc::clone(&self.signing_key);
+        let device_id = self.device_id.clone();
+        let state = Arc::clone(&self.state);
+        let admin_identity_pub = Arc::clone(&self.admin_identity_pub);
+        let identity_resolver = self.identity_resolver.clone();
+        let is_invite_only = self.is_invite_only;
+        let notify_dirty = Arc::clone(&self.notify_dirty);
+        let has_pending_dirty = Arc::clone(&self.has_pending_dirty);
+        // R3 (C4): plumb the delta channel so the auto-counter-sign task
+        // can emit CommunityMembershipDelta on Inserted.
+        let delta_tx = self.delta_tx.clone();
+
+        tokio::spawn(spawn_auto_counter_sign_task(
+            pending_id,
+            community_id,
+            self_owner,
+            admin_addr,
+            signing_key,
+            device_id,
+            state,
+            admin_identity_pub,
+            identity_resolver,
+            is_invite_only,
+            notify_dirty,
+            has_pending_dirty,
+            delta_tx,
+        ));
     }
 
     /// Returns this engine's per-community symmetric `EpochKey`.
@@ -1182,12 +1420,25 @@ impl CommunitySyncEngine {
         // check by passing an event whose community_id matches what it
         // claims. The entry-point guard above gives a clearer error class
         // for the common honest mismatch case.
+
+        // ZEB-254 R3 (S2): defer late-bind of admin_identity_pub until AFTER
+        // verify_event accepts the actor's event. Setting the OnceLock here
+        // (pre-insert) would persist a caller-supplied actor_pub even if the
+        // event itself is later rejected by verify — and OnceLock silently
+        // discards subsequent set() attempts, so a bad pub could permanently
+        // poison the binding. We snapshot whether this is the first admin
+        // self-event seen, run verify+insert, and only commit the bind on
+        // a successful `Inserted` outcome.
+        let admin_first_seen =
+            event.actor == self.admin_addr && self.admin_identity_pub.get().is_none();
+
         let ctx = crate::community_membership::VerifyContext {
             expected_community_id: self.community_id,
             admin_addr: self.admin_addr,
             is_invite_only: self.is_invite_only,
             actor_identity_pub: &actor_pub,
             countersigner_identity_pub: countersigner_pub.as_ref(),
+            admin_identity_pub: self.admin_identity_pub.get(),
         };
 
         let outcome = {
@@ -1195,20 +1446,91 @@ impl CommunitySyncEngine {
             state_g.insert_event(event.clone(), &ctx)
         };
 
+        // R3 (S2): commit the admin-pub binding only after verify+insert
+        // succeeded. OnceLock::set returns Err on second-set, which we
+        // discard — concurrent inserts may have already bound it, which
+        // is fine (same admin, same pub).
+        if admin_first_seen
+            && matches!(
+                outcome,
+                crate::community_state_crdt::InsertOutcome::Inserted
+            )
+        {
+            let _ = self.admin_identity_pub.set(actor_pub);
+        }
+
+        // C1 restart-recovery: when a PendingJoin returns AlreadyKnown
+        // (event was already in the CRDT from disk / prior session), still
+        // schedule the counter-sign eligibility check. The spawned task
+        // re-checks under the lock and returns immediately if a
+        // JoinCountersign already exists for this target — fully idempotent.
+        if matches!(
+            outcome,
+            crate::community_state_crdt::InsertOutcome::AlreadyKnown
+        ) && matches!(
+            &event.kind,
+            crate::community_membership::MembershipEventKind::PendingJoin { .. }
+        ) {
+            self.maybe_spawn_auto_counter_sign(&event);
+        }
+
         if matches!(
             outcome,
             crate::community_state_crdt::InsertOutcome::Inserted
         ) {
-            // ZEB-262 Phase 4: fire any redeem_invite oneshot waiting
-            // on this event id BEFORE the delta-emit / notify_dirty
-            // hooks. The send is sync; the lock is released before
-            // we touch any other channel. Order doesn't affect
-            // correctness — the oneshot, the delta channel, and the
-            // publish-debounce all observe the same Inserted event —
-            // but firing the oneshot first keeps the redeem_invite
-            // IPC's wait-then-decode latency minimal.
+            // ZEB-254 Task 10: auto-counter-sign PendingJoin events. Spawns
+            // asynchronously — does not block the insert caller or the IPC
+            // response. Must fire before notify_dirty so the JoinCountersign
+            // can land in the same debounce window as the PendingJoin.
+            self.maybe_spawn_auto_counter_sign(&event);
+
+            // ZEB-254 Task 11: joiner-side pending-join clear hook. Fires
+            // when a JoinCountersign targeting a self-authored PendingJoin
+            // lands. No-op for non-JoinCountersign events and for admin engines.
+            maybe_spawn_pending_join_clear(
+                &event,
+                Arc::clone(&self.state),
+                self.self_owner,
+                self.community_id,
+                self.crdt_state.clone(),
+                self.nav_emitter.clone(),
+            );
+
+            // R4-3: when this freshly-inserted event is a self-authored
+            // PendingJoin, rescan the log for an already-present
+            // matching JoinCountersign. Out-of-order arrival
+            // (JoinCountersign syncs BEFORE the joiner's own PendingJoin
+            // syncs back to their device — e.g., two-admin race where
+            // admin's countersign-publish reaches the joiner before the
+            // joiner's own state-root publish round-trips) would
+            // otherwise leave `Space.pending_join_at` set until the
+            // next-restart C3 healing pass. The rescan is idempotent
+            // (the pending-clear apply checks `pending_join_at.is_none()`
+            // before mutating).
+            maybe_spawn_pending_clear_rescan_for_pending_join(
+                &event,
+                Arc::clone(&self.state),
+                self.self_owner,
+                self.community_id,
+                self.crdt_state.clone(),
+                self.nav_emitter.clone(),
+            );
+
+            // ZEB-262 Phase 4: fire any redeem_invite oneshot waiting on
+            // this event id OR (ZEB-254 Task 11) on the JoinCountersign's
+            // target_event_id. The send is sync; the lock is released before
+            // we touch any other channel.
             if let Some(pending) = self.pending_redemptions.as_ref() {
                 notify_pending_redemption_in_map(pending, &event.id).await;
+                // ZEB-254 Task 11: also notify on target_event_id so that a
+                // JoinCountersign wakes any pending_redemption registered on
+                // the bootstrap_join's EventId.
+                if let crate::community_membership::MembershipEventKind::JoinCountersign {
+                    target_event_id,
+                } = &event.kind
+                {
+                    notify_pending_redemption_in_map(pending, target_event_id).await;
+                }
             }
             if let Some(tx) = self.delta_tx.as_ref() {
                 let _ = tx.try_send(CommunityMembershipDelta {
@@ -1308,6 +1630,7 @@ impl CommunitySyncEngine {
             is_invite_only: self.is_invite_only,
             actor_identity_pub: &first_actor_pub,
             countersigner_identity_pub: first_countersigner_pub.as_ref(),
+            admin_identity_pub: self.admin_identity_pub.get(),
         };
         let second_ctx = crate::community_membership::VerifyContext {
             expected_community_id: self.community_id,
@@ -1315,6 +1638,7 @@ impl CommunitySyncEngine {
             is_invite_only: self.is_invite_only,
             actor_identity_pub: &second_actor_pub,
             countersigner_identity_pub: second_countersigner_pub.as_ref(),
+            admin_identity_pub: self.admin_identity_pub.get(),
         };
 
         // C5: pre-validate BOTH events before any state mutation.
@@ -1484,7 +1808,517 @@ struct InternalCtx {
     /// key lookup. `None` for tests that use the spawn-time fallback.
     /// See `CommunitySyncEngineConfig.crdt_state` for the lock-order contract.
     crdt_state: Option<Arc<Mutex<crate::owner_state_crdt::OwnerState>>>,
+    /// ZEB-254: shared binding (Arc<OnceLock>) for the admin identity pub.
+    /// Shared with the engine struct so `bind_admin_identity_pub` sets it
+    /// for both the IPC-path (`insert_local_event*`) and this task path
+    /// (`handle_incoming_publish`) at once. `get()` returns `None` until
+    /// it is set, which leaves P5 failing for non-joiner engines (correct
+    /// — they don't receive PendingJoin events).
+    admin_identity_pub: Arc<std::sync::OnceLock<[u8; 64]>>,
+
+    /// ZEB-254 Task 11: callback for the joiner-side Space-pending-clear hook.
+    /// Shared with the engine struct via `Arc` clone so both paths observe the
+    /// same configured callback. `None` for admin engines and tests.
+    nav_emitter: Option<NavPendingClearEmitter>,
 }
+
+// ── ZEB-254 Task 10: auto-counter-sign helper ────────────────────────────────
+
+/// Shared async body for the auto-counter-sign spawn: checks eligibility,
+/// resolves self pub, builds + signs a `JoinCountersign`, and inserts it
+/// directly into the shared `CommunityState`. Called from both the engine's
+/// `maybe_spawn_auto_counter_sign` method and from `handle_incoming_publish`
+/// (via `maybe_spawn_auto_counter_sign_for_ctx`) so the logic lives in one
+/// place.
+///
+/// Uses `#[allow(clippy::too_many_arguments)]` because all parameters are
+/// distinct load-bearing fields — a struct wrapper would not reduce clarity
+/// here, and the function is only ever called from the two hook sites.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_auto_counter_sign_task(
+    pending_id: crate::community_membership::EventId,
+    community_id: crate::owner_state_types::SpaceId,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    admin_addr: crate::owner_state_types::OwnerAddr,
+    signing_key: Arc<ed25519_dalek::SigningKey>,
+    device_id: String,
+    state: Arc<Mutex<CommunityState>>,
+    admin_identity_pub: Arc<std::sync::OnceLock<[u8; 64]>>,
+    identity_resolver: Option<Arc<dyn IdentityResolver>>,
+    is_invite_only: bool,
+    notify_dirty: Arc<Notify>,
+    has_pending_dirty: Arc<AtomicBool>,
+    // ZEB-254 R3 (C4): plumb the membership-delta channel so the locally-
+    // emitted JoinCountersign drives the same `community-members-changed`
+    // Tauri event that any other Inserted membership event would. Without
+    // this, the admin's own UI doesn't observe the local counter-sign
+    // until the event round-trips back through state-root sync.
+    delta_tx: Option<mpsc::Sender<CommunityMembershipDelta>>,
+) {
+    use crate::community_membership::{
+        EventPayload, MemberStatus, MembershipEventKind, POWER_THRESHOLDS,
+    };
+
+    // --- Eligibility + idempotency check under the state lock. ---
+    let (self_joined, self_power, already_signed) = {
+        let state_g = state.lock().await;
+        let mat = state_g.materialize_now(admin_addr);
+
+        let self_status = mat.members.get(&self_owner).map(|m| m.status);
+        let joined = matches!(self_status, Some(MemberStatus::Joined));
+        let power = mat.power_levels.get(&self_owner).copied().unwrap_or(0);
+
+        let signed_already = state_g.events.values().any(|e| {
+            e.actor == self_owner
+                && matches!(
+                    &e.kind,
+                    MembershipEventKind::JoinCountersign { target_event_id }
+                    if *target_event_id == pending_id
+                )
+        });
+        (joined, power, signed_already)
+    };
+
+    // Note: POWER_THRESHOLDS.invite == 0 in v1, so the power guard is a no-op
+    // on u8 but retained for forward-compatibility when the threshold changes.
+    #[allow(clippy::absurd_extreme_comparisons)]
+    let power_ok = self_power >= POWER_THRESHOLDS.invite;
+    if !self_joined || !power_ok || already_signed {
+        return;
+    }
+
+    // --- Resolve self's 64-byte identity pub (async, no lock held). ---
+    let self_pub: [u8; 64] = match identity_resolver.as_deref() {
+        Some(resolver) => match resolver.resolve(&self_owner).await {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    community_id = ?community_id,
+                    self_owner = ?self_owner,
+                    "ZEB-254 auto-counter-sign: identity_resolver returned None for self; \
+                     skipping JoinCountersign"
+                );
+                return;
+            }
+        },
+        None => {
+            tracing::warn!(
+                community_id = ?community_id,
+                "ZEB-254 auto-counter-sign: no identity_resolver configured; \
+                 skipping JoinCountersign"
+            );
+            return;
+        }
+    };
+
+    // --- Build a HLC for the new event (wall-time, logical 0, self device). ---
+    let wall_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let cs_hlc = crate::owner_state_types::Hlc {
+        wall_ms,
+        logical: 0,
+        device_id: device_id.clone(),
+    };
+
+    // --- Mint + sign the JoinCountersign event. ---
+    let mut event_id_bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut event_id_bytes);
+
+    let cs_payload = EventPayload {
+        id: event_id_bytes,
+        community_id,
+        kind: MembershipEventKind::JoinCountersign {
+            target_event_id: pending_id,
+        },
+        actor: self_owner,
+        at: cs_hlc,
+    };
+    let signed_cs = match crate::community_membership::sign_event(&cs_payload, &signing_key) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                community_id = ?community_id,
+                error = %e,
+                "ZEB-254 auto-counter-sign: sign_event failed; skipping"
+            );
+            return;
+        }
+    };
+
+    // --- Insert directly into CommunityState. ---
+    // We bypass `insert_local_event` to avoid needing an Arc<CommunitySyncEngine>
+    // back-reference (which would create a reference cycle). The insert uses
+    // the same VerifyContext shape as `insert_event_with_resolved_pubs`.
+    let ctx_v = crate::community_membership::VerifyContext {
+        expected_community_id: community_id,
+        admin_addr,
+        is_invite_only,
+        actor_identity_pub: &self_pub,
+        countersigner_identity_pub: None,
+        admin_identity_pub: admin_identity_pub.get(),
+    };
+
+    // R3 (C4): clone before the move into insert_event so we can emit a
+    // CommunityMembershipDelta on success. Cheap (signed events are
+    // ~200B); only paid on the rare auto-counter-sign path.
+    let signed_cs_for_delta = signed_cs.clone();
+
+    let outcome = {
+        let mut state_g = state.lock().await;
+
+        // Re-check idempotency inside the lock so a race between two
+        // concurrent triggers (e.g. two PendingJoin deliveries) doesn't
+        // produce a duplicate JoinCountersign.
+        let already = state_g.events.values().any(|e| {
+            e.actor == self_owner
+                && matches!(
+                    &e.kind,
+                    MembershipEventKind::JoinCountersign { target_event_id }
+                    if *target_event_id == pending_id
+                )
+        });
+        if already {
+            return; // already inserted by a concurrent spawn
+        }
+
+        state_g.insert_event(signed_cs, &ctx_v)
+    };
+
+    match outcome {
+        InsertOutcome::Inserted => {
+            tracing::debug!(
+                community_id = ?community_id,
+                target = ?pending_id,
+                "ZEB-254 auto-counter-sign: JoinCountersign inserted"
+            );
+            // R3 (C4): emit the CommunityMembershipDelta so the admin's
+            // local UI/IPC consumers (community-members-changed Tauri
+            // event) observe the local counter-sign immediately, without
+            // waiting for the event to round-trip through state-root sync.
+            // Mirrors the post-Inserted hook in
+            // `insert_event_with_resolved_pubs`.
+            if let Some(tx) = delta_tx.as_ref() {
+                let _ = tx.try_send(CommunityMembershipDelta {
+                    community_id: signed_cs_for_delta.community_id,
+                    event: signed_cs_for_delta,
+                });
+            }
+            has_pending_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+            notify_dirty.notify_one();
+        }
+        InsertOutcome::AlreadyKnown => {
+            // Concurrent insert won the race — that's fine (idempotent).
+        }
+        InsertOutcome::Rejected(e) => {
+            tracing::warn!(
+                community_id = ?community_id,
+                target = ?pending_id,
+                error = ?e,
+                "ZEB-254 auto-counter-sign: JoinCountersign rejected by verify_event"
+            );
+        }
+    }
+}
+
+/// Wire `spawn_auto_counter_sign_task` into the `InternalCtx` / receive path.
+/// Called from `handle_incoming_publish` after `InsertOutcome::Inserted` OR after
+/// `AlreadyKnown` for a `PendingJoin` (restart-recovery — C1 bot-review finding).
+/// Mirrors `CommunitySyncEngine::maybe_spawn_auto_counter_sign`.
+///
+/// Self-eligibility: the spawned task requires self to be currently `Joined` with
+/// power ≥ `POWER_THRESHOLDS.invite`. In v1 that threshold is 0, so ANY joined
+/// member qualifies — not just the admin. The power check is retained for
+/// forward-compatibility with ZEB-251 per-community threshold customisation.
+fn maybe_spawn_auto_counter_sign_for_ctx(
+    ctx: &InternalCtx,
+    pending_event: &crate::community_membership::SignedMembershipEvent,
+) {
+    if !matches!(
+        &pending_event.kind,
+        crate::community_membership::MembershipEventKind::PendingJoin { .. }
+    ) {
+        return;
+    }
+
+    let pending_id = pending_event.id;
+    let community_id = ctx.community_id;
+    let self_owner = ctx.self_owner;
+    let admin_addr = ctx.admin_addr;
+    let signing_key = Arc::clone(&ctx.signing_key);
+    let device_id = ctx.device_id.clone();
+    let state = Arc::clone(&ctx.state);
+    let admin_identity_pub = Arc::clone(&ctx.admin_identity_pub);
+    let identity_resolver = ctx.identity_resolver.clone();
+    let is_invite_only = ctx.is_invite_only;
+    let notify_dirty = Arc::clone(&ctx.notify_dirty);
+    let has_pending_dirty = Arc::clone(&ctx.has_pending_dirty);
+    // R3 (C4): receive-path delta channel for the auto-counter-sign emission.
+    let delta_tx = ctx.delta_tx.clone();
+
+    tokio::spawn(spawn_auto_counter_sign_task(
+        pending_id,
+        community_id,
+        self_owner,
+        admin_addr,
+        signing_key,
+        device_id,
+        state,
+        admin_identity_pub,
+        identity_resolver,
+        is_invite_only,
+        notify_dirty,
+        has_pending_dirty,
+        delta_tx,
+    ));
+}
+
+// ── ZEB-254 Task 11: joiner-side Space-pending-clear hook ───────────────────
+
+/// Fires when a `JoinCountersign` is freshly `Inserted` in the joiner's
+/// engine: if the target event is a self-authored `PendingJoin`, spawns a
+/// task that clears `Space.pending_join_at` via `apply_space_with_
+/// canonicalization` and calls the `nav_emitter` callback (which production
+/// wires to `app.emit("nav-updated", { pending: false, ... })`).
+///
+/// Called from BOTH the `insert_local_event` engine path and the
+/// `handle_incoming_publish` receive path immediately after
+/// `InsertOutcome::Inserted`.
+///
+/// No-op when:
+///   - `inserted` is not a `JoinCountersign`.
+///   - `crdt_state` is `None` (test / admin engines).
+///
+/// The spawned task does its own eligibility check (is the target a
+/// self-authored PendingJoin?) under the state lock, so late-arriving
+/// out-of-order events are handled gracefully.
+fn maybe_spawn_pending_join_clear(
+    inserted: &crate::community_membership::SignedMembershipEvent,
+    community_state: Arc<Mutex<CommunityState>>,
+    self_owner: OwnerAddr,
+    community_id: SpaceId,
+    crdt_state: Option<Arc<Mutex<crate::owner_state_crdt::OwnerState>>>,
+    nav_emitter: Option<NavPendingClearEmitter>,
+) {
+    use crate::community_membership::MembershipEventKind;
+
+    // Only act on JoinCountersign.
+    let target_event_id = match &inserted.kind {
+        MembershipEventKind::JoinCountersign { target_event_id } => *target_event_id,
+        _ => return,
+    };
+
+    // Need crdt_state to update the Space row. Without it, skip (tests /
+    // admin engines don't carry it).
+    let crdt_arc = match crdt_state {
+        Some(a) => a,
+        None => return,
+    };
+
+    tokio::spawn(async move {
+        // Check eligibility: is the target a self-authored PendingJoin?
+        // ZEB-254 R5-6: capture the target PendingJoin's HLC so we can
+        // verify it matches the Space's `pending_join_at` before clearing.
+        // Without this, a late JoinCountersign for an OLDER attempt could
+        // clear a NEWER pending state and hide a still-pending redemption
+        // (symmetric to R4-5 which fixed the boot-heal case).
+        let target_pending_at = {
+            let state_g = community_state.lock().await;
+            let target = match state_g.events.get(&target_event_id) {
+                Some(t) => t,
+                None => {
+                    // Out-of-order: target not yet in CRDT.
+                    tracing::debug!(
+                        community_id = ?community_id,
+                        target_event_id = ?target_event_id,
+                        "ZEB-254 pending-clear: target event not in CRDT (out-of-order)"
+                    );
+                    return;
+                }
+            };
+            if target.actor != self_owner {
+                return;
+            }
+            if !matches!(&target.kind, MembershipEventKind::PendingJoin { .. }) {
+                return;
+            }
+            target.at.clone()
+        }; // community_state lock released
+
+        let wall_now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let mut owner_g = crdt_arc.lock().await;
+
+        let existing = match owner_g.spaces.get(&community_id).cloned() {
+            Some(s) => s,
+            None => {
+                tracing::warn!(
+                    community_id = ?community_id,
+                    "ZEB-254 pending-clear: Space not found in owner-state CRDT"
+                );
+                return;
+            }
+        };
+
+        // Already cleared — nothing to do (idempotent).
+        // ZEB-254 R5-6: also bail if pending_join_at points to a
+        // DIFFERENT attempt than the JoinCountersign's target. Compare
+        // full HLC equality — `Space.pending_join_at` is set to the
+        // PendingJoin event's `at` HLC at mint time (lib.rs:
+        // redeem_invite_inner), so equality on (wall_ms, logical,
+        // device_id) is the canonical "same attempt" check (mirrors
+        // R4-5's boot-heal full-HLC match at lib.rs:2424).
+        // If the user retried redemption (new PendingJoin with newer
+        // HLC) and a stale countersign for the OLDER attempt lands
+        // now, we must NOT clear the newer pending marker.
+        match existing.pending_join_at.as_ref() {
+            None => return,
+            Some(existing_at) if existing_at != &target_pending_at => {
+                tracing::debug!(
+                    community_id = ?community_id,
+                    target_event_id = ?target_event_id,
+                    existing_at = ?existing_at,
+                    target_at = ?target_pending_at,
+                    "ZEB-254 R5-6: pending-clear target HLC differs from Space.pending_join_at — \
+                     stale countersign for older attempt, skipping clear"
+                );
+                return;
+            }
+            Some(_) => {
+                // Matches — proceed to clear.
+            }
+        }
+
+        // Use monotonic HLC arithmetic: if wall_now_ms is strictly after
+        // existing.updated_at, take logical=0; otherwise bump logical so
+        // the new HLC is strictly greater even on clock rollback or
+        // same-millisecond execution (mirrors next_hlc semantics).
+        let new_hlc = if wall_now_ms > existing.updated_at.wall_ms {
+            crate::owner_state_types::Hlc {
+                wall_ms: wall_now_ms,
+                logical: 0,
+                device_id: existing.updated_at.device_id.clone(),
+            }
+        } else {
+            crate::owner_state_types::Hlc {
+                wall_ms: existing.updated_at.wall_ms,
+                logical: existing.updated_at.logical.saturating_add(1),
+                device_id: existing.updated_at.device_id.clone(),
+            }
+        };
+
+        let mut updated = existing.clone();
+        updated.pending_join_at = None;
+        updated.updated_at = new_hlc;
+
+        let space_name = existing.name.clone();
+        let outcome = owner_g.apply_space_with_canonicalization(updated);
+        drop(owner_g);
+
+        match outcome {
+            crate::owner_state_crdt::ApplyOutcome::Inserted
+            | crate::owner_state_crdt::ApplyOutcome::Merged { .. } => {
+                tracing::debug!(
+                    community_id = ?community_id,
+                    "ZEB-254 pending-clear: Space.pending_join_at cleared"
+                );
+            }
+            crate::owner_state_crdt::ApplyOutcome::Rejected(ref reason) => {
+                tracing::warn!(
+                    community_id = ?community_id,
+                    reason = ?reason,
+                    "ZEB-254 pending-clear: apply_space_with_canonicalization rejected"
+                );
+                return;
+            }
+        }
+
+        if let Some(cb) = nav_emitter {
+            cb(community_id, space_name);
+        }
+    });
+}
+
+/// R4-3 rescan helper: when a self-authored `PendingJoin` is freshly
+/// `Inserted`, check the CRDT for an *already-present* `JoinCountersign`
+/// whose `target_event_id` matches and — if found — fire the
+/// pending-clear path. Without this, an out-of-order JoinCountersign
+/// (arrives BEFORE the joiner's PendingJoin syncs to their device)
+/// silently drops on the floor at the live `maybe_spawn_pending_join_clear`
+/// site (the target wasn't in the log yet), and the only path to clear
+/// `Space.pending_join_at` is the next-restart C3 healing pass.
+///
+/// Idempotency: `maybe_spawn_pending_join_clear` already checks
+/// `existing.pending_join_at.is_none()` before mutating, so a double-fire
+/// (live JoinCountersign hook + this rescan) is a harmless no-op.
+fn maybe_spawn_pending_clear_rescan_for_pending_join(
+    inserted: &crate::community_membership::SignedMembershipEvent,
+    community_state: Arc<Mutex<CommunityState>>,
+    self_owner: OwnerAddr,
+    community_id: SpaceId,
+    crdt_state: Option<Arc<Mutex<crate::owner_state_crdt::OwnerState>>>,
+    nav_emitter: Option<NavPendingClearEmitter>,
+) {
+    use crate::community_membership::MembershipEventKind;
+
+    // Only act when the just-inserted event is a self-authored PendingJoin.
+    if inserted.actor != self_owner {
+        return;
+    }
+    if !matches!(&inserted.kind, MembershipEventKind::PendingJoin { .. }) {
+        return;
+    }
+    let pending_id = inserted.id;
+
+    // Need crdt_state for the eventual Space update — same gate as
+    // maybe_spawn_pending_join_clear.
+    let crdt_arc = match crdt_state.clone() {
+        Some(a) => a,
+        None => return,
+    };
+
+    let state_for_scan = Arc::clone(&community_state);
+    tokio::spawn(async move {
+        // Look for a JoinCountersign already in the log whose
+        // target_event_id matches our just-inserted PendingJoin.
+        let matched_countersign: Option<crate::community_membership::SignedMembershipEvent> = {
+            let g = state_for_scan.lock().await;
+            g.events
+                .values()
+                .find(|e| {
+                    matches!(
+                        &e.kind,
+                        MembershipEventKind::JoinCountersign { target_event_id }
+                            if *target_event_id == pending_id
+                    )
+                })
+                .cloned()
+        };
+
+        let cs = match matched_countersign {
+            Some(c) => c,
+            None => return, // No prior JoinCountersign — nothing to recover.
+        };
+
+        // Reuse the live pending-clear hook with the existing
+        // countersign event as the trigger. The hook already does
+        // its own eligibility re-check + idempotent owner-state apply.
+        maybe_spawn_pending_join_clear(
+            &cs,
+            community_state,
+            self_owner,
+            community_id,
+            Some(crdt_arc),
+            nav_emitter,
+        );
+    });
+}
+
+// ── end ZEB-254 Task 11 helpers ───────────────────────────────────────────────
 
 /// Internal task: `select!` loop multiplexing dirty signals, the
 /// debounce wakeup, forced flushes, inbound publishes, and shutdown.
@@ -2455,12 +3289,44 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         let actor_pub = match resolver.resolve(&event.actor).await {
             Some(p) => p,
             None => {
-                tracing::warn!(
-                    community_id = ?ctx.community_id,
-                    actor = ?event.actor,
-                    "skipping incoming event: unknown actor identity_pub"
-                );
-                continue;
+                // R4-2: PendingJoin events embed the joiner's
+                // identity_pub inline (`joiner_identity_pub`, the
+                // 64-byte X25519||Ed25519 composite). On state-root
+                // receive the resolver-backed `OwnerDeviceCache` may
+                // not yet hold an entry for a first-seen bootstrap
+                // joiner — that's the by-design bootstrap case the
+                // inline pub field exists for (mirroring
+                // `insert_local_event_with_pubs`, which fast-paths
+                // this on the IPC side; see the docs at lines
+                // 1326-1333 of this file).
+                //
+                // Fall back to the inline pub for PendingJoin only;
+                // otherwise preserve the existing skip-and-log
+                // behavior. `verify_event` for PendingJoin still
+                // cross-checks the inline pub against the actor
+                // address (P6 binding), so this fallback is safe —
+                // a forged event with a mismatching inline pub will
+                // still be rejected downstream.
+                if let crate::community_membership::MembershipEventKind::PendingJoin {
+                    joiner_identity_pub,
+                    ..
+                } = &event.kind
+                {
+                    tracing::debug!(
+                        community_id = ?ctx.community_id,
+                        actor = ?event.actor,
+                        "R4-2: cold OwnerDeviceCache for PendingJoin actor; \
+                         using inline joiner_identity_pub fallback"
+                    );
+                    *joiner_identity_pub
+                } else {
+                    tracing::warn!(
+                        community_id = ?ctx.community_id,
+                        actor = ?event.actor,
+                        "skipping incoming event: unknown actor identity_pub"
+                    );
+                    continue;
+                }
             }
         };
         let cs_pub: Option<[u8; 64]> = match event.countersig.as_ref() {
@@ -2491,6 +3357,12 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     // the emit lock-free preserves the "no channel ops while holding
     // state" invariant the rest of this module follows.
     let mut inserted_events: Vec<SignedMembershipEvent> = Vec::new();
+    // Restart-recovery: PendingJoins that returned AlreadyKnown still need
+    // the auto-counter-sign and pending-clear hooks, but must NOT drive
+    // delta emission or notify_pending_redemption_in_map (those should only
+    // fire for genuinely new CRDT insertions). A separate vec keeps the
+    // two concerns apart.
+    let mut pending_joins_for_recheck: Vec<SignedMembershipEvent> = Vec::new();
     {
         let mut state = ctx.state.lock().await;
 
@@ -2533,8 +3405,35 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
 
         for (event, actor_pub, cs_pub_owned) in resolved {
             if state.events.contains_key(&event.id) {
+                // C1 restart-recovery: even though we've already seen this
+                // event, check whether a self-authored JoinCountersign for
+                // it needs to be emitted. This handles the case where the
+                // engine restarted and reloaded a PendingJoin from disk
+                // (returned AlreadyKnown on the reconcile insert) before
+                // the auto-counter-sign hook had a chance to fire. We
+                // collect the event for post-lock processing; we don't
+                // flip `inserted_any` since the CRDT is unchanged.
+                // NOTE: push to pending_joins_for_recheck, NOT inserted_events,
+                // so hooks (auto-countersign, pending-clear) fire without
+                // triggering delta emission or notify_pending_redemption.
+                if matches!(
+                    &event.kind,
+                    crate::community_membership::MembershipEventKind::PendingJoin { .. }
+                ) {
+                    pending_joins_for_recheck.push(event);
+                }
                 continue;
             }
+
+            // ZEB-254 R3 (S2): defer late-bind of admin_identity_pub until
+            // AFTER verify_event accepts the actor's event. See the matching
+            // comment in `insert_event_with_resolved_pubs` — binding pre-
+            // verify could permanently poison the OnceLock on a bad
+            // caller-supplied pub. Snapshot the "first admin event" flag
+            // here, then commit the bind only on Inserted below.
+            let admin_first_seen =
+                event.actor == ctx.admin_addr && ctx.admin_identity_pub.get().is_none();
+
             // Inline `Option::as_ref` because rustc can't always infer
             // the right `AsRef` impl on `[u8; 64]`.
             let cs_pub_ref: Option<&[u8; 64]> = match &cs_pub_owned {
@@ -2547,6 +3446,7 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
                 is_invite_only: ctx.is_invite_only,
                 actor_identity_pub: &actor_pub,
                 countersigner_identity_pub: cs_pub_ref,
+                admin_identity_pub: ctx.admin_identity_pub.get(),
             };
             // Clone before `insert_event` consumes the event so we can
             // surface the delta if the outcome is `Inserted`. The clone
@@ -2556,13 +3456,34 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             match state.insert_event(event, &ctx_v) {
                 InsertOutcome::Inserted => {
                     inserted_any = true;
+                    // R3 (S2): bind admin pub now that verify accepted it.
+                    // OnceLock::set returns Err on second-set — discard:
+                    // a concurrent insert may have raced us in, which is
+                    // fine (same admin, same pub).
+                    if admin_first_seen {
+                        let _ = ctx.admin_identity_pub.set(actor_pub);
+                    }
                     inserted_events.push(event_clone);
                 }
                 InsertOutcome::AlreadyKnown => {
-                    // Skip — already in our log. Don't flip inserted_any
-                    // because the CRDT is unchanged; without this, every
-                    // duplicate Zenoh fanout echo would trigger a
-                    // disk-persist on the Mutated arm at Task 10.
+                    // Don't flip inserted_any — the CRDT is unchanged;
+                    // without this, every duplicate Zenoh fanout echo would
+                    // trigger a disk-persist on the Mutated arm at Task 10.
+                    //
+                    // C1 restart-recovery: if this is a PendingJoin that
+                    // returned AlreadyKnown (event was already in the CRDT
+                    // from a prior session / disk-reload), still schedule the
+                    // counter-sign eligibility check. The check is idempotent
+                    // — `spawn_auto_counter_sign_task` re-checks under the
+                    // lock and returns immediately if a JoinCountersign
+                    // already exists for this target.
+                    // NOTE: push to pending_joins_for_recheck, NOT inserted_events.
+                    if matches!(
+                        &event_clone.kind,
+                        crate::community_membership::MembershipEventKind::PendingJoin { .. }
+                    ) {
+                        pending_joins_for_recheck.push(event_clone);
+                    }
                 }
                 InsertOutcome::Rejected(verr) => {
                     tracing::warn!(
@@ -2580,6 +3501,46 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         }
     } // state lock released here
 
+    // ZEB-254 Task 10: auto-counter-sign any freshly-Inserted PendingJoin
+    // events. Spawn is fire-and-forget — doesn't block tracker advance or
+    // delta emission. The spawned task re-acquires the state lock internally
+    // for the final idempotency check + insert.
+    // Also run for restart-recovery PendingJoins (pending_joins_for_recheck)
+    // which returned AlreadyKnown but may still need a JoinCountersign.
+    for event in inserted_events
+        .iter()
+        .chain(pending_joins_for_recheck.iter())
+    {
+        maybe_spawn_auto_counter_sign_for_ctx(ctx, event);
+    }
+
+    // ZEB-254 Task 11: joiner-side pending-join clear hook for every
+    // freshly-Inserted JoinCountersign. Spawn is fire-and-forget — doesn't
+    // block tracker advance or delta emission.
+    //
+    // R4-3: ALSO fire the rescan helper for every freshly-Inserted
+    // PendingJoin so an out-of-order JoinCountersign already present in
+    // the log triggers the same pending-clear path. Both helpers are
+    // no-ops for the non-matching event kind.
+    for event in &inserted_events {
+        maybe_spawn_pending_join_clear(
+            event,
+            Arc::clone(&ctx.state),
+            ctx.self_owner,
+            ctx.community_id,
+            ctx.crdt_state.clone(),
+            ctx.nav_emitter.clone(),
+        );
+        maybe_spawn_pending_clear_rescan_for_pending_join(
+            event,
+            Arc::clone(&ctx.state),
+            ctx.self_owner,
+            ctx.community_id,
+            ctx.crdt_state.clone(),
+            ctx.nav_emitter.clone(),
+        );
+    }
+
     // 14. Advance the replay tracker — the SINGLE state-mutation
     //     point for tracker progress. Happens AFTER Phase B's
     //     state-merge (and AFTER the TOCTOU re-check inside Phase B)
@@ -2592,16 +3553,19 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         tracker.record(payload.publisher_addr, payload.at.clone());
     }
 
-    // ZEB-262 Phase 4: fire any redeem_invite oneshots waiting on
-    // events that were Inserted in this merge cycle. The notify path
-    // shares the lock-and-fire helper with `insert_local_event`; the
-    // map lock is taken once per inserted id (each call is independent)
-    // and dropped before any `.await` (the helper's send is sync). We
-    // borrow `&event.id` here so the subsequent delta-emit loop can
-    // still consume `inserted_events` by value.
+    // ZEB-262 Phase 4: fire any redeem_invite oneshots waiting on events
+    // that were Inserted in this merge cycle. ZEB-254 Task 11: also notify
+    // on JoinCountersign's target_event_id so a pending_redemption keyed on
+    // the bootstrap_join EventId is woken by the admin's JoinCountersign.
     if let Some(pending) = ctx.pending_redemptions.as_ref() {
         for event in &inserted_events {
             notify_pending_redemption_in_map(pending, &event.id).await;
+            if let crate::community_membership::MembershipEventKind::JoinCountersign {
+                target_event_id,
+            } = &event.kind
+            {
+                notify_pending_redemption_in_map(pending, target_event_id).await;
+            }
         }
     }
 
@@ -2836,6 +3800,13 @@ pub struct CommunityRegistryConfig {
     /// Arc so `publish_root_now` / `handle_incoming_publish` can read
     /// the live epoch key. `None` for tests that use the spawn-time key.
     pub crdt_state: Option<Arc<Mutex<crate::owner_state_crdt::OwnerState>>>,
+
+    /// ZEB-254 Task 11: optional callback cloned into every spawned engine's
+    /// `CommunitySyncEngineConfig.nav_emitter`. Production passes a closure
+    /// that calls `app.emit("nav-updated", { pending: false, ... })` on the
+    /// Tauri `AppHandle`. `None` for tests and for registries that don't
+    /// handle joiner-side pending-clear events.
+    pub nav_emitter: Option<NavPendingClearEmitter>,
 }
 
 /// Multi-community engine lifecycle manager. Owns
@@ -2880,6 +3851,12 @@ pub struct CommunitySyncRegistry {
     /// `Sender`. Never hold the guard across an `.await` of the
     /// recovered sender.
     pending_redemptions: PendingRedemptionMap,
+
+    /// ZEB-254 Task 11: optional nav-updated callback cloned from
+    /// `CommunityRegistryConfig.nav_emitter` at construction. Passed
+    /// to every spawned engine so each can fire the joiner-side
+    /// pending-clear hook independently. `None` for tests.
+    nav_emitter: Option<NavPendingClearEmitter>,
 }
 
 // ── CommunitySyncSpawnGuard (ZEB-274) ─────────────────────────────────────────
@@ -3024,6 +4001,7 @@ impl Drop for CommunitySyncSpawnGuard {
 impl CommunitySyncRegistry {
     pub fn new(cfg: CommunityRegistryConfig) -> Self {
         let crdt_state = cfg.crdt_state.as_ref().map(Arc::clone);
+        let nav_emitter = cfg.nav_emitter.clone();
         Self {
             cfg: Arc::new(cfg),
             engines: tokio::sync::Mutex::new(BTreeMap::new()),
@@ -3031,6 +4009,7 @@ impl CommunitySyncRegistry {
             pending_redemptions: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            nav_emitter,
         }
     }
 
@@ -3416,6 +4395,24 @@ impl CommunitySyncRegistry {
         let state = Arc::new(Mutex::new(initial_state));
         let tracker = Arc::new(Mutex::new(initial_tracker));
 
+        // ZEB-254 R3 (C1): pre-bind admin_identity_pub at spawn time via the
+        // registry's own identity_resolver, so the engine's receive task
+        // (which `spawn_engine_with_guard` dispatches BEFORE the caller can
+        // run `bind_admin_identity_pub`) sees the binding for the very
+        // first incoming publish. Without this, a PendingJoin arriving
+        // in the boot-reconcile window verifies under `admin_identity_pub:
+        // None` and falls back to the opportunistic late-bind path (which
+        // only kicks in if the bootstrap Join is in the same batch).
+        //
+        // Resolver short-circuit: when self_owner == admin_addr the
+        // resolver returns the local identity_pub immediately (no cache
+        // hit needed). For joiner engines, the resolver consults the
+        // owner-device cache — which may not yet have the admin recorded
+        // on first-ever join. In that case resolve() returns None and we
+        // fall back to the post-spawn `bind_admin_identity_pub` flow.
+        let admin_identity_pub_resolved: Option<[u8; 64]> =
+            self.cfg.identity_resolver.resolve(&admin_addr).await;
+
         let engine = Arc::new(CommunitySyncEngine::new(CommunitySyncEngineConfig {
             community_id,
             membership_key,
@@ -3450,6 +4447,17 @@ impl CommunitySyncRegistry {
             // ZEB-249 §10.6 (Phase A): pass the live owner-state CRDT
             // so the engine can read current_epoch_key dynamically.
             crdt_state: self.crdt_state.as_ref().map(Arc::clone),
+            // ZEB-254 R3 (C1): if the resolver knew about the admin at
+            // spawn time, plumb the pub in here so the receive task is
+            // never running with `admin_identity_pub: None`. Falls back
+            // to None when the resolver lookup misses (first-time join
+            // path) — IPC callers then call `bind_admin_identity_pub`
+            // post-spawn before any PendingJoin event can land.
+            admin_identity_pub: admin_identity_pub_resolved,
+            // ZEB-254 Task 11: clone the nav_emitter from the registry so
+            // the engine can fire nav-updated on joiner-side countersign.
+            // `None` for test registries that don't supply one.
+            nav_emitter: self.nav_emitter.clone(),
         }));
 
         engines.insert(community_id, engine);
@@ -3836,6 +4844,7 @@ mod tests {
             self_owner: OwnerAddr([0x01; 16]),
             signing_key: std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
             crdt_state: None,
+            nav_emitter: None,
         }));
 
         // Adapter-request bridge: `spawn_engine_with_guard` will
@@ -4452,6 +5461,7 @@ mod envelope_tests {
             admin_addr: Some(OwnerAddr([0xbb; 16])),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            pending_join_at: None,
         }
     }
 
@@ -4538,6 +5548,7 @@ mod envelope_tests {
             admin_addr: Some(OwnerAddr([0xbb; 16])),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            pending_join_at: None,
         };
         let err = encrypt_for_topic(&space, b"test payload")
             .expect_err("encrypt_for_topic must return Err on missing epoch state, not panic");
@@ -4576,6 +5587,7 @@ mod envelope_tests {
             admin_addr: Some(OwnerAddr([0xbb; 16])),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            pending_join_at: None,
         };
         let err = encrypt_for_topic(&space, b"test payload")
             .expect_err("encrypt_for_topic must return Err on missing epoch key, not panic");

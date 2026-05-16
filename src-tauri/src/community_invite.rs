@@ -1337,15 +1337,11 @@ where
     crate::community_membership::verify_signature(&signed.join_event, &signed.joiner_identity_pub)
         .map_err(|_| CommunityInviteVerifyError::JoinSigInvalid)?;
 
-    // 6. InviteToken sig.
-    let token_canonical = canonical_invite_token_bytes(&signed.invite_token)
-        .map_err(|_| CommunityInviteVerifyError::InviteTokenSigInvalid)?;
-    use ed25519_dalek::Signature;
-    let sig = Signature::from_bytes(&signed.invite_token.sig);
-    self_identity
-        .identity
-        .verifying_key
-        .verify_strict(&token_canonical, &sig)
+    // 6. InviteToken sig — delegate to the shared helper so this path
+    //    stays in sync with `verify_event`'s P5 gate without duplicating
+    //    the canonical-encode + Signature::from_bytes + verify_strict logic.
+    let admin_identity_pub = self_identity.identity.to_public_bytes();
+    verify_invite_token_signature(&signed.invite_token, &admin_identity_pub)
         .map_err(|_| CommunityInviteVerifyError::InviteTokenSigInvalid)?;
 
     Ok(signed.join_event.clone())
@@ -1411,6 +1407,34 @@ pub fn verify_envelope_sig(
         .verifying_key
         .verify_strict(signed_bytes, &sig)
         .map_err(|_| CommunityInviteVerifyError::EnvelopeSigInvalid)
+}
+
+/// ZEB-254: pure helper for verifying an InviteToken's signature against
+/// a known admin identity_pub. Extracted for use by `verify_event` on
+/// `PendingJoin` events, where the admin's identity_pub is available in
+/// `VerifyContext` but we don't have a `PrivateIdentity` to call
+/// `verify_packet_pure` with.
+///
+/// Verifies that `token.sig` covers the canonical token bytes (as produced
+/// by `canonical_invite_token_bytes`) and was produced by the Ed25519 key
+/// embedded in `admin_identity_pub[32..]`.
+///
+/// Returns `Err(CommunityInviteVerifyError::InviteTokenSigInvalid)` on any
+/// failure (malformed pub, bad signature).
+pub fn verify_invite_token_signature(
+    token: &InviteToken,
+    admin_identity_pub: &[u8; 64],
+) -> Result<(), CommunityInviteVerifyError> {
+    let token_canonical = canonical_invite_token_bytes(token)
+        .map_err(|_| CommunityInviteVerifyError::InviteTokenSigInvalid)?;
+    use ed25519_dalek::Signature;
+    let identity = harmony_identity::Identity::from_public_bytes(admin_identity_pub)
+        .map_err(|_| CommunityInviteVerifyError::InviteTokenSigInvalid)?;
+    let sig = Signature::from_bytes(&token.sig);
+    identity
+        .verifying_key
+        .verify_strict(&token_canonical, &sig)
+        .map_err(|_| CommunityInviteVerifyError::InviteTokenSigInvalid)
 }
 
 // =====================================================================
@@ -1561,7 +1585,19 @@ pub async fn handle_unicast<H: AppHandleEmit>(
         let s = state_arc.lock().await;
         let events: Vec<_> = s.events.values().cloned().collect();
         drop(s);
-        let mat = crate::community_membership::materialize(&events, engine_arc.admin_addr());
+        // R4-6: pass wall_now_ms so an idle-community PendingJoin is
+        // surfaced as expired (status == None) rather than as
+        // PendingJoin/Joined, preserving alignment with verify-time
+        // expiry semantics on this display path.
+        let wall_now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mat = crate::community_membership::materialize_with_now(
+            &events,
+            engine_arc.admin_addr(),
+            Some(wall_now_ms),
+        );
         let st = mat.members.get(&self_owner).map(|m| m.status);
         let pw = mat.power_levels.get(&self_owner).copied().unwrap_or(0);
         (st, pw)
@@ -1581,66 +1617,136 @@ pub async fn handle_unicast<H: AppHandleEmit>(
         return Err(e);
     }
 
-    // 6. Attach countersig with our identity.
-    let counter_signed = match crate::community_membership::attach_countersig_with_identity(
-        &join_event,
-        self_private_identity.as_ref(),
-    ) {
-        Ok(e) => e,
-        Err(err) => {
-            tracing::warn!(error = %err, "attach_countersig_with_identity failed");
-            let e = CommunityInviteVerifyError::CounterSignAttachFailed;
+    // ZEB-254: Two-event flow for invite-only counter-sign.
+    //
+    // New ZEB-254 path: joiner's PendingJoin event enters the engine
+    // via insert_local_event_with_pubs. The post-Inserted hook (Task 10)
+    // detects PendingJoin + self-has-power and emits a JoinCountersign
+    // automatically.
+    //
+    // LEGACY pre-ZEB-254 path: joiners on stale clients still send
+    // SignedMembershipEvent { kind: Join, countersig: None }. We
+    // continue to attach_countersig + insert the counter-signed Join
+    // so those joiners can still join.
+    let is_pending_join_shape = matches!(
+        &join_event.kind,
+        crate::community_membership::MembershipEventKind::PendingJoin { .. }
+    );
+
+    if is_pending_join_shape {
+        // 6+7 (ZEB-254 new shape). Insert PendingJoin AS-IS — no
+        // countersig append here. The joiner's `joiner_identity_pub`
+        // was already verified in `verify_packet_pure` step 5 (Path B
+        // app-sig binding). The production `OwnerDeviceCacheResolver`
+        // won't have the joiner yet (bootstrap-by-design), so we bypass
+        // it via `insert_local_event_with_pubs` which accepts explicit
+        // pubs.
+        //
+        // The post-Inserted hook (Task 10) detects PendingJoin +
+        // self-has-power and auto-emits JoinCountersign.
+        let joiner_identity_pub = match &join_event.kind {
+            crate::community_membership::MembershipEventKind::PendingJoin {
+                joiner_identity_pub,
+                ..
+            } => *joiner_identity_pub,
+            // Safety: is_pending_join_shape already confirmed the arm.
+            _ => unreachable!("is_pending_join_shape mismatch"),
+        };
+        // F6 trust-narrowing: the embedded PendingJoin.joiner_identity_pub
+        // must match the envelope's already-verified pub (from Path B sig
+        // verification in verify_packet_pure). A mismatch means the event
+        // was constructed with a different pub than the one that signed the
+        // envelope — reject before inserting into the engine.
+        if joiner_identity_pub != signed.joiner_identity_pub {
+            tracing::warn!(
+                "ZEB-254 handle_unicast: PendingJoin.joiner_identity_pub mismatch \
+                 with envelope.joiner_identity_pub — rejecting"
+            );
+            let e = CommunityInviteVerifyError::JoinSigInvalid;
             emit_degraded(app, &signed.community_id, e.reason_tag());
             return Err(e);
         }
-    };
+        match engine_arc
+            .insert_local_event_with_pubs(join_event, joiner_identity_pub, None)
+            .await
+        {
+            Ok(crate::community_state_crdt::InsertOutcome::Inserted) => Ok(()),
+            Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => Ok(()),
+            Ok(crate::community_state_crdt::InsertOutcome::Rejected(verr)) => {
+                tracing::warn!(error = ?verr, "ZEB-254 handle_unicast: PendingJoin rejected by engine");
+                let e = CommunityInviteVerifyError::EngineRejected;
+                emit_degraded(app, &signed.community_id, e.reason_tag());
+                Err(e)
+            }
+            Err(local_err) => {
+                tracing::warn!(error = %local_err, "ZEB-254 handle_unicast: insert PendingJoin failed");
+                let e = CommunityInviteVerifyError::EngineLocalError;
+                emit_degraded(app, &signed.community_id, e.reason_tag());
+                Err(e)
+            }
+        }
+    } else {
+        // 6. LEGACY path: Attach countersig with our identity.
+        let counter_signed = match crate::community_membership::attach_countersig_with_identity(
+            &join_event,
+            self_private_identity.as_ref(),
+        ) {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::warn!(error = %err, "attach_countersig_with_identity failed");
+                let e = CommunityInviteVerifyError::CounterSignAttachFailed;
+                emit_degraded(app, &signed.community_id, e.reason_tag());
+                return Err(e);
+            }
+        };
 
-    // 7. Insert via engine using `insert_local_event_with_pubs` — the
-    //    joiner's `joiner_identity_pub` was already verified in
-    //    `verify_packet_pure` step 5 (Path B app-sig binding), and the
-    //    receiver's own identity_pub is known locally. The production
-    //    `OwnerDeviceCacheResolver` won't have the joiner yet (this IS
-    //    the bootstrap that would populate the cache), so we MUST
-    //    bypass it. Skipping the resolver here is the load-bearing fix
-    //    for the bootstrap-by-design case: a counter-signed Join lands
-    //    LOCALLY here regardless of whether the resolver knows the
-    //    joiner; the publish-back path then carries the full
-    //    counter-signed event to peers, who do their own membership-
-    //    state verify against their resolver caches as those caches
-    //    populate.
-    //
-    //    The engine's post-Inserted hook
-    //    (`notify_pending_redemption_in_map`) fires
-    //    `pending_redemptions[event_id]` for the joiner side — this
-    //    wakes the redeemer's `redeem_invite_inner` oneshot wait once
-    //    the counter-signed Join propagates back via Phase 2's
-    //    state-root publish.
-    let countersigner_pub = self_private_identity.identity.to_public_bytes();
-    match engine_arc
-        .insert_local_event_with_pubs(
-            counter_signed,
-            signed.joiner_identity_pub,
-            Some(countersigner_pub),
-        )
-        .await
-    {
-        Ok(crate::community_state_crdt::InsertOutcome::Inserted) => Ok(()),
-        Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => {
-            // Idempotent retransmit (Reticulum can deliver duplicates).
-            // Treat as success — we've already counter-signed this id.
-            Ok(())
-        }
-        Ok(crate::community_state_crdt::InsertOutcome::Rejected(verr)) => {
-            tracing::warn!(error = ?verr, "counter-signed Join rejected by engine");
-            let e = CommunityInviteVerifyError::EngineRejected;
-            emit_degraded(app, &signed.community_id, e.reason_tag());
-            Err(e)
-        }
-        Err(local_err) => {
-            tracing::warn!(error = %local_err, "engine.insert_local_event_with_pubs errored");
-            let e = CommunityInviteVerifyError::EngineLocalError;
-            emit_degraded(app, &signed.community_id, e.reason_tag());
-            Err(e)
+        // 7. LEGACY path: Insert via engine using `insert_local_event_with_pubs` — the
+        //    joiner's `joiner_identity_pub` was already verified in
+        //    `verify_packet_pure` step 5 (Path B app-sig binding), and the
+        //    receiver's own identity_pub is known locally. The production
+        //    `OwnerDeviceCacheResolver` won't have the joiner yet (this IS
+        //    the bootstrap that would populate the cache), so we MUST
+        //    bypass it. Skipping the resolver here is the load-bearing fix
+        //    for the bootstrap-by-design case: a counter-signed Join lands
+        //    LOCALLY here regardless of whether the resolver knows the
+        //    joiner; the publish-back path then carries the full
+        //    counter-signed event to peers, who do their own membership-
+        //    state verify against their resolver caches as those caches
+        //    populate.
+        //
+        //    The engine's post-Inserted hook
+        //    (`notify_pending_redemption_in_map`) fires
+        //    `pending_redemptions[event_id]` for the joiner side — this
+        //    wakes the redeemer's `redeem_invite_inner` oneshot wait once
+        //    the counter-signed Join propagates back via Phase 2's
+        //    state-root publish.
+        let countersigner_pub = self_private_identity.identity.to_public_bytes();
+        match engine_arc
+            .insert_local_event_with_pubs(
+                counter_signed,
+                signed.joiner_identity_pub,
+                Some(countersigner_pub),
+            )
+            .await
+        {
+            Ok(crate::community_state_crdt::InsertOutcome::Inserted) => Ok(()),
+            Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => {
+                // Idempotent retransmit (Reticulum can deliver duplicates).
+                // Treat as success — we've already counter-signed this id.
+                Ok(())
+            }
+            Ok(crate::community_state_crdt::InsertOutcome::Rejected(verr)) => {
+                tracing::warn!(error = ?verr, "counter-signed Join rejected by engine");
+                let e = CommunityInviteVerifyError::EngineRejected;
+                emit_degraded(app, &signed.community_id, e.reason_tag());
+                Err(e)
+            }
+            Err(local_err) => {
+                tracing::warn!(error = %local_err, "engine.insert_local_event_with_pubs errored");
+                let e = CommunityInviteVerifyError::EngineLocalError;
+                emit_degraded(app, &signed.community_id, e.reason_tag());
+                Err(e)
+            }
         }
     }
 }

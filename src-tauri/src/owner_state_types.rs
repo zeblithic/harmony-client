@@ -1568,6 +1568,20 @@ pub struct Space {
     /// fixtures (Task 4 will add a dedicated regression test).
     #[serde(rename = "sp", default, skip_serializing_if = "core::ops::Not::not")]
     pub shared_in_profile: bool,
+
+    /// ZEB-254: set when the joiner has minted a PendingJoin for this
+    /// community but no JoinCountersign has yet landed locally. None
+    /// means the joiner is fully Joined (or this Space is non-Community,
+    /// or pre-ZEB-254 Space). Transitions:
+    ///   None → Some(hlc): set at redeem-invite commit when the 5s
+    ///     fast-path timeout fires without a counter-sign.
+    ///   Some(hlc) → None: cleared by the community engine's post-Inserted
+    ///     hook when self's PendingJoin receives a JoinCountersign.
+    ///
+    /// CRDT merge: existing LWW-by-updated_at handles None ↔ Some
+    /// transitions (Space.updated_at advances on each transition).
+    #[serde(rename = "pj", skip_serializing_if = "Option::is_none", default)]
+    pub pending_join_at: Option<Hlc>,
 }
 
 /// Per-kind dedupe key — what the CRDT uses to identify "same Space"
@@ -1608,6 +1622,12 @@ impl Space {
         // Checked before the per-kind match so every non-community kind gets
         // the same enforcement without per-arm duplication.
         if self.kind != SpaceKind::Community {
+            if self.pending_join_at.is_some() {
+                return Err(InvariantError(format!(
+                    "{:?} must have pending_join_at=None (only Community carries it)",
+                    self.kind
+                )));
+            }
             if self.current_epoch.is_some() {
                 return Err(InvariantError(format!(
                     "{:?} must have current_epoch=None (only Community carries epoch state)",
@@ -2289,6 +2309,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         }
     }
 
@@ -2309,6 +2330,25 @@ mod space_tests {
         let mut f = folder();
         f.members = vec![OwnerAddr([0u8; 16])];
         assert!(f.validate_invariants().is_err());
+    }
+
+    /// F2 (ZEB-254 R2): non-Community Spaces must not carry pending_join_at.
+    /// A malformed peer attempting to inject invalid state should be rejected
+    /// by validate_invariants before it can persist or replicate.
+    #[test]
+    fn space_non_community_with_pending_join_at_violates_invariant() {
+        let mut f = folder();
+        f.pending_join_at = Some(hlc(42));
+        let result = f.validate_invariants();
+        assert!(
+            result.is_err(),
+            "Folder with pending_join_at=Some must fail validate_invariants; got Ok"
+        );
+        let msg = result.unwrap_err().0;
+        assert!(
+            msg.contains("pending_join_at"),
+            "error message must mention pending_join_at; got: {msg}"
+        );
     }
 
     #[test]
@@ -2336,6 +2376,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         assert!(mk_dm(0).validate_invariants().is_err());
         assert!(mk_dm(1).validate_invariants().is_err());
@@ -2368,6 +2409,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         assert!(mk(2).validate_invariants().is_err());
         assert!(mk(3).validate_invariants().is_ok());
@@ -2403,6 +2445,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         assert!(d.validate_invariants().is_err());
         // Distinct members still pass.
@@ -2440,6 +2483,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         assert!(d.validate_invariants().is_err());
         // Sorted ascending passes.
@@ -2476,6 +2520,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         assert!(g.validate_invariants().is_err());
         g.members = vec![
@@ -2518,6 +2563,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         assert!(g.validate_invariants().is_err());
     }
@@ -2546,6 +2592,7 @@ mod space_tests {
                 admin_addr: None,
                 is_invite_only: None,
                 shared_in_profile: false,
+                pending_join_at: None,
             };
         // Missing community_id → reject.
         assert!(
@@ -2601,6 +2648,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         let a = OwnerAddr([1u8; 16]);
         let b = OwnerAddr([2u8; 16]);
@@ -2636,6 +2684,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         assert_eq!(
             pc.dedupe_key(),
@@ -2688,6 +2737,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         assert!(d.validate_invariants().is_err());
         d.content_key = Some(DmContentKey::new([0xaa; 32]));
@@ -2727,6 +2777,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         assert!(d.validate_invariants().is_err());
         d.content_key = Some(DmContentKey::new([0xaa; 32]));
@@ -2764,6 +2815,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         assert!(f.validate_invariants().is_err());
     }
@@ -2799,6 +2851,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         assert!(f.validate_invariants().is_err());
     }
@@ -2837,6 +2890,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         assert!(d.validate_invariants().is_err());
     }
@@ -2876,6 +2930,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         assert!(d.validate_invariants().is_err());
     }
@@ -2918,6 +2973,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         }
     }
 
@@ -3095,6 +3151,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         let mut bytes = Vec::new();
         into_writer(&s, &mut bytes).unwrap();
@@ -3134,6 +3191,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         let mut bytes = Vec::new();
         into_writer(&s, &mut bytes).unwrap();
@@ -3189,6 +3247,7 @@ mod space_tests {
             admin_addr: Some(admin),
             is_invite_only: Some(true),
             shared_in_profile: false,
+            pending_join_at: None,
         };
 
         let encoded = canonical_cbor_encode(&space).expect("encode");
@@ -3247,6 +3306,7 @@ mod space_tests {
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            pending_join_at: None,
         };
         assert!(s.validate_invariants().is_ok());
     }
@@ -3282,6 +3342,7 @@ mod space_tests {
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            pending_join_at: None,
         };
         let err = s.validate_invariants().expect_err("must reject");
         assert!(err.0.contains("current_epoch_key"));
@@ -3318,6 +3379,7 @@ mod space_tests {
             admin_addr: None, // ← invariant violation
             is_invite_only: Some(false),
             shared_in_profile: false,
+            pending_join_at: None,
         };
         let err = s.validate_invariants().expect_err("must reject");
         assert!(err.0.contains("admin_addr"));
@@ -3354,6 +3416,7 @@ mod space_tests {
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: None, // ← invariant violation
             shared_in_profile: false,
+            pending_join_at: None,
         };
         let err = s.validate_invariants().expect_err("must reject");
         assert!(err.0.contains("is_invite_only"));
@@ -3390,6 +3453,7 @@ mod space_tests {
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            pending_join_at: None,
         };
         let err = s.validate_invariants().expect_err("must reject");
         assert!(err.0.contains("community_id=None"));
@@ -3426,6 +3490,7 @@ mod space_tests {
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            pending_join_at: None,
         };
         let err = s.validate_invariants().expect_err("must reject");
         assert!(err.0.contains("content_key=None"));
@@ -3462,6 +3527,7 @@ mod space_tests {
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            pending_join_at: None,
         };
         let err = s.validate_invariants().expect_err("must reject");
         assert!(
@@ -3509,6 +3575,7 @@ mod space_tests {
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            pending_join_at: None,
         };
         let err = s.validate_invariants().expect_err("must reject");
         assert!(
@@ -3551,6 +3618,7 @@ mod space_tests {
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            pending_join_at: None,
         };
         let err = s.validate_invariants().expect_err("must reject");
         assert!(err.0.contains("transport=None"));
@@ -3589,6 +3657,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         let err = s.validate_invariants().expect_err("must reject");
         assert!(
@@ -3632,6 +3701,7 @@ mod space_tests {
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
             shared_in_profile: true,
+            pending_join_at: None,
         };
         assert_eq!(s.validate_invariants(), Ok(()));
     }
@@ -3673,6 +3743,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: true, // ← invariant violation
+            pending_join_at: None,
         };
         let err = s
             .validate_invariants()
@@ -3719,6 +3790,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
 
         let bytes = canonical_cbor_encode(&dm).expect("encode");
@@ -3745,6 +3817,102 @@ mod space_tests {
                 std::str::from_utf8(&needle[1..]).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn space_with_pending_join_at_round_trip() {
+        // R3 (M1): fixture must be internally consistent. Community Spaces
+        // require `current_epoch_key: Some(...)` per validate_invariants —
+        // the prior fixture set `current_epoch: Some(0)` with `current_epoch_key:
+        // None`, which would fail invariant validation in any context that
+        // performs it. The round-trip test only exercises serde, but a valid
+        // fixture documents the wire shape correctly.
+        let admin = OwnerAddr([1u8; 16]);
+        let space = Space {
+            id: SpaceId([7u8; 16]),
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "test community".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "admin".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "admin".into(),
+            },
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: Some(0),
+            current_epoch_key: Some(EpochKey([0x42u8; 32])),
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: Some(admin),
+            is_invite_only: Some(true),
+            shared_in_profile: false,
+            pending_join_at: Some(Hlc {
+                wall_ms: 1_700_000_000_500,
+                logical: 0,
+                device_id: "joiner".into(),
+            }),
+        };
+        let encoded = crate::owner_state_crypto::canonical_cbor_encode(&space).expect("encode");
+        let decoded: Space = ciborium::from_reader(&mut encoded.as_slice()).expect("decode");
+        assert_eq!(space, decoded);
+    }
+
+    #[test]
+    fn space_without_pending_join_at_omits_field() {
+        // Pre-ZEB-254 Space (pending_join_at = None) must encode WITHOUT
+        // the "pj" key — skip_serializing_if guarantees wire compat.
+        let admin = OwnerAddr([1u8; 16]);
+        let space = Space {
+            id: SpaceId([7u8; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "dm".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members: vec![OwnerAddr([1u8; 16]), OwnerAddr([2u8; 16])],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "admin".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "admin".into(),
+            },
+            content_key: Some(DmContentKey::new([0xaa; 32])),
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: false,
+            pending_join_at: None,
+        };
+        let _ = admin; // suppress unused warning — admin is for test symmetry
+        let encoded = crate::owner_state_crypto::canonical_cbor_encode(&space).expect("encode");
+        // The "pj" key (3-byte CBOR text(2) prefix: 0x62 'p' 'j') must NOT appear.
+        assert!(
+            !encoded.windows(3).any(|w| w == [0x62, b'p', b'j']),
+            "Space with pending_join_at=None must omit the pj key from canonical CBOR"
+        );
     }
 }
 

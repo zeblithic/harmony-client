@@ -1721,6 +1721,34 @@ async fn start_node(
                             // so every spawned engine reads the current epoch key
                             // dynamically rather than using its spawn-time capture.
                             crdt_state: Some(std::sync::Arc::clone(&crdt_state)),
+                            // ZEB-254 Task 11: joiner-side pending-clear hook. Emits
+                            // nav-updated { pending: false } when a JoinCountersign
+                            // targeting a self-authored PendingJoin lands in the engine.
+                            nav_emitter: Some(std::sync::Arc::new({
+                                let app_handle_for_emitter = app.clone();
+                                move |community_id: crate::owner_state_types::SpaceId,
+                                      space_name: String| {
+                                    use tauri::Emitter as _;
+                                    let space_id_hex = hex::encode(community_id.0);
+                                    if let Err(e) = app_handle_for_emitter.emit(
+                                        "nav-updated",
+                                        &NavUpdatedPayload {
+                                            action: "modified",
+                                            space_id: space_id_hex,
+                                            kind: "community",
+                                            name: space_name,
+                                            members: None,
+                                            parent_id: None,
+                                            pending: Some(false),
+                                        },
+                                    ) {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "ZEB-254 pending-clear: nav-updated emit failed"
+                                        );
+                                    }
+                                }
+                            })),
                         };
                         std::sync::Arc::new(
                             crate::community_state_sync::CommunitySyncRegistry::new(cfg),
@@ -2272,6 +2300,212 @@ async fn start_node(
                                     error = ?e,
                                     "channel-log registry reconcile_from_state failed at boot"
                                 );
+                            }
+                        }
+                    }
+
+                    // ZEB-254 R4-4: restart-time rehydrate pass for the
+                    // engine's `admin_identity_pub` OnceLock. The R3-C1
+                    // pre-bind at spawn time calls
+                    // `resolver.resolve(&admin_addr)`, but if the
+                    // OwnerDeviceCache was still cold at that moment
+                    // (e.g., the joiner crashed before the admin's
+                    // device entry got learned), the OnceLock is left
+                    // unset. Since the joiner's persisted CRDT may
+                    // already contain the admin's bootstrap Join (it
+                    // arrived in the SAME publish that bootstrapped
+                    // the engine, returned `AlreadyKnown` on the
+                    // reconcile insert, and the post-verify bind
+                    // therefore never fired), no later event-flow
+                    // will rebind the lock until a brand-new admin
+                    // event arrives.
+                    //
+                    // Sweep every spawned engine and call
+                    // `try_rehydrate_admin_identity_pub` — best-effort,
+                    // idempotent, no-ops cleanly on already-bound
+                    // engines and on engines whose persisted log
+                    // contains no admin events.
+                    {
+                        let space_ids: Vec<crate::owner_state_types::SpaceId> = {
+                            let g = crdt_state.lock().await;
+                            g.spaces
+                                .iter()
+                                .filter(|(_, s)| {
+                                    s.kind == crate::owner_state_types::SpaceKind::Community
+                                        && s.left_at.is_none()
+                                })
+                                .map(|(id, _)| *id)
+                                .collect()
+                        };
+                        for space_id in space_ids {
+                            let engine = match registry.engine_arc(&space_id).await {
+                                Some(e) => e,
+                                None => continue,
+                            };
+                            if engine.try_rehydrate_admin_identity_pub().await {
+                                tracing::info!(
+                                    ?space_id,
+                                    "ZEB-254 R4-4: admin_identity_pub rehydrated at boot \
+                                     (resolver re-resolve hit after spawn-time cold miss)"
+                                );
+                            }
+                        }
+                    }
+
+                    // ZEB-254 R3 (C3): restart-time healing pass for
+                    // pending_join_at. The post-Inserted clear hook only
+                    // fires for events freshly Inserted in this process —
+                    // if a process crashed between PendingJoin landing and
+                    // the JoinCountersign arriving (both events on disk,
+                    // but the hook never ran), `Space.pending_join_at`
+                    // would remain Some forever. Walk every Community
+                    // Space whose `pending_join_at` is Some; if the
+                    // engine's persisted event log holds a JoinCountersign
+                    // for a self-authored PendingJoin, clear it via the
+                    // same `apply_space_with_canonicalization` path the
+                    // online hook uses + invoke the nav_emitter callback.
+                    {
+                        // Snapshot under the crdt_state lock first.
+                        type HealCandidate = (
+                            crate::owner_state_types::SpaceId,
+                            crate::owner_state_types::Space,
+                        );
+                        let candidates: Vec<HealCandidate> = {
+                            let g = crdt_state.lock().await;
+                            g.spaces
+                                .iter()
+                                .filter(|(_, s)| {
+                                    s.kind == crate::owner_state_types::SpaceKind::Community
+                                        && s.pending_join_at.is_some()
+                                        && s.left_at.is_none()
+                                })
+                                .map(|(id, s)| (*id, s.clone()))
+                                .collect()
+                        };
+
+                        for (space_id, space) in candidates {
+                            let engine = match registry.engine_arc(&space_id).await {
+                                Some(e) => e,
+                                None => continue, // no engine spawned (skipped above)
+                            };
+                            // R4-5: locate the SPECIFIC self-authored
+                            // PendingJoin event matching `Space.pending_join_at`
+                            // (i.e., the HLC of THIS pending attempt — set
+                            // when the joiner minted the event in
+                            // `redeem_invite_inner`). Only clear if THAT
+                            // event has been countersigned, not just
+                            // "any prior PendingJoin from this user". A
+                            // joiner with history (leave → re-join twice)
+                            // could have a stale JoinCountersign for an
+                            // older attempt; without this guard, the
+                            // healing pass would clear `pending_join_at`
+                            // for the CURRENT attempt by matching against
+                            // a previous attempt's countersign.
+                            let pending_join_at = match space.pending_join_at.as_ref() {
+                                Some(hlc) => hlc.clone(),
+                                None => continue, // covered by the candidates filter, defensive
+                            };
+                            let cleared = {
+                                let state = engine.state();
+                                let g = state.lock().await;
+                                // Find the self-authored PendingJoin whose HLC equals
+                                // pending_join_at. HLC is the (wall_ms, logical, device_id)
+                                // triple; the `Space.pending_join_at` field is exactly
+                                // the `event.at` stored at mint time.
+                                let target_event_id: Option<crate::community_membership::EventId> = g
+                                    .events
+                                    .values()
+                                    .find(|e| {
+                                        e.actor == self_owner
+                                            && matches!(
+                                                &e.kind,
+                                                crate::community_membership::MembershipEventKind::PendingJoin { .. }
+                                            )
+                                            && e.at == pending_join_at
+                                    })
+                                    .map(|e| e.id);
+                                match target_event_id {
+                                    None => false, // no matching PendingJoin on disk
+                                    Some(target_id) => g.events.values().any(|e| matches!(
+                                        &e.kind,
+                                        crate::community_membership::MembershipEventKind::JoinCountersign {
+                                            target_event_id,
+                                        } if *target_event_id == target_id
+                                    )),
+                                }
+                            };
+
+                            if !cleared {
+                                continue;
+                            }
+
+                            // Found a matching JoinCountersign — clear
+                            // Space.pending_join_at. Use monotonic HLC.
+                            let wall_now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            let new_hlc = if wall_now_ms > space.updated_at.wall_ms {
+                                crate::owner_state_types::Hlc {
+                                    wall_ms: wall_now_ms,
+                                    logical: 0,
+                                    device_id: space.updated_at.device_id.clone(),
+                                }
+                            } else {
+                                crate::owner_state_types::Hlc {
+                                    wall_ms: space.updated_at.wall_ms,
+                                    logical: space.updated_at.logical.saturating_add(1),
+                                    device_id: space.updated_at.device_id.clone(),
+                                }
+                            };
+                            let mut updated = space.clone();
+                            updated.pending_join_at = None;
+                            updated.updated_at = new_hlc;
+                            let space_name = space.name.clone();
+
+                            let outcome = {
+                                let mut g = crdt_state.lock().await;
+                                g.apply_space_with_canonicalization(updated)
+                            };
+
+                            match outcome {
+                                crate::owner_state_crdt::ApplyOutcome::Inserted
+                                | crate::owner_state_crdt::ApplyOutcome::Merged { .. } => {
+                                    tracing::info!(
+                                        ?space_id,
+                                        "ZEB-254 R3 (C3): restart-time pending_join_at healed \
+                                         (countersign found on disk, owner-state stale Some cleared)"
+                                    );
+                                    // Fire nav-updated event so the UI
+                                    // ungreys this community at boot.
+                                    let space_id_hex = hex::encode(space_id.0);
+                                    use tauri::Emitter as _;
+                                    if let Err(e) = app.emit(
+                                        "nav-updated",
+                                        &NavUpdatedPayload {
+                                            action: "modified",
+                                            space_id: space_id_hex,
+                                            kind: "community",
+                                            name: space_name,
+                                            members: None,
+                                            parent_id: None,
+                                            pending: Some(false),
+                                        },
+                                    ) {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "ZEB-254 R3 (C3): nav-updated emit failed during boot heal"
+                                        );
+                                    }
+                                }
+                                crate::owner_state_crdt::ApplyOutcome::Rejected(ref reason) => {
+                                    tracing::warn!(
+                                        ?space_id,
+                                        reason = ?reason,
+                                        "ZEB-254 R3 (C3): apply_space_with_canonicalization \
+                                         rejected during restart-time heal"
+                                    );
+                                }
                             }
                         }
                     }
@@ -4102,6 +4336,7 @@ pub fn add_space_dm_inner(
         admin_addr: None,
         is_invite_only: None,
         shared_in_profile: false,
+        pending_join_at: None,
     };
 
     // Validate invariants up front — catches programmer error before we
@@ -6609,6 +6844,8 @@ pub enum MemberStatusDto {
     Left,
     Invited,
     Banned,
+    /// ZEB-254: joiner has minted a PendingJoin awaiting admin counter-sign.
+    PendingJoin,
 }
 
 impl From<crate::community_membership::MemberStatus> for MemberStatusDto {
@@ -6619,6 +6856,8 @@ impl From<crate::community_membership::MemberStatus> for MemberStatusDto {
             MemberStatus::Left => Self::Left,
             MemberStatus::Invited => Self::Invited,
             MemberStatus::Banned => Self::Banned,
+            // ZEB-254: wired in Task 4 (IPC).
+            MemberStatus::PendingJoin => Self::PendingJoin,
         }
     }
 }
@@ -7893,7 +8132,14 @@ async fn generate_invite(
             let events: Vec<crate::community_membership::SignedMembershipEvent> =
                 state.events.values().cloned().collect();
             drop(state);
-            crate::community_membership::materialize(&events, admin)
+            // R4-6: pass wall_now_ms so an idle-community PendingJoin
+            // already past 30d is excluded from the bootstrap snapshot
+            // sent to a new invitee.
+            let wall_now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            crate::community_membership::materialize_with_now(&events, admin, Some(wall_now_ms))
         } else {
             // No engine yet (e.g., just-created community with no events):
             // fall back to empty maps — still a valid bootstrap hint.
@@ -8139,6 +8385,7 @@ pub fn mint_community_creation(
         admin_addr: Some(self_owner),
         is_invite_only: Some(is_invite_only),
         shared_in_profile: false,
+        pending_join_at: None,
     };
 
     Ok(MintedCommunity {
@@ -8292,6 +8539,22 @@ pub async fn create_community_inner<R: tauri::Runtime>(
         )
         .await
         .map_err(|e| format!("registry.spawn_engine_with_guard: {e}"))?;
+
+    // ZEB-254 R1 (C1): bind admin_identity_pub so the P5 gate can verify
+    // PendingJoin InviteToken signatures on this engine. The admin IS the
+    // community creator — we derive the 64-byte composite pub from the
+    // signing key (same layout as the joiner path at ~L9350).
+    {
+        use crate::dm_signing::ed25519_priv_to_x25519;
+        let x25519_priv = ed25519_priv_to_x25519(&signing_key);
+        let x25519_pub =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*x25519_priv));
+        let ed25519_pub_bytes = signing_key.verifying_key().to_bytes();
+        let mut admin_identity_pub = [0u8; 64];
+        admin_identity_pub[..32].copy_from_slice(x25519_pub.as_bytes());
+        admin_identity_pub[32..].copy_from_slice(&ed25519_pub_bytes);
+        engine_arc.bind_admin_identity_pub(admin_identity_pub);
+    }
 
     // Bootstrap-Join via the engine. The engine's `insert_local_event`
     // runs verify_event (which authorizes the admin self-Join via the
@@ -8581,6 +8844,7 @@ async fn create_community(
             name: name_for_emit,
             members: None,
             parent_id: None,
+            pending: None,
         },
     ) {
         tracing::warn!(error = %e, "create_community: nav-updated emit failed");
@@ -8732,6 +8996,7 @@ mod create_community_inner_tests {
                 self_owner,
                 signing_key: std::sync::Arc::clone(&signing_key),
                 crdt_state: None,
+                nav_emitter: None,
             }));
 
         // Community adapter channel — receiver kept alive so try_send
@@ -9193,6 +9458,13 @@ pub struct RedeemInviteResultDto {
     pub community_id: String,
     pub community_name: String,
     pub is_invite_only: bool,
+    /// ZEB-254: true if the redemption returned before a JoinCountersign
+    /// landed locally (admin was offline; the 5s fast-path timeout
+    /// fired). The community appears in nav greyed; ungreys when
+    /// JoinCountersign arrives via state-root sync. false if either
+    /// (a) fast-path counter-sign came back within 5s, or (b) community
+    /// is open (no countersign required).
+    pub pending: bool,
 }
 
 /// Wire shape of the `nav-updated` IPC event. Mirrors the frontend
@@ -9211,6 +9483,13 @@ pub struct NavUpdatedPayload {
     pub members: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
+    /// ZEB-254 Task 11: emitted with `action = "modified"` when the
+    /// joiner-side pending-clear hook fires. `None` means "not relevant
+    /// to this payload" (the frontend skips the pending field on
+    /// `"added"` / `"removed"` actions). `Some(false)` means the pending
+    /// state just cleared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending: Option<bool>,
 }
 
 /// Pure function: builds the joiner-side `MintedCommunity` from an
@@ -9288,10 +9567,37 @@ pub fn mint_redemption(
     let mut event_id_bytes = [0u8; 16];
     rng.fill_bytes(&mut event_id_bytes);
 
+    // ZEB-254: invite-only redemptions mint a PendingJoin event carrying
+    // the InviteToken (admin-signed bearer credential) + the joiner's
+    // full identity_pub. Distributed via the community CRDT so admins
+    // who were offline at redemption time can counter-sign asynchronously.
+    let event_kind = if payload.is_invite_only {
+        use crate::dm_signing::ed25519_priv_to_x25519;
+        let x25519_priv = ed25519_priv_to_x25519(signing_key);
+        let x25519_pub =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*x25519_priv));
+        let ed25519_pub_bytes = signing_key.verifying_key().to_bytes();
+        let mut identity_pub = [0u8; 64];
+        identity_pub[..32].copy_from_slice(x25519_pub.as_bytes());
+        identity_pub[32..].copy_from_slice(&ed25519_pub_bytes);
+
+        let invite_token = payload
+            .invite_token
+            .clone()
+            .ok_or_else(|| "invite-only payload is missing invite_token".to_string())?;
+
+        MembershipEventKind::PendingJoin {
+            invite_token,
+            joiner_identity_pub: identity_pub,
+        }
+    } else {
+        MembershipEventKind::Join
+    };
+
     let join_payload = EventPayload {
         id: event_id_bytes,
         community_id: payload.community_id,
-        kind: MembershipEventKind::Join,
+        kind: event_kind,
         actor: self_owner,
         at: join_hlc.clone(),
     };
@@ -9323,6 +9629,7 @@ pub fn mint_redemption(
         // silently reject the redemption Space if these disagreed).
         is_invite_only: Some(payload.is_invite_only),
         shared_in_profile: false,
+        pending_join_at: None,
     };
 
     Ok(MintedCommunity {
@@ -9351,7 +9658,7 @@ pub fn mint_redemption(
 ///        - 7c. resolve inviter Reticulum dest(s); send packet via
 ///          `unicast_send_tx`
 ///        - 7d. await oneshot ≤ T (env
-///          `HARMONY_REDEEM_INVITE_TIMEOUT_MS`, default 15s)
+///          `HARMONY_REDEEM_INVITE_TIMEOUT_MS`, default 5s)
 ///   8. fence_check (generation guard via closure)
 ///   9. COMMIT owner-state Space (LAST step — ZEB-258 reorder)
 ///  10. return `Ok(hex(community_id))`
@@ -9489,6 +9796,17 @@ where
         .await
         .map_err(|e| format!("registry.spawn_engine_with_guard: {e}"))?;
 
+    // ZEB-254: bind admin identity pub to the engine so the P5 gate in
+    // verify_event can validate PendingJoin InviteToken signatures. Must
+    // happen before any event insert (including the bootstrap admin Join
+    // below) so the shared OnceLock is populated before the task's
+    // handle_incoming_publish path could race it. Invite-only payloads
+    // always carry admin_identity_pub; open-community payloads carry None
+    // (no PendingJoin events possible → no binding needed).
+    if let Some(pub_bytes) = payload.admin_identity_pub {
+        engine_arc.bind_admin_identity_pub(pub_bytes);
+    }
+
     // ZEB-249 Task 6 spec §5.2: seed the bootstrap hint BEFORE the first
     // insert_local_event so the guard (version == 0 && events.is_empty())
     // in CommunityState::materialized() can actually return the hint.
@@ -9512,6 +9830,10 @@ where
     }
 
     // 7. Branch on payload.is_invite_only.
+    // ZEB-254: tracks whether the invite-only fast-path 5s timeout fired
+    // without a counter-sign landing. Always false for open communities.
+    // Set inside the invite-only branch by the timeout match arm.
+    let mut pending_redemption_timed_out: bool = false;
     if !payload.is_invite_only {
         // OPEN: insert bootstrap_join via the engine. The engine's
         // `insert_local_event` runs verify_event (which authorizes the
@@ -9659,6 +9981,31 @@ where
             }
         };
 
+        // ZEB-254: insert PendingJoin into local engine FIRST so the
+        // engine's state-root publisher picks it up — the wire path
+        // (Zenoh CRDT) is the durable channel; the unicast below is
+        // just the fast-path optimization for when an admin device is
+        // online at this moment.
+        match engine_arc
+            .insert_local_event(minted.bootstrap_join.clone())
+            .await
+        {
+            Ok(crate::community_state_crdt::InsertOutcome::Inserted)
+            | Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => {}
+            Ok(crate::community_state_crdt::InsertOutcome::Rejected(verify_err)) => {
+                // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
+                return Err(format!(
+                    "engine rejected local PendingJoin insert: {verify_err}"
+                ));
+            }
+            Err(insert_err) => {
+                // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
+                return Err(format!(
+                    "engine.insert_local_event (PendingJoin): {insert_err}"
+                ));
+            }
+        }
+
         // 7c. Resolve inviter's Reticulum destination(s) and send.
         let inviter_addr = payload.admin_addr;
         let destinations = resolve_destinations_for_owner(crdt_state.as_ref(), inviter_addr).await;
@@ -9718,10 +10065,16 @@ where
         }
 
         // 7d. Await oneshot ≤ T (env-overridable for tests).
+        // ZEB-254: 5s fast-path timeout (down from 15s). On timeout,
+        // redeem_invite_inner does NOT roll back — it proceeds to commit
+        // the Space with pending_join_at = Some and returns Ok { pending:
+        // true }. The PendingJoin event is already on the wire via the
+        // engine's state-root publisher; admins counter-sign whenever
+        // they next come online.
         let timeout_ms: u64 = std::env::var("HARMONY_REDEEM_INVITE_TIMEOUT_MS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(15_000);
+            .unwrap_or(5_000);
 
         match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), notify_rx).await {
             Ok(Ok(())) => {
@@ -9735,44 +10088,56 @@ where
                 return Err("invite-only redemption oneshot closed unexpectedly".into());
             }
             Err(_elapsed) => {
-                // Race-window fix (CodeRabbit P0): the timeout future
-                // and the engine's notify hook can both observe the
-                // deadline near-simultaneously. The hook's
-                // `notify_pending_redemption_in_map` removes the map
-                // entry BEFORE calling `tx.send`, so use the entry's
-                // presence as the atomic synchronization point:
+                // ZEB-254: 5s fast-path timeout fired. Two sub-cases:
                 //
-                //   take_pending_redemption() → Some(tx) ⇒ we won the
-                //   race; the notifier hadn't run; genuine timeout —
-                //   roll back.
+                //   (A) take_pending_redemption returns Some(tx) — we won
+                //       the race; the notifier hadn't run; genuine
+                //       timeout → set pending_redemption_timed_out = true
+                //       and fall through to commit with pending = true.
                 //
-                //   take_pending_redemption() → None ⇒ the notifier
-                //   already removed it (and tried `tx.send` to a
-                //   dropped rx, which it swallowed). The
-                //   counter-signed Join is in our engine because
-                //   insert_local_event returned Ok before the hook
-                //   fired — treat as a success that landed exactly
-                //   at the deadline. DO NOT tear down the engine.
+                //   (B) take_pending_redemption returns None — notifier
+                //       won the race and already ingested the counter-
+                //       signed event → treat as success; commit with
+                //       pending = false.
                 //
-                // This narrows but does not entirely eliminate the
-                // race: an engine.insert_local_event that races with
-                // take_pending_redemption (notifier hasn't yet
-                // removed the entry) still ends in Some-claimed →
-                // rollback. That window is sub-microsecond and the
-                // peer's view stays consistent (the counter-signed
-                // Join is in their persistence; only OUR local engine
-                // is torn down). A complete fix would require a
-                // "completed" sentinel in the map (deferred — see
-                // PR #89 follow-up notes).
+                // CRITICAL: do NOT roll back. The PendingJoin event is
+                // already on the wire via the engine's state-root publish.
+                // Admins counter-sign whenever they come online.
                 match community_registry
                     .take_pending_redemption(&minted.bootstrap_join.id)
                     .await
                 {
                     Some(_tx) => {
-                        // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
-                        return Err(format!(
-                            "invite-only redemption timed out after {timeout_ms}ms"
-                        ));
+                        // ZEB-254 R3 (C2): TOCTOU recheck. Between the oneshot
+                        // timeout firing and our take_pending_redemption, a
+                        // JoinCountersign may have landed via state-root sync
+                        // (its post-Inserted hook ran and tried to fire the
+                        // oneshot but found the sender already consumed by us
+                        // — or fired it concurrently). Before latching
+                        // pending=true and writing pending_join_at, scan the
+                        // engine's CRDT for a JoinCountersign whose
+                        // target_event_id matches our bootstrap_join.id.
+                        // If found, treat as success (countersigned already).
+                        let countersigned_now = {
+                            let state = engine_arc.state();
+                            let g = state.lock().await;
+                            g.events.values().any(|e| matches!(
+                                &e.kind,
+                                crate::community_membership::MembershipEventKind::JoinCountersign {
+                                    target_event_id,
+                                } if *target_event_id == minted.bootstrap_join.id
+                            ))
+                        };
+                        if countersigned_now {
+                            tracing::debug!(
+                                community_id = %hex::encode(minted.community_id.0),
+                                event_id = %hex::encode(minted.bootstrap_join.id),
+                                "ZEB-254 R3 (C2): TOCTOU recheck found JoinCountersign \
+                                 between timeout and take_pending_redemption — treating as success"
+                            );
+                        } else {
+                            pending_redemption_timed_out = true;
+                        }
                     }
                     None => {
                         // Notifier won the race; treat as success.
@@ -9780,9 +10145,7 @@ where
                         tracing::debug!(
                             community_id = %hex::encode(minted.community_id.0),
                             event_id = %hex::encode(minted.bootstrap_join.id),
-                            "redeem_invite timeout fired but notifier had already \
-                             consumed the pending entry — counter-signed Join is in \
-                             the engine; treating as success"
+                            "ZEB-254: 5s timeout fired but counter-sign arrived just in time"
                         );
                     }
                 }
@@ -9798,6 +10161,40 @@ where
     // ZEB-274: rollback on Err collapses into community_sync_guard Drop.
     fence_check()?;
 
+    // ZEB-254 R5-2: FINAL TOCTOU recheck before commit. The R3 (C2)
+    // recheck above narrows but does not close the window between the
+    // `take_pending_redemption` decision and this commit. A
+    // `JoinCountersign` can still land via state-root sync in that gap;
+    // its post-Inserted clear hook will run before `pending_join_at`
+    // exists, leaving this commit to write a stale `Some(...)` that
+    // greys the community until restart heal. Re-scan the engine
+    // immediately before acquiring the owner-state lock; if a
+    // countersign is now present, drop the timed-out flag so the
+    // commit below writes pending_join_at = None.
+    if pending_redemption_timed_out {
+        let already_countersigned = {
+            let state = engine_arc.state();
+            let g = state.lock().await;
+            g.events.values().any(|e| {
+                matches!(
+                    &e.kind,
+                    crate::community_membership::MembershipEventKind::JoinCountersign {
+                        target_event_id,
+                    } if *target_event_id == minted.bootstrap_join.id
+                )
+            })
+        };
+        if already_countersigned {
+            tracing::debug!(
+                community_id = %hex::encode(minted.community_id.0),
+                event_id = %hex::encode(minted.bootstrap_join.id),
+                "ZEB-254 R5-2: final pre-commit recheck found JoinCountersign — \
+                 dropping pending_redemption_timed_out so commit writes pending_join_at = None"
+            );
+            pending_redemption_timed_out = false;
+        }
+    }
+
     // 9. COMMIT owner-state Space as the LAST persistent step
     //    (ZEB-258 reorder). Pre-ZEB-267 this block also held the
     //    tracker_g guard to advance the tracker atomically with the
@@ -9806,7 +10203,14 @@ where
     //    is owner-state-only.
     {
         let mut state_g = crdt_state.lock().await;
-        let outcome = state_g.apply_space_with_canonicalization(minted.space.clone());
+        // ZEB-254: set pending_join_at if the invite-only fast-path
+        // timed out (admin offline). For non-invite-only or
+        // counter-signed-in-time paths, pending_join_at stays None.
+        let mut space_to_commit = minted.space.clone();
+        if pending_redemption_timed_out {
+            space_to_commit.pending_join_at = Some(minted.space.created_at.clone());
+        }
+        let outcome = state_g.apply_space_with_canonicalization(space_to_commit);
         if matches!(outcome, crate::owner_state_crdt::ApplyOutcome::Rejected(_)) {
             // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
             // state_g drops at this block's scope end (before the function-
@@ -9920,6 +10324,7 @@ where
         community_id: hex::encode(minted.community_id.0),
         community_name: payload.community_name.clone(),
         is_invite_only: payload.is_invite_only,
+        pending: pending_redemption_timed_out,
     })
 }
 
@@ -10097,6 +10502,10 @@ async fn redeem_invite(
     // ZEB-265: surface the redeemed community to the nav listener.
     // emit failure is non-fatal — the join already committed, and
     // App.svelte still synthesizes from the DTO until step 3 lands.
+    //
+    // ZEB-254 R1 (I1): carry dto.pending so listeners that subscribe AFTER
+    // this emit (e.g. nav components mounted post-redeem) see the correct
+    // greyed state rather than assuming non-pending.
     if let Err(e) = app.emit(
         "nav-updated",
         &NavUpdatedPayload {
@@ -10106,6 +10515,7 @@ async fn redeem_invite(
             name: dto.community_name.clone(),
             members: None,
             parent_id: None,
+            pending: Some(dto.pending),
         },
     ) {
         tracing::warn!(error = %e, "redeem_invite: nav-updated emit failed");
@@ -10295,6 +10705,7 @@ async fn join_open_community(
             name: dto.community_name.clone(),
             members: None,
             parent_id: None,
+            pending: None,
         },
     ) {
         tracing::warn!(error = %e, "join_open_community: nav-updated emit failed");
@@ -10425,6 +10836,7 @@ mod redeem_invite_inner_tests {
                 self_owner,
                 signing_key: std::sync::Arc::clone(&signing_key),
                 crdt_state: None,
+                nav_emitter: None,
             }));
 
         let (community_adapter_tx, _community_adapter_rx) =
@@ -10725,6 +11137,155 @@ mod redeem_invite_inner_tests {
             Some(original_id),
             "CommunityState.forked_from must mirror the invite's forked_from"
         );
+    }
+
+    // ── ZEB-254 Task 7: mint_redemption event-kind tests ──────────────────────
+
+    #[test]
+    fn mint_redemption_open_path_still_produces_join() {
+        use crate::community_invite::{
+            InviteEpochSnapshot, InviteToken, MaterializedCommunityState,
+        };
+        use crate::community_membership::MembershipEventKind;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let admin_addr = OwnerAddr([0x11; 16]);
+        let community_id = SpaceId([0x33; 16]);
+        let joiner_sk = SigningKey::generate(&mut OsRng);
+        let joiner_addr = OwnerAddr([0x22; 16]);
+
+        let token = InviteToken {
+            inviter: admin_addr,
+            invitee_hint: None,
+            minted_at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "admin".into(),
+            },
+            expires_at: None,
+            sig: [0; 64],
+        };
+
+        let payload = CommunityInvitePayload {
+            community_id,
+            epoch_snapshot: InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: EpochKey::new([0x42; 32]).as_bytes().to_vec(),
+                state_snapshot: MaterializedCommunityState::default(),
+            },
+            admin_addr,
+            community_name: "Open Test".into(),
+            is_invite_only: false,
+            expires_at: None,
+            invite_token: Some(token),
+            admin_bootstrap: None,
+            admin_identity_pub: None,
+            forked_from: None,
+            pre_fork_snapshot: None,
+        };
+
+        let hlc = Hlc {
+            wall_ms: 1_700_000_001_000,
+            logical: 0,
+            device_id: "joiner".into(),
+        };
+        let minted = mint_redemption(&payload, joiner_addr, &joiner_sk, hlc).expect("mint open");
+
+        assert!(
+            matches!(minted.bootstrap_join.kind, MembershipEventKind::Join),
+            "open path must produce Join kind, got {:?}",
+            minted.bootstrap_join.kind
+        );
+    }
+
+    #[test]
+    fn mint_redemption_invite_only_path_produces_pending_join() {
+        use crate::community_invite::{
+            InviteEpochSnapshot, InviteToken, MaterializedCommunityState,
+        };
+        use crate::community_membership::MembershipEventKind;
+        use crate::dm_signing::{ed25519_priv_to_x25519, seal_to_owner};
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let admin_addr = OwnerAddr([0x11; 16]);
+        let community_id = SpaceId([0x33; 16]);
+        let joiner_sk = SigningKey::generate(&mut OsRng);
+        let joiner_addr = OwnerAddr([0x22; 16]);
+
+        // Derive joiner's X25519 pub for the seal.
+        let joiner_x25519_priv = ed25519_priv_to_x25519(&joiner_sk);
+        let joiner_x25519_pub =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*joiner_x25519_priv));
+
+        // Seal a 32-byte epoch key to the joiner's X25519 pub.
+        let raw_key = [0xEEu8; 32];
+        let sealed = seal_to_owner(joiner_x25519_pub.as_bytes(), &raw_key).expect("seal");
+        assert_eq!(sealed.len(), 92, "sealed envelope must be 92 bytes");
+
+        let token = InviteToken {
+            inviter: admin_addr,
+            invitee_hint: Some(joiner_addr),
+            minted_at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "admin".into(),
+            },
+            expires_at: None,
+            sig: [0; 64],
+        };
+
+        let payload = CommunityInvitePayload {
+            community_id,
+            epoch_snapshot: InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: sealed,
+                state_snapshot: MaterializedCommunityState::default(),
+            },
+            admin_addr,
+            community_name: "Invite-only Test".into(),
+            is_invite_only: true,
+            expires_at: None,
+            invite_token: Some(token),
+            admin_bootstrap: None,
+            admin_identity_pub: None,
+            forked_from: None,
+            pre_fork_snapshot: None,
+        };
+
+        let hlc = Hlc {
+            wall_ms: 1_700_000_001_000,
+            logical: 0,
+            device_id: "joiner".into(),
+        };
+        let minted =
+            mint_redemption(&payload, joiner_addr, &joiner_sk, hlc).expect("mint invite-only");
+
+        match &minted.bootstrap_join.kind {
+            MembershipEventKind::PendingJoin {
+                invite_token: t,
+                joiner_identity_pub,
+            } => {
+                assert_eq!(
+                    t.inviter, admin_addr,
+                    "InviteToken should be carried through"
+                );
+                assert_eq!(
+                    joiner_identity_pub.len(),
+                    64,
+                    "joiner_identity_pub must be 64 bytes"
+                );
+                // The Ed25519 half (bytes 32-64) MUST match the signing_key's verifying key.
+                let ed_pub = joiner_sk.verifying_key().to_bytes();
+                assert_eq!(
+                    &joiner_identity_pub[32..],
+                    &ed_pub,
+                    "Ed25519 half must match"
+                );
+            }
+            other => panic!("expected PendingJoin kind, got {:?}", other),
+        }
     }
 }
 
@@ -12193,6 +12754,7 @@ async fn leave_community(
             name: String::new(),
             members: None,
             parent_id: None,
+            pending: None,
         },
     ) {
         tracing::warn!(error = %e, "leave_community: nav-updated emit failed");
@@ -13106,6 +13668,333 @@ async fn list_recent_moderation_events(
     Ok(dtos)
 }
 
+// ── ZEB-254 Task 12: list_pending_joins + list_recent_counter_signs ──────────
+//
+// Admin audit feed IPCs. Both read the raw signed event log from the
+// community engine (same Arc<Mutex<CommunityState>> as list_recent_
+// moderation_events), apply lightweight filter+sort in-process, and
+// return DTOs. No state mutation.
+
+/// DTO returned by `list_pending_joins`. One entry per PendingJoin event
+/// that has no matching JoinCountersign and is within the 30-day window.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingJoinDto {
+    /// Hex-encoded EventId of the PendingJoin (16 bytes → 32 hex chars).
+    pub event_id: String,
+    /// Hex-encoded OwnerAddr of the joiner (16 bytes → 32 hex chars).
+    pub joiner_addr: String,
+    /// HLC at which the joiner published the PendingJoin.
+    pub pending_at_hlc: crate::community_channel_log_engine::HlcDto,
+    /// Optional invitee_hint from the InviteToken, hex-encoded if present.
+    pub invitee_hint: Option<String>,
+}
+
+/// ZEB-254: admin audit feed — pending joins awaiting counter-sign.
+/// Returns PendingJoin events without a matching JoinCountersign AND
+/// within the 30-day expiry window. Sorted by pending_at_hlc ascending.
+///
+/// Errors: same hex/registry/Space-row path as `list_community_members`.
+#[tauri::command]
+async fn list_pending_joins(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+) -> Result<Vec<PendingJoinDto>, String> {
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let (registry, self_owner) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.community_registry
+                .clone()
+                .ok_or("no community_registry — node not running?")?,
+            g.dm_self_owner
+                .ok_or("dm_self_owner missing — no owner identity?")?,
+        )
+    };
+
+    let engine_arc = registry.engine_arc(&space_id).await.ok_or_else(|| {
+        format!(
+            "no engine for community {} — not joined or not yet started",
+            hex::encode(space_id.0)
+        )
+    })?;
+
+    // Authorization: caller must be a Joined member with moderator-tier
+    // power (≥ POWER_THRESHOLDS.kick). This is an admin audit feed and
+    // must not be readable by plain members.
+    {
+        let admin_addr = engine_arc.admin_addr();
+        let materialized = {
+            let state = engine_arc.state();
+            let g = state.lock().await;
+            g.materialize_now(admin_addr)
+        };
+        let caller_status = materialized.members.get(&self_owner).map(|m| m.status);
+        if !matches!(
+            caller_status,
+            Some(crate::community_membership::MemberStatus::Joined)
+        ) {
+            return Err("list_pending_joins: caller is not a Joined member".to_string());
+        }
+        let caller_power = materialized
+            .power_levels
+            .get(&self_owner)
+            .copied()
+            .unwrap_or(0);
+        if caller_power < crate::community_membership::POWER_THRESHOLDS.kick {
+            return Err(format!(
+                "list_pending_joins: caller power {} is below moderator threshold {}",
+                caller_power,
+                crate::community_membership::POWER_THRESHOLDS.kick
+            ));
+        }
+    }
+
+    let engine_state = engine_arc.state();
+    let raw_events: Vec<crate::community_membership::SignedMembershipEvent> = {
+        let g = engine_state.lock().await;
+        g.events.values().cloned().collect()
+    };
+
+    // F7: use wall-clock now for expiry threshold so a lone PendingJoin
+    // in an otherwise-idle community ages out correctly.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    Ok(filter_pending_joins(&raw_events, now_ms))
+}
+
+/// Pure filter: given the raw event log, return PendingJoin DTOs that
+/// have no matching JoinCountersign and are within the 30-day window.
+/// Sorted oldest-first by (wall_ms, logical).
+///
+/// `now_ms` is the caller-supplied wall-clock time (milliseconds since Unix
+/// epoch). Using the caller's wall clock — rather than max(event.at.wall_ms)
+/// — ensures a lone PendingJoin in an otherwise-idle community ages out
+/// correctly (the CRDT materialize keeps max() for determinism; the IPC
+/// display layer uses real time).
+///
+/// Extracted so unit tests can exercise the logic without a full NodeState.
+pub fn filter_pending_joins(
+    events: &[crate::community_membership::SignedMembershipEvent],
+    now_ms: u64,
+) -> Vec<PendingJoinDto> {
+    let expiry_threshold =
+        now_ms.saturating_sub(crate::community_membership::MATERIALIZE_PENDING_EXPIRY_MS);
+
+    // Collect target_event_ids of all JoinCountersign events.
+    let countersigned: std::collections::HashSet<crate::community_membership::EventId> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            crate::community_membership::MembershipEventKind::JoinCountersign {
+                target_event_id,
+            } => Some(*target_event_id),
+            _ => None,
+        })
+        .collect();
+
+    let mut out: Vec<PendingJoinDto> = events
+        .iter()
+        .filter_map(|e| {
+            let invite_token = match &e.kind {
+                crate::community_membership::MembershipEventKind::PendingJoin {
+                    invite_token,
+                    ..
+                } => invite_token,
+                _ => return None,
+            };
+            // Skip if already countersigned.
+            if countersigned.contains(&e.id) {
+                return None;
+            }
+            // Skip if outside the 30-day expiry window.
+            if e.at.wall_ms < expiry_threshold {
+                return None;
+            }
+            Some(PendingJoinDto {
+                event_id: hex::encode(e.id),
+                joiner_addr: hex::encode(e.actor.0),
+                pending_at_hlc: crate::community_channel_log_engine::HlcDto {
+                    wall_ms: e.at.wall_ms,
+                    logical: e.at.logical,
+                    device_id: e.at.device_id.clone(),
+                },
+                invitee_hint: invite_token.invitee_hint.as_ref().map(|h| hex::encode(h.0)),
+            })
+        })
+        .collect();
+
+    out.sort_by_key(|p| (p.pending_at_hlc.wall_ms, p.pending_at_hlc.logical));
+    out
+}
+
+/// DTO returned by `list_recent_counter_signs`. One entry per self-authored
+/// JoinCountersign event, sorted recent-first, capped at `limit`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CounterSignDto {
+    /// Hex-encoded target_event_id (16 bytes → 32 hex chars).
+    pub join_event_id: String,
+    /// Hex-encoded OwnerAddr of the joiner (resolved from the PendingJoin
+    /// event; `"(unknown target)"` if the PendingJoin is missing from log).
+    pub joiner_addr: String,
+    /// HLC at which this JoinCountersign was signed.
+    pub countersigned_at_hlc: crate::community_channel_log_engine::HlcDto,
+}
+
+/// ZEB-254: admin audit feed — recent self-authored counter-signs.
+/// Sorted by countersigned_at_hlc descending. Pass limit=0 for default 20.
+///
+/// Errors: same hex/registry path as `list_recent_moderation_events`.
+#[tauri::command]
+async fn list_recent_counter_signs(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    limit: u32,
+) -> Result<Vec<CounterSignDto>, String> {
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+    let cap = if limit == 0 { 20 } else { limit as usize };
+
+    let (registry, self_owner) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.community_registry
+                .clone()
+                .ok_or("no community_registry — node not running?")?,
+            g.dm_self_owner
+                .ok_or("dm_self_owner missing — no owner identity?")?,
+        )
+    };
+
+    let engine_arc = registry.engine_arc(&space_id).await.ok_or_else(|| {
+        format!(
+            "no engine for community {} — not joined or not yet started",
+            hex::encode(space_id.0)
+        )
+    })?;
+
+    // ZEB-254 R3 (S3): authorize — caller must be a Joined member with
+    // moderator-tier power (≥ POWER_THRESHOLDS.kick). This is an admin
+    // audit feed and must not be readable by plain members. Mirrors the
+    // F1 guard in `list_pending_joins`.
+    {
+        let admin_addr = engine_arc.admin_addr();
+        let materialized = {
+            let state = engine_arc.state();
+            let g = state.lock().await;
+            g.materialize_now(admin_addr)
+        };
+        let caller_status = materialized.members.get(&self_owner).map(|m| m.status);
+        if !matches!(
+            caller_status,
+            Some(crate::community_membership::MemberStatus::Joined)
+        ) {
+            return Err("list_recent_counter_signs: caller is not a Joined member".to_string());
+        }
+        let caller_power = materialized
+            .power_levels
+            .get(&self_owner)
+            .copied()
+            .unwrap_or(0);
+        if caller_power < crate::community_membership::POWER_THRESHOLDS.kick {
+            return Err(format!(
+                "list_recent_counter_signs: caller power {} is below moderator threshold {}",
+                caller_power,
+                crate::community_membership::POWER_THRESHOLDS.kick
+            ));
+        }
+    }
+
+    let engine_state = engine_arc.state();
+    let raw_events: Vec<crate::community_membership::SignedMembershipEvent> = {
+        let g = engine_state.lock().await;
+        g.events.values().cloned().collect()
+    };
+
+    Ok(filter_recent_counter_signs(&raw_events, self_owner, cap))
+}
+
+/// Pure filter: given the raw event log and the local owner's address,
+/// return `CounterSignDto`s for JoinCountersign events authored by
+/// `self_owner`, sorted by countersigned_at_hlc descending, truncated to
+/// `cap`.
+///
+/// Extracted so unit tests can exercise the logic without a full NodeState.
+pub fn filter_recent_counter_signs(
+    events: &[crate::community_membership::SignedMembershipEvent],
+    self_owner: crate::owner_state_types::OwnerAddr,
+    cap: usize,
+) -> Vec<CounterSignDto> {
+    // Build event_id → joiner_addr lookup from PendingJoin events.
+    let pending_actors: std::collections::HashMap<
+        crate::community_membership::EventId,
+        crate::owner_state_types::OwnerAddr,
+    > = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            crate::community_membership::MembershipEventKind::PendingJoin { .. } => {
+                Some((e.id, e.actor))
+            }
+            _ => None,
+        })
+        .collect();
+
+    let mut out: Vec<CounterSignDto> = events
+        .iter()
+        .filter(|e| e.actor == self_owner)
+        .filter_map(|e| {
+            let target_event_id = match &e.kind {
+                crate::community_membership::MembershipEventKind::JoinCountersign {
+                    target_event_id,
+                } => target_event_id,
+                _ => return None,
+            };
+            let joiner_addr = pending_actors
+                .get(target_event_id)
+                .map(|a| hex::encode(a.0))
+                .unwrap_or_else(|| "(unknown target)".into());
+            Some(CounterSignDto {
+                join_event_id: hex::encode(target_event_id),
+                joiner_addr,
+                countersigned_at_hlc: crate::community_channel_log_engine::HlcDto {
+                    wall_ms: e.at.wall_ms,
+                    logical: e.at.logical,
+                    device_id: e.at.device_id.clone(),
+                },
+            })
+        })
+        .collect();
+
+    out.sort_by(|a, b| {
+        b.countersigned_at_hlc
+            .wall_ms
+            .cmp(&a.countersigned_at_hlc.wall_ms)
+            .then_with(|| {
+                b.countersigned_at_hlc
+                    .logical
+                    .cmp(&a.countersigned_at_hlc.logical)
+            })
+    });
+    out.truncate(cap);
+    out
+}
+
 /// Delta payload for the `community-members-changed` Tauri event.
 /// Matches the spec line 561 wire shape:
 /// `{ communityId, changes: [{type, target, by?, detail?}] }`. One
@@ -13291,7 +14180,11 @@ pub fn delta_to_change(
         // is projected for it. Fork events are surfaced via a separate
         // fork-lineage listing path (Task 7+), not via the membership-changed
         // Tauri event stream.
-        | crate::community_membership::MembershipEventKind::Fork { .. } => return None,
+        | crate::community_membership::MembershipEventKind::Fork { .. }
+        // ZEB-254: PendingJoin and JoinCountersign project to MembershipChange
+        // in Task 4 (IPC wiring). Until then, emit no Tauri event.
+        | crate::community_membership::MembershipEventKind::PendingJoin { .. }
+        | crate::community_membership::MembershipEventKind::JoinCountersign { .. } => return None,
     };
     Some((cid_hex, change))
 }
@@ -14333,6 +15226,8 @@ pub fn run() {
             set_power_level,
             unban_from_community,
             list_recent_moderation_events,
+            list_pending_joins,
+            list_recent_counter_signs,
             create_channel,
             modify_channel,
             delete_channel,
@@ -15139,6 +16034,7 @@ mod list_community_members_ipc_tests {
                     is_invite_only: false,
                     actor_identity_pub: &identity_pub,
                     countersigner_identity_pub: None,
+                    admin_identity_pub: None,
                 },
             );
             assert!(
@@ -15870,6 +16766,7 @@ mod unban_from_community_tests {
             is_invite_only: false,
             actor_identity_pub: actor_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         };
         let outcome = state.insert_event(ev, &ctx);
         assert!(
@@ -15979,6 +16876,7 @@ mod unban_from_community_tests {
                     is_invite_only: false,
                     actor_identity_pub: &admin_pub,
                     countersigner_identity_pub: None,
+                    admin_identity_pub: None,
                 },
             )
         };
@@ -16129,6 +17027,7 @@ mod unban_from_community_tests {
                 is_invite_only: false,
                 actor_identity_pub: &mod_pub,
                 countersigner_identity_pub: None,
+                admin_identity_pub: None,
             },
         );
 
@@ -16213,6 +17112,7 @@ mod unban_from_community_tests {
                 is_invite_only: false,
                 actor_identity_pub: &admin_pub,
                 countersigner_identity_pub: None,
+                admin_identity_pub: None,
             },
         );
 
@@ -16297,6 +17197,7 @@ mod unban_from_community_tests {
                 is_invite_only: false,
                 actor_identity_pub: &admin_pub,
                 countersigner_identity_pub: None,
+                admin_identity_pub: None,
             },
         );
         assert!(
@@ -16392,6 +17293,7 @@ mod unban_from_community_tests {
                 is_invite_only: false,
                 actor_identity_pub: &admin_pub,
                 countersigner_identity_pub: None,
+                admin_identity_pub: None,
             },
         );
         assert!(matches!(sp_outcome, InsertOutcome::Inserted));
@@ -16414,6 +17316,7 @@ mod unban_from_community_tests {
                 is_invite_only: false,
                 actor_identity_pub: &admin_pub,
                 countersigner_identity_pub: None,
+                admin_identity_pub: None,
             },
         );
         assert!(matches!(kick_outcome, InsertOutcome::Inserted));
@@ -16436,6 +17339,7 @@ mod unban_from_community_tests {
                 is_invite_only: false,
                 actor_identity_pub: &admin_pub,
                 countersigner_identity_pub: None,
+                admin_identity_pub: None,
             },
         );
         assert!(matches!(unban_outcome, InsertOutcome::Inserted));
@@ -16590,6 +17494,7 @@ mod unban_from_community_tests {
                     is_invite_only: false,
                     actor_identity_pub: &admin_pub,
                     countersigner_identity_pub: None,
+                    admin_identity_pub: None,
                 },
             );
             assert!(
@@ -16666,6 +17571,351 @@ mod unban_from_community_tests {
             dtos.iter().all(|d| d.hlc.wall_ms >= 300),
             "events at 100 and 200 must be truncated by limit=3"
         );
+    }
+}
+
+// ── ZEB-254 Task 12: list_pending_joins + list_recent_counter_signs unit tests ─
+//
+// These tests exercise the pure `filter_pending_joins` and
+// `filter_recent_counter_signs` helpers directly, bypassing the Tauri IPC
+// layer and NodeState. Events are inserted directly into a raw Vec so we can
+// control timestamps precisely without needing valid crypto signatures.
+// (End-to-end IPC coverage is deferred to Task 15.)
+#[cfg(test)]
+mod pending_join_audit_feed_tests {
+    use super::*;
+    use crate::community_invite::InviteToken;
+    use crate::community_membership::{MembershipEventKind, SignedMembershipEvent};
+    use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+
+    /// Build a minimal unsigned SignedMembershipEvent for filter testing.
+    /// Signature bytes are zeroed — the filter helpers never check sigs.
+    fn make_event(
+        id: [u8; 16],
+        actor: OwnerAddr,
+        wall_ms: u64,
+        kind: MembershipEventKind,
+        community_id: SpaceId,
+    ) -> SignedMembershipEvent {
+        SignedMembershipEvent {
+            id,
+            community_id,
+            kind,
+            actor,
+            at: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "test-device".into(),
+            },
+            sig: [0u8; 64],
+            countersig: None,
+        }
+    }
+
+    /// Build a minimal InviteToken for PendingJoin events in tests.
+    fn make_token(inviter: OwnerAddr, invitee_hint: Option<OwnerAddr>) -> InviteToken {
+        InviteToken {
+            inviter,
+            invitee_hint,
+            minted_at: Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "admin".into(),
+            },
+            expires_at: None,
+            sig: [0u8; 64],
+        }
+    }
+
+    // ── Test 1: list_pending_joins_returns_pending_only ───────────────────
+    //
+    // Seed four events:
+    //   A) PendingJoin, no countersign, within 30-day window → should appear
+    //   B) PendingJoin + JoinCountersign → should NOT appear (countersigned)
+    //   C) PendingJoin, expired (>30d before max_wall_ms) → should NOT appear
+    //   D) Join (plain) → should NOT appear (wrong kind)
+    //
+    // max_wall_ms is event A's wall_ms. Expiry threshold = max − 30d.
+    // Event C is placed at (max − 31d) so it falls outside the window.
+    #[tokio::test]
+    async fn list_pending_joins_returns_pending_only() {
+        let community_id = SpaceId([0xde; 16]);
+        let admin = OwnerAddr([0xaa; 16]);
+        let joiner_a = OwnerAddr([0x01; 16]);
+        let joiner_b = OwnerAddr([0x02; 16]);
+        let joiner_c = OwnerAddr([0x03; 16]);
+        let joiner_d = OwnerAddr([0x04; 16]);
+
+        // max_wall_ms will be this value (event A is the "newest").
+        const MAX_MS: u64 = 1_000_000_000_000;
+        const THIRTY_DAYS_MS: u64 = 30 * 86_400_000;
+        const EXPIRED_MS: u64 = MAX_MS - THIRTY_DAYS_MS - 1; // one ms past expiry
+
+        // A: un-countersigned, recent.
+        let ev_a = make_event(
+            [0x0a; 16],
+            joiner_a,
+            MAX_MS,
+            MembershipEventKind::PendingJoin {
+                invite_token: make_token(admin, None),
+                joiner_identity_pub: [0u8; 64],
+            },
+            community_id,
+        );
+
+        // B: PendingJoin that will be countersigned.
+        let ev_b = make_event(
+            [0x0b; 16],
+            joiner_b,
+            MAX_MS - 1_000,
+            MembershipEventKind::PendingJoin {
+                invite_token: make_token(admin, None),
+                joiner_identity_pub: [0u8; 64],
+            },
+            community_id,
+        );
+        // JoinCountersign targeting ev_b.
+        let ev_b_cs = make_event(
+            [0xb0; 16],
+            admin,
+            MAX_MS - 500,
+            MembershipEventKind::JoinCountersign {
+                target_event_id: [0x0b; 16],
+            },
+            community_id,
+        );
+
+        // C: expired PendingJoin (no countersign).
+        let ev_c = make_event(
+            [0x0c; 16],
+            joiner_c,
+            EXPIRED_MS,
+            MembershipEventKind::PendingJoin {
+                invite_token: make_token(admin, None),
+                joiner_identity_pub: [0u8; 64],
+            },
+            community_id,
+        );
+
+        // D: plain Join (should be filtered out by kind).
+        let ev_d = make_event(
+            [0x0d; 16],
+            joiner_d,
+            MAX_MS - 2_000,
+            MembershipEventKind::Join,
+            community_id,
+        );
+
+        let events = vec![ev_a, ev_b, ev_b_cs, ev_c, ev_d];
+        // Pass MAX_MS as now_ms so the expiry threshold is MAX_MS - 30d,
+        // consistent with the test's EXPIRED_MS constant.
+        let result = filter_pending_joins(&events, MAX_MS);
+
+        assert_eq!(
+            result.len(),
+            1,
+            "expected exactly 1 pending join; got {}: {result:?}",
+            result.len()
+        );
+        assert_eq!(
+            result[0].event_id,
+            hex::encode([0x0a; 16]),
+            "the single result must be event A"
+        );
+        assert_eq!(
+            result[0].joiner_addr,
+            hex::encode(joiner_a.0),
+            "joiner_addr must match joiner_a"
+        );
+        assert_eq!(
+            result[0].pending_at_hlc.wall_ms, MAX_MS,
+            "pending_at_hlc.wall_ms must be MAX_MS"
+        );
+        assert!(
+            result[0].invitee_hint.is_none(),
+            "invitee_hint must be None (token had no hint)"
+        );
+    }
+
+    // ── Test 2: list_pending_joins_invitee_hint_is_hex_encoded ───────────
+    //
+    // PendingJoin with invitee_hint set → result must carry the hex-encoded
+    // hint.
+    #[tokio::test]
+    async fn list_pending_joins_invitee_hint_is_hex_encoded() {
+        let community_id = SpaceId([0xef; 16]);
+        let admin = OwnerAddr([0xaa; 16]);
+        let hint_addr = OwnerAddr([0x42; 16]);
+        let joiner = OwnerAddr([0x01; 16]);
+
+        let ev = make_event(
+            [0x01; 16],
+            joiner,
+            1_000,
+            MembershipEventKind::PendingJoin {
+                invite_token: make_token(admin, Some(hint_addr)),
+                joiner_identity_pub: [0u8; 64],
+            },
+            community_id,
+        );
+
+        // Event wall_ms=1000; pass a now_ms well within 30d so it's visible.
+        let result = filter_pending_joins(&[ev], 1_000_000);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].invitee_hint.as_deref(),
+            Some(hex::encode(hint_addr.0).as_str()),
+            "invitee_hint must be hex-encoded OwnerAddr"
+        );
+    }
+
+    // ── Test 3: list_recent_counter_signs_returns_self_authored ──────────
+    //
+    // Seed: 2 JoinCountersigns by self_owner, 1 by another admin, 1 PendingJoin.
+    // Call filter_recent_counter_signs with cap=10.
+    // Expect: exactly 2 entries (only self-authored JoinCountersigns).
+    #[tokio::test]
+    async fn list_recent_counter_signs_returns_self_authored() {
+        let community_id = SpaceId([0xca; 16]);
+        let self_owner = OwnerAddr([0xaa; 16]);
+        let other_admin = OwnerAddr([0xbb; 16]);
+        let joiner_1 = OwnerAddr([0x01; 16]);
+        let joiner_2 = OwnerAddr([0x02; 16]);
+        let joiner_3 = OwnerAddr([0x03; 16]);
+
+        // Three PendingJoin events (targets for countersigns).
+        let pj_1 = make_event(
+            [0x10; 16],
+            joiner_1,
+            100,
+            MembershipEventKind::PendingJoin {
+                invite_token: make_token(self_owner, None),
+                joiner_identity_pub: [0u8; 64],
+            },
+            community_id,
+        );
+        let pj_2 = make_event(
+            [0x20; 16],
+            joiner_2,
+            200,
+            MembershipEventKind::PendingJoin {
+                invite_token: make_token(self_owner, None),
+                joiner_identity_pub: [0u8; 64],
+            },
+            community_id,
+        );
+        let pj_3 = make_event(
+            [0x30; 16],
+            joiner_3,
+            300,
+            MembershipEventKind::PendingJoin {
+                invite_token: make_token(other_admin, None),
+                joiner_identity_pub: [0u8; 64],
+            },
+            community_id,
+        );
+
+        // self_owner counter-signs pj_1 and pj_2.
+        let cs_self_1 = make_event(
+            [0xa1; 16],
+            self_owner,
+            500,
+            MembershipEventKind::JoinCountersign {
+                target_event_id: [0x10; 16],
+            },
+            community_id,
+        );
+        let cs_self_2 = make_event(
+            [0xa2; 16],
+            self_owner,
+            600,
+            MembershipEventKind::JoinCountersign {
+                target_event_id: [0x20; 16],
+            },
+            community_id,
+        );
+
+        // other_admin counter-signs pj_3 (should NOT appear).
+        let cs_other = make_event(
+            [0xb1; 16],
+            other_admin,
+            700,
+            MembershipEventKind::JoinCountersign {
+                target_event_id: [0x30; 16],
+            },
+            community_id,
+        );
+
+        let events = vec![pj_1, pj_2, pj_3, cs_self_1, cs_self_2, cs_other];
+        let result = filter_recent_counter_signs(&events, self_owner, 10);
+
+        assert_eq!(
+            result.len(),
+            2,
+            "expected 2 self-authored counter-signs; got {}: {result:?}",
+            result.len()
+        );
+
+        // Sorted descending by wall_ms: cs_self_2 (600) then cs_self_1 (500).
+        assert_eq!(
+            result[0].countersigned_at_hlc.wall_ms, 600,
+            "first result must be the more-recent countersign"
+        );
+        assert_eq!(
+            result[0].join_event_id,
+            hex::encode([0x20u8; 16]),
+            "first result must target pj_2"
+        );
+        assert_eq!(
+            result[0].joiner_addr,
+            hex::encode(joiner_2.0),
+            "joiner_addr must be resolved from pj_2"
+        );
+
+        assert_eq!(
+            result[1].countersigned_at_hlc.wall_ms, 500,
+            "second result must be the earlier countersign"
+        );
+        assert_eq!(
+            result[1].join_event_id,
+            hex::encode([0x10u8; 16]),
+            "second result must target pj_1"
+        );
+        assert_eq!(
+            result[1].joiner_addr,
+            hex::encode(joiner_1.0),
+            "joiner_addr must be resolved from pj_1"
+        );
+    }
+
+    // ── Test 4: list_recent_counter_signs_respects_cap ───────────────────
+    //
+    // 5 self-authored JoinCountersigns; cap=3. Expect 3 newest.
+    #[tokio::test]
+    async fn list_recent_counter_signs_respects_cap() {
+        let community_id = SpaceId([0xcb; 16]);
+        let self_owner = OwnerAddr([0xaa; 16]);
+
+        let events: Vec<SignedMembershipEvent> = (0u8..5)
+            .map(|i| {
+                make_event(
+                    [0xa0 + i; 16],
+                    self_owner,
+                    (i as u64 + 1) * 100,
+                    MembershipEventKind::JoinCountersign {
+                        target_event_id: [0x10 + i; 16],
+                    },
+                    community_id,
+                )
+            })
+            .collect();
+
+        let result = filter_recent_counter_signs(&events, self_owner, 3);
+        assert_eq!(result.len(), 3, "cap=3 must return exactly 3 entries");
+        // Sorted descending: wall_ms 500, 400, 300.
+        assert_eq!(result[0].countersigned_at_hlc.wall_ms, 500);
+        assert_eq!(result[1].countersigned_at_hlc.wall_ms, 400);
+        assert_eq!(result[2].countersigned_at_hlc.wall_ms, 300);
     }
 }
 

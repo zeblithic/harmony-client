@@ -96,6 +96,7 @@
 <div
   class="nav-row"
   class:active
+  class:pending={node.pending}
   role="button"
   tabindex="0"
   data-testid="nav-row-{node.id}"
@@ -154,7 +155,7 @@
           : undefined}
       >
         <span class="name-text">
-          {#if node.forkedFrom != null}<span class="fork-glyph" aria-hidden="true">↳ </span>{/if}{node.name}
+          {#if node.forkedFrom != null}<span class="fork-glyph" aria-hidden="true">↳ </span>{/if}{node.name}{#if node.pending}<span class="pending-badge" title="Waiting for admin to approve your join request" aria-label="pending approval">⏳</span>{/if}
         </span>
         {#if statusText}
           <span class="status-text">{statusText}</span>
@@ -220,6 +221,18 @@
   .nav-row.active {
     background: var(--bg-tertiary);
     color: var(--text-primary);
+  }
+
+  /* ZEB-254: pending community — greyed and italic until countersign arrives. */
+  .nav-row.pending {
+    opacity: 0.55;
+    font-style: italic;
+  }
+
+  .pending-badge {
+    font-size: 0.8em;
+    margin-left: 0.35em;
+    font-style: normal;
   }
 
   .nav-row:hover .unread-dot {

@@ -1232,6 +1232,7 @@ impl DmOutbox {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         let space_outcome = state.apply_space_with_canonicalization(space);
         if let crate::owner_state_crdt::ApplyOutcome::Rejected(reason) = space_outcome {
@@ -2319,6 +2320,7 @@ mod tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         }
     }
 
@@ -4021,6 +4023,7 @@ mod tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         let outcome = state.apply_space_with_canonicalization(space.clone());
         assert!(
@@ -4347,6 +4350,7 @@ mod tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         state.apply_space_with_canonicalization(space.clone());
 
@@ -4550,6 +4554,7 @@ mod tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         state.apply_space_with_canonicalization(space);
 
@@ -4652,6 +4657,7 @@ mod tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         state.apply_space_with_canonicalization(space.clone());
 
@@ -5979,6 +5985,7 @@ mod tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         let outcome = state.apply_space_with_canonicalization(space.clone());
         assert!(
@@ -6186,6 +6193,7 @@ mod tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
         state.spaces.insert(space_id, space);
 

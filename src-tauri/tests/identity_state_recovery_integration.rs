@@ -45,6 +45,7 @@ fn plant_state(harmony_dir: &std::path::Path) -> OwnerState {
         admin_addr: None,
         is_invite_only: None,
         shared_in_profile: false,
+        pending_join_at: None,
     };
     state.spaces.insert(sp.id, sp);
     owner_state_persist::save_crdt(&recovery_cli::owner_state_path(harmony_dir), &state).unwrap();

@@ -401,6 +401,7 @@ impl PairedEngines {
             self_owner: a_addr,
             signing_key: Arc::clone(&a_signing),
             crdt_state: None,
+            nav_emitter: None,
         }));
 
         let registry_b = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
@@ -414,6 +415,7 @@ impl PairedEngines {
             self_owner: b_addr,
             signing_key: Arc::clone(&b_signing),
             crdt_state: None,
+            nav_emitter: None,
         }));
 
         // Spawn the original community engine on both sides.

@@ -21,6 +21,12 @@ export interface NavUpdatedPayload {
   parentId?: string | null;
   /** ZEB-285: hex SpaceId of the original community, present only for forked communities. */
   forkedFrom?: string;
+  /**
+   * ZEB-254: present only on community `modified` payloads emitted by the
+   * joiner-side pending-clear hook (JoinCountersign landed). `false` means
+   * the pending state just cleared. Absent (`undefined`) on all other payloads.
+   */
+  pending?: boolean;
 }
 
 /**
@@ -173,7 +179,7 @@ export class NavService {
    * Phase 5 (ZEB-263) extends this to handle `community` kind.
    */
   addOrUpdateNavSpace(payload: NavUpdatedPayload): void {
-    const { action, spaceId, kind, name, members, parentId, forkedFrom } = payload;
+    const { action, spaceId, kind, name, members, parentId, forkedFrom, pending } = payload;
 
     if (kind === 'community') {
       if (action === 'removed') {
@@ -195,6 +201,9 @@ export class NavService {
         // ZEB-285: carry fork lineage through to the NavNode so the
         // nav-tree can render the ↳ glyph + tooltip.
         forkedFrom,
+        // ZEB-254: carry pending flag so greyed render shows immediately
+        // when the invite-only join countersign hasn't arrived yet.
+        pending: pending ?? undefined,
       };
 
       if (action === 'added') {
@@ -224,8 +233,12 @@ export class NavService {
         this.nodes = this.nodes.map((n) => {
           if (n.id !== spaceId) return n;
           found = true;
+          // ZEB-254: pending: false clears the greyed state on joiner-side
+          // countersign. Preserve existing pending when the payload doesn't
+          // touch it (pending === undefined means "not relevant to this emit").
+          const resolvedPending = pending === false ? false : (pending === true ? true : n.pending);
           // Preserve existing forkedFrom unless the payload supplies one.
-          return { ...n, name, forkedFrom: forkedFrom ?? n.forkedFrom };
+          return { ...n, name, forkedFrom: forkedFrom ?? n.forkedFrom, pending: resolvedPending };
         });
         if (!found) this.nodes = [...this.nodes, newNode];
       }

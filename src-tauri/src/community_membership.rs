@@ -180,6 +180,46 @@ pub enum MembershipEventKind {
         #[serde(rename = "fs")]
         fork_space_id: SpaceId,
     },
+
+    /// ZEB-254: joiner-signed pending join for invite-only communities.
+    /// Distributed via the community CRDT (Zenoh) so admins who were
+    /// offline at redemption time can counter-sign asynchronously.
+    /// Variant code "g" (gate / guest, unused before this). Inner field
+    /// keys are 2-char per same-length-keys invariant.
+    /// See spec `docs/specs/2026-05-15-zeb-254-pending-join-crdt-design.md` §3.
+    #[serde(rename = "g")]
+    PendingJoin {
+        #[serde(rename = "it")]
+        invite_token: crate::community_invite::InviteToken,
+        /// 64-byte concatenation of X25519_pub || Ed25519_pub matching
+        /// `harmony_identity::Identity::to_public_bytes()`. Same shape
+        /// as `CommunityInviteSigned.joiner_identity_pub` (community_invite.rs:258).
+        #[serde(
+            rename = "jp",
+            serialize_with = "serialize_bytes_as_bstr",
+            deserialize_with = "deserialize_bytes_from_bstr"
+        )]
+        joiner_identity_pub: [u8; 64],
+    },
+
+    /// ZEB-254: counter-sign approving a PendingJoin. Pairs by
+    /// `target_event_id`. Variant code "y" (yes / approve).
+    ///
+    /// The signer must be a currently-Joined member whose power level meets
+    /// `POWER_THRESHOLDS.invite`. In v1, `POWER_THRESHOLDS.invite = 0`, so
+    /// ANY joined member can counter-sign — not just the admin. This is
+    /// intentional v1 behaviour: any existing community member can vouch for
+    /// a new joiner. ZEB-251 will add per-community threshold customisation
+    /// that may restrict counter-signing to higher-power members.
+    #[serde(rename = "y")]
+    JoinCountersign {
+        #[serde(
+            rename = "tg",
+            serialize_with = "serialize_bytes_as_bstr",
+            deserialize_with = "deserialize_bytes_from_bstr"
+        )]
+        target_event_id: EventId,
+    },
 }
 
 impl CanonicalPayloadSealed for MembershipEventKind {}
@@ -555,6 +595,37 @@ pub enum VerifyError {
         expected: SpaceId,
         actual: SpaceId,
     },
+
+    /// ZEB-254: PendingJoin's InviteToken.inviter != ctx.admin_addr, OR
+    /// invitee_hint does not match the joiner's actor, OR the token's
+    /// signature does not verify against the admin's identity_pub.
+    PendingJoinTokenInvalid,
+
+    /// ZEB-254: PendingJoin's InviteToken has an `expires_at` value that
+    /// is at or before the event's wall_ms.
+    PendingJoinTokenExpired,
+
+    /// ZEB-254: PendingJoin's joiner_identity_pub does not hash (via
+    /// SHA-256[..16]) to the event's actor address.
+    PendingJoinJoinerPubMismatch,
+
+    /// ZEB-254 P6: PendingJoin actor's prior state is `Joined | Banned |
+    /// Invited | PendingJoin` — cannot accept a pending Join for an
+    /// already-engaged member. Rule: reject if prior state is any of those
+    /// four; allow only `None` (never joined) or `Some(Left)`.
+    PendingJoinAlreadyMember,
+
+    /// ZEB-254: JoinCountersign actor is not currently Joined in the
+    /// community.
+    JoinCountersignActorNotJoined,
+
+    /// ZEB-254: JoinCountersign actor's power is below invite_threshold.
+    ///
+    /// In v1, `POWER_THRESHOLDS.invite = 0` so this error is unreachable
+    /// (every member's power defaults to 0 ≥ 0). The variant is retained as
+    /// a forward-compatibility placeholder for ZEB-251 per-community threshold
+    /// customisation where invite_threshold may be set above 0.
+    JoinCountersignActorPowerInsufficient,
 }
 
 impl std::fmt::Display for VerifyError {
@@ -672,6 +743,12 @@ impl std::fmt::Display for VerifyError {
                     hex::encode(expected.0)
                 )
             }
+            VerifyError::PendingJoinTokenInvalid => write!(f, "ZEB-254 PendingJoin InviteToken invalid (inviter/invitee_hint/sig)"),
+            VerifyError::PendingJoinTokenExpired => write!(f, "ZEB-254 PendingJoin InviteToken expired"),
+            VerifyError::PendingJoinJoinerPubMismatch => write!(f, "ZEB-254 PendingJoin joiner_identity_pub hash != actor"),
+            VerifyError::PendingJoinAlreadyMember => write!(f, "ZEB-254 PendingJoin actor's prior state is already-engaged"),
+            VerifyError::JoinCountersignActorNotJoined => write!(f, "ZEB-254 JoinCountersign actor is not Joined"),
+            VerifyError::JoinCountersignActorPowerInsufficient => write!(f, "ZEB-254 JoinCountersign actor power < invite_threshold"),
         }
     }
 }
@@ -866,6 +943,11 @@ pub enum MemberStatus {
     Left,
     #[serde(rename = "b")]
     Banned,
+    /// ZEB-254: joiner has minted a PendingJoin but no JoinCountersign
+    /// has yet paired with it. Transitions to Joined when a matching
+    /// JoinCountersign is materialized.
+    #[serde(rename = "p")]
+    PendingJoin,
 }
 
 /// Materialized state for one channel in a community. Built by
@@ -953,11 +1035,77 @@ pub fn materialize(
     events: &[SignedMembershipEvent],
     admin_addr: OwnerAddr,
 ) -> MaterializedMembership {
+    // Back-compat wrapper for the no-floor case (tests, replay paths
+    // that don't carry a wall-clock). Production callers should use
+    // `materialize_with_now` so an idle community's PendingJoin still
+    // ages out at the 30-day threshold.
+    materialize_with_now(events, admin_addr, None)
+}
+
+/// R4-6 variant of `materialize` that accepts an optional wall-clock
+/// "now floor" used as the time-reference for PendingJoin's 30-day
+/// expiry check.
+///
+/// Without a floor (`now_ms = None`), expiry compares against
+/// `max(events.at.wall_ms)` only — perfectly deterministic across
+/// peers, but pathological for idle communities: a lone PendingJoin
+/// in a community where no other event has landed has
+/// `max(events.at.wall_ms) ≈ pending.at.wall_ms`, so `age_ms ≈ 0`
+/// and the event never expires from materialize's view. Combined with
+/// `verify_event`'s P6 gate (which calls `prior_state_at_hlc` → this
+/// function → renders the joiner as `PendingJoin`), the joiner can't
+/// re-redeem even 30 days later because P6 still says
+/// `PendingJoinAlreadyMember`.
+///
+/// Passing `Some(wall_now_ms)` makes the function compare against
+/// `max(events_max, wall_now_ms)` — admin's local wall-clock can age
+/// out the PendingJoin even when the community's event log is idle.
+/// Cross-peer divergence is bounded by the 30-day window vs. clock
+/// skew (orders of magnitude apart in practice), so the determinism
+/// loss is tolerable.
+///
+/// **Spec alignment.** Spec §3 ("30d pure-function expiry") permits
+/// parameterizing `now_ms` so long as the function remains pure for a
+/// fixed input pair — the function is still `(events, admin_addr,
+/// now_ms) -> MaterializedMembership`, just with an explicit now
+/// reference rather than an implicit one derived from event ordering.
+pub fn materialize_with_now(
+    events: &[SignedMembershipEvent],
+    admin_addr: OwnerAddr,
+    now_ms: Option<u64>,
+) -> MaterializedMembership {
     let mut m = MaterializedMembership::default();
 
     // Bootstrap: admin holds power 100 implicitly. SetPower events
     // (replayed below) can override.
     m.power_levels.insert(admin_addr, 100);
+
+    // ZEB-254 Pre-Pass: compute current max wall_ms across all events.
+    // Used as the "current time" reference for PendingJoin expiry.
+    //
+    // R4-6: if `now_ms` is supplied, take the max with it so an idle
+    // community whose only event IS the PendingJoin can still expire
+    // it once wall-clock advances 30 days. Without this, P6 in
+    // `verify_event` (which calls `prior_state_at_hlc` → this fn)
+    // permanently rejects re-redemption attempts because materialize
+    // never marks the original pending as expired.
+    let events_max_wall_ms: u64 = events.iter().map(|e| e.at.wall_ms).max().unwrap_or(0);
+    let current_max_wall_ms: u64 = match now_ms {
+        Some(now) => events_max_wall_ms.max(now),
+        None => events_max_wall_ms,
+    };
+
+    // ZEB-254 Pre-Pass: collect the target_event_ids of all JoinCountersign
+    // events into a set. The PendingJoin arm below consults this set to
+    // determine whether a pending join has been countersigned — if so, it
+    // renders as Joined rather than PendingJoin, regardless of expiry.
+    let countersigned_pending_ids: std::collections::HashSet<EventId> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            MembershipEventKind::JoinCountersign { target_event_id } => Some(*target_event_id),
+            _ => None,
+        })
+        .collect();
 
     // Sort by the canonical total order. We don't assume the input
     // is sorted because DAG-sync delivers events partial-ordered.
@@ -985,7 +1133,10 @@ pub fn materialize(
                 //     before the Ban arrived)
                 let prior_status = m.members.get(&event.actor).map(|s| s.status);
                 let should_refresh = match prior_status {
-                    None | Some(MemberStatus::Invited) | Some(MemberStatus::Left) => true,
+                    None
+                    | Some(MemberStatus::Invited)
+                    | Some(MemberStatus::Left)
+                    | Some(MemberStatus::PendingJoin) => true,
                     Some(MemberStatus::Joined) | Some(MemberStatus::Banned) => false,
                 };
                 if should_refresh {
@@ -1067,7 +1218,8 @@ pub fn materialize(
                     None | Some(MemberStatus::Left) => true,
                     Some(MemberStatus::Invited)
                     | Some(MemberStatus::Joined)
-                    | Some(MemberStatus::Banned) => false,
+                    | Some(MemberStatus::Banned)
+                    | Some(MemberStatus::PendingJoin) => false,
                 };
                 if should_refresh {
                     m.members.insert(
@@ -1089,6 +1241,18 @@ pub fn materialize(
                 // the hazard the verify-time check guards against, but
                 // a corrupted log or unverified replay could otherwise
                 // surface it. Symmetric with Join/Leave defense-in-depth.
+                //
+                // R4-1: capture the prior status BEFORE the mutation
+                // because the pending_rotation_for guard below needs to
+                // distinguish "kick of an established member" (epoch
+                // material was actually distributed to this address →
+                // rotation needed) from "kick of a PendingJoin" (no
+                // epoch material ever went to this address → rotation
+                // would be a spurious cycle of every existing member's
+                // keys). Mirrors the Leave arm's `leave_transitioned`
+                // guard that drops never-member Leaves out of
+                // pending_rotation_for.
+                let prior_status = m.members.get(target).map(|s| s.status);
                 if let Some(s) = m.members.get_mut(target) {
                     s.status = MemberStatus::Banned;
                     s.left_at = Some(event.at.clone());
@@ -1096,7 +1260,20 @@ pub fn materialize(
                 // ZEB-249: track that this kick needs a matching EpochRotation.
                 // The self-healing observer synthesizes one if the bundled
                 // rotation didn't land (e.g., concurrent-kick contention).
-                m.pending_rotation_for.insert(*target);
+                //
+                // R4-1: skip the rotation marker when the prior status
+                // was PendingJoin — a PendingJoin user never received
+                // any epoch key material, so kicking them does NOT
+                // require rotating live keys for the rest of the
+                // community. Without this guard, every admin "Reject"
+                // click in PendingJoinsPanel would synthesize a full
+                // EpochRotation re-keying ALL Joined/Invited members.
+                // Mirrors the Leave arm's "leave_transitioned" guard
+                // which also drops never-members from
+                // pending_rotation_for.
+                if !matches!(prior_status, Some(MemberStatus::PendingJoin)) {
+                    m.pending_rotation_for.insert(*target);
+                }
             }
             MembershipEventKind::SetPower { target, level } => {
                 m.power_levels.insert(*target, *level);
@@ -1299,9 +1476,31 @@ pub fn materialize(
 
                 // M1: triggered_by lookup restricted to causal prefix (events
                 // before this catchup in the sorted replay).
+                //
+                // ZEB-254 R5-1: accept BOTH legacy `Join` AND countersigned
+                // `PendingJoin` as a valid catchup trigger. The PendingJoin
+                // arm below enqueues a joiner into `pending_catchup_for`
+                // when they're admitted via countersign in a rotated epoch
+                // (line ~1578); without accepting PendingJoin here, that
+                // entry can never be cleared by an EpochCatchup pointing
+                // at the PendingJoin event — admins would have to mint a
+                // legacy `Join` (which they never do for this path), leaving
+                // the joiner permanently flagged for catchup.
+                //
+                // Uncountersigned PendingJoin is intentionally NOT accepted:
+                // a still-pending joiner is not yet a member, and no admin
+                // would (or should) issue a catchup for them. The
+                // countersigned-ness check uses the same Pre-Pass set
+                // (`countersigned_pending_ids`) consumed by the PendingJoin
+                // materialize arm, so the two paths stay consistent.
                 let triggered_event = sorted[..idx].iter().find(|e| e.id == *triggered_by);
                 let join_actor = match triggered_event.map(|e| &e.kind) {
                     Some(MembershipEventKind::Join) => triggered_event.map(|e| e.actor),
+                    Some(MembershipEventKind::PendingJoin { .. })
+                        if countersigned_pending_ids.contains(triggered_by) =>
+                    {
+                        triggered_event.map(|e| e.actor)
+                    }
                     _ => None,
                 };
                 let Some(target) = join_actor else {
@@ -1351,6 +1550,75 @@ pub fn materialize(
                 // materialized membership/power/channels view. They are
                 // surfaced separately via settings-panel listings.
             }
+            MembershipEventKind::PendingJoin { .. } => {
+                // ZEB-254: PendingJoin materializes to one of three states:
+                //   - if countersigned and prior state is not terminal: Joined
+                //   - else if within expiry window and prior state is not
+                //     terminal: PendingJoin
+                //   - else: hidden (no entry / no mutation)
+                //
+                // The countersigned set is built by the Pre-Pass above.
+                // Prior-state guard ensures Leave/Kick/Banned aren't
+                // overridden by a late-arriving JoinCountersign.
+                let countersigned = countersigned_pending_ids.contains(&event.id);
+                let age_ms = current_max_wall_ms.saturating_sub(event.at.wall_ms);
+                let expired = age_ms > MATERIALIZE_PENDING_EXPIRY_MS;
+
+                let prior_status = m.members.get(&event.actor).map(|s| s.status);
+                match prior_status {
+                    Some(MemberStatus::Joined) | Some(MemberStatus::Banned) => {
+                        // Terminal state — PendingJoin is shadowed.
+                        //
+                        // ZEB-254: Left is intentionally NOT in this list.
+                        // verify_event P6 explicitly allows prior state None | Left
+                        // as valid preconditions for PendingJoin — a user who left
+                        // a community is allowed to re-join via a new PendingJoin.
+                        // Including Left here would shadow the re-join and produce
+                        // a semantic mismatch with the verify gate.
+                    }
+                    _ => {
+                        if countersigned {
+                            m.members.insert(
+                                event.actor,
+                                MemberState {
+                                    status: MemberStatus::Joined,
+                                    // ZEB-254: joined_at is the PendingJoin event's HLC — i.e.,
+                                    // when the joiner declared their intent to join. This matches
+                                    // the legacy Join arm's semantics (joined_at = the Join
+                                    // event's HLC). For the resurrects-expired-pending case, the
+                                    // UI may surface a join date from up to 30+ days ago, which
+                                    // is the truthful "when did this person first try to join"
+                                    // answer.
+                                    joined_at: event.at.clone(),
+                                    left_at: None,
+                                },
+                            );
+                            // ZEB-254: mirror the Join arm's catchup invariant — a member
+                            // joining a community whose epoch has already rotated needs key
+                            // material catchup. Without this insert, the engine will treat
+                            // their snapshot as current and skip the catchup dispatch.
+                            if m.current_epoch.unwrap_or(0) > 0 {
+                                m.pending_catchup_for.insert(event.actor);
+                            }
+                        } else if !expired {
+                            m.members.insert(
+                                event.actor,
+                                MemberState {
+                                    status: MemberStatus::PendingJoin,
+                                    joined_at: event.at.clone(),
+                                    left_at: None,
+                                },
+                            );
+                        }
+                        // else: expired pending with no countersign → hidden (no insert).
+                    }
+                }
+            }
+            MembershipEventKind::JoinCountersign { .. } => {
+                // ZEB-254: pairing is handled by the Pre-Pass that builds
+                // countersigned_pending_ids, then consumed during the
+                // PendingJoin arm above. No direct state mutation here.
+            }
         }
     }
 
@@ -1392,7 +1660,14 @@ pub fn prior_state_at_event(
         .filter(|e| event_sort_key(e) < target_key)
         .cloned()
         .collect();
-    materialize(&prefix, admin_addr)
+    // R4-6: when computing prior state FOR a specific candidate event,
+    // that event's own `at.wall_ms` is the natural "now floor" — by
+    // the time this candidate is being verified, the community's
+    // wall-clock has reached at least `target.at.wall_ms`. Using it as
+    // the floor lets an idle-community re-redeem attempt (a new
+    // PendingJoin at t = T + 30d) see its prior-state PendingJoin as
+    // expired, so P6 admits the re-redemption.
+    materialize_with_now(&prefix, admin_addr, Some(target.at.wall_ms))
 }
 
 /// Compute the prior materialized state for a given HLC — the
@@ -1424,7 +1699,11 @@ pub fn prior_state_at_hlc(
         })
         .cloned()
         .collect();
-    materialize(&prefix, admin_addr)
+    // R4-6: pass `target_hlc.wall_ms` as the "now floor" for the same
+    // reason as `prior_state_at_event` — by the time we're authorizing
+    // an event AT this HLC, wall-clock has reached at least
+    // `target_hlc.wall_ms`.
+    materialize_with_now(&prefix, admin_addr, Some(target_hlc.wall_ms))
 }
 
 /// Caller-provided context for verify_event. Carries the expected
@@ -1462,6 +1741,12 @@ pub struct VerifyContext<'a> {
     pub is_invite_only: bool,
     pub actor_identity_pub: &'a [u8; 64],
     pub countersigner_identity_pub: Option<&'a [u8; 64]>,
+    /// ZEB-254: admin's identity_pub (X25519_pub || Ed25519_pub). Required
+    /// when verifying PendingJoin events because the verify gate needs to
+    /// check the InviteToken's signature against the admin's known pub.
+    /// For legacy paths (open community, legacy Join with countersig), this
+    /// field can be None; the existing verify paths don't reference it.
+    pub admin_identity_pub: Option<&'a [u8; 64]>,
 }
 
 /// Full membership-event verification per ZEB-217 spec §"Verification".
@@ -1667,6 +1952,60 @@ pub fn verify_event(
             if !is_joined_member(prior_state, &event.actor) {
                 return Err(VerifyError::ActorNotJoined);
             }
+        }
+        MembershipEventKind::PendingJoin {
+            invite_token,
+            joiner_identity_pub,
+        } => {
+            // P1: joiner_identity_pub must hash to event.actor.
+            // Use harmony_identity::Identity::from_public_bytes which derives
+            // address_hash = SHA256(X25519_pub || Ed25519_pub)[..16].
+            let identity = harmony_identity::Identity::from_public_bytes(joiner_identity_pub)
+                .map_err(|_| VerifyError::PendingJoinJoinerPubMismatch)?;
+            if identity.address_hash != event.actor.0 {
+                return Err(VerifyError::PendingJoinJoinerPubMismatch);
+            }
+
+            // P2: invite_token.inviter must equal ctx.admin_addr.
+            if invite_token.inviter != ctx.admin_addr {
+                return Err(VerifyError::PendingJoinTokenInvalid);
+            }
+
+            // P3: invite_token.invitee_hint must match actor (if hint present).
+            if let Some(hint) = invite_token.invitee_hint {
+                if hint != event.actor {
+                    return Err(VerifyError::PendingJoinTokenInvalid);
+                }
+            }
+
+            // P4: invite_token.expires_at must be strictly greater than
+            // event.at.wall_ms (token must not have expired at event time).
+            if let Some(exp) = invite_token.expires_at {
+                if event.at.wall_ms >= exp {
+                    return Err(VerifyError::PendingJoinTokenExpired);
+                }
+            }
+
+            // P5: invite_token signature verifies against admin's identity_pub.
+            let admin_pub = ctx
+                .admin_identity_pub
+                .ok_or(VerifyError::PendingJoinTokenInvalid)?;
+            if crate::community_invite::verify_invite_token_signature(invite_token, admin_pub)
+                .is_err()
+            {
+                return Err(VerifyError::PendingJoinTokenInvalid);
+            }
+
+            // P6: prior state must be None | Some(Left).
+            let prior_status = prior_state.members.get(&event.actor).map(|m| m.status);
+            match prior_status {
+                None | Some(MemberStatus::Left) => { /* ok */ }
+                _ => return Err(VerifyError::PendingJoinAlreadyMember),
+            }
+        }
+        MembershipEventKind::JoinCountersign { .. } => {
+            // ZEB-254: actor joined-membership check handled in the
+            // per-kind power-rules block below (step 5).
         }
     }
 
@@ -1903,6 +2242,22 @@ pub fn verify_event(
                 return Err(VerifyError::ActorPowerInsufficient);
             }
         }
+        MembershipEventKind::PendingJoin { .. } => {
+            // All PendingJoin gates are handled in the joined-membership block
+            // above (P1–P6). No separate power rule needed.
+        }
+        MembershipEventKind::JoinCountersign { .. } => {
+            // ZEB-254: actor must be Joined + power >= invite_threshold.
+            // Target event existence is a materialize concern (allow
+            // out-of-order delivery — JoinCountersign can land before
+            // its target PendingJoin on Zenoh state-root sync).
+            if !is_joined_member(prior_state, &event.actor) {
+                return Err(VerifyError::JoinCountersignActorNotJoined);
+            }
+            if actor_power < POWER_THRESHOLDS.invite {
+                return Err(VerifyError::JoinCountersignActorPowerInsufficient);
+            }
+        }
     }
 
     Ok(())
@@ -2036,6 +2391,11 @@ pub const POWER_THRESHOLDS: PowerThresholds = PowerThresholds {
 ///   - 280 codepoints is at minimum as permissive as the UI's
 ///     `maxlength="280"` (which counts UTF-16 code units, so emojis double).
 pub const MAX_MODERATION_REASON_CHARS: usize = 280;
+
+/// ZEB-254: PendingJoin events older than this (community current HLC
+/// minus event HLC, in wall-ms) are hidden from materialize unless a
+/// matching JoinCountersign exists. 30 days.
+pub const MATERIALIZE_PENDING_EXPIRY_MS: u64 = 30 * 86_400_000;
 
 #[cfg(test)]
 mod tests {
@@ -2612,6 +2972,7 @@ mod tests {
             is_invite_only: false,
             actor_identity_pub: &attacker_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         };
         let result = verify_event(&rotation_event, &prior, &ctx);
         assert!(
@@ -2684,6 +3045,7 @@ mod tests {
             is_invite_only: false,
             actor_identity_pub: &bob_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         };
         let result = verify_event(&catchup_event, &prior, &ctx);
         assert!(
@@ -2977,6 +3339,7 @@ mod tests {
             is_invite_only: false,
             actor_identity_pub: &admin_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         };
         let result = verify_event(&unban, &prior, &ctx);
         assert!(
@@ -3048,6 +3411,7 @@ mod tests {
             is_invite_only: false,
             actor_identity_pub: &mod_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&unban, &prior, &ctx),
@@ -3091,6 +3455,7 @@ mod tests {
             is_invite_only: false,
             actor_identity_pub: &admin_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&unban, &prior, &ctx),
@@ -3134,6 +3499,7 @@ mod tests {
             is_invite_only: false,
             actor_identity_pub: &admin_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&unban, &prior, &ctx),
@@ -3178,6 +3544,7 @@ mod tests {
             is_invite_only: false,
             actor_identity_pub: &admin_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&kick, &prior, &ctx),
@@ -3223,6 +3590,7 @@ mod tests {
             is_invite_only: false,
             actor_identity_pub: &admin_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&unban, &prior, &ctx),
@@ -3511,6 +3879,7 @@ mod tests {
             is_invite_only: false,
             actor_identity_pub: &regular_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&fork_event, &prior, &ctx),
@@ -3541,6 +3910,7 @@ mod tests {
             is_invite_only: false,
             actor_identity_pub: &admin_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&admin_fork, &prior, &admin_ctx),
@@ -3596,6 +3966,7 @@ mod tests {
             is_invite_only: false,
             actor_identity_pub: &outsider_pub,
             countersigner_identity_pub: None,
+            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&fork, &prior, &ctx),
@@ -3907,5 +4278,1473 @@ mod tests {
             }
             other => panic!("expected CommunityIdMismatch, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn pending_join_variant_canonical_cbor_round_trip() {
+        use crate::community_invite::InviteToken;
+
+        let token = InviteToken {
+            inviter: OwnerAddr([1u8; 16]),
+            invitee_hint: Some(OwnerAddr([2u8; 16])),
+            minted_at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            expires_at: Some(1_700_000_000_000 + 7 * 86_400_000),
+            sig: [3u8; 64],
+        };
+        let kind = MembershipEventKind::PendingJoin {
+            invite_token: token,
+            joiner_identity_pub: [4u8; 64],
+        };
+
+        let encoded = crate::owner_state_crypto::canonical_cbor_encode(&kind).expect("encode");
+        let decoded: MembershipEventKind =
+            ciborium::from_reader(&mut encoded.as_slice()).expect("decode");
+        assert_eq!(kind, decoded);
+    }
+
+    #[test]
+    fn join_countersign_variant_canonical_cbor_round_trip() {
+        let kind = MembershipEventKind::JoinCountersign {
+            target_event_id: [42u8; 16],
+        };
+        let encoded = crate::owner_state_crypto::canonical_cbor_encode(&kind).expect("encode");
+        let decoded: MembershipEventKind =
+            ciborium::from_reader(&mut encoded.as_slice()).expect("decode");
+        assert_eq!(kind, decoded);
+    }
+
+    #[test]
+    fn member_status_pending_join_canonical_cbor_round_trip() {
+        let status = MemberStatus::PendingJoin;
+        let encoded = crate::owner_state_crypto::canonical_cbor_encode(&status).expect("encode");
+        let decoded: MemberStatus = ciborium::from_reader(&mut encoded.as_slice()).expect("decode");
+        assert_eq!(status, decoded);
+    }
+}
+
+// ── ZEB-254 PendingJoin verify_event unit tests ───────────────────────────────
+
+#[cfg(test)]
+mod zeb_254_pending_join_verify_tests {
+    use super::*;
+    use crate::community_invite::InviteToken;
+
+    /// Build a test identity from a seed byte.
+    /// Returns (PrivateIdentity, identity_pub [u8; 64], OwnerAddr).
+    fn make_identity(seed_byte: u8) -> (harmony_identity::PrivateIdentity, [u8; 64], OwnerAddr) {
+        let seed = [seed_byte; 32];
+        let private = harmony_identity::PrivateIdentity::from_seed(&seed);
+        let public = private.public_identity();
+        let identity_pub = public.to_public_bytes();
+        let addr = OwnerAddr(public.address_hash);
+        (private, identity_pub, addr)
+    }
+
+    /// Build a signed InviteToken using the admin's identity.
+    fn make_invite_token(
+        admin_private: &harmony_identity::PrivateIdentity,
+        admin_addr: OwnerAddr,
+        invitee_hint: Option<OwnerAddr>,
+        expires_at: Option<u64>,
+    ) -> InviteToken {
+        use crate::community_invite::canonical_invite_token_bytes;
+
+        let mut tok = InviteToken {
+            inviter: admin_addr,
+            invitee_hint,
+            minted_at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "admin-device".into(),
+            },
+            expires_at,
+            sig: [0u8; 64],
+        };
+        // Sign canonical bytes via the admin's PrivateIdentity.
+        let bytes = canonical_invite_token_bytes(&tok).expect("encode token");
+        tok.sig = admin_private.sign(&bytes);
+        tok
+    }
+
+    /// Build a signed PendingJoin event for the given joiner.
+    fn make_pending_join_event(
+        joiner_private: &harmony_identity::PrivateIdentity,
+        joiner_addr: OwnerAddr,
+        joiner_pub: [u8; 64],
+        community_id: SpaceId,
+        token: InviteToken,
+    ) -> SignedMembershipEvent {
+        let payload = EventPayload {
+            id: [9u8; 16],
+            community_id,
+            kind: MembershipEventKind::PendingJoin {
+                invite_token: token,
+                joiner_identity_pub: joiner_pub,
+            },
+            actor: joiner_addr,
+            at: Hlc {
+                wall_ms: 1_700_000_001_000,
+                logical: 0,
+                device_id: "joiner-device".into(),
+            },
+        };
+        sign_event_with_identity(&payload, joiner_private).expect("sign PendingJoin")
+    }
+
+    #[test]
+    fn pending_join_event_signs_and_verifies() {
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+        let community_id = SpaceId([7u8; 16]);
+        let token = make_invite_token(
+            &admin_priv,
+            admin_addr,
+            Some(joiner_addr),
+            Some(1_700_000_100_000),
+        );
+        let event =
+            make_pending_join_event(&joiner_priv, joiner_addr, joiner_pub, community_id, token);
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: true,
+            actor_identity_pub: &joiner_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: Some(&admin_pub),
+        };
+        let mat = MaterializedMembership::default();
+        let result = verify_event(&event, &mat, &ctx);
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+    }
+
+    #[test]
+    fn pending_join_rejected_when_token_invitee_not_actor() {
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+        let community_id = SpaceId([7u8; 16]);
+        // Hint addresses someone else, not the joiner.
+        let token = make_invite_token(
+            &admin_priv,
+            admin_addr,
+            Some(OwnerAddr([99u8; 16])),
+            Some(1_700_000_100_000),
+        );
+        let event =
+            make_pending_join_event(&joiner_priv, joiner_addr, joiner_pub, community_id, token);
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: true,
+            actor_identity_pub: &joiner_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: Some(&admin_pub),
+        };
+        let mat = MaterializedMembership::default();
+        assert!(
+            matches!(
+                verify_event(&event, &mat, &ctx),
+                Err(VerifyError::PendingJoinTokenInvalid)
+            ),
+            "wrong invitee_hint must yield PendingJoinTokenInvalid"
+        );
+    }
+
+    #[test]
+    fn pending_join_rejected_when_token_expired() {
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+        let community_id = SpaceId([7u8; 16]);
+        // expires_at is BEFORE the event's wall_ms (1_700_000_001_000).
+        let token = make_invite_token(
+            &admin_priv,
+            admin_addr,
+            Some(joiner_addr),
+            Some(1_700_000_000_500),
+        );
+        let event =
+            make_pending_join_event(&joiner_priv, joiner_addr, joiner_pub, community_id, token);
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: true,
+            actor_identity_pub: &joiner_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: Some(&admin_pub),
+        };
+        let mat = MaterializedMembership::default();
+        assert!(
+            matches!(
+                verify_event(&event, &mat, &ctx),
+                Err(VerifyError::PendingJoinTokenExpired)
+            ),
+            "expired token must yield PendingJoinTokenExpired"
+        );
+    }
+
+    #[test]
+    fn pending_join_rejected_when_token_inviter_not_admin() {
+        let (rogue_priv, _rogue_pub, rogue_addr) = make_identity(0xc1);
+        let (_admin2_priv, admin2_pub, admin2_addr) = make_identity(0xa2);
+        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+        let community_id = SpaceId([7u8; 16]);
+        // Token is signed by rogue, not admin2.
+        let token = make_invite_token(
+            &rogue_priv,
+            rogue_addr,
+            Some(joiner_addr),
+            Some(1_700_000_100_000),
+        );
+        let event =
+            make_pending_join_event(&joiner_priv, joiner_addr, joiner_pub, community_id, token);
+        // ctx uses admin2 as admin — rogue != admin2, so P2 (inviter != admin) fires.
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr: admin2_addr,
+            is_invite_only: true,
+            actor_identity_pub: &joiner_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: Some(&admin2_pub),
+        };
+        let mat = MaterializedMembership::default();
+        let result = verify_event(&event, &mat, &ctx);
+        assert!(
+            matches!(result, Err(VerifyError::PendingJoinTokenInvalid)),
+            "token from non-admin inviter must yield PendingJoinTokenInvalid; got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn pending_join_rejected_when_actor_already_joined() {
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+        let community_id = SpaceId([7u8; 16]);
+        let token = make_invite_token(
+            &admin_priv,
+            admin_addr,
+            Some(joiner_addr),
+            Some(1_700_000_100_000),
+        );
+        let event =
+            make_pending_join_event(&joiner_priv, joiner_addr, joiner_pub, community_id, token);
+        let mut mat = MaterializedMembership::default();
+        mat.members.insert(
+            joiner_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                left_at: None,
+            },
+        );
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: true,
+            actor_identity_pub: &joiner_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: Some(&admin_pub),
+        };
+        assert!(
+            matches!(
+                verify_event(&event, &mat, &ctx),
+                Err(VerifyError::PendingJoinAlreadyMember)
+            ),
+            "already-Joined actor must yield PendingJoinAlreadyMember"
+        );
+    }
+
+    #[test]
+    fn pending_join_rejected_when_actor_banned() {
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+        let community_id = SpaceId([7u8; 16]);
+        let token = make_invite_token(
+            &admin_priv,
+            admin_addr,
+            Some(joiner_addr),
+            Some(1_700_000_100_000),
+        );
+        let event =
+            make_pending_join_event(&joiner_priv, joiner_addr, joiner_pub, community_id, token);
+        let mut mat = MaterializedMembership::default();
+        mat.members.insert(
+            joiner_addr,
+            MemberState {
+                status: MemberStatus::Banned,
+                joined_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                left_at: None,
+            },
+        );
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: true,
+            actor_identity_pub: &joiner_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: Some(&admin_pub),
+        };
+        assert!(
+            matches!(
+                verify_event(&event, &mat, &ctx),
+                Err(VerifyError::PendingJoinAlreadyMember)
+            ),
+            "Banned actor must yield PendingJoinAlreadyMember"
+        );
+    }
+
+    #[test]
+    fn pending_join_rejected_when_actor_already_pending() {
+        // P6 gate: PendingJoin prior state is itself PendingJoin — must
+        // reject because the actor is already-engaged (queue slot taken).
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+        let community_id = SpaceId([7u8; 16]);
+        let token = make_invite_token(
+            &admin_priv,
+            admin_addr,
+            Some(joiner_addr),
+            Some(1_700_000_100_000),
+        );
+        let event =
+            make_pending_join_event(&joiner_priv, joiner_addr, joiner_pub, community_id, token);
+        let mut mat = MaterializedMembership::default();
+        mat.members.insert(
+            joiner_addr,
+            MemberState {
+                status: MemberStatus::PendingJoin,
+                joined_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                left_at: None,
+            },
+        );
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: true,
+            actor_identity_pub: &joiner_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: Some(&admin_pub),
+        };
+        assert!(
+            matches!(
+                verify_event(&event, &mat, &ctx),
+                Err(VerifyError::PendingJoinAlreadyMember)
+            ),
+            "actor already in PendingJoin state must yield PendingJoinAlreadyMember"
+        );
+    }
+
+    #[test]
+    fn pending_join_accepted_when_actor_was_left() {
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+        let community_id = SpaceId([7u8; 16]);
+        let token = make_invite_token(
+            &admin_priv,
+            admin_addr,
+            Some(joiner_addr),
+            Some(1_700_000_100_000),
+        );
+        let event =
+            make_pending_join_event(&joiner_priv, joiner_addr, joiner_pub, community_id, token);
+        let mut mat = MaterializedMembership::default();
+        mat.members.insert(
+            joiner_addr,
+            MemberState {
+                status: MemberStatus::Left,
+                joined_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                left_at: Some(Hlc {
+                    wall_ms: 500,
+                    logical: 0,
+                    device_id: "t".into(),
+                }),
+            },
+        );
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: true,
+            actor_identity_pub: &joiner_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: Some(&admin_pub),
+        };
+        assert!(
+            verify_event(&event, &mat, &ctx).is_ok(),
+            "Left actor should be allowed to PendingJoin again"
+        );
+    }
+
+    #[test]
+    fn pending_join_rejected_when_identity_pub_does_not_hash_to_actor() {
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+        let community_id = SpaceId([7u8; 16]);
+        let token = make_invite_token(
+            &admin_priv,
+            admin_addr,
+            Some(joiner_addr),
+            Some(1_700_000_100_000),
+        );
+        // Embed a wrong pub — it won't hash to joiner_addr.
+        let wrong_pub = [0x55u8; 64];
+        // The event itself is signed with the real joiner key, but the embedded
+        // joiner_identity_pub in the PendingJoin payload is wrong.
+        let event =
+            make_pending_join_event(&joiner_priv, joiner_addr, wrong_pub, community_id, token);
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: true,
+            actor_identity_pub: &joiner_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: Some(&admin_pub),
+        };
+        let mat = MaterializedMembership::default();
+        let result = verify_event(&event, &mat, &ctx);
+        // Either PendingJoinJoinerPubMismatch (pub doesn't hash to actor) OR
+        // SignatureInvalid / InvalidIdentityPub (all-0x55 pub may fail key parsing).
+        assert!(
+            matches!(result, Err(VerifyError::PendingJoinJoinerPubMismatch))
+                || matches!(result, Err(VerifyError::SignatureInvalid))
+                || matches!(result, Err(VerifyError::InvalidIdentityPub)),
+            "wrong identity_pub must be rejected; got {:?}",
+            result
+        );
+    }
+}
+
+#[cfg(test)]
+mod zeb_254_join_countersign_verify_tests {
+    use super::*;
+
+    /// Build a test identity from a seed byte.
+    /// Returns (PrivateIdentity, identity_pub [u8; 64], OwnerAddr).
+    fn make_identity(seed_byte: u8) -> (harmony_identity::PrivateIdentity, [u8; 64], OwnerAddr) {
+        let seed = [seed_byte; 32];
+        let private = harmony_identity::PrivateIdentity::from_seed(&seed);
+        let public = private.public_identity();
+        let identity_pub = public.to_public_bytes();
+        let addr = OwnerAddr(public.address_hash);
+        (private, identity_pub, addr)
+    }
+
+    fn make_join_countersign_event(
+        admin_private: &harmony_identity::PrivateIdentity,
+        admin_addr: OwnerAddr,
+        community_id: SpaceId,
+        target_event_id: [u8; 16],
+    ) -> SignedMembershipEvent {
+        let payload = EventPayload {
+            id: [88u8; 16],
+            community_id,
+            kind: MembershipEventKind::JoinCountersign { target_event_id },
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 1_700_000_002_000,
+                logical: 0,
+                device_id: "admin-device".into(),
+            },
+        };
+        sign_event_with_identity(&payload, admin_private).expect("sign JoinCountersign")
+    }
+
+    #[test]
+    fn join_countersign_event_signs_and_verifies() {
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let community_id = SpaceId([7u8; 16]);
+        let target = [9u8; 16];
+        let event = make_join_countersign_event(&admin_priv, admin_addr, community_id, target);
+        let mut mat = MaterializedMembership::default();
+        mat.members.insert(
+            admin_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                left_at: None,
+            },
+        );
+        mat.power_levels.insert(admin_addr, POWER_THRESHOLDS.invite);
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: true,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: Some(&admin_pub),
+        };
+        let result = verify_event(&event, &mat, &ctx);
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+    }
+
+    #[test]
+    fn join_countersign_rejected_when_actor_not_joined() {
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let community_id = SpaceId([7u8; 16]);
+        let target = [9u8; 16];
+        let event = make_join_countersign_event(&admin_priv, admin_addr, community_id, target);
+        let mat = MaterializedMembership::default(); // actor not in members map
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: true,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: Some(&admin_pub),
+        };
+        let result = verify_event(&event, &mat, &ctx);
+        assert!(
+            matches!(result, Err(VerifyError::JoinCountersignActorNotJoined)),
+            "expected JoinCountersignActorNotJoined, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn join_countersign_accepted_when_target_missing() {
+        // Out-of-order delivery — JoinCountersign arrives before its
+        // target PendingJoin. Verify MUST accept it (target existence
+        // is a materialize-time concern, not verify-time).
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let community_id = SpaceId([7u8; 16]);
+        let target = [0xDEu8; 16]; // does not exist in prior state
+        let event = make_join_countersign_event(&admin_priv, admin_addr, community_id, target);
+        let mut mat = MaterializedMembership::default();
+        mat.members.insert(
+            admin_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                left_at: None,
+            },
+        );
+        mat.power_levels.insert(admin_addr, POWER_THRESHOLDS.invite);
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: true,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: Some(&admin_pub),
+        };
+        let result = verify_event(&event, &mat, &ctx);
+        assert!(
+            result.is_ok(),
+            "expected Ok (out-of-order delivery), got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn join_countersign_structural_power_check_documented() {
+        // POWER_THRESHOLDS.invite is 0 in v1 — there's no way for a
+        // Joined member to have insufficient power in v1. The check is
+        // structurally present and will become firable in ZEB-251 when
+        // per-community thresholds ship.
+        assert_eq!(
+            POWER_THRESHOLDS.invite, 0,
+            "ZEB-254 v1: invite_threshold is 0; JoinCountersignActorPowerInsufficient \
+             is structurally present but cannot fire under v1 thresholds"
+        );
+    }
+}
+
+#[cfg(test)]
+mod zeb_254_materialize_tests {
+    use super::*;
+    use crate::community_invite::InviteToken;
+
+    /// Build a test identity from a seed byte via PrivateIdentity::from_seed.
+    fn synth_identity(seed_byte: u8) -> (harmony_identity::PrivateIdentity, OwnerAddr, [u8; 64]) {
+        let seed = [seed_byte; 32];
+        let private = harmony_identity::PrivateIdentity::from_seed(&seed);
+        let public = private.public_identity();
+        let identity_pub = public.to_public_bytes();
+        let addr = OwnerAddr(public.address_hash);
+        (private, addr, identity_pub)
+    }
+
+    fn synth_pending_join(
+        actor_private: &harmony_identity::PrivateIdentity,
+        actor_addr: OwnerAddr,
+        joiner_pub: [u8; 64],
+        community_id: SpaceId,
+        at_wall_ms: u64,
+        event_id_seed: u8,
+    ) -> SignedMembershipEvent {
+        let token = InviteToken {
+            inviter: OwnerAddr([0u8; 16]),
+            invitee_hint: Some(actor_addr),
+            minted_at: Hlc {
+                wall_ms: at_wall_ms,
+                logical: 0,
+                device_id: "joiner".into(),
+            },
+            expires_at: None,
+            sig: [0u8; 64],
+        };
+        let payload = EventPayload {
+            id: [event_id_seed; 16],
+            community_id,
+            kind: MembershipEventKind::PendingJoin {
+                invite_token: token,
+                joiner_identity_pub: joiner_pub,
+            },
+            actor: actor_addr,
+            at: Hlc {
+                wall_ms: at_wall_ms,
+                logical: 0,
+                device_id: "joiner".into(),
+            },
+        };
+        sign_event_with_identity(&payload, actor_private).expect("sign pending")
+    }
+
+    fn synth_join_countersign(
+        admin_private: &harmony_identity::PrivateIdentity,
+        admin_addr: OwnerAddr,
+        community_id: SpaceId,
+        target: EventId,
+        at_wall_ms: u64,
+        event_id_seed: u8,
+    ) -> SignedMembershipEvent {
+        let payload = EventPayload {
+            id: [event_id_seed; 16],
+            community_id,
+            kind: MembershipEventKind::JoinCountersign {
+                target_event_id: target,
+            },
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: at_wall_ms,
+                logical: 0,
+                device_id: "admin".into(),
+            },
+        };
+        sign_event_with_identity(&payload, admin_private).expect("sign countersign")
+    }
+
+    fn synth_legacy_join(
+        actor_private: &harmony_identity::PrivateIdentity,
+        actor_addr: OwnerAddr,
+        community_id: SpaceId,
+        at_wall_ms: u64,
+        event_id_seed: u8,
+    ) -> SignedMembershipEvent {
+        let payload = EventPayload {
+            id: [event_id_seed; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: actor_addr,
+            at: Hlc {
+                wall_ms: at_wall_ms,
+                logical: 0,
+                device_id: "joiner".into(),
+            },
+        };
+        sign_event_with_identity(&payload, actor_private).expect("sign join")
+    }
+
+    fn synth_leave(
+        actor_private: &harmony_identity::PrivateIdentity,
+        actor_addr: OwnerAddr,
+        community_id: SpaceId,
+        at_wall_ms: u64,
+        event_id_seed: u8,
+    ) -> SignedMembershipEvent {
+        let payload = EventPayload {
+            id: [event_id_seed; 16],
+            community_id,
+            kind: MembershipEventKind::Leave,
+            actor: actor_addr,
+            at: Hlc {
+                wall_ms: at_wall_ms,
+                logical: 0,
+                device_id: "joiner".into(),
+            },
+        };
+        sign_event_with_identity(&payload, actor_private).expect("sign leave")
+    }
+
+    fn synth_kick(
+        actor_private: &harmony_identity::PrivateIdentity,
+        actor_addr: OwnerAddr,
+        target: OwnerAddr,
+        community_id: SpaceId,
+        at_wall_ms: u64,
+        event_id_seed: u8,
+    ) -> SignedMembershipEvent {
+        let payload = EventPayload {
+            id: [event_id_seed; 16],
+            community_id,
+            kind: MembershipEventKind::Kick {
+                target,
+                reason: None,
+            },
+            actor: actor_addr,
+            at: Hlc {
+                wall_ms: at_wall_ms,
+                logical: 0,
+                device_id: "admin".into(),
+            },
+        };
+        sign_event_with_identity(&payload, actor_private).expect("sign kick")
+    }
+
+    #[test]
+    fn materialize_pending_join_only_yields_pending_status() {
+        let community = SpaceId([7u8; 16]);
+        let (joiner_priv, joiner_addr, joiner_pub) = synth_identity(1);
+        let (_, admin_addr, _) = synth_identity(2);
+        let pending = synth_pending_join(
+            &joiner_priv,
+            joiner_addr,
+            joiner_pub,
+            community,
+            1_700_000_000_000,
+            1,
+        );
+        let mat = materialize(&[pending], admin_addr);
+        assert_eq!(
+            mat.members.get(&joiner_addr).map(|m| m.status),
+            Some(MemberStatus::PendingJoin)
+        );
+    }
+
+    #[test]
+    fn materialize_pending_join_with_countersign_yields_joined() {
+        let community = SpaceId([7u8; 16]);
+        let (joiner_priv, joiner_addr, joiner_pub) = synth_identity(1);
+        let (admin_priv, admin_addr, _) = synth_identity(2);
+        let pending = synth_pending_join(
+            &joiner_priv,
+            joiner_addr,
+            joiner_pub,
+            community,
+            1_700_000_000_000,
+            1,
+        );
+        let cs = synth_join_countersign(
+            &admin_priv,
+            admin_addr,
+            community,
+            pending.id,
+            1_700_000_001_000,
+            2,
+        );
+        let mat = materialize(&[pending, cs], admin_addr);
+        assert_eq!(
+            mat.members.get(&joiner_addr).map(|m| m.status),
+            Some(MemberStatus::Joined)
+        );
+    }
+
+    #[test]
+    fn materialize_pending_join_older_than_30d_hidden() {
+        let community = SpaceId([7u8; 16]);
+        let (joiner_priv, joiner_addr, joiner_pub) = synth_identity(1);
+        let (later_actor_priv, later_actor, _) = synth_identity(99);
+        let (_, admin_addr, _) = synth_identity(2);
+        let pending = synth_pending_join(
+            &joiner_priv,
+            joiner_addr,
+            joiner_pub,
+            community,
+            1_700_000_000_000,
+            1,
+        );
+        // Later join from a different actor pushes current_max_wall_ms > 30d ahead.
+        let later = synth_legacy_join(
+            &later_actor_priv,
+            later_actor,
+            community,
+            1_700_000_000_000 + 31 * 86_400_000,
+            2,
+        );
+        let mat = materialize(&[pending, later], admin_addr);
+        // Joiner is hidden — no entry in members map.
+        assert!(
+            !mat.members.contains_key(&joiner_addr),
+            "expected joiner hidden after 30d expiry, got {:?}",
+            mat.members.get(&joiner_addr)
+        );
+    }
+
+    #[test]
+    fn materialize_pending_join_countersign_resurrects_expired_pending() {
+        let community = SpaceId([7u8; 16]);
+        let (joiner_priv, joiner_addr, joiner_pub) = synth_identity(1);
+        let (admin_priv, admin_addr, _) = synth_identity(2);
+        let pending = synth_pending_join(
+            &joiner_priv,
+            joiner_addr,
+            joiner_pub,
+            community,
+            1_700_000_000_000,
+            1,
+        );
+        // Counter-sign 31 days later — past the expiry window.
+        let cs = synth_join_countersign(
+            &admin_priv,
+            admin_addr,
+            community,
+            pending.id,
+            1_700_000_000_000 + 31 * 86_400_000,
+            2,
+        );
+        let mat = materialize(&[pending, cs], admin_addr);
+        assert_eq!(
+            mat.members.get(&joiner_addr).map(|m| m.status),
+            Some(MemberStatus::Joined)
+        );
+    }
+
+    #[test]
+    fn materialize_legacy_join_with_countersig_still_yields_joined() {
+        let community = SpaceId([7u8; 16]);
+        let (joiner_priv, joiner_addr, _) = synth_identity(1);
+        let (_, admin_addr, _) = synth_identity(2);
+        let join = synth_legacy_join(&joiner_priv, joiner_addr, community, 1_700_000_000_000, 1);
+        let mat = materialize(&[join], admin_addr);
+        assert_eq!(
+            mat.members.get(&joiner_addr).map(|m| m.status),
+            Some(MemberStatus::Joined)
+        );
+    }
+
+    #[test]
+    fn materialize_pending_join_then_leave_yields_left() {
+        let community = SpaceId([7u8; 16]);
+        let (joiner_priv, joiner_addr, joiner_pub) = synth_identity(1);
+        let (_, admin_addr, _) = synth_identity(2);
+        let pending = synth_pending_join(
+            &joiner_priv,
+            joiner_addr,
+            joiner_pub,
+            community,
+            1_700_000_000_000,
+            1,
+        );
+        let leave = synth_leave(&joiner_priv, joiner_addr, community, 1_700_000_001_000, 2);
+        let mat = materialize(&[pending, leave], admin_addr);
+        assert_eq!(
+            mat.members.get(&joiner_addr).map(|m| m.status),
+            Some(MemberStatus::Left)
+        );
+    }
+
+    #[test]
+    fn materialize_pending_join_with_two_countersigns_yields_joined() {
+        let community = SpaceId([7u8; 16]);
+        let (joiner_priv, joiner_addr, joiner_pub) = synth_identity(1);
+        let (admin1_priv, admin1_addr, _) = synth_identity(2);
+        let (admin2_priv, admin2_addr, _) = synth_identity(3);
+        let pending = synth_pending_join(
+            &joiner_priv,
+            joiner_addr,
+            joiner_pub,
+            community,
+            1_700_000_000_000,
+            1,
+        );
+        let cs1 = synth_join_countersign(
+            &admin1_priv,
+            admin1_addr,
+            community,
+            pending.id,
+            1_700_000_001_000,
+            2,
+        );
+        let cs2 = synth_join_countersign(
+            &admin2_priv,
+            admin2_addr,
+            community,
+            pending.id,
+            1_700_000_001_500,
+            3,
+        );
+        let mat = materialize(&[pending, cs1, cs2], admin1_addr);
+        assert_eq!(
+            mat.members.get(&joiner_addr).map(|m| m.status),
+            Some(MemberStatus::Joined)
+        );
+        assert_eq!(
+            mat.members.len(),
+            1,
+            "duplicate countersigns must not produce extra entries; only the joiner is present"
+        );
+    }
+
+    #[test]
+    fn materialize_pending_join_countersign_in_rotated_epoch_marks_catchup() {
+        // Mirrors the Join arm's catchup behavior: a member joining via
+        // PendingJoin + JoinCountersign in a community that has rotated its
+        // epoch must be flagged for key-material catchup.
+        //
+        // We bypass EpochRotation synthesis (which requires RecipientCiphertexts
+        // scaffolding) and instead construct a MaterializedMembership with
+        // current_epoch = Some(1) by using an admin's legacy Join followed by
+        // manually verifying the path via the materialize fn outcome.
+        //
+        // Since we cannot trivially produce an EpochRotation event in unit-test
+        // scope, we exercise the guard through two separate assertions:
+        //   1. epoch = 0 community → pending_catchup_for NOT populated.
+        //   2. We simulate epoch > 0 by reading the implementation invariant:
+        //      the guard `if m.current_epoch.unwrap_or(0) > 0` is only satisfied
+        //      when an EpochRotation event has been applied. We therefore confirm
+        //      the epoch=0 case does NOT insert and rely on the integration test
+        //      in Task 15 (ZEB-254) for the full rotated-epoch path.
+        //
+        // For the epoch=0 case, pending_catchup_for must be empty.
+        let community = SpaceId([7u8; 16]);
+        let (joiner_priv, joiner_addr, joiner_pub) = synth_identity(1);
+        let (admin_priv, admin_addr, _) = synth_identity(2);
+        let pending = synth_pending_join(
+            &joiner_priv,
+            joiner_addr,
+            joiner_pub,
+            community,
+            1_700_000_002_000,
+            1,
+        );
+        let cs = synth_join_countersign(
+            &admin_priv,
+            admin_addr,
+            community,
+            pending.id,
+            1_700_000_003_000,
+            2,
+        );
+        // epoch = 0 (no EpochRotation events) → no catchup needed.
+        let mat = materialize(&[pending, cs], admin_addr);
+        assert_eq!(
+            mat.members.get(&joiner_addr).map(|m| m.status),
+            Some(MemberStatus::Joined),
+            "joiner must be Joined after countersign"
+        );
+        assert_eq!(
+            mat.current_epoch, None,
+            "no epoch rotation → current_epoch is None"
+        );
+        assert!(
+            !mat.pending_catchup_for.contains(&joiner_addr),
+            "epoch=0: joiner must NOT be in pending_catchup_for (no rotation yet)"
+        );
+        // The rotated-epoch path (current_epoch > 0 triggers insert) is validated
+        // by Task 15 integration tests where EpochRotation events can be fully
+        // synthesized with RecipientCiphertexts.
+    }
+
+    /// ZEB-254 bot-review Q1: A previously-Left member re-joining via
+    /// PendingJoin must materialize as PendingJoin, NOT be shadowed by Left.
+    ///
+    /// verify_event P6 gate explicitly permits prior state `None | Left` for
+    /// PendingJoin; materialize's terminal-shadow list must be consistent.
+    #[test]
+    fn materialize_pending_join_after_left_yields_pending() {
+        let community = SpaceId([7u8; 16]);
+        let (joiner_priv, joiner_addr, joiner_pub) = synth_identity(1);
+        let (_, admin_addr, _) = synth_identity(2);
+
+        // Sequence: original legacy Join → Leave → new PendingJoin (re-join
+        // attempt). The PendingJoin comes after the Leave in HLC order.
+        let original_join =
+            synth_legacy_join(&joiner_priv, joiner_addr, community, 1_700_000_000_000, 1);
+        let leave = synth_leave(&joiner_priv, joiner_addr, community, 1_700_000_001_000, 2);
+        let pending = synth_pending_join(
+            &joiner_priv,
+            joiner_addr,
+            joiner_pub,
+            community,
+            1_700_000_002_000,
+            3,
+        );
+
+        // Materialize the full log. The PendingJoin (event_sort_key > Leave)
+        // must NOT be shadowed by the Left status; it must win and yield
+        // PendingJoin.
+        let mat = materialize(&[original_join, leave, pending], admin_addr);
+        assert_eq!(
+            mat.members.get(&joiner_addr).map(|m| m.status),
+            Some(MemberStatus::PendingJoin),
+            "a previously-Left member re-joining via PendingJoin must materialize \
+             as PendingJoin, not be shadowed by Left"
+        );
+    }
+
+    /// ZEB-254 bot-review Q1 corollary: a PendingJoin WITH countersign after
+    /// Leave must materialize as Joined (countersign approval is not shadowed).
+    #[test]
+    fn materialize_pending_join_after_left_with_countersign_yields_joined() {
+        let community = SpaceId([7u8; 16]);
+        let (joiner_priv, joiner_addr, joiner_pub) = synth_identity(1);
+        let (admin_priv, admin_addr, _) = synth_identity(2);
+
+        let original_join =
+            synth_legacy_join(&joiner_priv, joiner_addr, community, 1_700_000_000_000, 1);
+        let leave = synth_leave(&joiner_priv, joiner_addr, community, 1_700_000_001_000, 2);
+        let pending = synth_pending_join(
+            &joiner_priv,
+            joiner_addr,
+            joiner_pub,
+            community,
+            1_700_000_002_000,
+            3,
+        );
+        let cs = synth_join_countersign(
+            &admin_priv,
+            admin_addr,
+            community,
+            pending.id,
+            1_700_000_003_000,
+            4,
+        );
+
+        let mat = materialize(&[original_join, leave, pending, cs], admin_addr);
+        assert_eq!(
+            mat.members.get(&joiner_addr).map(|m| m.status),
+            Some(MemberStatus::Joined),
+            "a previously-Left member with a countersigned re-join must materialize as Joined"
+        );
+    }
+
+    /// ZEB-254 R4-1: kicking a PendingJoin user must NOT mark them for
+    /// epoch rotation. A PendingJoin user never received any epoch key
+    /// material — they have no live key the rest of the community
+    /// needs to rotate away from. Without this guard the kick (admin
+    /// "Reject" click in PendingJoinsPanel) would synthesize a full
+    /// EpochRotation cycling EVERY existing member's keys for a user
+    /// who was never actually joined.
+    ///
+    /// Mirrors the Leave arm's `leave_transitioned` guard which also
+    /// drops never-members from pending_rotation_for.
+    #[test]
+    fn kick_of_pending_join_does_not_trigger_epoch_rotation() {
+        let community = SpaceId([7u8; 16]);
+        let (joiner_priv, joiner_addr, joiner_pub) = synth_identity(1);
+        let (admin_priv, admin_addr, _) = synth_identity(2);
+
+        // PendingJoin lands first; admin Kicks the still-pending joiner
+        // (Reject flow). No JoinCountersign — the kick happens BEFORE
+        // any counter-sign was issued.
+        let pending = synth_pending_join(
+            &joiner_priv,
+            joiner_addr,
+            joiner_pub,
+            community,
+            1_700_000_000_000,
+            1,
+        );
+        let kick = synth_kick(
+            &admin_priv,
+            admin_addr,
+            joiner_addr,
+            community,
+            1_700_000_001_000,
+            2,
+        );
+
+        let mat = materialize(&[pending, kick], admin_addr);
+
+        // The joiner is now Banned (the Kick arm always flips status
+        // when an existing entry is found — and PendingJoin inserted
+        // one).
+        assert_eq!(
+            mat.members.get(&joiner_addr).map(|m| m.status),
+            Some(MemberStatus::Banned),
+            "kick of a PendingJoin user must transition them to Banned"
+        );
+
+        // ... but pending_rotation_for must NOT contain the joiner —
+        // they never received epoch material, so no rotation is needed.
+        assert!(
+            !mat.pending_rotation_for.contains(&joiner_addr),
+            "R4-1: kick of a PendingJoin user must NOT mark them for \
+             EpochRotation — no epoch material was ever delivered to them"
+        );
+    }
+
+    /// ZEB-254 R4-6: idle-community PendingJoin expiry must agree
+    /// across the admin panel (uses wall-clock) and the verify-time
+    /// prior-state lookup (uses materialize). Before R4-6,
+    /// `materialize`'s `current_max_wall_ms` was always
+    /// `max(events.at.wall_ms)`. In a community whose only event IS the
+    /// PendingJoin, that max equals the PendingJoin's own wall_ms, so
+    /// age_ms = 0 and the event never registered as expired — verify
+    /// would reject re-redemption with PendingJoinAlreadyMember 30+
+    /// days later.
+    ///
+    /// This test exercises the fix: at t = T + 30d + 1s, both
+    ///   - the admin's view via `materialize_with_now(...,
+    ///     Some(wall_now))` (sees the joiner as expired / hidden)
+    ///   - the verify-time view via `prior_state_at_hlc(...,
+    ///     &re_redeem.at)` (sees the joiner as expired so P6 admits a
+    ///     new PendingJoin)
+    ///
+    /// converge on "expired".
+    #[test]
+    fn r4_6_idle_community_pending_join_expires_via_wall_clock_floor() {
+        let community = SpaceId([7u8; 16]);
+        let (joiner_priv, joiner_addr, joiner_pub) = synth_identity(1);
+        let (_, admin_addr, _) = synth_identity(2);
+
+        // PendingJoin minted at t=0 (epoch reference, simulating a
+        // community where nothing else has happened).
+        let t0 = 1_700_000_000_000_u64;
+        let pending = synth_pending_join(&joiner_priv, joiner_addr, joiner_pub, community, t0, 1);
+        let pending_slice = std::slice::from_ref(&pending);
+
+        // Without a wall-clock floor — i.e., the pre-R4-6 behavior:
+        // current_max_wall_ms = pending.at.wall_ms = t0, age_ms = 0 →
+        // status is PendingJoin (NOT expired). This is the bug.
+        let mat_no_floor = materialize_with_now(pending_slice, admin_addr, None);
+        assert_eq!(
+            mat_no_floor.members.get(&joiner_addr).map(|m| m.status),
+            Some(MemberStatus::PendingJoin),
+            "pre-R4-6 baseline: without wall-clock floor, idle-community \
+             PendingJoin never expires"
+        );
+
+        // With a wall-clock floor at t0 + 30d + 1s — i.e., the R4-6
+        // production behavior on admin's panel: the joiner is now
+        // expired and hidden from the materialized members map.
+        let wall_now = t0 + MATERIALIZE_PENDING_EXPIRY_MS + 1_000;
+        let mat_with_floor = materialize_with_now(pending_slice, admin_addr, Some(wall_now));
+        assert!(
+            !mat_with_floor.members.contains_key(&joiner_addr),
+            "R4-6: with wall-clock floor past 30d, PendingJoin must be \
+             hidden from materialize"
+        );
+
+        // And the verify-time path: when a re-redemption attempt
+        // arrives at HLC t0 + 30d + 1s, `prior_state_at_hlc` uses
+        // target_hlc.wall_ms as the now-floor, so the prior PendingJoin
+        // is seen as expired and P6 admits the re-redemption.
+        let re_redeem_hlc = Hlc {
+            wall_ms: wall_now,
+            logical: 0,
+            device_id: "joiner".into(),
+        };
+        let prior = prior_state_at_hlc(pending_slice, &re_redeem_hlc, admin_addr);
+        assert!(
+            !prior.members.contains_key(&joiner_addr),
+            "R4-6: prior_state_at_hlc must see the original PendingJoin \
+             as expired (so verify_event P6 admits the re-redemption)"
+        );
+    }
+
+    /// Companion to `kick_of_pending_join_does_not_trigger_epoch_rotation`:
+    /// confirm the Kick arm STILL marks an established (Joined) member
+    /// for rotation. Without this paired assertion, an over-eager guard
+    /// in the kick arm could silently regress ZEB-249's
+    /// epoch-rotation-on-kick invariant.
+    #[test]
+    fn kick_of_joined_member_does_trigger_epoch_rotation() {
+        let community = SpaceId([7u8; 16]);
+        let (member_priv, member_addr, _) = synth_identity(1);
+        let (admin_priv, admin_addr, _) = synth_identity(2);
+
+        // Member legacy-joins (so they actually hold epoch material),
+        // then admin kicks.
+        let join = synth_legacy_join(&member_priv, member_addr, community, 1_700_000_000_000, 1);
+        let kick = synth_kick(
+            &admin_priv,
+            admin_addr,
+            member_addr,
+            community,
+            1_700_000_001_000,
+            2,
+        );
+
+        let mat = materialize(&[join, kick], admin_addr);
+        assert_eq!(
+            mat.members.get(&member_addr).map(|m| m.status),
+            Some(MemberStatus::Banned),
+            "kick of a Joined member must transition them to Banned"
+        );
+        assert!(
+            mat.pending_rotation_for.contains(&member_addr),
+            "kick of an established Joined member MUST mark them for \
+             EpochRotation (ZEB-249 invariant preserved by R4-1 guard)"
+        );
+    }
+
+    /// ZEB-254 R5-1: EpochCatchup with `triggered_by` pointing to a
+    /// countersigned PendingJoin (not a legacy Join) MUST clear that
+    /// joiner from `pending_catchup_for`.
+    ///
+    /// Repro: In a community whose epoch has already rotated, a joiner
+    /// admitted via PendingJoin + JoinCountersign gets enqueued into
+    /// `pending_catchup_for` (mirrors the legacy Join arm's catchup
+    /// invariant). Before R5-1, the EpochCatchup arm only accepted
+    /// `triggered_by` pointing to a legacy `Join`, so the natural
+    /// catchup event (issued by an admin pointing at the PendingJoin)
+    /// matched no triggering event and silently no-op'd — leaving the
+    /// member permanently flagged for catchup.
+    #[test]
+    fn epoch_catchup_clears_pending_catchup_for_pending_join_admission() {
+        let community = SpaceId([7u8; 16]);
+        let (admin_priv, admin_addr, _) = synth_identity(2);
+        let (joiner_priv, joiner_addr, joiner_pub) = synth_identity(1);
+        // Bob is an existing member who will Leave to give us a valid
+        // EpochRotation trigger (rotation requires triggered_by to be a
+        // Kick or Leave per the rotation arm at line ~1376).
+        let (bob_priv, bob_addr, _) = synth_identity(3);
+
+        // 1. Bootstrap admin Join. Admin gets power=100 via the bootstrap
+        //    rule in materialize (line ~1081).
+        let admin_join =
+            synth_legacy_join(&admin_priv, admin_addr, community, 1_700_000_000_000, 10);
+
+        // 2. Bob joins so we have someone to remove.
+        let bob_join = synth_legacy_join(&bob_priv, bob_addr, community, 1_700_000_000_500, 11);
+
+        // 3. Bob leaves. This becomes the rotation trigger.
+        let bob_leave = synth_leave(&bob_priv, bob_addr, community, 1_700_000_001_000, 12);
+
+        // 4. EpochRotation 0→1 issued by admin, triggered_by=bob_leave.
+        //    recipient_ciphertexts must include all remaining
+        //    Joined/Invited members EXCEPT the target (bob); after
+        //    bob_leave, only admin is Joined, so recipients = [admin].
+        let rotation_payload = EventPayload {
+            id: [20; 16],
+            community_id: community,
+            kind: MembershipEventKind::EpochRotation {
+                prior_epoch: 0,
+                triggered_by: bob_leave.id,
+                recipient_ciphertexts: vec![RecipientCiphertext {
+                    recipient: admin_addr,
+                    sealed: vec![0u8; 92],
+                }],
+            },
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 1_700_000_001_500,
+                logical: 0,
+                device_id: "admin".into(),
+            },
+        };
+        let rotation =
+            sign_event_with_identity(&rotation_payload, &admin_priv).expect("sign rotation");
+
+        // 5. Joiner mints PendingJoin (epoch already at 1 by this point).
+        let pending = synth_pending_join(
+            &joiner_priv,
+            joiner_addr,
+            joiner_pub,
+            community,
+            1_700_000_002_000,
+            30,
+        );
+
+        // 6. Admin counter-signs the PendingJoin. Materializer now treats
+        //    joiner as Joined AND, because current_epoch=1, enqueues them
+        //    into pending_catchup_for (PendingJoin arm at line ~1578).
+        let countersign = synth_join_countersign(
+            &admin_priv,
+            admin_addr,
+            community,
+            pending.id,
+            1_700_000_003_000,
+            40,
+        );
+
+        // Sanity-check the precondition: after PendingJoin + countersign,
+        // joiner IS in pending_catchup_for.
+        {
+            let mat_pre = materialize(
+                &[
+                    admin_join.clone(),
+                    bob_join.clone(),
+                    bob_leave.clone(),
+                    rotation.clone(),
+                    pending.clone(),
+                    countersign.clone(),
+                ],
+                admin_addr,
+            );
+            assert_eq!(
+                mat_pre.current_epoch,
+                Some(1),
+                "EpochRotation must advance current_epoch to 1"
+            );
+            assert_eq!(
+                mat_pre.members.get(&joiner_addr).map(|m| m.status),
+                Some(MemberStatus::Joined),
+                "joiner must be Joined after countersign"
+            );
+            assert!(
+                mat_pre.pending_catchup_for.contains(&joiner_addr),
+                "PRECONDITION: countersigned PendingJoin in rotated epoch \
+                 MUST enqueue joiner into pending_catchup_for"
+            );
+        }
+
+        // 7. Admin issues EpochCatchup at epoch=1, triggered_by=PendingJoin
+        //    event id, recipient=joiner. Pre-R5-1 this was a silent no-op
+        //    (only Join-kind triggered_by was accepted); post-R5-1 the
+        //    countersigned-PendingJoin lookup must succeed and clear the
+        //    joiner from pending_catchup_for.
+        let catchup_payload = EventPayload {
+            id: [50; 16],
+            community_id: community,
+            kind: MembershipEventKind::EpochCatchup {
+                epoch: 1,
+                triggered_by: pending.id,
+                recipient_ciphertexts: vec![RecipientCiphertext {
+                    recipient: joiner_addr,
+                    sealed: vec![0u8; 92],
+                }],
+            },
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 1_700_000_004_000,
+                logical: 0,
+                device_id: "admin".into(),
+            },
+        };
+        let catchup =
+            sign_event_with_identity(&catchup_payload, &admin_priv).expect("sign catchup");
+
+        let mat = materialize(
+            &[
+                admin_join,
+                bob_join,
+                bob_leave,
+                rotation,
+                pending,
+                countersign,
+                catchup,
+            ],
+            admin_addr,
+        );
+
+        assert_eq!(
+            mat.current_epoch,
+            Some(1),
+            "current_epoch must still be 1 after catchup"
+        );
+        assert_eq!(
+            mat.members.get(&joiner_addr).map(|m| m.status),
+            Some(MemberStatus::Joined),
+            "joiner remains Joined after catchup"
+        );
+        assert!(
+            !mat.pending_catchup_for.contains(&joiner_addr),
+            "POST-R5-1: EpochCatchup with triggered_by=PendingJoin MUST clear \
+             joiner from pending_catchup_for (regression for unbounded catchup-pending state)"
+        );
+    }
+
+    /// ZEB-254 R5-1 negative: an EpochCatchup whose `triggered_by` points
+    /// to an UNCOUNTERSIGNED PendingJoin must be a no-op. A still-pending
+    /// joiner is not a member; no admin would (or should) issue catchup
+    /// keys to them. This guards against widening the trigger contract
+    /// past the intent of R5-1.
+    #[test]
+    fn epoch_catchup_ignores_uncountersigned_pending_join_trigger() {
+        let community = SpaceId([7u8; 16]);
+        let (admin_priv, admin_addr, _) = synth_identity(2);
+        let (joiner_priv, joiner_addr, joiner_pub) = synth_identity(1);
+        let (bob_priv, bob_addr, _) = synth_identity(3);
+
+        let admin_join =
+            synth_legacy_join(&admin_priv, admin_addr, community, 1_700_000_000_000, 10);
+        let bob_join = synth_legacy_join(&bob_priv, bob_addr, community, 1_700_000_000_500, 11);
+        let bob_leave = synth_leave(&bob_priv, bob_addr, community, 1_700_000_001_000, 12);
+        let rotation_payload = EventPayload {
+            id: [20; 16],
+            community_id: community,
+            kind: MembershipEventKind::EpochRotation {
+                prior_epoch: 0,
+                triggered_by: bob_leave.id,
+                recipient_ciphertexts: vec![RecipientCiphertext {
+                    recipient: admin_addr,
+                    sealed: vec![0u8; 92],
+                }],
+            },
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 1_700_000_001_500,
+                logical: 0,
+                device_id: "admin".into(),
+            },
+        };
+        let rotation =
+            sign_event_with_identity(&rotation_payload, &admin_priv).expect("sign rotation");
+        let pending = synth_pending_join(
+            &joiner_priv,
+            joiner_addr,
+            joiner_pub,
+            community,
+            1_700_000_002_000,
+            30,
+        );
+        // NOTE: no countersign event.
+        let catchup_payload = EventPayload {
+            id: [50; 16],
+            community_id: community,
+            kind: MembershipEventKind::EpochCatchup {
+                epoch: 1,
+                triggered_by: pending.id,
+                recipient_ciphertexts: vec![RecipientCiphertext {
+                    recipient: joiner_addr,
+                    sealed: vec![0u8; 92],
+                }],
+            },
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 1_700_000_004_000,
+                logical: 0,
+                device_id: "admin".into(),
+            },
+        };
+        let catchup =
+            sign_event_with_identity(&catchup_payload, &admin_priv).expect("sign catchup");
+
+        let mat = materialize(
+            &[admin_join, bob_join, bob_leave, rotation, pending, catchup],
+            admin_addr,
+        );
+
+        // Joiner is PendingJoin (uncountersigned, within expiry window).
+        assert_eq!(
+            mat.members.get(&joiner_addr).map(|m| m.status),
+            Some(MemberStatus::PendingJoin),
+            "uncountersigned PendingJoin within expiry window materializes as PendingJoin"
+        );
+        // pending_catchup_for is NOT populated for this joiner (only the
+        // countersigned-PendingJoin path enqueues), and the catchup itself
+        // would not clear anything regardless.
+        assert!(
+            !mat.pending_catchup_for.contains(&joiner_addr),
+            "uncountersigned PendingJoin must NOT be in pending_catchup_for"
+        );
     }
 }

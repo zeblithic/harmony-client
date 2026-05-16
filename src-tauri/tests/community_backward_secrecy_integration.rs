@@ -52,6 +52,7 @@ fn make_space_with_epoch(
         admin_addr: Some(admin_addr),
         is_invite_only: Some(false),
         shared_in_profile: false,
+        pending_join_at: None,
     }
 }
 
@@ -814,6 +815,7 @@ async fn stale_invite_catchup_unlocks_decryption_end_to_end() {
         self_owner: admin_addr,
         signing_key: Arc::clone(&admin_signing_key),
         crdt_state: None,
+        nav_emitter: None,
     }));
 
     let (pub_tx, _pub_rx) = mpsc::channel(8);

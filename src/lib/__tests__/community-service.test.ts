@@ -79,6 +79,7 @@ describe('CommunityService', () => {
       communityId: 'eeff0011',
       communityName: 'Real Name',
       isInviteOnly: true,
+      pending: false,
     });
     const dto = await service.redeemInvite('harmony://invite/v1?ci=...');
     expect(adapter.invoke).toHaveBeenCalledWith('redeem_invite', { url: 'harmony://invite/v1?ci=...' });
@@ -86,10 +87,39 @@ describe('CommunityService', () => {
       communityId: 'eeff0011',
       communityName: 'Real Name',
       isInviteOnly: true,
+      pending: false,
     });
     // ZEB-265: redeem now records kind so getKind() doesn't return 'unknown'
     // for redeemed communities.
     expect(service.getKind('eeff0011')).toBe('invite-only');
+  });
+
+  // ZEB-254: pending flag on RedeemInviteResultDto
+  it('redeemInvite returns pending: true when admin was offline (fast-path timeout)', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue({
+      communityId: 'aabb1122',
+      communityName: 'Secret Club',
+      isInviteOnly: true,
+      pending: true,
+    });
+    const dto = await service.redeemInvite('harmony://invite/v1?ci=pending');
+    expect(dto.pending).toBe(true);
+    // Kind is still recorded regardless of pending state.
+    expect(service.getKind('aabb1122')).toBe('invite-only');
+  });
+
+  it('redeemInvite returns pending: false for open communities', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue({
+      communityId: 'cc334455',
+      communityName: 'Open Crew',
+      isInviteOnly: false,
+      pending: false,
+    });
+    const dto = await service.redeemInvite('harmony://invite/v1?ci=open');
+    expect(dto.pending).toBe(false);
+    expect(service.getKind('cc334455')).toBe('open');
   });
 
   it('joinOpenCommunity returns the DTO and learns the community kind', async () => {
@@ -98,6 +128,7 @@ describe('CommunityService', () => {
       communityId: 'aabbccddeeff00112233445566778899',
       communityName: 'DirCommunity',
       isInviteOnly: false,
+      pending: false,
     });
     const returned = await service.joinOpenCommunity('aabbccddeeff00112233445566778899');
     expect(adapter.invoke).toHaveBeenCalledWith('join_open_community', {
@@ -107,6 +138,7 @@ describe('CommunityService', () => {
       communityId: 'aabbccddeeff00112233445566778899',
       communityName: 'DirCommunity',
       isInviteOnly: false,
+      pending: false,
     });
     // Same as redeemInvite: a successful direct-join learns the kind.
     expect(service.getKind('aabbccddeeff00112233445566778899')).toBe('open');
@@ -118,6 +150,7 @@ describe('CommunityService', () => {
       communityId: '00112233',
       communityName: 'Open Community',
       isInviteOnly: false,
+      pending: false,
     });
     await service.redeemInvite('harmony://invite/v1?ci=...');
     expect(service.getKind('00112233')).toBe('open');

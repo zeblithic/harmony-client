@@ -44,6 +44,7 @@ async fn registry_spawns_and_tears_down_per_community() {
         self_owner: OwnerAddr([0x01; 16]),
         signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
         crdt_state: None,
+        nav_emitter: None,
     });
 
     let cid_a = SpaceId([1u8; 16]);
@@ -89,6 +90,7 @@ async fn registry_spawn_is_idempotent_and_known_ids_is_sorted() {
         self_owner: OwnerAddr([0x01; 16]),
         signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
         crdt_state: None,
+        nav_emitter: None,
     });
 
     // Spawn two distinct communities. Use unsorted ID order to verify
@@ -175,6 +177,7 @@ async fn shutdown_engine_and_cleanup_persistence_idempotent_on_unknown_id() {
         self_owner: OwnerAddr([0x01; 16]),
         signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
         crdt_state: None,
+        nav_emitter: None,
     });
 
     let unknown_id = SpaceId([0xff; 16]);
@@ -220,6 +223,7 @@ async fn shutdown_engine_and_cleanup_persistence_removes_dir_after_engine_stops(
         self_owner: OwnerAddr([0x01; 16]),
         signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
         crdt_state: None,
+        nav_emitter: None,
     });
 
     let cid = SpaceId([1u8; 16]);
@@ -318,6 +322,7 @@ async fn pending_redemption_oneshot_fires_when_event_id_inserts_via_local() {
         self_owner: admin_addr,
         signing_key: Arc::clone(&admin_sk),
         crdt_state: None,
+        nav_emitter: None,
     }));
 
     let cid = SpaceId([0x10; 16]);
@@ -415,6 +420,7 @@ async fn pending_redemption_unregistered_when_no_match() {
         self_owner: admin_addr,
         signing_key: Arc::clone(&admin_sk),
         crdt_state: None,
+        nav_emitter: None,
     }));
 
     let cid = SpaceId([0x10; 16]);

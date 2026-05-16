@@ -815,6 +815,7 @@ mod tests {
             admin_addr: Some(OwnerAddr([0xbb; 16])),
             is_invite_only: Some(false),
             shared_in_profile: true,
+            pending_join_at: None,
         };
         // Community B — opted OUT. Must NOT appear.
         let community_opted_out = Space {
@@ -838,6 +839,7 @@ mod tests {
             admin_addr: Some(OwnerAddr([0xbb; 16])),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            pending_join_at: None,
         };
         // DM — shared_in_profile=true defensively, kind != Community
         // so it MUST be filtered out regardless of the flag.
@@ -864,6 +866,7 @@ mod tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: true,
+            pending_join_at: None,
         };
         // Channel — kind != Community, with community_id back-pointer
         // to community_opted_in. Previous bug would have included this
@@ -890,6 +893,7 @@ mod tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            pending_join_at: None,
         };
 
         let mut state = OwnerState::default();
@@ -965,6 +969,7 @@ mod tests {
             admin_addr: Some(OwnerAddr([0xbb; 16])),
             is_invite_only: Some(false),
             shared_in_profile: true,
+            pending_join_at: None,
         };
         // Community B — was opted-in but the user has since left. The
         // shared_in_profile flag is still true (not auto-cleared by
@@ -991,6 +996,7 @@ mod tests {
             admin_addr: Some(OwnerAddr([0xbb; 16])),
             is_invite_only: Some(false),
             shared_in_profile: true,
+            pending_join_at: None,
         };
 
         let mut state = OwnerState::default();
