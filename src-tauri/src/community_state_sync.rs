@@ -1148,6 +1148,60 @@ impl CommunitySyncEngine {
         self.admin_identity_pub.set(pub_bytes).is_ok()
     }
 
+    /// R4-4: engine-internal counterpart to R3-C1's registry-time pre-bind.
+    ///
+    /// At startup, if the engine's `admin_identity_pub` OnceLock is still
+    /// unset (the spawn-time `resolver.resolve(&admin_addr)` in R3-C1
+    /// returned `None`, e.g., the joiner crashed before OwnerDeviceCache
+    /// learned the admin) AND the persisted CRDT contains admin-authored
+    /// events (proof we've at least heard from the admin once), try the
+    /// resolver again. After restart, owner_state has finished loading
+    /// from disk and the cache may now hold the admin entry that was
+    /// missing at engine-spawn time.
+    ///
+    /// This is the engine-internal complement to R3-C3's restart heal
+    /// pass for `Space.pending_join_at`: both close the same crash-window
+    /// gap (the post-verify side-effect didn't run because the events
+    /// returned `AlreadyKnown` on the reconcile insert).
+    ///
+    /// Best-effort + idempotent. Returns `true` if the bind was newly
+    /// committed, `false` if either the lock was already set or the
+    /// resolver still misses. Caller need not await — the engine remains
+    /// functional with `None`; this just promotes the binding to
+    /// guarantee P5 validation on the FIRST incoming PendingJoin instead
+    /// of relying on the opportunistic bind in
+    /// `insert_event_with_resolved_pubs` / the merge path.
+    pub async fn try_rehydrate_admin_identity_pub(&self) -> bool {
+        // Already bound — nothing to do.
+        if self.admin_identity_pub.get().is_some() {
+            return false;
+        }
+        // Need a resolver to retry. (Tests / non-IPC engines may omit
+        // it; in those cases we cannot recover.)
+        let resolver = match self.identity_resolver.as_ref() {
+            Some(r) => r,
+            None => return false,
+        };
+        // Check the persisted CRDT for at least one admin-authored event.
+        // Without this, an engine that was spawned but never received
+        // anything from the admin would still trigger a resolver call
+        // (cheap but adds boot-time work for engines that have no
+        // admin history yet).
+        let admin_seen_in_log = {
+            let g = self.state.lock().await;
+            g.events.values().any(|e| e.actor == self.admin_addr)
+        };
+        if !admin_seen_in_log {
+            return false;
+        }
+        // Retry the resolver. If owner_state has populated the cache
+        // since spawn-time, this now hits.
+        match resolver.resolve(&self.admin_addr).await {
+            Some(p) => self.admin_identity_pub.set(p).is_ok(),
+            None => false,
+        }
+    }
+
     /// ZEB-254 Task 10: when a `PendingJoin` event is freshly inserted,
     /// check self-eligibility and — if eligible — spawn a task that
     /// signs + inserts a `JoinCountersign` event.
@@ -1434,6 +1488,26 @@ impl CommunitySyncEngine {
             // when a JoinCountersign targeting a self-authored PendingJoin
             // lands. No-op for non-JoinCountersign events and for admin engines.
             maybe_spawn_pending_join_clear(
+                &event,
+                Arc::clone(&self.state),
+                self.self_owner,
+                self.community_id,
+                self.crdt_state.clone(),
+                self.nav_emitter.clone(),
+            );
+
+            // R4-3: when this freshly-inserted event is a self-authored
+            // PendingJoin, rescan the log for an already-present
+            // matching JoinCountersign. Out-of-order arrival
+            // (JoinCountersign syncs BEFORE the joiner's own PendingJoin
+            // syncs back to their device — e.g., two-admin race where
+            // admin's countersign-publish reaches the joiner before the
+            // joiner's own state-root publish round-trips) would
+            // otherwise leave `Space.pending_join_at` set until the
+            // next-restart C3 healing pass. The rescan is idempotent
+            // (the pending-clear apply checks `pending_join_at.is_none()`
+            // before mutating).
+            maybe_spawn_pending_clear_rescan_for_pending_join(
                 &event,
                 Arc::clone(&self.state),
                 self.self_owner,
@@ -2136,6 +2210,81 @@ fn maybe_spawn_pending_join_clear(
         if let Some(cb) = nav_emitter {
             cb(community_id, space_name);
         }
+    });
+}
+
+/// R4-3 rescan helper: when a self-authored `PendingJoin` is freshly
+/// `Inserted`, check the CRDT for an *already-present* `JoinCountersign`
+/// whose `target_event_id` matches and — if found — fire the
+/// pending-clear path. Without this, an out-of-order JoinCountersign
+/// (arrives BEFORE the joiner's PendingJoin syncs to their device)
+/// silently drops on the floor at the live `maybe_spawn_pending_join_clear`
+/// site (the target wasn't in the log yet), and the only path to clear
+/// `Space.pending_join_at` is the next-restart C3 healing pass.
+///
+/// Idempotency: `maybe_spawn_pending_join_clear` already checks
+/// `existing.pending_join_at.is_none()` before mutating, so a double-fire
+/// (live JoinCountersign hook + this rescan) is a harmless no-op.
+fn maybe_spawn_pending_clear_rescan_for_pending_join(
+    inserted: &crate::community_membership::SignedMembershipEvent,
+    community_state: Arc<Mutex<CommunityState>>,
+    self_owner: OwnerAddr,
+    community_id: SpaceId,
+    crdt_state: Option<Arc<Mutex<crate::owner_state_crdt::OwnerState>>>,
+    nav_emitter: Option<NavPendingClearEmitter>,
+) {
+    use crate::community_membership::MembershipEventKind;
+
+    // Only act when the just-inserted event is a self-authored PendingJoin.
+    if inserted.actor != self_owner {
+        return;
+    }
+    if !matches!(&inserted.kind, MembershipEventKind::PendingJoin { .. }) {
+        return;
+    }
+    let pending_id = inserted.id;
+
+    // Need crdt_state for the eventual Space update — same gate as
+    // maybe_spawn_pending_join_clear.
+    let crdt_arc = match crdt_state.clone() {
+        Some(a) => a,
+        None => return,
+    };
+
+    let state_for_scan = Arc::clone(&community_state);
+    tokio::spawn(async move {
+        // Look for a JoinCountersign already in the log whose
+        // target_event_id matches our just-inserted PendingJoin.
+        let matched_countersign: Option<crate::community_membership::SignedMembershipEvent> = {
+            let g = state_for_scan.lock().await;
+            g.events
+                .values()
+                .find(|e| {
+                    matches!(
+                        &e.kind,
+                        MembershipEventKind::JoinCountersign { target_event_id }
+                            if *target_event_id == pending_id
+                    )
+                })
+                .cloned()
+        };
+
+        let cs = match matched_countersign {
+            Some(c) => c,
+            None => return, // No prior JoinCountersign — nothing to recover.
+        };
+
+        // Reuse the live pending-clear hook with the existing
+        // countersign event as the trigger. The hook already does
+        // its own eligibility re-check + idempotent owner-state apply.
+        maybe_spawn_pending_join_clear(
+            &cs,
+            community_state,
+            self_owner,
+            community_id,
+            Some(crdt_arc),
+            nav_emitter,
+        );
     });
 }
 
@@ -3110,12 +3259,44 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         let actor_pub = match resolver.resolve(&event.actor).await {
             Some(p) => p,
             None => {
-                tracing::warn!(
-                    community_id = ?ctx.community_id,
-                    actor = ?event.actor,
-                    "skipping incoming event: unknown actor identity_pub"
-                );
-                continue;
+                // R4-2: PendingJoin events embed the joiner's
+                // identity_pub inline (`joiner_identity_pub`, the
+                // 64-byte X25519||Ed25519 composite). On state-root
+                // receive the resolver-backed `OwnerDeviceCache` may
+                // not yet hold an entry for a first-seen bootstrap
+                // joiner — that's the by-design bootstrap case the
+                // inline pub field exists for (mirroring
+                // `insert_local_event_with_pubs`, which fast-paths
+                // this on the IPC side; see the docs at lines
+                // 1326-1333 of this file).
+                //
+                // Fall back to the inline pub for PendingJoin only;
+                // otherwise preserve the existing skip-and-log
+                // behavior. `verify_event` for PendingJoin still
+                // cross-checks the inline pub against the actor
+                // address (P6 binding), so this fallback is safe —
+                // a forged event with a mismatching inline pub will
+                // still be rejected downstream.
+                if let crate::community_membership::MembershipEventKind::PendingJoin {
+                    joiner_identity_pub,
+                    ..
+                } = &event.kind
+                {
+                    tracing::debug!(
+                        community_id = ?ctx.community_id,
+                        actor = ?event.actor,
+                        "R4-2: cold OwnerDeviceCache for PendingJoin actor; \
+                         using inline joiner_identity_pub fallback"
+                    );
+                    *joiner_identity_pub
+                } else {
+                    tracing::warn!(
+                        community_id = ?ctx.community_id,
+                        actor = ?event.actor,
+                        "skipping incoming event: unknown actor identity_pub"
+                    );
+                    continue;
+                }
             }
         };
         let cs_pub: Option<[u8; 64]> = match event.countersig.as_ref() {
@@ -3306,8 +3487,21 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     // ZEB-254 Task 11: joiner-side pending-join clear hook for every
     // freshly-Inserted JoinCountersign. Spawn is fire-and-forget — doesn't
     // block tracker advance or delta emission.
+    //
+    // R4-3: ALSO fire the rescan helper for every freshly-Inserted
+    // PendingJoin so an out-of-order JoinCountersign already present in
+    // the log triggers the same pending-clear path. Both helpers are
+    // no-ops for the non-matching event kind.
     for event in &inserted_events {
         maybe_spawn_pending_join_clear(
+            event,
+            Arc::clone(&ctx.state),
+            ctx.self_owner,
+            ctx.community_id,
+            ctx.crdt_state.clone(),
+            ctx.nav_emitter.clone(),
+        );
+        maybe_spawn_pending_clear_rescan_for_pending_join(
             event,
             Arc::clone(&ctx.state),
             ctx.self_owner,

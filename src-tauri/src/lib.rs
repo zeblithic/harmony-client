@@ -2304,6 +2304,54 @@ async fn start_node(
                         }
                     }
 
+                    // ZEB-254 R4-4: restart-time rehydrate pass for the
+                    // engine's `admin_identity_pub` OnceLock. The R3-C1
+                    // pre-bind at spawn time calls
+                    // `resolver.resolve(&admin_addr)`, but if the
+                    // OwnerDeviceCache was still cold at that moment
+                    // (e.g., the joiner crashed before the admin's
+                    // device entry got learned), the OnceLock is left
+                    // unset. Since the joiner's persisted CRDT may
+                    // already contain the admin's bootstrap Join (it
+                    // arrived in the SAME publish that bootstrapped
+                    // the engine, returned `AlreadyKnown` on the
+                    // reconcile insert, and the post-verify bind
+                    // therefore never fired), no later event-flow
+                    // will rebind the lock until a brand-new admin
+                    // event arrives.
+                    //
+                    // Sweep every spawned engine and call
+                    // `try_rehydrate_admin_identity_pub` — best-effort,
+                    // idempotent, no-ops cleanly on already-bound
+                    // engines and on engines whose persisted log
+                    // contains no admin events.
+                    {
+                        let space_ids: Vec<crate::owner_state_types::SpaceId> = {
+                            let g = crdt_state.lock().await;
+                            g.spaces
+                                .iter()
+                                .filter(|(_, s)| {
+                                    s.kind == crate::owner_state_types::SpaceKind::Community
+                                        && s.left_at.is_none()
+                                })
+                                .map(|(id, _)| *id)
+                                .collect()
+                        };
+                        for space_id in space_ids {
+                            let engine = match registry.engine_arc(&space_id).await {
+                                Some(e) => e,
+                                None => continue,
+                            };
+                            if engine.try_rehydrate_admin_identity_pub().await {
+                                tracing::info!(
+                                    ?space_id,
+                                    "ZEB-254 R4-4: admin_identity_pub rehydrated at boot \
+                                     (resolver re-resolve hit after spawn-time cold miss)"
+                                );
+                            }
+                        }
+                    }
+
                     // ZEB-254 R3 (C3): restart-time healing pass for
                     // pending_join_at. The post-Inserted clear hook only
                     // fires for events freshly Inserted in this process —
@@ -2340,35 +2388,50 @@ async fn start_node(
                                 Some(e) => e,
                                 None => continue, // no engine spawned (skipped above)
                             };
-                            // Build set of self-authored PendingJoin event IDs,
-                            // then check whether any matching JoinCountersign
-                            // exists in the engine's log.
+                            // R4-5: locate the SPECIFIC self-authored
+                            // PendingJoin event matching `Space.pending_join_at`
+                            // (i.e., the HLC of THIS pending attempt — set
+                            // when the joiner minted the event in
+                            // `redeem_invite_inner`). Only clear if THAT
+                            // event has been countersigned, not just
+                            // "any prior PendingJoin from this user". A
+                            // joiner with history (leave → re-join twice)
+                            // could have a stale JoinCountersign for an
+                            // older attempt; without this guard, the
+                            // healing pass would clear `pending_join_at`
+                            // for the CURRENT attempt by matching against
+                            // a previous attempt's countersign.
+                            let pending_join_at = match space.pending_join_at.as_ref() {
+                                Some(hlc) => hlc.clone(),
+                                None => continue, // covered by the candidates filter, defensive
+                            };
                             let cleared = {
                                 let state = engine.state();
                                 let g = state.lock().await;
-                                let self_pending_ids: std::collections::HashSet<
-                                    crate::community_membership::EventId,
-                                > = g
+                                // Find the self-authored PendingJoin whose HLC equals
+                                // pending_join_at. HLC is the (wall_ms, logical, device_id)
+                                // triple; the `Space.pending_join_at` field is exactly
+                                // the `event.at` stored at mint time.
+                                let target_event_id: Option<crate::community_membership::EventId> = g
                                     .events
                                     .values()
-                                    .filter(|e| {
+                                    .find(|e| {
                                         e.actor == self_owner
                                             && matches!(
                                                 &e.kind,
                                                 crate::community_membership::MembershipEventKind::PendingJoin { .. }
                                             )
+                                            && e.at == pending_join_at
                                     })
-                                    .map(|e| e.id)
-                                    .collect();
-                                if self_pending_ids.is_empty() {
-                                    false
-                                } else {
-                                    g.events.values().any(|e| matches!(
+                                    .map(|e| e.id);
+                                match target_event_id {
+                                    None => false, // no matching PendingJoin on disk
+                                    Some(target_id) => g.events.values().any(|e| matches!(
                                         &e.kind,
                                         crate::community_membership::MembershipEventKind::JoinCountersign {
                                             target_event_id,
-                                        } if self_pending_ids.contains(target_event_id)
-                                    ))
+                                        } if *target_event_id == target_id
+                                    )),
                                 }
                             };
 
@@ -8069,7 +8132,14 @@ async fn generate_invite(
             let events: Vec<crate::community_membership::SignedMembershipEvent> =
                 state.events.values().cloned().collect();
             drop(state);
-            crate::community_membership::materialize(&events, admin)
+            // R4-6: pass wall_now_ms so an idle-community PendingJoin
+            // already past 30d is excluded from the bootstrap snapshot
+            // sent to a new invitee.
+            let wall_now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            crate::community_membership::materialize_with_now(&events, admin, Some(wall_now_ms))
         } else {
             // No engine yet (e.g., just-created community with no events):
             // fall back to empty maps — still a valid bootstrap hint.

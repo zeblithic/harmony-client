@@ -1035,6 +1035,45 @@ pub fn materialize(
     events: &[SignedMembershipEvent],
     admin_addr: OwnerAddr,
 ) -> MaterializedMembership {
+    // Back-compat wrapper for the no-floor case (tests, replay paths
+    // that don't carry a wall-clock). Production callers should use
+    // `materialize_with_now` so an idle community's PendingJoin still
+    // ages out at the 30-day threshold.
+    materialize_with_now(events, admin_addr, None)
+}
+
+/// R4-6 variant of `materialize` that accepts an optional wall-clock
+/// "now floor" used as the time-reference for PendingJoin's 30-day
+/// expiry check.
+///
+/// Without a floor (`now_ms = None`), expiry compares against
+/// `max(events.at.wall_ms)` only — perfectly deterministic across
+/// peers, but pathological for idle communities: a lone PendingJoin
+/// in a community where no other event has landed has
+/// `max(events.at.wall_ms) ≈ pending.at.wall_ms`, so `age_ms ≈ 0`
+/// and the event never expires from materialize's view. Combined with
+/// `verify_event`'s P6 gate (which calls `prior_state_at_hlc` → this
+/// function → renders the joiner as `PendingJoin`), the joiner can't
+/// re-redeem even 30 days later because P6 still says
+/// `PendingJoinAlreadyMember`.
+///
+/// Passing `Some(wall_now_ms)` makes the function compare against
+/// `max(events_max, wall_now_ms)` — admin's local wall-clock can age
+/// out the PendingJoin even when the community's event log is idle.
+/// Cross-peer divergence is bounded by the 30-day window vs. clock
+/// skew (orders of magnitude apart in practice), so the determinism
+/// loss is tolerable.
+///
+/// **Spec alignment.** Spec §3 ("30d pure-function expiry") permits
+/// parameterizing `now_ms` so long as the function remains pure for a
+/// fixed input pair — the function is still `(events, admin_addr,
+/// now_ms) -> MaterializedMembership`, just with an explicit now
+/// reference rather than an implicit one derived from event ordering.
+pub fn materialize_with_now(
+    events: &[SignedMembershipEvent],
+    admin_addr: OwnerAddr,
+    now_ms: Option<u64>,
+) -> MaterializedMembership {
     let mut m = MaterializedMembership::default();
 
     // Bootstrap: admin holds power 100 implicitly. SetPower events
@@ -1043,7 +1082,18 @@ pub fn materialize(
 
     // ZEB-254 Pre-Pass: compute current max wall_ms across all events.
     // Used as the "current time" reference for PendingJoin expiry.
-    let current_max_wall_ms: u64 = events.iter().map(|e| e.at.wall_ms).max().unwrap_or(0);
+    //
+    // R4-6: if `now_ms` is supplied, take the max with it so an idle
+    // community whose only event IS the PendingJoin can still expire
+    // it once wall-clock advances 30 days. Without this, P6 in
+    // `verify_event` (which calls `prior_state_at_hlc` → this fn)
+    // permanently rejects re-redemption attempts because materialize
+    // never marks the original pending as expired.
+    let events_max_wall_ms: u64 = events.iter().map(|e| e.at.wall_ms).max().unwrap_or(0);
+    let current_max_wall_ms: u64 = match now_ms {
+        Some(now) => events_max_wall_ms.max(now),
+        None => events_max_wall_ms,
+    };
 
     // ZEB-254 Pre-Pass: collect the target_event_ids of all JoinCountersign
     // events into a set. The PendingJoin arm below consults this set to
@@ -1191,6 +1241,18 @@ pub fn materialize(
                 // the hazard the verify-time check guards against, but
                 // a corrupted log or unverified replay could otherwise
                 // surface it. Symmetric with Join/Leave defense-in-depth.
+                //
+                // R4-1: capture the prior status BEFORE the mutation
+                // because the pending_rotation_for guard below needs to
+                // distinguish "kick of an established member" (epoch
+                // material was actually distributed to this address →
+                // rotation needed) from "kick of a PendingJoin" (no
+                // epoch material ever went to this address → rotation
+                // would be a spurious cycle of every existing member's
+                // keys). Mirrors the Leave arm's `leave_transitioned`
+                // guard that drops never-member Leaves out of
+                // pending_rotation_for.
+                let prior_status = m.members.get(target).map(|s| s.status);
                 if let Some(s) = m.members.get_mut(target) {
                     s.status = MemberStatus::Banned;
                     s.left_at = Some(event.at.clone());
@@ -1198,7 +1260,20 @@ pub fn materialize(
                 // ZEB-249: track that this kick needs a matching EpochRotation.
                 // The self-healing observer synthesizes one if the bundled
                 // rotation didn't land (e.g., concurrent-kick contention).
-                m.pending_rotation_for.insert(*target);
+                //
+                // R4-1: skip the rotation marker when the prior status
+                // was PendingJoin — a PendingJoin user never received
+                // any epoch key material, so kicking them does NOT
+                // require rotating live keys for the rest of the
+                // community. Without this guard, every admin "Reject"
+                // click in PendingJoinsPanel would synthesize a full
+                // EpochRotation re-keying ALL Joined/Invited members.
+                // Mirrors the Leave arm's "leave_transitioned" guard
+                // which also drops never-members from
+                // pending_rotation_for.
+                if !matches!(prior_status, Some(MemberStatus::PendingJoin)) {
+                    m.pending_rotation_for.insert(*target);
+                }
             }
             MembershipEventKind::SetPower { target, level } => {
                 m.power_levels.insert(*target, *level);
@@ -1563,7 +1638,14 @@ pub fn prior_state_at_event(
         .filter(|e| event_sort_key(e) < target_key)
         .cloned()
         .collect();
-    materialize(&prefix, admin_addr)
+    // R4-6: when computing prior state FOR a specific candidate event,
+    // that event's own `at.wall_ms` is the natural "now floor" — by
+    // the time this candidate is being verified, the community's
+    // wall-clock has reached at least `target.at.wall_ms`. Using it as
+    // the floor lets an idle-community re-redeem attempt (a new
+    // PendingJoin at t = T + 30d) see its prior-state PendingJoin as
+    // expired, so P6 admits the re-redemption.
+    materialize_with_now(&prefix, admin_addr, Some(target.at.wall_ms))
 }
 
 /// Compute the prior materialized state for a given HLC — the
@@ -1595,7 +1677,11 @@ pub fn prior_state_at_hlc(
         })
         .cloned()
         .collect();
-    materialize(&prefix, admin_addr)
+    // R4-6: pass `target_hlc.wall_ms` as the "now floor" for the same
+    // reason as `prior_state_at_event` — by the time we're authorizing
+    // an event AT this HLC, wall-clock has reached at least
+    // `target_hlc.wall_ms`.
+    materialize_with_now(&prefix, admin_addr, Some(target_hlc.wall_ms))
 }
 
 /// Caller-provided context for verify_event. Carries the expected
@@ -4884,6 +4970,31 @@ mod zeb_254_materialize_tests {
         sign_event_with_identity(&payload, actor_private).expect("sign leave")
     }
 
+    fn synth_kick(
+        actor_private: &harmony_identity::PrivateIdentity,
+        actor_addr: OwnerAddr,
+        target: OwnerAddr,
+        community_id: SpaceId,
+        at_wall_ms: u64,
+        event_id_seed: u8,
+    ) -> SignedMembershipEvent {
+        let payload = EventPayload {
+            id: [event_id_seed; 16],
+            community_id,
+            kind: MembershipEventKind::Kick {
+                target,
+                reason: None,
+            },
+            actor: actor_addr,
+            at: Hlc {
+                wall_ms: at_wall_ms,
+                logical: 0,
+                device_id: "admin".into(),
+            },
+        };
+        sign_event_with_identity(&payload, actor_private).expect("sign kick")
+    }
+
     #[test]
     fn materialize_pending_join_only_yields_pending_status() {
         let community = SpaceId([7u8; 16]);
@@ -5198,6 +5309,167 @@ mod zeb_254_materialize_tests {
             mat.members.get(&joiner_addr).map(|m| m.status),
             Some(MemberStatus::Joined),
             "a previously-Left member with a countersigned re-join must materialize as Joined"
+        );
+    }
+
+    /// ZEB-254 R4-1: kicking a PendingJoin user must NOT mark them for
+    /// epoch rotation. A PendingJoin user never received any epoch key
+    /// material — they have no live key the rest of the community
+    /// needs to rotate away from. Without this guard the kick (admin
+    /// "Reject" click in PendingJoinsPanel) would synthesize a full
+    /// EpochRotation cycling EVERY existing member's keys for a user
+    /// who was never actually joined.
+    ///
+    /// Mirrors the Leave arm's `leave_transitioned` guard which also
+    /// drops never-members from pending_rotation_for.
+    #[test]
+    fn kick_of_pending_join_does_not_trigger_epoch_rotation() {
+        let community = SpaceId([7u8; 16]);
+        let (joiner_priv, joiner_addr, joiner_pub) = synth_identity(1);
+        let (admin_priv, admin_addr, _) = synth_identity(2);
+
+        // PendingJoin lands first; admin Kicks the still-pending joiner
+        // (Reject flow). No JoinCountersign — the kick happens BEFORE
+        // any counter-sign was issued.
+        let pending = synth_pending_join(
+            &joiner_priv,
+            joiner_addr,
+            joiner_pub,
+            community,
+            1_700_000_000_000,
+            1,
+        );
+        let kick = synth_kick(
+            &admin_priv,
+            admin_addr,
+            joiner_addr,
+            community,
+            1_700_000_001_000,
+            2,
+        );
+
+        let mat = materialize(&[pending, kick], admin_addr);
+
+        // The joiner is now Banned (the Kick arm always flips status
+        // when an existing entry is found — and PendingJoin inserted
+        // one).
+        assert_eq!(
+            mat.members.get(&joiner_addr).map(|m| m.status),
+            Some(MemberStatus::Banned),
+            "kick of a PendingJoin user must transition them to Banned"
+        );
+
+        // ... but pending_rotation_for must NOT contain the joiner —
+        // they never received epoch material, so no rotation is needed.
+        assert!(
+            !mat.pending_rotation_for.contains(&joiner_addr),
+            "R4-1: kick of a PendingJoin user must NOT mark them for \
+             EpochRotation — no epoch material was ever delivered to them"
+        );
+    }
+
+    /// ZEB-254 R4-6: idle-community PendingJoin expiry must agree
+    /// across the admin panel (uses wall-clock) and the verify-time
+    /// prior-state lookup (uses materialize). Before R4-6,
+    /// `materialize`'s `current_max_wall_ms` was always
+    /// `max(events.at.wall_ms)`. In a community whose only event IS the
+    /// PendingJoin, that max equals the PendingJoin's own wall_ms, so
+    /// age_ms = 0 and the event never registered as expired — verify
+    /// would reject re-redemption with PendingJoinAlreadyMember 30+
+    /// days later.
+    ///
+    /// This test exercises the fix: at t = T + 30d + 1s, both
+    ///   - the admin's view via `materialize_with_now(...,
+    ///     Some(wall_now))` (sees the joiner as expired / hidden)
+    ///   - the verify-time view via `prior_state_at_hlc(...,
+    ///     &re_redeem.at)` (sees the joiner as expired so P6 admits a
+    ///     new PendingJoin)
+    ///
+    /// converge on "expired".
+    #[test]
+    fn r4_6_idle_community_pending_join_expires_via_wall_clock_floor() {
+        let community = SpaceId([7u8; 16]);
+        let (joiner_priv, joiner_addr, joiner_pub) = synth_identity(1);
+        let (_, admin_addr, _) = synth_identity(2);
+
+        // PendingJoin minted at t=0 (epoch reference, simulating a
+        // community where nothing else has happened).
+        let t0 = 1_700_000_000_000_u64;
+        let pending = synth_pending_join(&joiner_priv, joiner_addr, joiner_pub, community, t0, 1);
+        let pending_slice = std::slice::from_ref(&pending);
+
+        // Without a wall-clock floor — i.e., the pre-R4-6 behavior:
+        // current_max_wall_ms = pending.at.wall_ms = t0, age_ms = 0 →
+        // status is PendingJoin (NOT expired). This is the bug.
+        let mat_no_floor = materialize_with_now(pending_slice, admin_addr, None);
+        assert_eq!(
+            mat_no_floor.members.get(&joiner_addr).map(|m| m.status),
+            Some(MemberStatus::PendingJoin),
+            "pre-R4-6 baseline: without wall-clock floor, idle-community \
+             PendingJoin never expires"
+        );
+
+        // With a wall-clock floor at t0 + 30d + 1s — i.e., the R4-6
+        // production behavior on admin's panel: the joiner is now
+        // expired and hidden from the materialized members map.
+        let wall_now = t0 + MATERIALIZE_PENDING_EXPIRY_MS + 1_000;
+        let mat_with_floor = materialize_with_now(pending_slice, admin_addr, Some(wall_now));
+        assert!(
+            !mat_with_floor.members.contains_key(&joiner_addr),
+            "R4-6: with wall-clock floor past 30d, PendingJoin must be \
+             hidden from materialize"
+        );
+
+        // And the verify-time path: when a re-redemption attempt
+        // arrives at HLC t0 + 30d + 1s, `prior_state_at_hlc` uses
+        // target_hlc.wall_ms as the now-floor, so the prior PendingJoin
+        // is seen as expired and P6 admits the re-redemption.
+        let re_redeem_hlc = Hlc {
+            wall_ms: wall_now,
+            logical: 0,
+            device_id: "joiner".into(),
+        };
+        let prior = prior_state_at_hlc(pending_slice, &re_redeem_hlc, admin_addr);
+        assert!(
+            !prior.members.contains_key(&joiner_addr),
+            "R4-6: prior_state_at_hlc must see the original PendingJoin \
+             as expired (so verify_event P6 admits the re-redemption)"
+        );
+    }
+
+    /// Companion to `kick_of_pending_join_does_not_trigger_epoch_rotation`:
+    /// confirm the Kick arm STILL marks an established (Joined) member
+    /// for rotation. Without this paired assertion, an over-eager guard
+    /// in the kick arm could silently regress ZEB-249's
+    /// epoch-rotation-on-kick invariant.
+    #[test]
+    fn kick_of_joined_member_does_trigger_epoch_rotation() {
+        let community = SpaceId([7u8; 16]);
+        let (member_priv, member_addr, _) = synth_identity(1);
+        let (admin_priv, admin_addr, _) = synth_identity(2);
+
+        // Member legacy-joins (so they actually hold epoch material),
+        // then admin kicks.
+        let join = synth_legacy_join(&member_priv, member_addr, community, 1_700_000_000_000, 1);
+        let kick = synth_kick(
+            &admin_priv,
+            admin_addr,
+            member_addr,
+            community,
+            1_700_000_001_000,
+            2,
+        );
+
+        let mat = materialize(&[join, kick], admin_addr);
+        assert_eq!(
+            mat.members.get(&member_addr).map(|m| m.status),
+            Some(MemberStatus::Banned),
+            "kick of a Joined member must transition them to Banned"
+        );
+        assert!(
+            mat.pending_rotation_for.contains(&member_addr),
+            "kick of an established Joined member MUST mark them for \
+             EpochRotation (ZEB-249 invariant preserved by R4-1 guard)"
         );
     }
 }

@@ -1585,7 +1585,19 @@ pub async fn handle_unicast<H: AppHandleEmit>(
         let s = state_arc.lock().await;
         let events: Vec<_> = s.events.values().cloned().collect();
         drop(s);
-        let mat = crate::community_membership::materialize(&events, engine_arc.admin_addr());
+        // R4-6: pass wall_now_ms so an idle-community PendingJoin is
+        // surfaced as expired (status == None) rather than as
+        // PendingJoin/Joined, preserving alignment with verify-time
+        // expiry semantics on this display path.
+        let wall_now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mat = crate::community_membership::materialize_with_now(
+            &events,
+            engine_arc.admin_addr(),
+            Some(wall_now_ms),
+        );
         let st = mat.members.get(&self_owner).map(|m| m.status);
         let pw = mat.power_levels.get(&self_owner).copied().unwrap_or(0);
         (st, pw)

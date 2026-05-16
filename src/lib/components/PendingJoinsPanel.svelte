@@ -25,6 +25,14 @@
     // a transient "Loading…" state. refresh() flips this to true at the
     // start of each fetch (M4 fix).
     let loading = false;
+    // R4-7: monotonically-increasing token captured at the start of each
+    // refresh(). Out-of-order async responses (e.g., a stale invoke()
+    // still in-flight when communityId / canModerate changes — or when
+    // a converged event triggers a refresh while a manual kickJoiner-
+    // triggered refresh is mid-flight) must NOT overwrite the results
+    // of the latest refresh. Each refresh checks `myCallId === latestCallId`
+    // before committing pending/recent/errorMessage/loading.
+    let latestCallId = 0;
 
     async function refresh() {
         // R3 (M4): reset loading state at the start of every refresh so
@@ -33,18 +41,42 @@
         // loading indicator. Without this, after the first load completes
         // loading stays false forever and the UI shows stale data with no
         // visual cue that a refresh is in flight.
+        const myCallId = ++latestCallId;
         loading = true;
         try {
-            pending = await invoke<PendingJoinDto[]>('list_pending_joins', { communityId });
-            recent = await invoke<CounterSignDto[]>('list_recent_counter_signs', {
+            const nextPending = await invoke<PendingJoinDto[]>('list_pending_joins', {
+                communityId,
+            });
+            const nextRecent = await invoke<CounterSignDto[]>('list_recent_counter_signs', {
                 communityId,
                 limit: 20,
             });
+            // R4-7: discard the result if a newer refresh has started
+            // while we were awaiting. The newer call will publish its
+            // own pending/recent — overwriting with our stale values
+            // would surface incorrect data (e.g., entries for a
+            // previously-selected community after a switch).
+            if (myCallId !== latestCallId) {
+                return;
+            }
+            pending = nextPending;
+            recent = nextRecent;
             errorMessage = '';
         } catch (e) {
+            // R4-7: also guard the error path. A late rejection from a
+            // stale call shouldn't blank out errors / valid results
+            // from the latest call.
+            if (myCallId !== latestCallId) {
+                return;
+            }
             errorMessage = e instanceof Error ? e.message : String(e);
         } finally {
-            loading = false;
+            // Only clear `loading` if THIS call is still the latest. A
+            // newer in-flight call sets loading=true at its start; we
+            // must not clobber that here.
+            if (myCallId === latestCallId) {
+                loading = false;
+            }
         }
     }
 
@@ -93,6 +125,12 @@
         }
         if (!canMod) {
             // Non-moderator path: clear any prior data and stop.
+            // R4-7: bump latestCallId so any in-flight refresh (kicked
+            // off before canMod flipped to false) discards its result
+            // when it resolves rather than re-populating pending/recent
+            // for a community the caller is no longer authorized to
+            // moderate.
+            ++latestCallId;
             pending = [];
             recent = [];
             errorMessage = '';
