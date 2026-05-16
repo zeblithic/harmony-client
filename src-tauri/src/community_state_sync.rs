@@ -1362,6 +1362,21 @@ impl CommunitySyncEngine {
         // check by passing an event whose community_id matches what it
         // claims. The entry-point guard above gives a clearer error class
         // for the common honest mismatch case.
+
+        // ZEB-254 R1 (C1) opportunistic late-bind: if admin_identity_pub is
+        // still unset and the incoming event's actor IS the admin, attempt
+        // to populate the OnceLock from the already-resolved actor_pub. This
+        // handles boot-reconcile engines (spawn_engine_inner_now sets
+        // admin_identity_pub: None) where the admin's bootstrap Join is the
+        // first event inserted — the identity_resolver already cached the
+        // admin's pub to reach this point, so we can safely promote it.
+        // Subsequent events (including PendingJoins) then see the binding.
+        if event.actor == self.admin_addr && self.admin_identity_pub.get().is_none() {
+            // OnceLock::set is no-op on the second call (Err on contention
+            // in concurrent inserts — safe to discard).
+            let _ = self.admin_identity_pub.set(actor_pub);
+        }
+
         let ctx = crate::community_membership::VerifyContext {
             expected_community_id: self.community_id,
             admin_addr: self.admin_addr,

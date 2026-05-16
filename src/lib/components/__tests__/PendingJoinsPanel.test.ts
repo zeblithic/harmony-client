@@ -43,7 +43,7 @@ describe('PendingJoinsPanel', () => {
         });
     });
 
-    test('Kick button calls kick IPC with correct args', async () => {
+    test('Kick button calls kick_from_community IPC with correct args', async () => {
         const { invoke } = await import('@tauri-apps/api/core');
         (invoke as any).mockImplementation((cmd: string) => {
             if (cmd === 'list_pending_joins') {
@@ -56,7 +56,7 @@ describe('PendingJoinsPanel', () => {
                 ]);
             }
             if (cmd === 'list_recent_counter_signs') return Promise.resolve([]);
-            if (cmd === 'kick') return Promise.resolve(null);
+            if (cmd === 'kick_from_community') return Promise.resolve(null);
             return Promise.resolve(null);
         });
         const { getByText } = render(PendingJoinsPanel, {
@@ -66,7 +66,7 @@ describe('PendingJoinsPanel', () => {
         const btn = getByText(/reject/i);
         await fireEvent.click(btn);
         await waitFor(() => {
-            expect(invoke).toHaveBeenCalledWith('kick', expect.objectContaining({
+            expect(invoke).toHaveBeenCalledWith('kick_from_community', expect.objectContaining({
                 communityId: 'abc',
                 targetAddr: '11223344',
             }));

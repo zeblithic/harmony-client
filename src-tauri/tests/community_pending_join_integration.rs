@@ -1406,6 +1406,156 @@ async fn pending_join_resolves_when_admin_comes_online() {
     admin_engine.shutdown().await.expect("admin shutdown");
 }
 
+// ── ZEB-254 R1 (C1): boot-reconcile late-bind regression test ────────────────
+
+/// Regression: an admin engine spawned with `admin_identity_pub: None`
+/// (simulating the boot-reconcile path in `spawn_engine_inner_now` before
+/// the ZEB-254 R1 fix) must still accept a PendingJoin after the admin's
+/// bootstrap Join triggers the opportunistic late-bind in
+/// `insert_event_with_resolved_pubs`.
+///
+/// The test intentionally does NOT pre-set `admin_identity_pub` in the engine
+/// config.  The only source of truth is the `identity_resolver` — which
+/// resolves the admin's pub from the admin's bootstrap Join — plus the
+/// opportunistic late-bind that promotes that resolved pub into the OnceLock.
+///
+/// Before the fix, the OnceLock remained empty for boot-reconcile engines and
+/// P5 unconditionally returned `PendingJoinTokenInvalid`.
+#[tokio::test]
+async fn boot_reconcile_engine_accepts_pending_join_via_opportunistic_late_bind() {
+    let community_id = SpaceId([0xE0u8; 16]);
+
+    // Admin.
+    let (admin_priv, admin_pub, admin_addr) = make_identity(0xC1);
+    let admin_signing = signing_key_from(&admin_priv);
+
+    // Joiner.
+    let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xD1);
+
+    // Resolver knows both parties — simulates OwnerDeviceCacheResolver in
+    // production, which has cached pubs for all known peers.
+    let mut resolver_map = HashMap::new();
+    resolver_map.insert(admin_addr, admin_pub);
+    resolver_map.insert(joiner_addr, joiner_pub);
+    let resolver: Arc<dyn IdentityResolver> = Arc::new(StaticResolver { map: resolver_map });
+
+    let cs = make_cas();
+    let (pub_tx, _pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_sub_tx, sub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // NOTE: admin_pub is intentionally NOT passed — simulates boot-reconcile
+    // spawn where admin_identity_pub defaults to None.
+    let engine = build_engine_with_resolver(
+        community_id,
+        admin_addr,
+        admin_addr, // self == admin
+        admin_signing,
+        pub_tx,
+        sub_rx,
+        cs,
+        &tmp,
+        Some(resolver),
+        None, // <-- boot-reconcile: no pre-set admin_identity_pub
+    );
+
+    // Step 1: insert admin bootstrap Join. The resolver returns admin_pub for
+    // admin_addr; the opportunistic late-bind in insert_event_with_resolved_pubs
+    // populates the OnceLock from this resolved actor_pub.
+    let admin_join_payload = EventPayload {
+        id: [0xC1u8; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: admin_addr,
+        at: Hlc {
+            wall_ms: 1_700_000_001_000,
+            logical: 0,
+            device_id: "admin-dev".into(),
+        },
+    };
+    let admin_join =
+        sign_event_with_identity(&admin_join_payload, &admin_priv).expect("sign admin join");
+    let bootstrap_outcome = engine
+        .insert_local_event_with_pubs(admin_join, admin_pub, None)
+        .await
+        .expect("admin join insert");
+    assert!(
+        matches!(bootstrap_outcome, InsertOutcome::Inserted),
+        "admin bootstrap join must be Inserted; got {:?}",
+        bootstrap_outcome
+    );
+
+    // Step 2: insert a PendingJoin from joiner. The P5 gate now sees a populated
+    // admin_identity_pub (set by the late-bind above) and can verify the token.
+    let token = make_signed_token(
+        &admin_priv,
+        admin_addr,
+        Some(joiner_addr),
+        Some(1_700_000_100_000),
+    );
+    let pending_payload = EventPayload {
+        id: [0xD1u8; 16],
+        community_id,
+        kind: MembershipEventKind::PendingJoin {
+            invite_token: token,
+            joiner_identity_pub: joiner_pub,
+        },
+        actor: joiner_addr,
+        at: Hlc {
+            wall_ms: 1_700_000_002_000,
+            logical: 0,
+            device_id: "joiner-dev".into(),
+        },
+    };
+    let pending_join =
+        sign_event_with_identity(&pending_payload, &joiner_priv).expect("sign PendingJoin");
+    let pending_id = pending_join.id;
+
+    let pending_outcome = engine
+        .insert_local_event_with_pubs(pending_join, joiner_pub, None)
+        .await
+        .expect("PendingJoin insert");
+
+    assert!(
+        matches!(pending_outcome, InsertOutcome::Inserted),
+        "PendingJoin must be Inserted after opportunistic late-bind; got {:?} — \
+         boot-reconcile engines likely still returning None from admin_identity_pub",
+        pending_outcome
+    );
+
+    // Step 3: admin engine auto-counter-sign hook should fire because self == admin.
+    // Wait for the JoinCountersign to appear in the state.
+    let state_arc = engine.state();
+    let found = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            {
+                let g = state_arc.lock().await;
+                let found = g.events.values().any(|e| {
+                    e.actor == admin_addr
+                        && matches!(
+                            &e.kind,
+                            MembershipEventKind::JoinCountersign { target_event_id }
+                            if *target_event_id == pending_id
+                        )
+                });
+                if found {
+                    return true;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for auto-JoinCountersign on boot-reconcile engine");
+
+    assert!(
+        found,
+        "auto-counter-sign must fire on boot-reconcile engine after late-bind"
+    );
+
+    engine.shutdown().await.expect("shutdown");
+}
+
 // SKIP: pending_join_30d_expiry_hides_joiner
 //
 // This integration test would be redundant with the unit tests already in

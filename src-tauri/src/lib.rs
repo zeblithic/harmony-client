@@ -8327,6 +8327,22 @@ pub async fn create_community_inner<R: tauri::Runtime>(
         .await
         .map_err(|e| format!("registry.spawn_engine_with_guard: {e}"))?;
 
+    // ZEB-254 R1 (C1): bind admin_identity_pub so the P5 gate can verify
+    // PendingJoin InviteToken signatures on this engine. The admin IS the
+    // community creator — we derive the 64-byte composite pub from the
+    // signing key (same layout as the joiner path at ~L9350).
+    {
+        use crate::dm_signing::ed25519_priv_to_x25519;
+        let x25519_priv = ed25519_priv_to_x25519(&signing_key);
+        let x25519_pub =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*x25519_priv));
+        let ed25519_pub_bytes = signing_key.verifying_key().to_bytes();
+        let mut admin_identity_pub = [0u8; 64];
+        admin_identity_pub[..32].copy_from_slice(x25519_pub.as_bytes());
+        admin_identity_pub[32..].copy_from_slice(&ed25519_pub_bytes);
+        engine_arc.bind_admin_identity_pub(admin_identity_pub);
+    }
+
     // Bootstrap-Join via the engine. The engine's `insert_local_event`
     // runs verify_event (which authorizes the admin self-Join via the
     // bootstrap rule) and fires `notify_dirty` on success; the debounced
@@ -10210,6 +10226,10 @@ async fn redeem_invite(
     // ZEB-265: surface the redeemed community to the nav listener.
     // emit failure is non-fatal — the join already committed, and
     // App.svelte still synthesizes from the DTO until step 3 lands.
+    //
+    // ZEB-254 R1 (I1): carry dto.pending so listeners that subscribe AFTER
+    // this emit (e.g. nav components mounted post-redeem) see the correct
+    // greyed state rather than assuming non-pending.
     if let Err(e) = app.emit(
         "nav-updated",
         &NavUpdatedPayload {
@@ -10219,7 +10239,7 @@ async fn redeem_invite(
             name: dto.community_name.clone(),
             members: None,
             parent_id: None,
-            pending: None,
+            pending: Some(dto.pending),
         },
     ) {
         tracing::warn!(error = %e, "redeem_invite: nav-updated emit failed");
