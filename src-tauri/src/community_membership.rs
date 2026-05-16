@@ -714,6 +714,12 @@ pub enum VerifyError {
     /// ZEB-250 AP5: ChangeQuorum new_quorum is < 1 or exceeds current
     /// admin count.
     AdminProposalQuorumOutOfRange,
+    /// ZEB-250 AC1: AdminCountersign actor is not currently Joined.
+    AdminCountersignActorNotJoined,
+    /// ZEB-250 AC2: AdminCountersign actor's power is below 100.
+    AdminCountersignActorNotAdmin,
+    /// ZEB-250 AC3: target_event_id is malformed (e.g., all-zero).
+    AdminCountersignTargetIdMalformed,
 }
 
 impl std::fmt::Display for VerifyError {
@@ -851,6 +857,15 @@ impl std::fmt::Display for VerifyError {
             }
             VerifyError::AdminProposalQuorumOutOfRange => {
                 write!(f, "ZEB-250 AdminProposal ChangeQuorum new_quorum out of range [1, admin_count]")
+            }
+            VerifyError::AdminCountersignActorNotJoined => {
+                write!(f, "ZEB-250 AdminCountersign actor is not Joined")
+            }
+            VerifyError::AdminCountersignActorNotAdmin => {
+                write!(f, "ZEB-250 AdminCountersign actor power < 100 (admin tier)")
+            }
+            VerifyError::AdminCountersignTargetIdMalformed => {
+                write!(f, "ZEB-250 AdminCountersign target_event_id is malformed")
             }
         }
     }
@@ -2228,8 +2243,29 @@ pub fn verify_event(
                 }
             }
         }
-        MembershipEventKind::AdminCountersign { .. } => {
-            // Task 5 will replace this stub with the real AC1-AC3 gates.
+        MembershipEventKind::AdminCountersign { target_event_id } => {
+            // AC1: actor Joined.
+            let actor_state = prior_state.members.get(&event.actor);
+            if !matches!(actor_state.map(|s| s.status), Some(MemberStatus::Joined)) {
+                return Err(VerifyError::AdminCountersignActorNotJoined);
+            }
+            // AC2: actor power >= 100.
+            let actor_power_ac = prior_state
+                .power_levels
+                .get(&event.actor)
+                .copied()
+                .unwrap_or(0);
+            if actor_power_ac < 100 {
+                return Err(VerifyError::AdminCountersignActorNotAdmin);
+            }
+            // AC3: target_event_id non-zero.
+            if target_event_id.iter().all(|b| *b == 0) {
+                return Err(VerifyError::AdminCountersignTargetIdMalformed);
+            }
+            // Note: AC verify does NOT require the target proposal to
+            // be in the event log yet. Lenient forward-ref semantics
+            // mirror ZEB-254's JoinCountersign — out-of-order DAG-sync
+            // delivery is normal. Pairing happens at materialize time.
         }
     }
 
@@ -2487,7 +2523,8 @@ pub fn verify_event(
             // joined-membership block above. No separate power rule needed.
         }
         MembershipEventKind::AdminCountersign { .. } => {
-            // Task 5 will add AC1-AC3 gates here.
+            // All AdminCountersign gates (AC1-AC3) are handled in the
+            // joined-membership block above. No separate power rule needed.
         }
     }
 
@@ -6538,6 +6575,164 @@ mod zeb_250_admin_proposal_verify_tests {
             admin_addr: admin1_addr,
             is_invite_only: false,
             actor_identity_pub: &admin1_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: None,
+        };
+        assert_eq!(verify_event(&evt, &prior, &ctx), Ok(()));
+    }
+}
+
+// ── ZEB-250 Task 5: AdminCountersign verify_event gate tests ──────────────
+
+#[cfg(test)]
+mod zeb_250_admin_countersign_verify_tests {
+    use super::*;
+
+    fn make_identity(seed_byte: u8) -> (harmony_identity::PrivateIdentity, [u8; 64], OwnerAddr) {
+        let seed = [seed_byte; 32];
+        let private = harmony_identity::PrivateIdentity::from_seed(&seed);
+        let public = private.public_identity();
+        let identity_pub = public.to_public_bytes();
+        let addr = OwnerAddr(public.address_hash);
+        (private, identity_pub, addr)
+    }
+
+    fn make_admin_countersign_event(
+        id: [u8; 16],
+        actor_priv: &harmony_identity::PrivateIdentity,
+        actor_addr: OwnerAddr,
+        target_event_id: [u8; 16],
+        at_wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        let payload = EventPayload {
+            id,
+            community_id: SpaceId([0xc0; 16]),
+            kind: MembershipEventKind::AdminCountersign { target_event_id },
+            actor: actor_addr,
+            at: Hlc {
+                wall_ms: at_wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+        };
+        sign_event_with_identity(&payload, actor_priv)
+            .expect("sign_event_with_identity must succeed")
+    }
+
+    #[test]
+    fn admin_countersign_accepted_when_actor_admin() {
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let mut prior = MaterializedMembership::default();
+        prior.members.insert(
+            admin_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "a".into(),
+                },
+                left_at: None,
+            },
+        );
+        prior.power_levels.insert(admin_addr, 100);
+        let evt =
+            make_admin_countersign_event([0x10; 16], &admin_priv, admin_addr, [0x55; 16], 1_000);
+        let ctx = VerifyContext {
+            expected_community_id: SpaceId([0xc0; 16]),
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: None,
+        };
+        assert_eq!(verify_event(&evt, &prior, &ctx), Ok(()));
+    }
+
+    #[test]
+    fn admin_countersign_rejected_when_actor_not_joined() {
+        let (actor_priv, actor_pub, actor_addr) = make_identity(0x01);
+        let prior = MaterializedMembership::default();
+        let evt =
+            make_admin_countersign_event([0x10; 16], &actor_priv, actor_addr, [0x55; 16], 1_000);
+        let ctx = VerifyContext {
+            expected_community_id: SpaceId([0xc0; 16]),
+            admin_addr: actor_addr,
+            is_invite_only: false,
+            actor_identity_pub: &actor_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: None,
+        };
+        assert_eq!(
+            verify_event(&evt, &prior, &ctx),
+            Err(VerifyError::AdminCountersignActorNotJoined)
+        );
+    }
+
+    #[test]
+    fn admin_countersign_rejected_when_actor_power_below_100() {
+        let (mod_priv, mod_pub, mod_addr) = make_identity(0x01);
+        let mut prior = MaterializedMembership::default();
+        prior.members.insert(
+            mod_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "m".into(),
+                },
+                left_at: None,
+            },
+        );
+        prior.power_levels.insert(mod_addr, 50);
+        let evt = make_admin_countersign_event([0x10; 16], &mod_priv, mod_addr, [0x55; 16], 1_000);
+        let ctx = VerifyContext {
+            expected_community_id: SpaceId([0xc0; 16]),
+            admin_addr: mod_addr,
+            is_invite_only: false,
+            actor_identity_pub: &mod_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: None,
+        };
+        assert_eq!(
+            verify_event(&evt, &prior, &ctx),
+            Err(VerifyError::AdminCountersignActorNotAdmin)
+        );
+    }
+
+    #[test]
+    fn admin_countersign_accepted_when_target_not_present_yet() {
+        // Lenient forward-ref: AC must verify even when the target
+        // AdminProposal is not yet in the log. prior_state has no
+        // record of [0x55; 16] — and that's fine.
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let mut prior = MaterializedMembership::default();
+        prior.members.insert(
+            admin_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "a".into(),
+                },
+                left_at: None,
+            },
+        );
+        prior.power_levels.insert(admin_addr, 100);
+        let evt = make_admin_countersign_event(
+            [0x11; 16],
+            &admin_priv,
+            admin_addr,
+            [0x55; 16], // target absent from prior_state
+            5_000,
+        );
+        let ctx = VerifyContext {
+            expected_community_id: SpaceId([0xc0; 16]),
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &admin_pub,
             countersigner_identity_pub: None,
             admin_identity_pub: None,
         };
