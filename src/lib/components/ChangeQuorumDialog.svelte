@@ -1,10 +1,7 @@
 <script lang="ts">
   import { untrack } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
-
-  type AdminActionResult =
-    | { kind: 'Completed' }
-    | { kind: 'Pending'; proposal_event_id: string; signers_so_far: number; quorum_required: number };
+  import type { AdminActionResult } from '../types';
 
   let {
     communityId,

@@ -149,17 +149,20 @@
   // ZEB-250: pending-badge map — indexed by target_addr for O(1) member-row lookup.
   // Only fetched when caller is admin (IPC is admin-gated per spec §7.5).
   let pendingProposalsByTarget = $state<Map<string, PendingAdminProposalDto>>(new Map());
+  let latestProposalsCallId = 0;
 
   $effect(() => {
     // Track reactive deps.
     void communityId;
-    const admin = canAdmin;
-    if (!admin) {
+    if (!canAdmin) {
+      latestProposalsCallId++;
       pendingProposalsByTarget = new Map();
       return;
     }
+    const myCallId = ++latestProposalsCallId;
     invoke<PendingAdminProposalDto[]>('list_pending_admin_proposals', { communityId })
       .then((proposals) => {
+        if (myCallId !== latestProposalsCallId) return; // stale
         const m = new Map<string, PendingAdminProposalDto>();
         for (const p of proposals) {
           if (p.expired || p.effective) continue;

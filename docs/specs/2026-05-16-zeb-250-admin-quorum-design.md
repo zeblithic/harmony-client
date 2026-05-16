@@ -60,7 +60,7 @@ ZEB-250 does NOT introduce a time-based admin-inactivity fallback. Documentation
 | Leave is self-determined (no quorum) | Per polycentric memory — personal liberty + free association. Documented: don't set `admin_quorum > current_admin_count - 1` if you want survivability. |
 | Fork: forker is sole admin with quorum=1 (fresh start) | Per ZEB-285 — fork is fresh sovereign entity, not a governance continuation. Avoids the trap of inheriting an unreachable quorum. |
 | New `PendingAdminProposalsPanel.svelte` + `ChangeQuorumDialog.svelte` (admin-only) | Parallel to ZEB-254's PendingJoinsPanel. Separate from PendingJoinsPanel for v1 (consolidation deferred). |
-| Existing `set_power_level` / `kick_from_community` auto-route based on `admin_quorum` | Frontend doesn't need to know which path. IPC returns discriminated `AdminActionResult { Completed | Pending { ... } }`. |
+| Existing `set_power_level` / `kick_from_community` auto-route based on `admin_quorum` | Frontend doesn't need to know which path. IPC returns discriminated `AdminActionResult { Completed \| Pending { ... } }`. |
 | No auto-countersign hook for admin proposals | Deliberate UX. Admin actions are governance, not bot-driven. Admins explicitly countersign via panel. |
 
 ## 3. Wire surface
@@ -824,7 +824,7 @@ Two-engine local run per ZEB-254/287 pattern:
 2. `CommunityState.admin_quorum` field added (default 1, byte-compatible).
 3. Direct `SetPower{level: 100}` / `SetPower{target: admin, level: <100}` / `Kick{target: admin}` rejected at verify when `admin_quorum > 1`.
 4. ProposalKind well-formedness (AP3) + admin-affecting check (AP4) + ChangeQuorum range (AP5) all enforced.
-5. Materialize pre-pass collects `quorum_signers` + `quorum_reached_at` HLCs.
+5. Materialize single-pass-with-running-state algorithm collects per-proposal signer state and applies effects once quorum is reached.
 6. Quorum-reached-then-aged proposals remain effective (permanence per §5.3).
 7. Late countersigns to expired proposals are no-ops.
 8. ChangeQuorum updates `admin_quorum` field on materialize.

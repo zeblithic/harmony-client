@@ -139,6 +139,8 @@
     if (result.kind === 'Pending') {
       pendingActionMsg =
         `Proposal submitted — ${result.signers_so_far} of ${result.quorum_required} signatures`;
+    } else {
+      pendingActionMsg = null;
     }
   }
 
