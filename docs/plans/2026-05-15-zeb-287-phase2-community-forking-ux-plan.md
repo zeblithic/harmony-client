@@ -216,11 +216,14 @@ In `src-tauri/src/community_invite.rs`, modify the existing `PreForkSnapshot` de
     #[serde(rename = "ts")]
     pub forked_at: Hlc,
 
-    /// ZEB-287 Phase 2: ordered list of ancestors above the immediate
-    /// parent (root → immediate parent), frozen at fork-time. The
-    /// immediate parent is encoded separately via the existing
-    /// `original_community_id` / `original_community_name` fields,
-    /// NOT duplicated here.
+    /// ZEB-287 Phase 2: ordered ancestor chain (root → immediate parent),
+    /// frozen at fork-time. INCLUDES the immediate parent as the last
+    /// (tail) entry — that tail is intentionally duplicated with the
+    /// existing `original_community_id` / `original_community_name`
+    /// fields so the redeem path can mirror the chain verbatim into
+    /// `CommunityState.parent_lineage` while keeping `original_community_id`
+    /// as the canonical immediate-parent pointer for the Phase 1
+    /// `forked_from` path. See spec §3.2.
     ///
     /// Length capped at 16 entries at fork-build time (see
     /// `community_fork.rs::build_fork_snapshot`). Phase 1 fork-invites
@@ -374,11 +377,13 @@ In `src-tauri/src/community_state_crdt.rs`, modify the existing struct. Add afte
     #[serde(rename = "fa", skip_serializing_if = "Option::is_none", default)]
     pub forked_at_wall_ms: Option<u64>,
 
-    /// ZEB-287 Phase 2: ordered list of ancestors above the immediate
-    /// parent (root → immediate parent). Mirrors
-    /// `PreForkSnapshot.parent_lineage` — populated at redeem-time from
-    /// the fork-invite snapshot. Empty for top-level communities and
-    /// for Phase 1 forks (which carried no chain). Byte-compatible.
+    /// ZEB-287 Phase 2: ordered ancestor chain (root → immediate parent).
+    /// INCLUDES the immediate parent as the tail entry (also encoded via
+    /// the Phase 1 `forked_from` field — intentional duplication; see
+    /// spec §3.3). Mirrors `PreForkSnapshot.parent_lineage` —
+    /// populated at redeem-time from the fork-invite snapshot. Empty for
+    /// top-level communities and for Phase 1 forks (which carried no
+    /// chain). Byte-compatible.
     #[serde(rename = "fl", skip_serializing_if = "Vec::is_empty", default)]
     pub parent_lineage: Vec<crate::community_invite::ParentLineageEntry>,
 
@@ -1059,9 +1064,14 @@ pub struct CommunityLineageDto {
     /// Phase 2 field: wall_ms of THIS community's Fork event from
     /// its parent. None for top-level or Phase 1 forks.
     pub forked_at_wall_ms: Option<u64>,
-    /// Phase 2 field: ordered ancestor chain (root → immediate-parent),
-    /// excluding the immediate parent (that's `forked_from`). Empty for
-    /// top-level communities and Phase 1 forks.
+    /// Phase 2 field: ordered ancestor chain (root → immediate parent),
+    /// INCLUDING the immediate parent as the tail entry — intentionally
+    /// duplicated with `forked_from` so consumers can iterate
+    /// `parent_lineage` linearly without special-casing the immediate
+    /// parent. Empty for top-level communities and (raw) Phase 1 forks;
+    /// the IPC synthesizes a single immediate-parent entry from
+    /// `forked_from` for Phase 1 forks so the tree still renders the
+    /// parent row. Matches CommunityState.parent_lineage shape (spec §3.3).
     pub parent_lineage: Vec<ParentLineageDto>,
     /// This community's own SpaceId (hex) — convenience so frontend can
     /// render "you are here" without a second IPC.
@@ -1502,7 +1512,9 @@ export interface CommunityLineageDto {
   forked_from: string | null;
   /** wall_ms of this community's fork-from-parent event. */
   forked_at_wall_ms: number | null;
-  /** Ancestors above immediate parent (root → above immediate parent). */
+  /** Ordered ancestor chain (root → immediate parent), INCLUDING the
+   *  immediate parent as the tail entry. Intentionally duplicated with
+   *  `forked_from` so consumers iterate this list linearly. */
   parent_lineage: ParentLineageDto[];
   /** This community's own SpaceId (hex). */
   self_space_id: string;

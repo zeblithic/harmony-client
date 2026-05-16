@@ -81,6 +81,10 @@
      *  activated. Caller routes the spaceId to the community-navigation
      *  primitive (NavService.selectCommunity equivalent). */
     onForkLineageNavigate?: (spaceId: string) => void;
+    /** ZEB-287 R3-1: resolver for a fork's display name from its hex SpaceId.
+     *  Caller passes NavService.getCommunityNameBySpaceId so the Forks tree
+     *  renders locally-known descendants by name (not raw hex). */
+    resolveLocalCommunityName?: (spaceId: string) => string | null | undefined;
   } = $props();
 
   let kickTarget = $state<CommunityMember | null>(null);
@@ -315,6 +319,7 @@
           lineage={phase2Lineage}
           {descendants}
           {localNavIds}
+          resolveLocalName={resolveLocalCommunityName}
           onNavigate={(spaceId) => onForkLineageNavigate?.(spaceId)}
         />
       {/if}

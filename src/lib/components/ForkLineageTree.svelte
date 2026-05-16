@@ -8,6 +8,7 @@
     lineage,
     descendants = [],
     localNavIds = new Set<string>(),
+    resolveLocalName,
     onNavigate,
   }: {
     lineage: CommunityLineageDto;
@@ -16,6 +17,14 @@
      *  ancestor / descendant rows. Caller typically passes the OwnerState
      *  Space-id set (e.g., the current NavService snapshot). */
     localNavIds?: Set<string>;
+    /** ZEB-287 R3-1: resolves a hex SpaceId to its display name from the
+     *  caller's local nav state (typically NavService.getCommunityNameBySpaceId).
+     *  Used to render `locally_known: true` descendants with their real
+     *  community name instead of a truncated hex. Returns `null`/`undefined`
+     *  if the caller can't resolve, in which case we fall back to truncated
+     *  hex (defense-in-depth — shouldn't happen when localNavIds includes
+     *  the SpaceId, but we don't trust prop-set consistency blindly). */
+    resolveLocalName?: (spaceId: string) => string | null | undefined;
     /** Callback fired when a clickable row is activated. Caller routes
      *  the spaceId to its own community-navigation primitive (NavService). */
     onNavigate?: (spaceId: string) => void;
@@ -105,7 +114,8 @@
 
   {#each descendants as desc (desc.forkSpaceId)}
     {@const known = desc.locallyKnown && localNavIds.has(desc.forkSpaceId)}
-    {@const display = known ? desc.forkSpaceId : truncSpaceId(desc.forkSpaceId)}
+    {@const resolvedName = known ? resolveLocalName?.(desc.forkSpaceId) : null}
+    {@const display = resolvedName ?? truncSpaceId(desc.forkSpaceId)}
     {@const forker = desc.forkerDisplayName ?? 'an unknown member'}
     <li
       role="treeitem"

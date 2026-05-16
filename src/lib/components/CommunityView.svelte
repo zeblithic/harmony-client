@@ -351,6 +351,7 @@
     {phase2Lineage}
     {descendants}
     localNavIds={localCommunityIds}
+    resolveLocalCommunityName={(spaceId) => navService.getCommunityNameBySpaceId(spaceId)}
     onForkLineageNavigate={(spaceId) => {
       settingsModalOpen = false;
       onSelectCommunity?.(spaceId);

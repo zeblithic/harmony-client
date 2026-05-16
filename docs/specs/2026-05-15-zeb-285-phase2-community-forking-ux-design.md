@@ -255,7 +255,12 @@ struct CommunityLineageDto {
     forked_from: Option<String>,
     /// Phase 2 — wall_ms of THIS community's Fork event, None for top-level
     forked_at_wall_ms: Option<u64>,
-    /// Phase 2 — root → immediate-parent ancestor chain (without immediate parent — that's `forked_from`)
+    /// Phase 2 — root → immediate-parent ancestor chain, INCLUDING the
+    /// immediate parent as the last (tail) entry. The immediate parent
+    /// is intentionally duplicated with `forked_from` so DTO consumers
+    /// can iterate `parent_lineage` linearly without special-casing the
+    /// immediate parent. Matches `CommunityState.parent_lineage` and
+    /// `PreForkSnapshot.parent_lineage` (see §3.2, §3.3).
     parent_lineage: Vec<ParentLineageDto>,
     /// Convenience: this community's own name + id, so the frontend can
     /// render "you are here" without a second IPC.
@@ -348,7 +353,7 @@ Rendered at the top of the ancestor region, non-clickable, muted.
 ```
 
 Where:
-- `{self-depth-indent}` = `parent_lineage.length` (deepest yet — one more indent than the deepest ancestor)
+- `{self-depth-indent}` = `parent_lineage.length + 1` (one more indent than the deepest ancestor, since `parent_lineage` INCLUDES the immediate parent as its tail entry)
 - The row has `aria-current="page"` and a subtle highlighted background
 - Non-clickable (you're already here)
 - The arrow direction is intentional: "the marker for current position points at the community name", reading naturally LTR
@@ -360,7 +365,7 @@ Where:
 ```
 
 Where:
-- `{descendant-depth-indent}` = `parent_lineage.length + 1` (one deeper than self)
+- `{descendant-depth-indent}` = `parent_lineage.length + 2` (one deeper than self, where self sits at `parent_lineage.length + 1` since `parent_lineage` INCLUDES the immediate parent as its tail entry)
 - `{display}`:
   - If `locally_known`: descendant community's display name from local NavService
   - Otherwise: `0x{first 8 hex chars of fork_space_id}…`

@@ -223,6 +223,77 @@ describe('ForkLineageTree', () => {
     expect(queryByText(/no forks yet/i)).toBeNull();
   });
 
+  it('renders_descendant_name_when_locally_known', () => {
+    // R3-1 regression: descendants with `locally_known: true` AND a hit in
+    // localNavIds should render via the injected resolveLocalName resolver
+    // — NOT a truncated hex string. Per spec §5.2.
+    const descendants: ForkDescendantDto[] = [
+      {
+        forkSpaceId: '33'.repeat(16),
+        forkerAddr: 'ab'.repeat(16),
+        forkerDisplayName: 'Maya',
+        forkedAtWallMs: 1_715_000_000_000,
+        locallyKnown: true,
+      },
+      {
+        forkSpaceId: '44'.repeat(16),
+        forkerAddr: 'cd'.repeat(16),
+        forkerDisplayName: 'Sam',
+        forkedAtWallMs: 1_716_000_000_000,
+        locallyKnown: false, // not locally known — should stay as truncated hex
+      },
+    ];
+    const resolver = vi.fn((hex: string) =>
+      hex === '33'.repeat(16) ? 'Resolved Fork Name' : null,
+    );
+
+    const { getByText, queryByText } = render(ForkLineageTree, {
+      props: {
+        lineage: emptyLineage('Root'),
+        descendants,
+        // Both forks "potentially known", but only the first has locallyKnown:true
+        localNavIds: new Set(['33'.repeat(16), '44'.repeat(16)]),
+        resolveLocalName: resolver,
+      },
+    });
+
+    // Known + resolver hit → real name shown
+    expect(getByText(/Resolved Fork Name/)).toBeTruthy();
+    // Not-known descendant → still truncated hex (locallyKnown: false suppresses resolution)
+    expect(getByText(/0x44444444…/)).toBeTruthy();
+    // The full hex for the known fork must NOT appear (spec §5.2 — names not hex when known)
+    expect(queryByText(/33{16}/)).toBeNull();
+    // Resolver was called only for the locally-known descendant
+    expect(resolver).toHaveBeenCalledWith('33'.repeat(16));
+  });
+
+  it('renders_descendant_truncated_hex_when_resolver_returns_null', () => {
+    // R3-1 defense-in-depth: even when locallyKnown + localNavIds both
+    // gate to "known", if the resolver returns null we fall back to
+    // truncated hex (shouldn't happen in production but the fallback
+    // keeps the row legible if NavService races the gating set).
+    const descendants: ForkDescendantDto[] = [
+      {
+        forkSpaceId: '77'.repeat(16),
+        forkerAddr: 'ee'.repeat(16),
+        forkerDisplayName: 'Ari',
+        forkedAtWallMs: 1_717_000_000_000,
+        locallyKnown: true,
+      },
+    ];
+
+    const { getByText } = render(ForkLineageTree, {
+      props: {
+        lineage: emptyLineage('Root'),
+        descendants,
+        localNavIds: new Set(['77'.repeat(16)]),
+        resolveLocalName: () => null,
+      },
+    });
+
+    expect(getByText(/0x77777777…/)).toBeTruthy();
+  });
+
   it('aria_current_page_on_self_row', () => {
     const { container } = render(ForkLineageTree, {
       props: {
