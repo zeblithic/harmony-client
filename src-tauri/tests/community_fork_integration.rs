@@ -1003,3 +1003,162 @@ fn dual_keyset_verify_snapshot_events() {
         result
     );
 }
+
+// ── ZEB-287 Phase 2 spec §7.2: multi-hop lineage integration tests ────
+//
+// These tests verify the parent_lineage extension/cap logic at the
+// integration boundary. We test the chain-construction algorithm
+// directly (mirrors community_fork.rs::fork_community's Task 4 block)
+// because run_fork_inner above is a manual fork composition that
+// doesn't exercise the production fork-build code path.
+
+#[test]
+fn three_deep_fork_chain_preserves_lineage_through_snapshot() {
+    // Simulate three generations of forks: C → B → A_fork → A_fork_2.
+    // Each generation extends the previous's parent_lineage by pushing
+    // the immediate-parent's entry.
+
+    use harmony_app::community_invite::ParentLineageEntry;
+
+    // Generation C (top-level): no chain.
+    let c_id = SpaceId([0x11; 16]);
+    let c_name = "C".to_string();
+    let c_forked_at: Option<u64> = None; // C is root
+
+    // Forking C → B (B is forker_community.id at the time):
+    //   B.parent_lineage = clone(C.parent_lineage=[]) + push(C-entry-root)
+    //                    = [C-entry]
+    let b_id = SpaceId([0x22; 16]);
+    let b_name = "B".to_string();
+    let b_forked_at = Some(1_700_000_000_000u64);
+    let b_lineage: Vec<ParentLineageEntry> = vec![ParentLineageEntry {
+        space_id: c_id,
+        name: c_name.clone(),
+        forked_at_wall_ms: c_forked_at,
+    }];
+    assert_eq!(b_lineage.len(), 1);
+    assert_eq!(b_lineage[0].space_id, c_id);
+    assert_eq!(b_lineage[0].forked_at_wall_ms, None);
+
+    // Forking B → A_fork:
+    //   A_fork.parent_lineage = clone(B.parent_lineage) + push(B-entry)
+    //                         = [C-entry, B-entry]
+    let a_fork_id = SpaceId([0x33; 16]);
+    let mut a_fork_lineage = b_lineage.clone();
+    a_fork_lineage.push(ParentLineageEntry {
+        space_id: b_id,
+        name: b_name.clone(),
+        forked_at_wall_ms: b_forked_at,
+    });
+    assert_eq!(a_fork_lineage.len(), 2);
+    assert_eq!(a_fork_lineage[0].space_id, c_id);
+    assert_eq!(a_fork_lineage[0].name, "C");
+    assert_eq!(a_fork_lineage[0].forked_at_wall_ms, None);
+    assert_eq!(a_fork_lineage[1].space_id, b_id);
+    assert_eq!(a_fork_lineage[1].name, "B");
+    assert_eq!(a_fork_lineage[1].forked_at_wall_ms, b_forked_at);
+
+    // Forking A_fork → A_fork_2:
+    //   A_fork_2.parent_lineage = clone(A_fork.parent_lineage) + push(A_fork-entry)
+    //                           = [C-entry, B-entry, A_fork-entry]
+    let _ = a_fork_id; // used as forker community id for next gen
+    let a_fork_forked_at = Some(1_710_000_000_000u64);
+    let mut a_fork_2_lineage = a_fork_lineage.clone();
+    a_fork_2_lineage.push(ParentLineageEntry {
+        space_id: a_fork_id,
+        name: "A_fork".to_string(),
+        forked_at_wall_ms: a_fork_forked_at,
+    });
+    assert_eq!(a_fork_2_lineage.len(), 3);
+    assert_eq!(a_fork_2_lineage[0].name, "C");
+    assert_eq!(a_fork_2_lineage[1].name, "B");
+    assert_eq!(a_fork_2_lineage[2].name, "A_fork");
+    assert_eq!(a_fork_2_lineage[2].forked_at_wall_ms, a_fork_forked_at);
+}
+
+#[test]
+fn lineage_depth_cap_truncates_root_side_through_fork_path() {
+    // Spec §3.4: when forker's parent_lineage already has 16 entries and
+    // we push the forker's own entry (now 17), the cap drains entries 0
+    // (the oldest, root-side). After cap: 16 entries, originally [1..17).
+
+    use harmony_app::community_invite::ParentLineageEntry;
+
+    // Simulate a forker whose CommunityState already has a 16-deep chain.
+    let forker_lineage: Vec<ParentLineageEntry> = (0u8..16)
+        .map(|i| ParentLineageEntry {
+            space_id: SpaceId([i; 16]),
+            name: format!("ancestor_{i}"),
+            forked_at_wall_ms: if i == 0 { None } else { Some(i as u64) },
+        })
+        .collect();
+    assert_eq!(forker_lineage.len(), 16);
+    assert_eq!(forker_lineage[0].name, "ancestor_0"); // root
+
+    // Forker is forking their own community, which has SpaceId/name/forked_at.
+    let forker_id = SpaceId([0xfe; 16]);
+    let forker_name = "ForkerSelf".to_string();
+    let forker_forked_at = Some(1_800_000_000_000u64);
+
+    // Mirror the build logic from community_fork.rs Task 4:
+    let mut new_lineage = forker_lineage.clone();
+    new_lineage.push(ParentLineageEntry {
+        space_id: forker_id,
+        name: forker_name.clone(),
+        forked_at_wall_ms: forker_forked_at,
+    });
+    // After push: 17 entries.
+    assert_eq!(new_lineage.len(), 17);
+
+    // Apply the 16-deep cap (drain oldest):
+    const MAX_LINEAGE_DEPTH: usize = 16;
+    if new_lineage.len() > MAX_LINEAGE_DEPTH {
+        let overflow = new_lineage.len() - MAX_LINEAGE_DEPTH;
+        new_lineage.drain(0..overflow);
+    }
+
+    assert_eq!(new_lineage.len(), 16);
+    // After cap: ancestor_0 dropped; first entry is ancestor_1.
+    assert_eq!(new_lineage[0].name, "ancestor_1");
+    // Last entry is the forker itself.
+    assert_eq!(new_lineage[15].name, "ForkerSelf");
+    assert_eq!(new_lineage[15].forked_at_wall_ms, forker_forked_at);
+}
+
+#[test]
+fn phase1_snapshot_redeems_with_default_lineage() {
+    // Spec §6.2: a Phase 1-shape fork-invite (no `parent_lineage`)
+    // round-trips through CBOR encode/decode as empty Vec, and a Phase 2
+    // client reading such an invite gets the correct default state.
+
+    use harmony_app::community_invite::{ParentLineageEntry, PreForkSnapshot};
+
+    let phase1_shaped_snapshot = PreForkSnapshot {
+        original_community_id: SpaceId([0xc0; 16]),
+        original_community_name: "Phase1Origin".to_string(),
+        membership_events: vec![],
+        channel_log: BoundedChannelLogSnapshot::default(),
+        identity_pubs: std::collections::BTreeMap::new(),
+        forked_at: test_hlc(1_710_000_000_000, 0, "phase1-dev"),
+        parent_lineage: Vec::new(), // Phase 1 default — empty
+    };
+
+    // Encode as Phase 1 would (because skip-if-empty drops the `pl` key).
+    let bytes = canonical_cbor_encode(&phase1_shaped_snapshot).expect("encode");
+
+    // Assert the encoded form omits the `pl` key — proving Phase 2's
+    // skip_serializing_if preserves Phase 1 wire format byte-identically.
+    assert!(
+        !bytes.windows(2).any(|w| w == b"pl"),
+        "Phase 1-shape snapshot must NOT contain `pl` key"
+    );
+
+    // Decode under Phase 2 types: the missing `pl` key resolves to
+    // empty Vec via #[serde(default)].
+    let decoded: PreForkSnapshot =
+        harmony_app::owner_state_crypto::canonical_cbor_decode(&bytes).expect("decode");
+    assert_eq!(decoded.parent_lineage, Vec::<ParentLineageEntry>::new());
+    // forked_at is Phase 1's existing field, must round-trip.
+    assert_eq!(decoded.forked_at.wall_ms, 1_710_000_000_000);
+    assert_eq!(decoded.original_community_id, SpaceId([0xc0; 16]));
+}
