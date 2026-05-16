@@ -14,6 +14,9 @@
   import ForkConfirmDialog from './ForkConfirmDialog.svelte';
   import ForkLineageTree from './ForkLineageTree.svelte';
   import PendingJoinsPanel from './PendingJoinsPanel.svelte';
+  import { invoke } from '@tauri-apps/api/core';
+  import PendingAdminProposalsPanel from './PendingAdminProposalsPanel.svelte';
+  import ChangeQuorumDialog from './ChangeQuorumDialog.svelte';
 
   let {
     communityId,
@@ -38,6 +41,7 @@
     localNavIds = new Set<string>(),
     onForkLineageNavigate,
     resolveLocalCommunityName,
+    adminQuorum = 1,
   }: {
     communityId: string;
     communityName: string;
@@ -53,6 +57,9 @@
     onSetPower: (targetAddr: string, newPower: number) => void;
     onLeave: () => void;
     onGenerateInvite: () => Promise<string>;
+    /** ZEB-250: current admin quorum threshold for this community.
+     *  When not provided, defaults to 1 (no multi-sig required). */
+    adminQuorum?: number;
     /** Optional: if provided, a "Manage members" button appears in the Members
      *  section that opens the full CommunityMembersPanel overlay (with recent
      *  moderation history). Callers that don't yet thread through communityService
@@ -90,6 +97,8 @@
 
   let kickTarget = $state<CommunityMember | null>(null);
   let setPowerTarget = $state<CommunityMember | null>(null);
+  // ZEB-250: change-quorum dialog state
+  let showChangeQuorumDialog = $state(false);
   // ZEB-285: fork dialog state
   let forkDialogOpen = $state(false);
   let forkError = $state<string | null>(null);
@@ -132,6 +141,39 @@
   );
   let myRole = $derived(powerToRole(myPower));
   let canModerate = $derived(myPower >= POWER_THRESHOLDS.setPower);
+  // ZEB-250: admin governance section
+  let canAdmin = $derived(myPower >= POWER_THRESHOLDS.setPower);
+  let currentAdminCount = $derived(adminCount);
+  let currentAdminQuorum = $derived(adminQuorum);
+
+  // ZEB-250: pending-badge map — indexed by target_addr for O(1) member-row lookup.
+  // Only fetched when caller is admin (IPC is admin-gated per spec §7.5).
+  let pendingProposalsByTarget = $state<Map<string, PendingAdminProposalDto>>(new Map());
+
+  $effect(() => {
+    // Track reactive deps.
+    void communityId;
+    const admin = canAdmin;
+    if (!admin) {
+      pendingProposalsByTarget = new Map();
+      return;
+    }
+    invoke<PendingAdminProposalDto[]>('list_pending_admin_proposals', { communityId })
+      .then((proposals) => {
+        const m = new Map<string, PendingAdminProposalDto>();
+        for (const p of proposals) {
+          if (p.expired || p.effective) continue;
+          const kind = p.proposal_kind;
+          if (kind.kind === 'SetPower' || kind.kind === 'Kick') {
+            m.set(kind.target_addr, p);
+          }
+        }
+        pendingProposalsByTarget = m;
+      })
+      .catch(() => {
+        // Badges are best-effort; silently skip on error.
+      });
+  });
 
   let search = $state('');
   let filteredMembers = $derived(
@@ -171,6 +213,35 @@
     // action's onCancel; no need to duplicate it on the overlay
     // (focus is always trapped inside the panel anyway).
     if (e.target === e.currentTarget) onClose();
+  }
+
+  // ZEB-250: pending-badge helpers for member-list rows.
+  type ProposalKindDto =
+    | { kind: 'SetPower'; target_addr: string; target_display_name: string | null; level: number }
+    | { kind: 'Kick'; target_addr: string; target_display_name: string | null; reason: string | null }
+    | { kind: 'ChangeQuorum'; new_quorum: number };
+
+  type PendingAdminProposalDto = {
+    event_id: string;
+    proposer_addr: string;
+    proposer_display_name: string | null;
+    proposal_kind: ProposalKindDto;
+    proposed_at_wall_ms: number;
+    signers_so_far: number;
+    quorum_required: number;
+    expired: boolean;
+    effective: boolean;
+    self_has_signed: boolean;
+    signer_display_names: string[];
+  };
+
+  function pendingBadgeText(p: PendingAdminProposalDto): string {
+    const kind = p.proposal_kind;
+    if (kind.kind === 'SetPower' && kind.level === 100) return 'pending promotion to admin';
+    if (kind.kind === 'SetPower' && kind.level === 0) return 'pending demotion';
+    if (kind.kind === 'SetPower') return 'pending power change';
+    if (kind.kind === 'Kick') return 'pending kick';
+    return 'pending action';
   }
 </script>
 
@@ -278,6 +349,12 @@
             {#if canKick(m)}
               <button class="kick" onclick={() => (kickTarget = m)}>Kick</button>
             {/if}
+            {#if canAdmin && pendingProposalsByTarget.has(m.address)}
+              {@const pending = pendingProposalsByTarget.get(m.address)!}
+              <span class="pending-badge" aria-label={`Pending: ${pendingBadgeText(pending)}`}>
+                ⏳ {pendingBadgeText(pending)}
+              </span>
+            {/if}
           </div>
         {/each}
       </div>
@@ -300,6 +377,30 @@
         <div class="section-label">Join requests</div>
         <PendingJoinsPanel {communityId} {canModerate} />
       </div>
+    {/if}
+
+    <!-- ZEB-250: Admin governance section — admin-only. -->
+    {#if canAdmin}
+      <div class="section admin-governance-section" aria-label="Admin governance">
+        <div class="section-label">Admin governance</div>
+        <p class="admin-quorum-info">
+          Current admin quorum: {currentAdminQuorum} of {currentAdminCount} admins required for
+          admin-affecting actions.
+        </p>
+        <button class="change-quorum-btn" onclick={() => (showChangeQuorumDialog = true)}>
+          Change quorum…
+        </button>
+        <PendingAdminProposalsPanel {communityId} {canAdmin} />
+      </div>
+    {/if}
+
+    {#if showChangeQuorumDialog && canAdmin}
+      <ChangeQuorumDialog
+        {communityId}
+        currentQuorum={currentAdminQuorum}
+        currentAdminCount={currentAdminCount}
+        onClose={() => (showChangeQuorumDialog = false)}
+      />
     {/if}
 
     <!-- ZEB-287 Phase 2 spec §5.1: unified "Forks" section that always renders
@@ -640,5 +741,35 @@
     font-size: 0.7rem;
     color: #cc7a7a;
     margin: 8px 0 0;
+  }
+  /* ZEB-250: admin governance section */
+  .admin-quorum-info {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    margin: 0 0 8px;
+  }
+  .change-quorum-btn {
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    padding: 4px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.75rem;
+    margin-bottom: 8px;
+  }
+  .change-quorum-btn:hover {
+    color: var(--text-primary);
+    border-color: var(--accent, #5865f2);
+  }
+  .change-quorum-btn:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 1px;
+  }
+  /* ZEB-250: member-row pending badge */
+  .pending-badge {
+    font-size: 0.65rem;
+    color: #ffb84a;
+    white-space: nowrap;
   }
 </style>
