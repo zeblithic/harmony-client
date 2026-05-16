@@ -43,7 +43,7 @@ impl CanonicalPayload for RecipientCiphertext {}
 /// 2-char inner-field keys. Tagged-union representation with `kd`
 /// (kind) discriminator + `bd` (body) container so the CBOR encoding
 /// has explicit discriminator + body keys at the ProposalKind level.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kd", content = "bd")]
 pub enum ProposalKind {
     /// SetPower whose target IS currently an admin (level was 100) OR
@@ -286,7 +286,11 @@ pub enum MembershipEventKind {
     /// Variant tag "n" (1-char value, lowercase, unused before this).
     #[serde(rename = "n")]
     AdminCountersign {
-        #[serde(rename = "ti")]
+        #[serde(
+            rename = "ti",
+            serialize_with = "serialize_bytes_as_bstr",
+            deserialize_with = "deserialize_bytes_from_bstr"
+        )]
         target_event_id: EventId,
     },
 }
@@ -1690,8 +1694,8 @@ pub fn materialize_with_now(
             }
             MembershipEventKind::AdminProposal { .. }
             | MembershipEventKind::AdminCountersign { .. } => {
-                // ZEB-250 Task 4 / Task 5 will replace this stub with the
-                // real verify gates.
+                // ZEB-250 Tasks 7 + 8 will replace this stub with the
+                // real materialize logic (pre-pass + main pass).
             }
         }
     }
