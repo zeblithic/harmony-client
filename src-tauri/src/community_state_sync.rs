@@ -1192,6 +1192,9 @@ impl CommunitySyncEngine {
         let is_invite_only = self.is_invite_only;
         let notify_dirty = Arc::clone(&self.notify_dirty);
         let has_pending_dirty = Arc::clone(&self.has_pending_dirty);
+        // R3 (C4): plumb the delta channel so the auto-counter-sign task
+        // can emit CommunityMembershipDelta on Inserted.
+        let delta_tx = self.delta_tx.clone();
 
         tokio::spawn(spawn_auto_counter_sign_task(
             pending_id,
@@ -1206,6 +1209,7 @@ impl CommunitySyncEngine {
             is_invite_only,
             notify_dirty,
             has_pending_dirty,
+            delta_tx,
         ));
     }
 
@@ -1363,19 +1367,16 @@ impl CommunitySyncEngine {
         // claims. The entry-point guard above gives a clearer error class
         // for the common honest mismatch case.
 
-        // ZEB-254 R1 (C1) opportunistic late-bind: if admin_identity_pub is
-        // still unset and the incoming event's actor IS the admin, attempt
-        // to populate the OnceLock from the already-resolved actor_pub. This
-        // handles boot-reconcile engines (spawn_engine_inner_now sets
-        // admin_identity_pub: None) where the admin's bootstrap Join is the
-        // first event inserted — the identity_resolver already cached the
-        // admin's pub to reach this point, so we can safely promote it.
-        // Subsequent events (including PendingJoins) then see the binding.
-        if event.actor == self.admin_addr && self.admin_identity_pub.get().is_none() {
-            // OnceLock::set is no-op on the second call (Err on contention
-            // in concurrent inserts — safe to discard).
-            let _ = self.admin_identity_pub.set(actor_pub);
-        }
+        // ZEB-254 R3 (S2): defer late-bind of admin_identity_pub until AFTER
+        // verify_event accepts the actor's event. Setting the OnceLock here
+        // (pre-insert) would persist a caller-supplied actor_pub even if the
+        // event itself is later rejected by verify — and OnceLock silently
+        // discards subsequent set() attempts, so a bad pub could permanently
+        // poison the binding. We snapshot whether this is the first admin
+        // self-event seen, run verify+insert, and only commit the bind on
+        // a successful `Inserted` outcome.
+        let admin_first_seen =
+            event.actor == self.admin_addr && self.admin_identity_pub.get().is_none();
 
         let ctx = crate::community_membership::VerifyContext {
             expected_community_id: self.community_id,
@@ -1390,6 +1391,19 @@ impl CommunitySyncEngine {
             let mut state_g = self.state.lock().await;
             state_g.insert_event(event.clone(), &ctx)
         };
+
+        // R3 (S2): commit the admin-pub binding only after verify+insert
+        // succeeded. OnceLock::set returns Err on second-set, which we
+        // discard — concurrent inserts may have already bound it, which
+        // is fine (same admin, same pub).
+        if admin_first_seen
+            && matches!(
+                outcome,
+                crate::community_state_crdt::InsertOutcome::Inserted
+            )
+        {
+            let _ = self.admin_identity_pub.set(actor_pub);
+        }
 
         // C1 restart-recovery: when a PendingJoin returns AlreadyKnown
         // (event was already in the CRDT from disk / prior session), still
@@ -1760,6 +1774,12 @@ async fn spawn_auto_counter_sign_task(
     is_invite_only: bool,
     notify_dirty: Arc<Notify>,
     has_pending_dirty: Arc<AtomicBool>,
+    // ZEB-254 R3 (C4): plumb the membership-delta channel so the locally-
+    // emitted JoinCountersign drives the same `community-members-changed`
+    // Tauri event that any other Inserted membership event would. Without
+    // this, the admin's own UI doesn't observe the local counter-sign
+    // until the event round-trips back through state-root sync.
+    delta_tx: Option<mpsc::Sender<CommunityMembershipDelta>>,
 ) {
     use crate::community_membership::{
         EventPayload, MemberStatus, MembershipEventKind, POWER_THRESHOLDS,
@@ -1866,6 +1886,11 @@ async fn spawn_auto_counter_sign_task(
         admin_identity_pub: admin_identity_pub.get(),
     };
 
+    // R3 (C4): clone before the move into insert_event so we can emit a
+    // CommunityMembershipDelta on success. Cheap (signed events are
+    // ~200B); only paid on the rare auto-counter-sign path.
+    let signed_cs_for_delta = signed_cs.clone();
+
     let outcome = {
         let mut state_g = state.lock().await;
 
@@ -1894,6 +1919,18 @@ async fn spawn_auto_counter_sign_task(
                 target = ?pending_id,
                 "ZEB-254 auto-counter-sign: JoinCountersign inserted"
             );
+            // R3 (C4): emit the CommunityMembershipDelta so the admin's
+            // local UI/IPC consumers (community-members-changed Tauri
+            // event) observe the local counter-sign immediately, without
+            // waiting for the event to round-trip through state-root sync.
+            // Mirrors the post-Inserted hook in
+            // `insert_event_with_resolved_pubs`.
+            if let Some(tx) = delta_tx.as_ref() {
+                let _ = tx.try_send(CommunityMembershipDelta {
+                    community_id: signed_cs_for_delta.community_id,
+                    event: signed_cs_for_delta,
+                });
+            }
             has_pending_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             notify_dirty.notify_one();
         }
@@ -1943,6 +1980,8 @@ fn maybe_spawn_auto_counter_sign_for_ctx(
     let is_invite_only = ctx.is_invite_only;
     let notify_dirty = Arc::clone(&ctx.notify_dirty);
     let has_pending_dirty = Arc::clone(&ctx.has_pending_dirty);
+    // R3 (C4): receive-path delta channel for the auto-counter-sign emission.
+    let delta_tx = ctx.delta_tx.clone();
 
     tokio::spawn(spawn_auto_counter_sign_task(
         pending_id,
@@ -1957,6 +1996,7 @@ fn maybe_spawn_auto_counter_sign_for_ctx(
         is_invite_only,
         notify_dirty,
         has_pending_dirty,
+        delta_tx,
     ));
 }
 
@@ -3174,22 +3214,14 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
                 continue;
             }
 
-            // ZEB-254 R1 bot-review Q2: opportunistic late-bind of
-            // admin_identity_pub on the state-root receive path — mirrors
-            // the identical fix in `insert_event_with_resolved_pubs`.
-            //
-            // Without this, a state-root-synced PendingJoin arrives after
-            // the admin's bootstrap Join in the same blob. The resolver
-            // has already verified (and cached) the admin's pub for the
-            // bootstrap Join entry, but the OnceLock is still empty because
-            // `insert_event_with_resolved_pubs` was never called for this
-            // path. P5 gate then sees `admin_identity_pub: None` and rejects
-            // the PendingJoin with `PendingJoinTokenInvalid`.
-            if event.actor == ctx.admin_addr && ctx.admin_identity_pub.get().is_none() {
-                // OnceLock::set is a no-op on the second call — safe to
-                // discard the Err (concurrent insert won the race).
-                let _ = ctx.admin_identity_pub.set(actor_pub);
-            }
+            // ZEB-254 R3 (S2): defer late-bind of admin_identity_pub until
+            // AFTER verify_event accepts the actor's event. See the matching
+            // comment in `insert_event_with_resolved_pubs` — binding pre-
+            // verify could permanently poison the OnceLock on a bad
+            // caller-supplied pub. Snapshot the "first admin event" flag
+            // here, then commit the bind only on Inserted below.
+            let admin_first_seen =
+                event.actor == ctx.admin_addr && ctx.admin_identity_pub.get().is_none();
 
             // Inline `Option::as_ref` because rustc can't always infer
             // the right `AsRef` impl on `[u8; 64]`.
@@ -3213,6 +3245,13 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             match state.insert_event(event, &ctx_v) {
                 InsertOutcome::Inserted => {
                     inserted_any = true;
+                    // R3 (S2): bind admin pub now that verify accepted it.
+                    // OnceLock::set returns Err on second-set — discard:
+                    // a concurrent insert may have raced us in, which is
+                    // fine (same admin, same pub).
+                    if admin_first_seen {
+                        let _ = ctx.admin_identity_pub.set(actor_pub);
+                    }
                     inserted_events.push(event_clone);
                 }
                 InsertOutcome::AlreadyKnown => {
@@ -4132,6 +4171,24 @@ impl CommunitySyncRegistry {
         let state = Arc::new(Mutex::new(initial_state));
         let tracker = Arc::new(Mutex::new(initial_tracker));
 
+        // ZEB-254 R3 (C1): pre-bind admin_identity_pub at spawn time via the
+        // registry's own identity_resolver, so the engine's receive task
+        // (which `spawn_engine_with_guard` dispatches BEFORE the caller can
+        // run `bind_admin_identity_pub`) sees the binding for the very
+        // first incoming publish. Without this, a PendingJoin arriving
+        // in the boot-reconcile window verifies under `admin_identity_pub:
+        // None` and falls back to the opportunistic late-bind path (which
+        // only kicks in if the bootstrap Join is in the same batch).
+        //
+        // Resolver short-circuit: when self_owner == admin_addr the
+        // resolver returns the local identity_pub immediately (no cache
+        // hit needed). For joiner engines, the resolver consults the
+        // owner-device cache — which may not yet have the admin recorded
+        // on first-ever join. In that case resolve() returns None and we
+        // fall back to the post-spawn `bind_admin_identity_pub` flow.
+        let admin_identity_pub_resolved: Option<[u8; 64]> =
+            self.cfg.identity_resolver.resolve(&admin_addr).await;
+
         let engine = Arc::new(CommunitySyncEngine::new(CommunitySyncEngineConfig {
             community_id,
             membership_key,
@@ -4166,11 +4223,13 @@ impl CommunitySyncRegistry {
             // ZEB-249 §10.6 (Phase A): pass the live owner-state CRDT
             // so the engine can read current_epoch_key dynamically.
             crdt_state: self.crdt_state.as_ref().map(Arc::clone),
-            // ZEB-254: default None at spawn time; joiner-side engines
-            // are patched via engine.bind_admin_identity_pub() right after
-            // spawn_engine_with_guard returns, before any PendingJoin
-            // events can land. Non-joiner engines leave this None.
-            admin_identity_pub: None,
+            // ZEB-254 R3 (C1): if the resolver knew about the admin at
+            // spawn time, plumb the pub in here so the receive task is
+            // never running with `admin_identity_pub: None`. Falls back
+            // to None when the resolver lookup misses (first-time join
+            // path) — IPC callers then call `bind_admin_identity_pub`
+            // post-spawn before any PendingJoin event can land.
+            admin_identity_pub: admin_identity_pub_resolved,
             // ZEB-254 Task 11: clone the nav_emitter from the registry so
             // the engine can fire nav-updated on joiner-side countersign.
             // `None` for test registries that don't supply one.

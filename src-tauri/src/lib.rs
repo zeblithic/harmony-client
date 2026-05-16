@@ -2304,6 +2304,149 @@ async fn start_node(
                         }
                     }
 
+                    // ZEB-254 R3 (C3): restart-time healing pass for
+                    // pending_join_at. The post-Inserted clear hook only
+                    // fires for events freshly Inserted in this process —
+                    // if a process crashed between PendingJoin landing and
+                    // the JoinCountersign arriving (both events on disk,
+                    // but the hook never ran), `Space.pending_join_at`
+                    // would remain Some forever. Walk every Community
+                    // Space whose `pending_join_at` is Some; if the
+                    // engine's persisted event log holds a JoinCountersign
+                    // for a self-authored PendingJoin, clear it via the
+                    // same `apply_space_with_canonicalization` path the
+                    // online hook uses + invoke the nav_emitter callback.
+                    {
+                        // Snapshot under the crdt_state lock first.
+                        type HealCandidate = (
+                            crate::owner_state_types::SpaceId,
+                            crate::owner_state_types::Space,
+                        );
+                        let candidates: Vec<HealCandidate> = {
+                            let g = crdt_state.lock().await;
+                            g.spaces
+                                .iter()
+                                .filter(|(_, s)| {
+                                    s.kind == crate::owner_state_types::SpaceKind::Community
+                                        && s.pending_join_at.is_some()
+                                        && s.left_at.is_none()
+                                })
+                                .map(|(id, s)| (*id, s.clone()))
+                                .collect()
+                        };
+
+                        for (space_id, space) in candidates {
+                            let engine = match registry.engine_arc(&space_id).await {
+                                Some(e) => e,
+                                None => continue, // no engine spawned (skipped above)
+                            };
+                            // Build set of self-authored PendingJoin event IDs,
+                            // then check whether any matching JoinCountersign
+                            // exists in the engine's log.
+                            let cleared = {
+                                let state = engine.state();
+                                let g = state.lock().await;
+                                let self_pending_ids: std::collections::HashSet<
+                                    crate::community_membership::EventId,
+                                > = g
+                                    .events
+                                    .values()
+                                    .filter(|e| {
+                                        e.actor == self_owner
+                                            && matches!(
+                                                &e.kind,
+                                                crate::community_membership::MembershipEventKind::PendingJoin { .. }
+                                            )
+                                    })
+                                    .map(|e| e.id)
+                                    .collect();
+                                if self_pending_ids.is_empty() {
+                                    false
+                                } else {
+                                    g.events.values().any(|e| matches!(
+                                        &e.kind,
+                                        crate::community_membership::MembershipEventKind::JoinCountersign {
+                                            target_event_id,
+                                        } if self_pending_ids.contains(target_event_id)
+                                    ))
+                                }
+                            };
+
+                            if !cleared {
+                                continue;
+                            }
+
+                            // Found a matching JoinCountersign — clear
+                            // Space.pending_join_at. Use monotonic HLC.
+                            let wall_now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            let new_hlc = if wall_now_ms > space.updated_at.wall_ms {
+                                crate::owner_state_types::Hlc {
+                                    wall_ms: wall_now_ms,
+                                    logical: 0,
+                                    device_id: space.updated_at.device_id.clone(),
+                                }
+                            } else {
+                                crate::owner_state_types::Hlc {
+                                    wall_ms: space.updated_at.wall_ms,
+                                    logical: space.updated_at.logical.saturating_add(1),
+                                    device_id: space.updated_at.device_id.clone(),
+                                }
+                            };
+                            let mut updated = space.clone();
+                            updated.pending_join_at = None;
+                            updated.updated_at = new_hlc;
+                            let space_name = space.name.clone();
+
+                            let outcome = {
+                                let mut g = crdt_state.lock().await;
+                                g.apply_space_with_canonicalization(updated)
+                            };
+
+                            match outcome {
+                                crate::owner_state_crdt::ApplyOutcome::Inserted
+                                | crate::owner_state_crdt::ApplyOutcome::Merged { .. } => {
+                                    tracing::info!(
+                                        ?space_id,
+                                        "ZEB-254 R3 (C3): restart-time pending_join_at healed \
+                                         (countersign found on disk, owner-state stale Some cleared)"
+                                    );
+                                    // Fire nav-updated event so the UI
+                                    // ungreys this community at boot.
+                                    let space_id_hex = hex::encode(space_id.0);
+                                    use tauri::Emitter as _;
+                                    if let Err(e) = app.emit(
+                                        "nav-updated",
+                                        &NavUpdatedPayload {
+                                            action: "modified",
+                                            space_id: space_id_hex,
+                                            kind: "community",
+                                            name: space_name,
+                                            members: None,
+                                            parent_id: None,
+                                            pending: Some(false),
+                                        },
+                                    ) {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "ZEB-254 R3 (C3): nav-updated emit failed during boot heal"
+                                        );
+                                    }
+                                }
+                                crate::owner_state_crdt::ApplyOutcome::Rejected(ref reason) => {
+                                    tracing::warn!(
+                                        ?space_id,
+                                        reason = ?reason,
+                                        "ZEB-254 R3 (C3): apply_space_with_canonicalization \
+                                         rejected during restart-time heal"
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     community_registry_arc = Some(registry);
 
                     // ── ZEB-281 Sub-D Phase 4: profile-broadcast publisher spawn ──
@@ -9895,7 +10038,36 @@ where
                     .await
                 {
                     Some(_tx) => {
-                        pending_redemption_timed_out = true;
+                        // ZEB-254 R3 (C2): TOCTOU recheck. Between the oneshot
+                        // timeout firing and our take_pending_redemption, a
+                        // JoinCountersign may have landed via state-root sync
+                        // (its post-Inserted hook ran and tried to fire the
+                        // oneshot but found the sender already consumed by us
+                        // — or fired it concurrently). Before latching
+                        // pending=true and writing pending_join_at, scan the
+                        // engine's CRDT for a JoinCountersign whose
+                        // target_event_id matches our bootstrap_join.id.
+                        // If found, treat as success (countersigned already).
+                        let countersigned_now = {
+                            let state = engine_arc.state();
+                            let g = state.lock().await;
+                            g.events.values().any(|e| matches!(
+                                &e.kind,
+                                crate::community_membership::MembershipEventKind::JoinCountersign {
+                                    target_event_id,
+                                } if *target_event_id == minted.bootstrap_join.id
+                            ))
+                        };
+                        if countersigned_now {
+                            tracing::debug!(
+                                community_id = %hex::encode(minted.community_id.0),
+                                event_id = %hex::encode(minted.bootstrap_join.id),
+                                "ZEB-254 R3 (C2): TOCTOU recheck found JoinCountersign \
+                                 between timeout and take_pending_redemption — treating as success"
+                            );
+                        } else {
+                            pending_redemption_timed_out = true;
+                        }
                     }
                     None => {
                         // Notifier won the race; treat as success.
@@ -13606,13 +13778,46 @@ async fn list_recent_counter_signs(
         )
     };
 
-    let engine_state = registry.state_for(&space_id).await.ok_or_else(|| {
+    let engine_arc = registry.engine_arc(&space_id).await.ok_or_else(|| {
         format!(
             "no engine for community {} — not joined or not yet started",
             hex::encode(space_id.0)
         )
     })?;
 
+    // ZEB-254 R3 (S3): authorize — caller must be a Joined member with
+    // moderator-tier power (≥ POWER_THRESHOLDS.kick). This is an admin
+    // audit feed and must not be readable by plain members. Mirrors the
+    // F1 guard in `list_pending_joins`.
+    {
+        let admin_addr = engine_arc.admin_addr();
+        let materialized = {
+            let state = engine_arc.state();
+            let g = state.lock().await;
+            g.materialize_now(admin_addr)
+        };
+        let caller_status = materialized.members.get(&self_owner).map(|m| m.status);
+        if !matches!(
+            caller_status,
+            Some(crate::community_membership::MemberStatus::Joined)
+        ) {
+            return Err("list_recent_counter_signs: caller is not a Joined member".to_string());
+        }
+        let caller_power = materialized
+            .power_levels
+            .get(&self_owner)
+            .copied()
+            .unwrap_or(0);
+        if caller_power < crate::community_membership::POWER_THRESHOLDS.kick {
+            return Err(format!(
+                "list_recent_counter_signs: caller power {} is below moderator threshold {}",
+                caller_power,
+                crate::community_membership::POWER_THRESHOLDS.kick
+            ));
+        }
+    }
+
+    let engine_state = engine_arc.state();
     let raw_events: Vec<crate::community_membership::SignedMembershipEvent> = {
         let g = engine_state.lock().await;
         g.events.values().cloned().collect()

@@ -1887,7 +1887,16 @@
     font-size: 0.875rem;
     z-index: 1000;
     pointer-events: none;
-    white-space: nowrap;
+    /* R3 (M2): allow wrapping so long community names don't overflow the
+       viewport. `white-space: nowrap` collapses to a single line and would
+       push the banner past the screen edge for any community name longer
+       than ~30 chars. `overflow-wrap: anywhere` breaks at any character if
+       a single token is wider than the box (unbroken URLs, etc.). The
+       max-width keeps the banner constrained to ~viewport width minus
+       gutters even when wrapping kicks in. */
+    white-space: normal;
+    overflow-wrap: anywhere;
+    max-width: calc(100% - 40px);
   }
 
 </style>

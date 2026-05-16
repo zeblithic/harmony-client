@@ -3821,6 +3821,12 @@ mod space_tests {
 
     #[test]
     fn space_with_pending_join_at_round_trip() {
+        // R3 (M1): fixture must be internally consistent. Community Spaces
+        // require `current_epoch_key: Some(...)` per validate_invariants —
+        // the prior fixture set `current_epoch: Some(0)` with `current_epoch_key:
+        // None`, which would fail invariant validation in any context that
+        // performs it. The round-trip test only exercises serde, but a valid
+        // fixture documents the wire shape correctly.
         let admin = OwnerAddr([1u8; 16]);
         let space = Space {
             id: SpaceId([7u8; 16]),
@@ -3846,7 +3852,7 @@ mod space_tests {
             content_key: None,
             prior_content_keys: vec![],
             current_epoch: Some(0),
-            current_epoch_key: None,
+            current_epoch_key: Some(EpochKey([0x42u8; 32])),
             old_epoch_keys: std::collections::BTreeMap::new(),
             admin_addr: Some(admin),
             is_invite_only: Some(true),

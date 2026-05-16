@@ -1,5 +1,4 @@
 <script lang="ts">
-    import { onMount, onDestroy } from 'svelte';
     import { invoke } from '@tauri-apps/api/core';
     import { listen, type UnlistenFn } from '@tauri-apps/api/event';
     export let communityId: string;
@@ -22,9 +21,18 @@
     let recent: CounterSignDto[] = [];
     let convergedUnlisten: UnlistenFn | null = null;
     let errorMessage = '';
-    let loading = true;
+    // R3 (M4): start non-loading so the !canModerate branch doesn't flash
+    // a transient "Loading…" state. refresh() flips this to true at the
+    // start of each fetch (M4 fix).
+    let loading = false;
 
     async function refresh() {
+        // R3 (M4): reset loading state at the start of every refresh so
+        // subsequent fetches (triggered by community-state-sync-converged
+        // events or kickJoiner-then-refresh) also surface a transient
+        // loading indicator. Without this, after the first load completes
+        // loading stays false forever and the UI shows stale data with no
+        // visual cue that a refresh is in flight.
         loading = true;
         try {
             pending = await invoke<PendingJoinDto[]>('list_pending_joins', { communityId });
@@ -57,8 +65,37 @@
         return new Date(hlc.wallMs).toLocaleString();
     }
 
-    onMount(async () => {
-        if (!canModerate) {
+    // R3 (M3): switch from onMount to a reactive statement so the panel
+    // re-fetches when `canModerate` or `communityId` change. onMount only
+    // fires once at component instantiation — if the parent toggles
+    // canModerate (e.g., power-level change observed via state-root sync)
+    // or swaps the displayed community without unmounting, the old
+    // onMount-fetched data would stay stuck. Svelte 4 reactive statement
+    // shape; the project hasn't moved to runes yet for this component.
+    let lastWatchedCanModerate: boolean | undefined = undefined;
+    let lastWatchedCommunityId: string | undefined = undefined;
+    $: void watchDeps(canModerate, communityId);
+
+    async function watchDeps(canMod: boolean, cid: string) {
+        if (canMod === lastWatchedCanModerate && cid === lastWatchedCommunityId) {
+            return;
+        }
+        lastWatchedCanModerate = canMod;
+        lastWatchedCommunityId = cid;
+        // Tear down any prior listener before re-registering.
+        if (convergedUnlisten) {
+            try {
+                convergedUnlisten();
+            } catch {
+                /* ignore */
+            }
+            convergedUnlisten = null;
+        }
+        if (!canMod) {
+            // Non-moderator path: clear any prior data and stop.
+            pending = [];
+            recent = [];
+            errorMessage = '';
             loading = false;
             return;
         }
@@ -66,7 +103,7 @@
         try {
             convergedUnlisten = await listen('community-state-sync-converged', async (evt) => {
                 const payload = evt.payload as { communityId?: string };
-                if (payload?.communityId === communityId) {
+                if (payload?.communityId === cid) {
                     await refresh();
                 }
             });
@@ -74,8 +111,9 @@
             // Event listener registration may fail in some test environments —
             // that's OK; manual refresh still works.
         }
-    });
+    }
 
+    import { onDestroy } from 'svelte';
     onDestroy(() => {
         convergedUnlisten?.();
     });
