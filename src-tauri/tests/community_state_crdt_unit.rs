@@ -219,3 +219,64 @@ fn materialized_cache_returns_same_object_until_insert() {
     let m_after = state.materialized(addr);
     assert_eq!(m_after.members.len(), 1, "Join event materialized");
 }
+
+// ZEB-287 Phase 2: CommunityState.parent_lineage + forked_at_wall_ms tests
+mod zeb287_lineage_fields {
+    use harmony_app::community_invite::ParentLineageEntry;
+    use harmony_app::community_state_crdt::CommunityState;
+    use harmony_app::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
+    use harmony_app::owner_state_types::SpaceId;
+
+    #[test]
+    fn community_state_with_no_lineage_omits_fa_and_fl_keys() {
+        let state = CommunityState::new(SpaceId([0x77; 16]));
+        let bytes = canonical_cbor_encode(&state).expect("encode");
+        assert!(
+            !bytes.windows(2).any(|w| w == b"fa"),
+            "skip_serializing_if failed to drop `fa` for None"
+        );
+        assert!(
+            !bytes.windows(2).any(|w| w == b"fl"),
+            "skip_serializing_if failed to drop `fl` for empty Vec"
+        );
+    }
+
+    #[test]
+    fn community_state_with_populated_lineage_roundtrips() {
+        let mut state = CommunityState::new(SpaceId([0x88; 16]));
+        state.forked_from = Some(SpaceId([0x22; 16]));
+        state.forked_at_wall_ms = Some(1_715_811_234_567);
+        state.parent_lineage = vec![ParentLineageEntry {
+            space_id: SpaceId([0x11; 16]),
+            name: "Project Cool".to_string(),
+            forked_at_wall_ms: None,
+        }];
+
+        let bytes = canonical_cbor_encode(&state).expect("encode");
+        let decoded: CommunityState = canonical_cbor_decode(&bytes).expect("decode");
+
+        assert_eq!(state, decoded);
+    }
+
+    #[test]
+    fn community_state_manual_clone_preserves_lineage() {
+        let mut state = CommunityState::new(SpaceId([0x99; 16]));
+        state.parent_lineage = vec![
+            ParentLineageEntry {
+                space_id: SpaceId([0x11; 16]),
+                name: "C".to_string(),
+                forked_at_wall_ms: None,
+            },
+            ParentLineageEntry {
+                space_id: SpaceId([0x22; 16]),
+                name: "B".to_string(),
+                forked_at_wall_ms: Some(123_456),
+            },
+        ];
+        state.forked_at_wall_ms = Some(789_012);
+
+        let cloned = state.clone();
+        assert_eq!(state.parent_lineage, cloned.parent_lineage);
+        assert_eq!(state.forked_at_wall_ms, cloned.forked_at_wall_ms);
+    }
+}
