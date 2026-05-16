@@ -85,14 +85,22 @@ The CBOR keys `si` / `nm` / `at` are all 2-char and within their own nesting lev
 Phase 1's `PreForkSnapshot` has 6 fields. Phase 2 adds a 7th:
 
 ```rust
-/// ZEB-285 Phase 2: ordered list of ancestors above the immediate parent
-/// (root → immediate parent), frozen at fork-time. The immediate parent
-/// is encoded separately via the existing `original_community_id` /
-/// `original_community_name` fields, NOT duplicated here.
+/// ZEB-285 Phase 2: ordered ancestor chain (root → immediate parent),
+/// frozen at fork-time. The **tail entry IS the immediate parent** — the
+/// forker community itself — which is ALSO encoded separately via the
+/// existing `original_community_id` / `original_community_name` fields.
+/// This duplication is intentional: it lets the redeemer mirror the
+/// chain into `CommunityState.parent_lineage` verbatim (per §3.5) while
+/// keeping `original_community_id` as the canonical immediate-parent
+/// pointer for the Phase 1 `forked_from` path.
 ///
-/// Length capped at 16 entries at fork-build time (per §3.4 build logic).
-/// Phase 1 fork-invites encode without this field; decoded as empty Vec
-/// via `default`.
+/// Per the build logic in §3.4: `A.parent_lineage =
+/// clone(B.parent_lineage).push(B-entry)`, so for a fork A built from
+/// forker B, `A.parent_lineage` ends with the B entry.
+///
+/// Length capped at 16 entries at fork-build time (per §3.4). Phase 1
+/// fork-invites encode without this field; decoded as empty Vec via
+/// `default`.
 #[serde(rename = "pl", skip_serializing_if = "Vec::is_empty", default)]
 pub parent_lineage: Vec<ParentLineageEntry>,
 ```
@@ -112,10 +120,13 @@ Phase 1 added `forked_from: Option<SpaceId>`. Phase 2 adds two siblings:
 #[serde(rename = "fa", skip_serializing_if = "Option::is_none", default)]
 pub forked_at_wall_ms: Option<u64>,
 
-/// ZEB-285 Phase 2: ordered list of ancestors above the immediate
-/// parent (root → immediate parent). Mirrors PreForkSnapshot.parent_lineage
-/// — populated at redeem-time. Empty for top-level communities and for
-/// Phase 1 forks (which carried no chain). Byte-compatible.
+/// ZEB-285 Phase 2: ordered ancestor chain (root → immediate parent).
+/// The tail entry IS the immediate parent (also encoded via the Phase 1
+/// `forked_from` field) — this matches PreForkSnapshot.parent_lineage
+/// (§3.2) and the build logic in §3.4. Populated at redeem-time by
+/// mirroring the snapshot's chain verbatim. Empty for top-level
+/// communities and for Phase 1 forks (which carried no chain).
+/// Byte-compatible with Phase 1 blobs (omitted when empty).
 #[serde(rename = "fl", skip_serializing_if = "Vec::is_empty", default)]
 pub parent_lineage: Vec<ParentLineageEntry>,
 ```

@@ -6,6 +6,48 @@ use harmony_app::community_invite::{
 use harmony_app::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
 use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
 
+/// Structural CBOR top-level-key check. Decodes `bytes` to
+/// `ciborium::Value::Map` and asserts that the named string keys are
+/// present / absent. Mirrors the helper of the same name in
+/// `tests/wire_format_zeb285_fixtures.rs` (R1 fix). Both copies exist
+/// because each integration-test file is a separate binary; sharing
+/// across them would require a `tests/common/mod.rs` module — kept local
+/// for now since the helper is small and self-contained.
+///
+/// Byte-substring matching (`bytes.windows(2).any(|w| w == b"pl")`) is
+/// brittle: a data value containing the bytes "pl" (e.g., a name field
+/// "Polite Project") false-positives. Decoding to `ciborium::Value` and
+/// inspecting the map keys is robust against data-content coincidences.
+fn assert_cbor_top_level_keys(bytes: &[u8], present: &[&str], absent: &[&str], label: &str) {
+    let decoded: ciborium::Value = ciborium::de::from_reader(bytes)
+        .unwrap_or_else(|e| panic!("{label}: decode as Value failed: {e}"));
+    let pairs = match decoded {
+        ciborium::Value::Map(m) => m,
+        other => panic!("{label}: expected CBOR map at top level, got {other:?}"),
+    };
+    // Collect string-typed keys (canonical encoding uses Text keys for
+    // these fields). Non-Text keys would be a wire-format break in itself.
+    let keys: std::collections::BTreeSet<String> = pairs
+        .iter()
+        .filter_map(|(k, _)| match k {
+            ciborium::Value::Text(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    for key in present {
+        assert!(
+            keys.contains(*key),
+            "{label}: expected key `{key}` to be present (top-level keys: {keys:?})"
+        );
+    }
+    for key in absent {
+        assert!(
+            !keys.contains(*key),
+            "{label}: expected key `{key}` to be absent (top-level keys: {keys:?})"
+        );
+    }
+}
+
 #[test]
 fn community_invite_payload_round_trips_open_form() {
     let p = CommunityInvitePayload {
@@ -1367,11 +1409,17 @@ mod zeb287_parent_lineage_entry {
         let decoded: ParentLineageEntry = canonical_cbor_decode(&bytes_no_at).expect("decode");
         assert_eq!(entry, decoded);
 
-        // The serialized form must NOT contain the bytes for key "at" since
-        // the field is skip-if-none.
-        assert!(
-            !bytes_no_at.windows(2).any(|w| w == b"at"),
-            "skip_serializing_if = Option::is_none failed to drop the `at` key"
+        // The serialized form must NOT contain a CBOR Text key "at"
+        // since the field is skip-if-none. Structural decode (via the
+        // top-level `assert_cbor_top_level_keys` helper) defends against
+        // false positives where the bytes "at" appear inside data values
+        // (e.g., a name like "atomic"); the previous `windows(2)` byte-
+        // substring check was brittle to such collisions.
+        super::assert_cbor_top_level_keys(
+            &bytes_no_at,
+            &["si", "nm"],
+            &["at"],
+            "Root ParentLineageEntry",
         );
     }
 }
@@ -1405,9 +1453,15 @@ mod zeb287_pre_fork_snapshot_lineage {
     fn pre_fork_snapshot_with_empty_lineage_omits_pl_key() {
         let snap = empty_pre_fork_snapshot_for_test();
         let bytes = canonical_cbor_encode(&snap).expect("encode");
-        assert!(
-            !bytes.windows(2).any(|w| w == b"pl"),
-            "skip_serializing_if = Vec::is_empty failed to drop `pl` key for empty lineage"
+        // Structural decode: the `pl` CBOR Text key must be absent.
+        // Defends against a value containing the bytes "pl" inside e.g.
+        // a name field ("Polite Project") false-positiving the previous
+        // `windows(2)` byte-substring check.
+        super::assert_cbor_top_level_keys(
+            &bytes,
+            &[],
+            &["pl"],
+            "PreForkSnapshot with empty parent_lineage",
         );
     }
 
@@ -1428,9 +1482,15 @@ mod zeb287_pre_fork_snapshot_lineage {
         ];
 
         let bytes = canonical_cbor_encode(&snap).expect("encode");
-        assert!(
-            bytes.windows(2).any(|w| w == b"pl"),
-            "non-empty lineage must produce `pl` key"
+        // Structural decode: the `pl` CBOR Text key must be present at
+        // the top-level map. Robust against the bytes "pl" appearing
+        // inside data values (the previous `windows(2)` check would
+        // false-positive on e.g. a name like "Polite Project").
+        super::assert_cbor_top_level_keys(
+            &bytes,
+            &["pl"],
+            &[],
+            "PreForkSnapshot with populated parent_lineage",
         );
 
         let decoded: PreForkSnapshot = canonical_cbor_decode(&bytes).expect("decode");

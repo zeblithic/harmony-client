@@ -174,6 +174,7 @@ cd src-tauri && cargo nextest run --locked --workspace --all-targets --features 
 cd .. && npx tsc --noEmit
 npx vitest run
 ```
+
 Expected: all green. Rust test count: 1369 → 1371 (+2).
 
 - [ ] **Step 5: Commit**
@@ -321,6 +322,7 @@ cd src-tauri && cargo nextest run --locked --workspace --all-targets --features 
 cd .. && npx tsc --noEmit
 npx vitest run
 ```
+
 Expected: all green. Rust test count: 1371 → 1373 (+2).
 
 - [ ] **Step 6: Commit**
@@ -537,6 +539,7 @@ cd src-tauri && cargo nextest run --locked --workspace --all-targets --features 
 cd .. && npx tsc --noEmit
 npx vitest run
 ```
+
 Expected: all green. Rust test count: 1373 → 1376 (+3).
 
 If clippy or nextest fails for OTHER construction sites that don't pass the new fields, fix those sites (they may need `..Default::default()` or explicit field assignment).
@@ -689,6 +692,7 @@ cd src-tauri && cargo nextest run --locked --workspace --all-targets --features 
 cd .. && npx tsc --noEmit
 npx vitest run
 ```
+
 Expected: all green. Rust test count: 1376 → 1378 (+2).
 
 - [ ] **Step 6: Commit**
@@ -1166,6 +1170,7 @@ async fn get_community_lineage_rejects_non_member_caller() {
 ```bash
 cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(get_community_lineage)'
 ```
+
 Expected: 3 new tests pass.
 
 Full 5-gate sweep. Expected: Rust test count 1384 → 1387 (+3).
