@@ -15,7 +15,6 @@ use harmony_app::owner_state_crypto::canonical_cbor_encode;
 use harmony_app::owner_state_types::OwnerAddr;
 
 const FIXTURE_TARGET_ADDR: OwnerAddr = OwnerAddr([0x11; 16]);
-const FIXTURE_PROPOSER_ADDR: OwnerAddr = OwnerAddr([0x22; 16]);
 const FIXTURE_TARGET_EVENT_ID: [u8; 16] = [0x66; 16];
 
 // EXPECTED_*_HEX constants are populated by running the test once with
@@ -58,9 +57,35 @@ fn admin_proposal_setpower_canonical_cbor() {
     // re-read the enum serde attributes before updating the bytes —
     // a wire-format change here breaks peer interop.
     let value: ciborium::Value = ciborium::de::from_reader(&encoded[..]).expect("decode as value");
-    let _ = value; // ensure decode succeeds; specific key asserts left to
-                   // the reviewer's discretion once the encoding shape is
-                   // confirmed by the first regen run.
+
+    // Top-level: adjacently-tagged MembershipEventKind → map with "tg" + "vl" keys.
+    let outer_map = value.as_map().expect("top level is a CBOR map");
+    assert_eq!(
+        outer_map.len(),
+        2,
+        "adjacent tag → exactly two outer keys (tg + vl)"
+    );
+    assert!(
+        outer_map.iter().any(|(k, _)| k.as_text() == Some("tg")),
+        "outer map missing \"tg\" key"
+    );
+    let vl_entry = outer_map.iter().find(|(k, _)| k.as_text() == Some("vl"));
+    let inner_value = &vl_entry.expect("outer map missing \"vl\" key").1;
+    assert_eq!(
+        outer_map
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("tg"))
+            .and_then(|(_, v)| v.as_text()),
+        Some("q"),
+        "AdminProposal variant tag should be \"q\""
+    );
+
+    // Inner: AdminProposal struct-variant content → map with key "pk".
+    let inner_map = inner_value.as_map().expect("AdminProposal value is a map");
+    assert!(
+        inner_map.iter().any(|(k, _)| k.as_text() == Some("pk")),
+        "AdminProposal inner map missing \"pk\" key"
+    );
 }
 
 #[test]
@@ -121,10 +146,33 @@ fn admin_countersign_canonical_cbor() {
         actual_hex, EXPECTED_ADMIN_COUNTERSIGN_HEX,
         "AdminCountersign wire format changed"
     );
-}
 
-// Reference: FIXTURE_PROPOSER_ADDR is reserved for use in
-// tests/community_admin_quorum_integration.rs (Task 16). Suppress
-// unused-const lint here.
-#[allow(dead_code)]
-const _: OwnerAddr = FIXTURE_PROPOSER_ADDR;
+    let value: ciborium::Value = ciborium::de::from_reader(&encoded[..]).expect("decode as value");
+
+    // Top-level: adjacently-tagged MembershipEventKind → map with "tg" + "vl" keys.
+    let outer_map = value.as_map().expect("top level is a CBOR map");
+    assert_eq!(
+        outer_map.len(),
+        2,
+        "adjacent tag → exactly two outer keys (tg + vl)"
+    );
+    assert_eq!(
+        outer_map
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("tg"))
+            .and_then(|(_, v)| v.as_text()),
+        Some("n"),
+        "AdminCountersign variant tag should be \"n\""
+    );
+    let vl_entry = outer_map.iter().find(|(k, _)| k.as_text() == Some("vl"));
+    let inner_value = &vl_entry.expect("outer map missing \"vl\" key").1;
+
+    // Inner: AdminCountersign struct-variant content → map with key "ti".
+    let inner_map = inner_value
+        .as_map()
+        .expect("AdminCountersign value is a map");
+    assert!(
+        inner_map.iter().any(|(k, _)| k.as_text() == Some("ti")),
+        "AdminCountersign inner map missing \"ti\" key"
+    );
+}
