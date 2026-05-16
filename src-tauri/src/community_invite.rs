@@ -468,14 +468,18 @@ pub struct PreForkSnapshot {
     #[serde(rename = "ts")]
     pub forked_at: Hlc,
 
-    /// ZEB-287 Phase 2: ordered list of ancestors above the immediate
-    /// parent (root → immediate parent), frozen at fork-time. The
-    /// immediate parent is encoded separately via the existing
-    /// `original_community_id` / `original_community_name` fields,
-    /// NOT duplicated here.
+    /// ZEB-287 Phase 2: ordered ancestor chain (root → immediate parent)
+    /// frozen at fork-time. For a Phase 2 fork-invite built via
+    /// `community_invite::build_parent_lineage`, the tail entry is the
+    /// fork's immediate parent — the forker community itself — which is
+    /// ALSO encoded via `original_community_id` / `original_community_name`.
+    /// This duplication is intentional: it lets the redeemer mirror the
+    /// chain into `CommunityState.parent_lineage` verbatim while keeping
+    /// `original_community_id` as the canonical immediate-parent pointer
+    /// for the Phase 1 `forked_from` path.
     ///
     /// Length capped at 16 entries at fork-build time (see
-    /// `community_fork.rs::build_fork_snapshot`). Phase 1 fork-invites
+    /// `community_invite::apply_lineage_cap`). Phase 1 fork-invites
     /// encode without this field; decoded as empty Vec via `default`.
     #[serde(rename = "pl", skip_serializing_if = "Vec::is_empty", default)]
     pub parent_lineage: Vec<ParentLineageEntry>,
@@ -483,6 +487,58 @@ pub struct PreForkSnapshot {
 
 impl CanonicalPayloadSealed for PreForkSnapshot {}
 impl CanonicalPayload for PreForkSnapshot {}
+
+/// ZEB-287 Phase 2: spec §3.4 maximum depth for a fork's parent_lineage.
+/// Applied at fork-build time (community_fork.rs) AND at redeem time
+/// (lib.rs::redeem_invite_inner) to defend against future-protocol-revision
+/// or malicious payloads that exceed the cap.
+pub const MAX_LINEAGE_DEPTH: usize = 16;
+
+/// ZEB-287 Phase 2: enforce the 16-deep cap on a parent_lineage vector by
+/// dropping the OLDEST (root-side) entries until length ≤ MAX_LINEAGE_DEPTH.
+/// Used by `build_parent_lineage` and by the redeem-path payload guard in
+/// `lib.rs::redeem_invite_inner` (R1-2).
+pub fn apply_lineage_cap(lineage: &mut Vec<ParentLineageEntry>) {
+    if lineage.len() > MAX_LINEAGE_DEPTH {
+        let overflow = lineage.len() - MAX_LINEAGE_DEPTH;
+        lineage.drain(0..overflow);
+    }
+}
+
+/// ZEB-287 Phase 2: build a new fork's parent_lineage by extending the
+/// forker's existing chain with the forker's own community as the new
+/// immediate-parent-above-the-immediate-parent. Mirrors spec §3.4.
+///
+/// Inputs:
+/// - `forker_lineage`: the forker community's existing `parent_lineage`
+///   (slice; cloned internally).
+/// - `forker_id` / `forker_name`: the forker community's identity at
+///   fork-time. Frozen into the new entry.
+/// - `forker_forked_at_wall_ms`: the forker community's own
+///   `forked_at_wall_ms` (Some when the forker is itself a fork; None
+///   when the forker is a top-level / root community).
+///
+/// The new entry (`forker_id`, `forker_name`, `forker_forked_at_wall_ms`)
+/// is appended; then the 16-deep cap is applied (drops oldest if needed).
+///
+/// Production callers: `community_fork.rs::fork_community` (Task 4 build
+/// site). Tests in `community_fork_integration.rs` + `community_invite_unit.rs`
+/// also use this helper so a regression in production logic surfaces there.
+pub fn build_parent_lineage(
+    forker_lineage: &[ParentLineageEntry],
+    forker_id: SpaceId,
+    forker_name: &str,
+    forker_forked_at_wall_ms: Option<u64>,
+) -> Vec<ParentLineageEntry> {
+    let mut chain: Vec<ParentLineageEntry> = forker_lineage.to_vec();
+    chain.push(ParentLineageEntry {
+        space_id: forker_id,
+        name: forker_name.to_string(),
+        forked_at_wall_ms: forker_forked_at_wall_ms,
+    });
+    apply_lineage_cap(&mut chain);
+    chain
+}
 
 /// ZEB-262 Phase 4: Path B app-sig wrapper around CommunityInviteSigned.
 /// Wire layout: `[u8 disc=0x10][CBOR(signed)][64 raw signature bytes]`.

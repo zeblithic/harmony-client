@@ -2331,7 +2331,7 @@ Per memory `feedback_ci_disabled`: GitHub Actions CI is disabled in this repo; b
 - [ ] Task 12: CommunitySettingsPanel.svelte refactor + tests
 - [ ] Task 13: Final 5-gate sweep + push + PR creation
 
-Total: 14 tasks, ~12 implementation commits + 1 final push commit (Task 13 doesn't commit).
+Total: 14 tasks, 12 implementation commits across Tasks 1-12. Task 13 performs the final 5-gate sweep + push + PR creation without an additional commit.
 
 Expected final test counts:
 - Rust: 1369 → ~1395 (+26)

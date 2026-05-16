@@ -422,8 +422,8 @@ A Phase 2 client encoding a `CommunityState` with empty/None new fields produces
 
 A community redeemed via a Phase 1 fork-invite has:
 - `forked_from: Some(parent_id)` (Phase 1, intact)
-- `forked_at_wall_ms: None` (Phase 2 redeem path doesn't run for Phase 1 invites — but even when Phase 2 redeem runs against a Phase 1 invite, `snapshot.forked_at` already exists in Phase 1, so we DO set this from Phase 1 invite snapshots; this gives mixed-version Phase 1 forks a forked_at)
-- `parent_lineage: []` (Phase 1 invite carried no chain)
+- `forked_at_wall_ms: Some(snapshot.forked_at.wall_ms)` (Phase 1 invites already carry `snapshot.forked_at` as an Hlc, so the Phase 2 redeem path reads its `wall_ms` and persists it; Phase 1 forks get a non-None `forked_at_wall_ms` automatically)
+- `parent_lineage: []` (Phase 1 invite carried no chain; the IPC DTO synthesizes a single immediate-parent entry from `forked_from` so the tree still renders the parent row — see `lib.rs::get_community_lineage`)
 
 The Lineage tree for a Phase 1 fork renders:
 

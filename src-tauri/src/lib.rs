@@ -7074,42 +7074,57 @@ pub fn build_fork_descendants(
         _ => return Err("not a member".to_string()),
     }
 
-    let mut dtos: Vec<ForkDescendantDto> = events
+    // R1-3: sort by full HLC ordering BEFORE projecting to DTOs so that two
+    // Fork events at the same wall_ms but different logical clocks order
+    // deterministically by full HLC (wall_ms → logical → device_id), then
+    // tiebreak by actor address. Projecting first and sorting on
+    // `forked_at_wall_ms` alone loses the logical-clock distinction.
+    let mut fork_events: Vec<&crate::community_membership::SignedMembershipEvent> = events
         .values()
-        .filter_map(|signed| {
-            if let crate::community_membership::MembershipEventKind::Fork { fork_space_id } =
-                &signed.kind
-            {
-                // Forker display name: per spec §4.1 only resolve when the
-                // forker is currently Joined. Phase 2 has no profile-broadcast
-                // ladder integration yet (ZEB-281 deferred), so the resolved
-                // value is None even for Joined members — matches Phase 1's
-                // MemberInfoDto.display_name placeholder pattern.
-                let forker_display_name =
-                    match materialized.members.get(&signed.actor).map(|m| m.status) {
-                        Some(crate::community_membership::MemberStatus::Joined) => None,
-                        _ => None,
-                    };
-                Some(ForkDescendantDto {
-                    fork_space_id: hex::encode(fork_space_id.0),
-                    forker_addr: hex::encode(signed.actor.0),
-                    forker_display_name,
-                    forked_at_wall_ms: signed.at.wall_ms,
-                    locally_known: locally_known.contains(fork_space_id),
-                })
-            } else {
-                None
+        .filter(|signed| {
+            matches!(
+                &signed.kind,
+                crate::community_membership::MembershipEventKind::Fork { .. }
+            )
+        })
+        .collect();
+    fork_events.sort_by(|a, b| {
+        a.at.wall_ms
+            .cmp(&b.at.wall_ms)
+            .then_with(|| a.at.logical.cmp(&b.at.logical))
+            .then_with(|| a.at.device_id.cmp(&b.at.device_id))
+            .then_with(|| a.actor.0.cmp(&b.actor.0))
+    });
+
+    let dtos: Vec<ForkDescendantDto> = fork_events
+        .into_iter()
+        .map(|signed| {
+            let fork_space_id = match &signed.kind {
+                crate::community_membership::MembershipEventKind::Fork { fork_space_id } => {
+                    fork_space_id
+                }
+                // Unreachable: filtered above.
+                _ => unreachable!("non-Fork event survived filter"),
+            };
+            // Forker display name: per spec §4.1 only resolve when the
+            // forker is currently Joined. Phase 2 has no profile-broadcast
+            // ladder integration yet (ZEB-281 deferred), so the resolved
+            // value is None even for Joined members — matches Phase 1's
+            // MemberInfoDto.display_name placeholder pattern.
+            let forker_display_name =
+                match materialized.members.get(&signed.actor).map(|m| m.status) {
+                    Some(crate::community_membership::MemberStatus::Joined) => None,
+                    _ => None,
+                };
+            ForkDescendantDto {
+                fork_space_id: hex::encode(fork_space_id.0),
+                forker_addr: hex::encode(signed.actor.0),
+                forker_display_name,
+                forked_at_wall_ms: signed.at.wall_ms,
+                locally_known: locally_known.contains(fork_space_id),
             }
         })
         .collect();
-
-    // Sort ascending by wall_ms with stable secondary sort by forker_addr
-    // for HLC-tie cases (spec §4.1).
-    dtos.sort_by(|a, b| {
-        a.forked_at_wall_ms
-            .cmp(&b.forked_at_wall_ms)
-            .then_with(|| a.forker_addr.cmp(&b.forker_addr))
-    });
 
     Ok(dtos)
 }
@@ -7250,9 +7265,18 @@ pub struct PhaseTwoCommunityLineageDto {
     /// Phase 2 field: wall_ms of THIS community's Fork event from its
     /// parent. None for top-level communities and Phase 1 forks.
     pub forked_at_wall_ms: Option<u64>,
-    /// Phase 2 field: ordered ancestor chain (root → above the immediate
-    /// parent), excluding the immediate parent (that's `forked_from`).
-    /// Empty for top-level communities and Phase 1 forks.
+    /// Phase 2 field: ordered ancestor chain (root → immediate parent).
+    ///
+    /// Stored-state shape (CommunityState.parent_lineage): EXCLUDES the
+    /// immediate parent (which lives in `forked_from`) per spec §3.2.
+    ///
+    /// IPC-DTO shape (this field): the `get_community_lineage` IPC
+    /// SYNTHESIZES an immediate-parent entry when the stored chain is
+    /// empty but `forked_from` is set (Phase 1 / single-hop forks), so
+    /// the frontend tree can render the parent row uniformly. For
+    /// multi-hop Phase 2 forks the stored chain already includes the
+    /// immediate parent at the tail. Empty only for top-level (non-fork)
+    /// communities.
     pub parent_lineage: Vec<ParentLineageDto>,
     /// This community's own SpaceId (hex) — convenience so frontend can
     /// render "you are here" without a second IPC.
@@ -7376,12 +7400,52 @@ async fn get_community_lineage(
         _ => return Err("not a member".to_string()),
     }
 
+    // R1-1: synthesize an immediate-parent entry for Phase 1 / single-hop
+    // forks. CommunityState.parent_lineage EXCLUDES the immediate parent
+    // (which lives in `forked_from`); the IPC DTO needs the parent so the
+    // frontend tree can render it as a row. When the stored chain is empty
+    // but `forked_from` is set, push a synthesized entry with the parent's
+    // name resolved from local owner-state (best-effort; falls back to a
+    // truncated-hex sentinel when the parent isn't locally known).
+    //
+    // Note: this synthesis affects ONLY the IPC-DTO shape, NOT the stored
+    // `CommunityState.parent_lineage` (which per spec §3.2 still excludes
+    // the immediate parent — that's encoded via `original_community_id` on
+    // the wire / `forked_from` on disk).
+    let lineage_for_dto: Vec<crate::community_invite::ParentLineageEntry> =
+        if let Some(parent_id) = forked_from {
+            if parent_lineage_clone.is_empty() {
+                let parent_name = {
+                    let s = crdt_state.lock().await;
+                    s.spaces
+                        .get(&parent_id)
+                        .map(|sp| sp.name.clone())
+                        .unwrap_or_else(|| {
+                            // Fallback: truncated hex sentinel for unknown parents.
+                            let hex = hex::encode(parent_id.0);
+                            format!("0x{}…", &hex[..8])
+                        })
+                };
+                vec![crate::community_invite::ParentLineageEntry {
+                    space_id: parent_id,
+                    name: parent_name,
+                    // wall_ms of how THIS-parent-was-forked-from-its-parent
+                    // is unknown for Phase 1 / single-hop synthesis; None.
+                    forked_at_wall_ms: None,
+                }]
+            } else {
+                parent_lineage_clone
+            }
+        } else {
+            parent_lineage_clone
+        };
+
     Ok(build_community_lineage_dto(
         space_id,
         self_name,
         forked_from,
         forked_at_wall_ms,
-        &parent_lineage_clone,
+        &lineage_for_dto,
     ))
 }
 
@@ -7742,6 +7806,75 @@ mod list_community_forks_tests {
         assert_eq!(result[0].forked_at_wall_ms, 100);
         assert_eq!(result[1].forked_at_wall_ms, 200);
         assert_eq!(result[2].forked_at_wall_ms, 300);
+    }
+
+    #[test]
+    fn list_community_forks_sorts_by_full_hlc_when_wall_ms_ties() {
+        // R1-3: two Fork events at the SAME wall_ms but different logical
+        // clocks must order by HLC.logical, not be wall_ms-only ambiguous.
+        // A naive sort on `forked_at_wall_ms` alone leaves the tiebreak
+        // dependent on the BTreeMap event-id ordering (the source values()
+        // iteration), which loses the HLC's authoritative ordering.
+        let cid = SpaceId([0xb0; 16]);
+        let caller = OwnerAddr([0xc7; 16]);
+        let f_low = SpaceId([0xa1; 16]); // logical=0 (earlier)
+        let f_high = SpaceId([0xa2; 16]); // logical=5 (later)
+
+        // The two Fork events share wall_ms=500 but differ in logical.
+        // Insert with the LATER (logical=5) event's id ordered FIRST in
+        // the BTreeMap so a wall_ms-only sort would emit it before the
+        // earlier (logical=0) event. Correct HLC sort must invert that.
+        let mut events: BTreeMap<[u8; 16], SignedMembershipEvent> = BTreeMap::new();
+        events.insert(
+            [0x01; 16],
+            SignedMembershipEvent {
+                id: [0x01; 16],
+                community_id: cid,
+                kind: MembershipEventKind::Fork {
+                    fork_space_id: f_high,
+                },
+                actor: caller,
+                at: Hlc {
+                    wall_ms: 500,
+                    logical: 5, // later
+                    device_id: "t".into(),
+                },
+                sig: [0u8; 64],
+                countersig: None,
+            },
+        );
+        events.insert(
+            [0x02; 16],
+            SignedMembershipEvent {
+                id: [0x02; 16],
+                community_id: cid,
+                kind: MembershipEventKind::Fork {
+                    fork_space_id: f_low,
+                },
+                actor: caller,
+                at: Hlc {
+                    wall_ms: 500,
+                    logical: 0, // earlier
+                    device_id: "t".into(),
+                },
+                sig: [0u8; 64],
+                countersig: None,
+            },
+        );
+
+        let materialized = materialized_with_join(caller, MemberStatus::Joined);
+        let result =
+            build_fork_descendants(&events, &materialized, &BTreeSet::new(), caller).unwrap();
+
+        assert_eq!(result.len(), 2);
+        // Earlier-logical-clock event must come first despite being
+        // inserted under a larger BTreeMap key.
+        assert_eq!(
+            result[0].fork_space_id,
+            hex::encode(f_low.0),
+            "HLC tiebreak: logical=0 must precede logical=5 at same wall_ms"
+        );
+        assert_eq!(result[1].fork_space_id, hex::encode(f_high.0));
     }
 }
 
@@ -10973,7 +11106,14 @@ where
             // always existed, so wall_ms is filled even for legacy invites.
             if let Some(snapshot) = payload.pre_fork_snapshot.as_ref() {
                 state_g.forked_at_wall_ms = Some(snapshot.forked_at.wall_ms);
-                state_g.parent_lineage = snapshot.parent_lineage.clone();
+                // R1-2: apply 16-deep cap on the redeem side too. A
+                // malicious or future-protocol-revision payload could
+                // carry > 16 entries; the cap drops the oldest (root-side)
+                // so our local state stays bounded. Same helper as
+                // community_fork.rs::fork_community uses at build time.
+                let mut capped_lineage = snapshot.parent_lineage.clone();
+                crate::community_invite::apply_lineage_cap(&mut capped_lineage);
+                state_g.parent_lineage = capped_lineage;
             }
         } else {
             tracing::warn!(

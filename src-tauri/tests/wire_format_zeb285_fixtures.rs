@@ -20,6 +20,44 @@ use harmony_app::owner_state_crypto::canonical_cbor_encode;
 use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
 use std::collections::BTreeMap;
 
+/// R1-5: structurally decode `bytes` as a CBOR map and assert presence /
+/// absence of the listed keys at the TOP level of the map.
+///
+/// Byte-substring matching (`bytes.windows(2).any(|w| w == b"pl")`) is
+/// brittle: a data value containing the bytes "pl" (e.g., a name field
+/// "Polite Project") false-positives. Decoding to `ciborium::Value` and
+/// inspecting the map keys is robust against data-content coincidences.
+/// Uses `ciborium` since `serde_cbor` is not a workspace dependency.
+fn assert_cbor_top_level_keys(bytes: &[u8], present: &[&str], absent: &[&str], label: &str) {
+    let decoded: ciborium::Value = ciborium::de::from_reader(bytes)
+        .unwrap_or_else(|e| panic!("{label}: decode as Value failed: {e}"));
+    let pairs = match decoded {
+        ciborium::Value::Map(m) => m,
+        other => panic!("{label}: expected CBOR map at top level, got {other:?}"),
+    };
+    // Collect string-typed keys (canonical encoding uses Text keys for
+    // these fields). Non-Text keys would be a wire-format break in itself.
+    let keys: std::collections::BTreeSet<String> = pairs
+        .iter()
+        .filter_map(|(k, _)| match k {
+            ciborium::Value::Text(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    for key in present {
+        assert!(
+            keys.contains(*key),
+            "{label}: expected key `{key}` to be present (top-level keys: {keys:?})"
+        );
+    }
+    for key in absent {
+        assert!(
+            !keys.contains(*key),
+            "{label}: expected key `{key}` to be absent (top-level keys: {keys:?})"
+        );
+    }
+}
+
 fn fixture_hlc() -> Hlc {
     Hlc {
         wall_ms: 1_700_000_000_000,
@@ -178,10 +216,9 @@ fn parent_lineage_entry_root_omits_at_canonical_cbor() {
 
     let expected_hex = "a26273695011111111111111111111111111111111626e6d64526f6f74";
     assert_eq!(hex, expected_hex, "Root ParentLineageEntry changed");
-    assert!(
-        !bytes.windows(2).any(|w| w == b"at"),
-        "root entry must omit `at` key"
-    );
+    // R1-5: structural assertion instead of byte-substring (which could
+    // false-positive on a name like "patio").
+    assert_cbor_top_level_keys(&bytes, &["si", "nm"], &["at"], "Root ParentLineageEntry");
 }
 
 /// Fixture 6: PreForkSnapshot carrying a 2-entry parent_lineage chain.
@@ -219,10 +256,10 @@ fn pre_fork_snapshot_with_parent_lineage_canonical_cbor() {
         hex, expected_hex,
         "PreForkSnapshot with parent_lineage wire format changed"
     );
-    assert!(
-        bytes.windows(2).any(|w| w == b"pl"),
-        "non-empty parent_lineage must produce `pl` key"
-    );
+    // R1-5: structural assertion — non-empty parent_lineage must produce
+    // the `pl` key at the TOP LEVEL of the snapshot map (not just somewhere
+    // in the byte stream, which would false-positive on data values).
+    assert_cbor_top_level_keys(&bytes, &["pl"], &[], "PreForkSnapshot with parent_lineage");
 }
 
 /// Fixture 7: CommunityState carrying parent_lineage + forked_at_wall_ms.
@@ -249,8 +286,14 @@ fn community_state_with_parent_lineage_canonical_cbor() {
         hex, expected_hex,
         "CommunityState with parent_lineage wire format changed"
     );
-    assert!(bytes.windows(2).any(|w| w == b"fa"));
-    assert!(bytes.windows(2).any(|w| w == b"fl"));
+    // R1-5: structural assertion — top-level `fa` (forked_at_wall_ms) and
+    // `fl` (parent_lineage) keys must both be present.
+    assert_cbor_top_level_keys(
+        &bytes,
+        &["fa", "fl"],
+        &[],
+        "CommunityState with parent_lineage",
+    );
 }
 
 /// Fixture 8: Phase 1 wire-form (no `fa`, no `fl`) decodes under Phase 2
@@ -275,13 +318,13 @@ fn phase1_community_state_decodes_under_phase2_types() {
     assert_eq!(decoded.forked_from, Some(SpaceId([0xbb; 16])));
     assert_eq!(decoded.community_id, SpaceId([0xaa; 16]));
 
-    // Byte-compat: the encoded form must NOT contain the Phase 2 keys.
-    assert!(
-        !bytes.windows(2).any(|w| w == b"fa"),
-        "Phase 1-shape CommunityState must omit `fa` key"
-    );
-    assert!(
-        !bytes.windows(2).any(|w| w == b"fl"),
-        "Phase 1-shape CommunityState must omit `fl` key"
+    // Byte-compat: the encoded form must NOT contain the Phase 2 keys at
+    // the top level. R1-5: structural decode is robust to incidental
+    // byte-pair occurrences inside SpaceId / name / etc. payloads.
+    assert_cbor_top_level_keys(
+        &bytes,
+        &["ff"], // Phase 1's forked_from key must still be present
+        &["fa", "fl"],
+        "Phase 1-shape CommunityState",
     );
 }

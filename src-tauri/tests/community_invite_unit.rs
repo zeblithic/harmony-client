@@ -1441,9 +1441,12 @@ mod zeb287_pre_fork_snapshot_lineage {
 
 // ZEB-287 Phase 2 Task 4: build_fork_snapshot lineage construction logic +
 // 16-deep cap. These tests pin the algorithm shape against
-// community_fork.rs::fork_community's Task 4 block.
+// community_fork.rs::fork_community's Task 4 block via the SHARED
+// `build_parent_lineage` / `apply_lineage_cap` helpers (R1-4).
 mod zeb287_lineage_build_logic {
-    use harmony_app::community_invite::ParentLineageEntry;
+    use harmony_app::community_invite::{
+        apply_lineage_cap, build_parent_lineage, ParentLineageEntry, MAX_LINEAGE_DEPTH,
+    };
     use harmony_app::owner_state_types::SpaceId;
 
     #[test]
@@ -1451,6 +1454,8 @@ mod zeb287_lineage_build_logic {
         // Simulate forker's CommunityState.parent_lineage = [C-entry] and
         // forker's community is B (forked from C). After fork into A_fork:
         //   A_fork.parent_lineage = [C-entry, B-entry]
+        // Driven through the production helper so a regression in
+        // production logic surfaces here.
         let c_entry = ParentLineageEntry {
             space_id: SpaceId([0x11; 16]),
             name: "C".to_string(),
@@ -1458,16 +1463,10 @@ mod zeb287_lineage_build_logic {
         };
         let forker_lineage = vec![c_entry.clone()];
         let b_id = SpaceId([0x22; 16]);
-        let b_name = "B".to_string();
+        let b_name = "B";
         let b_forked_at = Some(1_700_000_000_000u64);
 
-        // Mirror the build logic in community_fork.rs Task 4:
-        let mut new_lineage = forker_lineage.clone();
-        new_lineage.push(ParentLineageEntry {
-            space_id: b_id,
-            name: b_name.clone(),
-            forked_at_wall_ms: b_forked_at,
-        });
+        let new_lineage = build_parent_lineage(&forker_lineage, b_id, b_name, b_forked_at);
 
         assert_eq!(new_lineage.len(), 2);
         assert_eq!(new_lineage[0], c_entry);
@@ -1478,7 +1477,8 @@ mod zeb287_lineage_build_logic {
 
     #[test]
     fn lineage_cap_drops_oldest_root_side_entries() {
-        // Construct a 20-deep lineage; verify cap keeps newest 16.
+        // Construct a 20-deep lineage; verify cap keeps newest 16 via the
+        // shared helper.
         let mut overlong: Vec<ParentLineageEntry> = (0u8..20)
             .map(|i| ParentLineageEntry {
                 space_id: SpaceId([i; 16]),
@@ -1487,16 +1487,79 @@ mod zeb287_lineage_build_logic {
             })
             .collect();
 
-        const MAX_LINEAGE_DEPTH: usize = 16;
-        if overlong.len() > MAX_LINEAGE_DEPTH {
-            let overflow = overlong.len() - MAX_LINEAGE_DEPTH;
-            overlong.drain(0..overflow);
-        }
+        apply_lineage_cap(&mut overlong);
 
-        assert_eq!(overlong.len(), 16);
+        assert_eq!(overlong.len(), MAX_LINEAGE_DEPTH);
         // First entry should be ancestor_4 (oldest 4 dropped: 0,1,2,3).
         assert_eq!(overlong[0].name, "ancestor_4");
         // Last entry should be ancestor_19 (newest preserved).
         assert_eq!(overlong[15].name, "ancestor_19");
+    }
+
+    #[test]
+    fn build_parent_lineage_extends_and_caps_correctly() {
+        // R1-4 helper unit test: exercise both short and overlong inputs.
+
+        // Short input: chain of 3 entries + push 1 → result has 4 entries,
+        // no cap applied.
+        let short_chain: Vec<ParentLineageEntry> = (0u8..3)
+            .map(|i| ParentLineageEntry {
+                space_id: SpaceId([i; 16]),
+                name: format!("a_{i}"),
+                forked_at_wall_ms: Some(i as u64),
+            })
+            .collect();
+        let new_short = build_parent_lineage(&short_chain, SpaceId([0xff; 16]), "forker", Some(99));
+        assert_eq!(new_short.len(), 4);
+        assert_eq!(new_short[0].name, "a_0");
+        assert_eq!(new_short[3].name, "forker");
+        assert_eq!(new_short[3].forked_at_wall_ms, Some(99));
+
+        // Overlong input: chain of MAX_LINEAGE_DEPTH entries + push 1 →
+        // result has MAX_LINEAGE_DEPTH entries with the OLDEST dropped.
+        let max_chain: Vec<ParentLineageEntry> = (0u8..MAX_LINEAGE_DEPTH as u8)
+            .map(|i| ParentLineageEntry {
+                space_id: SpaceId([i; 16]),
+                name: format!("a_{i}"),
+                forked_at_wall_ms: if i == 0 { None } else { Some(i as u64) },
+            })
+            .collect();
+        let new_max = build_parent_lineage(&max_chain, SpaceId([0xfe; 16]), "forker", Some(999));
+        assert_eq!(new_max.len(), MAX_LINEAGE_DEPTH);
+        // a_0 dropped: first entry is a_1.
+        assert_eq!(new_max[0].name, "a_1");
+        // Last entry is the new forker entry.
+        assert_eq!(new_max[MAX_LINEAGE_DEPTH - 1].name, "forker");
+
+        // Empty input: just the new entry.
+        let new_empty = build_parent_lineage(&[], SpaceId([0xfd; 16]), "first", None);
+        assert_eq!(new_empty.len(), 1);
+        assert_eq!(new_empty[0].name, "first");
+        assert_eq!(new_empty[0].forked_at_wall_ms, None);
+    }
+
+    #[test]
+    fn redeem_overlong_lineage_payload_truncates_to_cap() {
+        // R1-2: a malicious or future-protocol-revision PreForkSnapshot
+        // payload could carry > MAX_LINEAGE_DEPTH entries. The redeem path
+        // applies `apply_lineage_cap` defensively so the joiner's local
+        // CommunityState.parent_lineage stays bounded regardless of payload
+        // length. This unit test mirrors the helper call site in
+        // `lib.rs::redeem_invite_inner`.
+        let mut payload_lineage: Vec<ParentLineageEntry> = (0u8..20)
+            .map(|i| ParentLineageEntry {
+                space_id: SpaceId([i; 16]),
+                name: format!("evil_{i}"),
+                forked_at_wall_ms: Some(i as u64),
+            })
+            .collect();
+        assert_eq!(payload_lineage.len(), 20);
+
+        apply_lineage_cap(&mut payload_lineage);
+
+        assert_eq!(payload_lineage.len(), MAX_LINEAGE_DEPTH);
+        // Oldest 4 dropped: first is evil_4, last is evil_19.
+        assert_eq!(payload_lineage[0].name, "evil_4");
+        assert_eq!(payload_lineage[15].name, "evil_19");
     }
 }

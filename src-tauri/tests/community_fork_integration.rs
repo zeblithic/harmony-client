@@ -210,11 +210,31 @@ async fn run_fork_inner(
         join_outcome
     );
 
-    // Step 4: set forked_from on the fork engine's CommunityState.
+    // Step 4: set forked_from + Phase 2 lineage fields on the fork engine's
+    // CommunityState — mirrors community_fork.rs Steps after engine spawn.
+    // R1-1b: also persist forked_at_wall_ms + parent_lineage so a
+    // subsequent fork of THIS community reads the correct ancestry.
+    let new_parent_lineage = {
+        // Read forker community's existing lineage to extend.
+        let original_engine = registry_original
+            .engine_arc(&original_community_id)
+            .await
+            .expect("original engine arc");
+        let state_arc = original_engine.state();
+        let state_g = state_arc.lock().await;
+        harmony_app::community_invite::build_parent_lineage(
+            &state_g.parent_lineage,
+            original_community_id,
+            "test-community",
+            state_g.forked_at_wall_ms,
+        )
+    };
     {
         let state_arc = fork_engine.state();
         let mut state_g = state_arc.lock().await;
         state_g.forked_from = Some(original_community_id);
+        state_g.forked_at_wall_ms = Some(hlc.wall_ms);
+        state_g.parent_lineage = new_parent_lineage.clone();
     }
 
     // Step 5: build a minimal PreForkSnapshot and write to disk.
@@ -239,7 +259,10 @@ async fn run_fork_inner(
         channel_log: BoundedChannelLogSnapshot::default(),
         identity_pubs,
         forked_at: hlc.clone(),
-        parent_lineage: Vec::new(),
+        // R1-1b: snapshot carries the new fork's lineage so that a
+        // subsequent fork of THIS fork reads correct ancestry through
+        // the invite path too.
+        parent_lineage: new_parent_lineage,
     };
 
     // Write snapshot to disk atomically.
@@ -1016,40 +1039,35 @@ fn dual_keyset_verify_snapshot_events() {
 fn three_deep_fork_chain_preserves_lineage_through_snapshot() {
     // Simulate three generations of forks: C → B → A_fork → A_fork_2.
     // Each generation extends the previous's parent_lineage by pushing
-    // the immediate-parent's entry.
+    // the immediate-parent's entry — exercises the SHARED
+    // `build_parent_lineage` helper (R1-4) used by production
+    // `community_fork.rs::fork_community`, so a regression there fails
+    // here too.
 
-    use harmony_app::community_invite::ParentLineageEntry;
+    use harmony_app::community_invite::{build_parent_lineage, ParentLineageEntry};
 
     // Generation C (top-level): no chain.
     let c_id = SpaceId([0x11; 16]);
-    let c_name = "C".to_string();
+    let c_name = "C";
     let c_forked_at: Option<u64> = None; // C is root
 
     // Forking C → B (B is forker_community.id at the time):
-    //   B.parent_lineage = clone(C.parent_lineage=[]) + push(C-entry-root)
+    //   B.parent_lineage = build_parent_lineage([], C.id, C.name, None)
     //                    = [C-entry]
     let b_id = SpaceId([0x22; 16]);
-    let b_name = "B".to_string();
+    let b_name = "B";
     let b_forked_at = Some(1_700_000_000_000u64);
-    let b_lineage: Vec<ParentLineageEntry> = vec![ParentLineageEntry {
-        space_id: c_id,
-        name: c_name.clone(),
-        forked_at_wall_ms: c_forked_at,
-    }];
+    let b_lineage: Vec<ParentLineageEntry> = build_parent_lineage(&[], c_id, c_name, c_forked_at);
     assert_eq!(b_lineage.len(), 1);
     assert_eq!(b_lineage[0].space_id, c_id);
     assert_eq!(b_lineage[0].forked_at_wall_ms, None);
 
     // Forking B → A_fork:
-    //   A_fork.parent_lineage = clone(B.parent_lineage) + push(B-entry)
+    //   A_fork.parent_lineage = build_parent_lineage(B.parent_lineage,
+    //                              B.id, B.name, B.forked_at_wall_ms)
     //                         = [C-entry, B-entry]
     let a_fork_id = SpaceId([0x33; 16]);
-    let mut a_fork_lineage = b_lineage.clone();
-    a_fork_lineage.push(ParentLineageEntry {
-        space_id: b_id,
-        name: b_name.clone(),
-        forked_at_wall_ms: b_forked_at,
-    });
+    let a_fork_lineage = build_parent_lineage(&b_lineage, b_id, b_name, b_forked_at);
     assert_eq!(a_fork_lineage.len(), 2);
     assert_eq!(a_fork_lineage[0].space_id, c_id);
     assert_eq!(a_fork_lineage[0].name, "C");
@@ -1059,16 +1077,10 @@ fn three_deep_fork_chain_preserves_lineage_through_snapshot() {
     assert_eq!(a_fork_lineage[1].forked_at_wall_ms, b_forked_at);
 
     // Forking A_fork → A_fork_2:
-    //   A_fork_2.parent_lineage = clone(A_fork.parent_lineage) + push(A_fork-entry)
-    //                           = [C-entry, B-entry, A_fork-entry]
-    let _ = a_fork_id; // used as forker community id for next gen
+    //   A_fork_2.parent_lineage = [C-entry, B-entry, A_fork-entry]
     let a_fork_forked_at = Some(1_710_000_000_000u64);
-    let mut a_fork_2_lineage = a_fork_lineage.clone();
-    a_fork_2_lineage.push(ParentLineageEntry {
-        space_id: a_fork_id,
-        name: "A_fork".to_string(),
-        forked_at_wall_ms: a_fork_forked_at,
-    });
+    let a_fork_2_lineage =
+        build_parent_lineage(&a_fork_lineage, a_fork_id, "A_fork", a_fork_forked_at);
     assert_eq!(a_fork_2_lineage.len(), 3);
     assert_eq!(a_fork_2_lineage[0].name, "C");
     assert_eq!(a_fork_2_lineage[1].name, "B");
@@ -1079,10 +1091,12 @@ fn three_deep_fork_chain_preserves_lineage_through_snapshot() {
 #[test]
 fn lineage_depth_cap_truncates_root_side_through_fork_path() {
     // Spec §3.4: when forker's parent_lineage already has 16 entries and
-    // we push the forker's own entry (now 17), the cap drains entries 0
+    // we push the forker's own entry (now 17), the cap drains entry 0
     // (the oldest, root-side). After cap: 16 entries, originally [1..17).
+    // Exercises the SHARED `build_parent_lineage` helper (R1-4) which
+    // owns the cap logic in production.
 
-    use harmony_app::community_invite::ParentLineageEntry;
+    use harmony_app::community_invite::{build_parent_lineage, ParentLineageEntry};
 
     // Simulate a forker whose CommunityState already has a 16-deep chain.
     let forker_lineage: Vec<ParentLineageEntry> = (0u8..16)
@@ -1097,25 +1111,12 @@ fn lineage_depth_cap_truncates_root_side_through_fork_path() {
 
     // Forker is forking their own community, which has SpaceId/name/forked_at.
     let forker_id = SpaceId([0xfe; 16]);
-    let forker_name = "ForkerSelf".to_string();
+    let forker_name = "ForkerSelf";
     let forker_forked_at = Some(1_800_000_000_000u64);
 
-    // Mirror the build logic from community_fork.rs Task 4:
-    let mut new_lineage = forker_lineage.clone();
-    new_lineage.push(ParentLineageEntry {
-        space_id: forker_id,
-        name: forker_name.clone(),
-        forked_at_wall_ms: forker_forked_at,
-    });
-    // After push: 17 entries.
-    assert_eq!(new_lineage.len(), 17);
-
-    // Apply the 16-deep cap (drain oldest):
-    const MAX_LINEAGE_DEPTH: usize = 16;
-    if new_lineage.len() > MAX_LINEAGE_DEPTH {
-        let overflow = new_lineage.len() - MAX_LINEAGE_DEPTH;
-        new_lineage.drain(0..overflow);
-    }
+    // Drive the SHARED helper — same code path as production.
+    let new_lineage =
+        build_parent_lineage(&forker_lineage, forker_id, forker_name, forker_forked_at);
 
     assert_eq!(new_lineage.len(), 16);
     // After cap: ancestor_0 dropped; first entry is ancestor_1.
@@ -1161,4 +1162,100 @@ fn phase1_snapshot_redeems_with_default_lineage() {
     // forked_at is Phase 1's existing field, must round-trip.
     assert_eq!(decoded.forked_at.wall_ms, 1_710_000_000_000);
     assert_eq!(decoded.original_community_id, SpaceId([0xc0; 16]));
+}
+
+/// R1-1b regression: `community_fork.rs::fork_community` (and its test
+/// mirror `run_fork_inner`) must persist the new fork's `parent_lineage`
+/// and `forked_at_wall_ms` into the new fork's `CommunityState`. Without
+/// this, a subsequent fork of THIS new fork reads an empty ancestry and
+/// the multi-hop chain truncates.
+///
+/// This test drives `run_fork_inner` twice (C → B then B → A) and asserts
+/// the engine-state mutation made by both fork operations.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_fork_creation_persists_lineage_into_new_state() {
+    let engines = PairedEngines::bootstrap().await;
+    let c_id = engines.community_id; // The "C" community: top-level / root.
+    let a_addr = engines.a_addr;
+    let a_pub = engines.a_pub;
+
+    // First fork: C → B.
+    let b_result = run_fork_inner(
+        &engines.id_a,
+        a_addr,
+        a_pub,
+        c_id,
+        &engines.mk,
+        &engines.registry_a,
+        &engines.registry_a, // same registry — A holds both engines
+        engines.dir_a.path(),
+        "B",
+        true, // silent — keeps test focused on local persistence
+        false,
+    )
+    .await;
+    let b_id = b_result.fork_space_id;
+
+    // Inspect B's CommunityState: it should have parent_lineage = [C-entry]
+    // (C is root, so C's forked_at_wall_ms = None at the time C was the
+    // forker) and forked_at_wall_ms = Some(wall_ms used in the fork mint).
+    let b_engine = engines.registry_a.engine_arc(&b_id).await.unwrap();
+    let b_state = b_engine.state().lock().await.clone();
+    assert_eq!(b_state.forked_from, Some(c_id));
+    assert!(
+        b_state.forked_at_wall_ms.is_some(),
+        "B's forked_at_wall_ms must be set after fork (R1-1b)"
+    );
+    assert_eq!(
+        b_state.parent_lineage.len(),
+        1,
+        "B's parent_lineage must contain exactly one entry (C) after first fork (R1-1b)"
+    );
+    assert_eq!(
+        b_state.parent_lineage[0].space_id, c_id,
+        "B's parent_lineage entry must reference C (R1-1b)"
+    );
+    assert_eq!(
+        b_state.parent_lineage[0].forked_at_wall_ms, None,
+        "C is root → its forked_at_wall_ms entry must be None (R1-1b)"
+    );
+
+    // Second fork: B → A. Reads B's lineage state (set above), extends it.
+    let a_result = run_fork_inner(
+        &engines.id_a,
+        a_addr,
+        a_pub,
+        b_id, // forking B this time
+        &b_result.fork_mk,
+        &engines.registry_a,
+        &engines.registry_a,
+        engines.dir_a.path(),
+        "A",
+        true,
+        false,
+    )
+    .await;
+    let a_id = a_result.fork_space_id;
+
+    // Inspect A's CommunityState: parent_lineage should be [C-entry, B-entry]
+    // — the chain extends through the production helper.
+    let a_engine = engines.registry_a.engine_arc(&a_id).await.unwrap();
+    let a_state = a_engine.state().lock().await.clone();
+    assert_eq!(a_state.forked_from, Some(b_id));
+    assert!(
+        a_state.forked_at_wall_ms.is_some(),
+        "A's forked_at_wall_ms must be set (R1-1b)"
+    );
+    assert_eq!(
+        a_state.parent_lineage.len(),
+        2,
+        "A's parent_lineage must contain two entries (C, B) after second fork (R1-1b)"
+    );
+    assert_eq!(a_state.parent_lineage[0].space_id, c_id);
+    assert_eq!(a_state.parent_lineage[0].forked_at_wall_ms, None);
+    assert_eq!(a_state.parent_lineage[1].space_id, b_id);
+    assert_eq!(
+        a_state.parent_lineage[1].forked_at_wall_ms, b_state.forked_at_wall_ms,
+        "B-entry's forked_at_wall_ms must equal B's stored value (R1-1b)"
+    );
 }

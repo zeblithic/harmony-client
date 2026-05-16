@@ -191,6 +191,38 @@ describe('ForkLineageTree', () => {
     expect(buttons.length).toBe(0);
   });
 
+  it('renders_phase1_fork_immediate_parent_row_from_forked_from', () => {
+    // R1-1 regression: for Phase 1 forks the backend `get_community_lineage`
+    // IPC synthesizes a single ParentLineageEntry from the immediate-parent
+    // pointer when CommunityState.parent_lineage is empty but forked_from
+    // is set. The component just iterates `parent_lineage`, so this test
+    // pins the rendering behaviour from the frontend's perspective: when
+    // the DTO carries that one synthesized entry, the ancestor row renders
+    // AND the "(no forks yet)" empty hint is suppressed.
+    const lineage: CommunityLineageDto = {
+      forkedFrom: 'aa'.repeat(16),
+      forkedAtWallMs: null, // Phase 1: forked_at_wall_ms not set
+      parentLineage: [
+        {
+          spaceId: 'aa'.repeat(16),
+          name: 'Parent',
+          forkedAtWallMs: null,
+        },
+      ],
+      selfSpaceId: '33'.repeat(16),
+      selfName: 'Phase 1 Leaf',
+    };
+
+    const { getByText, queryByText } = render(ForkLineageTree, {
+      props: { lineage, descendants: [], localNavIds: new Set() },
+    });
+
+    expect(getByText(/Parent/)).toBeTruthy();
+    expect(getByText(/Phase 1 Leaf/)).toBeTruthy();
+    // hasAnyForks must be true → empty hint suppressed.
+    expect(queryByText(/no forks yet/i)).toBeNull();
+  });
+
   it('aria_current_page_on_self_row', () => {
     const { container } = render(ForkLineageTree, {
       props: {
