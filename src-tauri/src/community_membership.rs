@@ -1291,17 +1291,12 @@ pub fn materialize_with_now(
     // Raw collection only; quorum-reached evaluation happens in the
     // main pass (§5.2) because `admin_quorum` itself is a function
     // of prior ChangeQuorum proposals (single-pass-with-running-state).
-    #[allow(unused_variables)]
     let mut quorum_signers: std::collections::HashMap<
         EventId,
         std::collections::HashSet<OwnerAddr>,
     > = std::collections::HashMap::new();
-    #[allow(unused_variables)]
-    let mut proposals_index: std::collections::HashMap<
-        EventId,
-        (ProposalKind, OwnerAddr, u64),
-    > = std::collections::HashMap::new();
-    #[allow(unused_variables)]
+    let mut proposals_index: std::collections::HashMap<EventId, (ProposalKind, OwnerAddr, u64)> =
+        std::collections::HashMap::new();
     let mut proposal_signing_hlcs: std::collections::HashMap<EventId, Vec<(u64, OwnerAddr)>> =
         std::collections::HashMap::new();
 
@@ -1851,10 +1846,42 @@ pub fn materialize_with_now(
                 // countersigned_pending_ids, then consumed during the
                 // PendingJoin arm above. No direct state mutation here.
             }
-            MembershipEventKind::AdminProposal { .. }
-            | MembershipEventKind::AdminCountersign { .. } => {
-                // ZEB-250 Tasks 7 + 8 will replace this stub with the
-                // real materialize logic (pre-pass + main pass).
+            MembershipEventKind::AdminProposal { proposal_kind: _ } => {
+                // ZEB-250 §5.2: evaluate the proposal against the
+                // *running* admin_quorum. If signers >= admin_quorum
+                // and the Nth signer landed within 30 days of the
+                // proposer's HLC, apply the effect.
+                let signers = quorum_signers.get(&event.id).map(|s| s.len()).unwrap_or(0);
+                let admin_quorum_now = m.admin_quorum as usize;
+                if signers >= admin_quorum_now && admin_quorum_now > 0 {
+                    // Find the Nth signer's wall_ms (sorted by wall_ms ascending).
+                    let mut sorted_hlcs: Vec<(u64, OwnerAddr)> = proposal_signing_hlcs
+                        .get(&event.id)
+                        .cloned()
+                        .unwrap_or_default();
+                    sorted_hlcs.sort_by_key(|(wall_ms, _)| *wall_ms);
+                    // 1-indexed: the (admin_quorum_now - 1)-th entry is the
+                    // signer that pushed the count over the threshold.
+                    if let Some((nth_signer_wall_ms, _)) = sorted_hlcs.get(admin_quorum_now - 1) {
+                        let age_when_reached = nth_signer_wall_ms.saturating_sub(event.at.wall_ms);
+                        if age_when_reached <= ADMIN_PROPOSAL_EXPIRY_MS {
+                            // Apply effect: ChangeQuorum updates running
+                            // admin_quorum; SetPower mutates power_levels;
+                            // Kick mutates members + power_levels.
+                            if let Some((kind, _proposer, _proposer_wall_ms)) =
+                                proposals_index.get(&event.id).cloned()
+                            {
+                                apply_admin_proposal_effect(&mut m, &kind, event);
+                            }
+                        }
+                        // else: quorum reached too late; no effect.
+                    }
+                }
+                // else: insufficient signatures; pending. No mutation.
+            }
+            MembershipEventKind::AdminCountersign { .. } => {
+                // ZEB-250: countersigns are consumed by the pre-pass.
+                // Main-pass arm is a no-op.
             }
         }
     }
@@ -2751,6 +2778,54 @@ pub const MAX_MODERATION_REASON_CHARS: usize = 280;
 /// minus event HLC, in wall-ms) are hidden from materialize unless a
 /// matching JoinCountersign exists. 30 days.
 pub const MATERIALIZE_PENDING_EXPIRY_MS: u64 = 30 * 86_400_000;
+
+/// ZEB-250: AdminProposal expiry window. A proposal that reaches
+/// quorum more than 30 days after its proposer's HLC is dead — late
+/// countersigns to expired proposals are no-ops at materialize time.
+///
+/// Mirrors ZEB-254's PendingJoin 30-day expiry. Same constant value;
+/// kept as a separate const for clarity at the call site.
+pub const ADMIN_PROPOSAL_EXPIRY_MS: u64 = 30 * 86_400_000;
+
+/// ZEB-250: apply an admin-proposal's effect to the running
+/// materialized state when the proposal has reached quorum within the
+/// 30-day window. Translates the wrapped ProposalKind into the same
+/// mutation that a direct SetPower / Kick / ChangeQuorum would produce.
+fn apply_admin_proposal_effect(
+    m: &mut MaterializedMembership,
+    proposal_kind: &ProposalKind,
+    proposal_event: &SignedMembershipEvent,
+) {
+    match proposal_kind {
+        ProposalKind::SetPower { target, level } => {
+            // Mirror the existing SetPower arm in the materialize main pass.
+            m.power_levels.insert(*target, *level);
+        }
+        ProposalKind::Kick { target, .. } => {
+            // Mirror the existing Kick arm in the materialize main pass.
+            // Capture prior status before mutation — needed to decide
+            // whether to mark pending_rotation_for (mirrors the direct
+            // Kick arm's R4-1 PendingJoin guard).
+            let prior_status = m.members.get(target).map(|s| s.status);
+            if let Some(ms) = m.members.get_mut(target) {
+                ms.status = MemberStatus::Banned;
+                ms.left_at = Some(proposal_event.at.clone());
+            }
+            // Mirror the direct Kick arm: track that a rotation is needed,
+            // EXCEPT when kicking a PendingJoin (they never received epoch
+            // key material, so no rotation is required).
+            if !matches!(prior_status, Some(MemberStatus::PendingJoin)) {
+                m.pending_rotation_for.insert(*target);
+            }
+        }
+        ProposalKind::ChangeQuorum { new_quorum } => {
+            // ChangeQuorum mutates the running admin_quorum so subsequent
+            // AdminProposal events in the same replay see the updated threshold
+            // (single-pass-with-running-state, spec §5.2).
+            m.admin_quorum = *new_quorum;
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -7208,5 +7283,586 @@ mod zeb_250_materialize_prepass_tests {
         // application. This test just exercises the pre-pass without
         // panicking.
         let _m = materialize(&events, admin1);
+    }
+}
+
+// ── ZEB-250 Task 8: materialize main-pass AdminProposal effect tests ─────────
+
+#[cfg(test)]
+mod zeb_250_admin_proposal_materialize_tests {
+    use super::*;
+
+    const COM: SpaceId = SpaceId([0xc0; 16]);
+
+    fn ev(
+        id: [u8; 16],
+        actor: OwnerAddr,
+        wall_ms: u64,
+        kind: MembershipEventKind,
+    ) -> SignedMembershipEvent {
+        SignedMembershipEvent {
+            id,
+            community_id: COM,
+            actor,
+            at: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            kind,
+            sig: [0; 64],
+            countersig: None,
+        }
+    }
+
+    /// Build the common two-admin bootstrap under quorum=1:
+    ///   - admin2 Join
+    ///   - admin1 SetPower admin2 → 100
+    ///   - admin1 AdminProposal{ChangeQuorum{new_quorum}} (self-satisfies at quorum=1)
+    ///
+    /// Returns the three events to prepend to per-test event lists.
+    fn bootstrap_two_admins_raise_quorum(
+        admin1: OwnerAddr,
+        admin2: OwnerAddr,
+        new_quorum: u8,
+    ) -> Vec<SignedMembershipEvent> {
+        vec![
+            ev([0x80; 16], admin2, 1_000, MembershipEventKind::Join),
+            ev(
+                [0x81; 16],
+                admin1,
+                2_000,
+                MembershipEventKind::SetPower {
+                    target: admin2,
+                    level: 100,
+                },
+            ),
+            ev(
+                [0xCC; 16],
+                admin1,
+                10_000,
+                MembershipEventKind::AdminProposal {
+                    proposal_kind: ProposalKind::ChangeQuorum { new_quorum },
+                },
+            ),
+        ]
+    }
+
+    /// A proposal that has no countersigns under quorum=2 must not apply its
+    /// effect — the proposer alone is 1 signer, short of the required 2.
+    #[test]
+    fn materialize_proposal_without_countersigns_pending_when_quorum_above_1() {
+        let admin1 = OwnerAddr([0x01; 16]);
+        let admin2 = OwnerAddr([0x02; 16]);
+
+        // Bootstrap: quorum=1 → raise to 2 via sole-signer ChangeQuorum.
+        let mut events = bootstrap_two_admins_raise_quorum(admin1, admin2, 2);
+
+        // Under quorum=2: propose demote admin2. No countersign.
+        events.push(ev(
+            [0xDD; 16],
+            admin1,
+            11_000,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::SetPower {
+                    target: admin2,
+                    level: 0,
+                },
+            },
+        ));
+
+        let m = materialize(&events, admin1);
+
+        // Effect must NOT have applied — admin2 still admin (power 100).
+        assert_eq!(
+            m.power_levels.get(&admin2).copied().unwrap_or(0),
+            100,
+            "admin2 must retain power=100 when proposal lacks countersign"
+        );
+        // admin_quorum updated to 2 (sole-signer ChangeQuorum self-satisfies under prior quorum=1).
+        assert_eq!(m.admin_quorum, 2);
+    }
+
+    /// One countersign from admin2 satisfies quorum=2 for a SetPower proposal.
+    #[test]
+    fn materialize_proposal_effective_when_one_countersign_reaches_quorum_2() {
+        let admin1 = OwnerAddr([0x01; 16]);
+        let admin2 = OwnerAddr([0x02; 16]);
+        let target = OwnerAddr([0x03; 16]);
+
+        let mut events = bootstrap_two_admins_raise_quorum(admin1, admin2, 2);
+
+        // target must join so SetPower has a member record (only needed for
+        // Kick; SetPower on power_levels doesn't require member presence, but
+        // adding target's Join makes the state realistic).
+
+        let prop_id = [0xDD; 16];
+        // Propose promote target to admin.
+        events.push(ev(
+            prop_id,
+            admin1,
+            20_000,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::SetPower { target, level: 100 },
+            },
+        ));
+        // admin2 countersigns — now 2 signers, meeting quorum=2.
+        events.push(ev(
+            [0xEE; 16],
+            admin2,
+            21_000,
+            MembershipEventKind::AdminCountersign {
+                target_event_id: prop_id,
+            },
+        ));
+
+        let m = materialize(&events, admin1);
+
+        assert_eq!(
+            m.power_levels.get(&target).copied().unwrap_or(0),
+            100,
+            "target must be promoted to 100 when quorum=2 is reached"
+        );
+    }
+
+    /// Two countersigns (admin2 + admin3) satisfy quorum=3.
+    #[test]
+    fn materialize_proposal_effective_when_two_countersigns_reach_quorum_3() {
+        let admin1 = OwnerAddr([0x01; 16]);
+        let admin2 = OwnerAddr([0x02; 16]);
+        let admin3 = OwnerAddr([0x04; 16]);
+        let target = OwnerAddr([0x03; 16]);
+
+        // Bootstrap with quorum=1, promote admin2 and admin3, then raise quorum to 3.
+        let mut events = vec![
+            // admin2 join + promote
+            ev([0x80; 16], admin2, 1_000, MembershipEventKind::Join),
+            ev(
+                [0x81; 16],
+                admin1,
+                2_000,
+                MembershipEventKind::SetPower {
+                    target: admin2,
+                    level: 100,
+                },
+            ),
+            // admin3 join + promote
+            ev([0x82; 16], admin3, 3_000, MembershipEventKind::Join),
+            ev(
+                [0x83; 16],
+                admin1,
+                4_000,
+                MembershipEventKind::SetPower {
+                    target: admin3,
+                    level: 100,
+                },
+            ),
+            // Raise quorum to 3 via sole-signer proposal under quorum=1.
+            ev(
+                [0xCC; 16],
+                admin1,
+                10_000,
+                MembershipEventKind::AdminProposal {
+                    proposal_kind: ProposalKind::ChangeQuorum { new_quorum: 3 },
+                },
+            ),
+        ];
+
+        let prop_id = [0xDD; 16];
+        // Propose promote target.
+        events.push(ev(
+            prop_id,
+            admin1,
+            20_000,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::SetPower { target, level: 100 },
+            },
+        ));
+        // admin2 countersigns.
+        events.push(ev(
+            [0xEE; 16],
+            admin2,
+            21_000,
+            MembershipEventKind::AdminCountersign {
+                target_event_id: prop_id,
+            },
+        ));
+        // admin3 countersigns — now 3 signers.
+        events.push(ev(
+            [0xFF; 16],
+            admin3,
+            22_000,
+            MembershipEventKind::AdminCountersign {
+                target_event_id: prop_id,
+            },
+        ));
+
+        let m = materialize(&events, admin1);
+
+        assert_eq!(
+            m.power_levels.get(&target).copied().unwrap_or(0),
+            100,
+            "target must be promoted to 100 when quorum=3 is reached with 2 countersigns"
+        );
+    }
+
+    /// Duplicate countersigns from the same actor must not be double-counted.
+    /// Two countersigns from admin2 (same actor) still count as 1 + proposer = 2 signers.
+    /// Under quorum=3 the proposal must remain pending.
+    #[test]
+    fn materialize_proposal_dedups_duplicate_countersigns_by_same_actor() {
+        let admin1 = OwnerAddr([0x01; 16]);
+        let admin2 = OwnerAddr([0x02; 16]);
+        let admin3 = OwnerAddr([0x04; 16]);
+        let target = OwnerAddr([0x03; 16]);
+
+        // Bootstrap three admins, raise quorum to 3.
+        let mut events = vec![
+            ev([0x80; 16], admin2, 1_000, MembershipEventKind::Join),
+            ev(
+                [0x81; 16],
+                admin1,
+                2_000,
+                MembershipEventKind::SetPower {
+                    target: admin2,
+                    level: 100,
+                },
+            ),
+            ev([0x82; 16], admin3, 3_000, MembershipEventKind::Join),
+            ev(
+                [0x83; 16],
+                admin1,
+                4_000,
+                MembershipEventKind::SetPower {
+                    target: admin3,
+                    level: 100,
+                },
+            ),
+            ev(
+                [0xCC; 16],
+                admin1,
+                10_000,
+                MembershipEventKind::AdminProposal {
+                    proposal_kind: ProposalKind::ChangeQuorum { new_quorum: 3 },
+                },
+            ),
+        ];
+
+        let prop_id = [0xDD; 16];
+        events.push(ev(
+            prop_id,
+            admin1,
+            20_000,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::SetPower { target, level: 100 },
+            },
+        ));
+        // admin2 countersigns twice — same actor, only counts once in pre-pass HashSet.
+        events.push(ev(
+            [0xE1; 16],
+            admin2,
+            21_000,
+            MembershipEventKind::AdminCountersign {
+                target_event_id: prop_id,
+            },
+        ));
+        events.push(ev(
+            [0xE2; 16],
+            admin2,
+            22_000,
+            MembershipEventKind::AdminCountersign {
+                target_event_id: prop_id,
+            },
+        ));
+
+        let m = materialize(&events, admin1);
+
+        // quorum=3 needs 3 distinct signers; only admin1 (proposer) + admin2 → 2 signers.
+        assert_eq!(
+            m.power_levels.get(&target).copied().unwrap_or(0),
+            0,
+            "duplicate countersigns from same actor must not satisfy quorum=3"
+        );
+    }
+
+    /// A proposal that never reaches quorum within 30 days is expired.
+    /// With wall_ms difference > ADMIN_PROPOSAL_EXPIRY_MS and quorum=1,
+    /// a sole-signer proposal should still apply because age_when_reached == 0
+    /// (proposer IS the Nth signer, same event). The expiry test needs quorum=2
+    /// plus one countersign arriving too late.
+    #[test]
+    fn materialize_proposal_expires_at_30_days_without_quorum() {
+        let admin1 = OwnerAddr([0x01; 16]);
+        let admin2 = OwnerAddr([0x02; 16]);
+        let target = OwnerAddr([0x03; 16]);
+
+        let mut events = bootstrap_two_admins_raise_quorum(admin1, admin2, 2);
+
+        let prop_id = [0xDD; 16];
+        let proposal_wall_ms = 20_000_u64;
+        // Propose promote target under quorum=2.
+        events.push(ev(
+            prop_id,
+            admin1,
+            proposal_wall_ms,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::SetPower { target, level: 100 },
+            },
+        ));
+        // admin2 countersigns MORE THAN 30 days after the proposal.
+        let late_wall_ms = proposal_wall_ms + ADMIN_PROPOSAL_EXPIRY_MS + 1;
+        events.push(ev(
+            [0xEE; 16],
+            admin2,
+            late_wall_ms,
+            MembershipEventKind::AdminCountersign {
+                target_event_id: prop_id,
+            },
+        ));
+
+        let m = materialize(&events, admin1);
+
+        // The Nth signer arrived > 30 days after proposal → expired.
+        assert_eq!(
+            m.power_levels.get(&target).copied().unwrap_or(0),
+            0,
+            "proposal with late countersign (>30d) must not apply"
+        );
+    }
+
+    /// A countersign that arrives exactly at the 30-day boundary (age ==
+    /// ADMIN_PROPOSAL_EXPIRY_MS) is still within the window (<=), so the
+    /// proposal applies. An identical scenario with age == expiry + 1 is the
+    /// expired case (tested by `materialize_proposal_expires_at_30_days_without_quorum`).
+    #[test]
+    fn materialize_proposal_late_countersign_after_expiry_is_noop() {
+        let admin1 = OwnerAddr([0x01; 16]);
+        let admin2 = OwnerAddr([0x02; 16]);
+        let target = OwnerAddr([0x03; 16]);
+
+        let mut events = bootstrap_two_admins_raise_quorum(admin1, admin2, 2);
+
+        let prop_id = [0xDD; 16];
+        let proposal_wall_ms = 50_000_u64;
+        events.push(ev(
+            prop_id,
+            admin1,
+            proposal_wall_ms,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::SetPower { target, level: 100 },
+            },
+        ));
+        // This countersign is at exactly expiry + 2 — strictly past the window.
+        let too_late_wall_ms = proposal_wall_ms + ADMIN_PROPOSAL_EXPIRY_MS + 2;
+        events.push(ev(
+            [0xEE; 16],
+            admin2,
+            too_late_wall_ms,
+            MembershipEventKind::AdminCountersign {
+                target_event_id: prop_id,
+            },
+        ));
+
+        let m = materialize(&events, admin1);
+
+        assert_eq!(
+            m.power_levels.get(&target).copied().unwrap_or(0),
+            0,
+            "countersign past 30-day expiry must be a no-op"
+        );
+    }
+
+    /// A proposal that reached quorum within 30 days is permanently effective
+    /// even if, by the time a later event arrives, 30 days have passed since
+    /// the proposal. Permanence rule: once the threshold was satisfied within
+    /// the window, the effect is applied forever (§5.3).
+    #[test]
+    fn materialize_quorum_reached_within_30d_then_aged_past_30d_remains_effective() {
+        let admin1 = OwnerAddr([0x01; 16]);
+        let admin2 = OwnerAddr([0x02; 16]);
+        let target = OwnerAddr([0x03; 16]);
+
+        let mut events = bootstrap_two_admins_raise_quorum(admin1, admin2, 2);
+
+        let prop_id = [0xDD; 16];
+        let proposal_wall_ms = 20_000_u64;
+        events.push(ev(
+            prop_id,
+            admin1,
+            proposal_wall_ms,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::SetPower { target, level: 100 },
+            },
+        ));
+        // admin2 countersigns within 30 days (1 day after).
+        let timely_wall_ms = proposal_wall_ms + 86_400_000;
+        events.push(ev(
+            [0xEE; 16],
+            admin2,
+            timely_wall_ms,
+            MembershipEventKind::AdminCountersign {
+                target_event_id: prop_id,
+            },
+        ));
+        // A later event arrives 60 days after the proposal — but the quorum
+        // was already reached on day 1, so the effect is permanent.
+        let much_later = proposal_wall_ms + 60 * 86_400_000;
+        events.push(ev(
+            [0xF0; 16],
+            admin1,
+            much_later,
+            MembershipEventKind::SetPower {
+                target: OwnerAddr([0x05; 16]),
+                level: 50,
+            },
+        ));
+
+        let m = materialize(&events, admin1);
+
+        assert_eq!(
+            m.power_levels.get(&target).copied().unwrap_or(0),
+            100,
+            "quorum reached within 30d must be permanently effective even if later events are much older"
+        );
+    }
+
+    /// ChangeQuorum proposal self-satisfies under quorum=1, then updates the
+    /// running admin_quorum field so subsequent proposals see the new threshold.
+    #[test]
+    fn materialize_change_quorum_proposal_updates_admin_quorum_field() {
+        let admin1 = OwnerAddr([0x01; 16]);
+        let admin2 = OwnerAddr([0x02; 16]);
+
+        // Start: quorum=1. ChangeQuorum{2} self-satisfies (admin1 is sole signer,
+        // quorum=1 → 1 signer is enough).
+        let mut events = bootstrap_two_admins_raise_quorum(admin1, admin2, 2);
+
+        let m = materialize(&events, admin1);
+        assert_eq!(
+            m.admin_quorum, 2,
+            "admin_quorum must be 2 after ChangeQuorum proposal"
+        );
+
+        // Now raise to 3 — requires 2 signers (quorum=2). admin1 proposes, admin2
+        // countersigns within 30 days.
+        let prop3_id = [0xD3; 16];
+        events.push(ev(
+            prop3_id,
+            admin1,
+            30_000,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::ChangeQuorum { new_quorum: 3 },
+            },
+        ));
+        events.push(ev(
+            [0xE3; 16],
+            admin2,
+            31_000,
+            MembershipEventKind::AdminCountersign {
+                target_event_id: prop3_id,
+            },
+        ));
+
+        let m2 = materialize(&events, admin1);
+        assert_eq!(
+            m2.admin_quorum, 3,
+            "admin_quorum must be 3 after second ChangeQuorum proposal with quorum=2 satisfied"
+        );
+    }
+
+    /// A SetPower via quorum (admin_quorum=1) produces the same materialized
+    /// power_levels entry as a direct SetPower event would — effect equivalence.
+    #[test]
+    fn materialize_setpower_via_quorum_matches_direct_setpower_effect_at_quorum_1() {
+        let admin1 = OwnerAddr([0x01; 16]);
+        let target = OwnerAddr([0x03; 16]);
+
+        // At quorum=1, a sole-signer AdminProposal{SetPower{target, 75}} self-satisfies.
+        let events_via_proposal = vec![ev(
+            [0xDD; 16],
+            admin1,
+            10_000,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::SetPower { target, level: 75 },
+            },
+        )];
+
+        // Equivalent: direct SetPower at quorum=1.
+        let events_direct = vec![ev(
+            [0xDE; 16],
+            admin1,
+            10_000,
+            MembershipEventKind::SetPower { target, level: 75 },
+        )];
+
+        let m_proposal = materialize(&events_via_proposal, admin1);
+        let m_direct = materialize(&events_direct, admin1);
+
+        assert_eq!(
+            m_proposal.power_levels.get(&target).copied().unwrap_or(0),
+            75,
+            "AdminProposal(SetPower) at quorum=1 must apply"
+        );
+        assert_eq!(
+            m_proposal.power_levels.get(&target),
+            m_direct.power_levels.get(&target),
+            "AdminProposal(SetPower) at quorum=1 must match direct SetPower effect"
+        );
+    }
+
+    /// Kick via quorum=2 (admin proposal + admin2 countersign) banishes the
+    /// target just as a direct Kick would: MemberStatus::Banned + left_at set
+    /// + pending_rotation_for populated.
+    #[test]
+    fn materialize_kick_via_quorum_sets_banned_and_pending_rotation() {
+        let admin1 = OwnerAddr([0x01; 16]);
+        let admin2 = OwnerAddr([0x02; 16]);
+        let target = OwnerAddr([0x03; 16]);
+
+        let mut events = bootstrap_two_admins_raise_quorum(admin1, admin2, 2);
+
+        // target must join first so the Kick arm has a member entry.
+        events.push(ev([0x90; 16], target, 5_000, MembershipEventKind::Join));
+
+        let prop_id = [0xDD; 16];
+        events.push(ev(
+            prop_id,
+            admin1,
+            20_000,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::Kick {
+                    target,
+                    reason: None,
+                },
+            },
+        ));
+        events.push(ev(
+            [0xEE; 16],
+            admin2,
+            21_000,
+            MembershipEventKind::AdminCountersign {
+                target_event_id: prop_id,
+            },
+        ));
+
+        let m = materialize(&events, admin1);
+
+        let ms = m
+            .members
+            .get(&target)
+            .expect("target must be in members map");
+        assert_eq!(
+            ms.status,
+            MemberStatus::Banned,
+            "kick-via-quorum must set target to Banned"
+        );
+        assert!(
+            ms.left_at.is_some(),
+            "kick-via-quorum must set left_at on target"
+        );
+        assert!(
+            m.pending_rotation_for.contains(&target),
+            "kick-via-quorum must add target to pending_rotation_for"
+        );
     }
 }
