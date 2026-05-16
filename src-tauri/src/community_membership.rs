@@ -1278,6 +1278,67 @@ pub fn materialize_with_now(
         })
         .collect();
 
+    // ZEB-250 Pre-Pass: collect per-proposal raw signature data.
+    // - quorum_signers[event_id]: set of admin OwnerAddrs who have
+    //   signed the proposal (proposer auto-included + each
+    //   AdminCountersign actor).
+    // - proposals_index[event_id]: (proposal_kind, proposer_addr,
+    //   proposer_wall_ms).
+    // - proposal_signing_hlcs[event_id]: per-signing-event (wall_ms,
+    //   actor). Used by the main pass to find when the Nth signature
+    //   was contributed (for 30-day expiry).
+    //
+    // Raw collection only; quorum-reached evaluation happens in the
+    // main pass (§5.2) because `admin_quorum` itself is a function
+    // of prior ChangeQuorum proposals (single-pass-with-running-state).
+    #[allow(unused_variables)]
+    let mut quorum_signers: std::collections::HashMap<
+        EventId,
+        std::collections::HashSet<OwnerAddr>,
+    > = std::collections::HashMap::new();
+    #[allow(unused_variables)]
+    let mut proposals_index: std::collections::HashMap<
+        EventId,
+        (ProposalKind, OwnerAddr, u64),
+    > = std::collections::HashMap::new();
+    #[allow(unused_variables)]
+    let mut proposal_signing_hlcs: std::collections::HashMap<EventId, Vec<(u64, OwnerAddr)>> =
+        std::collections::HashMap::new();
+
+    for signed_event in events.iter() {
+        match &signed_event.kind {
+            MembershipEventKind::AdminProposal { proposal_kind } => {
+                proposals_index.insert(
+                    signed_event.id,
+                    (
+                        proposal_kind.clone(),
+                        signed_event.actor,
+                        signed_event.at.wall_ms,
+                    ),
+                );
+                quorum_signers
+                    .entry(signed_event.id)
+                    .or_default()
+                    .insert(signed_event.actor);
+                proposal_signing_hlcs
+                    .entry(signed_event.id)
+                    .or_default()
+                    .push((signed_event.at.wall_ms, signed_event.actor));
+            }
+            MembershipEventKind::AdminCountersign { target_event_id } => {
+                quorum_signers
+                    .entry(*target_event_id)
+                    .or_default()
+                    .insert(signed_event.actor);
+                proposal_signing_hlcs
+                    .entry(*target_event_id)
+                    .or_default()
+                    .push((signed_event.at.wall_ms, signed_event.actor));
+            }
+            _ => {}
+        }
+    }
+
     // Sort by the canonical total order. We don't assume the input
     // is sorted because DAG-sync delivers events partial-ordered.
     // Cloning the &-refs is fine — the event vec is small (community
@@ -7091,5 +7152,61 @@ mod zeb_250_direct_event_quorum_gate_tests {
             Ok(()),
             "direct SetPower to 100 must pass when admin_quorum == 1"
         );
+    }
+}
+
+// ── ZEB-250 Task 7: materialize pre-pass smoke tests ─────────────────────────
+
+#[cfg(test)]
+mod zeb_250_materialize_prepass_tests {
+    use super::*;
+
+    #[test]
+    fn materialize_prepass_collects_admin_proposal_signers() {
+        // Smoke test: materialize over a log containing AdminProposal +
+        // AdminCountersign events shouldn't crash. Task 8 will add the
+        // effect-application assertions; this test just exercises the
+        // pre-pass without panicking.
+        let admin1 = OwnerAddr([0x01; 16]);
+        let admin2 = OwnerAddr([0x02; 16]);
+        let target = OwnerAddr([0x03; 16]);
+
+        let prop_id = [0xAA; 16];
+        let events = vec![
+            SignedMembershipEvent {
+                id: prop_id,
+                community_id: SpaceId([0xc0; 16]),
+                actor: admin1,
+                at: Hlc {
+                    wall_ms: 10_000,
+                    logical: 0,
+                    device_id: "a1".into(),
+                },
+                kind: MembershipEventKind::AdminProposal {
+                    proposal_kind: ProposalKind::SetPower { target, level: 100 },
+                },
+                sig: [0; 64],
+                countersig: None,
+            },
+            SignedMembershipEvent {
+                id: [0xBB; 16],
+                community_id: SpaceId([0xc0; 16]),
+                actor: admin2,
+                at: Hlc {
+                    wall_ms: 11_000,
+                    logical: 0,
+                    device_id: "a2".into(),
+                },
+                kind: MembershipEventKind::AdminCountersign {
+                    target_event_id: prop_id,
+                },
+                sig: [0; 64],
+                countersig: None,
+            },
+        ];
+        // No assertion on effect yet — Task 8 wires the main-pass
+        // application. This test just exercises the pre-pass without
+        // panicking.
+        let _m = materialize(&events, admin1);
     }
 }
