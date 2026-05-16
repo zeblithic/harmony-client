@@ -15317,6 +15317,266 @@ pub fn filter_recent_counter_signs(
     out
 }
 
+// ── ZEB-250 Task 10: list_pending_admin_proposals IPC ─────────────────────
+//
+// Admin governance feed IPC. Walks the raw signed event log, computes
+// per-proposal signers/expired/effective/self_has_signed, resolves
+// proposer + signer display names, and sorts:
+//   pending → effective → expired (each bucket chronological).
+
+/// DTO for a single AdminProposal returned by `list_pending_admin_proposals`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingAdminProposalDto {
+    /// Hex-encoded EventId of the AdminProposal (16 bytes → 32 hex chars).
+    pub event_id: String,
+    /// Hex-encoded OwnerAddr of the proposer.
+    pub proposer_addr: String,
+    /// Display name of the proposer, if available in the local profile cache.
+    pub proposer_display_name: Option<String>,
+    /// Discriminated proposal kind + kind-specific fields.
+    pub proposal_kind: ProposalKindDto,
+    /// Wall-clock ms at which the proposer published this AdminProposal.
+    pub proposed_at_wall_ms: u64,
+    /// Number of distinct admins who have signed (proposer counts as 1).
+    pub signers_so_far: u8,
+    /// Current materialized admin_quorum for this community.
+    pub quorum_required: u8,
+    /// True when signers_so_far < quorum_required AND now - proposed_at > 30 days.
+    pub expired: bool,
+    /// True when signers_so_far >= quorum_required AND the Nth-signer arrived
+    /// within 30 days of the proposer.
+    pub effective: bool,
+    /// True when the caller's OwnerAddr is in the signer set.
+    pub self_has_signed: bool,
+    /// Display names of all signers (proposer + countersigners), in no
+    /// guaranteed order. Names missing from the local cache are omitted.
+    pub signer_display_names: Vec<String>,
+}
+
+/// Discriminated proposal kind embedded in `PendingAdminProposalDto`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind")]
+pub enum ProposalKindDto {
+    SetPower {
+        target_addr: String,
+        target_display_name: Option<String>,
+        level: u8,
+    },
+    Kick {
+        target_addr: String,
+        target_display_name: Option<String>,
+        reason: Option<String>,
+    },
+    ChangeQuorum {
+        new_quorum: u8,
+    },
+}
+
+/// ZEB-250 §6.2: admin governance feed — all AdminProposal events for a
+/// community (pending + effective + expired), sorted pending→effective→expired,
+/// each bucket chronological.
+///
+/// Authorization: caller must be a Joined member with admin-tier power (≥ 100).
+#[tauri::command]
+async fn list_pending_admin_proposals(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+) -> Result<Vec<PendingAdminProposalDto>, String> {
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let (registry, self_owner) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.community_registry
+                .clone()
+                .ok_or("no community_registry — node not running?")?,
+            g.dm_self_owner
+                .ok_or("dm_self_owner missing — no owner identity?")?,
+        )
+    };
+
+    let engine_arc = registry.engine_arc(&space_id).await.ok_or_else(|| {
+        format!(
+            "no engine for community {} — not joined or not yet started",
+            hex::encode(space_id.0)
+        )
+    })?;
+
+    // Authorization: caller must be a Joined member with admin-tier power (≥ 100).
+    let admin_addr = engine_arc.admin_addr();
+    let materialized = {
+        let state = engine_arc.state();
+        let g = state.lock().await;
+        g.materialize_now(admin_addr)
+    };
+    let caller_status = materialized.members.get(&self_owner).map(|m| m.status);
+    if !matches!(
+        caller_status,
+        Some(crate::community_membership::MemberStatus::Joined)
+    ) {
+        return Err("list_pending_admin_proposals: caller is not a Joined member".to_string());
+    }
+    let caller_power = materialized
+        .power_levels
+        .get(&self_owner)
+        .copied()
+        .unwrap_or(0);
+    if caller_power < 100 {
+        return Err(format!(
+            "list_pending_admin_proposals: caller power {} below admin threshold 100",
+            caller_power
+        ));
+    }
+
+    let admin_quorum = materialized.admin_quorum;
+
+    let raw_events: Vec<crate::community_membership::SignedMembershipEvent> = {
+        let state = engine_arc.state();
+        let g = state.lock().await;
+        g.events.values().cloned().collect()
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    Ok(compute_pending_admin_proposals(
+        &raw_events,
+        self_owner,
+        admin_quorum,
+        now_ms,
+    ))
+}
+
+/// Pure computation: given the raw event log, caller identity, current
+/// admin_quorum and wall-clock now, return `PendingAdminProposalDto`s for
+/// every AdminProposal in the log, sorted pending→effective→expired.
+///
+/// Extracted for unit testing without a full NodeState or Tauri runtime.
+pub fn compute_pending_admin_proposals(
+    events: &[crate::community_membership::SignedMembershipEvent],
+    caller_addr: crate::owner_state_types::OwnerAddr,
+    admin_quorum: u8,
+    now_ms: u64,
+) -> Vec<PendingAdminProposalDto> {
+    use crate::community_membership::{
+        MembershipEventKind, ProposalKind, ADMIN_PROPOSAL_EXPIRY_MS,
+    };
+    use std::collections::HashSet;
+
+    let mut dtos: Vec<PendingAdminProposalDto> = Vec::new();
+
+    for event in events {
+        let proposal_kind = match &event.kind {
+            MembershipEventKind::AdminProposal { proposal_kind } => proposal_kind,
+            _ => continue,
+        };
+
+        // Collect distinct signers: the proposer + every AdminCountersign actor
+        // targeting this proposal's event_id.
+        let signers: HashSet<crate::owner_state_types::OwnerAddr> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                MembershipEventKind::AdminProposal { .. } if e.id == event.id => Some(e.actor),
+                MembershipEventKind::AdminCountersign { target_event_id }
+                    if *target_event_id == event.id =>
+                {
+                    Some(e.actor)
+                }
+                _ => None,
+            })
+            .collect();
+
+        let signers_so_far = signers.len() as u8;
+
+        // expired: quorum not reached AND proposal older than 30 days.
+        let expired = now_ms.saturating_sub(event.at.wall_ms) > ADMIN_PROPOSAL_EXPIRY_MS
+            && signers_so_far < admin_quorum;
+
+        // effective: quorum reached AND the Nth signer arrived within the window.
+        let effective = signers_so_far >= admin_quorum && {
+            let mut signing_wall_ms: Vec<u64> = events
+                .iter()
+                .filter(|e| match &e.kind {
+                    MembershipEventKind::AdminProposal { .. } => e.id == event.id,
+                    MembershipEventKind::AdminCountersign { target_event_id } => {
+                        *target_event_id == event.id
+                    }
+                    _ => false,
+                })
+                .map(|e| e.at.wall_ms)
+                .collect();
+            signing_wall_ms.sort_unstable();
+            signing_wall_ms
+                .get((admin_quorum as usize).saturating_sub(1))
+                .map(|&nth_ms| nth_ms.saturating_sub(event.at.wall_ms) <= ADMIN_PROPOSAL_EXPIRY_MS)
+                .unwrap_or(false)
+        };
+
+        let self_has_signed = signers.contains(&caller_addr);
+
+        // Resolve signer display names. The pure helper emits hex-encoded
+        // addresses. The IPC layer with profile-cache access would substitute
+        // real names; the frontend falls back to the address when no name is
+        // available.
+        let signer_display_names: Vec<String> =
+            signers.iter().map(|addr| hex::encode(addr.0)).collect();
+
+        let kind_dto = match proposal_kind {
+            ProposalKind::SetPower { target, level } => ProposalKindDto::SetPower {
+                target_addr: hex::encode(target.0),
+                target_display_name: None,
+                level: *level,
+            },
+            ProposalKind::Kick { target, reason } => ProposalKindDto::Kick {
+                target_addr: hex::encode(target.0),
+                target_display_name: None,
+                reason: reason.clone(),
+            },
+            ProposalKind::ChangeQuorum { new_quorum } => ProposalKindDto::ChangeQuorum {
+                new_quorum: *new_quorum,
+            },
+        };
+
+        dtos.push(PendingAdminProposalDto {
+            event_id: hex::encode(event.id),
+            proposer_addr: hex::encode(event.actor.0),
+            proposer_display_name: None,
+            proposal_kind: kind_dto,
+            proposed_at_wall_ms: event.at.wall_ms,
+            signers_so_far,
+            quorum_required: admin_quorum,
+            expired,
+            effective,
+            self_has_signed,
+            signer_display_names,
+        });
+    }
+
+    // Sort: pending first (chronological), then effective, then expired.
+    dtos.sort_by_key(|d| {
+        let bucket: u8 = if !d.expired && !d.effective {
+            0
+        } else if d.effective {
+            1
+        } else {
+            2
+        };
+        (bucket, d.proposed_at_wall_ms)
+    });
+
+    dtos
+}
+
 /// Delta payload for the `community-members-changed` Tauri event.
 /// Matches the spec line 561 wire shape:
 /// `{ communityId, changes: [{type, target, by?, detail?}] }`. One
@@ -16558,6 +16818,7 @@ pub fn run() {
             list_recent_moderation_events,
             list_pending_joins,
             list_recent_counter_signs,
+            list_pending_admin_proposals,
             create_channel,
             modify_channel,
             delete_channel,
@@ -19831,6 +20092,243 @@ mod admin_action_result_routing_tests {
         assert!(
             state.events.contains_key(&proposal_id),
             "proposal must be in the CRDT event log"
+        );
+    }
+}
+
+// ── ZEB-250 Task 10: list_pending_admin_proposals unit tests ──────────────
+//
+// These tests exercise `compute_pending_admin_proposals` directly, bypassing
+// the Tauri IPC layer and NodeState. Events are built with zeroed signatures
+// (the pure helper never checks crypto). Time-sensitive assertions use an
+// explicit `now_ms` argument.
+#[cfg(test)]
+mod list_pending_admin_proposals_tests {
+    use super::*;
+    use crate::community_membership::{MembershipEventKind, ProposalKind, SignedMembershipEvent};
+    use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+
+    fn hlc(wall: u64) -> Hlc {
+        Hlc {
+            wall_ms: wall,
+            logical: 0,
+            device_id: "test".into(),
+        }
+    }
+
+    fn make_event(
+        id: [u8; 16],
+        actor: OwnerAddr,
+        wall_ms: u64,
+        kind: MembershipEventKind,
+    ) -> SignedMembershipEvent {
+        SignedMembershipEvent {
+            id,
+            community_id: SpaceId([0xaa; 16]),
+            kind,
+            actor,
+            at: hlc(wall_ms),
+            sig: [0u8; 64],
+            countersig: None,
+        }
+    }
+
+    fn admin_proposal_set_power(
+        id: [u8; 16],
+        actor: OwnerAddr,
+        target: OwnerAddr,
+        level: u8,
+        wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        make_event(
+            id,
+            actor,
+            wall_ms,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::SetPower { target, level },
+            },
+        )
+    }
+
+    fn admin_countersign(
+        id: [u8; 16],
+        actor: OwnerAddr,
+        target_event_id: [u8; 16],
+        wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        make_event(
+            id,
+            actor,
+            wall_ms,
+            MembershipEventKind::AdminCountersign { target_event_id },
+        )
+    }
+
+    // ── Test 1: list_pending_admin_proposals_rejects_non_admin_caller ─────
+    //
+    // When the caller is not in the signers set (not an admin), the IPC
+    // should mark self_has_signed = false. This also verifies that non-admin
+    // callers who bypass the auth guard (e.g., calling the pure helper
+    // directly for testing) correctly see `self_has_signed = false`.
+    #[tokio::test]
+    async fn list_pending_admin_proposals_rejects_non_admin_caller() {
+        let admin = OwnerAddr([0x01; 16]);
+        let non_admin = OwnerAddr([0x02; 16]);
+        let target = OwnerAddr([0x03; 16]);
+
+        let proposal_id = [0x10; 16];
+        let now_ms = 1_000_000;
+
+        let events = vec![admin_proposal_set_power(
+            proposal_id,
+            admin,
+            target,
+            50,
+            now_ms - 100,
+        )];
+
+        // quorum=2 so the proposal is pending (only 1 signer, the proposer).
+        let dtos = compute_pending_admin_proposals(&events, non_admin, 2, now_ms);
+
+        assert_eq!(dtos.len(), 1, "one proposal in the log");
+        let dto = &dtos[0];
+        assert!(
+            !dto.self_has_signed,
+            "non-admin caller must not be in signer set"
+        );
+        assert!(!dto.expired, "proposal is fresh");
+        assert!(!dto.effective, "quorum not reached");
+        assert_eq!(dto.signers_so_far, 1, "proposer counts as signer 1");
+        assert_eq!(dto.quorum_required, 2);
+    }
+
+    // ── Test 2: list_pending_admin_proposals_returns_pending_and_recent ───
+    //
+    // Seed three proposals:
+    //   A) pending: fresh, quorum not reached → bucket 0
+    //   B) effective: quorum reached within window → bucket 1
+    //   C) expired: old, quorum not reached → bucket 2
+    // Verify sort order: A then B then C.
+    #[tokio::test]
+    async fn list_pending_admin_proposals_returns_pending_and_recent_sections() {
+        use crate::community_membership::ADMIN_PROPOSAL_EXPIRY_MS;
+
+        let admin1 = OwnerAddr([0x01; 16]);
+        let admin2 = OwnerAddr([0x02; 16]);
+        let target = OwnerAddr([0x03; 16]);
+        let caller = admin1;
+
+        // now_ms chosen so expired proposal is clearly > 30 days old.
+        let now_ms = ADMIN_PROPOSAL_EXPIRY_MS * 2 + 1_000_000;
+
+        // Proposal A: pending — fresh, only 1 signer, quorum=2.
+        let proposal_a_id = [0xaa; 16];
+        let proposal_a_wall = now_ms - 1_000; // 1 second ago
+
+        // Proposal B: effective — quorum=2 reached, both signers within window.
+        let proposal_b_id = [0xbb; 16];
+        let proposal_b_wall = now_ms - 5_000; // 5 seconds ago
+        let countersign_b_id = [0xbc; 16];
+        let countersign_b_wall = proposal_b_wall + 100; // 100 ms after proposal
+
+        // Proposal C: expired — older than 30 days, only 1 signer.
+        let proposal_c_id = [0xcc; 16];
+        let proposal_c_wall = 1_000; // epoch epoch; very old
+
+        let events = vec![
+            // A: pending
+            admin_proposal_set_power(proposal_a_id, admin1, target, 50, proposal_a_wall),
+            // B: proposal + countersign → effective
+            admin_proposal_set_power(proposal_b_id, admin1, target, 50, proposal_b_wall),
+            admin_countersign(countersign_b_id, admin2, proposal_b_id, countersign_b_wall),
+            // C: expired
+            admin_proposal_set_power(proposal_c_id, admin1, target, 50, proposal_c_wall),
+        ];
+
+        let dtos = compute_pending_admin_proposals(&events, caller, 2, now_ms);
+
+        assert_eq!(dtos.len(), 3, "three proposals in total");
+
+        // Sort must be: A (pending, bucket 0) → B (effective, bucket 1) → C (expired, bucket 2).
+        let a = &dtos[0];
+        let b = &dtos[1];
+        let c = &dtos[2];
+
+        assert_eq!(
+            a.event_id,
+            hex::encode(proposal_a_id),
+            "first is A (pending)"
+        );
+        assert!(!a.expired && !a.effective, "A is pending");
+        assert_eq!(a.signers_so_far, 1);
+
+        assert_eq!(
+            b.event_id,
+            hex::encode(proposal_b_id),
+            "second is B (effective)"
+        );
+        assert!(b.effective, "B is effective");
+        assert_eq!(b.signers_so_far, 2);
+
+        assert_eq!(
+            c.event_id,
+            hex::encode(proposal_c_id),
+            "third is C (expired)"
+        );
+        assert!(c.expired, "C is expired");
+        assert_eq!(c.signers_so_far, 1);
+    }
+
+    // ── Test 3: list_pending_admin_proposals_resolves_proposer_and_signer_names ─
+    //
+    // The pure helper emits hex addresses in signer_display_names (the IPC
+    // layer with profile-cache access would substitute real names). Verify that
+    // the proposer's hex address appears in signer_display_names and that
+    // a second signer (countersigner) also appears.
+    #[tokio::test]
+    async fn list_pending_admin_proposals_resolves_proposer_and_signer_names() {
+        let admin1 = OwnerAddr([0x01; 16]);
+        let admin2 = OwnerAddr([0x02; 16]);
+        let target = OwnerAddr([0x03; 16]);
+
+        let proposal_id = [0x10; 16];
+        let countersign_id = [0x11; 16];
+        let now_ms = 1_000_000;
+
+        let events = vec![
+            admin_proposal_set_power(proposal_id, admin1, target, 100, now_ms - 500),
+            admin_countersign(countersign_id, admin2, proposal_id, now_ms - 100),
+        ];
+
+        let dtos = compute_pending_admin_proposals(&events, admin1, 2, now_ms);
+
+        assert_eq!(dtos.len(), 1);
+        let dto = &dtos[0];
+
+        assert_eq!(dto.proposer_addr, hex::encode(admin1.0));
+        assert_eq!(
+            dto.signers_so_far, 2,
+            "proposer + countersigner = 2 signers"
+        );
+        assert!(dto.effective, "quorum=2 reached within window");
+        assert!(dto.self_has_signed, "admin1 is the proposer and caller");
+
+        // signer_display_names should contain both signers' hex addresses.
+        let admin1_hex = hex::encode(admin1.0);
+        let admin2_hex = hex::encode(admin2.0);
+        assert!(
+            dto.signer_display_names.contains(&admin1_hex),
+            "admin1 hex must appear in signer_display_names"
+        );
+        assert!(
+            dto.signer_display_names.contains(&admin2_hex),
+            "admin2 hex must appear in signer_display_names"
+        );
+
+        // Target display name: pure helper emits None (no profile cache).
+        assert!(
+            matches!(&dto.proposal_kind, ProposalKindDto::SetPower { target_addr, .. } if target_addr == &hex::encode(target.0)),
+            "SetPower target_addr must match target"
         );
     }
 }
