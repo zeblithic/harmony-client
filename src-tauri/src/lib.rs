@@ -15536,11 +15536,8 @@ pub fn compute_pending_admin_proposals(
 
         let signers_so_far = signers.len() as u8;
 
-        // expired: quorum not reached AND proposal older than 30 days.
-        let expired = now_ms.saturating_sub(event.at.wall_ms) > ADMIN_PROPOSAL_EXPIRY_MS
-            && signers_so_far < admin_quorum;
-
         // effective: quorum reached AND the Nth signer arrived within the window.
+        // Must be computed BEFORE expired so the expired flag can reference it.
         let effective = signers_so_far >= admin_quorum && {
             let mut signing_wall_ms: Vec<u64> = events
                 .iter()
@@ -15559,6 +15556,17 @@ pub fn compute_pending_admin_proposals(
                 .map(|&nth_ms| nth_ms.saturating_sub(event.at.wall_ms) <= ADMIN_PROPOSAL_EXPIRY_MS)
                 .unwrap_or(false)
         };
+
+        // expired: proposal is past the 30-day window AND did NOT achieve
+        // quorum within that window (effective == false). A proposal that
+        // reached quorum but did so late is NOT expired — it is simply
+        // ineffective (effective=false, expired=false).
+        //
+        // Bug-fix R1: previously computed before `effective`, which meant
+        // a late-quorum proposal (signers >= quorum but nth signer > 30d)
+        // showed as pending (both flags false) instead of expired.
+        let expired =
+            now_ms.saturating_sub(event.at.wall_ms) > ADMIN_PROPOSAL_EXPIRY_MS && !effective;
 
         let self_has_signed = signers.contains(&caller_addr);
 
@@ -15962,7 +15970,20 @@ async fn propose_change_quorum(
             ));
         }
 
-        let count = m.power_levels.values().filter(|p| **p == 100).count() as u32;
+        // Bug-fix R1 (Bug 3): count only LIVE admins (Joined) so kicked/left
+        // admins don't ghost-count toward the quorum range cap. Matches AP5
+        // in verify_event.
+        let count = m
+            .power_levels
+            .iter()
+            .filter(|(addr, p)| {
+                **p == 100
+                    && m.members
+                        .get(addr)
+                        .map(|ms| ms.status == crate::community_membership::MemberStatus::Joined)
+                        .unwrap_or(false)
+            })
+            .count() as u32;
         (m.admin_quorum, count)
     };
 
@@ -20766,6 +20787,68 @@ mod list_pending_admin_proposals_tests {
             matches!(&dto.proposal_kind, ProposalKindDto::SetPower { target_addr, .. } if target_addr == &hex::encode(target.0)),
             "SetPower target_addr must match target"
         );
+    }
+
+    // ── Test 4: compute_pending_admin_proposals_marks_late_quorum_as_expired
+    //
+    // Bug-fix R1 (Bug 4): a proposal whose Nth countersign landed AFTER the
+    // 30-day window should be marked expired=true, effective=false. Previously
+    // the expired flag was computed before effective using
+    //   `age > 30d && signers < quorum`
+    // which missed the case where signers >= quorum but the Nth signer was late.
+    // That case produced expired=false AND effective=false (phantom "pending").
+    #[tokio::test]
+    async fn compute_pending_admin_proposals_marks_late_quorum_as_expired_not_pending() {
+        use crate::community_membership::ADMIN_PROPOSAL_EXPIRY_MS;
+
+        let admin1 = OwnerAddr([0x01; 16]);
+        let admin2 = OwnerAddr([0x02; 16]);
+        let target = OwnerAddr([0x03; 16]);
+
+        let proposal_id = [0x10; 16];
+        let countersign_id = [0x11; 16];
+
+        // Proposal at wall_ms=0; Nth countersign arrives 31 days later.
+        let proposal_wall = 0u64;
+        let late_countersign_wall = ADMIN_PROPOSAL_EXPIRY_MS + 1;
+        // now_ms is 32 days — well past the window.
+        let now_ms = ADMIN_PROPOSAL_EXPIRY_MS * 2;
+
+        let events = vec![
+            make_event(
+                proposal_id,
+                admin1,
+                proposal_wall,
+                MembershipEventKind::AdminProposal {
+                    proposal_kind: ProposalKind::SetPower { target, level: 100 },
+                },
+            ),
+            make_event(
+                countersign_id,
+                admin2,
+                late_countersign_wall,
+                MembershipEventKind::AdminCountersign {
+                    target_event_id: proposal_id,
+                },
+            ),
+        ];
+
+        // quorum=2: proposer (admin1) + late countersign (admin2) = 2 signers,
+        // but the Nth signer arrived after the window. Expect expired=true,
+        // effective=false.
+        let dtos = compute_pending_admin_proposals(&events, admin1, 2, now_ms);
+
+        assert_eq!(dtos.len(), 1, "one proposal in the log");
+        let dto = &dtos[0];
+        assert!(
+            !dto.effective,
+            "proposal with late Nth countersign must not be effective"
+        );
+        assert!(
+            dto.expired,
+            "proposal with late Nth countersign (age > 30d, not effective) must be expired"
+        );
+        assert_eq!(dto.signers_so_far, 2, "two signers were recorded");
     }
 }
 
