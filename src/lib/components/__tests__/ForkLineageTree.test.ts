@@ -1,0 +1,207 @@
+import { describe, it, expect, vi } from 'vitest';
+import { render, fireEvent } from '@testing-library/svelte';
+import ForkLineageTree from '../ForkLineageTree.svelte';
+import type { CommunityLineageDto, ForkDescendantDto } from '../../types';
+
+function emptyLineage(selfName = 'My Community'): CommunityLineageDto {
+  return {
+    forkedFrom: null,
+    forkedAtWallMs: null,
+    parentLineage: [],
+    selfSpaceId: '00'.repeat(16),
+    selfName,
+  };
+}
+
+describe('ForkLineageTree', () => {
+  it('renders_non_fork_no_descendants_minimally', () => {
+    const { getByText } = render(ForkLineageTree, {
+      props: {
+        lineage: emptyLineage(),
+        descendants: [],
+        localNavIds: new Set<string>(),
+      },
+    });
+
+    expect(getByText(/You are here/)).toBeTruthy();
+    expect(getByText(/My Community/)).toBeTruthy();
+    expect(getByText(/no forks yet/i)).toBeTruthy();
+  });
+
+  it('renders_ancestors_only_for_leaf_fork', () => {
+    const lineage: CommunityLineageDto = {
+      ...emptyLineage('Leaf'),
+      forkedFrom: 'aa'.repeat(16),
+      forkedAtWallMs: 1_700_000_000_000,
+      parentLineage: [
+        { spaceId: '11'.repeat(16), name: 'Root C', forkedAtWallMs: null },
+        { spaceId: '22'.repeat(16), name: 'Middle B', forkedAtWallMs: 1_650_000_000_000 },
+      ],
+    };
+
+    const { getByText } = render(ForkLineageTree, {
+      props: { lineage, descendants: [], localNavIds: new Set() },
+    });
+
+    expect(getByText(/Root C/)).toBeTruthy();
+    expect(getByText(/Middle B/)).toBeTruthy();
+    expect(getByText(/Leaf/)).toBeTruthy();
+  });
+
+  it('renders_descendants_only_for_root_with_forks', () => {
+    const descendants: ForkDescendantDto[] = [
+      {
+        forkSpaceId: '33'.repeat(16),
+        forkerAddr: 'ab'.repeat(16),
+        forkerDisplayName: 'Maya',
+        forkedAtWallMs: 1_715_000_000_000,
+        locallyKnown: true,
+      },
+      {
+        forkSpaceId: '44'.repeat(16),
+        forkerAddr: 'cd'.repeat(16),
+        forkerDisplayName: null,
+        forkedAtWallMs: 1_716_000_000_000,
+        locallyKnown: false,
+      },
+    ];
+
+    const { getByText } = render(ForkLineageTree, {
+      props: { lineage: emptyLineage(), descendants, localNavIds: new Set() },
+    });
+
+    // Maya is rendered as the forker (descendant row shows "by {forker}").
+    expect(getByText(/Maya/)).toBeTruthy();
+    expect(getByText(/an unknown member/i)).toBeTruthy();
+  });
+
+  it('renders_full_tree_three_deep_two_descendants', () => {
+    const lineage: CommunityLineageDto = {
+      forkedFrom: '22'.repeat(16),
+      forkedAtWallMs: 1_700_000_000_000,
+      parentLineage: [
+        { spaceId: '11'.repeat(16), name: 'C', forkedAtWallMs: null },
+        { spaceId: '22'.repeat(16), name: 'B', forkedAtWallMs: 1_650_000_000_000 },
+      ],
+      selfSpaceId: '33'.repeat(16),
+      selfName: 'A',
+    };
+    const descendants: ForkDescendantDto[] = [
+      {
+        forkSpaceId: '44'.repeat(16),
+        forkerAddr: 'ab'.repeat(16),
+        forkerDisplayName: 'Maya',
+        forkedAtWallMs: 1_715_000_000_000,
+        locallyKnown: true,
+      },
+      {
+        forkSpaceId: '55'.repeat(16),
+        forkerAddr: 'cd'.repeat(16),
+        forkerDisplayName: 'Sam',
+        forkedAtWallMs: 1_716_000_000_000,
+        locallyKnown: true,
+      },
+    ];
+
+    const { getAllByRole } = render(ForkLineageTree, {
+      props: {
+        lineage,
+        descendants,
+        localNavIds: new Set([
+          '11'.repeat(16),
+          '22'.repeat(16),
+          '44'.repeat(16),
+          '55'.repeat(16),
+        ]),
+      },
+    });
+
+    const treeitems = getAllByRole('treeitem');
+    // 2 ancestors + 1 self + 2 descendants = 5
+    expect(treeitems.length).toBe(5);
+  });
+
+  it('renders_truncation_marker_for_overlong_lineage', () => {
+    const overlongLineage = Array.from({ length: 18 }, (_, i) => ({
+      spaceId: i.toString(16).padStart(2, '0').repeat(16),
+      name: `ancestor_${i}`,
+      forkedAtWallMs: i === 0 ? null : i,
+    }));
+
+    const lineage: CommunityLineageDto = {
+      ...emptyLineage('Deep Leaf'),
+      forkedFrom: 'ff'.repeat(16),
+      forkedAtWallMs: 999_999,
+      parentLineage: overlongLineage,
+    };
+
+    const { getByText } = render(ForkLineageTree, {
+      props: { lineage, descendants: [], localNavIds: new Set() },
+    });
+
+    expect(getByText(/and 2 earlier ancestors/i)).toBeTruthy();
+  });
+
+  it('click_navigates_to_locally_known_community', async () => {
+    const navigateSpy = vi.fn();
+    const lineage: CommunityLineageDto = {
+      ...emptyLineage('A'),
+      forkedFrom: '22'.repeat(16),
+      forkedAtWallMs: 1_700_000_000_000,
+      parentLineage: [
+        { spaceId: '11'.repeat(16), name: 'Cool C', forkedAtWallMs: null },
+      ],
+    };
+
+    const { getByText } = render(ForkLineageTree, {
+      props: {
+        lineage,
+        descendants: [],
+        localNavIds: new Set(['11'.repeat(16)]),
+        onNavigate: navigateSpy,
+      },
+    });
+
+    await fireEvent.click(getByText(/Cool C/));
+    expect(navigateSpy).toHaveBeenCalledWith('11'.repeat(16));
+  });
+
+  it('non_clickable_for_unknown_community', () => {
+    const lineage: CommunityLineageDto = {
+      ...emptyLineage('A'),
+      forkedFrom: '22'.repeat(16),
+      forkedAtWallMs: 1_700_000_000_000,
+      parentLineage: [
+        { spaceId: '11'.repeat(16), name: 'Cool C', forkedAtWallMs: null },
+      ],
+    };
+
+    const { container } = render(ForkLineageTree, {
+      props: {
+        lineage,
+        descendants: [],
+        localNavIds: new Set(), // empty — Cool C is NOT locally known
+      },
+    });
+
+    // The ancestor row should NOT be a <button> when not locally known.
+    // Self row is non-clickable; only locally-known rows are buttons.
+    // Empty localNavIds → NO ancestor/descendant rows are buttons.
+    const buttons = container.querySelectorAll('button');
+    expect(buttons.length).toBe(0);
+  });
+
+  it('aria_current_page_on_self_row', () => {
+    const { container } = render(ForkLineageTree, {
+      props: {
+        lineage: emptyLineage('My Self'),
+        descendants: [],
+        localNavIds: new Set(),
+      },
+    });
+
+    const selfRow = container.querySelector('[aria-current="page"]');
+    expect(selfRow).toBeTruthy();
+    expect(selfRow?.textContent).toMatch(/My Self/);
+  });
+});
