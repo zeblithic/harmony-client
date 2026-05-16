@@ -50,7 +50,7 @@
      *  callback which handles the actual IPC call + nav transition. */
     onFork?: (opts: { name: string; silent: boolean; alsoLeave: boolean }) => Promise<void>;
     /** ZEB-285: fork lineage metadata — present when this community was forked
-     *  from another. Populated by the caller via get_community_lineage IPC. */
+     *  from another. Populated by the caller via get_fork_snapshot_metadata IPC. */
     lineage?: {
       originalCommunityName: string | null;
       forkedAtMs: number;

@@ -227,7 +227,7 @@
           // ZEB-285: lazily load lineage metadata on first open (or when community changes).
           if (lineage === undefined) {
             const requestedCommunityId = communityId;
-            void communityService.getCommunityLineage(requestedCommunityId).then((dto) => {
+            void communityService.getForkSnapshotMetadata(requestedCommunityId).then((dto) => {
               // Guard: only apply if we're still on the same community; a late-arriving
               // response from a previous community must not overwrite the new one's state.
               // (Fix: PR #122 round-4, CodeRabbit inline.)

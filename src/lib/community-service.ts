@@ -359,11 +359,14 @@ export class CommunityService {
   }
 
   /**
-   * ZEB-285 Phase 1 Task 10: fetch fork lineage metadata for the Settings panel.
+   * ZEB-285 Phase 1 Task 10: fetch fork snapshot metadata for the Settings panel.
+   * ZEB-287 Phase 2 renamed (was `getCommunityLineage`) — Phase 2 introduces a
+   * distinct `getCommunityLineage` that returns the multi-hop ancestor chain.
    * Returns null when the community is not a fork (no pre_fork_snapshot.bin).
-   * Mirrors the `CommunityLineageDto` returned by the `get_community_lineage` IPC.
+   * Mirrors the `ForkSnapshotMetadataDto` returned by the
+   * `get_fork_snapshot_metadata` IPC.
    */
-  async getCommunityLineage(communityId: string): Promise<{
+  async getForkSnapshotMetadata(communityId: string): Promise<{
     originalCommunityName: string;
     forkedAtMs: number;
     snapshotMessageCount: number;
@@ -372,7 +375,7 @@ export class CommunityService {
       originalCommunityName: string;
       forkedAtMs: number;
       snapshotMessageCount: number;
-    } | null>('get_community_lineage', { communityId });
+    } | null>('get_fork_snapshot_metadata', { communityId });
     return dto ?? null;
   }
 
