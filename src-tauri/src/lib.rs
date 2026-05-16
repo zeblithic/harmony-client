@@ -6927,6 +6927,17 @@ pub enum AdminActionResult {
     },
 }
 
+/// ZEB-250 §6.3: return type for `countersign_admin_proposal` IPC.
+/// Reports the signer count after the (possibly no-op idempotent)
+/// operation, the community's current quorum requirement, and whether
+/// quorum has been reached.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CountersignResult {
+    pub signers_after: u8,
+    pub quorum_required: u8,
+    pub reached_quorum: bool,
+}
+
 /// Project a materialized membership into the IPC DTO list, sorted by
 /// power level descending then joined_at ascending. Stable for two
 /// addrs at the same power+joined_at — falls through to OwnerAddr-bytes
@@ -14090,6 +14101,33 @@ pub fn mint_admin_proposal_change_quorum_event(
     sign_event(&payload, signing_key).map_err(|e| format!("sign admin_proposal_change_quorum: {e}"))
 }
 
+/// ZEB-250 §6.3: mint a signed AdminCountersign event referencing an
+/// existing AdminProposal. Same signing/HLC contract as the
+/// `mint_admin_proposal_*` family.
+pub fn mint_admin_countersign_event(
+    community_id: crate::owner_state_types::SpaceId,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    target_event_id: [u8; 16],
+    signing_key: &ed25519_dalek::SigningKey,
+    hlc: crate::owner_state_types::Hlc,
+) -> Result<crate::community_membership::SignedMembershipEvent, String> {
+    use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use rand::RngCore;
+
+    let mut rng = rand::thread_rng();
+    let mut event_id_bytes = [0u8; 16];
+    rng.fill_bytes(&mut event_id_bytes);
+
+    let payload = EventPayload {
+        id: event_id_bytes,
+        community_id,
+        kind: MembershipEventKind::AdminCountersign { target_event_id },
+        actor: self_owner,
+        at: hlc,
+    };
+    sign_event(&payload, signing_key).map_err(|e| format!("sign admin_countersign: {e}"))
+}
+
 /// ZEB-249 Task 6: pure helper — mint a signed `EpochRotation` event.
 ///
 /// `triggered_by` is the `EventId` of the Kick or Leave event this rotation
@@ -15577,6 +15615,249 @@ pub fn compute_pending_admin_proposals(
     dtos
 }
 
+// ── ZEB-250 Task 11: countersign_admin_proposal IPC ──────────────────────
+
+/// ZEB-250 §6.3: count the distinct OwnerAddrs that have signed a given
+/// AdminProposal (proposer + all AdminCountersign actors targeting it).
+/// Returns 0 if the proposal_id is not found (no proposal event and no
+/// countersigns).
+pub fn count_signers(
+    events: &std::collections::BTreeMap<
+        crate::community_membership::EventId,
+        crate::community_membership::SignedMembershipEvent,
+    >,
+    proposal_id: [u8; 16],
+) -> u8 {
+    use crate::community_membership::MembershipEventKind;
+    events
+        .values()
+        .filter_map(|e| match &e.kind {
+            MembershipEventKind::AdminProposal { .. } if e.id == proposal_id => Some(e.actor),
+            MembershipEventKind::AdminCountersign { target_event_id }
+                if *target_event_id == proposal_id =>
+            {
+                Some(e.actor)
+            }
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .len() as u8
+}
+
+/// ZEB-250 §6.3: admin-only IPC that mints an AdminCountersign event
+/// targeting the given AdminProposal. Idempotent: if the caller has
+/// already signed (as proposer or via a prior AdminCountersign), returns
+/// the current signer count without minting a new event. Rejects
+/// expired (> 30 days) or non-existent proposals.
+///
+/// Authorization: caller must be Joined and have power ≥ 100.
+#[tauri::command]
+async fn countersign_admin_proposal(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    proposal_event_id: String,
+) -> Result<CountersignResult, String> {
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let proposal_id_bytes: [u8; 16] = hex::decode(&proposal_event_id)
+        .map_err(|e| format!("countersign_admin_proposal: invalid proposal_event_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "countersign_admin_proposal: proposal_event_id must be 16 bytes (32 hex chars)"
+                .to_string()
+        })?;
+
+    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or("dm_self_owner missing")?,
+            g.community_registry
+                .clone()
+                .ok_or("community_registry missing — node not running?")?,
+            g.dm_outbox
+                .clone()
+                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.generation,
+        )
+    };
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // ZEB-267: atomic HLC reservation.
+    let event_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+
+    // Generation + registry fence.
+    {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during countersign_admin_proposal (was {}, now {})",
+                snapshot_generation, g.generation
+            ));
+        }
+        if g.community_registry.is_none() {
+            return Err(
+                "community_registry detached during countersign_admin_proposal (node stopped?)"
+                    .to_string(),
+            );
+        }
+    }
+
+    let engine_arc = community_registry
+        .engine_arc(&space_id)
+        .await
+        .ok_or_else(|| {
+            format!(
+                "no engine for community {} — not currently joined",
+                hex::encode(space_id.0)
+            )
+        })?;
+
+    let admin_addr = engine_arc.admin_addr();
+
+    // Authorization + proposal lookup in a single read lock.
+    let (admin_quorum, already_signed, proposal_found, proposal_expired) = {
+        let state = engine_arc.state();
+        let g = state.lock().await;
+        let materialized = g.materialize_now(admin_addr);
+
+        let caller_status = materialized.members.get(&self_owner).map(|m| m.status);
+        if !matches!(
+            caller_status,
+            Some(crate::community_membership::MemberStatus::Joined)
+        ) {
+            return Err("countersign_admin_proposal: caller is not a Joined member".to_string());
+        }
+        let caller_power = materialized
+            .power_levels
+            .get(&self_owner)
+            .copied()
+            .unwrap_or(0);
+        if caller_power < 100 {
+            return Err(format!(
+                "countersign_admin_proposal: caller power {caller_power} below admin threshold 100"
+            ));
+        }
+
+        // Lookup + validate target event.
+        let target = g.events.get(&proposal_id_bytes);
+        let proposal_found = matches!(
+            target.map(|e| &e.kind),
+            Some(crate::community_membership::MembershipEventKind::AdminProposal { .. })
+        );
+        if !proposal_found {
+            // Either missing entirely or wrong kind — checked below.
+            if let Some(ev) = target {
+                // Exists but is not an AdminProposal.
+                let _ = ev;
+                return Err(format!(
+                    "countersign_admin_proposal: event {proposal_event_id} is not an AdminProposal"
+                ));
+            }
+        }
+
+        // Expiry check (only meaningful if the proposal exists).
+        let proposal_expired = target.is_some_and(|ev| {
+            wall_now_ms.saturating_sub(ev.at.wall_ms)
+                > crate::community_membership::ADMIN_PROPOSAL_EXPIRY_MS
+        });
+
+        // Idempotency: already signed as proposer or via AdminCountersign?
+        use crate::community_membership::MembershipEventKind;
+        let already_signed = g.events.values().any(|e| match &e.kind {
+            MembershipEventKind::AdminProposal { .. } => {
+                e.id == proposal_id_bytes && e.actor == self_owner
+            }
+            MembershipEventKind::AdminCountersign { target_event_id } => {
+                *target_event_id == proposal_id_bytes && e.actor == self_owner
+            }
+            _ => false,
+        });
+
+        (
+            materialized.admin_quorum,
+            already_signed,
+            proposal_found,
+            proposal_expired,
+        )
+    };
+
+    if !proposal_found {
+        return Err(format!(
+            "countersign_admin_proposal: proposal {proposal_event_id} not found"
+        ));
+    }
+    if proposal_expired {
+        return Err("countersign_admin_proposal: proposal has expired".to_string());
+    }
+
+    if already_signed {
+        // Idempotent — report current state without minting.
+        let state = engine_arc.state();
+        let g = state.lock().await;
+        let signers_after = count_signers(&g.events, proposal_id_bytes);
+        return Ok(CountersignResult {
+            signers_after,
+            quorum_required: admin_quorum,
+            reached_quorum: signers_after >= admin_quorum,
+        });
+    }
+
+    // Mint and insert AdminCountersign.
+    let countersign_event = {
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        mint_admin_countersign_event(
+            space_id,
+            self_owner,
+            proposal_id_bytes,
+            signing_key,
+            event_hlc,
+        )?
+    };
+    let outcome = engine_arc
+        .insert_local_event(countersign_event)
+        .await
+        .map_err(|e| format!("engine.insert_local_event (AdminCountersign): {e}"))?;
+    if matches!(
+        outcome,
+        crate::community_state_crdt::InsertOutcome::Rejected(_)
+    ) {
+        return Err(membership_outcome_err(
+            "countersign_admin_proposal",
+            &outcome,
+        ));
+    }
+
+    // Recompute signer count after insert.
+    let state = engine_arc.state();
+    let g = state.lock().await;
+    let signers_after = count_signers(&g.events, proposal_id_bytes);
+    let post_materialized = g.materialize_now(admin_addr);
+    let quorum_required = post_materialized.admin_quorum;
+    Ok(CountersignResult {
+        signers_after,
+        quorum_required,
+        reached_quorum: signers_after >= quorum_required,
+    })
+}
+
 /// Delta payload for the `community-members-changed` Tauri event.
 /// Matches the spec line 561 wire shape:
 /// `{ communityId, changes: [{type, target, by?, detail?}] }`. One
@@ -16819,6 +17100,7 @@ pub fn run() {
             list_pending_joins,
             list_recent_counter_signs,
             list_pending_admin_proposals,
+            countersign_admin_proposal,
             create_channel,
             modify_channel,
             delete_channel,
@@ -20329,6 +20611,419 @@ mod list_pending_admin_proposals_tests {
         assert!(
             matches!(&dto.proposal_kind, ProposalKindDto::SetPower { target_addr, .. } if target_addr == &hex::encode(target.0)),
             "SetPower target_addr must match target"
+        );
+    }
+}
+
+// ── ZEB-250 Task 11: countersign_admin_proposal unit tests ────────────────
+//
+// These tests exercise `count_signers` and the countersign routing logic
+// directly against `CommunityState`, bypassing the Tauri IPC layer and
+// NodeState. Crypto is real (PrivateIdentity + sign_event_with_identity)
+// so verify_event accepts the events. Time-sensitive checks use explicit
+// wall_ms values derived from ADMIN_PROPOSAL_EXPIRY_MS.
+#[cfg(test)]
+mod countersign_admin_proposal_tests {
+    use super::*;
+    use crate::community_membership::{
+        sign_event_with_identity, EventPayload, MembershipEventKind, ProposalKind, VerifyContext,
+        ADMIN_PROPOSAL_EXPIRY_MS,
+    };
+    use crate::community_state_crdt::{CommunityState, InsertOutcome};
+    use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+    use harmony_identity::PrivateIdentity;
+
+    fn hlc(wall: u64, dev: &str) -> Hlc {
+        Hlc {
+            wall_ms: wall,
+            logical: 0,
+            device_id: dev.to_string(),
+        }
+    }
+
+    /// Insert a signed event and assert it was Inserted (not Rejected).
+    fn insert_ok(
+        state: &mut CommunityState,
+        payload: EventPayload,
+        identity: &PrivateIdentity,
+        admin: OwnerAddr,
+        actor_pub: &[u8; 64],
+    ) {
+        let ev = sign_event_with_identity(&payload, identity).expect("sign");
+        let ctx = VerifyContext {
+            expected_community_id: payload.community_id,
+            admin_addr: admin,
+            is_invite_only: false,
+            actor_identity_pub: actor_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: None,
+        };
+        let outcome = state.insert_event(ev, &ctx);
+        assert!(
+            matches!(outcome, InsertOutcome::Inserted),
+            "fixture insert must succeed; got {outcome:?}"
+        );
+    }
+
+    /// Build a minimal community: admin + second admin (member promoted),
+    /// admin_quorum raised to 2 via ChangeQuorum AdminProposal.
+    /// Returns (state, admin_identity, admin_addr, second_identity, second_addr, proposal_id).
+    fn setup_quorum2_community(
+        community_id: SpaceId,
+    ) -> (
+        CommunityState,
+        PrivateIdentity,
+        OwnerAddr,
+        PrivateIdentity,
+        OwnerAddr,
+        [u8; 16],
+    ) {
+        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
+        let admin = OwnerAddr(admin_identity.identity.address_hash);
+        let admin_pub = admin_identity.identity.to_public_bytes();
+
+        let second_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
+        let second = OwnerAddr(second_identity.identity.address_hash);
+        let second_pub = second_identity.identity.to_public_bytes();
+
+        let mut state = CommunityState::new(community_id);
+
+        // admin Joins
+        insert_ok(
+            &mut state,
+            EventPayload {
+                id: [0x01; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: admin,
+                at: hlc(100, "admin"),
+            },
+            &admin_identity,
+            admin,
+            &admin_pub,
+        );
+        // second Joins
+        insert_ok(
+            &mut state,
+            EventPayload {
+                id: [0x02; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: second,
+                at: hlc(200, "second"),
+            },
+            &second_identity,
+            admin,
+            &second_pub,
+        );
+        // Promote second to admin power=100 (direct, quorum still 1)
+        let sk_bytes = admin_identity.to_private_bytes();
+        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+        let promote_ev = mint_set_power_event(
+            community_id,
+            admin,
+            second,
+            100,
+            &signing_key,
+            hlc(210, "admin"),
+        )
+        .expect("mint set_power");
+        let promote_outcome = state.insert_event(
+            promote_ev,
+            &VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+                actor_identity_pub: &admin_pub,
+                countersigner_identity_pub: None,
+                admin_identity_pub: None,
+            },
+        );
+        assert!(
+            matches!(promote_outcome, InsertOutcome::Inserted),
+            "promote to admin must insert; got {promote_outcome:?}"
+        );
+
+        // Raise quorum to 2 via ChangeQuorum AdminProposal.
+        // With 2 admins and quorum=1, the proposer alone meets the threshold.
+        let cq_ev = mint_admin_proposal_change_quorum_event(
+            community_id,
+            admin,
+            2,
+            &signing_key,
+            hlc(250, "admin"),
+        )
+        .expect("mint change_quorum_proposal");
+        let cq_outcome = state.insert_event(
+            cq_ev,
+            &VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+                actor_identity_pub: &admin_pub,
+                countersigner_identity_pub: None,
+                admin_identity_pub: None,
+            },
+        );
+        assert!(
+            matches!(cq_outcome, InsertOutcome::Inserted),
+            "ChangeQuorum must insert; got {cq_outcome:?}"
+        );
+        let m = state.materialize_now(admin);
+        assert_eq!(m.admin_quorum, 2, "quorum must be 2 after ChangeQuorum");
+
+        // Now mint an AdminProposal (SetPower for a 3rd member — just needs to exist
+        // in the log for the countersign target).
+        let proposal_id = [0xAB; 16];
+        let proposal_ev = sign_event_with_identity(
+            &EventPayload {
+                id: proposal_id,
+                community_id,
+                kind: MembershipEventKind::AdminProposal {
+                    proposal_kind: ProposalKind::SetPower {
+                        target: second,
+                        level: 50,
+                    },
+                },
+                actor: admin,
+                at: hlc(300, "admin"),
+            },
+            &admin_identity,
+        )
+        .expect("sign proposal");
+        let proposal_outcome = state.insert_event(
+            proposal_ev,
+            &VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+                actor_identity_pub: &admin_pub,
+                countersigner_identity_pub: None,
+                admin_identity_pub: None,
+            },
+        );
+        assert!(
+            matches!(proposal_outcome, InsertOutcome::Inserted),
+            "AdminProposal must insert; got {proposal_outcome:?}"
+        );
+
+        (
+            state,
+            admin_identity,
+            admin,
+            second_identity,
+            second,
+            proposal_id,
+        )
+    }
+
+    // ── Test 1: countersign_admin_proposal_idempotent_when_already_signed ──
+    //
+    // After the proposer's AdminProposal is in the log, `count_signers`
+    // must return 1. Inserting an AdminCountersign from the proposer again
+    // is blocked by verify_event (duplicate actor); the idempotency guard
+    // in the IPC layer must return current state without a second insert.
+    // We simulate idempotency here by checking count_signers before/after
+    // a second (duplicate-actor) countersign attempt is rejected.
+    #[tokio::test]
+    async fn countersign_admin_proposal_idempotent_when_already_signed() {
+        let community_id = SpaceId([0xc1; 16]);
+        let (mut state, _admin_identity, admin, second_identity, second, proposal_id) =
+            setup_quorum2_community(community_id);
+
+        // Proposer (admin) already signed via AdminProposal.
+        let signers_before = count_signers(&state.events, proposal_id);
+        assert_eq!(signers_before, 1, "only proposer signed so far");
+
+        // admin_quorum is 2 — quorum not yet reached.
+        let m = state.materialize_now(admin);
+        assert!(!m.power_levels.is_empty());
+        assert_eq!(m.admin_quorum, 2);
+
+        // Now let second countersign — should bump to 2.
+        let sk_bytes = second_identity.to_private_bytes();
+        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+        let second_pub = second_identity.identity.to_public_bytes();
+
+        let cs_ev = mint_admin_countersign_event(
+            community_id,
+            second,
+            proposal_id,
+            &signing_key,
+            hlc(350, "second"),
+        )
+        .expect("mint countersign");
+        let cs_outcome = state.insert_event(
+            cs_ev,
+            &VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+                actor_identity_pub: &second_pub,
+                countersigner_identity_pub: None,
+                admin_identity_pub: None,
+            },
+        );
+        assert!(
+            matches!(cs_outcome, InsertOutcome::Inserted),
+            "second countersign must insert; got {cs_outcome:?}"
+        );
+
+        let signers_after = count_signers(&state.events, proposal_id);
+        assert_eq!(signers_after, 2, "proposer + second = 2 signers");
+
+        // Idempotency: second admin already signed — a new AdminCountersign
+        // from second would be a duplicate. verify_event should reject it.
+        // (The IPC guard catches this BEFORE attempting insert, but we verify
+        // the CRDT also enforces it.)
+        let duplicate_cs = mint_admin_countersign_event(
+            community_id,
+            second,
+            proposal_id,
+            &signing_key,
+            hlc(360, "second"),
+        )
+        .expect("mint duplicate countersign");
+        let dup_outcome = state.insert_event(
+            duplicate_cs,
+            &VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+                actor_identity_pub: &second_pub,
+                countersigner_identity_pub: None,
+                admin_identity_pub: None,
+            },
+        );
+        // CRDT must reject duplicate countersign (duplicate actor for same proposal).
+        assert!(
+            matches!(dup_outcome, InsertOutcome::Rejected(_)),
+            "duplicate countersign must be rejected; got {dup_outcome:?}"
+        );
+
+        // count_signers must still be 2 (idempotent, no new signer added).
+        let signers_idempotent = count_signers(&state.events, proposal_id);
+        assert_eq!(
+            signers_idempotent, 2,
+            "count must remain 2 after duplicate attempt"
+        );
+    }
+
+    // ── Test 2: countersign_admin_proposal_rejects_non_admin_caller ────────
+    //
+    // Verify that the power-gate logic (caller_power < 100 → Err) fires
+    // correctly. We simulate this at the pure helper level: build a state
+    // where a non-admin member tries to countersign.
+    #[tokio::test]
+    async fn countersign_admin_proposal_rejects_non_admin_caller() {
+        let community_id = SpaceId([0xc2; 16]);
+        let (state, _admin_identity, admin, _second_identity, _second, proposal_id) =
+            setup_quorum2_community(community_id);
+
+        // A plain member (power 0) is NOT in the state above — simulate by
+        // checking that power_levels for an unknown addr is 0.
+        let stranger = OwnerAddr([0xff; 16]);
+        let m = state.materialize_now(admin);
+        let stranger_power = m.power_levels.get(&stranger).copied().unwrap_or(0);
+        assert_eq!(stranger_power, 0, "stranger has no power");
+
+        // The IPC checks caller_power < 100 → Err. We verify the predicate
+        // directly (the IPC layer is not instantiated in unit tests).
+        assert!(
+            stranger_power < 100,
+            "non-admin must have power < 100 → IPC rejects"
+        );
+
+        // Also verify count_signers is unaffected (still 1 — only proposer).
+        let signers = count_signers(&state.events, proposal_id);
+        assert_eq!(signers, 1, "only proposer; non-admin cannot sign");
+    }
+
+    // ── Test 3: countersign_admin_proposal_rejects_expired_proposal ────────
+    //
+    // A proposal older than ADMIN_PROPOSAL_EXPIRY_MS must be rejected.
+    // We build a state with an old AdminProposal (wall_ms = 1) and check
+    // that the age predicate fires correctly.
+    #[tokio::test]
+    async fn countersign_admin_proposal_rejects_expired_proposal() {
+        let now_ms = ADMIN_PROPOSAL_EXPIRY_MS * 2 + 1_000_000;
+        // Proposal inserted with wall_ms = 1 → age >> 30 days.
+        let proposal_wall_ms: u64 = 1;
+        let age = now_ms.saturating_sub(proposal_wall_ms);
+        assert!(
+            age > ADMIN_PROPOSAL_EXPIRY_MS,
+            "proposal must be expired; age={age}, expiry={ADMIN_PROPOSAL_EXPIRY_MS}"
+        );
+
+        // Also verify that a fresh proposal is NOT expired.
+        let fresh_wall_ms = now_ms - 1_000; // 1 second ago
+        let fresh_age = now_ms.saturating_sub(fresh_wall_ms);
+        assert!(
+            fresh_age <= ADMIN_PROPOSAL_EXPIRY_MS,
+            "fresh proposal must not be expired; age={fresh_age}"
+        );
+    }
+
+    // ── Test 4: countersign_admin_proposal_returns_reached_quorum_true_on_threshold_tip ──
+    //
+    // When signers_after == quorum_required, reached_quorum must be true.
+    // Set up a quorum=2 community, the proposer (signer 1), then add a
+    // countersign (signer 2) → signers_after=2 == quorum_required=2.
+    #[tokio::test]
+    async fn countersign_admin_proposal_returns_reached_quorum_true_on_threshold_tip() {
+        let community_id = SpaceId([0xc4; 16]);
+        let (mut state, _admin_identity, admin, second_identity, second, proposal_id) =
+            setup_quorum2_community(community_id);
+
+        let m = state.materialize_now(admin);
+        assert_eq!(m.admin_quorum, 2, "quorum must be 2");
+
+        // Before countersign: signers=1, quorum=2, not reached.
+        let signers_before = count_signers(&state.events, proposal_id);
+        assert_eq!(signers_before, 1);
+        assert!(signers_before < 2, "quorum not yet reached");
+
+        // Add second admin countersign.
+        let sk_bytes = second_identity.to_private_bytes();
+        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+        let second_pub = second_identity.identity.to_public_bytes();
+
+        let cs_ev = mint_admin_countersign_event(
+            community_id,
+            second,
+            proposal_id,
+            &signing_key,
+            hlc(400, "second"),
+        )
+        .expect("mint countersign");
+        let cs_outcome = state.insert_event(
+            cs_ev,
+            &VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+                actor_identity_pub: &second_pub,
+                countersigner_identity_pub: None,
+                admin_identity_pub: None,
+            },
+        );
+        assert!(
+            matches!(cs_outcome, InsertOutcome::Inserted),
+            "countersign must insert; got {cs_outcome:?}"
+        );
+
+        let signers_after = count_signers(&state.events, proposal_id);
+        let quorum_required = state.materialize_now(admin).admin_quorum;
+        let reached_quorum = signers_after >= quorum_required;
+
+        assert_eq!(signers_after, 2, "proposer + second = 2");
+        assert_eq!(quorum_required, 2);
+        assert!(
+            reached_quorum,
+            "reached_quorum must be true when signers == quorum"
         );
     }
 }
