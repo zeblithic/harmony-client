@@ -1,5 +1,11 @@
 import type { TauriAdapter } from './zenoh-service';
-import { POWER_THRESHOLDS, type CommunityMember, type ModerationEvent } from './types';
+import {
+  POWER_THRESHOLDS,
+  type CommunityLineageDto,
+  type CommunityMember,
+  type ForkDescendantDto,
+  type ModerationEvent,
+} from './types';
 import type { ChannelMessageDto } from './channel-message-service';
 
 interface MembersChangedPayload { communityId: string; }
@@ -377,6 +383,43 @@ export class CommunityService {
       snapshotMessageCount: number;
     } | null>('get_fork_snapshot_metadata', { communityId });
     return dto ?? null;
+  }
+
+  /**
+   * ZEB-287 Phase 2 spec §4.2: fetch multi-hop fork lineage metadata for
+   * a community, sourced from CommunityState (not disk). Returns the
+   * immediate-parent + ancestor chain + self info needed by
+   * ForkLineageTree.svelte to render ancestors / "you are here" /
+   * descendants in one component.
+   *
+   * Throws on backend error; caller renders the empty-state fallback if
+   * this rejects (e.g. caller not yet Joined, community not yet in
+   * registry).
+   */
+  async getCommunityLineage(communityId: string): Promise<CommunityLineageDto> {
+    try {
+      return await this.invoke<CommunityLineageDto>('get_community_lineage', { communityId });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(`getCommunityLineage: ${msg}`);
+    }
+  }
+
+  /**
+   * ZEB-287 Phase 2 spec §4.1: list visible Fork descendants for a
+   * community by walking its membership log for MembershipEventKind::Fork
+   * events. Silent forks are absent by design. Caller must be Joined.
+   *
+   * Returns rows sorted ascending by forkedAtWallMs with stable
+   * forkerAddr tie-break.
+   */
+  async listCommunityForks(communityId: string): Promise<ForkDescendantDto[]> {
+    try {
+      return await this.invoke<ForkDescendantDto[]>('list_community_forks', { communityId });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(`listCommunityForks: ${msg}`);
+    }
   }
 
   destroy(): void {

@@ -333,6 +333,46 @@ export interface CommunityMember {
   joinedAt?: number;
 }
 
+// ZEB-287 Phase 2: types matching backend DTOs for fork lineage IPCs.
+// Mirrors the camelCase-serialized shapes returned by get_community_lineage
+// and list_community_forks. SpaceId / OwnerAddr are hex strings at the IPC
+// boundary; nullable fields use `| null` (matching serde's None → null).
+
+export interface ParentLineageDto {
+  /** Hex-encoded SpaceId of this ancestor. */
+  spaceId: string;
+  /** Frozen display name of this ancestor at the time it was added to the chain. */
+  name: string;
+  /** wall_ms of this ancestor's fork-from-parent event; null for the root. */
+  forkedAtWallMs: number | null;
+}
+
+export interface CommunityLineageDto {
+  /** Hex SpaceId of immediate parent, or null for top-level. */
+  forkedFrom: string | null;
+  /** wall_ms of this community's fork-from-parent event; null for top-level. */
+  forkedAtWallMs: number | null;
+  /** Ancestors above immediate parent (root → above immediate parent). */
+  parentLineage: ParentLineageDto[];
+  /** This community's own SpaceId (hex). */
+  selfSpaceId: string;
+  /** This community's own display name. */
+  selfName: string;
+}
+
+export interface ForkDescendantDto {
+  /** Hex SpaceId of the descendant fork community. */
+  forkSpaceId: string;
+  /** Hex OwnerAddr of the forker. */
+  forkerAddr: string;
+  /** Resolved display name of forker, or null (Phase 2: always null pending ZEB-281). */
+  forkerDisplayName: string | null;
+  /** wall_ms of the Fork event. */
+  forkedAtWallMs: number;
+  /** Whether the descendant community is in local NavService/OwnerState. */
+  locallyKnown: boolean;
+}
+
 // Mirrors backend POWER_THRESHOLDS in src-tauri/src/community_membership.rs:1108.
 export const POWER_THRESHOLDS = {
   invite: 0,
