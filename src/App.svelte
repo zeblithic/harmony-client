@@ -1294,6 +1294,12 @@
           changeSelectedCommunity(forkSpaceId);
           void refreshCommunityMembers(forkSpaceId);
         }}
+        onSelectCommunity={(spaceId) => {
+          // ZEB-287 Phase 2: route the lineage-tree click into the
+          // changeSelectedCommunity primitive.
+          changeSelectedCommunity(spaceId);
+          void refreshCommunityMembers(spaceId);
+        }}
         onKickMember={async (target) => {
           if (!selectedCommunityId) return;
           try {

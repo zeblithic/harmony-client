@@ -1,11 +1,18 @@
 <script lang="ts">
   import { trapFocus } from '../actions/trap-focus';
-  import { POWER_THRESHOLDS, powerToRole, type CommunityMember } from '../types';
+  import {
+    POWER_THRESHOLDS,
+    powerToRole,
+    type CommunityLineageDto,
+    type CommunityMember,
+    type ForkDescendantDto,
+  } from '../types';
   import ConfirmationModal from './ConfirmationModal.svelte';
   import SetPowerDialog from './SetPowerDialog.svelte';
   import LastAdminWarningDialog from './LastAdminWarningDialog.svelte';
   import InviteLinkManager from './InviteLinkManager.svelte';
   import ForkConfirmDialog from './ForkConfirmDialog.svelte';
+  import ForkLineageTree from './ForkLineageTree.svelte';
   import PendingJoinsPanel from './PendingJoinsPanel.svelte';
 
   let {
@@ -26,6 +33,10 @@
     onOpenMembersPanel,
     onFork,
     lineage,
+    phase2Lineage = null,
+    descendants = [],
+    localNavIds = new Set<string>(),
+    onForkLineageNavigate,
   }: {
     communityId: string;
     communityName: string;
@@ -56,6 +67,20 @@
       forkedAtMs: number;
       snapshotMessageCount: number;
     } | null;
+    /** ZEB-287 Phase 2: full lineage DTO with multi-hop ancestor chain.
+     *  Populated by the caller via getCommunityLineage IPC. When null,
+     *  the Forks tree renders with self-only and no ancestors. */
+    phase2Lineage?: CommunityLineageDto | null;
+    /** ZEB-287 Phase 2: descendants list returned by listCommunityForks IPC. */
+    descendants?: ForkDescendantDto[];
+    /** ZEB-287 Phase 2: set of hex SpaceIds the user has locally
+     *  (joined / known via OwnerState). Used by ForkLineageTree to gate
+     *  clickability of ancestor and descendant rows. */
+    localNavIds?: Set<string>;
+    /** ZEB-287 Phase 2: callback fired when a clickable tree row is
+     *  activated. Caller routes the spaceId to the community-navigation
+     *  primitive (NavService.selectCommunity equivalent). */
+    onForkLineageNavigate?: (spaceId: string) => void;
   } = $props();
 
   let kickTarget = $state<CommunityMember | null>(null);
@@ -272,34 +297,37 @@
       </div>
     {/if}
 
-    {#if lineage}
-      <div class="section">
-        <div class="section-label">Lineage</div>
-        <dl class="lineage-grid">
-          <dt>Forked from</dt>
-          <dd>{lineage.originalCommunityName ?? 'another community'}</dd>
-          <dt>Forked at</dt>
-          <dd>{new Date(lineage.forkedAtMs).toUTCString()}</dd>
-          <dt>Snapshot</dt>
-          <dd>{lineage.snapshotMessageCount} messages bundled</dd>
-        </dl>
-      </div>
-    {/if}
+    <!-- ZEB-287 Phase 2 spec §5.1: unified "Forks" section that always renders
+         for every community. Replaces Phase 1's separate Lineage + Fork
+         sections with a single coherent block: polycentric-framing
+         explainer + ForkLineageTree + "Fork this community" button. -->
+    <div class="section forks-section">
+      <div class="section-label">Forks</div>
+      <p class="forks-explainer">
+        Any member of a community can fork it at any time, creating a new community with
+        the snapshot of history they had access to. The fork is independent &mdash; it has
+        its own membership, channels, and admin. Forks are how communities preserve
+        continuity if members want to take their conversation elsewhere.
+      </p>
 
-    {#if onFork}
-      <div class="section">
-        <div class="section-label">Fork</div>
-        <button class="fork-btn" onclick={() => { forkDialogOpen = true; forkError = null; }}>
+      {#if phase2Lineage}
+        <ForkLineageTree
+          lineage={phase2Lineage}
+          {descendants}
+          {localNavIds}
+          onNavigate={(spaceId) => onForkLineageNavigate?.(spaceId)}
+        />
+      {/if}
+
+      {#if onFork}
+        <button class="fork-btn fork-this-community" onclick={() => { forkDialogOpen = true; forkError = null; }}>
           Fork this community
         </button>
-        <p class="toggle-help">
-          Creates a new community with a frozen copy of the history you can see here.
-        </p>
         {#if forkError}
           <p class="fork-error">{forkError}</p>
         {/if}
-      </div>
-    {/if}
+      {/if}
+    </div>
 
     <div class="section">
       <div class="section-label">Danger zone</div>
@@ -578,19 +606,12 @@
     color: var(--text-secondary);
     margin: 4px 0 0;
   }
-  .lineage-grid {
-    display: grid;
-    grid-template-columns: 120px 1fr;
-    gap: 8px 16px;
+  /* ZEB-287 Phase 2: explainer paragraph in the Forks section. */
+  .forks-explainer {
     font-size: 0.8rem;
-    margin: 0;
-  }
-  .lineage-grid dt {
     color: var(--text-secondary);
-  }
-  .lineage-grid dd {
-    color: var(--text-primary);
-    margin: 0;
+    margin: 0 0 0.75rem;
+    line-height: 1.4;
   }
   .fork-btn {
     background: var(--bg-tertiary);

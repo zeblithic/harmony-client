@@ -255,4 +255,33 @@ describe('CommunitySettingsPanel', () => {
     await fireEvent.click(checkbox);
     expect(onToggle).toHaveBeenCalledWith(true);
   });
+
+  // ── ZEB-287 Phase 2: Forks section tests ──────────────────────────
+
+  it('forks_section_always_renders_for_non_fork_community', () => {
+    // No phase2Lineage prop → tree absent but section still renders.
+    const { getByText } = render(CommunitySettingsPanel, { props: baseProps });
+    expect(getByText('Forks')).toBeTruthy();
+  });
+
+  it('forks_section_renders_explainer_text_present', () => {
+    const { getByText } = render(CommunitySettingsPanel, { props: baseProps });
+    // Substring matches on the final explainer wording from spec §5.3.
+    expect(getByText(/Any member of a community can fork it at any time/)).toBeTruthy();
+    expect(getByText(/communities preserve continuity if members want to take/)).toBeTruthy();
+  });
+
+  it('fork_this_community_button_inside_forks_section', () => {
+    // Pass an onFork callback so the button renders.
+    const { container } = render(CommunitySettingsPanel, {
+      props: { ...baseProps, onFork: vi.fn() },
+    });
+
+    const forksSection = container.querySelector('.forks-section');
+    expect(forksSection).toBeTruthy();
+
+    const forkButton = forksSection!.querySelector('button.fork-this-community');
+    expect(forkButton).toBeTruthy();
+    expect(forkButton?.textContent).toMatch(/Fork this community/);
+  });
 });
