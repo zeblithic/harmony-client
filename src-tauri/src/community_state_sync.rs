@@ -1391,6 +1391,21 @@ impl CommunitySyncEngine {
             state_g.insert_event(event.clone(), &ctx)
         };
 
+        // C1 restart-recovery: when a PendingJoin returns AlreadyKnown
+        // (event was already in the CRDT from disk / prior session), still
+        // schedule the counter-sign eligibility check. The spawned task
+        // re-checks under the lock and returns immediately if a
+        // JoinCountersign already exists for this target — fully idempotent.
+        if matches!(
+            outcome,
+            crate::community_state_crdt::InsertOutcome::AlreadyKnown
+        ) && matches!(
+            &event.kind,
+            crate::community_membership::MembershipEventKind::PendingJoin { .. }
+        ) {
+            self.maybe_spawn_auto_counter_sign(&event);
+        }
+
         if matches!(
             outcome,
             crate::community_state_crdt::InsertOutcome::Inserted
@@ -1897,8 +1912,14 @@ async fn spawn_auto_counter_sign_task(
 }
 
 /// Wire `spawn_auto_counter_sign_task` into the `InternalCtx` / receive path.
-/// Called from `handle_incoming_publish` after `InsertOutcome::Inserted` fires
-/// for a `PendingJoin` event. Mirrors `CommunitySyncEngine::maybe_spawn_auto_counter_sign`.
+/// Called from `handle_incoming_publish` after `InsertOutcome::Inserted` OR after
+/// `AlreadyKnown` for a `PendingJoin` (restart-recovery — C1 bot-review finding).
+/// Mirrors `CommunitySyncEngine::maybe_spawn_auto_counter_sign`.
+///
+/// Self-eligibility: the spawned task requires self to be currently `Joined` with
+/// power ≥ `POWER_THRESHOLDS.invite`. In v1 that threshold is 0, so ANY joined
+/// member qualifies — not just the admin. The power check is retained for
+/// forward-compatibility with ZEB-251 per-community threshold customisation.
 fn maybe_spawn_auto_counter_sign_for_ctx(
     ctx: &InternalCtx,
     pending_event: &crate::community_membership::SignedMembershipEvent,
@@ -3115,8 +3136,40 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
 
         for (event, actor_pub, cs_pub_owned) in resolved {
             if state.events.contains_key(&event.id) {
+                // C1 restart-recovery: even though we've already seen this
+                // event, check whether a self-authored JoinCountersign for
+                // it needs to be emitted. This handles the case where the
+                // engine restarted and reloaded a PendingJoin from disk
+                // (returned AlreadyKnown on the reconcile insert) before
+                // the auto-counter-sign hook had a chance to fire. We
+                // collect the event for post-lock processing; we don't
+                // flip `inserted_any` since the CRDT is unchanged.
+                if matches!(
+                    &event.kind,
+                    crate::community_membership::MembershipEventKind::PendingJoin { .. }
+                ) {
+                    inserted_events.push(event);
+                }
                 continue;
             }
+
+            // ZEB-254 R1 bot-review Q2: opportunistic late-bind of
+            // admin_identity_pub on the state-root receive path — mirrors
+            // the identical fix in `insert_event_with_resolved_pubs`.
+            //
+            // Without this, a state-root-synced PendingJoin arrives after
+            // the admin's bootstrap Join in the same blob. The resolver
+            // has already verified (and cached) the admin's pub for the
+            // bootstrap Join entry, but the OnceLock is still empty because
+            // `insert_event_with_resolved_pubs` was never called for this
+            // path. P5 gate then sees `admin_identity_pub: None` and rejects
+            // the PendingJoin with `PendingJoinTokenInvalid`.
+            if event.actor == ctx.admin_addr && ctx.admin_identity_pub.get().is_none() {
+                // OnceLock::set is a no-op on the second call — safe to
+                // discard the Err (concurrent insert won the race).
+                let _ = ctx.admin_identity_pub.set(actor_pub);
+            }
+
             // Inline `Option::as_ref` because rustc can't always infer
             // the right `AsRef` impl on `[u8; 64]`.
             let cs_pub_ref: Option<&[u8; 64]> = match &cs_pub_owned {
@@ -3142,10 +3195,23 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
                     inserted_events.push(event_clone);
                 }
                 InsertOutcome::AlreadyKnown => {
-                    // Skip — already in our log. Don't flip inserted_any
-                    // because the CRDT is unchanged; without this, every
-                    // duplicate Zenoh fanout echo would trigger a
-                    // disk-persist on the Mutated arm at Task 10.
+                    // Don't flip inserted_any — the CRDT is unchanged;
+                    // without this, every duplicate Zenoh fanout echo would
+                    // trigger a disk-persist on the Mutated arm at Task 10.
+                    //
+                    // C1 restart-recovery: if this is a PendingJoin that
+                    // returned AlreadyKnown (event was already in the CRDT
+                    // from a prior session / disk-reload), still schedule the
+                    // counter-sign eligibility check. The check is idempotent
+                    // — `spawn_auto_counter_sign_task` re-checks under the
+                    // lock and returns immediately if a JoinCountersign
+                    // already exists for this target.
+                    if matches!(
+                        &event_clone.kind,
+                        crate::community_membership::MembershipEventKind::PendingJoin { .. }
+                    ) {
+                        inserted_events.push(event_clone);
+                    }
                 }
                 InsertOutcome::Rejected(verr) => {
                     tracing::warn!(

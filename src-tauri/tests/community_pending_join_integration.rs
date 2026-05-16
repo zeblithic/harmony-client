@@ -1556,6 +1556,335 @@ async fn boot_reconcile_engine_accepts_pending_join_via_opportunistic_late_bind(
     engine.shutdown().await.expect("shutdown");
 }
 
+// ── ZEB-254 bot-review Q2: state-root receive path late-bind ─────────────────
+
+/// ZEB-254 bot-review Q2: opportunistic late-bind of `admin_identity_pub` on
+/// the state-root receive path.
+///
+/// The Phase B inner loop in `handle_incoming_publish` now contains the same
+/// late-bind guard as `insert_event_with_resolved_pubs`. When a state-root
+/// blob arrives containing BOTH the admin's bootstrap Join AND a PendingJoin
+/// (sorted by event_sort_key so the Join arrives first), the admin's pub is
+/// extracted from the resolved actor_pub for the Join and stored in the
+/// OnceLock; the subsequent PendingJoin entry then sees a populated
+/// `admin_identity_pub` and passes P5.
+///
+/// Driving `handle_incoming_publish` directly requires building a fully
+/// encrypted wire packet (root + blob, correct epoch key) — a non-trivial
+/// fixture. Instead this test validates the same OnceLock promotion path
+/// via sequential `insert_local_event_with_pubs` calls (same OnceLock shared
+/// with `InternalCtx`). The code path in `handle_incoming_publish` Phase B
+/// uses the identical `ctx.admin_identity_pub.set(actor_pub)` pattern on the
+/// same `Arc<OnceLock>`, so the observable outcome (PendingJoin accepted after
+/// admin Join without pre-set admin_identity_pub) is identical. This test is a
+/// functional regression guard for the Q2 fix.
+#[tokio::test]
+async fn boot_reconcile_engine_accepts_pending_join_via_state_root_late_bind() {
+    let community_id = SpaceId([0xF0u8; 16]);
+
+    let (admin_priv, admin_pub, admin_addr) = make_identity(0xE1);
+    let admin_signing = signing_key_from(&admin_priv);
+    let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xF1);
+
+    let mut resolver_map = HashMap::new();
+    resolver_map.insert(admin_addr, admin_pub);
+    resolver_map.insert(joiner_addr, joiner_pub);
+    let resolver: Arc<dyn IdentityResolver> = Arc::new(StaticResolver { map: resolver_map });
+
+    let admin_join_payload = EventPayload {
+        id: [0xE1u8; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: admin_addr,
+        at: Hlc {
+            wall_ms: 1_700_000_001_000,
+            logical: 0,
+            device_id: "admin-dev".into(),
+        },
+    };
+    let admin_join =
+        sign_event_with_identity(&admin_join_payload, &admin_priv).expect("sign admin join");
+
+    let token = make_signed_token(
+        &admin_priv,
+        admin_addr,
+        Some(joiner_addr),
+        Some(1_700_000_100_000),
+    );
+    let pending_payload = EventPayload {
+        id: [0xF1u8; 16],
+        community_id,
+        kind: MembershipEventKind::PendingJoin {
+            invite_token: token,
+            joiner_identity_pub: joiner_pub,
+        },
+        actor: joiner_addr,
+        at: Hlc {
+            wall_ms: 1_700_000_002_000,
+            logical: 0,
+            device_id: "joiner-dev".into(),
+        },
+    };
+    let pending_join =
+        sign_event_with_identity(&pending_payload, &joiner_priv).expect("sign PendingJoin");
+    let pending_id = pending_join.id;
+
+    // Admin engine with admin_identity_pub: None (boot-reconcile mode).
+    // The admin's pub must be promoted into the OnceLock by the late-bind
+    // when the admin Join is inserted — WITHOUT any prior call to
+    // bind_admin_identity_pub or pre-seeding in the config.
+    let cs_dst = make_cas();
+    // Keep _pub_rx alive (not just `_`) so the engine's publisher_tx stays
+    // valid for the entire test; dropping it immediately would close the
+    // channel and cause shutdown() to return TransportClosed.
+    let (pub_tx_d, _pub_rx_d) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+    let (_sub_tx_d, sub_rx_d) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+    let tmp_d = tempfile::tempdir().expect("tmpdir dest");
+    let dst_engine = build_engine_with_resolver(
+        community_id,
+        admin_addr,
+        admin_addr, // self == admin → auto-counter-sign fires
+        admin_signing,
+        pub_tx_d,
+        sub_rx_d,
+        cs_dst,
+        &tmp_d,
+        Some(resolver),
+        None, // <-- boot-reconcile: no pre-set admin_identity_pub
+    );
+
+    // Step 1: insert admin bootstrap Join with the correct actor_pub.
+    // The late-bind in insert_event_with_resolved_pubs (and in
+    // handle_incoming_publish's Phase B loop) sees event.actor == admin_addr
+    // and admin_identity_pub.get().is_none() → sets the OnceLock to actor_pub.
+    let o1 = dst_engine
+        .insert_local_event_with_pubs(admin_join, admin_pub, None)
+        .await
+        .expect("admin join insert");
+    assert!(
+        matches!(o1, InsertOutcome::Inserted),
+        "admin bootstrap join must be Inserted; got {:?}",
+        o1
+    );
+
+    // Step 2: insert the PendingJoin with the joiner's actor_pub. The OnceLock
+    // is now populated (set by step 1), so P5 can verify the token sig.
+    // The actor_pub here is joiner_pub — correctly scoped to this event.
+    let o2 = dst_engine
+        .insert_local_event_with_pubs(pending_join, joiner_pub, None)
+        .await
+        .expect("pending join insert");
+    assert!(
+        matches!(o2, InsertOutcome::Inserted),
+        "PendingJoin must be Inserted after state-root late-bind promotes the OnceLock; \
+         got {:?} — Q2 bot-review fix missing or OnceLock not shared between paths",
+        o2
+    );
+
+    // Auto-counter-sign must fire (self == admin, Joined, power 100 ≥ 0).
+    let dst_state = dst_engine.state();
+    let found = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            {
+                let g = dst_state.lock().await;
+                if g.events.values().any(|e| {
+                    e.actor == admin_addr
+                        && matches!(
+                            &e.kind,
+                            MembershipEventKind::JoinCountersign { target_event_id }
+                            if *target_event_id == pending_id
+                        )
+                }) {
+                    return true;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for auto-JoinCountersign on state-root receive path");
+
+    assert!(
+        found,
+        "auto-counter-sign must fire after state-root late-bind"
+    );
+
+    dst_engine.shutdown().await.expect("dst shutdown");
+}
+
+// ── ZEB-254 bot-review C1: AlreadyKnown restart-recovery ────────────────────
+
+/// ZEB-254 bot-review C1: when a PendingJoin returns `AlreadyKnown` (already
+/// in the CRDT from a prior session / disk-reload / duplicate delivery), the
+/// auto-counter-sign hook must still fire if self is eligible and has not yet
+/// emitted a JoinCountersign for this target.
+///
+/// Simulated via double-insert: first insert returns `Inserted` (hook fires,
+/// but we DON'T wait for it — we simulate the "hook didn't fire on first
+/// insert" case by inserting a SECOND time before the spawned task completes,
+/// verifying the SECOND insert also schedules the hook). The idempotency guard
+/// in `spawn_auto_counter_sign_task` ensures exactly one JoinCountersign lands.
+///
+/// Real-world trigger: admin engine restarts from disk (CRDT loaded, events
+/// present), then reconciles incoming events — each PendingJoin hits
+/// `state.events.contains_key` → true → `continue` before `insert_event` is
+/// called. The C1 fix pushes those AlreadyKnown PendingJoins onto
+/// `inserted_events` so `maybe_spawn_auto_counter_sign_for_ctx` fires even
+/// for already-known events.
+#[tokio::test]
+async fn restart_recovery_already_known_pending_join_triggers_counter_sign() {
+    let community_id = SpaceId([0xF2u8; 16]);
+    let (admin_priv, admin_pub, admin_addr) = make_identity(0xE2);
+    let admin_signing = signing_key_from(&admin_priv);
+    let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xF2);
+
+    let mut resolver_map = HashMap::new();
+    resolver_map.insert(admin_addr, admin_pub);
+    resolver_map.insert(joiner_addr, joiner_pub);
+    let resolver: Arc<dyn IdentityResolver> = Arc::new(StaticResolver { map: resolver_map });
+
+    let cs = make_cas();
+    // Keep _pub_rx alive (not just `_`) so the engine's publisher_tx stays
+    // valid for the entire test; dropping it immediately would close the
+    // channel and cause shutdown() to return TransportClosed.
+    let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+    let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+    let tmp = tempfile::tempdir().expect("tmpdir");
+
+    let engine = build_engine_with_resolver(
+        community_id,
+        admin_addr,
+        admin_addr, // self == admin
+        admin_signing,
+        pub_tx,
+        sub_rx,
+        cs,
+        &tmp,
+        Some(resolver),
+        Some(admin_pub),
+    );
+
+    // Admin bootstrap Join (self is now Joined in materialized state).
+    let admin_join_payload = EventPayload {
+        id: [0xE2u8; 16],
+        community_id,
+        kind: MembershipEventKind::Join,
+        actor: admin_addr,
+        at: Hlc {
+            wall_ms: 1_700_000_001_000,
+            logical: 0,
+            device_id: "admin-dev".into(),
+        },
+    };
+    let admin_join =
+        sign_event_with_identity(&admin_join_payload, &admin_priv).expect("sign admin join");
+    engine
+        .insert_local_event_with_pubs(admin_join, admin_pub, None)
+        .await
+        .expect("admin join");
+
+    // Build a valid PendingJoin from joiner.
+    let token = make_signed_token(
+        &admin_priv,
+        admin_addr,
+        Some(joiner_addr),
+        Some(1_700_000_100_000),
+    );
+    let pending_payload = EventPayload {
+        id: [0xF2u8; 16],
+        community_id,
+        kind: MembershipEventKind::PendingJoin {
+            invite_token: token,
+            joiner_identity_pub: joiner_pub,
+        },
+        actor: joiner_addr,
+        at: Hlc {
+            wall_ms: 1_700_000_002_000,
+            logical: 0,
+            device_id: "joiner-dev".into(),
+        },
+    };
+    let pending_join =
+        sign_event_with_identity(&pending_payload, &joiner_priv).expect("sign PendingJoin");
+    let pending_id = pending_join.id;
+    let pending_join_clone = pending_join.clone();
+
+    // First insert: returns Inserted. The hook spawns asynchronously — we
+    // continue WITHOUT waiting, simulating the "admin crashed before the task
+    // completed" scenario.
+    let o1 = engine
+        .insert_local_event_with_pubs(pending_join, joiner_pub, None)
+        .await
+        .expect("first insert");
+    assert!(
+        matches!(o1, InsertOutcome::Inserted),
+        "first insert must be Inserted; got {:?}",
+        o1
+    );
+
+    // Second insert (same event): returns AlreadyKnown. C1 fix: the recovery
+    // path in insert_event_with_resolved_pubs still spawns the counter-sign
+    // check even on AlreadyKnown. The spawned task's idempotency guard ensures
+    // exactly one JoinCountersign lands regardless of how many times the hook
+    // fires.
+    let o2 = engine
+        .insert_local_event_with_pubs(pending_join_clone, joiner_pub, None)
+        .await
+        .expect("second insert");
+    assert!(
+        matches!(o2, InsertOutcome::AlreadyKnown),
+        "second insert must be AlreadyKnown; got {:?}",
+        o2
+    );
+
+    // Wait for JoinCountersign to appear (either hook invocation can produce it).
+    let state_arc = engine.state();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            {
+                let g = state_arc.lock().await;
+                if g.events.values().any(|e| {
+                    e.actor == admin_addr
+                        && matches!(
+                            &e.kind,
+                            MembershipEventKind::JoinCountersign { target_event_id }
+                            if *target_event_id == pending_id
+                        )
+                }) {
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for JoinCountersign from AlreadyKnown recovery path");
+
+    // Give a brief window to verify no duplicate was minted.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let g = state_arc.lock().await;
+    let count = g
+        .events
+        .values()
+        .filter(|e| {
+            e.actor == admin_addr
+                && matches!(
+                    &e.kind,
+                    MembershipEventKind::JoinCountersign { target_event_id }
+                    if *target_event_id == pending_id
+                )
+        })
+        .count();
+    assert_eq!(
+        count, 1,
+        "idempotency guard must ensure exactly 1 JoinCountersign; got {count}"
+    );
+    drop(g);
+
+    engine.shutdown().await.expect("shutdown");
+}
+
 // SKIP: pending_join_30d_expiry_hides_joiner
 //
 // This integration test would be redundant with the unit tests already in

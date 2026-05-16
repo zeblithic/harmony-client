@@ -202,8 +202,15 @@ pub enum MembershipEventKind {
         joiner_identity_pub: [u8; 64],
     },
 
-    /// ZEB-254: admin-signed counter-sign approving a PendingJoin.
-    /// Pairs by `target_event_id`. Variant code "y" (yes / approve).
+    /// ZEB-254: counter-sign approving a PendingJoin. Pairs by
+    /// `target_event_id`. Variant code "y" (yes / approve).
+    ///
+    /// The signer must be a currently-Joined member whose power level meets
+    /// `POWER_THRESHOLDS.invite`. In v1, `POWER_THRESHOLDS.invite = 0`, so
+    /// ANY joined member can counter-sign — not just the admin. This is
+    /// intentional v1 behaviour: any existing community member can vouch for
+    /// a new joiner. ZEB-251 will add per-community threshold customisation
+    /// that may restrict counter-signing to higher-power members.
     #[serde(rename = "y")]
     JoinCountersign {
         #[serde(
@@ -613,6 +620,11 @@ pub enum VerifyError {
     JoinCountersignActorNotJoined,
 
     /// ZEB-254: JoinCountersign actor's power is below invite_threshold.
+    ///
+    /// In v1, `POWER_THRESHOLDS.invite = 0` so this error is unreachable
+    /// (every member's power defaults to 0 ≥ 0). The variant is retained as
+    /// a forward-compatibility placeholder for ZEB-251 per-community threshold
+    /// customisation where invite_threshold may be set above 0.
     JoinCountersignActorPowerInsufficient,
 }
 
@@ -1457,10 +1469,15 @@ pub fn materialize(
 
                 let prior_status = m.members.get(&event.actor).map(|s| s.status);
                 match prior_status {
-                    Some(MemberStatus::Joined)
-                    | Some(MemberStatus::Banned)
-                    | Some(MemberStatus::Left) => {
-                        // Terminal/superseded state — PendingJoin is shadowed.
+                    Some(MemberStatus::Joined) | Some(MemberStatus::Banned) => {
+                        // Terminal state — PendingJoin is shadowed.
+                        //
+                        // ZEB-254: Left is intentionally NOT in this list.
+                        // verify_event P6 explicitly allows prior state None | Left
+                        // as valid preconditions for PendingJoin — a user who left
+                        // a community is allowed to re-join via a new PendingJoin.
+                        // Including Left here would shadow the re-join and produce
+                        // a semantic mismatch with the verify gate.
                     }
                     _ => {
                         if countersigned {
@@ -5109,5 +5126,78 @@ mod zeb_254_materialize_tests {
         // The rotated-epoch path (current_epoch > 0 triggers insert) is validated
         // by Task 15 integration tests where EpochRotation events can be fully
         // synthesized with RecipientCiphertexts.
+    }
+
+    /// ZEB-254 bot-review Q1: A previously-Left member re-joining via
+    /// PendingJoin must materialize as PendingJoin, NOT be shadowed by Left.
+    ///
+    /// verify_event P6 gate explicitly permits prior state `None | Left` for
+    /// PendingJoin; materialize's terminal-shadow list must be consistent.
+    #[test]
+    fn materialize_pending_join_after_left_yields_pending() {
+        let community = SpaceId([7u8; 16]);
+        let (joiner_priv, joiner_addr, joiner_pub) = synth_identity(1);
+        let (_, admin_addr, _) = synth_identity(2);
+
+        // Sequence: original legacy Join → Leave → new PendingJoin (re-join
+        // attempt). The PendingJoin comes after the Leave in HLC order.
+        let original_join =
+            synth_legacy_join(&joiner_priv, joiner_addr, community, 1_700_000_000_000, 1);
+        let leave = synth_leave(&joiner_priv, joiner_addr, community, 1_700_000_001_000, 2);
+        let pending = synth_pending_join(
+            &joiner_priv,
+            joiner_addr,
+            joiner_pub,
+            community,
+            1_700_000_002_000,
+            3,
+        );
+
+        // Materialize the full log. The PendingJoin (event_sort_key > Leave)
+        // must NOT be shadowed by the Left status; it must win and yield
+        // PendingJoin.
+        let mat = materialize(&[original_join, leave, pending], admin_addr);
+        assert_eq!(
+            mat.members.get(&joiner_addr).map(|m| m.status),
+            Some(MemberStatus::PendingJoin),
+            "a previously-Left member re-joining via PendingJoin must materialize \
+             as PendingJoin, not be shadowed by Left"
+        );
+    }
+
+    /// ZEB-254 bot-review Q1 corollary: a PendingJoin WITH countersign after
+    /// Leave must materialize as Joined (countersign approval is not shadowed).
+    #[test]
+    fn materialize_pending_join_after_left_with_countersign_yields_joined() {
+        let community = SpaceId([7u8; 16]);
+        let (joiner_priv, joiner_addr, joiner_pub) = synth_identity(1);
+        let (admin_priv, admin_addr, _) = synth_identity(2);
+
+        let original_join =
+            synth_legacy_join(&joiner_priv, joiner_addr, community, 1_700_000_000_000, 1);
+        let leave = synth_leave(&joiner_priv, joiner_addr, community, 1_700_000_001_000, 2);
+        let pending = synth_pending_join(
+            &joiner_priv,
+            joiner_addr,
+            joiner_pub,
+            community,
+            1_700_000_002_000,
+            3,
+        );
+        let cs = synth_join_countersign(
+            &admin_priv,
+            admin_addr,
+            community,
+            pending.id,
+            1_700_000_003_000,
+            4,
+        );
+
+        let mat = materialize(&[original_join, leave, pending, cs], admin_addr);
+        assert_eq!(
+            mat.members.get(&joiner_addr).map(|m| m.status),
+            Some(MemberStatus::Joined),
+            "a previously-Left member with a countersigned re-join must materialize as Joined"
+        );
     }
 }
