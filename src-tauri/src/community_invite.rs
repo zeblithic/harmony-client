@@ -387,6 +387,34 @@ pub struct BoundedChannelLogSnapshot {
 impl CanonicalPayloadSealed for BoundedChannelLogSnapshot {}
 impl CanonicalPayload for BoundedChannelLogSnapshot {}
 
+/// ZEB-287 Phase 2: one entry in a fork's ancestor chain. Frozen at the
+/// time it was added to a fork's lineage; ancestor renames after this
+/// do not propagate to descendants. Bundled into
+/// `PreForkSnapshot.parent_lineage` and persisted in
+/// `CommunityState.parent_lineage`.
+///
+/// Same-length-keys invariant: CBOR keys at this nesting level are all
+/// 2-char (`si`, `nm`, `at`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParentLineageEntry {
+    /// SpaceId of this ancestor community.
+    #[serde(rename = "si")]
+    pub space_id: SpaceId,
+
+    /// Display name of this ancestor at the time it was frozen.
+    #[serde(rename = "nm")]
+    pub name: String,
+
+    /// wall_ms component of the Fork event that created THIS ancestor
+    /// from its predecessor in the chain. `None` for the root (top of
+    /// the chain — never forked, has no predecessor).
+    #[serde(rename = "at", skip_serializing_if = "Option::is_none", default)]
+    pub forked_at_wall_ms: Option<u64>,
+}
+
+impl CanonicalPayloadSealed for ParentLineageEntry {}
+impl CanonicalPayload for ParentLineageEntry {}
+
 /// ZEB-285: frozen snapshot of an original community's history,
 /// bundled into fork-invites so fork-invitees can see pre-fork
 /// context. Self-contained for verification: `identity_pubs` carries
@@ -394,8 +422,9 @@ impl CanonicalPayload for BoundedChannelLogSnapshot {}
 /// `membership_events` and `channel_log`, so joiners do NOT need to
 /// query profile-broadcast to verify the snapshot.
 ///
-/// Wire format: 6-key CBOR map. Field codes 2-char per same-length-
-/// keys at this nesting level. See spec §3.4.
+/// Wire format: 6-key CBOR map (7th `pl` key added in ZEB-287 Phase 2,
+/// skipped when empty). Field codes 2-char per same-length-keys at this
+/// nesting level. See spec §3.4 (Phase 1) and §3.2 (Phase 2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreForkSnapshot {
     /// The original community's SpaceId. Signed pre-fork events
@@ -438,10 +467,78 @@ pub struct PreForkSnapshot {
     /// NOT used for any verification or ordering decision.
     #[serde(rename = "ts")]
     pub forked_at: Hlc,
+
+    /// ZEB-287 Phase 2: ordered ancestor chain (root → immediate parent)
+    /// frozen at fork-time. For a Phase 2 fork-invite built via
+    /// `community_invite::build_parent_lineage`, the tail entry is the
+    /// fork's immediate parent — the forker community itself — which is
+    /// ALSO encoded via `original_community_id` / `original_community_name`.
+    /// This duplication is intentional: it lets the redeemer mirror the
+    /// chain into `CommunityState.parent_lineage` verbatim while keeping
+    /// `original_community_id` as the canonical immediate-parent pointer
+    /// for the Phase 1 `forked_from` path.
+    ///
+    /// Length capped at 16 entries at fork-build time (see
+    /// `community_invite::apply_lineage_cap`). Phase 1 fork-invites
+    /// encode without this field; decoded as empty Vec via `default`.
+    #[serde(rename = "pl", skip_serializing_if = "Vec::is_empty", default)]
+    pub parent_lineage: Vec<ParentLineageEntry>,
 }
 
 impl CanonicalPayloadSealed for PreForkSnapshot {}
 impl CanonicalPayload for PreForkSnapshot {}
+
+/// ZEB-287 Phase 2: spec §3.4 maximum depth for a fork's parent_lineage.
+/// Applied at fork-build time (community_fork.rs) AND at redeem time
+/// (lib.rs::redeem_invite_inner) to defend against future-protocol-revision
+/// or malicious payloads that exceed the cap.
+pub const MAX_LINEAGE_DEPTH: usize = 16;
+
+/// ZEB-287 Phase 2: enforce the 16-deep cap on a parent_lineage vector by
+/// dropping the OLDEST (root-side) entries until length ≤ MAX_LINEAGE_DEPTH.
+/// Used by `build_parent_lineage` and by the redeem-path payload guard in
+/// `lib.rs::redeem_invite_inner` (R1-2).
+pub fn apply_lineage_cap(lineage: &mut Vec<ParentLineageEntry>) {
+    if lineage.len() > MAX_LINEAGE_DEPTH {
+        let overflow = lineage.len() - MAX_LINEAGE_DEPTH;
+        lineage.drain(0..overflow);
+    }
+}
+
+/// ZEB-287 Phase 2: build a new fork's parent_lineage by extending the
+/// forker's existing chain with the forker's own community as the new
+/// immediate-parent-above-the-immediate-parent. Mirrors spec §3.4.
+///
+/// Inputs:
+/// - `forker_lineage`: the forker community's existing `parent_lineage`
+///   (slice; cloned internally).
+/// - `forker_id` / `forker_name`: the forker community's identity at
+///   fork-time. Frozen into the new entry.
+/// - `forker_forked_at_wall_ms`: the forker community's own
+///   `forked_at_wall_ms` (Some when the forker is itself a fork; None
+///   when the forker is a top-level / root community).
+///
+/// The new entry (`forker_id`, `forker_name`, `forker_forked_at_wall_ms`)
+/// is appended; then the 16-deep cap is applied (drops oldest if needed).
+///
+/// Production callers: `community_fork.rs::fork_community` (Task 4 build
+/// site). Tests in `community_fork_integration.rs` + `community_invite_unit.rs`
+/// also use this helper so a regression in production logic surfaces there.
+pub fn build_parent_lineage(
+    forker_lineage: &[ParentLineageEntry],
+    forker_id: SpaceId,
+    forker_name: &str,
+    forker_forked_at_wall_ms: Option<u64>,
+) -> Vec<ParentLineageEntry> {
+    let mut chain: Vec<ParentLineageEntry> = forker_lineage.to_vec();
+    chain.push(ParentLineageEntry {
+        space_id: forker_id,
+        name: forker_name.to_string(),
+        forked_at_wall_ms: forker_forked_at_wall_ms,
+    });
+    apply_lineage_cap(&mut chain);
+    chain
+}
 
 /// ZEB-262 Phase 4: Path B app-sig wrapper around CommunityInviteSigned.
 /// Wire layout: `[u8 disc=0x10][CBOR(signed)][64 raw signature bytes]`.
@@ -1999,6 +2096,7 @@ mod tests {
                 logical: 0,
                 device_id: "t".to_string(),
             },
+            parent_lineage: Vec::new(),
         };
 
         let bytes = canonical_cbor_encode(&snapshot).expect("encode");
@@ -2103,6 +2201,7 @@ mod tests {
                 logical: 0,
                 device_id: "t".to_string(),
             },
+            parent_lineage: Vec::new(),
         };
 
         let payload = CommunityInvitePayload {

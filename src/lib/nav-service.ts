@@ -351,6 +351,20 @@ export class NavService {
     return node?.name ?? null;
   }
 
+  /**
+   * ZEB-287 R3-1: resolve a community's display name from a hex SpaceId.
+   * Used by `ForkLineageTree` to render a locally-known descendant fork
+   * with its real name instead of a truncated hex string. Returns the
+   * community's name if a `community`-kind NavNode is present, otherwise
+   * null (e.g., the user isn't a member of that fork).
+   */
+  getCommunityNameBySpaceId(spaceId: string): string | null {
+    const node = this.nodes.find(
+      (n) => n.id === spaceId && n.type === 'community',
+    );
+    return node?.name ?? null;
+  }
+
   /** Look up a peer's status text by address. */
   profileLookup(address: string): string | undefined {
     return this.profiles.get(address)?.statusText;

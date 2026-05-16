@@ -7018,6 +7018,866 @@ async fn list_community_members(
     Ok(member_info_for(&materialized))
 }
 
+// ── ZEB-287 Phase 2: list_community_forks IPC ─────────────────────────
+//
+// Walks a community's membership log for `MembershipEventKind::Fork`
+// events, resolves forker display names via the same ladder used for
+// member-list rendering (active member → cross-community cache → None
+// fallback), marks descendant communities `locally_known` if the
+// forker's local OwnerState carries a Space at that SpaceId. Authorized
+// behind a Joined gate: non-members cannot enumerate forks of
+// communities they aren't in.
+//
+// Silent forks are absent by design — silent mode emits no Fork event,
+// so a log walk returns nothing for those. Phase 2 spec §4.1.
+
+/// ZEB-287 Phase 2: one row in the descendants list. Returned by
+/// `list_community_forks` IPC. `forker_display_name` is None in Phase 2
+/// pending ZEB-281 PMB integration (matches Phase 1's
+/// `MemberInfoDto.display_name` pattern); the UI renders the fallback
+/// "an unknown member" when None.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkDescendantDto {
+    /// Hex-encoded SpaceId of the descendant fork community.
+    pub fork_space_id: String,
+    /// Hex-encoded OwnerAddr of the forker (the signer of the Fork event).
+    pub forker_addr: String,
+    /// Resolved display name of the forker if currently Joined in this
+    /// community AND a display-name source is available. None in Phase 2
+    /// until ZEB-281 wires profile-broadcast resolution.
+    pub forker_display_name: Option<String>,
+    /// wall_ms of the Fork event's HLC.
+    pub forked_at_wall_ms: u64,
+    /// Whether the descendant community is locally known
+    /// (in the joiner's OwnerState). UI uses this to gate clickability.
+    pub locally_known: bool,
+}
+
+/// Pure-helper for `list_community_forks` IPC: takes the engine state's
+/// event log + materialized membership + locally-known SpaceId set, plus
+/// the caller's OwnerAddr, and returns the sorted descendants list (or
+/// `Err("not a member")` if the caller is not Joined). Extracted to enable
+/// unit testing without standing up a full NodeState fixture.
+pub fn build_fork_descendants(
+    events: &std::collections::BTreeMap<
+        crate::community_membership::EventId,
+        crate::community_membership::SignedMembershipEvent,
+    >,
+    materialized: &crate::community_membership::MaterializedMembership,
+    locally_known: &std::collections::BTreeSet<crate::owner_state_types::SpaceId>,
+    self_owner: crate::owner_state_types::OwnerAddr,
+) -> Result<Vec<ForkDescendantDto>, String> {
+    // Authorize: caller must be Joined.
+    match materialized.members.get(&self_owner).map(|m| m.status) {
+        Some(crate::community_membership::MemberStatus::Joined) => {}
+        _ => return Err("not a member".to_string()),
+    }
+
+    // R1-3: sort by full HLC ordering BEFORE projecting to DTOs so that two
+    // Fork events at the same wall_ms but different logical clocks order
+    // deterministically by full HLC (wall_ms → logical → device_id), then
+    // tiebreak by actor address. Projecting first and sorting on
+    // `forked_at_wall_ms` alone loses the logical-clock distinction.
+    let mut fork_events: Vec<&crate::community_membership::SignedMembershipEvent> = events
+        .values()
+        .filter(|signed| {
+            matches!(
+                &signed.kind,
+                crate::community_membership::MembershipEventKind::Fork { .. }
+            )
+        })
+        .collect();
+    fork_events.sort_by(|a, b| {
+        a.at.wall_ms
+            .cmp(&b.at.wall_ms)
+            .then_with(|| a.at.logical.cmp(&b.at.logical))
+            .then_with(|| a.at.device_id.cmp(&b.at.device_id))
+            .then_with(|| a.actor.0.cmp(&b.actor.0))
+    });
+
+    let dtos: Vec<ForkDescendantDto> = fork_events
+        .into_iter()
+        .map(|signed| {
+            let fork_space_id = match &signed.kind {
+                crate::community_membership::MembershipEventKind::Fork { fork_space_id } => {
+                    fork_space_id
+                }
+                // Unreachable: filtered above.
+                _ => unreachable!("non-Fork event survived filter"),
+            };
+            // Forker display name: per spec §4.1 only resolve when the
+            // forker is currently Joined. Phase 2 has no profile-broadcast
+            // ladder integration yet (ZEB-281 deferred), so the resolved
+            // value is None even for Joined members — matches Phase 1's
+            // MemberInfoDto.display_name placeholder pattern.
+            let forker_display_name =
+                match materialized.members.get(&signed.actor).map(|m| m.status) {
+                    Some(crate::community_membership::MemberStatus::Joined) => None,
+                    _ => None,
+                };
+            ForkDescendantDto {
+                fork_space_id: hex::encode(fork_space_id.0),
+                forker_addr: hex::encode(signed.actor.0),
+                forker_display_name,
+                forked_at_wall_ms: signed.at.wall_ms,
+                locally_known: locally_known.contains(fork_space_id),
+            }
+        })
+        .collect();
+
+    Ok(dtos)
+}
+
+/// Tauri IPC: list visible Fork events from a community's membership log.
+///
+/// Authorization: caller must be `Joined` in the community. Sorted ascending
+/// by `forked_at_wall_ms` with stable secondary sort by `forker_addr` for
+/// HLC-tie cases.
+///
+/// Errors:
+/// - `Err("invalid community_id hex: ...")` — couldn't parse hex.
+/// - `Err("community_id must be 16 bytes (32 hex chars)")` — wrong length.
+/// - `Err("crdt_state missing — node not running?")` — node not started.
+/// - `Err("no community_registry — node not running?")` — registry missing.
+/// - `Err("no Space for community {hex} in owner-state")` — community absent.
+/// - `Err("no engine for community {hex} — not joined or not yet started")` —
+///   engine absent.
+/// - `Err("not a member")` — caller is not currently Joined.
+#[tauri::command]
+async fn list_community_forks(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+) -> Result<Vec<ForkDescendantDto>, String> {
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let (crdt_state, registry, self_owner) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        let self_owner = g
+            .dm_self_owner
+            .ok_or("self_owner missing — node not running?")?;
+        (
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
+            g.community_registry
+                .clone()
+                .ok_or("no community_registry — node not running?")?,
+            self_owner,
+        )
+    };
+
+    let admin_addr = {
+        let s = crdt_state.lock().await;
+        let space = s.spaces.get(&space_id).cloned();
+        drop(s);
+        let space = space.ok_or_else(|| {
+            format!(
+                "no Space for community {} in owner-state",
+                hex::encode(space_id.0)
+            )
+        })?;
+        if space.kind != crate::owner_state_types::SpaceKind::Community {
+            return Err(format!(
+                "Space {} exists but is kind {:?}, not Community",
+                hex::encode(space_id.0),
+                space.kind
+            ));
+        }
+        space
+            .admin_addr
+            .ok_or("community Space missing admin_addr (corrupt row?)")?
+    };
+
+    let engine_state = registry.state_for(&space_id).await.ok_or_else(|| {
+        format!(
+            "no engine for community {} — not joined or not yet started",
+            hex::encode(space_id.0)
+        )
+    })?;
+
+    // Snapshot the log + materialized members under the minimum mutex holding.
+    let (events_snapshot, materialized) = {
+        let g = engine_state.lock().await;
+        let materialized = g.materialize_now(admin_addr);
+        let events_clone: std::collections::BTreeMap<
+            crate::community_membership::EventId,
+            crate::community_membership::SignedMembershipEvent,
+        > = g.events.clone();
+        (events_clone, materialized)
+    };
+
+    // Resolve locally-known set: which SpaceIds appear in joiner's OwnerState.spaces?
+    let locally_known: std::collections::BTreeSet<crate::owner_state_types::SpaceId> = {
+        let s = crdt_state.lock().await;
+        s.spaces.keys().copied().collect()
+    };
+
+    build_fork_descendants(&events_snapshot, &materialized, &locally_known, self_owner)
+}
+
+// ── ZEB-287 Phase 2: get_community_lineage IPC ────────────────────────
+//
+// Exposes the lineage fields from CommunityState behind a tight DTO so
+// the frontend can render the ForkLineageTree without leaking the full
+// CommunityState wire shape. Authorized behind a Joined gate. Phase 2
+// spec §4.2 + §4.4.
+
+/// ZEB-287 Phase 2: one entry in the ancestor-chain DTO returned by
+/// `get_community_lineage`. Mirrors `community_invite::ParentLineageEntry`
+/// but with hex-encoded SpaceId for IPC boundary cleanliness.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParentLineageDto {
+    /// Hex-encoded SpaceId of this ancestor.
+    pub space_id: String,
+    /// Frozen display name of this ancestor at the time it was added
+    /// to the chain. May be empty for legacy/corrupted snapshots.
+    pub name: String,
+    /// wall_ms of this ancestor's fork-from-parent event; None for the
+    /// root of the chain.
+    pub forked_at_wall_ms: Option<u64>,
+}
+
+/// ZEB-287 Phase 2: lineage metadata returned by `get_community_lineage`
+/// IPC. Carries enough state for `ForkLineageTree.svelte` to render
+/// ancestors + "you are here" + descendants without a second IPC.
+///
+/// Note: Phase 1's `CommunityLineageDto` was renamed to
+/// `ForkSnapshotMetadataDto` to free this name for Phase 2 semantics.
+/// To minimize confusion at the call site, this Phase 2 type uses the
+/// `PhaseTwoCommunityLineageDto` Rust name even though it serializes as
+/// `CommunityLineageDto`-shaped JSON for the frontend (via camelCase
+/// renames matching `CommunityLineageDto` interface in TS).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhaseTwoCommunityLineageDto {
+    /// Phase 1 field: hex-encoded SpaceId of the immediate parent, or
+    /// None for top-level (non-fork) communities.
+    pub forked_from: Option<String>,
+    /// Phase 2 field: wall_ms of THIS community's Fork event from its
+    /// parent. None for top-level communities and Phase 1 forks.
+    pub forked_at_wall_ms: Option<u64>,
+    /// Phase 2 field: ordered ancestor chain (root → immediate parent).
+    ///
+    /// Stored-state shape (CommunityState.parent_lineage): EXCLUDES the
+    /// immediate parent (which lives in `forked_from`) per spec §3.2.
+    ///
+    /// IPC-DTO shape (this field): the `get_community_lineage` IPC
+    /// SYNTHESIZES an immediate-parent entry when the stored chain is
+    /// empty but `forked_from` is set (Phase 1 / single-hop forks), so
+    /// the frontend tree can render the parent row uniformly. For
+    /// multi-hop Phase 2 forks the stored chain already includes the
+    /// immediate parent at the tail. Empty only for top-level (non-fork)
+    /// communities.
+    pub parent_lineage: Vec<ParentLineageDto>,
+    /// This community's own SpaceId (hex) — convenience so frontend can
+    /// render "you are here" without a second IPC.
+    pub self_space_id: String,
+    /// This community's own display name.
+    pub self_name: String,
+}
+
+/// Pure helper: project Phase 2 `CommunityState` lineage data into the
+/// IPC DTO. Extracted to enable unit testing without standing up a
+/// full NodeState fixture.
+pub fn build_community_lineage_dto(
+    self_space_id: crate::owner_state_types::SpaceId,
+    self_name: String,
+    forked_from: Option<crate::owner_state_types::SpaceId>,
+    forked_at_wall_ms: Option<u64>,
+    parent_lineage: &[crate::community_invite::ParentLineageEntry],
+) -> PhaseTwoCommunityLineageDto {
+    PhaseTwoCommunityLineageDto {
+        forked_from: forked_from.map(|s| hex::encode(s.0)),
+        forked_at_wall_ms,
+        parent_lineage: parent_lineage
+            .iter()
+            .map(|e| ParentLineageDto {
+                space_id: hex::encode(e.space_id.0),
+                name: e.name.clone(),
+                forked_at_wall_ms: e.forked_at_wall_ms,
+            })
+            .collect(),
+        self_space_id: hex::encode(self_space_id.0),
+        self_name,
+    }
+}
+
+/// Tauri IPC: read lineage fields from CommunityState behind a tight DTO.
+/// Caller must be Joined in the community.
+///
+/// Errors:
+/// - `Err("invalid community_id hex: ...")` — couldn't parse hex.
+/// - `Err("community_id must be 16 bytes (32 hex chars)")` — wrong length.
+/// - `Err("crdt_state missing — node not running?")` — node not started.
+/// - `Err("no community_registry — node not running?")` — registry missing.
+/// - `Err("no Space for community {hex} in owner-state")` — community absent.
+/// - `Err("no engine for community {hex} — not joined or not yet started")` —
+///   engine absent.
+/// - `Err("not a member")` — caller is not currently Joined.
+#[tauri::command]
+async fn get_community_lineage(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+) -> Result<PhaseTwoCommunityLineageDto, String> {
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let (crdt_state, registry, self_owner) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        let self_owner = g
+            .dm_self_owner
+            .ok_or("self_owner missing — node not running?")?;
+        (
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
+            g.community_registry
+                .clone()
+                .ok_or("no community_registry — node not running?")?,
+            self_owner,
+        )
+    };
+
+    let (admin_addr, self_name) = {
+        let s = crdt_state.lock().await;
+        let space = s.spaces.get(&space_id).cloned();
+        drop(s);
+        let space = space.ok_or_else(|| {
+            format!(
+                "no Space for community {} in owner-state",
+                hex::encode(space_id.0)
+            )
+        })?;
+        if space.kind != crate::owner_state_types::SpaceKind::Community {
+            return Err(format!(
+                "Space {} exists but is kind {:?}, not Community",
+                hex::encode(space_id.0),
+                space.kind
+            ));
+        }
+        let admin = space
+            .admin_addr
+            .ok_or("community Space missing admin_addr (corrupt row?)")?;
+        (admin, space.name)
+    };
+
+    let engine_state = registry.state_for(&space_id).await.ok_or_else(|| {
+        format!(
+            "no engine for community {} — not joined or not yet started",
+            hex::encode(space_id.0)
+        )
+    })?;
+
+    let (forked_from, forked_at_wall_ms, parent_lineage_clone, materialized) = {
+        let g = engine_state.lock().await;
+        let mat = g.materialize_now(admin_addr);
+        (
+            g.forked_from,
+            g.forked_at_wall_ms,
+            g.parent_lineage.clone(),
+            mat,
+        )
+    };
+
+    // Authorize: caller must be Joined.
+    match materialized.members.get(&self_owner).map(|m| m.status) {
+        Some(crate::community_membership::MemberStatus::Joined) => {}
+        _ => return Err("not a member".to_string()),
+    }
+
+    // R1-1: synthesize an immediate-parent entry for Phase 1 / single-hop
+    // forks. CommunityState.parent_lineage EXCLUDES the immediate parent
+    // (which lives in `forked_from`); the IPC DTO needs the parent so the
+    // frontend tree can render it as a row. When the stored chain is empty
+    // but `forked_from` is set, push a synthesized entry with the parent's
+    // name resolved from local owner-state (best-effort; falls back to a
+    // truncated-hex sentinel when the parent isn't locally known).
+    //
+    // Note: this synthesis affects ONLY the IPC-DTO shape, NOT the stored
+    // `CommunityState.parent_lineage` (which per spec §3.2 still excludes
+    // the immediate parent — that's encoded via `original_community_id` on
+    // the wire / `forked_from` on disk).
+    let lineage_for_dto: Vec<crate::community_invite::ParentLineageEntry> =
+        if let Some(parent_id) = forked_from {
+            if parent_lineage_clone.is_empty() {
+                let parent_name = {
+                    let s = crdt_state.lock().await;
+                    s.spaces
+                        .get(&parent_id)
+                        .map(|sp| sp.name.clone())
+                        .unwrap_or_else(|| {
+                            // Fallback: truncated hex sentinel for unknown parents.
+                            let hex = hex::encode(parent_id.0);
+                            format!("0x{}…", &hex[..8])
+                        })
+                };
+                vec![crate::community_invite::ParentLineageEntry {
+                    space_id: parent_id,
+                    name: parent_name,
+                    // wall_ms of how THIS-parent-was-forked-from-its-parent
+                    // is unknown for Phase 1 / single-hop synthesis; None.
+                    forked_at_wall_ms: None,
+                }]
+            } else {
+                parent_lineage_clone
+            }
+        } else {
+            parent_lineage_clone
+        };
+
+    Ok(build_community_lineage_dto(
+        space_id,
+        self_name,
+        forked_from,
+        forked_at_wall_ms,
+        &lineage_for_dto,
+    ))
+}
+
+#[cfg(test)]
+mod get_community_lineage_tests {
+    use super::*;
+    use crate::community_invite::ParentLineageEntry;
+    use crate::owner_state_types::SpaceId;
+
+    #[test]
+    fn build_community_lineage_dto_returns_phase1_state_with_default_phase2_fields() {
+        // Phase 1-shape: no Phase 2 lineage data.
+        let self_id = SpaceId([0x77; 16]);
+        let parent_id = SpaceId([0x33; 16]);
+
+        let dto = build_community_lineage_dto(
+            self_id,
+            "Self".into(),
+            Some(parent_id),
+            None,
+            &[], // empty parent_lineage = Phase 1 shape
+        );
+
+        assert_eq!(dto.self_space_id, hex::encode(self_id.0));
+        assert_eq!(dto.self_name, "Self");
+        assert_eq!(dto.forked_from, Some(hex::encode(parent_id.0)));
+        assert_eq!(dto.forked_at_wall_ms, None);
+        assert!(dto.parent_lineage.is_empty());
+    }
+
+    #[test]
+    fn build_community_lineage_dto_returns_phase2_chain() {
+        // Phase 2-shape: 2-entry chain.
+        let self_id = SpaceId([0x77; 16]);
+        let parent_id = SpaceId([0x33; 16]);
+        let lineage = vec![
+            ParentLineageEntry {
+                space_id: SpaceId([0x11; 16]),
+                name: "Root".into(),
+                forked_at_wall_ms: None,
+            },
+            ParentLineageEntry {
+                space_id: SpaceId([0x22; 16]),
+                name: "Middle".into(),
+                forked_at_wall_ms: Some(1_700_000_000_000),
+            },
+        ];
+
+        let dto = build_community_lineage_dto(
+            self_id,
+            "MyFork".into(),
+            Some(parent_id),
+            Some(1_710_000_000_000),
+            &lineage,
+        );
+
+        assert_eq!(dto.self_space_id, hex::encode(self_id.0));
+        assert_eq!(dto.forked_from, Some(hex::encode(parent_id.0)));
+        assert_eq!(dto.forked_at_wall_ms, Some(1_710_000_000_000));
+        assert_eq!(dto.parent_lineage.len(), 2);
+        assert_eq!(dto.parent_lineage[0].name, "Root");
+        assert_eq!(dto.parent_lineage[0].forked_at_wall_ms, None);
+        assert_eq!(dto.parent_lineage[1].name, "Middle");
+        assert_eq!(
+            dto.parent_lineage[1].forked_at_wall_ms,
+            Some(1_700_000_000_000)
+        );
+    }
+
+    #[test]
+    fn build_community_lineage_dto_top_level_community() {
+        let self_id = SpaceId([0x88; 16]);
+        let dto = build_community_lineage_dto(self_id, "Top".into(), None, None, &[]);
+
+        assert_eq!(dto.forked_from, None);
+        assert_eq!(dto.forked_at_wall_ms, None);
+        assert!(dto.parent_lineage.is_empty());
+        assert_eq!(dto.self_name, "Top");
+    }
+}
+
+#[cfg(test)]
+mod list_community_forks_tests {
+    use super::*;
+    use crate::community_membership::{
+        ChannelId, MemberState, MemberStatus, MembershipEventKind, SignedMembershipEvent,
+    };
+    use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn hlc_at(wall_ms: u64) -> Hlc {
+        Hlc {
+            wall_ms,
+            logical: 0,
+            device_id: "t".into(),
+        }
+    }
+
+    fn synth_signed(
+        id_byte: u8,
+        community_id: SpaceId,
+        kind: MembershipEventKind,
+        actor: OwnerAddr,
+        wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        SignedMembershipEvent {
+            id: [id_byte; 16],
+            community_id,
+            kind,
+            actor,
+            at: hlc_at(wall_ms),
+            sig: [0u8; 64],
+            countersig: None,
+        }
+    }
+
+    fn materialized_with_join(
+        addr: OwnerAddr,
+        status: MemberStatus,
+    ) -> crate::community_membership::MaterializedMembership {
+        let mut m = crate::community_membership::MaterializedMembership::default();
+        m.members.insert(
+            addr,
+            MemberState {
+                status,
+                joined_at: hlc_at(0),
+                left_at: None,
+            },
+        );
+        m
+    }
+
+    #[test]
+    fn list_community_forks_returns_fork_events_only() {
+        // Setup: a Joined caller, an events log mixing a Join, a Fork, and a
+        // ChannelCreate. The IPC must surface only the Fork event.
+        let cid = SpaceId([0xaa; 16]);
+        let caller = OwnerAddr([0xc0; 16]);
+        let fork_dest = SpaceId([0xf1; 16]);
+
+        let mut events: BTreeMap<[u8; 16], SignedMembershipEvent> = BTreeMap::new();
+        events.insert(
+            [0x01; 16],
+            synth_signed(0x01, cid, MembershipEventKind::Join, caller, 100),
+        );
+        events.insert(
+            [0x02; 16],
+            synth_signed(
+                0x02,
+                cid,
+                MembershipEventKind::Fork {
+                    fork_space_id: fork_dest,
+                },
+                caller,
+                200,
+            ),
+        );
+        // A non-Fork event after the Fork: must NOT appear in descendants.
+        events.insert(
+            [0x03; 16],
+            synth_signed(
+                0x03,
+                cid,
+                MembershipEventKind::ChannelCreate {
+                    channel_id: ChannelId([0; 16]),
+                    name: "general".to_string(),
+                    write_power: 0,
+                },
+                caller,
+                300,
+            ),
+        );
+
+        let materialized = materialized_with_join(caller, MemberStatus::Joined);
+        let locally_known: BTreeSet<SpaceId> = std::iter::once(fork_dest).collect();
+
+        let result = build_fork_descendants(&events, &materialized, &locally_known, caller)
+            .expect("Joined caller must succeed");
+        assert_eq!(result.len(), 1, "only Fork event surfaces");
+        assert_eq!(result[0].fork_space_id, hex::encode(fork_dest.0));
+        assert_eq!(result[0].forker_addr, hex::encode(caller.0));
+        assert_eq!(result[0].forked_at_wall_ms, 200);
+        assert!(result[0].locally_known);
+    }
+
+    #[test]
+    fn list_community_forks_resolves_active_member_name() {
+        // ZEB-287 spec §4.1: forker_display_name is None in Phase 2 even
+        // when the forker is Joined (PMB resolution deferred to ZEB-281).
+        let cid = SpaceId([0xab; 16]);
+        let caller = OwnerAddr([0xc1; 16]);
+        let fork_dest = SpaceId([0xf2; 16]);
+
+        let mut events: BTreeMap<[u8; 16], SignedMembershipEvent> = BTreeMap::new();
+        events.insert(
+            [0x01; 16],
+            synth_signed(
+                0x01,
+                cid,
+                MembershipEventKind::Fork {
+                    fork_space_id: fork_dest,
+                },
+                caller,
+                200,
+            ),
+        );
+
+        let materialized = materialized_with_join(caller, MemberStatus::Joined);
+        let result =
+            build_fork_descendants(&events, &materialized, &BTreeSet::new(), caller).unwrap();
+
+        assert_eq!(result[0].forker_display_name, None);
+    }
+
+    #[test]
+    fn list_community_forks_falls_back_when_forker_kicked() {
+        // Forker has been kicked → status != Joined → forker_display_name None.
+        let cid = SpaceId([0xac; 16]);
+        let caller = OwnerAddr([0xc2; 16]);
+        let forker = OwnerAddr([0xc3; 16]);
+        let fork_dest = SpaceId([0xf3; 16]);
+
+        let mut events: BTreeMap<[u8; 16], SignedMembershipEvent> = BTreeMap::new();
+        events.insert(
+            [0x01; 16],
+            synth_signed(
+                0x01,
+                cid,
+                MembershipEventKind::Fork {
+                    fork_space_id: fork_dest,
+                },
+                forker,
+                200,
+            ),
+        );
+
+        // Materialized state: caller is Joined; forker is Banned (was kicked).
+        let mut materialized = materialized_with_join(caller, MemberStatus::Joined);
+        materialized.members.insert(
+            forker,
+            MemberState {
+                status: MemberStatus::Banned,
+                joined_at: hlc_at(50),
+                left_at: Some(hlc_at(150)),
+            },
+        );
+
+        let result =
+            build_fork_descendants(&events, &materialized, &BTreeSet::new(), caller).unwrap();
+        assert_eq!(result[0].forker_display_name, None);
+    }
+
+    #[test]
+    fn list_community_forks_marks_locally_unknown_descendants() {
+        let cid = SpaceId([0xad; 16]);
+        let caller = OwnerAddr([0xc4; 16]);
+        let fork_dest = SpaceId([0xf4; 16]);
+
+        let mut events: BTreeMap<[u8; 16], SignedMembershipEvent> = BTreeMap::new();
+        events.insert(
+            [0x01; 16],
+            synth_signed(
+                0x01,
+                cid,
+                MembershipEventKind::Fork {
+                    fork_space_id: fork_dest,
+                },
+                caller,
+                200,
+            ),
+        );
+
+        let materialized = materialized_with_join(caller, MemberStatus::Joined);
+
+        // No entries in locally_known → descendant is locally unknown.
+        let result =
+            build_fork_descendants(&events, &materialized, &BTreeSet::new(), caller).unwrap();
+        assert!(!result[0].locally_known);
+    }
+
+    #[test]
+    fn list_community_forks_rejects_non_member_caller() {
+        let cid = SpaceId([0xae; 16]);
+        let caller = OwnerAddr([0xc5; 16]);
+        let fork_dest = SpaceId([0xf5; 16]);
+
+        let mut events: BTreeMap<[u8; 16], SignedMembershipEvent> = BTreeMap::new();
+        events.insert(
+            [0x01; 16],
+            synth_signed(
+                0x01,
+                cid,
+                MembershipEventKind::Fork {
+                    fork_space_id: fork_dest,
+                },
+                caller,
+                200,
+            ),
+        );
+
+        // Empty materialized → caller is NOT a member.
+        let materialized = crate::community_membership::MaterializedMembership::default();
+
+        let result = build_fork_descendants(&events, &materialized, &BTreeSet::new(), caller);
+        assert_eq!(
+            result.as_ref().err().map(|s| s.as_str()),
+            Some("not a member")
+        );
+    }
+
+    #[test]
+    fn list_community_forks_sorts_chronologically() {
+        // Three Fork events with wall_ms = [200, 100, 300] — verify
+        // returned order is ascending [100, 200, 300].
+        let cid = SpaceId([0xaf; 16]);
+        let caller = OwnerAddr([0xc6; 16]);
+        let f_a = SpaceId([0xa1; 16]);
+        let f_b = SpaceId([0xb1; 16]);
+        let f_c = SpaceId([0xc1; 16]);
+
+        let mut events: BTreeMap<[u8; 16], SignedMembershipEvent> = BTreeMap::new();
+        events.insert(
+            [0x01; 16],
+            synth_signed(
+                0x01,
+                cid,
+                MembershipEventKind::Fork { fork_space_id: f_a },
+                caller,
+                200,
+            ),
+        );
+        events.insert(
+            [0x02; 16],
+            synth_signed(
+                0x02,
+                cid,
+                MembershipEventKind::Fork { fork_space_id: f_b },
+                caller,
+                100,
+            ),
+        );
+        events.insert(
+            [0x03; 16],
+            synth_signed(
+                0x03,
+                cid,
+                MembershipEventKind::Fork { fork_space_id: f_c },
+                caller,
+                300,
+            ),
+        );
+
+        let materialized = materialized_with_join(caller, MemberStatus::Joined);
+        let result =
+            build_fork_descendants(&events, &materialized, &BTreeSet::new(), caller).unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].forked_at_wall_ms, 100);
+        assert_eq!(result[1].forked_at_wall_ms, 200);
+        assert_eq!(result[2].forked_at_wall_ms, 300);
+    }
+
+    #[test]
+    fn list_community_forks_sorts_by_full_hlc_when_wall_ms_ties() {
+        // R1-3: two Fork events at the SAME wall_ms but different logical
+        // clocks must order by HLC.logical, not be wall_ms-only ambiguous.
+        // A naive sort on `forked_at_wall_ms` alone leaves the tiebreak
+        // dependent on the BTreeMap event-id ordering (the source values()
+        // iteration), which loses the HLC's authoritative ordering.
+        let cid = SpaceId([0xb0; 16]);
+        let caller = OwnerAddr([0xc7; 16]);
+        let f_low = SpaceId([0xa1; 16]); // logical=0 (earlier)
+        let f_high = SpaceId([0xa2; 16]); // logical=5 (later)
+
+        // The two Fork events share wall_ms=500 but differ in logical.
+        // Insert with the LATER (logical=5) event's id ordered FIRST in
+        // the BTreeMap so a wall_ms-only sort would emit it before the
+        // earlier (logical=0) event. Correct HLC sort must invert that.
+        let mut events: BTreeMap<[u8; 16], SignedMembershipEvent> = BTreeMap::new();
+        events.insert(
+            [0x01; 16],
+            SignedMembershipEvent {
+                id: [0x01; 16],
+                community_id: cid,
+                kind: MembershipEventKind::Fork {
+                    fork_space_id: f_high,
+                },
+                actor: caller,
+                at: Hlc {
+                    wall_ms: 500,
+                    logical: 5, // later
+                    device_id: "t".into(),
+                },
+                sig: [0u8; 64],
+                countersig: None,
+            },
+        );
+        events.insert(
+            [0x02; 16],
+            SignedMembershipEvent {
+                id: [0x02; 16],
+                community_id: cid,
+                kind: MembershipEventKind::Fork {
+                    fork_space_id: f_low,
+                },
+                actor: caller,
+                at: Hlc {
+                    wall_ms: 500,
+                    logical: 0, // earlier
+                    device_id: "t".into(),
+                },
+                sig: [0u8; 64],
+                countersig: None,
+            },
+        );
+
+        let materialized = materialized_with_join(caller, MemberStatus::Joined);
+        let result =
+            build_fork_descendants(&events, &materialized, &BTreeSet::new(), caller).unwrap();
+
+        assert_eq!(result.len(), 2);
+        // Earlier-logical-clock event must come first despite being
+        // inserted under a larger BTreeMap key.
+        assert_eq!(
+            result[0].fork_space_id,
+            hex::encode(f_low.0),
+            "HLC tiebreak: logical=0 must precede logical=5 at same wall_ms"
+        );
+        assert_eq!(result[1].fork_space_id, hex::encode(f_high.0));
+    }
+}
+
 // ── ZEB-248 Phase 1: create_channel ──────────────────────────────────
 //
 // Mints a ChannelCreate SignedMembershipEvent and inserts it through
@@ -10239,6 +11099,22 @@ where
         if let Some(state_arc) = community_registry.state_for(&minted.community_id).await {
             let mut state_g = state_arc.lock().await;
             state_g.forked_from = Some(original_id);
+            // ZEB-287 Phase 2 spec §3.5: when redeeming a fork-invite,
+            // mirror the snapshot's lineage data into the new fork's
+            // CommunityState. Phase 1 fork-invites have `parent_lineage`
+            // default-empty (skip-if-empty); their `forked_at` Hlc has
+            // always existed, so wall_ms is filled even for legacy invites.
+            if let Some(snapshot) = payload.pre_fork_snapshot.as_ref() {
+                state_g.forked_at_wall_ms = Some(snapshot.forked_at.wall_ms);
+                // R1-2: apply 16-deep cap on the redeem side too. A
+                // malicious or future-protocol-revision payload could
+                // carry > 16 entries; the cap drops the oldest (root-side)
+                // so our local state stays bounded. Same helper as
+                // community_fork.rs::fork_community uses at build time.
+                let mut capped_lineage = snapshot.parent_lineage.clone();
+                crate::community_invite::apply_lineage_cap(&mut capped_lineage);
+                state_g.parent_lineage = capped_lineage;
+            }
         } else {
             tracing::warn!(
                 community_id = %hex::encode(minted.community_id.0),
@@ -11060,6 +11936,7 @@ mod redeem_invite_inner_tests {
                 logical: 0,
                 device_id: "fork-dev".into(),
             },
+            parent_lineage: Vec::new(),
         };
 
         let invite_payload = CommunityInvitePayload {
@@ -11136,6 +12013,214 @@ mod redeem_invite_inner_tests {
             state_g.forked_from,
             Some(original_id),
             "CommunityState.forked_from must mirror the invite's forked_from"
+        );
+    }
+
+    /// ZEB-287 Phase 2 spec §3.5: when redeeming a fork-invite, the new
+    /// CommunityState must pick up `forked_at_wall_ms` and `parent_lineage`
+    /// from the snapshot. Phase 1 fork-invites with empty `parent_lineage`
+    /// still get `forked_at_wall_ms` populated from `snapshot.forked_at`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redeem_fork_invite_wires_parent_lineage_into_community_state() {
+        let fixture = build_redeem_invite_test_fixture().await;
+        let tmp = tempfile::TempDir::new().expect("tempdir for identity_dir");
+
+        let admin_identity = PrivateIdentity::from_seed(&[0xab; 32]);
+        let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
+
+        let original_id = SpaceId([0xac; 16]);
+        let community_id = SpaceId([0xf4; 16]);
+        let membership_key = EpochKey::new([0x43; 32]);
+
+        // Phase 2 snapshot: carries a 2-entry parent_lineage representing
+        // a grandparent (C) and a parent-of-parent (B) ancestor chain.
+        let c_entry = crate::community_invite::ParentLineageEntry {
+            space_id: SpaceId([0xc0; 16]),
+            name: "Grandparent C".into(),
+            forked_at_wall_ms: None, // C is root of the chain
+        };
+        let b_entry = crate::community_invite::ParentLineageEntry {
+            space_id: SpaceId([0xb0; 16]),
+            name: "Parent-of-parent B".into(),
+            forked_at_wall_ms: Some(1_650_000_000_000),
+        };
+
+        let snapshot = crate::community_invite::PreForkSnapshot {
+            original_community_id: original_id,
+            original_community_name: "OriginalCom".into(),
+            membership_events: vec![],
+            channel_log: crate::community_invite::BoundedChannelLogSnapshot {
+                per_channel: std::collections::BTreeMap::new(),
+            },
+            identity_pubs: std::collections::BTreeMap::new(),
+            forked_at: Hlc {
+                wall_ms: 1_715_000_000_000,
+                logical: 0,
+                device_id: "fork-dev".into(),
+            },
+            parent_lineage: vec![c_entry.clone(), b_entry.clone()],
+        };
+
+        let invite_payload = CommunityInvitePayload {
+            community_id,
+            epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: membership_key.as_bytes().to_vec(),
+                state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
+            },
+            admin_addr,
+            community_name: "ForkCom".into(),
+            is_invite_only: false,
+            expires_at: None,
+            invite_token: None,
+            admin_bootstrap: None,
+            admin_identity_pub: None,
+            forked_from: Some(original_id),
+            pre_fork_snapshot: Some(snapshot.clone()),
+        };
+
+        let invite_url =
+            crate::community_invite::encode_invite_url(&invite_payload).expect("encode invite url");
+
+        let result = redeem_invite_inner(
+            invite_url,
+            std::sync::Arc::clone(&fixture.crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            fixture.unicast_send_tx.clone(),
+            std::sync::Arc::clone(&fixture.dm_outbox),
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            || Ok(()),
+            Some(tmp.path().to_path_buf()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "fork-invite redeem must succeed: {:?}",
+            result
+        );
+
+        // Assert: CommunityState.forked_at_wall_ms + parent_lineage carry through.
+        let state_arc = fixture
+            .community_registry
+            .state_for(&community_id)
+            .await
+            .expect("engine state must exist after redeem");
+        let state_g = state_arc.lock().await;
+        assert_eq!(
+            state_g.forked_from,
+            Some(original_id),
+            "Phase 1 forked_from must still be wired"
+        );
+        assert_eq!(
+            state_g.forked_at_wall_ms,
+            Some(1_715_000_000_000),
+            "ZEB-287: forked_at_wall_ms must come from snapshot.forked_at.wall_ms"
+        );
+        assert_eq!(
+            state_g.parent_lineage,
+            vec![c_entry, b_entry],
+            "ZEB-287: parent_lineage must mirror snapshot.parent_lineage"
+        );
+    }
+
+    /// ZEB-287 Phase 2 spec §6.2: a Phase 1-shape fork-invite (whose
+    /// snapshot.parent_lineage is empty — Phase 1 wire compat default)
+    /// must still redeem cleanly. The resulting CommunityState has
+    /// `parent_lineage: []` (the correct "ancestry beyond immediate parent
+    /// unknown" state) and `forked_at_wall_ms: Some(...)` (Phase 1's
+    /// existing Hlc has wall_ms regardless of Phase 2).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redeem_phase1_fork_invite_yields_empty_lineage_with_forked_at_set() {
+        let fixture = build_redeem_invite_test_fixture().await;
+        let tmp = tempfile::TempDir::new().expect("tempdir for identity_dir");
+
+        let admin_identity = PrivateIdentity::from_seed(&[0xae; 32]);
+        let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
+
+        let original_id = SpaceId([0xad; 16]);
+        let community_id = SpaceId([0xf5; 16]);
+        let membership_key = EpochKey::new([0x44; 32]);
+
+        // Phase 1-shape snapshot: parent_lineage defaults empty.
+        let snapshot = crate::community_invite::PreForkSnapshot {
+            original_community_id: original_id,
+            original_community_name: "Phase1OriginalCom".into(),
+            membership_events: vec![],
+            channel_log: crate::community_invite::BoundedChannelLogSnapshot {
+                per_channel: std::collections::BTreeMap::new(),
+            },
+            identity_pubs: std::collections::BTreeMap::new(),
+            forked_at: Hlc {
+                wall_ms: 1_710_000_000_000,
+                logical: 0,
+                device_id: "phase1-dev".into(),
+            },
+            parent_lineage: Vec::new(), // Phase 1 default
+        };
+
+        let invite_payload = CommunityInvitePayload {
+            community_id,
+            epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: membership_key.as_bytes().to_vec(),
+                state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
+            },
+            admin_addr,
+            community_name: "Phase1ForkCom".into(),
+            is_invite_only: false,
+            expires_at: None,
+            invite_token: None,
+            admin_bootstrap: None,
+            admin_identity_pub: None,
+            forked_from: Some(original_id),
+            pre_fork_snapshot: Some(snapshot.clone()),
+        };
+
+        let invite_url =
+            crate::community_invite::encode_invite_url(&invite_payload).expect("encode invite url");
+
+        let result = redeem_invite_inner(
+            invite_url,
+            std::sync::Arc::clone(&fixture.crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            fixture.unicast_send_tx.clone(),
+            std::sync::Arc::clone(&fixture.dm_outbox),
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            || Ok(()),
+            Some(tmp.path().to_path_buf()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "Phase 1-shape fork-invite redeem must succeed: {:?}",
+            result
+        );
+
+        let state_arc = fixture
+            .community_registry
+            .state_for(&community_id)
+            .await
+            .expect("engine state must exist after redeem");
+        let state_g = state_arc.lock().await;
+        assert_eq!(state_g.forked_from, Some(original_id));
+        // Phase 2 still fills forked_at_wall_ms from Phase 1's existing forked_at Hlc.
+        assert_eq!(state_g.forked_at_wall_ms, Some(1_710_000_000_000));
+        // parent_lineage stays empty — "ancestry beyond immediate parent unknown".
+        assert!(
+            state_g.parent_lineage.is_empty(),
+            "Phase 1 fork's parent_lineage must remain empty"
         );
     }
 
@@ -12278,17 +13363,22 @@ mod library_directory_lww_tests {
 /// Mints a self-Leave event, looks up the per-community engine via
 /// `community_registry.engine_arc`, and inserts the event through
 /// `engine.insert_local_event` so the debounced publish loop pushes
-/// ZEB-285 Phase 1 Task 10: read fork lineage metadata for the Settings panel.
+/// ZEB-285 Phase 1 Task 10: read fork snapshot metadata for the Settings
+/// panel. ZEB-287 Phase 2 renamed from `get_community_lineage` /
+/// `CommunityLineageDto` because Phase 2 introduces a distinct
+/// `CommunityLineageDto` (the multi-hop ancestor chain pulled from
+/// CommunityState). This older IPC remains the source of the bundled-
+/// message count + original-community-name fields used by ForkConfirmDialog.
 ///
-/// Returns `Some(CommunityLineageDto)` when `pre_fork_snapshot.bin` exists
-/// in the community's data directory, `None` when the community is not a fork
-/// (file absent). Reads and decodes the snapshot on every call — suitable for
-/// the settings panel (opened rarely) but callers should not call this in a
-/// hot path. The full snapshot body (channel events) is decoded then dropped;
-/// only the lightweight header fields are returned.
+/// Returns `Some(ForkSnapshotMetadataDto)` when `pre_fork_snapshot.bin`
+/// exists in the community's data directory, `None` when the community is
+/// not a fork (file absent). Reads and decodes the snapshot on every call
+/// — suitable for the settings panel (opened rarely) but callers should
+/// not call this in a hot path. The full snapshot body (channel events) is
+/// decoded then dropped; only the lightweight header fields are returned.
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CommunityLineageDto {
+pub struct ForkSnapshotMetadataDto {
     /// Display name of the original community at fork time.
     pub original_community_name: String,
     /// Wall-clock milliseconds from the forked_at HLC.
@@ -12298,22 +13388,22 @@ pub struct CommunityLineageDto {
 }
 
 #[tauri::command]
-async fn get_community_lineage(
+async fn get_fork_snapshot_metadata(
     community_id: String,
-) -> Result<Option<CommunityLineageDto>, String> {
+) -> Result<Option<ForkSnapshotMetadataDto>, String> {
     // SECURITY: parse community_id as a typed SpaceId (16 raw bytes, 32 hex chars)
     // before using it as a path component. Rejects `../../etc/passwd` and other
     // path-traversal payloads at the boundary. (Fix: PR #122 bot review.)
     let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("get_community_lineage: invalid community_id hex: {e}"))?
+        .map_err(|e| format!("get_fork_snapshot_metadata: invalid community_id hex: {e}"))?
         .as_slice()
         .try_into()
         .map_err(|_| {
-            "get_community_lineage: community_id must be 16 bytes (32 hex chars)".to_string()
+            "get_fork_snapshot_metadata: community_id must be 16 bytes (32 hex chars)".to_string()
         })?;
     let safe_community_id = hex::encode(id_bytes); // canonical hex, no path components
     let identity_dir = crate::owner_commands::resolve_identity_dir()
-        .map_err(|e| format!("get_community_lineage: resolve identity_dir: {e}"))?;
+        .map_err(|e| format!("get_fork_snapshot_metadata: resolve identity_dir: {e}"))?;
     let snapshot_path = identity_dir
         .join("communities")
         .join(&safe_community_id)
@@ -12324,7 +13414,7 @@ async fn get_community_lineage(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
             return Err(format!(
-                "get_community_lineage: read pre_fork_snapshot.bin: {e}"
+                "get_fork_snapshot_metadata: read pre_fork_snapshot.bin: {e}"
             ))
         }
     };
@@ -12332,7 +13422,7 @@ async fn get_community_lineage(
     let snapshot = crate::owner_state_crypto::canonical_cbor_decode::<
         crate::community_invite::PreForkSnapshot,
     >(&bytes)
-    .map_err(|e| format!("get_community_lineage: decode snapshot: {e}"))?;
+    .map_err(|e| format!("get_fork_snapshot_metadata: decode snapshot: {e}"))?;
 
     let snapshot_message_count: usize = snapshot
         .channel_log
@@ -12341,7 +13431,7 @@ async fn get_community_lineage(
         .map(|v| v.len())
         .sum();
 
-    Ok(Some(CommunityLineageDto {
+    Ok(Some(ForkSnapshotMetadataDto {
         original_community_name: snapshot.original_community_name,
         forked_at_ms: snapshot.forked_at.wall_ms,
         snapshot_message_count,
@@ -15221,7 +16311,9 @@ pub fn run() {
             leave_community,
             kick_from_community,
             community_fork::fork_community,
+            list_community_forks,
             get_community_lineage,
+            get_fork_snapshot_metadata,
             get_pre_fork_snapshot,
             set_power_level,
             unban_from_community,
@@ -16114,6 +17206,7 @@ mod generate_invite_helper_tests {
                 logical: 0,
                 device_id: "fork-dev".into(),
             },
+            parent_lineage: Vec::new(),
         };
 
         let payload = CommunityInvitePayload {

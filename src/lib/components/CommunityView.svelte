@@ -33,6 +33,7 @@
     onGenerateInvite,
     onToggleSharedInProfile,
     onForkSuccess,
+    onSelectCommunity,
   }: {
     communityId: string;
     communityName: string;
@@ -58,6 +59,10 @@
     onToggleSharedInProfile: (shared: boolean) => Promise<void>;
     /** ZEB-285: called after a successful fork with the new fork community ID. */
     onForkSuccess?: (forkSpaceId: string) => void;
+    /** ZEB-287 Phase 2: called when the user clicks a clickable row in the
+     *  fork lineage tree. Routes the target SpaceId through the parent's
+     *  changeSelectedCommunity primitive. */
+    onSelectCommunity?: (spaceId: string) => void;
   } = $props();
 
   let channels = $state<ChannelInfo[]>([]);
@@ -75,6 +80,17 @@
     forkedAtMs: number;
     snapshotMessageCount: number;
   } | null | undefined>(undefined); // undefined = not yet fetched
+
+  // ZEB-287 Phase 2: multi-hop lineage + descendants — loaded lazily.
+  let phase2Lineage = $state<import('../types').CommunityLineageDto | null>(null);
+  let descendants = $state<import('../types').ForkDescendantDto[]>([]);
+
+  // ZEB-287 Phase 2: derive locally-known community SpaceIds from the
+  // NavService snapshot. Used by ForkLineageTree to gate clickability
+  // of ancestor + descendant rows. Recomputes when navService.nodes changes.
+  let localCommunityIds = $derived(
+    new Set<string>(navService.nodes.filter((n) => n.type === 'community').map((n) => n.id)),
+  );
 
   // ZEB-285 Task 11: pre-fork snapshot for unified timeline rendering.
   // Loaded once per community view. null = non-fork community; undefined = not yet loaded.
@@ -162,6 +178,9 @@
     // (Fix: PR #122 round-4, CodeRabbit inline — lineage was not cleared.)
     preForkSnapshot = undefined;
     lineage = undefined; // undefined = not yet fetched for this community
+    // ZEB-287 Phase 2: reset multi-hop lineage state on community switch.
+    phase2Lineage = null;
+    descendants = [];
 
     void (async () => {
       try {
@@ -227,7 +246,7 @@
           // ZEB-285: lazily load lineage metadata on first open (or when community changes).
           if (lineage === undefined) {
             const requestedCommunityId = communityId;
-            void communityService.getCommunityLineage(requestedCommunityId).then((dto) => {
+            void communityService.getForkSnapshotMetadata(requestedCommunityId).then((dto) => {
               // Guard: only apply if we're still on the same community; a late-arriving
               // response from a previous community must not overwrite the new one's state.
               // (Fix: PR #122 round-4, CodeRabbit inline.)
@@ -244,6 +263,23 @@
             }).catch(() => {
               if (communityId !== requestedCommunityId) return;
               lineage = null; // on error, hide lineage block
+            });
+          }
+          // ZEB-287 Phase 2: load multi-hop lineage + descendants for the Forks tree.
+          // Same race-guard pattern as the Phase 1 lineage load above.
+          if (phase2Lineage === null) {
+            const requestedCommunityId = communityId;
+            void Promise.allSettled([
+              communityService.getCommunityLineage(requestedCommunityId),
+              communityService.listCommunityForks(requestedCommunityId),
+            ]).then(([lineageResult, descendantsResult]) => {
+              if (communityId !== requestedCommunityId) return;
+              if (lineageResult.status === 'fulfilled') {
+                phase2Lineage = lineageResult.value;
+              }
+              if (descendantsResult.status === 'fulfilled') {
+                descendants = descendantsResult.value;
+              }
             });
           }
         }}
@@ -312,6 +348,14 @@
     onGenerateInvite={onGenerateInvite}
     onOpenMembersPanel={() => { communityMembersPanelOpen = true; }}
     lineage={lineage ?? null}
+    {phase2Lineage}
+    {descendants}
+    localNavIds={localCommunityIds}
+    resolveLocalCommunityName={(spaceId) => navService.getCommunityNameBySpaceId(spaceId)}
+    onForkLineageNavigate={(spaceId) => {
+      settingsModalOpen = false;
+      onSelectCommunity?.(spaceId);
+    }}
     onFork={async (opts) => {
       const result = await communityService.forkCommunity(communityId, opts);
       // Add the fork to the nav tree with forkedFrom lineage.

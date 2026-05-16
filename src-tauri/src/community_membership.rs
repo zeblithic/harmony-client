@@ -4135,6 +4135,7 @@ mod tests {
                 logical: 0,
                 device_id: "t".into(),
             },
+            parent_lineage: Vec::new(),
         };
 
         // Every event in the snapshot should verify against the snapshot's
@@ -4202,6 +4203,7 @@ mod tests {
                 logical: 0,
                 device_id: "t".into(),
             },
+            parent_lineage: Vec::new(),
         };
 
         let result = verify_snapshot_event(&outsider_event, &snapshot);
@@ -4262,6 +4264,7 @@ mod tests {
                 logical: 0,
                 device_id: "t".into(),
             },
+            parent_lineage: Vec::new(),
         };
 
         let result = verify_snapshot_event(&wrong_community_event, &snapshot);

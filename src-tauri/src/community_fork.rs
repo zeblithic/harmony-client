@@ -269,7 +269,13 @@ pub async fn fork_community(
             )
         })?;
 
-    let (original_name, original_events_vec, materialized) = {
+    let (
+        original_name,
+        original_events_vec,
+        materialized,
+        original_parent_lineage,
+        original_forked_at_wall_ms,
+    ) = {
         let state_arc = original_engine.state();
         let state_g = state_arc.lock().await;
         let admin_addr = original_engine.admin_addr();
@@ -289,6 +295,10 @@ pub async fn fork_community(
         // Collect membership events for the snapshot.
         let events: Vec<crate::community_membership::SignedMembershipEvent> =
             state_g.events.values().cloned().collect();
+        // ZEB-287 Task 4: capture forker's lineage + forked_at_wall_ms so we
+        // can extend the chain into the new fork's PreForkSnapshot.
+        let forker_parent_lineage = state_g.parent_lineage.clone();
+        let forker_forked_at_wall_ms = state_g.forked_at_wall_ms;
         // Derive original community name from owner-state crdt.
         let name = {
             let crdt_g = crdt_state.lock().await;
@@ -298,7 +308,13 @@ pub async fn fork_community(
                 .map(|s| s.name.clone())
                 .unwrap_or_else(|| hex::encode(original_id.0))
         };
-        (name, events, mat)
+        (
+            name,
+            events,
+            mat,
+            forker_parent_lineage,
+            forker_forked_at_wall_ms,
+        )
     };
 
     // Step 2a: Start building the signer address set from membership events.
@@ -432,6 +448,18 @@ pub async fn fork_community(
     let fork_space_id = minted.community_id;
     let fork_space_id_hex = hex::encode(fork_space_id.0);
 
+    // ZEB-287 Task 4 / spec §3.4: build the ancestor chain for the new fork
+    // via the shared `build_parent_lineage` helper. The helper extends the
+    // forker's lineage with a new entry for the forker community itself,
+    // then applies the 16-deep cap. (R1-4: shared helper so tests + prod
+    // exercise the same code path.)
+    let new_parent_lineage = crate::community_invite::build_parent_lineage(
+        &original_parent_lineage,
+        original_id,
+        &original_name,
+        original_forked_at_wall_ms,
+    );
+
     // Step 5: Build PreForkSnapshot (with correct fork_space_id already known).
     let pre_fork_snapshot = crate::community_invite::PreForkSnapshot {
         original_community_id: original_id,
@@ -440,6 +468,9 @@ pub async fn fork_community(
         channel_log: channel_log_snapshot,
         identity_pubs,
         forked_at: fork_hlc.clone(),
+        // R1-1b: clone — we also mutate the new fork's CommunityState
+        // below with this same chain.
+        parent_lineage: new_parent_lineage.clone(),
     };
 
     // Step 6 (pre-spawn): write pre_fork_snapshot.bin to the fork's data dir.
@@ -594,11 +625,16 @@ pub async fn fork_community(
         ));
     }
 
-    // Set forked_from on the fork's CommunityState via the engine.
+    // Set forked_from + Phase 2 lineage fields on the fork's CommunityState
+    // via the engine. (R1-1b: spec §3.5 mandates persisting parent_lineage +
+    // forked_at_wall_ms for both fork-redeem AND local-fork-create paths so
+    // a subsequent fork of THIS new community reads the correct ancestry.)
     {
         let state_arc = engine_arc.state();
         let mut state_g = state_arc.lock().await;
         state_g.forked_from = Some(original_id);
+        state_g.forked_at_wall_ms = Some(fork_hlc.wall_ms);
+        state_g.parent_lineage = new_parent_lineage;
     }
 
     // Generation fence (mirrors create_community_inner).

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, fireEvent } from '@testing-library/svelte';
 import CommunitySettingsPanel from '../CommunitySettingsPanel.svelte';
-import type { CommunityMember } from '../../types';
+import type { CommunityMember, CommunityLineageDto, ForkDescendantDto } from '../../types';
 
 const adminMember: CommunityMember = { address: 'a3f8c1d2', displayName: 'Alice', power: 100, status: 'joined' };
 const modMember: CommunityMember = { address: 'cc99', displayName: 'Charlie', power: 50, status: 'joined' };
@@ -254,5 +254,79 @@ describe('CommunitySettingsPanel', () => {
     const checkbox = getByLabelText(/share this community in my public profile/i);
     await fireEvent.click(checkbox);
     expect(onToggle).toHaveBeenCalledWith(true);
+  });
+
+  // ── ZEB-287 Phase 2: Forks section tests ──────────────────────────
+
+  it('forks_section_always_renders_for_non_fork_community', () => {
+    // No phase2Lineage prop → tree absent but section still renders.
+    const { getByText } = render(CommunitySettingsPanel, { props: baseProps });
+    expect(getByText('Forks')).toBeTruthy();
+  });
+
+  it('forks_section_renders_explainer_text_present', () => {
+    const { getByText } = render(CommunitySettingsPanel, { props: baseProps });
+    // Substring matches on the final explainer wording from spec §5.3.
+    expect(getByText(/Any member of a community can fork it at any time/)).toBeTruthy();
+    expect(getByText(/communities preserve continuity if members want to take/)).toBeTruthy();
+  });
+
+  it('fork_this_community_button_inside_forks_section', () => {
+    // Pass an onFork callback so the button renders.
+    const { container } = render(CommunitySettingsPanel, {
+      props: { ...baseProps, onFork: vi.fn() },
+    });
+
+    const forksSection = container.querySelector('.forks-section');
+    expect(forksSection).toBeTruthy();
+
+    const forkButton = forksSection!.querySelector('button.fork-this-community');
+    expect(forkButton).toBeTruthy();
+    expect(forkButton?.textContent).toMatch(/Fork this community/);
+  });
+
+  it('resolveLocalCommunityName_prop_flows_through_to_ForkLineageTree', () => {
+    // R4-1 regression: R3 added `resolveLocalCommunityName` to the type
+    // signature but forgot to pull it out of $props() destructuring, so
+    // ForkLineageTree received `undefined` and the descendant-name
+    // resolution silently no-op'd. This test asserts the prop is actually
+    // invoked with a locally-known descendant's hex.
+    const forkHex = '33'.repeat(16);
+    const selfHex = '11'.repeat(16);
+    const lineage: CommunityLineageDto = {
+      forkedFrom: null,
+      forkedAtWallMs: null,
+      parentLineage: [],
+      selfSpaceId: selfHex,
+      selfName: 'Root',
+    };
+    const descendants: ForkDescendantDto[] = [
+      {
+        forkSpaceId: forkHex,
+        forkerAddr: 'ab'.repeat(16),
+        forkerDisplayName: 'Maya',
+        forkedAtWallMs: 1_715_000_000_000,
+        locallyKnown: true,
+      },
+    ];
+    const resolver = vi.fn((hex: string) =>
+      hex === forkHex ? 'Resolved Descendant Name' : null,
+    );
+
+    const { getByText } = render(CommunitySettingsPanel, {
+      props: {
+        ...baseProps,
+        phase2Lineage: lineage,
+        descendants,
+        localNavIds: new Set([forkHex]),
+        resolveLocalCommunityName: resolver,
+      },
+    });
+
+    // The resolver MUST be called by ForkLineageTree — this fails fast if
+    // CommunitySettingsPanel's $props() destructuring drops the prop again.
+    expect(resolver).toHaveBeenCalledWith(forkHex);
+    // The resolved name must reach the DOM (end-to-end through the props chain).
+    expect(getByText(/Resolved Descendant Name/)).toBeTruthy();
   });
 });

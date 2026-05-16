@@ -6,6 +6,48 @@ use harmony_app::community_invite::{
 use harmony_app::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
 use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
 
+/// Structural CBOR top-level-key check. Decodes `bytes` to
+/// `ciborium::Value::Map` and asserts that the named string keys are
+/// present / absent. Mirrors the helper of the same name in
+/// `tests/wire_format_zeb285_fixtures.rs` (R1 fix). Both copies exist
+/// because each integration-test file is a separate binary; sharing
+/// across them would require a `tests/common/mod.rs` module — kept local
+/// for now since the helper is small and self-contained.
+///
+/// Byte-substring matching (`bytes.windows(2).any(|w| w == b"pl")`) is
+/// brittle: a data value containing the bytes "pl" (e.g., a name field
+/// "Polite Project") false-positives. Decoding to `ciborium::Value` and
+/// inspecting the map keys is robust against data-content coincidences.
+fn assert_cbor_top_level_keys(bytes: &[u8], present: &[&str], absent: &[&str], label: &str) {
+    let decoded: ciborium::Value = ciborium::de::from_reader(bytes)
+        .unwrap_or_else(|e| panic!("{label}: decode as Value failed: {e}"));
+    let pairs = match decoded {
+        ciborium::Value::Map(m) => m,
+        other => panic!("{label}: expected CBOR map at top level, got {other:?}"),
+    };
+    // Collect string-typed keys (canonical encoding uses Text keys for
+    // these fields). Non-Text keys would be a wire-format break in itself.
+    let keys: std::collections::BTreeSet<String> = pairs
+        .iter()
+        .filter_map(|(k, _)| match k {
+            ciborium::Value::Text(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    for key in present {
+        assert!(
+            keys.contains(*key),
+            "{label}: expected key `{key}` to be present (top-level keys: {keys:?})"
+        );
+    }
+    for key in absent {
+        assert!(
+            !keys.contains(*key),
+            "{label}: expected key `{key}` to be absent (top-level keys: {keys:?})"
+        );
+    }
+}
+
 #[test]
 fn community_invite_payload_round_trips_open_form() {
     let p = CommunityInvitePayload {
@@ -1335,5 +1377,249 @@ mod verify_admin_bootstrap_tests {
             verify_admin_bootstrap(&p).unwrap_err(),
             RedeemBootstrapVerifyError::BootstrapKindInvalid
         );
+    }
+}
+
+// ZEB-287 Phase 2: ParentLineageEntry roundtrip tests
+mod zeb287_parent_lineage_entry {
+    use harmony_app::community_invite::ParentLineageEntry;
+    use harmony_app::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
+    use harmony_app::owner_state_types::SpaceId;
+
+    #[test]
+    fn parent_lineage_entry_roundtrip_with_forked_at() {
+        let entry = ParentLineageEntry {
+            space_id: SpaceId([0x42; 16]),
+            name: "Cool Community".to_string(),
+            forked_at_wall_ms: Some(1_715_811_234_567),
+        };
+        let bytes = canonical_cbor_encode(&entry).expect("encode");
+        let decoded: ParentLineageEntry = canonical_cbor_decode(&bytes).expect("decode");
+        assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn parent_lineage_entry_roundtrip_root_omits_at() {
+        let entry = ParentLineageEntry {
+            space_id: SpaceId([0x11; 16]),
+            name: "Project Cool".to_string(),
+            forked_at_wall_ms: None,
+        };
+        let bytes_no_at = canonical_cbor_encode(&entry).expect("encode");
+        let decoded: ParentLineageEntry = canonical_cbor_decode(&bytes_no_at).expect("decode");
+        assert_eq!(entry, decoded);
+
+        // The serialized form must NOT contain a CBOR Text key "at"
+        // since the field is skip-if-none. Structural decode (via the
+        // top-level `assert_cbor_top_level_keys` helper) defends against
+        // false positives where the bytes "at" appear inside data values
+        // (e.g., a name like "atomic"); the previous `windows(2)` byte-
+        // substring check was brittle to such collisions.
+        super::assert_cbor_top_level_keys(
+            &bytes_no_at,
+            &["si", "nm"],
+            &["at"],
+            "Root ParentLineageEntry",
+        );
+    }
+}
+
+// ZEB-287 Phase 2: PreForkSnapshot.parent_lineage backwards-compat + roundtrip tests
+mod zeb287_pre_fork_snapshot_lineage {
+    use harmony_app::community_invite::{
+        BoundedChannelLogSnapshot, ParentLineageEntry, PreForkSnapshot,
+    };
+    use harmony_app::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
+    use harmony_app::owner_state_types::{Hlc, SpaceId};
+    use std::collections::BTreeMap;
+
+    fn empty_pre_fork_snapshot_for_test() -> PreForkSnapshot {
+        PreForkSnapshot {
+            original_community_id: SpaceId([0x42; 16]),
+            original_community_name: "Cool Community".to_string(),
+            membership_events: Vec::new(),
+            channel_log: BoundedChannelLogSnapshot::default(),
+            identity_pubs: BTreeMap::new(),
+            forked_at: Hlc {
+                wall_ms: 1_715_811_234_567,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            parent_lineage: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn pre_fork_snapshot_with_empty_lineage_omits_pl_key() {
+        let snap = empty_pre_fork_snapshot_for_test();
+        let bytes = canonical_cbor_encode(&snap).expect("encode");
+        // Structural decode: the `pl` CBOR Text key must be absent.
+        // Defends against a value containing the bytes "pl" inside e.g.
+        // a name field ("Polite Project") false-positiving the previous
+        // `windows(2)` byte-substring check.
+        super::assert_cbor_top_level_keys(
+            &bytes,
+            &[],
+            &["pl"],
+            "PreForkSnapshot with empty parent_lineage",
+        );
+    }
+
+    #[test]
+    fn pre_fork_snapshot_with_populated_lineage_roundtrips() {
+        let mut snap = empty_pre_fork_snapshot_for_test();
+        snap.parent_lineage = vec![
+            ParentLineageEntry {
+                space_id: SpaceId([0x11; 16]),
+                name: "Project Cool".to_string(),
+                forked_at_wall_ms: None,
+            },
+            ParentLineageEntry {
+                space_id: SpaceId([0x22; 16]),
+                name: "Cool Community".to_string(),
+                forked_at_wall_ms: Some(1_715_000_000_000),
+            },
+        ];
+
+        let bytes = canonical_cbor_encode(&snap).expect("encode");
+        // Structural decode: the `pl` CBOR Text key must be present at
+        // the top-level map. Robust against the bytes "pl" appearing
+        // inside data values (the previous `windows(2)` check would
+        // false-positive on e.g. a name like "Polite Project").
+        super::assert_cbor_top_level_keys(
+            &bytes,
+            &["pl"],
+            &[],
+            "PreForkSnapshot with populated parent_lineage",
+        );
+
+        let decoded: PreForkSnapshot = canonical_cbor_decode(&bytes).expect("decode");
+        assert_eq!(snap.parent_lineage, decoded.parent_lineage);
+        assert_eq!(snap.original_community_id, decoded.original_community_id);
+    }
+}
+
+// ZEB-287 Phase 2 Task 4: build_fork_snapshot lineage construction logic +
+// 16-deep cap. These tests pin the algorithm shape against
+// community_fork.rs::fork_community's Task 4 block via the SHARED
+// `build_parent_lineage` / `apply_lineage_cap` helpers (R1-4).
+mod zeb287_lineage_build_logic {
+    use harmony_app::community_invite::{
+        apply_lineage_cap, build_parent_lineage, ParentLineageEntry, MAX_LINEAGE_DEPTH,
+    };
+    use harmony_app::owner_state_types::SpaceId;
+
+    #[test]
+    fn build_fork_snapshot_lineage_extends_forker_chain() {
+        // Simulate forker's CommunityState.parent_lineage = [C-entry] and
+        // forker's community is B (forked from C). After fork into A_fork:
+        //   A_fork.parent_lineage = [C-entry, B-entry]
+        // Driven through the production helper so a regression in
+        // production logic surfaces here.
+        let c_entry = ParentLineageEntry {
+            space_id: SpaceId([0x11; 16]),
+            name: "C".to_string(),
+            forked_at_wall_ms: None, // C is root
+        };
+        let forker_lineage = vec![c_entry.clone()];
+        let b_id = SpaceId([0x22; 16]);
+        let b_name = "B";
+        let b_forked_at = Some(1_700_000_000_000u64);
+
+        let new_lineage = build_parent_lineage(&forker_lineage, b_id, b_name, b_forked_at);
+
+        assert_eq!(new_lineage.len(), 2);
+        assert_eq!(new_lineage[0], c_entry);
+        assert_eq!(new_lineage[1].space_id, b_id);
+        assert_eq!(new_lineage[1].name, b_name);
+        assert_eq!(new_lineage[1].forked_at_wall_ms, b_forked_at);
+    }
+
+    #[test]
+    fn lineage_cap_drops_oldest_root_side_entries() {
+        // Construct a 20-deep lineage; verify cap keeps newest 16 via the
+        // shared helper.
+        let mut overlong: Vec<ParentLineageEntry> = (0u8..20)
+            .map(|i| ParentLineageEntry {
+                space_id: SpaceId([i; 16]),
+                name: format!("ancestor_{i}"),
+                forked_at_wall_ms: if i == 0 { None } else { Some(i as u64) },
+            })
+            .collect();
+
+        apply_lineage_cap(&mut overlong);
+
+        assert_eq!(overlong.len(), MAX_LINEAGE_DEPTH);
+        // First entry should be ancestor_4 (oldest 4 dropped: 0,1,2,3).
+        assert_eq!(overlong[0].name, "ancestor_4");
+        // Last entry should be ancestor_19 (newest preserved).
+        assert_eq!(overlong[15].name, "ancestor_19");
+    }
+
+    #[test]
+    fn build_parent_lineage_extends_and_caps_correctly() {
+        // R1-4 helper unit test: exercise both short and overlong inputs.
+
+        // Short input: chain of 3 entries + push 1 → result has 4 entries,
+        // no cap applied.
+        let short_chain: Vec<ParentLineageEntry> = (0u8..3)
+            .map(|i| ParentLineageEntry {
+                space_id: SpaceId([i; 16]),
+                name: format!("a_{i}"),
+                forked_at_wall_ms: Some(i as u64),
+            })
+            .collect();
+        let new_short = build_parent_lineage(&short_chain, SpaceId([0xff; 16]), "forker", Some(99));
+        assert_eq!(new_short.len(), 4);
+        assert_eq!(new_short[0].name, "a_0");
+        assert_eq!(new_short[3].name, "forker");
+        assert_eq!(new_short[3].forked_at_wall_ms, Some(99));
+
+        // Overlong input: chain of MAX_LINEAGE_DEPTH entries + push 1 →
+        // result has MAX_LINEAGE_DEPTH entries with the OLDEST dropped.
+        let max_chain: Vec<ParentLineageEntry> = (0u8..MAX_LINEAGE_DEPTH as u8)
+            .map(|i| ParentLineageEntry {
+                space_id: SpaceId([i; 16]),
+                name: format!("a_{i}"),
+                forked_at_wall_ms: if i == 0 { None } else { Some(i as u64) },
+            })
+            .collect();
+        let new_max = build_parent_lineage(&max_chain, SpaceId([0xfe; 16]), "forker", Some(999));
+        assert_eq!(new_max.len(), MAX_LINEAGE_DEPTH);
+        // a_0 dropped: first entry is a_1.
+        assert_eq!(new_max[0].name, "a_1");
+        // Last entry is the new forker entry.
+        assert_eq!(new_max[MAX_LINEAGE_DEPTH - 1].name, "forker");
+
+        // Empty input: just the new entry.
+        let new_empty = build_parent_lineage(&[], SpaceId([0xfd; 16]), "first", None);
+        assert_eq!(new_empty.len(), 1);
+        assert_eq!(new_empty[0].name, "first");
+        assert_eq!(new_empty[0].forked_at_wall_ms, None);
+    }
+
+    #[test]
+    fn redeem_overlong_lineage_payload_truncates_to_cap() {
+        // R1-2: a malicious or future-protocol-revision PreForkSnapshot
+        // payload could carry > MAX_LINEAGE_DEPTH entries. The redeem path
+        // applies `apply_lineage_cap` defensively so the joiner's local
+        // CommunityState.parent_lineage stays bounded regardless of payload
+        // length. This unit test mirrors the helper call site in
+        // `lib.rs::redeem_invite_inner`.
+        let mut payload_lineage: Vec<ParentLineageEntry> = (0u8..20)
+            .map(|i| ParentLineageEntry {
+                space_id: SpaceId([i; 16]),
+                name: format!("evil_{i}"),
+                forked_at_wall_ms: Some(i as u64),
+            })
+            .collect();
+        assert_eq!(payload_lineage.len(), 20);
+
+        apply_lineage_cap(&mut payload_lineage);
+
+        assert_eq!(payload_lineage.len(), MAX_LINEAGE_DEPTH);
+        // Oldest 4 dropped: first is evil_4, last is evil_19.
+        assert_eq!(payload_lineage[0].name, "evil_4");
+        assert_eq!(payload_lineage[15].name, "evil_19");
     }
 }

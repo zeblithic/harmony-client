@@ -41,6 +41,33 @@ pub struct CommunityState {
     #[serde(rename = "ff", skip_serializing_if = "Option::is_none", default)]
     pub forked_from: Option<SpaceId>,
 
+    /// ZEB-287 Phase 2: wall_ms component of the Fork event that
+    /// created THIS community from its parent. Set at redeem-time from
+    /// `PreForkSnapshot.forked_at.wall_ms`. `None` for top-level
+    /// (non-fork) communities. Byte-compatible with pre-ZEB-287 blobs
+    /// (omitted when None).
+    #[serde(rename = "fa", skip_serializing_if = "Option::is_none", default)]
+    pub forked_at_wall_ms: Option<u64>,
+
+    /// ZEB-287 Phase 2: ordered list of ancestors (root → immediate parent)
+    /// frozen at fork-time. For a Phase 2 fork built via
+    /// `community_invite::build_parent_lineage`, the tail entry is the
+    /// fork's immediate parent (also reflected in `forked_from`). For a
+    /// Phase 1 fork (legacy invite, no `pl` carried), this stays empty
+    /// and `forked_from` alone identifies the immediate parent.
+    ///
+    /// Populated at redeem-time from `PreForkSnapshot.parent_lineage` and
+    /// at local-fork-create time by `community_fork.rs::fork_community`.
+    /// Empty for top-level (non-fork) communities. Byte-compatible.
+    ///
+    /// IPC-DTO note: the `get_community_lineage` IPC synthesizes a single
+    /// immediate-parent entry into the DTO when this stored chain is
+    /// empty but `forked_from` is set (Phase 1 single-hop forks) so the
+    /// frontend tree can render the parent row uniformly. Storage is
+    /// unaffected — the synthesized entry exists only on the IPC boundary.
+    #[serde(rename = "fl", skip_serializing_if = "Vec::is_empty", default)]
+    pub parent_lineage: Vec<crate::community_invite::ParentLineageEntry>,
+
     /// Append-only signed event log, keyed by EventId. BTreeMap (not
     /// HashMap) so iteration order is deterministic across replicas —
     /// canonical CBOR encoding requires a stable order.
@@ -96,6 +123,8 @@ impl Clone for CommunityState {
         Self {
             community_id: self.community_id,
             forked_from: self.forked_from,
+            forked_at_wall_ms: self.forked_at_wall_ms,
+            parent_lineage: self.parent_lineage.clone(),
             events: self.events.clone(),
             cache: std::sync::Mutex::new(MaterializedCache::default()),
             bootstrap_hint: std::sync::Mutex::new(
@@ -109,6 +138,8 @@ impl PartialEq for CommunityState {
     fn eq(&self, other: &Self) -> bool {
         self.community_id == other.community_id
             && self.forked_from == other.forked_from
+            && self.forked_at_wall_ms == other.forked_at_wall_ms
+            && self.parent_lineage == other.parent_lineage
             && self.events == other.events
     }
 }
@@ -138,6 +169,8 @@ impl CommunityState {
         Self {
             community_id,
             forked_from: None,
+            forked_at_wall_ms: None,
+            parent_lineage: Vec::new(),
             events: BTreeMap::new(),
             cache: std::sync::Mutex::new(MaterializedCache::default()),
             bootstrap_hint: std::sync::Mutex::new(None),
