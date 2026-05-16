@@ -785,18 +785,25 @@ use harmony_app::community_membership::{
 };
 
 /// Drain all events from `from_state` that are not yet in `to_engine`
-/// and insert them into `to_engine` using the given `actor_pub`. Simulates
-/// one-way state-root sync between two engines.
+/// and insert them into `to_engine`, resolving the per-event actor pub from
+/// `actor_pubs`. Simulates one-way state-root sync between two engines.
+///
+/// Each event is inserted with the pub keyed on `ev.actor` so verification
+/// uses the actual signing key rather than a single shared pub. Events
+/// whose actor is not in `actor_pubs` are silently skipped (unknown actor).
 async fn sync_one_way(
     from_state: &Arc<Mutex<CommunityState>>,
     to_engine: &CommunitySyncEngine,
-    actor_pub: [u8; 64],
+    actor_pubs: &HashMap<OwnerAddr, [u8; 64]>,
 ) {
     let events: Vec<SignedMembershipEvent> = {
         let g = from_state.lock().await;
         g.events.values().cloned().collect()
     };
     for ev in events {
+        let Some(actor_pub) = actor_pubs.get(&ev.actor).copied() else {
+            continue;
+        };
         // Ignore errors — AlreadyKnown and verify errors for out-of-order
         // events are expected during sync simulation.
         let _ = to_engine
@@ -1362,7 +1369,7 @@ async fn pending_join_resolves_when_admin_comes_online() {
 
     // Sync joiner → admin (delivers PendingJoin).
     let joiner_state = joiner_engine.state();
-    sync_one_way(&joiner_state, &admin_engine, joiner_pub).await;
+    sync_one_way(&joiner_state, &admin_engine, &resolver_map).await;
 
     // Wait for admin to produce the JoinCountersign.
     let admin_state = admin_engine.state();
@@ -1388,7 +1395,7 @@ async fn pending_join_resolves_when_admin_comes_online() {
     .expect("timed out waiting for admin JoinCountersign");
 
     // Sync admin → joiner (delivers JoinCountersign back).
-    sync_one_way(&admin_state, &joiner_engine, admin_pub).await;
+    sync_one_way(&admin_state, &joiner_engine, &resolver_map).await;
 
     // Materialize from joiner's state.
     let joiner_state_final = joiner_engine.state();

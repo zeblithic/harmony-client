@@ -1622,6 +1622,12 @@ impl Space {
         // Checked before the per-kind match so every non-community kind gets
         // the same enforcement without per-arm duplication.
         if self.kind != SpaceKind::Community {
+            if self.pending_join_at.is_some() {
+                return Err(InvariantError(format!(
+                    "{:?} must have pending_join_at=None (only Community carries it)",
+                    self.kind
+                )));
+            }
             if self.current_epoch.is_some() {
                 return Err(InvariantError(format!(
                     "{:?} must have current_epoch=None (only Community carries epoch state)",
@@ -2324,6 +2330,25 @@ mod space_tests {
         let mut f = folder();
         f.members = vec![OwnerAddr([0u8; 16])];
         assert!(f.validate_invariants().is_err());
+    }
+
+    /// F2 (ZEB-254 R2): non-Community Spaces must not carry pending_join_at.
+    /// A malformed peer attempting to inject invalid state should be rejected
+    /// by validate_invariants before it can persist or replicate.
+    #[test]
+    fn space_non_community_with_pending_join_at_violates_invariant() {
+        let mut f = folder();
+        f.pending_join_at = Some(hlc(42));
+        let result = f.validate_invariants();
+        assert!(
+            result.is_err(),
+            "Folder with pending_join_at=Some must fail validate_invariants; got Ok"
+        );
+        let msg = result.unwrap_err().0;
+        assert!(
+            msg.contains("pending_join_at"),
+            "error message must mention pending_join_at; got: {msg}"
+        );
     }
 
     #[test]

@@ -13431,43 +13431,89 @@ async fn list_pending_joins(
         .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
-    let registry = {
+    let (registry, self_owner) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        g.community_registry
-            .clone()
-            .ok_or("no community_registry — node not running?")?
+        (
+            g.community_registry
+                .clone()
+                .ok_or("no community_registry — node not running?")?,
+            g.dm_self_owner
+                .ok_or("dm_self_owner missing — no owner identity?")?,
+        )
     };
 
-    let engine_state = registry.state_for(&space_id).await.ok_or_else(|| {
+    let engine_arc = registry.engine_arc(&space_id).await.ok_or_else(|| {
         format!(
             "no engine for community {} — not joined or not yet started",
             hex::encode(space_id.0)
         )
     })?;
 
+    // Authorization: caller must be a Joined member with moderator-tier
+    // power (≥ POWER_THRESHOLDS.kick). This is an admin audit feed and
+    // must not be readable by plain members.
+    {
+        let admin_addr = engine_arc.admin_addr();
+        let materialized = {
+            let state = engine_arc.state();
+            let g = state.lock().await;
+            g.materialize_now(admin_addr)
+        };
+        let caller_status = materialized.members.get(&self_owner).map(|m| m.status);
+        if !matches!(
+            caller_status,
+            Some(crate::community_membership::MemberStatus::Joined)
+        ) {
+            return Err("list_pending_joins: caller is not a Joined member".to_string());
+        }
+        let caller_power = materialized
+            .power_levels
+            .get(&self_owner)
+            .copied()
+            .unwrap_or(0);
+        if caller_power < crate::community_membership::POWER_THRESHOLDS.kick {
+            return Err(format!(
+                "list_pending_joins: caller power {} is below moderator threshold {}",
+                caller_power,
+                crate::community_membership::POWER_THRESHOLDS.kick
+            ));
+        }
+    }
+
+    let engine_state = engine_arc.state();
     let raw_events: Vec<crate::community_membership::SignedMembershipEvent> = {
         let g = engine_state.lock().await;
         g.events.values().cloned().collect()
     };
 
-    Ok(filter_pending_joins(&raw_events))
+    // F7: use wall-clock now for expiry threshold so a lone PendingJoin
+    // in an otherwise-idle community ages out correctly.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    Ok(filter_pending_joins(&raw_events, now_ms))
 }
 
 /// Pure filter: given the raw event log, return PendingJoin DTOs that
 /// have no matching JoinCountersign and are within the 30-day window.
 /// Sorted oldest-first by (wall_ms, logical).
 ///
+/// `now_ms` is the caller-supplied wall-clock time (milliseconds since Unix
+/// epoch). Using the caller's wall clock — rather than max(event.at.wall_ms)
+/// — ensures a lone PendingJoin in an otherwise-idle community ages out
+/// correctly (the CRDT materialize keeps max() for determinism; the IPC
+/// display layer uses real time).
+///
 /// Extracted so unit tests can exercise the logic without a full NodeState.
 pub fn filter_pending_joins(
     events: &[crate::community_membership::SignedMembershipEvent],
+    now_ms: u64,
 ) -> Vec<PendingJoinDto> {
-    // Use the maximum wall_ms in the log as "current time" (same approach
-    // as materialize in community_membership.rs).
-    let max_wall_ms: u64 = events.iter().map(|e| e.at.wall_ms).max().unwrap_or(0);
     let expiry_threshold =
-        max_wall_ms.saturating_sub(crate::community_membership::MATERIALIZE_PENDING_EXPIRY_MS);
+        now_ms.saturating_sub(crate::community_membership::MATERIALIZE_PENDING_EXPIRY_MS);
 
     // Collect target_event_ids of all JoinCountersign events.
     let countersigned: std::collections::HashSet<crate::community_membership::EventId> = events
@@ -17352,7 +17398,9 @@ mod pending_join_audit_feed_tests {
         );
 
         let events = vec![ev_a, ev_b, ev_b_cs, ev_c, ev_d];
-        let result = filter_pending_joins(&events);
+        // Pass MAX_MS as now_ms so the expiry threshold is MAX_MS - 30d,
+        // consistent with the test's EXPIRED_MS constant.
+        let result = filter_pending_joins(&events, MAX_MS);
 
         assert_eq!(
             result.len(),
@@ -17402,7 +17450,8 @@ mod pending_join_audit_feed_tests {
             community_id,
         );
 
-        let result = filter_pending_joins(&[ev]);
+        // Event wall_ms=1000; pass a now_ms well within 30d so it's visible.
+        let result = filter_pending_joins(&[ev], 1_000_000);
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0].invitee_hint.as_deref(),

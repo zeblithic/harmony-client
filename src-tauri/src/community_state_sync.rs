@@ -2049,10 +2049,22 @@ fn maybe_spawn_pending_join_clear(
             return;
         }
 
-        let new_hlc = crate::owner_state_types::Hlc {
-            wall_ms: wall_now_ms,
-            logical: 0,
-            device_id: existing.updated_at.device_id.clone(),
+        // Use monotonic HLC arithmetic: if wall_now_ms is strictly after
+        // existing.updated_at, take logical=0; otherwise bump logical so
+        // the new HLC is strictly greater even on clock rollback or
+        // same-millisecond execution (mirrors next_hlc semantics).
+        let new_hlc = if wall_now_ms > existing.updated_at.wall_ms {
+            crate::owner_state_types::Hlc {
+                wall_ms: wall_now_ms,
+                logical: 0,
+                device_id: existing.updated_at.device_id.clone(),
+            }
+        } else {
+            crate::owner_state_types::Hlc {
+                wall_ms: existing.updated_at.wall_ms,
+                logical: existing.updated_at.logical.saturating_add(1),
+                device_id: existing.updated_at.device_id.clone(),
+            }
         };
 
         let mut updated = existing.clone();
@@ -3094,6 +3106,12 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     // the emit lock-free preserves the "no channel ops while holding
     // state" invariant the rest of this module follows.
     let mut inserted_events: Vec<SignedMembershipEvent> = Vec::new();
+    // Restart-recovery: PendingJoins that returned AlreadyKnown still need
+    // the auto-counter-sign and pending-clear hooks, but must NOT drive
+    // delta emission or notify_pending_redemption_in_map (those should only
+    // fire for genuinely new CRDT insertions). A separate vec keeps the
+    // two concerns apart.
+    let mut pending_joins_for_recheck: Vec<SignedMembershipEvent> = Vec::new();
     {
         let mut state = ctx.state.lock().await;
 
@@ -3144,11 +3162,14 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
                 // the auto-counter-sign hook had a chance to fire. We
                 // collect the event for post-lock processing; we don't
                 // flip `inserted_any` since the CRDT is unchanged.
+                // NOTE: push to pending_joins_for_recheck, NOT inserted_events,
+                // so hooks (auto-countersign, pending-clear) fire without
+                // triggering delta emission or notify_pending_redemption.
                 if matches!(
                     &event.kind,
                     crate::community_membership::MembershipEventKind::PendingJoin { .. }
                 ) {
-                    inserted_events.push(event);
+                    pending_joins_for_recheck.push(event);
                 }
                 continue;
             }
@@ -3206,11 +3227,12 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
                     // — `spawn_auto_counter_sign_task` re-checks under the
                     // lock and returns immediately if a JoinCountersign
                     // already exists for this target.
+                    // NOTE: push to pending_joins_for_recheck, NOT inserted_events.
                     if matches!(
                         &event_clone.kind,
                         crate::community_membership::MembershipEventKind::PendingJoin { .. }
                     ) {
-                        inserted_events.push(event_clone);
+                        pending_joins_for_recheck.push(event_clone);
                     }
                 }
                 InsertOutcome::Rejected(verr) => {
@@ -3233,7 +3255,12 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     // events. Spawn is fire-and-forget — doesn't block tracker advance or
     // delta emission. The spawned task re-acquires the state lock internally
     // for the final idempotency check + insert.
-    for event in &inserted_events {
+    // Also run for restart-recovery PendingJoins (pending_joins_for_recheck)
+    // which returned AlreadyKnown but may still need a JoinCountersign.
+    for event in inserted_events
+        .iter()
+        .chain(pending_joins_for_recheck.iter())
+    {
         maybe_spawn_auto_counter_sign_for_ctx(ctx, event);
     }
 

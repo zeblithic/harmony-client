@@ -1617,7 +1617,7 @@ pub async fn handle_unicast<H: AppHandleEmit>(
     // continue to attach_countersig + insert the counter-signed Join
     // so those joiners can still join.
     let is_pending_join_shape = matches!(
-        join_event.kind,
+        &join_event.kind,
         crate::community_membership::MembershipEventKind::PendingJoin { .. }
     );
 
@@ -1640,6 +1640,20 @@ pub async fn handle_unicast<H: AppHandleEmit>(
             // Safety: is_pending_join_shape already confirmed the arm.
             _ => unreachable!("is_pending_join_shape mismatch"),
         };
+        // F6 trust-narrowing: the embedded PendingJoin.joiner_identity_pub
+        // must match the envelope's already-verified pub (from Path B sig
+        // verification in verify_packet_pure). A mismatch means the event
+        // was constructed with a different pub than the one that signed the
+        // envelope — reject before inserting into the engine.
+        if joiner_identity_pub != signed.joiner_identity_pub {
+            tracing::warn!(
+                "ZEB-254 handle_unicast: PendingJoin.joiner_identity_pub mismatch \
+                 with envelope.joiner_identity_pub — rejecting"
+            );
+            let e = CommunityInviteVerifyError::JoinSigInvalid;
+            emit_degraded(app, &signed.community_id, e.reason_tag());
+            return Err(e);
+        }
         match engine_arc
             .insert_local_event_with_pubs(join_event, joiner_identity_pub, None)
             .await

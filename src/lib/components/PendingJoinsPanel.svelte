@@ -25,6 +25,7 @@
     let loading = true;
 
     async function refresh() {
+        loading = true;
         try {
             pending = await invoke<PendingJoinDto[]>('list_pending_joins', { communityId });
             recent = await invoke<CounterSignDto[]>('list_recent_counter_signs', {
@@ -57,6 +58,10 @@
     }
 
     onMount(async () => {
+        if (!canModerate) {
+            loading = false;
+            return;
+        }
         await refresh();
         try {
             convergedUnlisten = await listen('community-state-sync-converged', async (evt) => {

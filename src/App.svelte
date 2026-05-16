@@ -226,6 +226,9 @@
   /** ZEB-254: transient status message shown after a successful redeem.
    *  Empty string = no message displayed. Auto-cleared after 6 s. */
   let redeemStatusMsg = $state('');
+  /** Timer ID for auto-clearing redeemStatusMsg. Tracked so back-to-back
+   *  redeems cancel the previous timer before arming a new one. */
+  let redeemStatusTimer: ReturnType<typeof setTimeout> | null = null;
 
   // ── ZEB-218 Sub-D Phase 1: library directory browser modal ─────────
   // The adapter is constructed inside the Tauri-init IIFE below; we
@@ -1717,10 +1720,16 @@
         showRedeemInvite = false;
         redeemUrl = '';
         // ZEB-254: show a transient status message; auto-clear after 6 s.
+        // Cancel any in-flight timer so back-to-back redeems don't clear
+        // the second message early.
         redeemStatusMsg = dto.pending
           ? `Join request sent. "${dto.communityName}" will unlock once an admin approves.`
           : `You're in "${dto.communityName}"!`;
-        setTimeout(() => { redeemStatusMsg = ''; }, 6000);
+        if (redeemStatusTimer !== null) clearTimeout(redeemStatusTimer);
+        redeemStatusTimer = setTimeout(() => {
+          redeemStatusMsg = '';
+          redeemStatusTimer = null;
+        }, 6000);
         changeSelectedCommunity(dto.communityId);
         await refreshCommunityMembers(dto.communityId);
       } catch (e) {

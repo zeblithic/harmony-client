@@ -228,7 +228,7 @@ Byte-pinned canonical CBOR fixtures for:
 3. `MemberStatus::PendingJoin` round-trip.
 4. `Space` with `pending_join_at = Some(hlc)` and round-trip.
 
-Uses `test-fixtures` feature for deterministic crypto helpers, following the `wire_format_zeb285_fixtures.rs` and `wire_format_channel_log_fixtures.rs` shape.
+Uses `test-fixtures` feature for deterministic crypto helpers, following the `wire_format_zeb254_fixtures.rs` and `wire_format_channel_log_fixtures.rs` shape.
 
 ## §4 redeem_invite_inner changes
 
@@ -518,51 +518,51 @@ Right-click / long-press on a pending community shows a "Cancel join request" co
 
 ### `redeem_invite_inner_tests` (`lib.rs`)
 
-20. `redeem_invite_pending_returns_ok_pending_when_no_admin_online` — mock unicast destinations empty; 5s timeout fires; `Ok { pending: true }`; Space has `pending_join_at = Some`.
-21. `redeem_invite_fast_path_returns_ok_joined_when_admin_online` — synthetic JoinCountersign delivered within 5s window; oneshot resolves; `Ok { pending: false }`; Space.pending_join_at = None.
-22. `redeem_invite_pending_to_joined_transition_clears_pending_at` — async path: pending committed; JoinCountersign arrives later via state-root sync; Space.pending_join_at flips to None.
+1. `redeem_invite_pending_returns_ok_pending_when_no_admin_online` — mock unicast destinations empty; 5s timeout fires; `Ok { pending: true }`; Space has `pending_join_at = Some`.
+2. `redeem_invite_fast_path_returns_ok_joined_when_admin_online` — synthetic JoinCountersign delivered within 5s window; oneshot resolves; `Ok { pending: false }`; Space.pending_join_at = None.
+3. `redeem_invite_pending_to_joined_transition_clears_pending_at` — async path: pending committed; JoinCountersign arrives later via state-root sync; Space.pending_join_at flips to None.
 
 ### Engine post-Inserted hook tests (`community_state_sync.rs`)
 
-23. `admin_engine_auto_counter_signs_on_pending_join_insert` — admin's engine receives PendingJoin via state-root, auto-emits JoinCountersign.
-24. `admin_engine_idempotent_no_duplicate_counter_sign` — same PendingJoin inserted twice; only one JoinCountersign emitted.
-25. `non_admin_engine_does_not_auto_counter_sign` — self.power < invite_threshold → hook skips.
-26. `kicked_admin_does_not_auto_counter_sign` — self.status == Banned → hook skips even with cached power_levels entry.
+1. `admin_engine_auto_counter_signs_on_pending_join_insert` — admin's engine receives PendingJoin via state-root, auto-emits JoinCountersign.
+2. `admin_engine_idempotent_no_duplicate_counter_sign` — same PendingJoin inserted twice; only one JoinCountersign emitted.
+3. `non_admin_engine_does_not_auto_counter_sign` — self.power < invite_threshold → hook skips.
+4. `kicked_admin_does_not_auto_counter_sign` — self.status == Banned → hook skips even with cached power_levels entry.
 
 ### Integration tests (new file `src-tauri/tests/community_pending_join_integration.rs`)
 
-27. `pending_join_resolves_when_admin_comes_online` — two-engine harness: joiner mints PendingJoin and publishes (admin engine offline); admin engine starts; admin receives + auto-counter-signs; joiner observes JoinCountersign; Space.pending_join_at clears; status → Joined.
-28. `pending_join_survives_joiner_restart` — joiner mints + publishes; admin offline; joiner shuts down + restarts; pending Join re-publishes via state-root on engine respawn; admin (started post-restart) sees + counter-signs; joiner observes.
-29. `pending_join_resolves_under_two_admin_race` — two admin engines online; both auto-counter-sign; both JoinCountersign events accepted; materialize gives Joined.
-30. `legacy_invite_only_join_with_countersig_still_accepted` — pre-ZEB-254 wire shape `j`+countersig still verifies + materializes Joined.
-31. `pending_join_cancellation_via_leave` — joiner mints PendingJoin, then emits Leave; materialize: Left supersedes; admin's post-Inserted hook still emits JoinCountersign (idempotent — JoinCountersign just stays as audit trail; Left wins at materialize).
-32. `pending_join_30d_expiry_hides_joiner` — joiner mints PendingJoin at HLC0; community HLC advances 30+ days; materialize hides joiner; later JoinCountersign upgrades to Joined regardless.
+1. `pending_join_resolves_when_admin_comes_online` — two-engine harness: joiner mints PendingJoin and publishes (admin engine offline); admin engine starts; admin receives + auto-counter-signs; joiner observes JoinCountersign; Space.pending_join_at clears; status → Joined.
+2. `pending_join_survives_joiner_restart` — joiner mints + publishes; admin offline; joiner shuts down + restarts; pending Join re-publishes via state-root on engine respawn; admin (started post-restart) sees + counter-signs; joiner observes.
+3. `pending_join_resolves_under_two_admin_race` — two admin engines online; both auto-counter-sign; both JoinCountersign events accepted; materialize gives Joined.
+4. `legacy_invite_only_join_with_countersig_still_accepted` — pre-ZEB-254 wire shape `j`+countersig still verifies + materializes Joined.
+5. `pending_join_cancellation_via_leave` — joiner mints PendingJoin, then emits Leave; materialize: Left supersedes; admin's post-Inserted hook still emits JoinCountersign (idempotent — JoinCountersign just stays as audit trail; Left wins at materialize).
+6. `pending_join_30d_expiry_hides_joiner` — joiner mints PendingJoin at HLC0; community HLC advances 30+ days; materialize hides joiner; later JoinCountersign upgrades to Joined regardless.
 
 ### Wire fixtures (new file `src-tauri/tests/wire_format_zeb254_fixtures.rs`)
 
-33. `pending_join_canonical_cbor_pinned` — byte-exact CBOR for a synthetic PendingJoin.
-34. `join_countersign_canonical_cbor_pinned` — byte-exact CBOR for a synthetic JoinCountersign.
-35. `member_status_pending_join_round_trip` — `MemberStatus::PendingJoin` serde round-trip.
-36. `space_with_pending_join_at_round_trip` — Space CBOR with `pending_join_at = Some(hlc)`.
+1. `pending_join_canonical_cbor_pinned` — byte-exact CBOR for a synthetic PendingJoin.
+2. `join_countersign_canonical_cbor_pinned` — byte-exact CBOR for a synthetic JoinCountersign.
+3. `member_status_pending_join_round_trip` — `MemberStatus::PendingJoin` serde round-trip.
+4. `space_with_pending_join_at_round_trip` — Space CBOR with `pending_join_at = Some(hlc)`.
 
 ### Frontend tests (vitest)
 
-37. `RedeemInviteWizard.test.ts` — pending=true result → toast "Join request sent…" + dismiss + nav refresh.
-38. `RedeemInviteWizard.test.ts` — pending=false result → toast "You're in!".
-39. `NavService.test.ts` — community with pending_join_at renders greyed; `nav-updated { pending: false }` event removes greyed.
-40. `CommunitySettingsPanel.test.ts` — `list_pending_joins` returns 2 entries → 2 rows; Kick button calls `kick` IPC with correct args.
-41. `CommunitySettingsPanel.test.ts` — `list_recent_counter_signs` returns 3 entries → 3 audit-log rows.
+1. `RedeemInviteWizard.test.ts` — pending=true result → toast "Join request sent…" + dismiss + nav refresh.
+2. `RedeemInviteWizard.test.ts` — pending=false result → toast "You're in!".
+3. `NavService.test.ts` — community with pending_join_at renders greyed; `nav-updated { pending: false }` event removes greyed.
+4. `CommunitySettingsPanel.test.ts` — `list_pending_joins` returns 2 entries → 2 rows; Kick button calls `kick` IPC with correct args.
+5. `CommunitySettingsPanel.test.ts` — `list_recent_counter_signs` returns 3 entries → 3 audit-log rows.
 
 ### Acceptance criteria mapping
 
 | Criterion (ticket) | Covered by tests |
 |---|---|
-| Joiner offline-redemption returns Ok with pending status | 20 |
-| Admin comes online → sees pending → counter-signs → full member | 23, 27 |
-| Restarts preserve pending state | 28 |
-| Stale Joins >30 days auto-expire | 15, 32 |
-| Pending badge in NavService for joiner | 39 + render check |
-| "Pending join requests" in CommunitySettingsPanel for admin | 40 |
+| Joiner offline-redemption returns Ok with pending status | `redeem_invite_pending_returns_ok_pending_when_no_admin_online` |
+| Admin comes online → sees pending → counter-signs → full member | `admin_engine_auto_counter_signs_on_pending_join_insert`, `pending_join_resolves_when_admin_comes_online` |
+| Restarts preserve pending state | `pending_join_survives_joiner_restart` |
+| Stale Joins >30 days auto-expire | materialize tests 15 + `pending_join_30d_expiry_hides_joiner` |
+| Pending badge in NavService for joiner | `NavService.test.ts` + render check |
+| "Pending join requests" in CommunitySettingsPanel for admin | `CommunitySettingsPanel.test.ts` |
 
 ## §10 Scope
 
