@@ -6911,6 +6911,22 @@ pub struct ModerationEventDto {
     pub hlc: crate::owner_state_types::Hlc,
 }
 
+/// ZEB-250: discriminated result of an admin moderation IPC. The
+/// handler auto-routes based on the target community's admin_quorum:
+/// - `Completed` if admin_quorum == 1 OR action is not admin-affecting.
+/// - `Pending` if admin_quorum > 1 AND action is admin-affecting — an
+///   AdminProposal was minted instead and is awaiting countersignatures.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind")]
+pub enum AdminActionResult {
+    Completed,
+    Pending {
+        proposal_event_id: String,
+        signers_so_far: u8,
+        quorum_required: u8,
+    },
+}
+
 /// Project a materialized membership into the IPC DTO list, sorted by
 /// power level descending then joined_at ascending. Stable for two
 /// addrs at the same power+joined_at — falls through to OwnerAddr-bytes
@@ -13976,6 +13992,104 @@ pub fn mint_unban_event(
     sign_event(&payload, signing_key).map_err(|e| format!("sign unban: {e}"))
 }
 
+// ── ZEB-250: AdminProposal minting helpers ────────────────────────────
+
+/// ZEB-250: mint a signed AdminProposal carrying a SetPower proposal_kind,
+/// sign with the caller's identity, and return the signed event.
+///
+/// The caller is responsible for inserting the returned event into the
+/// community engine. `signing_key` and `hlc` must be pre-acquired.
+pub fn mint_admin_proposal_set_power_event(
+    community_id: crate::owner_state_types::SpaceId,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    target: crate::owner_state_types::OwnerAddr,
+    level: u8,
+    signing_key: &ed25519_dalek::SigningKey,
+    hlc: crate::owner_state_types::Hlc,
+) -> Result<crate::community_membership::SignedMembershipEvent, String> {
+    use crate::community_membership::{
+        sign_event, EventPayload, MembershipEventKind, ProposalKind,
+    };
+    use rand::RngCore;
+
+    let mut rng = rand::thread_rng();
+    let mut event_id_bytes = [0u8; 16];
+    rng.fill_bytes(&mut event_id_bytes);
+
+    let payload = EventPayload {
+        id: event_id_bytes,
+        community_id,
+        kind: MembershipEventKind::AdminProposal {
+            proposal_kind: ProposalKind::SetPower { target, level },
+        },
+        actor: self_owner,
+        at: hlc,
+    };
+    sign_event(&payload, signing_key).map_err(|e| format!("sign admin_proposal_set_power: {e}"))
+}
+
+/// ZEB-250: mint a signed AdminProposal carrying a Kick proposal_kind.
+///
+/// Same signing/HLC contract as `mint_admin_proposal_set_power_event`.
+pub fn mint_admin_proposal_kick_event(
+    community_id: crate::owner_state_types::SpaceId,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    target: crate::owner_state_types::OwnerAddr,
+    reason: Option<String>,
+    signing_key: &ed25519_dalek::SigningKey,
+    hlc: crate::owner_state_types::Hlc,
+) -> Result<crate::community_membership::SignedMembershipEvent, String> {
+    use crate::community_membership::{
+        sign_event, EventPayload, MembershipEventKind, ProposalKind,
+    };
+    use rand::RngCore;
+
+    let mut rng = rand::thread_rng();
+    let mut event_id_bytes = [0u8; 16];
+    rng.fill_bytes(&mut event_id_bytes);
+
+    let payload = EventPayload {
+        id: event_id_bytes,
+        community_id,
+        kind: MembershipEventKind::AdminProposal {
+            proposal_kind: ProposalKind::Kick { target, reason },
+        },
+        actor: self_owner,
+        at: hlc,
+    };
+    sign_event(&payload, signing_key).map_err(|e| format!("sign admin_proposal_kick: {e}"))
+}
+
+/// ZEB-250: mint a signed AdminProposal carrying a ChangeQuorum proposal_kind.
+/// Used by `propose_change_quorum` (Task 12).
+pub fn mint_admin_proposal_change_quorum_event(
+    community_id: crate::owner_state_types::SpaceId,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    new_quorum: u8,
+    signing_key: &ed25519_dalek::SigningKey,
+    hlc: crate::owner_state_types::Hlc,
+) -> Result<crate::community_membership::SignedMembershipEvent, String> {
+    use crate::community_membership::{
+        sign_event, EventPayload, MembershipEventKind, ProposalKind,
+    };
+    use rand::RngCore;
+
+    let mut rng = rand::thread_rng();
+    let mut event_id_bytes = [0u8; 16];
+    rng.fill_bytes(&mut event_id_bytes);
+
+    let payload = EventPayload {
+        id: event_id_bytes,
+        community_id,
+        kind: MembershipEventKind::AdminProposal {
+            proposal_kind: ProposalKind::ChangeQuorum { new_quorum },
+        },
+        actor: self_owner,
+        at: hlc,
+    };
+    sign_event(&payload, signing_key).map_err(|e| format!("sign admin_proposal_change_quorum: {e}"))
+}
+
 /// ZEB-249 Task 6: pure helper — mint a signed `EpochRotation` event.
 ///
 /// `triggered_by` is the `EventId` of the Kick or Leave event this rotation
@@ -14112,13 +14226,18 @@ fn build_sealed_epoch_recipients(
 /// Power-gated by `verify_event`: actor must have power ≥ 50 (kick
 /// threshold) AND strictly greater than target's current power.
 /// Returns Err with the VerifyError discriminant on rejection.
+///
+/// ZEB-250: when admin_quorum > 1 AND the target is currently an admin
+/// (power == 100), mints an AdminProposal instead of a direct Kick and
+/// returns `AdminActionResult::Pending`. Otherwise performs the direct
+/// Kick + EpochRotation and returns `AdminActionResult::Completed`.
 #[tauri::command]
 async fn kick_from_community(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     community_id: String,
     target_addr: String,
     reason: Option<String>,
-) -> Result<(), String> {
+) -> Result<AdminActionResult, String> {
     let id_bytes: [u8; 16] = hex::decode(&community_id)
         .map_err(|e| format!("invalid community_id hex: {e}"))?
         .as_slice()
@@ -14160,13 +14279,8 @@ async fn kick_from_community(
     // tracker lock) BEFORE minting. Replaces the prior
     // snapshot-then-release pattern that had a race window between
     // the prev_hlc read and the post-Inserted advance.
-    let kick_hlc =
+    let event_hlc =
         crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
-    let kick = {
-        let outbox_g = dm_outbox.lock().await;
-        let signing_key = outbox_g.signing_key.as_ref();
-        mint_kick_event(space_id, self_owner, target, reason, signing_key, kick_hlc)?
-    };
 
     // Generation + registry fence (mirrors leave_community + the
     // create_community / redeem_invite shape). Plain generation check
@@ -14201,6 +14315,64 @@ async fn kick_from_community(
                 hex::encode(space_id.0)
             )
         })?;
+
+    // ZEB-250: read materialized state to determine admin_quorum + target's
+    // current power level. This read is done BEFORE minting any event so
+    // the routing decision reflects the current CRDT state.
+    let (admin_quorum, target_power_now) = {
+        let state = engine_arc.state();
+        let state_g = state.lock().await;
+        let admin_addr = engine_arc.admin_addr();
+        let m = state_g.materialize_now(admin_addr);
+        let tpow = m.power_levels.get(&target).copied().unwrap_or(0);
+        (m.admin_quorum, tpow)
+    };
+
+    // ZEB-250: admin-affecting kick = target is currently an admin (power == 100).
+    let admin_affecting = target_power_now == 100;
+
+    if admin_quorum > 1 && admin_affecting {
+        // Route via AdminProposal — the proposer counts as signer 1.
+        let proposal = {
+            let outbox_g = dm_outbox.lock().await;
+            let signing_key = outbox_g.signing_key.as_ref();
+            mint_admin_proposal_kick_event(
+                space_id,
+                self_owner,
+                target,
+                reason.clone(),
+                signing_key,
+                event_hlc,
+            )?
+        };
+        let proposal_id_hex = hex::encode(proposal.id);
+        let outcome = engine_arc
+            .insert_local_event(proposal)
+            .await
+            .map_err(|e| format!("engine.insert_local_event (AdminProposal kick): {e}"))?;
+        if matches!(
+            outcome,
+            crate::community_state_crdt::InsertOutcome::Rejected(_)
+        ) {
+            return Err(membership_outcome_err(
+                "kick_from_community (AdminProposal)",
+                &outcome,
+            ));
+        }
+        return Ok(AdminActionResult::Pending {
+            proposal_event_id: proposal_id_hex,
+            signers_so_far: 1,
+            quorum_required: admin_quorum,
+        });
+    }
+
+    // Direct kick path (admin_quorum == 1 OR target is not an admin).
+    let kick = {
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        mint_kick_event(space_id, self_owner, target, reason, signing_key, event_hlc)?
+    };
+
     // ZEB-249 Task 6 spec §4.1 atomicity: mint the EpochRotation BEFORE
     // inserting either event, then submit both via insert_local_event_pair
     // so no crash window exists between the Kick and its matching Rotation.
@@ -14368,7 +14540,7 @@ async fn kick_from_community(
         }
     }
 
-    Ok(())
+    Ok(AdminActionResult::Completed)
 }
 
 // ── ZEB-262 Phase 4: set_power_level ─────────────────────────────────
@@ -14415,13 +14587,19 @@ pub fn mint_set_power_event(
 /// set_power threshold). Out-of-range levels are rejected by
 /// verify_event as `PowerLevelOutOfRange`. Returns Err with the
 /// VerifyError discriminant on rejection.
+///
+/// ZEB-250: when admin_quorum > 1 AND the action is admin-affecting
+/// (new level == 100 OR target is currently admin with level == 100),
+/// mints an AdminProposal instead of a direct SetPower event and returns
+/// `AdminActionResult::Pending`. Otherwise performs the direct SetPower
+/// and returns `AdminActionResult::Completed`.
 #[tauri::command]
 async fn set_power_level(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     community_id: String,
     target_addr: String,
     level: u8,
-) -> Result<(), String> {
+) -> Result<AdminActionResult, String> {
     let id_bytes: [u8; 16] = hex::decode(&community_id)
         .map_err(|e| format!("invalid community_id hex: {e}"))?
         .as_slice()
@@ -14460,13 +14638,8 @@ async fn set_power_level(
         .as_millis() as u64;
 
     // ZEB-267: atomic HLC reservation.
-    let hlc =
+    let event_hlc =
         crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
-    let event = {
-        let outbox_g = dm_outbox.lock().await;
-        let signing_key = outbox_g.signing_key.as_ref();
-        mint_set_power_event(space_id, self_owner, target, level, signing_key, hlc)?
-    };
 
     // Generation + registry fence (see kick_from_community for
     // motivation; stop_node nullifies registry without bumping
@@ -14497,6 +14670,64 @@ async fn set_power_level(
                 hex::encode(space_id.0)
             )
         })?;
+
+    // ZEB-250: read materialized state to determine admin_quorum + target's
+    // current power level. This read is done BEFORE minting any event so
+    // the routing decision reflects the current CRDT state.
+    let (admin_quorum, target_power_now) = {
+        let state = engine_arc.state();
+        let state_g = state.lock().await;
+        let admin_addr = engine_arc.admin_addr();
+        let m = state_g.materialize_now(admin_addr);
+        let tpow = m.power_levels.get(&target).copied().unwrap_or(0);
+        (m.admin_quorum, tpow)
+    };
+
+    // ZEB-250: admin-affecting SetPower = new level is 100 (promoting to admin)
+    // OR target is currently an admin (power == 100, i.e. a demotion).
+    let admin_affecting = level == 100 || target_power_now == 100;
+
+    if admin_quorum > 1 && admin_affecting {
+        // Route via AdminProposal — the proposer counts as signer 1.
+        let proposal = {
+            let outbox_g = dm_outbox.lock().await;
+            let signing_key = outbox_g.signing_key.as_ref();
+            mint_admin_proposal_set_power_event(
+                space_id,
+                self_owner,
+                target,
+                level,
+                signing_key,
+                event_hlc,
+            )?
+        };
+        let proposal_id_hex = hex::encode(proposal.id);
+        let outcome = engine_arc
+            .insert_local_event(proposal)
+            .await
+            .map_err(|e| format!("engine.insert_local_event (AdminProposal set_power): {e}"))?;
+        if matches!(
+            outcome,
+            crate::community_state_crdt::InsertOutcome::Rejected(_)
+        ) {
+            return Err(membership_outcome_err(
+                "set_power_level (AdminProposal)",
+                &outcome,
+            ));
+        }
+        return Ok(AdminActionResult::Pending {
+            proposal_event_id: proposal_id_hex,
+            signers_so_far: 1,
+            quorum_required: admin_quorum,
+        });
+    }
+
+    // Direct SetPower path (admin_quorum == 1 OR action is not admin-affecting).
+    let event = {
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        mint_set_power_event(space_id, self_owner, target, level, signing_key, event_hlc)?
+    };
     let outcome = engine_arc
         .insert_local_event(event.clone())
         .await
@@ -14508,7 +14739,7 @@ async fn set_power_level(
         return Err(membership_outcome_err("set_power_level", &outcome));
     }
 
-    Ok(())
+    Ok(AdminActionResult::Completed)
 }
 
 // ── ZEB-284 Task 2: unban_from_community ─────────────────────────────
@@ -19266,5 +19497,340 @@ mod start_node_race_tests {
             } => {}
             other => panic!("unexpected error: {:?}", other),
         }
+    }
+}
+
+// ── ZEB-250 Task 9: AdminActionResult routing tests ───────────────────────
+//
+// These tests verify the mint helpers + CRDT-layer routing at the level
+// that the IPC handler exercises. The IPC itself delegates the routing
+// decision to the same `admin_quorum > 1 && admin_affecting` predicate
+// and the same `insert_event` / `insert_local_event` path, so testing
+// at this level covers all invariants without needing the full Tauri
+// engine stack.
+#[cfg(test)]
+mod admin_action_result_routing_tests {
+    use super::*;
+    use crate::community_membership::{
+        sign_event_with_identity, EventPayload, MembershipEventKind, ProposalKind, VerifyContext,
+    };
+    use crate::community_state_crdt::{CommunityState, InsertOutcome};
+    use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+    use harmony_identity::PrivateIdentity;
+
+    fn hlc(wall: u64, dev: &str) -> Hlc {
+        Hlc {
+            wall_ms: wall,
+            logical: 0,
+            device_id: dev.to_string(),
+        }
+    }
+
+    fn insert_ok(
+        state: &mut CommunityState,
+        payload: EventPayload,
+        identity: &PrivateIdentity,
+        admin: OwnerAddr,
+        actor_pub: &[u8; 64],
+    ) {
+        let ev = sign_event_with_identity(&payload, identity).expect("sign");
+        let ctx = VerifyContext {
+            expected_community_id: payload.community_id,
+            admin_addr: admin,
+            is_invite_only: false,
+            actor_identity_pub: actor_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: None,
+        };
+        let outcome = state.insert_event(ev, &ctx);
+        assert!(
+            matches!(outcome, InsertOutcome::Inserted),
+            "fixture insert must succeed; got {outcome:?}"
+        );
+    }
+
+    // ── Test 1: set_power_level_returns_completed_when_quorum_1 ───────────
+    //
+    // Backwards-compat: admin_quorum=1 (default) → direct SetPower is
+    // accepted by verify_event (no quorum gate). The IPC handler routes
+    // here and returns Completed. We verify by showing the direct-SetPower
+    // event inserts without rejection (which is what the Completed branch
+    // does) even when the target's new level is 100.
+    #[tokio::test]
+    async fn set_power_level_returns_completed_when_quorum_1() {
+        let community_id = SpaceId([0xa1; 16]);
+
+        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
+        let admin = OwnerAddr(admin_identity.identity.address_hash);
+        let admin_pub = admin_identity.identity.to_public_bytes();
+
+        let member_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
+        let member = OwnerAddr(member_identity.identity.address_hash);
+        let member_pub = member_identity.identity.to_public_bytes();
+
+        let mut state = CommunityState::new(community_id);
+        // admin_quorum defaults to 1 — no change needed.
+
+        insert_ok(
+            &mut state,
+            EventPayload {
+                id: [0x01; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: admin,
+                at: hlc(100, "admin"),
+            },
+            &admin_identity,
+            admin,
+            &admin_pub,
+        );
+        insert_ok(
+            &mut state,
+            EventPayload {
+                id: [0x02; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: member,
+                at: hlc(200, "member"),
+            },
+            &member_identity,
+            admin,
+            &member_pub,
+        );
+
+        // Promote member to admin (level == 100). With admin_quorum == 1 this
+        // must succeed as a direct SetPower (the Completed path).
+        let sk_bytes = admin_identity.to_private_bytes();
+        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+
+        let sp_event = mint_set_power_event(
+            community_id,
+            admin,
+            member,
+            100,
+            &signing_key,
+            hlc(300, "admin"),
+        )
+        .expect("mint_set_power_event must succeed");
+
+        let outcome = state.insert_event(
+            sp_event,
+            &VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+                actor_identity_pub: &admin_pub,
+                countersigner_identity_pub: None,
+                admin_identity_pub: None,
+            },
+        );
+        // admin_quorum == 1 → direct SetPower accepted (Completed path).
+        assert!(
+            matches!(outcome, InsertOutcome::Inserted),
+            "direct SetPower to 100 with admin_quorum=1 must be Inserted; got {outcome:?}"
+        );
+
+        // Verify member's power is now 100 in the materialized view.
+        let m = state.materialize_now(admin);
+        assert_eq!(
+            m.power_levels.get(&member).copied().unwrap_or(0),
+            100,
+            "member power must be 100 after direct SetPower"
+        );
+    }
+
+    // ── Test 2: set_power_level_routes_to_proposal_when_quorum_above_1 ───
+    //
+    // When admin_quorum > 1 AND action is admin-affecting (new level == 100),
+    // verify_event rejects a direct SetPower with SetPowerRequiresQuorum AND
+    // accepts an AdminProposal for the same action. This validates both halves
+    // of the IPC routing branch.
+    #[tokio::test]
+    async fn set_power_level_routes_to_proposal_when_quorum_above_1_and_target_becomes_admin() {
+        let community_id = SpaceId([0xa2; 16]);
+
+        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
+        let admin = OwnerAddr(admin_identity.identity.address_hash);
+        let admin_pub = admin_identity.identity.to_public_bytes();
+
+        let member_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
+        let member = OwnerAddr(member_identity.identity.address_hash);
+        let member_pub = member_identity.identity.to_public_bytes();
+
+        let mut state = CommunityState::new(community_id);
+
+        insert_ok(
+            &mut state,
+            EventPayload {
+                id: [0x01; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: admin,
+                at: hlc(100, "admin"),
+            },
+            &admin_identity,
+            admin,
+            &admin_pub,
+        );
+        insert_ok(
+            &mut state,
+            EventPayload {
+                id: [0x02; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: member,
+                at: hlc(200, "member"),
+            },
+            &member_identity,
+            admin,
+            &member_pub,
+        );
+
+        let sk_bytes = admin_identity.to_private_bytes();
+        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+
+        // Step 1: promote the member to admin (SetPower 100) while admin_quorum==1.
+        // This is valid as a direct event (no quorum gate yet).
+        let promote_event = mint_set_power_event(
+            community_id,
+            admin,
+            member,
+            100,
+            &signing_key,
+            hlc(210, "admin"),
+        )
+        .expect("mint_set_power_event must succeed");
+        let promote_outcome = state.insert_event(
+            promote_event,
+            &VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+                actor_identity_pub: &admin_pub,
+                countersigner_identity_pub: None,
+                admin_identity_pub: None,
+            },
+        );
+        assert!(
+            matches!(promote_outcome, InsertOutcome::Inserted),
+            "direct SetPower to 100 must be Inserted when admin_quorum=1; got {promote_outcome:?}"
+        );
+
+        // Step 2: raise admin_quorum to 2 by inserting a ChangeQuorum AdminProposal.
+        // Now that there are 2 admins, ChangeQuorum(2) is in range [1, 2].
+        // With the current materialized admin_quorum=1, a single signer
+        // (the proposer) meets the quorum threshold, so this self-approves
+        // immediately when the event log is replayed in materialize().
+        let change_quorum_proposal = mint_admin_proposal_change_quorum_event(
+            community_id,
+            admin,
+            2,
+            &signing_key,
+            hlc(250, "admin"),
+        )
+        .expect("mint_admin_proposal_change_quorum_event must succeed");
+        let cq_outcome = state.insert_event(
+            change_quorum_proposal,
+            &VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+                actor_identity_pub: &admin_pub,
+                countersigner_identity_pub: None,
+                admin_identity_pub: None,
+            },
+        );
+        assert!(
+            matches!(cq_outcome, InsertOutcome::Inserted),
+            "ChangeQuorum AdminProposal must be Inserted; got {cq_outcome:?}"
+        );
+        // Verify the quorum is now 2 in the materialized view.
+        let m_after_cq = state.materialize_now(admin);
+        assert_eq!(
+            m_after_cq.admin_quorum, 2,
+            "admin_quorum must be 2 after ChangeQuorum"
+        );
+
+        // Verify that a direct SetPower to 100 is REJECTED (SetPowerRequiresQuorum).
+        // This confirms the routing predicate is correct: the IPC must NOT take
+        // the direct path when admin_quorum > 1 AND admin-affecting.
+        let direct_sp = mint_set_power_event(
+            community_id,
+            admin,
+            member,
+            100,
+            &signing_key,
+            hlc(300, "admin"),
+        )
+        .expect("mint must succeed");
+
+        let direct_outcome = state.insert_event(
+            direct_sp,
+            &VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+                actor_identity_pub: &admin_pub,
+                countersigner_identity_pub: None,
+                admin_identity_pub: None,
+            },
+        );
+        match direct_outcome {
+            InsertOutcome::Rejected(
+                crate::community_membership::VerifyError::SetPowerRequiresQuorum,
+            ) => {
+                // Expected: direct SetPower is rejected — routing to AdminProposal is correct.
+            }
+            other => panic!("expected SetPowerRequiresQuorum rejection; got {other:?}"),
+        }
+
+        // Now mint an AdminProposal for the same action — must be ACCEPTED.
+        // This validates mint_admin_proposal_set_power_event + the Pending branch.
+        let proposal = mint_admin_proposal_set_power_event(
+            community_id,
+            admin,
+            member,
+            100,
+            &signing_key,
+            hlc(310, "admin"),
+        )
+        .expect("mint_admin_proposal_set_power_event must succeed");
+
+        // Verify the event kind is AdminProposal{SetPower}.
+        match &proposal.kind {
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::SetPower { target, level },
+            } => {
+                assert_eq!(*target, member, "proposal target must be member");
+                assert_eq!(*level, 100, "proposal level must be 100");
+            }
+            other => panic!("expected AdminProposal{{SetPower}}; got {other:?}"),
+        }
+
+        let proposal_id = proposal.id;
+        let proposal_outcome = state.insert_event(
+            proposal,
+            &VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+                actor_identity_pub: &admin_pub,
+                countersigner_identity_pub: None,
+                admin_identity_pub: None,
+            },
+        );
+        assert!(
+            matches!(proposal_outcome, InsertOutcome::Inserted),
+            "AdminProposal SetPower must be Inserted; got {proposal_outcome:?}"
+        );
+
+        // Confirm the proposal is in the event log (mirrors what the IPC Pending
+        // branch returns via hex::encode(proposal.id)).
+        assert!(
+            state.events.contains_key(&proposal_id),
+            "proposal must be in the CRDT event log"
+        );
     }
 }

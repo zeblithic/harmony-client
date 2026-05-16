@@ -1,6 +1,7 @@
 import type { TauriAdapter } from './zenoh-service';
 import {
   POWER_THRESHOLDS,
+  type AdminActionResult,
   type CommunityLineageDto,
   type CommunityMember,
   type ForkDescendantDto,
@@ -226,8 +227,8 @@ export class CommunityService {
     communityId: string,
     targetAddr: string,
     reason?: string,
-  ): Promise<void> {
-    await this.invoke<void>('kick_from_community', {
+  ): Promise<AdminActionResult> {
+    return this.invoke<AdminActionResult>('kick_from_community', {
       communityId,
       targetAddr,
       reason: reason ?? null,
@@ -246,14 +247,18 @@ export class CommunityService {
     });
   }
 
-  async setPowerLevel(communityId: string, targetAddr: string, newPower: number): Promise<void> {
+  async setPowerLevel(
+    communityId: string,
+    targetAddr: string,
+    newPower: number,
+  ): Promise<AdminActionResult> {
     // Clamp to POWER_THRESHOLDS.max (100) — matches the UI slider's
     // declared range and the backend's accepted range. Earlier
     // revisions clamped to 255 (u8 max) which made the intent
     // unambiguous to readers and would have allowed out-of-range
     // values if this method ever got called outside SetPowerDialog.
     const level = Math.max(0, Math.min(POWER_THRESHOLDS.max, Math.trunc(newPower)));
-    await this.invoke<void>('set_power_level', { communityId, targetAddr, level });
+    return this.invoke<AdminActionResult>('set_power_level', { communityId, targetAddr, level });
   }
 
   async generateInvite(communityId: string): Promise<string> {

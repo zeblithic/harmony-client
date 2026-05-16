@@ -388,3 +388,24 @@ export function powerToRole(power: number): PowerRole {
   if (power >= POWER_THRESHOLDS.kick) return 'mod';
   return 'member';
 }
+
+/**
+ * ZEB-250: discriminated return type for admin moderation IPCs
+ * (`set_power_level`, `kick_from_community`).
+ *
+ * - `Completed` → action was applied directly (admin_quorum == 1 OR
+ *   action is not admin-affecting). Existing behavior.
+ * - `Pending` → action was admin-affecting AND admin_quorum > 1; an
+ *   AdminProposal was minted. `signers_so_far` is 1 (the proposer);
+ *   awaits `quorum_required - 1` more AdminCountersign events.
+ *
+ * Mirrors `AdminActionResult` in src-tauri/src/lib.rs.
+ */
+export type AdminActionResult =
+  | { kind: 'Completed' }
+  | {
+      kind: 'Pending';
+      proposal_event_id: string;
+      signers_so_far: number;
+      quorum_required: number;
+    };

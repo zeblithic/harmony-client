@@ -37,6 +37,9 @@
   let loadError: string | null = $state(null);
   let actionError: string | null = $state(null);
   let refreshError: string | null = $state(null);
+  // ZEB-250: non-error informational message shown when an admin action was
+  // routed to an AdminProposal (admin_quorum > 1 AND admin-affecting).
+  let pendingActionMsg: string | null = $state(null);
   // Tracks whether the initial fetch has ever succeeded — gates the
   // loadError-vs-refreshError routing in `refresh()`.
   let hasLoadedMembers = $state(false);
@@ -128,6 +131,17 @@
     }
   }
 
+  // ZEB-250: handle AdminActionResult returned by set_power_level / kick IPC.
+  // Completed → no-op (success is silent; refresh will show updated state).
+  // Pending   → show an informational banner so the admin knows a quorum
+  //             proposal was submitted rather than a direct action.
+  function handleAdminActionResult(result: import('../types').AdminActionResult) {
+    if (result.kind === 'Pending') {
+      pendingActionMsg =
+        `Proposal submitted — ${result.signers_so_far} of ${result.quorum_required} signatures`;
+    }
+  }
+
   async function onMemberAction(detail: { action: KebabAction; member: CommunityMember }) {
     const { action, member } = detail;
     try {
@@ -140,9 +154,11 @@
         dialogTarget = member;
         dialogOpen = true;
       } else if (action === 'promote-mod') {
-        await communityService.setPowerLevel(communityId, member.address, 50);
+        const r = await communityService.setPowerLevel(communityId, member.address, 50);
+        handleAdminActionResult(r);
       } else if (action === 'promote-admin') {
-        await communityService.setPowerLevel(communityId, member.address, 100);
+        const r = await communityService.setPowerLevel(communityId, member.address, 100);
+        handleAdminActionResult(r);
       } else if (action === 'demote-mod' || action === 'demote-member') {
         const isSelf = member.address === viewer.addr;
         const newPower = action === 'demote-mod' ? 50 : 0;
@@ -152,7 +168,8 @@
           lastAdminDialogOpen = true;
           return;
         }
-        await communityService.setPowerLevel(communityId, member.address, newPower);
+        const r = await communityService.setPowerLevel(communityId, member.address, newPower);
+        handleAdminActionResult(r);
       }
     } catch (e) {
       // Surface IPC errors as a transient banner above the member list —
@@ -165,7 +182,8 @@
   async function onDialogConfirm(reason: string | null): Promise<void> {
     if (!dialogTarget) return;
     if (dialogAction === 'kick') {
-      await communityService.kickFromCommunity(communityId, dialogTarget.address, reason ?? undefined);
+      const r = await communityService.kickFromCommunity(communityId, dialogTarget.address, reason ?? undefined);
+      handleAdminActionResult(r);
     } else {
       await communityService.unbanFromCommunity(communityId, dialogTarget.address, reason ?? undefined);
     }
@@ -178,7 +196,12 @@
 
   async function onLastAdminDialogConfirm() {
     if (lastAdminDialogAction === 'demote' && ownAddress) {
-      await communityService.setPowerLevel(communityId, ownAddress, lastAdminDialogPendingPower);
+      const r = await communityService.setPowerLevel(
+        communityId,
+        ownAddress,
+        lastAdminDialogPendingPower,
+      );
+      handleAdminActionResult(r);
     }
   }
 
@@ -219,6 +242,17 @@
   {:else if loadError}
     <p class="error" role="alert">{loadError}</p>
   {:else}
+    {#if pendingActionMsg}
+      <p class="info pending-action" role="status">
+        {pendingActionMsg}
+        <button
+          type="button"
+          class="dismiss-action-error"
+          aria-label="Dismiss pending action notice"
+          onclick={() => (pendingActionMsg = null)}
+        >&times;</button>
+      </p>
+    {/if}
     {#if actionError}
       <p class="error action-error" role="alert">
         {actionError}
