@@ -440,6 +440,8 @@ pub async fn fork_community(
         channel_log: channel_log_snapshot,
         identity_pubs,
         forked_at: fork_hlc.clone(),
+        // ZEB-287 Task 2 placeholder; Task 4 populates with real chain + cap.
+        parent_lineage: Vec::new(),
     };
 
     // Step 6 (pre-spawn): write pre_fork_snapshot.bin to the fork's data dir.

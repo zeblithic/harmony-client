@@ -1375,3 +1375,66 @@ mod zeb287_parent_lineage_entry {
         );
     }
 }
+
+// ZEB-287 Phase 2: PreForkSnapshot.parent_lineage backwards-compat + roundtrip tests
+mod zeb287_pre_fork_snapshot_lineage {
+    use harmony_app::community_invite::{
+        BoundedChannelLogSnapshot, ParentLineageEntry, PreForkSnapshot,
+    };
+    use harmony_app::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
+    use harmony_app::owner_state_types::{Hlc, SpaceId};
+    use std::collections::BTreeMap;
+
+    fn empty_pre_fork_snapshot_for_test() -> PreForkSnapshot {
+        PreForkSnapshot {
+            original_community_id: SpaceId([0x42; 16]),
+            original_community_name: "Cool Community".to_string(),
+            membership_events: Vec::new(),
+            channel_log: BoundedChannelLogSnapshot::default(),
+            identity_pubs: BTreeMap::new(),
+            forked_at: Hlc {
+                wall_ms: 1_715_811_234_567,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            parent_lineage: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn pre_fork_snapshot_with_empty_lineage_omits_pl_key() {
+        let snap = empty_pre_fork_snapshot_for_test();
+        let bytes = canonical_cbor_encode(&snap).expect("encode");
+        assert!(
+            !bytes.windows(2).any(|w| w == b"pl"),
+            "skip_serializing_if = Vec::is_empty failed to drop `pl` key for empty lineage"
+        );
+    }
+
+    #[test]
+    fn pre_fork_snapshot_with_populated_lineage_roundtrips() {
+        let mut snap = empty_pre_fork_snapshot_for_test();
+        snap.parent_lineage = vec![
+            ParentLineageEntry {
+                space_id: SpaceId([0x11; 16]),
+                name: "Project Cool".to_string(),
+                forked_at_wall_ms: None,
+            },
+            ParentLineageEntry {
+                space_id: SpaceId([0x22; 16]),
+                name: "Cool Community".to_string(),
+                forked_at_wall_ms: Some(1_715_000_000_000),
+            },
+        ];
+
+        let bytes = canonical_cbor_encode(&snap).expect("encode");
+        assert!(
+            bytes.windows(2).any(|w| w == b"pl"),
+            "non-empty lineage must produce `pl` key"
+        );
+
+        let decoded: PreForkSnapshot = canonical_cbor_decode(&bytes).expect("decode");
+        assert_eq!(snap.parent_lineage, decoded.parent_lineage);
+        assert_eq!(snap.original_community_id, decoded.original_community_id);
+    }
+}

@@ -239,6 +239,7 @@ async fn run_fork_inner(
         channel_log: BoundedChannelLogSnapshot::default(),
         identity_pubs,
         forked_at: hlc.clone(),
+        parent_lineage: Vec::new(),
     };
 
     // Write snapshot to disk atomically.
@@ -969,6 +970,7 @@ fn dual_keyset_verify_snapshot_events() {
         channel_log: BoundedChannelLogSnapshot::default(),
         identity_pubs,
         forked_at: test_hlc(1_700_000_002_000, 0, "a-dev"),
+        parent_lineage: Vec::new(),
     };
 
     // Each event must verify against the snapshot's identity_pubs.

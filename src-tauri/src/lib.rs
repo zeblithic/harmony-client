@@ -11060,6 +11060,7 @@ mod redeem_invite_inner_tests {
                 logical: 0,
                 device_id: "fork-dev".into(),
             },
+            parent_lineage: Vec::new(),
         };
 
         let invite_payload = CommunityInvitePayload {
@@ -16114,6 +16115,7 @@ mod generate_invite_helper_tests {
                 logical: 0,
                 device_id: "fork-dev".into(),
             },
+            parent_lineage: Vec::new(),
         };
 
         let payload = CommunityInvitePayload {

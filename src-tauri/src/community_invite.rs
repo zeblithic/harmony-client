@@ -467,6 +467,18 @@ pub struct PreForkSnapshot {
     /// NOT used for any verification or ordering decision.
     #[serde(rename = "ts")]
     pub forked_at: Hlc,
+
+    /// ZEB-287 Phase 2: ordered list of ancestors above the immediate
+    /// parent (root → immediate parent), frozen at fork-time. The
+    /// immediate parent is encoded separately via the existing
+    /// `original_community_id` / `original_community_name` fields,
+    /// NOT duplicated here.
+    ///
+    /// Length capped at 16 entries at fork-build time (see
+    /// `community_fork.rs::build_fork_snapshot`). Phase 1 fork-invites
+    /// encode without this field; decoded as empty Vec via `default`.
+    #[serde(rename = "pl", skip_serializing_if = "Vec::is_empty", default)]
+    pub parent_lineage: Vec<ParentLineageEntry>,
 }
 
 impl CanonicalPayloadSealed for PreForkSnapshot {}
@@ -2028,6 +2040,7 @@ mod tests {
                 logical: 0,
                 device_id: "t".to_string(),
             },
+            parent_lineage: Vec::new(),
         };
 
         let bytes = canonical_cbor_encode(&snapshot).expect("encode");
@@ -2132,6 +2145,7 @@ mod tests {
                 logical: 0,
                 device_id: "t".to_string(),
             },
+            parent_lineage: Vec::new(),
         };
 
         let payload = CommunityInvitePayload {

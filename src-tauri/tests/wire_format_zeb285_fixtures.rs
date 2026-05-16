@@ -71,6 +71,9 @@ fn pre_fork_snapshot_canonical_cbor_pinned() {
         channel_log: BoundedChannelLogSnapshot::default(),
         identity_pubs: BTreeMap::new(),
         forked_at: fixture_hlc(),
+        // ZEB-287 Phase 2: empty lineage → skip-if-empty drops `pl` key,
+        // preserving Phase 1 byte-identity for this fixture.
+        parent_lineage: Vec::new(),
     };
 
     let bytes = canonical_cbor_encode(&snapshot).expect("encode");
@@ -96,6 +99,9 @@ fn community_invite_with_fork_fields_pinned() {
         channel_log: BoundedChannelLogSnapshot::default(),
         identity_pubs,
         forked_at: fixture_hlc(),
+        // ZEB-287 Phase 2: empty lineage → skip-if-empty preserves Phase 1
+        // byte-identity for this fixture.
+        parent_lineage: Vec::new(),
     };
 
     let payload = CommunityInvitePayload {
