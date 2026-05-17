@@ -17841,7 +17841,14 @@ async fn voting_get_poll(
             };
 
             // Find this node's own latest ballot (highest HLC among
-            // BallotCast events whose actor == self_owner).
+            // BallotCast events whose actor == self_owner). MUST use
+            // the full (wall_ms, logical, device_id) HLC comparator —
+            // tally_tier1 uses Hlc::is_strictly_newer_than which
+            // includes device_id, so a two-device tie at the same
+            // (wall_ms, logical) is deterministic in the tally but
+            // would be arbitrary here without the same tiebreaker,
+            // making the UI "your current ballot" diverge from what
+            // the tally actually counted. (Cursor #130 round-3 catch.)
             let your_ballot = if let Some(self_owner) = self_owner_opt {
                 state
                     .events
@@ -17851,10 +17858,11 @@ async fn voting_get_poll(
                             && ev.actor == self_owner
                     })
                     .max_by(|a, b| {
-                        a.hlc
-                            .wall_ms
-                            .cmp(&b.hlc.wall_ms)
-                            .then(a.hlc.logical.cmp(&b.hlc.logical))
+                        (a.hlc.wall_ms, a.hlc.logical, a.hlc.device_id.as_str()).cmp(&(
+                            b.hlc.wall_ms,
+                            b.hlc.logical,
+                            b.hlc.device_id.as_str(),
+                        ))
                     })
                     .and_then(|ev| {
                         ciborium::de::from_reader::<

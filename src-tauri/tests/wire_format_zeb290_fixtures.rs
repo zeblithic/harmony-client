@@ -164,14 +164,19 @@ fn envelope_ballotcast_canonical_cbor() {
     );
 }
 
+/// Shared payload shape for PollOpen, PollExtend, PollClose envelopes.
+/// (PollResult uses Tier1PollResultPayload from the approval module.)
+/// Locked here so any future schema bump that shifts envelope layout
+/// is caught for every event kind, not just the three with custom payloads.
+#[derive(serde::Serialize)]
+struct PollIdRef {
+    #[serde(rename = "pi")]
+    pi: PollId,
+}
+
 #[test]
 fn envelope_pollclose_canonical_cbor() {
-    #[derive(serde::Serialize)]
-    struct CloseRef {
-        #[serde(rename = "pi")]
-        pi: PollId,
-    }
-    let payload = encode(&CloseRef {
+    let payload = encode(&PollIdRef {
         pi: FIXTURE_POLL_ID,
     });
     let encoded = encode_envelope(PollEventKindCode::PollClose, payload);
@@ -183,17 +188,6 @@ fn envelope_pollclose_canonical_cbor() {
         actual_hex, EXPECTED_ENVELOPE_POLLCLOSE_HEX,
         "PollClose envelope wire format changed"
     );
-}
-
-/// PollOpen, PollExtend, and PollResult envelopes all carry the same
-/// `{ "pi": <PollId> }` shape in `pd`; the only wire difference is the
-/// `kd` discriminator. Wire-locked here so any future schema bump that
-/// shifts envelope layout is caught for every event kind, not just the
-/// three with custom payloads.
-#[derive(serde::Serialize)]
-struct PollIdRef {
-    #[serde(rename = "pi")]
-    pi: PollId,
 }
 
 #[test]
@@ -230,7 +224,6 @@ fn envelope_pollextend_canonical_cbor() {
 
 #[test]
 fn envelope_pollresult_canonical_cbor() {
-    use harmony_app::community_voting_approval::{Tier1PollResultPayload, Tier1Result};
     let payload_obj = Tier1PollResultPayload {
         poll_id: FIXTURE_POLL_ID,
         result: Tier1Result::Winners(vec![0, 2]),

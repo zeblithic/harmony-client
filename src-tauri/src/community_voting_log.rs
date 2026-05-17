@@ -336,19 +336,35 @@ impl VotingLog {
     /// `NodeState.voting_logs`.
     pub fn archive_finalized_polls(&mut self, now_wall_ms: u64) -> Vec<PollId> {
         let mut archived = Vec::new();
-        for (pid, state) in self.polls.iter_mut() {
+        // Collect the set of (poll_id) to archive in a first pass so we can
+        // also rewrite the top-level `events` vector below without holding
+        // a mutable borrow on `self.polls`.
+        let mut to_archive: Vec<PollId> = Vec::new();
+        for (pid, state) in self.polls.iter() {
             if state.meta.lifecycle != Lifecycle::Finalized {
                 continue;
             }
-            let finalized_at = state
+            let Some(fin_at) = state
                 .events
                 .iter()
                 .find(|e| e.kind == PollEventKindCode::PollResult)
-                .map(|e| e.hlc.wall_ms);
-            let Some(fin_at) = finalized_at else {
+                .map(|e| e.hlc.wall_ms)
+            else {
                 continue;
             };
             if now_wall_ms.saturating_sub(fin_at) > NINETY_DAYS_MS {
+                to_archive.push(*pid);
+            }
+        }
+
+        if to_archive.is_empty() {
+            return archived;
+        }
+        let archive_set: std::collections::HashSet<PollId> = to_archive.iter().copied().collect();
+
+        // Per-poll retain + lifecycle transition.
+        for pid in &to_archive {
+            if let Some(state) = self.polls.get_mut(pid) {
                 state.events.retain(|e| {
                     matches!(
                         e.kind,
@@ -359,6 +375,35 @@ impl VotingLog {
                 archived.push(*pid);
             }
         }
+
+        // Top-level events vector also needs to drop the same ballots
+        // (apply pushes into both locations; without this, the global
+        // log grows unboundedly even after archival — spec §2 says
+        // the archive sweep bounds disk use for a community's lifetime).
+        // Cursor #130 round-3 catch.
+        self.events.retain(|ev| {
+            // PollCreate of an archived poll is always retained (audit);
+            // we can't easily re-derive its PollId here without the
+            // community_id, but we don't need to — the per-poll retain
+            // above kept the PollCreate for archived polls too, and
+            // dropping a PollCreate would break R2 reproducibility on
+            // the still-archived PollResult.
+            if ev.kind == PollEventKindCode::PollCreate {
+                return true;
+            }
+            // Non-create events carry their poll-id reference in the
+            // payload. If the poll is in the archive set, retain only
+            // PollResult; otherwise (active poll, or undecodable payload
+            // we're being defensive about), keep the event.
+            let Some(pid) = decode_poll_id_ref(&ev.payload) else {
+                return true;
+            };
+            if !archive_set.contains(&pid) {
+                return true;
+            }
+            ev.kind == PollEventKindCode::PollResult
+        });
+
         archived
     }
 }
@@ -457,6 +502,135 @@ mod archive_tests {
         assert_eq!(archived, vec![pid]);
         assert_eq!(log.polls[&pid].meta.lifecycle, Lifecycle::Archived);
         assert_eq!(log.polls[&pid].events.len(), 2);
+    }
+
+    #[test]
+    fn archive_sweep_prunes_top_level_events_vector() {
+        // Build a Finalized poll with real `{ "pi": PollId }` payloads
+        // on non-create events so `decode_poll_id_ref` can route them
+        // in the top-level prune step. The shape-less make_event helper
+        // used by the other tests produces empty payloads; defensively
+        // those just stay in `log.events`, which is the safe-but-no-op
+        // path of the prune. This test exercises the actually-prunes
+        // path Cursor flagged on PR #130.
+        #[derive(serde::Serialize)]
+        struct PiRef {
+            #[serde(rename = "pi")]
+            pi: PollId,
+        }
+        let pid = PollId([0x99; 32]);
+        let mk = |kind: PollEventKindCode, wall_ms: u64| -> SignedVotingEvent {
+            let payload = if matches!(kind, PollEventKindCode::PollCreate) {
+                vec![]
+            } else {
+                let mut buf = Vec::new();
+                ciborium::into_writer(&PiRef { pi: pid }, &mut buf).unwrap();
+                buf
+            };
+            SignedVotingEvent {
+                tag: 'p',
+                version: 1,
+                tier: Tier::Approval,
+                kind,
+                hlc: Hlc {
+                    wall_ms,
+                    logical: 0,
+                    device_id: "a".into(),
+                },
+                actor: OwnerAddr([0xaa; 16]),
+                payload,
+                sig: vec![0u8; 64],
+            }
+        };
+
+        let create_ev = mk(PollEventKindCode::PollCreate, 0);
+        let close_ev = mk(PollEventKindCode::PollClose, 200);
+        let result_ev = mk(PollEventKindCode::PollResult, 300);
+        let ballots: Vec<SignedVotingEvent> = (0..5)
+            .map(|i| mk(PollEventKindCode::BallotCast, 100 + i))
+            .collect();
+
+        let mut log = VotingLog::new();
+        log.events.push(create_ev.clone());
+        for b in &ballots {
+            log.events.push(b.clone());
+        }
+        log.events.push(close_ev.clone());
+        log.events.push(result_ev.clone());
+
+        let mut per_poll_events = vec![create_ev.clone()];
+        per_poll_events.extend(ballots.iter().cloned());
+        per_poll_events.push(close_ev);
+        per_poll_events.push(result_ev);
+
+        let meta = PollMeta {
+            poll_id: pid,
+            community_id: SpaceId([0xcc; 16]),
+            creator: OwnerAddr([0xaa; 16]),
+            tier: Tier::Approval,
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            lifecycle: Lifecycle::Finalized,
+            created_at: Hlc {
+                wall_ms: 0,
+                logical: 0,
+                device_id: "a".into(),
+            },
+            opens_at: Hlc {
+                wall_ms: 0,
+                logical: 0,
+                device_id: "a".into(),
+            },
+            closes_at: Hlc {
+                wall_ms: 300,
+                logical: 0,
+                device_id: "a".into(),
+            },
+            extends_at: None,
+            channel_id: None,
+        };
+        log.polls.insert(
+            pid,
+            PollState {
+                meta,
+                events: per_poll_events,
+                tier_state: TierState::Empty,
+                tier1_cfg: None,
+                tier1_snapshot: None,
+            },
+        );
+
+        let before_total = log.events.len();
+        assert_eq!(
+            before_total, 8,
+            "8 events: create + 5 ballots + close + result"
+        );
+
+        let now_ms = 91 * 24 * 60 * 60 * 1000;
+        let archived = log.archive_finalized_polls(now_ms);
+        assert_eq!(archived, vec![pid]);
+        assert_eq!(
+            log.events.len(),
+            2,
+            "top-level events vector pruned to PollCreate + PollResult"
+        );
+        assert_eq!(
+            log.events
+                .iter()
+                .filter(|e| e.kind == PollEventKindCode::PollCreate)
+                .count(),
+            1
+        );
+        assert_eq!(
+            log.events
+                .iter()
+                .filter(|e| e.kind == PollEventKindCode::PollResult)
+                .count(),
+            1
+        );
     }
 
     #[test]
