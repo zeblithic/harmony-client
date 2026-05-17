@@ -22,6 +22,23 @@
   // Bidirectional sync: slider + number input share the same $state.
   // Both bind to proposedQuorum — changing either updates the other automatically.
 
+  // ZEB-250 R2 Fix 4: bind to <dialog> element so we can call showModal().
+  // showModal() enables the browser's native focus trap and Escape-to-close
+  // (via the 'cancel' event), unlike the declarative `open` attribute which
+  // leaves focus management to the page.
+  let dialogEl: HTMLDialogElement | undefined = $state();
+
+  $effect(() => {
+    if (dialogEl && !dialogEl.open) {
+      dialogEl.showModal();
+    }
+  });
+
+  function handleClose() {
+    dialogEl?.close();
+    onClose();
+  }
+
   async function propose() {
     if (proposedQuorum < 1 || proposedQuorum > currentAdminCount) {
       errorMessage = `Quorum must be between 1 and ${currentAdminCount}.`;
@@ -36,10 +53,10 @@
       });
       if (result.kind === 'Completed') {
         // Quorum=1 self-satisfied; close.
-        onClose();
+        handleClose();
       } else {
         // Pending; close — pending will appear in PendingAdminProposalsPanel.
-        onClose();
+        handleClose();
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -50,7 +67,7 @@
   }
 </script>
 
-<dialog open class="change-quorum-dialog" aria-label="Change admin quorum">
+<dialog bind:this={dialogEl} oncancel={handleClose} class="change-quorum-dialog" aria-label="Change admin quorum">
   <h2>Change admin quorum</h2>
   <p>
     Currently {currentQuorum} of {currentAdminCount} admin signatures are required to approve
@@ -81,7 +98,7 @@
   {/if}
 
   <div class="actions">
-    <button onclick={onClose} disabled={submitting}>Cancel</button>
+    <button onclick={handleClose} disabled={submitting}>Cancel</button>
     <button
       onclick={propose}
       disabled={submitting || proposedQuorum < 1 || proposedQuorum > currentAdminCount || proposedQuorum === currentQuorum}

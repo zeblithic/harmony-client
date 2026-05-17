@@ -15507,9 +15507,126 @@ pub fn compute_pending_admin_proposals(
     now_ms: u64,
 ) -> Vec<PendingAdminProposalDto> {
     use crate::community_membership::{
-        MembershipEventKind, ProposalKind, ADMIN_PROPOSAL_EXPIRY_MS,
+        EventId, MembershipEventKind, ProposalKind, ADMIN_PROPOSAL_EXPIRY_MS,
     };
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
+
+    // ZEB-250 R2 Fix 3: compute per-proposal historical admin_quorum.
+    //
+    // Walk events in HLC order, maintaining a running admin_quorum (mirrors
+    // materialize's main-pass logic). For each AdminProposal encountered,
+    // record the CURRENT running_quorum as the proposal's quorum_required.
+    // This prevents a post-materialize ChangeQuorum from incorrectly showing
+    // older proposals as "Pending 1 of 2" when they self-satisfied under
+    // quorum=1 before the threshold changed.
+    //
+    // Initialization heuristic: if the event log contains NO AdminProposal
+    // events of kind ChangeQuorum, the quorum level was established before
+    // the visible log window. In that case, use the passed-in `admin_quorum`
+    // (the post-materialize final value) as the baseline so all proposals
+    // correctly reflect the quorum that was in effect. If the log DOES
+    // contain ChangeQuorum proposals, rebuild the history from quorum=1
+    // (the community default) to derive per-proposal historical values.
+    let proposal_quorum_map: HashMap<EventId, u8> = {
+        // Determine whether the event log contains any ChangeQuorum proposals.
+        // If not, all proposals share the same `admin_quorum` and we skip
+        // the more expensive forward-walk derivation.
+        let has_change_quorum_events = events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                MembershipEventKind::AdminProposal {
+                    proposal_kind: ProposalKind::ChangeQuorum { .. }
+                }
+            )
+        });
+
+        if !has_change_quorum_events {
+            // No ChangeQuorum in log: all proposals were filed under the same
+            // admin_quorum. Build a trivial map from each AdminProposal id →
+            // admin_quorum.
+            events
+                .iter()
+                .filter_map(|e| {
+                    if matches!(e.kind, MembershipEventKind::AdminProposal { .. }) {
+                        Some((e.id, admin_quorum))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            // Sort by event_sort_key (same total order as materialize).
+            let mut sorted_events: Vec<&crate::community_membership::SignedMembershipEvent> =
+                events.iter().collect();
+            sorted_events.sort_by(|a, b| {
+                crate::community_membership::event_sort_key(a)
+                    .cmp(&crate::community_membership::event_sort_key(b))
+            });
+
+            let mut map: HashMap<EventId, u8> = HashMap::new();
+            // Walk events forward in HLC order, recording the running admin_quorum
+            // at each proposal's HLC, then updating it when a ChangeQuorum proposal
+            // fires. Community starts at quorum=1 (the default initial value).
+            let mut running_quorum: u8 = 1;
+
+            // Running signer set per proposal (for detecting ChangeQuorum fire).
+            let mut q_signers: HashMap<EventId, HashSet<crate::owner_state_types::OwnerAddr>> =
+                HashMap::new();
+            let mut q_applied: HashSet<EventId> = HashSet::new();
+            let mut q_seen: HashSet<EventId> = HashSet::new();
+
+            for ev in &sorted_events {
+                match &ev.kind {
+                    MembershipEventKind::AdminProposal { proposal_kind } => {
+                        // Record running_quorum AT this proposal's HLC.
+                        map.insert(ev.id, running_quorum);
+                        q_seen.insert(ev.id);
+                        let sset = q_signers.entry(ev.id).or_default();
+                        sset.insert(ev.actor);
+                        let count = sset.len();
+                        if !q_applied.contains(&ev.id) && count >= running_quorum as usize {
+                            // Self-satisfy: apply ChangeQuorum effect on running_quorum.
+                            if let ProposalKind::ChangeQuorum { new_quorum } = proposal_kind {
+                                running_quorum = *new_quorum;
+                            }
+                            q_applied.insert(ev.id);
+                        }
+                    }
+                    MembershipEventKind::AdminCountersign { target_event_id } => {
+                        if !q_seen.contains(target_event_id) {
+                            // Forward-ref: queue signer for when proposal is seen.
+                            q_signers
+                                .entry(*target_event_id)
+                                .or_default()
+                                .insert(ev.actor);
+                        } else if !q_applied.contains(target_event_id) {
+                            let sset = q_signers.entry(*target_event_id).or_default();
+                            sset.insert(ev.actor);
+                            let count = sset.len();
+                            // Get the quorum that was in effect at this proposal's HLC.
+                            let prop_quorum = map.get(target_event_id).copied().unwrap_or(1);
+                            if count >= prop_quorum as usize {
+                                // Find the proposal kind to apply ChangeQuorum if needed.
+                                if let Some(prop_ev) =
+                                    sorted_events.iter().find(|e| e.id == *target_event_id)
+                                {
+                                    if let MembershipEventKind::AdminProposal {
+                                        proposal_kind: ProposalKind::ChangeQuorum { new_quorum },
+                                    } = &prop_ev.kind
+                                    {
+                                        running_quorum = *new_quorum;
+                                    }
+                                }
+                                q_applied.insert(*target_event_id);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            map
+        }
+    };
 
     let mut dtos: Vec<PendingAdminProposalDto> = Vec::new();
 
@@ -15518,6 +15635,15 @@ pub fn compute_pending_admin_proposals(
             MembershipEventKind::AdminProposal { proposal_kind } => proposal_kind,
             _ => continue,
         };
+
+        // ZEB-250 R2 Fix 3: use the per-proposal historical quorum, not the
+        // post-materialize final value. Falls back to the passed-in admin_quorum
+        // (the final value) for proposals not found in the map (shouldn't happen
+        // in well-formed logs).
+        let quorum_required = proposal_quorum_map
+            .get(&event.id)
+            .copied()
+            .unwrap_or(admin_quorum);
 
         // Collect distinct signers: the proposer + every AdminCountersign actor
         // targeting this proposal's event_id.
@@ -15538,7 +15664,7 @@ pub fn compute_pending_admin_proposals(
 
         // effective: quorum reached AND the Nth signer arrived within the window.
         // Must be computed BEFORE expired so the expired flag can reference it.
-        let effective = signers_so_far >= admin_quorum && {
+        let effective = signers_so_far >= quorum_required && {
             let mut signing_wall_ms: Vec<u64> = events
                 .iter()
                 .filter(|e| match &e.kind {
@@ -15552,7 +15678,7 @@ pub fn compute_pending_admin_proposals(
                 .collect();
             signing_wall_ms.sort_unstable();
             signing_wall_ms
-                .get((admin_quorum as usize).saturating_sub(1))
+                .get((quorum_required as usize).saturating_sub(1))
                 .map(|&nth_ms| nth_ms.saturating_sub(event.at.wall_ms) <= ADMIN_PROPOSAL_EXPIRY_MS)
                 .unwrap_or(false)
         };
@@ -15600,7 +15726,7 @@ pub fn compute_pending_admin_proposals(
             proposal_kind: kind_dto,
             proposed_at_wall_ms: event.at.wall_ms,
             signers_so_far,
-            quorum_required: admin_quorum,
+            quorum_required,
             expired,
             effective,
             self_has_signed,
@@ -20849,6 +20975,124 @@ mod list_pending_admin_proposals_tests {
             "proposal with late Nth countersign (age > 30d, not effective) must be expired"
         );
         assert_eq!(dto.signers_so_far, 2, "two signers were recorded");
+    }
+
+    // ── Test 5: compute_pending_admin_proposals_reports_per_proposal_historical_quorum ──
+    //
+    // ZEB-250 R2 Fix 3: each proposal's quorum_required must reflect the running
+    // admin_quorum AT the proposal's HLC, not the post-materialize final value.
+    //
+    // Scenario:
+    //   - admin1 alone, quorum=1.
+    //   - P1 at HLC=10: SetPower promoting bob to admin. Self-satisfies at quorum=1.
+    //   - After P1: bob is admin; quorum still 1.
+    //   - P2 at HLC=20: ChangeQuorum=2. Self-satisfies at quorum=1.
+    //   - After P2: quorum=2.
+    //   - P3 at HLC=30: SetPower promoting charlie to admin. Requires quorum=2.
+    //
+    // After compute_pending_admin_proposals with post-materialize admin_quorum=2:
+    //   - P1 DTO: quorum_required = 1 (NOT 2 — historical value at HLC=10)
+    //   - P2 DTO: quorum_required = 1
+    //   - P3 DTO: quorum_required = 2
+    #[tokio::test]
+    async fn compute_pending_admin_proposals_reports_per_proposal_historical_quorum() {
+        let admin1 = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let charlie = OwnerAddr([0x03; 16]);
+
+        let p1_id = [0x01; 16]; // SetPower(bob→admin) at quorum=1
+        let p2_id = [0x02; 16]; // ChangeQuorum=2 at quorum=1
+        let p3_id = [0x03; 16]; // SetPower(charlie→admin) at quorum=2
+
+        let events = vec![
+            // P1: promote bob at quorum=1 (self-satisfies).
+            make_event(
+                p1_id,
+                admin1,
+                10,
+                MembershipEventKind::AdminProposal {
+                    proposal_kind: ProposalKind::SetPower {
+                        target: bob,
+                        level: 100,
+                    },
+                },
+            ),
+            // P2: raise quorum to 2 (self-satisfies at quorum=1).
+            make_event(
+                p2_id,
+                admin1,
+                20,
+                MembershipEventKind::AdminProposal {
+                    proposal_kind: ProposalKind::ChangeQuorum { new_quorum: 2 },
+                },
+            ),
+            // P3: propose charlie promotion at quorum=2 (still pending, no countersign).
+            make_event(
+                p3_id,
+                admin1,
+                30,
+                MembershipEventKind::AdminProposal {
+                    proposal_kind: ProposalKind::SetPower {
+                        target: charlie,
+                        level: 100,
+                    },
+                },
+            ),
+        ];
+
+        // Pass post-materialize admin_quorum=2 (the final value).
+        let now_ms = 1_000_000;
+        let dtos = compute_pending_admin_proposals(&events, admin1, 2, now_ms);
+
+        // Should have 3 DTOs.
+        assert_eq!(dtos.len(), 3, "must return one DTO per AdminProposal");
+
+        // Find each DTO by event_id hex.
+        let find_dto = |id: [u8; 16]| {
+            dtos.iter()
+                .find(|d| d.event_id == hex::encode(id))
+                .expect("DTO not found")
+        };
+
+        let p1_dto = find_dto(p1_id);
+        let p2_dto = find_dto(p2_id);
+        let p3_dto = find_dto(p3_id);
+
+        // P1 was filed at quorum=1 → quorum_required must be 1, NOT post-materialize 2.
+        assert_eq!(
+            p1_dto.quorum_required, 1,
+            "P1 quorum_required must be 1 (historical value at HLC=10, before ChangeQuorum)"
+        );
+        // P1 self-satisfied: 1 signer (admin1) >= quorum=1.
+        assert!(
+            p1_dto.effective,
+            "P1 must be effective (self-satisfied at quorum=1)"
+        );
+
+        // P2 was also filed at quorum=1 → quorum_required must be 1.
+        assert_eq!(
+            p2_dto.quorum_required, 1,
+            "P2 quorum_required must be 1 (historical value at HLC=20)"
+        );
+        assert!(
+            p2_dto.effective,
+            "P2 must be effective (ChangeQuorum self-satisfied at quorum=1)"
+        );
+
+        // P3 was filed AFTER ChangeQuorum → quorum_required must be 2.
+        assert_eq!(
+            p3_dto.quorum_required, 2,
+            "P3 quorum_required must be 2 (historical value at HLC=30, after ChangeQuorum)"
+        );
+        // P3 has only 1 signer (admin1), quorum=2 not met.
+        assert!(
+            !p3_dto.effective,
+            "P3 must not be effective (quorum=2 not met)"
+        );
+        assert!(
+            !p3_dto.expired,
+            "P3 must not be expired (within 30-day window)"
+        );
     }
 }
 

@@ -29,3 +29,22 @@ if (typeof jsdom !== 'undefined' && jsdom.window) {
     configurable: true,
   });
 }
+
+// jsdom does not implement the <dialog> showModal() / close() APIs.
+// Polyfill them so components that use dialog.showModal() for native
+// focus-trap + Escape handling work in vitest without throwing TypeError.
+//
+// The polyfill sets the `open` attribute (matching what the browser does
+// after showModal()) so testing-library queries still see the dialog as
+// visible. `close()` removes the `open` attribute and fires 'close'.
+if (!HTMLDialogElement.prototype.showModal) {
+  HTMLDialogElement.prototype.showModal = function () {
+    this.setAttribute('open', '');
+  };
+}
+if (!HTMLDialogElement.prototype.close) {
+  HTMLDialogElement.prototype.close = function () {
+    this.removeAttribute('open');
+    this.dispatchEvent(new Event('close'));
+  };
+}

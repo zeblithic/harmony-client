@@ -1378,6 +1378,25 @@ pub fn materialize_with_now(
         std::collections::HashSet<OwnerAddr>,
     > = std::collections::HashMap::new();
 
+    // ZEB-250 R2 Bug-fix (a+b):
+    //
+    // (a) applied_admin_proposals: sticky guard preventing double-application
+    //     when a ChangeQuorum proposal lowers the threshold AFTER the effect
+    //     was already applied. Without this guard, subsequent countersigns
+    //     could re-cross the (now lower) threshold and apply the effect again.
+    //
+    // (b) seen_admin_proposals: tracks which proposal events have been
+    //     reached in HLC order. AdminCountersign events whose target proposal
+    //     hasn't been seen yet are "forward-ref" countersigns (clock-skewed
+    //     or out-of-order DAG delivery). We queue the signer but skip
+    //     triggering — the proposal's own arm (when it is reached) will fire
+    //     with the already-populated signer_set and use >= to catch the case
+    //     where count is already at quorum by proposer-arm time.
+    let mut applied_admin_proposals: std::collections::HashSet<EventId> =
+        std::collections::HashSet::new();
+    let mut seen_admin_proposals: std::collections::HashSet<EventId> =
+        std::collections::HashSet::new();
+
     for (idx, event) in sorted.iter().enumerate() {
         match &event.kind {
             MembershipEventKind::Join => {
@@ -1892,20 +1911,34 @@ pub fn materialize_with_now(
                 // the effect immediately. If admin_quorum > 1, we insert the
                 // proposer into running_signers_seen but don't apply yet —
                 // the later countersign that crosses the threshold will apply.
+                //
+                // ZEB-250 R2 fix (b): mark this proposal as seen so the
+                // AdminCountersign arm knows the proposal has been reached
+                // in HLC order (forward-ref countersigns queue the signer
+                // but don't trigger; the proposer arm fires instead).
+                seen_admin_proposals.insert(event.id);
                 let admin_quorum_now = m.admin_quorum as usize;
-                let proposer_wall_ms = event.at.wall_ms;
                 let signer_set = running_signers_seen.entry(event.id).or_default();
                 signer_set.insert(event.actor);
                 let count_now = signer_set.len();
-                if count_now >= admin_quorum_now && admin_quorum_now > 0 {
-                    // This event IS the Nth signer. The age is 0 (proposer ==
-                    // Nth signer at quorum=1, same event's wall_ms).
-                    let age_when_reached = event.at.wall_ms.saturating_sub(proposer_wall_ms);
+                // ZEB-250 R2 fix (a): use >= (not ==) so a forward-ref
+                // countersign that sorted before the proposer (out-of-order
+                // DAG delivery) doesn't bypass the trigger when count is
+                // already >= quorum by proposer-arm time.
+                // Sticky applied guard prevents double-application.
+                if !applied_admin_proposals.contains(&event.id)
+                    && count_now >= admin_quorum_now
+                    && admin_quorum_now > 0
+                {
+                    // This event IS the trigger. Age = 0 since proposer
+                    // wall_ms == event.at.wall_ms for the self-satisfy path.
+                    let age_when_reached = event.at.wall_ms.saturating_sub(event.at.wall_ms);
                     if age_when_reached <= ADMIN_PROPOSAL_EXPIRY_MS {
                         if let Some((kind, _proposer, _proposer_wall_ms)) =
                             proposals_index.get(&event.id).cloned()
                         {
                             apply_admin_proposal_effect(&mut m, &kind, event);
+                            applied_admin_proposals.insert(event.id);
                         }
                     }
                 }
@@ -1921,7 +1954,24 @@ pub fn materialize_with_now(
                 // This guarantees events between AdminProposal HLC and this
                 // countersign's HLC were materialized under the OLD state,
                 // matching CRDT causality (§5.3).
-                if let Some((kind, _proposer_addr, proposer_wall_ms)) =
+                //
+                // ZEB-250 R2 fix (b): if the target proposal hasn't been seen
+                // yet in HLC order (forward-ref countersign from out-of-order
+                // DAG delivery), queue the signer in running_signers_seen but
+                // do NOT trigger application. The proposal's own arm will fire
+                // later with this signer already in the set, and >= will catch
+                // the case where count is already at quorum by proposer-arm time.
+                if !seen_admin_proposals.contains(target_event_id) {
+                    // Forward-ref: queue the signer for when the proposal arrives.
+                    let signer_set = running_signers_seen.entry(*target_event_id).or_default();
+                    signer_set.insert(event.actor);
+                    // Don't trigger application — proposal arm handles it.
+                } else if applied_admin_proposals.contains(target_event_id) {
+                    // ZEB-250 R2 fix (a): idempotent re-trigger guard.
+                    // If already applied (e.g., ChangeQuorum lowered the
+                    // threshold so count now re-crosses the new threshold),
+                    // skip to avoid double-application.
+                } else if let Some((kind, _proposer_addr, proposer_wall_ms)) =
                     proposals_index.get(target_event_id).cloned()
                 {
                     let admin_quorum_now = m.admin_quorum as usize;
@@ -1934,26 +1984,19 @@ pub fn materialize_with_now(
                     if count_now == admin_quorum_now && admin_quorum_now > 0 {
                         let age_when_reached = event.at.wall_ms.saturating_sub(proposer_wall_ms);
                         if age_when_reached <= ADMIN_PROPOSAL_EXPIRY_MS {
-                            // Temporarily construct a proxy event so
-                            // apply_admin_proposal_effect records the correct
-                            // actor (the proposer) and HLC semantics. We pass
-                            // the proposal's own event fetched from proposals_index.
-                            // Because apply_admin_proposal_effect only reads
-                            // `event.actor` for Kick effects (to set kicked_by),
-                            // we look up the proposer's full event if needed.
-                            // For simplicity: re-fetch the original proposal
-                            // event from sorted to pass correct actor/HLC.
-                            if let Some(proposal_event) =
-                                sorted.iter().find(|e| e.id == *target_event_id).copied()
-                            {
-                                apply_admin_proposal_effect(&mut m, &kind, proposal_event);
-                            }
+                            // ZEB-250 R2 Fix 2: pass THIS event (the countersign
+                            // that tipped quorum) as effective_event so
+                            // apply_admin_proposal_effect's left_at uses the
+                            // Nth-signer HLC, not the proposal's original HLC.
+                            // Preserves CRDT causality: moderation is not backdated.
+                            apply_admin_proposal_effect(&mut m, &kind, event);
+                            applied_admin_proposals.insert(*target_event_id);
                         }
                     }
                 }
-                // else: countersign targets an unknown proposal (forward-ref
-                // from out-of-order DAG-sync) — ignore; materialize will
-                // reprocess when the proposal arrives.
+                // else: countersign targets an unknown proposal and target IS
+                // in seen_admin_proposals but not in proposals_index — shouldn't
+                // happen in a well-formed log; silently skip.
             }
         }
     }
@@ -2879,10 +2922,16 @@ pub const ADMIN_PROPOSAL_EXPIRY_MS: u64 = 30 * 86_400_000;
 /// materialized state when the proposal has reached quorum within the
 /// 30-day window. Translates the wrapped ProposalKind into the same
 /// mutation that a direct SetPower / Kick / ChangeQuorum would produce.
+///
+/// `effective_event` is the event that TIPPED the quorum threshold: the
+/// AdminProposal itself (when admin_quorum == 1, self-satisfy path) or
+/// the AdminCountersign that added the Nth signer (quorum > 1 path).
+/// Using the trigger event's HLC ensures `left_at` is set to when the
+/// decision was actually reached, not backdated to the proposal's HLC.
 fn apply_admin_proposal_effect(
     m: &mut MaterializedMembership,
     proposal_kind: &ProposalKind,
-    proposal_event: &SignedMembershipEvent,
+    effective_event: &SignedMembershipEvent,
 ) {
     match proposal_kind {
         ProposalKind::SetPower { target, level } => {
@@ -2897,7 +2946,10 @@ fn apply_admin_proposal_effect(
             let prior_status = m.members.get(target).map(|s| s.status);
             if let Some(ms) = m.members.get_mut(target) {
                 ms.status = MemberStatus::Banned;
-                ms.left_at = Some(proposal_event.at.clone());
+                // ZEB-250 R2 Fix 2: use effective_event.at (the trigger
+                // event's HLC) so left_at reflects when quorum was reached,
+                // not the proposal's original HLC.
+                ms.left_at = Some(effective_event.at.clone());
             }
             // Mirror the direct Kick arm: track that a rotation is needed,
             // EXCEPT when kicking a PendingJoin (they never received epoch
@@ -8081,6 +8133,226 @@ mod zeb_250_admin_proposal_materialize_tests {
         assert!(
             m.pending_rotation_for.contains(&target),
             "kick-via-quorum must add target to pending_rotation_for"
+        );
+    }
+
+    /// ZEB-250 R2 Fix 1: forward-ref countersign (wall_ms < proposal wall_ms
+    /// due to clock-skew / out-of-order DAG delivery). The countersign sorts
+    /// BEFORE the proposal in HLC order; the proposal arm fires with the signer
+    /// already in the set and >= catches the already-at-quorum case.
+    #[test]
+    fn materialize_proposal_with_forward_ref_countersigns_applied_at_proposer_hlc() {
+        let admin1 = OwnerAddr([0x01; 16]);
+        let admin2 = OwnerAddr([0x02; 16]);
+
+        // Bootstrap: quorum=1 → raise to 2 via sole-signer ChangeQuorum.
+        let mut events = bootstrap_two_admins_raise_quorum(admin1, admin2, 2);
+
+        let prop_id = [0xDD; 16];
+
+        // Forward-ref countersign at wall_ms=19_900 (BEFORE the proposal at 20_000).
+        // In HLC sort order this countersign will appear before the AdminProposal
+        // because its wall_ms is smaller. The proposal arm must still apply the
+        // effect (count >= quorum) using the already-populated signer set.
+        events.push(ev(
+            [0xEE; 16],
+            admin2,
+            19_900, // BEFORE prop at 20_000
+            MembershipEventKind::AdminCountersign {
+                target_event_id: prop_id,
+            },
+        ));
+
+        // Proposal at 20_000 — admin1 is the second signer (plus admin2 above = 2 total).
+        // The proposer arm runs AFTER the forward-ref countersign in HLC order.
+        events.push(ev(
+            prop_id,
+            admin1,
+            20_000,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::SetPower {
+                    target: admin2,
+                    level: 50,
+                },
+            },
+        ));
+
+        let m = materialize(&events, admin1);
+
+        // Effect must have applied: admin2 power drops to 50.
+        assert_eq!(
+            m.power_levels.get(&admin2).copied().unwrap_or(0),
+            50,
+            "forward-ref countersign must not prevent proposer-arm application when count >= quorum"
+        );
+    }
+
+    /// ZEB-250 R2 Fix 2: kick via quorum — left_at must be set to the
+    /// COUNTERSIGN event's HLC (the Nth signer that tipped quorum), not
+    /// the proposal's original HLC. Preserves CRDT causality.
+    #[test]
+    fn materialize_kick_via_quorum_left_at_equals_countersign_hlc_not_proposal_hlc() {
+        let admin1 = OwnerAddr([0x01; 16]);
+        let admin2 = OwnerAddr([0x02; 16]);
+        let target = OwnerAddr([0x03; 16]);
+
+        let mut events = bootstrap_two_admins_raise_quorum(admin1, admin2, 2);
+
+        // target must join so the Kick arm has a member entry.
+        events.push(ev([0x90; 16], target, 5_000, MembershipEventKind::Join));
+
+        let prop_id = [0xDD; 16];
+        let prop_wall_ms: u64 = 20_000;
+        let countersign_wall_ms: u64 = 21_000;
+
+        events.push(ev(
+            prop_id,
+            admin1,
+            prop_wall_ms,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::Kick {
+                    target,
+                    reason: None,
+                },
+            },
+        ));
+        events.push(ev(
+            [0xEE; 16],
+            admin2,
+            countersign_wall_ms,
+            MembershipEventKind::AdminCountersign {
+                target_event_id: prop_id,
+            },
+        ));
+
+        let m = materialize(&events, admin1);
+
+        let ms = m
+            .members
+            .get(&target)
+            .expect("target must be in members map");
+        assert_eq!(ms.status, MemberStatus::Banned);
+        let left_at = ms.left_at.as_ref().expect("left_at must be set");
+        assert_eq!(
+            left_at.wall_ms, countersign_wall_ms,
+            "left_at.wall_ms must equal the countersign HLC (Nth signer), not the proposal HLC"
+        );
+        assert_ne!(
+            left_at.wall_ms, prop_wall_ms,
+            "left_at must NOT be backdated to the proposal's HLC"
+        );
+    }
+
+    /// ZEB-250 R2 Fix 1b: sticky applied guard. After a ChangeQuorum proposal
+    /// lowers the threshold, subsequent countersigns on a prior proposal must NOT
+    /// re-apply its effect.
+    #[test]
+    fn materialize_applied_guard_prevents_double_application_after_change_quorum() {
+        let admin1 = OwnerAddr([0x01; 16]);
+        let admin2 = OwnerAddr([0x02; 16]);
+        let admin3 = OwnerAddr([0x04; 16]);
+        let target = OwnerAddr([0x03; 16]);
+
+        // Bootstrap three admins at quorum=1, then raise quorum to 3.
+        let mut events = vec![
+            ev([0x80; 16], admin2, 1_000, MembershipEventKind::Join),
+            ev(
+                [0x81; 16],
+                admin1,
+                2_000,
+                MembershipEventKind::SetPower {
+                    target: admin2,
+                    level: 100,
+                },
+            ),
+            ev([0x82; 16], admin3, 3_000, MembershipEventKind::Join),
+            ev(
+                [0x83; 16],
+                admin1,
+                4_000,
+                MembershipEventKind::SetPower {
+                    target: admin3,
+                    level: 100,
+                },
+            ),
+            // Raise to quorum=3.
+            ev(
+                [0xCC; 16],
+                admin1,
+                10_000,
+                MembershipEventKind::AdminProposal {
+                    proposal_kind: ProposalKind::ChangeQuorum { new_quorum: 3 },
+                },
+            ),
+        ];
+
+        // Propose SetPower for target at quorum=3.
+        let prop_id = [0xDD; 16];
+        events.push(ev(
+            prop_id,
+            admin1,
+            20_000,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::SetPower { target, level: 100 },
+            },
+        ));
+        // admin2 + admin3 countersign → 3 signers, quorum=3 satisfied. Effect applied.
+        events.push(ev(
+            [0xEE; 16],
+            admin2,
+            21_000,
+            MembershipEventKind::AdminCountersign {
+                target_event_id: prop_id,
+            },
+        ));
+        events.push(ev(
+            [0xFF; 16],
+            admin3,
+            22_000,
+            MembershipEventKind::AdminCountersign {
+                target_event_id: prop_id,
+            },
+        ));
+
+        // Now a ChangeQuorum lowers the quorum to 2. This must NOT cause the
+        // above proposal (already applied at quorum=3) to be "re-applied" for
+        // any hypothetical 4th countersign.
+        // Propose + countersign ChangeQuorum(2) requiring all 3 admins again.
+        let cq_id = [0xA1; 16];
+        events.push(ev(
+            cq_id,
+            admin1,
+            30_000,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::ChangeQuorum { new_quorum: 2 },
+            },
+        ));
+        events.push(ev(
+            [0xA2; 16],
+            admin2,
+            31_000,
+            MembershipEventKind::AdminCountersign {
+                target_event_id: cq_id,
+            },
+        ));
+        events.push(ev(
+            [0xA3; 16],
+            admin3,
+            32_000,
+            MembershipEventKind::AdminCountersign {
+                target_event_id: cq_id,
+            },
+        ));
+
+        let m = materialize(&events, admin1);
+
+        // quorum is now 2.
+        assert_eq!(m.admin_quorum, 2);
+        // target was promoted to 100 exactly once.
+        assert_eq!(
+            m.power_levels.get(&target).copied().unwrap_or(0),
+            100,
+            "target must be promoted to 100 (effect applied exactly once)"
         );
     }
 }
