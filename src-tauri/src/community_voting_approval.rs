@@ -581,3 +581,210 @@ mod tally_tests {
         assert_eq!(t.ballot_count, 3);
     }
 }
+
+/// Final result of a Tier 1 poll. Spec §4 result variants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Tier1Result {
+    /// One or more winners (option indices, sorted ascending in case
+    /// of multi-winner; first is highest count).
+    #[serde(rename = "w")]
+    Winners(Vec<u8>),
+    /// Insufficient ballots to meet quorum requirement.
+    #[serde(rename = "q")]
+    NoQuorum {
+        #[serde(rename = "n")]
+        required: u32,
+        #[serde(rename = "a")]
+        actual: u32,
+    },
+    /// Winner exists but didn't meet the supermajority threshold.
+    #[serde(rename = "m")]
+    NoMajority {
+        #[serde(rename = "n")]
+        required_percent: u8,
+        #[serde(rename = "p")]
+        actual_percent: u8,
+    },
+}
+
+/// Apply spec §4 tally algorithm steps 5-9 to compute the final result.
+pub fn finalize_tier1(cfg: &Tier1PollConfig, tally: &Tier1TallyState) -> Tier1Result {
+    // Step 5: quorum check.
+    if let Some(q) = cfg.quorum {
+        if tally.ballot_count < q {
+            return Tier1Result::NoQuorum {
+                required: q,
+                actual: tally.ballot_count,
+            };
+        }
+    }
+
+    // Step 6: sort options by count desc; tie-break by index asc.
+    let mut sorted: Vec<(usize, u32)> = tally
+        .counts
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| (i, c))
+        .collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    // Step 7: multi-winner top-N.
+    let mw = cfg.multi_winner.unwrap_or(1) as usize;
+    let winners: Vec<(usize, u32)> = sorted.iter().take(mw).copied().collect();
+
+    // Step 8: threshold check on the Nth winner (skipped when no ballots,
+    // so an unconstrained empty poll still emits Winners for stable output).
+    if let Some(th) = cfg.threshold_percent {
+        if tally.ballot_count > 0 {
+            let nth_winner_count = winners[mw - 1].1;
+            let actual_percent =
+                ((nth_winner_count as u64 * 100) / tally.ballot_count as u64) as u8;
+            if actual_percent < th {
+                return Tier1Result::NoMajority {
+                    required_percent: th,
+                    actual_percent,
+                };
+            }
+        }
+    }
+
+    // Step 9: return Winners (sorted ascending by index for stable output).
+    let mut winner_indices: Vec<u8> = winners.iter().map(|(i, _)| *i as u8).collect();
+    winner_indices.sort();
+    Tier1Result::Winners(winner_indices)
+}
+
+#[cfg(test)]
+mod result_tests {
+    use super::*;
+
+    fn cfg(
+        opts: usize,
+        quorum: Option<u32>,
+        threshold: Option<u8>,
+        mw: Option<u8>,
+    ) -> Tier1PollConfig {
+        Tier1PollConfig {
+            options: (0..opts).map(|i| format!("opt{i}")).collect(),
+            window_seconds: 3600,
+            quorum,
+            threshold_percent: threshold,
+            multi_winner: mw,
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            channel_id: ChannelId([0; 16]),
+        }
+    }
+
+    fn tally(counts: Vec<u32>, ballot_count: u32) -> Tier1TallyState {
+        Tier1TallyState {
+            counts,
+            ballot_count,
+            latest_ballots: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn single_winner_clear_majority() {
+        let r = finalize_tier1(&cfg(3, None, None, None), &tally(vec![5, 2, 1], 8));
+        assert_eq!(r, Tier1Result::Winners(vec![0]));
+    }
+
+    #[test]
+    fn tie_break_by_lower_index() {
+        let r = finalize_tier1(&cfg(3, None, None, None), &tally(vec![3, 3, 1], 7));
+        assert_eq!(r, Tier1Result::Winners(vec![0]));
+    }
+
+    #[test]
+    fn no_quorum_emitted() {
+        let r = finalize_tier1(&cfg(3, Some(10), None, None), &tally(vec![3, 2, 1], 6));
+        assert_eq!(
+            r,
+            Tier1Result::NoQuorum {
+                required: 10,
+                actual: 6,
+            }
+        );
+    }
+
+    #[test]
+    fn no_majority_emitted() {
+        let r = finalize_tier1(&cfg(3, None, Some(50), None), &tally(vec![3, 2, 1], 10));
+        assert_eq!(
+            r,
+            Tier1Result::NoMajority {
+                required_percent: 50,
+                actual_percent: 30,
+            }
+        );
+    }
+
+    #[test]
+    fn supermajority_threshold_passes() {
+        let r = finalize_tier1(&cfg(3, None, Some(50), None), &tally(vec![7, 2, 1], 10));
+        assert_eq!(r, Tier1Result::Winners(vec![0]));
+    }
+
+    #[test]
+    fn multi_winner_top_two() {
+        let r = finalize_tier1(&cfg(4, None, None, Some(2)), &tally(vec![5, 4, 2, 1], 12));
+        assert_eq!(r, Tier1Result::Winners(vec![0, 1]));
+    }
+
+    #[test]
+    fn multi_winner_with_threshold_checks_nth_winner() {
+        let r = finalize_tier1(
+            &cfg(4, None, Some(30), Some(2)),
+            &tally(vec![5, 4, 2, 1], 12),
+        );
+        assert_eq!(r, Tier1Result::Winners(vec![0, 1]));
+
+        let r2 = finalize_tier1(
+            &cfg(4, None, Some(50), Some(2)),
+            &tally(vec![5, 4, 2, 1], 12),
+        );
+        assert_eq!(
+            r2,
+            Tier1Result::NoMajority {
+                required_percent: 50,
+                actual_percent: 33,
+            }
+        );
+    }
+
+    #[test]
+    fn quorum_checked_before_threshold() {
+        let r = finalize_tier1(&cfg(3, Some(10), Some(50), None), &tally(vec![5, 0, 0], 5));
+        assert!(matches!(r, Tier1Result::NoQuorum { .. }));
+    }
+
+    #[test]
+    fn empty_ballots_with_no_constraints() {
+        let r = finalize_tier1(&cfg(3, None, None, None), &tally(vec![0, 0, 0], 0));
+        assert_eq!(r, Tier1Result::Winners(vec![0]));
+    }
+
+    #[test]
+    fn result_round_trips_via_cbor() {
+        for r in &[
+            Tier1Result::Winners(vec![0, 2]),
+            Tier1Result::NoQuorum {
+                required: 5,
+                actual: 2,
+            },
+            Tier1Result::NoMajority {
+                required_percent: 50,
+                actual_percent: 33,
+            },
+        ] {
+            let mut encoded = Vec::new();
+            ciborium::into_writer(r, &mut encoded).expect("encode");
+            let decoded: Tier1Result = ciborium::from_reader(&encoded[..]).expect("decode");
+            assert_eq!(*r, decoded);
+        }
+    }
+}
