@@ -203,7 +203,7 @@ Chat-native, no draft phase. `PollCreate` opens the poll immediately. Auto-close
 5. If `q` set and len(ballots) < q: result = NoQuorum.
 6. Sort options by count descending; tie-break by option index ascending.
 7. winners = top mw.unwrap_or(1) options.
-8. If `th` set and winners[mw-1].count < th * len(ballots) / 100: result = NoMajority.
+8. If `th` set and `winners[mw-1].count * 100 / len(ballots) < th`: result = NoMajority. (Use the count-side multiplication so integer truncation rounds against the winner, never against the threshold — `50 * 3 / 100 = 1`, which would let a 1-of-3 win declare "≥50%" under the naive form.)
 9. Else: result = Winners(winners).
 ```
 

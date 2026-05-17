@@ -27,7 +27,7 @@
    * `e instanceof Error ? e.message : String(e)`.
    */
 
-  import type { PollStateExport, PollMeta } from '../types/voting';
+  import type { PollStateExport, PollMeta, VotingBallotCastPayload } from '../types/voting';
   import type { VotingAdapter } from '../voting-adapter';
 
   let {
@@ -54,8 +54,13 @@
    *  highlight + toggle. Derived from `state.your_ballot`. */
   let myApproved = $state<Set<number>>(new Set());
 
-  /** True when the poll is currently accepting ballots. */
-  let isOpen = $derived(state?.meta.lifecycle === 'Open' || meta.lifecycle === 'Open');
+  /** True when the poll is currently accepting ballots.
+   *  Once getPoll resolves we trust the fetched lifecycle as the source
+   *  of truth (the initial `meta` snapshot can be stale — caught by
+   *  CodeRabbit on PR #130). */
+  let isOpen = $derived(
+    state ? state.meta.lifecycle === 'Open' : meta.lifecycle === 'Open',
+  );
 
   /** Total approvals across all options — divisor for percentage bars
    *  (using ballot_count would make bars sum to >100% in multi-approve
@@ -82,7 +87,11 @@
     })();
 
     const prevOnBallotCast = adapter.onBallotCast;
-    adapter.onBallotCast = (payload) => {
+    // Capture this handler reference so cleanup only restores the previous
+    // chain link if WE are still the current head. Out-of-order unmount
+    // (e.g. virtual-scroll, parent {#if} toggle) was overwriting siblings'
+    // live handlers — Greptile P1 on PR #130 caught this.
+    const thisHandler = (payload: VotingBallotCastPayload) => {
       prevOnBallotCast?.(payload);
       if (payload.pollId !== id) return;
       // Refetch on any matching ballot-cast (self or — Phase 1.5 — peer).
@@ -97,13 +106,17 @@
         }
       })();
     };
+    adapter.onBallotCast = thisHandler;
 
     return () => {
       cancelled = true;
-      // Restore the previous handler so we don't permanently steal
-      // event delivery from siblings. (Multiple PollMessage instances
-      // chain through this pattern.)
-      adapter.onBallotCast = prevOnBallotCast;
+      // Only restore the previous handler if we're still the current head;
+      // otherwise a sibling has chained on top of us and removing ourselves
+      // would silently break their delivery. The sibling's own cleanup
+      // will eventually unlink us.
+      if (adapter.onBallotCast === thisHandler) {
+        adapter.onBallotCast = prevOnBallotCast;
+      }
     };
   });
 

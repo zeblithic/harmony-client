@@ -17595,7 +17595,6 @@ async fn voting_create_tier1_poll<R: tauri::Runtime>(
         crate::community_voting_core::build_signed_poll_create_tier1(
             signing_key,
             self_owner,
-            crate::community_voting_core::Tier::Approval,
             &cfg,
             hlc,
         )
@@ -17950,7 +17949,7 @@ mod voting_ipc_tests {
     fn voting_log_create_then_ballot_end_to_end() {
         use crate::community_voting_core::{
             build_signed_ballot_tier1, build_signed_poll_create_tier1, check_eligibility,
-            MemberAttrs, MembershipSnapshot, Tier,
+            MemberAttrs, MembershipSnapshot,
         };
         use crate::owner_state_types::Hlc;
         use ed25519_dalek::SigningKey;
@@ -17990,9 +17989,8 @@ mod voting_ipc_tests {
             logical: 0,
             device_id: "dev-a".into(),
         };
-        let create_ev =
-            build_signed_poll_create_tier1(&keypair, voter, Tier::Approval, &cfg, hlc_create)
-                .expect("build create");
+        let create_ev = build_signed_poll_create_tier1(&keypair, voter, &cfg, hlc_create)
+            .expect("build create");
 
         let mut log = crate::community_voting_log::VotingLog::new();
         let poll_id = log

@@ -8,6 +8,7 @@
 use crate::community_membership::ChannelId;
 use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
@@ -22,7 +23,13 @@ pub struct PollId(pub [u8; 32]);
 
 /// The three voting tiers. Wire-encoded as u8 (`tr` field of envelope).
 /// See spec §1 + §3.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// `serde_repr` is load-bearing here: without it, the standard
+/// `#[derive(Serialize)]` would encode variants by NAME ("Approval"),
+/// not by the u8 discriminant the spec mandates. `#[repr(u8)]` alone
+/// only affects Rust memory layout, not serde — that mismatch was
+/// caught by CodeRabbit on PR #130.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
 #[repr(u8)]
 pub enum Tier {
     Approval = 1,
@@ -602,10 +609,14 @@ pub enum BuildError {
 
 /// Build a fully-signed PollCreate event for Tier 1, ready to broadcast.
 /// Used by `voting_create_tier1_poll` IPC.
+///
+/// The tier is hardcoded to `Tier::Approval` so a caller cannot accidentally
+/// emit a cross-tier-invalid event (Conviction/Sortition payload shapes
+/// differ; pairing a Tier1PollConfig with a non-Approval tier on the wire
+/// would produce events peers can't materialize).
 pub fn build_signed_poll_create_tier1(
     keypair: &ed25519_dalek::SigningKey,
     actor: OwnerAddr,
-    tier: Tier,
     config: &crate::community_voting_approval::Tier1PollConfig,
     hlc: Hlc,
 ) -> Result<SignedVotingEvent, BuildError> {
@@ -615,7 +626,7 @@ pub fn build_signed_poll_create_tier1(
     let mut ev = SignedVotingEvent {
         tag: 'p',
         version: 1,
-        tier,
+        tier: Tier::Approval,
         kind: PollEventKindCode::PollCreate,
         hlc,
         actor,
@@ -709,8 +720,7 @@ mod build_tests {
             logical: 0,
             device_id: "a".into(),
         };
-        let ev = build_signed_poll_create_tier1(&keypair, actor, Tier::Approval, &cfg, hlc)
-            .expect("build");
+        let ev = build_signed_poll_create_tier1(&keypair, actor, &cfg, hlc).expect("build");
         assert_eq!(ev.kind, PollEventKindCode::PollCreate);
         assert_eq!(ev.actor, actor);
         let sb = ev.signing_bytes().expect("signing bytes");

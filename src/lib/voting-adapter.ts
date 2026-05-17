@@ -61,34 +61,54 @@ export class VotingAdapter {
   private unlisteners: Array<() => void> = [];
 
   /** Wire the three event listeners onto a Tauri adapter. Idempotent
-   *  (second call with a different adapter is a no-op). */
+   *  (second call with a different adapter is a no-op).
+   *
+   *  Stages unlisteners in a local array and only commits to `this.adapter`
+   *  after every `listen` resolves; on failure, unwires any partial
+   *  registrations so a retry sees a clean slate. CodeRabbit on PR #130
+   *  caught the prior implementation marking the adapter connected before
+   *  all three listens succeeded — a mid-connect throw left subsequent
+   *  `connectAdapter` calls returning early with partial wiring. */
   async connectAdapter(adapter: TauriAdapter): Promise<void> {
     if (this.adapter) return;
-    this.adapter = adapter;
+    const stagedUnlisteners: Array<() => void> = [];
+    try {
+      const unlistenCreated = await adapter.listen(
+        'voting-poll-created',
+        (event) => {
+          this.onPollCreated?.(event.payload as VotingPollCreatedPayload);
+        },
+      );
+      stagedUnlisteners.push(unlistenCreated);
 
-    const unlistenCreated = await adapter.listen(
-      'voting-poll-created',
-      (event) => {
-        this.onPollCreated?.(event.payload as VotingPollCreatedPayload);
-      },
-    );
-    this.unlisteners.push(unlistenCreated);
+      const unlistenCast = await adapter.listen(
+        'voting-ballot-cast',
+        (event) => {
+          this.onBallotCast?.(event.payload as VotingBallotCastPayload);
+        },
+      );
+      stagedUnlisteners.push(unlistenCast);
 
-    const unlistenCast = await adapter.listen(
-      'voting-ballot-cast',
-      (event) => {
-        this.onBallotCast?.(event.payload as VotingBallotCastPayload);
-      },
-    );
-    this.unlisteners.push(unlistenCast);
+      const unlistenClosed = await adapter.listen(
+        'voting-poll-closed',
+        (event) => {
+          this.onPollClosed?.(event.payload as VotingPollClosedPayload);
+        },
+      );
+      stagedUnlisteners.push(unlistenClosed);
 
-    const unlistenClosed = await adapter.listen(
-      'voting-poll-closed',
-      (event) => {
-        this.onPollClosed?.(event.payload as VotingPollClosedPayload);
-      },
-    );
-    this.unlisteners.push(unlistenClosed);
+      this.adapter = adapter;
+      this.unlisteners.push(...stagedUnlisteners);
+    } catch (e) {
+      for (const u of stagedUnlisteners) {
+        try {
+          u();
+        } catch {
+          // swallow cleanup failures
+        }
+      }
+      throw e;
+    }
   }
 
   /** Tear down all event listeners. Safe to call before connect. */
