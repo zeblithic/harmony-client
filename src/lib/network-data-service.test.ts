@@ -79,10 +79,18 @@ describe('MockNetworkDataService', () => {
   });
 
   it('calls onAlert when node status changes', () => {
+    // ZEB-278: the original test relied on the 60-tick offline-flip branch
+    // (15% per non-local node) which has a real 17-32% per-run flake rate
+    // depending on Math.random() draws. Force a known-degraded CPU on a
+    // non-local node so the FIRST tick deterministically fires an
+    // online→degraded transition: with prevCpu=95, the per-tick drift of
+    // ±~5 keeps the new CPU above the > 85 threshold, guaranteeing the
+    // alert path runs exactly once.
     const alerts: string[] = [];
     service.onAlert = (msg) => alerts.push(msg);
+    service.nodes[1].metrics.cpuPercent = 95;
     service.start();
-    vi.advanceTimersByTime(60000);
+    vi.advanceTimersByTime(1000);
     expect(alerts.length).toBeGreaterThan(0);
   });
 
