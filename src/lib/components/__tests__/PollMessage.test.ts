@@ -3,20 +3,28 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import PollMessage from '../PollMessage.svelte';
 import { VotingAdapter } from '../../voting-adapter';
 import { createMockAdapter } from '../../test-utils';
-import type { PollMeta, PollStateExport } from '../../types/voting';
+import type { PollIdHex, PollMeta, PollStateExport } from '../../types/voting';
+
+// Tauri JSON IPC delivers byte-array IDs as `number[]`, not hex strings —
+// see PollIdHex JSDoc. Use these helpers so test fixtures match the
+// production wire shape rather than the historical hex-string shape.
+const POLL_ID: PollIdHex = new Array(32).fill(0xab);
+const COMMUNITY_ID: number[] = new Array(16).fill(0xbb);
+const CHANNEL_ID: number[] = new Array(16).fill(0xdd);
+const CREATOR: number[] = new Array(16).fill(0xcc);
 
 function makeMeta(overrides: Partial<PollMeta> = {}): PollMeta {
   return {
-    poll_id: 'aa'.repeat(32),
-    community_id: 'bb'.repeat(16),
-    creator: 'cc'.repeat(16),
+    poll_id: POLL_ID,
+    community_id: COMMUNITY_ID,
+    creator: CREATOR,
     tier: 1,
     eligibility: { mp: 0 },
     lifecycle: 'Open',
     created_at: { w: 100, l: 0, d: 'dev' },
     opens_at: { w: 100, l: 0, d: 'dev' },
     closes_at: { w: 1000, l: 0, d: 'dev' },
-    channel_id: 'dd'.repeat(16),
+    channel_id: CHANNEL_ID,
     ...overrides,
   };
 }
@@ -55,7 +63,7 @@ describe('PollMessage', () => {
 
     render(PollMessage, {
       props: {
-        pollId: 'aa'.repeat(32),
+        pollId: POLL_ID,
         meta: makeMeta(),
         adapter,
       },
@@ -89,7 +97,7 @@ describe('PollMessage', () => {
 
     render(PollMessage, {
       props: {
-        pollId: 'aa'.repeat(32),
+        pollId: POLL_ID,
         meta: makeMeta({ lifecycle: 'Closed' }),
         adapter,
       },
@@ -113,7 +121,7 @@ describe('PollMessage', () => {
 
     render(PollMessage, {
       props: {
-        pollId: 'aa'.repeat(32),
+        pollId: POLL_ID,
         meta: makeMeta(),
         adapter,
       },
@@ -130,7 +138,7 @@ describe('PollMessage', () => {
     await waitFor(() => {
       expect(castMock).toHaveBeenCalled();
     });
-    expect(castMock).toHaveBeenCalledWith('aa'.repeat(32), [0]);
+    expect(castMock).toHaveBeenCalledWith(POLL_ID, [0]);
   });
 
   it('does NOT send an empty ballot when the last selected option is deselected', async () => {
@@ -144,7 +152,7 @@ describe('PollMessage', () => {
     getPollMock.mockResolvedValue(state);
 
     render(PollMessage, {
-      props: { pollId: 'aa'.repeat(32), meta: makeMeta(), adapter },
+      props: { pollId: POLL_ID, meta: makeMeta(), adapter },
     });
 
     await waitFor(() => {
@@ -169,7 +177,7 @@ describe('PollMessage', () => {
     getPollMock.mockResolvedValue(state);
 
     render(PollMessage, {
-      props: { pollId: 'aa'.repeat(32), meta: makeMeta(), adapter },
+      props: { pollId: POLL_ID, meta: makeMeta(), adapter },
     });
 
     await waitFor(() => {

@@ -11,17 +11,42 @@
  * See `src-tauri/src/community_voting_core.rs` for the source of truth.
  */
 
-/** 32-byte SHA-256, hex-encoded (64 chars). */
-export type PollIdHex = string;
+/** 32-byte SHA-256 poll id.
+ *
+ * **IPC reality:** Tauri's JSON serializer has no byte-string type, so
+ * `[u8; N]` Rust fields arrive over the IPC boundary as integer arrays
+ * (`[171, 171, ...]`), not as the hex strings the Rust wire format
+ * (CBOR bstr via `serialize_bytes_as_bstr`) uses. Treat these as opaque
+ * `number[]` round-trip identifiers, NOT as strings — interpolating
+ * them into a URL or comparing with `===` would silently misbehave
+ * (`===` reference-compares arrays). Use `pollIdEqual()` for value
+ * equality.
+ *
+ * A format-aware (`is_human_readable`) serializer that hex-encodes for
+ * IPC while keeping bstr for CBOR is tracked as a Phase 1.5 cleanup
+ * shared with `SpaceId`/`OwnerAddr`/`ChannelId`. Once shipped, these
+ * types narrow to `string` without code-side changes. */
+export type PollIdHex = number[];
 
-/** 16-byte SpaceId, hex-encoded (32 chars). */
-export type CommunityIdHex = string;
+/** 16-byte SpaceId. See PollIdHex JSDoc — same JSON integer-array reality. */
+export type CommunityIdHex = number[];
 
-/** 16-byte ChannelId, hex-encoded (32 chars). */
-export type ChannelIdHex = string;
+/** 16-byte ChannelId. See PollIdHex JSDoc. */
+export type ChannelIdHex = number[];
 
-/** 16-byte OwnerAddr, hex-encoded (32 chars). */
-export type OwnerAddrHex = string;
+/** 16-byte OwnerAddr. See PollIdHex JSDoc. */
+export type OwnerAddrHex = number[];
+
+/** Compare two byte-array identifiers by value (===-comparing arrays
+ *  is reference-equality and would always be false for distinct
+ *  Tauri-IPC-decoded instances). */
+export function pollIdEqual(a: number[], b: number[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
 
 /** Voting tiers. Mirrors Rust `Tier` (u8 repr — Approval=1, Conviction=2,
  *  Sortition=3); the Rust enum uses `serde_repr` so the wire form (and

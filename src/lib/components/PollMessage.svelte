@@ -27,7 +27,13 @@
    * `e instanceof Error ? e.message : String(e)`.
    */
 
-  import type { PollStateExport, PollMeta, VotingBallotCastPayload } from '../types/voting';
+  import {
+    pollIdEqual,
+    type PollIdHex,
+    type PollStateExport,
+    type PollMeta,
+    type VotingBallotCastPayload,
+  } from '../types/voting';
   import type { VotingAdapter } from '../voting-adapter';
 
   let {
@@ -35,8 +41,9 @@
     meta,
     adapter,
   }: {
-    /** 64-char hex poll id. */
-    pollId: string;
+    /** 32-byte poll id (arrives over Tauri JSON IPC as `number[]` —
+     *  see PollIdHex JSDoc). */
+    pollId: PollIdHex;
     /** Initial PollMeta (e.g. from listActivePolls cache). Used for
      *  first-paint title/tier/lifecycle before getPoll() resolves. */
     meta: PollMeta;
@@ -103,7 +110,9 @@
       prevOnBallotCast?.(payload);
       // Bail early if we've been unmounted but the head-only restore
       // pattern left our closure still chained behind a sibling.
-      if (cancelled || payload.pollId !== id) return;
+      // pollId is a byte-array over Tauri JSON IPC (see PollIdHex JSDoc),
+      // so `!==` would reference-compare and always be true. Value-equal.
+      if (cancelled || !pollIdEqual(payload.pollId, id)) return;
       // Refetch on any matching ballot-cast (self or — Phase 1.5 — peer).
       void (async () => {
         try {
@@ -155,15 +164,17 @@
     casting = true;
     try {
       await adapter.castTier1Ballot(id, indices);
-      if (pollId !== id) return;
+      // pollId is a byte-array (JSON IPC), so `!==` would reference-compare
+      // and always be true. Value-equal via pollIdEqual.
+      if (!pollIdEqual(pollId, id)) return;
       // Optimistic local update; the ballot-cast event will trigger a
       // server-confirmed refresh that supersedes this.
       myApproved = next;
     } catch (e) {
-      if (pollId !== id) return;
+      if (!pollIdEqual(pollId, id)) return;
       castError = e instanceof Error ? e.message : String(e);
     } finally {
-      if (pollId === id) {
+      if (pollIdEqual(pollId, id)) {
         casting = false;
       }
     }
