@@ -131,6 +131,14 @@
     } else {
       next.add(idx);
     }
+    // Mirror the backend's validate_ballot rules (EmptyBallot /
+    // AbstentionBallot) on the client so a deselect-to-zero or
+    // select-all interaction is a silent no-op rather than a
+    // confusing "Vote failed" round-trip. Withdrawing a vote is a
+    // future affordance (Phase 2 conviction-withdraw) and would
+    // need a different verb than "toggle the last option off".
+    if (next.size === 0) return;
+    if (next.size === state.options.length) return;
     const indices = Array.from(next).sort((a, b) => a - b);
     casting = true;
     try {

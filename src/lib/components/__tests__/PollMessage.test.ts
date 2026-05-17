@@ -132,6 +132,56 @@ describe('PollMessage', () => {
     });
     expect(castMock).toHaveBeenCalledWith('aa'.repeat(32), [0]);
   });
+
+  it('does NOT send an empty ballot when the last selected option is deselected', async () => {
+    // Voter already has their ballot at [0]; clicking option 0 again
+    // would deselect it, producing an empty ballot that the backend
+    // rejects as EmptyBallot. The component must silently no-op.
+    const state = makeState({
+      tally: { counts: [1, 0], ballot_count: 1 },
+      your_ballot: [0],
+    });
+    getPollMock.mockResolvedValue(state);
+
+    render(PollMessage, {
+      props: { pollId: 'aa'.repeat(32), meta: makeMeta(), adapter },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('Yes')).toBeTruthy();
+    });
+
+    const yesBtn = screen.getByRole('button', { name: /Yes/ });
+    await fireEvent.click(yesBtn);
+
+    // Give any in-flight promise chain a chance to resolve.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(castMock).not.toHaveBeenCalled();
+  });
+
+  it('does NOT send an approve-all ballot when every option would be selected', async () => {
+    // Voter has [0]; clicking [1] would make their next ballot [0, 1]
+    // which equals options.length — backend rejects as AbstentionBallot.
+    const state = makeState({
+      tally: { counts: [1, 0], ballot_count: 1 },
+      your_ballot: [0],
+    });
+    getPollMock.mockResolvedValue(state);
+
+    render(PollMessage, {
+      props: { pollId: 'aa'.repeat(32), meta: makeMeta(), adapter },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('No')).toBeTruthy();
+    });
+
+    const noBtn = screen.getByRole('button', { name: /No/ });
+    await fireEvent.click(noBtn);
+
+    await new Promise((r) => setTimeout(r, 0));
+    expect(castMock).not.toHaveBeenCalled();
+  });
 });
 
 describe('VotingAdapter (consumer-side IPC contract)', () => {
