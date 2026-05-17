@@ -223,6 +223,82 @@ pub fn decay_q32(conviction_q32: ConvictionQ32, dt_ms: i128, half_life_ms: i128)
 }
 
 // ---------------------------------------------------------------------------
+// Per-voter conviction state
+// ---------------------------------------------------------------------------
+
+/// Per-voter conviction state for a single Tier 2 proposal.
+///
+/// Persisted-across-events; aggregated by `Tier2ProposalState` (Task 6).
+/// All time values are i128 milliseconds (signed for arithmetic safety).
+/// All conviction values are Q96.32 fixed-point.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VoterConvictionState {
+    /// Currently signaling support? (Toggled by Signal events.)
+    pub is_supporting: bool,
+    /// HLC of the most recent Signal{true} that started the current support session.
+    /// 0 if has never signaled support.
+    pub support_started_at_ms: i128,
+    /// Conviction accumulated from PRIOR support sessions (i.e., sessions
+    /// that have been "closed" by a Signal{false}). Q96.32.
+    pub accumulated_conviction_q32: ConvictionQ32,
+    /// HLC of the last event applied (Signal toggle in either direction).
+    /// Used as the reference point for decaying `accumulated_conviction_q32`.
+    pub last_event_at_ms: i128,
+}
+
+impl VoterConvictionState {
+    /// Apply a Signal event at the given HLC ms. Idempotent: a repeated
+    /// Signal in the same direction is a no-op.
+    pub fn apply_signal(&mut self, support: bool, event_hlc_ms: i128, half_life_ms: i128) {
+        if support && !self.is_supporting {
+            // Decay any prior accumulation up to the moment the new session
+            // begins, so subsequent `conviction_at` computations can treat
+            // `last_event_at_ms` as the reference point for both the prior
+            // pool and the active-session start.
+            let dt = event_hlc_ms - self.last_event_at_ms;
+            self.accumulated_conviction_q32 =
+                decay_q32(self.accumulated_conviction_q32, dt, half_life_ms);
+            self.is_supporting = true;
+            self.support_started_at_ms = event_hlc_ms;
+            self.last_event_at_ms = event_hlc_ms;
+        } else if !support && self.is_supporting {
+            let session_dur = event_hlc_ms - self.support_started_at_ms;
+            self.accumulated_conviction_q32 += charge_q32(session_dur, half_life_ms);
+            self.is_supporting = false;
+            self.last_event_at_ms = event_hlc_ms;
+        }
+        // No-op cases: support==is_supporting (idempotent toggle).
+    }
+
+    /// Compute conviction at wall-clock t_ms (Q96.32). Handles both
+    /// "currently supporting" (active charge + prior decay) and "not
+    /// supporting" (decay of accumulated only) branches per spec §5.
+    pub fn conviction_at(&self, t_ms: i128, half_life_ms: i128) -> ConvictionQ32 {
+        if self.is_supporting {
+            // active charge from the current session
+            let session_dur = t_ms - self.support_started_at_ms;
+            let active = charge_q32(session_dur, half_life_ms);
+            // plus decay of any prior accumulation (which has been
+            // decaying since the moment the current session started,
+            // i.e., since `last_event_at_ms` which == support_started_at_ms
+            // when is_supporting was just toggled on)
+            let decayed = decay_q32(
+                self.accumulated_conviction_q32,
+                t_ms - self.last_event_at_ms,
+                half_life_ms,
+            );
+            decayed + active
+        } else {
+            decay_q32(
+                self.accumulated_conviction_q32,
+                t_ms - self.last_event_at_ms,
+                half_life_ms,
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -558,5 +634,215 @@ mod tests {
         let (k, v) = &map[0];
         assert_eq!(k.as_text(), Some("kk"));
         assert_eq!(v.as_text(), Some("n"));
+    }
+
+    // -------- VoterConvictionState --------
+
+    /// Half-life used across the voter-state tests. 1 second in ms gives
+    /// charge(hl, hl) ≈ 721 (plain ms units; see `charge_at_one_half_life`
+    /// test for the unit discussion).
+    const TEST_HL: i128 = 1_000;
+
+    #[test]
+    fn voter_state_default_has_zero_conviction() {
+        let s = VoterConvictionState::default();
+        // At any t (zero, mid, far future), default state has nothing.
+        assert_eq!(s.conviction_at(0, TEST_HL), 0);
+        assert_eq!(s.conviction_at(TEST_HL, TEST_HL), 0);
+        assert_eq!(s.conviction_at(100 * TEST_HL, TEST_HL), 0);
+        // Also: default field values are the spec defaults.
+        assert!(!s.is_supporting);
+        assert_eq!(s.support_started_at_ms, 0);
+        assert_eq!(s.accumulated_conviction_q32, 0);
+        assert_eq!(s.last_event_at_ms, 0);
+    }
+
+    #[test]
+    fn single_support_session_builds_conviction() {
+        let mut s = VoterConvictionState::default();
+        s.apply_signal(true, 0, TEST_HL);
+        // After one half-life of continuous support, conviction equals
+        // the closed-form charge(hl, hl).
+        let actual = s.conviction_at(TEST_HL, TEST_HL);
+        let expected = charge_q32(TEST_HL, TEST_HL);
+        assert_eq!(actual, expected);
+        // And it is positive.
+        assert!(actual > 0);
+    }
+
+    #[test]
+    fn toggle_off_freezes_accumulated_conviction() {
+        let mut s = VoterConvictionState::default();
+        s.apply_signal(true, 0, TEST_HL);
+        s.apply_signal(false, TEST_HL, TEST_HL);
+        // At the moment of toggle-off, conviction == charge(hl, hl).
+        let at_off = s.conviction_at(TEST_HL, TEST_HL);
+        assert_eq!(at_off, charge_q32(TEST_HL, TEST_HL));
+        // One more half-life later, it should have decayed by 0.5.
+        let at_decayed = s.conviction_at(2 * TEST_HL, TEST_HL);
+        let expected = decay_q32(charge_q32(TEST_HL, TEST_HL), TEST_HL, TEST_HL);
+        assert_eq!(at_decayed, expected);
+        assert!(at_decayed < at_off);
+    }
+
+    #[test]
+    fn toggle_off_then_idle_decays() {
+        let mut s = VoterConvictionState::default();
+        s.apply_signal(true, 0, TEST_HL);
+        s.apply_signal(false, TEST_HL, TEST_HL);
+        let base = s.conviction_at(TEST_HL, TEST_HL);
+        // After 1 idle half-life: ≈ base/2. After 2 idle half-lives: ≈ base/4.
+        // After 3 idle half-lives: ≈ base/8. Tolerances scale with the
+        // base magnitude (Q32 noise from the integer division in decay).
+        let tol = base / 1_000_000 + 1;
+        let h1 = s.conviction_at(2 * TEST_HL, TEST_HL);
+        let h2 = s.conviction_at(3 * TEST_HL, TEST_HL);
+        let h3 = s.conviction_at(4 * TEST_HL, TEST_HL);
+        assert!(approx_eq(h1, base / 2, tol), "h1 = {h1}, want ≈ {}", base / 2);
+        assert!(approx_eq(h2, base / 4, tol), "h2 = {h2}, want ≈ {}", base / 4);
+        assert!(approx_eq(h3, base / 8, tol), "h3 = {h3}, want ≈ {}", base / 8);
+    }
+
+    #[test]
+    fn toggle_on_after_decay_resumes_from_decayed_base() {
+        // support → 1hl → not-support → 1hl → support; query at 2hl.
+        let mut s = VoterConvictionState::default();
+        s.apply_signal(true, 0, TEST_HL);
+        s.apply_signal(false, TEST_HL, TEST_HL);
+        s.apply_signal(true, 2 * TEST_HL, TEST_HL);
+        // At 2*hl, active session just started (dur=0 → active charge=0);
+        // accumulated has been decaying for one full hl from charge(hl,hl).
+        let actual = s.conviction_at(2 * TEST_HL, TEST_HL);
+        let expected = decay_q32(charge_q32(TEST_HL, TEST_HL), TEST_HL, TEST_HL) + 0;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn re_toggle_off_accumulates_more() {
+        // support → 1hl → off → support → 1hl → off.
+        let mut s = VoterConvictionState::default();
+        s.apply_signal(true, 0, TEST_HL);
+        s.apply_signal(false, TEST_HL, TEST_HL);
+        s.apply_signal(true, TEST_HL, TEST_HL); // immediate restart, no idle
+        s.apply_signal(false, 2 * TEST_HL, TEST_HL);
+        // Accumulated should be charge(hl,hl) + charge(hl,hl).
+        // (The first segment's accumulated was decayed for 0 ms before the
+        // second segment began, so no decay loss; second segment adds another
+        // charge(hl, hl).)
+        let expected = 2 * charge_q32(TEST_HL, TEST_HL);
+        assert_eq!(s.accumulated_conviction_q32, expected);
+        // And the conviction at the moment of second-off equals that
+        // accumulated total (no further time elapsed).
+        let at_off = s.conviction_at(2 * TEST_HL, TEST_HL);
+        assert_eq!(at_off, expected);
+    }
+
+    #[test]
+    fn idempotent_repeat_signal_true() {
+        let mut a = VoterConvictionState::default();
+        a.apply_signal(true, 0, TEST_HL);
+        let mut b = a.clone();
+        b.apply_signal(true, TEST_HL, TEST_HL); // repeat true; should be no-op
+        assert_eq!(a, b);
+        // And conviction queries match.
+        assert_eq!(
+            a.conviction_at(2 * TEST_HL, TEST_HL),
+            b.conviction_at(2 * TEST_HL, TEST_HL),
+        );
+    }
+
+    #[test]
+    fn idempotent_repeat_signal_false() {
+        // apply_signal(false, ...) when not supporting is a no-op.
+        let mut a = VoterConvictionState::default();
+        let snapshot = a.clone();
+        a.apply_signal(false, TEST_HL, TEST_HL);
+        assert_eq!(a, snapshot);
+        // Also after a complete session, repeated false is still no-op.
+        let mut s = VoterConvictionState::default();
+        s.apply_signal(true, 0, TEST_HL);
+        s.apply_signal(false, TEST_HL, TEST_HL);
+        let snap2 = s.clone();
+        s.apply_signal(false, 2 * TEST_HL, TEST_HL);
+        assert_eq!(s, snap2);
+    }
+
+    #[test]
+    fn determinism_two_states_identical_event_seq() {
+        // Build a deterministic 10-event mixed signal sequence.
+        // (true/false toggles with varied gaps; exercises both branches +
+        // idempotent no-ops.)
+        let seq: [(bool, i128); 10] = [
+            (true, 0),
+            (true, 50),     // idempotent no-op
+            (false, 1_000), // close session 1
+            (false, 1_500), // idempotent no-op
+            (true, 2_000),  // start session 2 after 1*hl idle
+            (false, 2_500), // close session 2
+            (true, 4_000),  // start session 3 after 1.5*hl idle
+            (false, 5_000), // close session 3
+            (true, 5_000),  // start session 4 immediately
+            (false, 7_000), // close session 4
+        ];
+        let mut a = VoterConvictionState::default();
+        let mut b = VoterConvictionState::default();
+        for (sup, t) in &seq {
+            a.apply_signal(*sup, *t, TEST_HL);
+            b.apply_signal(*sup, *t, TEST_HL);
+        }
+        // Bit-identical state.
+        assert_eq!(a, b);
+        // And conviction queries agree.
+        for t in &[0i128, 100, 1_000, 2_500, 7_000, 10_000] {
+            assert_eq!(
+                a.conviction_at(*t, TEST_HL),
+                b.conviction_at(*t, TEST_HL),
+            );
+        }
+    }
+
+    #[test]
+    fn determinism_conviction_at_repeatable() {
+        // Identical inputs to conviction_at produce identical outputs
+        // across N=100 iterations. Pure-integer arithmetic makes this
+        // trivially true, but pin the invariant.
+        let mut s = VoterConvictionState::default();
+        s.apply_signal(true, 0, TEST_HL);
+        s.apply_signal(false, TEST_HL, TEST_HL);
+        s.apply_signal(true, 3 * TEST_HL, TEST_HL);
+        let baseline: Vec<i128> = (0..10)
+            .map(|i| s.conviction_at(i as i128 * TEST_HL, TEST_HL))
+            .collect();
+        for _ in 0..100 {
+            for (i, expected) in baseline.iter().enumerate() {
+                assert_eq!(s.conviction_at(i as i128 * TEST_HL, TEST_HL), *expected);
+            }
+        }
+    }
+
+    #[test]
+    fn negative_dt_handled_gracefully() {
+        // conviction_at(t) where t < last_event_at_ms must not panic.
+        // Not-supporting branch: dt < 0 → decay_q32 returns identity, so
+        // result equals accumulated.
+        let mut s = VoterConvictionState::default();
+        s.apply_signal(true, 1_000, TEST_HL);
+        s.apply_signal(false, 2_000, TEST_HL);
+        let accumulated = s.accumulated_conviction_q32;
+        let result = s.conviction_at(500, TEST_HL); // t < last_event_at_ms
+        assert_eq!(result, accumulated);
+
+        // Supporting branch: t < support_started_at_ms gives session_dur < 0
+        // (charge_q32 returns 0) and dt < 0 (decay_q32 is identity); so
+        // result equals accumulated unchanged.
+        let mut s2 = VoterConvictionState::default();
+        s2.apply_signal(true, 0, TEST_HL);
+        s2.apply_signal(false, TEST_HL, TEST_HL);
+        s2.apply_signal(true, 5_000, TEST_HL);
+        let result2 = s2.conviction_at(100, TEST_HL); // before everything
+        // accumulated at this point is the prior charge after pre-resume
+        // decay, plus zero active charge.
+        let expected2 = s2.accumulated_conviction_q32;
+        assert_eq!(result2, expected2);
     }
 }
