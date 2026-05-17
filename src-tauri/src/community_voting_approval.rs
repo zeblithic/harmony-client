@@ -4,10 +4,16 @@
 //! validation rules per spec §4, and (in later tasks) the deterministic
 //! tally per spec §4 tally algorithm.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::community_membership::ChannelId;
-use crate::community_voting_core::{Eligibility, PollId};
+use crate::community_voting_core::{
+    check_eligibility, Eligibility, MembershipSnapshot, PollEventKindCode, PollId,
+    SignedVotingEvent,
+};
+use crate::owner_state_types::{Hlc, OwnerAddr};
 
 /// Maximum number of options per Tier 1 poll. Spec §4.
 pub const MAX_OPTIONS: usize = 20;
@@ -348,5 +354,230 @@ mod tests {
         ciborium::into_writer(&b, &mut encoded).expect("encode");
         let decoded: Tier1Ballot = ciborium::from_reader(&encoded[..]).expect("decode");
         assert_eq!(b, decoded);
+    }
+}
+
+/// Tally state for a Tier 1 poll. Per-option approval counts plus
+/// the LWW-resolved latest ballot per voter (kept for audit + IPC
+/// "your current ballot" lookup).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tier1TallyState {
+    /// Per-option approval count.
+    pub counts: Vec<u32>,
+    /// Number of distinct voters whose latest ballot was eligible
+    /// and counted.
+    pub ballot_count: u32,
+    /// Latest ballot per voter (for "your current vote" UI + audit).
+    pub latest_ballots: HashMap<OwnerAddr, Tier1Ballot>,
+}
+
+impl Tier1TallyState {
+    pub fn empty(options_len: usize) -> Self {
+        Self {
+            counts: vec![0; options_len],
+            ballot_count: 0,
+            latest_ballots: HashMap::new(),
+        }
+    }
+}
+
+/// Deterministically tally all BallotCast events for a Tier 1 poll.
+/// Spec §4 tally algorithm steps 1-4 (steps 5-9 = result variants in Task 9).
+///
+/// Inputs:
+///   - `cfg`: poll's deserialized Tier1PollConfig
+///   - `events`: all signed events for this poll (any order; HLC LWW used internally)
+///   - `snapshot`: community-membership snapshot at PollCreate.hlc
+///
+/// Returns: per-voter latest ballot + per-option counts + ballot count.
+/// Defensively drops malformed/invalid/ineligible ballots — verify-on-receive
+/// is the primary gate, but materialize must remain pure-deterministic even
+/// against a corrupt log.
+pub fn tally_tier1(
+    cfg: &Tier1PollConfig,
+    events: &[SignedVotingEvent],
+    snapshot: &MembershipSnapshot,
+) -> Tier1TallyState {
+    let mut latest_ballots: HashMap<OwnerAddr, Tier1Ballot> = HashMap::new();
+    let mut latest_hlc: HashMap<OwnerAddr, Hlc> = HashMap::new();
+    for ev in events {
+        if ev.kind != PollEventKindCode::BallotCast {
+            continue;
+        }
+        let ballot: Tier1Ballot = match ciborium::de::from_reader(&ev.payload[..]) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if validate_ballot(&ballot, cfg).is_err() {
+            continue;
+        }
+        if check_eligibility(snapshot, &ev.actor, &cfg.eligibility).is_err() {
+            continue;
+        }
+        let should_replace = latest_hlc
+            .get(&ev.actor)
+            .map(|prev| ev.hlc.is_strictly_newer_than(prev))
+            .unwrap_or(true);
+        if should_replace {
+            latest_ballots.insert(ev.actor, ballot);
+            latest_hlc.insert(ev.actor, ev.hlc.clone());
+        }
+    }
+
+    let mut counts = vec![0u32; cfg.options.len()];
+    for ballot in latest_ballots.values() {
+        for &i in &ballot.approved_indices {
+            counts[i as usize] += 1;
+        }
+    }
+    let ballot_count = latest_ballots.len() as u32;
+
+    Tier1TallyState {
+        counts,
+        ballot_count,
+        latest_ballots,
+    }
+}
+
+#[cfg(test)]
+mod tally_tests {
+    use super::*;
+    use crate::community_voting_core::{MemberAttrs, Tier};
+
+    fn cfg_three_opts() -> Tier1PollConfig {
+        Tier1PollConfig {
+            options: vec!["A".into(), "B".into(), "C".into()],
+            window_seconds: 3600,
+            quorum: None,
+            threshold_percent: None,
+            multi_winner: None,
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            channel_id: ChannelId([0; 16]),
+        }
+    }
+
+    fn ballot_ev(voter: OwnerAddr, hlc_ms: u64, ap: Vec<u8>) -> SignedVotingEvent {
+        let payload_obj = Tier1Ballot {
+            poll_id: PollId([0xab; 32]),
+            approved_indices: ap,
+        };
+        let mut payload = Vec::new();
+        ciborium::ser::into_writer(&payload_obj, &mut payload).unwrap();
+        SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Approval,
+            kind: PollEventKindCode::BallotCast,
+            hlc: Hlc {
+                wall_ms: hlc_ms,
+                logical: 0,
+                device_id: "a".into(),
+            },
+            actor: voter,
+            payload,
+            sig: vec![0u8; 64],
+        }
+    }
+
+    fn snapshot_of(addrs: &[OwnerAddr]) -> MembershipSnapshot {
+        let mut members = HashMap::new();
+        for a in addrs {
+            members.insert(
+                *a,
+                MemberAttrs {
+                    power: 10,
+                    vouching_depth: 0,
+                },
+            );
+        }
+        MembershipSnapshot { members }
+    }
+
+    #[test]
+    fn empty_events_zero_counts() {
+        let cfg = cfg_three_opts();
+        let snap = snapshot_of(&[]);
+        let t = tally_tier1(&cfg, &[], &snap);
+        assert_eq!(t.counts, vec![0, 0, 0]);
+        assert_eq!(t.ballot_count, 0);
+    }
+
+    #[test]
+    fn single_ballot_counted() {
+        let cfg = cfg_three_opts();
+        let v = OwnerAddr([0x11; 16]);
+        let snap = snapshot_of(&[v]);
+        let evs = vec![ballot_ev(v, 1000, vec![0, 2])];
+        let t = tally_tier1(&cfg, &evs, &snap);
+        assert_eq!(t.counts, vec![1, 0, 1]);
+        assert_eq!(t.ballot_count, 1);
+    }
+
+    #[test]
+    fn re_vote_lww_keeps_latest() {
+        let cfg = cfg_three_opts();
+        let v = OwnerAddr([0x11; 16]);
+        let snap = snapshot_of(&[v]);
+        let evs = vec![ballot_ev(v, 1000, vec![0]), ballot_ev(v, 2000, vec![2])];
+        let t = tally_tier1(&cfg, &evs, &snap);
+        assert_eq!(t.counts, vec![0, 0, 1]);
+        assert_eq!(t.ballot_count, 1);
+    }
+
+    #[test]
+    fn re_vote_lww_handles_out_of_order_arrival() {
+        let cfg = cfg_three_opts();
+        let v = OwnerAddr([0x11; 16]);
+        let snap = snapshot_of(&[v]);
+        let evs = vec![ballot_ev(v, 2000, vec![2]), ballot_ev(v, 1000, vec![0])];
+        let t = tally_tier1(&cfg, &evs, &snap);
+        assert_eq!(t.counts, vec![0, 0, 1]);
+    }
+
+    #[test]
+    fn ineligible_voter_dropped() {
+        let cfg = cfg_three_opts();
+        let v_eligible = OwnerAddr([0x11; 16]);
+        let v_ineligible = OwnerAddr([0x22; 16]);
+        let snap = snapshot_of(&[v_eligible]);
+        let evs = vec![
+            ballot_ev(v_eligible, 1000, vec![0]),
+            ballot_ev(v_ineligible, 1500, vec![1]),
+        ];
+        let t = tally_tier1(&cfg, &evs, &snap);
+        assert_eq!(t.counts, vec![1, 0, 0]);
+        assert_eq!(t.ballot_count, 1);
+    }
+
+    #[test]
+    fn malformed_ballot_dropped_defensively() {
+        let cfg = cfg_three_opts();
+        let v = OwnerAddr([0x11; 16]);
+        let snap = snapshot_of(&[v]);
+        let evs = vec![ballot_ev(v, 1000, vec![5])];
+        let t = tally_tier1(&cfg, &evs, &snap);
+        assert_eq!(t.counts, vec![0, 0, 0]);
+        assert_eq!(t.ballot_count, 0);
+    }
+
+    #[test]
+    fn multiple_voters_sum_correctly() {
+        let cfg = cfg_three_opts();
+        let v1 = OwnerAddr([0x11; 16]);
+        let v2 = OwnerAddr([0x22; 16]);
+        let v3 = OwnerAddr([0x33; 16]);
+        let snap = snapshot_of(&[v1, v2, v3]);
+        let evs = vec![
+            ballot_ev(v1, 1000, vec![0, 2]),
+            ballot_ev(v2, 1100, vec![0]),
+            ballot_ev(v3, 1200, vec![1, 2]),
+        ];
+        let t = tally_tier1(&cfg, &evs, &snap);
+        assert_eq!(t.counts, vec![2, 1, 2]);
+        assert_eq!(t.ballot_count, 3);
     }
 }
