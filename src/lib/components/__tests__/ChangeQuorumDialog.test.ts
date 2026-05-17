@@ -141,6 +141,53 @@ describe('ChangeQuorumDialog', () => {
     });
   });
 
+  it('dialog_cancel_event_does_not_close_while_submitting', async () => {
+    // R4 CodeRabbit follow-up: complement the Cancel-button test with explicit
+    // coverage of the native dialog `cancel` event path (what Escape fires).
+    // handleUserCancel should preventDefault when submitting, leaving the
+    // dialog open and onClose unfired.
+    const { invoke } = await import('@tauri-apps/api/core');
+    const mockInvoke = invoke as ReturnType<typeof vi.fn>;
+    let resolveInvoke: (v: { kind: string }) => void = () => {};
+    mockInvoke.mockReturnValueOnce(
+      new Promise((res) => {
+        resolveInvoke = res;
+      })
+    );
+
+    const onClose = vi.fn();
+    const { container } = render(ChangeQuorumDialog, {
+      props: {
+        communityId: 'c-x',
+        currentQuorum: 1,
+        currentAdminCount: 3,
+        onClose,
+      },
+    });
+
+    const number = screen.getByLabelText('Quorum number') as HTMLInputElement;
+    await fireEvent.input(number, { target: { value: '2' } });
+    const proposeBtn = screen.getByRole('button', { name: /Propose/i });
+    await fireEvent.click(proposeBtn);
+
+    // Find the dialog element and dispatch a cancellable `cancel` event
+    // (the same event the browser fires when the user presses Escape).
+    const dialogEl = container.querySelector('dialog') as HTMLDialogElement;
+    expect(dialogEl).toBeTruthy();
+    const cancelEvent = new Event('cancel', { cancelable: true });
+    dialogEl.dispatchEvent(cancelEvent);
+
+    // Guard should have called preventDefault and skipped handleClose.
+    expect(cancelEvent.defaultPrevented).toBe(true);
+    expect(onClose).not.toHaveBeenCalled();
+
+    // Resolving the IPC lets propose()'s internal handleClose fire normally.
+    resolveInvoke({ kind: 'Completed' });
+    await waitFor(() => {
+      expect(onClose).toHaveBeenCalled();
+    });
+  });
+
   it('explainer_text_present_for_survivability_recommendation', () => {
     const { container } = render(ChangeQuorumDialog, {
       props: {
