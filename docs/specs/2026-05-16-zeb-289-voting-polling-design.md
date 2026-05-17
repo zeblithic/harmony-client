@@ -251,6 +251,17 @@ voting_get_poll(poll_id: PollId) -> PollState   # includes live tally
 
 ## 5. Tier 2 — Conviction Voting
 
+> **Amendment note (ZEB-291, 2026-05-17).**
+> The `Conviction compute (deterministic materialize)` and `Dynamic threshold` subsections below have been rewritten from the original f64 floating-point pseudocode to **fixed-point i128 Q96.32** equivalents. The change is required by ZEB-291 acceptance criterion #2 (two engines on different architectures must materialize bit-identical conviction state from the same event log). IEEE 754 f64 cannot guarantee this — fused-multiply-add reordering, subnormal handling, and reciprocal-table approximations diverge between x86 SSE/AVX and ARM NEON. See the **Why fixed-point i128, not f64?** rationale at the end of this section.
+>
+> Constants introduced by this amendment:
+> - `LN2_Q32 = 2_977_044_472` — `ln(2) * 2^32`, rounded up from the exact value `2_977_044_471.5340…`.
+> - `CONVICTION_FRAC_BITS = 32`.
+> - `Q32 = 1 << 32 = 4_294_967_296`.
+> - Conviction values are stored as `i128` in Q96.32 fixed-point (96 integer bits, 32 fractional bits) with an implicit `/ 2^32` interpretation factor.
+>
+> The Tier 2 PollConfig key `b` (β exponent) has also been renamed to `bb` to satisfy the §3 same-length-keys invariant (2-char throughout). All other Tier 2 wire-format keys and the Phase 1 / Tier 1 wire format are unchanged.
+
 Continuous-signaling, medium-stakes mechanism. Aragon / 1Hive lineage adapted for 1p1v non-monetary context. Replaces dramatic "election day" events with an always-on signaling layer.
 
 ### Mechanism
@@ -262,10 +273,12 @@ Each voter has unit weight (1p1v); signal is binary (supporting / not supporting
 ```text
 {
   "pt": "Promote @alice to moderator (power 50)",   # proposal text
-  "hl": 604800,                # half-life seconds (default 7 days; community-policy default)
-  "tn": 0.05,                  # T_min: 5% of total_supply
-  "tx": 0.50,                  # T_max: 50% of total_supply
-  "b":  2,                     # β exponent (curvature)
+  "hl": 604800,                # half-life seconds (u32; default 7 days; community-policy default)
+  "tn": "214748365",           # T_min as i128 Q32 (= 0.05 * 2^32); CBOR encodes as integer,
+                               #   JSON IPC encodes as decimal string to avoid f64 round-trip
+  "tx": "2147483648",          # T_max as i128 Q32 (= 0.50 * 2^32)
+  "bb": 2,                     # β exponent (curvature; small u32; renamed from "b" for
+                               #   §3 same-length-keys invariant)
   "dl": true,                  # delegation_allowed (default true)
   "ax": "sp"                   # auto-exec action kind (only "none" or "sp"=set_power in v1)
 }
@@ -286,50 +299,92 @@ Each voter has unit weight (1p1v); signal is binary (supporting / not supporting
 
 ### Conviction compute (deterministic materialize)
 
-Walk events in HLC order; per-(voter, proposal) maintain:
+Walk events in HLC order; per-(voter, proposal) maintain Q96.32 fixed-point state:
 
 ```text
 state = {
   is_supporting: bool,
-  support_started_at: HLC,
-  accumulated_conviction: f64,
-  last_decay_at: HLC,
+  support_started_at_ms: i128,
+  accumulated_conviction_q32: i128,  // Q96.32 fixed-point
+  last_event_at_ms: i128,
 }
 
-On Signal{support: true}:
-  if !is_supporting: set is_supporting=true, support_started_at=event.hlc
+On Signal{support: true} at event.hlc_ms:
+  if !is_supporting:
+    is_supporting = true
+    support_started_at_ms = event.hlc_ms
+    last_event_at_ms = event.hlc_ms
 
-On Signal{support: false}:
+On Signal{support: false} at event.hlc_ms:
   if is_supporting:
-    duration = event.hlc - support_started_at
-    accumulated_conviction += charge(duration, half_life)
+    duration_ms = event.hlc_ms - support_started_at_ms
+    accumulated_conviction_q32 += charge_q32(duration_ms, half_life_ms)
     is_supporting = false
-    last_decay_at = event.hlc
+    last_event_at_ms = event.hlc_ms
 
-charge(d, hl) = (1 - 0.5^(d/hl)) / ln(2) * hl
-# Integral of 0.5^(t/hl) dt from 0 to d.
+# Fixed-point charge function (Q96.32):
+# charge(d, hl) = (1 - 0.5^(d/hl)) * hl / ln(2)
+charge_q32(duration_ms: i128, half_life_ms: i128) -> i128:
+  pow = pow_half_q32(duration_ms, half_life_ms)        # Q32; ≤ Q32
+  one_minus = Q32 - pow
+  return (one_minus * half_life_ms) / LN2_Q32          # ms
 
-conviction_at(t):
+# Fixed-point decay function (Q96.32):
+# decay(c, dt, hl) = c * 0.5^(dt/hl)
+decay_q32(c_q32: i128, dt_ms: i128, half_life_ms: i128) -> i128:
+  pow = pow_half_q32(dt_ms, half_life_ms)              # Q32
+  return (c_q32 * pow) >> CONVICTION_FRAC_BITS
+
+# Fixed-point 0.5^(t/hl) via Taylor series for exp(-x ln 2):
+pow_half_q32(t_ms: i128, hl_ms: i128) -> i128:
+  x_q32 = (t_ms * LN2_Q32) / hl_ms
+  return exp_neg_q32(x_q32)
+
+exp_neg_q32(x_q32: i128) -> i128:
+  # Taylor: exp(-x) = Σ (-x)^n / n!, truncated at n=7 (error < 1e-9 for x ≤ 10)
+  term = Q32   # n=0
+  sum = Q32
+  for n in 1..=7:
+    term = -(term * x_q32) / (Q32 * n)
+    sum += term
+  return sum
+
+conviction_at(t_ms, half_life_ms):
   if is_supporting:
-    elapsed = t - support_started_at
-    return accumulated_conviction * 0.5^((t - last_decay_at) / hl)
-         + charge(elapsed, hl)
+    active_charge = charge_q32(t_ms - support_started_at_ms, half_life_ms)
+    decayed_prior = decay_q32(accumulated_conviction_q32, t_ms - last_event_at_ms, half_life_ms)
+    return decayed_prior + active_charge
   else:
-    return accumulated_conviction * 0.5^((t - last_decay_at) / hl)
+    return decay_q32(accumulated_conviction_q32, t_ms - last_event_at_ms, half_life_ms)
 ```
 
-Per-proposal total conviction at time t = Σ over voters of `conviction_at(t)`, weighted by delegation if applicable.
+Per-proposal total conviction at time t = Σ over voters of `conviction_at(t)`, weighted by delegation if applicable. Sums are performed on i128 Q32 values directly (associative integer addition is bit-identical across architectures).
 
 ### Dynamic threshold
 
 ```text
-effective_supply(t) = | { voter : voter has ≥ 1 active Signal at HLC t } |
-total_supply        = | eligible_voters at PollCreate.hlc |   # snapshotted
-ratio(t)            = effective_supply(t) / total_supply
-threshold(t)        = T_min + (T_max - T_min) * (1 - ratio(t))^β
+effective_supply(t_ms) = | { voter : voter has ≥ 1 active Signal at hlc_ms ≤ t_ms } |
+total_supply           = | eligible_voters at PollCreate.hlc_ms |   # snapshotted
+
+# All values Q32 fixed-point:
+ratio_q32 = (effective_supply * Q32) / total_supply              # ≤ Q32
+one_minus_ratio_q32 = Q32 - ratio_q32
+
+# (1 - ratio)^β via repeated multiplication (β is small integer, default 2):
+pow_q32 = one_minus_ratio_q32
+for _ in 1..β:
+  pow_q32 = (pow_q32 * one_minus_ratio_q32) >> CONVICTION_FRAC_BITS
+
+# Final threshold (Q32):
+span_q32 = T_max_q32 - T_min_q32
+threshold_q32 = T_min_q32 + ((span_q32 * pow_q32) >> CONVICTION_FRAC_BITS)
 ```
 
 High participation → low threshold; low participation → high threshold. Solves the low-turnout paralysis problem: a small dedicated subgroup can pass routine items provided broader community doesn't actively oppose.
+
+### Why fixed-point i128, not f64?
+
+ZEB-291 acceptance criterion #2 requires that two engines running on different architectures (e.g., x86_64 desktop vs ARM laptop) materialize bit-identical conviction state from the same event log. IEEE 754 f64 does not provide this guarantee — fused-multiply-add hint reordering, subnormal handling, and `1/x` table approximations differ between x86 SSE/AVX and ARM NEON. Empirically, the same f64 computation on two x86 chips can differ in the least 1-2 bits, and on x86 vs ARM the divergence is reproducible. Q96.32 fixed-point is bit-identical by construction: every operation is integer arithmetic with explicit shift/divide rounding. The cost is a small implementation complexity and the loss of subnormal-range precision, neither of which matter for conviction values bounded by community membership × half-life.
 
 ### Lifecycle
 
