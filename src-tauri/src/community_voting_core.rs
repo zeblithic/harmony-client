@@ -9,6 +9,7 @@ use crate::community_membership::ChannelId;
 use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 
 /// Globally-unique identifier for a poll, derived from
 /// `H(community_id || poll_create_event_hash)`.
@@ -405,5 +406,161 @@ mod poll_meta_tests {
         ciborium::into_writer(&meta, &mut encoded).expect("encode");
         let decoded: PollMeta = ciborium::from_reader(&encoded[..]).expect("decode");
         assert_eq!(meta, decoded);
+    }
+}
+
+/// Snapshot of community membership at a specific HLC, used by the
+/// eligibility verifier. Built by querying `community_membership`
+/// materialized state at the desired HLC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MembershipSnapshot {
+    pub members: HashMap<OwnerAddr, MemberAttrs>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemberAttrs {
+    pub power: u8,
+    pub vouching_depth: u8,
+}
+
+/// Why an eligibility check failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EligibilityFailure {
+    NotMember,
+    InsufficientPower { required: u8, actual: u8 },
+    InsufficientVouchingDepth { required: u8, actual: u8 },
+}
+
+/// Verify that `signer` meets `eligibility` against `snapshot`.
+/// Returns Ok(()) if eligible; Err(reason) otherwise.
+pub fn check_eligibility(
+    snapshot: &MembershipSnapshot,
+    signer: &OwnerAddr,
+    eligibility: &Eligibility,
+) -> Result<(), EligibilityFailure> {
+    let attrs = snapshot
+        .members
+        .get(signer)
+        .ok_or(EligibilityFailure::NotMember)?;
+    if attrs.power < eligibility.min_power {
+        return Err(EligibilityFailure::InsufficientPower {
+            required: eligibility.min_power,
+            actual: attrs.power,
+        });
+    }
+    if let Some(req_depth) = eligibility.min_vouching_depth {
+        if attrs.vouching_depth < req_depth {
+            return Err(EligibilityFailure::InsufficientVouchingDepth {
+                required: req_depth,
+                actual: attrs.vouching_depth,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod eligibility_tests {
+    use super::*;
+
+    fn snapshot_with(addr: OwnerAddr, power: u8, vouching_depth: u8) -> MembershipSnapshot {
+        let mut members = HashMap::new();
+        members.insert(
+            addr,
+            MemberAttrs {
+                power,
+                vouching_depth,
+            },
+        );
+        MembershipSnapshot { members }
+    }
+
+    #[test]
+    fn non_member_rejected() {
+        let snap = snapshot_with(OwnerAddr([0x11; 16]), 100, 5);
+        let elig = Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        };
+        assert_eq!(
+            check_eligibility(&snap, &OwnerAddr([0x22; 16]), &elig),
+            Err(EligibilityFailure::NotMember)
+        );
+    }
+
+    #[test]
+    fn member_with_sufficient_power_accepted() {
+        let addr = OwnerAddr([0x11; 16]);
+        let snap = snapshot_with(addr, 50, 0);
+        let elig = Eligibility {
+            min_power: 50,
+            min_vouching_depth: None,
+            sortition_size: None,
+        };
+        assert_eq!(check_eligibility(&snap, &addr, &elig), Ok(()));
+    }
+
+    #[test]
+    fn member_with_insufficient_power_rejected() {
+        let addr = OwnerAddr([0x11; 16]);
+        let snap = snapshot_with(addr, 10, 0);
+        let elig = Eligibility {
+            min_power: 50,
+            min_vouching_depth: None,
+            sortition_size: None,
+        };
+        assert_eq!(
+            check_eligibility(&snap, &addr, &elig),
+            Err(EligibilityFailure::InsufficientPower {
+                required: 50,
+                actual: 10
+            })
+        );
+    }
+
+    #[test]
+    fn vouching_depth_gate_enforced() {
+        let addr = OwnerAddr([0x11; 16]);
+        let snap = snapshot_with(addr, 1, 1);
+        let elig = Eligibility {
+            min_power: 1,
+            min_vouching_depth: Some(3),
+            sortition_size: None,
+        };
+        assert_eq!(
+            check_eligibility(&snap, &addr, &elig),
+            Err(EligibilityFailure::InsufficientVouchingDepth {
+                required: 3,
+                actual: 1
+            })
+        );
+    }
+
+    #[test]
+    fn vouching_depth_gate_satisfied() {
+        let addr = OwnerAddr([0x11; 16]);
+        let snap = snapshot_with(addr, 1, 5);
+        let elig = Eligibility {
+            min_power: 1,
+            min_vouching_depth: Some(3),
+            sortition_size: None,
+        };
+        assert_eq!(check_eligibility(&snap, &addr, &elig), Ok(()));
+    }
+
+    #[test]
+    fn power_checked_before_vouching_depth() {
+        let addr = OwnerAddr([0x11; 16]);
+        let snap = snapshot_with(addr, 1, 1);
+        let elig = Eligibility {
+            min_power: 50,
+            min_vouching_depth: Some(10),
+            sortition_size: None,
+        };
+        assert!(matches!(
+            check_eligibility(&snap, &addr, &elig),
+            Err(EligibilityFailure::InsufficientPower { .. })
+        ));
     }
 }
