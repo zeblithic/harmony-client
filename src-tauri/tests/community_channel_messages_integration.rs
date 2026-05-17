@@ -180,14 +180,6 @@ async fn wait_for_stable_count(
     counter.lock().expect("count lock").len()
 }
 
-// ZEB-288: orphaned wall-clock-flaky test. The "go offline" race against
-// the publisher loop is no longer cleanly bounded (B sees ~68 in-flight
-// messages during the offline window vs. the test's slack-of-5 budget).
-// Tracked in https://linear.app/zeblith/issue/ZEB-288; fix in a separate
-// PR (likely tokio::time::pause + logical time) per the
-// `feedback_wall_clock_regression_budget` + `feedback_unrelated_test_failures`
-// memory rules.
-#[ignore = "ZEB-288 wall-clock race; fix tracked separately"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
     use std::sync::Mutex as StdMutex;
@@ -381,13 +373,16 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
         .await
         .expect("stop B");
 
-    // Briefly let the adapter teardown settle (closing flag is poll-
-    // based on a 1s timer for select arms — but we don't need to wait
-    // a full second; the publisher task exits as soon as the queue is
-    // empty AND closing is true on its next tick).
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let received_at_offline_start = received_b.lock().expect("received_b lock").len();
+    // ZEB-288: the registry's `stop()` only flips the adapter's `closing`
+    // flag; the adapter's select arms poll that flag on a 1s interval,
+    // so B's adapter can keep delivering for up to ~1s after stop returns.
+    // A fixed wall-clock sleep here is the wrong shape (200ms << 1s poll;
+    // failed under load during ZEB-250 baseline). Instead, wait for B's
+    // received counter to actually stop growing — 5 quiet polls of 100ms
+    // each = 500ms of confirmed silence — which proves the adapter has
+    // drained regardless of host load or future poll-interval changes.
+    let received_at_offline_start =
+        wait_for_stable_count(&received_b, 5, Duration::from_secs(3)).await;
 
     for i in 100..150 {
         Arc::clone(&engine_a)
@@ -399,12 +394,13 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
         }
     }
 
-    // Give a moment for any in-flight loopback packets to settle.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let received_at_offline_end = received_b.lock().expect("received_b lock").len();
-    // B may receive a small number of in-flight messages racing with
-    // the stop; we allow ≤5 slack on either side of 100.
+    // Re-confirm B stays quiet across a second stable-count window. If
+    // any of the 50 publishes leak past the (already-stopped) adapter,
+    // they'll show up here and the assertion below fails loudly.
+    let received_at_offline_end =
+        wait_for_stable_count(&received_b, 5, Duration::from_secs(2)).await;
+    // Slack of ≤5 covers any in-flight events that were already queued
+    // between B's adapter and engine when `closing` was first observed.
     assert!(
         (received_at_offline_start..=received_at_offline_start + 5)
             .contains(&received_at_offline_end),
