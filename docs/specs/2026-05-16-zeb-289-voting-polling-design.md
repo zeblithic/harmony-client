@@ -783,17 +783,17 @@ Future / parking-lot items the spec explicitly does not design:
 
 ## 15. Phased decomposition into sub-tickets
 
-Seven phases, ascending complexity / descending user-frequency. ZEB-289 stays as parent epic; each phase becomes its own sub-ticket with own spec + plan + implementation cycle. **Linear sub-ticket numbers will be filed after this umbrella spec is committed** (per `feedback_never_invent_linear_ids` — no inventing ZEB-NNN for issues that don't exist yet).
+Seven phases, ascending complexity / descending user-frequency. ZEB-289 stays as parent epic; each phase becomes its own sub-ticket with own spec + plan + implementation cycle.
 
-| Phase | Scope | Dependencies | Effort |
-|---|---|---|---|
-| **1** | `voting_core.rs` (shared types, eligibility verifier, IPC dispatcher, lifecycle state machine) + `voting_approval.rs` (Approval mechanism, ballot, materialize, tally) + chat-embedded poll UI + IPC commands + Tauri events. | none | M (~2-3w) |
-| **2** | `voting_conviction.rs` (conviction compute, dynamic threshold, lifecycle, 24h contestability, **delegation event types + verify rules** but no delegation UI) + CommunityProposalsPanel.svelte (basic signal toggle, no delegation widget) + `set_power` auto-exec wiring. | Phase 1 | M (~2-3w) |
-| **3** | Delegation widget in CommunityProposalsPanel, delegate-graph visualization, revocation flow, delegation-state notifications. No new backend (already shipped in Phase 2). | Phase 2 | S (~1w) |
-| **4** | `voting_sortition.rs` (sortition selection, STAR ratification, drafting), D-FROST-derived VRF beacon, mini-public/full-electorate eligibility split, public ratification ballots only (no Pol.is, no privacy). Includes foundational D-FROST committee primitives. | Phase 1 (Tier 1 reused within drafting), D-FROST committee primitives | L (~3-4w) |
-| **5** | DeliberationStatement + DeliberationVote CRDT, opinion clustering / bridging-statement detection. Algorithm choice deferred to phase brainstorm. Mini-public deliberation UI. | Phase 4 | M (~2-3w) |
-| **6** | Extend D-FROST committee to handle threshold-ElGamal decryption. Encrypted RatificationBallot, TallyShare events, multi-party decryption protocol. CHURP-style proactive secret share rotation. | Phase 4, Phase 5 if in path | L (~3-4w) |
-| **7** | TRIP kiosk software (likely separate small repo), credential generation + paper IZKP printing, voter UX for credential storage + ballot signing, library partnership onboarding documentation. Builds on Phase 6 D-FROST tally. | Phase 6, civic infrastructure partnerships | XL (~6-8w + civic rollout) |
+| Phase | Linear | Scope | Dependencies | Effort |
+|---|---|---|---|---|
+| **1** | [ZEB-290](https://linear.app/zeblith/issue/ZEB-290) | `voting_core.rs` (shared types, eligibility verifier, IPC dispatcher, lifecycle state machine) + `voting_approval.rs` (Approval mechanism, ballot, materialize, tally) + chat-embedded poll UI + IPC commands + Tauri events. | none | M (~2-3w) |
+| **2** | [ZEB-291](https://linear.app/zeblith/issue/ZEB-291) | `voting_conviction.rs` (conviction compute, dynamic threshold, lifecycle, 24h contestability, **delegation event types + verify rules** but no delegation UI) + CommunityProposalsPanel.svelte (basic signal toggle, no delegation widget) + `set_power` auto-exec wiring. | Phase 1 | M (~2-3w) |
+| **3** | [ZEB-292](https://linear.app/zeblith/issue/ZEB-292) | Delegation widget in CommunityProposalsPanel, delegate-graph visualization, revocation flow, delegation-state notifications. No new backend (already shipped in Phase 2). | Phase 2 | S (~1w) |
+| **4** | [ZEB-293](https://linear.app/zeblith/issue/ZEB-293) | `voting_sortition.rs` (sortition selection, STAR ratification, drafting), D-FROST-derived VRF beacon, mini-public/full-electorate eligibility split, public ratification ballots only (no Pol.is, no privacy). Includes foundational D-FROST committee primitives. | Phase 1 (Tier 1 reused within drafting), D-FROST committee primitives | L (~3-4w) |
+| **5** | [ZEB-294](https://linear.app/zeblith/issue/ZEB-294) | DeliberationStatement + DeliberationVote CRDT, opinion clustering / bridging-statement detection. Algorithm choice deferred to phase brainstorm. Mini-public deliberation UI. | Phase 4 | M (~2-3w) |
+| **6** | [ZEB-295](https://linear.app/zeblith/issue/ZEB-295) | Extend D-FROST committee to handle threshold-ElGamal decryption. Encrypted RatificationBallot, TallyShare events, multi-party decryption protocol. CHURP-style proactive secret share rotation. | Phase 4, Phase 5 if in path | L (~3-4w) |
+| **7** | [ZEB-296](https://linear.app/zeblith/issue/ZEB-296) | TRIP kiosk software (likely separate small repo), credential generation + paper IZKP printing, voter UX for credential storage + ballot signing, library partnership onboarding documentation. Builds on Phase 6 D-FROST tally. | Phase 6, civic infrastructure partnerships | XL (~6-8w + civic rollout) |
 
 **Parallelization opportunities:** Phase 4 doesn't strictly depend on Phase 3 (delegation UI), so Phase 4 could start while Phase 3 is in flight. Phase 5 (Pol.is) doesn't block Phase 6 (D-FROST tally) — they touch different parts of Tier 3 lifecycle. If shipping Tier 3 privacy is higher priority than deliberation polish, order can become 4 → 6 → 5 → 7. Linear order matches user-value-per-phase (most-useful first).
 
