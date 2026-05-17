@@ -7,10 +7,12 @@
 
 use std::collections::HashMap;
 
+use crate::community_voting_approval::{validate_poll_config, Tier1PollConfig};
 use crate::community_voting_core::{
     derive_poll_id, next_lifecycle, Eligibility, Lifecycle, PollEventKindCode, PollId, PollMeta,
-    SignedVotingEvent,
+    SignedVotingEvent, Tier,
 };
+use crate::owner_state_types::Hlc;
 
 /// All voting events for a single community, plus the materialized
 /// per-poll state derived from them.
@@ -51,6 +53,8 @@ pub enum ApplyError {
     MissingPollIdRef,
     IllegalTransition,
     EventBeforePollCreate,
+    PayloadDecode,
+    PayloadValidate,
 }
 
 impl VotingLog {
@@ -99,29 +103,56 @@ impl VotingLog {
             state.meta.lifecycle = next;
             state.events.push(event.clone());
         } else if event.kind == PollEventKindCode::PollCreate {
-            // Stub PollMeta — populated fully in Task 7 once Tier 1
-            // PollConfig deserialization lands.
-            let stub = PollMeta {
-                poll_id,
-                community_id: *community_id,
-                creator: event.actor,
-                tier: event.tier,
-                eligibility: Eligibility {
-                    min_power: 0,
-                    min_vouching_depth: None,
-                    sortition_size: None,
-                },
-                lifecycle: next,
-                created_at: event.hlc.clone(),
-                opens_at: event.hlc.clone(),
-                closes_at: event.hlc.clone(),
-                extends_at: None,
-                channel_id: None,
+            // Tier-1 PollCreate: deserialize and validate Tier1PollConfig
+            // from the payload, then populate PollMeta fully from it.
+            // Tier 2/3 land in their respective phases — until then,
+            // PollCreate events with non-Tier 1 tier values populate a
+            // minimal PollMeta with default Eligibility (closes_at = hlc).
+            let meta = if event.tier == Tier::Approval {
+                let cfg: Tier1PollConfig = ciborium::de::from_reader(&event.payload[..])
+                    .map_err(|_| ApplyError::PayloadDecode)?;
+                validate_poll_config(&cfg).map_err(|_| ApplyError::PayloadValidate)?;
+                let closes_at = Hlc {
+                    wall_ms: event.hlc.wall_ms + (cfg.window_seconds as u64 * 1000),
+                    logical: 0,
+                    device_id: event.hlc.device_id.clone(),
+                };
+                PollMeta {
+                    poll_id,
+                    community_id: *community_id,
+                    creator: event.actor,
+                    tier: event.tier,
+                    eligibility: cfg.eligibility,
+                    lifecycle: next,
+                    created_at: event.hlc.clone(),
+                    opens_at: event.hlc.clone(),
+                    closes_at,
+                    extends_at: None,
+                    channel_id: Some(cfg.channel_id),
+                }
+            } else {
+                PollMeta {
+                    poll_id,
+                    community_id: *community_id,
+                    creator: event.actor,
+                    tier: event.tier,
+                    eligibility: Eligibility {
+                        min_power: 0,
+                        min_vouching_depth: None,
+                        sortition_size: None,
+                    },
+                    lifecycle: next,
+                    created_at: event.hlc.clone(),
+                    opens_at: event.hlc.clone(),
+                    closes_at: event.hlc.clone(),
+                    extends_at: None,
+                    channel_id: None,
+                }
             };
             self.polls.insert(
                 poll_id,
                 PollState {
-                    meta: stub,
+                    meta,
                     events: vec![event.clone()],
                     tier_state: TierState::Empty,
                 },
@@ -149,14 +180,34 @@ fn decode_poll_id_ref(pd: &[u8]) -> Option<PollId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::community_voting_core::Tier;
-    use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+    use crate::community_membership::ChannelId;
+    use crate::community_voting_approval::Tier1PollConfig;
+    use crate::owner_state_types::OwnerAddr;
+    use crate::owner_state_types::SpaceId;
 
     fn signing_bytes_of(ev: &SignedVotingEvent) -> Vec<u8> {
         ev.signing_bytes().expect("signing bytes")
     }
 
+    fn good_poll_config() -> Tier1PollConfig {
+        Tier1PollConfig {
+            options: vec!["A".into(), "B".into(), "C".into()],
+            window_seconds: 3600,
+            quorum: None,
+            threshold_percent: None,
+            multi_winner: None,
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            channel_id: ChannelId([0x11; 16]),
+        }
+    }
+
     fn poll_create_event(creator: OwnerAddr) -> SignedVotingEvent {
+        let mut payload = Vec::new();
+        ciborium::into_writer(&good_poll_config(), &mut payload).expect("encode cfg");
         SignedVotingEvent {
             tag: 'p',
             version: 1,
@@ -168,7 +219,7 @@ mod tests {
                 device_id: "a".into(),
             },
             actor: creator,
-            payload: vec![],
+            payload,
             sig: vec![0u8; 64],
         }
     }
