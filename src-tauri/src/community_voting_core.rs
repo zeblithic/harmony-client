@@ -564,3 +564,104 @@ mod eligibility_tests {
         ));
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleError {
+    IllegalTransition {
+        from: Lifecycle,
+        attempted: PollEventKindCode,
+    },
+}
+
+/// Given current lifecycle + incoming event kind, return new lifecycle
+/// or an error. Per spec §2 + verify rules L1, B2, R1.
+pub fn next_lifecycle(
+    current: Lifecycle,
+    kind: PollEventKindCode,
+) -> Result<Lifecycle, LifecycleError> {
+    use Lifecycle::*;
+    use PollEventKindCode::*;
+    match (current, kind) {
+        (Draft, PollCreate) => Ok(Open),
+        (Open, BallotCast) | (Open, PollExtend) | (Open, PollOpen) => Ok(Open),
+        (Open, PollClose) => Ok(Closed),
+        (Closed, PollResult) => Ok(Finalized),
+        _ => Err(LifecycleError::IllegalTransition {
+            from: current,
+            attempted: kind,
+        }),
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn draft_to_open_via_create() {
+        assert_eq!(
+            next_lifecycle(Lifecycle::Draft, PollEventKindCode::PollCreate),
+            Ok(Lifecycle::Open)
+        );
+    }
+
+    #[test]
+    fn open_accepts_ballot_cast() {
+        assert_eq!(
+            next_lifecycle(Lifecycle::Open, PollEventKindCode::BallotCast),
+            Ok(Lifecycle::Open)
+        );
+    }
+
+    #[test]
+    fn open_to_closed_via_close() {
+        assert_eq!(
+            next_lifecycle(Lifecycle::Open, PollEventKindCode::PollClose),
+            Ok(Lifecycle::Closed)
+        );
+    }
+
+    #[test]
+    fn closed_to_finalized_via_result() {
+        assert_eq!(
+            next_lifecycle(Lifecycle::Closed, PollEventKindCode::PollResult),
+            Ok(Lifecycle::Finalized)
+        );
+    }
+
+    #[test]
+    fn closed_rejects_ballot_cast() {
+        assert!(matches!(
+            next_lifecycle(Lifecycle::Closed, PollEventKindCode::BallotCast),
+            Err(LifecycleError::IllegalTransition { .. })
+        ));
+    }
+
+    #[test]
+    fn finalized_rejects_everything() {
+        for kind in &[
+            PollEventKindCode::BallotCast,
+            PollEventKindCode::PollClose,
+            PollEventKindCode::PollResult,
+        ] {
+            assert!(matches!(
+                next_lifecycle(Lifecycle::Finalized, *kind),
+                Err(LifecycleError::IllegalTransition { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn archived_rejects_everything() {
+        for kind in &[
+            PollEventKindCode::BallotCast,
+            PollEventKindCode::PollClose,
+            PollEventKindCode::PollResult,
+        ] {
+            assert!(matches!(
+                next_lifecycle(Lifecycle::Archived, *kind),
+                Err(LifecycleError::IllegalTransition { .. })
+            ));
+        }
+    }
+}
