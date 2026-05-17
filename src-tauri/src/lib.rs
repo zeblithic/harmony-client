@@ -21,6 +21,7 @@ pub mod community_voting_approval;
 pub mod community_voting_conviction;
 pub mod community_voting_core;
 pub mod community_voting_log;
+pub mod community_voting_log_engine;
 pub mod content_index;
 pub mod content_store;
 pub mod dm_crypto;
