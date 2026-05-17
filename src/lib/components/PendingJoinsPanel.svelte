@@ -82,6 +82,9 @@
 
     async function kickJoiner(joinerAddr: string) {
         try {
+            // ZEB-250: result is AdminActionResult{Completed|Pending}. A pending
+            // joiner's power is always 0 (not admin-tier), so this will always
+            // be Completed, but we type it correctly for forwards-compatibility.
             await invoke('kick_from_community', {
                 communityId,
                 targetAddr: joinerAddr,

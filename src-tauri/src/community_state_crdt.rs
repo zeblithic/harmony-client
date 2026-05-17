@@ -68,6 +68,28 @@ pub struct CommunityState {
     #[serde(rename = "fl", skip_serializing_if = "Vec::is_empty", default)]
     pub parent_lineage: Vec<crate::community_invite::ParentLineageEntry>,
 
+    /// ZEB-250: M-of-N admin quorum. Number of admin-tier signatures
+    /// required for admin-affecting actions (SetPower to/from 100,
+    /// Kick of an admin, change of admin_quorum itself).
+    ///
+    /// Default 1 (single-admin governance — the proposer's signature
+    /// alone suffices). When raised >= 2, admin-affecting actions
+    /// must arrive as AdminProposal (with >= N-1 AdminCountersigns)
+    /// instead of direct SetPower/Kick events. Backwards-compatible:
+    /// pre-ZEB-250 blobs lack this field and decode as default 1.
+    ///
+    /// Cache of materialize-derived state — `materialize` walks
+    /// ChangeQuorum proposals to compute the current value, and
+    /// `insert_event` writes the result back here so fast-load
+    /// (deserialize from disk) has the right value without
+    /// re-materializing.
+    #[serde(
+        rename = "aq",
+        default = "crate::community_membership::default_admin_quorum",
+        skip_serializing_if = "crate::community_membership::is_default_admin_quorum"
+    )]
+    pub admin_quorum: u8,
+
     /// Append-only signed event log, keyed by EventId. BTreeMap (not
     /// HashMap) so iteration order is deterministic across replicas —
     /// canonical CBOR encoding requires a stable order.
@@ -125,6 +147,7 @@ impl Clone for CommunityState {
             forked_from: self.forked_from,
             forked_at_wall_ms: self.forked_at_wall_ms,
             parent_lineage: self.parent_lineage.clone(),
+            admin_quorum: self.admin_quorum,
             events: self.events.clone(),
             cache: std::sync::Mutex::new(MaterializedCache::default()),
             bootstrap_hint: std::sync::Mutex::new(
@@ -140,6 +163,7 @@ impl PartialEq for CommunityState {
             && self.forked_from == other.forked_from
             && self.forked_at_wall_ms == other.forked_at_wall_ms
             && self.parent_lineage == other.parent_lineage
+            && self.admin_quorum == other.admin_quorum
             && self.events == other.events
     }
 }
@@ -171,6 +195,7 @@ impl CommunityState {
             forked_from: None,
             forked_at_wall_ms: None,
             parent_lineage: Vec::new(),
+            admin_quorum: 1,
             events: BTreeMap::new(),
             cache: std::sync::Mutex::new(MaterializedCache::default()),
             bootstrap_hint: std::sync::Mutex::new(None),
@@ -291,6 +316,15 @@ impl CommunityState {
         // Invalidate cache by bumping version. Lazy re-mat happens on
         // the next `materialized` call.
         self.cache.lock().expect("cache mutex poisoned").version += 1;
+
+        // ZEB-250: synchronize CommunityState.admin_quorum with the
+        // freshly-recomputed materialized view. `materialize` is the
+        // source of truth (walks ChangeQuorum proposals in HLC order);
+        // we write the result back to the persistent field so fast-load
+        // doesn't need to re-materialize.
+        let derived = self.materialize_now(ctx.admin_addr).admin_quorum;
+        self.admin_quorum = derived;
+
         InsertOutcome::Inserted
     }
 

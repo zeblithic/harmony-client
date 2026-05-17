@@ -1,7 +1,17 @@
 import { describe, it, expect, vi } from 'vitest';
-import { render, fireEvent } from '@testing-library/svelte';
+import { render, fireEvent, waitFor } from '@testing-library/svelte';
 import CommunitySettingsPanel from '../CommunitySettingsPanel.svelte';
 import type { CommunityMember, CommunityLineageDto, ForkDescendantDto } from '../../types';
+
+// ZEB-250: CommunitySettingsPanel now imports invoke (for pending-badge map)
+// and mounts PendingAdminProposalsPanel (which also imports invoke + listen).
+// Hoist mocks so all tests render cleanly; default to empty-list resolution.
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: vi.fn().mockResolvedValue([]),
+}));
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: vi.fn().mockResolvedValue(() => {}),
+}));
 
 const adminMember: CommunityMember = { address: 'a3f8c1d2', displayName: 'Alice', power: 100, status: 'joined' };
 const modMember: CommunityMember = { address: 'cc99', displayName: 'Charlie', power: 50, status: 'joined' };
@@ -283,6 +293,75 @@ describe('CommunitySettingsPanel', () => {
     const forkButton = forksSection!.querySelector('button.fork-this-community');
     expect(forkButton).toBeTruthy();
     expect(forkButton?.textContent).toMatch(/Fork this community/);
+  });
+
+  // ── ZEB-250: Admin governance section tests ───────────────────────────────
+
+  it('admin_governance_section_renders_for_admin', async () => {
+    const { getByText } = render(CommunitySettingsPanel, {
+      props: { ...baseProps, myPower: 100, adminQuorum: 2 },
+    });
+    // Section label visible for admin caller.
+    expect(getByText('Admin governance')).toBeTruthy();
+    // Quorum info line rendered.
+    await waitFor(() => {
+      expect(getByText(/Current admin quorum: 2 of/)).toBeTruthy();
+    });
+    // Change quorum button present.
+    expect(getByText('Change quorum…')).toBeTruthy();
+  });
+
+  it('admin_governance_section_hidden_for_non_admin', () => {
+    const { queryByText } = render(CommunitySettingsPanel, {
+      props: { ...baseProps, myPower: 0, myAddress: plainMember.address, adminQuorum: 2 },
+    });
+    // Section must be absent for a plain member.
+    expect(queryByText('Admin governance')).toBeNull();
+    expect(queryByText('Change quorum…')).toBeNull();
+  });
+
+  it('pending_promotion_badge_renders_on_target_member_row', async () => {
+    const { invoke } = vi.mocked(await import('@tauri-apps/api/core'));
+    const adminProposal = {
+      event_id: 'bb'.repeat(16),
+      proposer_addr: adminMember.address,
+      proposer_display_name: 'Alice',
+      proposal_kind: {
+        kind: 'SetPower',
+        target_addr: plainMember.address,
+        target_display_name: 'Bob',
+        level: 100,
+      },
+      proposed_at_wall_ms: Date.now(),
+      signers_so_far: 1,
+      quorum_required: 2,
+      expired: false,
+      effective: false,
+      self_has_signed: false,
+      signer_display_names: ['Alice'],
+    };
+    // Use a per-command implementation so only list_pending_admin_proposals
+    // receives the proposal. Other IPC calls (e.g. list_pending_join_requests
+    // from PendingJoinsPanel) must receive [] to avoid shape-mismatch errors.
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) => {
+      if (cmd === 'list_pending_admin_proposals') return Promise.resolve([adminProposal]);
+      return Promise.resolve([]);
+    });
+
+    const { container } = render(CommunitySettingsPanel, {
+      props: { ...baseProps, myPower: 100 },
+    });
+
+    // Wait for the async $effect to resolve and update the DOM.
+    await waitFor(() => {
+      const bobRow = Array.from(container.querySelectorAll('.member-row')).find((r) =>
+        r.textContent?.includes('Bob'),
+      );
+      expect(bobRow?.querySelector('.pending-badge')).toBeTruthy();
+      expect(bobRow?.querySelector('.pending-badge')?.textContent).toMatch(
+        /pending promotion to admin/,
+      );
+    });
   });
 
   it('resolveLocalCommunityName_prop_flows_through_to_ForkLineageTree', () => {
