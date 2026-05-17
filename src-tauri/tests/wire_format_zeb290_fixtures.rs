@@ -20,7 +20,8 @@ const FIXTURE_ACTOR: OwnerAddr = OwnerAddr([0xaa; 16]);
 const FIXTURE_CHANNEL_BYTES: [u8; 16] = [0xcc; 16];
 
 const EXPECTED_TIER1_POLLCONFIG_HEX: &str = "a4626f70836550697a7a61674275726765727365537573686962776e190e1062656ca1626d700062636950cccccccccccccccccccccccccccccccc";
-const EXPECTED_TIER1_BALLOT_HEX: &str = "a26270695820abababababababababababababababababababababababababababababababab626170820002";
+const EXPECTED_TIER1_BALLOT_HEX: &str =
+    "a26270695820abababababababababababababababababababababababababababababababab626170820002";
 const EXPECTED_TIER1_POLLRESULT_HEX: &str = "a26270695820abababababababababababababababababababababababababababababababab627273a162776e820002";
 // Envelope fixtures regenerated on PR #130 follow-up after:
 //   1) Tier serialization switched to u8 discriminant via serde_repr (spec §3).

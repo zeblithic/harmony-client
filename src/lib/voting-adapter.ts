@@ -45,17 +45,63 @@ export interface CreateTier1PollArgs {
 }
 
 export class VotingAdapter {
-  /** Fired when ANY poll-created event arrives (local or — Phase 1.5
-   *  — peer). Consumers should refresh `listActivePolls(communityId)`. */
-  onPollCreated?: (payload: VotingPollCreatedPayload) => void;
-  /** Fired when ANY ballot-cast event arrives. Consumers holding a
-   *  cached `PollStateExport` for `payload.pollId` should refresh it
-   *  (the tally has changed). */
-  onBallotCast?: (payload: VotingBallotCastPayload) => void;
-  /** Fired when a poll's lifecycle transitions to Closed. Phase 1.5
-   *  only — not emitted by the backend in Phase 1. Wired for forward
-   *  compatibility. */
-  onPollClosed?: (payload: VotingPollClosedPayload) => void;
+  /** Convenience single-slot setters (kept for backward compat with
+   *  existing consumers that own the only subscription). Setting these
+   *  appends a subscriber; clearing requires the returned unsubscribe
+   *  from the explicit `subscribeXxx` methods. Prefer the explicit
+   *  subscribers for components that mount/unmount in non-LIFO order
+   *  (Cursor #130 round-6 caught a leak in the old monkey-patch
+   *  linked-list pattern). */
+  get onPollCreated(): ((payload: VotingPollCreatedPayload) => void) | undefined {
+    return this._onPollCreated;
+  }
+  set onPollCreated(handler: ((payload: VotingPollCreatedPayload) => void) | undefined) {
+    this._onPollCreated = handler;
+  }
+  get onBallotCast(): ((payload: VotingBallotCastPayload) => void) | undefined {
+    return this._onBallotCast;
+  }
+  set onBallotCast(handler: ((payload: VotingBallotCastPayload) => void) | undefined) {
+    this._onBallotCast = handler;
+  }
+  get onPollClosed(): ((payload: VotingPollClosedPayload) => void) | undefined {
+    return this._onPollClosed;
+  }
+  set onPollClosed(handler: ((payload: VotingPollClosedPayload) => void) | undefined) {
+    this._onPollClosed = handler;
+  }
+  private _onPollCreated?: (payload: VotingPollCreatedPayload) => void;
+  private _onBallotCast?: (payload: VotingBallotCastPayload) => void;
+  private _onPollClosed?: (payload: VotingPollClosedPayload) => void;
+
+  /** Multi-subscriber lists. `subscribeXxx` returns an unsubscribe
+   *  closure that splices the handler out of the list — order-
+   *  independent cleanup with no chain-leak risk. */
+  private pollCreatedSubs: Array<(p: VotingPollCreatedPayload) => void> = [];
+  private ballotCastSubs: Array<(p: VotingBallotCastPayload) => void> = [];
+  private pollClosedSubs: Array<(p: VotingPollClosedPayload) => void> = [];
+
+  subscribePollCreated(handler: (p: VotingPollCreatedPayload) => void): () => void {
+    this.pollCreatedSubs.push(handler);
+    return () => {
+      const i = this.pollCreatedSubs.indexOf(handler);
+      if (i >= 0) this.pollCreatedSubs.splice(i, 1);
+    };
+  }
+  subscribeBallotCast(handler: (p: VotingBallotCastPayload) => void): () => void {
+    this.ballotCastSubs.push(handler);
+    return () => {
+      const i = this.ballotCastSubs.indexOf(handler);
+      if (i >= 0) this.ballotCastSubs.splice(i, 1);
+    };
+  }
+  subscribePollClosed(handler: (p: VotingPollClosedPayload) => void): () => void {
+    this.pollClosedSubs.push(handler);
+    return () => {
+      const i = this.pollClosedSubs.indexOf(handler);
+      if (i >= 0) this.pollClosedSubs.splice(i, 1);
+    };
+  }
 
   private adapter: TauriAdapter | null = null;
   private unlisteners: Array<() => void> = [];
@@ -80,7 +126,11 @@ export class VotingAdapter {
         const unlistenCreated = await adapter.listen(
           'voting-poll-created',
           (event) => {
-            this.onPollCreated?.(event.payload as VotingPollCreatedPayload);
+            const payload = event.payload as VotingPollCreatedPayload;
+            this._onPollCreated?.(payload);
+            // Copy first so a handler that unsubscribes itself during
+            // delivery doesn't skip a sibling at the same index.
+            for (const sub of [...this.pollCreatedSubs]) sub(payload);
           },
         );
         stagedUnlisteners.push(unlistenCreated);
@@ -88,7 +138,9 @@ export class VotingAdapter {
         const unlistenCast = await adapter.listen(
           'voting-ballot-cast',
           (event) => {
-            this.onBallotCast?.(event.payload as VotingBallotCastPayload);
+            const payload = event.payload as VotingBallotCastPayload;
+            this._onBallotCast?.(payload);
+            for (const sub of [...this.ballotCastSubs]) sub(payload);
           },
         );
         stagedUnlisteners.push(unlistenCast);
@@ -96,7 +148,9 @@ export class VotingAdapter {
         const unlistenClosed = await adapter.listen(
           'voting-poll-closed',
           (event) => {
-            this.onPollClosed?.(event.payload as VotingPollClosedPayload);
+            const payload = event.payload as VotingPollClosedPayload;
+            this._onPollClosed?.(payload);
+            for (const sub of [...this.pollClosedSubs]) sub(payload);
           },
         );
         stagedUnlisteners.push(unlistenClosed);

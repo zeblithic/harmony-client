@@ -1399,15 +1399,17 @@ pub fn validate_poll_config(cfg: &Tier1PollConfig) -> Result<(), ValidationError
 }
 
 /// Validate a Ballot against its poll's config. Spec §4 ballot constraints.
+///
+/// Check ordering matters: structural checks (empty, range, sort/dedup)
+/// run before the abstention check so that `[0, 0, 2]` against a 3-option
+/// poll surfaces as `IndicesNotSortedDeduped` rather than as a spurious
+/// `AbstentionBallot` (raw len happens to equal options.len()).
 pub fn validate_ballot(
     ballot: &Tier1Ballot,
     cfg: &Tier1PollConfig,
 ) -> Result<(), ValidationError> {
     if ballot.approved_indices.is_empty() {
         return Err(ValidationError::EmptyBallot);
-    }
-    if ballot.approved_indices.len() == cfg.options.len() {
-        return Err(ValidationError::AbstentionBallot);
     }
     // Indices in range.
     for &i in &ballot.approved_indices {
@@ -1420,6 +1422,9 @@ pub fn validate_ballot(
         if w[0] >= w[1] {
             return Err(ValidationError::IndicesNotSortedDeduped);
         }
+    }
+    if ballot.approved_indices.len() == cfg.options.len() {
+        return Err(ValidationError::AbstentionBallot);
     }
     Ok(())
 }

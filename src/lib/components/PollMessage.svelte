@@ -32,7 +32,6 @@
     type PollIdHex,
     type PollStateExport,
     type PollMeta,
-    type VotingBallotCastPayload,
   } from '../types/voting';
   import type { VotingAdapter } from '../voting-adapter';
 
@@ -101,19 +100,16 @@
       }
     })();
 
-    const prevOnBallotCast = adapter.onBallotCast;
-    // Capture this handler reference so cleanup only restores the previous
-    // chain link if WE are still the current head. Out-of-order unmount
-    // (e.g. virtual-scroll, parent {#if} toggle) was overwriting siblings'
-    // live handlers — Greptile P1 on PR #130 caught this.
-    const thisHandler = (payload: VotingBallotCastPayload) => {
-      prevOnBallotCast?.(payload);
-      // Bail early if we've been unmounted but the head-only restore
-      // pattern left our closure still chained behind a sibling.
+    // Use the adapter's subscriber-list API so multiple poll cards can
+    // each receive ballot-cast events without the chain-pattern leak
+    // the monkey-patched onBallotCast had (Cursor #130 round-6 caught
+    // dead handlers accumulating after non-LIFO unmount). The returned
+    // unsubscribe closure splices our handler out of the list in O(n)
+    // regardless of mount/unmount order.
+    const unsubBallotCast = adapter.subscribeBallotCast((payload) => {
       // pollId is a byte-array over Tauri JSON IPC (see PollIdHex JSDoc),
       // so `!==` would reference-compare and always be true. Value-equal.
       if (cancelled || !pollIdEqual(payload.pollId, id)) return;
-      // Refetch on any matching ballot-cast (self or — Phase 1.5 — peer).
       void (async () => {
         try {
           const next = await adapter.getPoll(id);
@@ -124,18 +120,11 @@
           // Stale poll (e.g. log evicted): keep last-known state.
         }
       })();
-    };
-    adapter.onBallotCast = thisHandler;
+    });
 
     return () => {
       cancelled = true;
-      // Only restore the previous handler if we're still the current head;
-      // otherwise a sibling has chained on top of us and removing ourselves
-      // would silently break their delivery. The sibling's own cleanup
-      // will eventually unlink us.
-      if (adapter.onBallotCast === thisHandler) {
-        adapter.onBallotCast = prevOnBallotCast;
-      }
+      unsubBallotCast();
     };
   });
 

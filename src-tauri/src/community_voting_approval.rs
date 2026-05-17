@@ -645,19 +645,27 @@ pub fn finalize_tier1(cfg: &Tier1PollConfig, tally: &Tier1TallyState) -> Tier1Re
     let mw = cfg.multi_winner.unwrap_or(1) as usize;
     let winners: Vec<(usize, u32)> = sorted.iter().take(mw).copied().collect();
 
-    // Step 8: threshold check on the Nth winner (skipped when no ballots,
-    // so an unconstrained empty poll still emits Winners for stable output).
+    // Step 8: threshold check on the Nth winner. A configured threshold
+    // is a hard floor — zero ballots cast against a threshold-set poll
+    // means actual_percent = 0, which is below any positive threshold,
+    // so emit NoMajority rather than silently declaring a phantom
+    // "winner with zero votes" (Cursor #130 round-6 catch). The earlier
+    // gate of `ballot_count > 0` was a divide-by-zero defense but
+    // collapsed the wrong way; compute the percent only when
+    // ballot_count > 0, and emit NoMajority unconditionally otherwise
+    // when a threshold is configured.
     if let Some(th) = cfg.threshold_percent {
-        if tally.ballot_count > 0 {
+        let actual_percent = if tally.ballot_count > 0 {
             let nth_winner_count = winners[mw - 1].1;
-            let actual_percent =
-                ((nth_winner_count as u64 * 100) / tally.ballot_count as u64) as u8;
-            if actual_percent < th {
-                return Tier1Result::NoMajority {
-                    required_percent: th,
-                    actual_percent,
-                };
-            }
+            ((nth_winner_count as u64 * 100) / tally.ballot_count as u64) as u8
+        } else {
+            0
+        };
+        if actual_percent < th {
+            return Tier1Result::NoMajority {
+                required_percent: th,
+                actual_percent,
+            };
         }
     }
 
@@ -779,6 +787,22 @@ mod result_tests {
     fn empty_ballots_with_no_constraints() {
         let r = finalize_tier1(&cfg(3, None, None, None), &tally(vec![0, 0, 0], 0));
         assert_eq!(r, Tier1Result::Winners(vec![0]));
+    }
+
+    #[test]
+    fn empty_ballots_with_threshold_emits_no_majority() {
+        // Threshold is a hard floor — zero votes against a non-zero
+        // threshold cannot pass, even if quorum isn't configured.
+        // Cursor #130 round-6 caught the previous skip-on-zero collapsing
+        // into a phantom Winners(vec![0]).
+        let r = finalize_tier1(&cfg(3, None, Some(50), None), &tally(vec![0, 0, 0], 0));
+        assert_eq!(
+            r,
+            Tier1Result::NoMajority {
+                required_percent: 50,
+                actual_percent: 0,
+            }
+        );
     }
 
     #[test]
