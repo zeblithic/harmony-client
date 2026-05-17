@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::community_voting_core::Eligibility;
+use crate::community_voting_core::{Eligibility, PollId};
 use crate::owner_state_types::OwnerAddr;
 
 // ---------------------------------------------------------------------------
@@ -115,6 +115,52 @@ pub struct Tier2PollConfig {
     #[serde(rename = "el")]
     pub eligibility: Eligibility,
 }
+
+// ---------------------------------------------------------------------------
+// Tier 2 event payloads (Signal / Delegate / Undelegate)
+// ---------------------------------------------------------------------------
+
+/// Signal payload — wire form for `kd="sg"`, `tr=2`.
+///
+/// Same-length-keys (§3): two 2-char keys. The `"sp"` key is a Phase-2
+/// rename of the spec's original `"s"` (1-char) — the §3 invariant pins
+/// every-key-at-this-nesting-level to identical lengths.
+/// `tests/wire_format_zeb291_fixtures.rs` byte-pins this shape so any
+/// drift in serde renames or field ordering fails before it can land.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignalPayload {
+    /// Proposal (poll) id this Signal targets.
+    #[serde(rename = "pr")]
+    pub proposal_id: PollId,
+    /// `true` = start (or continue) signaling support; `false` = withdraw
+    /// support. Per spec §5 this is a toggle — repeated same-direction
+    /// Signal events are idempotent at the `VoterConvictionState` layer.
+    #[serde(rename = "sp")]
+    pub support: bool,
+}
+
+/// Delegate payload — wire form for `kd="dg"`, `tr=2`.
+///
+/// `to` is the 32-byte ed25519 pubkey of the delegate (NOT the 16-byte
+/// `OwnerAddr`; spec §5 explicitly uses the full pubkey). Encoded as a
+/// CBOR byte string (major type 2) via `serde_bytes` — same wire-shape
+/// convention as `SignedVotingEvent.payload`/`.sig`.
+///
+/// `sc` ("scope") is reserved for future per-poll or per-tag delegation
+/// scoping; v1 callers always pass `"all"` (community-wide delegation).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegatePayload {
+    #[serde(rename = "to", with = "serde_bytes")]
+    pub to: Vec<u8>,
+    #[serde(rename = "sc")]
+    pub scope: String,
+}
+
+/// Undelegate payload — wire form for `kd="ud"`, `tr=2`. Empty map per
+/// spec §5; the delegator (`event.actor`) is the only data needed and
+/// already lives in the envelope.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UndelegatePayload {}
 
 // ---------------------------------------------------------------------------
 // Fixed-point math primitives

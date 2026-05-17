@@ -30,7 +30,9 @@
 //! Delegate uses `{"to", "sc"}` (both 2 chars — spec is self-consistent).
 //! Undelegate is `{}` (no keys, invariant vacuously satisfied).
 
-use harmony_app::community_voting_conviction::{AutoExecAction, Tier2PollConfig};
+use harmony_app::community_voting_conviction::{
+    AutoExecAction, DelegatePayload, SignalPayload, Tier2PollConfig, UndelegatePayload,
+};
 use harmony_app::community_voting_core::{
     Eligibility, PollEventKindCode, PollId, SignedVotingEvent, Tier,
 };
@@ -52,45 +54,13 @@ const EXPECTED_ENVELOPE_UNDELEGATE_HEX: &str = "a862746761706276720162747202626b
 const EXPECTED_ENVELOPE_TIER2_POLLCREATE_HEX: &str = "a862746761706276720162747202626b64626372626863a361771903e8616c006164616462616350aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa627064587ea8627074782650726f6d6f74652040616c69636520746f206d6f64657261746f722028706f7765722035302962686c1a00093a8062746e1b0000000a000000006274781b000003e8000000006262620262646cf5626178a3626b6b6273706274675042424242424242424242424242424242626e700562656ca1626d7001627367584000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
 
 // ---------------------------------------------------------------------------
-// Inline payload structs for Signal / Delegate / Undelegate.
+// Payload structs for Signal / Delegate / Undelegate.
 //
-// These are intentionally local to this fixture file: Task 9 will move
-// the canonical versions into `community_voting_conviction.rs`. Pinning
-// the wire format here first means Task 9's move is forced to preserve
-// it byte-for-byte (or this test fails and surfaces the drift).
+// Canonicalized into `community_voting_conviction.rs` by Task 9. The byte
+// fixtures below pin the wire format so any drift in the canonical types'
+// serde renames / field ordering / serde_bytes attribute fails this test
+// before it can land.
 // ---------------------------------------------------------------------------
-
-/// Signal payload (`pd` for `kd="sg"`, `tr=2`).
-///
-/// Uses `"sp"` for the support flag instead of the spec's `"s"` so the
-/// payload satisfies §3's same-length-keys invariant — see file-level
-/// note above.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct SignalPayload {
-    #[serde(rename = "pr")]
-    proposal_id: PollId,
-    #[serde(rename = "sp")]
-    support: bool,
-}
-
-/// Delegate payload (`pd` for `kd="dg"`, `tr=2`).
-///
-/// `"to"` is the 32-byte ed25519 pubkey of the delegate (NOT the
-/// 16-byte OwnerAddr; spec §5 explicitly says `<ed25519_pubkey>`).
-/// `serde_bytes` is used so the field encodes as a CBOR byte string
-/// (major type 2) instead of an array-of-u8 (major type 4) — same
-/// rationale as Phase 1's `SignedVotingEvent.payload`/`.sig` fields.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct DelegatePayload {
-    #[serde(rename = "to", with = "serde_bytes")]
-    to: Vec<u8>,
-    #[serde(rename = "sc")]
-    scope: String,
-}
-
-/// Undelegate payload (`pd` for `kd="ud"`, `tr=2`). Empty map per spec §5.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct UndelegatePayload {}
 
 // ---------------------------------------------------------------------------
 // Helpers (mirror wire_format_zeb290_fixtures.rs).
