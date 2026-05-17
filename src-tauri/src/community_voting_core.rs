@@ -76,13 +76,20 @@ pub struct Eligibility {
 
 /// Poll lifecycle state. Spec §2 (poll lifecycle diagram).
 ///
-/// Transitions: Draft → Open → Closed → Finalized → Archived.
-/// (Draft is implementation-only — never on the wire; PollCreate
-/// events publish directly into Open.)
+/// Tier 1 transitions: Draft → Open → Closed → Finalized → Archived.
+/// Tier 2 transitions: Draft → Open ⇄ ThresholdReached → Finalized → Archived.
+/// (`ThresholdReached` is a Tier-2-only transient state where conviction
+/// has crossed the threshold but the 24h contestability window has not
+/// elapsed; late Unsignal events can drop conviction back below threshold,
+/// reverting to `Open`.)
+///
+/// Draft is implementation-only — never on the wire; PollCreate events
+/// publish directly into Open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Lifecycle {
     Draft,
     Open,
+    ThresholdReached,
     Closed,
     Finalized,
     Archived,
@@ -131,6 +138,7 @@ mod tests {
         for state in &[
             Lifecycle::Draft,
             Lifecycle::Open,
+            Lifecycle::ThresholdReached,
             Lifecycle::Closed,
             Lifecycle::Finalized,
             Lifecycle::Archived,
@@ -161,6 +169,12 @@ pub enum PollEventKindCode {
     BallotCast,
     #[serde(rename = "rs")]
     PollResult,
+    #[serde(rename = "sg")]
+    Signal,
+    #[serde(rename = "dg")]
+    Delegate,
+    #[serde(rename = "ud")]
+    Undelegate,
 }
 
 /// The wire envelope for every voting event. Spec §3.
@@ -321,11 +335,36 @@ mod envelope_tests {
             PollEventKindCode::PollClose,
             PollEventKindCode::BallotCast,
             PollEventKindCode::PollResult,
+            PollEventKindCode::Signal,
+            PollEventKindCode::Delegate,
+            PollEventKindCode::Undelegate,
         ] {
             let mut encoded = Vec::new();
             ciborium::into_writer(kind, &mut encoded).expect("encode");
             let decoded: PollEventKindCode = ciborium::from_reader(&encoded[..]).expect("decode");
             assert_eq!(*kind, decoded);
+        }
+    }
+
+    /// Pin the Tier 2 wire codes (`sg`/`dg`/`ud`) so a future enum
+    /// rename can't silently change them.
+    #[test]
+    fn tier2_kind_codes_have_expected_wire_strings() {
+        let cases = [
+            (PollEventKindCode::Signal, "sg"),
+            (PollEventKindCode::Delegate, "dg"),
+            (PollEventKindCode::Undelegate, "ud"),
+        ];
+        for (kind, expected) in cases {
+            let mut encoded = Vec::new();
+            ciborium::into_writer(&kind, &mut encoded).expect("encode");
+            let value: ciborium::Value =
+                ciborium::from_reader(&encoded[..]).expect("decode as value");
+            assert_eq!(
+                value.as_text(),
+                Some(expected),
+                "wire code for {kind:?} must be {expected:?}"
+            );
         }
     }
 }
@@ -603,23 +642,66 @@ pub enum LifecycleError {
     },
 }
 
-/// Given current lifecycle + incoming event kind, return new lifecycle
+/// Given current lifecycle + incoming event kind + tier, return new lifecycle
 /// or an error. Per spec §2 + verify rules L1, B2, R1.
+///
+/// The `tier` parameter gates Tier-specific transitions: only `Tier::Conviction`
+/// polls may enter `Lifecycle::ThresholdReached`. Tier 1 (Approval) polls are
+/// rejected at any ThresholdReached touchpoint.
+///
+/// For Tier 2, `Signal` is treated as a *toggle* between `Open` and
+/// `ThresholdReached`: the caller is responsible for invoking
+/// `next_lifecycle` with a `Signal` kind only when the conviction
+/// computation indicates the threshold has actually been crossed (going up)
+/// or dropped (going back down — typically a late-arriving CRDT Unsignal).
+/// Normal-case Signal events that don't cross or drop the threshold are
+/// not lifecycle-driving; the caller must skip the state machine in that
+/// case (the Signal still applies to the delegation/signaling state).
+///
+/// `Delegate` and `Undelegate` never change lifecycle; they affect the
+/// delegation graph, not the poll lifecycle. They're accepted in any
+/// Open-equivalent state for Tier 2 only.
+///
+/// Tier 2 finalization (`ThresholdReached → Finalized`) is driven by a
+/// `PollResult` event emitted after the 24h contestability window has
+/// elapsed uncontested. There is no `ThresholdReached → Closed` path;
+/// `PollClose` from `ThresholdReached` is rejected (per spec, the close
+/// path is reserved for window-expiry on Tier 2 polls that never crossed
+/// threshold, i.e. `Open → Closed → Finalized`).
 pub fn next_lifecycle(
     current: Lifecycle,
     kind: PollEventKindCode,
+    tier: Tier,
 ) -> Result<Lifecycle, LifecycleError> {
     use Lifecycle::*;
     use PollEventKindCode::*;
-    match (current, kind) {
-        (Draft, PollCreate) => Ok(Open),
-        (Open, BallotCast) | (Open, PollExtend) | (Open, PollOpen) => Ok(Open),
-        (Open, PollClose) => Ok(Closed),
-        (Closed, PollResult) => Ok(Finalized),
-        _ => Err(LifecycleError::IllegalTransition {
-            from: current,
-            attempted: kind,
-        }),
+    let illegal = || LifecycleError::IllegalTransition {
+        from: current,
+        attempted: kind,
+    };
+    match (current, kind, tier) {
+        // Tier-agnostic transitions (apply to both Tier 1 + Tier 2).
+        (Draft, PollCreate, _) => Ok(Open),
+        (Open, BallotCast, _) | (Open, PollExtend, _) | (Open, PollOpen, _) => Ok(Open),
+        (Open, PollClose, _) => Ok(Closed),
+        (Closed, PollResult, _) => Ok(Finalized),
+
+        // Tier 2: Signal toggles between Open and ThresholdReached.
+        // Caller invokes only on threshold-cross or threshold-drop —
+        // see fn-level doc.
+        (Open, Signal, Tier::Conviction) => Ok(ThresholdReached),
+        (ThresholdReached, Signal, Tier::Conviction) => Ok(Open),
+
+        // Tier 2: Delegate / Undelegate do not move lifecycle.
+        (Open, Delegate, Tier::Conviction)
+        | (Open, Undelegate, Tier::Conviction)
+        | (ThresholdReached, Delegate, Tier::Conviction)
+        | (ThresholdReached, Undelegate, Tier::Conviction) => Ok(current),
+
+        // Tier 2: 24h-uncontested finalization from ThresholdReached.
+        (ThresholdReached, PollResult, Tier::Conviction) => Ok(Finalized),
+
+        _ => Err(illegal()),
     }
 }
 
@@ -781,7 +863,11 @@ mod lifecycle_tests {
     #[test]
     fn draft_to_open_via_create() {
         assert_eq!(
-            next_lifecycle(Lifecycle::Draft, PollEventKindCode::PollCreate),
+            next_lifecycle(
+                Lifecycle::Draft,
+                PollEventKindCode::PollCreate,
+                Tier::Approval
+            ),
             Ok(Lifecycle::Open)
         );
     }
@@ -789,7 +875,11 @@ mod lifecycle_tests {
     #[test]
     fn open_accepts_ballot_cast() {
         assert_eq!(
-            next_lifecycle(Lifecycle::Open, PollEventKindCode::BallotCast),
+            next_lifecycle(
+                Lifecycle::Open,
+                PollEventKindCode::BallotCast,
+                Tier::Approval
+            ),
             Ok(Lifecycle::Open)
         );
     }
@@ -797,7 +887,11 @@ mod lifecycle_tests {
     #[test]
     fn open_to_closed_via_close() {
         assert_eq!(
-            next_lifecycle(Lifecycle::Open, PollEventKindCode::PollClose),
+            next_lifecycle(
+                Lifecycle::Open,
+                PollEventKindCode::PollClose,
+                Tier::Approval
+            ),
             Ok(Lifecycle::Closed)
         );
     }
@@ -805,7 +899,11 @@ mod lifecycle_tests {
     #[test]
     fn closed_to_finalized_via_result() {
         assert_eq!(
-            next_lifecycle(Lifecycle::Closed, PollEventKindCode::PollResult),
+            next_lifecycle(
+                Lifecycle::Closed,
+                PollEventKindCode::PollResult,
+                Tier::Approval
+            ),
             Ok(Lifecycle::Finalized)
         );
     }
@@ -813,7 +911,11 @@ mod lifecycle_tests {
     #[test]
     fn closed_rejects_ballot_cast() {
         assert!(matches!(
-            next_lifecycle(Lifecycle::Closed, PollEventKindCode::BallotCast),
+            next_lifecycle(
+                Lifecycle::Closed,
+                PollEventKindCode::BallotCast,
+                Tier::Approval
+            ),
             Err(LifecycleError::IllegalTransition { .. })
         ));
     }
@@ -826,7 +928,7 @@ mod lifecycle_tests {
             PollEventKindCode::PollResult,
         ] {
             assert!(matches!(
-                next_lifecycle(Lifecycle::Finalized, *kind),
+                next_lifecycle(Lifecycle::Finalized, *kind, Tier::Approval),
                 Err(LifecycleError::IllegalTransition { .. })
             ));
         }
@@ -840,7 +942,171 @@ mod lifecycle_tests {
             PollEventKindCode::PollResult,
         ] {
             assert!(matches!(
-                next_lifecycle(Lifecycle::Archived, *kind),
+                next_lifecycle(Lifecycle::Archived, *kind, Tier::Approval),
+                Err(LifecycleError::IllegalTransition { .. })
+            ));
+        }
+    }
+
+    // ---------- Tier 2 (Conviction) transitions ----------
+
+    #[test]
+    fn tier2_open_to_threshold_reached_via_signal() {
+        assert_eq!(
+            next_lifecycle(Lifecycle::Open, PollEventKindCode::Signal, Tier::Conviction),
+            Ok(Lifecycle::ThresholdReached)
+        );
+    }
+
+    #[test]
+    fn tier2_threshold_reached_to_open_via_signal() {
+        // Late-arriving Unsignal modeled as a Signal event landing while
+        // the poll is in ThresholdReached and conviction has dropped.
+        assert_eq!(
+            next_lifecycle(
+                Lifecycle::ThresholdReached,
+                PollEventKindCode::Signal,
+                Tier::Conviction
+            ),
+            Ok(Lifecycle::Open)
+        );
+    }
+
+    #[test]
+    fn tier2_threshold_reached_to_finalized_via_result() {
+        // 24h-uncontested finalization.
+        assert_eq!(
+            next_lifecycle(
+                Lifecycle::ThresholdReached,
+                PollEventKindCode::PollResult,
+                Tier::Conviction
+            ),
+            Ok(Lifecycle::Finalized)
+        );
+    }
+
+    #[test]
+    fn tier2_delegate_undelegate_preserve_lifecycle() {
+        for current in &[Lifecycle::Open, Lifecycle::ThresholdReached] {
+            for kind in &[PollEventKindCode::Delegate, PollEventKindCode::Undelegate] {
+                assert_eq!(
+                    next_lifecycle(*current, *kind, Tier::Conviction),
+                    Ok(*current),
+                    "tier2 {kind:?} in {current:?} must preserve state"
+                );
+            }
+        }
+    }
+
+    // ---------- Tier 2 rejection cases ----------
+
+    #[test]
+    fn tier2_draft_to_threshold_reached_rejected() {
+        // Draft can only reach ThresholdReached by going Open first.
+        assert!(matches!(
+            next_lifecycle(
+                Lifecycle::Draft,
+                PollEventKindCode::Signal,
+                Tier::Conviction
+            ),
+            Err(LifecycleError::IllegalTransition { .. })
+        ));
+    }
+
+    #[test]
+    fn tier2_threshold_reached_to_closed_rejected() {
+        // No close path from ThresholdReached — must go via Open revert
+        // or via 24h-uncontested PollResult.
+        assert!(matches!(
+            next_lifecycle(
+                Lifecycle::ThresholdReached,
+                PollEventKindCode::PollClose,
+                Tier::Conviction
+            ),
+            Err(LifecycleError::IllegalTransition { .. })
+        ));
+    }
+
+    #[test]
+    fn tier2_archived_rejects_signal() {
+        // Archived → anything is rejected, including Tier 2 events.
+        for kind in &[
+            PollEventKindCode::Signal,
+            PollEventKindCode::Delegate,
+            PollEventKindCode::Undelegate,
+        ] {
+            assert!(matches!(
+                next_lifecycle(Lifecycle::Archived, *kind, Tier::Conviction),
+                Err(LifecycleError::IllegalTransition { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn tier2_finalized_rejects_signal() {
+        for kind in &[
+            PollEventKindCode::Signal,
+            PollEventKindCode::Delegate,
+            PollEventKindCode::Undelegate,
+        ] {
+            assert!(matches!(
+                next_lifecycle(Lifecycle::Finalized, *kind, Tier::Conviction),
+                Err(LifecycleError::IllegalTransition { .. })
+            ));
+        }
+    }
+
+    // ---------- Tier 1 (Approval) cannot enter ThresholdReached ----------
+
+    #[test]
+    fn tier1_signal_rejected_in_any_state() {
+        // Tier 1 (Approval) polls have no Signal/Delegate/Undelegate
+        // semantics — these are Tier 2 only.
+        for current in &[
+            Lifecycle::Draft,
+            Lifecycle::Open,
+            Lifecycle::ThresholdReached,
+            Lifecycle::Closed,
+            Lifecycle::Finalized,
+            Lifecycle::Archived,
+        ] {
+            for kind in &[
+                PollEventKindCode::Signal,
+                PollEventKindCode::Delegate,
+                PollEventKindCode::Undelegate,
+            ] {
+                assert!(
+                    matches!(
+                        next_lifecycle(*current, *kind, Tier::Approval),
+                        Err(LifecycleError::IllegalTransition { .. })
+                    ),
+                    "tier1 must reject {kind:?} in {current:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tier1_cannot_enter_threshold_reached() {
+        // Even from Open, Tier 1 cannot transition to ThresholdReached.
+        // (Signal kind for Tier::Approval is rejected outright.)
+        let result = next_lifecycle(Lifecycle::Open, PollEventKindCode::Signal, Tier::Approval);
+        assert!(matches!(
+            result,
+            Err(LifecycleError::IllegalTransition { .. })
+        ));
+    }
+
+    #[test]
+    fn tier3_signal_rejected() {
+        // Sortition (Tier 3) does not use Signal/Delegate/Undelegate.
+        for kind in &[
+            PollEventKindCode::Signal,
+            PollEventKindCode::Delegate,
+            PollEventKindCode::Undelegate,
+        ] {
+            assert!(matches!(
+                next_lifecycle(Lifecycle::Open, *kind, Tier::Sortition),
                 Err(LifecycleError::IllegalTransition { .. })
             ));
         }

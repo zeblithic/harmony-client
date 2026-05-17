@@ -123,8 +123,8 @@ impl VotingLog {
         }
 
         let current = existing_lifecycle.unwrap_or(Lifecycle::Draft);
-        let next =
-            next_lifecycle(current, event.kind).map_err(|_| ApplyError::IllegalTransition)?;
+        let next = next_lifecycle(current, event.kind, event.tier)
+            .map_err(|_| ApplyError::IllegalTransition)?;
 
         if let Some(state) = self.polls.get_mut(&poll_id) {
             state.meta.lifecycle = next;
