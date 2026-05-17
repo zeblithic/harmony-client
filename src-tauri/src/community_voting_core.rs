@@ -5,12 +5,10 @@
 //! This module owns wire-stable types used by all voting tiers
 //! (`voting_approval.rs`, future `voting_conviction.rs`, `voting_sortition.rs`).
 
-use crate::owner_state_types::{Hlc, OwnerAddr};
+use crate::community_membership::ChannelId;
+use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 use serde::{Deserialize, Serialize};
-
-// `crate::owner_state_types::SpaceId` will be wired in
-// in later ZEB-290 Phase 1 tasks (tier-1 ballot structs).
-// Kept out of imports for now so clippy `-D warnings` stays green.
+use sha2::{Digest, Sha256};
 
 /// Globally-unique identifier for a poll, derived from
 /// `H(community_id || poll_create_event_hash)`.
@@ -298,5 +296,114 @@ mod envelope_tests {
             let decoded: PollEventKindCode = ciborium::from_reader(&encoded[..]).expect("decode");
             assert_eq!(*kind, decoded);
         }
+    }
+}
+
+/// Materialized metadata for a single poll. Returned by
+/// `voting_get_poll` / `voting_list_active_polls` IPCs.
+///
+/// `created_at`, `opens_at`, `closes_at` are HLC timestamps;
+/// `extends_at` is the most recent PollExtend event's HLC (or None
+/// if no extend has occurred).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PollMeta {
+    pub poll_id: PollId,
+    pub community_id: SpaceId,
+    pub creator: OwnerAddr,
+    pub tier: Tier,
+    pub eligibility: Eligibility,
+    pub lifecycle: Lifecycle,
+    pub created_at: Hlc,
+    pub opens_at: Hlc,
+    pub closes_at: Hlc,
+    pub extends_at: Option<Hlc>,
+    /// Channel where the poll was created (Tier 1 only; Tier 2/3 may
+    /// not be channel-scoped). For Tier 1 chat-native polls this is
+    /// the channel where the poll-message card appears.
+    pub channel_id: Option<ChannelId>,
+}
+
+/// Deterministically derive a PollId from the community + the
+/// PollCreate event's signing-bytes hash.
+///
+/// `PollId = SHA-256(community_id_bytes || create_event_signing_bytes)`.
+///
+/// Two nodes that independently observe the same PollCreate event
+/// derive the same PollId. Re-derivable at any time; never stored
+/// inside the event itself (would be circular).
+pub fn derive_poll_id(community_id: &SpaceId, create_signing_bytes: &[u8]) -> PollId {
+    let mut hasher = Sha256::new();
+    hasher.update(community_id.0);
+    hasher.update(create_signing_bytes);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    PollId(out)
+}
+
+#[cfg(test)]
+mod poll_meta_tests {
+    use super::*;
+
+    #[test]
+    fn derive_poll_id_is_deterministic() {
+        let cid = SpaceId([0x11; 16]);
+        let sb = vec![1, 2, 3, 4, 5];
+        let pid1 = derive_poll_id(&cid, &sb);
+        let pid2 = derive_poll_id(&cid, &sb);
+        assert_eq!(pid1, pid2);
+    }
+
+    #[test]
+    fn derive_poll_id_differs_by_community() {
+        let sb = vec![1, 2, 3];
+        let pid_a = derive_poll_id(&SpaceId([0x11; 16]), &sb);
+        let pid_b = derive_poll_id(&SpaceId([0x22; 16]), &sb);
+        assert_ne!(pid_a, pid_b);
+    }
+
+    #[test]
+    fn derive_poll_id_differs_by_event_bytes() {
+        let cid = SpaceId([0x33; 16]);
+        let pid_a = derive_poll_id(&cid, &[1, 2, 3]);
+        let pid_b = derive_poll_id(&cid, &[1, 2, 4]);
+        assert_ne!(pid_a, pid_b);
+    }
+
+    #[test]
+    fn poll_meta_round_trip() {
+        let meta = PollMeta {
+            poll_id: PollId([0xab; 32]),
+            community_id: SpaceId([0x11; 16]),
+            creator: OwnerAddr([0xcc; 16]),
+            tier: Tier::Approval,
+            eligibility: Eligibility {
+                min_power: 1,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            lifecycle: Lifecycle::Open,
+            created_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "a".into(),
+            },
+            opens_at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "a".into(),
+            },
+            closes_at: Hlc {
+                wall_ms: 3700,
+                logical: 0,
+                device_id: "a".into(),
+            },
+            extends_at: None,
+            channel_id: Some(ChannelId([0xdd; 16])),
+        };
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&meta, &mut encoded).expect("encode");
+        let decoded: PollMeta = ciborium::from_reader(&encoded[..]).expect("decode");
+        assert_eq!(meta, decoded);
     }
 }
