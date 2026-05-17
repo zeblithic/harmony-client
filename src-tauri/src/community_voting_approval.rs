@@ -788,3 +788,144 @@ mod result_tests {
         }
     }
 }
+
+/// PollResult payload, CBOR-encoded as the envelope's pd field
+/// for kd="rs" events. Tier-agnostic discriminator + tier-specific
+/// result bytes; Tier 1 uses Tier1Result encoded inside `rs`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tier1PollResultPayload {
+    /// PollId this result is for.
+    #[serde(rename = "pi")]
+    pub poll_id: PollId,
+    /// The computed Tier1Result.
+    #[serde(rename = "rs")]
+    pub result: Tier1Result,
+}
+
+/// Verify that a candidate PollResult matches the deterministically-
+/// computed tally from the event log. Spec §8 R2.
+///
+/// Used by:
+///   - voting_log apply() when accepting a PollResult event (other
+///     node may have signed it; we recompute to confirm).
+///   - voting_create_poll_result() pre-flight (our own node signing).
+pub fn verify_poll_result_reproducible(
+    candidate: &Tier1PollResultPayload,
+    cfg: &Tier1PollConfig,
+    events: &[SignedVotingEvent],
+    snapshot: &MembershipSnapshot,
+) -> bool {
+    let tally = tally_tier1(cfg, events, snapshot);
+    let computed = finalize_tier1(cfg, &tally);
+    computed == candidate.result
+}
+
+#[cfg(test)]
+mod result_reproducibility_tests {
+    use super::*;
+    use crate::community_voting_core::{MemberAttrs, Tier};
+
+    fn cfg_two_opts() -> Tier1PollConfig {
+        Tier1PollConfig {
+            options: vec!["yes".into(), "no".into()],
+            window_seconds: 600,
+            quorum: None,
+            threshold_percent: None,
+            multi_winner: None,
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            channel_id: ChannelId([0; 16]),
+        }
+    }
+
+    fn snapshot_of(addrs: &[OwnerAddr]) -> MembershipSnapshot {
+        let mut members = HashMap::new();
+        for a in addrs {
+            members.insert(
+                *a,
+                MemberAttrs {
+                    power: 10,
+                    vouching_depth: 0,
+                },
+            );
+        }
+        MembershipSnapshot { members }
+    }
+
+    fn ballot(voter: OwnerAddr, hlc_ms: u64, ap: Vec<u8>, pid: PollId) -> SignedVotingEvent {
+        let payload_obj = Tier1Ballot {
+            poll_id: pid,
+            approved_indices: ap,
+        };
+        let mut payload = Vec::new();
+        ciborium::ser::into_writer(&payload_obj, &mut payload).unwrap();
+        SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Approval,
+            kind: PollEventKindCode::BallotCast,
+            hlc: Hlc {
+                wall_ms: hlc_ms,
+                logical: 0,
+                device_id: "a".into(),
+            },
+            actor: voter,
+            payload,
+            sig: vec![0u8; 64],
+        }
+    }
+
+    #[test]
+    fn matching_result_verifies() {
+        let cfg = cfg_two_opts();
+        let pid = PollId([0xab; 32]);
+        let v = OwnerAddr([0x11; 16]);
+        let snap = snapshot_of(&[v]);
+        let events = vec![ballot(v, 1000, vec![0], pid)];
+        let candidate = Tier1PollResultPayload {
+            poll_id: pid,
+            result: Tier1Result::Winners(vec![0]),
+        };
+        assert!(verify_poll_result_reproducible(
+            &candidate, &cfg, &events, &snap
+        ));
+    }
+
+    #[test]
+    fn wrong_winner_rejected() {
+        let cfg = cfg_two_opts();
+        let pid = PollId([0xab; 32]);
+        let v = OwnerAddr([0x11; 16]);
+        let snap = snapshot_of(&[v]);
+        let events = vec![ballot(v, 1000, vec![0], pid)];
+        let candidate = Tier1PollResultPayload {
+            poll_id: pid,
+            result: Tier1Result::Winners(vec![1]),
+        };
+        assert!(!verify_poll_result_reproducible(
+            &candidate, &cfg, &events, &snap
+        ));
+    }
+
+    #[test]
+    fn fabricated_no_quorum_rejected_if_no_quorum_configured() {
+        let cfg = cfg_two_opts();
+        let pid = PollId([0xab; 32]);
+        let v = OwnerAddr([0x11; 16]);
+        let snap = snapshot_of(&[v]);
+        let events = vec![ballot(v, 1000, vec![0], pid)];
+        let candidate = Tier1PollResultPayload {
+            poll_id: pid,
+            result: Tier1Result::NoQuorum {
+                required: 5,
+                actual: 1,
+            },
+        };
+        assert!(!verify_poll_result_reproducible(
+            &candidate, &cfg, &events, &snap
+        ));
+    }
+}
