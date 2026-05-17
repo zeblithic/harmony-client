@@ -9,8 +9,8 @@ use std::collections::HashMap;
 
 use crate::community_voting_approval::{validate_poll_config, Tier1PollConfig};
 use crate::community_voting_core::{
-    derive_poll_id, next_lifecycle, Eligibility, Lifecycle, PollEventKindCode, PollId, PollMeta,
-    SignedVotingEvent, Tier,
+    derive_poll_id, next_lifecycle, Eligibility, Lifecycle, MembershipSnapshot, PollEventKindCode,
+    PollId, PollMeta, SignedVotingEvent, Tier,
 };
 use crate::owner_state_types::Hlc;
 
@@ -38,6 +38,17 @@ pub struct PollState {
     /// than `Box<dyn Any>`) keeps the code monomorphic and trivially
     /// Clone'able for fork/persist.
     pub tier_state: TierState,
+    /// Tier 1 deserialized config, populated at PollCreate-apply time.
+    /// Cached so ballot validation can fail fast without re-decoding
+    /// the PollCreate payload on every ballot. None for non-Tier 1.
+    pub tier1_cfg: Option<Tier1PollConfig>,
+    /// Frozen eligibility snapshot captured at PollCreate-apply time
+    /// (spec §7 — eligibility is evaluated against community state at
+    /// the poll's create HLC, not at ballot-cast HLC). The local
+    /// IPC creator passes its own computed snapshot via `apply_with_snapshot`;
+    /// peer-received PollCreate events leave this `None` until Task 12
+    /// wires the materialize-at-HLC path. None for non-Tier 1.
+    pub tier1_snapshot: Option<MembershipSnapshot>,
 }
 
 /// Tier-specific tally state. Replaced by `Tier1TallyState` from
@@ -68,10 +79,26 @@ impl VotingLog {
     ///
     /// Returns Ok(poll_id) if applied; Err if lifecycle transition
     /// is illegal (which indicates a verify-rule violation by the caller).
+    ///
+    /// For locally-created PollCreate events, prefer `apply_with_snapshot`
+    /// — the IPC path knows the membership snapshot at create-HLC and
+    /// caches it on the inserted `PollState` for cheap ballot re-checks.
     pub fn apply(
         &mut self,
         event: SignedVotingEvent,
         community_id: &crate::owner_state_types::SpaceId,
+    ) -> Result<PollId, ApplyError> {
+        self.apply_with_snapshot(event, community_id, None)
+    }
+
+    /// Apply with an optional caller-supplied eligibility snapshot.
+    /// Stored on the new `PollState` when `event.kind == PollCreate`
+    /// and `event.tier == Tier::Approval`. Ignored otherwise.
+    pub fn apply_with_snapshot(
+        &mut self,
+        event: SignedVotingEvent,
+        community_id: &crate::owner_state_types::SpaceId,
+        snapshot: Option<MembershipSnapshot>,
     ) -> Result<PollId, ApplyError> {
         // PollCreate derives PollId from H(community_id || signing_bytes);
         // every other kind references an existing PollId via a `{ "pi": ... }`
@@ -108,7 +135,7 @@ impl VotingLog {
             // Tier 2/3 land in their respective phases — until then,
             // PollCreate events with non-Tier 1 tier values populate a
             // minimal PollMeta with default Eligibility (closes_at = hlc).
-            let meta = if event.tier == Tier::Approval {
+            let (meta, tier1_cfg) = if event.tier == Tier::Approval {
                 let cfg: Tier1PollConfig = ciborium::de::from_reader(&event.payload[..])
                     .map_err(|_| ApplyError::PayloadDecode)?;
                 validate_poll_config(&cfg).map_err(|_| ApplyError::PayloadValidate)?;
@@ -117,7 +144,7 @@ impl VotingLog {
                     logical: 0,
                     device_id: event.hlc.device_id.clone(),
                 };
-                PollMeta {
+                let meta = PollMeta {
                     poll_id,
                     community_id: *community_id,
                     creator: event.actor,
@@ -129,9 +156,10 @@ impl VotingLog {
                     closes_at,
                     extends_at: None,
                     channel_id: Some(cfg.channel_id),
-                }
+                };
+                (meta, Some(cfg))
             } else {
-                PollMeta {
+                let meta = PollMeta {
                     poll_id,
                     community_id: *community_id,
                     creator: event.actor,
@@ -147,7 +175,15 @@ impl VotingLog {
                     closes_at: event.hlc.clone(),
                     extends_at: None,
                     channel_id: None,
-                }
+                };
+                (meta, None)
+            };
+            // Snapshot is only meaningful for Tier 1 in Phase 1; other
+            // tiers have their own eligibility paths and we discard.
+            let tier1_snapshot = if event.tier == Tier::Approval {
+                snapshot
+            } else {
+                None
             };
             self.polls.insert(
                 poll_id,
@@ -155,6 +191,8 @@ impl VotingLog {
                     meta,
                     events: vec![event.clone()],
                     tier_state: TierState::Empty,
+                    tier1_cfg,
+                    tier1_snapshot,
                 },
             );
         } else {
