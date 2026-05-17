@@ -35,8 +35,22 @@
   });
 
   function handleClose() {
+    // Internal close — used by propose() after a Completed/Pending IPC result.
+    // Always closes regardless of submitting state.
     dialogEl?.close();
     onClose();
+  }
+
+  function handleUserCancel(e?: Event) {
+    // User-initiated close (Escape via dialog `cancel`, or Cancel button).
+    // Don't close mid-submission — the IPC is in flight; closing would
+    // leave the optimistic UI in a confusing state. Native `cancel`
+    // requires preventDefault to keep the dialog open.
+    if (submitting) {
+      e?.preventDefault();
+      return;
+    }
+    handleClose();
   }
 
   async function propose() {
@@ -67,7 +81,7 @@
   }
 </script>
 
-<dialog bind:this={dialogEl} oncancel={handleClose} class="change-quorum-dialog" aria-label="Change admin quorum">
+<dialog bind:this={dialogEl} oncancel={handleUserCancel} class="change-quorum-dialog" aria-label="Change admin quorum">
   <h2>Change admin quorum</h2>
   <p>
     Currently {currentQuorum} of {currentAdminCount} admin signatures are required to approve
@@ -98,7 +112,7 @@
   {/if}
 
   <div class="actions">
-    <button onclick={handleClose} disabled={submitting}>Cancel</button>
+    <button onclick={handleUserCancel} disabled={submitting}>Cancel</button>
     <button
       onclick={propose}
       disabled={submitting || proposedQuorum < 1 || proposedQuorum > currentAdminCount || proposedQuorum === currentQuorum}

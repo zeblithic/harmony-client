@@ -94,6 +94,53 @@ describe('ChangeQuorumDialog', () => {
     expect(onClose).toHaveBeenCalled();
   });
 
+  it('cancel_button_does_not_close_while_submitting', async () => {
+    // R3 CodeRabbit finding: Escape / Cancel mid-submission should not close
+    // the dialog (would leave the IPC in flight + optimistic UI confused).
+    const { invoke } = await import('@tauri-apps/api/core');
+    const mockInvoke = invoke as ReturnType<typeof vi.fn>;
+    // Make invoke hang so submitting stays true.
+    let resolveInvoke: (v: { kind: string }) => void = () => {};
+    mockInvoke.mockReturnValueOnce(
+      new Promise((res) => {
+        resolveInvoke = res;
+      })
+    );
+
+    const onClose = vi.fn();
+    render(ChangeQuorumDialog, {
+      props: {
+        communityId: 'c-x',
+        currentQuorum: 1,
+        currentAdminCount: 3,
+        onClose,
+      },
+    });
+
+    const number = screen.getByLabelText('Quorum number') as HTMLInputElement;
+    await fireEvent.input(number, { target: { value: '2' } });
+    const proposeBtn = screen.getByRole('button', { name: /Propose/i });
+    await fireEvent.click(proposeBtn);
+
+    // submitting is now true (invoke is pending). The Cancel button should
+    // be disabled (existing behavior), AND clicking it programmatically
+    // should not trigger onClose because of the new guard.
+    const cancelBtn = screen.getByRole('button', { name: /Cancel/i });
+    expect(cancelBtn).toBeDisabled();
+    // Even if disabled were bypassed (programmatic click), onClose should
+    // not fire. Fire click anyway to exercise the guard.
+    await fireEvent.click(cancelBtn);
+    expect(onClose).not.toHaveBeenCalled();
+
+    // Now resolve the IPC; the propose() finally-block resets submitting,
+    // and propose() calls handleClose() which DOES close (internal call,
+    // no guard). onClose should fire.
+    resolveInvoke({ kind: 'Completed' });
+    await waitFor(() => {
+      expect(onClose).toHaveBeenCalled();
+    });
+  });
+
   it('explainer_text_present_for_survivability_recommendation', () => {
     const { container } = render(ChangeQuorumDialog, {
       props: {
