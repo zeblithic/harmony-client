@@ -17,6 +17,9 @@ pub mod community_membership;
 pub mod community_state_crdt;
 pub mod community_state_persist;
 pub mod community_state_sync;
+pub mod community_voting_approval;
+pub mod community_voting_core;
+pub mod community_voting_log;
 pub mod content_index;
 pub mod content_store;
 pub mod dm_crypto;
@@ -372,6 +375,20 @@ pub struct NodeState {
     /// Persisted only across IPC calls within a single node lifetime;
     /// reset on stop_node.
     profile_broadcast_next_subscription_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// ZEB-290 Phase 1 Task 11: per-community voting-event logs. Holds
+    /// `VotingLog` per `SpaceId`; lazily populated on first local
+    /// `voting_create_tier1_poll` / `voting_cast_tier1_ballot`. In-memory
+    /// only for Phase 1 — persistence + Zenoh sync land in Tasks 12 / 13.
+    /// Always present (never `None`) so IPCs can take + insert without
+    /// node-running gating; the inner map is empty until first use.
+    pub voting_logs: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                crate::owner_state_types::SpaceId,
+                crate::community_voting_log::VotingLog,
+            >,
+        >,
+    >,
 }
 
 impl NodeState {
@@ -438,6 +455,12 @@ impl Default for NodeState {
             profile_broadcast_next_subscription_id: std::sync::Arc::new(
                 std::sync::atomic::AtomicU64::new(1),
             ),
+            // ZEB-290 Phase 1 Task 11: voting log registry starts empty
+            // and survives stop_node (in-memory only; cleared on
+            // process exit).
+            voting_logs: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 }
@@ -17319,6 +17342,689 @@ mod community_member_dto_tests {
     }
 }
 
+// ── ZEB-290 voting IPCs ──────────────────────────────────────────────────
+//
+// Phase 1 Task 11: four read+write IPCs that drive Tier 1 (Approval)
+// voting against per-community in-memory `VotingLog`s on `NodeState`.
+//
+// IMPORTANT scope notes (deferred to later tasks):
+// - Zenoh publish (so peers see the event): Task 12.
+// - Disk persistence: Task 13.
+// - Auto-close on window expiry: Task 13.
+// - Multi-engine integration tests: Task 15.
+//
+// Pre-flight ordering follows the metadata-before-irreversible-write
+// rule (see `feedback_metadata_before_irreversible_write`): we
+// validate the config, build the snapshot, and run eligibility
+// BEFORE signing the event. A doomed event never gets minted.
+
+/// Build a `MembershipSnapshot` for `community_id` from the engine's
+/// materialized state at the current HLC. The IPC supplies this to
+/// `apply_with_snapshot` so future ballot validation can run eligibility
+/// against the frozen snapshot (spec §7) without re-querying CRDT state.
+///
+/// Phase 1 simplification: `vouching_depth` is set to 0 for every
+/// member. The Sybil-resistance gate (`min_vouching_depth`) is not yet
+/// enforceable until the vouching log lands (post-Phase 1); for now
+/// the IPC rejects any `min_vouching_depth > 0` request at the
+/// boundary so we never silently admit ineligible voters. Removing
+/// this restriction is tracked under the same epic as the vouching
+/// log ticket.
+async fn voting_build_snapshot_for_community(
+    crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
+    space_id: crate::owner_state_types::SpaceId,
+) -> Result<crate::community_voting_core::MembershipSnapshot, String> {
+    let admin_addr = {
+        let s = crdt_state.lock().await;
+        let space = s.spaces.get(&space_id).cloned();
+        drop(s);
+        let space = space.ok_or_else(|| {
+            format!(
+                "no Space for community {} in owner-state",
+                hex::encode(space_id.0)
+            )
+        })?;
+        if space.kind != crate::owner_state_types::SpaceKind::Community {
+            return Err(format!(
+                "Space {} exists but is kind {:?}, not Community",
+                hex::encode(space_id.0),
+                space.kind
+            ));
+        }
+        space
+            .admin_addr
+            .ok_or("community Space missing admin_addr (corrupt row?)")?
+    };
+
+    let engine_state = community_registry
+        .state_for(&space_id)
+        .await
+        .ok_or_else(|| {
+            format!(
+                "no engine for community {} — not joined or not yet started",
+                hex::encode(space_id.0)
+            )
+        })?;
+
+    let materialized = {
+        let g = engine_state.lock().await;
+        g.materialize_now(admin_addr)
+    };
+
+    let mut members = std::collections::HashMap::new();
+    for (addr, state) in materialized.members.iter() {
+        // Only Joined members are eligible voters in Phase 1. Invited /
+        // PendingJoin / Left / Banned are excluded so even
+        // `min_power: 0` polls don't admit them.
+        if !matches!(
+            state.status,
+            crate::community_membership::MemberStatus::Joined
+        ) {
+            continue;
+        }
+        let power = *materialized.power_levels.get(addr).unwrap_or(&0);
+        members.insert(
+            *addr,
+            crate::community_voting_core::MemberAttrs {
+                power,
+                // TODO(post-Phase-1): wire vouching-depth from the
+                // vouching log once it lands. The IPC boundary already
+                // rejects min_vouching_depth>0 today so 0 is safe.
+                vouching_depth: 0,
+            },
+        );
+    }
+    Ok(crate::community_voting_core::MembershipSnapshot { members })
+}
+
+/// Pure helper used by both `voting_create_tier1_poll` and the unit
+/// test: assemble a `Tier1PollConfig` from raw IPC args + validate it.
+#[allow(clippy::too_many_arguments)]
+fn voting_build_tier1_config(
+    channel_id: crate::community_membership::ChannelId,
+    options: Vec<String>,
+    window_seconds: u32,
+    min_power: u8,
+    min_vouching_depth: Option<u8>,
+    quorum: Option<u32>,
+    threshold_percent: Option<u8>,
+    multi_winner: Option<u8>,
+) -> Result<crate::community_voting_approval::Tier1PollConfig, String> {
+    // Phase 1 hard rule: reject min_vouching_depth>0 because the
+    // snapshot helper hardcodes vouching_depth=0 — accepting >0 would
+    // make every poll effectively unvotable and confuse the UI.
+    if let Some(mv) = min_vouching_depth {
+        if mv > 0 {
+            return Err(
+                "voting_create_tier1_poll: min_vouching_depth > 0 not supported until \
+                 the vouching log lands (post-Phase 1)"
+                    .to_string(),
+            );
+        }
+    }
+    let cfg = crate::community_voting_approval::Tier1PollConfig {
+        options,
+        window_seconds,
+        quorum,
+        threshold_percent,
+        multi_winner,
+        eligibility: crate::community_voting_core::Eligibility {
+            min_power,
+            min_vouching_depth,
+            sortition_size: None,
+        },
+        channel_id,
+    };
+    crate::community_voting_approval::validate_poll_config(&cfg)
+        .map_err(|e| format!("voting_create_tier1_poll: invalid config: {e:?}"))?;
+    Ok(cfg)
+}
+
+/// Tauri event payload for `"voting-poll-created"`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VotingPollCreatedPayload {
+    pub poll_id: String,
+    pub channel_id: String,
+    pub community_id: String,
+}
+
+/// Tauri event payload for `"voting-ballot-cast"`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VotingBallotCastPayload {
+    pub poll_id: String,
+    pub voter: String,
+    pub approved_count: u8,
+}
+
+/// Tauri IPC: create a Tier 1 (Approval) poll. Returns the new
+/// `PollId` as a hex string (32 bytes → 64 chars).
+///
+/// Pre-flight ordering: validate config → build snapshot → check
+/// eligibility (so we don't sign a poll we can't even vote in) → mint
+/// signed event → apply locally. Zenoh publish lands in Task 12.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn voting_create_tier1_poll<R: tauri::Runtime>(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    app: tauri::AppHandle<R>,
+    community_id: String,
+    channel_id: String,
+    options: Vec<String>,
+    window_seconds: u32,
+    min_power: u8,
+    min_vouching_depth: Option<u8>,
+    quorum: Option<u32>,
+    threshold_percent: Option<u8>,
+    multi_winner: Option<u8>,
+) -> Result<String, String> {
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(cid_bytes);
+
+    let chid_bytes: [u8; 16] = hex::decode(&channel_id)
+        .map_err(|e| format!("invalid channel_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "channel_id must be 16 bytes (32 hex chars)".to_string())?;
+    let channel = crate::community_membership::ChannelId(chid_bytes);
+
+    let cfg = voting_build_tier1_config(
+        channel,
+        options,
+        window_seconds,
+        min_power,
+        min_vouching_depth,
+        quorum,
+        threshold_percent,
+        multi_winner,
+    )?;
+
+    let (
+        hlc_tracker,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        crdt_state,
+        voting_logs,
+    ) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or("dm_self_owner missing")?,
+            g.community_registry
+                .clone()
+                .ok_or("community_registry missing — node not running?")?,
+            g.dm_outbox
+                .clone()
+                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
+            std::sync::Arc::clone(&g.voting_logs),
+        )
+    };
+
+    // Build snapshot + check eligibility BEFORE signing. If we're not
+    // eligible to vote in our own poll, the UI should surface that
+    // instead of producing an unusable poll.
+    let snapshot =
+        voting_build_snapshot_for_community(crdt_state, community_registry, space_id).await?;
+    crate::community_voting_core::check_eligibility(&snapshot, &self_owner, &cfg.eligibility)
+        .map_err(|e| format!("voting_create_tier1_poll: creator not eligible: {e:?}"))?;
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+
+    let event = {
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        crate::community_voting_core::build_signed_poll_create_tier1(
+            signing_key,
+            self_owner,
+            &cfg,
+            hlc,
+        )
+        .map_err(|e| format!("voting_create_tier1_poll: build_signed: {e:?}"))?
+    };
+
+    let poll_id = {
+        let mut g = voting_logs
+            .lock()
+            .map_err(|e| format!("voting_logs poisoned: {e}"))?;
+        let log = g.entry(space_id).or_default();
+        log.apply_with_snapshot(event, &space_id, Some(snapshot))
+            .map_err(|e| format!("voting_create_tier1_poll: apply: {e:?}"))?
+    };
+
+    let poll_id_hex = hex::encode(poll_id.0);
+    let payload = VotingPollCreatedPayload {
+        poll_id: poll_id_hex.clone(),
+        channel_id: hex::encode(channel.0),
+        community_id: hex::encode(space_id.0),
+    };
+    if let Err(e) = app.emit("voting-poll-created", &payload) {
+        // Non-fatal: poll is already in the log; emit is just a UI hint.
+        tracing::warn!(error = %e, "voting-poll-created emit failed");
+    }
+
+    Ok(poll_id_hex)
+}
+
+/// Tauri IPC: cast a Tier 1 (Approval) ballot. Re-validates against
+/// the cached `Tier1PollConfig` + frozen eligibility snapshot stored
+/// on `PollState` at create-time.
+#[tauri::command]
+async fn voting_cast_tier1_ballot<R: tauri::Runtime>(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    app: tauri::AppHandle<R>,
+    poll_id: String,
+    approved_indices: Vec<u8>,
+) -> Result<(), String> {
+    let pid_bytes: [u8; 32] = hex::decode(&poll_id)
+        .map_err(|e| format!("invalid poll_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "poll_id must be 32 bytes (64 hex chars)".to_string())?;
+    let pid = crate::community_voting_core::PollId(pid_bytes);
+
+    let (hlc_tracker, device_id, self_owner, dm_outbox, voting_logs) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or("dm_self_owner missing")?,
+            g.dm_outbox
+                .clone()
+                .ok_or("dm_outbox missing — no owner identity?")?,
+            std::sync::Arc::clone(&g.voting_logs),
+        )
+    };
+
+    // Metadata-before-write: look up poll, check Open + Tier1, validate
+    // ballot, check eligibility — all under the voting_logs lock.
+    // We clone what we need so the signing await can happen without
+    // holding the std mutex.
+    let (space_id, cfg, snapshot) = {
+        let g = voting_logs
+            .lock()
+            .map_err(|e| format!("voting_logs poisoned: {e}"))?;
+        let mut found: Option<(
+            crate::owner_state_types::SpaceId,
+            crate::community_voting_approval::Tier1PollConfig,
+            crate::community_voting_core::MembershipSnapshot,
+        )> = None;
+        for (sid, log) in g.iter() {
+            if let Some(state) = log.polls.get(&pid) {
+                if state.meta.lifecycle != crate::community_voting_core::Lifecycle::Open {
+                    return Err(format!(
+                        "voting_cast_tier1_ballot: poll lifecycle is {:?}, not Open",
+                        state.meta.lifecycle
+                    ));
+                }
+                if state.meta.tier != crate::community_voting_core::Tier::Approval {
+                    return Err(format!(
+                        "voting_cast_tier1_ballot: poll tier is {:?}, not Approval",
+                        state.meta.tier
+                    ));
+                }
+                let cfg = state
+                    .tier1_cfg
+                    .clone()
+                    .ok_or("voting_cast_tier1_ballot: tier1_cfg missing on Approval poll")?;
+                let snapshot = state.tier1_snapshot.clone().ok_or(
+                    "voting_cast_tier1_ballot: tier1_snapshot missing (peer-received \
+                     poll without local snapshot — Task 12 will fill this in)",
+                )?;
+                found = Some((*sid, cfg, snapshot));
+                break;
+            }
+        }
+        found.ok_or_else(|| format!("voting_cast_tier1_ballot: poll {} not found", poll_id))?
+    };
+
+    let ballot = crate::community_voting_approval::Tier1Ballot {
+        poll_id: pid,
+        approved_indices: approved_indices.clone(),
+    };
+    crate::community_voting_approval::validate_ballot(&ballot, &cfg)
+        .map_err(|e| format!("voting_cast_tier1_ballot: invalid ballot: {e:?}"))?;
+    crate::community_voting_core::check_eligibility(&snapshot, &self_owner, &cfg.eligibility)
+        .map_err(|e| format!("voting_cast_tier1_ballot: not eligible: {e:?}"))?;
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+
+    let approved_count: u8 = approved_indices.len().min(u8::MAX as usize) as u8;
+    let event = {
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        crate::community_voting_core::build_signed_ballot_tier1(
+            signing_key,
+            self_owner,
+            pid,
+            approved_indices,
+            hlc,
+        )
+        .map_err(|e| format!("voting_cast_tier1_ballot: build_signed: {e:?}"))?
+    };
+
+    {
+        let mut g = voting_logs
+            .lock()
+            .map_err(|e| format!("voting_logs poisoned: {e}"))?;
+        let log = g
+            .get_mut(&space_id)
+            .ok_or("voting_cast_tier1_ballot: log disappeared between checks")?;
+        log.apply(event, &space_id)
+            .map_err(|e| format!("voting_cast_tier1_ballot: apply: {e:?}"))?;
+    }
+
+    let payload = VotingBallotCastPayload {
+        poll_id: poll_id.clone(),
+        voter: hex::encode(self_owner.0),
+        approved_count,
+    };
+    if let Err(e) = app.emit("voting-ballot-cast", &payload) {
+        tracing::warn!(error = %e, "voting-ballot-cast emit failed");
+    }
+
+    Ok(())
+}
+
+/// Tauri IPC: list all polls for `community_id` whose lifecycle is
+/// `Open` (Draft is never on the wire). Returns the lightweight
+/// `PollMeta` for each (sufficient for UI list rendering).
+#[tauri::command]
+async fn voting_list_active_polls(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    community_id: String,
+) -> Result<Vec<crate::community_voting_core::PollMeta>, String> {
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(cid_bytes);
+
+    let voting_logs = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        std::sync::Arc::clone(&g.voting_logs)
+    };
+
+    let g = voting_logs
+        .lock()
+        .map_err(|e| format!("voting_logs poisoned: {e}"))?;
+    let Some(log) = g.get(&space_id) else {
+        return Ok(Vec::new());
+    };
+    Ok(log
+        .polls
+        .values()
+        .filter(|p| p.meta.lifecycle == crate::community_voting_core::Lifecycle::Open)
+        .map(|p| p.meta.clone())
+        .collect())
+}
+
+/// Tauri IPC: get full state for a single poll by id. Includes meta,
+/// tally projection, and the caller's own latest ballot indices (so
+/// the UI can pre-fill the ballot picker without a second IPC).
+#[tauri::command]
+async fn voting_get_poll(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    poll_id: String,
+) -> Result<crate::community_voting_core::PollStateExport, String> {
+    let pid_bytes: [u8; 32] = hex::decode(&poll_id)
+        .map_err(|e| format!("invalid poll_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "poll_id must be 32 bytes (64 hex chars)".to_string())?;
+    let pid = crate::community_voting_core::PollId(pid_bytes);
+
+    let (self_owner_opt, voting_logs) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (g.dm_self_owner, std::sync::Arc::clone(&g.voting_logs))
+    };
+
+    let g = voting_logs
+        .lock()
+        .map_err(|e| format!("voting_logs poisoned: {e}"))?;
+    for log in g.values() {
+        if let Some(state) = log.polls.get(&pid) {
+            // Tally projection: only Tier 1 in Phase 1. Walk the
+            // poll's ballot events and accumulate counts. Multi-ballot
+            // per voter is allowed (last-write-wins by HLC) — Task 7's
+            // tally helper does that properly; we mirror it here using
+            // the public `tally_tier1` so we stay in sync.
+            // Tally requires cfg + frozen snapshot — both populated at
+            // create-time for locally-created polls. For peer-received
+            // polls without a cached snapshot (Task 12 will fill in),
+            // we surface an empty tally so the UI can still render
+            // meta + lifecycle.
+            let tally = match (state.tier1_cfg.as_ref(), state.tier1_snapshot.as_ref()) {
+                (Some(cfg), Some(snap))
+                    if state.meta.tier == crate::community_voting_core::Tier::Approval =>
+                {
+                    let t = crate::community_voting_approval::tally_tier1(cfg, &state.events, snap);
+                    crate::community_voting_core::TallyExport {
+                        counts: t.counts,
+                        ballot_count: t.ballot_count,
+                    }
+                }
+                _ => crate::community_voting_core::TallyExport {
+                    counts: Vec::new(),
+                    ballot_count: 0,
+                },
+            };
+
+            // Find this node's own latest ballot (highest HLC among
+            // BallotCast events whose actor == self_owner). MUST use
+            // the full (wall_ms, logical, device_id) HLC comparator —
+            // tally_tier1 uses Hlc::is_strictly_newer_than which
+            // includes device_id, so a two-device tie at the same
+            // (wall_ms, logical) is deterministic in the tally but
+            // would be arbitrary here without the same tiebreaker,
+            // making the UI "your current ballot" diverge from what
+            // the tally actually counted. (Cursor #130 round-3 catch.)
+            let your_ballot = if let Some(self_owner) = self_owner_opt {
+                state
+                    .events
+                    .iter()
+                    .filter(|ev| {
+                        ev.kind == crate::community_voting_core::PollEventKindCode::BallotCast
+                            && ev.actor == self_owner
+                    })
+                    .max_by(|a, b| {
+                        (a.hlc.wall_ms, a.hlc.logical, a.hlc.device_id.as_str()).cmp(&(
+                            b.hlc.wall_ms,
+                            b.hlc.logical,
+                            b.hlc.device_id.as_str(),
+                        ))
+                    })
+                    .and_then(|ev| {
+                        ciborium::de::from_reader::<
+                            crate::community_voting_approval::Tier1Ballot,
+                            _,
+                        >(&ev.payload[..])
+                        .ok()
+                        .map(|b| b.approved_indices)
+                    })
+            } else {
+                None
+            };
+
+            // Tier-1 option labels: surfaced alongside the tally so
+            // the UI doesn't need a second IPC. Empty vec for
+            // non-Tier-1 polls or peer-received polls without a
+            // cached `Tier1PollConfig`.
+            let options = state
+                .tier1_cfg
+                .as_ref()
+                .map(|cfg| cfg.options.clone())
+                .unwrap_or_default();
+
+            return Ok(crate::community_voting_core::PollStateExport {
+                meta: state.meta.clone(),
+                tally,
+                your_ballot,
+                options,
+            });
+        }
+    }
+    Err(format!("voting_get_poll: poll {} not found", poll_id))
+}
+
+#[cfg(test)]
+mod voting_ipc_tests {
+    use super::*;
+
+    /// Smoke test for the pure config-builder: rejects invalid configs,
+    /// rejects min_vouching_depth>0 (Phase 1 hard gate), accepts good
+    /// configs.
+    #[test]
+    fn build_tier1_config_rejects_vouching_depth() {
+        let cid = crate::community_membership::ChannelId([0x11; 16]);
+        let err = voting_build_tier1_config(
+            cid,
+            vec!["A".into(), "B".into()],
+            3600,
+            0,
+            Some(1),
+            None,
+            None,
+            None,
+        )
+        .expect_err("min_vouching_depth>0 must be rejected");
+        assert!(err.contains("min_vouching_depth"));
+    }
+
+    #[test]
+    fn build_tier1_config_rejects_invalid_options() {
+        let cid = crate::community_membership::ChannelId([0x11; 16]);
+        let err =
+            voting_build_tier1_config(cid, vec!["solo".into()], 3600, 0, None, None, None, None)
+                .expect_err("single option must be rejected");
+        assert!(err.contains("TooFewOptions"));
+    }
+
+    #[test]
+    fn build_tier1_config_accepts_minimal_good() {
+        let cid = crate::community_membership::ChannelId([0x11; 16]);
+        let cfg = voting_build_tier1_config(
+            cid,
+            vec!["A".into(), "B".into(), "C".into()],
+            3600,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("good config validates");
+        assert_eq!(cfg.options.len(), 3);
+        assert_eq!(cfg.eligibility.min_power, 0);
+        assert_eq!(cfg.channel_id, cid);
+    }
+
+    /// End-to-end smoke at the helper layer: create → cast against the
+    /// log directly. Exercises VotingLog.apply_with_snapshot + the
+    /// build_signed helpers under realistic input shapes, mirroring
+    /// what the IPCs do internally without the Tauri State plumbing.
+    #[test]
+    fn voting_log_create_then_ballot_end_to_end() {
+        use crate::community_voting_core::{
+            build_signed_ballot_tier1, build_signed_poll_create_tier1, check_eligibility,
+            MemberAttrs, MembershipSnapshot,
+        };
+        use crate::owner_state_types::Hlc;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let mut csprng = OsRng;
+        let keypair = SigningKey::generate(&mut csprng);
+        let voter = crate::owner_state_types::OwnerAddr([0xaa; 16]);
+        let cid = crate::owner_state_types::SpaceId([0x11; 16]);
+        let channel = crate::community_membership::ChannelId([0x22; 16]);
+
+        let cfg = voting_build_tier1_config(
+            channel,
+            vec!["Pizza".into(), "Burgers".into(), "Sushi".into()],
+            3600,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("cfg valid");
+
+        let mut members = std::collections::HashMap::new();
+        members.insert(
+            voter,
+            MemberAttrs {
+                power: 1,
+                vouching_depth: 0,
+            },
+        );
+        let snapshot = MembershipSnapshot { members };
+        check_eligibility(&snapshot, &voter, &cfg.eligibility).expect("voter eligible");
+
+        let hlc_create = Hlc {
+            wall_ms: 1_000,
+            logical: 0,
+            device_id: "dev-a".into(),
+        };
+        let create_ev = build_signed_poll_create_tier1(&keypair, voter, &cfg, hlc_create)
+            .expect("build create");
+
+        let mut log = crate::community_voting_log::VotingLog::new();
+        let poll_id = log
+            .apply_with_snapshot(create_ev, &cid, Some(snapshot.clone()))
+            .expect("apply create");
+
+        // Snapshot + cfg are cached on the PollState.
+        let state = log.polls.get(&poll_id).expect("poll state");
+        assert!(state.tier1_cfg.is_some());
+        assert!(state.tier1_snapshot.is_some());
+
+        // Now build + apply a ballot.
+        let hlc_ballot = Hlc {
+            wall_ms: 2_000,
+            logical: 0,
+            device_id: "dev-a".into(),
+        };
+        let ballot_ev = build_signed_ballot_tier1(&keypair, voter, poll_id, vec![0, 2], hlc_ballot)
+            .expect("build ballot");
+        log.apply(ballot_ev, &cid).expect("apply ballot");
+
+        let state = log.polls.get(&poll_id).expect("poll state after ballot");
+        assert_eq!(state.events.len(), 2);
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -17419,6 +18125,11 @@ pub fn run() {
             subscribe_peer_profile,
             unsubscribe_peer_profile,
             get_cached_peer_profile,
+            // ZEB-290 Phase 1 Task 11: Tier 1 voting IPCs.
+            voting_create_tier1_poll,
+            voting_cast_tier1_ballot,
+            voting_list_active_polls,
+            voting_get_poll,
             #[cfg(debug_assertions)]
             e2e_close_window,
         ])
@@ -17445,6 +18156,11 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         read_dm_thread,
         delete_outbox_entry,
         add_space,
+        // ZEB-290 Phase 1 Task 11: Tier 1 voting IPCs.
+        voting_create_tier1_poll,
+        voting_cast_tier1_ballot,
+        voting_list_active_polls,
+        voting_get_poll,
     ])
 }
 
@@ -20268,6 +20984,9 @@ mod start_node_race_tests {
             profile_broadcast_next_subscription_id: std::sync::Arc::new(
                 std::sync::atomic::AtomicU64::new(1),
             ),
+            voting_logs: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         })
     }
 

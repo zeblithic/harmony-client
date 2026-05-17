@@ -268,6 +268,31 @@
         <button type="button" class="retry-btn" onclick={retryLoad}>Retry</button>
       </div>
     {/if}
+    <!--
+      TODO ZEB-290 Phase 1.5 — chat-native poll dispatch seam.
+
+      Phase 1 ships PollMessage.svelte + voting-adapter but the
+      ChannelMessageDto wire shape (channel-message-service.ts) is
+      currently kind-agnostic — its only payload is a raw body byte
+      array, rendered verbatim as text below. To embed a poll card
+      inline, Phase 1.5 needs to:
+        1. Extend ChannelMessageDto with a `kind` discriminator
+           ('text' | 'poll'), defaulting to 'text' for back-compat.
+        2. Carry the pollId hex on poll-kind messages (e.g. as part
+           of body or a sibling `pollId?: string` field).
+        3. Add an `{:else if msg.kind === 'poll'}` branch here that
+           renders `<PollMessage pollId={msg.pollId} meta={…}
+           adapter={votingAdapter} />`. Meta comes from the parent
+           feed prefetching listActivePolls(communityId) so the card
+           renders instantly without a per-message getPoll round trip.
+        4. Plumb a VotingAdapter prop into ChannelMessageFeed (similar
+           to how `channelMessageService` is plumbed today).
+
+      Phase 1 backend currently has no poll-kind chat messages on
+      the wire, so there is nothing for this branch to render
+      against yet — the seam is documented here so the diff in
+      Phase 1.5 is localized.
+    -->
     {#each timeline as row}
       {#if 'kind' in row && row.kind === 'fork-divider'}
         <div
