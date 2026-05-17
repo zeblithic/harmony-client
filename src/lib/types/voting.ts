@@ -23,9 +23,14 @@ export type ChannelIdHex = string;
 /** 16-byte OwnerAddr, hex-encoded (32 chars). */
 export type OwnerAddrHex = string;
 
-/** Voting tiers. Mirrors `Tier` (u8 repr — Approval=1, Conviction=2,
- *  Sortition=3) but serialized by serde as the variant string. */
-export type Tier = 'Approval' | 'Conviction' | 'Sortition';
+/** Voting tiers. Mirrors Rust `Tier` (u8 repr — Approval=1, Conviction=2,
+ *  Sortition=3); the Rust enum uses `serde_repr` so the wire form (and
+ *  thus the Tauri IPC payload) is the integer discriminant. Compare
+ *  against the numeric literals, not against string variant names. */
+export type Tier = 1 | 2 | 3;
+export const TIER_APPROVAL = 1 as const;
+export const TIER_CONVICTION = 2 as const;
+export const TIER_SORTITION = 3 as const;
 
 /** Lifecycle phases. Draft is implementation-only — never on the wire. */
 export type Lifecycle = 'Draft' | 'Open' | 'Closed' | 'Finalized' | 'Archived';

@@ -1937,6 +1937,7 @@ dependencies = [
  "rand 0.8.5",
  "secrecy 0.10.3",
  "serde",
+ "serde_bytes",
  "serde_json",
  "serde_repr",
  "serial_test",

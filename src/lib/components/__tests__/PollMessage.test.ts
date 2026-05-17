@@ -10,7 +10,7 @@ function makeMeta(overrides: Partial<PollMeta> = {}): PollMeta {
     poll_id: 'aa'.repeat(32),
     community_id: 'bb'.repeat(16),
     creator: 'cc'.repeat(16),
-    tier: 'Approval',
+    tier: 1,
     eligibility: { mp: 0 },
     lifecycle: 'Open',
     created_at: { w: 100, l: 0, d: 'dev' },

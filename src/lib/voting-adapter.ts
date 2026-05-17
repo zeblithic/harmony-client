@@ -59,56 +59,64 @@ export class VotingAdapter {
 
   private adapter: TauriAdapter | null = null;
   private unlisteners: Array<() => void> = [];
+  private connectInFlight: Promise<void> | null = null;
 
   /** Wire the three event listeners onto a Tauri adapter. Idempotent
    *  (second call with a different adapter is a no-op).
    *
    *  Stages unlisteners in a local array and only commits to `this.adapter`
    *  after every `listen` resolves; on failure, unwires any partial
-   *  registrations so a retry sees a clean slate. CodeRabbit on PR #130
-   *  caught the prior implementation marking the adapter connected before
-   *  all three listens succeeded — a mid-connect throw left subsequent
-   *  `connectAdapter` calls returning early with partial wiring. */
+   *  registrations so a retry sees a clean slate. Uses a `connectInFlight`
+   *  promise singleton so two overlapping callers share the in-flight
+   *  connect rather than double-registering — both PR #130 review rounds
+   *  caught successive corners of this code path. */
   async connectAdapter(adapter: TauriAdapter): Promise<void> {
     if (this.adapter) return;
-    const stagedUnlisteners: Array<() => void> = [];
-    try {
-      const unlistenCreated = await adapter.listen(
-        'voting-poll-created',
-        (event) => {
-          this.onPollCreated?.(event.payload as VotingPollCreatedPayload);
-        },
-      );
-      stagedUnlisteners.push(unlistenCreated);
+    if (this.connectInFlight) return this.connectInFlight;
 
-      const unlistenCast = await adapter.listen(
-        'voting-ballot-cast',
-        (event) => {
-          this.onBallotCast?.(event.payload as VotingBallotCastPayload);
-        },
-      );
-      stagedUnlisteners.push(unlistenCast);
+    this.connectInFlight = (async () => {
+      const stagedUnlisteners: Array<() => void> = [];
+      try {
+        const unlistenCreated = await adapter.listen(
+          'voting-poll-created',
+          (event) => {
+            this.onPollCreated?.(event.payload as VotingPollCreatedPayload);
+          },
+        );
+        stagedUnlisteners.push(unlistenCreated);
 
-      const unlistenClosed = await adapter.listen(
-        'voting-poll-closed',
-        (event) => {
-          this.onPollClosed?.(event.payload as VotingPollClosedPayload);
-        },
-      );
-      stagedUnlisteners.push(unlistenClosed);
+        const unlistenCast = await adapter.listen(
+          'voting-ballot-cast',
+          (event) => {
+            this.onBallotCast?.(event.payload as VotingBallotCastPayload);
+          },
+        );
+        stagedUnlisteners.push(unlistenCast);
 
-      this.adapter = adapter;
-      this.unlisteners.push(...stagedUnlisteners);
-    } catch (e) {
-      for (const u of stagedUnlisteners) {
-        try {
-          u();
-        } catch {
-          // swallow cleanup failures
+        const unlistenClosed = await adapter.listen(
+          'voting-poll-closed',
+          (event) => {
+            this.onPollClosed?.(event.payload as VotingPollClosedPayload);
+          },
+        );
+        stagedUnlisteners.push(unlistenClosed);
+
+        this.adapter = adapter;
+        this.unlisteners.push(...stagedUnlisteners);
+      } catch (e) {
+        for (const u of stagedUnlisteners) {
+          try {
+            u();
+          } catch {
+            // swallow cleanup failures
+          }
         }
+        throw e;
+      } finally {
+        this.connectInFlight = null;
       }
-      throw e;
-    }
+    })();
+    return this.connectInFlight;
   }
 
   /** Tear down all event listeners. Safe to call before connect. */

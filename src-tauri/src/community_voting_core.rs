@@ -166,9 +166,15 @@ pub struct SignedVotingEvent {
     pub hlc: Hlc,
     #[serde(rename = "ac")]
     pub actor: OwnerAddr,
-    #[serde(rename = "pd")]
+    /// Opaque tier+kind-specific CBOR-encoded payload. `serde_bytes`
+    /// is load-bearing here: without it ciborium encodes `Vec<u8>` as
+    /// a CBOR array-of-u8 (major type 4) instead of a byte string
+    /// (major type 2), roughly doubling the on-wire size and producing
+    /// a format peers from other languages wouldn't expect for binary.
+    #[serde(rename = "pd", with = "serde_bytes")]
     pub payload: Vec<u8>,
-    #[serde(rename = "sg")]
+    /// Ed25519 signature; see `payload` for serde_bytes rationale.
+    #[serde(rename = "sg", with = "serde_bytes")]
     pub sig: Vec<u8>,
 }
 
@@ -189,7 +195,7 @@ impl SignedVotingEvent {
             hlc: &'a Hlc,
             #[serde(rename = "ac")]
             actor: &'a OwnerAddr,
-            #[serde(rename = "pd")]
+            #[serde(rename = "pd", with = "serde_bytes")]
             payload: &'a [u8],
         }
         let inp = SigInput {

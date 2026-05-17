@@ -93,7 +93,9 @@
     // live handlers — Greptile P1 on PR #130 caught this.
     const thisHandler = (payload: VotingBallotCastPayload) => {
       prevOnBallotCast?.(payload);
-      if (payload.pollId !== id) return;
+      // Bail early if we've been unmounted but the head-only restore
+      // pattern left our closure still chained behind a sibling.
+      if (cancelled || payload.pollId !== id) return;
       // Refetch on any matching ballot-cast (self or — Phase 1.5 — peer).
       void (async () => {
         try {
@@ -149,11 +151,18 @@
     }
     return `Option ${idx + 1}`;
   }
+
+  function tierLabel(t: number): string {
+    if (t === 1) return 'Approval';
+    if (t === 2) return 'Conviction';
+    if (t === 3) return 'Sortition';
+    return `Tier ${t}`;
+  }
 </script>
 
 <article class="poll-message" data-poll-id={pollId} aria-label="Poll">
   <header class="poll-header">
-    <span class="poll-tier" aria-label="Tier">{meta.tier}</span>
+    <span class="poll-tier" aria-label="Tier">{tierLabel(meta.tier)}</span>
     <span class="poll-lifecycle" class:open={isOpen} aria-label="Lifecycle">
       {state?.meta.lifecycle ?? meta.lifecycle}
     </span>
