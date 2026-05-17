@@ -593,6 +593,149 @@ pub fn next_lifecycle(
     }
 }
 
+/// Errors from signed-event construction helpers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildError {
+    EncodePayload,
+    SigningBytes,
+}
+
+/// Build a fully-signed PollCreate event for Tier 1, ready to broadcast.
+/// Used by `voting_create_tier1_poll` IPC.
+pub fn build_signed_poll_create_tier1(
+    keypair: &ed25519_dalek::SigningKey,
+    actor: OwnerAddr,
+    tier: Tier,
+    config: &crate::community_voting_approval::Tier1PollConfig,
+    hlc: Hlc,
+) -> Result<SignedVotingEvent, BuildError> {
+    use ed25519_dalek::Signer;
+    let mut payload = Vec::new();
+    ciborium::ser::into_writer(config, &mut payload).map_err(|_| BuildError::EncodePayload)?;
+    let mut ev = SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier,
+        kind: PollEventKindCode::PollCreate,
+        hlc,
+        actor,
+        payload,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev.signing_bytes().map_err(|_| BuildError::SigningBytes)?;
+    ev.sig = keypair.sign(&sb).to_bytes().to_vec();
+    Ok(ev)
+}
+
+/// Build a fully-signed BallotCast event for Tier 1.
+pub fn build_signed_ballot_tier1(
+    keypair: &ed25519_dalek::SigningKey,
+    actor: OwnerAddr,
+    poll_id: PollId,
+    approved_indices: Vec<u8>,
+    hlc: Hlc,
+) -> Result<SignedVotingEvent, BuildError> {
+    use ed25519_dalek::Signer;
+    let ballot = crate::community_voting_approval::Tier1Ballot {
+        poll_id,
+        approved_indices,
+    };
+    let mut payload = Vec::new();
+    ciborium::ser::into_writer(&ballot, &mut payload).map_err(|_| BuildError::EncodePayload)?;
+    let mut ev = SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier: Tier::Approval,
+        kind: PollEventKindCode::BallotCast,
+        hlc,
+        actor,
+        payload,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev.signing_bytes().map_err(|_| BuildError::SigningBytes)?;
+    ev.sig = keypair.sign(&sb).to_bytes().to_vec();
+    Ok(ev)
+}
+
+/// Frontend-friendly subset of `PollState` for IPC return values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PollStateExport {
+    pub meta: PollMeta,
+    pub tally: TallyExport,
+    /// The calling node's own latest ballot (if any) — used by the UI
+    /// to render "your current vote" state without a second IPC call.
+    pub your_ballot: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TallyExport {
+    pub counts: Vec<u32>,
+    pub ballot_count: u32,
+}
+
+#[cfg(test)]
+mod build_tests {
+    use super::*;
+    use crate::community_membership::ChannelId;
+    use crate::community_voting_approval::Tier1PollConfig;
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+
+    #[test]
+    fn signed_poll_create_round_trip() {
+        let mut csprng = OsRng;
+        let keypair = SigningKey::generate(&mut csprng);
+        let actor = OwnerAddr([0xaa; 16]);
+        let cfg = Tier1PollConfig {
+            options: vec!["a".into(), "b".into()],
+            window_seconds: 600,
+            quorum: None,
+            threshold_percent: None,
+            multi_winner: None,
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            channel_id: ChannelId([0; 16]),
+        };
+        let hlc = Hlc {
+            wall_ms: 1000,
+            logical: 0,
+            device_id: "a".into(),
+        };
+        let ev = build_signed_poll_create_tier1(&keypair, actor, Tier::Approval, &cfg, hlc)
+            .expect("build");
+        assert_eq!(ev.kind, PollEventKindCode::PollCreate);
+        assert_eq!(ev.actor, actor);
+        let sb = ev.signing_bytes().expect("signing bytes");
+        let sig_bytes: [u8; 64] = ev.sig.clone().try_into().expect("sig len");
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+        use ed25519_dalek::Verifier;
+        keypair.verifying_key().verify(&sb, &sig).expect("verify");
+    }
+
+    #[test]
+    fn signed_ballot_round_trip() {
+        let mut csprng = OsRng;
+        let keypair = SigningKey::generate(&mut csprng);
+        let actor = OwnerAddr([0xbb; 16]);
+        let pid = PollId([0xcc; 32]);
+        let hlc = Hlc {
+            wall_ms: 2000,
+            logical: 0,
+            device_id: "b".into(),
+        };
+        let ev = build_signed_ballot_tier1(&keypair, actor, pid, vec![0, 2], hlc).expect("build");
+        assert_eq!(ev.kind, PollEventKindCode::BallotCast);
+        let sb = ev.signing_bytes().expect("signing bytes");
+        let sig_bytes: [u8; 64] = ev.sig.clone().try_into().expect("sig len");
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+        use ed25519_dalek::Verifier;
+        keypair.verifying_key().verify(&sb, &sig).expect("verify");
+    }
+}
+
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
