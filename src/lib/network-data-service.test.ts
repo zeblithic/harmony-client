@@ -88,7 +88,13 @@ describe('MockNetworkDataService', () => {
     // alert path runs exactly once.
     const alerts: string[] = [];
     service.onAlert = (msg) => alerts.push(msg);
-    service.nodes[1].metrics.cpuPercent = 95;
+    // Find a non-local node by isLocal rather than fixed array index
+    // (ZEB-288 R1 CodeRabbit) — robust to any future constructor
+    // reordering. The status-flip branches apply to all nodes; we
+    // pick non-local just to match the original spec's intent.
+    const target = service.nodes.find((n) => !n.isLocal);
+    if (!target) throw new Error('no non-local node — constructor invariant broken');
+    target.metrics.cpuPercent = 95;
     service.start();
     vi.advanceTimersByTime(1000);
     expect(alerts.length).toBeGreaterThan(0);
