@@ -17,6 +17,7 @@ pub mod community_membership;
 pub mod community_state_crdt;
 pub mod community_state_persist;
 pub mod community_state_sync;
+pub mod community_voting_core;
 pub mod content_index;
 pub mod content_store;
 pub mod dm_crypto;
