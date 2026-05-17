@@ -341,13 +341,27 @@ pow_half_q32(t_ms: i128, hl_ms: i128) -> i128:
   return exp_neg_q32(x_q32)
 
 exp_neg_q32(x_q32: i128) -> i128:
-  # Taylor: exp(-x) = Σ (-x)^n / n!, truncated at n=7 (error < 1e-9 for x ≤ 10)
+  # Argument reduction + Taylor + squaring. Direct 7-term Taylor of exp(-x)
+  # diverges at x ≥ ~2 (the |x^n/n!| terms overshoot the limit). Instead:
+  #
+  #   1. Clamp: if x > 20 * Q32, return 0 (exp(-20) ≈ 2e-9 underflows Q32 anyway).
+  #   2. Halve k=8 times: x_reduced = x >> 8 (so x_reduced ≤ 20 * Q32 / 256 ≈ 0.08).
+  #   3. Taylor 7 terms on x_reduced (error < 1e-12 in this small-x range).
+  #   4. Square k=8 times: result = (result^2 >> Q32)^... (mathematically exact:
+  #      exp(-x/256)^256 = exp(-x)).
+  #
+  # All steps are pure integer arithmetic with fixed iteration counts; bit-
+  # identical across architectures.
+  if x_q32 > 20 * Q32: return 0
+  x_reduced = x_q32 >> 8
   term = Q32   # n=0
   sum = Q32
   for n in 1..=7:
-    term = -(term * x_q32) / (Q32 * n)
+    term = -(term * x_reduced) / (Q32 * n)
     sum += term
-  return sum
+  for _ in 0..8:
+    sum = (sum * sum) >> CONVICTION_FRAC_BITS
+  return max(sum, 0)
 
 conviction_at(t_ms, half_life_ms):
   if is_supporting:

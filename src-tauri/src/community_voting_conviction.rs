@@ -542,7 +542,7 @@ mod tests {
                 "AutoExecAction::SetPower key {s:?} violates 2-char invariant",
             );
         }
-        // Sanity: SetPower has exactly 3 keys: k/tg/np.
+        // Sanity: SetPower has exactly 3 keys: kk/tg/np.
         assert_eq!(ax_map.len(), 3);
     }
 
