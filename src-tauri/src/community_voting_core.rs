@@ -6,7 +6,9 @@
 //! (`voting_approval.rs`, future `voting_conviction.rs`, `voting_sortition.rs`).
 
 use crate::community_membership::ChannelId;
-use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+use crate::owner_state_types::{
+    deserialize_bytes_from_bstr, serialize_bytes_as_bstr, Hlc, OwnerAddr, SpaceId,
+};
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use sha2::{Digest, Sha256};
@@ -18,8 +20,23 @@ use std::collections::HashMap;
 /// 32 bytes (SHA-256 output). Newtype wrapper keeps type-safety —
 /// callers cannot accidentally pass a raw `[u8; 32]` like a `ChannelId`
 /// or `EventId` of the same length.
+///
+/// Uses `serialize_bytes_as_bstr` for CBOR consistency with the other
+/// ID newtypes (`SpaceId`, `OwnerAddr`, `ChannelId`). Note: this fixes
+/// the CBOR wire encoding but not the Tauri IPC JSON boundary — JSON
+/// has no byte-string type and still emits an integer array. Frontend
+/// must currently treat `poll_id` over IPC as `number[]`; a format-
+/// aware (is_human_readable) serializer for hex-string IPC encoding
+/// is tracked as a Phase 1.5 IPC-boundary concern shared with the
+/// other ID types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct PollId(pub [u8; 32]);
+pub struct PollId(
+    #[serde(
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub [u8; 32],
+);
 
 /// The three voting tiers. Wire-encoded as u8 (`tr` field of envelope).
 /// See spec §1 + §3.

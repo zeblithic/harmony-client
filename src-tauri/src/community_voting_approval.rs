@@ -26,16 +26,23 @@ pub const MAX_WINDOW_SECS: u32 = 2_592_000;
 
 /// Tier 1 PollCreate payload, encoded as the envelope's `pd` field.
 /// Spec §4 PollConfig payload.
+///
+/// All map keys are 2-char to satisfy the spec §3 same-length-keys
+/// invariant at every nesting level. Cursor #130 round-5 caught the
+/// previous mix of 1-char (`o`/`w`/`q`) and 2-char keys — though no
+/// code path currently runs these payloads through
+/// `canonical_cbor_encode`'s same-length-keys enforcer, future
+/// canonicalization would have failed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tier1PollConfig {
     /// Option labels (2-20, each ≤ 80 chars).
-    #[serde(rename = "o")]
+    #[serde(rename = "op")]
     pub options: Vec<String>,
     /// Window in seconds (60-2_592_000).
-    #[serde(rename = "w")]
+    #[serde(rename = "wn")]
     pub window_seconds: u32,
     /// Optional minimum quorum (number of ballots required for valid result).
-    #[serde(rename = "q", skip_serializing_if = "Option::is_none", default)]
+    #[serde(rename = "qr", skip_serializing_if = "Option::is_none", default)]
     pub quorum: Option<u32>,
     /// Optional supermajority threshold percent (0-100).
     #[serde(rename = "th", skip_serializing_if = "Option::is_none", default)]
@@ -583,14 +590,20 @@ mod tally_tests {
 }
 
 /// Final result of a Tier 1 poll. Spec §4 result variants.
+///
+/// Outer variant tags use 2-char keys (wn/qr/mj) and inner fields use
+/// 1-char keys (n/a/p) — same-length-keys is per-nesting-level, so the
+/// outer tag map and each variant's field map are independently
+/// uniform. Caught by Cursor #130 round-5; the previous 1-char outer
+/// tags violated the invariant relative to other Tier 1 payloads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Tier1Result {
     /// One or more winners (option indices, sorted ascending in case
     /// of multi-winner; first is highest count).
-    #[serde(rename = "w")]
+    #[serde(rename = "wn")]
     Winners(Vec<u8>),
     /// Insufficient ballots to meet quorum requirement.
-    #[serde(rename = "q")]
+    #[serde(rename = "qr")]
     NoQuorum {
         #[serde(rename = "n")]
         required: u32,
@@ -598,7 +611,7 @@ pub enum Tier1Result {
         actual: u32,
     },
     /// Winner exists but didn't meet the supermajority threshold.
-    #[serde(rename = "m")]
+    #[serde(rename = "mj")]
     NoMajority {
         #[serde(rename = "n")]
         required_percent: u8,

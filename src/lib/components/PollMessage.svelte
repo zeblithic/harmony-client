@@ -68,10 +68,18 @@
    *  bar" visual without misrepresenting absolute counts). */
   let maxCount = $derived(state ? Math.max(1, ...state.tally.counts) : 1);
 
-  // Initial fetch + listener wiring.
+  // Initial fetch + listener wiring. Resets per-poll UI state at the
+  // top of the effect so a parent that swaps `pollId` on the same
+  // component instance (or {#key pollId} reuse without remount) sees
+  // a clean slate rather than the previous poll's bars / approval
+  // highlight bleeding through. CodeRabbit #130 round-5 caught this.
   $effect(() => {
     let cancelled = false;
     const id = pollId;
+    state = null;
+    loadError = null;
+    castError = null;
+    myApproved = new Set();
 
     void (async () => {
       try {
@@ -124,6 +132,10 @@
 
   async function toggleOption(idx: number) {
     if (!isOpen || casting || !state) return;
+    // Snapshot pollId at function-entry so a post-await prop swap
+    // doesn't write this poll's optimistic ballot into another poll's
+    // UI state. CodeRabbit #130 round-5 catch.
+    const id = pollId;
     castError = null;
     const next = new Set(myApproved);
     if (next.has(idx)) {
@@ -142,14 +154,18 @@
     const indices = Array.from(next).sort((a, b) => a - b);
     casting = true;
     try {
-      await adapter.castTier1Ballot(pollId, indices);
+      await adapter.castTier1Ballot(id, indices);
+      if (pollId !== id) return;
       // Optimistic local update; the ballot-cast event will trigger a
       // server-confirmed refresh that supersedes this.
       myApproved = next;
     } catch (e) {
+      if (pollId !== id) return;
       castError = e instanceof Error ? e.message : String(e);
     } finally {
-      casting = false;
+      if (pollId === id) {
+        casting = false;
+      }
     }
   }
 
