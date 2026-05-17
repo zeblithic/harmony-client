@@ -18,6 +18,8 @@
 //! arithmetic with explicit shift/divide rounding. The Task 1 spec
 //! amendment captures the full rationale.
 
+use std::collections::{HashMap, HashSet};
+
 use serde::{Deserialize, Serialize};
 
 use crate::community_voting_core::Eligibility;
@@ -294,6 +296,260 @@ impl VoterConvictionState {
                 t_ms - self.last_event_at_ms,
                 half_life_ms,
             )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 2 per-proposal aggregated state
+// ---------------------------------------------------------------------------
+
+/// Per-proposal aggregated state for a Tier 2 conviction poll.
+///
+/// Owns each voter's `VoterConvictionState` keyed by `OwnerAddr`, plus the
+/// poll-level `Tier2PollConfig`, snapshotted `total_supply`, and two
+/// wall-clock tracking fields used by the 24h-contestability tick (Task 16):
+/// `threshold_reached_at_ms` and `last_unsignal_after_threshold_ms`.
+///
+/// `total_supply` is snapshotted at `PollCreate.hlc` and never mutates — Tier
+/// 2's `effective_supply` ratio (used by `threshold_conviction_at`) is the
+/// ratio of currently-supporting voters to that snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tier2ProposalState {
+    pub config: Tier2PollConfig,
+    /// Total eligible voters at PollCreate.hlc — snapshotted; never changes
+    /// after poll creation (Tier 2's effective_supply derives from this).
+    pub total_supply: u32,
+    /// Per-voter state, keyed by voter's OwnerAddr.
+    pub per_voter: HashMap<OwnerAddr, VoterConvictionState>,
+    /// Wall-clock when total_conviction first crossed threshold_conviction.
+    /// None if never crossed; reset to None on conviction-drop reversion.
+    pub threshold_reached_at_ms: Option<i128>,
+    /// Wall-clock of the most recent Unsignal (Signal{false}) event that
+    /// arrived AFTER threshold was reached. Used by the tick to compute
+    /// "24h uncontested since".
+    pub last_unsignal_after_threshold_ms: Option<i128>,
+}
+
+impl Tier2ProposalState {
+    pub fn new(config: Tier2PollConfig, total_supply: u32) -> Self {
+        Self {
+            config,
+            total_supply,
+            per_voter: HashMap::new(),
+            threshold_reached_at_ms: None,
+            last_unsignal_after_threshold_ms: None,
+        }
+    }
+
+    /// Sum of all per-voter conviction values at t_ms.
+    pub fn total_conviction_at(&self, t_ms: i128) -> ConvictionQ32 {
+        let hl_ms = (self.config.half_life_seconds as i128) * 1000;
+        self.per_voter
+            .values()
+            .map(|v| v.conviction_at(t_ms, hl_ms))
+            .sum()
+    }
+
+    /// Effective supply: count of voters with an active Signal at t_ms.
+    ///
+    /// Note: the per-voter `is_supporting` flag is the source of truth — it
+    /// reflects the most-recent Signal applied. Querying at a `t_ms` earlier
+    /// than the last applied event will still report the post-event state
+    /// (matching `VoterConvictionState`'s own time-travel limitations).
+    pub fn effective_supply_at(&self, _t_ms: i128) -> u32 {
+        self.per_voter.values().filter(|v| v.is_supporting).count() as u32
+    }
+
+    /// Dynamic threshold conviction at t_ms per spec §5:
+    /// `T_min + (T_max - T_min) * (1 - ratio)^β` in Q96.32.
+    /// At zero participation: returns `T_max`. At full participation: returns `T_min`.
+    /// If `total_supply == 0` (degenerate; should be guarded at PollCreate
+    /// time), returns `T_max` so the threshold is never inadvertently low.
+    pub fn threshold_conviction_at(&self, t_ms: i128) -> ConvictionQ32 {
+        let cfg = &self.config;
+        if self.total_supply == 0 {
+            return cfg.threshold_max_q32;
+        }
+        let ratio_q32 = (self.effective_supply_at(t_ms) as i128 * Q32) / self.total_supply as i128;
+        let one_minus = Q32 - ratio_q32;
+        // (1 - ratio)^β via repeated multiplication; β=1 → no iter (pow=one_minus).
+        let mut pow = one_minus;
+        for _ in 1..cfg.beta {
+            pow = (pow * one_minus) >> CONVICTION_FRAC_BITS;
+        }
+        let span = cfg.threshold_max_q32 - cfg.threshold_min_q32;
+        cfg.threshold_min_q32 + ((span * pow) >> CONVICTION_FRAC_BITS)
+    }
+
+    /// True if the threshold was JUST crossed at t_ms (and isn't already in
+    /// the "reached" state). Used by the 24h-contestability tick (Task 16).
+    pub fn just_crossed_threshold(&self, t_ms: i128) -> bool {
+        self.threshold_reached_at_ms.is_none()
+            && self.total_conviction_at(t_ms) >= self.threshold_conviction_at(t_ms)
+    }
+
+    /// True if conviction dropped back below threshold at t_ms (from a
+    /// previously-reached state).
+    pub fn just_dropped_below_threshold(&self, t_ms: i128) -> bool {
+        self.threshold_reached_at_ms.is_some()
+            && self.total_conviction_at(t_ms) < self.threshold_conviction_at(t_ms)
+    }
+
+    /// Total conviction at t_ms with delegation weights applied.
+    ///
+    /// Each voter `V` in `per_voter` contributes
+    /// `(1 + N) * conviction_at(t_ms)`, where `N` is the count of accounts
+    /// delegating to `V` via `delegation_graph` who have NOT themselves
+    /// directly signaled on this proposal (override semantics, spec §5).
+    ///
+    /// **Non-transitive in v1** per spec §5: "voter A delegates to voter B
+    /// → B's signaling carries B's own weight + A's weight." Only direct
+    /// delegators count; chains do not propagate. If spec §5 is later
+    /// amended to make delegation transitive, this is the single function
+    /// to change.
+    pub fn total_conviction_at_with_delegation(
+        &self,
+        t_ms: i128,
+        delegation_graph: &DelegationGraph,
+    ) -> ConvictionQ32 {
+        let hl_ms = (self.config.half_life_seconds as i128) * 1000;
+        let mut weighted: ConvictionQ32 = 0;
+        for (voter, state) in self.per_voter.iter() {
+            // Count direct delegators who haven't themselves directly
+            // signaled on THIS proposal (override semantics).
+            let direct_delegators = delegation_graph
+                .delegators_of(*voter)
+                .filter(|delegator| !self.per_voter.contains_key(delegator))
+                .count() as i128;
+            let weight = 1 + direct_delegators;
+            let conv = state.conviction_at(t_ms, hl_ms);
+            weighted += conv * weight;
+        }
+        weighted
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Delegation graph CRDT
+// ---------------------------------------------------------------------------
+
+/// Failure modes for `DelegationGraph::apply_delegate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegationError {
+    /// D2 violation: applying this Delegate would create a cycle in the graph.
+    Cycle,
+    /// HLC-LWW: an existing Delegate event for this delegator has a
+    /// newer-or-equal HLC, so the incoming event is stale.
+    StaleHlc,
+}
+
+/// Per-community delegation graph CRDT.
+///
+/// Each delegator has at most one active delegate. Conflicts between
+/// concurrent Delegate events for the same delegator resolve by HLC-LWW
+/// (latest wins). Undelegate clears the delegator's edge with HLC-LWW too.
+///
+/// D2 invariant: the graph is acyclic at all times. `apply_delegate`
+/// rejects any event that would create a cycle (including the degenerate
+/// self-delegation A→A).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DelegationGraph {
+    /// delegator → (delegate, hlc_ms_of_latest_event)
+    edges: HashMap<OwnerAddr, (OwnerAddr, i128)>,
+}
+
+impl DelegationGraph {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Apply a `Delegate` event. Returns:
+    /// - `Err(Cycle)` if `delegator == delegate` or if the new edge would
+    ///   close a cycle through the existing graph.
+    /// - `Err(StaleHlc)` if there's already an edge for `delegator` with
+    ///   an HLC `>= hlc_ms` (HLC-LWW; ties also rejected — first applied
+    ///   wins, which is fine because real HLC values are unique-per-actor).
+    /// - `Ok(())` on success; the edge is installed.
+    pub fn apply_delegate(
+        &mut self,
+        delegator: OwnerAddr,
+        delegate: OwnerAddr,
+        hlc_ms: i128,
+    ) -> Result<(), DelegationError> {
+        // Self-delegation is also a degenerate cycle.
+        if delegator == delegate {
+            return Err(DelegationError::Cycle);
+        }
+        // D2: walk delegate's outgoing chain looking for delegator. We must
+        // do this BEFORE the HLC-LWW check so a stale-and-cyclic event is
+        // diagnosed precisely; the order doesn't change the eventual graph
+        // state (both branches reject), but it surfaces the structural
+        // problem to callers/tests.
+        if self.would_create_cycle(delegator, delegate) {
+            return Err(DelegationError::Cycle);
+        }
+        // HLC-LWW: reject if existing edge has newer-or-equal HLC.
+        if let Some(&(_, existing_hlc)) = self.edges.get(&delegator) {
+            if existing_hlc >= hlc_ms {
+                return Err(DelegationError::StaleHlc);
+            }
+        }
+        self.edges.insert(delegator, (delegate, hlc_ms));
+        Ok(())
+    }
+
+    /// Apply an `Undelegate` event. HLC-LWW: silently skips if existing
+    /// edge has a newer-or-equal HLC. Idempotent if there's no edge to remove.
+    pub fn apply_undelegate(&mut self, delegator: OwnerAddr, hlc_ms: i128) {
+        if let Some(&(_, existing_hlc)) = self.edges.get(&delegator) {
+            if existing_hlc >= hlc_ms {
+                return;
+            }
+            self.edges.remove(&delegator);
+        }
+    }
+
+    /// Number of accounts directly delegating to `delegate` (not transitive).
+    pub fn delegator_count(&self, delegate: OwnerAddr) -> u32 {
+        self.edges.values().filter(|(d, _)| *d == delegate).count() as u32
+    }
+
+    /// Current delegate of `who`, or `None` if `who` is not delegating.
+    pub fn delegate_of(&self, who: OwnerAddr) -> Option<OwnerAddr> {
+        self.edges.get(&who).map(|&(d, _)| d)
+    }
+
+    /// Iterate the accounts directly delegating to `delegate`. Helper used
+    /// by `Tier2ProposalState::total_conviction_at_with_delegation` so the
+    /// `edges` field can stay private.
+    pub fn delegators_of(&self, delegate: OwnerAddr) -> impl Iterator<Item = OwnerAddr> + '_ {
+        self.edges
+            .iter()
+            .filter(move |(_, (d, _))| *d == delegate)
+            .map(|(delegator, _)| *delegator)
+    }
+
+    /// Walk from `start` through the delegate chain; return true if any
+    /// node visited equals `target`. Used by cycle detection in
+    /// `apply_delegate`.
+    fn would_create_cycle(&self, target: OwnerAddr, start: OwnerAddr) -> bool {
+        let mut visited = HashSet::new();
+        let mut current = start;
+        loop {
+            if current == target {
+                return true;
+            }
+            if !visited.insert(current) {
+                // Defensive: pre-existing cycle. apply_delegate prevents
+                // these from ever being installed, but bail out rather than
+                // looping forever if invariants ever get violated.
+                return true;
+            }
+            match self.edges.get(&current) {
+                Some(&(next, _)) => current = next,
+                None => return false,
+            }
         }
     }
 }
@@ -844,5 +1100,372 @@ mod tests {
         // decay, plus zero active charge.
         let expected2 = s2.accumulated_conviction_q32;
         assert_eq!(result2, expected2);
+    }
+
+    // -------- Tier2ProposalState --------
+
+    fn voter(byte: u8) -> OwnerAddr {
+        OwnerAddr([byte; 16])
+    }
+
+    /// Sample Tier 2 config with a 1-second half-life (matches `TEST_HL` ms)
+    /// and a wide threshold band so per-voter conviction can drive crossings
+    /// in a few half-lives.
+    fn t2_config(beta: u8, t_min_q32: ConvictionQ32, t_max_q32: ConvictionQ32) -> Tier2PollConfig {
+        Tier2PollConfig {
+            proposal_text: "Test proposal".into(),
+            // 1-second half-life → hl_ms = 1000 = TEST_HL.
+            half_life_seconds: 1,
+            threshold_min_q32: t_min_q32,
+            threshold_max_q32: t_max_q32,
+            beta,
+            delegation_allowed: true,
+            auto_exec: AutoExecAction::None,
+            eligibility: Eligibility {
+                min_power: 1,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+        }
+    }
+
+    #[test]
+    fn tier2_state_new_starts_empty() {
+        let cfg = t2_config(2, 0, 100 * Q32);
+        let s = Tier2ProposalState::new(cfg.clone(), 10);
+        assert_eq!(s.total_supply, 10);
+        assert_eq!(s.per_voter.len(), 0);
+        assert_eq!(s.threshold_reached_at_ms, None);
+        assert_eq!(s.last_unsignal_after_threshold_ms, None);
+        assert_eq!(s.config, cfg);
+    }
+
+    #[test]
+    fn total_conviction_zero_with_no_signals() {
+        let s = Tier2ProposalState::new(t2_config(2, 0, 100 * Q32), 10);
+        assert_eq!(s.total_conviction_at(0), 0);
+        assert_eq!(s.total_conviction_at(1_000_000), 0);
+    }
+
+    #[test]
+    fn threshold_full_participation_equals_t_min() {
+        // 3 voters, total_supply 3, all supporting → ratio = 1 → (1-1)^β = 0
+        // → threshold = T_min.
+        let mut s = Tier2ProposalState::new(t2_config(2, 7 * Q32, 100 * Q32), 3);
+        for i in 0..3u8 {
+            let mut v = VoterConvictionState::default();
+            v.apply_signal(true, 0, TEST_HL);
+            s.per_voter.insert(voter(i + 1), v);
+        }
+        assert_eq!(s.effective_supply_at(0), 3);
+        assert_eq!(s.threshold_conviction_at(0), 7 * Q32);
+    }
+
+    #[test]
+    fn threshold_zero_participation_equals_t_max() {
+        // No active signals → ratio = 0 → (1-0)^β = 1 → threshold = T_max.
+        let s = Tier2ProposalState::new(t2_config(2, 7 * Q32, 100 * Q32), 5);
+        assert_eq!(s.effective_supply_at(0), 0);
+        assert_eq!(s.threshold_conviction_at(0), 100 * Q32);
+    }
+
+    #[test]
+    fn threshold_curve_beta_2_mid_participation() {
+        // ratio = 0.5, β = 2: pow = 0.25, threshold = T_min + 0.25*(T_max-T_min).
+        let mut s = Tier2ProposalState::new(t2_config(2, 0, 100 * Q32), 4);
+        for i in 0..2u8 {
+            let mut v = VoterConvictionState::default();
+            v.apply_signal(true, 0, TEST_HL);
+            s.per_voter.insert(voter(i + 1), v);
+        }
+        // Two non-supporting voters fill out the total_supply count.
+        for i in 2..4u8 {
+            s.per_voter
+                .insert(voter(i + 1), VoterConvictionState::default());
+        }
+        assert_eq!(s.effective_supply_at(0), 2);
+        assert_eq!(s.total_supply, 4);
+        // Expected: 0 + 0.25 * (100 - 0) * Q32 = 25 * Q32.
+        assert_eq!(s.threshold_conviction_at(0), 25 * Q32);
+    }
+
+    #[test]
+    fn threshold_curve_beta_1_mid_participation() {
+        // β=1: pow = (1 - ratio); ratio = 0.5 → pow = 0.5 → threshold = T_min + 0.5*(T_max - T_min) = 50.
+        let mut s = Tier2ProposalState::new(t2_config(1, 0, 100 * Q32), 4);
+        for i in 0..2u8 {
+            let mut v = VoterConvictionState::default();
+            v.apply_signal(true, 0, TEST_HL);
+            s.per_voter.insert(voter(i + 1), v);
+        }
+        for i in 2..4u8 {
+            s.per_voter
+                .insert(voter(i + 1), VoterConvictionState::default());
+        }
+        assert_eq!(s.threshold_conviction_at(0), 50 * Q32);
+    }
+
+    #[test]
+    fn threshold_zero_total_supply_returns_t_max() {
+        // Degenerate guard: avoid div-by-zero, return the safe (high) ceiling.
+        let s = Tier2ProposalState::new(t2_config(2, 5 * Q32, 42 * Q32), 0);
+        assert_eq!(s.threshold_conviction_at(0), 42 * Q32);
+    }
+
+    #[test]
+    fn just_crossed_threshold_true_when_total_meets_threshold_first_time() {
+        // Construct a state where total_conviction crosses threshold at a
+        // specific t. With T_min=0, T_max=very high, and a single voter
+        // signaling for an hour, total grows monotonically; eventually it
+        // crosses the (full-participation) T_min = 0 — but T_min=0 makes
+        // the test trivial. Use a non-zero T_min so the crossing is real.
+        // total_supply=1, single voter → ratio=1 → threshold = T_min.
+        // Pick T_min such that crossing happens after exactly 1 half-life.
+        let target = charge_q32(TEST_HL, TEST_HL); // conviction after 1 hl
+        let mut s = Tier2ProposalState::new(t2_config(2, target, 100 * Q32), 1);
+        let mut v = VoterConvictionState::default();
+        v.apply_signal(true, 0, TEST_HL);
+        s.per_voter.insert(voter(1), v);
+
+        // Just before 1 half-life: not crossed.
+        assert!(s.total_conviction_at(TEST_HL - 1) < s.threshold_conviction_at(TEST_HL - 1));
+        assert!(!s.just_crossed_threshold(TEST_HL - 1));
+
+        // At 1 half-life: total == threshold → crossed.
+        assert!(s.just_crossed_threshold(TEST_HL));
+
+        // Once "reached" is recorded, subsequent calls return false.
+        s.threshold_reached_at_ms = Some(TEST_HL);
+        assert!(!s.just_crossed_threshold(2 * TEST_HL));
+    }
+
+    #[test]
+    fn just_dropped_below_threshold_only_after_reached() {
+        let mut s = Tier2ProposalState::new(t2_config(2, 100 * Q32, 100 * Q32), 1);
+        // Never reached: just_dropped is always false.
+        assert!(!s.just_dropped_below_threshold(0));
+        assert!(!s.just_dropped_below_threshold(10_000));
+
+        // Mark reached, ensure total_conviction is below threshold (no
+        // signals → 0; threshold T_min=T_max=100 * Q32). just_dropped true.
+        s.threshold_reached_at_ms = Some(0);
+        assert!(s.just_dropped_below_threshold(1_000));
+    }
+
+    // -------- DelegationGraph --------
+
+    #[test]
+    fn delegation_simple_a_to_b_accepted() {
+        let mut g = DelegationGraph::new();
+        let a = voter(1);
+        let b = voter(2);
+        assert_eq!(g.apply_delegate(a, b, 1_000), Ok(()));
+        assert_eq!(g.delegate_of(a), Some(b));
+        assert_eq!(g.delegate_of(b), None);
+        assert_eq!(g.delegator_count(b), 1);
+        assert_eq!(g.delegator_count(a), 0);
+    }
+
+    #[test]
+    fn delegation_cycle_a_to_b_to_a_rejected() {
+        let mut g = DelegationGraph::new();
+        let a = voter(1);
+        let b = voter(2);
+        g.apply_delegate(a, b, 1_000).unwrap();
+        // Now trying B→A would close a 2-cycle.
+        assert_eq!(g.apply_delegate(b, a, 2_000), Err(DelegationError::Cycle));
+        // Graph state unchanged.
+        assert_eq!(g.delegate_of(b), None);
+        assert_eq!(g.delegate_of(a), Some(b));
+    }
+
+    #[test]
+    fn delegation_transitive_cycle_a_to_b_to_c_to_a_rejected() {
+        let mut g = DelegationGraph::new();
+        let a = voter(1);
+        let b = voter(2);
+        let c = voter(3);
+        g.apply_delegate(a, b, 1_000).unwrap();
+        g.apply_delegate(b, c, 2_000).unwrap();
+        // Now C→A would close the 3-cycle A→B→C→A.
+        assert_eq!(g.apply_delegate(c, a, 3_000), Err(DelegationError::Cycle));
+        assert_eq!(g.delegate_of(c), None);
+    }
+
+    #[test]
+    fn delegation_self_delegation_rejected() {
+        let mut g = DelegationGraph::new();
+        let a = voter(1);
+        assert_eq!(g.apply_delegate(a, a, 1_000), Err(DelegationError::Cycle));
+        assert_eq!(g.delegate_of(a), None);
+    }
+
+    #[test]
+    fn delegation_hlc_lww_newer_replaces_older() {
+        let mut g = DelegationGraph::new();
+        let a = voter(1);
+        let b = voter(2);
+        let c = voter(3);
+        g.apply_delegate(a, b, 1_000).unwrap();
+        // Newer Delegate from A→C wins.
+        g.apply_delegate(a, c, 2_000).unwrap();
+        assert_eq!(g.delegate_of(a), Some(c));
+        assert_eq!(g.delegator_count(b), 0);
+        assert_eq!(g.delegator_count(c), 1);
+    }
+
+    #[test]
+    fn delegation_hlc_lww_older_rejected_as_stale() {
+        let mut g = DelegationGraph::new();
+        let a = voter(1);
+        let b = voter(2);
+        let c = voter(3);
+        g.apply_delegate(a, b, 2_000).unwrap();
+        // Older Delegate from A→C is stale.
+        assert_eq!(
+            g.apply_delegate(a, c, 1_000),
+            Err(DelegationError::StaleHlc),
+        );
+        // Equal HLC is also rejected (ties → first wins).
+        assert_eq!(
+            g.apply_delegate(a, c, 2_000),
+            Err(DelegationError::StaleHlc),
+        );
+        assert_eq!(g.delegate_of(a), Some(b));
+    }
+
+    #[test]
+    fn undelegate_clears_edge_when_newer() {
+        let mut g = DelegationGraph::new();
+        let a = voter(1);
+        let b = voter(2);
+        g.apply_delegate(a, b, 1_000).unwrap();
+        g.apply_undelegate(a, 2_000);
+        assert_eq!(g.delegate_of(a), None);
+        assert_eq!(g.delegator_count(b), 0);
+    }
+
+    #[test]
+    fn undelegate_no_op_when_older() {
+        let mut g = DelegationGraph::new();
+        let a = voter(1);
+        let b = voter(2);
+        g.apply_delegate(a, b, 2_000).unwrap();
+        // Stale Undelegate: should not remove the edge.
+        g.apply_undelegate(a, 1_000);
+        assert_eq!(g.delegate_of(a), Some(b));
+        // Equal HLC also no-op (LWW: ≥ existing, so skip).
+        g.apply_undelegate(a, 2_000);
+        assert_eq!(g.delegate_of(a), Some(b));
+    }
+
+    #[test]
+    fn undelegate_idempotent_when_no_edge() {
+        let mut g = DelegationGraph::new();
+        let a = voter(1);
+        g.apply_undelegate(a, 1_000); // no edge to clear; just no-op
+        assert_eq!(g.delegate_of(a), None);
+    }
+
+    #[test]
+    fn delegator_count_basic() {
+        let mut g = DelegationGraph::new();
+        let a = voter(1);
+        let b = voter(2);
+        let c = voter(3);
+        let d = voter(4);
+        g.apply_delegate(a, d, 1_000).unwrap();
+        g.apply_delegate(b, d, 1_001).unwrap();
+        g.apply_delegate(c, d, 1_002).unwrap();
+        assert_eq!(g.delegator_count(d), 3);
+        assert_eq!(g.delegator_count(a), 0);
+        // Re-delegate one away.
+        let e = voter(5);
+        g.apply_delegate(b, e, 2_000).unwrap();
+        assert_eq!(g.delegator_count(d), 2);
+        assert_eq!(g.delegator_count(e), 1);
+    }
+
+    // -------- Delegation-weighted conviction --------
+
+    #[test]
+    fn weighted_conviction_no_delegation_equals_simple_total() {
+        // Sanity: with an empty graph, weighted == simple total.
+        let mut s = Tier2ProposalState::new(t2_config(2, 0, 100 * Q32), 2);
+        let mut v1 = VoterConvictionState::default();
+        v1.apply_signal(true, 0, TEST_HL);
+        s.per_voter.insert(voter(1), v1);
+        let g = DelegationGraph::new();
+        assert_eq!(
+            s.total_conviction_at_with_delegation(TEST_HL, &g),
+            s.total_conviction_at(TEST_HL),
+        );
+    }
+
+    #[test]
+    fn weighted_conviction_counts_delegator_weight() {
+        // A→B; only B signals. B's conviction should be doubled (weight = 1 + 1).
+        let mut s = Tier2ProposalState::new(t2_config(2, 0, 100 * Q32), 2);
+        let a = voter(1);
+        let b = voter(2);
+        let mut vb = VoterConvictionState::default();
+        vb.apply_signal(true, 0, TEST_HL);
+        s.per_voter.insert(b, vb);
+        let mut g = DelegationGraph::new();
+        g.apply_delegate(a, b, 1).unwrap();
+
+        let simple = s.total_conviction_at(TEST_HL);
+        let weighted = s.total_conviction_at_with_delegation(TEST_HL, &g);
+        assert_eq!(weighted, 2 * simple);
+    }
+
+    #[test]
+    fn direct_signal_overrides_delegation_for_that_proposal() {
+        // A→B; BOTH A and B signal directly on this proposal. Override
+        // semantics: A's direct signal beats their delegation; B does NOT
+        // get A's weight. So total = conviction(A) + conviction(B).
+        let mut s = Tier2ProposalState::new(t2_config(2, 0, 100 * Q32), 2);
+        let a = voter(1);
+        let b = voter(2);
+        let mut va = VoterConvictionState::default();
+        va.apply_signal(true, 0, TEST_HL);
+        s.per_voter.insert(a, va);
+        let mut vb = VoterConvictionState::default();
+        vb.apply_signal(true, 0, TEST_HL);
+        s.per_voter.insert(b, vb);
+        let mut g = DelegationGraph::new();
+        g.apply_delegate(a, b, 1).unwrap();
+
+        let weighted = s.total_conviction_at_with_delegation(TEST_HL, &g);
+        // Both at weight 1 (A overrides; B has no eligible delegators).
+        let single = charge_q32(TEST_HL, TEST_HL);
+        assert_eq!(weighted, 2 * single);
+    }
+
+    #[test]
+    fn multi_level_delegation_does_not_double_count() {
+        // A→B and C→A. Neither A nor C has a direct signal; B signals.
+        //
+        // SPEC §5 (v1, "universal scope only"): delegation is
+        // NON-TRANSITIVE — "voter A delegates to voter B → B's signaling
+        // carries B's own weight + A's weight." Only A's vote moves to B;
+        // C's delegation to A does NOT cascade to B in v1.
+        //
+        // Therefore: B's weight = 1 (self) + 1 (A) = 2; C's delegation to
+        // A contributes nothing because A doesn't signal. Total weight = 2.
+        let mut s = Tier2ProposalState::new(t2_config(2, 0, 100 * Q32), 3);
+        let a = voter(1);
+        let b = voter(2);
+        let c = voter(3);
+        let mut vb = VoterConvictionState::default();
+        vb.apply_signal(true, 0, TEST_HL);
+        s.per_voter.insert(b, vb);
+        let mut g = DelegationGraph::new();
+        g.apply_delegate(a, b, 1).unwrap();
+        g.apply_delegate(c, a, 2).unwrap();
+
+        let weighted = s.total_conviction_at_with_delegation(TEST_HL, &g);
+        let single = charge_q32(TEST_HL, TEST_HL);
+        assert_eq!(weighted, 2 * single);
     }
 }
