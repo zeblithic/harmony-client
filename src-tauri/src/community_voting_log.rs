@@ -322,3 +322,206 @@ mod tests {
         assert_eq!(log.polls[&pid].events.len(), 2);
     }
 }
+
+const NINETY_DAYS_MS: u64 = 90 * 24 * 60 * 60 * 1000;
+
+impl VotingLog {
+    /// Sweep polls finalized > 90 days ago (per spec §2). Drop per-ballot
+    /// events but retain `PollCreate` + `PollResult` so the audit record
+    /// stays intact forever. Transition lifecycle to `Archived`.
+    /// Idempotent. Returns the `PollId`s that were archived this sweep.
+    ///
+    /// Caller responsibility (deferred to a follow-up that wires this into
+    /// the periodic tick in `lib.rs`): invoke daily across every entry in
+    /// `NodeState.voting_logs`.
+    pub fn archive_finalized_polls(&mut self, now_wall_ms: u64) -> Vec<PollId> {
+        let mut archived = Vec::new();
+        for (pid, state) in self.polls.iter_mut() {
+            if state.meta.lifecycle != Lifecycle::Finalized {
+                continue;
+            }
+            let finalized_at = state
+                .events
+                .iter()
+                .find(|e| e.kind == PollEventKindCode::PollResult)
+                .map(|e| e.hlc.wall_ms);
+            let Some(fin_at) = finalized_at else {
+                continue;
+            };
+            if now_wall_ms.saturating_sub(fin_at) > NINETY_DAYS_MS {
+                state.events.retain(|e| {
+                    matches!(
+                        e.kind,
+                        PollEventKindCode::PollCreate | PollEventKindCode::PollResult
+                    )
+                });
+                state.meta.lifecycle = Lifecycle::Archived;
+                archived.push(*pid);
+            }
+        }
+        archived
+    }
+}
+
+#[cfg(test)]
+mod archive_tests {
+    use super::*;
+    use crate::community_voting_core::Tier;
+    use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+
+    fn make_event(kind: PollEventKindCode, wall_ms: u64) -> SignedVotingEvent {
+        SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Approval,
+            kind,
+            hlc: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "a".into(),
+            },
+            actor: OwnerAddr([0xaa; 16]),
+            payload: vec![],
+            sig: vec![0u8; 64],
+        }
+    }
+
+    /// Build a PollState by direct construction — bypasses the full
+    /// signed-event chain so archive tests stay focused on the sweep
+    /// semantics rather than re-exercising every other layer.
+    fn make_finalized_log(finalized_at_ms: u64, n_ballots: usize) -> (VotingLog, PollId) {
+        let mut log = VotingLog::new();
+        let pid = PollId([0x77; 32]);
+        let cid = SpaceId([0xcc; 16]);
+        let create_ev = make_event(PollEventKindCode::PollCreate, 0);
+        let result_ev = make_event(PollEventKindCode::PollResult, finalized_at_ms);
+        let mut events = vec![create_ev.clone()];
+        for i in 0..n_ballots {
+            events.push(make_event(
+                PollEventKindCode::BallotCast,
+                (i as u64 + 1) * 100,
+            ));
+        }
+        events.push(make_event(
+            PollEventKindCode::PollClose,
+            finalized_at_ms.saturating_sub(1),
+        ));
+        events.push(result_ev);
+        let meta = PollMeta {
+            poll_id: pid,
+            community_id: cid,
+            creator: OwnerAddr([0xaa; 16]),
+            tier: Tier::Approval,
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            lifecycle: Lifecycle::Finalized,
+            created_at: Hlc {
+                wall_ms: 0,
+                logical: 0,
+                device_id: "a".into(),
+            },
+            opens_at: Hlc {
+                wall_ms: 0,
+                logical: 0,
+                device_id: "a".into(),
+            },
+            closes_at: Hlc {
+                wall_ms: finalized_at_ms,
+                logical: 0,
+                device_id: "a".into(),
+            },
+            extends_at: None,
+            channel_id: None,
+        };
+        log.polls.insert(
+            pid,
+            PollState {
+                meta,
+                events,
+                tier_state: TierState::Empty,
+                tier1_cfg: None,
+                tier1_snapshot: None,
+            },
+        );
+        (log, pid)
+    }
+
+    #[test]
+    fn old_finalized_poll_archived() {
+        let (mut log, pid) = make_finalized_log(0, 10);
+        let now_ms = 91 * 24 * 60 * 60 * 1000;
+        let archived = log.archive_finalized_polls(now_ms);
+        assert_eq!(archived, vec![pid]);
+        assert_eq!(log.polls[&pid].meta.lifecycle, Lifecycle::Archived);
+        assert_eq!(log.polls[&pid].events.len(), 2);
+    }
+
+    #[test]
+    fn young_finalized_poll_kept() {
+        let (mut log, pid) = make_finalized_log(0, 10);
+        let now_ms = 89 * 24 * 60 * 60 * 1000;
+        let archived = log.archive_finalized_polls(now_ms);
+        assert!(archived.is_empty());
+        assert_eq!(log.polls[&pid].meta.lifecycle, Lifecycle::Finalized);
+    }
+
+    #[test]
+    fn archive_is_idempotent() {
+        let (mut log, _pid) = make_finalized_log(0, 10);
+        let now_ms = 100 * 24 * 60 * 60 * 1000;
+        let first = log.archive_finalized_polls(now_ms);
+        let second = log.archive_finalized_polls(now_ms);
+        assert_eq!(first.len(), 1);
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn open_poll_not_archived() {
+        let mut log = VotingLog::new();
+        let pid = PollId([0x88; 32]);
+        let meta = PollMeta {
+            poll_id: pid,
+            community_id: SpaceId([0xcc; 16]),
+            creator: OwnerAddr([0xaa; 16]),
+            tier: Tier::Approval,
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            lifecycle: Lifecycle::Open,
+            created_at: Hlc {
+                wall_ms: 0,
+                logical: 0,
+                device_id: "a".into(),
+            },
+            opens_at: Hlc {
+                wall_ms: 0,
+                logical: 0,
+                device_id: "a".into(),
+            },
+            closes_at: Hlc {
+                wall_ms: 100_000,
+                logical: 0,
+                device_id: "a".into(),
+            },
+            extends_at: None,
+            channel_id: None,
+        };
+        log.polls.insert(
+            pid,
+            PollState {
+                meta,
+                events: vec![],
+                tier_state: TierState::Empty,
+                tier1_cfg: None,
+                tier1_snapshot: None,
+            },
+        );
+        let archived = log.archive_finalized_polls(999 * 24 * 60 * 60 * 1000);
+        assert!(archived.is_empty());
+    }
+}
