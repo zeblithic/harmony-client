@@ -665,6 +665,11 @@ pub struct PollStateExport {
     /// The calling node's own latest ballot (if any) — used by the UI
     /// to render "your current vote" state without a second IPC call.
     pub your_ballot: Option<Vec<u8>>,
+    /// Tier-1 option labels (display strings). Empty for non-Tier-1
+    /// polls or peer-received polls without a cached `Tier1PollConfig`.
+    /// Populated from `state.tier1_cfg.options` so the UI can render
+    /// labels alongside the tally without a second IPC.
+    pub options: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

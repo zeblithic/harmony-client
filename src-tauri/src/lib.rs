@@ -17869,10 +17869,21 @@ async fn voting_get_poll(
                 None
             };
 
+            // Tier-1 option labels: surfaced alongside the tally so
+            // the UI doesn't need a second IPC. Empty vec for
+            // non-Tier-1 polls or peer-received polls without a
+            // cached `Tier1PollConfig`.
+            let options = state
+                .tier1_cfg
+                .as_ref()
+                .map(|cfg| cfg.options.clone())
+                .unwrap_or_default();
+
             return Ok(crate::community_voting_core::PollStateExport {
                 meta: state.meta.clone(),
                 tally,
                 your_ballot,
+                options,
             });
         }
     }
