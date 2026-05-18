@@ -24,11 +24,17 @@
 
 import type { TauriAdapter } from './zenoh-service';
 import type {
+  AutoExecAction,
   PollMeta,
   PollStateExport,
+  Tier2ProposalExport,
   VotingBallotCastPayload,
   VotingPollClosedPayload,
   VotingPollCreatedPayload,
+  VotingProposalFinalizedPayload,
+  VotingThresholdReachedPayload,
+  VotingTier2ProposalCreatedPayload,
+  VotingTier2SignalCastPayload,
 } from './types/voting';
 
 /** Args for `createTier1Poll`. Mirrors the Rust IPC signature 1:1. */
@@ -81,6 +87,13 @@ export class VotingAdapter {
   private ballotCastSubs: Array<(p: VotingBallotCastPayload) => void> = [];
   private pollClosedSubs: Array<(p: VotingPollClosedPayload) => void> = [];
 
+  // ZEB-291 Phase 2 — Tier 2 subscriber lists. Same single-pattern as
+  // Phase 1's round-6 refactor: handler list + splice-on-unsubscribe.
+  private proposalCreatedSubs: Array<(p: VotingTier2ProposalCreatedPayload) => void> = [];
+  private signalCastSubs: Array<(p: VotingTier2SignalCastPayload) => void> = [];
+  private thresholdReachedSubs: Array<(p: VotingThresholdReachedPayload) => void> = [];
+  private proposalFinalizedSubs: Array<(p: VotingProposalFinalizedPayload) => void> = [];
+
   subscribePollCreated(handler: (p: VotingPollCreatedPayload) => void): () => void {
     this.pollCreatedSubs.push(handler);
     return () => {
@@ -100,6 +113,44 @@ export class VotingAdapter {
     return () => {
       const i = this.pollClosedSubs.indexOf(handler);
       if (i >= 0) this.pollClosedSubs.splice(i, 1);
+    };
+  }
+
+  // ─── Tier 2 (Conviction) event subscribers ──────────────────────────
+  subscribeProposalCreated(
+    handler: (p: VotingTier2ProposalCreatedPayload) => void,
+  ): () => void {
+    this.proposalCreatedSubs.push(handler);
+    return () => {
+      const i = this.proposalCreatedSubs.indexOf(handler);
+      if (i >= 0) this.proposalCreatedSubs.splice(i, 1);
+    };
+  }
+  subscribeSignalCast(
+    handler: (p: VotingTier2SignalCastPayload) => void,
+  ): () => void {
+    this.signalCastSubs.push(handler);
+    return () => {
+      const i = this.signalCastSubs.indexOf(handler);
+      if (i >= 0) this.signalCastSubs.splice(i, 1);
+    };
+  }
+  subscribeThresholdReached(
+    handler: (p: VotingThresholdReachedPayload) => void,
+  ): () => void {
+    this.thresholdReachedSubs.push(handler);
+    return () => {
+      const i = this.thresholdReachedSubs.indexOf(handler);
+      if (i >= 0) this.thresholdReachedSubs.splice(i, 1);
+    };
+  }
+  subscribeProposalFinalized(
+    handler: (p: VotingProposalFinalizedPayload) => void,
+  ): () => void {
+    this.proposalFinalizedSubs.push(handler);
+    return () => {
+      const i = this.proposalFinalizedSubs.indexOf(handler);
+      if (i >= 0) this.proposalFinalizedSubs.splice(i, 1);
     };
   }
 
@@ -154,6 +205,45 @@ export class VotingAdapter {
           },
         );
         stagedUnlisteners.push(unlistenClosed);
+
+        // ZEB-291 Phase 2 — Tier 2 events. The same copy-then-iterate
+        // pattern as Tier 1 above so a handler that unsubscribes itself
+        // during delivery doesn't skip a sibling at the same index.
+        const unlistenProposalCreated = await adapter.listen(
+          'voting-tier2-proposal-created',
+          (event) => {
+            const payload = event.payload as VotingTier2ProposalCreatedPayload;
+            for (const sub of [...this.proposalCreatedSubs]) sub(payload);
+          },
+        );
+        stagedUnlisteners.push(unlistenProposalCreated);
+
+        const unlistenSignalCast = await adapter.listen(
+          'voting-tier2-signal-cast',
+          (event) => {
+            const payload = event.payload as VotingTier2SignalCastPayload;
+            for (const sub of [...this.signalCastSubs]) sub(payload);
+          },
+        );
+        stagedUnlisteners.push(unlistenSignalCast);
+
+        const unlistenThresholdReached = await adapter.listen(
+          'voting-threshold-reached',
+          (event) => {
+            const payload = event.payload as VotingThresholdReachedPayload;
+            for (const sub of [...this.thresholdReachedSubs]) sub(payload);
+          },
+        );
+        stagedUnlisteners.push(unlistenThresholdReached);
+
+        const unlistenProposalFinalized = await adapter.listen(
+          'voting-proposal-finalized',
+          (event) => {
+            const payload = event.payload as VotingProposalFinalizedPayload;
+            for (const sub of [...this.proposalFinalizedSubs]) sub(payload);
+          },
+        );
+        stagedUnlisteners.push(unlistenProposalFinalized);
 
         this.adapter = adapter;
         this.unlisteners.push(...stagedUnlisteners);
@@ -219,6 +309,76 @@ export class VotingAdapter {
   /** Fetch full state (meta + tally + your-ballot + options) for one poll. */
   async getPoll(pollId: string): Promise<PollStateExport> {
     return this.invoke<PollStateExport>('voting_get_poll', { pollId });
+  }
+
+  // ─── ZEB-291 Phase 2 — Tier 2 (Conviction) IPC wrappers ────────────
+  // Param names use camelCase per the Tauri snake_case ↔ camelCase
+  // boundary convention (see harmony-client/CLAUDE.md). The Rust IPC
+  // functions in src-tauri/src/lib.rs declare these as snake_case;
+  // Tauri auto-converts at the JSON IPC boundary.
+
+  /** Create a Tier 2 (Conviction) proposal. Returns the new proposal id
+   *  as a hex string (32 bytes → 64 chars). The Rust IPC accepts
+   *  optional config fields and substitutes spec defaults when
+   *  omitted (TIER2_DEFAULT_HALF_LIFE_SECONDS etc.). */
+  async createTier2Proposal(args: {
+    communityId: string;
+    channelId: string;
+    proposalText: string;
+    halfLifeSeconds?: number;
+    thresholdMin?: number;
+    thresholdMax?: number;
+    beta?: number;
+    delegationAllowed?: boolean;
+    autoExec?: AutoExecAction;
+    minPower?: number;
+  }): Promise<string> {
+    return this.invoke<string>('voting_create_tier2_proposal', {
+      communityId: args.communityId,
+      channelId: args.channelId,
+      proposalText: args.proposalText,
+      halfLifeSeconds: args.halfLifeSeconds,
+      thresholdMin: args.thresholdMin,
+      thresholdMax: args.thresholdMax,
+      beta: args.beta,
+      delegationAllowed: args.delegationAllowed,
+      autoExec: args.autoExec,
+      minPower: args.minPower,
+    });
+  }
+
+  /** Cast (or withdraw) a Tier 2 Signal on a Conviction proposal.
+   *  `support = true` registers support; `support = false` withdraws
+   *  previously-cast support (acts as a "contest" if the proposal is
+   *  in ThresholdReached). Idempotent at the per-voter state layer. */
+  async signalTier2(proposalId: string, support: boolean): Promise<void> {
+    await this.invoke<void>('voting_signal_tier2', { proposalId, support });
+  }
+
+  /** Install a Tier 2 Delegate edge: caller → `delegate` (the
+   *  delegate's 32-byte ed25519 pubkey, hex). Community-wide; affects
+   *  every Tier 2 proposal in the community per spec §5. */
+  async delegateTier2(communityId: string, delegate: string): Promise<void> {
+    await this.invoke<void>('voting_delegate_tier2', { communityId, delegate });
+  }
+
+  /** Revoke the caller's Delegate edge in `communityId`. */
+  async undelegateTier2(communityId: string): Promise<void> {
+    await this.invoke<void>('voting_undelegate_tier2', { communityId });
+  }
+
+  /** List all Tier 2 proposals (any lifecycle) for `communityId`. */
+  async listTier2Proposals(communityId: string): Promise<Tier2ProposalExport[]> {
+    return this.invoke<Tier2ProposalExport[]>('voting_list_tier2_proposals', {
+      communityId,
+    });
+  }
+
+  /** Fetch full state for one Tier 2 proposal. */
+  async getTier2Proposal(proposalId: string): Promise<Tier2ProposalExport> {
+    return this.invoke<Tier2ProposalExport>('voting_get_tier2_proposal', {
+      proposalId,
+    });
   }
 
   private async invoke<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
