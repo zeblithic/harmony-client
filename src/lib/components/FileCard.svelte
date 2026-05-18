@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { ContentItem } from '../types';
   import { categoryIcon, formatBytes, sensitivityIcon } from '../file-utils';
+  import { autoFocus } from '../actions/auto-focus';
   import StalenessIndicator from './StalenessIndicator.svelte';
 
   let {
@@ -9,6 +10,11 @@
     selected = false,
     onRowDragStart,
     onRowDrop,
+    editing = false,
+    editValue = $bindable(''),
+    onBeginRename,
+    onCommitRename,
+    onCancelRename,
   }: {
     item: ContentItem;
     onClick?: (item: ContentItem) => void;
@@ -16,27 +22,59 @@
     /** ZEB-162: drag-drop handlers wired by FileGrid → FileBrowser. */
     onRowDragStart?: (e: DragEvent, item: ContentItem) => void;
     onRowDrop?: (e: DragEvent, targetCid: string, targetSidecarId: string | null) => void;
+    /** ZEB-299: inline rename. See FileRow.svelte for the contract. */
+    editing?: boolean;
+    editValue?: string;
+    onBeginRename?: (item: ContentItem) => void;
+    onCommitRename?: () => void;
+    onCancelRename?: () => void;
   } = $props();
 
   let icon = $derived(categoryIcon(item.category));
   let size = $derived(formatBytes(item.sizeBytes));
   let sensIcon = $derived(sensitivityIcon(item.sensitivity));
 
+  // ZEB-299 slow-click state — per-card so a slow-click on one card
+  // doesn't leak to another. Same 300–800ms gap as FileRow.
+  let lastNameClickAt = 0;
+
   function handleDragOver(e: DragEvent) {
     if (!item.isFolder) return;
     e.preventDefault();
     if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+  }
+
+  function handleNameClick(e: MouseEvent) {
+    if (editing) return;
+    if (!selected) return;
+    const now = performance.now();
+    const gap = now - lastNameClickAt;
+    lastNameClickAt = now;
+    if (gap >= 300 && gap <= 800) {
+      e.stopPropagation();
+      onBeginRename?.(item);
+    }
+  }
+
+  function handleEditKey(e: KeyboardEvent) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      onCommitRename?.();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      onCancelRename?.();
+    }
   }
 </script>
 
 <button
   class="file-card"
   class:selected
-  draggable="true"
+  draggable={editing ? 'false' : 'true'}
   onclick={() => onClick?.(item)}
-  ondragstart={(e) => onRowDragStart?.(e, item)}
-  ondragover={handleDragOver}
-  ondrop={item.isFolder ? (e) => onRowDrop?.(e, item.cid, item.sidecarId ?? null) : undefined}
+  ondragstart={editing ? undefined : (e) => onRowDragStart?.(e, item)}
+  ondragover={editing ? undefined : handleDragOver}
+  ondrop={!editing && item.isFolder ? (e) => onRowDrop?.(e, item.cid, item.sidecarId ?? null) : undefined}
   aria-label={item.name}
 >
   <div class="file-card-overlay-top">
@@ -49,7 +87,23 @@
     <span class="file-card-icon">{icon}</span>
   </div>
   <div class="file-card-info">
-    <span class="file-card-name">{item.name}</span>
+    {#if editing}
+      <input
+        class="file-card-name-input"
+        type="text"
+        bind:value={editValue}
+        onkeydown={handleEditKey}
+        onblur={() => onCancelRename?.()}
+        onclick={(e) => e.stopPropagation()}
+        use:autoFocus
+      />
+    {:else}
+      <span
+        class="file-card-name"
+        onclick={handleNameClick}
+        role="presentation"
+      >{item.name}</span>
+    {/if}
     <span class="file-card-size">{size}</span>
   </div>
 </button>
@@ -123,6 +177,19 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .file-card-name-input {
+    font: inherit;
+    font-size: 0.85rem;
+    color: inherit;
+    background: transparent;
+    border: 1px solid var(--accent, #5865f2);
+    border-radius: 3px;
+    padding: 2px 4px;
+    min-width: 0;
+    width: 100%;
+    box-sizing: border-box;
   }
 
   .file-card-size {

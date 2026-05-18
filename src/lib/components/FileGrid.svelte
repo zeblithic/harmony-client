@@ -9,6 +9,11 @@
     onItemClick,
     onRowDragStart,
     onRowDrop,
+    editingItem = null,
+    editingValue = $bindable(''),
+    onBeginRename,
+    onCommitRename,
+    onCancelRename,
   }: {
     items: ContentItem[];
     selectedCid: string | null;
@@ -17,6 +22,12 @@
     /** ZEB-162: per-card drag handlers, wired by FileBrowser. */
     onRowDragStart?: (e: DragEvent, item: ContentItem) => void;
     onRowDrop?: (e: DragEvent, targetCid: string, targetSidecarId: string | null) => void;
+    /** ZEB-299: inline rename — see FileList.svelte for the contract. */
+    editingItem?: ContentItem | null;
+    editingValue?: string;
+    onBeginRename?: (item: ContentItem) => void;
+    onCommitRename?: () => void;
+    onCancelRename?: () => void;
   } = $props();
 </script>
 
@@ -28,6 +39,13 @@
       selected={selectedSidecarId !== null ? selectedSidecarId === item.sidecarId : selectedCid === item.cid}
       {onRowDragStart}
       {onRowDrop}
+      editing={editingItem !== null
+        && editingItem.sidecarId === item.sidecarId
+        && editingItem.cid === item.cid}
+      bind:editValue={editingValue}
+      {onBeginRename}
+      {onCommitRename}
+      {onCancelRename}
     />
   {/each}
 </div>

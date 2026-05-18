@@ -127,6 +127,14 @@
   // component).
   let error = $state<string | null>(null);
 
+  // ZEB-299 inline-rename state. `editingItem` non-null toggles the
+  // matching row/card into edit mode; `editingValue` two-way-binds to
+  // the input; `renameError` surfaces backend failures inline (same
+  // banner pattern as `error`).
+  let editingItem = $state<ContentItem | null>(null);
+  let editingValue = $state('');
+  let renameError = $state<string | null>(null);
+
   // Sync navStack with currentFolderCid (driven by the parent component).
   // The effect's only reactive dependency is currentFolderCid; navStack /
   // pendingNav / items are read inside untrack() so writes to navStack
@@ -441,6 +449,80 @@
     }
   }
 
+  // ZEB-299 inline-rename flow. Enter edit mode by selecting a row and
+  // pressing F2 (handled here) or slow-click-on-name (handled in
+  // FileRow/FileCard). The trio of helpers is the only place that
+  // mutates editingItem/editingValue/renameError.
+  function beginRename(item: ContentItem) {
+    editingItem = item;
+    editingValue = item.name;
+    renameError = null;
+  }
+
+  function cancelRename() {
+    editingItem = null;
+    editingValue = '';
+    renameError = null;
+  }
+
+  async function commitRename() {
+    if (!editingItem) return;
+    const item = editingItem;
+    const trimmed = editingValue.trim();
+    if (!trimmed) {
+      renameError = 'Name cannot be empty';
+      return;
+    }
+    if (trimmed === item.name) {
+      // Same-name short-circuit — skip the IPC and exit edit mode.
+      cancelRename();
+      return;
+    }
+    // Path/sidecar computation mirrors handleRowDragStart: at root,
+    // srcPath = [item.cid] and the sidecarId comes from the row;
+    // nested, srcPath = navStack chain and the sidecarId is the
+    // top-level root's.
+    const srcPath =
+      navStack.length === 0 ? [item.cid] : navStack.map((s) => s.cid);
+    const srcSidecarId =
+      navStack.length === 0 ? item.sidecarId : navStack[0].sidecarId ?? '';
+    if (!srcSidecarId) {
+      renameError = 'Cannot rename: folder identity not loaded';
+      return;
+    }
+    try {
+      await service.renameContent({
+        srcSidecarId,
+        srcPath,
+        srcChildCid: item.cid,
+        srcChildName: item.name,
+        newName: trimmed,
+      });
+      cancelRename();
+    } catch (e) {
+      const raw = e instanceof Error ? e.message : String(e);
+      renameError = raw.replace(/^Error:\s*/, '');
+      // Keep edit mode open so the user can fix the name and retry.
+    }
+  }
+
+  function handleKeyDown(e: KeyboardEvent) {
+    // F2 enters rename mode for the selected row, matching desktop
+    // file-manager convention. Gated on no active edit so an in-flight
+    // rename can't be clobbered by a stray F2.
+    if (e.key === 'F2' && !editingItem) {
+      const selected = items.find(
+        (i) =>
+          (selectedSidecarId !== null && i.sidecarId === selectedSidecarId) ||
+          (selectedSidecarId === null && i.cid === selectedCid),
+      );
+      if (selected) {
+        e.preventDefault();
+        beginRename(selected);
+      }
+    }
+  }
+
   function handleRowDragStart(e: DragEvent, item: ContentItem) {
     if (!e.dataTransfer) return;
     // Build the source path: top-level CID → immediate parent CID
@@ -548,7 +630,16 @@
   }
 </script>
 
-<div class="file-browser">
+<!-- ZEB-299: the root container catches F2 so a row-level focus isn't required; the region role + label keep this discoverable to AT. -->
+<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+<div
+  class="file-browser"
+  role="region"
+  aria-label="File browser"
+  tabindex="-1"
+  onkeydown={handleKeyDown}
+>
   <BrowserToolbar
     {viewMode}
     {onViewModeChange}
@@ -587,6 +678,10 @@
         <div class="file-browser-error" role="alert">{error}</div>
       {/if}
 
+      {#if renameError}
+        <div class="file-browser-error" role="alert">{renameError}</div>
+      {/if}
+
       {#if viewMode === 'list'}
         <FileList
           {items}
@@ -595,6 +690,11 @@
           onItemClick={handleItemClick}
           onRowDragStart={handleRowDragStart}
           onRowDrop={handleRowDrop}
+          {editingItem}
+          bind:editingValue
+          onBeginRename={beginRename}
+          onCommitRename={commitRename}
+          onCancelRename={cancelRename}
         />
       {:else}
         <FileGrid
@@ -604,6 +704,11 @@
           onItemClick={handleItemClick}
           onRowDragStart={handleRowDragStart}
           onRowDrop={handleRowDrop}
+          {editingItem}
+          bind:editingValue
+          onBeginRename={beginRename}
+          onCommitRename={commitRename}
+          onCancelRename={cancelRename}
         />
       {/if}
 
