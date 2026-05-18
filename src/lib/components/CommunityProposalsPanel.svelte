@@ -23,14 +23,19 @@
    */
 
   import { onDestroy } from 'svelte';
+  import type { CommunityMember } from '../types';
   import type { Tier2ProposalExport } from '../types/voting';
   import type { VotingAdapter } from '../voting-adapter';
   import ConvictionProposalCard from './ConvictionProposalCard.svelte';
+  import DelegationGraph from './DelegationGraph.svelte';
+  import DelegationWidget from './DelegationWidget.svelte';
 
   let {
     communityId,
     adapter,
     myPower,
+    myAddr,
+    communityMembers,
   }: {
     /** Hex SpaceId of the community. */
     communityId: string;
@@ -40,11 +45,47 @@
      *  (current-member check). Backend separately enforces per-proposal
      *  eligibility (`min_power`) at create time. */
     myPower: number;
+    /** ZEB-292 Phase 3: caller's 32-char hex OwnerAddr. Forwarded to
+     *  DelegationWidget + ConvictionProposalCard's per-proposal override
+     *  affordance. */
+    myAddr: string;
+    /** ZEB-292 Phase 3: community member roster, forwarded to the
+     *  DelegationWidget picker + the override affordance's delegate-
+     *  name resolution. */
+    communityMembers: CommunityMember[];
   } = $props();
 
   let proposals = $state<Tier2ProposalExport[] | null>(null);
   let loadError = $state<string | null>(null);
   let loading = $state(false);
+  /** Whether the delegation-graph collapsible is expanded. Bound to
+   *  the <details> element below; the graph component is conditionally
+   *  rendered so its d3-force simulation only runs after the user
+   *  expands the section (Cursor R1: HTML <details> renders children
+   *  regardless of open state — visibility-only via CSS — so the
+   *  simulation would otherwise tick continuously while collapsed). */
+  let graphOpen = $state(false);
+  /** ZEB-292 Phase 3: caller's current delegate hex (32 chars) or
+   *  null. Loaded on mount and refreshed on every
+   *  voting-delegation-changed event for the local user. Passed to
+   *  each ConvictionProposalCard so the per-proposal override
+   *  affordance can render. */
+  let myDelegate = $state<string | null>(null);
+  let myDelegateName = $derived(
+    myDelegate
+      ? (communityMembers.find((m) => m.address === myDelegate)?.displayName ??
+        `${myDelegate.slice(0, 8)}…`)
+      : null,
+  );
+  /** Monotonic counter; bumped per proposals-list load. Resolution
+   *  callbacks of superseded loads drop their results. Guards against
+   *  a community switch landing while a previous `refetch` is still
+   *  in flight (CR R1 outside-diff). */
+  let latestProposalsLoadToken = 0;
+  /** Separate token space for the delegate read so a proposals
+   *  refetch firing while a delegate read is in flight doesn't
+   *  silently drop the delegate result (Cursor R2 #2). */
+  let latestDelegateLoadToken = 0;
 
   // New-proposal form state.
   let proposalText = $state('');
@@ -59,15 +100,18 @@
   let canPropose = $derived(myPower >= 1);
 
   async function refetch() {
+    const token = ++latestProposalsLoadToken;
     loading = true;
     try {
       const list = await adapter.listTier2Proposals(communityId);
+      if (token !== latestProposalsLoadToken) return;
       proposals = list;
       loadError = null;
     } catch (e) {
+      if (token !== latestProposalsLoadToken) return;
       loadError = e instanceof Error ? e.message : String(e);
     } finally {
-      loading = false;
+      if (token === latestProposalsLoadToken) loading = false;
     }
   }
 
@@ -75,15 +119,31 @@
   // `communityId` changes so swapping the parent's selected community
   // re-loads from scratch (without this, a parent that re-uses this
   // component instance across community switches would show stale data).
+  async function refetchDelegate() {
+    const token = ++latestDelegateLoadToken;
+    try {
+      const next = await adapter.getMyDelegate(communityId);
+      if (token !== latestDelegateLoadToken) return;
+      myDelegate = next;
+    } catch {
+      if (token !== latestDelegateLoadToken) return;
+      // Defensive: a failure to read the delegate just means the
+      // override affordance won't render. The proposals list itself
+      // is independent.
+      myDelegate = null;
+    }
+  }
+
   $effect(() => {
     const cid = communityId;
     let cancelled = false;
     proposals = null;
     loadError = null;
+    myDelegate = null;
 
     void (async () => {
       if (cancelled) return;
-      await refetch();
+      await Promise.all([refetch(), refetchDelegate()]);
     })();
 
     // The three event subscribers. Each refetches on fire — cheap
@@ -100,12 +160,21 @@
       if (cancelled || p.communityId !== cid) return;
       void refetch();
     });
+    // ZEB-292 Phase 3: refresh `myDelegate` when the local user's
+    // delegation changes (so the override pill appears/disappears in
+    // sync with DelegationWidget).
+    const unsubDelegation = adapter.subscribeDelegationChanged((p) => {
+      if (cancelled || p.communityId !== cid) return;
+      if (p.delegator !== myAddr) return;
+      void refetchDelegate();
+    });
 
     return () => {
       cancelled = true;
       unsubCreated();
       unsubThreshold();
       unsubFinalized();
+      unsubDelegation();
     };
   });
 
@@ -151,6 +220,25 @@
 </script>
 
 <section class="community-proposals" aria-label="Community proposals">
+  <DelegationWidget
+    {communityId}
+    {adapter}
+    {myAddr}
+    {communityMembers}
+    currentDelegate={myDelegate}
+  />
+
+  <details class="dg-section" bind:open={graphOpen}>
+    <summary>Delegation graph</summary>
+    {#if graphOpen}
+      <!-- {#if} guard: <details> renders children regardless of `open`
+           (CSS-only visibility), so without this the d3-force
+           simulation would tick while collapsed. Conditional render
+           defers mount until the user expands. -->
+      <DelegationGraph {communityId} {adapter} {myAddr} {communityMembers} />
+    {/if}
+  </details>
+
   {#if canPropose}
     <form
       class="new-proposal-form"
@@ -196,7 +284,13 @@
       <p class="cp-empty">No active proposals. Create one to start.</p>
     {:else if proposals}
       {#each proposals as proposal (proposal.proposal_id)}
-        <ConvictionProposalCard {communityId} {proposal} {adapter} />
+        <ConvictionProposalCard
+          {communityId}
+          {proposal}
+          {adapter}
+          {myDelegate}
+          delegateName={myDelegateName}
+        />
       {/each}
     {/if}
   </div>
@@ -286,5 +380,19 @@
     color: var(--danger, #f87171);
     font-size: 0.9rem;
     margin: 0;
+  }
+  .dg-section {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-secondary);
+  }
+  .dg-section > summary {
+    cursor: pointer;
+    padding: 10px 14px;
+    font-size: 0.92rem;
+    color: var(--text-primary);
+  }
+  .dg-section[open] > summary {
+    border-bottom: 1px solid var(--border);
   }
 </style>

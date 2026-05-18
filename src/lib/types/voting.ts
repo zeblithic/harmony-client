@@ -319,3 +319,42 @@ export interface VotingProposalFinalizedPayload {
   communityId: string;
   proposalId: string;
 }
+
+/** ZEB-292 Phase 3: one Delegate edge in the community delegation graph.
+ *  Mirrors the Rust `DelegationEdgeExport` shape exactly. */
+export interface DelegationEdgeExport {
+  /** 32-char hex `OwnerAddr` of the delegator. */
+  from: string;
+  /** 32-char hex `OwnerAddr` of the delegate. */
+  to: string;
+  /** Wall-clock millisecond component of the most recent HLC ordinal
+   *  for this delegator's terminal event (Delegate or Undelegate). */
+  lastHlcMs: number;
+  /** Logical-counter component of the HLC ordinal. */
+  lastHlcLogical: number;
+}
+
+/** ZEB-292 Phase 3: payload for `voting-delegation-changed` event.
+ *  Fired by both local IPCs (`voting_delegate_tier2` /
+ *  `voting_undelegate_tier2`) and the engine's inbound apply path so
+ *  the UI refreshes regardless of origin. `delegate` is null for
+ *  undelegate events. */
+export interface VotingDelegationChangedPayload {
+  communityId: string;
+  /** 32-char hex `OwnerAddr` of the delegator. */
+  delegator: string;
+  /** 32-char hex `OwnerAddr` of the new delegate, or null on undelegate. */
+  delegate: string | null;
+}
+
+/** ZEB-292 Phase 3: payload for `voting-delegate-signaled-on-your-behalf`
+ *  event. Fired only when (a) the local user has a Delegate edge active
+ *  for `communityId`, (b) the signaler IS the delegate, and (c) the
+ *  community policy `notifyOnDelegateSignal` is true. */
+export interface VotingDelegateSignaledOnYourBehalfPayload {
+  communityId: string;
+  proposalId: string;
+  /** 32-char hex `OwnerAddr` of the delegate who signaled. */
+  delegate: string;
+  support: boolean;
+}

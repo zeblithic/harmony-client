@@ -32,6 +32,8 @@
     communityId: _communityId,
     proposal,
     adapter,
+    myDelegate = null,
+    delegateName = null,
   }: {
     /** Hex community id this proposal lives in. Currently unused inside
      *  the card (the proposal already carries it) but accepted for
@@ -44,6 +46,16 @@
     /** Voting IPC adapter. Must be connected (connectAdapter) so the
      *  signal IPC has a route. */
     adapter: VotingAdapter;
+    /** ZEB-292 Phase 3: caller's current delegate (32-char hex
+     *  OwnerAddr) for this community, or null if voting directly. When
+     *  set AND the caller has not signaled directly on this proposal
+     *  (`proposal.your_signal === undefined`), a per-proposal "Vote
+     *  directly" override affordance appears. */
+    myDelegate?: string | null;
+    /** ZEB-292 Phase 3: display name of the delegate (already resolved
+     *  by the parent panel from the community member roster) — used
+     *  in the override pill copy. Null when myDelegate is null. */
+    delegateName?: string | null;
   } = $props();
 
   let signaling = $state(false);
@@ -74,6 +86,16 @@
    *  Archived are terminal — toggle is hidden. */
   let canSignal = $derived(
     proposal.lifecycle === 'Open' || proposal.lifecycle === 'ThresholdReached',
+  );
+
+  /** ZEB-292 Phase 3 override affordance gate: show the "delegate votes
+   *  for you — [Vote directly]" pill when the caller has a delegate
+   *  AND has never signaled directly on this proposal yet. Once the
+   *  caller has any direct signal state (true OR false), the regular
+   *  signal toggle takes over — the backend has no "un-override"
+   *  primitive that removes a per_voter entry. */
+  let showOverridePill = $derived(
+    canSignal && myDelegate !== null && optimisticSignal === undefined,
   );
 
   let pctFilled = $derived(
@@ -168,7 +190,32 @@
     </span>
   </div>
 
-  {#if canSignal}
+  {#if showOverridePill}
+    <!-- ZEB-292 Phase 3: override affordance. Single click → cast a
+         direct Signal(true) on this proposal, which moves the caller's
+         weight out of the delegate's effective conviction (per spec §5
+         override rule enforced by community_voting_conviction.rs:583).
+         Copy describes the routing relationship (always true while a
+         delegate edge exists) rather than asserting the delegate has
+         signaled — the proposal DTO doesn't surface per-voter state,
+         so claiming "X voted" would be unverifiable (Cursor R4). -->
+    <div class="cp-override-pill" role="status" aria-label="Delegate signaling on your behalf">
+      <span class="cp-override-text">
+        Your conviction follows <strong>{delegateName ?? 'your delegate'}</strong> on this proposal.
+      </span>
+      <button
+        type="button"
+        class="cp-override-btn"
+        disabled={signaling}
+        onclick={toggleSignal}
+      >
+        Vote directly
+      </button>
+      {#if signalError}
+        <span class="cp-error" role="alert">Override failed: {signalError}</span>
+      {/if}
+    </div>
+  {:else if canSignal}
     <div class="cp-signal-row">
       <button
         type="button"
@@ -286,5 +333,33 @@
   .cp-error {
     color: var(--danger, #f87171);
     font-size: 0.85rem;
+  }
+  .cp-override-pill {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    padding: 8px 12px;
+    border: 1px solid var(--warning, #fbbf24);
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--warning, #fbbf24) 8%, var(--bg-primary));
+  }
+  .cp-override-text {
+    flex: 1 1 auto;
+    color: var(--text-primary);
+    font-size: 0.85rem;
+  }
+  .cp-override-btn {
+    padding: 4px 12px;
+    border: 1px solid var(--warning, #fbbf24);
+    background: var(--warning, #fbbf24);
+    color: var(--bg-primary);
+    border-radius: 4px;
+    font: inherit;
+    cursor: pointer;
+  }
+  .cp-override-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.6;
   }
 </style>

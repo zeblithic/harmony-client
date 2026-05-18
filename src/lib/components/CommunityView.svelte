@@ -334,6 +334,8 @@
         {communityId}
         adapter={votingAdapter}
         {myPower}
+        myAddr={ownAddress}
+        communityMembers={members}
       />
     {:else if activeChannel}
       <ChannelMessageFeed
