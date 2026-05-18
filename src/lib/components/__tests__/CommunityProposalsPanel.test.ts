@@ -75,10 +75,11 @@ describe('CommunityProposalsPanel', () => {
     // patch to no-op unsubscribes so the $effect cleanup is well-formed.
     adapter.subscribeThresholdReached = () => () => {};
     adapter.subscribeProposalFinalized = () => () => {};
-    // ZEB-292 Phase 3: the embedded DelegationWidget calls these on
-    // mount. Patch to safe no-ops so the parent's tests stay focused
-    // on proposal flow.
+    // ZEB-292 Phase 3: the embedded DelegationWidget and DelegationGraph
+    // call these on mount. Patch to safe no-ops so the parent's tests
+    // stay focused on proposal flow.
     adapter.getMyDelegate = vi.fn().mockResolvedValue(null);
+    adapter.listDelegations = vi.fn().mockResolvedValue([]);
     adapter.subscribeDelegationChanged = () => () => {};
   });
 

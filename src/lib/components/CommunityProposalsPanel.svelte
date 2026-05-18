@@ -27,6 +27,7 @@
   import type { Tier2ProposalExport } from '../types/voting';
   import type { VotingAdapter } from '../voting-adapter';
   import ConvictionProposalCard from './ConvictionProposalCard.svelte';
+  import DelegationGraph from './DelegationGraph.svelte';
   import DelegationWidget from './DelegationWidget.svelte';
 
   let {
@@ -165,6 +166,13 @@
 <section class="community-proposals" aria-label="Community proposals">
   <DelegationWidget {communityId} {adapter} {myAddr} {communityMembers} />
 
+  <details class="dg-section">
+    <summary>Delegation graph</summary>
+    <!-- Graph mounts on expansion so the d3 simulation doesn't run when
+         the section is collapsed (no benefit, just CPU). -->
+    <DelegationGraph {communityId} {adapter} {myAddr} {communityMembers} />
+  </details>
+
   {#if canPropose}
     <form
       class="new-proposal-form"
@@ -300,5 +308,19 @@
     color: var(--danger, #f87171);
     font-size: 0.9rem;
     margin: 0;
+  }
+  .dg-section {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-secondary);
+  }
+  .dg-section > summary {
+    cursor: pointer;
+    padding: 10px 14px;
+    font-size: 0.92rem;
+    color: var(--text-primary);
+  }
+  .dg-section[open] > summary {
+    border-bottom: 1px solid var(--border);
   }
 </style>
