@@ -378,20 +378,52 @@ pub struct NodeState {
     /// Persisted only across IPC calls within a single node lifetime;
     /// reset on stop_node.
     profile_broadcast_next_subscription_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// ZEB-290 Phase 1 Task 11: per-community voting-event logs. Holds
-    /// `VotingLog` per `SpaceId`; lazily populated on first local
-    /// `voting_create_tier1_poll` / `voting_cast_tier1_ballot`. In-memory
-    /// only for Phase 1 — persistence + Zenoh sync land in Tasks 12 / 13.
+    /// ZEB-290 Phase 1 Task 11 (+ ZEB-291 Phase 2 Task 19 shape migration):
+    /// per-community voting-event logs. Holds an `Arc<tokio::Mutex<VotingLog>>`
+    /// per `SpaceId`; lazily populated on first local
+    /// `voting_create_tier1_poll` / `voting_create_tier2_proposal` / etc.
+    ///
+    /// Outer container is `Arc<tokio::Mutex<HashMap<..>>>` (NOT std::sync) so
+    /// the Phase 2 voting tick (`community_voting_tick::VotingTickContext`)
+    /// can share the same source-of-truth as the IPCs without copying. Each
+    /// per-community VotingLog is wrapped in its own `Arc<tokio::Mutex<..>>`
+    /// so the engine + IPCs + tick can all hold short, independent locks
+    /// rather than serializing through a single outer lock.
+    ///
     /// Always present (never `None`) so IPCs can take + insert without
     /// node-running gating; the inner map is empty until first use.
     pub voting_logs: std::sync::Arc<
-        std::sync::Mutex<
+        tokio::sync::Mutex<
             std::collections::HashMap<
                 crate::owner_state_types::SpaceId,
-                crate::community_voting_log::VotingLog,
+                std::sync::Arc<tokio::sync::Mutex<crate::community_voting_log::VotingLog>>,
             >,
         >,
     >,
+    /// ZEB-291 Phase 2 Task 19: per-community voting-log Zenoh engine
+    /// registry. Engines are lazily registered when an IPC first touches a
+    /// community via `ensure_voting_engine_for(..)`. Each engine shares the
+    /// matching `Arc<tokio::Mutex<VotingLog>>` from `voting_logs`, so apply
+    /// paths (local IPC + peer inbound) converge on a single source of
+    /// truth.
+    ///
+    /// TODO ZEB-291 Task 19.1: wire the engines' mpsc pairs to the
+    /// existing Zenoh adapter (`harmony/community/{id}/voting` key). Phase
+    /// 2 ships with stub mpsc endpoints (drop-on-floor publisher, never-fed
+    /// subscriber) so the registry surface + lifetime management are in
+    /// place; cross-peer voting sync lights up when Task 19.1 lands.
+    pub voting_log_engines: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                crate::owner_state_types::SpaceId,
+                std::sync::Arc<crate::community_voting_log_engine::VotingLogEngine>,
+            >,
+        >,
+    >,
+    /// ZEB-291 Phase 2 Task 20: handle for the periodic voting tick task
+    /// spawned by `start_node`. `Some` while the node is running; `take()`
+    /// + `abort()` during `stop_inner` so a restart starts a fresh tick.
+    pub voting_tick_handle: std::sync::Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl NodeState {
@@ -458,12 +490,18 @@ impl Default for NodeState {
             profile_broadcast_next_subscription_id: std::sync::Arc::new(
                 std::sync::atomic::AtomicU64::new(1),
             ),
-            // ZEB-290 Phase 1 Task 11: voting log registry starts empty
-            // and survives stop_node (in-memory only; cleared on
-            // process exit).
-            voting_logs: std::sync::Arc::new(std::sync::Mutex::new(
+            // ZEB-290 Phase 1 Task 11 + ZEB-291 Task 19 migration: voting
+            // log registry starts empty and survives stop_node (in-memory
+            // only; cleared on process exit). Outer Mutex is tokio so the
+            // Phase 2 tick can share without holding a std::Mutex across
+            // awaits.
+            voting_logs: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            voting_log_engines: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            voting_tick_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -716,6 +754,24 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         // scope via a separate binding rather than trying to thread
         // it through the already-saturated `tup`.
         channel_log_registry_for_shutdown = guard.channel_log_registry.take();
+        // ZEB-291 Phase 2 Task 20: abort the voting tick task. Done
+        // under the lock so a racing start_node can't re-spawn a new
+        // tick that we'd then orphan. Engines clear in the same scope.
+        {
+            if let Ok(mut slot) = guard.voting_tick_handle.lock() {
+                if let Some(handle) = slot.take() {
+                    handle.abort();
+                }
+            }
+            if let Ok(mut engines) = guard.voting_log_engines.lock() {
+                // Dropping each Arc<VotingLogEngine> drops its
+                // publisher_tx + JoinHandle, which the engine's
+                // self-owned receive task observes via channel close
+                // and exits cleanly. See VotingLogRegistry::shutdown
+                // for the same pattern.
+                engines.clear();
+            }
+        }
         // ZEB-218 Sub-D Phase 1: drop the library_directory Arc. The
         // event-loop's consumer task observes the matching request_tx
         // close on next recv and exits cleanly.
@@ -3271,6 +3327,89 @@ async fn start_node(
                     }
                     // else: a newer start_node has replaced us; drop the
                     // freshly spawned handle by letting it fall out of scope.
+                }
+            }
+            // ── ZEB-291 Phase 2 Task 20 — periodic voting tick ─────────
+            // Spawn one tick task per start_node lifetime: walks the
+            // (now-tokio-Mutex) voting_logs registry every 60s in prod,
+            // running Tier 1 auto-close + Tier 2 threshold/finalize +
+            // archive sweep. JoinHandle is stashed on NodeState so
+            // stop_inner can abort it before the runtime tears down.
+            //
+            // emit closure forwards Tauri events synchronously (the
+            // Tauri AppHandle's `emit` is Send + Sync + cheap).
+            // auto_exec_set_power closure logs-and-skips for now —
+            // TODO ZEB-291 Task 20.1: thread `Arc<Mutex<NodeState>>`
+            // through `apply_auto_exec_set_power` so a finalized
+            // Tier 2 SetPower proposal actually rewrites the target's
+            // power level. Today the tick still finalizes the proposal
+            // (lifecycle → Finalized + Tauri event emitted) and the
+            // skipped auto-exec is observable via the tracing::warn!
+            // line below. Single-node Phase 2 acceptance: Finalized
+            // status + UI signal is sufficient; cross-peer power
+            // rewrite lands with the Task 19.1 + 20.1 follow-up.
+            {
+                let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+                if guard.generation == our_gen {
+                    let voting_logs_clone = std::sync::Arc::clone(&guard.voting_logs);
+                    let tick_handle_slot = std::sync::Arc::clone(&guard.voting_tick_handle);
+                    drop(guard);
+
+                    let app_for_emit = app.clone();
+                    let emit_fn: crate::community_voting_tick::EmitFn =
+                        std::sync::Arc::new(move |event_name: &str, payload: serde_json::Value| {
+                            if let Err(e) = app_for_emit.emit(event_name, payload) {
+                                tracing::warn!(
+                                    event = event_name,
+                                    error = %e,
+                                    "voting tick emit failed"
+                                );
+                            }
+                        });
+                    let auto_exec_fn: crate::community_voting_tick::AutoExecSetPowerFn =
+                        std::sync::Arc::new(
+                            move |cid: crate::owner_state_types::SpaceId,
+                                  target: crate::owner_state_types::OwnerAddr,
+                                  new_power: u32| {
+                                Box::pin(async move {
+                                    // TODO ZEB-291 Task 20.1: when we
+                                    // wire the auto-exec dispatch into
+                                    // a NodeState-aware helper, replace
+                                    // this with the real call. Today we
+                                    // log the intent so observability
+                                    // surfaces the deferred behavior.
+                                    tracing::warn!(
+                                        community = %hex::encode(cid.0),
+                                        target = %hex::encode(target.0),
+                                        new_power = new_power,
+                                        "voting tick: auto_exec_set_power dispatch \
+                                         deferred (Task 20.1 — NodeState wiring)"
+                                    );
+                                    Ok::<(), String>(())
+                                })
+                            },
+                        );
+
+                    let tick_ctx = crate::community_voting_tick::VotingTickContext {
+                        voting_logs: voting_logs_clone,
+                        last_archive_sweep_ms: std::sync::Arc::new(tokio::sync::Mutex::new(0)),
+                        emit: emit_fn,
+                        auto_exec_set_power: auto_exec_fn,
+                    };
+                    let handle = crate::community_voting_tick::spawn_voting_tick(
+                        tick_ctx,
+                        crate::community_voting_tick::DEFAULT_TICK_INTERVAL,
+                    );
+                    // Replace any prior handle (a leftover from a racing
+                    // start_node would already have been aborted by
+                    // stop_inner; this is defense-in-depth).
+                    let prev = match tick_handle_slot.lock() {
+                        Ok(mut slot) => slot.replace(handle),
+                        Err(_) => None,
+                    };
+                    if let Some(old) = prev {
+                        old.abort();
+                    }
                 }
             }
             let _ = app.emit(
@@ -17605,10 +17744,21 @@ async fn voting_create_tier1_poll<R: tauri::Runtime>(
     };
 
     let poll_id = {
-        let mut g = voting_logs
-            .lock()
-            .map_err(|e| format!("voting_logs poisoned: {e}"))?;
-        let log = g.entry(space_id).or_default();
+        // Outer map lock (tokio): get-or-insert an Arc<Mutex<VotingLog>>
+        // for this community; then drop the outer lock before locking the
+        // inner one so concurrent IPCs touching DIFFERENT communities
+        // don't serialize through the outer Mutex.
+        let log_arc = {
+            let mut map = voting_logs.lock().await;
+            map.entry(space_id)
+                .or_insert_with(|| {
+                    std::sync::Arc::new(tokio::sync::Mutex::new(
+                        crate::community_voting_log::VotingLog::new(),
+                    ))
+                })
+                .clone()
+        };
+        let mut log = log_arc.lock().await;
         log.apply_with_snapshot(event, &space_id, Some(snapshot))
             .map_err(|e| format!("voting_create_tier1_poll: apply: {e:?}"))?
     };
@@ -17660,46 +17810,51 @@ async fn voting_cast_tier1_ballot<R: tauri::Runtime>(
     };
 
     // Metadata-before-write: look up poll, check Open + Tier1, validate
-    // ballot, check eligibility — all under the voting_logs lock.
-    // We clone what we need so the signing await can happen without
-    // holding the std mutex.
-    let (space_id, cfg, snapshot) = {
-        let g = voting_logs
-            .lock()
-            .map_err(|e| format!("voting_logs poisoned: {e}"))?;
-        let mut found: Option<(
-            crate::owner_state_types::SpaceId,
-            crate::community_voting_approval::Tier1PollConfig,
-            crate::community_voting_core::MembershipSnapshot,
-        )> = None;
-        for (sid, log) in g.iter() {
-            if let Some(state) = log.polls.get(&pid) {
-                if state.meta.lifecycle != crate::community_voting_core::Lifecycle::Open {
-                    return Err(format!(
-                        "voting_cast_tier1_ballot: poll lifecycle is {:?}, not Open",
-                        state.meta.lifecycle
-                    ));
-                }
-                if state.meta.tier != crate::community_voting_core::Tier::Approval {
-                    return Err(format!(
-                        "voting_cast_tier1_ballot: poll tier is {:?}, not Approval",
-                        state.meta.tier
-                    ));
-                }
-                let cfg = state
-                    .tier1_cfg
-                    .clone()
-                    .ok_or("voting_cast_tier1_ballot: tier1_cfg missing on Approval poll")?;
-                let snapshot = state.tier1_snapshot.clone().ok_or(
-                    "voting_cast_tier1_ballot: tier1_snapshot missing (peer-received \
-                     poll without local snapshot — Task 12 will fill this in)",
-                )?;
-                found = Some((*sid, cfg, snapshot));
-                break;
-            }
-        }
-        found.ok_or_else(|| format!("voting_cast_tier1_ballot: poll {} not found", poll_id))?
+    // ballot, check eligibility. Outer map lock is held briefly to
+    // snapshot the per-community Arc; each per-community lock is then
+    // acquired independently to read the poll state. This avoids holding
+    // the outer lock across multiple inner-lock awaits.
+    let log_arcs: Vec<(
+        crate::owner_state_types::SpaceId,
+        std::sync::Arc<tokio::sync::Mutex<crate::community_voting_log::VotingLog>>,
+    )> = {
+        let map = voting_logs.lock().await;
+        map.iter().map(|(k, v)| (*k, v.clone())).collect()
     };
+    let mut found_opt: Option<(
+        crate::owner_state_types::SpaceId,
+        crate::community_voting_approval::Tier1PollConfig,
+        crate::community_voting_core::MembershipSnapshot,
+    )> = None;
+    for (sid, log_arc) in &log_arcs {
+        let g = log_arc.lock().await;
+        if let Some(state) = g.polls.get(&pid) {
+            if state.meta.lifecycle != crate::community_voting_core::Lifecycle::Open {
+                return Err(format!(
+                    "voting_cast_tier1_ballot: poll lifecycle is {:?}, not Open",
+                    state.meta.lifecycle
+                ));
+            }
+            if state.meta.tier != crate::community_voting_core::Tier::Approval {
+                return Err(format!(
+                    "voting_cast_tier1_ballot: poll tier is {:?}, not Approval",
+                    state.meta.tier
+                ));
+            }
+            let cfg = state
+                .tier1_cfg
+                .clone()
+                .ok_or("voting_cast_tier1_ballot: tier1_cfg missing on Approval poll")?;
+            let snapshot = state.tier1_snapshot.clone().ok_or(
+                "voting_cast_tier1_ballot: tier1_snapshot missing (peer-received \
+                 poll without local snapshot — Task 12 will fill this in)",
+            )?;
+            found_opt = Some((*sid, cfg, snapshot));
+            break;
+        }
+    }
+    let (space_id, cfg, snapshot) =
+        found_opt.ok_or_else(|| format!("voting_cast_tier1_ballot: poll {} not found", poll_id))?;
 
     let ballot = crate::community_voting_approval::Tier1Ballot {
         poll_id: pid,
@@ -17732,12 +17887,13 @@ async fn voting_cast_tier1_ballot<R: tauri::Runtime>(
     };
 
     {
-        let mut g = voting_logs
-            .lock()
-            .map_err(|e| format!("voting_logs poisoned: {e}"))?;
-        let log = g
-            .get_mut(&space_id)
-            .ok_or("voting_cast_tier1_ballot: log disappeared between checks")?;
+        let log_arc = {
+            let map = voting_logs.lock().await;
+            map.get(&space_id)
+                .cloned()
+                .ok_or("voting_cast_tier1_ballot: log disappeared between checks")?
+        };
+        let mut log = log_arc.lock().await;
         log.apply(event, &space_id)
             .map_err(|e| format!("voting_cast_tier1_ballot: apply: {e:?}"))?;
     }
@@ -17776,12 +17932,14 @@ async fn voting_list_active_polls(
         std::sync::Arc::clone(&g.voting_logs)
     };
 
-    let g = voting_logs
-        .lock()
-        .map_err(|e| format!("voting_logs poisoned: {e}"))?;
-    let Some(log) = g.get(&space_id) else {
-        return Ok(Vec::new());
+    let log_arc = {
+        let map = voting_logs.lock().await;
+        match map.get(&space_id) {
+            Some(arc) => arc.clone(),
+            None => return Ok(Vec::new()),
+        }
     };
+    let log = log_arc.lock().await;
     Ok(log
         .polls
         .values()
@@ -17812,11 +17970,13 @@ async fn voting_get_poll(
         (g.dm_self_owner, std::sync::Arc::clone(&g.voting_logs))
     };
 
-    let g = voting_logs
-        .lock()
-        .map_err(|e| format!("voting_logs poisoned: {e}"))?;
-    for log in g.values() {
-        if let Some(state) = log.polls.get(&pid) {
+    let log_arcs: Vec<std::sync::Arc<tokio::sync::Mutex<crate::community_voting_log::VotingLog>>> = {
+        let map = voting_logs.lock().await;
+        map.values().cloned().collect()
+    };
+    for log_arc in log_arcs.iter() {
+        let g = log_arc.lock().await;
+        if let Some(state) = g.polls.get(&pid) {
             // Tally projection: only Tier 1 in Phase 1. Walk the
             // poll's ballot events and accumulate counts. Multi-ballot
             // per voter is allowed (last-write-wins by HLC) — Task 7's
@@ -17898,6 +18058,905 @@ async fn voting_get_poll(
         }
     }
     Err(format!("voting_get_poll: poll {} not found", poll_id))
+}
+
+// ─── ZEB-291 Phase 2 Task 18 — Tier 2 (Conviction) IPCs ────────────────────
+
+/// Frontend-friendly subset of `PollState` for Tier 2 IPC return values.
+/// Mirrors `PollStateExport` (Phase 1 / Tier 1) shape but surfaces the
+/// Tier-2-specific fields a UI needs: proposal text, total/threshold
+/// conviction (Q96.32 raw — UI is responsible for formatting), participation
+/// metrics, and the caller's own current Signal direction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Tier2ProposalExport {
+    pub proposal_id: String,  // hex
+    pub community_id: String, // hex
+    pub proposal_text: String,
+    /// "Open" | "ThresholdReached" | "Finalized" | "Closed" | "Archived" |
+    /// "Draft". String for stable JS-side switch over an internal enum
+    /// rename surface.
+    pub lifecycle: String,
+    /// Q96.32 sum of per-voter conviction (post-delegation if applicable);
+    /// the UI divides by `Q32` (1 << 32) to render a human-friendly number.
+    pub total_conviction_ms: i128,
+    /// Q96.32 dynamic threshold at `now` (recomputed each call). Compare
+    /// against `total_conviction_ms` to render the "X% to threshold" UI.
+    pub threshold_conviction_ms: i128,
+    pub half_life_seconds: u32,
+    pub auto_exec: crate::community_voting_conviction::AutoExecAction,
+    /// Total members eligible at PollCreate.hlc (frozen on the proposal).
+    pub total_supply: u32,
+    /// Count of voters with an active Signal{true} right now.
+    pub voter_count: u32,
+    /// The calling node's own latest Signal direction: `Some(true)` =
+    /// supporting, `Some(false)` = explicitly withdrew, `None` = never
+    /// signaled (or self-identity unavailable).
+    pub your_signal: Option<bool>,
+    /// Wall-clock (ms since UNIX_EPOCH) when total_conviction first crossed
+    /// threshold_conviction. `None` if never crossed (or reverted).
+    pub threshold_reached_at_ms: Option<i128>,
+}
+
+/// Pure helper: project a `PollState` (which must be Tier 2) into the
+/// frontend DTO. Computes `total_conviction` + `threshold_conviction` at
+/// `now_ms`; the caller's signal is resolved from the per-voter map.
+fn build_tier2_export(
+    state: &crate::community_voting_log::PollState,
+    self_owner_opt: Option<crate::owner_state_types::OwnerAddr>,
+    now_ms: i128,
+) -> Result<Tier2ProposalExport, String> {
+    let t2 = state
+        .tier_state
+        .as_tier2()
+        .ok_or("build_tier2_export: poll is not Tier 2")?;
+    let total = t2.total_conviction_at(now_ms);
+    let threshold = t2.threshold_conviction_at(now_ms);
+    let voter_count = t2.effective_supply_at(now_ms);
+    let your_signal = self_owner_opt
+        .and_then(|owner| t2.per_voter.get(&owner))
+        .map(|v| v.is_supporting);
+    let lifecycle_str = format!("{:?}", state.meta.lifecycle);
+    Ok(Tier2ProposalExport {
+        proposal_id: hex::encode(state.meta.poll_id.0),
+        community_id: hex::encode(state.meta.community_id.0),
+        proposal_text: t2.config.proposal_text.clone(),
+        lifecycle: lifecycle_str,
+        total_conviction_ms: total,
+        threshold_conviction_ms: threshold,
+        half_life_seconds: t2.config.half_life_seconds,
+        auto_exec: t2.config.auto_exec.clone(),
+        total_supply: t2.total_supply,
+        voter_count,
+        your_signal,
+        threshold_reached_at_ms: t2.threshold_reached_at_ms,
+    })
+}
+
+/// Shorthand for the per-community VotingLog map shape on NodeState
+/// after the ZEB-291 Task 19 migration. Keeps the
+/// `ensure_voting_engine_for` signature within clippy's
+/// `type_complexity` budget.
+type VotingLogsMap = std::sync::Arc<
+    tokio::sync::Mutex<
+        std::collections::HashMap<
+            crate::owner_state_types::SpaceId,
+            std::sync::Arc<tokio::sync::Mutex<crate::community_voting_log::VotingLog>>,
+        >,
+    >,
+>;
+
+/// Shorthand for the per-community engine registry shape on NodeState.
+type VotingLogEnginesMap = std::sync::Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<
+            crate::owner_state_types::SpaceId,
+            std::sync::Arc<crate::community_voting_log_engine::VotingLogEngine>,
+        >,
+    >,
+>;
+
+/// Lazy-register a `VotingLogEngine` for `community_id` if none exists,
+/// sharing the per-community `Arc<Mutex<VotingLog>>` from `voting_logs`.
+///
+/// TODO ZEB-291 Task 19.1: the engine's `publisher_tx` currently drops on
+/// the floor and `subscriber_rx` is never fed — wire the existing Zenoh
+/// adapter (`harmony/community/{id}/voting`) so cross-peer Tier 2 sync
+/// lights up. Phase 2 ships single-node-correct: every Tier 2 IPC applies
+/// directly to the local `VotingLog` (which the engine ALSO holds), so
+/// local UX works; remote peers only see local-mint events once the
+/// adapter is wired.
+async fn ensure_voting_engine_for(
+    voting_logs: &VotingLogsMap,
+    voting_log_engines: &VotingLogEnginesMap,
+    community_id: crate::owner_state_types::SpaceId,
+) -> Result<(), String> {
+    // Fast-path read under the std::Mutex (no awaits).
+    {
+        let g = voting_log_engines
+            .lock()
+            .map_err(|e| format!("voting_log_engines poisoned: {e}"))?;
+        if g.contains_key(&community_id) {
+            return Ok(());
+        }
+    }
+    // Get-or-insert the VotingLog Arc — same shape as the IPC fast path.
+    let log_arc = {
+        let mut map = voting_logs.lock().await;
+        map.entry(community_id)
+            .or_insert_with(|| {
+                std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::community_voting_log::VotingLog::new(),
+                ))
+            })
+            .clone()
+    };
+    // Build stub mpsc pairs: publisher_tx drops on the floor (its
+    // receiver is held inside an immediately-spawned drain task that
+    // exits when the sender is dropped, NEVER while the engine lives);
+    // subscriber_rx is fed by nothing (its matching Sender is created
+    // here and immediately dropped, so the engine's inbound loop sees
+    // the channel as closed and exits without doing any work). Bot
+    // halves get replaced once Task 19.1 wires the real Zenoh adapter.
+    let (publisher_tx, publisher_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    // Drain the stub publisher so try_send doesn't pile up infinitely
+    // — without this drain, the channel fills and publishes start
+    // logging "publisher_tx full or closed" warnings. The drain task
+    // exits cleanly when the engine drops its sender (i.e. when the
+    // registry drops the Arc).
+    tokio::spawn(async move {
+        let mut rx = publisher_rx;
+        while rx.recv().await.is_some() {
+            // Drop on the floor. TODO Task 19.1: forward to Zenoh adapter.
+        }
+    });
+    let (sub_tx_unused, subscriber_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    drop(sub_tx_unused);
+
+    let engine = crate::community_voting_log_engine::VotingLogEngine::start(
+        crate::community_voting_log_engine::VotingLogEngineParams {
+            community_id,
+            voting_log: log_arc,
+            publisher_tx,
+            subscriber_rx,
+        },
+    )
+    .await;
+
+    let mut g = voting_log_engines
+        .lock()
+        .map_err(|e| format!("voting_log_engines poisoned: {e}"))?;
+    // Race: another caller may have raced us to insert. The "winner" is
+    // whichever Arc landed first; we drop ours by overwrite-only-if-
+    // -empty semantics. Use entry().or_insert_with for atomic
+    // insert-if-absent.
+    g.entry(community_id).or_insert(engine);
+    Ok(())
+}
+
+/// Build + sign a Tier 2 PollCreate event. Mirrors Tier 1's
+/// `build_signed_poll_create_tier1` shape but encodes a Tier2PollConfig
+/// and tags the envelope with `Tier::Conviction`.
+fn build_signed_poll_create_tier2(
+    keypair: &ed25519_dalek::SigningKey,
+    actor: crate::owner_state_types::OwnerAddr,
+    cfg: &crate::community_voting_conviction::Tier2PollConfig,
+    hlc: crate::owner_state_types::Hlc,
+) -> Result<crate::community_voting_core::SignedVotingEvent, String> {
+    use ed25519_dalek::Signer;
+    let mut payload = Vec::new();
+    ciborium::ser::into_writer(cfg, &mut payload).map_err(|e| format!("encode cfg: {e}"))?;
+    let mut ev = crate::community_voting_core::SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier: crate::community_voting_core::Tier::Conviction,
+        kind: crate::community_voting_core::PollEventKindCode::PollCreate,
+        hlc,
+        actor,
+        payload,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev
+        .signing_bytes()
+        .map_err(|e| format!("signing_bytes: {e}"))?;
+    ev.sig = keypair.sign(&sb).to_bytes().to_vec();
+    Ok(ev)
+}
+
+/// Build + sign a Tier 2 Signal event.
+fn build_signed_signal_tier2(
+    keypair: &ed25519_dalek::SigningKey,
+    actor: crate::owner_state_types::OwnerAddr,
+    proposal_id: crate::community_voting_core::PollId,
+    support: bool,
+    hlc: crate::owner_state_types::Hlc,
+) -> Result<crate::community_voting_core::SignedVotingEvent, String> {
+    use ed25519_dalek::Signer;
+    let payload_struct = crate::community_voting_conviction::SignalPayload {
+        proposal_id,
+        support,
+    };
+    let mut payload = Vec::new();
+    ciborium::ser::into_writer(&payload_struct, &mut payload)
+        .map_err(|e| format!("encode signal: {e}"))?;
+    let mut ev = crate::community_voting_core::SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier: crate::community_voting_core::Tier::Conviction,
+        kind: crate::community_voting_core::PollEventKindCode::Signal,
+        hlc,
+        actor,
+        payload,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev
+        .signing_bytes()
+        .map_err(|e| format!("signing_bytes: {e}"))?;
+    ev.sig = keypair.sign(&sb).to_bytes().to_vec();
+    Ok(ev)
+}
+
+/// Build + sign a Tier 2 Delegate event. `to_pubkey` is the full 32-byte
+/// ed25519 pubkey of the delegate (spec §5 — NOT the 16-byte OwnerAddr).
+fn build_signed_delegate_tier2(
+    keypair: &ed25519_dalek::SigningKey,
+    actor: crate::owner_state_types::OwnerAddr,
+    to_pubkey: Vec<u8>,
+    hlc: crate::owner_state_types::Hlc,
+) -> Result<crate::community_voting_core::SignedVotingEvent, String> {
+    use ed25519_dalek::Signer;
+    let payload_struct = crate::community_voting_conviction::DelegatePayload {
+        to: to_pubkey,
+        scope: "all".into(),
+    };
+    let mut payload = Vec::new();
+    ciborium::ser::into_writer(&payload_struct, &mut payload)
+        .map_err(|e| format!("encode delegate: {e}"))?;
+    let mut ev = crate::community_voting_core::SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier: crate::community_voting_core::Tier::Conviction,
+        kind: crate::community_voting_core::PollEventKindCode::Delegate,
+        hlc,
+        actor,
+        payload,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev
+        .signing_bytes()
+        .map_err(|e| format!("signing_bytes: {e}"))?;
+    ev.sig = keypair.sign(&sb).to_bytes().to_vec();
+    Ok(ev)
+}
+
+/// Build + sign a Tier 2 Undelegate event (payload is an empty map).
+fn build_signed_undelegate_tier2(
+    keypair: &ed25519_dalek::SigningKey,
+    actor: crate::owner_state_types::OwnerAddr,
+    hlc: crate::owner_state_types::Hlc,
+) -> Result<crate::community_voting_core::SignedVotingEvent, String> {
+    use ed25519_dalek::Signer;
+    let payload_struct = crate::community_voting_conviction::UndelegatePayload {};
+    let mut payload = Vec::new();
+    ciborium::ser::into_writer(&payload_struct, &mut payload)
+        .map_err(|e| format!("encode undelegate: {e}"))?;
+    let mut ev = crate::community_voting_core::SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier: crate::community_voting_core::Tier::Conviction,
+        kind: crate::community_voting_core::PollEventKindCode::Undelegate,
+        hlc,
+        actor,
+        payload,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev
+        .signing_bytes()
+        .map_err(|e| format!("signing_bytes: {e}"))?;
+    ev.sig = keypair.sign(&sb).to_bytes().to_vec();
+    Ok(ev)
+}
+
+/// Spec-§5 default conviction half-life: 7 days.
+const TIER2_DEFAULT_HALF_LIFE_SECONDS: u32 = 7 * 24 * 60 * 60;
+/// Default `T_min` threshold (Q96.32 raw). Roughly equivalent to one
+/// voter supporting for ~1 day at hl=7d. Caller can override.
+const TIER2_DEFAULT_THRESHOLD_MIN_Q32: i128 = 100_000_000;
+/// Default `T_max` threshold (Q96.32 raw). Roughly equivalent to one
+/// voter supporting for ~2 weeks at hl=7d. Caller can override.
+const TIER2_DEFAULT_THRESHOLD_MAX_Q32: i128 = 10_000_000_000;
+/// Default `β` exponent for `(1-ratio)^β` curve shaping.
+const TIER2_DEFAULT_BETA: u8 = 2;
+
+/// Tauri event payload for `"voting-tier2-proposal-created"`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VotingTier2ProposalCreatedPayload {
+    pub proposal_id: String,
+    pub community_id: String,
+}
+
+/// Tauri event payload for `"voting-tier2-signal-cast"`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VotingTier2SignalCastPayload {
+    pub proposal_id: String,
+    pub voter: String,
+    pub support: bool,
+}
+
+/// Tauri IPC: create a Tier 2 (Conviction) proposal. Returns the new
+/// `PollId` as a hex string (32 bytes → 64 chars).
+///
+/// Metadata-before-irreversible: validate inputs, build snapshot, check
+/// creator eligibility BEFORE signing; signing path runs only after we
+/// know the proposal will be locally apply-able.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn voting_create_tier2_proposal<R: tauri::Runtime>(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    app: tauri::AppHandle<R>,
+    community_id: String,
+    channel_id: String,
+    proposal_text: String,
+    half_life_seconds: Option<u32>,
+    threshold_min: Option<i64>,
+    threshold_max: Option<i64>,
+    beta: Option<u8>,
+    delegation_allowed: Option<bool>,
+    auto_exec: Option<crate::community_voting_conviction::AutoExecAction>,
+    min_power: Option<u32>,
+) -> Result<String, String> {
+    // ── 1. Decode hex ids ──────────────────────────────────────────────
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(cid_bytes);
+
+    // Decode channel_id for verification only; Tier 2 polls are NOT
+    // channel-scoped (per Tier2PollConfig there's no channel_id field),
+    // but the IPC accepts a channel_id so the UI can verify the user has
+    // post permission in the channel they created the proposal in.
+    let _chid_bytes: [u8; 16] = hex::decode(&channel_id)
+        .map_err(|e| format!("invalid channel_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "channel_id must be 16 bytes (32 hex chars)".to_string())?;
+
+    // ── 2. Build Tier2PollConfig with defaults ────────────────────────
+    if proposal_text.is_empty() {
+        return Err("voting_create_tier2_proposal: proposal_text must not be empty".into());
+    }
+    if proposal_text.len() > 4096 {
+        return Err(format!(
+            "voting_create_tier2_proposal: proposal_text too long ({} bytes; max 4096)",
+            proposal_text.len()
+        ));
+    }
+    let mp_u8: u8 = min_power.unwrap_or(0).min(100) as u8;
+    let cfg = crate::community_voting_conviction::Tier2PollConfig {
+        proposal_text,
+        half_life_seconds: half_life_seconds.unwrap_or(TIER2_DEFAULT_HALF_LIFE_SECONDS),
+        threshold_min_q32: threshold_min
+            .map(|v| v as i128)
+            .unwrap_or(TIER2_DEFAULT_THRESHOLD_MIN_Q32),
+        threshold_max_q32: threshold_max
+            .map(|v| v as i128)
+            .unwrap_or(TIER2_DEFAULT_THRESHOLD_MAX_Q32),
+        beta: beta.unwrap_or(TIER2_DEFAULT_BETA),
+        delegation_allowed: delegation_allowed.unwrap_or(true),
+        auto_exec: auto_exec.unwrap_or(crate::community_voting_conviction::AutoExecAction::None),
+        eligibility: crate::community_voting_core::Eligibility {
+            min_power: mp_u8,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+    };
+    // Minimal sanity checks (no spec validator yet — Task 1 amendment
+    // pushed validation to the per-tier helpers; for Tier 2 we
+    // enforce only the obvious invariants here).
+    if cfg.threshold_min_q32 < 0
+        || cfg.threshold_max_q32 <= cfg.threshold_min_q32
+        || cfg.half_life_seconds == 0
+        || cfg.beta == 0
+    {
+        return Err(format!(
+            "voting_create_tier2_proposal: invalid config (hl={} beta={} t_min={} t_max={})",
+            cfg.half_life_seconds, cfg.beta, cfg.threshold_min_q32, cfg.threshold_max_q32
+        ));
+    }
+
+    // ── 3. Extract NodeState handles ──────────────────────────────────
+    let (
+        hlc_tracker,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        crdt_state,
+        voting_logs,
+        voting_log_engines,
+    ) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or("dm_self_owner missing")?,
+            g.community_registry
+                .clone()
+                .ok_or("community_registry missing — node not running?")?,
+            g.dm_outbox
+                .clone()
+                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
+            std::sync::Arc::clone(&g.voting_logs),
+            std::sync::Arc::clone(&g.voting_log_engines),
+        )
+    };
+
+    // ── 4. Build snapshot + verify creator eligibility ────────────────
+    let snapshot =
+        voting_build_snapshot_for_community(crdt_state, community_registry, space_id).await?;
+    crate::community_voting_core::check_eligibility(&snapshot, &self_owner, &cfg.eligibility)
+        .map_err(|e| format!("voting_create_tier2_proposal: creator not eligible: {e:?}"))?;
+
+    // ── 5. Lazy-register the engine for this community ────────────────
+    ensure_voting_engine_for(&voting_logs, &voting_log_engines, space_id).await?;
+
+    // ── 6. Reserve HLC + sign PollCreate ──────────────────────────────
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let event = {
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        build_signed_poll_create_tier2(signing_key, self_owner, &cfg, hlc)?
+    };
+
+    // ── 7. Apply locally with snapshot ────────────────────────────────
+    let poll_id = {
+        let log_arc = {
+            let map = voting_logs.lock().await;
+            map.get(&space_id)
+                .cloned()
+                .ok_or("voting_create_tier2_proposal: VotingLog disappeared after register")?
+        };
+        let mut log = log_arc.lock().await;
+        log.apply_with_snapshot(event, &space_id, Some(snapshot))
+            .map_err(|e| format!("voting_create_tier2_proposal: apply: {e:?}"))?
+    };
+
+    // TODO ZEB-291 Task 19.1: invoke `engine.publish_event(event)` once
+    // the Zenoh adapter is wired so peers see this PollCreate. For now
+    // the local apply above is the source of truth single-node and the
+    // engine's local-apply path is intentionally not invoked (would
+    // double-apply).
+
+    let poll_id_hex = hex::encode(poll_id.0);
+    let payload = VotingTier2ProposalCreatedPayload {
+        proposal_id: poll_id_hex.clone(),
+        community_id: hex::encode(space_id.0),
+    };
+    if let Err(e) = app.emit("voting-tier2-proposal-created", &payload) {
+        tracing::warn!(error = %e, "voting-tier2-proposal-created emit failed");
+    }
+    Ok(poll_id_hex)
+}
+
+/// Tauri IPC: cast (or withdraw) a Tier 2 Signal on a Conviction proposal.
+///
+/// Metadata-before-irreversible: verify the proposal is in
+/// `Open`/`ThresholdReached` lifecycle (per S1) + the caller is a
+/// current community member (S2 rolling eligibility) BEFORE signing.
+#[tauri::command]
+async fn voting_signal_tier2<R: tauri::Runtime>(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    app: tauri::AppHandle<R>,
+    proposal_id: String,
+    support: bool,
+) -> Result<(), String> {
+    let pid_bytes: [u8; 32] = hex::decode(&proposal_id)
+        .map_err(|e| format!("invalid proposal_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "proposal_id must be 32 bytes (64 hex chars)".to_string())?;
+    let pid = crate::community_voting_core::PollId(pid_bytes);
+
+    let (
+        hlc_tracker,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        crdt_state,
+        voting_logs,
+    ) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or("dm_self_owner missing")?,
+            g.community_registry
+                .clone()
+                .ok_or("community_registry missing — node not running?")?,
+            g.dm_outbox
+                .clone()
+                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
+            std::sync::Arc::clone(&g.voting_logs),
+        )
+    };
+
+    // ── Lookup proposal + verify lifecycle (S1) ────────────────────────
+    let log_arcs: Vec<(
+        crate::owner_state_types::SpaceId,
+        std::sync::Arc<tokio::sync::Mutex<crate::community_voting_log::VotingLog>>,
+    )> = {
+        let map = voting_logs.lock().await;
+        map.iter().map(|(k, v)| (*k, v.clone())).collect()
+    };
+    let mut found_opt: Option<(crate::owner_state_types::SpaceId,)> = None;
+    for (sid, log_arc) in &log_arcs {
+        let g = log_arc.lock().await;
+        if let Some(state) = g.polls.get(&pid) {
+            if state.meta.tier != crate::community_voting_core::Tier::Conviction {
+                return Err(format!(
+                    "voting_signal_tier2: poll tier is {:?}, not Conviction",
+                    state.meta.tier
+                ));
+            }
+            use crate::community_voting_core::Lifecycle;
+            if !matches!(
+                state.meta.lifecycle,
+                Lifecycle::Open | Lifecycle::ThresholdReached
+            ) {
+                return Err(format!(
+                    "voting_signal_tier2: proposal lifecycle is {:?}; signals only \
+                     accepted in Open / ThresholdReached",
+                    state.meta.lifecycle
+                ));
+            }
+            found_opt = Some((*sid,));
+            break;
+        }
+    }
+    let (space_id,) = found_opt
+        .ok_or_else(|| format!("voting_signal_tier2: proposal {} not found", proposal_id))?;
+
+    // ── S2 rolling eligibility: confirm caller is currently a member ──
+    let snapshot =
+        voting_build_snapshot_for_community(crdt_state, community_registry, space_id).await?;
+    if !snapshot.members.contains_key(&self_owner) {
+        return Err("voting_signal_tier2: caller is not a current community member".into());
+    }
+
+    // ── Mint + apply ───────────────────────────────────────────────────
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let event = {
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        build_signed_signal_tier2(signing_key, self_owner, pid, support, hlc)?
+    };
+    {
+        let log_arc = {
+            let map = voting_logs.lock().await;
+            map.get(&space_id)
+                .cloned()
+                .ok_or("voting_signal_tier2: VotingLog disappeared between checks")?
+        };
+        let mut log = log_arc.lock().await;
+        log.apply(event, &space_id)
+            .map_err(|e| format!("voting_signal_tier2: apply: {e:?}"))?;
+    }
+
+    let payload = VotingTier2SignalCastPayload {
+        proposal_id: proposal_id.clone(),
+        voter: hex::encode(self_owner.0),
+        support,
+    };
+    if let Err(e) = app.emit("voting-tier2-signal-cast", &payload) {
+        tracing::warn!(error = %e, "voting-tier2-signal-cast emit failed");
+    }
+    Ok(())
+}
+
+/// Tauri IPC: install a Tier 2 Delegate edge `caller → delegate` for
+/// `community_id`. Delegation is community-wide (NOT per-poll) — affects
+/// every Tier 2 proposal in the community per spec §5.
+#[tauri::command]
+async fn voting_delegate_tier2<R: tauri::Runtime>(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    app: tauri::AppHandle<R>,
+    community_id: String,
+    delegate: String,
+) -> Result<(), String> {
+    let _ = app; // emit deferred — Delegate events do not fire a Tauri event by spec.
+
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(cid_bytes);
+
+    let delegate_pubkey: Vec<u8> =
+        hex::decode(&delegate).map_err(|e| format!("invalid delegate hex: {e}"))?;
+    if delegate_pubkey.len() != 32 {
+        return Err(format!(
+            "delegate must be 32 bytes (64 hex chars); got {}",
+            delegate_pubkey.len()
+        ));
+    }
+
+    let (
+        hlc_tracker,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        crdt_state,
+        voting_logs,
+        voting_log_engines,
+    ) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or("dm_self_owner missing")?,
+            g.community_registry
+                .clone()
+                .ok_or("community_registry missing — node not running?")?,
+            g.dm_outbox
+                .clone()
+                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
+            std::sync::Arc::clone(&g.voting_logs),
+            std::sync::Arc::clone(&g.voting_log_engines),
+        )
+    };
+
+    // Membership check: both caller AND delegate must currently be in
+    // the community. The delegate's OwnerAddr is the first 16 bytes of
+    // the pubkey (matching the apply path's truncation in
+    // VotingLog::apply_with_snapshot).
+    let snapshot =
+        voting_build_snapshot_for_community(crdt_state, community_registry, space_id).await?;
+    if !snapshot.members.contains_key(&self_owner) {
+        return Err("voting_delegate_tier2: caller is not a current community member".into());
+    }
+    let mut to_addr_bytes = [0u8; 16];
+    to_addr_bytes.copy_from_slice(&delegate_pubkey[..16]);
+    let to_addr = crate::owner_state_types::OwnerAddr(to_addr_bytes);
+    if !snapshot.members.contains_key(&to_addr) {
+        return Err("voting_delegate_tier2: delegate is not a current community member".into());
+    }
+
+    // Lazy-register the engine so the per-community log exists.
+    ensure_voting_engine_for(&voting_logs, &voting_log_engines, space_id).await?;
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let event = {
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        build_signed_delegate_tier2(signing_key, self_owner, delegate_pubkey, hlc)?
+    };
+    {
+        let log_arc = {
+            let map = voting_logs.lock().await;
+            map.get(&space_id)
+                .cloned()
+                .ok_or("voting_delegate_tier2: VotingLog disappeared after register")?
+        };
+        let mut log = log_arc.lock().await;
+        log.apply(event, &space_id)
+            .map_err(|e| format!("voting_delegate_tier2: apply (D2 cycle? stale?): {e:?}"))?;
+    }
+    Ok(())
+}
+
+/// Tauri IPC: revoke the caller's Delegate edge in `community_id`.
+#[tauri::command]
+async fn voting_undelegate_tier2<R: tauri::Runtime>(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    app: tauri::AppHandle<R>,
+    community_id: String,
+) -> Result<(), String> {
+    let _ = app; // emit deferred — Undelegate events do not fire a Tauri event by spec.
+
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(cid_bytes);
+
+    let (hlc_tracker, device_id, self_owner, dm_outbox, voting_logs, voting_log_engines) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or("dm_self_owner missing")?,
+            g.dm_outbox
+                .clone()
+                .ok_or("dm_outbox missing — no owner identity?")?,
+            std::sync::Arc::clone(&g.voting_logs),
+            std::sync::Arc::clone(&g.voting_log_engines),
+        )
+    };
+
+    ensure_voting_engine_for(&voting_logs, &voting_log_engines, space_id).await?;
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let event = {
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        build_signed_undelegate_tier2(signing_key, self_owner, hlc)?
+    };
+    {
+        let log_arc = {
+            let map = voting_logs.lock().await;
+            map.get(&space_id)
+                .cloned()
+                .ok_or("voting_undelegate_tier2: VotingLog disappeared after register")?
+        };
+        let mut log = log_arc.lock().await;
+        log.apply(event, &space_id)
+            .map_err(|e| format!("voting_undelegate_tier2: apply: {e:?}"))?;
+    }
+    Ok(())
+}
+
+/// Tauri IPC: list all Tier 2 proposals for `community_id` — regardless
+/// of lifecycle (the UI filters by status: active / threshold-reached /
+/// finalized / archived). Returns the full DTO per proposal so a list
+/// view can render every field without a follow-up `get` call.
+#[tauri::command]
+async fn voting_list_tier2_proposals(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    community_id: String,
+) -> Result<Vec<Tier2ProposalExport>, String> {
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(cid_bytes);
+
+    let (self_owner_opt, voting_logs) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (g.dm_self_owner, std::sync::Arc::clone(&g.voting_logs))
+    };
+
+    let log_arc = {
+        let map = voting_logs.lock().await;
+        match map.get(&space_id) {
+            Some(arc) => arc.clone(),
+            None => return Ok(Vec::new()),
+        }
+    };
+    let g = log_arc.lock().await;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i128)
+        .unwrap_or(0);
+    let mut out = Vec::new();
+    for state in g.polls.values() {
+        if state.meta.tier != crate::community_voting_core::Tier::Conviction {
+            continue;
+        }
+        match build_tier2_export(state, self_owner_opt, now_ms) {
+            Ok(e) => out.push(e),
+            Err(e) => {
+                tracing::warn!(
+                    proposal_id = %hex::encode(state.meta.poll_id.0),
+                    error = %e,
+                    "voting_list_tier2_proposals: skip malformed Tier 2 poll"
+                );
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Tauri IPC: full state for a single Tier 2 proposal.
+#[tauri::command]
+async fn voting_get_tier2_proposal(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    proposal_id: String,
+) -> Result<Tier2ProposalExport, String> {
+    let pid_bytes: [u8; 32] = hex::decode(&proposal_id)
+        .map_err(|e| format!("invalid proposal_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "proposal_id must be 32 bytes (64 hex chars)".to_string())?;
+    let pid = crate::community_voting_core::PollId(pid_bytes);
+
+    let (self_owner_opt, voting_logs) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (g.dm_self_owner, std::sync::Arc::clone(&g.voting_logs))
+    };
+
+    let log_arcs: Vec<std::sync::Arc<tokio::sync::Mutex<crate::community_voting_log::VotingLog>>> = {
+        let map = voting_logs.lock().await;
+        map.values().cloned().collect()
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i128)
+        .unwrap_or(0);
+    for log_arc in log_arcs.iter() {
+        let g = log_arc.lock().await;
+        if let Some(state) = g.polls.get(&pid) {
+            if state.meta.tier != crate::community_voting_core::Tier::Conviction {
+                return Err(format!(
+                    "voting_get_tier2_proposal: poll {} is tier {:?}, not Conviction",
+                    proposal_id, state.meta.tier
+                ));
+            }
+            return build_tier2_export(state, self_owner_opt, now_ms);
+        }
+    }
+    Err(format!(
+        "voting_get_tier2_proposal: proposal {} not found",
+        proposal_id
+    ))
+}
+
+/// Tauri IPC: convenience wrapper for "contesting" a near-finalize
+/// Tier 2 proposal by issuing an Unsignal event from the caller's
+/// identity. If the caller previously signaled support, this withdraws
+/// it; if that withdrawal drops total conviction below threshold, the
+/// next tick reverts lifecycle from `ThresholdReached` to `Open` and
+/// the 24h finalize timer restarts.
+///
+/// Pure delegation to `voting_signal_tier2(proposal_id, false)` — the
+/// "contest" framing matches the spec §5 UX language but the wire-
+/// level effect is identical.
+#[tauri::command]
+async fn voting_contest_tier2_finalization<R: tauri::Runtime>(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    app: tauri::AppHandle<R>,
+    proposal_id: String,
+) -> Result<(), String> {
+    voting_signal_tier2(state_lock, app, proposal_id, false).await
 }
 
 #[cfg(test)]
@@ -18133,6 +19192,14 @@ pub fn run() {
             voting_cast_tier1_ballot,
             voting_list_active_polls,
             voting_get_poll,
+            // ZEB-291 Phase 2 Task 18: Tier 2 (Conviction) voting IPCs.
+            voting_create_tier2_proposal,
+            voting_signal_tier2,
+            voting_delegate_tier2,
+            voting_undelegate_tier2,
+            voting_list_tier2_proposals,
+            voting_get_tier2_proposal,
+            voting_contest_tier2_finalization,
             #[cfg(debug_assertions)]
             e2e_close_window,
         ])
@@ -18164,6 +19231,14 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         voting_cast_tier1_ballot,
         voting_list_active_polls,
         voting_get_poll,
+        // ZEB-291 Phase 2 Task 18: Tier 2 (Conviction) voting IPCs.
+        voting_create_tier2_proposal,
+        voting_signal_tier2,
+        voting_delegate_tier2,
+        voting_undelegate_tier2,
+        voting_list_tier2_proposals,
+        voting_get_tier2_proposal,
+        voting_contest_tier2_finalization,
     ])
 }
 
@@ -20987,9 +22062,13 @@ mod start_node_race_tests {
             profile_broadcast_next_subscription_id: std::sync::Arc::new(
                 std::sync::atomic::AtomicU64::new(1),
             ),
-            voting_logs: std::sync::Arc::new(std::sync::Mutex::new(
+            voting_logs: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            voting_log_engines: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            voting_tick_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 

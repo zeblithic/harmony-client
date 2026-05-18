@@ -283,7 +283,7 @@ impl VotingLog {
                     community_id: *community_id,
                     creator: event.actor,
                     tier: event.tier,
-                    eligibility: cfg.eligibility.clone(),
+                    eligibility: cfg.eligibility,
                     lifecycle: next,
                     created_at: event.hlc.clone(),
                     opens_at: event.hlc.clone(),
@@ -322,7 +322,7 @@ impl VotingLog {
                     community_id: *community_id,
                     creator: event.actor,
                     tier: event.tier,
-                    eligibility: cfg.eligibility.clone(),
+                    eligibility: cfg.eligibility,
                     lifecycle: next,
                     created_at: event.hlc.clone(),
                     opens_at: event.hlc.clone(),
@@ -695,8 +695,11 @@ mod tests {
         // Signal on at t=1_000_000, off at t=1_086_400_000 (=24h later, == 1 half-life).
         log.apply(signal_event(pid, voter, true, 1_000_000), &cid)
             .expect("on");
-        log.apply(signal_event(pid, voter, false, 1_000_000 + 86_400_000), &cid)
-            .expect("off");
+        log.apply(
+            signal_event(pid, voter, false, 1_000_000 + 86_400_000),
+            &cid,
+        )
+        .expect("off");
         let v = log.polls[&pid]
             .tier_state
             .as_tier2()

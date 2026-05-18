@@ -319,9 +319,7 @@ impl VotingLogRegistry {
 mod tests {
     use super::*;
     use crate::community_voting_approval::Tier1PollConfig;
-    use crate::community_voting_core::{
-        Eligibility, PollEventKindCode, SignedVotingEvent, Tier,
-    };
+    use crate::community_voting_core::{Eligibility, PollEventKindCode, SignedVotingEvent, Tier};
     use crate::owner_state_types::Hlc;
     use std::time::Duration;
 

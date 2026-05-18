@@ -56,11 +56,11 @@ pub type AutoExecSetPowerFn = Arc<
 /// Type alias for the Tauri-event emit hook.
 pub type EmitFn = Arc<dyn Fn(&str, serde_json::Value) + Send + Sync>;
 
-/// Context handed to `run_voting_tick`. Holds the shared voting_logs map,
-/// the last-archive-sweep wall-clock, and two function hooks (event-emit
-/// + auto-exec-set-power) so the tick can be unit-tested via closure
-/// injection. The Task 20 wiring in `lib.rs` populates these from the
-/// real `AppHandle` + `NodeState`.
+/// Context handed to `run_voting_tick`. Holds the shared voting_logs
+/// map, the last-archive-sweep wall-clock, and two function hooks
+/// (event-emit and auto-exec-set-power) so the tick can be unit-tested
+/// via closure injection. The Task 20 wiring in `lib.rs` populates these
+/// from the real `AppHandle` + `NodeState`.
 pub struct VotingTickContext {
     pub voting_logs: Arc<Mutex<HashMap<SpaceId, Arc<Mutex<VotingLog>>>>>,
     pub last_archive_sweep_ms: Arc<Mutex<i128>>,
@@ -73,10 +73,7 @@ pub struct VotingTickContext {
 /// Sub-passes are sequential and each acquires the necessary locks
 /// independently to avoid holding the outer `voting_logs` lock across
 /// long-running awaits (e.g. auto-exec dispatch).
-pub async fn run_voting_tick(
-    ctx: &VotingTickContext,
-    now_ms: i128,
-) -> Result<TickStats, String> {
+pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<TickStats, String> {
     let mut stats = TickStats::default();
 
     // ── Pass 1: Tier 1 auto-close ────────────────────────────────────
@@ -207,10 +204,8 @@ pub async fn run_voting_tick(
                         // skipping here avoids accidentally finalizing.
                         None => continue,
                     };
-                    let uncontested_since = reached_at.max(
-                        t2.last_unsignal_after_threshold_ms
-                            .unwrap_or(reached_at),
-                    );
+                    let uncontested_since =
+                        reached_at.max(t2.last_unsignal_after_threshold_ms.unwrap_or(reached_at));
                     if (now_ms - uncontested_since) >= CONTESTABILITY_WINDOW_MS {
                         to_finalize.push((*cid, *pid, t2.config.auto_exec.clone()));
                     }
@@ -305,7 +300,7 @@ mod tests {
     use super::*;
     use crate::community_membership::ChannelId;
     use crate::community_voting_approval::{Tier1PollConfig, Tier1TallyState};
-    use crate::community_voting_conviction::{Tier2PollConfig, Tier2ProposalState, Q32};
+    use crate::community_voting_conviction::{Tier2PollConfig, Tier2ProposalState};
     use crate::community_voting_core::{Eligibility, PollMeta};
     use crate::community_voting_log::{PollState, TierState};
     use crate::owner_state_types::Hlc;
@@ -431,15 +426,14 @@ mod tests {
         });
 
         let captured_auto_exec_clone = Arc::clone(&captured_auto_exec);
-        let auto_exec_set_power: AutoExecSetPowerFn = Arc::new(
-            move |cid: SpaceId, target: OwnerAddr, power: u32| {
+        let auto_exec_set_power: AutoExecSetPowerFn =
+            Arc::new(move |cid: SpaceId, target: OwnerAddr, power: u32| {
                 let captured = Arc::clone(&captured_auto_exec_clone);
                 Box::pin(async move {
                     captured.lock().unwrap().push((cid, target, power));
                     Ok(())
                 })
-            },
-        );
+            });
 
         let ctx = VotingTickContext {
             voting_logs: Arc::new(Mutex::new(logs)),
@@ -455,8 +449,10 @@ mod tests {
         let cid = SpaceId([0x11; 16]);
         let pid = PollId([0x22; 32]);
         let mut log = VotingLog::new();
-        log.polls
-            .insert(pid, make_tier1_poll(cid, pid, 1_000, 10_000, Lifecycle::Open));
+        log.polls.insert(
+            pid,
+            make_tier1_poll(cid, pid, 1_000, 10_000, Lifecycle::Open),
+        );
 
         let mut logs = HashMap::new();
         logs.insert(cid, Arc::new(Mutex::new(log)));
@@ -538,10 +534,7 @@ mod tests {
             Arc::clone(logs.get(&cid).unwrap())
         };
         let log = log_mtx.lock().await;
-        assert_eq!(
-            log.polls[&pid].meta.lifecycle,
-            Lifecycle::ThresholdReached
-        );
+        assert_eq!(log.polls[&pid].meta.lifecycle, Lifecycle::ThresholdReached);
         let t2 = log.polls[&pid].tier_state.as_tier2().unwrap();
         assert_eq!(t2.threshold_reached_at_ms, Some(now_ms));
 
@@ -661,10 +654,7 @@ mod tests {
             Arc::clone(logs.get(&cid).unwrap())
         };
         let log = log_mtx.lock().await;
-        assert_eq!(
-            log.polls[&pid].meta.lifecycle,
-            Lifecycle::ThresholdReached
-        );
+        assert_eq!(log.polls[&pid].meta.lifecycle, Lifecycle::ThresholdReached);
     }
 
     #[tokio::test]
@@ -709,7 +699,7 @@ mod tests {
     async fn community_voting_tick_archive_sweep_runs_after_24h() {
         let logs = HashMap::new();
         let now_ms = 30 * 60 * 60 * 1000i128; // 30h after epoch.
-        // last_sweep = (now - 25h) so 25h has elapsed → sweep should run.
+                                              // last_sweep = (now - 25h) so 25h has elapsed → sweep should run.
         let last_sweep = now_ms - 25 * 60 * 60 * 1000;
         let (ctx, _events, _) = make_ctx_with_logs(logs, last_sweep);
 

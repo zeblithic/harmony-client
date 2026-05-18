@@ -1000,9 +1000,21 @@ mod tests {
         let h1 = s.conviction_at(2 * TEST_HL, TEST_HL);
         let h2 = s.conviction_at(3 * TEST_HL, TEST_HL);
         let h3 = s.conviction_at(4 * TEST_HL, TEST_HL);
-        assert!(approx_eq(h1, base / 2, tol), "h1 = {h1}, want ≈ {}", base / 2);
-        assert!(approx_eq(h2, base / 4, tol), "h2 = {h2}, want ≈ {}", base / 4);
-        assert!(approx_eq(h3, base / 8, tol), "h3 = {h3}, want ≈ {}", base / 8);
+        assert!(
+            approx_eq(h1, base / 2, tol),
+            "h1 = {h1}, want ≈ {}",
+            base / 2
+        );
+        assert!(
+            approx_eq(h2, base / 4, tol),
+            "h2 = {h2}, want ≈ {}",
+            base / 4
+        );
+        assert!(
+            approx_eq(h3, base / 8, tol),
+            "h3 = {h3}, want ≈ {}",
+            base / 8
+        );
     }
 
     #[test]
@@ -1015,7 +1027,7 @@ mod tests {
         // At 2*hl, active session just started (dur=0 → active charge=0);
         // accumulated has been decaying for one full hl from charge(hl,hl).
         let actual = s.conviction_at(2 * TEST_HL, TEST_HL);
-        let expected = decay_q32(charge_q32(TEST_HL, TEST_HL), TEST_HL, TEST_HL) + 0;
+        let expected = decay_q32(charge_q32(TEST_HL, TEST_HL), TEST_HL, TEST_HL);
         assert_eq!(actual, expected);
     }
 
@@ -1096,10 +1108,7 @@ mod tests {
         assert_eq!(a, b);
         // And conviction queries agree.
         for t in &[0i128, 100, 1_000, 2_500, 7_000, 10_000] {
-            assert_eq!(
-                a.conviction_at(*t, TEST_HL),
-                b.conviction_at(*t, TEST_HL),
-            );
+            assert_eq!(a.conviction_at(*t, TEST_HL), b.conviction_at(*t, TEST_HL),);
         }
     }
 
@@ -1142,8 +1151,8 @@ mod tests {
         s2.apply_signal(false, TEST_HL, TEST_HL);
         s2.apply_signal(true, 5_000, TEST_HL);
         let result2 = s2.conviction_at(100, TEST_HL); // before everything
-        // accumulated at this point is the prior charge after pre-resume
-        // decay, plus zero active charge.
+                                                      // accumulated at this point is the prior charge after pre-resume
+                                                      // decay, plus zero active charge.
         let expected2 = s2.accumulated_conviction_q32;
         assert_eq!(result2, expected2);
     }
