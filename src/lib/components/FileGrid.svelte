@@ -46,7 +46,7 @@
 </script>
 
 <div class="file-grid" aria-label="File grid">
-  {#each items as item (item.sidecarId || item.cid)}
+  {#each items as item (item.sidecarId || `nested:${item.cid}:${item.name}`)}
     <FileCard
       {item}
       onClick={onItemClick}

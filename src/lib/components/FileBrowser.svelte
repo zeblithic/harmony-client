@@ -144,8 +144,13 @@
     untrack(() => {
       // ZEB-162: auto-clear move-error banner on folder navigation —
       // the error referred to the previous folder context and is no
-      // longer actionable here.
+      // longer actionable here. ZEB-299: same goes for rename state
+      // (editingItem / editingValue / renameError) — without this an
+      // in-flight commitRename whose blur fires before the IPC
+      // resolves would leave an orphaned banner that persists across
+      // navigations.
       error = null;
+      cancelRename();
       if (cid === null) {
         navStack = [];
         pendingNav = null;

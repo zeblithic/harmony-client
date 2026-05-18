@@ -41,7 +41,14 @@ impl Drop for TestHarness {
         // pattern into the shared harness extraction.
         let _ = self._shutdown_tx.send(true);
         if let Some(handle) = self.runtime_thread.take() {
-            let _ = handle.join();
+            // Surface a runtime-thread panic via eprintln rather than
+            // propagating it: panicking from Drop while a test is
+            // already failing aborts the process with a double-panic,
+            // hiding the original failure. The eprintln lands in
+            // nextest's per-test log so the cause isn't lost.
+            if let Err(payload) = handle.join() {
+                eprintln!("TestHarness runtime thread panicked: {:?}", payload);
+            }
         }
     }
 }
