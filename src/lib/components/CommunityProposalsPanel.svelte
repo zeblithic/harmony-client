@@ -23,14 +23,18 @@
    */
 
   import { onDestroy } from 'svelte';
+  import type { CommunityMember } from '../types';
   import type { Tier2ProposalExport } from '../types/voting';
   import type { VotingAdapter } from '../voting-adapter';
   import ConvictionProposalCard from './ConvictionProposalCard.svelte';
+  import DelegationWidget from './DelegationWidget.svelte';
 
   let {
     communityId,
     adapter,
     myPower,
+    myAddr,
+    communityMembers,
   }: {
     /** Hex SpaceId of the community. */
     communityId: string;
@@ -40,6 +44,14 @@
      *  (current-member check). Backend separately enforces per-proposal
      *  eligibility (`min_power`) at create time. */
     myPower: number;
+    /** ZEB-292 Phase 3: caller's 32-char hex OwnerAddr. Forwarded to
+     *  DelegationWidget + ConvictionProposalCard's per-proposal override
+     *  affordance. */
+    myAddr: string;
+    /** ZEB-292 Phase 3: community member roster, forwarded to the
+     *  DelegationWidget picker + the override affordance's delegate-
+     *  name resolution. */
+    communityMembers: CommunityMember[];
   } = $props();
 
   let proposals = $state<Tier2ProposalExport[] | null>(null);
@@ -151,6 +163,8 @@
 </script>
 
 <section class="community-proposals" aria-label="Community proposals">
+  <DelegationWidget {communityId} {adapter} {myAddr} {communityMembers} />
+
   {#if canPropose}
     <form
       class="new-proposal-form"

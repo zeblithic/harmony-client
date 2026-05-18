@@ -9,6 +9,7 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import CommunityProposalsPanel from '../CommunityProposalsPanel.svelte';
 import { VotingAdapter } from '../../voting-adapter';
+import type { CommunityMember } from '../../types';
 import type {
   Tier2ProposalExport,
   VotingTier2ProposalCreatedPayload,
@@ -16,6 +17,12 @@ import type {
 
 const COMMUNITY_ID = 'bb'.repeat(16);
 const OTHER_COMMUNITY = 'cc'.repeat(16);
+const MY_ADDR = 'aa'.repeat(16);
+const BOB_ADDR = 'cc'.repeat(16);
+const COMMUNITY_MEMBERS: CommunityMember[] = [
+  { address: MY_ADDR, displayName: 'me', power: 50, status: 'joined' },
+  { address: BOB_ADDR, displayName: 'bob', power: 1, status: 'joined' },
+];
 
 function makeProposal(id: string, overrides: Partial<Tier2ProposalExport> = {}): Tier2ProposalExport {
   return {
@@ -68,12 +75,17 @@ describe('CommunityProposalsPanel', () => {
     // patch to no-op unsubscribes so the $effect cleanup is well-formed.
     adapter.subscribeThresholdReached = () => () => {};
     adapter.subscribeProposalFinalized = () => () => {};
+    // ZEB-292 Phase 3: the embedded DelegationWidget calls these on
+    // mount. Patch to safe no-ops so the parent's tests stay focused
+    // on proposal flow.
+    adapter.getMyDelegate = vi.fn().mockResolvedValue(null);
+    adapter.subscribeDelegationChanged = () => () => {};
   });
 
   it('loads proposals on mount via listTier2Proposals', async () => {
     listMock.mockResolvedValueOnce([makeProposal('1'), makeProposal('2')]);
     render(CommunityProposalsPanel, {
-      props: { communityId: COMMUNITY_ID, adapter, myPower: 50 },
+      props: { communityId: COMMUNITY_ID, adapter, myPower: 50, myAddr: MY_ADDR, communityMembers: COMMUNITY_MEMBERS },
     });
     await waitFor(() => {
       expect(listMock).toHaveBeenCalledWith(COMMUNITY_ID);
@@ -86,7 +98,7 @@ describe('CommunityProposalsPanel', () => {
 
   it('shows the new-proposal form when myPower >= 1', async () => {
     render(CommunityProposalsPanel, {
-      props: { communityId: COMMUNITY_ID, adapter, myPower: 1 },
+      props: { communityId: COMMUNITY_ID, adapter, myPower: 1, myAddr: MY_ADDR, communityMembers: COMMUNITY_MEMBERS },
     });
     await waitFor(() => {
       expect(listMock).toHaveBeenCalled();
@@ -97,7 +109,7 @@ describe('CommunityProposalsPanel', () => {
 
   it('hides the new-proposal form when myPower < 1', async () => {
     render(CommunityProposalsPanel, {
-      props: { communityId: COMMUNITY_ID, adapter, myPower: 0 },
+      props: { communityId: COMMUNITY_ID, adapter, myPower: 0, myAddr: MY_ADDR, communityMembers: COMMUNITY_MEMBERS },
     });
     await waitFor(() => {
       expect(listMock).toHaveBeenCalled();
@@ -108,7 +120,7 @@ describe('CommunityProposalsPanel', () => {
 
   it('submits proposal form via createTier2Proposal', async () => {
     render(CommunityProposalsPanel, {
-      props: { communityId: COMMUNITY_ID, adapter, myPower: 50 },
+      props: { communityId: COMMUNITY_ID, adapter, myPower: 50, myAddr: MY_ADDR, communityMembers: COMMUNITY_MEMBERS },
     });
     await waitFor(() => {
       expect(listMock).toHaveBeenCalled();
@@ -128,7 +140,7 @@ describe('CommunityProposalsPanel', () => {
   it('refetches on proposalCreated event for the same community', async () => {
     listMock.mockResolvedValueOnce([]);
     render(CommunityProposalsPanel, {
-      props: { communityId: COMMUNITY_ID, adapter, myPower: 1 },
+      props: { communityId: COMMUNITY_ID, adapter, myPower: 1, myAddr: MY_ADDR, communityMembers: COMMUNITY_MEMBERS },
     });
     await waitFor(() => {
       expect(listMock).toHaveBeenCalledTimes(1);
