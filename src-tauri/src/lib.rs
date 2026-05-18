@@ -6738,6 +6738,16 @@ pub async fn move_content_impl(
         }
     }
 
+    // Reject the degenerate "top-level → root" case: source is already
+    // a top-level entry AND destination is root. Without this guard the
+    // request falls into Case D and tries to look up the source root's
+    // own CID inside its own manifest, which never matches, producing a
+    // confusing "no entry pointing to child" error instead of the
+    // honest no-op rejection.
+    if is_case_d && src_cids.len() == 1 && src_cids[0] == child_cid {
+        return Err("source and destination are identical".to_string());
+    }
+
     // For Cases A/B/D the source-side walk needs to read the immediate
     // parent's manifest to find the moved child's manifest entry — both
     // for the destination-side append (Cases A, B) and for the new
@@ -7099,21 +7109,13 @@ async fn move_case_a(
         rebuilt_lca.bundle_bytes,
     ));
 
-    // Above-LCA walk: src_cids[..lca_idx] — propagate the LCA's CID
-    // change up to the top-level.
+    // Above-LCA walk: walk `src_cids[..lca_idx]` (the chain ABOVE the
+    // LCA, exclusive) with a deepest-edit that replaces the LCA's old
+    // CID with its rebuilt CID. The walker handles propagation from
+    // the LCA-parent up to the top-level root.
     let new_top_level_cid = if lca_idx == 0 {
         lca_new_cid
     } else {
-        let above_path = &src_cids[..lca_idx + 1];
-        // The bottom-most ancestor in `above_path` IS the LCA, so we
-        // need a deepest-edit that replaces the LCA's old CID with its
-        // new CID. But the walker treats the deepest element of
-        // `above_path` as the LCA itself — so we want the deepest edit
-        // to be "rebuild yourself with prev_old_cid → prev_new_cid for
-        // your child entry which is the layer below." That's actually
-        // not what `path` semantics encode. Instead, walk `src_cids[..lca_idx]`
-        // (excluding the LCA) with a deepest edit of
-        // Replace(lca_old → lca_new).
         let above_only = &src_cids[..lca_idx];
         let walked = walk_and_rebuild_chain(
             verb_tx,
@@ -7126,7 +7128,6 @@ async fn move_case_a(
         )
         .await?;
         last_bundle_size = walked.new_top_level_size;
-        let _ = above_path; // silence unused
         walked.new_top_level_cid
     };
 
@@ -7186,7 +7187,7 @@ async fn move_case_b(
     moved_entry: folders::ManifestEntry,
     dst_old_cid: [u8; 32],
     dst_old_size: u64,
-    dst_old_stored_at: u64,
+    _dst_old_stored_at: u64,
     stored_at_ms: u64,
 ) -> Result<MoveContentResult, String> {
     let src_root_old = src_cids[0];
@@ -7252,12 +7253,17 @@ async fn move_case_b(
         Err(e) => {
             let undo_err: Option<content_index::RekeyError> = {
                 let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+                // Use current `stored_at_ms`, not the captured pre-move
+                // `dst_old_stored_at`: the entry was just touched twice
+                // (forward + undo), so the modified-at timestamp must
+                // reflect the undo event, not pretend the entry was last
+                // modified in the past.
                 idx.rekey(
                     &dst_sid,
                     dst_walked.new_top_level_cid,
                     dst_old_cid,
                     dst_old_size,
-                    dst_old_stored_at,
+                    stored_at_ms,
                 )
                 .err()
             };
@@ -7302,7 +7308,7 @@ async fn move_case_c(
     moved_entry: folders::ManifestEntry,
     dst_old_cid: [u8; 32],
     dst_old_size: u64,
-    dst_old_stored_at: u64,
+    _dst_old_stored_at: u64,
     stored_at_ms: u64,
 ) -> Result<MoveContentResult, String> {
     let mut pending_ingests: Vec<(String, Vec<u8>)> = Vec::new();
@@ -7342,27 +7348,36 @@ async fn move_case_c(
         }
     }
 
-    // STAGE 2: remove the source sidecar entry.
-    let removed = {
+    // STAGE 2: remove the source sidecar entry, CAS-protected via a
+    // CID re-check. A concurrent rekey on src landing between boundary
+    // verify and here would have changed the entry's CID without
+    // burning the sidecar row — a plain `remove(&src_sid)` would
+    // happily delete the user's freshly-rekeyed entry. The CAS-style
+    // `remove_if_cid_matches` returns OldMissing or Conflict instead,
+    // which the compensating-undo path below routes through.
+    let stage2_err: Option<content_index::RekeyError> = {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
-        idx.remove(&src_sid)
+        idx.remove_if_cid_matches(&src_sid, src_root_old).err()
     };
-    if !removed {
-        // Absence at this point means a concurrent burn / remove
-        // landed between our verify and our remove. Compensating-undo
-        // rewinds the dst rekey.
+    if let Some(src_err) = stage2_err {
         let undo_err: Option<content_index::RekeyError> = {
             let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+            // Use current `stored_at_ms` for the undo (see Case B
+            // for the same reasoning).
             idx.rekey(
                 &dst_sid,
                 dst_walked.new_top_level_cid,
                 dst_old_cid,
                 dst_old_size,
-                dst_old_stored_at,
+                stored_at_ms,
             )
             .err()
         };
-        return Err(stage2_error_c(undo_err, dst_walked.new_top_level_cid));
+        return Err(stage2_error_c(
+            src_err,
+            undo_err,
+            dst_walked.new_top_level_cid,
+        ));
     }
 
     maintain_pin_invariant(verb_tx, index, src_root_old, None).await;
@@ -7594,13 +7609,40 @@ fn stage2_error_b(
     }
 }
 
-fn stage2_error_c(undo_err: Option<content_index::RekeyError>, dst_new_cid: [u8; 32]) -> String {
+fn stage2_error_c(
+    src_err: content_index::RekeyError,
+    undo_err: Option<content_index::RekeyError>,
+    dst_new_cid: [u8; 32],
+) -> String {
+    let src_state = match src_err {
+        content_index::RekeyError::OldMissing => "src_sidecar_id already removed".to_string(),
+        content_index::RekeyError::Conflict { actual } => format!(
+            "concurrent rekey on src_sidecar_id (now at cid {})",
+            hex::encode(actual)
+        ),
+    };
+    // Whether the moved child appears in both folders after this error
+    // depends on whether src's entry is still around:
+    //   - OldMissing: src entry was concurrently burned → child is only
+    //     in dst (if undo failed) or in neither folder's sidecar view (if
+    //     undo succeeded).
+    //   - Conflict: src entry still exists at a different CID; that other
+    //     CID's tree may or may not contain the moved child. If dst's
+    //     undo failed, dst's tree also contains the moved child — so the
+    //     child is reachable from both sides.
+    let in_both =
+        matches!(src_err, content_index::RekeyError::Conflict { .. }) && undo_err.is_some();
+    let suffix = if in_both {
+        "; child may appear in both folders — manual reconcile required"
+    } else {
+        ""
+    };
     match undo_err {
-        None => "src_sidecar_id removed mid-flight; dst rekey reverted".to_string(),
+        None => format!("{src_state}; dst rekey reverted{suffix}"),
         Some(content_index::RekeyError::OldMissing) => {
             tracing::warn!("move_content: dst sidecar entry disappeared during compensating undo");
             format!(
-                "src_sidecar_id removed mid-flight; compensating undo of dst FAILED (dst entry missing); dst is at cid {}; child appears in both folders",
+                "{src_state}; compensating undo of dst FAILED (dst entry missing); last-known dst cid was {}{suffix}",
                 hex::encode(dst_new_cid)
             )
         }
@@ -7610,7 +7652,7 @@ fn stage2_error_c(undo_err: Option<content_index::RekeyError>, dst_new_cid: [u8;
                 "move_content: compensating undo of dst lost the CAS race; manual reconcile required"
             );
             format!(
-                "src_sidecar_id removed mid-flight; compensating undo of dst FAILED (dst now at cid {}); child appears in both folders",
+                "{src_state}; compensating undo of dst FAILED (dst now at cid {}){suffix}",
                 hex::encode(actual)
             )
         }

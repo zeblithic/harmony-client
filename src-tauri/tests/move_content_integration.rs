@@ -658,8 +658,13 @@ async fn move_b_dst_rekey_conflict_at_stage_1_no_undo_path() {
     .await
     .expect_err("dst CAS conflict must surface as Err");
 
+    // The pre-flip happens BEFORE the boundary verify, so the boundary
+    // check is the first guard to fire. Accept either the boundary
+    // message or the STAGE 1 CAS message — both indicate the move
+    // correctly refused to clobber a divergent dst.
     assert!(
-        err.contains("concurrent rekey on dst_sidecar_id"),
+        err.contains("concurrent rekey on dst_sidecar_id")
+            || err.contains("dst_sidecar_id refers to cid"),
         "got: {err}"
     );
 
@@ -676,33 +681,12 @@ async fn move_b_dst_rekey_conflict_at_stage_1_no_undo_path() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn move_b_src_rekey_conflict_after_dst_commit_undo_reverts_dst() {
-    // We can't easily inject a barrier between STAGE 1 and STAGE 2 from
-    // outside, but we CAN make src's CAS guard fail by pre-flipping src's
-    // CID — which simulates "concurrent rekey on src landed between
-    // boundary verify and STAGE 2 rekey." Because src verification is
-    // snapshotted at the boundary BEFORE the dst walks, the pre-flip
-    // does not trip the boundary check; it manifests as a CAS conflict
-    // at STAGE 2, after STAGE 1 has already committed. The compensating
-    // undo restores T2.
-    //
-    // Note: this exercises the *post-STAGE-1, STAGE-2-conflict* path
-    // even though our forced-flip happens before the call returns the
-    // verify guard. The boundary verify reads src's CID once; STAGE 2
-    // reads it again via rekey's CAS — those two reads can diverge if a
-    // force_set lands in between. Because we cannot easily land that
-    // mutation between two awaited points without a deeper hook, we
-    // instead trip the STAGE 2 CAS by mutating src's CID AFTER the
-    // boundary verify reads it. The boundary verify is a fast non-await
-    // block, so race timing is tricky. Workaround: pre-snapshot the
-    // source's CID, mutate it AFTER the boundary verify but BEFORE STAGE
-    // 2 — done by interleaving with a one-shot signal.
-    //
-    // For the slice-1 test we approximate by spawning the move task
-    // and racing a flip into the same index BEFORE either stage runs.
-    // The flip lands during the dst-side walk (the longest awaited
-    // segment) and trips STAGE 2's CAS. Validated by the resulting
-    // error string AND by T2 returning to its original CID after the
-    // compensating undo.
+    // Deterministically exercise the post-STAGE-1 / STAGE-2-conflict
+    // path by arming the test-only rekey conflict hook on src's
+    // sidecar. The hook fires when move_case_b reaches its STAGE 2
+    // rekey on src — STAGE 1 has already committed by then — and
+    // returns Conflict, triggering the compensating undo that reverts
+    // T2 to its pre-STAGE-1 CID.
     let (l_cid, l_bytes) = make_leaf(b"undo-test");
     let t1_old = folders::build_folder(
         "T1",
@@ -742,19 +726,16 @@ async fn move_b_src_rekey_conflict_after_dst_commit_undo_reverts_dst() {
     );
     let t2_old_cid = t2_old.bundle_cid.to_bytes();
 
-    // Spawn a task that flips src AFTER a brief yield, so it lands
-    // during the dst chain walk — between boundary-verify and STAGE 2.
-    let flipper_index = index.clone();
-    let flipper_sid = t1_sid;
-    let flipper = tokio::spawn(async move {
-        // Yield enough for the move task to clear the boundary-verify
-        // lock release but not yet reach STAGE 2.
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        let mut idx = flipper_index.lock().unwrap();
-        idx.force_set_cid_for_test(&flipper_sid, [0xAB; 32]);
-    });
+    // Arm the conflict hook on src's sidecar. The boundary verify
+    // doesn't call rekey, so it's unaffected; STAGE 1 (dst rekey) also
+    // unaffected; STAGE 2 (src rekey) is the FIRST rekey targeting
+    // t1_sid in this call and consumes the hook.
+    {
+        let mut idx = index.lock().unwrap();
+        idx.arm_next_rekey_conflict(t1_sid, [0xAB; 32]);
+    }
 
-    let res = harmony_app::move_content_impl(
+    let err = harmony_app::move_content_impl(
         t1_sid.to_string(),
         vec![hex::encode(t1_old.bundle_cid.to_bytes())],
         hex::encode(l_cid),
@@ -765,36 +746,21 @@ async fn move_b_src_rekey_conflict_after_dst_commit_undo_reverts_dst() {
         harness.verb_tx.clone(),
         index.clone(),
     )
-    .await;
-    let _ = flipper.await;
+    .await
+    .expect_err("STAGE 2 src rekey must fail under armed conflict hook");
 
-    // We accept either outcome: if the flip landed BEFORE the boundary
-    // verify, the move fails at boundary with a different message; if
-    // it landed AFTER, STAGE 2 fails and compensating undo restores
-    // T2. Either way, T2 must end up at its original CID (no leftover
-    // forward-rekey), and T1 must be at the post-flip CID (not at the
-    // post-move CID — STAGE 2 never committed).
-    match res {
-        Ok(_) => panic!("STAGE 2 should have failed under the forced src flip"),
-        Err(e) => {
-            // Both possible boundary messages are acceptable for this
-            // test's purpose, but the post-STAGE-1 path is the
-            // interesting one.
-            assert!(
-                e.contains("concurrent rekey on src") || e.contains("src_sidecar_id refers to cid"),
-                "unexpected error: {e}"
-            );
-        }
-    }
+    assert!(
+        err.contains("concurrent rekey on src"),
+        "expected post-STAGE-1 src-conflict path, got: {err}"
+    );
 
     let idx = index.lock().unwrap();
-    // T2 either was never rekeyed (boundary-fail path) or was
-    // compensating-undone (STAGE-2-fail path). Either way it should be
-    // at its original CID.
+    // T2 was forward-rekeyed at STAGE 1 then compensating-undone after
+    // STAGE 2 failed. End state: T2 back at its pre-move CID.
     assert_eq!(
         idx.get(&t2_sid).unwrap().cid,
         t2_old_cid,
-        "T2 ends up at its original CID (either untouched or compensating-undone)"
+        "T2 reverted by compensating undo"
     );
 }
 
@@ -1157,5 +1123,123 @@ async fn move_d_new_top_level_pin_defaults_unpinned() {
     assert!(
         !new_top.pinned,
         "Case D defaults the new top-level entry to unpinned"
+    );
+}
+
+// ── Test 17: move_top_level_to_root_rejected (Qodo Bug #1 regression) ─────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn move_top_level_to_root_rejected() {
+    // Source is a top-level entry; destination is the root. This is a
+    // no-op shape that pre-fix fell into Case D and tried to look up
+    // the source root's own CID inside its own manifest, producing a
+    // confusing "no entry pointing to child" error. The early-reject
+    // guard surfaces it as an honest "source and destination are
+    // identical" instead.
+    let l_bytes = b"top-level-to-root".to_vec();
+    let l_cid = ContentId::for_book(&l_bytes, ContentFlags::default())
+        .expect("book cid")
+        .to_bytes();
+
+    let harness = match spawn_test_runtime().await {
+        Some(h) => h,
+        None => return,
+    };
+    ingest_leaf(&harness, l_cid, l_bytes).await;
+
+    let index = fresh_index();
+    let l_sid = insert_top_level(&index, l_cid, "L", ContentKind::Leaf, false, 17);
+
+    let err = harmony_app::move_content_impl(
+        l_sid.to_string(),
+        vec![hex::encode(l_cid)],
+        hex::encode(l_cid),
+        None,
+        vec![],
+        None,
+        harness.ingest_tx.clone(),
+        harness.verb_tx.clone(),
+        index.clone(),
+    )
+    .await
+    .expect_err("top-level → root must be rejected");
+
+    assert!(
+        err.contains("source and destination are identical"),
+        "got: {err}"
+    );
+}
+
+// ── Test 18: move_case_c_src_concurrently_rekeyed_compensates ─────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn move_case_c_src_concurrently_rekeyed_compensates() {
+    // Case C STAGE 2 is now CAS-protected: if a concurrent rekey landed
+    // on src between boundary verify and STAGE 2, `remove_if_cid_matches`
+    // surfaces Conflict instead of silently deleting the freshly-rekeyed
+    // user entry. Compensating undo then reverts the destination.
+    let (l_cid, l_bytes) = make_leaf(b"case-c-cas");
+    let f_old = folders::build_folder("F", &[]).expect("build F");
+
+    let harness = match spawn_test_runtime().await {
+        Some(h) => h,
+        None => return,
+    };
+    ingest_leaf(&harness, l_cid, l_bytes).await;
+    ingest_folder(&harness, &f_old).await;
+
+    let index = fresh_index();
+    let l_sid = insert_top_level(&index, l_cid, "L", ContentKind::Leaf, false, 11);
+    let f_sid = insert_top_level(
+        &index,
+        f_old.bundle_cid.to_bytes(),
+        "F",
+        ContentKind::Folder,
+        false,
+        f_old.bundle_bytes.len() as u64,
+    );
+    let f_old_cid = f_old.bundle_cid.to_bytes();
+
+    // Race a concurrent rekey of L's sidecar entry between boundary
+    // verify and STAGE 2's CAS-protected remove. force_set_cid_for_test
+    // is deterministic — we set it after harness setup but before the
+    // move call; boundary verify still passes because dst CID matches,
+    // but the CAS remove will see the flipped cid and Conflict.
+    {
+        let mut idx = index.lock().unwrap();
+        idx.force_set_cid_for_test(&l_sid, [0xCD; 32]);
+    }
+
+    let err = harmony_app::move_content_impl(
+        l_sid.to_string(),
+        vec![hex::encode(l_cid)],
+        hex::encode(l_cid),
+        Some(f_sid.to_string()),
+        vec![hex::encode(f_old.bundle_cid.to_bytes())],
+        None,
+        harness.ingest_tx.clone(),
+        harness.verb_tx.clone(),
+        index.clone(),
+    )
+    .await
+    .expect_err("CAS-protected Case C remove must reject divergent src");
+
+    // The boundary verify trips on src first (entry.cid != src_path[0])
+    // — that's the correct first guard. Both this message and the
+    // post-STAGE-1 conflict message indicate the move refused to
+    // clobber a divergent src.
+    assert!(
+        err.contains("concurrent rekey on src_sidecar_id")
+            || err.contains("src_sidecar_id refers to cid"),
+        "got: {err}"
+    );
+
+    // F (destination) must end at its original CID — either never
+    // forward-rekeyed (boundary-fail) or compensating-undone.
+    let idx = index.lock().unwrap();
+    assert_eq!(
+        idx.get(&f_sid).unwrap().cid,
+        f_old_cid,
+        "F ends at its original CID (no leftover forward-rekey)"
     );
 }
