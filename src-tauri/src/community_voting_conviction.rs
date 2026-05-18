@@ -156,17 +156,19 @@ pub struct SignalPayload {
 /// — that hash cannot be derived from just the Ed25519 pubkey, so any
 /// delegate-target field that carried the raw pubkey would never match
 /// the membership-graph keys. Carrying the OwnerAddr directly mirrors
-/// every other actor identifier in the system. Encoded as a CBOR byte
-/// string (major type 2) via `serde_bytes` — same wire-shape convention
-/// as `SignedVotingEvent.payload`/`.sig`. Decoders MUST reject a `to`
-/// whose length is not exactly 16.
+/// every other actor identifier in the system. The `OwnerAddr` newtype's
+/// serde impl emits a CBOR `bstr(16)` and rejects any other length at
+/// decode time (CR R5 Major — the prior `Vec<u8>` + `serde_bytes` shape
+/// accepted any length on the wire and relied on a downstream length
+/// check, leaving a window where the wire boundary and the apply layer
+/// could disagree).
 ///
 /// `sc` ("scope") is reserved for future per-poll or per-tag delegation
 /// scoping; v1 callers always pass `"all"` (community-wide delegation).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegatePayload {
-    #[serde(rename = "to", with = "serde_bytes")]
-    pub to: Vec<u8>,
+    #[serde(rename = "to")]
+    pub to: OwnerAddr,
     #[serde(rename = "sc")]
     pub scope: String,
 }

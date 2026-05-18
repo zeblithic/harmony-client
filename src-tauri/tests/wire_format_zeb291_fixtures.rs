@@ -178,7 +178,7 @@ fn wire_format_zeb291_signal_envelope_fixture_pinned() {
 #[test]
 fn wire_format_zeb291_delegate_envelope_fixture_pinned() {
     let payload = encode(&DelegatePayload {
-        to: FIXTURE_DELEGATE_TARGET.to_vec(),
+        to: OwnerAddr(FIXTURE_DELEGATE_TARGET),
         scope: "all".into(),
     });
     let encoded = encode_envelope(PollEventKindCode::Delegate, payload);

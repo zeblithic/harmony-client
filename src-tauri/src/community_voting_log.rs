@@ -16,7 +16,7 @@ use crate::community_voting_core::{
     derive_poll_id, next_lifecycle, Eligibility, Lifecycle, MembershipSnapshot, PollEventKindCode,
     PollId, PollMeta, SignedVotingEvent, Tier,
 };
-use crate::owner_state_types::{Hlc, OwnerAddr};
+use crate::owner_state_types::Hlc;
 
 /// All voting events for a single community, plus the materialized
 /// per-poll state derived from them.
@@ -222,19 +222,16 @@ impl VotingLog {
 
         // ---- Tier 2 Delegate: graph mutation; NO lifecycle ----
         if event.kind == PollEventKindCode::Delegate && event.tier == Tier::Conviction {
+            // The 16-byte length invariant is now enforced at decode by
+            // `DelegatePayload.to: OwnerAddr` (CR R5 Major). Decode-time
+            // rejection means malformed peer events never reach the
+            // apply path with an unconstrained Vec<u8>.
             let payload: DelegatePayload = ciborium::de::from_reader(&event.payload[..])
                 .map_err(|_| ApplyError::PayloadDecode)?;
-            // Wire `to` is the 16-byte OwnerAddr (see
-            // `DelegatePayload` doc for why this is not a raw pubkey).
-            if payload.to.len() != 16 {
-                return Err(ApplyError::PayloadValidate);
-            }
-            let mut to_bytes = [0u8; 16];
-            to_bytes.copy_from_slice(&payload.to);
             self.delegation_graph
                 .apply_delegate(
                     event.actor,
-                    OwnerAddr(to_bytes),
+                    payload.to,
                     (event.hlc.wall_ms, event.hlc.logical),
                 )
                 .map_err(|_| ApplyError::DelegationRejected)?;
@@ -592,7 +589,7 @@ mod tests {
     fn delegate_event(actor: OwnerAddr, to: [u8; 16], hlc_ms: u64) -> SignedVotingEvent {
         // Wire `to` is the 16-byte OwnerAddr.
         let payload_obj = DelegatePayload {
-            to: to.to_vec(),
+            to: OwnerAddr(to),
             scope: "all".into(),
         };
         let mut payload = Vec::new();

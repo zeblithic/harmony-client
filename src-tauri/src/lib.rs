@@ -18399,7 +18399,7 @@ fn build_signed_delegate_tier2(
 ) -> Result<crate::community_voting_core::SignedVotingEvent, String> {
     use ed25519_dalek::Signer;
     let payload_struct = crate::community_voting_conviction::DelegatePayload {
-        to: to_addr.0.to_vec(),
+        to: to_addr,
         scope: "all".into(),
     };
     let mut payload = Vec::new();
