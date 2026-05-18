@@ -28,11 +28,21 @@ struct TestHarness {
     pub verb_tx: mpsc::Sender<ContentVerbRequest>,
     _shutdown_tx: watch::Sender<bool>,
     _tmp: tempfile::TempDir,
+    runtime_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for TestHarness {
     fn drop(&mut self) {
+        // Signal shutdown, then join the runtime thread. Joining is
+        // load-bearing here despite --test-threads=1: without it, the
+        // OS-thread keeps the event loop alive past TestHarness drop,
+        // and a subsequent test in the same process can race against
+        // the still-draining channels. ZEB-183 will pull this Drop
+        // pattern into the shared harness extraction.
         let _ = self._shutdown_tx.send(true);
+        if let Some(handle) = self.runtime_thread.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -101,7 +111,7 @@ async fn spawn_test_runtime() -> Option<TestHarness> {
     let (fetch_completion_tx, fetch_completion_rx) = mpsc::channel::<[u8; 32]>(4);
     let pin_intent: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
 
-    thread::Builder::new()
+    let runtime_thread = thread::Builder::new()
         .name("harmony-runtime-rename-test".to_string())
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
@@ -190,6 +200,7 @@ async fn spawn_test_runtime() -> Option<TestHarness> {
         verb_tx,
         _shutdown_tx: shutdown_tx,
         _tmp: tmp,
+        runtime_thread: Some(runtime_thread),
     })
 }
 
