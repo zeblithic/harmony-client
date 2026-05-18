@@ -58,6 +58,18 @@
   let proposals = $state<Tier2ProposalExport[] | null>(null);
   let loadError = $state<string | null>(null);
   let loading = $state(false);
+  /** ZEB-292 Phase 3: caller's current delegate hex (32 chars) or
+   *  null. Loaded on mount and refreshed on every
+   *  voting-delegation-changed event for the local user. Passed to
+   *  each ConvictionProposalCard so the per-proposal override
+   *  affordance can render. */
+  let myDelegate = $state<string | null>(null);
+  let myDelegateName = $derived(
+    myDelegate
+      ? (communityMembers.find((m) => m.address === myDelegate)?.displayName ??
+        `${myDelegate.slice(0, 8)}…`)
+      : null,
+  );
 
   // New-proposal form state.
   let proposalText = $state('');
@@ -88,15 +100,27 @@
   // `communityId` changes so swapping the parent's selected community
   // re-loads from scratch (without this, a parent that re-uses this
   // component instance across community switches would show stale data).
+  async function refetchDelegate() {
+    try {
+      myDelegate = await adapter.getMyDelegate(communityId);
+    } catch {
+      // Defensive: a failure to read the delegate just means the
+      // override affordance won't render. The proposals list itself
+      // is independent.
+      myDelegate = null;
+    }
+  }
+
   $effect(() => {
     const cid = communityId;
     let cancelled = false;
     proposals = null;
     loadError = null;
+    myDelegate = null;
 
     void (async () => {
       if (cancelled) return;
-      await refetch();
+      await Promise.all([refetch(), refetchDelegate()]);
     })();
 
     // The three event subscribers. Each refetches on fire — cheap
@@ -113,12 +137,21 @@
       if (cancelled || p.communityId !== cid) return;
       void refetch();
     });
+    // ZEB-292 Phase 3: refresh `myDelegate` when the local user's
+    // delegation changes (so the override pill appears/disappears in
+    // sync with DelegationWidget).
+    const unsubDelegation = adapter.subscribeDelegationChanged((p) => {
+      if (cancelled || p.communityId !== cid) return;
+      if (p.delegator !== myAddr) return;
+      void refetchDelegate();
+    });
 
     return () => {
       cancelled = true;
       unsubCreated();
       unsubThreshold();
       unsubFinalized();
+      unsubDelegation();
     };
   });
 
@@ -218,7 +251,13 @@
       <p class="cp-empty">No active proposals. Create one to start.</p>
     {:else if proposals}
       {#each proposals as proposal (proposal.proposal_id)}
-        <ConvictionProposalCard {communityId} {proposal} {adapter} />
+        <ConvictionProposalCard
+          {communityId}
+          {proposal}
+          {adapter}
+          {myDelegate}
+          delegateName={myDelegateName}
+        />
       {/each}
     {/if}
   </div>

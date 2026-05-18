@@ -144,4 +144,95 @@ describe('ConvictionProposalCard', () => {
     // optimistic flip to "Withdraw signal" reverted).
     expect(screen.getByRole('button').textContent).toContain('Signal support');
   });
+
+  // ─── ZEB-292 Phase 3: per-proposal override affordance ────────────
+  describe('per-proposal override affordance', () => {
+    const DELEGATE = 'cc'.repeat(16);
+
+    it('shows the override pill when caller has a delegate and no direct signal', () => {
+      render(ConvictionProposalCard, {
+        props: {
+          communityId: COMMUNITY_ID,
+          proposal: makeProposal({ your_signal: undefined }),
+          adapter,
+          myDelegate: DELEGATE,
+          delegateName: 'bob',
+        },
+      });
+      expect(screen.getByRole('status', { name: /delegate signaling on your behalf/i })).toBeTruthy();
+      expect(screen.getByText(/bob/i)).toBeTruthy();
+      expect(screen.getByRole('button', { name: /vote directly/i })).toBeTruthy();
+    });
+
+    it('hides the override pill when caller has signaled directly', () => {
+      render(ConvictionProposalCard, {
+        props: {
+          communityId: COMMUNITY_ID,
+          proposal: makeProposal({ your_signal: true }),
+          adapter,
+          myDelegate: DELEGATE,
+          delegateName: 'bob',
+        },
+      });
+      expect(screen.queryByRole('status', { name: /delegate signaling on your behalf/i })).toBeNull();
+      // The standard signal toggle is visible instead.
+      expect(screen.getByRole('button', { name: /withdraw signal/i })).toBeTruthy();
+    });
+
+    it('hides the override pill when caller has no delegate', () => {
+      render(ConvictionProposalCard, {
+        props: {
+          communityId: COMMUNITY_ID,
+          proposal: makeProposal({ your_signal: undefined }),
+          adapter,
+          myDelegate: null,
+          delegateName: null,
+        },
+      });
+      expect(screen.queryByRole('status', { name: /delegate signaling on your behalf/i })).toBeNull();
+      expect(screen.getByRole('button', { name: /signal support/i })).toBeTruthy();
+    });
+
+    it('clicking "Vote directly" fires signalTier2(proposalId, true)', async () => {
+      render(ConvictionProposalCard, {
+        props: {
+          communityId: COMMUNITY_ID,
+          proposal: makeProposal({ your_signal: undefined }),
+          adapter,
+          myDelegate: DELEGATE,
+          delegateName: 'bob',
+        },
+      });
+      await fireEvent.click(screen.getByRole('button', { name: /vote directly/i }));
+      await waitFor(() => {
+        expect(signalMock).toHaveBeenCalledWith(PROPOSAL_ID, true);
+      });
+    });
+
+    it('falls back to generic "Your delegate" label when delegateName is null', () => {
+      render(ConvictionProposalCard, {
+        props: {
+          communityId: COMMUNITY_ID,
+          proposal: makeProposal({ your_signal: undefined }),
+          adapter,
+          myDelegate: DELEGATE,
+          delegateName: null,
+        },
+      });
+      expect(screen.getByText(/your delegate/i)).toBeTruthy();
+    });
+
+    it('hides the override pill on Finalized lifecycle', () => {
+      render(ConvictionProposalCard, {
+        props: {
+          communityId: COMMUNITY_ID,
+          proposal: makeProposal({ your_signal: undefined, lifecycle: 'Finalized' }),
+          adapter,
+          myDelegate: DELEGATE,
+          delegateName: 'bob',
+        },
+      });
+      expect(screen.queryByRole('status', { name: /delegate signaling on your behalf/i })).toBeNull();
+    });
+  });
 });
