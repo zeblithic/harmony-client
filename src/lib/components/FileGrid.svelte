@@ -29,6 +29,20 @@
     onCommitRename?: () => void;
     onCancelRename?: () => void;
   } = $props();
+
+  // See FileList.svelte for the rationale — top-level uses sidecarId
+  // (insert dedupes by id only), nested uses (name, cid) (manifest
+  // invariants make name unique within a folder).
+  function matchesEditing(item: ContentItem): boolean {
+    if (editingItem === null) return false;
+    if (editingItem.sidecarId && item.sidecarId) {
+      return editingItem.sidecarId === item.sidecarId;
+    }
+    if (!editingItem.sidecarId && !item.sidecarId) {
+      return editingItem.name === item.name && editingItem.cid === item.cid;
+    }
+    return false;
+  }
 </script>
 
 <div class="file-grid" aria-label="File grid">
@@ -39,9 +53,7 @@
       selected={selectedSidecarId !== null ? selectedSidecarId === item.sidecarId : selectedCid === item.cid}
       {onRowDragStart}
       {onRowDrop}
-      editing={editingItem !== null
-        && editingItem.name === item.name
-        && editingItem.cid === item.cid}
+      editing={matchesEditing(item)}
       bind:editValue={editingValue}
       {onBeginRename}
       {onCommitRename}

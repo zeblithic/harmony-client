@@ -31,6 +31,22 @@
     onCommitRename?: () => void;
     onCancelRename?: () => void;
   } = $props();
+
+  // Edit-mode match: top-level rows carry a non-empty sidecarId (the
+  // sidecar's unique key); manifest-derived nested rows carry "". For
+  // top-level use sidecarId (two sidecar entries CAN share name+cid
+  // because insert only dedupes by id). For nested fall back to
+  // name+cid, which manifest invariants make unique within a folder.
+  function matchesEditing(item: ContentItem): boolean {
+    if (editingItem === null) return false;
+    if (editingItem.sidecarId && item.sidecarId) {
+      return editingItem.sidecarId === item.sidecarId;
+    }
+    if (!editingItem.sidecarId && !item.sidecarId) {
+      return editingItem.name === item.name && editingItem.cid === item.cid;
+    }
+    return false;
+  }
 </script>
 
 <div class="file-list" role="table" aria-label="File list">
@@ -50,9 +66,7 @@
       selected={selectedSidecarId !== null ? selectedSidecarId === item.sidecarId : selectedCid === item.cid}
       {onRowDragStart}
       {onRowDrop}
-      editing={editingItem !== null
-        && editingItem.name === item.name
-        && editingItem.cid === item.cid}
+      editing={matchesEditing(item)}
       bind:editValue={editingValue}
       {onBeginRename}
       {onCommitRename}

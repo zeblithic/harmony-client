@@ -46,7 +46,10 @@ impl Drop for TestHarness {
     }
 }
 
-async fn spawn_test_runtime() -> Option<TestHarness> {
+// All error paths in this fn panic, so the harness is never None.
+// Return TestHarness directly (per CodeRabbit round 2) and let
+// callers do `let harness = spawn_test_runtime().await;`.
+async fn spawn_test_runtime() -> TestHarness {
     let tmp = tempdir().unwrap();
     let app_data_dir = tmp.path().to_path_buf();
 
@@ -195,13 +198,13 @@ async fn spawn_test_runtime() -> Option<TestHarness> {
         Err(_) => panic!("event loop dropped ready signal"),
     }
 
-    Some(TestHarness {
+    TestHarness {
         ingest_tx,
         verb_tx,
         _shutdown_tx: shutdown_tx,
         _tmp: tmp,
         runtime_thread: Some(runtime_thread),
-    })
+    }
 }
 
 /// Ingest a built folder's manifest + bundle through the runtime.
@@ -281,10 +284,7 @@ async fn rename_top_level_file() {
     // leave `cid` untouched — bundle bytes are not rebuilt.
     let (l_cid, l_bytes) = make_leaf(b"hello world");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_leaf(&harness, l_cid, l_bytes.clone()).await;
 
     let index = fresh_index();
@@ -335,10 +335,7 @@ async fn rename_top_level_folder() {
     )
     .expect("build F");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_leaf(&harness, l_cid, l_bytes).await;
     ingest_folder(&harness, &f_old).await;
 
@@ -394,10 +391,7 @@ async fn rename_nested_one_level_deep() {
     )
     .expect("build T");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_folder(&harness, &f_old).await;
     ingest_folder(&harness, &t_old).await;
 
@@ -473,10 +467,7 @@ async fn rename_nested_two_levels_deep() {
     )
     .expect("build T");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_leaf(&harness, l_cid, l_bytes).await;
     ingest_folder(&harness, &a_old).await;
     ingest_folder(&harness, &t_old).await;
@@ -562,10 +553,7 @@ async fn rename_disambiguates_siblings_with_shared_cid() {
     )
     .expect("build T");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_folder(&harness, &empty).await;
     ingest_folder(&harness, &t_old).await;
 
@@ -623,10 +611,7 @@ async fn rename_empty_name_rejected() {
     // Both "" and "   " (whitespace-only after trim) must reject.
     let (l_cid, l_bytes) = make_leaf(b"empty-reject");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_leaf(&harness, l_cid, l_bytes.clone()).await;
 
     let index = fresh_index();
@@ -681,10 +666,7 @@ async fn rename_same_name_nested_no_op() {
     )
     .expect("build T");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_folder(&harness, &f_old).await;
     ingest_folder(&harness, &t_old).await;
 
@@ -728,10 +710,7 @@ async fn rename_same_name_nested_no_op() {
 async fn rename_same_name_top_level_no_op() {
     let (l_cid, l_bytes) = make_leaf(b"same-name-top");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_leaf(&harness, l_cid, l_bytes.clone()).await;
 
     let index = fresh_index();
@@ -788,10 +767,7 @@ async fn rename_duplicate_sibling_rejected_nested() {
     )
     .expect("build T");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_folder(&harness, &a_old).await;
     ingest_folder(&harness, &b_old).await;
     ingest_folder(&harness, &t_old).await;
@@ -836,10 +812,7 @@ async fn rename_duplicate_sibling_rejected_top_level() {
     let (a_cid, a_bytes) = make_leaf(b"alpha");
     let (b_cid, b_bytes) = make_leaf(b"beta");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_leaf(&harness, a_cid, a_bytes.clone()).await;
     ingest_leaf(&harness, b_cid, b_bytes.clone()).await;
 
@@ -890,10 +863,7 @@ async fn rename_name_mismatch_rejected() {
     // Top-level: src_child_name does not match the sidecar entry name.
     let (l_cid, l_bytes) = make_leaf(b"mismatch-top");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_leaf(&harness, l_cid, l_bytes.clone()).await;
 
     let index = fresh_index();
@@ -984,10 +954,7 @@ async fn rename_concurrent_rekey_conflict() {
     )
     .expect("build T");
 
-    let harness = match spawn_test_runtime().await {
-        Some(h) => h,
-        None => return,
-    };
+    let harness = spawn_test_runtime().await;
     ingest_folder(&harness, &f_old).await;
     ingest_folder(&harness, &t_old).await;
 
