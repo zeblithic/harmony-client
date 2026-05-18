@@ -329,6 +329,7 @@
     srcSidecarId: string;
     srcPath: string[];
     srcChildCid: string;
+    srcChildName: string;
     dstSidecarId: string | null;
     dstPath: string[];
   } | null {
@@ -374,6 +375,7 @@
         srcSidecarId: src.srcSidecarId,
         srcPath: src.srcPath,
         srcChildCid: src.srcChildCid,
+        srcChildName: src.srcChildName,
         dstSidecarId,
         dstPath,
       };
@@ -391,6 +393,7 @@
         srcSidecarId: src.srcSidecarId,
         srcPath: src.srcPath,
         srcChildCid: src.srcChildCid,
+        srcChildName: src.srcChildName,
         dstSidecarId: null,
         dstPath: [],
       };
@@ -415,6 +418,7 @@
       srcSidecarId: src.srcSidecarId,
       srcPath: src.srcPath,
       srcChildCid: src.srcChildCid,
+      srcChildName: src.srcChildName,
       dstSidecarId: topLevel,
       dstPath,
     };

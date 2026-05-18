@@ -6103,12 +6103,25 @@ async fn create_folder(
 
 /// Per-ancestor manifest edit driving `walk_and_rebuild_chain`.
 ///
-/// `Remove` drops the entry whose CID matches; `Replace` flips the CID
-/// of the entry whose CID matches `old_child_cid`; `Append` appends a
-/// new entry at the tail.
+/// `Remove` drops the entry whose `(name, cid)` matches; `Replace`
+/// flips the CID of the entry whose CID matches `old_child_cid`;
+/// `Append` appends a new entry at the tail.
+///
+/// `Remove` carries `child_name` because sibling manifest entries can
+/// legitimately share a CID (e.g., two empty folders, or two folders
+/// holding identical content) — matching by CID alone would
+/// non-deterministically remove the wrong sibling. Within a single
+/// folder `name` is unique, so `(name, cid)` is a stable per-entry
+/// discriminator at the leaf level. `Replace` is only emitted by
+/// upstream walk steps where the only edit target is the ancestor we
+/// just rebuilt below; the shared-CID hazard there requires two
+/// children of the SAME parent pointing at the SAME ancestor CID,
+/// which would only arise with mid-chain shared-content navigation
+/// (tracked separately for the broader path-level fix).
 enum AncestorEdit {
     Remove {
         child_cid: [u8; 32],
+        child_name: String,
     },
     Replace {
         old_child_cid: [u8; 32],
@@ -6188,16 +6201,20 @@ async fn walk_and_rebuild_chain(
                 AncestorEdit::Append { entry } => {
                     manifest.folder_manifest.entries.push(entry);
                 }
-                AncestorEdit::Remove { child_cid } => {
+                AncestorEdit::Remove {
+                    child_cid,
+                    child_name,
+                } => {
                     let target_idx = manifest
                         .folder_manifest
                         .entries
                         .iter()
-                        .position(|e| e.cid == child_cid)
+                        .position(|e| e.name == child_name && e.cid == child_cid)
                         .ok_or_else(|| {
                             format!(
-                                "ancestor {} has no entry pointing to child {}",
+                                "ancestor {} has no entry named '{}' pointing to child {}",
                                 hex::encode(anc_cid),
+                                child_name,
                                 hex::encode(child_cid)
                             )
                         })?;
@@ -6628,10 +6645,12 @@ pub struct MoveContentResult {
 ///   mint a new top-level sidecar entry for the moved child, then rekey
 ///   src.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn move_content(
     src_sidecar_id: String,
     src_path: Vec<String>,
     src_child_cid: String,
+    src_child_name: String,
     dst_sidecar_id: Option<String>,
     dst_path: Vec<String>,
     new_name: Option<String>,
@@ -6655,6 +6674,7 @@ async fn move_content(
         src_sidecar_id,
         src_path,
         src_child_cid,
+        src_child_name,
         dst_sidecar_id,
         dst_path,
         new_name,
@@ -6669,11 +6689,18 @@ async fn move_content(
 /// `tauri::State` so integration tests can drive it with a raw
 /// `(ingest_tx, verb_tx, ContentIndex)` triple. Production callers go
 /// through the `#[tauri::command]` wrapper.
+///
+/// `src_child_name` is the manifest entry name of the moved child
+/// inside its immediate parent (for Cases A/B/D) or the sidecar
+/// `file_name` (for Case C). Carried alongside the CID because sibling
+/// entries can legitimately share a CID — the name acts as the stable
+/// per-entry discriminator.
 #[allow(clippy::too_many_arguments)]
 pub async fn move_content_impl(
     src_sidecar_id: String,
     src_path: Vec<String>,
     src_child_cid: String,
+    src_child_name: String,
     dst_sidecar_id: Option<String>,
     dst_path: Vec<String>,
     new_name: Option<String>,
@@ -6753,15 +6780,26 @@ pub async fn move_content_impl(
     // for the destination-side append (Cases A, B) and for the new
     // top-level entry mint (Case D). For Case C the moved child IS the
     // top-level, so the manifest name + kind come from the source's
-    // sidecar entry.
+    // sidecar entry — verify the caller-supplied name matches.
     let moved_entry: folders::ManifestEntry = if is_case_c {
+        if src_entry_name != src_child_name {
+            return Err(format!(
+                "src_child_name '{src_child_name}' does not match src sidecar entry name '{src_entry_name}'",
+            ));
+        }
         folders::ManifestEntry {
             cid: child_cid,
             name: src_entry_name.clone(),
             kind: src_entry_kind,
         }
     } else {
-        read_child_manifest_entry(&verb_tx, src_cids[src_cids.len() - 1], child_cid).await?
+        read_child_manifest_entry(
+            &verb_tx,
+            src_cids[src_cids.len() - 1],
+            child_cid,
+            &src_child_name,
+        )
+        .await?
     };
 
     // Cycle check: if the moved child is itself a folder, ensure it
@@ -6911,20 +6949,25 @@ pub async fn move_content_impl(
 }
 
 /// Read an ancestor folder's bundle + manifest and return the
-/// `(cid, name, kind)` entry whose CID matches `child_cid`.
+/// `(cid, name, kind)` entry whose `(name, cid)` matches the caller's
+/// expectation. Within a folder, `name` is unique, so the name
+/// disambiguates between siblings that happen to share a CID
+/// (content-identical entries — e.g., two empty folders).
 async fn read_child_manifest_entry(
     verb_tx: &tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>,
     parent_cid: [u8; 32],
     child_cid: [u8; 32],
+    child_name: &str,
 ) -> Result<folders::ManifestEntry, String> {
     let entries = read_manifest_entries(verb_tx, parent_cid).await?;
     entries
         .into_iter()
-        .find(|e| e.cid == child_cid)
+        .find(|e| e.name == child_name && e.cid == child_cid)
         .ok_or_else(|| {
             format!(
-                "src_path's immediate parent {} has no entry pointing to child {}",
+                "src_path's immediate parent {} has no entry named '{}' pointing to child {}",
                 hex::encode(parent_cid),
+                child_name,
                 hex::encode(child_cid)
             )
         })
@@ -6982,6 +7025,16 @@ async fn move_case_a(
     stored_at_ms: u64,
 ) -> Result<MoveContentResult, String> {
     let src_root_old = src_cids[0];
+    // Case A invariant: caller-side dispatch has already verified src
+    // and dst share the same top-level sidecar AND non-empty paths,
+    // which implies src_cids[0] == dst_cids[0]. Belt-and-braces: trip
+    // the assert in debug builds if the dispatch ever regresses, since
+    // an LCA computation starting at lca_idx=0 with a mismatched root
+    // would silently produce a corrupt Y-shape walk.
+    debug_assert!(
+        !src_cids.is_empty() && !dst_cids.is_empty() && src_cids[0] == dst_cids[0],
+        "move_case_a invariant: src and dst must share top-level root",
+    );
     // LCA index is the largest i where src_cids[..=i] == dst_cids[..=i].
     let mut lca_idx: usize = 0;
     let max = src_cids.len().min(dst_cids.len());
@@ -7000,7 +7053,10 @@ async fn move_case_a(
         let walked = walk_and_rebuild_chain(
             verb_tx,
             src_below_lca,
-            AncestorEdit::Remove { child_cid },
+            AncestorEdit::Remove {
+                child_cid,
+                child_name: moved_entry.name.clone(),
+            },
             &mut pending_ingests,
         )
         .await?;
@@ -7040,11 +7096,12 @@ async fn move_case_a(
     let src_lca_pos: usize = match (src_side_new_below, src_side_old_below_lca) {
         (None, None) => lca_entries
             .iter()
-            .position(|e| e.cid == child_cid)
+            .position(|e| e.name == moved_entry.name && e.cid == child_cid)
             .ok_or_else(|| {
                 format!(
-                    "ancestor {} has no entry pointing to child {}",
+                    "ancestor {} has no entry named '{}' pointing to child {}",
                     hex::encode(lca_cid),
+                    moved_entry.name,
                     hex::encode(child_cid)
                 )
             })?,
@@ -7203,7 +7260,10 @@ async fn move_case_b(
     let src_walked = walk_and_rebuild_chain(
         verb_tx,
         src_cids,
-        AncestorEdit::Remove { child_cid },
+        AncestorEdit::Remove {
+            child_cid,
+            child_name: moved_entry.name.clone(),
+        },
         &mut pending_ingests,
     )
     .await?;
@@ -7425,7 +7485,10 @@ async fn move_case_d(
     let src_walked = walk_and_rebuild_chain(
         verb_tx,
         src_cids,
-        AncestorEdit::Remove { child_cid },
+        AncestorEdit::Remove {
+            child_cid,
+            child_name: moved_entry.name.clone(),
+        },
         &mut pending_ingests,
     )
     .await?;
@@ -7759,6 +7822,7 @@ mod walk_and_rebuild_chain_tests {
             &[f.bundle_cid.to_bytes()],
             AncestorEdit::Remove {
                 child_cid: leaf_cid,
+                child_name: "leaf".into(),
             },
             &mut pending,
         )
@@ -7872,6 +7936,7 @@ mod walk_and_rebuild_chain_tests {
             &[[0x66; 32]],
             AncestorEdit::Remove {
                 child_cid: [0x77; 32],
+                child_name: "absent".into(),
             },
             &mut pending,
         )
@@ -7924,13 +7989,17 @@ mod walk_and_rebuild_chain_tests {
             &[outer.bundle_cid.to_bytes(), inner.bundle_cid.to_bytes()],
             AncestorEdit::Remove {
                 child_cid: [0xEE; 32],
+                child_name: "absent".into(),
             },
             &mut pending,
         )
         .await
         .expect_err("missing child must surface as Err");
 
-        assert!(err.contains("has no entry pointing to child"), "got: {err}");
+        assert!(
+            err.contains("has no entry named 'absent' pointing to child"),
+            "got: {err}"
+        );
         assert!(pending.is_empty(), "pending must be untouched on error");
     }
 
@@ -7963,7 +8032,10 @@ mod walk_and_rebuild_chain_tests {
         let walked = walk_and_rebuild_chain(
             &verb_tx,
             &[outer.bundle_cid.to_bytes(), inner.bundle_cid.to_bytes()],
-            AncestorEdit::Remove { child_cid: leaf },
+            AncestorEdit::Remove {
+                child_cid: leaf,
+                child_name: "leaf".into(),
+            },
             &mut pending,
         )
         .await

@@ -41,6 +41,7 @@ describe('FileManagerService.moveContent', () => {
         srcSidecarId: 'sid-src',
         srcPath: ['aa'.repeat(32)],
         srcChildCid: 'cc'.repeat(32),
+        srcChildName: 'doc.txt',
         dstSidecarId: 'sid-dst',
         dstPath: ['dd'.repeat(32)],
       }),
@@ -64,6 +65,7 @@ describe('FileManagerService.moveContent', () => {
       srcSidecarId: 'sid-T',
       srcPath: ['top'.padEnd(64, '0'), 'parA'.padEnd(64, '0')],
       srcChildCid: 'child'.padEnd(64, '0'),
+      srcChildName: 'doc.txt',
       dstSidecarId: 'sid-T',
       dstPath: ['top'.padEnd(64, '0'), 'parB'.padEnd(64, '0')],
     });
@@ -72,6 +74,7 @@ describe('FileManagerService.moveContent', () => {
       srcSidecarId: 'sid-T',
       srcPath: ['top'.padEnd(64, '0'), 'parA'.padEnd(64, '0')],
       srcChildCid: 'child'.padEnd(64, '0'),
+      srcChildName: 'doc.txt',
       dstSidecarId: 'sid-T',
       dstPath: ['top'.padEnd(64, '0'), 'parB'.padEnd(64, '0')],
       newName: null,
@@ -91,6 +94,7 @@ describe('FileManagerService.moveContent', () => {
       srcSidecarId: 'sid-T1',
       srcPath: ['t1'.padEnd(64, '0'), 'p'.padEnd(64, '0')],
       srcChildCid: 'c'.padEnd(64, '0'),
+      srcChildName: 'doc.txt',
       dstSidecarId: 'sid-T2',
       dstPath: ['t2'.padEnd(64, '0')],
     });
@@ -120,6 +124,7 @@ describe('FileManagerService.moveContent', () => {
       srcSidecarId: 'sid-leaf-as-top',
       srcPath: [topCid],
       srcChildCid: topCid,
+      srcChildName: 'top-level-leaf',
       dstSidecarId: 'sid-dst',
       dstPath: ['dd'.repeat(32)],
     });
@@ -149,6 +154,7 @@ describe('FileManagerService.moveContent', () => {
       srcSidecarId: 'sid-T',
       srcPath: ['top'.padEnd(64, '0'), 'parent'.padEnd(64, '0')],
       srcChildCid: 'child'.padEnd(64, '0'),
+      srcChildName: 'doc.txt',
       dstSidecarId: null,
       dstPath: [],
     });
@@ -185,6 +191,7 @@ describe('FileManagerService.moveContent', () => {
       srcSidecarId: 'sid-T',
       srcPath: ['t'.padEnd(64, '0'), 'p'.padEnd(64, '0')],
       srcChildCid: 'c'.padEnd(64, '0'),
+      srcChildName: 'doc.txt',
       dstSidecarId: 'sid-T',
       dstPath: ['t'.padEnd(64, '0'), 'q'.padEnd(64, '0')],
     });
@@ -215,6 +222,7 @@ describe('FileManagerService.moveContent', () => {
         srcSidecarId: 'sid-T',
         srcPath: ['t'.padEnd(64, '0'), 'p'.padEnd(64, '0')],
         srcChildCid: 'c'.padEnd(64, '0'),
+        srcChildName: 'foo.txt',
         dstSidecarId: 'sid-T',
         dstPath: ['t'.padEnd(64, '0'), 'q'.padEnd(64, '0')],
       }),

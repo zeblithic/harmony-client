@@ -489,6 +489,13 @@ export class FileManagerService {
     srcSidecarId: string;
     srcPath: string[];
     srcChildCid: string;
+    /**
+     * Manifest entry name of the dragged row (or sidecar `file_name`
+     * when the source IS a top-level entry). Required because sibling
+     * entries can share a CID — name disambiguates which sibling to
+     * remove. Mismatch with the on-disk manifest aborts the move.
+     */
+    srcChildName: string;
     dstSidecarId: string | null;
     dstPath: string[];
     newName?: null;
@@ -498,6 +505,7 @@ export class FileManagerService {
       srcSidecarId: args.srcSidecarId,
       srcPath: args.srcPath,
       srcChildCid: args.srcChildCid,
+      srcChildName: args.srcChildName,
       dstSidecarId: args.dstSidecarId,
       dstPath: args.dstPath,
       newName: null,

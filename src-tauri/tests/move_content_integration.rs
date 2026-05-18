@@ -316,6 +316,7 @@ async fn move_a_within_same_top_level_one_level_deep() {
             hex::encode(a_old.bundle_cid.to_bytes()),
         ],
         hex::encode(l_cid),
+        "L".to_string(),
         Some(t_sid.to_string()),
         vec![
             hex::encode(t_old.bundle_cid.to_bytes()),
@@ -413,6 +414,7 @@ async fn move_b_across_top_levels() {
         t1_sid.to_string(),
         vec![hex::encode(t1_old.bundle_cid.to_bytes())],
         hex::encode(l_cid),
+        "L".to_string(),
         Some(t2_sid.to_string()),
         vec![hex::encode(t2_old.bundle_cid.to_bytes())],
         None,
@@ -493,6 +495,7 @@ async fn move_c_root_to_nested() {
         l_sid.to_string(),
         vec![hex::encode(l_cid)],
         hex::encode(l_cid),
+        "L".to_string(),
         Some(f_sid.to_string()),
         vec![hex::encode(f_old.bundle_cid.to_bytes())],
         None,
@@ -561,6 +564,7 @@ async fn move_d_nested_to_root() {
         f_sid.to_string(),
         vec![hex::encode(f_old.bundle_cid.to_bytes())],
         hex::encode(l_cid),
+        "L".to_string(),
         None,
         vec![],
         None,
@@ -648,6 +652,7 @@ async fn move_b_dst_rekey_conflict_at_stage_1_no_undo_path() {
         t1_sid.to_string(),
         vec![hex::encode(t1_old.bundle_cid.to_bytes())],
         hex::encode(l_cid),
+        "L".to_string(),
         Some(t2_sid.to_string()),
         vec![hex::encode(t2_old.bundle_cid.to_bytes())],
         None,
@@ -739,6 +744,7 @@ async fn move_b_src_rekey_conflict_after_dst_commit_undo_reverts_dst() {
         t1_sid.to_string(),
         vec![hex::encode(t1_old.bundle_cid.to_bytes())],
         hex::encode(l_cid),
+        "L".to_string(),
         Some(t2_sid.to_string()),
         vec![hex::encode(t2_old.bundle_cid.to_bytes())],
         None,
@@ -805,6 +811,7 @@ async fn move_cycle_rejected() {
         t_sid.to_string(),
         vec![hex::encode(t_old.bundle_cid.to_bytes())],
         hex::encode(t_old.bundle_cid.to_bytes()),
+        "T".to_string(),
         Some(t_sid.to_string()),
         vec![
             hex::encode(t_old.bundle_cid.to_bytes()),
@@ -859,6 +866,7 @@ async fn move_no_op_rejected() {
         t_sid.to_string(),
         vec![hex::encode(t_old.bundle_cid.to_bytes())],
         hex::encode(l_cid),
+        "L".to_string(),
         Some(t_sid.to_string()),
         vec![hex::encode(t_old.bundle_cid.to_bytes())],
         None,
@@ -934,6 +942,7 @@ async fn move_name_collision_rejected() {
         t1_sid.to_string(),
         vec![hex::encode(t1_old.bundle_cid.to_bytes())],
         hex::encode(cid_a),
+        "foo.txt".to_string(),
         Some(t2_sid.to_string()),
         vec![hex::encode(t2_old.bundle_cid.to_bytes())],
         None,
@@ -1028,6 +1037,7 @@ async fn move_pin_cascade_a_within_same_root() {
             hex::encode(a_old.bundle_cid.to_bytes()),
         ],
         hex::encode(l_cid),
+        "L".to_string(),
         Some(t_sid.to_string()),
         vec![
             hex::encode(t_old.bundle_cid.to_bytes()),
@@ -1107,6 +1117,7 @@ async fn move_d_new_top_level_pin_defaults_unpinned() {
         f_sid.to_string(),
         vec![hex::encode(f_old.bundle_cid.to_bytes())],
         hex::encode(l_cid),
+        "L".to_string(),
         None,
         vec![],
         None,
@@ -1154,6 +1165,7 @@ async fn move_top_level_to_root_rejected() {
         l_sid.to_string(),
         vec![hex::encode(l_cid)],
         hex::encode(l_cid),
+        "L".to_string(),
         None,
         vec![],
         None,
@@ -1214,6 +1226,7 @@ async fn move_case_c_src_concurrently_rekeyed_compensates() {
         l_sid.to_string(),
         vec![hex::encode(l_cid)],
         hex::encode(l_cid),
+        "L".to_string(),
         Some(f_sid.to_string()),
         vec![hex::encode(f_old.bundle_cid.to_bytes())],
         None,
@@ -1241,5 +1254,157 @@ async fn move_case_c_src_concurrently_rekeyed_compensates() {
         idx.get(&f_sid).unwrap().cid,
         f_old_cid,
         "F ends at its original CID (no leftover forward-rekey)"
+    );
+}
+
+// ── Test 19: move_disambiguates_siblings_with_shared_cid (CodeRabbit round 3) ─
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn move_disambiguates_siblings_with_shared_cid() {
+    // Two sibling sub-folders in T that share the empty-folder CID
+    // because both are empty. Pre-fix the source-side walk matched by
+    // CID alone and would remove whichever entry .position() hit first
+    // (EmptyA), even though the caller asked to move EmptyB. The
+    // round-3 fix carries `child_name` through the IPC + walk so the
+    // requested sibling is removed.
+    let empty = folders::build_folder("", &[]).expect("build empty placeholder");
+    let empty_cid = empty.bundle_cid.to_bytes();
+    let t_old = folders::build_folder(
+        "T",
+        &[
+            folders::ManifestEntry {
+                cid: empty_cid,
+                name: "EmptyA".into(),
+                kind: ContentKind::Folder,
+            },
+            folders::ManifestEntry {
+                cid: empty_cid,
+                name: "EmptyB".into(),
+                kind: ContentKind::Folder,
+            },
+        ],
+    )
+    .expect("build T with two shared-CID siblings");
+
+    let harness = match spawn_test_runtime().await {
+        Some(h) => h,
+        None => return,
+    };
+    ingest_folder(&harness, &empty).await;
+    ingest_folder(&harness, &t_old).await;
+
+    let index = fresh_index();
+    let t_sid = insert_top_level(
+        &index,
+        t_old.bundle_cid.to_bytes(),
+        "T",
+        ContentKind::Folder,
+        false,
+        t_old.bundle_bytes.len() as u64,
+    );
+
+    // Move EmptyB (the second sibling) to root via Case D.
+    let result = harmony_app::move_content_impl(
+        t_sid.to_string(),
+        vec![hex::encode(t_old.bundle_cid.to_bytes())],
+        hex::encode(empty_cid),
+        "EmptyB".to_string(),
+        None,
+        vec![],
+        None,
+        harness.ingest_tx.clone(),
+        harness.verb_tx.clone(),
+        index.clone(),
+    )
+    .await
+    .expect("move EmptyB to root");
+
+    // The rebuilt T must contain exactly one entry — and that entry
+    // must be EmptyA, not EmptyB. (Both removal outcomes leave a
+    // single-entry manifest of the same length, but different names,
+    // so different bundle CIDs.)
+    let t_new_cid_hex = result.src_new_cid.expect("src rekeyed");
+    let t_new_cid_bytes = hex::decode(&t_new_cid_hex).expect("hex decode");
+    let mut t_new_cid = [0u8; 32];
+    t_new_cid.copy_from_slice(&t_new_cid_bytes);
+    let expected_t_new = folders::build_folder(
+        "T",
+        &[folders::ManifestEntry {
+            cid: empty_cid,
+            name: "EmptyA".into(),
+            kind: ContentKind::Folder,
+        }],
+    )
+    .expect("build expected T");
+    assert_eq!(
+        t_new_cid,
+        expected_t_new.bundle_cid.to_bytes(),
+        "T must end with [EmptyA] (the requested-move-target EmptyB was removed)",
+    );
+
+    // The minted top-level sidecar must carry the moved sibling's name.
+    let new_top_sid = SidecarId::parse_str(&result.dst_sidecar_id).expect("parse dst sid");
+    let idx = index.lock().unwrap();
+    let new_top = idx.get(&new_top_sid).expect("new top entry exists");
+    assert_eq!(new_top.file_name, "EmptyB");
+    assert_eq!(new_top.cid, empty_cid);
+}
+
+// ── Test 20: move_rejects_when_name_does_not_match_cid ────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn move_rejects_when_name_does_not_match_cid() {
+    // If the caller passes a `src_child_name` that disagrees with the
+    // manifest's actual entry name for `src_child_cid`, the move must
+    // refuse rather than silently grabbing whichever sibling happens
+    // to match by CID. This protects against stale frontend state
+    // where the row that was dragged no longer exists by the time the
+    // command reaches the backend.
+    let (l_cid, l_bytes) = make_leaf(b"named-mismatch");
+    let a_old = folders::build_folder(
+        "A",
+        &[folders::ManifestEntry {
+            cid: l_cid,
+            name: "actual-name".into(),
+            kind: ContentKind::Leaf,
+        }],
+    )
+    .expect("build A");
+
+    let harness = match spawn_test_runtime().await {
+        Some(h) => h,
+        None => return,
+    };
+    ingest_leaf(&harness, l_cid, l_bytes).await;
+    ingest_folder(&harness, &a_old).await;
+
+    let index = fresh_index();
+    let a_sid = insert_top_level(
+        &index,
+        a_old.bundle_cid.to_bytes(),
+        "A",
+        ContentKind::Folder,
+        false,
+        a_old.bundle_bytes.len() as u64,
+    );
+
+    let err = harmony_app::move_content_impl(
+        a_sid.to_string(),
+        vec![hex::encode(a_old.bundle_cid.to_bytes())],
+        hex::encode(l_cid),
+        "stale-name".to_string(),
+        None,
+        vec![],
+        None,
+        harness.ingest_tx.clone(),
+        harness.verb_tx.clone(),
+        index.clone(),
+    )
+    .await
+    .expect_err("mismatched name must reject");
+
+    assert!(
+        err.contains("has no entry named 'stale-name'"),
+        "expected name+cid mismatch error, got: {err}"
     );
 }
