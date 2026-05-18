@@ -7,10 +7,17 @@
     item,
     onClick,
     selected = false,
+    onRowDragStart,
+    onRowDragEnd,
+    onRowDrop,
   }: {
     item: ContentItem;
     onClick?: (item: ContentItem) => void;
     selected?: boolean;
+    /** ZEB-162: drag-drop handlers wired by FileList → FileBrowser. */
+    onRowDragStart?: (e: DragEvent, item: ContentItem) => void;
+    onRowDragEnd?: (e: DragEvent, item: ContentItem) => void;
+    onRowDrop?: (e: DragEvent, targetCid: string) => void;
   } = $props();
 
   let icon = $derived(categoryIcon(item.category));
@@ -18,13 +25,25 @@
   let lastAccessed = $derived(relativeTime(item.lastAccessed));
   let replication = $derived(`${item.replicaCount}/${tierTarget(item.replicationTier)}`);
   let sensIcon = $derived(sensitivityIcon(item.sensitivity));
+
+  function handleDragOver(e: DragEvent) {
+    if (!item.isFolder) return;
+    // preventDefault is required to mark this element as a valid drop target.
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+  }
 </script>
 
 <button
   class="file-row"
   class:selected
   role="row"
+  draggable="true"
   onclick={() => onClick?.(item)}
+  ondragstart={(e) => onRowDragStart?.(e, item)}
+  ondragend={(e) => onRowDragEnd?.(e, item)}
+  ondragover={handleDragOver}
+  ondrop={item.isFolder ? (e) => onRowDrop?.(e, item.cid) : undefined}
   aria-label={item.name}
 >
   <span class="file-row-icon" aria-hidden="true">{icon}</span>

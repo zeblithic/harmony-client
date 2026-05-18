@@ -378,6 +378,23 @@ impl ContentIndex {
     pub fn entries(&self) -> impl Iterator<Item = &ContentIndexEntry> {
         self.entries.values()
     }
+
+    /// Test-only: bypass the CAS check and force an entry's CID to a
+    /// new value. Used by `tests/move_content_integration.rs` to
+    /// simulate a concurrent rekey landing between two awaited points
+    /// inside `move_content` — the production code's `rekey` always
+    /// requires an `expected_old_cid`, so simulating "an unrelated
+    /// rekey already landed" needs a non-CAS rewrite. Returns `true`
+    /// if an entry was rewritten.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn force_set_cid_for_test(&mut self, id: &SidecarId, new_cid: [u8; 32]) -> bool {
+        let Some(entry) = self.entries.get_mut(id) else {
+            return false;
+        };
+        entry.cid = new_cid;
+        self.save();
+        true
+    }
 }
 
 pub(crate) mod hex_cid {

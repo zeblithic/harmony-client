@@ -18,6 +18,26 @@
   import PublishedView from './PublishedView.svelte';
   import CleanupView from './CleanupView.svelte';
 
+  // ZEB-162: custom MIME for drag-drop content moves. Deliberately NOT
+  // text/plain — that would invite OS-level text drops (URLs, snippets)
+  // to fire move handlers.
+  const HARMONY_DRAG_MIME = 'application/x-harmony-content';
+
+  /** Payload that rides on dataTransfer between the dragged row and the
+   *  drop target. srcChildName and srcChildKind are carried for client-side
+   *  pre-checks; the backend re-validates everything. */
+  type DragPayload = {
+    srcSidecarId: string;
+    srcPath: string[];
+    srcChildCid: string;
+    srcChildName: string;
+    srcChildKind: 'folder' | 'leaf';
+  };
+
+  type DropTarget =
+    | { kind: 'folder-row'; cid: string }
+    | { kind: 'breadcrumb'; segIdx: number };
+
   let {
     service,
     currentFolderCid = null,
@@ -97,6 +117,15 @@
   // lifecycle.
   let pendingNav: { cid: string; name: string; sidecarId?: string } | null = null;
 
+  // ZEB-162 drag-drop coordination state. `error` surfaces backend
+  // failures inline (no window.alert; ZEB-166 bans those from this
+  // component). `draggingPayload` tracks the in-flight drag — not
+  // strictly required for correctness (the payload also rides on
+  // dataTransfer), but lets the UI offer affordances like cycle-check
+  // hover styling without parsing the dataTransfer on every dragover.
+  let error = $state<string | null>(null);
+  let draggingPayload: DragPayload | null = $state(null);
+
   // Sync navStack with currentFolderCid (driven by the parent component).
   // The effect's only reactive dependency is currentFolderCid; navStack /
   // pendingNav / items are read inside untrack() so writes to navStack
@@ -104,6 +133,10 @@
   $effect(() => {
     const cid = currentFolderCid;
     untrack(() => {
+      // ZEB-162: auto-clear move-error banner on folder navigation —
+      // the error referred to the previous folder context and is no
+      // longer actionable here.
+      error = null;
       if (cid === null) {
         navStack = [];
         pendingNav = null;
@@ -283,6 +316,180 @@
   // Used by createFolder so the backend can cascade the CID update up the tree.
   let breadcrumbStack = $derived.by<string[]>(() => navStack.map((seg) => seg.cid));
 
+  // ZEB-162: compute the destination args from the active drag and drop
+  // target. Returns null when the drop is a no-op (drop on self, drop on
+  // current parent) so the caller can silently skip without invoking the
+  // backend and getting back a "source and destination are identical"
+  // rejection. The backend's checks remain the final authority — this
+  // pre-check is purely to avoid spurious error toasts.
+  function computeMoveArgs(
+    src: DragPayload,
+    dropTarget: DropTarget,
+  ): {
+    srcSidecarId: string;
+    srcPath: string[];
+    srcChildCid: string;
+    dstSidecarId: string | null;
+    dstPath: string[];
+  } | null {
+    if (dropTarget.kind === 'folder-row') {
+      // Drop on a folder row inside the current view. Destination is
+      // navStack chain extended by the target folder's cid. The
+      // top-level sidecar id is the same one we're currently inside;
+      // when at root navStack is empty and the target folder IS the
+      // top-level, so we use the dragged-from sidecarId vs the target
+      // folder's sidecar — but the target row's own sidecar id isn't
+      // known to this fn (the row only passes cid). For nested drops
+      // (navStack non-empty) navStack[0].sidecarId is the top-level.
+      // For root-view drops we re-look up the target folder's sidecar
+      // from the items list.
+      const dropOnSelf = src.srcChildCid === dropTarget.cid;
+      if (dropOnSelf) return null;
+      let dstSidecarId: string | null;
+      let dstPath: string[];
+      if (navStack.length === 0) {
+        // Dropping onto a top-level folder row. The target row IS a
+        // top-level sidecar entry; look it up from the current items.
+        const targetItem = items.find((i) => i.cid === dropTarget.cid);
+        if (!targetItem || !targetItem.sidecarId) return null;
+        dstSidecarId = targetItem.sidecarId;
+        dstPath = [dropTarget.cid];
+      } else {
+        const topLevel = navStack[0].sidecarId;
+        if (!topLevel) return null;
+        dstSidecarId = topLevel;
+        dstPath = [...navStack.map((s) => s.cid), dropTarget.cid];
+      }
+      // No-op when source's immediate parent equals destination parent
+      // chain AND the dragged child is already a direct child. This
+      // catches "drag onto the folder you're already inside of."
+      if (
+        src.srcSidecarId === dstSidecarId &&
+        src.srcPath.length === dstPath.length &&
+        src.srcPath.every((c, i) => c === dstPath[i])
+      ) {
+        return null;
+      }
+      return {
+        srcSidecarId: src.srcSidecarId,
+        srcPath: src.srcPath,
+        srcChildCid: src.srcChildCid,
+        dstSidecarId,
+        dstPath,
+      };
+    }
+    // Breadcrumb drop.
+    const { segIdx } = dropTarget;
+    if (segIdx === 0) {
+      // Root sentinel → Case D (nested → root). When source is already
+      // at root (srcPath.length === 1 && srcPath[0] === srcChildCid),
+      // moving to root is a no-op.
+      if (src.srcPath.length === 1 && src.srcPath[0] === src.srcChildCid) {
+        return null;
+      }
+      return {
+        srcSidecarId: src.srcSidecarId,
+        srcPath: src.srcPath,
+        srcChildCid: src.srcChildCid,
+        dstSidecarId: null,
+        dstPath: [],
+      };
+    }
+    // Nested breadcrumb. segIdx-1 is the index into navStack (because
+    // segIdx 0 is the root sentinel, segIdx 1 maps to navStack[0]).
+    const navIdx = segIdx - 1;
+    if (navIdx < 0 || navIdx >= navStack.length) return null;
+    const topLevel = navStack[0].sidecarId;
+    if (!topLevel) return null;
+    const dstPath = navStack.slice(0, navIdx + 1).map((s) => s.cid);
+    // Drop on the breadcrumb segment that equals the source's immediate
+    // parent is a no-op (would re-add into the same folder).
+    if (
+      src.srcSidecarId === topLevel &&
+      src.srcPath.length === dstPath.length &&
+      src.srcPath.every((c, i) => c === dstPath[i])
+    ) {
+      return null;
+    }
+    return {
+      srcSidecarId: src.srcSidecarId,
+      srcPath: src.srcPath,
+      srcChildCid: src.srcChildCid,
+      dstSidecarId: topLevel,
+      dstPath,
+    };
+  }
+
+  async function handleMove(src: DragPayload, dropTarget: DropTarget) {
+    const args = computeMoveArgs(src, dropTarget);
+    if (args === null) return; // silent no-op
+    try {
+      await service.moveContent(args);
+      error = null;
+    } catch (e) {
+      // Tauri error rejections are strings in production and `Error`
+      // objects with `"Error: "` prefix in tests; normalise to a clean
+      // message either way (per CLAUDE.md IPC error pattern).
+      const raw = e instanceof Error ? e.message : String(e);
+      error = raw.replace(/^Error:\s*/, '');
+    }
+  }
+
+  function handleRowDragStart(e: DragEvent, item: ContentItem) {
+    if (!e.dataTransfer) return;
+    // Build the source path: top-level CID → immediate parent CID
+    // (inclusive). Root rows have no nav stack ⇒ srcPath = [item.cid]
+    // (Case C source). Nested rows: navStack chain (top-level is
+    // navStack[0]) — items in current view have srcPath = navStack chain.
+    const srcPath =
+      navStack.length === 0 ? [item.cid] : navStack.map((s) => s.cid);
+    const srcSidecarId =
+      navStack.length === 0 ? item.sidecarId : navStack[0].sidecarId ?? '';
+    if (!srcSidecarId) return; // can't move without a top-level sidecar id
+    const payload: DragPayload = {
+      srcSidecarId,
+      srcPath,
+      srcChildCid: item.cid,
+      srcChildName: item.name,
+      srcChildKind: item.isFolder ? 'folder' : 'leaf',
+    };
+    e.dataTransfer.setData(HARMONY_DRAG_MIME, JSON.stringify(payload));
+    e.dataTransfer.effectAllowed = 'move';
+    draggingPayload = payload;
+  }
+
+  function handleRowDragEnd() {
+    draggingPayload = null;
+  }
+
+  function handleRowDrop(e: DragEvent, targetCid: string) {
+    e.preventDefault();
+    const raw = e.dataTransfer?.getData(HARMONY_DRAG_MIME);
+    if (!raw) return;
+    let payload: DragPayload;
+    try {
+      payload = JSON.parse(raw) as DragPayload;
+    } catch {
+      return;
+    }
+    draggingPayload = null;
+    void handleMove(payload, { kind: 'folder-row', cid: targetCid });
+  }
+
+  function handleBreadcrumbDrop(e: DragEvent, segIdx: number) {
+    e.preventDefault();
+    const raw = e.dataTransfer?.getData(HARMONY_DRAG_MIME);
+    if (!raw) return;
+    let payload: DragPayload;
+    try {
+      payload = JSON.parse(raw) as DragPayload;
+    } catch {
+      return;
+    }
+    draggingPayload = null;
+    void handleMove(payload, { kind: 'breadcrumb', segIdx });
+  }
+
   function handleItemClick(item: ContentItem) {
     if (item.isFolder) {
       // Stash for the navStack $effect. sidecarId is only set when the
@@ -366,12 +573,37 @@
         onBulkPublish={(cids) => onBulkPublish?.(cids)}
       />
     {:else}
-      <Breadcrumbs path={breadcrumbPath} onNavigate={onNavigateFolder} />
+      <Breadcrumbs
+        path={breadcrumbPath}
+        onNavigate={onNavigateFolder}
+        onSegmentDrop={handleBreadcrumbDrop}
+        dragMime={HARMONY_DRAG_MIME}
+      />
+
+      {#if error}
+        <div class="file-browser-error" role="alert">{error}</div>
+      {/if}
 
       {#if viewMode === 'list'}
-        <FileList {items} {selectedCid} {selectedSidecarId} onItemClick={handleItemClick} />
+        <FileList
+          {items}
+          {selectedCid}
+          {selectedSidecarId}
+          onItemClick={handleItemClick}
+          onRowDragStart={handleRowDragStart}
+          onRowDragEnd={handleRowDragEnd}
+          onRowDrop={handleRowDrop}
+        />
       {:else}
-        <FileGrid {items} {selectedCid} {selectedSidecarId} onItemClick={handleItemClick} />
+        <FileGrid
+          {items}
+          {selectedCid}
+          {selectedSidecarId}
+          onItemClick={handleItemClick}
+          onRowDragStart={handleRowDragStart}
+          onRowDragEnd={handleRowDragEnd}
+          onRowDrop={handleRowDrop}
+        />
       {/if}
 
       <QuotaBar
@@ -391,5 +623,15 @@
     flex-direction: column;
     height: 100%;
     min-height: 0;
+  }
+
+  .file-browser-error {
+    margin: 8px 12px;
+    padding: 8px 12px;
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--danger, #ed4245) 12%, transparent);
+    border: 1px solid var(--danger, #ed4245);
+    color: var(--text-primary, #f2f3f5);
+    font-size: 0.85rem;
   }
 </style>
