@@ -25,6 +25,7 @@
 import type { TauriAdapter } from './zenoh-service';
 import type {
   AutoExecAction,
+  DelegationEdgeExport,
   PollMeta,
   PollStateExport,
   Tier2ProposalExport,
@@ -385,6 +386,19 @@ export class VotingAdapter {
   /** Revoke the caller's Delegate edge in `communityId`. */
   async undelegateTier2(communityId: string): Promise<void> {
     await this.invoke<void>('voting_undelegate_tier2', { communityId });
+  }
+
+  /** ZEB-292 Phase 3: read the caller's current delegate (32-hex
+   *  `OwnerAddr`), or null when the caller votes directly. */
+  async getMyDelegate(communityId: string): Promise<string | null> {
+    const r = await this.invoke<string | null>('voting_get_my_delegate', { communityId });
+    return r ?? null;
+  }
+
+  /** ZEB-292 Phase 3: list every live Delegate edge in the community —
+   *  consumed by the delegation-graph visualization. */
+  async listDelegations(communityId: string): Promise<DelegationEdgeExport[]> {
+    return this.invoke<DelegationEdgeExport[]>('voting_list_delegations', { communityId });
   }
 
   /** List all Tier 2 proposals (any lifecycle) for `communityId`. */

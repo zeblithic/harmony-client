@@ -18950,6 +18950,108 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
     Ok(())
 }
 
+/// ZEB-292 Phase 3: serialized delegation edge DTO for the frontend graph
+/// visualization. `lastHlcMs` + `lastHlcLogical` are the HLC ordinal of the
+/// most recent terminal event for this delegator (Delegate or Undelegate);
+/// surfaces in the graph so the UI can sort or fade stale edges if it
+/// wants. Field names use camelCase via the serde-rename annotation since
+/// they cross the IPC boundary.
+#[derive(serde::Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegationEdgeExport {
+    /// 32-hex-char `OwnerAddr` of the delegator.
+    pub from: String,
+    /// 32-hex-char `OwnerAddr` of the delegate.
+    pub to: String,
+    /// Wall-clock millisecond component of the HLC.
+    pub last_hlc_ms: u64,
+    /// Logical-counter component of the HLC.
+    pub last_hlc_logical: u32,
+}
+
+/// Tauri IPC: read the caller's current delegate in `community_id`, if
+/// any. Returns `Some(hex_owner_addr)` (32 hex chars) when the caller has
+/// a live Delegate edge, or `None` when they vote directly.
+#[tauri::command]
+async fn voting_get_my_delegate(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    community_id: String,
+) -> Result<Option<String>, String> {
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(cid_bytes);
+
+    let (self_owner, voting_logs) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.dm_self_owner.ok_or("dm_self_owner missing")?,
+            std::sync::Arc::clone(&g.voting_logs),
+        )
+    };
+
+    let log_arc = {
+        let map = voting_logs.lock().await;
+        match map.get(&space_id).cloned() {
+            Some(arc) => arc,
+            None => return Ok(None),
+        }
+    };
+    let log = log_arc.lock().await;
+    Ok(log
+        .delegation_graph
+        .delegate_of(self_owner)
+        .map(|addr| hex::encode(addr.0)))
+}
+
+/// Tauri IPC: list every live Delegate edge in `community_id`. Returns
+/// an empty vec when no `VotingLog` exists locally for the community
+/// (e.g. the user just joined and hasn't synced yet). Edge iteration
+/// order is non-deterministic; the frontend graph layout doesn't depend
+/// on it.
+#[tauri::command]
+async fn voting_list_delegations(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    community_id: String,
+) -> Result<Vec<DelegationEdgeExport>, String> {
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(cid_bytes);
+
+    let voting_logs = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        std::sync::Arc::clone(&g.voting_logs)
+    };
+
+    let log_arc = {
+        let map = voting_logs.lock().await;
+        match map.get(&space_id).cloned() {
+            Some(arc) => arc,
+            None => return Ok(Vec::new()),
+        }
+    };
+    let log = log_arc.lock().await;
+    Ok(log
+        .delegation_graph
+        .iter_edges()
+        .map(|(from, to, (wall, logical))| DelegationEdgeExport {
+            from: hex::encode(from.0),
+            to: hex::encode(to.0),
+            last_hlc_ms: wall,
+            last_hlc_logical: logical,
+        })
+        .collect())
+}
+
 /// Tauri IPC: list all Tier 2 proposals for `community_id` — regardless
 /// of lifecycle (the UI filters by status: active / threshold-reached /
 /// finalized / archived). Returns the full DTO per proposal so a list
@@ -19310,6 +19412,9 @@ pub fn run() {
             voting_list_tier2_proposals,
             voting_get_tier2_proposal,
             voting_contest_tier2_finalization,
+            // ZEB-292 Phase 3: delegation UI read IPCs.
+            voting_get_my_delegate,
+            voting_list_delegations,
             #[cfg(debug_assertions)]
             e2e_close_window,
         ])
@@ -19349,6 +19454,9 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         voting_list_tier2_proposals,
         voting_get_tier2_proposal,
         voting_contest_tier2_finalization,
+        // ZEB-292 Phase 3: delegation UI read IPCs.
+        voting_get_my_delegate,
+        voting_list_delegations,
     ])
 }
 

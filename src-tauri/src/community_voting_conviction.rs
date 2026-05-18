@@ -725,6 +725,17 @@ impl DelegationGraph {
             .map(|(delegator, _)| *delegator)
     }
 
+    /// Iterate every live delegation edge as `(delegator, delegate, hlc)`.
+    /// Used by `voting_list_delegations` to surface the full graph to the
+    /// frontend visualization. Iteration order is the underlying HashMap
+    /// order — not deterministic across runs; consumers must not rely on
+    /// it for cross-engine convergence (the CRDT itself converges).
+    pub fn iter_edges(&self) -> impl Iterator<Item = (OwnerAddr, OwnerAddr, HlcOrdinal)> + '_ {
+        self.edges
+            .iter()
+            .map(|(delegator, &(delegate, hlc))| (*delegator, delegate, hlc))
+    }
+
     /// Walk from `start` through the delegate chain; return true if any
     /// node visited equals `target`. Used by cycle detection in
     /// `apply_delegate`.
