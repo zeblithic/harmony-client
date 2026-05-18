@@ -6101,6 +6101,183 @@ async fn create_folder(
     create_folder_nested(name, psid, parent_path, state).await
 }
 
+/// Per-ancestor manifest edit driving `walk_and_rebuild_chain`.
+///
+/// `Remove` drops the entry whose `(name, cid)` matches; `Replace`
+/// flips the CID of the entry whose CID matches `old_child_cid`;
+/// `Append` appends a new entry at the tail.
+///
+/// `Remove` carries `child_name` because sibling manifest entries can
+/// legitimately share a CID (e.g., two empty folders, or two folders
+/// holding identical content) — matching by CID alone would
+/// non-deterministically remove the wrong sibling. Within a single
+/// folder `name` is unique, so `(name, cid)` is a stable per-entry
+/// discriminator at the leaf level. `Replace` is only emitted by
+/// upstream walk steps where the only edit target is the ancestor we
+/// just rebuilt below; the shared-CID hazard there requires two
+/// children of the SAME parent pointing at the SAME ancestor CID,
+/// which would only arise with mid-chain shared-content navigation
+/// (tracked separately for the broader path-level fix).
+enum AncestorEdit {
+    Remove {
+        child_cid: [u8; 32],
+        child_name: String,
+    },
+    Replace {
+        old_child_cid: [u8; 32],
+        new_child_cid: [u8; 32],
+    },
+    Append {
+        entry: folders::ManifestEntry,
+    },
+}
+
+/// Outcome of a successful `walk_and_rebuild_chain`.
+#[derive(Debug)]
+struct WalkedChain {
+    new_top_level_cid: [u8; 32],
+    new_top_level_size: u64,
+}
+
+/// Walk an ancestor chain bottom-up, rebuilding each ancestor's
+/// manifest + bundle.
+///
+/// `path` is top-level → immediate parent (inclusive). `deepest_edit`
+/// applies to the deepest ancestor (`path.last()`); higher ancestors get
+/// an automatic `Replace { old_child_cid: anc_below_old, new_child_cid:
+/// anc_below_new }`.
+///
+/// Returns the new top-level CID and bundle size, pushing every rebuilt
+/// `(manifest_hex, manifest_bytes)` and `(bundle_hex, bundle_bytes)` pair
+/// into the caller's `pending_ingests`. On any cache miss or
+/// malformed-manifest condition, returns `Err` WITHOUT having mutated
+/// `pending_ingests` — partial state is accumulated locally and only
+/// committed after the walk succeeds.
+async fn walk_and_rebuild_chain(
+    verb_tx: &tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>,
+    path: &[[u8; 32]],
+    deepest_edit: AncestorEdit,
+    pending_ingests: &mut Vec<(String, Vec<u8>)>,
+) -> Result<WalkedChain, String> {
+    use harmony_content::bundle::parse_bundle;
+
+    if path.is_empty() {
+        return Err("walk_and_rebuild_chain: empty path".to_string());
+    }
+
+    let mut local_pending: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut prev_old_cid: [u8; 32] = [0; 32];
+    let mut prev_new_cid: [u8; 32] = [0; 32];
+    let mut last_bundle_size: u64 = 0;
+    let mut deepest_edit_opt = Some(deepest_edit);
+
+    for (i, &anc_cid) in path.iter().enumerate().rev() {
+        let is_deepest = i == path.len() - 1;
+
+        let anc_bundle = read_cached_bytes(verb_tx, anc_cid).await?.ok_or_else(|| {
+            format!(
+                "ancestor {} not in cache; cannot rebuild parent chain",
+                hex::encode(anc_cid)
+            )
+        })?;
+        let anc_child_ids =
+            parse_bundle(&anc_bundle).map_err(|e| format!("malformed ancestor bundle: {e:?}"))?;
+        let manifest_cid = anc_child_ids
+            .first()
+            .copied()
+            .ok_or_else(|| "ancestor bundle has no children".to_string())?;
+        let anc_children: Vec<[u8; 32]> = anc_child_ids.iter().map(|c| c.to_bytes()).collect();
+
+        let manifest_bytes = read_cached_bytes(verb_tx, manifest_cid.to_bytes())
+            .await?
+            .ok_or_else(|| "ancestor manifest not in cache".to_string())?;
+        let mut manifest =
+            folders::parse_manifest(&manifest_bytes).map_err(|e| format!("ancestor {e}"))?;
+        folders::validate_manifest_matches_bundle(&manifest, &anc_children)
+            .map_err(|e| format!("ancestor {} {e}", hex::encode(anc_cid)))?;
+
+        if is_deepest {
+            match deepest_edit_opt.take().expect("set on entry") {
+                AncestorEdit::Append { entry } => {
+                    manifest.folder_manifest.entries.push(entry);
+                }
+                AncestorEdit::Remove {
+                    child_cid,
+                    child_name,
+                } => {
+                    let target_idx = manifest
+                        .folder_manifest
+                        .entries
+                        .iter()
+                        .position(|e| e.name == child_name && e.cid == child_cid)
+                        .ok_or_else(|| {
+                            format!(
+                                "ancestor {} has no entry named '{}' pointing to child {}",
+                                hex::encode(anc_cid),
+                                child_name,
+                                hex::encode(child_cid)
+                            )
+                        })?;
+                    manifest.folder_manifest.entries.remove(target_idx);
+                }
+                AncestorEdit::Replace {
+                    old_child_cid,
+                    new_child_cid,
+                } => {
+                    let target_idx = manifest
+                        .folder_manifest
+                        .entries
+                        .iter()
+                        .position(|e| e.cid == old_child_cid)
+                        .ok_or_else(|| {
+                            format!(
+                                "ancestor {} has no entry pointing to child {}",
+                                hex::encode(anc_cid),
+                                hex::encode(old_child_cid)
+                            )
+                        })?;
+                    manifest.folder_manifest.entries[target_idx].cid = new_child_cid;
+                }
+            }
+        } else {
+            let target_idx = manifest
+                .folder_manifest
+                .entries
+                .iter()
+                .position(|e| e.cid == prev_old_cid)
+                .ok_or_else(|| {
+                    format!(
+                        "ancestor {} has no entry pointing to child {}",
+                        hex::encode(anc_cid),
+                        hex::encode(prev_old_cid)
+                    )
+                })?;
+            manifest.folder_manifest.entries[target_idx].cid = prev_new_cid;
+        }
+
+        let rebuilt = folders::build_folder("", &manifest.folder_manifest.entries)?;
+        let rebuilt_bundle_cid = rebuilt.bundle_cid;
+        last_bundle_size = rebuilt.bundle_bytes.len() as u64;
+        local_pending.push((
+            hex::encode(rebuilt.manifest_cid.to_bytes()),
+            rebuilt.manifest_bytes,
+        ));
+        local_pending.push((
+            hex::encode(rebuilt_bundle_cid.to_bytes()),
+            rebuilt.bundle_bytes,
+        ));
+
+        prev_old_cid = anc_cid;
+        prev_new_cid = rebuilt_bundle_cid.to_bytes();
+    }
+
+    pending_ingests.extend(local_pending);
+    Ok(WalkedChain {
+        new_top_level_cid: prev_new_cid,
+        new_top_level_size: last_bundle_size,
+    })
+}
+
 async fn create_folder_at_root(
     name: String,
     state: tauri::State<'_, Mutex<NodeState>>,
@@ -6195,8 +6372,6 @@ async fn create_folder_nested(
     parent_path: Vec<String>,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<CreateFolderResult, String> {
-    use harmony_content::bundle::parse_bundle;
-
     let parent_id = parse_sidecar_id(&parent_sidecar_id)?;
 
     // Parse all path CIDs up-front; fail fast on malformed input.
@@ -6205,7 +6380,6 @@ async fn create_folder_nested(
         .map(|h| parse_cid_hex(h))
         .collect::<Result<_, _>>()?;
     let root_old = *path_cids.first().expect("non-empty by guard above");
-    let immediate_parent_cid = *path_cids.last().expect("non-empty");
 
     let (ingest_tx, verb_tx, index) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
@@ -6269,79 +6443,24 @@ async fn create_folder_nested(
     ));
 
     // 2. Bottom-up walk: rebuild each ancestor LOCALLY (read-only verb
-    // requests), accumulating into pending_ingests.
-    let mut prev_old_cid = immediate_parent_cid;
-    let mut prev_new_cid = new_child_bundle_cid.to_bytes();
-    let mut last_bundle_size: u64 = pending_ingests
-        .last()
-        .map(|(_, b)| b.len() as u64)
-        .unwrap_or(0);
-
-    for (i, &anc_cid) in path_cids.iter().enumerate().rev() {
-        let is_deepest = i == path_cids.len() - 1;
-
-        let anc_bundle = read_cached_bytes(&verb_tx, anc_cid).await?.ok_or_else(|| {
-            format!(
-                "ancestor {} not in cache; cannot rebuild parent chain",
-                hex::encode(anc_cid)
-            )
-        })?;
-        let anc_child_ids =
-            parse_bundle(&anc_bundle).map_err(|e| format!("malformed ancestor bundle: {e:?}"))?;
-        let manifest_cid = anc_child_ids
-            .first()
-            .copied()
-            .ok_or_else(|| "ancestor bundle has no children".to_string())?;
-        let anc_children: Vec<[u8; 32]> = anc_child_ids.iter().map(|c| c.to_bytes()).collect();
-
-        let manifest_bytes = read_cached_bytes(&verb_tx, manifest_cid.to_bytes())
-            .await?
-            .ok_or_else(|| "ancestor manifest not in cache".to_string())?;
-        let mut manifest =
-            folders::parse_manifest(&manifest_bytes).map_err(|e| format!("ancestor {e}"))?;
-        folders::validate_manifest_matches_bundle(&manifest, &anc_children)
-            .map_err(|e| format!("ancestor {} {e}", hex::encode(anc_cid)))?;
-
-        if is_deepest {
-            manifest
-                .folder_manifest
-                .entries
-                .push(folders::ManifestEntry {
-                    cid: prev_new_cid,
-                    name: name.clone(),
-                    kind: content_index::ContentKind::Folder,
-                });
-        } else {
-            let target_idx = manifest
-                .folder_manifest
-                .entries
-                .iter()
-                .position(|e| e.cid == prev_old_cid)
-                .ok_or_else(|| {
-                    format!(
-                        "ancestor {} has no entry pointing to child {}",
-                        hex::encode(anc_cid),
-                        hex::encode(prev_old_cid)
-                    )
-                })?;
-            manifest.folder_manifest.entries[target_idx].cid = prev_new_cid;
-        }
-
-        let rebuilt = folders::build_folder("", &manifest.folder_manifest.entries)?;
-        let rebuilt_bundle_cid = rebuilt.bundle_cid;
-        last_bundle_size = rebuilt.bundle_bytes.len() as u64;
-        pending_ingests.push((
-            hex::encode(rebuilt.manifest_cid.to_bytes()),
-            rebuilt.manifest_bytes,
-        ));
-        pending_ingests.push((
-            hex::encode(rebuilt_bundle_cid.to_bytes()),
-            rebuilt.bundle_bytes,
-        ));
-
-        prev_old_cid = anc_cid;
-        prev_new_cid = rebuilt_bundle_cid.to_bytes();
-    }
+    // requests), accumulating into pending_ingests. The deepest ancestor
+    // appends the new sub-folder; higher ancestors propagate the CID
+    // change. `walk_and_rebuild_chain` is shared with `move_content`.
+    let walked = walk_and_rebuild_chain(
+        &verb_tx,
+        &path_cids,
+        AncestorEdit::Append {
+            entry: folders::ManifestEntry {
+                cid: new_child_bundle_cid.to_bytes(),
+                name: name.clone(),
+                kind: content_index::ContentKind::Folder,
+            },
+        },
+        &mut pending_ingests,
+    )
+    .await?;
+    let prev_new_cid = walked.new_top_level_cid;
+    let last_bundle_size = walked.new_top_level_size;
 
     // 3. Drain the deferred ingests BEFORE rekeying. Earlier this was
     // ordered rekey-then-ingest to avoid leaving orphan bytes in the
@@ -6496,6 +6615,1470 @@ async fn read_cached_bytes(
     reply_rx
         .await
         .map_err(|_| "event loop dropped read request".to_string())
+}
+
+/// Result returned by `move_content`. `src_new_cid` is `None` for Case C
+/// (the source top-level was removed). `dst_sidecar_id` matches the
+/// input for Cases A/B/C and is the freshly-minted sidecar for Case D.
+/// `dst_new_cid` is the destination top-level's new CID; for Case D it
+/// equals `src_child_cid` (the moved child becomes its own top-level).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveContentResult {
+    pub src_new_cid: Option<String>,
+    pub dst_sidecar_id: String,
+    pub dst_new_cid: String,
+}
+
+/// ZEB-162: move a file or sub-folder between File Manager locations.
+///
+/// Four cases dispatched at the boundary by the
+/// `(src_sidecar_id, dst_sidecar_id, src_path[0] == src_child_cid)` shape:
+/// - A: source and destination share the same top-level — single ancestor
+///   chain, Y-shape walk, one CAS rekey.
+/// - B: source and destination are different top-levels — drain both
+///   chains, stage the dst rekey, then the src rekey; compensating undo
+///   on STAGE 2 failure.
+/// - C: source is a top-level itself, destination is nested — drain dst
+///   chain, rekey dst, then remove the src sidecar entry.
+/// - D: source is nested, destination is the root — drain src chain,
+///   mint a new top-level sidecar entry for the moved child, then rekey
+///   src.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn move_content(
+    src_sidecar_id: String,
+    src_path: Vec<String>,
+    src_child_cid: String,
+    src_child_name: String,
+    dst_sidecar_id: Option<String>,
+    dst_path: Vec<String>,
+    new_name: Option<String>,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<MoveContentResult, String> {
+    let (ingest_tx, verb_tx, index) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        (
+            guard
+                .ingest_tx
+                .clone()
+                .ok_or_else(|| "not connected".to_string())?,
+            guard
+                .content_verb_tx
+                .clone()
+                .ok_or_else(|| "not connected".to_string())?,
+            guard.content_index.clone(),
+        )
+    };
+    move_content_impl(
+        src_sidecar_id,
+        src_path,
+        src_child_cid,
+        src_child_name,
+        dst_sidecar_id,
+        dst_path,
+        new_name,
+        ingest_tx,
+        verb_tx,
+        index,
+    )
+    .await
+}
+
+/// Inner implementation of [`move_content`] decoupled from
+/// `tauri::State` so integration tests can drive it with a raw
+/// `(ingest_tx, verb_tx, ContentIndex)` triple. Production callers go
+/// through the `#[tauri::command]` wrapper.
+///
+/// `src_child_name` is the manifest entry name of the moved child
+/// inside its immediate parent (for Cases A/B/D) or the sidecar
+/// `file_name` (for Case C). Carried alongside the CID because sibling
+/// entries can legitimately share a CID — the name acts as the stable
+/// per-entry discriminator.
+#[allow(clippy::too_many_arguments)]
+pub async fn move_content_impl(
+    src_sidecar_id: String,
+    src_path: Vec<String>,
+    src_child_cid: String,
+    src_child_name: String,
+    dst_sidecar_id: Option<String>,
+    dst_path: Vec<String>,
+    new_name: Option<String>,
+    ingest_tx: tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    verb_tx: tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>,
+    index: std::sync::Arc<Mutex<content_index::ContentIndex>>,
+) -> Result<MoveContentResult, String> {
+    if new_name.is_some() {
+        return Err("new_name is reserved for ZEB-299; pass null".to_string());
+    }
+    if src_path.is_empty() {
+        return Err("src_path cannot be empty".to_string());
+    }
+    let src_sid = parse_sidecar_id(&src_sidecar_id)?;
+    let child_cid = parse_cid_hex(&src_child_cid)?;
+    let src_cids: Vec<[u8; 32]> = src_path
+        .iter()
+        .map(|h| parse_cid_hex(h))
+        .collect::<Result<_, _>>()?;
+    let src_root_old = src_cids[0];
+    let dst_cids: Vec<[u8; 32]> = dst_path
+        .iter()
+        .map(|h| parse_cid_hex(h))
+        .collect::<Result<_, _>>()?;
+
+    let dst_sid_parsed: Option<content_index::SidecarId> = match dst_sidecar_id.as_deref() {
+        Some(s) => Some(parse_sidecar_id(s)?),
+        None => None,
+    };
+
+    // Snapshot sidecar state we need to validate against. Done once
+    // up-front so subsequent reads in the chain-walk can't race with
+    // sidecar mutations on other commands.
+    let (src_entry_cid, src_entry_name, src_entry_kind, src_entry_pinned) = {
+        let idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        let entry = idx
+            .get(&src_sid)
+            .ok_or_else(|| "src_sidecar_id not in sidecar".to_string())?;
+        (entry.cid, entry.file_name.clone(), entry.kind, entry.pinned)
+    };
+    if src_entry_cid != src_root_old {
+        return Err(format!(
+            "src_sidecar_id refers to cid {} but src_path[0] is {}",
+            hex::encode(src_entry_cid),
+            hex::encode(src_root_old),
+        ));
+    }
+
+    // Case dispatch derived from the (sidecar, path, child) triple.
+    let is_case_d = dst_sid_parsed.is_none() && dst_cids.is_empty();
+    let is_case_c =
+        !is_case_d && src_cids.len() == 1 && src_cids[0] == child_cid && dst_sid_parsed.is_some();
+    let is_case_a = !is_case_d && !is_case_c && dst_sid_parsed.is_some_and(|d| d == src_sid);
+    let is_case_b = !is_case_d && !is_case_c && !is_case_a;
+
+    if !is_case_d {
+        if dst_sid_parsed.is_none() {
+            return Err("dst_sidecar_id required when destination is not root".to_string());
+        }
+        if dst_cids.is_empty() {
+            return Err("dst_path required when destination is not root".to_string());
+        }
+    }
+
+    // Reject the degenerate "top-level → root" case: source is already
+    // a top-level entry AND destination is root. Without this guard the
+    // request falls into Case D and tries to look up the source root's
+    // own CID inside its own manifest, which never matches, producing a
+    // confusing "no entry pointing to child" error instead of the
+    // honest no-op rejection.
+    if is_case_d && src_cids.len() == 1 && src_cids[0] == child_cid {
+        return Err("source and destination are identical".to_string());
+    }
+
+    // For Cases A/B/D the source-side walk needs to read the immediate
+    // parent's manifest to find the moved child's manifest entry — both
+    // for the destination-side append (Cases A, B) and for the new
+    // top-level entry mint (Case D). For Case C the moved child IS the
+    // top-level, so the manifest name + kind come from the source's
+    // sidecar entry — verify the caller-supplied name matches.
+    let moved_entry: folders::ManifestEntry = if is_case_c {
+        if src_entry_name != src_child_name {
+            return Err(format!(
+                "src_child_name '{src_child_name}' does not match src sidecar entry name '{src_entry_name}'",
+            ));
+        }
+        folders::ManifestEntry {
+            cid: child_cid,
+            name: src_entry_name.clone(),
+            kind: src_entry_kind,
+        }
+    } else {
+        read_child_manifest_entry(
+            &verb_tx,
+            src_cids[src_cids.len() - 1],
+            child_cid,
+            &src_child_name,
+        )
+        .await?
+    };
+
+    // Cycle check: if the moved child is itself a folder, ensure it
+    // does not appear anywhere in the destination path (would create a
+    // loop or move-into-self).
+    if moved_entry.kind == content_index::ContentKind::Folder
+        && dst_cids.iter().any(|c| c == &child_cid)
+    {
+        return Err("cannot move folder into its own descendant".to_string());
+    }
+
+    // No-op check at the same sidecar + same path + same child.
+    if dst_sid_parsed == Some(src_sid) && dst_cids == src_cids && !is_case_c {
+        return Err("source and destination are identical".to_string());
+    }
+
+    // Destination name-collision check. For Cases A/B/C the destination
+    // parent's manifest is the source of truth; for Case D the sidecar
+    // top-level entries are.
+    if is_case_d {
+        let idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        if idx.entries().any(|e| e.file_name == moved_entry.name) {
+            return Err(format!(
+                "destination already has an entry named '{}'",
+                moved_entry.name
+            ));
+        }
+    } else {
+        let dst_immediate_parent = *dst_cids.last().expect("dst non-empty by guard");
+        let dst_parent_entries = read_manifest_entries(&verb_tx, dst_immediate_parent).await?;
+        // Skip the moved child's own entry (`e.cid == child_cid`): when
+        // src_immediate_parent and dst_immediate_parent are the same
+        // folder reached via different paths (shared-content folders,
+        // ZEB-156 territory), the moved child's pre-move position shows
+        // up in dst_parent_entries with its own name, producing a
+        // spurious self-collision rejection. Real same-name siblings
+        // necessarily have a different CID, so this exclusion only
+        // affects the self-match case.
+        if dst_parent_entries
+            .iter()
+            .any(|e| e.name == moved_entry.name && e.cid != child_cid)
+        {
+            return Err(format!(
+                "destination already has an entry named '{}'",
+                moved_entry.name
+            ));
+        }
+    }
+
+    // Validate the destination sidecar (for non-root cases) matches its
+    // declared first path element — same CAS-style verify as the source.
+    let dst_entry_state: Option<(content_index::SidecarId, [u8; 32], u64, u64, bool)> =
+        if let (Some(dst_sid), false) = (dst_sid_parsed, dst_cids.is_empty()) {
+            let idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+            let entry = idx
+                .get(&dst_sid)
+                .ok_or_else(|| "dst_sidecar_id not in sidecar".to_string())?;
+            if entry.cid != dst_cids[0] {
+                return Err(format!(
+                    "dst_sidecar_id refers to cid {} but dst_path[0] is {}",
+                    hex::encode(entry.cid),
+                    hex::encode(dst_cids[0]),
+                ));
+            }
+            Some((
+                dst_sid,
+                entry.cid,
+                entry.size_bytes,
+                entry.stored_at_ms,
+                entry.pinned,
+            ))
+        } else {
+            None
+        };
+
+    let stored_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    if is_case_a {
+        move_case_a(
+            &ingest_tx,
+            &verb_tx,
+            &index,
+            src_sid,
+            &src_cids,
+            &dst_cids,
+            child_cid,
+            moved_entry,
+            stored_at_ms,
+        )
+        .await
+    } else if is_case_b {
+        let (dst_sid, dst_old_cid, dst_old_size, dst_old_stored_at, _dst_pinned) =
+            dst_entry_state.expect("Case B has dst sidecar");
+        move_case_b(
+            &ingest_tx,
+            &verb_tx,
+            &index,
+            src_sid,
+            &src_cids,
+            child_cid,
+            dst_sid,
+            &dst_cids,
+            moved_entry,
+            dst_old_cid,
+            dst_old_size,
+            dst_old_stored_at,
+            stored_at_ms,
+        )
+        .await
+    } else if is_case_c {
+        let (dst_sid, dst_old_cid, dst_old_size, dst_old_stored_at, _dst_pinned) =
+            dst_entry_state.expect("Case C has dst sidecar");
+        move_case_c(
+            &ingest_tx,
+            &verb_tx,
+            &index,
+            src_sid,
+            src_root_old,
+            child_cid,
+            dst_sid,
+            &dst_cids,
+            moved_entry,
+            dst_old_cid,
+            dst_old_size,
+            dst_old_stored_at,
+            stored_at_ms,
+        )
+        .await
+    } else {
+        debug_assert!(is_case_d);
+        move_case_d(
+            &ingest_tx,
+            &verb_tx,
+            &index,
+            src_sid,
+            &src_cids,
+            child_cid,
+            moved_entry,
+            src_entry_pinned,
+            stored_at_ms,
+        )
+        .await
+    }
+}
+
+/// Read an ancestor folder's bundle + manifest and return the
+/// `(cid, name, kind)` entry whose `(name, cid)` matches the caller's
+/// expectation. Within a folder, `name` is unique, so the name
+/// disambiguates between siblings that happen to share a CID
+/// (content-identical entries — e.g., two empty folders).
+async fn read_child_manifest_entry(
+    verb_tx: &tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>,
+    parent_cid: [u8; 32],
+    child_cid: [u8; 32],
+    child_name: &str,
+) -> Result<folders::ManifestEntry, String> {
+    let entries = read_manifest_entries(verb_tx, parent_cid).await?;
+    entries
+        .into_iter()
+        .find(|e| e.name == child_name && e.cid == child_cid)
+        .ok_or_else(|| {
+            format!(
+                "src_path's immediate parent {} has no entry named '{}' pointing to child {}",
+                hex::encode(parent_cid),
+                child_name,
+                hex::encode(child_cid)
+            )
+        })
+}
+
+/// Read an ancestor folder's bundle + manifest and return the full
+/// manifest entry list. Validates the bundle ↔ manifest invariant.
+async fn read_manifest_entries(
+    verb_tx: &tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>,
+    parent_cid: [u8; 32],
+) -> Result<Vec<folders::ManifestEntry>, String> {
+    use harmony_content::bundle::parse_bundle;
+
+    let bundle_bytes = read_cached_bytes(verb_tx, parent_cid)
+        .await?
+        .ok_or_else(|| {
+            format!(
+                "ancestor {} not in cache; cannot rebuild parent chain",
+                hex::encode(parent_cid)
+            )
+        })?;
+    let child_ids =
+        parse_bundle(&bundle_bytes).map_err(|e| format!("malformed ancestor bundle: {e:?}"))?;
+    let manifest_cid = child_ids
+        .first()
+        .copied()
+        .ok_or_else(|| "ancestor bundle has no children".to_string())?;
+    let anc_children: Vec<[u8; 32]> = child_ids.iter().map(|c| c.to_bytes()).collect();
+    let manifest_bytes = read_cached_bytes(verb_tx, manifest_cid.to_bytes())
+        .await?
+        .ok_or_else(|| "ancestor manifest not in cache".to_string())?;
+    let manifest = folders::parse_manifest(&manifest_bytes)?;
+    folders::validate_manifest_matches_bundle(&manifest, &anc_children)
+        .map_err(|e| format!("ancestor {} {e}", hex::encode(parent_cid)))?;
+    Ok(manifest.folder_manifest.entries)
+}
+
+/// Case A: source and destination are within the same top-level. The
+/// move is mechanically a single ancestor chain rebuild with a Y-shape:
+/// at the deepest common ancestor (LCA) of `src_path` and `dst_path`
+/// the manifest gets both a removal (source side) and an
+/// append/replace (destination side) applied; above the LCA only one
+/// CID propagation happens; below diverges into independent leaf-side
+/// walks. Exactly one CAS rekey at the end.
+#[allow(clippy::too_many_arguments)]
+async fn move_case_a(
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    verb_tx: &tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>,
+    index: &std::sync::Arc<Mutex<content_index::ContentIndex>>,
+    src_sid: content_index::SidecarId,
+    src_cids: &[[u8; 32]],
+    dst_cids: &[[u8; 32]],
+    child_cid: [u8; 32],
+    moved_entry: folders::ManifestEntry,
+    stored_at_ms: u64,
+) -> Result<MoveContentResult, String> {
+    let src_root_old = src_cids[0];
+    // Case A invariant: caller-side dispatch has already verified src
+    // and dst share the same top-level sidecar AND non-empty paths,
+    // which implies src_cids[0] == dst_cids[0]. Belt-and-braces: trip
+    // the assert in debug builds if the dispatch ever regresses, since
+    // an LCA computation starting at lca_idx=0 with a mismatched root
+    // would silently produce a corrupt Y-shape walk.
+    debug_assert!(
+        !src_cids.is_empty() && !dst_cids.is_empty() && src_cids[0] == dst_cids[0],
+        "move_case_a invariant: src and dst must share top-level root",
+    );
+    // LCA index is the largest i where src_cids[..=i] == dst_cids[..=i].
+    let mut lca_idx: usize = 0;
+    let max = src_cids.len().min(dst_cids.len());
+    while lca_idx + 1 < max && src_cids[lca_idx + 1] == dst_cids[lca_idx + 1] {
+        lca_idx += 1;
+    }
+
+    let mut pending_ingests: Vec<(String, Vec<u8>)> = Vec::new();
+
+    // Source-side leaf-up-to-LCA: indices (lca_idx+1)..src_cids.len()
+    let src_below_lca = &src_cids[(lca_idx + 1)..];
+    let (src_side_new_below, src_side_old_below_lca) = if src_below_lca.is_empty() {
+        // Source's immediate parent is the LCA. LCA edit will Remove(child_cid).
+        (None, None)
+    } else {
+        let walked = walk_and_rebuild_chain(
+            verb_tx,
+            src_below_lca,
+            AncestorEdit::Remove {
+                child_cid,
+                child_name: moved_entry.name.clone(),
+            },
+            &mut pending_ingests,
+        )
+        .await?;
+        // The CID under the LCA on the source side was src_below_lca[0] (old) →
+        // walked.new_top_level_cid (new).
+        (Some(walked.new_top_level_cid), Some(src_below_lca[0]))
+    };
+
+    // Destination-side leaf-up-to-LCA: indices (lca_idx+1)..dst_cids.len()
+    let dst_below_lca = &dst_cids[(lca_idx + 1)..];
+    let (dst_side_new_below, dst_side_old_below_lca) = if dst_below_lca.is_empty() {
+        (None, None)
+    } else {
+        let walked = walk_and_rebuild_chain(
+            verb_tx,
+            dst_below_lca,
+            AncestorEdit::Append {
+                entry: moved_entry.clone(),
+            },
+            &mut pending_ingests,
+        )
+        .await?;
+        (Some(walked.new_top_level_cid), Some(dst_below_lca[0]))
+    };
+
+    // LCA edit combines both sides. Resolve BOTH target positions before
+    // applying any edit — under content-addressing, two sibling entries
+    // can share a CID (when their underlying content is identical, e.g.
+    // two empty folders or two folders containing the same leaf set), and
+    // a position lookup performed AFTER the src-side edit can silently
+    // hit the wrong sibling. Snapshot positions while entries still hold
+    // their original CIDs, then mutate. ZEB-156 owns the broader
+    // shared-content cascade hazard at the pin layer; this is the
+    // manifest-layer instance specific to Y-shape walks.
+    let lca_cid = src_cids[lca_idx];
+    let mut lca_entries = read_manifest_entries(verb_tx, lca_cid).await?;
+    let src_lca_pos: usize = match (src_side_new_below, src_side_old_below_lca) {
+        (None, None) => lca_entries
+            .iter()
+            .position(|e| e.name == moved_entry.name && e.cid == child_cid)
+            .ok_or_else(|| {
+                format!(
+                    "ancestor {} has no entry named '{}' pointing to child {}",
+                    hex::encode(lca_cid),
+                    moved_entry.name,
+                    hex::encode(child_cid)
+                )
+            })?,
+        (Some(_), Some(old_below)) => lca_entries
+            .iter()
+            .position(|e| e.cid == old_below)
+            .ok_or_else(|| {
+                format!(
+                    "ancestor {} has no entry pointing to child {}",
+                    hex::encode(lca_cid),
+                    hex::encode(old_below)
+                )
+            })?,
+        _ => unreachable!("source-side below-LCA invariants paired"),
+    };
+    let dst_lca_pos: Option<usize> = match (dst_side_new_below, dst_side_old_below_lca) {
+        (None, None) => None,
+        (Some(_), Some(old_below)) => Some(
+            lca_entries
+                .iter()
+                .position(|e| e.cid == old_below)
+                .ok_or_else(|| {
+                    format!(
+                        "ancestor {} has no entry pointing to child {}",
+                        hex::encode(lca_cid),
+                        hex::encode(old_below)
+                    )
+                })?,
+        ),
+        _ => unreachable!("dest-side below-LCA invariants paired"),
+    };
+
+    // Apply src-side edit at its precomputed position.
+    let src_is_remove = matches!((src_side_new_below, src_side_old_below_lca), (None, None));
+    match (src_side_new_below, src_side_old_below_lca) {
+        (None, None) => {
+            lca_entries.remove(src_lca_pos);
+        }
+        (Some(new_below), Some(_)) => {
+            lca_entries[src_lca_pos].cid = new_below;
+        }
+        _ => unreachable!(),
+    }
+    // Apply dst-side edit. If src was a Remove that shifted indices and
+    // dst's target sits after src's, adjust dst's index by -1.
+    match (dst_side_new_below, dst_side_old_below_lca) {
+        (None, None) => {
+            lca_entries.push(moved_entry.clone());
+        }
+        (Some(new_below), Some(_)) => {
+            let raw = dst_lca_pos.expect("dst position resolved");
+            let adjusted = if src_is_remove && raw > src_lca_pos {
+                raw - 1
+            } else {
+                raw
+            };
+            lca_entries[adjusted].cid = new_below;
+        }
+        _ => unreachable!(),
+    }
+    let rebuilt_lca = folders::build_folder("", &lca_entries)?;
+    let lca_new_cid = rebuilt_lca.bundle_cid.to_bytes();
+    let mut last_bundle_size = rebuilt_lca.bundle_bytes.len() as u64;
+    pending_ingests.push((
+        hex::encode(rebuilt_lca.manifest_cid.to_bytes()),
+        rebuilt_lca.manifest_bytes,
+    ));
+    pending_ingests.push((
+        hex::encode(rebuilt_lca.bundle_cid.to_bytes()),
+        rebuilt_lca.bundle_bytes,
+    ));
+
+    // Above-LCA walk: walk `src_cids[..lca_idx]` (the chain ABOVE the
+    // LCA, exclusive) with a deepest-edit that replaces the LCA's old
+    // CID with its rebuilt CID. The walker handles propagation from
+    // the LCA-parent up to the top-level root.
+    let new_top_level_cid = if lca_idx == 0 {
+        lca_new_cid
+    } else {
+        let above_only = &src_cids[..lca_idx];
+        let walked = walk_and_rebuild_chain(
+            verb_tx,
+            above_only,
+            AncestorEdit::Replace {
+                old_child_cid: src_cids[lca_idx],
+                new_child_cid: lca_new_cid,
+            },
+            &mut pending_ingests,
+        )
+        .await?;
+        last_bundle_size = walked.new_top_level_size;
+        walked.new_top_level_cid
+    };
+
+    // Drain ingests BEFORE rekey — same correctness argument as
+    // create_folder_nested (a rekey-after-ingest-failure window is
+    // strictly better than ingest-after-rekey-failure: an orphan-bytes
+    // outcome on this path beats an unreachable-chain outcome).
+    for (cid_hex, bytes) in pending_ingests {
+        send_ingest(ingest_tx, cid_hex, bytes).await?;
+    }
+
+    // Single CAS rekey on the source/destination sidecar (they are the
+    // same in Case A).
+    {
+        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        match idx.rekey(
+            &src_sid,
+            src_root_old,
+            new_top_level_cid,
+            last_bundle_size,
+            stored_at_ms,
+        ) {
+            Ok(()) => {}
+            Err(content_index::RekeyError::OldMissing) => {
+                return Err("src_sidecar_id removed mid-flight — nothing to rekey".to_string());
+            }
+            Err(content_index::RekeyError::Conflict { actual }) => {
+                return Err(format!(
+                    "concurrent rekey on src_sidecar_id (now at cid {}); retry from refreshed state",
+                    hex::encode(actual)
+                ));
+            }
+        }
+    }
+
+    maintain_pin_invariant(verb_tx, index, src_root_old, Some(new_top_level_cid)).await;
+
+    Ok(MoveContentResult {
+        src_new_cid: Some(hex::encode(new_top_level_cid)),
+        dst_sidecar_id: src_sid.to_string(),
+        dst_new_cid: hex::encode(new_top_level_cid),
+    })
+}
+
+/// Case B: source and destination are different top-levels. Two
+/// chains, two sidecar rekeys, staged commit with compensating undo.
+#[allow(clippy::too_many_arguments)]
+async fn move_case_b(
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    verb_tx: &tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>,
+    index: &std::sync::Arc<Mutex<content_index::ContentIndex>>,
+    src_sid: content_index::SidecarId,
+    src_cids: &[[u8; 32]],
+    child_cid: [u8; 32],
+    dst_sid: content_index::SidecarId,
+    dst_cids: &[[u8; 32]],
+    moved_entry: folders::ManifestEntry,
+    dst_old_cid: [u8; 32],
+    dst_old_size: u64,
+    _dst_old_stored_at: u64,
+    stored_at_ms: u64,
+) -> Result<MoveContentResult, String> {
+    let src_root_old = src_cids[0];
+    let mut pending_ingests: Vec<(String, Vec<u8>)> = Vec::new();
+    let src_walked = walk_and_rebuild_chain(
+        verb_tx,
+        src_cids,
+        AncestorEdit::Remove {
+            child_cid,
+            child_name: moved_entry.name.clone(),
+        },
+        &mut pending_ingests,
+    )
+    .await?;
+    let dst_walked = walk_and_rebuild_chain(
+        verb_tx,
+        dst_cids,
+        AncestorEdit::Append {
+            entry: moved_entry.clone(),
+        },
+        &mut pending_ingests,
+    )
+    .await?;
+
+    for (cid_hex, bytes) in pending_ingests {
+        send_ingest(ingest_tx, cid_hex, bytes).await?;
+    }
+
+    // STAGE 1: rekey destination.
+    {
+        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        match idx.rekey(
+            &dst_sid,
+            dst_old_cid,
+            dst_walked.new_top_level_cid,
+            dst_walked.new_top_level_size,
+            stored_at_ms,
+        ) {
+            Ok(()) => {}
+            Err(content_index::RekeyError::OldMissing) => {
+                return Err("dst_sidecar_id removed mid-flight — nothing to rekey".to_string());
+            }
+            Err(content_index::RekeyError::Conflict { actual }) => {
+                return Err(format!(
+                    "concurrent rekey on dst_sidecar_id (now at cid {}); retry from refreshed state",
+                    hex::encode(actual)
+                ));
+            }
+        }
+    }
+
+    // STAGE 2: rekey source. On failure, attempt compensating undo
+    // that restores dst to its pre-STAGE-1 state.
+    let stage2 = {
+        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        idx.rekey(
+            &src_sid,
+            src_root_old,
+            src_walked.new_top_level_cid,
+            src_walked.new_top_level_size,
+            stored_at_ms,
+        )
+    };
+    match stage2 {
+        Ok(()) => {}
+        Err(e) => {
+            let undo_err: Option<content_index::RekeyError> = {
+                let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+                // Use current `stored_at_ms`, not the captured pre-move
+                // `dst_old_stored_at`: the entry was just touched twice
+                // (forward + undo), so the modified-at timestamp must
+                // reflect the undo event, not pretend the entry was last
+                // modified in the past.
+                idx.rekey(
+                    &dst_sid,
+                    dst_walked.new_top_level_cid,
+                    dst_old_cid,
+                    dst_old_size,
+                    stored_at_ms,
+                )
+                .err()
+            };
+            return Err(stage2_error_b(e, undo_err, dst_walked.new_top_level_cid));
+        }
+    }
+
+    maintain_pin_invariant(
+        verb_tx,
+        index,
+        src_root_old,
+        Some(src_walked.new_top_level_cid),
+    )
+    .await;
+    maintain_pin_invariant(
+        verb_tx,
+        index,
+        dst_old_cid,
+        Some(dst_walked.new_top_level_cid),
+    )
+    .await;
+
+    Ok(MoveContentResult {
+        src_new_cid: Some(hex::encode(src_walked.new_top_level_cid)),
+        dst_sidecar_id: dst_sid.to_string(),
+        dst_new_cid: hex::encode(dst_walked.new_top_level_cid),
+    })
+}
+
+/// Case C: source IS a top-level; destination is nested. Drain dst
+/// chain, rekey dst, then remove the src sidecar entry.
+#[allow(clippy::too_many_arguments)]
+async fn move_case_c(
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    verb_tx: &tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>,
+    index: &std::sync::Arc<Mutex<content_index::ContentIndex>>,
+    src_sid: content_index::SidecarId,
+    src_root_old: [u8; 32],
+    _child_cid: [u8; 32],
+    dst_sid: content_index::SidecarId,
+    dst_cids: &[[u8; 32]],
+    moved_entry: folders::ManifestEntry,
+    dst_old_cid: [u8; 32],
+    dst_old_size: u64,
+    _dst_old_stored_at: u64,
+    stored_at_ms: u64,
+) -> Result<MoveContentResult, String> {
+    let mut pending_ingests: Vec<(String, Vec<u8>)> = Vec::new();
+    let dst_walked = walk_and_rebuild_chain(
+        verb_tx,
+        dst_cids,
+        AncestorEdit::Append {
+            entry: moved_entry.clone(),
+        },
+        &mut pending_ingests,
+    )
+    .await?;
+    for (cid_hex, bytes) in pending_ingests {
+        send_ingest(ingest_tx, cid_hex, bytes).await?;
+    }
+
+    // STAGE 1: rekey destination.
+    {
+        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        match idx.rekey(
+            &dst_sid,
+            dst_old_cid,
+            dst_walked.new_top_level_cid,
+            dst_walked.new_top_level_size,
+            stored_at_ms,
+        ) {
+            Ok(()) => {}
+            Err(content_index::RekeyError::OldMissing) => {
+                return Err("dst_sidecar_id removed mid-flight — nothing to rekey".to_string());
+            }
+            Err(content_index::RekeyError::Conflict { actual }) => {
+                return Err(format!(
+                    "concurrent rekey on dst_sidecar_id (now at cid {}); retry from refreshed state",
+                    hex::encode(actual)
+                ));
+            }
+        }
+    }
+
+    // STAGE 2: remove the source sidecar entry, CAS-protected via a
+    // CID re-check. A concurrent rekey on src landing between boundary
+    // verify and here would have changed the entry's CID without
+    // burning the sidecar row — a plain `remove(&src_sid)` would
+    // happily delete the user's freshly-rekeyed entry. The CAS-style
+    // `remove_if_cid_matches` returns OldMissing or Conflict instead,
+    // which the compensating-undo path below routes through.
+    let stage2_err: Option<content_index::RekeyError> = {
+        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        idx.remove_if_cid_matches(&src_sid, src_root_old).err()
+    };
+    if let Some(src_err) = stage2_err {
+        let undo_err: Option<content_index::RekeyError> = {
+            let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+            // Use current `stored_at_ms` for the undo (see Case B
+            // for the same reasoning).
+            idx.rekey(
+                &dst_sid,
+                dst_walked.new_top_level_cid,
+                dst_old_cid,
+                dst_old_size,
+                stored_at_ms,
+            )
+            .err()
+        };
+        return Err(stage2_error_c(
+            src_err,
+            undo_err,
+            dst_walked.new_top_level_cid,
+        ));
+    }
+
+    maintain_pin_invariant(verb_tx, index, src_root_old, None).await;
+    maintain_pin_invariant(
+        verb_tx,
+        index,
+        dst_old_cid,
+        Some(dst_walked.new_top_level_cid),
+    )
+    .await;
+
+    Ok(MoveContentResult {
+        src_new_cid: None,
+        dst_sidecar_id: dst_sid.to_string(),
+        dst_new_cid: hex::encode(dst_walked.new_top_level_cid),
+    })
+}
+
+/// Case D: source is nested; destination is the root. Drain src chain,
+/// mint a new top-level sidecar entry for the moved child, then rekey
+/// the source.
+#[allow(clippy::too_many_arguments)]
+async fn move_case_d(
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    verb_tx: &tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>,
+    index: &std::sync::Arc<Mutex<content_index::ContentIndex>>,
+    src_sid: content_index::SidecarId,
+    src_cids: &[[u8; 32]],
+    child_cid: [u8; 32],
+    moved_entry: folders::ManifestEntry,
+    _src_pinned: bool,
+    stored_at_ms: u64,
+) -> Result<MoveContentResult, String> {
+    let src_root_old = src_cids[0];
+
+    let mut pending_ingests: Vec<(String, Vec<u8>)> = Vec::new();
+    let src_walked = walk_and_rebuild_chain(
+        verb_tx,
+        src_cids,
+        AncestorEdit::Remove {
+            child_cid,
+            child_name: moved_entry.name.clone(),
+        },
+        &mut pending_ingests,
+    )
+    .await?;
+    for (cid_hex, bytes) in pending_ingests {
+        send_ingest(ingest_tx, cid_hex, bytes).await?;
+    }
+
+    // Size of the new top-level entry: try to read the moved child's
+    // bundle to measure it. Cache-miss → default to 0 rather than fail
+    // the move (next refresh repopulates).
+    let child_size = read_cached_bytes(verb_tx, child_cid)
+        .await
+        .ok()
+        .flatten()
+        .map(|b| b.len() as u64)
+        .unwrap_or(0);
+
+    // STAGE 1: mint a new top-level sidecar entry. The preflight name
+    // check at the IPC boundary happens before several .await points,
+    // so a concurrent move-to-root or create-folder-at-root can claim
+    // the same `file_name` between our preflight read and this insert.
+    // Re-validate uniqueness while holding the same lock as the insert
+    // — `ContentIndex::insert` only de-duplicates by SidecarId, not by
+    // file_name.
+    let new_top_sid = content_index::SidecarId::new();
+    let inserted = {
+        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        if idx.entries().any(|e| e.file_name == moved_entry.name) {
+            return Err(format!(
+                "destination already has an entry named '{}'",
+                moved_entry.name
+            ));
+        }
+        idx.insert(content_index::ContentIndexEntry {
+            sidecar_id: new_top_sid,
+            cid: child_cid,
+            file_name: moved_entry.name.clone(),
+            size_bytes: child_size,
+            stored_at_ms,
+            sensitivity: content_index::Sensitivity::Private,
+            replication_tier: content_index::ReplicationTier::Default,
+            licensed: false,
+            archived: false,
+            pinned: false,
+            kind: moved_entry.kind,
+        })
+    };
+    if !inserted {
+        // SidecarId is UUID v4, collision is effectively impossible —
+        // surface as a hard error rather than silently overwriting.
+        return Err("sidecar_id collision on Case D mint".to_string());
+    }
+
+    // STAGE 2: rekey source. On failure, undo by removing the
+    // freshly-minted top-level entry.
+    let stage2 = {
+        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        idx.rekey(
+            &src_sid,
+            src_root_old,
+            src_walked.new_top_level_cid,
+            src_walked.new_top_level_size,
+            stored_at_ms,
+        )
+    };
+    match stage2 {
+        Ok(()) => {}
+        Err(e) => {
+            let undo_removed = {
+                let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+                idx.remove(&new_top_sid)
+            };
+            return Err(stage2_error_d(e, undo_removed));
+        }
+    }
+
+    maintain_pin_invariant(
+        verb_tx,
+        index,
+        src_root_old,
+        Some(src_walked.new_top_level_cid),
+    )
+    .await;
+    maintain_pin_invariant(verb_tx, index, child_cid, Some(child_cid)).await;
+
+    Ok(MoveContentResult {
+        src_new_cid: Some(hex::encode(src_walked.new_top_level_cid)),
+        dst_sidecar_id: new_top_sid.to_string(),
+        dst_new_cid: hex::encode(child_cid),
+    })
+}
+
+/// After every rekey/insert/remove, run the `is_cid_pinned_by_any`
+/// check and dispatch best-effort verb requests. Mirrors the
+/// `create_folder_nested` post-rekey block.
+async fn maintain_pin_invariant(
+    verb_tx: &tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>,
+    index: &std::sync::Arc<Mutex<content_index::ContentIndex>>,
+    old_cid: [u8; 32],
+    new_cid: Option<[u8; 32]>,
+) {
+    let (drop_old, add_new) = {
+        let Ok(idx) = index.lock() else {
+            return;
+        };
+        (
+            !idx.is_cid_pinned_by_any(&old_cid),
+            new_cid.is_some_and(|c| idx.is_cid_pinned_by_any(&c)),
+        )
+    };
+    if drop_old {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        match verb_tx
+            .send(event_loop::ContentVerbRequest::Unpin {
+                cid: old_cid,
+                reply: reply_tx,
+            })
+            .await
+        {
+            Ok(()) => match reply_rx.await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!(
+                    old_cid = %hex::encode(old_cid),
+                    err = %e,
+                    "move_content: runtime unpin of old root failed; cache may hold stale pin",
+                ),
+                Err(_) => tracing::warn!(
+                    old_cid = %hex::encode(old_cid),
+                    "move_content: event loop dropped unpin reply",
+                ),
+            },
+            Err(_) => tracing::warn!(
+                old_cid = %hex::encode(old_cid),
+                "move_content: event loop closed before unpin send; cache may hold stale pin",
+            ),
+        }
+    }
+    if add_new {
+        let new = new_cid.expect("guarded by add_new");
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        match verb_tx
+            .send(event_loop::ContentVerbRequest::Pin {
+                cid: new,
+                reply: reply_tx,
+            })
+            .await
+        {
+            Ok(()) => match reply_rx.await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!(
+                    new_cid = %hex::encode(new),
+                    err = %e,
+                    "move_content: runtime pin of new root failed; sidecar pin intent will repin on next fetch",
+                ),
+                Err(_) => tracing::warn!(
+                    new_cid = %hex::encode(new),
+                    "move_content: event loop dropped pin reply",
+                ),
+            },
+            Err(_) => tracing::warn!(
+                new_cid = %hex::encode(new),
+                "move_content: event loop closed before pin send; sidecar pin intent will repin on next fetch",
+            ),
+        }
+    }
+}
+
+fn stage2_error_b(
+    src_err: content_index::RekeyError,
+    undo_err: Option<content_index::RekeyError>,
+    dst_new_cid: [u8; 32],
+) -> String {
+    let src_state = match src_err {
+        content_index::RekeyError::OldMissing => "src_sidecar_id removed".to_string(),
+        content_index::RekeyError::Conflict { actual } => {
+            format!(
+                "concurrent rekey on src (now at cid {})",
+                hex::encode(actual)
+            )
+        }
+    };
+    match undo_err {
+        None => format!("{src_state}; dst rekey reverted"),
+        Some(content_index::RekeyError::OldMissing) => {
+            tracing::warn!("move_content: dst sidecar entry disappeared during compensating undo");
+            format!(
+                "{src_state}; compensating undo of dst FAILED (dst entry missing); dst is at cid {}; src untouched",
+                hex::encode(dst_new_cid)
+            )
+        }
+        Some(content_index::RekeyError::Conflict { actual }) => {
+            tracing::warn!(
+                actual = %hex::encode(actual),
+                "move_content: compensating undo of dst lost the CAS race; manual reconcile required"
+            );
+            format!(
+                "{src_state}; compensating undo of dst FAILED (dst now at cid {}); src untouched; child appears in both folders",
+                hex::encode(actual)
+            )
+        }
+    }
+}
+
+fn stage2_error_c(
+    src_err: content_index::RekeyError,
+    undo_err: Option<content_index::RekeyError>,
+    dst_new_cid: [u8; 32],
+) -> String {
+    let src_state = match src_err {
+        content_index::RekeyError::OldMissing => "src_sidecar_id already removed".to_string(),
+        content_index::RekeyError::Conflict { actual } => format!(
+            "concurrent rekey on src_sidecar_id (now at cid {})",
+            hex::encode(actual)
+        ),
+    };
+    // Whether the moved child appears in both folders after this error
+    // depends on whether src's entry is still around:
+    //   - OldMissing: src entry was concurrently burned → child is only
+    //     in dst (if undo failed) or in neither folder's sidecar view (if
+    //     undo succeeded).
+    //   - Conflict: src entry still exists at a different CID; that other
+    //     CID's tree may or may not contain the moved child. If dst's
+    //     undo failed, dst's tree also contains the moved child — so the
+    //     child is reachable from both sides.
+    let in_both =
+        matches!(src_err, content_index::RekeyError::Conflict { .. }) && undo_err.is_some();
+    let suffix = if in_both {
+        "; child may appear in both folders — manual reconcile required"
+    } else {
+        ""
+    };
+    match undo_err {
+        None => format!("{src_state}; dst rekey reverted{suffix}"),
+        Some(content_index::RekeyError::OldMissing) => {
+            tracing::warn!("move_content: dst sidecar entry disappeared during compensating undo");
+            format!(
+                "{src_state}; compensating undo of dst FAILED (dst entry missing); last-known dst cid was {}{suffix}",
+                hex::encode(dst_new_cid)
+            )
+        }
+        Some(content_index::RekeyError::Conflict { actual }) => {
+            tracing::warn!(
+                actual = %hex::encode(actual),
+                "move_content: compensating undo of dst lost the CAS race; manual reconcile required"
+            );
+            format!(
+                "{src_state}; compensating undo of dst FAILED (dst now at cid {}){suffix}",
+                hex::encode(actual)
+            )
+        }
+    }
+}
+
+fn stage2_error_d(src_err: content_index::RekeyError, undo_removed: bool) -> String {
+    let src_state = match src_err {
+        content_index::RekeyError::OldMissing => "src_sidecar_id removed".to_string(),
+        content_index::RekeyError::Conflict { actual } => {
+            format!(
+                "concurrent rekey on src (now at cid {})",
+                hex::encode(actual)
+            )
+        }
+    };
+    if undo_removed {
+        format!("{src_state}; freshly-minted top-level entry removed (clean revert)")
+    } else {
+        tracing::warn!(
+            "move_content: failed to remove freshly-minted top-level during Case D undo"
+        );
+        format!(
+            "{src_state}; compensating undo FAILED to remove freshly-minted top-level entry; entry remains; src untouched"
+        )
+    }
+}
+
+#[cfg(test)]
+mod walk_and_rebuild_chain_tests {
+    use super::*;
+    use harmony_content::bundle::BundleBuilder;
+    use harmony_content::cid::{ContentFlags, ContentId};
+    use std::collections::HashMap;
+
+    /// Spawn an in-test handler that replies to ReadBytes from a seeded
+    /// HashMap. The handler runs until the channel closes (i.e., until
+    /// `verb_tx` is dropped at the end of the test).
+    fn spawn_seeded_verb_handler(
+        store: HashMap<[u8; 32], Vec<u8>>,
+    ) -> tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest> {
+        let (verb_tx, mut verb_rx) =
+            tokio::sync::mpsc::channel::<event_loop::ContentVerbRequest>(8);
+        tokio::spawn(async move {
+            while let Some(req) = verb_rx.recv().await {
+                // No other verbs needed for chain-walk tests; only
+                // ReadBytes is exercised.
+                if let event_loop::ContentVerbRequest::ReadBytes { cid, reply } = req {
+                    let _ = reply.send(store.get(&cid).cloned());
+                }
+            }
+        });
+        verb_tx
+    }
+
+    /// Build a minimal folder bundle holding a single leaf entry.
+    fn build_one_leaf_folder(leaf_cid: [u8; 32]) -> folders::BuiltFolder {
+        folders::build_folder(
+            "",
+            &[folders::ManifestEntry {
+                cid: leaf_cid,
+                name: "leaf".into(),
+                kind: content_index::ContentKind::Leaf,
+            }],
+        )
+        .expect("build")
+    }
+
+    #[tokio::test]
+    async fn walk_and_rebuild_chain_remove_deepest() {
+        // Folder F contains leaf L. Walking [F] with Remove(L) should
+        // produce an empty-folder rebuild of F.
+        let leaf_cid = [0x11; 32];
+        let f = build_one_leaf_folder(leaf_cid);
+
+        let mut store = HashMap::new();
+        store.insert(f.bundle_cid.to_bytes(), f.bundle_bytes.clone());
+        store.insert(f.manifest_cid.to_bytes(), f.manifest_bytes.clone());
+
+        let verb_tx = spawn_seeded_verb_handler(store);
+        let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
+        let walked = walk_and_rebuild_chain(
+            &verb_tx,
+            &[f.bundle_cid.to_bytes()],
+            AncestorEdit::Remove {
+                child_cid: leaf_cid,
+                child_name: "leaf".into(),
+            },
+            &mut pending,
+        )
+        .await
+        .expect("walk");
+
+        let empty = folders::build_folder("", &[]).expect("build empty");
+        assert_eq!(walked.new_top_level_cid, empty.bundle_cid.to_bytes());
+        assert_eq!(walked.new_top_level_size, empty.bundle_bytes.len() as u64);
+        // Two pending entries pushed: rebuilt manifest + rebuilt bundle.
+        assert_eq!(pending.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn walk_and_rebuild_chain_replace_deepest() {
+        // Folder F contains entry pointing at OLD. Replace OLD → NEW.
+        let old_cid = [0x22; 32];
+        let new_cid = [0x33; 32];
+        let f = build_one_leaf_folder(old_cid);
+
+        let mut store = HashMap::new();
+        store.insert(f.bundle_cid.to_bytes(), f.bundle_bytes.clone());
+        store.insert(f.manifest_cid.to_bytes(), f.manifest_bytes.clone());
+
+        let verb_tx = spawn_seeded_verb_handler(store);
+        let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
+        let walked = walk_and_rebuild_chain(
+            &verb_tx,
+            &[f.bundle_cid.to_bytes()],
+            AncestorEdit::Replace {
+                old_child_cid: old_cid,
+                new_child_cid: new_cid,
+            },
+            &mut pending,
+        )
+        .await
+        .expect("walk");
+
+        let expected = folders::build_folder(
+            "",
+            &[folders::ManifestEntry {
+                cid: new_cid,
+                name: "leaf".into(),
+                kind: content_index::ContentKind::Leaf,
+            }],
+        )
+        .expect("build");
+        assert_eq!(walked.new_top_level_cid, expected.bundle_cid.to_bytes());
+        assert_eq!(pending.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn walk_and_rebuild_chain_append_deepest() {
+        let leaf_cid = [0x44; 32];
+        let f = build_one_leaf_folder(leaf_cid);
+
+        let mut store = HashMap::new();
+        store.insert(f.bundle_cid.to_bytes(), f.bundle_bytes.clone());
+        store.insert(f.manifest_cid.to_bytes(), f.manifest_bytes.clone());
+
+        let new_child_cid = [0x55; 32];
+        let verb_tx = spawn_seeded_verb_handler(store);
+        let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
+        let walked = walk_and_rebuild_chain(
+            &verb_tx,
+            &[f.bundle_cid.to_bytes()],
+            AncestorEdit::Append {
+                entry: folders::ManifestEntry {
+                    cid: new_child_cid,
+                    name: "newly".into(),
+                    kind: content_index::ContentKind::Folder,
+                },
+            },
+            &mut pending,
+        )
+        .await
+        .expect("walk");
+
+        let expected = folders::build_folder(
+            "",
+            &[
+                folders::ManifestEntry {
+                    cid: leaf_cid,
+                    name: "leaf".into(),
+                    kind: content_index::ContentKind::Leaf,
+                },
+                folders::ManifestEntry {
+                    cid: new_child_cid,
+                    name: "newly".into(),
+                    kind: content_index::ContentKind::Folder,
+                },
+            ],
+        )
+        .expect("build");
+        assert_eq!(walked.new_top_level_cid, expected.bundle_cid.to_bytes());
+        assert_eq!(pending.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn walk_and_rebuild_chain_cache_miss_returns_err_without_mutating_pending() {
+        // Nothing seeded — the bundle read will return None.
+        let verb_tx = spawn_seeded_verb_handler(HashMap::new());
+        let mut pending: Vec<(String, Vec<u8>)> = vec![(
+            "preexisting".into(),
+            b"caller had already pushed this".to_vec(),
+        )];
+        let preexisting_len = pending.len();
+
+        let err = walk_and_rebuild_chain(
+            &verb_tx,
+            &[[0x66; 32]],
+            AncestorEdit::Remove {
+                child_cid: [0x77; 32],
+                child_name: "absent".into(),
+            },
+            &mut pending,
+        )
+        .await
+        .expect_err("cache miss must surface as Err");
+
+        assert!(err.contains("not in cache"), "got: {err}");
+        // The helper guarantees pending_ingests is not partially mutated
+        // on failure: only entries the caller had before the call remain.
+        assert_eq!(pending.len(), preexisting_len);
+        assert_eq!(pending[0].0, "preexisting");
+    }
+
+    #[tokio::test]
+    async fn walk_and_rebuild_chain_missing_child_in_manifest() {
+        // Build a 2-level chain: outer contains inner. Walk with a
+        // non-deepest edit whose old_child_cid does not appear in the
+        // outer ancestor's manifest. Should surface a missing-entry
+        // error and leave pending_ingests untouched.
+        let bottom_leaf = [0x88; 32];
+        let inner = build_one_leaf_folder(bottom_leaf);
+        let outer = folders::build_folder(
+            "",
+            &[folders::ManifestEntry {
+                cid: inner.bundle_cid.to_bytes(),
+                name: "inner".into(),
+                kind: content_index::ContentKind::Folder,
+            }],
+        )
+        .expect("build outer");
+
+        let mut store = HashMap::new();
+        store.insert(outer.bundle_cid.to_bytes(), outer.bundle_bytes.clone());
+        store.insert(outer.manifest_cid.to_bytes(), outer.manifest_bytes.clone());
+        store.insert(inner.bundle_cid.to_bytes(), inner.bundle_bytes.clone());
+        store.insert(inner.manifest_cid.to_bytes(), inner.manifest_bytes.clone());
+
+        // Deliberately pass an inner CID that doesn't actually appear in
+        // outer's manifest. The deepest-edit (Remove on `inner`) is
+        // applied to `inner`'s manifest fine; the next iteration up
+        // (outer) tries to Replace inner's old CID with the new one
+        // produced by inner's rebuild — that part should always
+        // succeed. To trigger the missing-child error, we instead pass
+        // a path where the bottom is `inner` but with a Remove edit
+        // for a leaf that isn't in `inner`'s manifest.
+        let verb_tx = spawn_seeded_verb_handler(store);
+        let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
+        let err = walk_and_rebuild_chain(
+            &verb_tx,
+            &[outer.bundle_cid.to_bytes(), inner.bundle_cid.to_bytes()],
+            AncestorEdit::Remove {
+                child_cid: [0xEE; 32],
+                child_name: "absent".into(),
+            },
+            &mut pending,
+        )
+        .await
+        .expect_err("missing child must surface as Err");
+
+        assert!(
+            err.contains("has no entry named 'absent' pointing to child"),
+            "got: {err}"
+        );
+        assert!(pending.is_empty(), "pending must be untouched on error");
+    }
+
+    #[tokio::test]
+    async fn walk_and_rebuild_chain_two_level_propagates_cid_change() {
+        // outer (folder) contains inner (folder) contains leaf L.
+        // Walking [outer, inner] with Remove(L) should rebuild inner
+        // empty AND rebuild outer with its inner-entry CID flipped to
+        // the new (empty) inner CID.
+        let leaf = [0x99; 32];
+        let inner = build_one_leaf_folder(leaf);
+        let outer = folders::build_folder(
+            "",
+            &[folders::ManifestEntry {
+                cid: inner.bundle_cid.to_bytes(),
+                name: "inner".into(),
+                kind: content_index::ContentKind::Folder,
+            }],
+        )
+        .expect("build outer");
+
+        let mut store = HashMap::new();
+        store.insert(outer.bundle_cid.to_bytes(), outer.bundle_bytes.clone());
+        store.insert(outer.manifest_cid.to_bytes(), outer.manifest_bytes.clone());
+        store.insert(inner.bundle_cid.to_bytes(), inner.bundle_bytes.clone());
+        store.insert(inner.manifest_cid.to_bytes(), inner.manifest_bytes.clone());
+
+        let verb_tx = spawn_seeded_verb_handler(store);
+        let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
+        let walked = walk_and_rebuild_chain(
+            &verb_tx,
+            &[outer.bundle_cid.to_bytes(), inner.bundle_cid.to_bytes()],
+            AncestorEdit::Remove {
+                child_cid: leaf,
+                child_name: "leaf".into(),
+            },
+            &mut pending,
+        )
+        .await
+        .expect("walk");
+
+        let empty_inner = folders::build_folder("", &[]).expect("build empty");
+        let expected_outer = folders::build_folder(
+            "",
+            &[folders::ManifestEntry {
+                cid: empty_inner.bundle_cid.to_bytes(),
+                name: "inner".into(),
+                kind: content_index::ContentKind::Folder,
+            }],
+        )
+        .expect("build outer");
+        assert_eq!(
+            walked.new_top_level_cid,
+            expected_outer.bundle_cid.to_bytes()
+        );
+        // 4 pushed pairs (inner manifest+bundle, then outer manifest+bundle).
+        assert_eq!(pending.len(), 4);
+    }
+
+    // Pin a couple of synthetic CIDs to prove our [0x11;32] fixtures
+    // never accidentally collide with real ContentFlags-tagged CIDs:
+    // synthetic CIDs are raw arbitrary bytes; the build path tags
+    // CIDs with content-type + size bits; the two namespaces never
+    // overlap.
+    #[test]
+    fn synthetic_cid_does_not_collide_with_built_cid() {
+        let leaf_bytes = b"hello".to_vec();
+        let real_cid = ContentId::for_book(&leaf_bytes, ContentFlags::default())
+            .expect("book cid")
+            .to_bytes();
+        assert_ne!(real_cid, [0x11; 32]);
+        let mut builder = BundleBuilder::new();
+        builder.add(ContentId::from_bytes([0x11; 32]));
+        builder.add(ContentId::from_bytes([0x22; 32]));
+        let (_, bundle_cid) = builder
+            .build_with_flags(ContentFlags::default())
+            .expect("bundle");
+        assert_ne!(bundle_cid.to_bytes(), [0x11; 32]);
+    }
 }
 
 /// Fetch raw content bytes by hex-encoded CID via Zenoh get().
@@ -19380,6 +20963,7 @@ pub fn run() {
             export_content,
             ingest_content,
             create_folder,
+            move_content,
             send_voice_frame,
             join_voice_channel,
             leave_voice_channel,

@@ -143,6 +143,18 @@ struct IndexFile {
 pub struct ContentIndex {
     path: PathBuf,
     entries: HashMap<SidecarId, ContentIndexEntry>,
+    /// Test-only one-shot hook armed via `arm_next_rekey_conflict`.
+    /// When `Some((sid, fake_actual))`, the next `rekey` call targeting
+    /// `sid` returns `Err(RekeyError::Conflict { actual: fake_actual })`
+    /// without mutating any entry, then clears the hook.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    test_rekey_conflict_hook: Option<(SidecarId, [u8; 32])>,
+    /// Test-only one-shot hook armed via
+    /// `arm_next_remove_if_cid_matches_conflict`. Symmetric counterpart
+    /// of `test_rekey_conflict_hook` for the `remove_if_cid_matches`
+    /// path that backs `move_content`'s Case C STAGE 2.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    test_remove_conflict_hook: Option<(SidecarId, [u8; 32])>,
 }
 
 /// Error returned by [`ContentIndex::rekey`].
@@ -177,7 +189,14 @@ impl ContentIndex {
         } else {
             Self::read_file(&path).unwrap_or_default()
         };
-        ContentIndex { path, entries }
+        ContentIndex {
+            path,
+            entries,
+            #[cfg(any(test, feature = "test-fixtures"))]
+            test_rekey_conflict_hook: None,
+            #[cfg(any(test, feature = "test-fixtures"))]
+            test_remove_conflict_hook: None,
+        }
     }
 
     fn read_file(path: &Path) -> Option<HashMap<SidecarId, ContentIndexEntry>> {
@@ -301,6 +320,15 @@ impl ContentIndex {
         new_size_bytes: u64,
         new_stored_at_ms: u64,
     ) -> Result<(), RekeyError> {
+        #[cfg(any(test, feature = "test-fixtures"))]
+        if let Some((armed_sid, fake_actual)) = self.test_rekey_conflict_hook {
+            if armed_sid == *id {
+                self.test_rekey_conflict_hook = None;
+                return Err(RekeyError::Conflict {
+                    actual: fake_actual,
+                });
+            }
+        }
         let Some(entry) = self.entries.get_mut(id) else {
             return Err(RekeyError::OldMissing);
         };
@@ -310,6 +338,38 @@ impl ContentIndex {
         entry.cid = new_cid;
         entry.size_bytes = new_size_bytes;
         entry.stored_at_ms = new_stored_at_ms;
+        self.save();
+        Ok(())
+    }
+
+    /// Remove the sidecar entry whose `id` is `id` and whose current CID
+    /// is `expected_cid`. CAS-protected counterpart of [`Self::remove`]:
+    /// returns `Err(RekeyError::OldMissing)` if the entry is absent and
+    /// `Err(RekeyError::Conflict { actual })` if it exists but its CID
+    /// differs. Used by `move_content`'s Case C STAGE 2 so a concurrent
+    /// rekey doesn't get its top-level entry deleted.
+    pub fn remove_if_cid_matches(
+        &mut self,
+        id: &SidecarId,
+        expected_cid: [u8; 32],
+    ) -> Result<(), RekeyError> {
+        #[cfg(any(test, feature = "test-fixtures"))]
+        if let Some((armed_sid, fake_actual)) = self.test_remove_conflict_hook {
+            if armed_sid == *id {
+                self.test_remove_conflict_hook = None;
+                return Err(RekeyError::Conflict {
+                    actual: fake_actual,
+                });
+            }
+        }
+        let actual = match self.entries.get(id) {
+            None => return Err(RekeyError::OldMissing),
+            Some(entry) => entry.cid,
+        };
+        if actual != expected_cid {
+            return Err(RekeyError::Conflict { actual });
+        }
+        self.entries.remove(id);
         self.save();
         Ok(())
     }
@@ -377,6 +437,35 @@ impl ContentIndex {
     /// Callers that surface results to users must sort.
     pub fn entries(&self) -> impl Iterator<Item = &ContentIndexEntry> {
         self.entries.values()
+    }
+
+    /// Test-only: arm a one-shot hook that forces the NEXT `rekey` call
+    /// targeting `target` to return `Conflict { actual: fake_actual }`
+    /// without mutating the entry. Consumes itself on use.
+    ///
+    /// Lets tests deterministically exercise STAGE-2 CAS-conflict paths
+    /// in `move_content`'s Case B/C/D that would otherwise require a
+    /// timing race via wall-clock sleep.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn arm_next_rekey_conflict(&mut self, target: SidecarId, fake_actual: [u8; 32]) {
+        self.test_rekey_conflict_hook = Some((target, fake_actual));
+    }
+
+    /// Test-only: symmetric counterpart of `arm_next_rekey_conflict` for
+    /// the `remove_if_cid_matches` path. Forces the NEXT
+    /// `remove_if_cid_matches` call targeting `target` to return
+    /// `Conflict { actual: fake_actual }` without mutating the entry.
+    ///
+    /// Lets the Case C STAGE 2 test exercise the post-STAGE-1 CAS
+    /// conflict + compensating-undo flow without the boundary verify
+    /// pre-empting it.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn arm_next_remove_if_cid_matches_conflict(
+        &mut self,
+        target: SidecarId,
+        fake_actual: [u8; 32],
+    ) {
+        self.test_remove_conflict_hook = Some((target, fake_actual));
     }
 }
 

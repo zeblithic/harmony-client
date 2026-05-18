@@ -39,6 +39,20 @@ export interface CreateFolderResult {
   cid: string;
 }
 
+/** Wire format returned by the move_content Tauri command (ZEB-162). */
+export interface MoveContentResult {
+  /** New CID of the source top-level after the move. Null for Case C
+   *  (source top-level was deleted). */
+  srcNewCid: string | null;
+  /** SidecarId of the (possibly newly minted) destination top-level entry.
+   *  For Cases A/B/C this equals the dst_sidecar_id arg; for Case D this
+   *  is a freshly minted sidecar_id. */
+  dstSidecarId: string;
+  /** New CID of the destination top-level after the move. For Case D
+   *  this equals srcChildCid. */
+  dstNewCid: string;
+}
+
 /** Wire format for entries returned by the list_content Tauri command. */
 interface ContentItemWire {
   sidecarId: string;
@@ -447,6 +461,67 @@ export class FileManagerService {
     } catch (err) {
       console.warn(
         'createFolder: refetchRoot failed (folder was created); UI may show stale list:',
+        err,
+      );
+    }
+    return result;
+  }
+
+  /**
+   * Move a file or sub-folder between File Manager locations (ZEB-162).
+   *
+   * The four cases are inferred by the backend from the arg shape:
+   * - Case A (same top-level): `dstSidecarId === srcSidecarId` and
+   *   `dstPath[0] === srcPath[0]`.
+   * - Case B (across top-levels): `dstSidecarId` is set and ≠ `srcSidecarId`.
+   * - Case C (root → nested): `srcPath.length === 1 && srcPath[0] === srcChildCid`,
+   *   `dstSidecarId` set.
+   * - Case D (nested → root): `dstSidecarId === null && dstPath === []`.
+   *
+   * @param args - move operands. `newName` must remain `null` in this
+   *   slice (rename is ZEB-299).
+   *
+   * Returns the rekeyed CIDs and the destination sidecar id. On any
+   * backend error throws with the error message — callers surface it
+   * inline (no `alert`).
+   */
+  async moveContent(args: {
+    srcSidecarId: string;
+    srcPath: string[];
+    srcChildCid: string;
+    /**
+     * Manifest entry name of the dragged row (or sidecar `file_name`
+     * when the source IS a top-level entry). Required because sibling
+     * entries can share a CID — name disambiguates which sibling to
+     * remove. Mismatch with the on-disk manifest aborts the move.
+     */
+    srcChildName: string;
+    dstSidecarId: string | null;
+    dstPath: string[];
+    newName?: null;
+  }): Promise<MoveContentResult> {
+    if (!this.adapter) throw new Error('adapter not connected');
+    const result = (await this.adapter.invoke('move_content', {
+      srcSidecarId: args.srcSidecarId,
+      srcPath: args.srcPath,
+      srcChildCid: args.srcChildCid,
+      srcChildName: args.srcChildName,
+      dstSidecarId: args.dstSidecarId,
+      dstPath: args.dstPath,
+      newName: null,
+    })) as MoveContentResult;
+    // The move may have removed (Case C) or rekeyed (Cases A/B/D) one or
+    // two top-level sidecar entries, plus mutated nested manifests inside
+    // the affected chains. Same refresh shape as createFolder: re-list the
+    // root so the top-level rows reflect the new CIDs and any
+    // addition/removal of root entries. Nested-folder views are kept in
+    // sync by FileBrowser's serviceVersion-tracking effect when refetchRoot
+    // fires onChange.
+    try {
+      await this.refetchRoot();
+    } catch (err) {
+      console.warn(
+        'moveContent: refetchRoot failed (move succeeded); UI may show stale list:',
         err,
       );
     }

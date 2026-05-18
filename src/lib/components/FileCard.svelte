@@ -7,21 +7,36 @@
     item,
     onClick,
     selected = false,
+    onRowDragStart,
+    onRowDrop,
   }: {
     item: ContentItem;
     onClick?: (item: ContentItem) => void;
     selected?: boolean;
+    /** ZEB-162: drag-drop handlers wired by FileGrid → FileBrowser. */
+    onRowDragStart?: (e: DragEvent, item: ContentItem) => void;
+    onRowDrop?: (e: DragEvent, targetCid: string, targetSidecarId: string | null) => void;
   } = $props();
 
   let icon = $derived(categoryIcon(item.category));
   let size = $derived(formatBytes(item.sizeBytes));
   let sensIcon = $derived(sensitivityIcon(item.sensitivity));
+
+  function handleDragOver(e: DragEvent) {
+    if (!item.isFolder) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+  }
 </script>
 
 <button
   class="file-card"
   class:selected
+  draggable="true"
   onclick={() => onClick?.(item)}
+  ondragstart={(e) => onRowDragStart?.(e, item)}
+  ondragover={handleDragOver}
+  ondrop={item.isFolder ? (e) => onRowDrop?.(e, item.cid, item.sidecarId ?? null) : undefined}
   aria-label={item.name}
 >
   <div class="file-card-overlay-top">

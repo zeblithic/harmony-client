@@ -7,11 +7,16 @@
     selectedCid,
     selectedSidecarId = null,
     onItemClick,
+    onRowDragStart,
+    onRowDrop,
   }: {
     items: ContentItem[];
     selectedCid: string | null;
     selectedSidecarId?: string | null;
     onItemClick: (item: ContentItem) => void;
+    /** ZEB-162: per-row drag handlers, wired by FileBrowser. */
+    onRowDragStart?: (e: DragEvent, item: ContentItem) => void;
+    onRowDrop?: (e: DragEvent, targetCid: string, targetSidecarId: string | null) => void;
   } = $props();
 </script>
 
@@ -26,7 +31,13 @@
     <span class="header-sensitivity" aria-hidden="true"></span>
   </div>
   {#each items as item (item.sidecarId || item.cid)}
-    <FileRow {item} onClick={onItemClick} selected={selectedSidecarId !== null ? selectedSidecarId === item.sidecarId : selectedCid === item.cid} />
+    <FileRow
+      {item}
+      onClick={onItemClick}
+      selected={selectedSidecarId !== null ? selectedSidecarId === item.sidecarId : selectedCid === item.cid}
+      {onRowDragStart}
+      {onRowDrop}
+    />
   {/each}
 </div>
 
