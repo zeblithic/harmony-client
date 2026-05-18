@@ -2967,6 +2967,44 @@ fn apply_admin_proposal_effect(
     }
 }
 
+/// ZEB-297: outcome of an auto-exec `SetPower` dispatch from a Tier 2
+/// finalization. Distinguishes "the mint actually happened" from "this
+/// replica intentionally skipped" so the tick can keep accurate
+/// metrics and operators can tell admin replicas from non-admin
+/// replicas in logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoExecOutcome {
+    /// Local actor satisfied `POWER_THRESHOLDS.set_power`; SetPower
+    /// event was minted, signed, and inserted into the engine's local
+    /// log. Peers receive it via Zenoh sync on the membership topic.
+    Applied,
+    /// Local actor's power level in this community is below the
+    /// `set_power` threshold (100), so this replica cannot produce a
+    /// SetPower event that any verifier will accept. Skip silently —
+    /// admins race to mint, HLC LWW dedupes, and the first one's
+    /// event propagates to every replica via the existing membership
+    /// log sync. This is the intentional "wrong replica" path, not a
+    /// failure.
+    SkippedNotAdmin,
+}
+
+/// ZEB-297: pure helper deciding whether the local actor is allowed
+/// to mint a `SetPower` event in this community. Lifted out of
+/// `apply_auto_exec_set_power` so the admin-only-mint guard is unit
+/// testable without spinning up a full `CommunitySyncEngine` +
+/// `NodeState` + registry fixture.
+///
+/// Returns `true` iff the local actor's materialized `power_levels`
+/// entry is `>= POWER_THRESHOLDS.set_power` (currently 100). Treats a
+/// missing entry as 0 (default per spec §4 power table).
+///
+/// Boundary condition: `actor_power == POWER_THRESHOLDS.set_power` is
+/// allowed (admins at exactly 100 can mint SetPower).
+pub fn local_actor_can_mint_set_power(mat: &MaterializedMembership, self_owner: OwnerAddr) -> bool {
+    let actor_power = mat.power_levels.get(&self_owner).copied().unwrap_or(0);
+    actor_power >= POWER_THRESHOLDS.set_power
+}
+
 /// ZEB-291 Phase 2 Task 10: auto-exec dispatch from a Tier 2 contestability finalize.
 ///
 /// Signs and applies a `SetPower` membership event using the node's local
@@ -2983,6 +3021,15 @@ fn apply_admin_proposal_effect(
 /// rather than panicking — voting tick (Task 16) logs and continues; the
 /// PollResult event is NOT rolled back.
 ///
+/// ZEB-297: returns `Ok(AutoExecOutcome::SkippedNotAdmin)` when the local
+/// actor's materialized power level in this community is below
+/// `POWER_THRESHOLDS.set_power`. Without this guard, a non-admin replica
+/// would mint a SetPower event that its own `verify_event` would reject
+/// (`InsufficientPower`), so finalization would only land on whichever
+/// admin replica's tick ran first. With the guard, admins race to mint
+/// and HLC LWW dedupes; the first admin's event propagates to every
+/// replica via the existing membership log sync.
+///
 /// Returns `Err` (as String, matching the existing IPC error convention)
 /// if:
 /// - NodeState is missing any required field (registry, outbox, etc.) —
@@ -2996,7 +3043,7 @@ pub async fn apply_auto_exec_set_power(
     community_id: crate::owner_state_types::SpaceId,
     target_pubkey: crate::owner_state_types::OwnerAddr,
     new_power: u32,
-) -> Result<(), String> {
+) -> Result<AutoExecOutcome, String> {
     if new_power > 100 {
         return Err(format!(
             "new_power out of range: {} > 100 (u8/power-table cap)",
@@ -3030,13 +3077,6 @@ pub async fn apply_auto_exec_set_power(
         )
     };
 
-    let wall_now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    let event_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
-
     let engine_arc = community_registry
         .engine_arc(&community_id)
         .await
@@ -3046,6 +3086,34 @@ pub async fn apply_auto_exec_set_power(
                 hex::encode(community_id.0)
             )
         })?;
+
+    // ZEB-297: admin-only mint. Read the engine's materialized
+    // power_levels for the local actor; skip if below the set_power
+    // threshold. Done BEFORE reserving an HLC so we don't burn a
+    // tracker slot on a no-op. Admins race to mint; the first one's
+    // event propagates via the existing membership log sync.
+    let can_mint = {
+        let state_arc = engine_arc.state();
+        let state_g = state_arc.lock().await;
+        let mat = state_g.materialized(engine_arc.admin_addr());
+        local_actor_can_mint_set_power(&mat, self_owner)
+    };
+    if !can_mint {
+        tracing::info!(
+            community = %hex::encode(community_id.0),
+            target = %hex::encode(target_pubkey.0),
+            new_power,
+            "auto_exec_set_power: skipping — local actor is not admin in this community (deferring to admin race)"
+        );
+        return Ok(AutoExecOutcome::SkippedNotAdmin);
+    }
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let event_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
 
     let event = {
         let outbox_g = dm_outbox.lock().await;
@@ -3071,13 +3139,47 @@ pub async fn apply_auto_exec_set_power(
         return Err(format!("apply_auto_exec_set_power: rejected: {outcome:?}"));
     }
     let _ = device_id;
-    Ok(())
+    Ok(AutoExecOutcome::Applied)
 }
 
 #[cfg(test)]
 mod auto_exec_tests {
     use super::*;
     use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+
+    /// ZEB-297: `local_actor_can_mint_set_power` returns false when the
+    /// local actor's materialized power level is below the
+    /// `set_power` threshold (100). This is the pure-helper unit
+    /// underpinning the guard inside `apply_auto_exec_set_power` — a
+    /// non-admin replica must NOT mint a SetPower event that its own
+    /// `verify_event` would self-reject (`InsufficientPower`).
+    #[test]
+    fn local_actor_can_mint_set_power_returns_false_when_below_threshold() {
+        let self_owner = OwnerAddr([0xaa; 16]);
+        let mut mat = MaterializedMembership::default();
+        // Default power for `self_owner` is 0 (key absent) — non-admin.
+        assert!(!local_actor_can_mint_set_power(&mat, self_owner));
+
+        // Power 99 is still below the 100 admin threshold.
+        mat.power_levels
+            .insert(self_owner, POWER_THRESHOLDS.set_power - 1);
+        assert!(!local_actor_can_mint_set_power(&mat, self_owner));
+    }
+
+    /// ZEB-297: positive-path companion — `local_actor_can_mint_set_power`
+    /// returns true at exactly `POWER_THRESHOLDS.set_power` (100) and
+    /// above. Pins the boundary condition so a future refactor that
+    /// accidentally uses `>` instead of `>=` would fail loudly.
+    #[test]
+    fn local_actor_can_mint_set_power_returns_true_when_at_or_above_threshold() {
+        let self_owner = OwnerAddr([0xaa; 16]);
+        let mut mat = MaterializedMembership::default();
+
+        // Power == threshold (100): admin can mint.
+        mat.power_levels
+            .insert(self_owner, POWER_THRESHOLDS.set_power);
+        assert!(local_actor_can_mint_set_power(&mat, self_owner));
+    }
 
     /// Apply-auto-exec helper test: bounds-check on `new_power > 100`.
     ///

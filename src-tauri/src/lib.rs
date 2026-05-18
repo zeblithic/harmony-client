@@ -3378,6 +3378,16 @@ async fn start_node(
                                     // this with the real call. Today we
                                     // log the intent so observability
                                     // surfaces the deferred behavior.
+                                    //
+                                    // ZEB-297: stub returns
+                                    // `SkippedNotAdmin` so the tick
+                                    // counts this as an intentional
+                                    // skip rather than a success. The
+                                    // real wiring (Task 20.1) will
+                                    // call `apply_auto_exec_set_power`
+                                    // which decides Applied vs Skipped
+                                    // based on the local actor's
+                                    // materialized power level.
                                     tracing::warn!(
                                         community = %hex::encode(cid.0),
                                         target = %hex::encode(target.0),
@@ -3385,7 +3395,12 @@ async fn start_node(
                                         "voting tick: auto_exec_set_power dispatch \
                                          deferred (Task 20.1 — NodeState wiring)"
                                     );
-                                    Ok::<(), String>(())
+                                    Ok::<
+                                        crate::community_membership::AutoExecOutcome,
+                                        String,
+                                    >(
+                                        crate::community_membership::AutoExecOutcome::SkippedNotAdmin,
+                                    )
                                 })
                             },
                         );

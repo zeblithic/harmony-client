@@ -36,6 +36,14 @@ pub struct TickStats {
     pub tier2_proposals_finalized: u32,
     pub tier2_auto_execs_attempted: u32,
     pub tier2_auto_execs_succeeded: u32,
+    /// ZEB-297: number of `AutoExecAction::SetPower` dispatches the
+    /// auto-exec callback intentionally skipped because the local
+    /// replica's actor is not an admin in the affected community.
+    /// Distinct from `tier2_auto_execs_succeeded` (admin minted the
+    /// event) and the implicit error-counted-by-warn path (callback
+    /// returned `Err`). Each Tier 2 finalization with a SetPower auto-
+    /// exec increments exactly one of these three on every replica.
+    pub tier2_auto_execs_skipped_not_admin: u32,
     pub archive_swept: bool,
 }
 
@@ -47,9 +55,13 @@ pub type AutoExecSetPowerFn = Arc<
             SpaceId,
             OwnerAddr,
             u32,
-        )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
-        + Send
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<crate::community_membership::AutoExecOutcome, String>,
+                    > + Send,
+            >,
+        > + Send
         + Sync,
 >;
 
@@ -290,7 +302,18 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
                 } => {
                     stats.tier2_auto_execs_attempted += 1;
                     match (ctx.auto_exec_set_power)(cid, *target_pubkey, *new_power).await {
-                        Ok(()) => stats.tier2_auto_execs_succeeded += 1,
+                        Ok(crate::community_membership::AutoExecOutcome::Applied) => {
+                            stats.tier2_auto_execs_succeeded += 1;
+                        }
+                        Ok(crate::community_membership::AutoExecOutcome::SkippedNotAdmin) => {
+                            // ZEB-297: this replica's local actor is not
+                            // admin in the community, so the mint would
+                            // self-reject. Admins race to mint; HLC LWW
+                            // dedupes; the first admin's SetPower
+                            // propagates here via the existing
+                            // membership log sync.
+                            stats.tier2_auto_execs_skipped_not_admin += 1;
+                        }
                         Err(e) => {
                             tracing::warn!(
                                 community = %hex::encode(cid.0),
@@ -496,7 +519,7 @@ mod tests {
                 let captured = Arc::clone(&captured_auto_exec_clone);
                 Box::pin(async move {
                     captured.lock().unwrap().push((cid, target, power));
-                    Ok(())
+                    Ok(crate::community_membership::AutoExecOutcome::Applied)
                 })
             });
 
@@ -824,6 +847,60 @@ mod tests {
         let calls = auto_exec_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0], (cid, target, new_power));
+    }
+
+    /// ZEB-297: when the auto-exec callback returns `SkippedNotAdmin`
+    /// (the local actor isn't admin in this community), the tick must
+    /// increment `tier2_auto_execs_skipped_not_admin` rather than
+    /// `tier2_auto_execs_succeeded`. Without this branching, the stats
+    /// would lie about how often the dispatch actually mutated state —
+    /// every non-admin replica's tick would falsely count as a success.
+    #[tokio::test]
+    async fn community_voting_tick_tier2_auto_exec_set_power_skipped_when_non_admin() {
+        let cid = SpaceId([0x55; 16]);
+        let pid = PollId([0x66; 32]);
+        let target = OwnerAddr([0xcc; 16]);
+        let new_power = 50;
+        let cfg = make_tier2_config(AutoExecAction::SetPower {
+            target_pubkey: target,
+            new_power,
+        });
+        let mut t2 = Tier2ProposalState::new(cfg, 1);
+        use crate::community_voting_conviction::VoterConvictionState;
+        let mut vs = VoterConvictionState::default();
+        vs.apply_signal(true, 0, 0, 86_400_000);
+        t2.per_voter.insert(OwnerAddr([0xbb; 16]), vs);
+        let reached_at = 1_000i128;
+        t2.threshold_reached_at_ms = Some(reached_at);
+
+        let mut log = VotingLog::new();
+        log.polls.insert(
+            pid,
+            make_tier2_poll(cid, pid, Lifecycle::ThresholdReached, t2),
+        );
+
+        let mut logs = HashMap::new();
+        logs.insert(cid, Arc::new(Mutex::new(log)));
+        let now_ms = reached_at + 25 * 60 * 60 * 1000;
+        let (mut ctx, _events, _auto_exec_calls) = make_ctx_with_logs(logs, now_ms);
+
+        // Override the captured callback to simulate a non-admin
+        // replica: return SkippedNotAdmin instead of Applied.
+        ctx.auto_exec_set_power = Arc::new(|_cid, _target, _power| {
+            Box::pin(async { Ok(crate::community_membership::AutoExecOutcome::SkippedNotAdmin) })
+        });
+
+        let stats = run_voting_tick(&ctx, now_ms).await.unwrap();
+        assert_eq!(stats.tier2_proposals_finalized, 1);
+        assert_eq!(stats.tier2_auto_execs_attempted, 1);
+        assert_eq!(
+            stats.tier2_auto_execs_succeeded, 0,
+            "skip path must NOT bump the success counter"
+        );
+        assert_eq!(
+            stats.tier2_auto_execs_skipped_not_admin, 1,
+            "skip path must bump the dedicated skip counter exactly once"
+        );
     }
 
     #[tokio::test]
