@@ -149,6 +149,12 @@ pub struct ContentIndex {
     /// without mutating any entry, then clears the hook.
     #[cfg(any(test, feature = "test-fixtures"))]
     test_rekey_conflict_hook: Option<(SidecarId, [u8; 32])>,
+    /// Test-only one-shot hook armed via
+    /// `arm_next_remove_if_cid_matches_conflict`. Symmetric counterpart
+    /// of `test_rekey_conflict_hook` for the `remove_if_cid_matches`
+    /// path that backs `move_content`'s Case C STAGE 2.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    test_remove_conflict_hook: Option<(SidecarId, [u8; 32])>,
 }
 
 /// Error returned by [`ContentIndex::rekey`].
@@ -188,6 +194,8 @@ impl ContentIndex {
             entries,
             #[cfg(any(test, feature = "test-fixtures"))]
             test_rekey_conflict_hook: None,
+            #[cfg(any(test, feature = "test-fixtures"))]
+            test_remove_conflict_hook: None,
         }
     }
 
@@ -345,6 +353,15 @@ impl ContentIndex {
         id: &SidecarId,
         expected_cid: [u8; 32],
     ) -> Result<(), RekeyError> {
+        #[cfg(any(test, feature = "test-fixtures"))]
+        if let Some((armed_sid, fake_actual)) = self.test_remove_conflict_hook {
+            if armed_sid == *id {
+                self.test_remove_conflict_hook = None;
+                return Err(RekeyError::Conflict {
+                    actual: fake_actual,
+                });
+            }
+        }
         let actual = match self.entries.get(id) {
             None => return Err(RekeyError::OldMissing),
             Some(entry) => entry.cid,
@@ -449,6 +466,23 @@ impl ContentIndex {
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn arm_next_rekey_conflict(&mut self, target: SidecarId, fake_actual: [u8; 32]) {
         self.test_rekey_conflict_hook = Some((target, fake_actual));
+    }
+
+    /// Test-only: symmetric counterpart of `arm_next_rekey_conflict` for
+    /// the `remove_if_cid_matches` path. Forces the NEXT
+    /// `remove_if_cid_matches` call targeting `target` to return
+    /// `Conflict { actual: fake_actual }` without mutating the entry.
+    ///
+    /// Lets the Case C STAGE 2 test exercise the post-STAGE-1 CAS
+    /// conflict + compensating-undo flow without the boundary verify
+    /// pre-empting it.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn arm_next_remove_if_cid_matches_conflict(
+        &mut self,
+        target: SidecarId,
+        fake_actual: [u8; 32],
+    ) {
+        self.test_remove_conflict_hook = Some((target, fake_actual));
     }
 }
 

@@ -641,11 +641,13 @@ async fn move_b_dst_rekey_conflict_at_stage_1_no_undo_path() {
         t2_old.bundle_bytes.len() as u64,
     );
 
-    // Pre-flip T2's CID before the move runs.
+    // Arm a one-shot conflict for T2's STAGE 1 rekey. Unlike a pre-flip
+    // via force_set_cid_for_test, the armed hook leaves the entry's CID
+    // untouched so the boundary verify still passes — STAGE 1 is the
+    // first guard to trip, exercising the path this test names.
     {
         let mut idx = index.lock().unwrap();
-        let flipped = idx.force_set_cid_for_test(&t2_sid, [0xEE; 32]);
-        assert!(flipped, "test-only force_set_cid succeeded");
+        idx.arm_next_rekey_conflict(t2_sid, [0xEE; 32]);
     }
 
     let err = harmony_app::move_content_impl(
@@ -663,13 +665,8 @@ async fn move_b_dst_rekey_conflict_at_stage_1_no_undo_path() {
     .await
     .expect_err("dst CAS conflict must surface as Err");
 
-    // The pre-flip happens BEFORE the boundary verify, so the boundary
-    // check is the first guard to fire. Accept either the boundary
-    // message or the STAGE 1 CAS message — both indicate the move
-    // correctly refused to clobber a divergent dst.
     assert!(
-        err.contains("concurrent rekey on dst_sidecar_id")
-            || err.contains("dst_sidecar_id refers to cid"),
+        err.contains("concurrent rekey on dst_sidecar_id"),
         "got: {err}"
     );
 
@@ -1212,14 +1209,14 @@ async fn move_case_c_src_concurrently_rekeyed_compensates() {
     );
     let f_old_cid = f_old.bundle_cid.to_bytes();
 
-    // Race a concurrent rekey of L's sidecar entry between boundary
-    // verify and STAGE 2's CAS-protected remove. force_set_cid_for_test
-    // is deterministic — we set it after harness setup but before the
-    // move call; boundary verify still passes because dst CID matches,
-    // but the CAS remove will see the flipped cid and Conflict.
+    // Arm a one-shot conflict on L's STAGE 2 remove. Boundary verify
+    // and STAGE 1 (dst rekey on F) still succeed against the unmodified
+    // index; the armed hook fires at the CAS-protected
+    // `remove_if_cid_matches` call so the test exercises the actual
+    // post-STAGE-1 compensating-undo path its name claims.
     {
         let mut idx = index.lock().unwrap();
-        idx.force_set_cid_for_test(&l_sid, [0xCD; 32]);
+        idx.arm_next_remove_if_cid_matches_conflict(l_sid, [0xCD; 32]);
     }
 
     let err = harmony_app::move_content_impl(
@@ -1237,23 +1234,32 @@ async fn move_case_c_src_concurrently_rekeyed_compensates() {
     .await
     .expect_err("CAS-protected Case C remove must reject divergent src");
 
-    // The boundary verify trips on src first (entry.cid != src_path[0])
-    // — that's the correct first guard. Both this message and the
-    // post-STAGE-1 conflict message indicate the move refused to
-    // clobber a divergent src.
+    // Boundary verify passed (real CID matched), STAGE 1 committed,
+    // STAGE 2 hit the armed conflict — the error must reflect the
+    // STAGE-2 path plus a successful compensating undo of dst.
     assert!(
-        err.contains("concurrent rekey on src_sidecar_id")
-            || err.contains("src_sidecar_id refers to cid"),
+        err.contains("concurrent rekey on src_sidecar_id"),
         "got: {err}"
     );
+    assert!(
+        err.contains("dst rekey reverted"),
+        "compensating undo of dst must succeed; got: {err}"
+    );
 
-    // F (destination) must end at its original CID — either never
-    // forward-rekeyed (boundary-fail) or compensating-undone.
+    // F (destination) must be back at its original CID via the
+    // compensating-undo path now that STAGE 1 actually committed.
     let idx = index.lock().unwrap();
     assert_eq!(
         idx.get(&f_sid).unwrap().cid,
         f_old_cid,
-        "F ends at its original CID (no leftover forward-rekey)"
+        "F ends at its original CID (compensating undo succeeded)"
+    );
+    // L's sidecar entry must still exist at its original CID — the CAS
+    // remove refused to delete it.
+    assert_eq!(
+        idx.get(&l_sid).expect("L still present").cid,
+        l_cid,
+        "L untouched by failed STAGE 2",
     );
 }
 

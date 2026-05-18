@@ -18,7 +18,7 @@
     /** ZEB-162: per-card drag handlers, wired by FileBrowser. */
     onRowDragStart?: (e: DragEvent, item: ContentItem) => void;
     onRowDragEnd?: (e: DragEvent, item: ContentItem) => void;
-    onRowDrop?: (e: DragEvent, targetCid: string) => void;
+    onRowDrop?: (e: DragEvent, targetCid: string, targetSidecarId: string | null) => void;
   } = $props();
 </script>
 

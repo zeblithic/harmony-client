@@ -34,8 +34,13 @@
     srcChildKind: 'folder' | 'leaf';
   };
 
+  /** `sidecarId` on a root-view folder-row drop disambiguates between
+   *  multiple top-level sidecar entries that legitimately share a CID
+   *  under ZEB-164's symlink-style model. Nested drops resolve their
+   *  top-level via `navStack[0].sidecarId` so the field is optional
+   *  there. */
   type DropTarget =
-    | { kind: 'folder-row'; cid: string }
+    | { kind: 'folder-row'; cid: string; sidecarId: string | null }
     | { kind: 'breadcrumb'; segIdx: number };
 
   let {
@@ -349,11 +354,12 @@
       let dstSidecarId: string | null;
       let dstPath: string[];
       if (navStack.length === 0) {
-        // Dropping onto a top-level folder row. The target row IS a
-        // top-level sidecar entry; look it up from the current items.
-        const targetItem = items.find((i) => i.cid === dropTarget.cid);
-        if (!targetItem || !targetItem.sidecarId) return null;
-        dstSidecarId = targetItem.sidecarId;
+        // Dropping onto a top-level folder row. Use the sidecarId the
+        // row passed through the drop handler — under ZEB-164 multiple
+        // top-level entries can share a CID, so resolving by CID alone
+        // would pick the wrong sidecar branch.
+        if (!dropTarget.sidecarId) return null;
+        dstSidecarId = dropTarget.sidecarId;
         dstPath = [dropTarget.cid];
       } else {
         const topLevel = navStack[0].sidecarId;
@@ -466,7 +472,7 @@
     draggingPayload = null;
   }
 
-  function handleRowDrop(e: DragEvent, targetCid: string) {
+  function handleRowDrop(e: DragEvent, targetCid: string, targetSidecarId: string | null) {
     e.preventDefault();
     const raw = e.dataTransfer?.getData(HARMONY_DRAG_MIME);
     if (!raw) return;
@@ -477,7 +483,11 @@
       return;
     }
     draggingPayload = null;
-    void handleMove(payload, { kind: 'folder-row', cid: targetCid });
+    void handleMove(payload, {
+      kind: 'folder-row',
+      cid: targetCid,
+      sidecarId: targetSidecarId,
+    });
   }
 
   function handleBreadcrumbDrop(e: DragEvent, segIdx: number) {

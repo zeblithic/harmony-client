@@ -17,7 +17,7 @@
     /** ZEB-162: drag-drop handlers wired by FileGrid → FileBrowser. */
     onRowDragStart?: (e: DragEvent, item: ContentItem) => void;
     onRowDragEnd?: (e: DragEvent, item: ContentItem) => void;
-    onRowDrop?: (e: DragEvent, targetCid: string) => void;
+    onRowDrop?: (e: DragEvent, targetCid: string, targetSidecarId: string | null) => void;
   } = $props();
 
   let icon = $derived(categoryIcon(item.category));
@@ -39,7 +39,7 @@
   ondragstart={(e) => onRowDragStart?.(e, item)}
   ondragend={(e) => onRowDragEnd?.(e, item)}
   ondragover={handleDragOver}
-  ondrop={item.isFolder ? (e) => onRowDrop?.(e, item.cid) : undefined}
+  ondrop={item.isFolder ? (e) => onRowDrop?.(e, item.cid, item.sidecarId ?? null) : undefined}
   aria-label={item.name}
 >
   <div class="file-card-overlay-top">
