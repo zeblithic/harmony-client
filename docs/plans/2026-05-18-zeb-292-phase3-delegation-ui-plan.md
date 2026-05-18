@@ -1149,19 +1149,20 @@ Phase 3 of the [ZEB-289](https://linear.app/zeblith/issue/ZEB-289) voting/pollin
 ### Backend additions (small)
 - `voting_get_my_delegate` IPC + adapter wrapper
 - `voting_list_delegations` IPC + adapter wrapper
-- `voting-delegation-changed` Tauri event (emitted from local + inbound deleg/undeleg)
-- `voting-delegate-signaled-on-your-behalf` Tauri event (gated by community policy)
-- `notify_on_delegate_signal` community-policy field (opt-in default-off)
+- `voting-delegation-changed` Tauri event (local IPC emit only; engine-inbound emit deferred to [ZEB-298](https://linear.app/zeblith/issue/ZEB-298))
 
 ### Frontend
 - `DelegationWidget.svelte` — set / change / revoke with severity-tiered confirmation per `feedback_severe_action_confirmation` (no-confirm for change, click-confirm for low-weight revoke, typed-confirm for high-weight revoke)
 - `DelegationGraph.svelte` — force-directed viz reusing the d3-force pattern from `NetworkGraph.svelte`. Performant to 100+ nodes per acceptance criterion
 - Per-proposal override affordance in `ConvictionProposalCard.svelte` — direct Signal supersedes delegate's effective vote for that proposal only (backend semantics already enforce this; this adds the UI)
-- In-app toast on `voting-delegate-signaled-on-your-behalf`
+
+### Deferred to [ZEB-298](https://linear.app/zeblith/issue/ZEB-298)
+- `voting-delegate-signaled-on-your-behalf` Tauri event + in-app toast (functionally blocked on engine-inbound `verify_event` wiring — [ZEB-291](https://linear.app/zeblith/issue/ZEB-291) Task 19.1)
+- `notify_on_delegate_signal` community-policy field (lands with the on-behalf event since the gate is only meaningful once the event exists)
+- Two-engine integration test for delegation propagation
 
 ### Spec amendments
 - `voting-delegation-changed` event is a Phase 3 addition not in the original §5 (events list grew; wire format unchanged)
-- `voting-delegate-signaled-on-your-behalf` event likewise
 
 Plan: `docs/plans/2026-05-18-zeb-292-phase3-delegation-ui-plan.md`
 Spec (unchanged from Phase 2 merge): `docs/specs/2026-05-16-zeb-289-voting-polling-design.md` §5
@@ -1171,17 +1172,16 @@ Spec (unchanged from Phase 2 merge): `docs/specs/2026-05-16-zeb-289-voting-polli
 - [x] Delegate widget functional: set, change, revoke
 - [x] Delegate-graph visualization renders correctly for graphs ≤100 nodes
 - [x] Severe-action confirmation triggers for revoking a delegate with significant accumulated weight
-- [x] Notifications fire (when opted in) on delegate-signals-on-behalf events
 - [x] Per-proposal override UI: direct signal supersedes delegate's signal for that proposal only
 - [x] Vitest UI tests for delegation components
+- [ ] Notifications fire (when opted in) on delegate-signals-on-behalf events — **deferred to [ZEB-298](https://linear.app/zeblith/issue/ZEB-298)**
 
 ## Test plan
 - [ ] Open the community proposals panel — DelegationWidget appears
 - [ ] Set, change, then revoke a delegate; verify pill text updates
 - [ ] Revoke when delegate is signaling on an active high-weight proposal — verify typed-confirm appears
-- [ ] Open the delegation graph — verify edges render with force-directed layout, zoom/pan works
-- [ ] On a Tier 2 proposal where you have a delegate, click "Override and vote directly" — verify direct signal lands and weight no longer routes via delegate
-- [ ] Enable `notify_on_delegate_signal` in policy — when delegate signals, verify toast fires
+- [ ] Open the delegation graph — verify edges render with force-directed layout
+- [ ] On a Tier 2 proposal where you have a delegate, click "Vote directly" — verify direct signal lands and weight no longer routes via delegate
 
 ## References
 - Closes [ZEB-292](https://linear.app/zeblith/issue/ZEB-292)

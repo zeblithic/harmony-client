@@ -77,11 +77,15 @@
         `${myDelegate.slice(0, 8)}…`)
       : null,
   );
-  /** Monotonic counter; bumped per load. Resolution callbacks of
-   *  superseded loads drop their results. Guards against a community
-   *  switch landing while a previous refetch / refetchDelegate is
-   *  still in flight (CR R1 outside-diff). */
-  let latestLoadToken = 0;
+  /** Monotonic counter; bumped per proposals-list load. Resolution
+   *  callbacks of superseded loads drop their results. Guards against
+   *  a community switch landing while a previous `refetch` is still
+   *  in flight (CR R1 outside-diff). */
+  let latestProposalsLoadToken = 0;
+  /** Separate token space for the delegate read so a proposals
+   *  refetch firing while a delegate read is in flight doesn't
+   *  silently drop the delegate result (Cursor R2 #2). */
+  let latestDelegateLoadToken = 0;
 
   // New-proposal form state.
   let proposalText = $state('');
@@ -96,18 +100,18 @@
   let canPropose = $derived(myPower >= 1);
 
   async function refetch() {
-    const token = ++latestLoadToken;
+    const token = ++latestProposalsLoadToken;
     loading = true;
     try {
       const list = await adapter.listTier2Proposals(communityId);
-      if (token !== latestLoadToken) return;
+      if (token !== latestProposalsLoadToken) return;
       proposals = list;
       loadError = null;
     } catch (e) {
-      if (token !== latestLoadToken) return;
+      if (token !== latestProposalsLoadToken) return;
       loadError = e instanceof Error ? e.message : String(e);
     } finally {
-      if (token === latestLoadToken) loading = false;
+      if (token === latestProposalsLoadToken) loading = false;
     }
   }
 
@@ -116,13 +120,13 @@
   // re-loads from scratch (without this, a parent that re-uses this
   // component instance across community switches would show stale data).
   async function refetchDelegate() {
-    const token = latestLoadToken; // share the same token space as refetch
+    const token = ++latestDelegateLoadToken;
     try {
       const next = await adapter.getMyDelegate(communityId);
-      if (token !== latestLoadToken) return;
+      if (token !== latestDelegateLoadToken) return;
       myDelegate = next;
     } catch {
-      if (token !== latestLoadToken) return;
+      if (token !== latestDelegateLoadToken) return;
       // Defensive: a failure to read the delegate just means the
       // override affordance won't render. The proposals list itself
       // is independent.

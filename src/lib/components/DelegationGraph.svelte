@@ -199,9 +199,18 @@
     }
   });
 
-  // Reactive position readout: tickN drives the recomputation. We read
-  // from simNodes/simEdges (mutated in place by d3) on each tick.
-  let _tickSignal = $derived(tickN);
+  // Tick-driven attribute reactivity helper: returns a value derived
+  // from tickN that we can reference inside SVG attribute expressions.
+  // Cursor R2 #1: wrapping the whole node/edge list in `{#key tickN}`
+  // would destroy + recreate every <line> / <circle> / <text> element
+  // on every tick (~300 ticks per layout = tens of thousands of DOM
+  // teardowns at 100 nodes). Referencing this in attributes triggers
+  // attribute-level reactive updates without element teardown.
+  let tickPulse = $derived(tickN);
+  // Suppress unused-binding warning when the template doesn't read it
+  // directly (some attribute expressions consume the dependency via a
+  // throwaway comma operator below).
+  void tickPulse;
 </script>
 
 <section class="delegation-graph" aria-label="Delegation graph">
@@ -231,32 +240,30 @@
           <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--text-secondary)" />
         </marker>
       </defs>
-      {#key _tickSignal}
-        {#each simEdges as edge (edge.id)}
-          <line
-            class="dg-edge"
-            x1={(edge.source as SimNode).x ?? 0}
-            y1={(edge.source as SimNode).y ?? 0}
-            x2={(edge.target as SimNode).x ?? 0}
-            y2={(edge.target as SimNode).y ?? 0}
-            marker-end="url(#dg-arrow)"
+      {#each simEdges as edge (edge.id)}
+        <line
+          class="dg-edge"
+          x1={(tickPulse, (edge.source as SimNode).x ?? 0)}
+          y1={(tickPulse, (edge.source as SimNode).y ?? 0)}
+          x2={(tickPulse, (edge.target as SimNode).x ?? 0)}
+          y2={(tickPulse, (edge.target as SimNode).y ?? 0)}
+          marker-end="url(#dg-arrow)"
+        />
+      {/each}
+      {#each simNodes as node (node.address)}
+        <g
+          class="dg-node-group"
+          transform={`translate(${(tickPulse, node.x ?? 0)}, ${node.y ?? 0})`}
+        >
+          <circle
+            class={node.isLocal ? 'dg-node dg-node-local' : 'dg-node'}
+            r={NODE_RADIUS}
           />
-        {/each}
-        {#each simNodes as node (node.address)}
-          <g
-            class="dg-node-group"
-            transform={`translate(${node.x ?? 0}, ${node.y ?? 0})`}
-          >
-            <circle
-              class={node.isLocal ? 'dg-node dg-node-local' : 'dg-node'}
-              r={NODE_RADIUS}
-            />
-            <text class="dg-label" y={NODE_RADIUS + 12} text-anchor="middle">
-              {node.displayName}
-            </text>
-          </g>
-        {/each}
-      {/key}
+          <text class="dg-label" y={NODE_RADIUS + 12} text-anchor="middle">
+            {node.displayName}
+          </text>
+        </g>
+      {/each}
     </svg>
   {/if}
 </section>

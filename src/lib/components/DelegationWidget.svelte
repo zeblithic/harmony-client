@@ -93,6 +93,13 @@
   $effect(() => {
     const cid = communityId;
     let cancelled = false;
+    // Cursor R2 #3: reset all dialog/error state on community swap so a
+    // mid-revoke confirmation can't carry over to a different
+    // community's delegate (which would route the next undelegate call
+    // to the wrong community).
+    confirmState = 'none';
+    typedInput = '';
+    error = null;
     void (async () => {
       if (cancelled) return;
       await loadDelegate();
