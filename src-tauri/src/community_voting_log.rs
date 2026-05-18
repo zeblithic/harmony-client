@@ -181,8 +181,14 @@ impl VotingLog {
         // Per spec §5 + Task 9: Signal events alone do NOT drive lifecycle
         // transitions. Threshold-cross / threshold-drop transitions are
         // owned by the Task 15 tick which inspects total_conviction vs
-        // threshold_conviction. The Signal apply path just updates the
-        // per-voter state and appends to the event log.
+        // threshold_conviction. The Signal apply path updates the per-
+        // voter state, appends to the event log, AND — when an unsignal
+        // arrives while the proposal is in ThresholdReached — stamps
+        // `last_unsignal_after_threshold_ms` so the tick's 24h
+        // contestability window resets. Without that stamp, a fresh
+        // contest would finalize against the original
+        // `threshold_reached_at_ms` and slip through inside the original
+        // window (CR R3 Major).
         if event.kind == PollEventKindCode::Signal && event.tier == Tier::Conviction {
             let payload: SignalPayload = ciborium::de::from_reader(&event.payload[..])
                 .map_err(|_| ApplyError::PayloadDecode)?;
@@ -190,6 +196,7 @@ impl VotingLog {
                 .polls
                 .get_mut(&poll_id)
                 .ok_or(ApplyError::EventBeforePollCreate)?;
+            let in_threshold_reached = state.meta.lifecycle == Lifecycle::ThresholdReached;
             let proposal_state = state
                 .tier_state
                 .as_tier2_mut()
@@ -205,6 +212,9 @@ impl VotingLog {
                     event.hlc.logical,
                     hl_ms,
                 );
+            if !payload.support && in_threshold_reached {
+                proposal_state.last_unsignal_after_threshold_ms = Some(event.hlc.wall_ms as i128);
+            }
             state.events.push(event.clone());
             self.events.push(event);
             return Ok(poll_id);
@@ -222,7 +232,11 @@ impl VotingLog {
             let mut to_bytes = [0u8; 16];
             to_bytes.copy_from_slice(&payload.to);
             self.delegation_graph
-                .apply_delegate(event.actor, OwnerAddr(to_bytes), event.hlc.wall_ms as i128)
+                .apply_delegate(
+                    event.actor,
+                    OwnerAddr(to_bytes),
+                    (event.hlc.wall_ms, event.hlc.logical),
+                )
                 .map_err(|_| ApplyError::DelegationRejected)?;
             self.events.push(event);
             return Ok(poll_id);
@@ -236,7 +250,7 @@ impl VotingLog {
             let _payload: UndelegatePayload = ciborium::de::from_reader(&event.payload[..])
                 .map_err(|_| ApplyError::PayloadDecode)?;
             self.delegation_graph
-                .apply_undelegate(event.actor, event.hlc.wall_ms as i128);
+                .apply_undelegate(event.actor, (event.hlc.wall_ms, event.hlc.logical));
             self.events.push(event);
             return Ok(poll_id);
         }
@@ -288,6 +302,7 @@ impl VotingLog {
                     closes_at,
                     extends_at: None,
                     channel_id: Some(cfg.channel_id),
+                    finalized_at_ms: None,
                 };
                 let tally = Tier1TallyState::empty(cfg.options.len());
                 (meta, Some(cfg), TierState::Tier1(tally))
@@ -331,6 +346,7 @@ impl VotingLog {
                     closes_at: event.hlc.clone(),
                     extends_at: None,
                     channel_id: None,
+                    finalized_at_ms: None,
                 };
                 let proposal_state = Tier2ProposalState::new(cfg, total_supply);
                 (meta, None, TierState::Tier2(proposal_state))
@@ -352,6 +368,7 @@ impl VotingLog {
                     closes_at: event.hlc.clone(),
                     extends_at: None,
                     channel_id: None,
+                    finalized_at_ms: None,
                 };
                 (meta, None, TierState::Tier1(Tier1TallyState::empty(0)))
             };
@@ -816,14 +833,19 @@ impl VotingLog {
             if state.meta.lifecycle != Lifecycle::Finalized {
                 continue;
             }
-            let Some(fin_at) = state
+            // Tier 1 emits a terminal `PollResult` event whose HLC is the
+            // canonical finalize timestamp. Tier 2 has no terminal event
+            // (the tick flips lifecycle directly), so we stamp
+            // `meta.finalized_at_ms` on the lifecycle transition and
+            // consult that here as a fallback. Without the fallback,
+            // Tier 2 finalized polls would never archive — CR R3 Major.
+            let fin_at = state
                 .events
                 .iter()
                 .find(|e| e.kind == PollEventKindCode::PollResult)
                 .map(|e| e.hlc.wall_ms)
-            else {
-                continue;
-            };
+                .or(state.meta.finalized_at_ms);
+            let Some(fin_at) = fin_at else { continue };
             if now_wall_ms.saturating_sub(fin_at) > NINETY_DAYS_MS {
                 to_archive.push(*pid);
             }
@@ -952,6 +974,7 @@ mod archive_tests {
             },
             extends_at: None,
             channel_id: None,
+            finalized_at_ms: None,
         };
         log.polls.insert(
             pid,
@@ -1063,6 +1086,7 @@ mod archive_tests {
             },
             extends_at: None,
             channel_id: None,
+            finalized_at_ms: None,
         };
         log.polls.insert(
             pid,
@@ -1156,6 +1180,7 @@ mod archive_tests {
             },
             extends_at: None,
             channel_id: None,
+            finalized_at_ms: None,
         };
         log.polls.insert(
             pid,

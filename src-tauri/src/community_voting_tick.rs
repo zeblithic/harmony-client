@@ -236,6 +236,11 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
             // between the Pass 2 snapshot and now, causing Pass 2's
             // revert branch to put the poll back into Open. Finalizing
             // an Open poll would skip the 24h contestability window.
+            //
+            // Also stamp `meta.finalized_at_ms` so the archive sweep can
+            // age this Tier 2 poll. Tier 1 uses its terminal PollResult
+            // event's HLC for the same purpose; Tier 2 has no terminal
+            // event, so the meta field is the only signal (CR R3 Major).
             let mut did_finalize = false;
             {
                 let logs = ctx.voting_logs.lock().await;
@@ -244,6 +249,8 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
                     if let Some(state) = log.polls.get_mut(&pid) {
                         if state.meta.lifecycle == Lifecycle::ThresholdReached {
                             state.meta.lifecycle = Lifecycle::Finalized;
+                            let stamp = if now_ms < 0 { 0 } else { now_ms as u64 };
+                            state.meta.finalized_at_ms = Some(stamp);
                             stats.tier2_proposals_finalized += 1;
                             did_finalize = true;
                         }
@@ -390,6 +397,7 @@ mod tests {
             closes_at: make_hlc(closes_at_ms),
             extends_at: None,
             channel_id: Some(cfg.channel_id),
+            finalized_at_ms: None,
         };
         PollState {
             meta,
@@ -436,6 +444,7 @@ mod tests {
             closes_at: make_hlc(0),
             extends_at: None,
             channel_id: None,
+            finalized_at_ms: None,
         };
         PollState {
             meta,

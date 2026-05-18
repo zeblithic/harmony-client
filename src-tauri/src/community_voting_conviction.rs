@@ -496,18 +496,30 @@ impl Tier2ProposalState {
         cfg.threshold_min_q32 + ((span * pow) >> CONVICTION_FRAC_BITS)
     }
 
-    /// True if the threshold was JUST crossed at t_ms (and isn't already in
-    /// the "reached" state). Used by the 24h-contestability tick (Task 16).
-    pub fn just_crossed_threshold(&self, t_ms: i128) -> bool {
+    /// True if the threshold was JUST crossed at t_ms (and isn't already
+    /// in the "reached" state). Takes an explicit `&DelegationGraph` so
+    /// the comparison stays delegation-weighted; the production tick
+    /// holds the graph by ref alongside the proposal state and passes it
+    /// here. (An earlier draft of this helper used the unweighted
+    /// `total_conviction_at` and was flagged by Cursor R3: silently
+    /// produced wrong answers in the presence of any Delegate edges.)
+    pub fn just_crossed_threshold(&self, t_ms: i128, delegation_graph: &DelegationGraph) -> bool {
         self.threshold_reached_at_ms.is_none()
-            && self.total_conviction_at(t_ms) >= self.threshold_conviction_at(t_ms)
+            && self.total_conviction_at_with_delegation(t_ms, delegation_graph)
+                >= self.threshold_conviction_at(t_ms)
     }
 
     /// True if conviction dropped back below threshold at t_ms (from a
-    /// previously-reached state).
-    pub fn just_dropped_below_threshold(&self, t_ms: i128) -> bool {
+    /// previously-reached state). Same `&DelegationGraph` discipline as
+    /// `just_crossed_threshold`.
+    pub fn just_dropped_below_threshold(
+        &self,
+        t_ms: i128,
+        delegation_graph: &DelegationGraph,
+    ) -> bool {
         self.threshold_reached_at_ms.is_some()
-            && self.total_conviction_at(t_ms) < self.threshold_conviction_at(t_ms)
+            && self.total_conviction_at_with_delegation(t_ms, delegation_graph)
+                < self.threshold_conviction_at(t_ms)
     }
 
     /// Total conviction at t_ms with delegation weights applied.
@@ -527,6 +539,16 @@ impl Tier2ProposalState {
         t_ms: i128,
         delegation_graph: &DelegationGraph,
     ) -> ConvictionQ32 {
+        // Honor the per-proposal `delegation_allowed` toggle: when a
+        // proposal was created with delegation disabled, ignore the
+        // graph entirely and fall back to the unweighted sum. Without
+        // this gate, a community-wide DelegationGraph edge would
+        // silently fold into the conviction even for proposals that
+        // explicitly opted out — Tier 2 proposals would converge on
+        // different decisions than the config dictated. (CR R3 Major.)
+        if !self.config.delegation_allowed {
+            return self.total_conviction_at(t_ms);
+        }
         let hl_ms = (self.config.half_life_seconds as i128) * 1000;
         let mut weighted: ConvictionQ32 = 0;
         for (voter, state) in self.per_voter.iter() {
@@ -558,6 +580,13 @@ pub enum DelegationError {
     StaleHlc,
 }
 
+/// Full HLC ordinal `(wall_ms, logical)` used for LWW comparisons across
+/// the voting subsystem. Matches the shape used by `VotingReplayTracker`
+/// and `VoterConvictionState`; lexicographic tuple ordering is the
+/// canonical HLC ordering. CR R3 Major: prior `i128 ms-only` shape
+/// misordered same-ms different-logical Delegate/Undelegate events.
+pub type HlcOrdinal = (u64, u32);
+
 /// Per-community delegation graph CRDT.
 ///
 /// Each delegator has at most one active delegate. Conflicts between
@@ -575,13 +604,18 @@ pub enum DelegationError {
 /// and silently re-install the stale delegation. Consulting `last_hlc`
 /// during `apply_delegate` rejects such resurrection by HLC-LWW even when
 /// no edge currently exists.
+///
+/// Both `edges` and `last_hlc` key the HLC component as a full
+/// `(wall_ms, logical)` ordinal — same-ms different-logical events are
+/// distinguishable, matching `VotingReplayTracker` /
+/// `VoterConvictionState` semantics.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DelegationGraph {
-    /// delegator → (delegate, hlc_ms_of_latest_event)
-    edges: HashMap<OwnerAddr, (OwnerAddr, i128)>,
-    /// delegator → hlc_ms of last terminal event (Delegate OR Undelegate).
-    /// Survives edge removal so Undelegates leave a tombstone.
-    last_hlc: HashMap<OwnerAddr, i128>,
+    /// delegator → (delegate, hlc_ordinal_of_latest_event)
+    edges: HashMap<OwnerAddr, (OwnerAddr, HlcOrdinal)>,
+    /// delegator → hlc_ordinal of last terminal event (Delegate OR
+    /// Undelegate). Survives edge removal so Undelegates leave a tombstone.
+    last_hlc: HashMap<OwnerAddr, HlcOrdinal>,
 }
 
 impl DelegationGraph {
@@ -592,15 +626,17 @@ impl DelegationGraph {
     /// Apply a `Delegate` event. Returns:
     /// - `Err(Cycle)` if `delegator == delegate` or if the new edge would
     ///   close a cycle through the existing graph.
-    /// - `Err(StaleHlc)` if there's already an edge for `delegator` with
-    ///   an HLC `>= hlc_ms` (HLC-LWW; ties also rejected — first applied
-    ///   wins, which is fine because real HLC values are unique-per-actor).
+    /// - `Err(StaleHlc)` if there's already a terminal event for
+    ///   `delegator` with an HLC ordinal `>= hlc` (HLC-LWW; ties also
+    ///   rejected — first applied wins, which is fine because real HLC
+    ///   ordinals are unique-per-actor by the per-device tracker's
+    ///   logical-bump rule).
     /// - `Ok(())` on success; the edge is installed.
     pub fn apply_delegate(
         &mut self,
         delegator: OwnerAddr,
         delegate: OwnerAddr,
-        hlc_ms: i128,
+        hlc: HlcOrdinal,
     ) -> Result<(), DelegationError> {
         // Self-delegation is also a degenerate cycle.
         if delegator == delegate {
@@ -619,29 +655,30 @@ impl DelegationGraph {
         // (not just the live edge) is the load-bearing part: it blocks
         // resurrection by a late-arriving Delegate whose HLC predates a
         // prior Undelegate.
-        if let Some(&last_hlc) = self.last_hlc.get(&delegator) {
-            if last_hlc >= hlc_ms {
+        if let Some(&last) = self.last_hlc.get(&delegator) {
+            if last >= hlc {
                 return Err(DelegationError::StaleHlc);
             }
         }
-        self.edges.insert(delegator, (delegate, hlc_ms));
-        self.last_hlc.insert(delegator, hlc_ms);
+        self.edges.insert(delegator, (delegate, hlc));
+        self.last_hlc.insert(delegator, hlc);
         Ok(())
     }
 
     /// Apply an `Undelegate` event. HLC-LWW: silently skips if the last
     /// terminal event (edge OR prior Undelegate tombstone) has a
-    /// newer-or-equal HLC. The tombstone is recorded unconditionally on
-    /// a successful undelegate so subsequent out-of-order Delegate events
-    /// with earlier HLCs can still be rejected.
-    pub fn apply_undelegate(&mut self, delegator: OwnerAddr, hlc_ms: i128) {
-        if let Some(&last_hlc) = self.last_hlc.get(&delegator) {
-            if last_hlc >= hlc_ms {
+    /// newer-or-equal HLC ordinal. The tombstone is recorded
+    /// unconditionally on a successful undelegate so subsequent
+    /// out-of-order Delegate events with earlier ordinals can still be
+    /// rejected.
+    pub fn apply_undelegate(&mut self, delegator: OwnerAddr, hlc: HlcOrdinal) {
+        if let Some(&last) = self.last_hlc.get(&delegator) {
+            if last >= hlc {
                 return;
             }
         }
         self.edges.remove(&delegator);
-        self.last_hlc.insert(delegator, hlc_ms);
+        self.last_hlc.insert(delegator, hlc);
     }
 
     /// Number of accounts directly delegating to `delegate` (not transitive).
@@ -1435,29 +1472,31 @@ mod tests {
         v.apply_signal(true, 0, 0, TEST_HL);
         s.per_voter.insert(voter(1), v);
 
+        let empty_graph = DelegationGraph::new();
         // Just before 1 half-life: not crossed.
         assert!(s.total_conviction_at(TEST_HL - 1) < s.threshold_conviction_at(TEST_HL - 1));
-        assert!(!s.just_crossed_threshold(TEST_HL - 1));
+        assert!(!s.just_crossed_threshold(TEST_HL - 1, &empty_graph));
 
         // At 1 half-life: total == threshold → crossed.
-        assert!(s.just_crossed_threshold(TEST_HL));
+        assert!(s.just_crossed_threshold(TEST_HL, &empty_graph));
 
         // Once "reached" is recorded, subsequent calls return false.
         s.threshold_reached_at_ms = Some(TEST_HL);
-        assert!(!s.just_crossed_threshold(2 * TEST_HL));
+        assert!(!s.just_crossed_threshold(2 * TEST_HL, &empty_graph));
     }
 
     #[test]
     fn just_dropped_below_threshold_only_after_reached() {
         let mut s = Tier2ProposalState::new(t2_config(2, 100 * Q32, 100 * Q32), 1);
+        let empty_graph = DelegationGraph::new();
         // Never reached: just_dropped is always false.
-        assert!(!s.just_dropped_below_threshold(0));
-        assert!(!s.just_dropped_below_threshold(10_000));
+        assert!(!s.just_dropped_below_threshold(0, &empty_graph));
+        assert!(!s.just_dropped_below_threshold(10_000, &empty_graph));
 
         // Mark reached, ensure total_conviction is below threshold (no
         // signals → 0; threshold T_min=T_max=100 * Q32). just_dropped true.
         s.threshold_reached_at_ms = Some(0);
-        assert!(s.just_dropped_below_threshold(1_000));
+        assert!(s.just_dropped_below_threshold(1_000, &empty_graph));
     }
 
     // -------- DelegationGraph --------
@@ -1467,7 +1506,7 @@ mod tests {
         let mut g = DelegationGraph::new();
         let a = voter(1);
         let b = voter(2);
-        assert_eq!(g.apply_delegate(a, b, 1_000), Ok(()));
+        assert_eq!(g.apply_delegate(a, b, (1_000, 0)), Ok(()));
         assert_eq!(g.delegate_of(a), Some(b));
         assert_eq!(g.delegate_of(b), None);
         assert_eq!(g.delegator_count(b), 1);
@@ -1479,9 +1518,12 @@ mod tests {
         let mut g = DelegationGraph::new();
         let a = voter(1);
         let b = voter(2);
-        g.apply_delegate(a, b, 1_000).unwrap();
+        g.apply_delegate(a, b, (1_000, 0)).unwrap();
         // Now trying B→A would close a 2-cycle.
-        assert_eq!(g.apply_delegate(b, a, 2_000), Err(DelegationError::Cycle));
+        assert_eq!(
+            g.apply_delegate(b, a, (2_000, 0)),
+            Err(DelegationError::Cycle)
+        );
         // Graph state unchanged.
         assert_eq!(g.delegate_of(b), None);
         assert_eq!(g.delegate_of(a), Some(b));
@@ -1493,10 +1535,13 @@ mod tests {
         let a = voter(1);
         let b = voter(2);
         let c = voter(3);
-        g.apply_delegate(a, b, 1_000).unwrap();
-        g.apply_delegate(b, c, 2_000).unwrap();
+        g.apply_delegate(a, b, (1_000, 0)).unwrap();
+        g.apply_delegate(b, c, (2_000, 0)).unwrap();
         // Now C→A would close the 3-cycle A→B→C→A.
-        assert_eq!(g.apply_delegate(c, a, 3_000), Err(DelegationError::Cycle));
+        assert_eq!(
+            g.apply_delegate(c, a, (3_000, 0)),
+            Err(DelegationError::Cycle)
+        );
         assert_eq!(g.delegate_of(c), None);
     }
 
@@ -1504,7 +1549,10 @@ mod tests {
     fn delegation_self_delegation_rejected() {
         let mut g = DelegationGraph::new();
         let a = voter(1);
-        assert_eq!(g.apply_delegate(a, a, 1_000), Err(DelegationError::Cycle));
+        assert_eq!(
+            g.apply_delegate(a, a, (1_000, 0)),
+            Err(DelegationError::Cycle)
+        );
         assert_eq!(g.delegate_of(a), None);
     }
 
@@ -1514,9 +1562,9 @@ mod tests {
         let a = voter(1);
         let b = voter(2);
         let c = voter(3);
-        g.apply_delegate(a, b, 1_000).unwrap();
+        g.apply_delegate(a, b, (1_000, 0)).unwrap();
         // Newer Delegate from A→C wins.
-        g.apply_delegate(a, c, 2_000).unwrap();
+        g.apply_delegate(a, c, (2_000, 0)).unwrap();
         assert_eq!(g.delegate_of(a), Some(c));
         assert_eq!(g.delegator_count(b), 0);
         assert_eq!(g.delegator_count(c), 1);
@@ -1528,15 +1576,15 @@ mod tests {
         let a = voter(1);
         let b = voter(2);
         let c = voter(3);
-        g.apply_delegate(a, b, 2_000).unwrap();
+        g.apply_delegate(a, b, (2_000, 0)).unwrap();
         // Older Delegate from A→C is stale.
         assert_eq!(
-            g.apply_delegate(a, c, 1_000),
+            g.apply_delegate(a, c, (1_000, 0)),
             Err(DelegationError::StaleHlc),
         );
         // Equal HLC is also rejected (ties → first wins).
         assert_eq!(
-            g.apply_delegate(a, c, 2_000),
+            g.apply_delegate(a, c, (2_000, 0)),
             Err(DelegationError::StaleHlc),
         );
         assert_eq!(g.delegate_of(a), Some(b));
@@ -1547,8 +1595,8 @@ mod tests {
         let mut g = DelegationGraph::new();
         let a = voter(1);
         let b = voter(2);
-        g.apply_delegate(a, b, 1_000).unwrap();
-        g.apply_undelegate(a, 2_000);
+        g.apply_delegate(a, b, (1_000, 0)).unwrap();
+        g.apply_undelegate(a, (2_000, 0));
         assert_eq!(g.delegate_of(a), None);
         assert_eq!(g.delegator_count(b), 0);
     }
@@ -1558,12 +1606,12 @@ mod tests {
         let mut g = DelegationGraph::new();
         let a = voter(1);
         let b = voter(2);
-        g.apply_delegate(a, b, 2_000).unwrap();
+        g.apply_delegate(a, b, (2_000, 0)).unwrap();
         // Stale Undelegate: should not remove the edge.
-        g.apply_undelegate(a, 1_000);
+        g.apply_undelegate(a, (1_000, 0));
         assert_eq!(g.delegate_of(a), Some(b));
         // Equal HLC also no-op (LWW: ≥ existing, so skip).
-        g.apply_undelegate(a, 2_000);
+        g.apply_undelegate(a, (2_000, 0));
         assert_eq!(g.delegate_of(a), Some(b));
     }
 
@@ -1571,7 +1619,7 @@ mod tests {
     fn undelegate_idempotent_when_no_edge() {
         let mut g = DelegationGraph::new();
         let a = voter(1);
-        g.apply_undelegate(a, 1_000); // no edge to clear; just no-op
+        g.apply_undelegate(a, (1_000, 0)); // no edge to clear; just no-op
         assert_eq!(g.delegate_of(a), None);
     }
 
@@ -1582,14 +1630,14 @@ mod tests {
         let b = voter(2);
         let c = voter(3);
         let d = voter(4);
-        g.apply_delegate(a, d, 1_000).unwrap();
-        g.apply_delegate(b, d, 1_001).unwrap();
-        g.apply_delegate(c, d, 1_002).unwrap();
+        g.apply_delegate(a, d, (1_000, 0)).unwrap();
+        g.apply_delegate(b, d, (1_001, 0)).unwrap();
+        g.apply_delegate(c, d, (1_002, 0)).unwrap();
         assert_eq!(g.delegator_count(d), 3);
         assert_eq!(g.delegator_count(a), 0);
         // Re-delegate one away.
         let e = voter(5);
-        g.apply_delegate(b, e, 2_000).unwrap();
+        g.apply_delegate(b, e, (2_000, 0)).unwrap();
         assert_eq!(g.delegator_count(d), 2);
         assert_eq!(g.delegator_count(e), 1);
     }
@@ -1620,11 +1668,32 @@ mod tests {
         vb.apply_signal(true, 0, 0, TEST_HL);
         s.per_voter.insert(b, vb);
         let mut g = DelegationGraph::new();
-        g.apply_delegate(a, b, 1).unwrap();
+        g.apply_delegate(a, b, (1, 0)).unwrap();
 
         let simple = s.total_conviction_at(TEST_HL);
         let weighted = s.total_conviction_at_with_delegation(TEST_HL, &g);
         assert_eq!(weighted, 2 * simple);
+    }
+
+    #[test]
+    fn delegation_disabled_falls_back_to_unweighted() {
+        // Same A→B; only B signals; but the proposal config has
+        // delegation_allowed=false. The weighted variant must ignore the
+        // graph and return the unweighted sum (CR R3 Major).
+        let mut cfg = t2_config(2, 0, 100 * Q32);
+        cfg.delegation_allowed = false;
+        let mut s = Tier2ProposalState::new(cfg, 2);
+        let a = voter(1);
+        let b = voter(2);
+        let mut vb = VoterConvictionState::default();
+        vb.apply_signal(true, 0, 0, TEST_HL);
+        s.per_voter.insert(b, vb);
+        let mut g = DelegationGraph::new();
+        g.apply_delegate(a, b, (1, 0)).unwrap();
+
+        let simple = s.total_conviction_at(TEST_HL);
+        let weighted = s.total_conviction_at_with_delegation(TEST_HL, &g);
+        assert_eq!(weighted, simple);
     }
 
     #[test]
@@ -1642,7 +1711,7 @@ mod tests {
         vb.apply_signal(true, 0, 0, TEST_HL);
         s.per_voter.insert(b, vb);
         let mut g = DelegationGraph::new();
-        g.apply_delegate(a, b, 1).unwrap();
+        g.apply_delegate(a, b, (1, 0)).unwrap();
 
         let weighted = s.total_conviction_at_with_delegation(TEST_HL, &g);
         // Both at weight 1 (A overrides; B has no eligible delegators).
@@ -1669,8 +1738,8 @@ mod tests {
         vb.apply_signal(true, 0, 0, TEST_HL);
         s.per_voter.insert(b, vb);
         let mut g = DelegationGraph::new();
-        g.apply_delegate(a, b, 1).unwrap();
-        g.apply_delegate(c, a, 2).unwrap();
+        g.apply_delegate(a, b, (1, 0)).unwrap();
+        g.apply_delegate(c, a, (2, 0)).unwrap();
 
         let weighted = s.total_conviction_at_with_delegation(TEST_HL, &g);
         let single = charge_q32(TEST_HL, TEST_HL);

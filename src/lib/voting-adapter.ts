@@ -33,6 +33,7 @@ import type {
   VotingPollCreatedPayload,
   VotingProposalFinalizedPayload,
   VotingThresholdReachedPayload,
+  VotingThresholdRevertedPayload,
   VotingTier2ProposalCreatedPayload,
   VotingTier2SignalCastPayload,
 } from './types/voting';
@@ -92,6 +93,7 @@ export class VotingAdapter {
   private proposalCreatedSubs: Array<(p: VotingTier2ProposalCreatedPayload) => void> = [];
   private signalCastSubs: Array<(p: VotingTier2SignalCastPayload) => void> = [];
   private thresholdReachedSubs: Array<(p: VotingThresholdReachedPayload) => void> = [];
+  private thresholdRevertedSubs: Array<(p: VotingThresholdRevertedPayload) => void> = [];
   private proposalFinalizedSubs: Array<(p: VotingProposalFinalizedPayload) => void> = [];
 
   subscribePollCreated(handler: (p: VotingPollCreatedPayload) => void): () => void {
@@ -142,6 +144,15 @@ export class VotingAdapter {
     return () => {
       const i = this.thresholdReachedSubs.indexOf(handler);
       if (i >= 0) this.thresholdReachedSubs.splice(i, 1);
+    };
+  }
+  subscribeThresholdReverted(
+    handler: (p: VotingThresholdRevertedPayload) => void,
+  ): () => void {
+    this.thresholdRevertedSubs.push(handler);
+    return () => {
+      const i = this.thresholdRevertedSubs.indexOf(handler);
+      if (i >= 0) this.thresholdRevertedSubs.splice(i, 1);
     };
   }
   subscribeProposalFinalized(
@@ -235,6 +246,15 @@ export class VotingAdapter {
           },
         );
         stagedUnlisteners.push(unlistenThresholdReached);
+
+        const unlistenThresholdReverted = await adapter.listen(
+          'voting-threshold-reverted',
+          (event) => {
+            const payload = event.payload as VotingThresholdRevertedPayload;
+            for (const sub of [...this.thresholdRevertedSubs]) sub(payload);
+          },
+        );
+        stagedUnlisteners.push(unlistenThresholdReverted);
 
         const unlistenProposalFinalized = await adapter.listen(
           'voting-proposal-finalized',

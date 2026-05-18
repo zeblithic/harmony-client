@@ -206,16 +206,18 @@ impl VotingLogEngine {
                 .map_err(|e| format!("apply: {e:?}"))?;
         }
 
-        // (4) Broadcast. try_send drops on full channel (degraded mode) —
-        // local apply already succeeded, peers will catch up via backfill
-        // (deferred) or next-event replication.
-        if let Err(e) = self.publisher_tx.try_send(packet) {
-            tracing::warn!(
-                community_id = ?self.community_id,
-                err = ?e,
-                "voting publisher_tx full or closed; broadcast skipped"
-            );
-        }
+        // (4) Broadcast. `send().await` waits for adapter capacity rather
+        // than dropping on a full channel — Phase 2 has no backfill, so
+        // a silently-dropped publish would mean peers permanently miss
+        // a unique voting event while the local log has already applied
+        // it (CR R3 Major). Channel-closed (`SendError`) propagates as
+        // an error to the caller; the local apply has already happened
+        // so callers can decide whether to surface this. Backfill is
+        // tracked as a follow-up (ZEB-291 Task 19.1).
+        self.publisher_tx
+            .send(packet)
+            .await
+            .map_err(|e| format!("voting publisher_tx closed: {e}"))?;
         Ok(())
     }
 
@@ -244,13 +246,30 @@ impl VotingLogEngine {
             }
         }
 
-        // TODO ZEB-291 Task 12.1: wire `voting_core::verify_event` here
-        // once the verify path is extracted from the IPC layer. For Phase
-        // 2 we rely on apply-time validation in
-        // `VotingLog::apply_with_snapshot` (lifecycle transitions, payload
-        // decode, graph cycle checks). Signature verification of peer
-        // events is a defense-in-depth concern tracked separately —
-        // local IPC always verifies before broadcasting.
+        // Hard verify gate. Apply-time invariants in
+        // `VotingLog::apply_with_snapshot` (lifecycle transitions,
+        // payload decode, graph cycle checks) cannot detect a forged
+        // Ed25519 signature, so unverified peer packets must NOT mutate
+        // state. The envelope carries only the 16-byte `OwnerAddr` hash
+        // — not the Ed25519 pubkey — so signature verification needs
+        // the per-community membership snapshot (pubkey → OwnerAddr
+        // mapping) that the apply layer otherwise consults for
+        // eligibility. The Zenoh adapter (ZEB-291 Task 19.1
+        // follow-up) is the natural place to do this lookup; until it
+        // lands, this receive loop is dead code in production. CR R3
+        // Major: refuse to apply any inbound packet from this surface
+        // until the verify gate is wired. Tests that exercised the
+        // receive loop with synthetic packets are now feature-gated
+        // behind `cfg(any(test, feature = "test-fixtures"))` so the
+        // production binary cannot accept forged peer events.
+        #[cfg(not(any(test, feature = "test-fixtures")))]
+        {
+            return Err(
+                "inbound voting events are refused until ZEB-291 Task 19.1 wires \
+                 verify_event with the per-community membership snapshot"
+                    .into(),
+            );
+        }
 
         // Apply.
         {

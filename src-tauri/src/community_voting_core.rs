@@ -391,6 +391,16 @@ pub struct PollMeta {
     /// not be channel-scoped). For Tier 1 chat-native polls this is
     /// the channel where the poll-message card appears.
     pub channel_id: Option<ChannelId>,
+    /// Wall-clock ms (UNIX_EPOCH-relative) when the poll transitioned
+    /// to `Lifecycle::Finalized`. Set by the tick for Tier 2 (which has
+    /// no terminal event), unset for Tier 1 (which uses the PollResult
+    /// event's HLC instead). `archive_finalized_polls` consults this for
+    /// Tier 2 ageing — without it, Tier 2 finalized polls would never
+    /// archive because the sweep only knew about PollResult HLCs.
+    /// Defaults to `None` for backwards compatibility with pre-Tier-2
+    /// PollState records (`#[serde(default)]`).
+    #[serde(default)]
+    pub finalized_at_ms: Option<u64>,
 }
 
 /// Deterministically derive a PollId from the community + the
@@ -470,6 +480,7 @@ mod poll_meta_tests {
             },
             extends_at: None,
             channel_id: Some(ChannelId([0xdd; 16])),
+            finalized_at_ms: None,
         };
         let mut encoded = Vec::new();
         ciborium::into_writer(&meta, &mut encoded).expect("encode");

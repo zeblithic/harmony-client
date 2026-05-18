@@ -272,7 +272,10 @@ export function convictionPercent(total: string, threshold: string): number {
   if (thresholdBI <= 0n) return 0;
   const tenthsBI = (totalBI * 1000n) / thresholdBI;
   const tenths = Number(tenthsBI);
-  return Math.min(100, tenths / 10);
+  // Lower-bound clamp keeps the bar non-negative if a malformed or
+  // hostile payload ships a negative total (the Q96.32 fields are i128
+  // so negative values are encodable). CR R3 Minor.
+  return Math.max(0, Math.min(100, tenths / 10));
 }
 
 // ─── Tier 2 Tauri event payloads ───────────────────────────────────────
@@ -301,6 +304,14 @@ export interface VotingThresholdReachedPayload {
   communityId: string;
   proposalId: string;
   thresholdReachedAtMs: number;
+}
+
+/** Payload for `voting-threshold-reverted` event (tick-emitted when a
+ *  Tier 2 proposal drops back below threshold from `ThresholdReached`). */
+export interface VotingThresholdRevertedPayload {
+  communityId: string;
+  proposalId: string;
+  revertedAtMs: number;
 }
 
 /** Payload for `voting-proposal-finalized` event (tick-emitted). */
