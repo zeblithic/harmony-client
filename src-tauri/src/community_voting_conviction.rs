@@ -333,13 +333,19 @@ impl VoterConvictionState {
         if matches!(self.last_event_ordinal, Some(last) if event_ord <= last) {
             return;
         }
-        // Idempotent same-direction Signal: no state change AND no
-        // ordinal update — preserves the v1 "apply_signal is idempotent
-        // on repeated same-direction events" invariant.
+        // Always bump the high-water mark on a freshness-passing event —
+        // including idempotent same-direction Signals where no other
+        // state changes. Skipping the bump leaves a hole: a later-
+        // arriving Signal with HLC between this event and the prior
+        // bumped event could pass the LWW guard and incorrectly mutate
+        // state (Cursor High Sev, round-2). The visible-state invariant
+        // "repeated same-direction Signals are no-ops" still holds —
+        // `conviction_at` queries are unchanged because the support
+        // session boundaries don't move.
+        self.last_event_ordinal = Some(event_ord);
         if support == self.is_supporting {
             return;
         }
-        self.last_event_ordinal = Some(event_ord);
         if support && !self.is_supporting {
             // Decay any prior accumulation up to the moment the new session
             // begins, so subsequent `conviction_at` computations can treat
@@ -467,6 +473,16 @@ impl Tier2ProposalState {
     pub fn threshold_conviction_at(&self, t_ms: i128) -> ConvictionQ32 {
         let cfg = &self.config;
         if self.total_supply == 0 {
+            return cfg.threshold_max_q32;
+        }
+        // β = 0 case: mathematically `(1-ratio)^0 = 1` for any ratio, so
+        // the threshold is participation-insensitive and equals `T_max`.
+        // Without this branch the loop `for _ in 1..0` would be empty,
+        // leaving `pow = one_minus = (1-ratio)^1` — silently behaving as
+        // β = 1. The IPC config-validator rejects β = 0 at creation time,
+        // but a malformed config arriving via the wire would otherwise
+        // bypass that; handling it here makes the math defensively correct.
+        if cfg.beta == 0 {
             return cfg.threshold_max_q32;
         }
         let ratio_q32 = (self.effective_supply_at(t_ms) as i128 * Q32) / self.total_supply as i128;
@@ -1129,12 +1145,25 @@ mod tests {
 
     #[test]
     fn idempotent_repeat_signal_true() {
+        // "Idempotent" here means the externally-observable state
+        // (is_supporting, support_started_at_ms, accumulated_conviction)
+        // is unchanged by a same-direction repeat. The LWW high-water
+        // mark `last_event_ordinal` DOES advance — see the Cursor
+        // round-2 fix: skipping the bump for "idempotent" events
+        // re-opened a hole where a later-arriving earlier-HLC opposite
+        // signal could pass the guard and rewind state.
         let mut a = VoterConvictionState::default();
         a.apply_signal(true, 0, 0, TEST_HL);
         let mut b = a.clone();
-        b.apply_signal(true, TEST_HL, 0, TEST_HL); // repeat true; should be no-op
-        assert_eq!(a, b);
-        // And conviction queries match.
+        b.apply_signal(true, TEST_HL, 0, TEST_HL); // repeat true; observably no-op
+        assert_eq!(a.is_supporting, b.is_supporting);
+        assert_eq!(a.support_started_at_ms, b.support_started_at_ms);
+        assert_eq!(a.accumulated_conviction_q32, b.accumulated_conviction_q32);
+        assert_eq!(a.last_event_at_ms, b.last_event_at_ms);
+        // The ordinal advances on the repeat — that's the LWW guard
+        // doing its job, not a bug.
+        assert!(b.last_event_ordinal > a.last_event_ordinal);
+        // And conviction queries agree (the observable behavior).
         assert_eq!(
             a.conviction_at(2 * TEST_HL, TEST_HL),
             b.conviction_at(2 * TEST_HL, TEST_HL),
@@ -1143,18 +1172,31 @@ mod tests {
 
     #[test]
     fn idempotent_repeat_signal_false() {
-        // apply_signal(false, ...) when not supporting is a no-op.
+        // apply_signal(false, ...) when not supporting is observably a
+        // no-op for support state; the ordinal still advances (Cursor
+        // round-2 fix — see `idempotent_repeat_signal_true`).
         let mut a = VoterConvictionState::default();
         let snapshot = a.clone();
         a.apply_signal(false, TEST_HL, 0, TEST_HL);
-        assert_eq!(a, snapshot);
-        // Also after a complete session, repeated false is still no-op.
+        assert_eq!(a.is_supporting, snapshot.is_supporting);
+        assert_eq!(
+            a.accumulated_conviction_q32,
+            snapshot.accumulated_conviction_q32
+        );
+        assert!(a.last_event_ordinal > snapshot.last_event_ordinal);
+        // Also after a complete session, repeated false is still observably no-op.
         let mut s = VoterConvictionState::default();
         s.apply_signal(true, 0, 0, TEST_HL);
         s.apply_signal(false, TEST_HL, 0, TEST_HL);
         let snap2 = s.clone();
         s.apply_signal(false, 2 * TEST_HL, 0, TEST_HL);
-        assert_eq!(s, snap2);
+        // Observable state unchanged; ordinal advances.
+        assert_eq!(s.is_supporting, snap2.is_supporting);
+        assert_eq!(
+            s.accumulated_conviction_q32,
+            snap2.accumulated_conviction_q32
+        );
+        assert!(s.last_event_ordinal > snap2.last_event_ordinal);
     }
 
     #[test]
@@ -1301,6 +1343,37 @@ mod tests {
         // No active signals → ratio = 0 → (1-0)^β = 1 → threshold = T_max.
         let s = Tier2ProposalState::new(t2_config(2, 7 * Q32, 100 * Q32), 5);
         assert_eq!(s.effective_supply_at(0), 0);
+        assert_eq!(s.threshold_conviction_at(0), 100 * Q32);
+    }
+
+    #[test]
+    fn threshold_beta_zero_always_returns_t_max() {
+        // β = 0 mathematically gives `(1-ratio)^0 = 1` regardless of
+        // ratio, so the threshold must equal `T_max` at every
+        // participation level. Without the `cfg.beta == 0` special-case
+        // the `for _ in 1..0` loop is empty and `pow` stays at
+        // `one_minus`, silently behaving as β = 1 — Cursor round-2 Low
+        // Severity. IPC-layer validation rejects β = 0 at creation, but
+        // a malformed config arriving via the wire would still hit this
+        // codepath, so the defensive branch lives in the math.
+        let mut s = Tier2ProposalState::new(t2_config(0, 7 * Q32, 100 * Q32), 4);
+        // No participation → T_max.
+        assert_eq!(s.threshold_conviction_at(0), 100 * Q32);
+        // Half participation → still T_max (not the β=1-equivalent value).
+        for i in 0..2u8 {
+            let mut v = VoterConvictionState::default();
+            v.apply_signal(true, 0, 0, TEST_HL);
+            s.per_voter.insert(voter(i + 1), v);
+        }
+        assert_eq!(s.effective_supply_at(0), 2);
+        assert_eq!(s.threshold_conviction_at(0), 100 * Q32);
+        // Full participation → still T_max.
+        for i in 2..4u8 {
+            let mut v = VoterConvictionState::default();
+            v.apply_signal(true, 0, 0, TEST_HL);
+            s.per_voter.insert(voter(i + 1), v);
+        }
+        assert_eq!(s.effective_supply_at(0), 4);
         assert_eq!(s.threshold_conviction_at(0), 100 * Q32);
     }
 
