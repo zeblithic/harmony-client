@@ -194,10 +194,14 @@
     <!-- ZEB-292 Phase 3: override affordance. Single click → cast a
          direct Signal(true) on this proposal, which moves the caller's
          weight out of the delegate's effective conviction (per spec §5
-         override rule enforced by community_voting_conviction.rs:583). -->
+         override rule enforced by community_voting_conviction.rs:583).
+         Copy describes the routing relationship (always true while a
+         delegate edge exists) rather than asserting the delegate has
+         signaled — the proposal DTO doesn't surface per-voter state,
+         so claiming "X voted" would be unverifiable (Cursor R4). -->
     <div class="cp-override-pill" role="status" aria-label="Delegate signaling on your behalf">
       <span class="cp-override-text">
-        <strong>{delegateName ?? 'Your delegate'}</strong> votes for you on this proposal.
+        Your conviction follows <strong>{delegateName ?? 'your delegate'}</strong> on this proposal.
       </span>
       <button
         type="button"

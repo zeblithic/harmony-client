@@ -320,13 +320,13 @@ git commit -m "feat(zeb-292-p3): voting_get_my_delegate + voting_list_delegation
 
 ---
 
-### Task 3: Backend Tauri event — `voting-delegation-changed`
+### Task 3: Backend Tauri event — `voting-delegation-changed` (local IPC only)
 
 **Files:**
 - Modify: `src-tauri/src/lib.rs` (emit from delegate/undelegate IPCs)
-- Modify: `src-tauri/src/community_voting_log_engine.rs` (emit on inbound peer delegate/undelegate apply)
 - Modify: `src/lib/voting-adapter.ts` (subscribe + listener registration)
 - Modify: `src/lib/types/voting.ts` (event payload type)
+- _Engine-inbound emission deferred — see Steps 5-6 below ([ZEB-298](https://linear.app/zeblith/issue/ZEB-298))._
 
 Backend currently does NOT emit on delegate/undelegate (per the comment "Delegate events do not fire a Tauri event by spec"). Phase 3 needs this event so the UI can refresh. Spec amendment: emission is purely a local UX signal — wire format and verify-rules unchanged.
 
@@ -445,9 +445,8 @@ export interface VotingDelegationChangedPayload {
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src-tauri/src/lib.rs src-tauri/src/community_voting_log_engine.rs \
-        src/lib/voting-adapter.ts src/lib/types/voting.ts
-git commit -m "feat(zeb-292-p3): emit voting-delegation-changed on local + inbound deleg/undeleg"
+git add src-tauri/src/lib.rs src/lib/voting-adapter.ts src/lib/types/voting.ts
+git commit -m "feat(zeb-292-p3): emit voting-delegation-changed on local deleg/undeleg IPCs"
 ```
 
 ---
@@ -736,20 +735,35 @@ Expected: FAIL (file does not exist).
   }
 
   async function decideRevokeSeverity(): Promise<'click' | 'typed'> {
-    // Severity check: does the delegate have ≥SEVERE_REVOKE_WEIGHT_RATIO
-    // of the community's effective supply currently routed through them
-    // on at least one Open Tier 2 proposal?
+    // Heuristic: trigger typed-confirm whenever any Open or
+    // ThresholdReached Tier 2 proposal has participation ratio
+    // (voter_count / total_supply) >= SEVERE_REVOKE_WEIGHT_RATIO.
+    //
+    // Originally this was intended to check the specific delegate's
+    // routed-weight share, but Tier2ProposalExport doesn't currently
+    // surface per-voter state (only aggregates: total_supply,
+    // voter_count, total_conviction_ms). The participation-ratio
+    // proxy is conservative — any live tally with meaningful
+    // participation triggers typed-confirm, even if the delegate
+    // doesn't happen to be one of the signalers. False-positive
+    // typed-confirm is benign (extra friction); false-negative
+    // would silently rug-pull a tally, which is the cost we want
+    // to avoid. Tighter "this delegate's weight share" requires a
+    // richer per-voter DTO — followed up when needed.
     try {
-      const props = await adapter.listTier2Proposals(communityId);
-      const openProps = props.filter((p) => p.lifecycle === 'Open' || p.lifecycle === 'ThresholdReached');
-      const hasSignificant = openProps.some((p) => {
-        // p includes per-voter signal state — verify the field name in
-        // Tier2ProposalExport. The delegate must (a) be signaling and
-        // (b) have delegated weight >= threshold * effective_supply.
-        // ...
-      });
-      return hasSignificant ? 'typed' : 'click';
-    } catch {
+      const proposals = await adapter.listTier2Proposals(communityId);
+      for (const p of proposals) {
+        if (p.lifecycle !== 'Open' && p.lifecycle !== 'ThresholdReached') continue;
+        const totalSupply = p.total_supply ?? 0;
+        if (totalSupply <= 0) continue;
+        const participationShare = (p.voter_count ?? 0) / totalSupply;
+        if (participationShare >= SEVERE_REVOKE_WEIGHT_RATIO) return 'typed';
+      }
+      return 'click';
+    } catch (e) {
+      // Per Tauri error-extraction memory: surface the message into
+      // the widget's error state rather than swallowing.
+      error = e instanceof Error ? e.message : String(e);
       return 'typed'; // err on the side of more confirmation
     }
   }

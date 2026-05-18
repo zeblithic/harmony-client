@@ -59,6 +59,15 @@
    *  Guards against a community switch landing while a previous
    *  community's getMyDelegate request is still in flight (CR R1). */
   let latestLoadToken = 0;
+  /** Generation counter bumped every time the $effect re-runs (i.e.,
+   *  on every `communityId` change). Async functions in the widget
+   *  capture the current generation at entry and discard their
+   *  post-await side effects if the value has advanced. Distinct
+   *  from `latestLoadToken` because that's per-load, this is
+   *  per-community-instance — handles the A→B→A scenario where the
+   *  community id matches the captured value but the user has
+   *  swapped twice (CR R4). */
+  let generation = 0;
 
   let delegateName = $derived(
     currentDelegate
@@ -92,17 +101,21 @@
 
   $effect(() => {
     const cid = communityId;
+    const gen = ++generation;
     let cancelled = false;
-    // Cursor R2 #3 / CR R3: reset all transient widget state on
+    // Cursor R2 #3 / CR R3+R4: reset all transient widget state on
     // community swap so no value lingers that could be applied
-    // against the wrong community. `pendingDelegate` is the most
-    // dangerous (bind:value on a <select> doesn't reliably clear
-    // when options change → an Apply click could send the prior
-    // community's selection as a delegate target in the new one).
+    // against the wrong community. `pendingDelegate` and
+    // `currentDelegate` are the most dangerous — the former could
+    // route Apply to the prior community's selection, the latter
+    // would briefly show the prior community's delegate name (and
+    // make Revoke target the wrong community) until loadDelegate
+    // resolves.
     confirmState = 'none';
     typedInput = '';
     error = null;
     pendingDelegate = '';
+    currentDelegate = null;
     void (async () => {
       if (cancelled) return;
       await loadDelegate();
@@ -112,7 +125,7 @@
     // Other community members' changes don't impact this widget's
     // visible state, so we ignore them to avoid spurious IPC.
     const unsub = adapter.subscribeDelegationChanged((p) => {
-      if (cancelled || p.communityId !== cid) return;
+      if (cancelled || gen !== generation || p.communityId !== cid) return;
       if (p.delegator !== myAddr && p.delegate !== myAddr) return;
       void loadDelegate();
     });
@@ -125,21 +138,25 @@
 
   async function setDelegate(target: string) {
     if (busy || !target) return;
-    // Capture the community id at call time so a swap-mid-IPC doesn't
-    // disable / error the wrong widget instance on resume (CR R3).
+    // Capture community id + generation at call time so a community
+    // swap during the IPC discards post-await side effects. Generation
+    // catches A→B→A (cid would match but the user has swapped twice
+    // — CR R4); cidAtStart is kept as a redundant safety net + for
+    // the IPC argument so the call always targets the captured value.
     const cidAtStart = communityId;
+    const genAtStart = generation;
     busy = true;
     error = null;
     try {
       await adapter.delegateTier2(cidAtStart, target);
-      if (cidAtStart !== communityId) return;
+      if (genAtStart !== generation) return;
       pendingDelegate = '';
       // currentDelegate refreshes via voting-delegation-changed subscriber.
     } catch (e) {
-      if (cidAtStart !== communityId) return;
+      if (genAtStart !== generation) return;
       error = e instanceof Error ? e.message : String(e);
     } finally {
-      if (cidAtStart === communityId) busy = false;
+      if (genAtStart === generation) busy = false;
     }
   }
 
@@ -186,12 +203,9 @@
 
   async function beginRevoke() {
     if (busy) return;
-    // Capture cid so the severity tier from an in-flight
-    // `listTier2Proposals` doesn't surface against the wrong
-    // community on resume (Cursor R3).
-    const cidAtStart = communityId;
+    const genAtStart = generation;
     const severity = await decideRevokeSeverity();
-    if (cidAtStart !== communityId) return;
+    if (genAtStart !== generation) return;
     confirmState = severity;
   }
 
@@ -199,18 +213,19 @@
     if (busy) return;
     if (confirmState === 'typed' && typedInput.trim().toLowerCase() !== 'revoke') return;
     const cidAtStart = communityId;
+    const genAtStart = generation;
     busy = true;
     error = null;
     try {
       await adapter.undelegateTier2(cidAtStart);
-      if (cidAtStart !== communityId) return;
+      if (genAtStart !== generation) return;
       confirmState = 'none';
       typedInput = '';
     } catch (e) {
-      if (cidAtStart !== communityId) return;
+      if (genAtStart !== generation) return;
       error = e instanceof Error ? e.message : String(e);
     } finally {
-      if (cidAtStart === communityId) busy = false;
+      if (genAtStart === generation) busy = false;
     }
   }
 
