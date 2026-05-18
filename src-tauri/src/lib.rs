@@ -18490,6 +18490,32 @@ pub struct VotingTier2SignalCastPayload {
     pub support: bool,
 }
 
+/// ZEB-292 Phase 3: Tauri event payload for `"voting-delegation-changed"`.
+/// `delegate` is None on Undelegate. Fired by the local IPC and also by
+/// the engine's inbound apply path so the UI refreshes regardless of
+/// whether the change originated locally or arrived from a peer.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VotingDelegationChangedPayload {
+    pub community_id: String,
+    pub delegator: String,
+    pub delegate: Option<String>,
+}
+
+/// ZEB-292 Phase 3: Tauri event payload for
+/// `"voting-delegate-signaled-on-your-behalf"`. Fired ONLY when the local
+/// caller has a Delegate edge active for `community_id` and the inbound
+/// signaler IS the delegate; gated by community policy
+/// `notify_on_delegate_signal` so opt-in stays explicit.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VotingDelegateSignaledOnYourBehalfPayload {
+    pub community_id: String,
+    pub proposal_id: String,
+    pub delegate: String,
+    pub support: bool,
+}
+
 /// Tauri IPC: create a Tier 2 (Conviction) proposal. Returns the new
 /// `PollId` as a hex string (32 bytes → 64 chars).
 ///
@@ -18805,8 +18831,6 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
     community_id: String,
     delegate: String,
 ) -> Result<(), String> {
-    let _ = app; // emit deferred — Delegate events do not fire a Tauri event by spec.
-
     let cid_bytes: [u8; 16] = hex::decode(&community_id)
         .map_err(|e| format!("invalid community_id hex: {e}"))?
         .as_slice()
@@ -18888,6 +18912,19 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
         log.apply(event, &space_id)
             .map_err(|e| format!("voting_delegate_tier2: apply (D2 cycle? stale?): {e:?}"))?;
     }
+
+    // ZEB-292 Phase 3: surface the delegation change to the local UI so
+    // DelegationWidget + DelegationGraph refresh without polling. Inbound
+    // peer Delegate events are emitted from the voting_log_engine apply
+    // path (separate code path; same event shape).
+    let payload = VotingDelegationChangedPayload {
+        community_id: community_id.clone(),
+        delegator: hex::encode(self_owner.0),
+        delegate: Some(hex::encode(to_addr.0)),
+    };
+    if let Err(e) = app.emit("voting-delegation-changed", &payload) {
+        tracing::warn!(error = %e, "voting-delegation-changed emit failed");
+    }
     Ok(())
 }
 
@@ -18898,8 +18935,6 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     community_id: String,
 ) -> Result<(), String> {
-    let _ = app; // emit deferred — Undelegate events do not fire a Tauri event by spec.
-
     let cid_bytes: [u8; 16] = hex::decode(&community_id)
         .map_err(|e| format!("invalid community_id hex: {e}"))?
         .as_slice()
@@ -18946,6 +18981,16 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
         let mut log = log_arc.lock().await;
         log.apply(event, &space_id)
             .map_err(|e| format!("voting_undelegate_tier2: apply: {e:?}"))?;
+    }
+
+    // ZEB-292 Phase 3: surface the delegation removal to the local UI.
+    let payload = VotingDelegationChangedPayload {
+        community_id: community_id.clone(),
+        delegator: hex::encode(self_owner.0),
+        delegate: None,
+    };
+    if let Err(e) = app.emit("voting-delegation-changed", &payload) {
+        tracing::warn!(error = %e, "voting-delegation-changed emit failed");
     }
     Ok(())
 }

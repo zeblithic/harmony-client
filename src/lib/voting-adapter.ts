@@ -30,6 +30,8 @@ import type {
   PollStateExport,
   Tier2ProposalExport,
   VotingBallotCastPayload,
+  VotingDelegateSignaledOnYourBehalfPayload,
+  VotingDelegationChangedPayload,
   VotingPollClosedPayload,
   VotingPollCreatedPayload,
   VotingProposalFinalizedPayload,
@@ -96,6 +98,11 @@ export class VotingAdapter {
   private thresholdReachedSubs: Array<(p: VotingThresholdReachedPayload) => void> = [];
   private thresholdRevertedSubs: Array<(p: VotingThresholdRevertedPayload) => void> = [];
   private proposalFinalizedSubs: Array<(p: VotingProposalFinalizedPayload) => void> = [];
+  // ZEB-292 Phase 3 — delegation event subscribers.
+  private delegationChangedSubs: Array<(p: VotingDelegationChangedPayload) => void> = [];
+  private delegateSignaledOnYourBehalfSubs: Array<
+    (p: VotingDelegateSignaledOnYourBehalfPayload) => void
+  > = [];
 
   subscribePollCreated(handler: (p: VotingPollCreatedPayload) => void): () => void {
     this.pollCreatedSubs.push(handler);
@@ -163,6 +170,26 @@ export class VotingAdapter {
     return () => {
       const i = this.proposalFinalizedSubs.indexOf(handler);
       if (i >= 0) this.proposalFinalizedSubs.splice(i, 1);
+    };
+  }
+
+  // ─── ZEB-292 Phase 3 — delegation event subscribers ─────────────────
+  subscribeDelegationChanged(
+    handler: (p: VotingDelegationChangedPayload) => void,
+  ): () => void {
+    this.delegationChangedSubs.push(handler);
+    return () => {
+      const i = this.delegationChangedSubs.indexOf(handler);
+      if (i >= 0) this.delegationChangedSubs.splice(i, 1);
+    };
+  }
+  subscribeDelegateSignaledOnYourBehalf(
+    handler: (p: VotingDelegateSignaledOnYourBehalfPayload) => void,
+  ): () => void {
+    this.delegateSignaledOnYourBehalfSubs.push(handler);
+    return () => {
+      const i = this.delegateSignaledOnYourBehalfSubs.indexOf(handler);
+      if (i >= 0) this.delegateSignaledOnYourBehalfSubs.splice(i, 1);
     };
   }
 
@@ -265,6 +292,25 @@ export class VotingAdapter {
           },
         );
         stagedUnlisteners.push(unlistenProposalFinalized);
+
+        // ZEB-292 Phase 3 — delegation events (local + inbound).
+        const unlistenDelegationChanged = await adapter.listen(
+          'voting-delegation-changed',
+          (event) => {
+            const payload = event.payload as VotingDelegationChangedPayload;
+            for (const sub of [...this.delegationChangedSubs]) sub(payload);
+          },
+        );
+        stagedUnlisteners.push(unlistenDelegationChanged);
+
+        const unlistenDelegateOnBehalf = await adapter.listen(
+          'voting-delegate-signaled-on-your-behalf',
+          (event) => {
+            const payload = event.payload as VotingDelegateSignaledOnYourBehalfPayload;
+            for (const sub of [...this.delegateSignaledOnYourBehalfSubs]) sub(payload);
+          },
+        );
+        stagedUnlisteners.push(unlistenDelegateOnBehalf);
 
         this.adapter = adapter;
         this.unlisteners.push(...stagedUnlisteners);
