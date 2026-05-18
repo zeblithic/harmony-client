@@ -51,7 +51,7 @@
       {onRowDragStart}
       {onRowDrop}
       editing={editingItem !== null
-        && editingItem.sidecarId === item.sidecarId
+        && editingItem.name === item.name
         && editingItem.cid === item.cid}
       bind:editValue={editingValue}
       {onBeginRename}

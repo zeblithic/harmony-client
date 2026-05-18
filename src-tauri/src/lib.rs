@@ -7082,15 +7082,19 @@ pub async fn rename_content_impl(
     let is_top_level = src_cids.len() == 1 && src_cids[0] == child_cid;
 
     if is_top_level {
-        // Same-name no-op (defensive — frontend short-circuits).
-        if src_entry_name == new_name_trimmed {
-            return Ok(RenameContentResult { src_new_cid: None });
-        }
-        // Verify the caller's claimed current name matches the sidecar.
+        // Verify the caller's claimed current name matches the sidecar
+        // FIRST. A stale caller passing `src_child_name="wrong"` but
+        // `new_name=<current name>` must error on the mismatch, not
+        // silently no-op — the mismatch is a signal the frontend's view
+        // is stale and a refresh is needed before retrying.
         if src_entry_name != src_child_name {
             return Err(format!(
                 "src_child_name '{src_child_name}' does not match src sidecar entry name '{src_entry_name}'",
             ));
+        }
+        // Same-name no-op (defensive — frontend short-circuits).
+        if src_entry_name == new_name_trimmed {
+            return Ok(RenameContentResult { src_new_cid: None });
         }
         // Duplicate-sibling check across top-level entries; skip self by
         // sidecar_id (not by name).

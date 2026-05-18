@@ -303,7 +303,14 @@ F2 keyboard handler at the FileBrowser level (gated on having a selected row and
 ```typescript
 function handleKeyDown(e: KeyboardEvent) {
   if (e.key === 'F2' && !editingItem) {
-    const selected = items.find((i) => i.sidecarId === selectedSidecarId || i.cid === selectedCid);
+    // Mutually exclusive selection match — pick the right row when
+    // sidecarId-based selection is active vs. CID-based. A naive
+    // `sidecarId === X || cid === Y` would match the wrong item when
+    // CIDs are shared (shared-CID siblings at root, etc.).
+    const selected = items.find((i) =>
+      (selectedSidecarId !== null && i.sidecarId === selectedSidecarId) ||
+      (selectedSidecarId === null && i.cid === selectedCid),
+    );
     if (selected) {
       e.preventDefault();
       beginRename(selected);

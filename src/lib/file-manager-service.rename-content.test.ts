@@ -171,4 +171,33 @@ describe('FileManagerService.renameContent', () => {
       }),
     ).rejects.toThrow("parent folder already has an entry named 'foo.txt'");
   });
+
+  it('passes through string IPC rejections so callers can normalize them', async () => {
+    // Production Tauri rejects with strings; tests use Error objects.
+    // The service layer doesn't normalize — that's the consumer's job
+    // (per CLAUDE.md: `e instanceof Error ? e.message : String(e)`
+    // at the call site, e.g. FileBrowser.commitRename). This test
+    // pins the passthrough behavior so a future "helpful" service-side
+    // wrapping doesn't break the consumer contract silently.
+    const svc = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    adapter.invoke = vi.fn().mockImplementation((cmd: string) => {
+      if (cmd === 'list_content') return Promise.resolve([]);
+      if (cmd === 'rename_content') {
+        return Promise.reject("duplicate name: 'foo.txt'");
+      }
+      return Promise.resolve(undefined);
+    });
+    await svc.connectAdapter(adapter);
+
+    await expect(
+      svc.renameContent({
+        srcSidecarId: 'sid-T',
+        srcPath: ['t'.padEnd(64, '0'), 'p'.padEnd(64, '0')],
+        srcChildCid: 'c'.padEnd(64, '0'),
+        srcChildName: 'bar.txt',
+        newName: 'foo.txt',
+      }),
+    ).rejects.toThrow("duplicate name: 'foo.txt'");
+  });
 });
