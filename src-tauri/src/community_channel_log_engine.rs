@@ -2147,8 +2147,7 @@ mod tests {
         // Plain UTF-8 chat text.
         assert_eq!(detect_poll_kind(b"hello world"), (None, None));
         // 65-byte body that is NOT prefixed with 0x00.
-        let mut not_magic = vec![b'!'; 65];
-        not_magic.extend([]);
+        let not_magic = vec![b'!'; 65];
         assert_eq!(detect_poll_kind(&not_magic), (None, None));
         // 0x00 prefix but wrong length.
         let too_short = [0u8; 32];
