@@ -14,6 +14,19 @@ export interface ChannelMessageDto {
   at: HlcDto;
   body: number[];
   replyTo?: string;
+  /**
+   * ZEB-291 Phase 1.5 chat dispatch — message kind discriminator.
+   * Defaults to 'text' for backward compat. Set to 'poll' by the Rust
+   * IPC boundary when the body matches the poll-message convention
+   * (`0x00` magic byte + 64 ASCII hex chars = the poll_id).
+   */
+  kind?: 'text' | 'poll';
+  /**
+   * ZEB-291 Phase 1.5 — present iff `kind === 'poll'`. Hex 64-char
+   * (32 bytes) PollId, extracted from the body convention by the Rust
+   * IPC boundary. UI dispatches to `<PollMessage>` keyed on this.
+   */
+  pollId?: string;
 }
 
 interface ChannelMessageReceivedPayload {

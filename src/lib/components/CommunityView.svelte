@@ -13,6 +13,8 @@
   import ModifyChannelDialog from './ModifyChannelDialog.svelte';
   import TypedConfirmationModal from './TypedConfirmationModal.svelte';
   import CommunitySettingsPanel from './CommunitySettingsPanel.svelte';
+  import CommunityProposalsPanel from './CommunityProposalsPanel.svelte';
+  import type { VotingAdapter } from '../voting-adapter';
 
   let {
     communityId,
@@ -34,6 +36,7 @@
     onToggleSharedInProfile,
     onForkSuccess,
     onSelectCommunity,
+    votingAdapter,
   }: {
     communityId: string;
     communityName: string;
@@ -46,6 +49,12 @@
     communityService: CommunityService;
     channelMessageService: ChannelMessageService;
     trustService?: TrustService;
+    /** ZEB-291 Phase 2: connected VotingAdapter. When present, a
+     *  Proposals tab appears next to Channels — switches the middle
+     *  column to the Tier 2 governance panel. Optional so existing
+     *  CommunityView consumers (App.svelte mounts that haven't been
+     *  updated yet) keep working with the channels-only view. */
+    votingAdapter?: VotingAdapter;
     /** ZEB-285: NavService ref for fork-parent name resolution in the Lineage block and
      *  for adding the new fork to the sidebar after fork_community succeeds. Required —
      *  the fork nav-visibility path (navService.addOrUpdateNavSpace) silently no-ops if
@@ -67,6 +76,11 @@
 
   let channels = $state<ChannelInfo[]>([]);
   let activeChannelId = $state<string | null>(null);
+  /** ZEB-291 Phase 2: which middle-column view is active. Default is
+   *  'channels' (chat-native, current behavior); 'proposals' switches
+   *  to the Tier 2 governance panel. Only togglable when a
+   *  votingAdapter is provided. */
+  let activeView = $state<'channels' | 'proposals'>('channels');
   let settingsModalOpen = $state(false);
   let communityMembersPanelOpen = $state(false);
   let showCreateDialog = $state(false);
@@ -229,6 +243,24 @@
 <section class="community-view" aria-label={`Community: ${communityName}`}>
   <header class="community-header">
     <h2 class="community-name">{communityName}</h2>
+    {#if votingAdapter}
+      <nav class="view-tabs" aria-label="Community view">
+        <button
+          type="button"
+          class="view-tab"
+          class:active={activeView === 'channels'}
+          aria-pressed={activeView === 'channels'}
+          onclick={() => { activeView = 'channels'; }}
+        >Channels</button>
+        <button
+          type="button"
+          class="view-tab"
+          class:active={activeView === 'proposals'}
+          aria-pressed={activeView === 'proposals'}
+          onclick={() => { activeView = 'proposals'; }}
+        >Proposals</button>
+      </nav>
+    {/if}
     <div class="header-actions">
       <button
         type="button"
@@ -297,12 +329,19 @@
       onModifyClick={(c) => { modifyDialogChannel = c; }}
       onDeleteClick={(c) => { deleteConfirmChannel = c; }}
     />
-    {#if activeChannel}
+    {#if activeView === 'proposals' && votingAdapter}
+      <CommunityProposalsPanel
+        {communityId}
+        adapter={votingAdapter}
+        {myPower}
+      />
+    {:else if activeChannel}
       <ChannelMessageFeed
         {communityId}
         channelId={activeChannel.channelId}
         channelName={activeChannel.name}
         {channelMessageService}
+        {votingAdapter}
         {ownAddress}
         {trustService}
         {myPower}
@@ -452,6 +491,30 @@
     background: var(--bg-secondary);
   }
   .community-name { margin: 0; color: var(--text-primary); font-size: 1rem; }
+  .view-tabs {
+    display: flex;
+    gap: 4px;
+    margin-left: 16px;
+  }
+  .view-tab {
+    background: none;
+    border: 1px solid transparent;
+    color: var(--text-secondary);
+    padding: 4px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.85rem;
+  }
+  .view-tab:hover {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+  }
+  .view-tab.active {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    border-color: var(--border);
+  }
   .header-actions {
     display: flex;
     align-items: center;

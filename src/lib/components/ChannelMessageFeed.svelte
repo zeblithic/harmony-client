@@ -3,7 +3,10 @@
   import type { ChannelMessageDto, HlcDto } from '../channel-message-service';
   import type { ChannelMessageService } from '../channel-message-service';
   import type { TrustService } from '../trust-service';
+  import type { VotingAdapter } from '../voting-adapter';
+  import type { PollMeta } from '../types/voting';
   import Avatar from './Avatar.svelte';
+  import PollMessage from './PollMessage.svelte';
   import { buildUnifiedTimeline, type TimelineRow } from '../fork-timeline';
 
   let {
@@ -21,6 +24,15 @@
     originalCommunityName = '',
     /** ZEB-285 Task 11: wall-clock ms of the fork point (for the divider label). */
     forkedAtMs = 0,
+    /**
+     * ZEB-291 Phase 1.5 chat dispatch — optional voting adapter. When
+     * provided, poll-kind messages (`msg.kind === 'poll'`) render an
+     * inline `<PollMessage>` card; otherwise they fall through to the
+     * text rendering as a degraded but readable fallback. The adapter
+     * is also used to pre-fetch poll metas via `listActivePolls` so
+     * the card renders instantly without a per-message round trip.
+     */
+    votingAdapter,
   }: {
     communityId: string;
     channelId: string;
@@ -34,6 +46,7 @@
     snapshotMessages?: ChannelMessageDto[];
     originalCommunityName?: string;
     forkedAtMs?: number;
+    votingAdapter?: VotingAdapter;
   } = $props();
 
   // Local mirror of service.byChannel cache for this channel.
@@ -117,6 +130,51 @@
         loadError = err instanceof Error ? err.message : String(err);
       });
 
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  // ZEB-291 Phase 1.5 chat dispatch — poll meta cache keyed by hex
+  // poll_id (matches `ChannelMessageDto.pollId` from the Rust IPC
+  // boundary). Pre-fetched via `listActivePolls` so a poll-kind
+  // message in the feed can render `<PollMessage>` immediately
+  // without a per-message `getPoll` round trip.
+  //
+  // Re-runs when communityId or votingAdapter changes (e.g. a parent
+  // swap during testing or a re-connect). Cancelled flag protects
+  // against late completions overwriting fresh state.
+  let pollMetaCache = $state<Map<string, PollMeta>>(new Map());
+
+  $effect(() => {
+    if (!votingAdapter) {
+      pollMetaCache = new Map();
+      return;
+    }
+    const cid = communityId;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const polls = await votingAdapter.listActivePolls(cid);
+        if (cancelled) return;
+        const m = new Map<string, PollMeta>();
+        for (const p of polls) {
+          // poll_id is `number[]` over Tauri JSON IPC (see PollIdHex
+          // JSDoc in types/voting.ts); convert to lowercase hex to
+          // match the `kind=poll` discriminator emitted by the Rust
+          // detect_poll_kind helper.
+          const hex = (p.poll_id as number[])
+            .map((b) => b.toString(16).padStart(2, '0'))
+            .join('');
+          m.set(hex, p);
+        }
+        pollMetaCache = m;
+      } catch {
+        // Non-fatal: chat feed still renders text messages even if
+        // poll meta pre-fetch fails (e.g. node not running). Poll
+        // bodies will just show a "Loading poll…" placeholder.
+      }
+    })();
     return () => {
       cancelled = true;
     };
@@ -268,31 +326,6 @@
         <button type="button" class="retry-btn" onclick={retryLoad}>Retry</button>
       </div>
     {/if}
-    <!--
-      TODO ZEB-290 Phase 1.5 — chat-native poll dispatch seam.
-
-      Phase 1 ships PollMessage.svelte + voting-adapter but the
-      ChannelMessageDto wire shape (channel-message-service.ts) is
-      currently kind-agnostic — its only payload is a raw body byte
-      array, rendered verbatim as text below. To embed a poll card
-      inline, Phase 1.5 needs to:
-        1. Extend ChannelMessageDto with a `kind` discriminator
-           ('text' | 'poll'), defaulting to 'text' for back-compat.
-        2. Carry the pollId hex on poll-kind messages (e.g. as part
-           of body or a sibling `pollId?: string` field).
-        3. Add an `{:else if msg.kind === 'poll'}` branch here that
-           renders `<PollMessage pollId={msg.pollId} meta={…}
-           adapter={votingAdapter} />`. Meta comes from the parent
-           feed prefetching listActivePolls(communityId) so the card
-           renders instantly without a per-message getPoll round trip.
-        4. Plumb a VotingAdapter prop into ChannelMessageFeed (similar
-           to how `channelMessageService` is plumbed today).
-
-      Phase 1 backend currently has no poll-kind chat messages on
-      the wire, so there is nothing for this branch to render
-      against yet — the seam is documented here so the diff in
-      Phase 1.5 is localized.
-    -->
     {#each timeline as row}
       {#if 'kind' in row && row.kind === 'fork-divider'}
         <div
@@ -320,7 +353,20 @@
                 <span class="pre-fork-badge" aria-label="From original community">from {originalCommunityName}</span>
               {/if}
             </header>
-            <p class="body">{bodyToText(msg.body)}</p>
+            {#if msg.kind === 'poll' && msg.pollId && votingAdapter}
+              {@const pollMeta = pollMetaCache.get(msg.pollId)}
+              {#if pollMeta}
+                <PollMessage
+                  pollId={pollMeta.poll_id}
+                  meta={pollMeta}
+                  adapter={votingAdapter}
+                />
+              {:else}
+                <p class="poll-loading">Loading poll…</p>
+              {/if}
+            {:else}
+              <p class="body">{bodyToText(msg.body)}</p>
+            {/if}
           </div>
         </article>
       {/if}
@@ -453,6 +499,12 @@
    * them from live post-fork messages per spec §6.4. */
   .channel-message.pre-fork {
     opacity: 0.65;
+  }
+  .poll-loading {
+    margin: 4px 0 0;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    font-style: italic;
   }
   .pre-fork-badge {
     font-size: 0.68rem;

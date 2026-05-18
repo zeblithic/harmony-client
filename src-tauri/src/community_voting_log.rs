@@ -7,7 +7,11 @@
 
 use std::collections::HashMap;
 
-use crate::community_voting_approval::{validate_poll_config, Tier1PollConfig};
+use crate::community_voting_approval::{validate_poll_config, Tier1PollConfig, Tier1TallyState};
+use crate::community_voting_conviction::{
+    DelegatePayload, DelegationGraph, SignalPayload, Tier2PollConfig, Tier2ProposalState,
+    UndelegatePayload,
+};
 use crate::community_voting_core::{
     derive_poll_id, next_lifecycle, Eligibility, Lifecycle, MembershipSnapshot, PollEventKindCode,
     PollId, PollMeta, SignedVotingEvent, Tier,
@@ -25,6 +29,13 @@ pub struct VotingLog {
     pub events: Vec<SignedVotingEvent>,
     /// Materialized per-poll state, keyed by PollId.
     pub polls: HashMap<PollId, PollState>,
+    /// Per-community delegation graph for Tier 2 conviction voting (spec §5).
+    /// Delegation is community-wide (NOT per-poll): a single
+    /// `delegator → delegate` edge applies to every Tier 2 proposal in the
+    /// community. Maintained via `Delegate`/`Undelegate` events; HLC-LWW
+    /// resolves concurrent updates. Empty for communities with no Tier 2
+    /// activity yet.
+    pub delegation_graph: DelegationGraph,
 }
 
 /// Materialized state for a single poll.
@@ -51,11 +62,41 @@ pub struct PollState {
     pub tier1_snapshot: Option<MembershipSnapshot>,
 }
 
-/// Tier-specific tally state. Replaced by `Tier1TallyState` from
-/// `community_voting_approval.rs` in Task 8.
+/// Tier-specific tally state. Each variant holds the materialized
+/// per-tier aggregate; the apply path picks the right variant at
+/// `PollCreate` time based on `event.tier`. Phase 1 ships only
+/// `Tier1`; Phase 2 adds `Tier2`.
 #[derive(Debug, Clone)]
 pub enum TierState {
-    Empty,
+    Tier1(Tier1TallyState),
+    Tier2(Tier2ProposalState),
+}
+
+impl TierState {
+    pub fn as_tier1(&self) -> Option<&Tier1TallyState> {
+        match self {
+            TierState::Tier1(s) => Some(s),
+            _ => None,
+        }
+    }
+    pub fn as_tier1_mut(&mut self) -> Option<&mut Tier1TallyState> {
+        match self {
+            TierState::Tier1(s) => Some(s),
+            _ => None,
+        }
+    }
+    pub fn as_tier2(&self) -> Option<&Tier2ProposalState> {
+        match self {
+            TierState::Tier2(s) => Some(s),
+            _ => None,
+        }
+    }
+    pub fn as_tier2_mut(&mut self) -> Option<&mut Tier2ProposalState> {
+        match self {
+            TierState::Tier2(s) => Some(s),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +107,13 @@ pub enum ApplyError {
     EventBeforePollCreate,
     PayloadDecode,
     PayloadValidate,
+    /// Tier 2 Signal/Delegate/Undelegate applied to a poll whose
+    /// `tier_state` is not `Tier2` (mis-routed event — caller should have
+    /// rejected at verify-time).
+    WrongTierForEvent,
+    /// Tier 2 Delegate event rejected by `DelegationGraph::apply_delegate`
+    /// (cycle in the graph or HLC-LWW stale).
+    DelegationRejected,
 }
 
 impl VotingLog {
@@ -92,8 +140,10 @@ impl VotingLog {
     }
 
     /// Apply with an optional caller-supplied eligibility snapshot.
-    /// Stored on the new `PollState` when `event.kind == PollCreate`
-    /// and `event.tier == Tier::Approval`. Ignored otherwise.
+    /// Stored on the new `PollState` when `event.kind == PollCreate`.
+    /// For Tier 1 (`Tier::Approval`) it caches as `tier1_snapshot`; for
+    /// Tier 2 (`Tier::Conviction`) it's used to derive `total_supply` for
+    /// the new `Tier2ProposalState`.
     pub fn apply_with_snapshot(
         &mut self,
         event: SignedVotingEvent,
@@ -102,7 +152,9 @@ impl VotingLog {
     ) -> Result<PollId, ApplyError> {
         // PollCreate derives PollId from H(community_id || signing_bytes);
         // every other kind references an existing PollId via a `{ "pi": ... }`
-        // map in the payload (encoded by tier modules; Task 7 covers Tier 1).
+        // map in the payload — except Tier 2 Signal/Delegate/Undelegate which
+        // use their own canonical payload shapes (proposal_id field for Signal,
+        // delegator-implicit for Delegate/Undelegate). Decoded below.
         let poll_id = match event.kind {
             PollEventKindCode::PollCreate => {
                 let sb = event
@@ -110,8 +162,110 @@ impl VotingLog {
                     .map_err(|_| ApplyError::SigningBytesError)?;
                 derive_poll_id(community_id, &sb)
             }
+            PollEventKindCode::Signal => {
+                let p: SignalPayload = ciborium::de::from_reader(&event.payload[..])
+                    .map_err(|_| ApplyError::PayloadDecode)?;
+                p.proposal_id
+            }
+            // Delegate/Undelegate are NOT bound to a specific poll — they
+            // mutate the community-wide delegation graph. We still need a
+            // poll_id return value for the IPC layer; for now route via
+            // a sentinel zero PollId. (Tier 2 IPC/UI in Task 18 may stop
+            // calling apply for these and route the graph mutation
+            // directly; for Task 9 we keep the apply call site uniform.)
+            PollEventKindCode::Delegate | PollEventKindCode::Undelegate => PollId([0u8; 32]),
             _ => decode_poll_id_ref(&event.payload).ok_or(ApplyError::MissingPollIdRef)?,
         };
+
+        // ---- Tier 2 Signal: mutate per-voter conviction; NO lifecycle ----
+        // Per spec §5 + Task 9: Signal events alone do NOT drive lifecycle
+        // transitions. Threshold-cross / threshold-drop transitions are
+        // owned by the Task 15 tick which inspects total_conviction vs
+        // threshold_conviction. The Signal apply path updates the per-
+        // voter state, appends to the event log, AND — when an unsignal
+        // arrives while the proposal is in ThresholdReached — stamps
+        // `last_unsignal_after_threshold_ms` so the tick's 24h
+        // contestability window resets. Without that stamp, a fresh
+        // contest would finalize against the original
+        // `threshold_reached_at_ms` and slip through inside the original
+        // window (CR R3 Major).
+        if event.kind == PollEventKindCode::Signal && event.tier == Tier::Conviction {
+            let payload: SignalPayload = ciborium::de::from_reader(&event.payload[..])
+                .map_err(|_| ApplyError::PayloadDecode)?;
+            let state = self
+                .polls
+                .get_mut(&poll_id)
+                .ok_or(ApplyError::EventBeforePollCreate)?;
+            // Lifecycle gate (Cursor R6 Medium): Signal events are
+            // only valid while the proposal is still actively
+            // collecting conviction. A Signal arriving on a Finalized,
+            // Closed, or Archived proposal would otherwise still
+            // mutate `per_voter` conviction state and stamp
+            // `last_unsignal_after_threshold_ms` — corrupting the
+            // historical record of a terminal proposal.
+            if !matches!(
+                state.meta.lifecycle,
+                Lifecycle::Open | Lifecycle::ThresholdReached
+            ) {
+                return Err(ApplyError::IllegalTransition);
+            }
+            let in_threshold_reached = state.meta.lifecycle == Lifecycle::ThresholdReached;
+            let proposal_state = state
+                .tier_state
+                .as_tier2_mut()
+                .ok_or(ApplyError::WrongTierForEvent)?;
+            let hl_ms = (proposal_state.config.half_life_seconds as i128) * 1000;
+            proposal_state
+                .per_voter
+                .entry(event.actor)
+                .or_default()
+                .apply_signal(
+                    payload.support,
+                    event.hlc.wall_ms as i128,
+                    event.hlc.logical,
+                    hl_ms,
+                );
+            if !payload.support && in_threshold_reached {
+                proposal_state.last_unsignal_after_threshold_ms = Some(event.hlc.wall_ms as i128);
+            }
+            state.events.push(event.clone());
+            self.events.push(event);
+            return Ok(poll_id);
+        }
+
+        // ---- Tier 2 Delegate: graph mutation; NO lifecycle ----
+        if event.kind == PollEventKindCode::Delegate && event.tier == Tier::Conviction {
+            // The 16-byte length invariant is now enforced at decode by
+            // `DelegatePayload.to: OwnerAddr` (CR R5 Major). Decode-time
+            // rejection means malformed peer events never reach the
+            // apply path with an unconstrained Vec<u8>.
+            let payload: DelegatePayload = ciborium::de::from_reader(&event.payload[..])
+                .map_err(|_| ApplyError::PayloadDecode)?;
+            self.delegation_graph
+                .apply_delegate(
+                    event.actor,
+                    payload.to,
+                    (event.hlc.wall_ms, event.hlc.logical),
+                )
+                .map_err(|_| ApplyError::DelegationRejected)?;
+            self.events.push(event);
+            return Ok(poll_id);
+        }
+
+        // ---- Tier 2 Undelegate: graph mutation; NO lifecycle ----
+        if event.kind == PollEventKindCode::Undelegate && event.tier == Tier::Conviction {
+            // Payload is the empty `UndelegatePayload {}`; we decode
+            // defensively to surface PayloadDecode on a malformed input
+            // rather than silently accepting whatever bytes arrived.
+            let _payload: UndelegatePayload = ciborium::de::from_reader(&event.payload[..])
+                .map_err(|_| ApplyError::PayloadDecode)?;
+            self.delegation_graph
+                .apply_undelegate(event.actor, (event.hlc.wall_ms, event.hlc.logical));
+            self.events.push(event);
+            return Ok(poll_id);
+        }
+
+        // ---- All other event kinds: existing lifecycle-driven path ----
 
         // For non-create events, require an existing poll. We check this
         // *before* the lifecycle transition so the failure surfaces as
@@ -123,19 +277,21 @@ impl VotingLog {
         }
 
         let current = existing_lifecycle.unwrap_or(Lifecycle::Draft);
-        let next =
-            next_lifecycle(current, event.kind).map_err(|_| ApplyError::IllegalTransition)?;
+        let next = next_lifecycle(current, event.kind, event.tier)
+            .map_err(|_| ApplyError::IllegalTransition)?;
 
         if let Some(state) = self.polls.get_mut(&poll_id) {
             state.meta.lifecycle = next;
             state.events.push(event.clone());
         } else if event.kind == PollEventKindCode::PollCreate {
-            // Tier-1 PollCreate: deserialize and validate Tier1PollConfig
-            // from the payload, then populate PollMeta fully from it.
-            // Tier 2/3 land in their respective phases — until then,
-            // PollCreate events with non-Tier 1 tier values populate a
-            // minimal PollMeta with default Eligibility (closes_at = hlc).
-            let (meta, tier1_cfg) = if event.tier == Tier::Approval {
+            // PollCreate dispatch: Tier 1 (Approval) decodes Tier1PollConfig
+            // and seeds a `Tier1(Tier1TallyState)` tier_state. Tier 2
+            // (Conviction) decodes Tier2PollConfig, computes total_supply
+            // from the caller-supplied snapshot (filtered by the
+            // config's Eligibility), and seeds a `Tier2(Tier2ProposalState)`.
+            // Other tiers fall through to a minimal Tier1-shaped placeholder
+            // — they'll be replaced in their respective phases.
+            let (meta, tier1_cfg, tier_state) = if event.tier == Tier::Approval {
                 let cfg: Tier1PollConfig = ciborium::de::from_reader(&event.payload[..])
                     .map_err(|_| ApplyError::PayloadDecode)?;
                 validate_poll_config(&cfg).map_err(|_| ApplyError::PayloadValidate)?;
@@ -156,9 +312,66 @@ impl VotingLog {
                     closes_at,
                     extends_at: None,
                     channel_id: Some(cfg.channel_id),
+                    finalized_at_ms: None,
                 };
-                (meta, Some(cfg))
+                let tally = Tier1TallyState::empty(cfg.options.len());
+                (meta, Some(cfg), TierState::Tier1(tally))
+            } else if event.tier == Tier::Conviction {
+                let cfg: Tier2PollConfig = ciborium::de::from_reader(&event.payload[..])
+                    .map_err(|_| ApplyError::PayloadDecode)?;
+                // Defensive apply-layer validation (CR R6 nit): peer-
+                // received configs bypass the IPC layer's invariant
+                // check. Inverted thresholds (T_min > T_max) flip the
+                // band sign, producing an "easier-to-finalize-at-low-
+                // participation" curve. A zero half-life would
+                // degenerate the conviction math. Mirrors the Tier 1
+                // `validate_poll_config` discipline that runs above.
+                if cfg.threshold_min_q32 > cfg.threshold_max_q32 || cfg.half_life_seconds == 0 {
+                    return Err(ApplyError::PayloadValidate);
+                }
+                // total_supply = count of members in the caller-supplied
+                // snapshot who pass the Tier 2 config's Eligibility. If
+                // no snapshot was supplied (peer-received PollCreate path
+                // pending Task 12 wiring), default to the snapshot member
+                // count or 0; downstream `Tier2ProposalState` guards
+                // against total_supply=0 in `threshold_conviction_at`.
+                let total_supply = if let Some(snap) = &snapshot {
+                    snap.members
+                        .iter()
+                        .filter(|(addr, _)| {
+                            crate::community_voting_core::check_eligibility(
+                                snap,
+                                addr,
+                                &cfg.eligibility,
+                            )
+                            .is_ok()
+                        })
+                        .count() as u32
+                } else {
+                    0
+                };
+                let meta = PollMeta {
+                    poll_id,
+                    community_id: *community_id,
+                    creator: event.actor,
+                    tier: event.tier,
+                    eligibility: cfg.eligibility,
+                    lifecycle: next,
+                    created_at: event.hlc.clone(),
+                    opens_at: event.hlc.clone(),
+                    // Tier 2 polls have no fixed close window — they
+                    // finalize via threshold-cross + 24h contestability.
+                    // Mirror created_at as a benign default; the tick
+                    // never reads this for Tier 2.
+                    closes_at: event.hlc.clone(),
+                    extends_at: None,
+                    channel_id: None,
+                    finalized_at_ms: None,
+                };
+                let proposal_state = Tier2ProposalState::new(cfg, total_supply);
+                (meta, None, TierState::Tier2(proposal_state))
             } else {
+                // Sortition (Tier 3) and future tiers: minimal placeholder.
                 let meta = PollMeta {
                     poll_id,
                     community_id: *community_id,
@@ -175,8 +388,9 @@ impl VotingLog {
                     closes_at: event.hlc.clone(),
                     extends_at: None,
                     channel_id: None,
+                    finalized_at_ms: None,
                 };
-                (meta, None)
+                (meta, None, TierState::Tier1(Tier1TallyState::empty(0)))
             };
             // Snapshot is only meaningful for Tier 1 in Phase 1; other
             // tiers have their own eligibility paths and we discard.
@@ -190,7 +404,7 @@ impl VotingLog {
                 PollState {
                     meta,
                     events: vec![event.clone()],
-                    tier_state: TierState::Empty,
+                    tier_state,
                     tier1_cfg,
                     tier1_snapshot,
                 },
@@ -321,6 +535,301 @@ mod tests {
 
         assert_eq!(log.polls[&pid].events.len(), 2);
     }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Tier 2 apply-path tests (ZEB-291 Task 9)
+    // ────────────────────────────────────────────────────────────────────
+
+    use crate::community_voting_conviction::{
+        AutoExecAction, DelegatePayload, SignalPayload, Tier2PollConfig, UndelegatePayload, Q32,
+    };
+    use crate::community_voting_core::{MemberAttrs, MembershipSnapshot};
+
+    fn tier2_config() -> Tier2PollConfig {
+        Tier2PollConfig {
+            proposal_text: "promote".into(),
+            half_life_seconds: 86_400,
+            threshold_min_q32: Q32,
+            threshold_max_q32: 100 * Q32,
+            beta: 2,
+            delegation_allowed: true,
+            auto_exec: AutoExecAction::None,
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+        }
+    }
+
+    fn tier2_poll_create_event(creator: OwnerAddr) -> SignedVotingEvent {
+        let mut payload = Vec::new();
+        ciborium::into_writer(&tier2_config(), &mut payload).expect("encode tier2 cfg");
+        SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Conviction,
+            kind: PollEventKindCode::PollCreate,
+            hlc: Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "a".into(),
+            },
+            actor: creator,
+            payload,
+            sig: vec![0u8; 64],
+        }
+    }
+
+    fn signal_event(
+        poll_id: PollId,
+        actor: OwnerAddr,
+        support: bool,
+        hlc_ms: u64,
+    ) -> SignedVotingEvent {
+        let payload_obj = SignalPayload {
+            proposal_id: poll_id,
+            support,
+        };
+        let mut payload = Vec::new();
+        ciborium::into_writer(&payload_obj, &mut payload).expect("encode signal");
+        SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Conviction,
+            kind: PollEventKindCode::Signal,
+            hlc: Hlc {
+                wall_ms: hlc_ms,
+                logical: 0,
+                device_id: "a".into(),
+            },
+            actor,
+            payload,
+            sig: vec![0u8; 64],
+        }
+    }
+
+    fn delegate_event(actor: OwnerAddr, to: [u8; 16], hlc_ms: u64) -> SignedVotingEvent {
+        // Wire `to` is the 16-byte OwnerAddr.
+        let payload_obj = DelegatePayload {
+            to: OwnerAddr(to),
+            scope: "all".into(),
+        };
+        let mut payload = Vec::new();
+        ciborium::into_writer(&payload_obj, &mut payload).expect("encode delegate");
+        SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Conviction,
+            kind: PollEventKindCode::Delegate,
+            hlc: Hlc {
+                wall_ms: hlc_ms,
+                logical: 0,
+                device_id: "a".into(),
+            },
+            actor,
+            payload,
+            sig: vec![0u8; 64],
+        }
+    }
+
+    fn undelegate_event(actor: OwnerAddr, hlc_ms: u64) -> SignedVotingEvent {
+        let payload_obj = UndelegatePayload {};
+        let mut payload = Vec::new();
+        ciborium::into_writer(&payload_obj, &mut payload).expect("encode undelegate");
+        SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Conviction,
+            kind: PollEventKindCode::Undelegate,
+            hlc: Hlc {
+                wall_ms: hlc_ms,
+                logical: 0,
+                device_id: "a".into(),
+            },
+            actor,
+            payload,
+            sig: vec![0u8; 64],
+        }
+    }
+
+    fn snapshot_of(addrs: &[OwnerAddr]) -> MembershipSnapshot {
+        let mut members = HashMap::new();
+        for a in addrs {
+            members.insert(
+                *a,
+                MemberAttrs {
+                    power: 10,
+                    vouching_depth: 0,
+                },
+            );
+        }
+        MembershipSnapshot { members }
+    }
+
+    #[test]
+    fn tier2_pollcreate_creates_tier2_state() {
+        let mut log = VotingLog::new();
+        let cid = SpaceId([0x55; 16]);
+        let creator = OwnerAddr([0xaa; 16]);
+        let voter1 = OwnerAddr([0xb1; 16]);
+        let voter2 = OwnerAddr([0xb2; 16]);
+        let ev = tier2_poll_create_event(creator);
+        let pid = log
+            .apply_with_snapshot(ev, &cid, Some(snapshot_of(&[creator, voter1, voter2])))
+            .expect("apply tier2 create");
+        let state = &log.polls[&pid];
+        assert_eq!(state.meta.lifecycle, Lifecycle::Open);
+        assert_eq!(state.meta.tier, Tier::Conviction);
+        let t2 = state.tier_state.as_tier2().expect("tier2 state");
+        assert_eq!(t2.total_supply, 3);
+        assert!(t2.per_voter.is_empty());
+    }
+
+    #[test]
+    fn tier2_signal_updates_voter_state() {
+        let mut log = VotingLog::new();
+        let cid = SpaceId([0x55; 16]);
+        let creator = OwnerAddr([0xaa; 16]);
+        let voter = OwnerAddr([0xb1; 16]);
+        let pid = log
+            .apply_with_snapshot(
+                tier2_poll_create_event(creator),
+                &cid,
+                Some(snapshot_of(&[creator, voter])),
+            )
+            .expect("create");
+        log.apply(signal_event(pid, voter, true, 2000), &cid)
+            .expect("signal");
+        let t2 = log.polls[&pid].tier_state.as_tier2().unwrap();
+        let v = t2.per_voter.get(&voter).expect("voter state");
+        assert!(v.is_supporting);
+        assert_eq!(v.support_started_at_ms, 2000);
+        // Lifecycle stays Open — Signal does NOT drive lifecycle (Task 15
+        // tick owns that path).
+        assert_eq!(log.polls[&pid].meta.lifecycle, Lifecycle::Open);
+    }
+
+    #[test]
+    fn tier2_signal_toggle_on_off_accumulates_conviction() {
+        let mut log = VotingLog::new();
+        let cid = SpaceId([0x55; 16]);
+        let creator = OwnerAddr([0xaa; 16]);
+        let voter = OwnerAddr([0xb1; 16]);
+        let pid = log
+            .apply_with_snapshot(
+                tier2_poll_create_event(creator),
+                &cid,
+                Some(snapshot_of(&[creator, voter])),
+            )
+            .expect("create");
+        // Signal on at t=1_000_000, off at t=1_086_400_000 (=24h later, == 1 half-life).
+        log.apply(signal_event(pid, voter, true, 1_000_000), &cid)
+            .expect("on");
+        log.apply(
+            signal_event(pid, voter, false, 1_000_000 + 86_400_000),
+            &cid,
+        )
+        .expect("off");
+        let v = log.polls[&pid]
+            .tier_state
+            .as_tier2()
+            .unwrap()
+            .per_voter
+            .get(&voter)
+            .unwrap();
+        assert!(!v.is_supporting);
+        // After one half-life of continuous support, accumulated conviction
+        // is the charge function value — strictly positive.
+        assert!(
+            v.accumulated_conviction_q32 > 0,
+            "accumulated conviction must be > 0 after full support session, got {}",
+            v.accumulated_conviction_q32
+        );
+    }
+
+    #[test]
+    fn tier2_delegate_updates_delegation_graph() {
+        let mut log = VotingLog::new();
+        let cid = SpaceId([0x55; 16]);
+        let creator = OwnerAddr([0xaa; 16]);
+        let alice = OwnerAddr([0xa1; 16]);
+        let bob = OwnerAddr([0xb1; 16]);
+        log.apply_with_snapshot(
+            tier2_poll_create_event(creator),
+            &cid,
+            Some(snapshot_of(&[creator, alice, bob])),
+        )
+        .expect("create");
+        log.apply(delegate_event(alice, bob.0, 2000), &cid)
+            .expect("delegate");
+        assert_eq!(log.delegation_graph.delegate_of(alice), Some(bob));
+        assert_eq!(log.delegation_graph.delegator_count(bob), 1);
+    }
+
+    #[test]
+    fn tier2_delegate_cycle_rejected() {
+        let mut log = VotingLog::new();
+        let cid = SpaceId([0x55; 16]);
+        let creator = OwnerAddr([0xaa; 16]);
+        let alice = OwnerAddr([0xa1; 16]);
+        let bob = OwnerAddr([0xb1; 16]);
+        log.apply_with_snapshot(
+            tier2_poll_create_event(creator),
+            &cid,
+            Some(snapshot_of(&[creator, alice, bob])),
+        )
+        .expect("create");
+        // alice → bob succeeds; bob → alice would close a cycle and is
+        // rejected by DelegationGraph::apply_delegate.
+        log.apply(delegate_event(alice, bob.0, 2000), &cid)
+            .expect("alice → bob");
+        let err = log
+            .apply(delegate_event(bob, alice.0, 3000), &cid)
+            .expect_err("bob → alice must be rejected");
+        assert_eq!(err, ApplyError::DelegationRejected);
+        assert_eq!(log.delegation_graph.delegate_of(bob), None);
+    }
+
+    #[test]
+    fn tier2_undelegate_clears_edge() {
+        let mut log = VotingLog::new();
+        let cid = SpaceId([0x55; 16]);
+        let creator = OwnerAddr([0xaa; 16]);
+        let alice = OwnerAddr([0xa1; 16]);
+        let bob = OwnerAddr([0xb1; 16]);
+        log.apply_with_snapshot(
+            tier2_poll_create_event(creator),
+            &cid,
+            Some(snapshot_of(&[creator, alice, bob])),
+        )
+        .expect("create");
+        log.apply(delegate_event(alice, bob.0, 2000), &cid)
+            .expect("delegate");
+        assert_eq!(log.delegation_graph.delegate_of(alice), Some(bob));
+        log.apply(undelegate_event(alice, 3000), &cid)
+            .expect("undelegate");
+        assert_eq!(log.delegation_graph.delegate_of(alice), None);
+    }
+
+    #[test]
+    fn tier1_apply_path_still_works() {
+        // Regression guard for Task 9's TierState extension: Tier 1
+        // PollCreate + BallotCast must still flow through and seed a
+        // `Tier1(Tier1TallyState)` instead of the old `Empty` variant.
+        let mut log = VotingLog::new();
+        let cid = SpaceId([0x33; 16]);
+        let create_ev = poll_create_event(OwnerAddr([0xaa; 16]));
+        let pid = log.apply(create_ev, &cid).expect("apply create");
+        let ballot = ballot_event(pid, 2000, OwnerAddr([0xbb; 16]));
+        log.apply(ballot, &cid).expect("apply ballot");
+        let state = &log.polls[&pid];
+        assert_eq!(state.events.len(), 2);
+        assert_eq!(state.meta.lifecycle, Lifecycle::Open);
+        let t1 = state.tier_state.as_tier1().expect("tier1 state");
+        // good_poll_config() has 3 options.
+        assert_eq!(t1.counts.len(), 3);
+    }
 }
 
 const NINETY_DAYS_MS: u64 = 90 * 24 * 60 * 60 * 1000;
@@ -344,14 +853,19 @@ impl VotingLog {
             if state.meta.lifecycle != Lifecycle::Finalized {
                 continue;
             }
-            let Some(fin_at) = state
+            // Tier 1 emits a terminal `PollResult` event whose HLC is the
+            // canonical finalize timestamp. Tier 2 has no terminal event
+            // (the tick flips lifecycle directly), so we stamp
+            // `meta.finalized_at_ms` on the lifecycle transition and
+            // consult that here as a fallback. Without the fallback,
+            // Tier 2 finalized polls would never archive — CR R3 Major.
+            let fin_at = state
                 .events
                 .iter()
                 .find(|e| e.kind == PollEventKindCode::PollResult)
                 .map(|e| e.hlc.wall_ms)
-            else {
-                continue;
-            };
+                .or(state.meta.finalized_at_ms);
+            let Some(fin_at) = fin_at else { continue };
             if now_wall_ms.saturating_sub(fin_at) > NINETY_DAYS_MS {
                 to_archive.push(*pid);
             }
@@ -480,13 +994,14 @@ mod archive_tests {
             },
             extends_at: None,
             channel_id: None,
+            finalized_at_ms: None,
         };
         log.polls.insert(
             pid,
             PollState {
                 meta,
                 events,
-                tier_state: TierState::Empty,
+                tier_state: TierState::Tier1(Tier1TallyState::empty(0)),
                 tier1_cfg: None,
                 tier1_snapshot: None,
             },
@@ -591,13 +1106,14 @@ mod archive_tests {
             },
             extends_at: None,
             channel_id: None,
+            finalized_at_ms: None,
         };
         log.polls.insert(
             pid,
             PollState {
                 meta,
                 events: per_poll_events,
-                tier_state: TierState::Empty,
+                tier_state: TierState::Tier1(Tier1TallyState::empty(0)),
                 tier1_cfg: None,
                 tier1_snapshot: None,
             },
@@ -684,13 +1200,14 @@ mod archive_tests {
             },
             extends_at: None,
             channel_id: None,
+            finalized_at_ms: None,
         };
         log.polls.insert(
             pid,
             PollState {
                 meta,
                 events: vec![],
-                tier_state: TierState::Empty,
+                tier_state: TierState::Tier1(Tier1TallyState::empty(0)),
                 tier1_cfg: None,
                 tier1_snapshot: None,
             },

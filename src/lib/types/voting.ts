@@ -161,3 +161,161 @@ export interface VotingPollClosedPayload {
   pollId: PollIdHex;
   communityId: CommunityIdHex;
 }
+
+// ─── ZEB-291 Phase 2 — Tier 2 (Conviction) frontend types ──────────────
+// These mirror the Rust shapes from src-tauri/src/lib.rs
+// (`Tier2ProposalExport`, `VotingTier2ProposalCreatedPayload`,
+// `VotingTier2SignalCastPayload`) and from
+// `community_voting_conviction::{AutoExecAction, Tier2PollConfig}`.
+//
+// The IPC return values use `#[serde(rename_all = "camelCase")]` so
+// fields arrive at the JS boundary in snake_case → camelCase form — but
+// we deliberately keep the snake_case spelling on the TS side (same
+// convention PollStateExport uses) because the field names ARE the
+// snake_case spelling on the wire here (Rust struct fields are
+// snake_case; the `rename_all` was a Tier 1 mistake we don't repeat
+// here — see PollMeta JSDoc note about which structs do/don't use the
+// rename). Actual wire shape verified against `build_tier2_export`.
+
+/** Auto-exec action attached to a Tier 2 proposal.
+ *
+ * Wire form: tagged union with a 2-char `kk` discriminator. Mirrors
+ * Rust `community_voting_conviction::AutoExecAction`:
+ *   - `None` → `{ kk: 'n' }`
+ *   - `SetPower { target_pubkey, new_power }` → `{ kk: 'sp', tg, np }`
+ *
+ * The 2-char discriminator is load-bearing for the spec §3 same-length-
+ * keys invariant — every key at this nesting level is 2 chars. */
+export type AutoExecAction =
+  | { kk: 'n' }
+  /** `tg` is the 16-byte target OwnerAddr as a JSON `number[]`; `np`
+   *  is the new power level (0..=100). */
+  | { kk: 'sp'; tg: number[]; np: number };
+
+/** Tier 2 (Conviction) poll config. Mirrors Rust
+ *  `community_voting_conviction::Tier2PollConfig` (same 2-char-key
+ *  invariant). Frontend-emitted when creating a proposal via the
+ *  voting-adapter; the adapter expands these into the camelCase IPC
+ *  arg names the Rust `voting_create_tier2_proposal` command expects. */
+export interface Tier2PollConfig {
+  /** Proposal text (max 4096 bytes per Rust IPC validation). */
+  pt: string;
+  /** Conviction half-life, in seconds. */
+  hl: number;
+  /** `T_min` — floor of the dynamic threshold band (Q96.32 raw — see
+   *  spec §5 amendment). */
+  tn: number;
+  /** `T_max` — ceiling of the dynamic threshold band (Q96.32 raw). */
+  tx: number;
+  /** β exponent for the `(1 - participation_ratio)^β` curve. */
+  bb: number;
+  /** Whether voters may delegate their conviction-weight. */
+  dl: boolean;
+  /** Auto-exec action that fires on finalization. */
+  ax: AutoExecAction;
+  /** Eligibility predicate — mirrors Phase 1 `Eligibility` shape. */
+  el: { mp: number; mv?: number; sz?: number };
+}
+
+/** Frontend DTO for a Tier 2 proposal. Mirrors Rust
+ *  `Tier2ProposalExport` (lib.rs). The `lifecycle` field is a string
+ *  because the Rust side serializes via `format!("{:?}", lifecycle)`
+ *  rather than a typed enum — UI compares against the string spellings. */
+export interface Tier2ProposalExport {
+  /** Hex-encoded 32-byte PollId. */
+  proposal_id: string;
+  /** Hex-encoded 16-byte SpaceId. */
+  community_id: string;
+  proposal_text: string;
+  /** "Open" | "ThresholdReached" | "Finalized" | "Archived". (The
+   *  Rust enum also emits "Draft" and "Closed" variants but neither
+   *  applies to a Tier 2 lifecycle in practice — Draft is impl-only,
+   *  Closed is Tier 1's terminal pre-Finalized state.) */
+  lifecycle: 'Open' | 'ThresholdReached' | 'Finalized' | 'Archived';
+  /** Q96.32 sum of per-voter conviction (post-delegation). Serialized
+   *  as a decimal string by the Rust IPC layer because raw Q96.32 values
+   *  routinely exceed `Number.MAX_SAFE_INTEGER` — reconstruct via
+   *  `BigInt(value)`. For progress bars use `convictionPercent()` below. */
+  total_conviction_ms: string;
+  /** Q96.32 dynamic threshold at fetch-time (recomputed each call).
+   *  Decimal string, same rationale as `total_conviction_ms`. */
+  threshold_conviction_ms: string;
+  half_life_seconds: number;
+  auto_exec: AutoExecAction;
+  /** Total members eligible at PollCreate.hlc (frozen). */
+  total_supply: number;
+  /** Active-Signal-true voter count right now. */
+  voter_count: number;
+  /** Caller's own latest Signal direction: true = supporting, false =
+   *  withdrawn, undefined = never signaled (or self-identity unavailable). */
+  your_signal?: boolean;
+  /** Wall-clock (ms since UNIX_EPOCH) when total_conviction first
+   *  crossed threshold_conviction. Undefined if never crossed (or
+   *  reverted by an unsignal). */
+  threshold_reached_at_ms?: number;
+}
+
+/** Convert raw Q96.32 conviction values (decimal-string i128s from the
+ *  Rust IPC layer) to a 0-100 progress percentage for UI bars. Returns
+ *  0 when `threshold` is non-positive (defensive — the Rust apply path
+ *  enforces `T_max > T_min ≥ 0`, but a peer with a malformed
+ *  Tier2PollConfig could conceivably ship 0 across the wire). Caps at
+ *  100 so the bar never overflows the track.
+ *
+ *  Uses BigInt throughout because raw Q96.32 conviction values
+ *  routinely exceed `Number.MAX_SAFE_INTEGER`; `*1000n / threshold`
+ *  preserves one decimal place of precision in integer math, then we
+ *  cast to Number for the final `/10` (the ratio fits in a double). */
+export function convictionPercent(total: string, threshold: string): number {
+  const totalBI = BigInt(total);
+  const thresholdBI = BigInt(threshold);
+  if (thresholdBI <= 0n) return 0;
+  const tenthsBI = (totalBI * 1000n) / thresholdBI;
+  const tenths = Number(tenthsBI);
+  // Lower-bound clamp keeps the bar non-negative if a malformed or
+  // hostile payload ships a negative total (the Q96.32 fields are i128
+  // so negative values are encodable). CR R3 Minor.
+  return Math.max(0, Math.min(100, tenths / 10));
+}
+
+// ─── Tier 2 Tauri event payloads ───────────────────────────────────────
+// These are camelCased — the Rust payload structs use
+// `#[serde(rename_all = "camelCase")]` (see
+// `VotingTier2ProposalCreatedPayload`, `VotingTier2SignalCastPayload`
+// in lib.rs). The tick-emitted events (`voting-threshold-reached`,
+// `voting-proposal-finalized`) are built ad-hoc via `serde_json::json!`
+// in community_voting_tick.rs and also use camelCase keys.
+
+/** Payload for `voting-tier2-proposal-created` event. */
+export interface VotingTier2ProposalCreatedPayload {
+  proposalId: string;
+  communityId: string;
+}
+
+/** Payload for `voting-tier2-signal-cast` event. */
+export interface VotingTier2SignalCastPayload {
+  proposalId: string;
+  voter: string;
+  support: boolean;
+}
+
+/** Payload for `voting-threshold-reached` event (tick-emitted). */
+export interface VotingThresholdReachedPayload {
+  communityId: string;
+  proposalId: string;
+  thresholdReachedAtMs: number;
+}
+
+/** Payload for `voting-threshold-reverted` event (tick-emitted when a
+ *  Tier 2 proposal drops back below threshold from `ThresholdReached`). */
+export interface VotingThresholdRevertedPayload {
+  communityId: string;
+  proposalId: string;
+  revertedAtMs: number;
+}
+
+/** Payload for `voting-proposal-finalized` event (tick-emitted). */
+export interface VotingProposalFinalizedPayload {
+  communityId: string;
+  proposalId: string;
+}
