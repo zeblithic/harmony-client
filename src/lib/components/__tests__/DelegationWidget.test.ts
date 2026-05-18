@@ -165,6 +165,55 @@ describe('DelegationWidget', () => {
     });
   });
 
+  it('resets busy on community switch so the widget recovers when IPC was in-flight', async () => {
+    // Cursor R8 regression: an in-flight delegate IPC at the moment of
+    // community switch must not leave `busy` stuck on `true` in the new
+    // community. The generation guard correctly suppresses the stale
+    // callback's success-effects, but `busy` is widget-local UI state
+    // that the community-swap $effect now resets explicitly.
+    let resolveDelegate: () => void = () => {};
+    delegateMock.mockImplementationOnce(
+      () =>
+        new Promise<void>((res) => {
+          resolveDelegate = () => res();
+        }),
+    );
+    const { rerender } = render(DelegationWidget, {
+      props: {
+        communityId: COMMUNITY_ID,
+        adapter,
+        myAddr: ME,
+        communityMembers: members,
+        currentDelegate: null,
+      },
+    });
+    const select = screen.getByLabelText(/delegate to/i) as HTMLSelectElement;
+    await fireEvent.change(select, { target: { value: BOB } });
+    await fireEvent.click(screen.getByRole('button', { name: /^delegate$/i }));
+    await waitFor(() => {
+      expect(delegateMock).toHaveBeenCalledWith(COMMUNITY_ID, BOB);
+    });
+    // While IPC is pending, the button label flips to "Applying…" + disabled.
+    expect(screen.getByRole('button', { name: /applying/i })).toBeDisabled();
+    // Swap to a different community mid-IPC.
+    const OTHER_COMMUNITY = '99'.repeat(16);
+    await rerender({
+      communityId: OTHER_COMMUNITY,
+      adapter,
+      myAddr: ME,
+      communityMembers: members,
+      currentDelegate: null,
+    });
+    // Without the busy reset, the button would still read "Applying…"
+    // and stay disabled forever in the new community. The fix restores
+    // the original "Delegate" label and re-enables once a member is picked.
+    const select2 = screen.getByLabelText(/delegate to/i) as HTMLSelectElement;
+    await fireEvent.change(select2, { target: { value: BOB } });
+    expect(screen.getByRole('button', { name: /^delegate$/i })).not.toBeDisabled();
+    // Resolve the orphaned IPC for cleanliness.
+    resolveDelegate();
+  });
+
   it('member picker excludes the caller and non-joined members', () => {
     render(DelegationWidget, {
       props: {

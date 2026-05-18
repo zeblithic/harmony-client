@@ -99,10 +99,18 @@
     // against the wrong community. `pendingDelegate` is the most
     // dangerous (an Apply click would route to delegateTier2 with
     // the prior community's selection).
+    //
+    // `busy` reset is load-bearing (Cursor R8): an in-flight IPC for
+    // the previous community will not clear `busy` in its `finally`
+    // (the generation guard correctly suppresses the stale callback),
+    // so the new community's widget would be stuck with every button
+    // disabled until remount. Resetting here is safe because the
+    // stale IPC's success-effects are already gated.
     confirmState = 'none';
     typedInput = '';
     error = null;
     pendingDelegate = '';
+    busy = false;
   });
 
   async function setDelegate(target: string) {
