@@ -93,13 +93,16 @@
   $effect(() => {
     const cid = communityId;
     let cancelled = false;
-    // Cursor R2 #3: reset all dialog/error state on community swap so a
-    // mid-revoke confirmation can't carry over to a different
-    // community's delegate (which would route the next undelegate call
-    // to the wrong community).
+    // Cursor R2 #3 / CR R3: reset all transient widget state on
+    // community swap so no value lingers that could be applied
+    // against the wrong community. `pendingDelegate` is the most
+    // dangerous (bind:value on a <select> doesn't reliably clear
+    // when options change → an Apply click could send the prior
+    // community's selection as a delegate target in the new one).
     confirmState = 'none';
     typedInput = '';
     error = null;
+    pendingDelegate = '';
     void (async () => {
       if (cancelled) return;
       await loadDelegate();
@@ -122,16 +125,21 @@
 
   async function setDelegate(target: string) {
     if (busy || !target) return;
+    // Capture the community id at call time so a swap-mid-IPC doesn't
+    // disable / error the wrong widget instance on resume (CR R3).
+    const cidAtStart = communityId;
     busy = true;
     error = null;
     try {
-      await adapter.delegateTier2(communityId, target);
+      await adapter.delegateTier2(cidAtStart, target);
+      if (cidAtStart !== communityId) return;
       pendingDelegate = '';
       // currentDelegate refreshes via voting-delegation-changed subscriber.
     } catch (e) {
+      if (cidAtStart !== communityId) return;
       error = e instanceof Error ? e.message : String(e);
     } finally {
-      busy = false;
+      if (cidAtStart === communityId) busy = false;
     }
   }
 
@@ -178,23 +186,31 @@
 
   async function beginRevoke() {
     if (busy) return;
+    // Capture cid so the severity tier from an in-flight
+    // `listTier2Proposals` doesn't surface against the wrong
+    // community on resume (Cursor R3).
+    const cidAtStart = communityId;
     const severity = await decideRevokeSeverity();
+    if (cidAtStart !== communityId) return;
     confirmState = severity;
   }
 
   async function confirmRevoke() {
     if (busy) return;
     if (confirmState === 'typed' && typedInput.trim().toLowerCase() !== 'revoke') return;
+    const cidAtStart = communityId;
     busy = true;
     error = null;
     try {
-      await adapter.undelegateTier2(communityId);
+      await adapter.undelegateTier2(cidAtStart);
+      if (cidAtStart !== communityId) return;
       confirmState = 'none';
       typedInput = '';
     } catch (e) {
+      if (cidAtStart !== communityId) return;
       error = e instanceof Error ? e.message : String(e);
     } finally {
-      busy = false;
+      if (cidAtStart === communityId) busy = false;
     }
   }
 

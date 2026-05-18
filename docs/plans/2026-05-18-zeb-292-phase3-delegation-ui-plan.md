@@ -397,24 +397,18 @@ let _ = app.emit_all(
 Run: `cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(voting_delegate_tier2_emits)'`
 Expected: PASS.
 
-- [ ] **Step 5: Emit from inbound peer delegate/undelegate path**
+- [ ] **Step 5: Emit from inbound peer delegate/undelegate path** **[DEFERRED to [ZEB-298](https://linear.app/zeblith/issue/ZEB-298)]**
 
-In `src-tauri/src/community_voting_log_engine.rs`, locate the `process_inbound` branch that applies Delegate / Undelegate events (search for `PollEventKindCode::Delegate` and `Undelegate`). After a successful apply, emit the same event. Use the `EmitFn` hook already in the engine context (matching how `voting-threshold-reached` is emitted from the tick).
+> Functionally blocked on the engine-inbound `verify_event` gate
+> ([ZEB-291](https://linear.app/zeblith/issue/ZEB-291) Task 19.1).
+> The inbound apply path is feature-gated production dead code per
+> `community_voting_log_engine.rs:265-272`; emit logic there would
+> be unreachable in production until verify_event is wired.
 
-If the engine context doesn't currently have an `EmitFn`, thread one through (mirror the `community_voting_tick::EmitFn` pattern).
+- [ ] **Step 6: Add an integration test that asserts inbound emission** **[DEFERRED to [ZEB-298](https://linear.app/zeblith/issue/ZEB-298)]**
 
-- [ ] **Step 6: Add an integration test that asserts inbound emission**
-
-```rust
-#[tokio::test]
-async fn inbound_delegate_emits_delegation_changed() {
-    // Two engines: alice on engine A delegates; engine B receives via
-    // Zenoh and must emit voting-delegation-changed locally.
-    // Reuse the two-engine harness from
-    // community_voting_log_engine.rs's existing convergence tests.
-    // ...
-}
-```
+> Lands with Step 5 since the test requires the engine-inbound
+> emit point to exist.
 
 - [ ] **Step 7: Add Tauri event subscriber + listener registration in adapter**
 
