@@ -18152,8 +18152,17 @@ mod i128_as_string {
 /// Tier-2-specific fields a UI needs: proposal text, total/threshold
 /// conviction (Q96.32 raw — UI is responsible for formatting), participation
 /// metrics, and the caller's own current Signal direction.
+// IMPORTANT: this struct intentionally uses Rust-default snake_case
+// field-naming on the wire (no `#[serde(rename_all = "camelCase")]`)
+// because the TypeScript `Tier2ProposalExport` interface in
+// `src/lib/types/voting.ts` declares snake_case keys, matching the
+// Tier 1 `PollStateExport` pattern. An earlier draft carried
+// `#[serde(rename_all = "camelCase")]` here and crashed
+// `ConvictionProposalCard.svelte` at the first `BigInt(undefined)`
+// call (Greptile R7 P0) — every TS field read returned `undefined`.
+// If the TS side ever switches to camelCase keys this attribute can
+// be re-introduced; both must change together.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct Tier2ProposalExport {
     pub proposal_id: String,  // hex
     pub community_id: String, // hex
@@ -18704,7 +18713,10 @@ async fn voting_signal_tier2<R: tauri::Runtime>(
         let map = voting_logs.lock().await;
         map.iter().map(|(k, v)| (*k, v.clone())).collect()
     };
-    let mut found_opt: Option<(crate::owner_state_types::SpaceId,)> = None;
+    let mut found_opt: Option<(
+        crate::owner_state_types::SpaceId,
+        crate::community_voting_core::Eligibility,
+    )> = None;
     for (sid, log_arc) in &log_arcs {
         let g = log_arc.lock().await;
         if let Some(state) = g.polls.get(&pid) {
@@ -18725,19 +18737,28 @@ async fn voting_signal_tier2<R: tauri::Runtime>(
                     state.meta.lifecycle
                 ));
             }
-            found_opt = Some((*sid,));
+            // Capture the proposal's eligibility predicate so the post-
+            // snapshot check below can enforce it (Greptile R7 P1 — the
+            // prior version only checked community membership and let
+            // voters below `min_power` / `min_vouching_depth` sign,
+            // diverging from Tier 1's discipline).
+            found_opt = Some((*sid, state.meta.eligibility));
             break;
         }
     }
-    let (space_id,) = found_opt
+    let (space_id, eligibility) = found_opt
         .ok_or_else(|| format!("voting_signal_tier2: proposal {} not found", proposal_id))?;
 
-    // ── S2 rolling eligibility: confirm caller is currently a member ──
+    // ── S2 rolling eligibility: confirm caller is currently a member
+    // AND satisfies the proposal's Eligibility predicate (mirrors
+    // `voting_cast_tier1_ballot`'s `check_eligibility` discipline). ──
     let snapshot =
         voting_build_snapshot_for_community(crdt_state, community_registry, space_id).await?;
     if !snapshot.members.contains_key(&self_owner) {
         return Err("voting_signal_tier2: caller is not a current community member".into());
     }
+    crate::community_voting_core::check_eligibility(&snapshot, &self_owner, &eligibility)
+        .map_err(|e| format!("voting_signal_tier2: ineligible voter: {e:?}"))?;
 
     // ── Mint + apply ───────────────────────────────────────────────────
     let wall_now_ms = std::time::SystemTime::now()
