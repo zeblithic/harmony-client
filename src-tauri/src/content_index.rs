@@ -439,23 +439,6 @@ impl ContentIndex {
         self.entries.values()
     }
 
-    /// Test-only: bypass the CAS check and force an entry's CID to a
-    /// new value. Used by `tests/move_content_integration.rs` to
-    /// simulate a concurrent rekey landing between two awaited points
-    /// inside `move_content` — the production code's `rekey` always
-    /// requires an `expected_old_cid`, so simulating "an unrelated
-    /// rekey already landed" needs a non-CAS rewrite. Returns `true`
-    /// if an entry was rewritten.
-    #[cfg(any(test, feature = "test-fixtures"))]
-    pub fn force_set_cid_for_test(&mut self, id: &SidecarId, new_cid: [u8; 32]) -> bool {
-        let Some(entry) = self.entries.get_mut(id) else {
-            return false;
-        };
-        entry.cid = new_cid;
-        self.save();
-        true
-    }
-
     /// Test-only: arm a one-shot hook that forces the NEXT `rekey` call
     /// targeting `target` to return `Conflict { actual: fake_actual }`
     /// without mutating the entry. Consumes itself on use.

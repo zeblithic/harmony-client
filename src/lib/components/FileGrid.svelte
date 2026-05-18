@@ -8,7 +8,6 @@
     selectedSidecarId = null,
     onItemClick,
     onRowDragStart,
-    onRowDragEnd,
     onRowDrop,
   }: {
     items: ContentItem[];
@@ -17,7 +16,6 @@
     onItemClick: (item: ContentItem) => void;
     /** ZEB-162: per-card drag handlers, wired by FileBrowser. */
     onRowDragStart?: (e: DragEvent, item: ContentItem) => void;
-    onRowDragEnd?: (e: DragEvent, item: ContentItem) => void;
     onRowDrop?: (e: DragEvent, targetCid: string, targetSidecarId: string | null) => void;
   } = $props();
 </script>
@@ -29,7 +27,6 @@
       onClick={onItemClick}
       selected={selectedSidecarId !== null ? selectedSidecarId === item.sidecarId : selectedCid === item.cid}
       {onRowDragStart}
-      {onRowDragEnd}
       {onRowDrop}
     />
   {/each}

@@ -124,12 +124,8 @@
 
   // ZEB-162 drag-drop coordination state. `error` surfaces backend
   // failures inline (no window.alert; ZEB-166 bans those from this
-  // component). `draggingPayload` tracks the in-flight drag — not
-  // strictly required for correctness (the payload also rides on
-  // dataTransfer), but lets the UI offer affordances like cycle-check
-  // hover styling without parsing the dataTransfer on every dragover.
+  // component).
   let error = $state<string | null>(null);
-  let draggingPayload: DragPayload | null = $state(null);
 
   // Sync navStack with currentFolderCid (driven by the parent component).
   // The effect's only reactive dependency is currentFolderCid; navStack /
@@ -465,11 +461,6 @@
     };
     e.dataTransfer.setData(HARMONY_DRAG_MIME, JSON.stringify(payload));
     e.dataTransfer.effectAllowed = 'move';
-    draggingPayload = payload;
-  }
-
-  function handleRowDragEnd() {
-    draggingPayload = null;
   }
 
   function handleRowDrop(e: DragEvent, targetCid: string, targetSidecarId: string | null) {
@@ -482,7 +473,6 @@
     } catch {
       return;
     }
-    draggingPayload = null;
     void handleMove(payload, {
       kind: 'folder-row',
       cid: targetCid,
@@ -500,7 +490,6 @@
     } catch {
       return;
     }
-    draggingPayload = null;
     void handleMove(payload, { kind: 'breadcrumb', segIdx });
   }
 
@@ -605,7 +594,6 @@
           {selectedSidecarId}
           onItemClick={handleItemClick}
           onRowDragStart={handleRowDragStart}
-          onRowDragEnd={handleRowDragEnd}
           onRowDrop={handleRowDrop}
         />
       {:else}
@@ -615,7 +603,6 @@
           {selectedSidecarId}
           onItemClick={handleItemClick}
           onRowDragStart={handleRowDragStart}
-          onRowDragEnd={handleRowDragEnd}
           onRowDrop={handleRowDrop}
         />
       {/if}

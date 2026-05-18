@@ -641,10 +641,10 @@ async fn move_b_dst_rekey_conflict_at_stage_1_no_undo_path() {
         t2_old.bundle_bytes.len() as u64,
     );
 
-    // Arm a one-shot conflict for T2's STAGE 1 rekey. Unlike a pre-flip
-    // via force_set_cid_for_test, the armed hook leaves the entry's CID
-    // untouched so the boundary verify still passes — STAGE 1 is the
-    // first guard to trip, exercising the path this test names.
+    // Arm a one-shot conflict for T2's STAGE 1 rekey. The armed hook
+    // leaves the entry's CID untouched so the boundary verify still
+    // passes — STAGE 1 is the first guard to trip, exercising the path
+    // this test names.
     {
         let mut idx = index.lock().unwrap();
         idx.arm_next_rekey_conflict(t2_sid, [0xEE; 32]);
