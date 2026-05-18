@@ -127,6 +127,56 @@ pub struct ChannelMessageDto {
     pub body: Vec<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
+    /// ZEB-291 Phase 1.5 chat dispatch — `Some("poll")` iff the body
+    /// matches the poll-message convention (`0x00` magic + 64 ASCII hex
+    /// chars). `None` (= text) for all other bodies. Serialized as `kind`
+    /// over IPC; omitted when None so existing text-only consumers
+    /// don't see a `kind: null`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<&'static str>,
+    /// ZEB-291 Phase 1.5 — 64-char hex `PollId`, present iff `kind ==
+    /// Some("poll")`. Extracted from `body[1..65]` (the ASCII-hex tail
+    /// of the poll-body convention).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll_id: Option<String>,
+}
+
+/// Magic-byte prefix for ZEB-291 Phase 1.5 poll-message bodies. Chosen
+/// as `0x00` (NUL) because it is valid UTF-8 (the engine enforces UTF-8
+/// on channel bodies — see `ChannelLogEngine::publish`) and is
+/// vanishingly unlikely to occur at offset 0 in legitimate UTF-8 chat
+/// text (which always starts with a printable codepoint).
+pub const POLL_BODY_MAGIC: u8 = 0x00;
+
+/// Poll-message body length: 1 magic byte + 64 ASCII hex chars (the
+/// hex encoding of a 32-byte `PollId`). Total 65 bytes.
+pub const POLL_BODY_LEN: usize = 1 + 64;
+
+/// Inspect a channel-message body for the ZEB-291 Phase 1.5 poll
+/// convention. Returns `(Some("poll"), Some(hex))` when the body is
+/// exactly `0x00` + 64 ASCII hex chars; `(None, None)` otherwise.
+///
+/// We use hex-encoded ASCII (not raw bytes) because the engine
+/// enforces UTF-8 on bodies — random poll_id bytes would frequently
+/// fail UTF-8 validation. ASCII hex is always valid UTF-8 and only
+/// adds 32 bytes per poll message.
+pub fn detect_poll_kind(body: &[u8]) -> (Option<&'static str>, Option<String>) {
+    if body.len() != POLL_BODY_LEN || body[0] != POLL_BODY_MAGIC {
+        return (None, None);
+    }
+    // All of body[1..] must be lowercase ASCII hex. We accept only
+    // lowercase to match `hex::encode` output exactly, so a malformed
+    // body that happens to be 65 bytes with a NUL prefix doesn't
+    // accidentally trigger poll dispatch.
+    for &b in &body[1..] {
+        let is_hex = b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+        if !is_hex {
+            return (None, None);
+        }
+    }
+    // Safe: we just validated the tail is ASCII hex.
+    let hex = std::str::from_utf8(&body[1..]).expect("ASCII hex is UTF-8");
+    (Some("poll"), Some(hex.to_string()))
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
@@ -678,6 +728,8 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
             ..
         } = event;
 
+        let body_bytes = body.as_bytes().to_vec();
+        let (kind, poll_id) = detect_poll_kind(&body_bytes);
         ChannelMessageDto {
             message_id: hex::encode(id.0),
             community_id: hex::encode(self.community_id.0),
@@ -688,8 +740,10 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
                 logical: at.logical,
                 device_id: at.device_id.clone(),
             },
-            body: body.as_bytes().to_vec(),
+            body: body_bytes,
             reply_to: reply_to.map(|m| hex::encode(m.0)),
+            kind,
+            poll_id,
         }
     }
 
@@ -2071,6 +2125,45 @@ mod tests {
     /// projection lifts every relevant `SignedChannelEvent::Post`
     /// field, and that hex encoding + body byte projection match
     /// the spec §9.1 shape.
+    /// ZEB-291 Tasks 21-23: `detect_poll_kind` recognizes the Phase
+    /// 1.5 poll-body convention (`0x00` magic + 64-char ASCII hex)
+    /// and rejects everything else. Locked here because the
+    /// JS-side dispatch in `ChannelMessageFeed.svelte` consumes the
+    /// `(kind, poll_id)` tuple this returns.
+    #[test]
+    fn detect_poll_kind_recognizes_valid_poll_body() {
+        let poll_id = [0xab; 32];
+        let hex = hex::encode(poll_id);
+        let mut body = Vec::with_capacity(POLL_BODY_LEN);
+        body.push(POLL_BODY_MAGIC);
+        body.extend_from_slice(hex.as_bytes());
+        let (kind, pid) = detect_poll_kind(&body);
+        assert_eq!(kind, Some("poll"));
+        assert_eq!(pid.as_deref(), Some(hex.as_str()));
+    }
+
+    #[test]
+    fn detect_poll_kind_rejects_text_bodies() {
+        // Plain UTF-8 chat text.
+        assert_eq!(detect_poll_kind(b"hello world"), (None, None));
+        // 65-byte body that is NOT prefixed with 0x00.
+        let mut not_magic = vec![b'!'; 65];
+        not_magic.extend([]);
+        assert_eq!(detect_poll_kind(&not_magic), (None, None));
+        // 0x00 prefix but wrong length.
+        let too_short = [0u8; 32];
+        assert_eq!(detect_poll_kind(&too_short), (None, None));
+        // 0x00 prefix + correct length but non-hex tail.
+        let mut bad_tail = vec![POLL_BODY_MAGIC];
+        bad_tail.extend(std::iter::repeat(b'z').take(64));
+        assert_eq!(detect_poll_kind(&bad_tail), (None, None));
+        // 0x00 prefix + uppercase hex (we accept lowercase only to
+        // match hex::encode output exactly).
+        let mut upper = vec![POLL_BODY_MAGIC];
+        upper.extend(std::iter::repeat(b'A').take(64));
+        assert_eq!(detect_poll_kind(&upper), (None, None));
+    }
+
     #[tokio::test]
     async fn event_to_dto_projects_post_fields() {
         let fix = build_engine_fixture(8, 250, 1000).await;

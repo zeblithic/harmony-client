@@ -3,6 +3,8 @@ import { render, fireEvent, waitFor } from '@testing-library/svelte';
 import ChannelMessageFeed from '../ChannelMessageFeed.svelte';
 import { ChannelMessageService } from '../../channel-message-service';
 import type { TauriAdapter } from '../../zenoh-service';
+import { VotingAdapter } from '../../voting-adapter';
+import type { PollMeta } from '../../types/voting';
 
 function makeAdapter(): TauriAdapter & { listeners: Map<string, Function> } {
   const listeners = new Map<string, Function>();
@@ -220,6 +222,171 @@ describe('ChannelMessageFeed', () => {
     await waitFor(() => {
       expect(adapter.invoke).toHaveBeenCalledWith('list_channel_messages', expect.objectContaining({ channelId: 'dd'.repeat(16) }));
     });
+  });
+
+  // ── ZEB-291 Tasks 21-23: Phase 1.5 chat-native poll dispatch ────────
+  //
+  // The Rust IPC boundary tags `ChannelMessageDto.kind = 'poll'` and
+  // `pollId = hex` when the body matches the convention
+  // (`0x00` magic byte + 64 ASCII hex chars). The feed then renders
+  // `<PollMessage>` inline when a matching `PollMeta` is in the
+  // pre-fetched cache (from `listActivePolls`). Tests cover:
+  //
+  //   1. Happy path: poll-kind message + matching meta → PollMessage renders.
+  //   2. Regression: text-kind message still renders as text.
+  //   3. Race: poll-kind message but no matching meta → "Loading poll…".
+  //
+  // PollMessage's $effect calls `adapter.getPoll(pollId)` on mount;
+  // we stub it to a never-resolving promise so the inner card stays
+  // in its initial "Loading poll…" state and the OUTER feed-level
+  // cache-miss placeholder vs OUTER cache-hit (PollMessage mount) are
+  // distinguishable by component-presence rather than text content.
+
+  const POLL_ID_HEX = 'ab'.repeat(32); // 64 hex chars = 32-byte poll_id.
+  const POLL_ID_BYTES = new Array(32).fill(0xab);
+  const COMMUNITY_ID_BYTES = new Array(16).fill(0xaa);
+  const CHANNEL_ID_BYTES = new Array(16).fill(0xbb);
+  const CREATOR_BYTES = new Array(16).fill(0xcc);
+
+  function makePollMeta(overrides: Partial<PollMeta> = {}): PollMeta {
+    return {
+      poll_id: POLL_ID_BYTES,
+      community_id: COMMUNITY_ID_BYTES,
+      creator: CREATOR_BYTES,
+      tier: 1,
+      eligibility: { mp: 0 },
+      lifecycle: 'Open',
+      created_at: { w: 100, l: 0, d: 'dev' },
+      opens_at: { w: 100, l: 0, d: 'dev' },
+      closes_at: { w: 1000, l: 0, d: 'dev' },
+      channel_id: CHANNEL_ID_BYTES,
+      ...overrides,
+    };
+  }
+
+  function makeVotingAdapter(
+    polls: PollMeta[],
+  ): { adapter: VotingAdapter; listActivePollsMock: ReturnType<typeof vi.fn> } {
+    const adapter = new VotingAdapter();
+    const listActivePollsMock = vi
+      .fn<(communityId: string) => Promise<PollMeta[]>>()
+      .mockResolvedValue(polls);
+    // Patch directly so we don't need a real Tauri adapter wired in.
+    adapter.listActivePolls = listActivePollsMock;
+    // PollMessage's $effect calls adapter.getPoll on mount. Keep it
+    // pending so we can distinguish "PollMessage mounted, loading"
+    // from the feed-level "Loading poll…" miss placeholder.
+    // VotingAdapter.getPoll signature takes a hex string; we just
+    // keep the promise pending so we can distinguish the OUTER feed
+    // miss-placeholder vs the PollMessage inner loading state.
+    adapter.getPoll = vi
+      .fn<VotingAdapter['getPoll']>()
+      .mockImplementation(() => new Promise(() => {}));
+    return { adapter, listActivePollsMock };
+  }
+
+  it('poll-kind message renders <PollMessage> when meta is cached', async () => {
+    const { adapter: votingAdapter, listActivePollsMock } = makeVotingAdapter([makePollMeta()]);
+    const { adapter, container } = await setup({ votingAdapter });
+
+    // Pre-fetch was invoked with the feed's communityId.
+    await waitFor(() => {
+      expect(listActivePollsMock).toHaveBeenCalledWith('aa'.repeat(16));
+    });
+
+    // Inject a poll-kind message via the live event (body bytes
+    // unused; the kind/pollId discriminator is the dispatch key).
+    const handler = adapter.listeners.get('channel-message-received')!;
+    handler({
+      payload: {
+        communityId: 'aa'.repeat(16),
+        channelId: 'bb'.repeat(16),
+        message: {
+          messageId: 'pollmsg1',
+          communityId: 'aa'.repeat(16),
+          channelId: 'bb'.repeat(16),
+          author: 'cc'.repeat(20),
+          at: { wallMs: 2000, logical: 0, deviceId: 'd' },
+          body: [0x00, ...Array.from(POLL_ID_HEX).map((c) => c.charCodeAt(0))],
+          kind: 'poll',
+          pollId: POLL_ID_HEX,
+        },
+      },
+    });
+
+    await waitFor(() => {
+      // PollMessage renders its `.poll-message` article wrapper.
+      const card = container.querySelector('.poll-message');
+      expect(card).toBeTruthy();
+    });
+    // The text-body element should NOT be rendered for poll-kind messages.
+    const msg = container.querySelector('.channel-message');
+    expect(msg?.querySelector('p.body')).toBeNull();
+  });
+
+  it('text-kind message still renders as text (regression)', async () => {
+    const { adapter: votingAdapter } = makeVotingAdapter([makePollMeta()]);
+    const { adapter, container } = await setup({ votingAdapter });
+
+    const handler = adapter.listeners.get('channel-message-received')!;
+    handler({
+      payload: {
+        communityId: 'aa'.repeat(16),
+        channelId: 'bb'.repeat(16),
+        message: {
+          messageId: 'textmsg1',
+          communityId: 'aa'.repeat(16),
+          channelId: 'bb'.repeat(16),
+          author: 'cc'.repeat(20),
+          at: { wallMs: 3000, logical: 0, deviceId: 'd' },
+          body: Array.from(new TextEncoder().encode('plain text message')),
+          // kind omitted = text (default)
+        },
+      },
+    });
+
+    await waitFor(() => {
+      const body = container.querySelector('.channel-message p.body');
+      expect(body?.textContent).toContain('plain text message');
+    });
+    expect(container.querySelector('.poll-message')).toBeNull();
+  });
+
+  it('poll-kind message with no matching meta shows "Loading poll…" placeholder', async () => {
+    // listActivePolls returns EMPTY → the incoming poll_id has no cache entry.
+    const { adapter: votingAdapter, listActivePollsMock } = makeVotingAdapter([]);
+    const { adapter, container } = await setup({ votingAdapter });
+
+    await waitFor(() => {
+      expect(listActivePollsMock).toHaveBeenCalled();
+    });
+
+    const handler = adapter.listeners.get('channel-message-received')!;
+    handler({
+      payload: {
+        communityId: 'aa'.repeat(16),
+        channelId: 'bb'.repeat(16),
+        message: {
+          messageId: 'pollmsg2',
+          communityId: 'aa'.repeat(16),
+          channelId: 'bb'.repeat(16),
+          author: 'cc'.repeat(20),
+          at: { wallMs: 4000, logical: 0, deviceId: 'd' },
+          body: [0x00, ...Array.from(POLL_ID_HEX).map((c) => c.charCodeAt(0))],
+          kind: 'poll',
+          pollId: POLL_ID_HEX,
+        },
+      },
+    });
+
+    await waitFor(() => {
+      // The feed-level placeholder appears (NOT the PollMessage card,
+      // which would only render with a cache hit).
+      const placeholder = container.querySelector('.channel-message .poll-loading');
+      expect(placeholder).toBeTruthy();
+      expect(placeholder?.textContent).toContain('Loading poll');
+    });
+    expect(container.querySelector('.poll-message')).toBeNull();
   });
 
   it('shows inline error when post fails', async () => {

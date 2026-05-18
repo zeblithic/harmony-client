@@ -13717,19 +13717,26 @@ async fn get_pre_fork_snapshot(community_id: String) -> Result<Option<PreForkSna
                         community_id: ev_community_id,
                         channel_id: ev_channel_id,
                         ..
-                    } => Some(crate::community_channel_log_engine::ChannelMessageDto {
-                        message_id: hex::encode(id.0),
-                        community_id: hex::encode(ev_community_id.0),
-                        channel_id: hex::encode(ev_channel_id.0),
-                        author: hex::encode(author.0),
-                        at: crate::community_channel_log_engine::HlcDto {
-                            wall_ms: at.wall_ms,
-                            logical: at.logical,
-                            device_id: at.device_id.clone(),
-                        },
-                        body: body.as_bytes().to_vec(),
-                        reply_to: reply_to.map(|m| hex::encode(m.0)),
-                    }),
+                    } => {
+                        let body_bytes = body.as_bytes().to_vec();
+                        let (kind, poll_id) =
+                            crate::community_channel_log_engine::detect_poll_kind(&body_bytes);
+                        Some(crate::community_channel_log_engine::ChannelMessageDto {
+                            message_id: hex::encode(id.0),
+                            community_id: hex::encode(ev_community_id.0),
+                            channel_id: hex::encode(ev_channel_id.0),
+                            author: hex::encode(author.0),
+                            at: crate::community_channel_log_engine::HlcDto {
+                                wall_ms: at.wall_ms,
+                                logical: at.logical,
+                                device_id: at.device_id.clone(),
+                            },
+                            body: body_bytes,
+                            reply_to: reply_to.map(|m| hex::encode(m.0)),
+                            kind,
+                            poll_id,
+                        })
+                    }
                     _ => None,
                 }
             })
@@ -17695,6 +17702,7 @@ async fn voting_create_tier1_poll<R: tauri::Runtime>(
         dm_outbox,
         crdt_state,
         voting_logs,
+        channel_log_registry,
     ) = {
         let g = state_lock
             .lock()
@@ -17713,6 +17721,12 @@ async fn voting_create_tier1_poll<R: tauri::Runtime>(
                 .clone()
                 .ok_or("crdt_state missing — node not running?")?,
             std::sync::Arc::clone(&g.voting_logs),
+            // Tasks 21-23: channel_log_registry is needed for the
+            // poll-kind chat-message fanout below. May be absent in
+            // tests that exercise voting in isolation; we treat
+            // absence as "skip the chat fanout" rather than as a
+            // hard error so poll creation itself still succeeds.
+            g.channel_log_registry.clone(),
         )
     };
 
@@ -17772,6 +17786,57 @@ async fn voting_create_tier1_poll<R: tauri::Runtime>(
     if let Err(e) = app.emit("voting-poll-created", &payload) {
         // Non-fatal: poll is already in the log; emit is just a UI hint.
         tracing::warn!(error = %e, "voting-poll-created emit failed");
+    }
+
+    // ZEB-291 Tasks 21-23: chat-fanout. After the PollCreate voting
+    // event has been successfully applied, also publish a poll-kind
+    // chat message in the host channel so the chat feed can render a
+    // `<PollMessage>` card inline at the point in conversation where
+    // the poll was created. Body format is the Phase 1.5 convention:
+    // `0x00` magic byte + 64-char ASCII hex `poll_id`. The Rust IPC
+    // boundary detects this in `detect_poll_kind` and tags the DTO
+    // with `kind: 'poll'` / `pollId: hex` for frontend dispatch.
+    //
+    // ASCII hex (not raw bytes) because `ChannelLogEngine::publish`
+    // enforces UTF-8 on bodies — random poll_id bytes would frequently
+    // fail UTF-8 validation. ASCII hex is always valid UTF-8 and only
+    // adds 32 bytes per poll message.
+    //
+    // Failures here are non-fatal: the poll is already in the voting
+    // log + the `voting-poll-created` event has fired, so any
+    // dedicated poll-list UI continues to work. Only the chat-feed
+    // dispatch is degraded if the channel engine isn't live (e.g.,
+    // race with channel teardown, or tests that don't wire a
+    // channel registry). We log and continue.
+    if let Some(registry) = channel_log_registry {
+        match registry.engine(&space_id, &channel).await {
+            Some(engine) => {
+                let mut body =
+                    Vec::with_capacity(crate::community_channel_log_engine::POLL_BODY_LEN);
+                body.push(crate::community_channel_log_engine::POLL_BODY_MAGIC);
+                body.extend_from_slice(poll_id_hex.as_bytes());
+                if let Err(e) = engine.publish(body, None).await {
+                    tracing::warn!(
+                        error = %e,
+                        community_id = %hex::encode(space_id.0),
+                        channel_id = %hex::encode(channel.0),
+                        poll_id = %poll_id_hex,
+                        "voting_create_tier1_poll: poll-kind chat fanout failed (non-fatal)"
+                    );
+                }
+            }
+            None => {
+                tracing::debug!(
+                    community_id = %hex::encode(space_id.0),
+                    channel_id = %hex::encode(channel.0),
+                    "voting_create_tier1_poll: no channel engine; skipping chat fanout"
+                );
+            }
+        }
+    } else {
+        tracing::debug!(
+            "voting_create_tier1_poll: channel_log_registry absent; skipping chat fanout"
+        );
     }
 
     Ok(poll_id_hex)
