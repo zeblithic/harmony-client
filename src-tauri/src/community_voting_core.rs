@@ -693,7 +693,16 @@ pub fn next_lifecycle(
     match (current, kind, tier) {
         // Tier-agnostic transitions (apply to both Tier 1 + Tier 2).
         (Draft, PollCreate, _) => Ok(Open),
-        (Open, BallotCast, _) | (Open, PollExtend, _) | (Open, PollOpen, _) => Ok(Open),
+        // BallotCast / PollOpen / PollExtend are Tier 1 (Approval) only —
+        // Tier 2 uses Signal for vote events and has no explicit
+        // open/extend lifecycle (those are derived from continuous
+        // conviction state). Apply-time decode would also fail on the
+        // wrong tier, but pinning the lifecycle gate here is a
+        // defense-in-depth layer that catches malformed/forged events
+        // before they reach apply (Cursor R4 Low Sev).
+        (Open, BallotCast, Tier::Approval)
+        | (Open, PollExtend, Tier::Approval)
+        | (Open, PollOpen, Tier::Approval) => Ok(Open),
         (Open, PollClose, _) => Ok(Closed),
         (Closed, PollResult, _) => Ok(Finalized),
 
@@ -1120,6 +1129,38 @@ mod lifecycle_tests {
                 next_lifecycle(Lifecycle::Open, *kind, Tier::Sortition),
                 Err(LifecycleError::IllegalTransition { .. })
             ));
+        }
+    }
+
+    #[test]
+    fn tier2_rejects_tier1_only_kinds() {
+        // Defense-in-depth (Cursor R4 Low Sev): BallotCast / PollOpen /
+        // PollExtend are Tier 1 — Approval semantics — and the
+        // lifecycle gate must reject them outright for Tier 2 so
+        // forged/malformed events can't slip past apply-time decode.
+        for kind in &[
+            PollEventKindCode::BallotCast,
+            PollEventKindCode::PollOpen,
+            PollEventKindCode::PollExtend,
+        ] {
+            assert!(
+                matches!(
+                    next_lifecycle(Lifecycle::Open, *kind, Tier::Conviction),
+                    Err(LifecycleError::IllegalTransition { .. })
+                ),
+                "Tier 2 must reject {kind:?} at the lifecycle gate"
+            );
+        }
+        // Sanity: same kinds are still legal for Tier 1.
+        for kind in &[
+            PollEventKindCode::BallotCast,
+            PollEventKindCode::PollOpen,
+            PollEventKindCode::PollExtend,
+        ] {
+            assert_eq!(
+                next_lifecycle(Lifecycle::Open, *kind, Tier::Approval),
+                Ok(Lifecycle::Open)
+            );
         }
     }
 }

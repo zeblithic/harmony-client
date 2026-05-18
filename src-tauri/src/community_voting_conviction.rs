@@ -485,7 +485,18 @@ impl Tier2ProposalState {
         if cfg.beta == 0 {
             return cfg.threshold_max_q32;
         }
-        let ratio_q32 = (self.effective_supply_at(t_ms) as i128 * Q32) / self.total_supply as i128;
+        // `effective_supply_at` can legitimately exceed `total_supply`
+        // under spec §5 rolling eligibility (members joining mid-
+        // proposal can signal). If we let `ratio_q32 > Q32` flow
+        // through, `one_minus` goes negative, and for odd β that drops
+        // the threshold below `T_min` — even into negative territory —
+        // making the proposal easier to finalize than the config
+        // allows. Clamp to `[0, Q32]` so over-100% participation is
+        // treated as 100% (already-saturated minimum threshold = T_min).
+        // CR R4 Major.
+        let ratio_q32 = ((self.effective_supply_at(t_ms) as i128 * Q32)
+            / self.total_supply as i128)
+            .clamp(0, Q32);
         let one_minus = Q32 - ratio_q32;
         // (1 - ratio)^β via repeated multiplication; β=1 → no iter (pow=one_minus).
         let mut pow = one_minus;
@@ -1381,6 +1392,41 @@ mod tests {
         let s = Tier2ProposalState::new(t2_config(2, 7 * Q32, 100 * Q32), 5);
         assert_eq!(s.effective_supply_at(0), 0);
         assert_eq!(s.threshold_conviction_at(0), 100 * Q32);
+    }
+
+    #[test]
+    fn threshold_over_full_participation_clamps_to_t_min() {
+        // Rolling eligibility (spec §5): members joining post-snapshot
+        // can signal. effective_supply can therefore exceed
+        // total_supply, which would push ratio_q32 above Q32 and make
+        // `(1 - ratio)` negative. For odd β that drops the threshold
+        // below `T_min` (potentially negative); for even β it stays
+        // positive but still doesn't match the spec intent of
+        // "saturated minimum threshold = T_min". Clamp ratio to
+        // `[0, Q32]` so we treat overfill as 100% — CR R4 Major.
+        //
+        // total_supply = 2 (snapshot at PollCreate), but 4 voters
+        // signal: ratio computes as 2.0 (200%), clamps to 1.0 → T_min.
+        let mut s = Tier2ProposalState::new(t2_config(1, 5 * Q32, 100 * Q32), 2);
+        for i in 0..4u8 {
+            let mut v = VoterConvictionState::default();
+            v.apply_signal(true, 0, 0, TEST_HL);
+            s.per_voter.insert(voter(i + 1), v);
+        }
+        assert_eq!(s.effective_supply_at(0), 4);
+        // β=1 (odd) would have produced a negative threshold without
+        // the clamp; with the clamp it equals T_min.
+        assert_eq!(s.threshold_conviction_at(0), 5 * Q32);
+
+        // Same scenario with β=3 (also odd, would also have driven
+        // negative): clamps to T_min.
+        let mut s3 = Tier2ProposalState::new(t2_config(3, 5 * Q32, 100 * Q32), 2);
+        for i in 0..4u8 {
+            let mut v = VoterConvictionState::default();
+            v.apply_signal(true, 0, 0, TEST_HL);
+            s3.per_voter.insert(voter(i + 1), v);
+        }
+        assert_eq!(s3.threshold_conviction_at(0), 5 * Q32);
     }
 
     #[test]
