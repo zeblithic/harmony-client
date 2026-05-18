@@ -68,11 +68,6 @@
   let edges = $state<DelegationEdgeExport[]>([]);
   let loadError = $state<string | null>(null);
   let loading = $state(true);
-  /** Force-simulation tick counter — bumped each animation frame so the
-   *  reactive template re-evaluates node + edge positions. Avoids
-   *  reassigning the simNodes / simEdges arrays which would trigger a
-   *  full Svelte reactive re-walk. */
-  let tickN = $state(0);
   let simNodes = $state<SimNode[]>([]);
   let simEdges = $state<SimEdge[]>([]);
 
@@ -139,14 +134,10 @@
       .force('collide', forceCollide(NODE_RADIUS + 4))
       .alpha(0.9)
       .on('tick', () => {
-        tickN += 1;
         // d3 mutates SimNode objects in place; reassign the array
         // references with `.slice()` so Svelte 5 sees the change and
         // re-runs the keyed {#each} bodies (reusing existing keyed
-        // DOM elements — only attributes re-evaluate). The previous
-        // `(tickPulse, expr)` comma-operator trick triggered
-        // state_referenced_locally and did NOT actually create
-        // reactive dependency tracking on attribute expressions.
+        // DOM elements — only attributes re-evaluate).
         simNodes = simNodes.slice();
         simEdges = simEdges.slice();
       });
@@ -225,7 +216,7 @@
   // Tick-driven reactivity: the d3 tick handler reassigns simNodes /
   // simEdges with `.slice()` so the keyed {#each} re-renders attribute
   // values (existing elements are reused via the address key — no
-  // full destroy/recreate per tick, which `{#key tickN}` would do).
+  // full destroy/recreate per tick, which `{#key …}` would do).
 </script>
 
 <section class="delegation-graph" aria-label="Delegation graph">
