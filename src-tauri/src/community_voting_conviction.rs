@@ -1829,4 +1829,50 @@ mod tests {
         let single = charge_q32(TEST_HL, TEST_HL);
         assert_eq!(weighted, 2 * single);
     }
+
+    #[test]
+    fn total_conviction_with_delegation_override_for_one_proposal_only() {
+        // Phase 3 UI scenario: voter A delegates to B (community-wide).
+        // On proposal P1, A signals directly — A's weight is counted via
+        // A's direct state, NOT folded into B's effective conviction
+        // (override semantics). On proposal P2, A does not signal — A's
+        // weight folds into B (delegate's normal behavior). Regression
+        // pin: prevents future refactors from silently breaking
+        // `.filter(|delegator| !self.per_voter.contains_key(delegator))`
+        // in `total_conviction_at_with_delegation`.
+        let delegator = OwnerAddr([0xa1; 16]);
+        let delegate = OwnerAddr([0xb2; 16]);
+        let mut graph = DelegationGraph::new();
+        graph
+            .apply_delegate(delegator, delegate, (1, 0))
+            .expect("delegate edge applies");
+
+        let cfg = t2_config(2, 0, 100 * Q32);
+        let per_voter_charge = charge_q32(TEST_HL, TEST_HL);
+
+        // P1: B signals, A also signals directly (override).
+        let mut p1 = Tier2ProposalState::new(cfg.clone(), 10);
+        let mut a_state = VoterConvictionState::default();
+        a_state.apply_signal(true, 0, 0, TEST_HL);
+        let mut b_state = VoterConvictionState::default();
+        b_state.apply_signal(true, 0, 0, TEST_HL);
+        p1.per_voter.insert(delegator, a_state);
+        p1.per_voter.insert(delegate, b_state.clone());
+        let p1_total = p1.total_conviction_at_with_delegation(TEST_HL, &graph);
+        assert_eq!(
+            p1_total,
+            per_voter_charge * 2,
+            "P1: A direct + B direct, A's delegation override prevents double-count"
+        );
+
+        // P2: only B signals; A's weight folds into B via delegation.
+        let mut p2 = Tier2ProposalState::new(cfg, 10);
+        p2.per_voter.insert(delegate, b_state);
+        let p2_total = p2.total_conviction_at_with_delegation(TEST_HL, &graph);
+        assert_eq!(
+            p2_total,
+            per_voter_charge * 2,
+            "P2: B's conviction weighted by (1 + 1 delegator)"
+        );
+    }
 }
