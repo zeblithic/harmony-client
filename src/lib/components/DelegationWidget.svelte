@@ -121,12 +121,14 @@
       await loadDelegate();
     })();
 
-    // Refresh on delegation-changed events that touch the local user.
-    // Other community members' changes don't impact this widget's
-    // visible state, so we ignore them to avoid spurious IPC.
+    // Refresh on delegation-changed events affecting OUR outbound
+    // delegation edge — i.e. only when the local user IS the
+    // delegator. `getMyDelegate` returns who we delegate to; a third
+    // party picking us as THEIR delegate (p.delegate === myAddr)
+    // doesn't change that value (Greptile R5 P2).
     const unsub = adapter.subscribeDelegationChanged((p) => {
       if (cancelled || gen !== generation || p.communityId !== cid) return;
-      if (p.delegator !== myAddr && p.delegate !== myAddr) return;
+      if (p.delegator !== myAddr) return;
       void loadDelegate();
     });
 
@@ -177,7 +179,7 @@
    * On error: defaults to 'typed' — better to over-warn than to silently
    * rug-pull a live vote.
    */
-  async function decideRevokeSeverity(): Promise<'click' | 'typed'> {
+  async function decideRevokeSeverity(genAtStart: number): Promise<'click' | 'typed'> {
     if (!currentDelegate) return 'click';
     try {
       const proposals = await adapter.listTier2Proposals(communityId);
@@ -196,7 +198,11 @@
       // readable failure message rather than swallowing the error
       // silently. We still fall back to 'typed' so the user gets an
       // extra warning if proposal state is unreadable (CR R1).
-      error = e instanceof Error ? e.message : String(e);
+      // Generation-gated so a stale catch from a previous community
+      // doesn't leak its error into the new community's UI (CR R5).
+      if (genAtStart === generation) {
+        error = e instanceof Error ? e.message : String(e);
+      }
       return 'typed';
     }
   }
@@ -204,7 +210,7 @@
   async function beginRevoke() {
     if (busy) return;
     const genAtStart = generation;
-    const severity = await decideRevokeSeverity();
+    const severity = await decideRevokeSeverity(genAtStart);
     if (genAtStart !== generation) return;
     confirmState = severity;
   }

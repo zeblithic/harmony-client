@@ -20,7 +20,6 @@
    * may have shifted).
    */
 
-  import { onDestroy } from 'svelte';
   import {
     forceSimulation,
     forceLink,
@@ -192,12 +191,27 @@
     };
   });
 
-  onDestroy(() => {
-    if (simulation) {
-      simulation.stop();
-      simulation = null;
-    }
-  });
+  // Simulation teardown is handled by the $effect cleanup above —
+  // Svelte 5 runs $effect cleanups on both community swap and
+  // component destroy (Greptile R5 P2: prior onDestroy was redundant).
+
+  /** Shorten an edge endpoint by NODE_RADIUS along the source→target
+   *  vector so the arrowhead at the target end sits at the circle
+   *  perimeter rather than the center (where it would be fully
+   *  occluded by the target node — Cursor R5). Returns the original
+   *  target coords if source and target coincide (degenerate). */
+  function shortenedEndpoint(
+    sx: number,
+    sy: number,
+    tx: number,
+    ty: number,
+  ): { x: number; y: number } {
+    const dx = tx - sx;
+    const dy = ty - sy;
+    const len = Math.sqrt(dx * dx + dy * dy);
+    if (len <= NODE_RADIUS) return { x: tx, y: ty };
+    return { x: tx - (dx / len) * NODE_RADIUS, y: ty - (dy / len) * NODE_RADIUS };
+  }
 
   // Tick-driven attribute reactivity helper: returns a value derived
   // from tickN that we can reference inside SVG attribute expressions.
@@ -241,12 +255,17 @@
         </marker>
       </defs>
       {#each simEdges as edge (edge.id)}
+        {@const sx = (tickPulse, (edge.source as SimNode).x ?? 0)}
+        {@const sy = (edge.source as SimNode).y ?? 0}
+        {@const tx = (edge.target as SimNode).x ?? 0}
+        {@const ty = (edge.target as SimNode).y ?? 0}
+        {@const end = shortenedEndpoint(sx, sy, tx, ty)}
         <line
           class="dg-edge"
-          x1={(tickPulse, (edge.source as SimNode).x ?? 0)}
-          y1={(tickPulse, (edge.source as SimNode).y ?? 0)}
-          x2={(tickPulse, (edge.target as SimNode).x ?? 0)}
-          y2={(tickPulse, (edge.target as SimNode).y ?? 0)}
+          x1={sx}
+          y1={sy}
+          x2={end.x}
+          y2={end.y}
           marker-end="url(#dg-arrow)"
         />
       {/each}
