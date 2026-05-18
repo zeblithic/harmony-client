@@ -7008,30 +7008,44 @@ async fn move_case_a(
         (Some(walked.new_top_level_cid), Some(dst_below_lca[0]))
     };
 
-    // LCA edit combines both sides. Read LCA bundle+manifest, apply
-    // remove/replace on the source side and append/replace on the dst
-    // side, rebuild.
+    // LCA edit combines both sides. Resolve BOTH target positions before
+    // applying any edit — under content-addressing, two sibling entries
+    // can share a CID (when their underlying content is identical, e.g.
+    // two empty folders or two folders containing the same leaf set), and
+    // a position lookup performed AFTER the src-side edit can silently
+    // hit the wrong sibling. Snapshot positions while entries still hold
+    // their original CIDs, then mutate. ZEB-156 owns the broader
+    // shared-content cascade hazard at the pin layer; this is the
+    // manifest-layer instance specific to Y-shape walks.
     let lca_cid = src_cids[lca_idx];
     let mut lca_entries = read_manifest_entries(verb_tx, lca_cid).await?;
-    // Source-side edit at LCA: either the LCA IS the source's immediate
-    // parent (then remove child_cid) or it's higher up (then replace
-    // src_side_old_below_lca → src_side_new_below).
-    match (src_side_new_below, src_side_old_below_lca) {
-        (None, None) => {
-            let pos = lca_entries
-                .iter()
-                .position(|e| e.cid == child_cid)
-                .ok_or_else(|| {
-                    format!(
-                        "ancestor {} has no entry pointing to child {}",
-                        hex::encode(lca_cid),
-                        hex::encode(child_cid)
-                    )
-                })?;
-            lca_entries.remove(pos);
-        }
-        (Some(new_below), Some(old_below)) => {
-            let pos = lca_entries
+    let src_lca_pos: usize = match (src_side_new_below, src_side_old_below_lca) {
+        (None, None) => lca_entries
+            .iter()
+            .position(|e| e.cid == child_cid)
+            .ok_or_else(|| {
+                format!(
+                    "ancestor {} has no entry pointing to child {}",
+                    hex::encode(lca_cid),
+                    hex::encode(child_cid)
+                )
+            })?,
+        (Some(_), Some(old_below)) => lca_entries
+            .iter()
+            .position(|e| e.cid == old_below)
+            .ok_or_else(|| {
+                format!(
+                    "ancestor {} has no entry pointing to child {}",
+                    hex::encode(lca_cid),
+                    hex::encode(old_below)
+                )
+            })?,
+        _ => unreachable!("source-side below-LCA invariants paired"),
+    };
+    let dst_lca_pos: Option<usize> = match (dst_side_new_below, dst_side_old_below_lca) {
+        (None, None) => None,
+        (Some(_), Some(old_below)) => Some(
+            lca_entries
                 .iter()
                 .position(|e| e.cid == old_below)
                 .ok_or_else(|| {
@@ -7040,30 +7054,38 @@ async fn move_case_a(
                         hex::encode(lca_cid),
                         hex::encode(old_below)
                     )
-                })?;
-            lca_entries[pos].cid = new_below;
+                })?,
+        ),
+        _ => unreachable!("dest-side below-LCA invariants paired"),
+    };
+
+    // Apply src-side edit at its precomputed position.
+    let src_is_remove = matches!((src_side_new_below, src_side_old_below_lca), (None, None));
+    match (src_side_new_below, src_side_old_below_lca) {
+        (None, None) => {
+            lca_entries.remove(src_lca_pos);
         }
-        _ => unreachable!("source-side below-LCA invariants paired"),
+        (Some(new_below), Some(_)) => {
+            lca_entries[src_lca_pos].cid = new_below;
+        }
+        _ => unreachable!(),
     }
-    // Destination-side edit at LCA.
+    // Apply dst-side edit. If src was a Remove that shifted indices and
+    // dst's target sits after src's, adjust dst's index by -1.
     match (dst_side_new_below, dst_side_old_below_lca) {
         (None, None) => {
             lca_entries.push(moved_entry.clone());
         }
-        (Some(new_below), Some(old_below)) => {
-            let pos = lca_entries
-                .iter()
-                .position(|e| e.cid == old_below)
-                .ok_or_else(|| {
-                    format!(
-                        "ancestor {} has no entry pointing to child {}",
-                        hex::encode(lca_cid),
-                        hex::encode(old_below)
-                    )
-                })?;
-            lca_entries[pos].cid = new_below;
+        (Some(new_below), Some(_)) => {
+            let raw = dst_lca_pos.expect("dst position resolved");
+            let adjusted = if src_is_remove && raw > src_lca_pos {
+                raw - 1
+            } else {
+                raw
+            };
+            lca_entries[adjusted].cid = new_below;
         }
-        _ => unreachable!("dest-side below-LCA invariants paired"),
+        _ => unreachable!(),
     }
     let rebuilt_lca = folders::build_folder("", &lca_entries)?;
     let lca_new_cid = rebuilt_lca.bundle_cid.to_bytes();
