@@ -39,28 +39,23 @@ use crate::owner_state_types::{OwnerAddr, SpaceId};
 
 // ── Replay tracker ──────────────────────────────────────────────────────────
 
-/// Dedup table keyed on `(actor, device_id)` → max HLC `wall_ms` seen.
+/// Dedup table keyed on `(actor, device_id)` → max HLC `(wall_ms, logical)`
+/// tuple seen.
 ///
-/// Mirrors `community_channel_log::ChannelLogReplayTracker`. An event is
-/// considered a duplicate (or self-loopback) if its HLC `wall_ms` is `<=`
-/// the high-water mark already recorded for its `(actor, device_id)` lane.
+/// Mirrors `community_channel_log::ChannelLogReplayTracker` in shape but
+/// dedups on the full `(wall_ms, logical)` HLC ordinal rather than just
+/// `wall_ms`. Two distinct events minted on the same lane in the same
+/// millisecond (e.g. a Signal followed immediately by a Delegate) share
+/// `wall_ms` but differ in `logical`; a `wall_ms`-only tracker would
+/// silently drop the second as a duplicate and permanently diverge tier
+/// state across replicas.
 ///
-/// We intentionally key on `(OwnerAddr, String)` rather than the full
-/// `Hlc` because:
-/// - device IDs are stable per-actor-per-device across reboots, so the
-///   lane identity is `(actor, device)`;
-/// - HLC `wall_ms` is monotonic per device (the local HLC tracker is the
-///   serialization point on the publish side), so a single u64 high-water
-///   mark is sufficient to detect both self-loopbacks and out-of-order
-///   peer redeliveries.
-///
-/// `wall_ms == 0` is treated as "never seen" — same as the channel-log
-/// tracker. Phase 2 has no production events at `wall_ms == 0`; the only
-/// place that constant appears is unit-test scaffolding which constructs
+/// `(0, 0)` is treated as "never seen" — Phase 2 has no production
+/// events at the epoch HLC; only unit-test scaffolding which constructs
 /// events strictly after `record`.
 #[derive(Debug, Default)]
 pub struct VotingReplayTracker {
-    seen: HashMap<(OwnerAddr, String), u64>,
+    seen: HashMap<(OwnerAddr, String), (u64, u32)>,
 }
 
 impl VotingReplayTracker {
@@ -68,23 +63,30 @@ impl VotingReplayTracker {
         Self::default()
     }
 
+    fn ordinal(event: &SignedVotingEvent) -> (u64, u32) {
+        (event.hlc.wall_ms, event.hlc.logical)
+    }
+
     /// Unconditionally bump the high-water mark for an event's lane.
     /// Called by `publish_event` BEFORE the broadcast (the self-loopback
     /// fix from ZEB-270) and by `process_inbound` after a successful apply.
     pub fn record(&mut self, event: &SignedVotingEvent) {
         let key = (event.actor, event.hlc.device_id.clone());
-        let entry = self.seen.entry(key).or_insert(0);
-        *entry = (*entry).max(event.hlc.wall_ms);
+        let ord = Self::ordinal(event);
+        let entry = self.seen.entry(key).or_insert((0u64, 0u32));
+        if ord > *entry {
+            *entry = ord;
+        }
     }
 
     /// Returns true if this event has already been seen on its lane
-    /// (`wall_ms` is `<=` the recorded high-water mark). Used by
-    /// `process_inbound` to drop self-loopbacks and peer duplicates
-    /// before doing the (cheap) apply work.
+    /// (`(wall_ms, logical)` is `<=` the recorded high-water mark).
+    /// Used by `process_inbound` to drop self-loopbacks and peer
+    /// duplicates before doing the (cheap) apply work.
     pub fn contains(&self, event: &SignedVotingEvent) -> bool {
         let key = (event.actor, event.hlc.device_id.clone());
         match self.seen.get(&key) {
-            Some(&max_ms) => event.hlc.wall_ms <= max_ms,
+            Some(&max_ord) => Self::ordinal(event) <= max_ord,
             None => false,
         }
     }

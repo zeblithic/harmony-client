@@ -18127,6 +18127,26 @@ async fn voting_get_poll(
 
 // ─── ZEB-291 Phase 2 Task 18 — Tier 2 (Conviction) IPCs ────────────────────
 
+/// Serialize / deserialize `i128` as a decimal JSON string. Required for
+/// any i128 field crossing the Tauri IPC boundary because JavaScript
+/// `Number` is IEEE 754 (53 bits of integer precision), but Q96.32
+/// conviction values routinely exceed `Number.MAX_SAFE_INTEGER` (~9e15)
+/// — a 7-day half-life with a single voter supporting for one day
+/// produces a raw Q96.32 value around 3.5e17. The JS side reconstructs
+/// these via `BigInt(stringValue)`.
+mod i128_as_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &i128, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&v.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<i128, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse::<i128>().map_err(serde::de::Error::custom)
+    }
+}
+
 /// Frontend-friendly subset of `PollState` for Tier 2 IPC return values.
 /// Mirrors `PollStateExport` (Phase 1 / Tier 1) shape but surfaces the
 /// Tier-2-specific fields a UI needs: proposal text, total/threshold
@@ -18142,11 +18162,16 @@ pub struct Tier2ProposalExport {
     /// "Draft". String for stable JS-side switch over an internal enum
     /// rename surface.
     pub lifecycle: String,
-    /// Q96.32 sum of per-voter conviction (post-delegation if applicable);
-    /// the UI divides by `Q32` (1 << 32) to render a human-friendly number.
+    /// Q96.32 sum of per-voter conviction (post-delegation). Serialized
+    /// as a decimal string at the IPC boundary because raw Q96.32 values
+    /// routinely exceed `Number.MAX_SAFE_INTEGER` in JS. The UI parses
+    /// via `BigInt(value)` and divides by `Q32` (1 << 32) to render a
+    /// human-friendly number.
+    #[serde(with = "i128_as_string")]
     pub total_conviction_ms: i128,
-    /// Q96.32 dynamic threshold at `now` (recomputed each call). Compare
-    /// against `total_conviction_ms` to render the "X% to threshold" UI.
+    /// Q96.32 dynamic threshold at `now` (recomputed each call). Same
+    /// string serialization as `total_conviction_ms` — compare via BigInt.
+    #[serde(with = "i128_as_string")]
     pub threshold_conviction_ms: i128,
     pub half_life_seconds: u32,
     pub auto_exec: crate::community_voting_conviction::AutoExecAction,
@@ -18168,6 +18193,7 @@ pub struct Tier2ProposalExport {
 /// `now_ms`; the caller's signal is resolved from the per-voter map.
 fn build_tier2_export(
     state: &crate::community_voting_log::PollState,
+    delegation_graph: &crate::community_voting_conviction::DelegationGraph,
     self_owner_opt: Option<crate::owner_state_types::OwnerAddr>,
     now_ms: i128,
 ) -> Result<Tier2ProposalExport, String> {
@@ -18175,7 +18201,9 @@ fn build_tier2_export(
         .tier_state
         .as_tier2()
         .ok_or("build_tier2_export: poll is not Tier 2")?;
-    let total = t2.total_conviction_at(now_ms);
+    // Delegation-weighted total; unweighted `total_conviction_at` would
+    // undercount any community with active Delegate edges.
+    let total = t2.total_conviction_at_with_delegation(now_ms, delegation_graph);
     let threshold = t2.threshold_conviction_at(now_ms);
     let voter_count = t2.effective_supply_at(now_ms);
     let your_signal = self_owner_opt
@@ -18361,17 +18389,17 @@ fn build_signed_signal_tier2(
     Ok(ev)
 }
 
-/// Build + sign a Tier 2 Delegate event. `to_pubkey` is the full 32-byte
-/// ed25519 pubkey of the delegate (spec §5 — NOT the 16-byte OwnerAddr).
+/// Build + sign a Tier 2 Delegate event. `to_addr` is the 16-byte
+/// `OwnerAddr` of the delegate; see `DelegatePayload` doc for rationale.
 fn build_signed_delegate_tier2(
     keypair: &ed25519_dalek::SigningKey,
     actor: crate::owner_state_types::OwnerAddr,
-    to_pubkey: Vec<u8>,
+    to_addr: crate::owner_state_types::OwnerAddr,
     hlc: crate::owner_state_types::Hlc,
 ) -> Result<crate::community_voting_core::SignedVotingEvent, String> {
     use ed25519_dalek::Signer;
     let payload_struct = crate::community_voting_conviction::DelegatePayload {
-        to: to_pubkey,
+        to: to_addr.0.to_vec(),
         scope: "all".into(),
     };
     let mut payload = Vec::new();
@@ -18424,11 +18452,14 @@ fn build_signed_undelegate_tier2(
 
 /// Spec-§5 default conviction half-life: 7 days.
 const TIER2_DEFAULT_HALF_LIFE_SECONDS: u32 = 7 * 24 * 60 * 60;
-/// Default `T_min` threshold (Q96.32 raw). Roughly equivalent to one
-/// voter supporting for ~1 day at hl=7d. Caller can override.
+/// Default `T_min` threshold in conviction-multiplier ms (see
+/// `Tier2PollConfig::threshold_min_q32` doc — the `_q32` suffix is
+/// vestigial). Roughly `charge(7d, 7d) ≈ 8.7e8 ms`, i.e., one voter
+/// supporting continuously for ~one half-life. Caller can override.
 const TIER2_DEFAULT_THRESHOLD_MIN_Q32: i128 = 100_000_000;
-/// Default `T_max` threshold (Q96.32 raw). Roughly equivalent to one
-/// voter supporting for ~2 weeks at hl=7d. Caller can override.
+/// Default `T_max` threshold in the same ms units as
+/// `TIER2_DEFAULT_THRESHOLD_MIN_Q32`. Roughly one voter supporting
+/// continuously for ~10 half-lives (asymptotic). Caller can override.
 const TIER2_DEFAULT_THRESHOLD_MAX_Q32: i128 = 10_000_000_000;
 /// Default `β` exponent for `(1-ratio)^β` curve shaping.
 const TIER2_DEFAULT_BETA: u8 = 2;
@@ -18762,14 +18793,12 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
         .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
     let space_id = crate::owner_state_types::SpaceId(cid_bytes);
 
-    let delegate_pubkey: Vec<u8> =
-        hex::decode(&delegate).map_err(|e| format!("invalid delegate hex: {e}"))?;
-    if delegate_pubkey.len() != 32 {
-        return Err(format!(
-            "delegate must be 32 bytes (64 hex chars); got {}",
-            delegate_pubkey.len()
-        ));
-    }
+    let delegate_addr_bytes: [u8; 16] = hex::decode(&delegate)
+        .map_err(|e| format!("invalid delegate hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "delegate must be a 16-byte OwnerAddr (32 hex chars)".to_string())?;
+    let to_addr = crate::owner_state_types::OwnerAddr(delegate_addr_bytes);
 
     let (
         hlc_tracker,
@@ -18803,17 +18832,12 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
     };
 
     // Membership check: both caller AND delegate must currently be in
-    // the community. The delegate's OwnerAddr is the first 16 bytes of
-    // the pubkey (matching the apply path's truncation in
-    // VotingLog::apply_with_snapshot).
+    // the community. Both surfaces use 16-byte OwnerAddr keys.
     let snapshot =
         voting_build_snapshot_for_community(crdt_state, community_registry, space_id).await?;
     if !snapshot.members.contains_key(&self_owner) {
         return Err("voting_delegate_tier2: caller is not a current community member".into());
     }
-    let mut to_addr_bytes = [0u8; 16];
-    to_addr_bytes.copy_from_slice(&delegate_pubkey[..16]);
-    let to_addr = crate::owner_state_types::OwnerAddr(to_addr_bytes);
     if !snapshot.members.contains_key(&to_addr) {
         return Err("voting_delegate_tier2: delegate is not a current community member".into());
     }
@@ -18830,7 +18854,7 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
     let event = {
         let outbox_g = dm_outbox.lock().await;
         let signing_key = outbox_g.signing_key.as_ref();
-        build_signed_delegate_tier2(signing_key, self_owner, delegate_pubkey, hlc)?
+        build_signed_delegate_tier2(signing_key, self_owner, to_addr, hlc)?
     };
     {
         let log_arc = {
@@ -18945,7 +18969,7 @@ async fn voting_list_tier2_proposals(
         if state.meta.tier != crate::community_voting_core::Tier::Conviction {
             continue;
         }
-        match build_tier2_export(state, self_owner_opt, now_ms) {
+        match build_tier2_export(state, &g.delegation_graph, self_owner_opt, now_ms) {
             Ok(e) => out.push(e),
             Err(e) => {
                 tracing::warn!(
@@ -18996,7 +19020,7 @@ async fn voting_get_tier2_proposal(
                     proposal_id, state.meta.tier
                 ));
             }
-            return build_tier2_export(state, self_owner_opt, now_ms);
+            return build_tier2_export(state, &g.delegation_graph, self_owner_opt, now_ms);
         }
     }
     Err(format!(

@@ -128,13 +128,23 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
     // ── Pass 2: Tier 2 threshold-cross detection + reversion ────────
     // For every Tier 2 poll: if Open and total_conviction crossed
     // threshold → ThresholdReached + emit event. If ThresholdReached and
-    // total_conviction dropped back below threshold → revert to Open,
+    // total_conviction dropped back below threshold → revert to Open
+    // (emitting `voting-threshold-reverted` so the UI reflects it),
     // clearing `threshold_reached_at_ms` and recording the unsignal
     // wall-clock so the next finalize attempt resets the 24h timer.
+    //
+    // Conviction totals use the delegation-weighted variant so direct
+    // delegators contribute their `(1 + delegator_count) * conviction`
+    // weight per spec §5 — the unweighted `total_conviction_at` would
+    // silently treat a voter with N delegators as weight 1.
     {
         let logs = ctx.voting_logs.lock().await;
         for (cid, log_mtx) in logs.iter() {
             let mut log = log_mtx.lock().await;
+            // Snapshot the delegation graph by clone before borrowing
+            // `log.polls` mutably; cheap (small HashMaps) and lets the
+            // per-proposal loop pass a `&DelegationGraph` reference.
+            let graph_snapshot = log.delegation_graph.clone();
             for (pid, state) in log.polls.iter_mut() {
                 if state.meta.tier != Tier::Conviction {
                     continue;
@@ -143,7 +153,7 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
                     Some(t) => t,
                     None => continue,
                 };
-                let total = t2.total_conviction_at(now_ms);
+                let total = t2.total_conviction_at_with_delegation(now_ms, &graph_snapshot);
                 let threshold = t2.threshold_conviction_at(now_ms);
                 match state.meta.lifecycle {
                     Lifecycle::Open if total >= threshold => {
@@ -165,6 +175,14 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
                         t2.last_unsignal_after_threshold_ms = Some(now_ms);
                         state.meta.lifecycle = Lifecycle::Open;
                         stats.tier2_thresholds_reverted += 1;
+                        (ctx.emit)(
+                            "voting-threshold-reverted",
+                            serde_json::json!({
+                                "communityId": hex::encode(cid.0),
+                                "proposalId": hex::encode(pid.0),
+                                "revertedAtMs": now_ms,
+                            }),
+                        );
                     }
                     _ => {}
                 }
@@ -213,15 +231,27 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
             }
         }
         for (cid, pid, auto_exec) in to_finalize {
+            // Re-validate lifecycle == ThresholdReached before mutating:
+            // a concurrent Signal IPC could have withdrawn support
+            // between the Pass 2 snapshot and now, causing Pass 2's
+            // revert branch to put the poll back into Open. Finalizing
+            // an Open poll would skip the 24h contestability window.
+            let mut did_finalize = false;
             {
                 let logs = ctx.voting_logs.lock().await;
                 if let Some(log_mtx) = logs.get(&cid) {
                     let mut log = log_mtx.lock().await;
                     if let Some(state) = log.polls.get_mut(&pid) {
-                        state.meta.lifecycle = Lifecycle::Finalized;
-                        stats.tier2_proposals_finalized += 1;
+                        if state.meta.lifecycle == Lifecycle::ThresholdReached {
+                            state.meta.lifecycle = Lifecycle::Finalized;
+                            stats.tier2_proposals_finalized += 1;
+                            did_finalize = true;
+                        }
                     }
                 }
+            }
+            if !did_finalize {
+                continue;
             }
             (ctx.emit)(
                 "voting-proposal-finalized",
@@ -284,10 +314,21 @@ pub fn spawn_voting_tick(
         let mut tick = tokio::time::interval(interval);
         loop {
             tick.tick().await;
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i128)
-                .unwrap_or(0);
+            // SystemTime::now() returning Err means the system clock is
+            // before UNIX_EPOCH. We MUST NOT proceed with `now_ms = 0`:
+            // that would close every Tier 1 poll (any positive
+            // `closes_at` <= 0) and treat every Tier 2 charge interval
+            // as negative. Skip this iteration and warn instead.
+            let now_ms = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                Ok(d) => d.as_millis() as i128,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "voting_tick: SystemTime before UNIX_EPOCH; skipping iteration"
+                    );
+                    continue;
+                }
+            };
             if let Err(e) = run_voting_tick(&ctx, now_ms).await {
                 tracing::warn!(error = %e, "voting_tick iteration failed (continuing)");
             }
@@ -514,7 +555,7 @@ mod tests {
         let voter = OwnerAddr([0xbb; 16]);
         let mut vs = VoterConvictionState::default();
         // Signal on at t=0; query at t = many half-lives → conviction ≈ Q32 + accumulated.
-        vs.apply_signal(true, 0, 86_400_000);
+        vs.apply_signal(true, 0, 0, 86_400_000);
         t2.per_voter.insert(voter, vs);
 
         let mut log = VotingLog::new();
@@ -586,7 +627,7 @@ mod tests {
         let mut t2 = Tier2ProposalState::new(cfg, 1);
         use crate::community_voting_conviction::VoterConvictionState;
         let mut vs = VoterConvictionState::default();
-        vs.apply_signal(true, 0, 86_400_000);
+        vs.apply_signal(true, 0, 0, 86_400_000);
         t2.per_voter.insert(OwnerAddr([0xbb; 16]), vs);
         let reached_at = 1_000i128;
         t2.threshold_reached_at_ms = Some(reached_at);
@@ -629,7 +670,7 @@ mod tests {
         let mut t2 = Tier2ProposalState::new(cfg, 1);
         use crate::community_voting_conviction::VoterConvictionState;
         let mut vs = VoterConvictionState::default();
-        vs.apply_signal(true, 0, 86_400_000);
+        vs.apply_signal(true, 0, 0, 86_400_000);
         t2.per_voter.insert(OwnerAddr([0xbb; 16]), vs);
         let reached_at = 1_000i128;
         t2.threshold_reached_at_ms = Some(reached_at);
@@ -670,7 +711,7 @@ mod tests {
         let mut t2 = Tier2ProposalState::new(cfg, 1);
         use crate::community_voting_conviction::VoterConvictionState;
         let mut vs = VoterConvictionState::default();
-        vs.apply_signal(true, 0, 86_400_000);
+        vs.apply_signal(true, 0, 0, 86_400_000);
         t2.per_voter.insert(OwnerAddr([0xbb; 16]), vs);
         let reached_at = 1_000i128;
         t2.threshold_reached_at_ms = Some(reached_at);

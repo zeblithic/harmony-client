@@ -3123,16 +3123,18 @@ mod auto_exec_tests {
         );
     }
 
-    /// End-to-end: apply_auto_exec_set_power changes the target's power
-    /// level in the materialized community state.
-    ///
-    /// Builds a minimally-wired NodeState: identity, hlc_tracker,
-    /// dm_outbox (carrying the signing key), and a single-community
-    /// CommunitySyncRegistry engine. Joins an admin (the auto-exec actor)
-    /// and a target member, then calls `apply_auto_exec_set_power` and
-    /// asserts the target's power_level moved.
+    /// Unit test: the SetPower-signing path that `apply_auto_exec_set_power`
+    /// uses produces an Ed25519 signature that verifies against the admin's
+    /// pubkey — proving the helper's mint step yields a CRDT-acceptable
+    /// event. This does NOT call `apply_auto_exec_set_power` itself; the
+    /// helper depends on a fully-wired NodeState (CommunitySyncRegistry,
+    /// dm_outbox, materialized CommunityState) that's out of reach for a
+    /// pure unit test. The full end-to-end pipeline (Tier 2 finalize →
+    /// auto-exec dispatch → CRDT accept → peer publish) is exercised by
+    /// the `community_voting_tick` integration test that wires the tick
+    /// to a real engine.
     #[tokio::test]
-    async fn apply_auto_exec_set_power_changes_target_power() {
+    async fn auto_exec_set_power_signing_path_produces_verifiable_signature() {
         use crate::community_state_crdt::CommunityState;
         use crate::owner_state_crypto::canonical_cbor_encode;
         use ed25519_dalek::{Signer, SigningKey};

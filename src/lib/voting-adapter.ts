@@ -356,8 +356,8 @@ export class VotingAdapter {
   }
 
   /** Install a Tier 2 Delegate edge: caller → `delegate` (the
-   *  delegate's 32-byte ed25519 pubkey, hex). Community-wide; affects
-   *  every Tier 2 proposal in the community per spec §5. */
+   *  delegate's 16-byte `OwnerAddr`, hex; 32 hex chars). Community-wide;
+   *  affects every Tier 2 proposal in the community per spec §5. */
   async delegateTier2(communityId: string, delegate: string): Promise<void> {
     await this.invoke<void>('voting_delegate_tier2', { communityId, delegate });
   }

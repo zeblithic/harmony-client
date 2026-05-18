@@ -2154,12 +2154,12 @@ mod tests {
         assert_eq!(detect_poll_kind(&too_short), (None, None));
         // 0x00 prefix + correct length but non-hex tail.
         let mut bad_tail = vec![POLL_BODY_MAGIC];
-        bad_tail.extend(std::iter::repeat(b'z').take(64));
+        bad_tail.extend(std::iter::repeat_n(b'z', 64));
         assert_eq!(detect_poll_kind(&bad_tail), (None, None));
         // 0x00 prefix + uppercase hex (we accept lowercase only to
         // match hex::encode output exactly).
         let mut upper = vec![POLL_BODY_MAGIC];
-        upper.extend(std::iter::repeat(b'A').take(64));
+        upper.extend(std::iter::repeat_n(b'A', 64));
         assert_eq!(detect_poll_kind(&upper), (None, None));
     }
 

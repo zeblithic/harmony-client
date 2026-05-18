@@ -88,13 +88,22 @@ pub struct Tier2PollConfig {
     /// ≈ `0.721 * hl` of conviction-multiplier units.
     #[serde(rename = "hl")]
     pub half_life_seconds: u32,
-    /// `T_min` — the floor of the dynamic threshold band, stored as Q96.32.
-    /// At full participation (effective_supply == total_supply) the
-    /// threshold equals exactly `T_min`.
+    /// `T_min` — the floor of the dynamic threshold band, in the same
+    /// units `charge_q32` / `total_conviction_at` return (raw
+    /// milliseconds at the conviction-multiplier scale; see `charge_q32`
+    /// doc). At full participation (effective_supply == total_supply)
+    /// the threshold equals exactly `T_min`. The `_q32` field-name
+    /// suffix is vestigial — spec §5's first draft documented these as
+    /// Q96.32 fractions of a notional ceiling, but the actual conviction
+    /// arithmetic (`(1 - 0.5^(d/h)) * h / ln(2)`) yields ms-scale
+    /// values, so thresholds must be ms-scale for `just_crossed_threshold`
+    /// to be meaningful. A sensible value at hl=7d is on the order of
+    /// `charge(1d, 7d) ≈ 8.2e6 ms` per voter-day of desired effort.
     #[serde(rename = "tn")]
     pub threshold_min_q32: ConvictionQ32,
-    /// `T_max` — the ceiling of the dynamic threshold band, stored as Q96.32.
-    /// At zero participation the threshold equals exactly `T_max`.
+    /// `T_max` — the ceiling of the dynamic threshold band, same ms
+    /// units as `threshold_min_q32` (see that field's doc). At zero
+    /// participation the threshold equals exactly `T_max`.
     #[serde(rename = "tx")]
     pub threshold_max_q32: ConvictionQ32,
     /// β exponent for the `(1 - participation_ratio)^β` curve shaping
@@ -141,10 +150,16 @@ pub struct SignalPayload {
 
 /// Delegate payload — wire form for `kd="dg"`, `tr=2`.
 ///
-/// `to` is the 32-byte ed25519 pubkey of the delegate (NOT the 16-byte
-/// `OwnerAddr`; spec §5 explicitly uses the full pubkey). Encoded as a
-/// CBOR byte string (major type 2) via `serde_bytes` — same wire-shape
-/// convention as `SignedVotingEvent.payload`/`.sig`.
+/// `to` is the 16-byte `OwnerAddr` of the delegate. Spec §5's original
+/// "32-byte ed25519 pubkey" choice was incompatible with the rest of the
+/// CRDT, which keys on `OwnerAddr = SHA256(X25519_pub || Ed25519_pub)[..16]`
+/// — that hash cannot be derived from just the Ed25519 pubkey, so any
+/// delegate-target field that carried the raw pubkey would never match
+/// the membership-graph keys. Carrying the OwnerAddr directly mirrors
+/// every other actor identifier in the system. Encoded as a CBOR byte
+/// string (major type 2) via `serde_bytes` — same wire-shape convention
+/// as `SignedVotingEvent.payload`/`.sig`. Decoders MUST reject a `to`
+/// whose length is not exactly 16.
 ///
 /// `sc` ("scope") is reserved for future per-poll or per-tag delegation
 /// scoping; v1 callers always pass `"all"` (community-wide delegation).
@@ -292,12 +307,39 @@ pub struct VoterConvictionState {
     /// HLC of the last event applied (Signal toggle in either direction).
     /// Used as the reference point for decaying `accumulated_conviction_q32`.
     pub last_event_at_ms: i128,
+    /// Full `(wall_ms, logical)` HLC ordinal of the last event applied,
+    /// or `None` if no event has been applied yet. Used by `apply_signal`
+    /// to enforce LWW across (a) same-ms different-logical events on one
+    /// device and (b) inter-device re-orderings on the same actor.
+    /// Without this, a stale event arriving after a newer one would
+    /// overwrite state with rewound `support_started_at_ms`. `None` is
+    /// the sentinel because `(0, 0)` is a valid (test-only) ordinal.
+    pub last_event_ordinal: Option<(u64, u32)>,
 }
 
 impl VoterConvictionState {
-    /// Apply a Signal event at the given HLC ms. Idempotent: a repeated
-    /// Signal in the same direction is a no-op.
-    pub fn apply_signal(&mut self, support: bool, event_hlc_ms: i128, half_life_ms: i128) {
+    /// Apply a Signal event at the given HLC. Idempotent: a repeated
+    /// Signal in the same direction is a no-op. Events whose HLC
+    /// ordinal is `<=` the last applied ordinal are dropped (LWW), so
+    /// out-of-order delivery converges to the same state on every replica.
+    pub fn apply_signal(
+        &mut self,
+        support: bool,
+        event_hlc_ms: i128,
+        event_hlc_logical: u32,
+        half_life_ms: i128,
+    ) {
+        let event_ord = (event_hlc_ms as u64, event_hlc_logical);
+        if matches!(self.last_event_ordinal, Some(last) if event_ord <= last) {
+            return;
+        }
+        // Idempotent same-direction Signal: no state change AND no
+        // ordinal update — preserves the v1 "apply_signal is idempotent
+        // on repeated same-direction events" invariant.
+        if support == self.is_supporting {
+            return;
+        }
+        self.last_event_ordinal = Some(event_ord);
         if support && !self.is_supporting {
             // Decay any prior accumulation up to the moment the new session
             // begins, so subsequent `conviction_at` computations can treat
@@ -311,7 +353,17 @@ impl VoterConvictionState {
             self.last_event_at_ms = event_hlc_ms;
         } else if !support && self.is_supporting {
             let session_dur = event_hlc_ms - self.support_started_at_ms;
-            self.accumulated_conviction_q32 += charge_q32(session_dur, half_life_ms);
+            // Mirror `conviction_at(is_supporting=true)`: the prior pool
+            // has been decaying across the support session while the
+            // active charge grew. When the session closes we collapse
+            // both into `accumulated_conviction_q32`: decay the prior
+            // pool by `session_dur` first, then add the session charge.
+            // Without the leading decay, `accumulated += charge` would
+            // freeze the prior pool at its session-start value and
+            // overstate post-close conviction.
+            self.accumulated_conviction_q32 =
+                decay_q32(self.accumulated_conviction_q32, session_dur, half_life_ms)
+                    + charge_q32(session_dur, half_life_ms);
             self.is_supporting = false;
             self.last_event_at_ms = event_hlc_ms;
         }
@@ -499,10 +551,21 @@ pub enum DelegationError {
 /// D2 invariant: the graph is acyclic at all times. `apply_delegate`
 /// rejects any event that would create a cycle (including the degenerate
 /// self-delegation A→A).
+///
+/// LWW tombstone (`last_hlc`): tracks the HLC of the most recent terminal
+/// event for each delegator — Delegate OR Undelegate. Without this an
+/// out-of-order Delegate(A→B, hlc=t1) delivered *after* an
+/// Undelegate(A, hlc=t2 > t1) would find no live edge to compare against
+/// and silently re-install the stale delegation. Consulting `last_hlc`
+/// during `apply_delegate` rejects such resurrection by HLC-LWW even when
+/// no edge currently exists.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DelegationGraph {
     /// delegator → (delegate, hlc_ms_of_latest_event)
     edges: HashMap<OwnerAddr, (OwnerAddr, i128)>,
+    /// delegator → hlc_ms of last terminal event (Delegate OR Undelegate).
+    /// Survives edge removal so Undelegates leave a tombstone.
+    last_hlc: HashMap<OwnerAddr, i128>,
 }
 
 impl DelegationGraph {
@@ -535,25 +598,34 @@ impl DelegationGraph {
         if self.would_create_cycle(delegator, delegate) {
             return Err(DelegationError::Cycle);
         }
-        // HLC-LWW: reject if existing edge has newer-or-equal HLC.
-        if let Some(&(_, existing_hlc)) = self.edges.get(&delegator) {
-            if existing_hlc >= hlc_ms {
+        // HLC-LWW: reject if last terminal event (edge OR tombstone) for
+        // this delegator has newer-or-equal HLC. Checking the tombstone
+        // (not just the live edge) is the load-bearing part: it blocks
+        // resurrection by a late-arriving Delegate whose HLC predates a
+        // prior Undelegate.
+        if let Some(&last_hlc) = self.last_hlc.get(&delegator) {
+            if last_hlc >= hlc_ms {
                 return Err(DelegationError::StaleHlc);
             }
         }
         self.edges.insert(delegator, (delegate, hlc_ms));
+        self.last_hlc.insert(delegator, hlc_ms);
         Ok(())
     }
 
-    /// Apply an `Undelegate` event. HLC-LWW: silently skips if existing
-    /// edge has a newer-or-equal HLC. Idempotent if there's no edge to remove.
+    /// Apply an `Undelegate` event. HLC-LWW: silently skips if the last
+    /// terminal event (edge OR prior Undelegate tombstone) has a
+    /// newer-or-equal HLC. The tombstone is recorded unconditionally on
+    /// a successful undelegate so subsequent out-of-order Delegate events
+    /// with earlier HLCs can still be rejected.
     pub fn apply_undelegate(&mut self, delegator: OwnerAddr, hlc_ms: i128) {
-        if let Some(&(_, existing_hlc)) = self.edges.get(&delegator) {
-            if existing_hlc >= hlc_ms {
+        if let Some(&last_hlc) = self.last_hlc.get(&delegator) {
+            if last_hlc >= hlc_ms {
                 return;
             }
-            self.edges.remove(&delegator);
         }
+        self.edges.remove(&delegator);
+        self.last_hlc.insert(delegator, hlc_ms);
     }
 
     /// Number of accounts directly delegating to `delegate` (not transitive).
@@ -962,7 +1034,7 @@ mod tests {
     #[test]
     fn single_support_session_builds_conviction() {
         let mut s = VoterConvictionState::default();
-        s.apply_signal(true, 0, TEST_HL);
+        s.apply_signal(true, 0, 0, TEST_HL);
         // After one half-life of continuous support, conviction equals
         // the closed-form charge(hl, hl).
         let actual = s.conviction_at(TEST_HL, TEST_HL);
@@ -975,8 +1047,8 @@ mod tests {
     #[test]
     fn toggle_off_freezes_accumulated_conviction() {
         let mut s = VoterConvictionState::default();
-        s.apply_signal(true, 0, TEST_HL);
-        s.apply_signal(false, TEST_HL, TEST_HL);
+        s.apply_signal(true, 0, 0, TEST_HL);
+        s.apply_signal(false, TEST_HL, 0, TEST_HL);
         // At the moment of toggle-off, conviction == charge(hl, hl).
         let at_off = s.conviction_at(TEST_HL, TEST_HL);
         assert_eq!(at_off, charge_q32(TEST_HL, TEST_HL));
@@ -990,8 +1062,8 @@ mod tests {
     #[test]
     fn toggle_off_then_idle_decays() {
         let mut s = VoterConvictionState::default();
-        s.apply_signal(true, 0, TEST_HL);
-        s.apply_signal(false, TEST_HL, TEST_HL);
+        s.apply_signal(true, 0, 0, TEST_HL);
+        s.apply_signal(false, TEST_HL, 0, TEST_HL);
         let base = s.conviction_at(TEST_HL, TEST_HL);
         // After 1 idle half-life: ≈ base/2. After 2 idle half-lives: ≈ base/4.
         // After 3 idle half-lives: ≈ base/8. Tolerances scale with the
@@ -1021,9 +1093,9 @@ mod tests {
     fn toggle_on_after_decay_resumes_from_decayed_base() {
         // support → 1hl → not-support → 1hl → support; query at 2hl.
         let mut s = VoterConvictionState::default();
-        s.apply_signal(true, 0, TEST_HL);
-        s.apply_signal(false, TEST_HL, TEST_HL);
-        s.apply_signal(true, 2 * TEST_HL, TEST_HL);
+        s.apply_signal(true, 0, 0, TEST_HL);
+        s.apply_signal(false, TEST_HL, 0, TEST_HL);
+        s.apply_signal(true, 2 * TEST_HL, 0, TEST_HL);
         // At 2*hl, active session just started (dur=0 → active charge=0);
         // accumulated has been decaying for one full hl from charge(hl,hl).
         let actual = s.conviction_at(2 * TEST_HL, TEST_HL);
@@ -1035,15 +1107,19 @@ mod tests {
     fn re_toggle_off_accumulates_more() {
         // support → 1hl → off → support → 1hl → off.
         let mut s = VoterConvictionState::default();
-        s.apply_signal(true, 0, TEST_HL);
-        s.apply_signal(false, TEST_HL, TEST_HL);
-        s.apply_signal(true, TEST_HL, TEST_HL); // immediate restart, no idle
-        s.apply_signal(false, 2 * TEST_HL, TEST_HL);
-        // Accumulated should be charge(hl,hl) + charge(hl,hl).
-        // (The first segment's accumulated was decayed for 0 ms before the
-        // second segment began, so no decay loss; second segment adds another
-        // charge(hl, hl).)
-        let expected = 2 * charge_q32(TEST_HL, TEST_HL);
+        s.apply_signal(true, 0, 0, TEST_HL);
+        s.apply_signal(false, TEST_HL, 0, TEST_HL);
+        // Immediate restart at same wall_ms; logical+1 keeps the ordinal
+        // strictly greater so the LWW guard accepts it.
+        s.apply_signal(true, TEST_HL, 1, TEST_HL);
+        s.apply_signal(false, 2 * TEST_HL, 0, TEST_HL);
+        // Per the decay-before-add fix in `apply_signal`'s unsignal branch,
+        // closing session 2 first decays the prior accumulated pool (one
+        // charge(hl,hl) earned in session 1) by `session_dur == TEST_HL`
+        // — i.e., by one half-life, halving it — then adds session 2's
+        // charge(hl,hl). So accumulated ≈ 0.5*charge + charge = 1.5*charge.
+        let one_charge = charge_q32(TEST_HL, TEST_HL);
+        let expected = decay_q32(one_charge, TEST_HL, TEST_HL) + one_charge;
         assert_eq!(s.accumulated_conviction_q32, expected);
         // And the conviction at the moment of second-off equals that
         // accumulated total (no further time elapsed).
@@ -1054,9 +1130,9 @@ mod tests {
     #[test]
     fn idempotent_repeat_signal_true() {
         let mut a = VoterConvictionState::default();
-        a.apply_signal(true, 0, TEST_HL);
+        a.apply_signal(true, 0, 0, TEST_HL);
         let mut b = a.clone();
-        b.apply_signal(true, TEST_HL, TEST_HL); // repeat true; should be no-op
+        b.apply_signal(true, TEST_HL, 0, TEST_HL); // repeat true; should be no-op
         assert_eq!(a, b);
         // And conviction queries match.
         assert_eq!(
@@ -1070,14 +1146,14 @@ mod tests {
         // apply_signal(false, ...) when not supporting is a no-op.
         let mut a = VoterConvictionState::default();
         let snapshot = a.clone();
-        a.apply_signal(false, TEST_HL, TEST_HL);
+        a.apply_signal(false, TEST_HL, 0, TEST_HL);
         assert_eq!(a, snapshot);
         // Also after a complete session, repeated false is still no-op.
         let mut s = VoterConvictionState::default();
-        s.apply_signal(true, 0, TEST_HL);
-        s.apply_signal(false, TEST_HL, TEST_HL);
+        s.apply_signal(true, 0, 0, TEST_HL);
+        s.apply_signal(false, TEST_HL, 0, TEST_HL);
         let snap2 = s.clone();
-        s.apply_signal(false, 2 * TEST_HL, TEST_HL);
+        s.apply_signal(false, 2 * TEST_HL, 0, TEST_HL);
         assert_eq!(s, snap2);
     }
 
@@ -1085,24 +1161,28 @@ mod tests {
     fn determinism_two_states_identical_event_seq() {
         // Build a deterministic 10-event mixed signal sequence.
         // (true/false toggles with varied gaps; exercises both branches +
-        // idempotent no-ops.)
-        let seq: [(bool, i128); 10] = [
-            (true, 0),
-            (true, 50),     // idempotent no-op
-            (false, 1_000), // close session 1
-            (false, 1_500), // idempotent no-op
-            (true, 2_000),  // start session 2 after 1*hl idle
-            (false, 2_500), // close session 2
-            (true, 4_000),  // start session 3 after 1.5*hl idle
-            (false, 5_000), // close session 3
-            (true, 5_000),  // start session 4 immediately
-            (false, 7_000), // close session 4
+        // idempotent no-ops.) The two same-ms events at t=5_000 must have
+        // distinct logical ordinals — in production HLCs are monotonic
+        // per device, so two state-changing events cannot share an
+        // ordinal; the LWW guard in `apply_signal` would otherwise drop
+        // the second.
+        let seq: [(bool, i128, u32); 10] = [
+            (true, 0, 0),
+            (true, 50, 0),     // idempotent no-op
+            (false, 1_000, 0), // close session 1
+            (false, 1_500, 0), // idempotent no-op
+            (true, 2_000, 0),  // start session 2 after 1*hl idle
+            (false, 2_500, 0), // close session 2
+            (true, 4_000, 0),  // start session 3 after 1.5*hl idle
+            (false, 5_000, 0), // close session 3
+            (true, 5_000, 1),  // start session 4 immediately (logical+1)
+            (false, 7_000, 0), // close session 4
         ];
         let mut a = VoterConvictionState::default();
         let mut b = VoterConvictionState::default();
-        for (sup, t) in &seq {
-            a.apply_signal(*sup, *t, TEST_HL);
-            b.apply_signal(*sup, *t, TEST_HL);
+        for (sup, t, l) in &seq {
+            a.apply_signal(*sup, *t, *l, TEST_HL);
+            b.apply_signal(*sup, *t, *l, TEST_HL);
         }
         // Bit-identical state.
         assert_eq!(a, b);
@@ -1118,9 +1198,9 @@ mod tests {
         // across N=100 iterations. Pure-integer arithmetic makes this
         // trivially true, but pin the invariant.
         let mut s = VoterConvictionState::default();
-        s.apply_signal(true, 0, TEST_HL);
-        s.apply_signal(false, TEST_HL, TEST_HL);
-        s.apply_signal(true, 3 * TEST_HL, TEST_HL);
+        s.apply_signal(true, 0, 0, TEST_HL);
+        s.apply_signal(false, TEST_HL, 0, TEST_HL);
+        s.apply_signal(true, 3 * TEST_HL, 0, TEST_HL);
         let baseline: Vec<i128> = (0..10)
             .map(|i| s.conviction_at(i as i128 * TEST_HL, TEST_HL))
             .collect();
@@ -1137,8 +1217,8 @@ mod tests {
         // Not-supporting branch: dt < 0 → decay_q32 returns identity, so
         // result equals accumulated.
         let mut s = VoterConvictionState::default();
-        s.apply_signal(true, 1_000, TEST_HL);
-        s.apply_signal(false, 2_000, TEST_HL);
+        s.apply_signal(true, 1_000, 0, TEST_HL);
+        s.apply_signal(false, 2_000, 0, TEST_HL);
         let accumulated = s.accumulated_conviction_q32;
         let result = s.conviction_at(500, TEST_HL); // t < last_event_at_ms
         assert_eq!(result, accumulated);
@@ -1147,9 +1227,9 @@ mod tests {
         // (charge_q32 returns 0) and dt < 0 (decay_q32 is identity); so
         // result equals accumulated unchanged.
         let mut s2 = VoterConvictionState::default();
-        s2.apply_signal(true, 0, TEST_HL);
-        s2.apply_signal(false, TEST_HL, TEST_HL);
-        s2.apply_signal(true, 5_000, TEST_HL);
+        s2.apply_signal(true, 0, 0, TEST_HL);
+        s2.apply_signal(false, TEST_HL, 0, TEST_HL);
+        s2.apply_signal(true, 5_000, 0, TEST_HL);
         let result2 = s2.conviction_at(100, TEST_HL); // before everything
                                                       // accumulated at this point is the prior charge after pre-resume
                                                       // decay, plus zero active charge.
@@ -1209,7 +1289,7 @@ mod tests {
         let mut s = Tier2ProposalState::new(t2_config(2, 7 * Q32, 100 * Q32), 3);
         for i in 0..3u8 {
             let mut v = VoterConvictionState::default();
-            v.apply_signal(true, 0, TEST_HL);
+            v.apply_signal(true, 0, 0, TEST_HL);
             s.per_voter.insert(voter(i + 1), v);
         }
         assert_eq!(s.effective_supply_at(0), 3);
@@ -1230,7 +1310,7 @@ mod tests {
         let mut s = Tier2ProposalState::new(t2_config(2, 0, 100 * Q32), 4);
         for i in 0..2u8 {
             let mut v = VoterConvictionState::default();
-            v.apply_signal(true, 0, TEST_HL);
+            v.apply_signal(true, 0, 0, TEST_HL);
             s.per_voter.insert(voter(i + 1), v);
         }
         // Two non-supporting voters fill out the total_supply count.
@@ -1250,7 +1330,7 @@ mod tests {
         let mut s = Tier2ProposalState::new(t2_config(1, 0, 100 * Q32), 4);
         for i in 0..2u8 {
             let mut v = VoterConvictionState::default();
-            v.apply_signal(true, 0, TEST_HL);
+            v.apply_signal(true, 0, 0, TEST_HL);
             s.per_voter.insert(voter(i + 1), v);
         }
         for i in 2..4u8 {
@@ -1279,7 +1359,7 @@ mod tests {
         let target = charge_q32(TEST_HL, TEST_HL); // conviction after 1 hl
         let mut s = Tier2ProposalState::new(t2_config(2, target, 100 * Q32), 1);
         let mut v = VoterConvictionState::default();
-        v.apply_signal(true, 0, TEST_HL);
+        v.apply_signal(true, 0, 0, TEST_HL);
         s.per_voter.insert(voter(1), v);
 
         // Just before 1 half-life: not crossed.
@@ -1448,7 +1528,7 @@ mod tests {
         // Sanity: with an empty graph, weighted == simple total.
         let mut s = Tier2ProposalState::new(t2_config(2, 0, 100 * Q32), 2);
         let mut v1 = VoterConvictionState::default();
-        v1.apply_signal(true, 0, TEST_HL);
+        v1.apply_signal(true, 0, 0, TEST_HL);
         s.per_voter.insert(voter(1), v1);
         let g = DelegationGraph::new();
         assert_eq!(
@@ -1464,7 +1544,7 @@ mod tests {
         let a = voter(1);
         let b = voter(2);
         let mut vb = VoterConvictionState::default();
-        vb.apply_signal(true, 0, TEST_HL);
+        vb.apply_signal(true, 0, 0, TEST_HL);
         s.per_voter.insert(b, vb);
         let mut g = DelegationGraph::new();
         g.apply_delegate(a, b, 1).unwrap();
@@ -1483,10 +1563,10 @@ mod tests {
         let a = voter(1);
         let b = voter(2);
         let mut va = VoterConvictionState::default();
-        va.apply_signal(true, 0, TEST_HL);
+        va.apply_signal(true, 0, 0, TEST_HL);
         s.per_voter.insert(a, va);
         let mut vb = VoterConvictionState::default();
-        vb.apply_signal(true, 0, TEST_HL);
+        vb.apply_signal(true, 0, 0, TEST_HL);
         s.per_voter.insert(b, vb);
         let mut g = DelegationGraph::new();
         g.apply_delegate(a, b, 1).unwrap();
@@ -1513,7 +1593,7 @@ mod tests {
         let b = voter(2);
         let c = voter(3);
         let mut vb = VoterConvictionState::default();
-        vb.apply_signal(true, 0, TEST_HL);
+        vb.apply_signal(true, 0, 0, TEST_HL);
         s.per_voter.insert(b, vb);
         let mut g = DelegationGraph::new();
         g.apply_delegate(a, b, 1).unwrap();

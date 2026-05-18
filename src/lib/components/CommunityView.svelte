@@ -341,6 +341,7 @@
         channelId={activeChannel.channelId}
         channelName={activeChannel.name}
         {channelMessageService}
+        {votingAdapter}
         {ownAddress}
         {trustService}
         {myPower}

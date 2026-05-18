@@ -214,7 +214,7 @@ export interface Tier2PollConfig {
   /** Auto-exec action that fires on finalization. */
   ax: AutoExecAction;
   /** Eligibility predicate — mirrors Phase 1 `Eligibility` shape. */
-  el: { mp: number; mvd?: number; ss?: number };
+  el: { mp: number; mv?: number; sz?: number };
 }
 
 /** Frontend DTO for a Tier 2 proposal. Mirrors Rust
@@ -232,12 +232,14 @@ export interface Tier2ProposalExport {
    *  applies to a Tier 2 lifecycle in practice — Draft is impl-only,
    *  Closed is Tier 1's terminal pre-Finalized state.) */
   lifecycle: 'Open' | 'ThresholdReached' | 'Finalized' | 'Archived';
-  /** Q96.32 sum of per-voter conviction (post-delegation). UI divides
-   *  by `Q32 = 1 << 32` to render a human-friendly number; for progress
-   *  bars use `convictionPercent()` below. */
-  total_conviction_ms: number;
-  /** Q96.32 dynamic threshold at fetch-time (recomputed each call). */
-  threshold_conviction_ms: number;
+  /** Q96.32 sum of per-voter conviction (post-delegation). Serialized
+   *  as a decimal string by the Rust IPC layer because raw Q96.32 values
+   *  routinely exceed `Number.MAX_SAFE_INTEGER` — reconstruct via
+   *  `BigInt(value)`. For progress bars use `convictionPercent()` below. */
+  total_conviction_ms: string;
+  /** Q96.32 dynamic threshold at fetch-time (recomputed each call).
+   *  Decimal string, same rationale as `total_conviction_ms`. */
+  threshold_conviction_ms: string;
   half_life_seconds: number;
   auto_exec: AutoExecAction;
   /** Total members eligible at PollCreate.hlc (frozen). */
@@ -253,18 +255,24 @@ export interface Tier2ProposalExport {
   threshold_reached_at_ms?: number;
 }
 
-/** Convert raw Q96.32 conviction values to a 0-100 progress percentage
- *  for UI bars. Returns 0 when `threshold_ms` is non-positive (defensive
- *  — the Rust apply path enforces `T_max > T_min ≥ 0`, but a peer with
- *  a malformed Tier2PollConfig could conceivably ship 0 across the
- *  wire). Caps at 100 so the bar never overflows the track. */
-export function convictionPercent(total_ms: number, threshold_ms: number): number {
-  if (threshold_ms <= 0) return 0;
-  // ratio * 1000 then /10 → one decimal place of precision while
-  // staying in integer math (avoids Q96.32 → float drift for typical
-  // i128 values that exceed `Number.MAX_SAFE_INTEGER`). The Math.round
-  // happens before the /10 divisor so e.g. 0.05% rounds to 0.1 cleanly.
-  return Math.min(100, Math.round((total_ms * 1000) / threshold_ms) / 10);
+/** Convert raw Q96.32 conviction values (decimal-string i128s from the
+ *  Rust IPC layer) to a 0-100 progress percentage for UI bars. Returns
+ *  0 when `threshold` is non-positive (defensive — the Rust apply path
+ *  enforces `T_max > T_min ≥ 0`, but a peer with a malformed
+ *  Tier2PollConfig could conceivably ship 0 across the wire). Caps at
+ *  100 so the bar never overflows the track.
+ *
+ *  Uses BigInt throughout because raw Q96.32 conviction values
+ *  routinely exceed `Number.MAX_SAFE_INTEGER`; `*1000n / threshold`
+ *  preserves one decimal place of precision in integer math, then we
+ *  cast to Number for the final `/10` (the ratio fits in a double). */
+export function convictionPercent(total: string, threshold: string): number {
+  const totalBI = BigInt(total);
+  const thresholdBI = BigInt(threshold);
+  if (thresholdBI <= 0n) return 0;
+  const tenthsBI = (totalBI * 1000n) / thresholdBI;
+  const tenths = Number(tenthsBI);
+  return Math.min(100, tenths / 10);
 }
 
 // ─── Tier 2 Tauri event payloads ───────────────────────────────────────

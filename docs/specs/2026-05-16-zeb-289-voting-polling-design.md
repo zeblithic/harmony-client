@@ -291,7 +291,13 @@ Each voter has unit weight (1p1v); signal is binary (supporting / not supporting
 { "pr": <proposal_id>, "s": true | false }
 
 # Delegate (kd="dg")
-{ "to": <ed25519_pubkey>, "sc": "all" }     # scope: "all" only in v1
+{ "to": <16-byte OwnerAddr>, "sc": "all" }  # scope: "all" only in v1
+# Spec amendment (post-implementation review): `to` was originally
+# documented as the 32-byte ed25519 pubkey, but the rest of the CRDT
+# keys on `OwnerAddr = SHA256(X25519_pub || Ed25519_pub)[..16]` — a hash
+# that cannot be derived from just the Ed25519 pubkey. Carrying the
+# OwnerAddr directly matches every other actor identifier in the system.
+# Decoders MUST reject any `to` whose length is not exactly 16 bytes.
 
 # Undelegate (kd="ud")
 { }
@@ -311,6 +317,11 @@ state = {
 
 On Signal{support: true} at event.hlc_ms:
   if !is_supporting:
+    # Decay prior accumulated up to "now" first, so subsequent
+    # conviction_at queries treat last_event_at_ms as the joint
+    # reference for both pools.
+    dt = event.hlc_ms - last_event_at_ms
+    accumulated_conviction_q32 = decay_q32(accumulated_conviction_q32, dt, half_life_ms)
     is_supporting = true
     support_started_at_ms = event.hlc_ms
     last_event_at_ms = event.hlc_ms
@@ -318,7 +329,13 @@ On Signal{support: true} at event.hlc_ms:
 On Signal{support: false} at event.hlc_ms:
   if is_supporting:
     duration_ms = event.hlc_ms - support_started_at_ms
-    accumulated_conviction_q32 += charge_q32(duration_ms, half_life_ms)
+    # Decay prior accumulated across the just-ended support session
+    # BEFORE adding the session's charge — mirrors conviction_at's
+    # supporting branch (decayed prior + active charge). Without the
+    # leading decay, += would freeze the prior pool at its session-start
+    # value and overstate post-close conviction.
+    accumulated_conviction_q32 = decay_q32(accumulated_conviction_q32, duration_ms, half_life_ms)
+                                 + charge_q32(duration_ms, half_life_ms)
     is_supporting = false
     last_event_at_ms = event.hlc_ms
 
@@ -380,7 +397,7 @@ Per-proposal total conviction at time t = Σ over voters of `conviction_at(t)`, 
 effective_supply(t_ms) = | { voter : voter has ≥ 1 active Signal at hlc_ms ≤ t_ms } |
 total_supply           = | eligible_voters at PollCreate.hlc_ms |   # snapshotted
 
-# All values Q32 fixed-point:
+# `ratio` and `(1-ratio)^β` are dimensionless Q32 fractions:
 ratio_q32 = (effective_supply * Q32) / total_supply              # ≤ Q32
 one_minus_ratio_q32 = Q32 - ratio_q32
 
@@ -389,9 +406,14 @@ pow_q32 = one_minus_ratio_q32
 for _ in 1..β:
   pow_q32 = (pow_q32 * one_minus_ratio_q32) >> CONVICTION_FRAC_BITS
 
-# Final threshold (Q32):
-span_q32 = T_max_q32 - T_min_q32
-threshold_q32 = T_min_q32 + ((span_q32 * pow_q32) >> CONVICTION_FRAC_BITS)
+# T_min and T_max are in conviction-multiplier ms units — the SAME
+# units `charge_q32` returns. This is a spec amendment from the first
+# draft (which described them as Q96.32 fractions of a notional ceiling).
+# The amendment was forced by `charge_q32`'s actual return units (the
+# Q32 factors in `one_minus` and `LN2_Q32` cancel, leaving plain ms).
+# Compare directly against `total_conviction_at` for threshold crossing.
+span = T_max - T_min
+threshold = T_min + ((span * pow_q32) >> CONVICTION_FRAC_BITS)
 ```
 
 High participation → low threshold; low participation → high threshold. Solves the low-turnout paralysis problem: a small dedicated subgroup can pass routine items provided broader community doesn't actively oppose.
@@ -451,7 +473,7 @@ voting_create_tier2_proposal(
 ) -> Result<PollId>
 
 voting_signal_tier2(proposal_id: PollId, support: bool) -> Result<()>
-voting_delegate_tier2(community_id: SpaceId, delegate: Option<Ed25519PubKey>) -> Result<()>
+voting_delegate_tier2(community_id: SpaceId, delegate: Option<OwnerAddr>) -> Result<()>
 voting_list_tier2_proposals(community_id: SpaceId) -> Vec<ProposalState>
 voting_get_tier2_proposal(proposal_id: PollId) -> ProposalState
 voting_contest_tier2_finalization(proposal_id: PollId) -> Result<()>
@@ -703,7 +725,7 @@ S2  Actor eligible per poll's eligibility predicate AT EVENT.HLC (rolling — §
 ### Tier 2 Delegate (`kd="dg"`)
 
 ```text
-D1  Delegate pubkey is community member at event.hlc.
+D1  Delegate OwnerAddr is a community member at event.hlc.
 D2  No delegation cycle (A→B→...→A); detected via transitive-closure walk over active Delegate events.
 ```
 

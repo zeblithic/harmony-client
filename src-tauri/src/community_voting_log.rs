@@ -199,7 +199,12 @@ impl VotingLog {
                 .per_voter
                 .entry(event.actor)
                 .or_default()
-                .apply_signal(payload.support, event.hlc.wall_ms as i128, hl_ms);
+                .apply_signal(
+                    payload.support,
+                    event.hlc.wall_ms as i128,
+                    event.hlc.logical,
+                    hl_ms,
+                );
             state.events.push(event.clone());
             self.events.push(event);
             return Ok(poll_id);
@@ -209,20 +214,13 @@ impl VotingLog {
         if event.kind == PollEventKindCode::Delegate && event.tier == Tier::Conviction {
             let payload: DelegatePayload = ciborium::de::from_reader(&event.payload[..])
                 .map_err(|_| ApplyError::PayloadDecode)?;
-            // Spec §5: the wire `to` field is the 32-byte ed25519 pubkey
-            // of the delegate. Internally the delegation graph keys on
-            // 16-byte OwnerAddr (matching the rest of the membership
-            // CRDT). harmony-identity's `address_hash` is the
-            // SHA-256-MSB-truncated pubkey; here we take the first 16
-            // bytes of the supplied pubkey as the address surface for
-            // graph membership. Task 18's IPC verify step is responsible
-            // for ensuring the supplied pubkey corresponds to an
-            // OwnerAddr that's actually a community member.
-            if payload.to.len() < 16 {
+            // Wire `to` is the 16-byte OwnerAddr (see
+            // `DelegatePayload` doc for why this is not a raw pubkey).
+            if payload.to.len() != 16 {
                 return Err(ApplyError::PayloadValidate);
             }
             let mut to_bytes = [0u8; 16];
-            to_bytes.copy_from_slice(&payload.to[..16]);
+            to_bytes.copy_from_slice(&payload.to);
             self.delegation_graph
                 .apply_delegate(event.actor, OwnerAddr(to_bytes), event.hlc.wall_ms as i128)
                 .map_err(|_| ApplyError::DelegationRejected)?;
@@ -575,13 +573,9 @@ mod tests {
     }
 
     fn delegate_event(actor: OwnerAddr, to: [u8; 16], hlc_ms: u64) -> SignedVotingEvent {
-        // Pad to 32 bytes (delegate field is the ed25519 pubkey on wire,
-        // but the apply path keys on the first 16 bytes — see fn
-        // apply_with_snapshot).
-        let mut to_32 = [0u8; 32];
-        to_32[..16].copy_from_slice(&to);
+        // Wire `to` is the 16-byte OwnerAddr.
         let payload_obj = DelegatePayload {
-            to: to_32.to_vec(),
+            to: to.to_vec(),
             scope: "all".into(),
         };
         let mut payload = Vec::new();
