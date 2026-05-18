@@ -6792,9 +6792,17 @@ pub async fn move_content_impl(
     } else {
         let dst_immediate_parent = *dst_cids.last().expect("dst non-empty by guard");
         let dst_parent_entries = read_manifest_entries(&verb_tx, dst_immediate_parent).await?;
+        // Skip the moved child's own entry (`e.cid == child_cid`): when
+        // src_immediate_parent and dst_immediate_parent are the same
+        // folder reached via different paths (shared-content folders,
+        // ZEB-156 territory), the moved child's pre-move position shows
+        // up in dst_parent_entries with its own name, producing a
+        // spurious self-collision rejection. Real same-name siblings
+        // necessarily have a different CID, so this exclusion only
+        // affects the self-match case.
         if dst_parent_entries
             .iter()
-            .any(|e| e.name == moved_entry.name)
+            .any(|e| e.name == moved_entry.name && e.cid != child_cid)
         {
             return Err(format!(
                 "destination already has an entry named '{}'",
@@ -7435,10 +7443,22 @@ async fn move_case_d(
         .map(|b| b.len() as u64)
         .unwrap_or(0);
 
-    // STAGE 1: mint a new top-level sidecar entry.
+    // STAGE 1: mint a new top-level sidecar entry. The preflight name
+    // check at the IPC boundary happens before several .await points,
+    // so a concurrent move-to-root or create-folder-at-root can claim
+    // the same `file_name` between our preflight read and this insert.
+    // Re-validate uniqueness while holding the same lock as the insert
+    // — `ContentIndex::insert` only de-duplicates by SidecarId, not by
+    // file_name.
     let new_top_sid = content_index::SidecarId::new();
     let inserted = {
         let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        if idx.entries().any(|e| e.file_name == moved_entry.name) {
+            return Err(format!(
+                "destination already has an entry named '{}'",
+                moved_entry.name
+            ));
+        }
         idx.insert(content_index::ContentIndexEntry {
             sidecar_id: new_top_sid,
             cid: child_cid,
