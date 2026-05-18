@@ -231,11 +231,14 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
             }
         }
         for (cid, pid, auto_exec) in to_finalize {
-            // Re-validate lifecycle == ThresholdReached before mutating:
-            // a concurrent Signal IPC could have withdrawn support
-            // between the Pass 2 snapshot and now, causing Pass 2's
-            // revert branch to put the poll back into Open. Finalizing
-            // an Open poll would skip the 24h contestability window.
+            // Re-validate lifecycle == ThresholdReached AND the 24h
+            // contestability window before mutating. Two separable
+            // invariants because Signal{false} during ThresholdReached
+            // doesn't drop lifecycle (Pass 2's revert branch handles
+            // total-conviction-below-threshold), but it DOES stamp
+            // `last_unsignal_after_threshold_ms` which resets the
+            // window per spec §5. Without the window re-check the
+            // collect→mutate gap is TOCTOU-vulnerable (Cursor R8).
             //
             // Also stamp `meta.finalized_at_ms` so the archive sweep can
             // age this Tier 2 poll. Tier 1 uses its terminal PollResult
@@ -248,11 +251,23 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
                     let mut log = log_mtx.lock().await;
                     if let Some(state) = log.polls.get_mut(&pid) {
                         if state.meta.lifecycle == Lifecycle::ThresholdReached {
-                            state.meta.lifecycle = Lifecycle::Finalized;
-                            let stamp = if now_ms < 0 { 0 } else { now_ms as u64 };
-                            state.meta.finalized_at_ms = Some(stamp);
-                            stats.tier2_proposals_finalized += 1;
-                            did_finalize = true;
+                            let window_still_clear =
+                                state.tier_state.as_tier2().is_some_and(|t2| {
+                                    t2.threshold_reached_at_ms.is_some_and(|reached_at| {
+                                        let uncontested_since = reached_at.max(
+                                            t2.last_unsignal_after_threshold_ms
+                                                .unwrap_or(reached_at),
+                                        );
+                                        (now_ms - uncontested_since) >= CONTESTABILITY_WINDOW_MS
+                                    })
+                                });
+                            if window_still_clear {
+                                state.meta.lifecycle = Lifecycle::Finalized;
+                                let stamp = if now_ms < 0 { 0 } else { now_ms as u64 };
+                                state.meta.finalized_at_ms = Some(stamp);
+                                stats.tier2_proposals_finalized += 1;
+                                did_finalize = true;
+                            }
                         }
                     }
                 }
@@ -705,6 +720,72 @@ mod tests {
         };
         let log = log_mtx.lock().await;
         assert_eq!(log.polls[&pid].meta.lifecycle, Lifecycle::ThresholdReached);
+    }
+
+    /// Regression: Pass 3 mutation phase must re-validate the 24h
+    /// contestability window, not just lifecycle == ThresholdReached.
+    /// Without the re-check, a concurrent Signal{false} that stamped
+    /// `last_unsignal_after_threshold_ms` between candidate collection
+    /// and mutation would slip through (Cursor R8 TOCTOU).
+    ///
+    /// Simulating the race directly via two tasks is brittle; instead
+    /// we pre-stamp `last_unsignal_after_threshold_ms` to exactly the
+    /// boundary state that a concurrent Signal{false} would have left
+    /// (window-just-reset) and assert the tick does not finalize.
+    /// This is the same observable state the mutation phase would see
+    /// on lock re-acquisition.
+    #[tokio::test]
+    async fn community_voting_tick_tier2_contestability_recheck_skips_after_window_reset() {
+        let cid = SpaceId([0x33; 16]);
+        let pid = PollId([0x44; 32]);
+        let cfg = make_tier2_config(AutoExecAction::None);
+        let mut t2 = Tier2ProposalState::new(cfg, 1);
+        use crate::community_voting_conviction::VoterConvictionState;
+        let mut vs = VoterConvictionState::default();
+        vs.apply_signal(true, 0, 0, 86_400_000);
+        t2.per_voter.insert(OwnerAddr([0xbb; 16]), vs);
+        let reached_at = 1_000i128;
+        t2.threshold_reached_at_ms = Some(reached_at);
+        let now_ms = reached_at + 25 * 60 * 60 * 1000;
+        // Simulate a concurrent Signal{false} that landed just before
+        // the mutation phase re-acquired the lock: window reset to
+        // ~now, so 24h has NOT elapsed since the reset.
+        t2.last_unsignal_after_threshold_ms = Some(now_ms - 60 * 1000);
+
+        let mut log = VotingLog::new();
+        log.polls.insert(
+            pid,
+            make_tier2_poll(cid, pid, Lifecycle::ThresholdReached, t2),
+        );
+        let mut logs = HashMap::new();
+        logs.insert(cid, Arc::new(Mutex::new(log)));
+        let (ctx, events, _) = make_ctx_with_logs(logs, now_ms);
+
+        let stats = run_voting_tick(&ctx, now_ms).await.unwrap();
+        // Pass 3 first-phase scan still uses the original tier2 state
+        // (no concurrent IPC actually ran), so the proposal IS in the
+        // to_finalize candidate list. The mutation-phase re-check is
+        // what must reject it because of the reset window. The end
+        // observable: no finalization, no event.
+        assert_eq!(
+            stats.tier2_proposals_finalized, 0,
+            "mutation phase must re-validate contestability window, not just lifecycle"
+        );
+        let log_mtx = {
+            let logs = ctx.voting_logs.lock().await;
+            Arc::clone(logs.get(&cid).unwrap())
+        };
+        let log = log_mtx.lock().await;
+        assert_eq!(log.polls[&pid].meta.lifecycle, Lifecycle::ThresholdReached);
+        assert!(log.polls[&pid].meta.finalized_at_ms.is_none());
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(n, _)| n == "voting-proposal-finalized"),
+            "no finalize event should fire when window reset between phases"
+        );
     }
 
     #[tokio::test]
