@@ -196,6 +196,19 @@ impl VotingLog {
                 .polls
                 .get_mut(&poll_id)
                 .ok_or(ApplyError::EventBeforePollCreate)?;
+            // Lifecycle gate (Cursor R6 Medium): Signal events are
+            // only valid while the proposal is still actively
+            // collecting conviction. A Signal arriving on a Finalized,
+            // Closed, or Archived proposal would otherwise still
+            // mutate `per_voter` conviction state and stamp
+            // `last_unsignal_after_threshold_ms` — corrupting the
+            // historical record of a terminal proposal.
+            if !matches!(
+                state.meta.lifecycle,
+                Lifecycle::Open | Lifecycle::ThresholdReached
+            ) {
+                return Err(ApplyError::IllegalTransition);
+            }
             let in_threshold_reached = state.meta.lifecycle == Lifecycle::ThresholdReached;
             let proposal_state = state
                 .tier_state
@@ -306,6 +319,16 @@ impl VotingLog {
             } else if event.tier == Tier::Conviction {
                 let cfg: Tier2PollConfig = ciborium::de::from_reader(&event.payload[..])
                     .map_err(|_| ApplyError::PayloadDecode)?;
+                // Defensive apply-layer validation (CR R6 nit): peer-
+                // received configs bypass the IPC layer's invariant
+                // check. Inverted thresholds (T_min > T_max) flip the
+                // band sign, producing an "easier-to-finalize-at-low-
+                // participation" curve. A zero half-life would
+                // degenerate the conviction math. Mirrors the Tier 1
+                // `validate_poll_config` discipline that runs above.
+                if cfg.threshold_min_q32 > cfg.threshold_max_q32 || cfg.half_life_seconds == 0 {
+                    return Err(ApplyError::PayloadValidate);
+                }
                 // total_supply = count of members in the caller-supplied
                 // snapshot who pass the Tier 2 config's Eligibility. If
                 // no snapshot was supplied (peer-received PollCreate path

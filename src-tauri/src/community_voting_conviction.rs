@@ -331,6 +331,17 @@ impl VoterConvictionState {
         event_hlc_logical: u32,
         half_life_ms: i128,
     ) {
+        // Reject negative event_hlc_ms. The production caller always
+        // passes `event.hlc.wall_ms as i128` where `wall_ms: u64`, so
+        // production traffic never lands here negative. But the i128
+        // signature permits negative values from tests or malformed
+        // peer events, and a naive `as u64` cast would wrap a negative
+        // ms into `u64::MAX`-adjacent — making the event appear newer
+        // than any prior recorded ordinal and slipping past the LWW
+        // guard. Cursor R6 Medium.
+        if event_hlc_ms < 0 {
+            return;
+        }
         let event_ord = (event_hlc_ms as u64, event_hlc_logical);
         if matches!(self.last_event_ordinal, Some(last) if event_ord <= last) {
             return;
@@ -1327,6 +1338,31 @@ mod tests {
                                                       // decay, plus zero active charge.
         let expected2 = s2.accumulated_conviction_q32;
         assert_eq!(result2, expected2);
+    }
+
+    #[test]
+    fn negative_event_hlc_dropped_does_not_wrap_lww_guard() {
+        // Cursor R6 Medium: a negative i128 `event_hlc_ms` cast through
+        // `as u64` would wrap to ~u64::MAX, making a stale event appear
+        // newer than any prior ordinal and bypassing the LWW guard.
+        // apply_signal must reject negative wall-times before that cast.
+        let mut s = VoterConvictionState::default();
+        // First, a legitimate Signal at wall_ms=100.
+        s.apply_signal(true, 100, 0, TEST_HL);
+        let baseline = s.clone();
+
+        // A negative-wall-ms Signal must be a no-op — neither bump the
+        // LWW high-water mark nor toggle is_supporting.
+        s.apply_signal(false, -1, 0, TEST_HL);
+        assert_eq!(s, baseline, "negative event_hlc_ms must not mutate state");
+
+        // And without the guard, the wrapped ordinal (u64::MAX, 0)
+        // would have passed the freshness check; a follow-up legitimate
+        // event at wall_ms=200 must still be applied (proves the
+        // guard didn't poison the ordinal).
+        s.apply_signal(false, 200, 0, TEST_HL);
+        assert!(!s.is_supporting);
+        assert_eq!(s.last_event_ordinal, Some((200, 0)));
     }
 
     // -------- Tier2ProposalState --------
