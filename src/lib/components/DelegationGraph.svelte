@@ -140,6 +140,15 @@
       .alpha(0.9)
       .on('tick', () => {
         tickN += 1;
+        // d3 mutates SimNode objects in place; reassign the array
+        // references with `.slice()` so Svelte 5 sees the change and
+        // re-runs the keyed {#each} bodies (reusing existing keyed
+        // DOM elements — only attributes re-evaluate). The previous
+        // `(tickPulse, expr)` comma-operator trick triggered
+        // state_referenced_locally and did NOT actually create
+        // reactive dependency tracking on attribute expressions.
+        simNodes = simNodes.slice();
+        simEdges = simEdges.slice();
       });
   }
 
@@ -213,18 +222,10 @@
     return { x: tx - (dx / len) * NODE_RADIUS, y: ty - (dy / len) * NODE_RADIUS };
   }
 
-  // Tick-driven attribute reactivity helper: returns a value derived
-  // from tickN that we can reference inside SVG attribute expressions.
-  // Cursor R2 #1: wrapping the whole node/edge list in `{#key tickN}`
-  // would destroy + recreate every <line> / <circle> / <text> element
-  // on every tick (~300 ticks per layout = tens of thousands of DOM
-  // teardowns at 100 nodes). Referencing this in attributes triggers
-  // attribute-level reactive updates without element teardown.
-  let tickPulse = $derived(tickN);
-  // Suppress unused-binding warning when the template doesn't read it
-  // directly (some attribute expressions consume the dependency via a
-  // throwaway comma operator below).
-  void tickPulse;
+  // Tick-driven reactivity: the d3 tick handler reassigns simNodes /
+  // simEdges with `.slice()` so the keyed {#each} re-renders attribute
+  // values (existing elements are reused via the address key — no
+  // full destroy/recreate per tick, which `{#key tickN}` would do).
 </script>
 
 <section class="delegation-graph" aria-label="Delegation graph">
@@ -255,7 +256,7 @@
         </marker>
       </defs>
       {#each simEdges as edge (edge.id)}
-        {@const sx = (tickPulse, (edge.source as SimNode).x ?? 0)}
+        {@const sx = (edge.source as SimNode).x ?? 0}
         {@const sy = (edge.source as SimNode).y ?? 0}
         {@const tx = (edge.target as SimNode).x ?? 0}
         {@const ty = (edge.target as SimNode).y ?? 0}
@@ -272,7 +273,7 @@
       {#each simNodes as node (node.address)}
         <g
           class="dg-node-group"
-          transform={`translate(${(tickPulse, node.x ?? 0)}, ${node.y ?? 0})`}
+          transform={`translate(${node.x ?? 0}, ${node.y ?? 0})`}
         >
           <circle
             class={node.isLocal ? 'dg-node dg-node-local' : 'dg-node'}

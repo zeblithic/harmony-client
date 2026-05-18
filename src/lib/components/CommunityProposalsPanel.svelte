@@ -220,7 +220,13 @@
 </script>
 
 <section class="community-proposals" aria-label="Community proposals">
-  <DelegationWidget {communityId} {adapter} {myAddr} {communityMembers} />
+  <DelegationWidget
+    {communityId}
+    {adapter}
+    {myAddr}
+    {communityMembers}
+    currentDelegate={myDelegate}
+  />
 
   <details class="dg-section" bind:open={graphOpen}>
     <summary>Delegation graph</summary>

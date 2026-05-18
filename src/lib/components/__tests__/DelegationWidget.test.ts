@@ -1,20 +1,17 @@
 /**
  * ZEB-292 Phase 3 — DelegationWidget vitest coverage.
  *
- * Patches VotingAdapter methods + the subscribeDelegationChanged
- * handler so we can drive the widget through DOM interactions and
- * synthesize delegation-changed events without standing up a real
- * Tauri adapter.
+ * Widget is a pure render+actions surface: the parent
+ * (CommunityProposalsPanel) owns the `currentDelegate` state and
+ * passes it as a prop. The widget only fires set/revoke IPCs and
+ * renders the picker / confirmation dialogs.
  */
 import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import DelegationWidget from '../DelegationWidget.svelte';
 import { VotingAdapter } from '../../voting-adapter';
 import type { CommunityMember } from '../../types';
-import type {
-  Tier2ProposalExport,
-  VotingDelegationChangedPayload,
-} from '../../types/voting';
+import type { Tier2ProposalExport } from '../../types/voting';
 
 const COMMUNITY_ID = 'bb'.repeat(16);
 const ME = 'aa'.repeat(16);
@@ -45,11 +42,9 @@ function makeProposal(overrides: Partial<Tier2ProposalExport> = {}): Tier2Propos
 
 describe('DelegationWidget', () => {
   let adapter: VotingAdapter;
-  let getMyDelegateMock: ReturnType<typeof vi.fn<(cid: string) => Promise<string | null>>>;
   let delegateMock: ReturnType<typeof vi.fn<(cid: string, d: string) => Promise<void>>>;
   let undelegateMock: ReturnType<typeof vi.fn<(cid: string) => Promise<void>>>;
   let listProposalsMock: ReturnType<typeof vi.fn<(cid: string) => Promise<Tier2ProposalExport[]>>>;
-  let delegationChangedHandlers: Array<(p: VotingDelegationChangedPayload) => void>;
 
   const members: CommunityMember[] = [
     makeMember(ME, 'me'),
@@ -59,10 +54,6 @@ describe('DelegationWidget', () => {
 
   beforeEach(() => {
     adapter = new VotingAdapter();
-    delegationChangedHandlers = [];
-    getMyDelegateMock = vi
-      .fn<(cid: string) => Promise<string | null>>()
-      .mockResolvedValue(null);
     delegateMock = vi
       .fn<(cid: string, d: string) => Promise<void>>()
       .mockResolvedValue(undefined);
@@ -72,41 +63,49 @@ describe('DelegationWidget', () => {
     listProposalsMock = vi
       .fn<(cid: string) => Promise<Tier2ProposalExport[]>>()
       .mockResolvedValue([]);
-    adapter.getMyDelegate = getMyDelegateMock;
     adapter.delegateTier2 = delegateMock;
     adapter.undelegateTier2 = undelegateMock;
     adapter.listTier2Proposals = listProposalsMock;
-    adapter.subscribeDelegationChanged = (h) => {
-      delegationChangedHandlers.push(h);
-      return () => {
-        const i = delegationChangedHandlers.indexOf(h);
-        if (i >= 0) delegationChangedHandlers.splice(i, 1);
-      };
-    };
   });
 
-  it('renders "Voting directly" when caller has no delegate', async () => {
-    getMyDelegateMock.mockResolvedValueOnce(null);
+  it('renders "Voting directly" when currentDelegate is null', () => {
     render(DelegationWidget, {
-      props: { communityId: COMMUNITY_ID, adapter, myAddr: ME, communityMembers: members },
+      props: {
+        communityId: COMMUNITY_ID,
+        adapter,
+        myAddr: ME,
+        communityMembers: members,
+        currentDelegate: null,
+      },
     });
-    expect(await screen.findByText(/voting directly/i)).toBeInTheDocument();
+    expect(screen.getByText(/voting directly/i)).toBeInTheDocument();
   });
 
-  it('renders the delegate display name when caller has a delegate', async () => {
-    getMyDelegateMock.mockResolvedValueOnce(BOB);
+  it('renders the delegate display name when currentDelegate is set', () => {
     render(DelegationWidget, {
-      props: { communityId: COMMUNITY_ID, adapter, myAddr: ME, communityMembers: members },
+      props: {
+        communityId: COMMUNITY_ID,
+        adapter,
+        myAddr: ME,
+        communityMembers: members,
+        currentDelegate: BOB,
+      },
     });
-    await waitFor(() => {
-      expect(screen.getByText('bob')).toBeInTheDocument();
-    });
+    // The picker `<option>` also contains "bob"; assert on the
+    // status-line `<strong>` specifically so we don't match the
+    // option element by accident.
+    expect(screen.getByText('Delegated to', { exact: false })).toHaveTextContent('bob');
   });
 
   it('delegate-on-pick fires delegateTier2 IPC with the picked address', async () => {
-    getMyDelegateMock.mockResolvedValueOnce(null);
     render(DelegationWidget, {
-      props: { communityId: COMMUNITY_ID, adapter, myAddr: ME, communityMembers: members },
+      props: {
+        communityId: COMMUNITY_ID,
+        adapter,
+        myAddr: ME,
+        communityMembers: members,
+        currentDelegate: null,
+      },
     });
     const select = (await screen.findByLabelText(/delegate to/i)) as HTMLSelectElement;
     await fireEvent.change(select, { target: { value: BOB } });
@@ -117,12 +116,17 @@ describe('DelegationWidget', () => {
   });
 
   it('revoke with no active proposals shows the click-confirm bar', async () => {
-    getMyDelegateMock.mockResolvedValueOnce(BOB);
     listProposalsMock.mockResolvedValueOnce([]);
     render(DelegationWidget, {
-      props: { communityId: COMMUNITY_ID, adapter, myAddr: ME, communityMembers: members },
+      props: {
+        communityId: COMMUNITY_ID,
+        adapter,
+        myAddr: ME,
+        communityMembers: members,
+        currentDelegate: BOB,
+      },
     });
-    await fireEvent.click(await screen.findByText(/revoke delegation/i));
+    await fireEvent.click(screen.getByText(/revoke delegation/i));
     expect(
       await screen.findByRole('alertdialog', { name: /confirm revoke/i }),
     ).toBeInTheDocument();
@@ -133,15 +137,20 @@ describe('DelegationWidget', () => {
   });
 
   it('revoke with high-participation active proposal shows typed-confirm', async () => {
-    getMyDelegateMock.mockResolvedValueOnce(BOB);
     // 3 voters of 10 total supply = 30% participation, > 25% threshold.
     listProposalsMock.mockResolvedValueOnce([
       makeProposal({ lifecycle: 'Open', total_supply: 10, voter_count: 3 }),
     ]);
     render(DelegationWidget, {
-      props: { communityId: COMMUNITY_ID, adapter, myAddr: ME, communityMembers: members },
+      props: {
+        communityId: COMMUNITY_ID,
+        adapter,
+        myAddr: ME,
+        communityMembers: members,
+        currentDelegate: BOB,
+      },
     });
-    await fireEvent.click(await screen.findByText(/revoke delegation/i));
+    await fireEvent.click(screen.getByText(/revoke delegation/i));
     const dialog = await screen.findByRole('alertdialog', { name: /type-to-confirm revoke/i });
     expect(dialog).toBeInTheDocument();
     // Typing wrong word should NOT enable the confirm button.
@@ -156,58 +165,7 @@ describe('DelegationWidget', () => {
     });
   });
 
-  it('voting-delegation-changed event for the local user triggers a refetch', async () => {
-    getMyDelegateMock.mockResolvedValueOnce(null);
-    render(DelegationWidget, {
-      props: { communityId: COMMUNITY_ID, adapter, myAddr: ME, communityMembers: members },
-    });
-    // Wait for the initial mount load to flush.
-    await waitFor(() => {
-      expect(getMyDelegateMock).toHaveBeenCalledTimes(1);
-    });
-    getMyDelegateMock.mockResolvedValueOnce(BOB);
-    // Synthesize a delegation-changed event affecting the local user.
-    for (const h of delegationChangedHandlers) {
-      h({ communityId: COMMUNITY_ID, delegator: ME, delegate: BOB });
-    }
-    await waitFor(() => {
-      expect(getMyDelegateMock).toHaveBeenCalledTimes(2);
-    });
-  });
-
-  it('voting-delegation-changed for a different community is ignored', async () => {
-    getMyDelegateMock.mockResolvedValueOnce(null);
-    render(DelegationWidget, {
-      props: { communityId: COMMUNITY_ID, adapter, myAddr: ME, communityMembers: members },
-    });
-    await waitFor(() => {
-      expect(getMyDelegateMock).toHaveBeenCalledTimes(1);
-    });
-    for (const h of delegationChangedHandlers) {
-      h({ communityId: 'ee'.repeat(16), delegator: ME, delegate: BOB });
-    }
-    // Allow a few microtasks to flush.
-    await new Promise((r) => setTimeout(r, 5));
-    expect(getMyDelegateMock).toHaveBeenCalledTimes(1);
-  });
-
-  it('voting-delegation-changed for an unrelated user is ignored', async () => {
-    getMyDelegateMock.mockResolvedValueOnce(null);
-    render(DelegationWidget, {
-      props: { communityId: COMMUNITY_ID, adapter, myAddr: ME, communityMembers: members },
-    });
-    await waitFor(() => {
-      expect(getMyDelegateMock).toHaveBeenCalledTimes(1);
-    });
-    for (const h of delegationChangedHandlers) {
-      h({ communityId: COMMUNITY_ID, delegator: CAROL, delegate: BOB });
-    }
-    await new Promise((r) => setTimeout(r, 5));
-    expect(getMyDelegateMock).toHaveBeenCalledTimes(1);
-  });
-
-  it('member picker excludes the caller and non-joined members', async () => {
-    getMyDelegateMock.mockResolvedValueOnce(null);
+  it('member picker excludes the caller and non-joined members', () => {
     render(DelegationWidget, {
       props: {
         communityId: COMMUNITY_ID,
@@ -218,9 +176,9 @@ describe('DelegationWidget', () => {
           makeMember(BOB, 'bob'),
           { ...makeMember(CAROL, 'carol'), status: 'banned' },
         ],
+        currentDelegate: null,
       },
     });
-    await screen.findByText(/voting directly/i);
     const select = screen.getByLabelText(/delegate to/i) as HTMLSelectElement;
     const opts = Array.from(select.options).map((o) => o.value);
     expect(opts).toContain(BOB);

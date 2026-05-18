@@ -35,6 +35,7 @@
     adapter,
     myAddr,
     communityMembers,
+    currentDelegate,
   }: {
     /** Hex SpaceId of the community. */
     communityId: string;
@@ -44,9 +45,14 @@
     myAddr: string;
     /** Full community member roster for the picker + name resolution. */
     communityMembers: CommunityMember[];
+    /** Caller's current Tier 2 delegate (32-char hex) or null. Owned
+     *  by the parent so it can also drive the per-proposal override
+     *  affordance in ConvictionProposalCard; widget reads this prop
+     *  rather than maintaining a duplicate state + subscription
+     *  (Cursor R6 — was double-IPC + double-subscription). */
+    currentDelegate: string | null;
   } = $props();
 
-  let currentDelegate = $state<string | null>(null);
   let pendingDelegate = $state<string>('');
   let busy = $state(false);
   let error = $state<string | null>(null);
@@ -54,19 +60,12 @@
    *  confirm bar, 'typed' = type-the-word confirm modal. */
   let confirmState = $state<'none' | 'click' | 'typed'>('none');
   let typedInput = $state('');
-  /** Monotonic counter incremented per load; the async resolution
-   *  callback drops its result if the token has been superseded.
-   *  Guards against a community switch landing while a previous
-   *  community's getMyDelegate request is still in flight (CR R1). */
-  let latestLoadToken = 0;
   /** Generation counter bumped every time the $effect re-runs (i.e.,
    *  on every `communityId` change). Async functions in the widget
    *  capture the current generation at entry and discard their
-   *  post-await side effects if the value has advanced. Distinct
-   *  from `latestLoadToken` because that's per-load, this is
-   *  per-community-instance — handles the A→B→A scenario where the
-   *  community id matches the captured value but the user has
-   *  swapped twice (CR R4). */
+   *  post-await side effects if the value has advanced. Catches the
+   *  A→B→A swap scenario where the community id matches the captured
+   *  value but the user has swapped twice (CR R4). */
   let generation = 0;
 
   let delegateName = $derived(
@@ -83,59 +82,27 @@
       .sort((a, b) => (a.displayName ?? a.address).localeCompare(b.displayName ?? b.address)),
   );
 
-  async function loadDelegate() {
-    const token = ++latestLoadToken;
-    try {
-      const next = await adapter.getMyDelegate(communityId);
-      if (token !== latestLoadToken) return;
-      currentDelegate = next;
-      // CR R1: a prior error should clear once a later load succeeds —
-      // otherwise the failure message stays visible even after the
-      // underlying issue resolves.
-      error = null;
-    } catch (e) {
-      if (token !== latestLoadToken) return;
-      error = e instanceof Error ? e.message : String(e);
-    }
-  }
+  // `currentDelegate` is now a prop owned by the parent
+  // (CommunityProposalsPanel) — single source of truth + single IPC
+  // + single voting-delegation-changed subscription (Cursor R6:
+  // panel and widget were each loading/subscribing independently,
+  // double-IPC'ing on every event).
 
   $effect(() => {
-    const cid = communityId;
-    const gen = ++generation;
-    let cancelled = false;
+    // Track communityId so generation bumps on swap. The captured
+    // `cid` value isn't read here but the property access in the
+    // effect body is what registers the dependency.
+    void communityId;
+    ++generation;
     // Cursor R2 #3 / CR R3+R4: reset all transient widget state on
     // community swap so no value lingers that could be applied
-    // against the wrong community. `pendingDelegate` and
-    // `currentDelegate` are the most dangerous — the former could
-    // route Apply to the prior community's selection, the latter
-    // would briefly show the prior community's delegate name (and
-    // make Revoke target the wrong community) until loadDelegate
-    // resolves.
+    // against the wrong community. `pendingDelegate` is the most
+    // dangerous (an Apply click would route to delegateTier2 with
+    // the prior community's selection).
     confirmState = 'none';
     typedInput = '';
     error = null;
     pendingDelegate = '';
-    currentDelegate = null;
-    void (async () => {
-      if (cancelled) return;
-      await loadDelegate();
-    })();
-
-    // Refresh on delegation-changed events affecting OUR outbound
-    // delegation edge — i.e. only when the local user IS the
-    // delegator. `getMyDelegate` returns who we delegate to; a third
-    // party picking us as THEIR delegate (p.delegate === myAddr)
-    // doesn't change that value (Greptile R5 P2).
-    const unsub = adapter.subscribeDelegationChanged((p) => {
-      if (cancelled || gen !== generation || p.communityId !== cid) return;
-      if (p.delegator !== myAddr) return;
-      void loadDelegate();
-    });
-
-    return () => {
-      cancelled = true;
-      unsub();
-    };
   });
 
   async function setDelegate(target: string) {
