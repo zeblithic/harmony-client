@@ -4,7 +4,7 @@
 
 **Goal:** Ship the Tier 2 delegation UI surface so community members can set, change, revoke, and visualize their delegate relationships, with per-proposal override.
 
-**Architecture:** Pure frontend except for three small backend additions — two read IPCs (`voting_get_my_delegate`, `voting_list_delegations`) and two Tauri events (`voting-delegation-changed`, `voting-delegate-signaled-on-your-behalf`). Per-proposal override semantics are already correctly enforced by `total_conviction_at_with_delegation` (verified at branch creation 2026-05-18); we add a backend regression test to pin them, then layer the UI on top. Graph visualization reuses the existing d3-force pattern from `src/lib/components/NetworkGraph.svelte`. Severity-tiered revocation per `feedback_severe_action_confirmation` memory rule.
+**Architecture:** Pure frontend except for four small backend additions — two read IPCs (`voting_get_my_delegate`, `voting_list_delegations`) and two Tauri events (`voting-delegation-changed`, `voting-delegate-signaled-on-your-behalf`). Of the two events, only `voting-delegation-changed` ships in this PR; `voting-delegate-signaled-on-your-behalf` is functionally blocked on the engine-inbound `verify_event` gate ([ZEB-291](https://linear.app/zeblith/issue/ZEB-291) Task 19.1 follow-up) and is filed as [ZEB-298](https://linear.app/zeblith/issue/ZEB-298). Per-proposal override semantics are already correctly enforced by `total_conviction_at_with_delegation` (verified at branch creation 2026-05-18); we add a backend regression test to pin them, then layer the UI on top. Graph visualization reuses the existing d3-force pattern from `src/lib/components/NetworkGraph.svelte`. Severity-tiered revocation per `feedback_severe_action_confirmation` memory rule.
 
 **Tech Stack:** Rust 2021 (Tauri IPC, voting_log apply path, tauri::AppHandle event emission), Svelte 5 (runes), d3-force + d3-selection + d3-zoom (already in `package.json`), vitest for UI tests.
 
@@ -458,7 +458,17 @@ git commit -m "feat(zeb-292-p3): emit voting-delegation-changed on local + inbou
 
 ---
 
-### Task 4: Backend Tauri event — `voting-delegate-signaled-on-your-behalf`
+### Task 4: Backend Tauri event — `voting-delegate-signaled-on-your-behalf` **[DEFERRED to [ZEB-298](https://linear.app/zeblith/issue/ZEB-298)]**
+
+> Functionally blocked on the engine-inbound `verify_event` gate
+> ([ZEB-291](https://linear.app/zeblith/issue/ZEB-291) Task 19.1
+> follow-up). The on-behalf notification is fundamentally cross-peer
+> (signaler's local IPC can't know about delegators on other devices),
+> so the engine apply path is the only correct emit point — and that
+> path is feature-gated production dead code until verify_event is
+> wired. Type stubs + adapter subscriber DO ship in this PR so
+> ZEB-298 can land the engine emit without further frontend changes.
+
 
 **Files:**
 - Modify: `src-tauri/src/community_voting_log.rs` OR `src-tauri/src/community_voting_log_engine.rs` (wherever Signal apply happens)
@@ -520,7 +530,11 @@ git commit -m "feat(zeb-292-p3): emit voting-delegate-signaled-on-your-behalf"
 
 ---
 
-### Task 5: Community-policy `notify_on_delegate_signal` field
+### Task 5: Community-policy `notify_on_delegate_signal` field **[DEFERRED to [ZEB-298](https://linear.app/zeblith/issue/ZEB-298)]**
+
+> Lands with Task 4 since the policy gate is only meaningful once
+> the engine emit point exists.
+
 
 **Files:**
 - Modify: `src-tauri/src/community_voting_core.rs` (CommunityVotingPolicy struct)
@@ -1011,7 +1025,11 @@ git commit -m "feat(zeb-292-p3): per-proposal override affordance in ConvictionP
 
 ---
 
-### Task 10: In-app toast for `voting-delegate-signaled-on-your-behalf`
+### Task 10: In-app toast for `voting-delegate-signaled-on-your-behalf` **[DEFERRED to [ZEB-298](https://linear.app/zeblith/issue/ZEB-298)]**
+
+> Lands with Tasks 4-5 since the toast has nothing to fire on
+> until the underlying event emits.
+
 
 **Files:**
 - Modify or Create: a toast-host component (find existing first: `grep -rn "toast" src/lib/`)
@@ -1061,7 +1079,12 @@ git commit -m "feat(zeb-292-p3): in-app toast for delegate-signaled-on-your-beha
 
 ---
 
-### Task 11: Two-engine integration test — delegation propagates end-to-end
+### Task 11: Two-engine integration test — delegation propagates end-to-end **[DEFERRED to [ZEB-298](https://linear.app/zeblith/issue/ZEB-298)]**
+
+> The cross-peer convergence scenarios this test exercises require
+> the engine-inbound apply path (currently feature-gated dead code).
+> Will land with the verify_event work in ZEB-298.
+
 
 **Files:**
 - Create: `src-tauri/tests/voting_delegation_two_engine_integration.rs`

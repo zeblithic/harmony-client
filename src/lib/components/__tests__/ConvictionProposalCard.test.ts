@@ -234,5 +234,29 @@ describe('ConvictionProposalCard', () => {
       });
       expect(screen.queryByRole('status', { name: /delegate signaling on your behalf/i })).toBeNull();
     });
+
+    it('shows error on Vote directly failure and keeps the pill visible for retry', async () => {
+      signalMock.mockRejectedValueOnce(new Error('voting_signal_tier2: not a member'));
+      render(ConvictionProposalCard, {
+        props: {
+          communityId: COMMUNITY_ID,
+          proposal: makeProposal({ your_signal: undefined }),
+          adapter,
+          myDelegate: DELEGATE,
+          delegateName: 'bob',
+        },
+      });
+      await fireEvent.click(screen.getByRole('button', { name: /vote directly/i }));
+      await waitFor(() => {
+        expect(screen.getByRole('alert').textContent).toContain('voting_signal_tier2: not a member');
+      });
+      // The override pill should still be visible since the optimistic
+      // flip rolls back on error — the caller can retry without losing
+      // the override affordance.
+      expect(
+        screen.getByRole('status', { name: /delegate signaling on your behalf/i }),
+      ).toBeTruthy();
+      expect(screen.getByRole('button', { name: /vote directly/i })).toBeTruthy();
+    });
   });
 });

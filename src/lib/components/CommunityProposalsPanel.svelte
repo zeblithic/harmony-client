@@ -58,6 +58,13 @@
   let proposals = $state<Tier2ProposalExport[] | null>(null);
   let loadError = $state<string | null>(null);
   let loading = $state(false);
+  /** Whether the delegation-graph collapsible is expanded. Bound to
+   *  the <details> element below; the graph component is conditionally
+   *  rendered so its d3-force simulation only runs after the user
+   *  expands the section (Cursor R1: HTML <details> renders children
+   *  regardless of open state — visibility-only via CSS — so the
+   *  simulation would otherwise tick continuously while collapsed). */
+  let graphOpen = $state(false);
   /** ZEB-292 Phase 3: caller's current delegate hex (32 chars) or
    *  null. Loaded on mount and refreshed on every
    *  voting-delegation-changed event for the local user. Passed to
@@ -70,6 +77,11 @@
         `${myDelegate.slice(0, 8)}…`)
       : null,
   );
+  /** Monotonic counter; bumped per load. Resolution callbacks of
+   *  superseded loads drop their results. Guards against a community
+   *  switch landing while a previous refetch / refetchDelegate is
+   *  still in flight (CR R1 outside-diff). */
+  let latestLoadToken = 0;
 
   // New-proposal form state.
   let proposalText = $state('');
@@ -84,15 +96,18 @@
   let canPropose = $derived(myPower >= 1);
 
   async function refetch() {
+    const token = ++latestLoadToken;
     loading = true;
     try {
       const list = await adapter.listTier2Proposals(communityId);
+      if (token !== latestLoadToken) return;
       proposals = list;
       loadError = null;
     } catch (e) {
+      if (token !== latestLoadToken) return;
       loadError = e instanceof Error ? e.message : String(e);
     } finally {
-      loading = false;
+      if (token === latestLoadToken) loading = false;
     }
   }
 
@@ -101,9 +116,13 @@
   // re-loads from scratch (without this, a parent that re-uses this
   // component instance across community switches would show stale data).
   async function refetchDelegate() {
+    const token = latestLoadToken; // share the same token space as refetch
     try {
-      myDelegate = await adapter.getMyDelegate(communityId);
+      const next = await adapter.getMyDelegate(communityId);
+      if (token !== latestLoadToken) return;
+      myDelegate = next;
     } catch {
+      if (token !== latestLoadToken) return;
       // Defensive: a failure to read the delegate just means the
       // override affordance won't render. The proposals list itself
       // is independent.
@@ -199,11 +218,15 @@
 <section class="community-proposals" aria-label="Community proposals">
   <DelegationWidget {communityId} {adapter} {myAddr} {communityMembers} />
 
-  <details class="dg-section">
+  <details class="dg-section" bind:open={graphOpen}>
     <summary>Delegation graph</summary>
-    <!-- Graph mounts on expansion so the d3 simulation doesn't run when
-         the section is collapsed (no benefit, just CPU). -->
-    <DelegationGraph {communityId} {adapter} {myAddr} {communityMembers} />
+    {#if graphOpen}
+      <!-- {#if} guard: <details> renders children regardless of `open`
+           (CSS-only visibility), so without this the d3-force
+           simulation would tick while collapsed. Conditional render
+           defers mount until the user expands. -->
+      <DelegationGraph {communityId} {adapter} {myAddr} {communityMembers} />
+    {/if}
   </details>
 
   {#if canPropose}

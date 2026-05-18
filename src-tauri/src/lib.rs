@@ -18491,9 +18491,11 @@ pub struct VotingTier2SignalCastPayload {
 }
 
 /// ZEB-292 Phase 3: Tauri event payload for `"voting-delegation-changed"`.
-/// `delegate` is None on Undelegate. Fired by the local IPC and also by
-/// the engine's inbound apply path so the UI refreshes regardless of
-/// whether the change originated locally or arrived from a peer.
+/// `delegate` is None on Undelegate. Currently fired only from the
+/// local `voting_delegate_tier2` / `voting_undelegate_tier2` IPCs; the
+/// engine-inbound emit point is deferred to ZEB-298 (gated on the
+/// ZEB-291 Task 19.1 verify_event wiring that unblocks the peer-event
+/// apply path).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VotingDelegationChangedPayload {
@@ -18914,9 +18916,10 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
     }
 
     // ZEB-292 Phase 3: surface the delegation change to the local UI so
-    // DelegationWidget + DelegationGraph refresh without polling. Inbound
-    // peer Delegate events are emitted from the voting_log_engine apply
-    // path (separate code path; same event shape).
+    // DelegationWidget + DelegationGraph refresh without polling. The
+    // engine-inbound emit point (for peer-originated Delegate events)
+    // is deferred to ZEB-298, gated on the ZEB-291 Task 19.1 verify_event
+    // wiring that unblocks the inbound apply path.
     let payload = VotingDelegationChangedPayload {
         community_id: community_id.clone(),
         delegator: hex::encode(self_owner.0),

@@ -54,6 +54,11 @@
    *  confirm bar, 'typed' = type-the-word confirm modal. */
   let confirmState = $state<'none' | 'click' | 'typed'>('none');
   let typedInput = $state('');
+  /** Monotonic counter incremented per load; the async resolution
+   *  callback drops its result if the token has been superseded.
+   *  Guards against a community switch landing while a previous
+   *  community's getMyDelegate request is still in flight (CR R1). */
+  let latestLoadToken = 0;
 
   let delegateName = $derived(
     currentDelegate
@@ -70,9 +75,17 @@
   );
 
   async function loadDelegate() {
+    const token = ++latestLoadToken;
     try {
-      currentDelegate = await adapter.getMyDelegate(communityId);
+      const next = await adapter.getMyDelegate(communityId);
+      if (token !== latestLoadToken) return;
+      currentDelegate = next;
+      // CR R1: a prior error should clear once a later load succeeds —
+      // otherwise the failure message stays visible even after the
+      // underlying issue resolves.
+      error = null;
     } catch (e) {
+      if (token !== latestLoadToken) return;
       error = e instanceof Error ? e.message : String(e);
     }
   }
@@ -146,7 +159,12 @@
         }
       }
       return 'click';
-    } catch {
+    } catch (e) {
+      // Per the project's Tauri-error-extraction convention: surface a
+      // readable failure message rather than swallowing the error
+      // silently. We still fall back to 'typed' so the user gets an
+      // extra warning if proposal state is unreadable (CR R1).
+      error = e instanceof Error ? e.message : String(e);
       return 'typed';
     }
   }

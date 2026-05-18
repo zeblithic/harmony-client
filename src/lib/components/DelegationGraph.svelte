@@ -84,8 +84,11 @@
 
   /** Map address → display name; falls back to short hex when the
    *  member is unknown (e.g. delegate present in graph but no longer
-   *  in the member roster — race during a kick/leave). */
-  let nameByAddr = $derived(() => {
+   *  in the member roster — race during a kick/leave). $derived.by
+   *  (not $derived) because the expression is a multi-statement
+   *  function literal, not a bare value — $derived(fn) stores the
+   *  function itself and skips reactivity (Cursor R1). */
+  let nameByAddr = $derived.by(() => {
     const m = new Map<string, string>();
     for (const member of communityMembers) {
       m.set(member.address, member.displayName ?? `${member.address.slice(0, 8)}…`);
@@ -111,7 +114,7 @@
     }
     const nodes: SimNode[] = Array.from(addrSet).map((addr) => ({
       address: addr,
-      displayName: nameByAddr().get(addr) ?? `${addr.slice(0, 8)}…`,
+      displayName: nameByAddr.get(addr) ?? `${addr.slice(0, 8)}…`,
       isLocal: addr === myAddr,
     }));
     const nodeByAddr = new Map(nodes.map((n) => [n.address, n]));
@@ -161,6 +164,16 @@
   $effect(() => {
     const cid = communityId;
     let cancelled = false;
+    // CR R1: reset state synchronously on community swap so the
+    // previous community's nodes don't briefly render against the new
+    // community's name lookup while the new fetch is in flight.
+    edges = [];
+    simNodes = [];
+    simEdges = [];
+    if (simulation) {
+      simulation.stop();
+      simulation = null;
+    }
     void (async () => {
       if (cancelled) return;
       await refetch();
