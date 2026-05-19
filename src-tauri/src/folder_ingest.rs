@@ -11,10 +11,9 @@
 //! `symlink_metadata` checks the file type before any recursion or `read`,
 //! so a symlinked directory cannot loop the walker.
 //!
-//! Files larger than `FLAT_BUNDLE_MAX` are skipped with a count rather than
-//! failed — ZEB-161 (nested bundles) is the planned successor that lifts the
-//! cap; until then, oversized files surface in the summary modal under their
-//! own bucket.
+//! Every leaf file is streamed through the FastCDC chunker + nested-bundle
+//! tree builder (ZEB-161), regardless of size; the per-leaf size cap that
+//! preceded streaming is gone.
 //!
 //! Cancellation is best-effort: the walker checks the shared `AtomicBool` at
 //! the top of every recursive call and the top of every per-child loop
@@ -34,7 +33,6 @@ use tauri::{AppHandle, Emitter, Runtime};
 use crate::content_index::{ContentIndex, ContentKind};
 use crate::event_loop::IngestRequest;
 use crate::folders::ManifestEntry;
-use crate::{send_ingest_bytes_only, FLAT_BUNDLE_MAX};
 
 /// Cap on individually-listed failed entries in the summary. Walks that
 /// exceed this bound roll up the rest under `overflow_count`; the modal
@@ -155,9 +153,9 @@ pub fn should_filter_name(name: &str) -> bool {
 
 /// Cheap pre-walk that counts non-filtered leaf files under `root`. Used
 /// to populate the progress event's `total` field so the modal can render
-/// a determinate bar. Skips files larger than `FLAT_BUNDLE_MAX` so the
-/// count matches what the actual walker will settle (oversized files are
-/// `Skipped`, not `Succeeded`).
+/// a determinate bar. Every regular file is counted — ZEB-161's streaming
+/// pipeline handles arbitrary file sizes, so there is no per-leaf size cap
+/// to apply here.
 ///
 /// Returns `None` on any I/O error so the IPC can ship `total = -1` to the
 /// frontend without aborting the actual walk. Symlinks are not followed
@@ -192,7 +190,7 @@ fn pre_walk_count(root: &Path) -> Option<u64> {
                 let Ok(entry) = entry_res else { continue };
                 stack.push(entry.path());
             }
-        } else if metadata.is_file() && metadata.len() <= FLAT_BUNDLE_MAX {
+        } else if metadata.is_file() {
             total += 1;
         }
     }
@@ -540,42 +538,23 @@ fn walk<'a, R: Runtime>(
                 }
             }
         } else if metadata.is_file() {
-            // Cheap oversized pre-check from metadata. The capped read
-            // below is the authoritative gate — a file that grows past
-            // the cap between stat and read is rejected by the read
-            // limit (Bot finding 9: TOCTOU).
-            if metadata.len() > FLAT_BUNDLE_MAX {
-                counters.skipped.oversized = counters.skipped.oversized.saturating_add(1);
-                return WalkOutcome::Skipped;
-            }
-            // Capped read: `take(FLAT_BUNDLE_MAX + 1)` lets us distinguish
-            // "exactly at cap" (allowed) from "grew past cap mid-read"
-            // (rejected). Without the cap a file that doubled in size
-            // between stat and read would allocate the full grown size
-            // into a Vec.
-            use tokio::io::AsyncReadExt;
-            let mut file = match tokio::fs::File::open(path).await {
+            // Stream the leaf through the FastCDC chunker (ZEB-161): memory
+            // is bounded by the chunker buffer (~1 MiB) regardless of file
+            // size. CRITICAL: no per-leaf sidecar entry — leaves live in the
+            // parent folder's manifest only; a per-leaf sidecar here would
+            // pollute the root listing (ZEB-163 task 2 invariant).
+            use harmony_content::chunker::ChunkerConfig;
+            let file = match tokio::fs::File::open(path).await {
                 Ok(f) => f,
                 Err(e) => return WalkOutcome::Failed(format!("open: {e}")),
             };
-            let max_plus_one = FLAT_BUNDLE_MAX.saturating_add(1);
-            let mut bytes = Vec::new();
-            if let Err(e) = (&mut file).take(max_plus_one).read_to_end(&mut bytes).await {
-                return WalkOutcome::Failed(format!("read: {e}"));
-            }
-            if (bytes.len() as u64) > FLAT_BUNDLE_MAX {
-                counters.skipped.oversized = counters.skipped.oversized.saturating_add(1);
-                return WalkOutcome::Skipped;
-            }
-            // CRITICAL: bytes-only — no sidecar entry. Leaves live in the
-            // parent folder's manifest only; a per-leaf sidecar here would
-            // pollute the root listing (see send_ingest_bytes_only docs).
-            match send_ingest_bytes_only(&ctx.ingest_tx, bytes, name.clone()).await {
-                Ok(cid_bytes) => {
+            let reader = tokio::io::BufReader::new(file);
+            match crate::streaming_ingest(reader, &ctx.ingest_tx, ChunkerConfig::DEFAULT).await {
+                Ok(root) => {
                     counters.succeeded = counters.succeeded.saturating_add(1);
                     ctx.emit_progress(counters, path);
                     WalkOutcome::Ingested(ManifestEntry {
-                        cid: cid_bytes,
+                        cid: root.to_bytes(),
                         name,
                         kind: ContentKind::Leaf,
                     })
@@ -639,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_walk_counts_only_non_filtered_under_cap() {
+    fn pre_walk_counts_only_non_filtered_leaves() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("a.txt"), b"a").expect("write");
         std::fs::write(dir.path().join("b.txt"), b"b").expect("write");

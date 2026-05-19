@@ -305,11 +305,11 @@ async fn ingest_list_pin_burn_roundtrip() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
-    use harmony_app::chunk_and_bundle;
     use harmony_app::content_index::{self, ContentIndexEntry, ReplicationTier, Sensitivity};
     use harmony_app::event_loop::{ContentVerbRequest, IngestRequest};
-    use harmony_content::bundle;
-    use harmony_content::cid::{CidType, ContentId};
+    use harmony_app::streaming_ingest;
+    use harmony_content::chunker::ChunkerConfig;
+    use harmony_content::cid::CidType;
     use std::collections::HashSet;
 
     // ── Harness setup (copied verbatim from ingest_list_pin_burn_roundtrip) ──
@@ -463,46 +463,73 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
         Err(_) => panic!("event loop dropped ready signal"),
     }
 
-    // ── Step 1: Generate 3 MiB deterministic bytes and chunk them ─────
+    // ── Step 1: Generate 3 MiB deterministic bytes and stream-ingest ──
     let bytes: Vec<u8> = (0..3 * 1024 * 1024)
         .map(|i| ((i * 37) % 251) as u8)
         .collect();
-    let (leaves, bundle_payload, root_cid) = chunk_and_bundle(&bytes).expect("chunking");
-    let leaf_cids: Vec<ContentId> = leaves.iter().map(|(c, _)| *c).collect();
-    let expected_descendants: HashSet<[u8; 32]> = std::iter::once(root_cid.to_bytes())
-        .chain(leaf_cids.iter().map(|c| c.to_bytes()))
-        .collect();
+
+    // Wrap `ingest_tx` in a forwarding channel that records every (cid_hex,
+    // data_len) it sees on its way to the runtime. Lets the test recompute
+    // `expected_descendants` (root + every leaf + every interior bundle)
+    // from the actual stream rather than depending on a re-walk of the
+    // ingested bundle tree. Captured pairs are kept in `captured_cids`,
+    // shared with the forwarder task via Arc<Mutex<_>>.
+    let captured_cids: Arc<Mutex<Vec<[u8; 32]>>> = Arc::new(Mutex::new(Vec::new()));
+    let (capture_tx, mut capture_rx) = mpsc::channel::<IngestRequest>(4);
+    let forwarder_real_tx = ingest_tx.clone();
+    let forwarder_captured = captured_cids.clone();
+    let forwarder = tokio::spawn(async move {
+        while let Some(req) = capture_rx.recv().await {
+            // Record the CID this send is for.
+            let cid_bytes = ::hex::decode(&req.cid_hex)
+                .ok()
+                .and_then(|v| v.try_into().ok())
+                .expect("forwarder: cid_hex must decode to 32 bytes");
+            forwarder_captured.lock().unwrap().push(cid_bytes);
+            // Forward to the real ingest channel and await its ack so the
+            // streaming caller sees backpressure consistent with the
+            // event-loop's response time.
+            let (ack_tx, ack_rx) = oneshot::channel();
+            forwarder_real_tx
+                .send(IngestRequest {
+                    cid_hex: req.cid_hex,
+                    data: req.data,
+                    reply: ack_tx,
+                })
+                .await
+                .expect("forward to event loop");
+            let ack = ack_rx.await.expect("event loop ack");
+            let _ = req.reply.send(ack);
+        }
+    });
+
+    let root_cid = streaming_ingest(bytes.as_slice(), &capture_tx, ChunkerConfig::DEFAULT)
+        .await
+        .expect("streaming ingest must succeed");
+    drop(capture_tx);
+    forwarder.await.expect("forwarder task joins cleanly");
+
     assert!(
         matches!(root_cid.cid_type(), CidType::Bundle(_)),
         "precondition: root must be a bundle"
     );
-    assert!(leaves.len() >= 3, "3 MiB input should chunk to >= 3 leaves");
 
-    // ── Step 2: Ingest every leaf + the bundle through the event loop ─
-    for (leaf_cid, leaf_data) in &leaves {
-        let (ack_tx, ack_rx) = oneshot::channel();
-        ingest_tx
-            .send(IngestRequest {
-                cid_hex: hex::encode(leaf_cid.to_bytes()),
-                data: leaf_data.to_vec(),
-                reply: ack_tx,
-            })
-            .await
-            .unwrap();
-        ack_rx.await.unwrap().expect("leaf ingest ok");
-    }
-    {
-        let (ack_tx, ack_rx) = oneshot::channel();
-        ingest_tx
-            .send(IngestRequest {
-                cid_hex: hex::encode(root_cid.to_bytes()),
-                data: bundle_payload.clone(),
-                reply: ack_tx,
-            })
-            .await
-            .unwrap();
-        ack_rx.await.unwrap().expect("bundle ingest ok");
-    }
+    // `expected_descendants` is the set of every CID streaming_ingest
+    // pushed through the channel — leaves + every interior bundle + root.
+    // For a 3 MiB / 256 KiB-min-chunk input this is depth-1 (≤16 leaves),
+    // so the count is leaf_count + 1 (root bundle). The Pin verb is
+    // expected to cascade across exactly this set.
+    let expected_descendants: HashSet<[u8; 32]> =
+        captured_cids.lock().unwrap().iter().copied().collect();
+    assert!(
+        expected_descendants.contains(&root_cid.to_bytes()),
+        "captured set must include the root CID"
+    );
+    assert!(
+        expected_descendants.len() >= 4,
+        "3 MiB input should produce >= 3 leaves + root bundle (got {})",
+        expected_descendants.len()
+    );
 
     // ── Step 3: Sidecar insert for the root CID ───────────────────────
     let index = Arc::new(Mutex::new(content_index::ContentIndex::load(&app_data_dir)));
@@ -556,28 +583,14 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
         "Pin should cascade to root + every leaf"
     );
 
-    // ── Step 6: Reassembly assertion via the already-chunked bytes ────
-    // The integration harness doesn't exercise Zenoh-backed fetch; this
-    // test verifies (a) that leaves in bundle-child order reassemble to
-    // the original, and (b) that the bundle payload round-trips via
-    // parse_bundle — i.e., the data we just ingested can be correctly
-    // reconstructed by the fetch_recursive algorithm. Actual
-    // fetch_via_zenoh exercise is ZEB-150 E2E.
-    let reassembled: Vec<u8> = leaves
-        .iter()
-        .flat_map(|(_, data)| data.iter().copied())
-        .collect();
-    assert_eq!(
-        reassembled, bytes,
-        "concatenated leaves must equal original"
-    );
-
-    let parsed_children = bundle::parse_bundle(&bundle_payload).unwrap();
-    assert_eq!(
-        parsed_children.to_vec(),
-        leaf_cids,
-        "bundle payload must parse back to the same leaf CIDs in order"
-    );
+    // ── Step 6: Sanity — streaming ingest produced a valid tree ──────
+    // The pre-ZEB-161 test reassembled bytes from the local `leaves` /
+    // `bundle_payload` returned by `chunk_and_bundle`. The streaming
+    // pipeline doesn't return those buffers; reassembly correctness for
+    // the chunker+tree-builder is covered by the unit tests in
+    // `streaming_ingest_tests` (single-shot vs. multi-feed equivalence)
+    // and ZEB-161 Task 5 lands a deeper depth-2 nested-bundle round-trip
+    // here. No fetch_via_zenoh exercise; that's ZEB-150 E2E.
 
     // ── Step 7: Burn root — expect cascade unpin ──────────────────────
     let (reply_tx, reply_rx) = oneshot::channel();
