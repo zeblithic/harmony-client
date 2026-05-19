@@ -3,6 +3,7 @@
   import { MintService } from '../mint-service';
   import type { Transaction, Account } from '../mint-types';
   import MintTransactionTable from './MintTransactionTable.svelte';
+  import MintTransactionDialog from './MintTransactionDialog.svelte';
 
   let { adapter }: { adapter: TauriAdapter } = $props();
 
@@ -99,7 +100,17 @@
     />
   {/if}
 
-  <!-- Add/Edit dialog: rendered in Task 8 -->
+  {#if showAddEdit}
+    <MintTransactionDialog
+      {service}
+      {accounts}
+      {defaultCurrency}
+      editingId={editingTxId}
+      onClose={() => { showAddEdit = false; editingTxId = null; }}
+      onSaved={load}
+    />
+  {/if}
+
   <!-- Account manager dialog: rendered in Task 9 -->
 </section>
 
