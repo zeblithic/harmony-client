@@ -22591,6 +22591,199 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
     Ok(())
 }
 
+/// Tauri IPC: committee member produces their FROST signing-nonce
+/// commitment for a VRF beacon. Computes `message_hash =
+/// derive_vrf_seed(seed, epoch)`, runs `frost::round1::commit` (which
+/// returns secret `SigningNonces` + public `SigningCommitments`), then
+/// builds + signs a `ts` event carrying the public commitments with an
+/// empty share. After `apply_with_identity` materialises
+/// `pending_sign[ceremony_id]`, the secret nonces are stashed on
+/// `PendingSignSession.local_nonces` for the follow-up
+/// `dfrost_contribute_threshold_sign` IPC (Task 5) to retrieve and feed
+/// into `frost::round2::sign`.
+///
+/// `ceremony_id` is derived deterministically from
+/// `(community_id, epoch, seed_bytes)` so every committee member that
+/// independently observes the same beacon trigger materialises the
+/// same `pending_sign` key — no separate coordination event needed.
+///
+/// Returns the hex-encoded ceremony_id.
+///
+/// Out of scope (Phase 4a-foundation): Zenoh broadcast of the `ts`
+/// event to peer committee members (Phase 4a-main wires `dfrost` topic).
+#[tauri::command]
+async fn dfrost_request_vrf_beacon<R: tauri::Runtime>(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    app: tauri::AppHandle<R>,
+    community_id: String,
+    seed_hex: String,
+    epoch: u64,
+) -> Result<String, String> {
+    // The `vb` event emit on quorum is the job of
+    // `dfrost_contribute_threshold_sign`; this IPC just stashes nonces +
+    // applies the round-1 commitment locally. AppHandle accepted for
+    // signature uniformity with the rest of the dfrost IPC surface.
+    let _ = app;
+
+    // 1. Decode hex args.
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("dfrost_request_vrf_beacon: invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "dfrost_request_vrf_beacon: community_id must be 16 bytes (32 hex chars)".to_string()
+        })?;
+    let space_id = crate::owner_state_types::SpaceId(cid_bytes);
+
+    let seed_bytes: [u8; 32] = hex::decode(&seed_hex)
+        .map_err(|e| format!("dfrost_request_vrf_beacon: invalid seed hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "dfrost_request_vrf_beacon: seed must be 32 bytes (64 hex chars)".to_string()
+        })?;
+
+    // 2. Extract NodeState handles. No community_registry needed: a `ts`
+    //    event does NOT seal to per-recipient X25519 pubkeys (the
+    //    commitments + share fields are public scalars). We still need
+    //    self's X25519 private key because `apply_with_identity` requires
+    //    it as a parameter — for `ts` the impl falls through to `apply()`
+    //    without ever touching the decrypt path.
+    let (hlc_tracker, device_id, self_owner, dm_outbox, dfrost_logs) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("dfrost_request_vrf_beacon: NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker
+                .clone()
+                .ok_or("dfrost_request_vrf_beacon: hlc_tracker missing — node not running?")?,
+            g.dm_device_id
+                .clone()
+                .ok_or("dfrost_request_vrf_beacon: dm_device_id missing — no owner identity?")?,
+            g.dm_self_owner
+                .ok_or("dfrost_request_vrf_beacon: dm_self_owner missing — no owner identity?")?,
+            g.dm_outbox
+                .clone()
+                .ok_or("dfrost_request_vrf_beacon: dm_outbox missing — no owner identity?")?,
+            std::sync::Arc::clone(&g.dfrost_logs),
+        )
+    };
+
+    // 3. Get the per-community DfrostLog Arc.
+    let log_arc = {
+        let mut map = dfrost_logs.lock().await;
+        map.entry(space_id)
+            .or_insert_with(|| {
+                std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::community_dfrost_log::DfrostLog::new(),
+                ))
+            })
+            .clone()
+    };
+
+    // 4. Snapshot the local FROST KeyPackage (materialised by Task 3's
+    //    round_num=3 path on DKG completion). Bail early if either the
+    //    committee isn't active or this node wasn't a DKG member.
+    let key_package = {
+        let log = log_arc.lock().await;
+        if !log.committee_state.active {
+            return Err(
+                "dfrost_request_vrf_beacon: no active committee — DKG must complete first"
+                    .to_string(),
+            );
+        }
+        log.local_key_package.clone().ok_or(
+            "dfrost_request_vrf_beacon: local_key_package missing — was this node a DKG member?",
+        )?
+    };
+
+    // 5. Derive ceremony_id deterministically from
+    //    `(community_id, epoch, seed_bytes)`. Every committee member that
+    //    observes the same beacon trigger materialises the same key into
+    //    `pending_sign`, so contributions accumulate against a single
+    //    session without an explicit coordination event. The `sign-v1:`
+    //    tag separates this domain from DKG/refresh ceremony ids.
+    let mut sign_tag = Vec::with_capacity(b"sign-v1:".len() + seed_bytes.len());
+    sign_tag.extend_from_slice(b"sign-v1:");
+    sign_tag.extend_from_slice(&seed_bytes);
+    let ceremony_id =
+        crate::community_dfrost_types::derive_ceremony_id(&space_id, epoch, &sign_tag);
+
+    // 6. Run FROST round-1 commit. Returns the secret nonces (must be
+    //    stashed for round-2; one-shot use, re-use leaks the signing
+    //    share per FROST spec §6.2) + the public commitments.
+    let signing_share = key_package.signing_share();
+    let mut rng = frost_ristretto255::rand_core::OsRng;
+    let (nonces, commitments) = frost_ristretto255::round1::commit(signing_share, &mut rng);
+
+    let mut nonces_cbor = Vec::new();
+    ciborium::into_writer(&nonces, &mut nonces_cbor)
+        .map_err(|e| format!("dfrost_request_vrf_beacon: encode SigningNonces: {e}"))?;
+    let mut commitments_cbor = Vec::new();
+    ciborium::into_writer(&commitments, &mut commitments_cbor)
+        .map_err(|e| format!("dfrost_request_vrf_beacon: encode SigningCommitments: {e}"))?;
+
+    let message_hash = crate::community_dfrost_types::derive_vrf_seed(&seed_bytes, epoch);
+
+    // 7. Build + sign the `ts` event. share_bytes is empty at this stage:
+    //    Task 5's `dfrost_contribute_threshold_sign` posts a second `ts`
+    //    event with the share once it has gathered every member's
+    //    commitments via the SigningPackage.
+    let payload = crate::community_dfrost_types::ThresholdSignPayload {
+        ceremony_id,
+        message_hash,
+        commitment_bytes: commitments_cbor,
+        share_bytes: Vec::new(),
+    };
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+
+    let event = {
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        crate::community_dfrost_log::build_signed_dfrost_event(
+            signing_key,
+            self_owner,
+            crate::community_dfrost_types::DfrostEventKind::ThresholdSign,
+            &payload,
+            hlc,
+        )
+        .map_err(|e| format!("dfrost_request_vrf_beacon: build_signed: {e}"))?
+    };
+
+    // 8. Derive self's X25519 priv for `apply_with_identity` (required
+    //    by signature; `ts` falls through to `apply()` without using it).
+    let self_x25519_priv: [u8; 32] = {
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        *crate::dm_signing::ed25519_priv_to_x25519(signing_key)
+    };
+
+    // 9. Apply locally, then stash the secret nonces on the freshly-
+    //    materialised PendingSignSession. Apply must succeed first
+    //    because apply_threshold_sign is what creates the pending_sign
+    //    entry on the first `ts` contribution.
+    {
+        let mut log = log_arc.lock().await;
+        log.apply_with_identity(event, &self_owner, &self_x25519_priv)
+            .map_err(|e| format!("dfrost_request_vrf_beacon: apply: {e:?}"))?;
+
+        let pending = log
+            .committee_state
+            .pending_sign
+            .get_mut(&ceremony_id)
+            .ok_or("dfrost_request_vrf_beacon: apply succeeded but pending_sign entry missing")?;
+        pending.local_nonces = Some(nonces_cbor);
+    }
+
+    Ok(hex::encode(ceremony_id))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -22739,6 +22932,7 @@ pub fn run() {
             // ZEB-305 Phase 4a-foundation: D-FROST committee IPCs.
             dfrost_initiate_dkg,
             dfrost_contribute_dkg_round,
+            dfrost_request_vrf_beacon,
             #[cfg(debug_assertions)]
             e2e_close_window,
         ])
@@ -22784,6 +22978,7 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         // ZEB-305 Phase 4a-foundation: D-FROST committee IPCs.
         dfrost_initiate_dkg,
         dfrost_contribute_dkg_round,
+        dfrost_request_vrf_beacon,
     ])
 }
 
