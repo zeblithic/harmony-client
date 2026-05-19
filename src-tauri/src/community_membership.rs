@@ -2967,6 +2967,108 @@ fn apply_admin_proposal_effect(
     }
 }
 
+/// ZEB-297: outcome of an auto-exec `SetPower` dispatch from a Tier 2
+/// finalization. Distinguishes "the mint actually happened" from "this
+/// replica intentionally skipped" so the tick can keep accurate
+/// metrics and operators can tell admin replicas from non-admin
+/// replicas in logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoExecOutcome {
+    /// Local actor satisfied `POWER_THRESHOLDS.set_power`; SetPower
+    /// event was minted, signed, and inserted into the engine's local
+    /// log. Peers receive it via Zenoh sync on the membership topic.
+    Applied,
+    /// Local actor's power level in this community is below the
+    /// `set_power` threshold (100), so this replica cannot produce a
+    /// SetPower event that any verifier will accept. Skip silently —
+    /// admins race to mint, HLC LWW dedupes, and the first one's
+    /// event propagates to every replica via the existing membership
+    /// log sync. This is the intentional "wrong replica" path, not a
+    /// failure.
+    SkippedNotAdmin,
+    /// Community has `admin_quorum > 1` and the SetPower outcome is
+    /// admin-affecting (`new_power == 100` OR target currently holds
+    /// power 100). Direct SetPower would self-reject at `verify_event`
+    /// with `SetPowerRequiresQuorum` (spec §4.5 / ZEB-250) — admin-tier
+    /// changes in multi-admin-quorum communities must route through
+    /// `AdminProposal`, which Tier 2 auto-exec does not yet do. Skip
+    /// so no HLC is burned and no doomed event is minted; the broader
+    /// architectural fix (auto-route through AdminProposal when quorum
+    /// requires it) is tracked separately as a follow-up.
+    SkippedRequiresQuorum,
+}
+
+/// ZEB-297: pure helper deciding whether the local actor is allowed
+/// to mint a `SetPower` event in this community. Lifted out of
+/// `apply_auto_exec_set_power` so the admin-only-mint guard is unit
+/// testable without spinning up a full `CommunitySyncEngine` +
+/// `NodeState` + registry fixture.
+///
+/// Mirrors `verify_event`'s two SetPower preconditions (so the guard
+/// never lets through an event the verifier would reject):
+/// 1. `power_levels[self_owner] >= POWER_THRESHOLDS.set_power`
+///    (currently 100). Missing entry treated as 0 per spec §4.
+/// 2. `members[self_owner].status == MemberStatus::Joined`. Kick and
+///    Leave intentionally do NOT clean up `power_levels` (see the
+///    materialize comments on the SetPower / Kick arms), so a former
+///    admin who was kicked or who left voluntarily would otherwise
+///    sail past a power-only check, mint a SetPower locally, and then
+///    have it self-reject at `verify_event` with `ActorNotJoined` —
+///    exactly the doomed-mint path this guard exists to prevent
+///    (CodeRabbit R1 Major on PR #135).
+///
+/// Boundary condition: `actor_power == POWER_THRESHOLDS.set_power` is
+/// allowed (admins at exactly 100 can mint SetPower) AND the actor
+/// must be currently Joined.
+pub fn local_actor_can_mint_set_power(mat: &MaterializedMembership, self_owner: OwnerAddr) -> bool {
+    let actor_power = mat.power_levels.get(&self_owner).copied().unwrap_or(0);
+    if actor_power < POWER_THRESHOLDS.set_power {
+        return false;
+    }
+    matches!(
+        mat.members.get(&self_owner).map(|state| state.status),
+        Some(MemberStatus::Joined)
+    )
+}
+
+/// ZEB-297 R2 (CodeRabbit Major): mirrors `verify_event`'s third SetPower
+/// precondition — direct SetPower of an admin-affecting target is rejected
+/// when `admin_quorum > 1` (spec §4.5 / ZEB-250). Without this check, a
+/// Tier 2 auto-exec on an admin promotion (`new_power == max`) or admin
+/// demotion (target currently holds power max) in a multi-admin-quorum
+/// community would mint a SetPower event that the verifier would reject
+/// with `SetPowerRequiresQuorum` — exactly the doomed-mint path the R1
+/// joined-member guard exists to eliminate, surfacing in a different
+/// population.
+///
+/// Returns `true` when the (target, level) combination would be rejected
+/// by the quorum guard at `verify_event`; the auto-exec caller should
+/// short-circuit with `AutoExecOutcome::SkippedRequiresQuorum` rather
+/// than mint. Returns `false` when `admin_quorum <= 1` (single-admin
+/// community, direct SetPower allowed) or when the change is not
+/// admin-affecting (e.g., moderator-tier reassignment).
+///
+/// ZEB-297 R3 (Cursor Low): uses `POWER_THRESHOLDS.max` (the admin-tier
+/// power cap), NOT `POWER_THRESHOLDS.set_power` (the minimum power to
+/// call SetPower). These are coincidentally equal (100) in v1, but
+/// conceptually distinct — if `set_power` is ever lowered (e.g., to
+/// allow moderators to perform non-admin SetPower) while `max` remains
+/// the admin tier, the "admin-affecting" check still belongs on `max`.
+/// Matches the semantic intent of `verify_event:2570`'s `*level == 100`
+/// literal (which should ideally also move to `.max` — tracked as a
+/// follow-up readability cleanup, not blocking this fix).
+pub fn setpower_mint_admin_blocked_by_quorum(
+    mat: &MaterializedMembership,
+    target: OwnerAddr,
+    level: u8,
+) -> bool {
+    if mat.admin_quorum <= 1 {
+        return false;
+    }
+    let target_power = mat.power_levels.get(&target).copied().unwrap_or(0);
+    level == POWER_THRESHOLDS.max || target_power == POWER_THRESHOLDS.max
+}
+
 /// ZEB-291 Phase 2 Task 10: auto-exec dispatch from a Tier 2 contestability finalize.
 ///
 /// Signs and applies a `SetPower` membership event using the node's local
@@ -2983,6 +3085,24 @@ fn apply_admin_proposal_effect(
 /// rather than panicking — voting tick (Task 16) logs and continues; the
 /// PollResult event is NOT rolled back.
 ///
+/// ZEB-297: returns `Ok(AutoExecOutcome::SkippedNotAdmin)` when the local
+/// actor's materialized power level in this community is below
+/// `POWER_THRESHOLDS.set_power`. Without this guard, a non-admin replica
+/// would mint a SetPower event that its own `verify_event` would reject
+/// (`InsufficientPower`), so finalization would only land on whichever
+/// admin replica's tick ran first. With the guard, admins race to mint
+/// and HLC LWW dedupes; the first admin's event propagates to every
+/// replica via the existing membership log sync.
+///
+/// ZEB-297 R2: also returns `Ok(AutoExecOutcome::SkippedRequiresQuorum)`
+/// when the community has `admin_quorum > 1` AND the (target, level)
+/// combination is admin-affecting (`new_power == 100` or target currently
+/// holds power 100). Direct SetPower in that case would self-reject at
+/// `verify_event` with `SetPowerRequiresQuorum` (spec §4.5). Tier 2
+/// auto-exec cannot currently route through `AdminProposal`, so the
+/// outcome lands as a NoOp on every replica; a follow-up ticket tracks
+/// the AdminProposal-routing fix.
+///
 /// Returns `Err` (as String, matching the existing IPC error convention)
 /// if:
 /// - NodeState is missing any required field (registry, outbox, etc.) —
@@ -2996,7 +3116,7 @@ pub async fn apply_auto_exec_set_power(
     community_id: crate::owner_state_types::SpaceId,
     target_pubkey: crate::owner_state_types::OwnerAddr,
     new_power: u32,
-) -> Result<(), String> {
+) -> Result<AutoExecOutcome, String> {
     if new_power > 100 {
         return Err(format!(
             "new_power out of range: {} > 100 (u8/power-table cap)",
@@ -3030,13 +3150,6 @@ pub async fn apply_auto_exec_set_power(
         )
     };
 
-    let wall_now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    let event_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
-
     let engine_arc = community_registry
         .engine_arc(&community_id)
         .await
@@ -3046,6 +3159,72 @@ pub async fn apply_auto_exec_set_power(
                 hex::encode(community_id.0)
             )
         })?;
+
+    // ZEB-297: admin-only mint. Read the engine's materialized
+    // power_levels for the local actor; skip if below the set_power
+    // threshold OR if the (target, level) combination would be
+    // rejected by the admin_quorum > 1 guard at verify_event. Both
+    // checks happen BEFORE reserving an HLC so we don't burn a
+    // tracker slot on a no-op. Admins race to mint; the first one's
+    // event propagates via the existing membership log sync.
+    //
+    // The quorum-blocked path (admin_affecting && admin_quorum > 1)
+    // is structurally unsupported by Tier 2 auto-exec — it requires
+    // routing through AdminProposal instead, which is filed as a
+    // follow-up ticket. Skipping here is correct (no doomed mint)
+    // but means the Tier 2 outcome lands as a NoOp on every replica
+    // until that follow-up ships.
+    //
+    // ZEB-297 R3 (CodeRabbit Major): the guard reads `mat` under the
+    // engine state lock then drops it, so a concurrent membership
+    // change can theoretically invalidate the precondition before
+    // `insert_local_event` runs below. This is benign — wire safety
+    // is enforced by `insert_local_event_with_resolved_pubs`
+    // (community_state_sync.rs:1444-1447), which runs verify_event
+    // atomically under `self.state.lock().await` immediately before
+    // CRDT apply. A race-and-rejected event surfaces as an
+    // `InsertOutcome::Rejected` here (caught at line 3175-3179), not
+    // a doomed event on the wire. The fast-path guard exists to (a)
+    // avoid burning an HLC for the common-case admin-replica
+    // dispatch, and (b) generate accurate skip-counter telemetry.
+    // Full atomicity (do guard + sign + insert under one critical
+    // section) would require holding the engine state lock across
+    // the dm_outbox signing await, a pattern not used elsewhere and
+    // out of scope for this fix.
+    let (is_admin, blocked_by_quorum) = {
+        let state_arc = engine_arc.state();
+        let state_g = state_arc.lock().await;
+        let mat = state_g.materialized(engine_arc.admin_addr());
+        (
+            local_actor_can_mint_set_power(&mat, self_owner),
+            setpower_mint_admin_blocked_by_quorum(&mat, target_pubkey, level),
+        )
+    };
+    if !is_admin {
+        tracing::info!(
+            community = %hex::encode(community_id.0),
+            target = %hex::encode(target_pubkey.0),
+            new_power,
+            "auto_exec_set_power: skipping — local actor is not admin in this community (deferring to admin race)"
+        );
+        return Ok(AutoExecOutcome::SkippedNotAdmin);
+    }
+    if blocked_by_quorum {
+        tracing::warn!(
+            community = %hex::encode(community_id.0),
+            target = %hex::encode(target_pubkey.0),
+            new_power,
+            "auto_exec_set_power: skipping — admin_quorum > 1 and outcome is admin-affecting (Tier 2 cannot route through AdminProposal yet)"
+        );
+        return Ok(AutoExecOutcome::SkippedRequiresQuorum);
+    }
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let event_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
 
     let event = {
         let outbox_g = dm_outbox.lock().await;
@@ -3071,13 +3250,231 @@ pub async fn apply_auto_exec_set_power(
         return Err(format!("apply_auto_exec_set_power: rejected: {outcome:?}"));
     }
     let _ = device_id;
-    Ok(())
+    Ok(AutoExecOutcome::Applied)
 }
 
 #[cfg(test)]
 mod auto_exec_tests {
     use super::*;
     use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+
+    /// ZEB-297: `local_actor_can_mint_set_power` returns false when the
+    /// local actor's materialized power level is below the
+    /// `set_power` threshold (100). This is the pure-helper unit
+    /// underpinning the guard inside `apply_auto_exec_set_power` — a
+    /// non-admin replica must NOT mint a SetPower event that its own
+    /// `verify_event` would self-reject (`InsufficientPower`).
+    #[test]
+    fn local_actor_can_mint_set_power_returns_false_when_below_threshold() {
+        let self_owner = OwnerAddr([0xaa; 16]);
+        let mut mat = MaterializedMembership::default();
+        // Default power for `self_owner` is 0 (key absent) — non-admin.
+        assert!(!local_actor_can_mint_set_power(&mat, self_owner));
+
+        // ZEB-297 R3 (CodeRabbit Nitpick): seed Joined status so the
+        // membership gate is satisfied. Without this, the test would
+        // pass even if the numeric threshold check were accidentally
+        // removed (because the membership check alone would still
+        // reject). Seeding Joined isolates the power-gate boundary.
+        mat.members.insert(
+            self_owner,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "test".to_string(),
+                },
+                left_at: None,
+            },
+        );
+        // Power 99 is still below the 100 admin threshold — Joined alone
+        // is not enough.
+        mat.power_levels
+            .insert(self_owner, POWER_THRESHOLDS.set_power - 1);
+        assert!(!local_actor_can_mint_set_power(&mat, self_owner));
+    }
+
+    /// ZEB-297: positive-path companion — `local_actor_can_mint_set_power`
+    /// returns true at exactly `POWER_THRESHOLDS.set_power` (100) and
+    /// above WHEN the actor is currently Joined. Pins the boundary
+    /// condition so a future refactor that accidentally uses `>`
+    /// instead of `>=` would fail loudly.
+    #[test]
+    fn local_actor_can_mint_set_power_returns_true_when_at_or_above_threshold() {
+        let self_owner = OwnerAddr([0xaa; 16]);
+        let mut mat = MaterializedMembership::default();
+
+        // Power == threshold (100) AND Joined: admin can mint.
+        mat.power_levels
+            .insert(self_owner, POWER_THRESHOLDS.set_power);
+        mat.members.insert(
+            self_owner,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "test".to_string(),
+                },
+                left_at: None,
+            },
+        );
+        assert!(local_actor_can_mint_set_power(&mat, self_owner));
+    }
+
+    /// ZEB-297 R1 (CodeRabbit Major): the guard must mirror
+    /// `verify_event`'s joined-member check, not just its power check.
+    /// Kick/Leave intentionally leave stale `power_levels` entries in
+    /// place (so a kicked admin's prior signed events still validate
+    /// at their original HLC), which means a former admin who is now
+    /// `Left` or `Banned` retains power 100 in the materialized view.
+    /// Without the Joined check, the guard would let such an actor
+    /// mint a SetPower locally, then `verify_event` would self-reject
+    /// with `ActorNotJoined` — the exact doomed-mint path ZEB-297 was
+    /// filed to eliminate.
+    #[test]
+    fn local_actor_can_mint_set_power_returns_false_for_former_admin_who_left() {
+        let self_owner = OwnerAddr([0xaa; 16]);
+        let mut mat = MaterializedMembership::default();
+        mat.power_levels
+            .insert(self_owner, POWER_THRESHOLDS.set_power);
+        mat.members.insert(
+            self_owner,
+            MemberState {
+                status: MemberStatus::Left,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "test".to_string(),
+                },
+                left_at: Some(Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "test".to_string(),
+                }),
+            },
+        );
+        assert!(
+            !local_actor_can_mint_set_power(&mat, self_owner),
+            "Left former admin must NOT pass the guard"
+        );
+    }
+
+    /// Same as the `Left` case but for `Banned` — a kicked former
+    /// admin retains power 100 by spec but must not be allowed to mint.
+    #[test]
+    fn local_actor_can_mint_set_power_returns_false_for_former_admin_who_was_banned() {
+        let self_owner = OwnerAddr([0xaa; 16]);
+        let mut mat = MaterializedMembership::default();
+        mat.power_levels
+            .insert(self_owner, POWER_THRESHOLDS.set_power);
+        mat.members.insert(
+            self_owner,
+            MemberState {
+                status: MemberStatus::Banned,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "test".to_string(),
+                },
+                left_at: Some(Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "test".to_string(),
+                }),
+            },
+        );
+        assert!(
+            !local_actor_can_mint_set_power(&mat, self_owner),
+            "Banned former admin must NOT pass the guard"
+        );
+    }
+
+    /// Missing-from-members rejection: a `power_levels` entry without
+    /// a corresponding `members` entry shouldn't happen in practice,
+    /// but defense-in-depth ensures the guard's two-part predicate
+    /// fails closed.
+    #[test]
+    fn local_actor_can_mint_set_power_returns_false_when_member_record_missing() {
+        let self_owner = OwnerAddr([0xaa; 16]);
+        let mut mat = MaterializedMembership::default();
+        mat.power_levels
+            .insert(self_owner, POWER_THRESHOLDS.set_power);
+        // No mat.members.insert(...) — power but no member record.
+        assert!(!local_actor_can_mint_set_power(&mat, self_owner));
+    }
+
+    /// ZEB-297 R2 (CodeRabbit Major): single-admin-quorum communities
+    /// (the default) must NEVER trip the quorum guard — direct SetPower
+    /// is always allowed there. Pins the early-return so future refactors
+    /// that read `mat.admin_quorum` don't accidentally promote the
+    /// single-admin path into the quorum-blocked branch.
+    #[test]
+    fn setpower_mint_admin_blocked_by_quorum_false_when_quorum_is_one() {
+        let target = OwnerAddr([0xbb; 16]);
+        let mat = MaterializedMembership::default();
+        assert_eq!(mat.admin_quorum, 1, "default quorum is 1");
+
+        // level == max (admin promotion) — would block at quorum > 1.
+        assert!(!setpower_mint_admin_blocked_by_quorum(
+            &mat,
+            target,
+            POWER_THRESHOLDS.max
+        ));
+        // level < max, target unknown — non-admin-affecting at any quorum.
+        assert!(!setpower_mint_admin_blocked_by_quorum(&mat, target, 50));
+    }
+
+    /// ZEB-297 R2: multi-admin-quorum (>= 2) + admin promotion
+    /// (`level == 100`) is the canonical quorum-blocked path. Mirrors
+    /// `verify_event`'s `admin_affecting = *level == 100 || target_power == 100`
+    /// check at line 2570 — auto-exec must short-circuit here so the
+    /// minted event can't outrun the verifier's rejection.
+    #[test]
+    fn setpower_mint_admin_blocked_by_quorum_true_for_promote_to_admin() {
+        let target = OwnerAddr([0xbb; 16]);
+        let mat = MaterializedMembership {
+            admin_quorum: 2,
+            ..Default::default()
+        };
+        assert!(setpower_mint_admin_blocked_by_quorum(
+            &mat,
+            target,
+            POWER_THRESHOLDS.max
+        ));
+    }
+
+    /// ZEB-297 R2: multi-admin-quorum + demotion of an existing admin
+    /// (target currently has `power_levels[target] == 100`, new level
+    /// below 100) is the second admin-affecting branch — also blocked.
+    #[test]
+    fn setpower_mint_admin_blocked_by_quorum_true_for_demote_existing_admin() {
+        let target = OwnerAddr([0xbb; 16]);
+        let mut mat = MaterializedMembership {
+            admin_quorum: 2,
+            ..Default::default()
+        };
+        mat.power_levels.insert(target, POWER_THRESHOLDS.max);
+        assert!(setpower_mint_admin_blocked_by_quorum(&mat, target, 50));
+    }
+
+    /// ZEB-297 R2: multi-admin-quorum but non-admin-affecting change
+    /// (e.g., moderator-tier reassignment — target below 100 AND new
+    /// level below 100) is allowed direct, just like single-admin
+    /// communities. Pins the boundary so the helper doesn't over-skip
+    /// and starve legitimate Tier 2 outcomes.
+    #[test]
+    fn setpower_mint_admin_blocked_by_quorum_false_for_non_admin_affecting_change() {
+        let target = OwnerAddr([0xbb; 16]);
+        let mut mat = MaterializedMembership {
+            admin_quorum: 2,
+            ..Default::default()
+        };
+        // target is moderator-tier; moving 30 → 70 is non-admin-affecting.
+        mat.power_levels.insert(target, 30);
+        assert!(!setpower_mint_admin_blocked_by_quorum(&mat, target, 70));
+    }
 
     /// Apply-auto-exec helper test: bounds-check on `new_power > 100`.
     ///
