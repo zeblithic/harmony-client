@@ -21859,6 +21859,20 @@ pub struct DfrostDkgProgressPayload {
     pub participants_so_far: u8,
 }
 
+/// Tauri event payload for `"dfrost-beacon-ready"`. Fired by
+/// `dfrost_contribute_threshold_sign` on the node that observes the
+/// threshold-th `ts` share land (i.e. the one that successfully aggregates
+/// the joint Schnorr signature + applies the resulting `vb` event). The
+/// payload exposes the ceremony-id + the 32-byte VRF output as hex so the
+/// frontend can surface beacon-derived randomness without having to decode
+/// the underlying CBOR `vb` event.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DfrostBeaconReadyPayload {
+    pub ceremony_id: String,
+    pub vrf_output: String, // 32 bytes → 64 hex chars
+}
+
 /// Tauri IPC: admin initiates a fresh D-FROST committee DKG ceremony.
 ///
 /// Derives `ceremony_id` deterministically from `blake3(sorted_members ||
@@ -22784,6 +22798,370 @@ async fn dfrost_request_vrf_beacon<R: tauri::Runtime>(
     Ok(hex::encode(ceremony_id))
 }
 
+/// Tauri IPC: committee member contributes their partial threshold-sign
+/// share, and — if their share is the threshold-th to land — aggregates
+/// the joint Schnorr signature + emits the `vb` beacon event.
+///
+/// Precondition: this member has already called
+/// `dfrost_request_vrf_beacon(community_id, seed_hex, epoch)` for the
+/// same ceremony, which stashed their secret nonces into
+/// `committee_state.pending_sign[ceremony_id].local_nonces` and applied
+/// a `ts` event with empty `share_bytes` carrying their commitments.
+/// Other members must independently have applied their own `ts(empty
+/// share)` events so the local `pending_sign[ceremony_id].contributions`
+/// map carries at least `threshold` commitment entries — otherwise the
+/// `SigningPackage` won't include their identifier and `frost::aggregate`
+/// will reject the result.
+///
+/// Pipeline:
+///   1. Decode stashed `local_nonces` back into `frost::round1::SigningNonces`.
+///   2. Decode every member's `commitment_bytes` from `pending_sign.contributions`
+///      into a `BTreeMap<Identifier, SigningCommitments>`.
+///   3. Build the `SigningPackage` from the commitment map + the
+///      `message_hash` recorded on the pending session.
+///   4. Run `frost::round2::sign` to produce this node's `SignatureShare`.
+///   5. Build + apply a `ts` event re-using the existing commitment bytes
+///      and populating `share_bytes` with the CBOR-encoded share.
+///   6. Post-apply, count contributions with non-empty `share_bytes`. If
+///      `>= threshold`, build the shares map, call `frost::aggregate`,
+///      derive `vrf_output = derive_vrf_output(R)` (first 32 bytes of the
+///      64-byte Schnorr sig), build + apply a `vb` event, and emit
+///      `dfrost-beacon-ready { ceremony_id, vrf_output }`.
+///
+/// Out of scope (Phase 4a-foundation): Zenoh broadcast of the share-bearing
+/// `ts` and the `vb` event to peer committee members (Phase 4a-main wires
+/// the `dfrost` topic). For now they land only on the local log.
+#[tauri::command]
+async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    app: tauri::AppHandle<R>,
+    community_id: String,
+    ceremony_id: String,
+) -> Result<(), String> {
+    // 1. Decode hex args.
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("dfrost_contribute_threshold_sign: invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "dfrost_contribute_threshold_sign: community_id must be 16 bytes (32 hex chars)"
+                .to_string()
+        })?;
+    let space_id = crate::owner_state_types::SpaceId(cid_bytes);
+
+    let ceremony_bytes: [u8; 32] = hex::decode(&ceremony_id)
+        .map_err(|e| format!("dfrost_contribute_threshold_sign: invalid ceremony_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "dfrost_contribute_threshold_sign: ceremony_id must be 32 bytes (64 hex chars)"
+                .to_string()
+        })?;
+
+    // 2. Snapshot NodeState handles.
+    let (hlc_tracker, device_id, self_owner, dm_outbox, dfrost_logs) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("dfrost_contribute_threshold_sign: NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or(
+                "dfrost_contribute_threshold_sign: hlc_tracker missing — node not running?",
+            )?,
+            g.dm_device_id.clone().ok_or(
+                "dfrost_contribute_threshold_sign: dm_device_id missing — no owner identity?",
+            )?,
+            g.dm_self_owner.ok_or(
+                "dfrost_contribute_threshold_sign: dm_self_owner missing — no owner identity?",
+            )?,
+            g.dm_outbox.clone().ok_or(
+                "dfrost_contribute_threshold_sign: dm_outbox missing — no owner identity?",
+            )?,
+            std::sync::Arc::clone(&g.dfrost_logs),
+        )
+    };
+
+    // 3. Get the per-community DfrostLog Arc.
+    let log_arc = {
+        let mut map = dfrost_logs.lock().await;
+        map.entry(space_id)
+            .or_insert_with(|| {
+                std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::community_dfrost_log::DfrostLog::new(),
+                ))
+            })
+            .clone()
+    };
+
+    // 4. Read state, decode nonces + commitments, build SigningPackage.
+    //    Snapshot the KeyPackage + PublicKeyPackage now so we don't hold
+    //    the log lock across the FROST signing call.
+    let (
+        key_package,
+        pub_key_package,
+        members,
+        threshold,
+        message_hash,
+        my_commitment_bytes,
+        nonces,
+        signing_package,
+    ) = {
+        let log = log_arc.lock().await;
+        if !log.committee_state.active {
+            return Err(
+                "dfrost_contribute_threshold_sign: no active committee — DKG must complete first"
+                    .to_string(),
+            );
+        }
+        let pending = log
+            .committee_state
+            .pending_sign
+            .get(&ceremony_bytes)
+            .ok_or(
+                "dfrost_contribute_threshold_sign: no pending sign session — \
+                 dfrost_request_vrf_beacon must run first",
+            )?;
+        let members = log.committee_state.members.clone();
+        let threshold = log.committee_state.threshold;
+
+        // Decode stashed local nonces. `#[serde(skip)]` on local_nonces
+        // means a process restart wipes them — that branch requires
+        // re-running `dfrost_request_vrf_beacon` for this ceremony.
+        let nonces_cbor = pending.local_nonces.as_ref().ok_or(
+            "dfrost_contribute_threshold_sign: local_nonces missing — \
+             was dfrost_request_vrf_beacon called in this process?",
+        )?;
+        let nonces: frost_ristretto255::round1::SigningNonces =
+            ciborium::from_reader(&nonces_cbor[..]).map_err(|e| {
+                format!("dfrost_contribute_threshold_sign: decode local_nonces: {e}")
+            })?;
+
+        // Build commitments_map: Identifier → SigningCommitments. Iterate
+        // EVERY contribution, not just self's — the SigningPackage must
+        // include each signer that will provide a share. Members without
+        // a contribution cannot sign this ceremony.
+        let mut commitments_map: std::collections::BTreeMap<
+            frost_ristretto255::Identifier,
+            frost_ristretto255::round1::SigningCommitments,
+        > = std::collections::BTreeMap::new();
+        for (addr, (commitment_bytes, _share_bytes)) in &pending.contributions {
+            let idx = members.iter().position(|a| *a == *addr).ok_or(
+                "dfrost_contribute_threshold_sign: contribution from non-committee member",
+            )?;
+            let id = crate::community_dfrost_crypto::identifier_for_index(idx);
+            let commitments: frost_ristretto255::round1::SigningCommitments =
+                ciborium::from_reader(&commitment_bytes[..]).map_err(|e| {
+                    format!("dfrost_contribute_threshold_sign: decode peer commitment: {e}")
+                })?;
+            commitments_map.insert(id, commitments);
+        }
+
+        // Reuse self's existing commitment_bytes for the share-bearing
+        // `ts` event; apply_threshold_sign keeps both fields aligned.
+        let my_pending = pending.contributions.get(&self_owner).ok_or(
+            "dfrost_contribute_threshold_sign: self contribution missing — \
+             dfrost_request_vrf_beacon must apply locally first",
+        )?;
+        let my_commitment_bytes = my_pending.0.clone();
+        let message_hash = pending.message_hash;
+
+        let signing_package =
+            frost_ristretto255::SigningPackage::new(commitments_map, &message_hash);
+
+        let kp = log.local_key_package.clone().ok_or(
+            "dfrost_contribute_threshold_sign: local_key_package missing — \
+             was this node a DKG member?",
+        )?;
+        let pkp = log.local_pub_key_package.clone().ok_or(
+            "dfrost_contribute_threshold_sign: local_pub_key_package missing — \
+             was this node a DKG member?",
+        )?;
+
+        (
+            kp,
+            pkp,
+            members,
+            threshold,
+            message_hash,
+            my_commitment_bytes,
+            nonces,
+            signing_package,
+        )
+    };
+
+    // 5. Run FROST round-2. `frost::round2::sign` CONSUMES the nonces by
+    //    value — single-use enforcement by the type system. Re-running
+    //    this IPC would fail at step 4 (nonces decoded fresh from the
+    //    stashed CBOR), but the CBOR itself does not get cleared, so an
+    //    intentional duplicate call would currently re-sign and re-emit
+    //    a duplicate `ts` event. The apply path's idempotency check (same
+    //    `(actor, ceremony_id, hlc)`) is the backstop.
+    let sig_share = frost_ristretto255::round2::sign(&signing_package, &nonces, &key_package)
+        .map_err(|e| format!("dfrost_contribute_threshold_sign: round2::sign: {e}"))?;
+
+    let mut share_bytes = Vec::new();
+    ciborium::into_writer(&sig_share, &mut share_bytes)
+        .map_err(|e| format!("dfrost_contribute_threshold_sign: encode SignatureShare: {e}"))?;
+
+    // 6. Build + sign the share-bearing `ts` event. `commitment_bytes`
+    //    matches the round-1 contribution exactly — apply_threshold_sign
+    //    requires it (it never mutates the commitment slot of an existing
+    //    contribution; the same `(actor, ceremony_id)` pair can only post
+    //    a single commitment, the second `ts` here adds the share).
+    let payload = crate::community_dfrost_types::ThresholdSignPayload {
+        ceremony_id: ceremony_bytes,
+        message_hash,
+        commitment_bytes: my_commitment_bytes,
+        share_bytes,
+    };
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+
+    let event = {
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        crate::community_dfrost_log::build_signed_dfrost_event(
+            signing_key,
+            self_owner,
+            crate::community_dfrost_types::DfrostEventKind::ThresholdSign,
+            &payload,
+            hlc,
+        )
+        .map_err(|e| format!("dfrost_contribute_threshold_sign: build_signed: {e}"))?
+    };
+
+    // Self's X25519 priv for `apply_with_identity`. The `ts` apply path
+    // never touches the decrypt branch (no per-recipient seal), but the
+    // signature requires the parameter.
+    let self_x25519_priv: [u8; 32] = {
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        *crate::dm_signing::ed25519_priv_to_x25519(signing_key)
+    };
+
+    {
+        let mut log = log_arc.lock().await;
+        log.apply_with_identity(event, &self_owner, &self_x25519_priv)
+            .map_err(|e| format!("dfrost_contribute_threshold_sign: apply ts: {e:?}"))?;
+    }
+
+    // 7. Post-apply: did this share push the contribution-with-share count
+    //    over threshold? The initial Task 4 `ts(empty share)` events from
+    //    request_vrf_beacon do NOT count — they have `share_bytes.is_empty()`.
+    let aggregation_possible = {
+        let log = log_arc.lock().await;
+        let pending = log
+            .committee_state
+            .pending_sign
+            .get(&ceremony_bytes)
+            .ok_or("dfrost_contribute_threshold_sign: pending_sign vanished after share apply")?;
+        let with_share = pending
+            .contributions
+            .values()
+            .filter(|(_, share)| !share.is_empty())
+            .count();
+        with_share >= threshold as usize
+    };
+
+    if !aggregation_possible {
+        return Ok(());
+    }
+
+    // 8. Aggregate: build SignatureShare map, call frost::aggregate, derive
+    //    VRF output, build + apply `vb`, emit dfrost-beacon-ready.
+    let shares_map = {
+        let log = log_arc.lock().await;
+        let pending = log
+            .committee_state
+            .pending_sign
+            .get(&ceremony_bytes)
+            .expect("pending_sign verified non-empty above under same log lock pattern");
+        let mut shares_map: std::collections::BTreeMap<
+            frost_ristretto255::Identifier,
+            frost_ristretto255::round2::SignatureShare,
+        > = std::collections::BTreeMap::new();
+        for (addr, (_commit, share_b)) in &pending.contributions {
+            if share_b.is_empty() {
+                continue;
+            }
+            let idx = members.iter().position(|a| *a == *addr).ok_or(
+                "dfrost_contribute_threshold_sign: share contribution from non-committee member",
+            )?;
+            let id = crate::community_dfrost_crypto::identifier_for_index(idx);
+            let share: frost_ristretto255::round2::SignatureShare =
+                ciborium::from_reader(&share_b[..]).map_err(|e| {
+                    format!("dfrost_contribute_threshold_sign: decode SignatureShare: {e}")
+                })?;
+            shares_map.insert(id, share);
+        }
+        shares_map
+    };
+
+    let signature = frost_ristretto255::aggregate(&signing_package, &shares_map, &pub_key_package)
+        .map_err(|e| format!("dfrost_contribute_threshold_sign: aggregate: {e}"))?;
+    let sig_bytes: Vec<u8> = signature
+        .serialize()
+        .map_err(|e| format!("dfrost_contribute_threshold_sign: serialize signature: {e}"))?;
+    debug_assert_eq!(
+        sig_bytes.len(),
+        64,
+        "Schnorr signature must be R(32)||s(32)"
+    );
+    let r_compressed: [u8; 32] = sig_bytes[..32]
+        .try_into()
+        .expect("sig_bytes asserted to be 64 bytes above");
+    let vrf_output = crate::community_dfrost_types::derive_vrf_output(&r_compressed);
+
+    let vb_payload = crate::community_dfrost_types::VrfBeaconPayload {
+        ceremony_id: ceremony_bytes,
+        message_hash,
+        signature: sig_bytes,
+        vrf_output,
+    };
+
+    let wall_now_ms_vb = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let hlc_vb =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms_vb)
+            .await;
+
+    let vb_event = {
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        crate::community_dfrost_log::build_signed_dfrost_event(
+            signing_key,
+            self_owner,
+            crate::community_dfrost_types::DfrostEventKind::VrfBeacon,
+            &vb_payload,
+            hlc_vb,
+        )
+        .map_err(|e| format!("dfrost_contribute_threshold_sign: build_signed vb: {e}"))?
+    };
+
+    {
+        let mut log = log_arc.lock().await;
+        log.apply_with_identity(vb_event, &self_owner, &self_x25519_priv)
+            .map_err(|e| format!("dfrost_contribute_threshold_sign: apply vb: {e:?}"))?;
+    }
+
+    let evt = DfrostBeaconReadyPayload {
+        ceremony_id: hex::encode(ceremony_bytes),
+        vrf_output: hex::encode(vrf_output),
+    };
+    if let Err(e) = app.emit("dfrost-beacon-ready", &evt) {
+        // Non-fatal: vb event is already applied; the emit is a UI hint.
+        tracing::warn!(error = %e, "dfrost-beacon-ready emit failed");
+    }
+
+    Ok(())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -22933,6 +23311,7 @@ pub fn run() {
             dfrost_initiate_dkg,
             dfrost_contribute_dkg_round,
             dfrost_request_vrf_beacon,
+            dfrost_contribute_threshold_sign,
             #[cfg(debug_assertions)]
             e2e_close_window,
         ])
@@ -22979,6 +23358,7 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         dfrost_initiate_dkg,
         dfrost_contribute_dkg_round,
         dfrost_request_vrf_beacon,
+        dfrost_contribute_threshold_sign,
     ])
 }
 
