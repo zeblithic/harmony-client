@@ -572,4 +572,108 @@ describe('FileBrowser inline new-folder + load error (ZEB-166)', () => {
     // The FileList for root renders instead.
     expect(container.querySelector('.file-list')).not.toBeNull();
   });
+
+  // ── Round 2: stale in-flight create after nav-away ────────────────
+
+  it('stale create completion after nav-away does not call onNavigateFolder', async () => {
+    // Reproduces the round-2 bot finding: without the createCommitSeq
+    // guard, a nested-folder create whose IPC resolves AFTER the user
+    // navigated away would call onNavigateFolder(null), yanking them
+    // back to root from wherever they had moved to. The seq token
+    // captured before the await + cancelCreateFolder's bump on the
+    // nav effect must cause the post-await success path to early-return.
+    const service = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    let resolveCreate!: (value: unknown) => void;
+    const createPending = new Promise((resolve) => {
+      resolveCreate = resolve;
+    });
+    adapter.invoke = vi.fn().mockImplementation((cmd: string) => {
+      if (cmd === 'list_content') return Promise.resolve([]);
+      if (cmd === 'create_folder') return createPending;
+      return Promise.resolve(undefined);
+    });
+    await service.connectAdapter(adapter);
+    (service as unknown as { privateContent: unknown[] }).privateContent = (
+      await import('../../mock-file-data')
+    ).mockPrivateContent.slice();
+
+    // Start inside a nested folder so wasNestedCreate = true and the
+    // success path would call onNavigateFolder(null).
+    const onNavigateFolder = vi.fn();
+    const { container, rerender } = render(FileBrowser, {
+      props: {
+        service,
+        currentFolderCid: 'cid-folder-projects',
+        selectedCid: null,
+        selectedSidecarId: null,
+        viewMode: 'list' as const,
+        section: 'private' as const,
+        searchQuery: '',
+        showCleanup: false,
+        serviceVersion: 0,
+        onItemClick: vi.fn(),
+        onNavigateFolder,
+        onViewModeChange: vi.fn(),
+        onSearchChange: vi.fn(),
+        onSectionChange: vi.fn(),
+        onUploadClick: vi.fn(),
+        onCleanupClick: vi.fn(),
+      },
+    });
+
+    // Open the placeholder and fire the commit IPC.
+    const newFolderBtn = container.querySelector(
+      '[aria-label="New Folder"]',
+    ) as HTMLButtonElement;
+    await fireEvent.click(newFolderBtn);
+    const input = await waitFor(() => {
+      const el = container.querySelector(
+        '.file-row-name-input',
+      ) as HTMLInputElement | null;
+      if (!el) throw new Error('placeholder input not rendered');
+      return el;
+    });
+    await fireEvent.input(input, { target: { value: 'in-flight-nested' } });
+    await fireEvent.keyDown(input, { key: 'Enter' });
+
+    // Snapshot the navigate call count before the rerender (the rerender
+    // itself is test-driven via props, not a child callback).
+    const navCallsBeforeRerender = onNavigateFolder.mock.calls.length;
+
+    // Navigate away (back to root) while the create IPC is still in flight.
+    // The nav $effect calls cancelCreateFolder() which bumps createCommitSeq,
+    // so the captured mySeq inside commitCreateFolder becomes stale.
+    await rerender({
+      service,
+      currentFolderCid: null,
+      selectedCid: null,
+      selectedSidecarId: null,
+      viewMode: 'list' as const,
+      section: 'private' as const,
+      searchQuery: '',
+      showCleanup: false,
+      serviceVersion: 0,
+      onItemClick: vi.fn(),
+      onNavigateFolder,
+      onViewModeChange: vi.fn(),
+      onSearchChange: vi.fn(),
+      onSectionChange: vi.fn(),
+      onUploadClick: vi.fn(),
+      onCleanupClick: vi.fn(),
+    });
+
+    // Now resolve the create IPC. Without the seq guard the success path
+    // would call onNavigateFolder(null) — with the guard it returns early.
+    resolveCreate({ sidecarId: 'created-sid', cid: 'created-cid' });
+
+    // Let microtasks flush so the .then continuation runs.
+    await new Promise((r) => setTimeout(r, 0));
+
+    // The post-await onNavigateFolder(null) call from the stale success
+    // path MUST NOT fire. (Any pre-rerender calls from drag-drop or
+    // breadcrumb interactions are unrelated and are captured in the
+    // before-rerender snapshot.)
+    expect(onNavigateFolder.mock.calls.length).toBe(navCallsBeforeRerender);
+  });
 });

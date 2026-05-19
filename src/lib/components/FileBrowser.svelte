@@ -172,6 +172,14 @@
   let creatingFolderInFlightCount = $state(0);
   let creatingFolderInFlight = $derived(creatingFolderInFlightCount > 0);
 
+  // Generation token mirrors renameCommitSeq — captured before the
+  // await in commitCreateFolder, bumped by begin/cancel. A stale
+  // capture means the user navigated, escaped, or started a new
+  // create mid-IPC, so the post-await success path (which calls
+  // onNavigateFolder(null) for nested creates) and the catch's
+  // newFolderError write must be discarded.
+  let createCommitSeq = 0;
+
   // Tagged with the cid the failure belongs to so a fast nav-away
   // auto-discards the stale block (mirrors the folderItems.cid guard).
   let folderLoadError = $state<{ cid: string; message: string } | null>(null);
@@ -597,12 +605,14 @@
   // ZEB-166 new-folder lifecycle. Trio mirrors the ZEB-299 rename
   // shape — only place that mutates the create-folder state.
   function beginCreateFolder() {
+    createCommitSeq++;
     creatingFolder = true;
     newFolderName = '';
     newFolderError = null;
   }
 
   function cancelCreateFolder() {
+    createCommitSeq++;
     creatingFolder = false;
     newFolderName = '';
     newFolderError = null;
@@ -629,12 +639,20 @@
       return;
     }
 
+    // Capture generation token before the await so a folder nav,
+    // Escape-cancel, or new create that fires mid-IPC discards this
+    // call's tail mutations. Without this guard, a stale success
+    // path would call onNavigateFolder(null) and yank the user to
+    // root from a different folder they navigated to.
+    const mySeq = ++createCommitSeq;
     creatingFolderInFlightCount++;
     try {
       await service.createFolder(trimmed, parentSidecarId, breadcrumbStack);
+      if (mySeq !== createCommitSeq) return; // stale — context changed during await
       cancelCreateFolder();
       if (wasNestedCreate) onNavigateFolder(null);
     } catch (err) {
+      if (mySeq !== createCommitSeq) return; // stale — discard the rejection
       const raw = err instanceof Error ? err.message : String(err);
       newFolderError = raw.replace(/^Error:\s*/, '');
       // Keep placeholder open so the user can fix and retry.

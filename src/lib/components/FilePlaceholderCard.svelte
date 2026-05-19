@@ -24,6 +24,8 @@
 
   function handleEditKey(e: KeyboardEvent) {
     if (e.key === 'Enter') {
+      // Gate Enter on !inFlight — see FilePlaceholderRow for rationale.
+      if (inFlight) return;
       e.preventDefault();
       onCommit?.();
     } else if (e.key === 'Escape') {
@@ -41,6 +43,7 @@
     <input
       class="file-card-name-input"
       type="text"
+      aria-label="Folder name"
       bind:value
       onkeydown={handleEditKey}
       onblur={() => { if (!inFlight) onCancel?.(); }}

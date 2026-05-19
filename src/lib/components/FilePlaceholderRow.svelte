@@ -25,6 +25,10 @@
 
   function handleEditKey(e: KeyboardEvent) {
     if (e.key === 'Enter') {
+      // Gate Enter on !inFlight so repeated keystrokes during the
+      // commit await don't fire duplicate create IPCs (one click of
+      // Enter should create exactly one folder, not N).
+      if (inFlight) return;
       e.preventDefault();
       onCommit?.();
     } else if (e.key === 'Escape') {
@@ -39,6 +43,7 @@
   <input
     class="file-row-name-input"
     type="text"
+    aria-label="Folder name"
     bind:value
     onkeydown={handleEditKey}
     onblur={() => { if (!inFlight) onCancel?.(); }}
