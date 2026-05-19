@@ -14,6 +14,7 @@
   import Breadcrumbs from './Breadcrumbs.svelte';
   import FileList from './FileList.svelte';
   import FileGrid from './FileGrid.svelte';
+  import FolderLoadError from './FolderLoadError.svelte';
   import QuotaBar from './QuotaBar.svelte';
   import PublishedView from './PublishedView.svelte';
   import CleanupView from './CleanupView.svelte';
@@ -123,8 +124,8 @@
   let pendingNav: { cid: string; name: string; sidecarId?: string } | null = null;
 
   // ZEB-162 drag-drop coordination state. `error` surfaces backend
-  // failures inline (no window.alert; ZEB-166 bans those from this
-  // component).
+  // failures inline (no blocking browser modals; ZEB-166 bans those
+  // from this component).
   let error = $state<string | null>(null);
 
   // ZEB-299 inline-rename state. `editingItem` non-null toggles the
@@ -159,6 +160,24 @@
   let renameInFlight = $derived(renameInFlightCount > 0);
   let renameCommitSeq = 0;
 
+  // ZEB-166 inline new-folder state. Same shape as the ZEB-299 rename
+  // trio — see beginRename/cancelRename/commitRename for the pattern
+  // being mirrored.
+  let creatingFolder = $state(false);
+  let newFolderName = $state('');
+  let newFolderError = $state<string | null>(null);
+  // Counter mirrors renameInFlightCount (round-6 multi-commit fix) —
+  // the create IPC can be in-flight while the user clicks elsewhere;
+  // suppress the placeholder-row blur-cancel during the await window.
+  let creatingFolderInFlightCount = $state(0);
+  let creatingFolderInFlight = $derived(creatingFolderInFlightCount > 0);
+
+  // Tagged with the cid the failure belongs to so a fast nav-away
+  // auto-discards the stale block (mirrors the folderItems.cid guard).
+  let folderLoadError = $state<{ cid: string; message: string } | null>(null);
+  // Bump-to-retry token consumed by the fetch effect's dep list.
+  let folderFetchRetryToken = $state(0);
+
   // Sync navStack with currentFolderCid (driven by the parent component).
   // The effect's only reactive dependency is currentFolderCid; navStack /
   // pendingNav / items are read inside untrack() so writes to navStack
@@ -172,9 +191,13 @@
       // (editingItem / editingValue / renameError) — without this an
       // in-flight commitRename whose blur fires before the IPC
       // resolves would leave an orphaned banner that persists across
-      // navigations.
+      // navigations. ZEB-166: also clear inline new-folder state and
+      // any prior folder-load error banner — both are scoped to the
+      // folder we're leaving.
       error = null;
       cancelRename();
+      cancelCreateFolder();   // ZEB-166: clear inline new-folder state on nav
+      folderLoadError = null; // ZEB-166: stale across folders
       if (cid === null) {
         navStack = [];
         pendingNav = null;
@@ -232,12 +255,17 @@
   // list stays put until the re-fetch resolves.
   $effect(() => {
     void serviceVersion; // re-fetch on cache mutation
+    void folderFetchRetryToken; // ZEB-166: bump to re-run after a Retry click
     const cid = currentFolderCid;
     const mySeq = ++folderFetchSeq;
     if (!cid) {
       folderItems = null;
+      folderLoadError = null;
       return;
     }
+    // Fresh attempt — drop any prior error so a successful retry doesn't
+    // briefly render the error banner alongside the new items.
+    folderLoadError = null;
     service
       .listFolderContents(cid)
       .then((result) => {
@@ -246,6 +274,7 @@
         // snapshot after a rapid mutation burst.
         if (currentFolderCid === cid && mySeq === folderFetchSeq) {
           folderItems = { cid, items: result };
+          folderLoadError = null;
         }
       })
       .catch((err) => {
@@ -253,15 +282,15 @@
         // consistency-check failures, event-loop drop). Surface them to the
         // user so a corrupted folder doesn't look indistinguishable from an
         // empty one, and clear the list so stale contents don't mislead.
-        // Everything (state, log, alert) is gated on the same staleness
-        // check so a rapid navigate-away doesn't pop a blocking alert
-        // about a folder the user is no longer viewing — the error is
-        // not actionable from elsewhere in the tree.
+        // Everything (state, log, error-banner state) is gated on the same
+        // staleness check so a rapid navigate-away doesn't strand an error
+        // about a folder the user is no longer viewing — the error is not
+        // actionable from elsewhere in the tree.
         if (currentFolderCid === cid && mySeq === folderFetchSeq) {
           folderItems = { cid, items: [] };
           const msg = err instanceof Error ? err.message : String(err);
           console.error('listFolderContents failed:', err);
-          window.alert(`Could not load folder: ${msg}`);
+          folderLoadError = { cid, message: msg };
         }
       });
   });
@@ -565,6 +594,60 @@
     }
   }
 
+  // ZEB-166 new-folder lifecycle. Trio mirrors the ZEB-299 rename
+  // shape — only place that mutates the create-folder state.
+  function beginCreateFolder() {
+    creatingFolder = true;
+    newFolderName = '';
+    newFolderError = null;
+  }
+
+  function cancelCreateFolder() {
+    creatingFolder = false;
+    newFolderName = '';
+    newFolderError = null;
+  }
+
+  async function commitCreateFolder() {
+    if (!creatingFolder) return;
+    const trimmed = newFolderName.trim();
+    if (!trimmed) {
+      newFolderError = 'Name cannot be empty';
+      return;
+    }
+
+    // Path/sidecar computation mirrors handleNewFolder's pre-rewrite
+    // logic and the rename commit path.
+    const wasNestedCreate = breadcrumbStack.length > 0;
+    const parentSidecarId = wasNestedCreate
+      ? navStack[0]?.sidecarId ?? null
+      : null;
+
+    if (wasNestedCreate && !parentSidecarId) {
+      newFolderError =
+        'Folder identity not yet loaded. Return to root and navigate back, then retry.';
+      return;
+    }
+
+    creatingFolderInFlightCount++;
+    try {
+      await service.createFolder(trimmed, parentSidecarId, breadcrumbStack);
+      cancelCreateFolder();
+      if (wasNestedCreate) onNavigateFolder(null);
+    } catch (err) {
+      const raw = err instanceof Error ? err.message : String(err);
+      newFolderError = raw.replace(/^Error:\s*/, '');
+      // Keep placeholder open so the user can fix and retry.
+    } finally {
+      creatingFolderInFlightCount--;
+    }
+  }
+
+  function retryFolderLoad() {
+    folderLoadError = null;
+    folderFetchRetryToken++; // re-trigger the fetch effect
+  }
+
   function handleRowDragStart(e: DragEvent, item: ContentItem) {
     if (!e.dataTransfer) return;
     // Build the source path: top-level CID → immediate parent CID
@@ -635,40 +718,8 @@
     onItemClick(item);
   }
 
-  async function handleNewFolder() {
-    const name = window.prompt('Folder name:');
-    if (!name || !name.trim()) return;
-
-    // Capture pre-create state. breadcrumbStack drives whether this is a
-    // nested create. parentSidecarId is the top-level root's id (the
-    // sidecar entry that owns the cascade) — present iff breadcrumbStack
-    // is non-empty (at root, parent_sidecar_id is null).
-    const wasNestedCreate = breadcrumbStack.length > 0;
-    const parentSidecarId = wasNestedCreate
-      ? navStack[0]?.sidecarId ?? null
-      : null;
-
-    if (wasNestedCreate && !parentSidecarId) {
-      // Nested create requires a top-level sidecar id. If we don't have
-      // one (e.g., user navigated by URL/programmatic jump before the
-      // first list_content settled), bail with a user-visible error.
-      window.alert(
-        'Could not create folder: folder identity not yet loaded. Click "My Content" in the breadcrumb to return to root, then navigate back into this folder and retry.',
-      );
-      return;
-    }
-
-    try {
-      await service.createFolder(name.trim(), parentSidecarId, breadcrumbStack);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      window.alert(`Could not create folder: ${msg}`);
-      return;
-    }
-
-    if (wasNestedCreate) {
-      onNavigateFolder(null);
-    }
+  function handleNewFolder() {
+    beginCreateFolder();
   }
 </script>
 
@@ -724,7 +775,12 @@
         <div class="file-browser-error" role="alert">{renameError}</div>
       {/if}
 
-      {#if viewMode === 'list'}
+      {#if folderLoadError && folderLoadError.cid === currentFolderCid}
+        <FolderLoadError
+          message={folderLoadError.message}
+          onRetry={retryFolderLoad}
+        />
+      {:else if viewMode === 'list'}
         <FileList
           {items}
           {selectedCid}
@@ -738,6 +794,12 @@
           onBeginRename={beginRename}
           onCommitRename={commitRename}
           onCancelRename={cancelRename}
+          {creatingFolder}
+          bind:newFolderName
+          {newFolderError}
+          {creatingFolderInFlight}
+          onCommitCreateFolder={commitCreateFolder}
+          onCancelCreateFolder={cancelCreateFolder}
         />
       {:else}
         <FileGrid
@@ -753,6 +815,12 @@
           onBeginRename={beginRename}
           onCommitRename={commitRename}
           onCancelRename={cancelRename}
+          {creatingFolder}
+          bind:newFolderName
+          {newFolderError}
+          {creatingFolderInFlight}
+          onCommitCreateFolder={commitCreateFolder}
+          onCancelCreateFolder={cancelCreateFolder}
         />
       {/if}
 
