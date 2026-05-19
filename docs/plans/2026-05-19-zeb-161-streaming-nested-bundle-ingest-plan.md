@@ -123,7 +123,7 @@ Tasks 1-3 are tightly serialized (each removes APIs the previous step establishe
 - `src-tauri/tests/content_index_integration.rs:307-..` — verify Task 3's driver swap is in place. If Task 3's PR-iteration loop adjusted the assertions, confirm `expected_descendants` is correctly recomputed from `walk_recursive(root)`. (This is verification — not a new edit unless Task 3's commit needs a fix-up.)
 - `src-tauri/tests/folder_ingest_walker_integration.rs:473-494` — delete the oversized-leaf test (`set_len past FLAT_BUNDLE_MAX`).
 - `src-tauri/tests/folder_ingest_walker_integration.rs` (new test) — add `nested_bundle_tree_round_trip`:
-  - Skip with `if std::env::var("HARMONY_LARGE_TESTS").is_err() { return; }` for local-dev opt-out.
+  - Skip with `if std::env::var("HARMONY_LARGE_TESTS").ok().as_deref() != Some("1") { return; }` for local-dev opt-out — exact-"1" check (not just `.is_err()`) so `HARMONY_LARGE_TESTS=0` doesn't accidentally enable the 36 GiB path.
   - Open a tempfile, `set_len(36 * 1024 * 1024 * 1024 + 1)` — sparse 36 GiB.
   - Drive `streaming_ingest(tokio::fs::File::open(path).await?, &ingest_tx, ChunkerConfig::DEFAULT).await` — record the elapsed time as a smoke-test bound (warn at > 60 s).
   - Assert the returned CID is `CidType::Bundle(d)` with `d >= 2`.
