@@ -403,6 +403,24 @@ pub struct NodeState {
             >,
         >,
     >,
+    /// ZEB-301 Phase 4a-foundation: per-community D-FROST committee event
+    /// logs. Parallels `voting_logs`. Lazy-populated on first dfrost_* IPC
+    /// call for a community via a future `ensure_dfrost_log_for` helper
+    /// (introduced when the IPC layer lands in a follow-up PR — this PR
+    /// ships the data layer + tests only, no IPC wiring).
+    ///
+    /// `DfrostLog` is in-memory only in this phase; no Zenoh sync wiring
+    /// and no stop_inner cleanup. Phase 4a-main adds the parallel sync
+    /// engine + IPC surface that turns this field into a live committee
+    /// event log mirroring the voting-log architecture.
+    pub dfrost_logs: std::sync::Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<
+                crate::owner_state_types::SpaceId,
+                std::sync::Arc<tokio::sync::Mutex<crate::community_dfrost_log::DfrostLog>>,
+            >,
+        >,
+    >,
     /// ZEB-291 Phase 2 Task 19: per-community voting-log Zenoh engine
     /// registry. Engines are lazily registered when an IPC first touches a
     /// community via `ensure_voting_engine_for(..)`. Each engine shares the
@@ -499,6 +517,11 @@ impl Default for NodeState {
             // Phase 2 tick can share without holding a std::Mutex across
             // awaits.
             voting_logs: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            // ZEB-301 Phase 4a-foundation: empty registry. Lazy-populated
+            // on first dfrost_* IPC call (IPC surface lands in Phase 4a-main).
+            dfrost_logs: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
             voting_log_engines: std::sync::Arc::new(std::sync::Mutex::new(
@@ -24272,6 +24295,9 @@ mod start_node_race_tests {
                 std::sync::atomic::AtomicU64::new(1),
             ),
             voting_logs: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            dfrost_logs: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
             voting_log_engines: std::sync::Arc::new(std::sync::Mutex::new(

@@ -37,8 +37,7 @@ pub fn dkg_part1_local(
     max_signers: u16,
     min_signers: u16,
 ) -> Result<(round1::SecretPackage, Vec<u8>), String> {
-    let mut rng = rand_core::OsRng;
-    let (secret, package) = dkg::part1(identifier, max_signers, min_signers, &mut rng)
+    let (secret, package) = dkg::part1(identifier, max_signers, min_signers, rand_core::OsRng)
         .map_err(|e| format!("dkg::part1: {e}"))?;
     let mut buf = Vec::new();
     ciborium::into_writer(&package, &mut buf).map_err(|e| format!("encode r1 pkg: {e}"))?;
