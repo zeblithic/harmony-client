@@ -392,6 +392,17 @@ impl DfrostLog {
             return Err(ApplyError::UnknownCeremony);
         };
 
+        // R5 (CodeRabbit Major): once the committee is active, refresh is
+        // the only forward path. A stale or accidentally-seeded
+        // pending_dkg (corrupted state, race condition, future code
+        // change) MUST NOT be allowed to finalize a `dk` — that would
+        // let it rewrite members / threshold / max_signers / current_epoch
+        // under the existing joint VK, silently swapping the committee
+        // shape. Reject loudly to surface the protocol bug.
+        if self.committee_state.active && matches!(pending_slot, PendingSlot::Dkg) {
+            return Err(ApplyError::InvariantViolation);
+        }
+
         // Borrow the matching pending ceremony mutably. The branches are
         // identical except for which slot we read; collapse via a small
         // helper closure so the rest of the logic is one path.
@@ -1452,6 +1463,79 @@ mod tests {
         // Pending sign session MUST NOT be cleared on rejection — it
         // remains in-flight so a legitimate beacon can still land.
         assert!(log.committee_state.pending_sign.contains_key(&ceremony_id));
+    }
+
+    /// R5 (CodeRabbit Major): once the committee is active, a stale or
+    /// accidentally-seeded `pending_dkg` MUST NOT be allowed to finalize.
+    /// Only `pending_refresh` is a legitimate forward path after
+    /// activation. Without this guard, a stale initial-DKG dk that
+    /// happens to share the active joint vk could rewrite members /
+    /// threshold / max_signers under the existing key, silently
+    /// swapping committee shape.
+    #[test]
+    fn dk_against_pending_dkg_after_activation_rejected() {
+        use crate::community_dfrost_types::{
+            DfrostEventKind, DkgCompletePayload, MemberVerifyingShare, SignedCommitteeEvent,
+        };
+        use crate::owner_state_types::Hlc;
+
+        let alice = OwnerAddr([0x01; 16]);
+        let active_vk = [0x11u8; 32];
+
+        let mut log = DfrostLog::new();
+        // Committee is already active (e.g., initial DKG completed).
+        log.committee_state.active = true;
+        log.committee_state.current_epoch = 1;
+        log.committee_state.joint_verifying_key = Some(active_vk);
+        log.committee_state.members = vec![alice];
+        log.committee_state.threshold = 1;
+        log.committee_state.max_signers = 1;
+
+        // Simulated bug / corruption: pending_dkg is somehow non-None
+        // post-activation. The IPC layer should never produce this state,
+        // but defence-in-depth means apply must reject.
+        log.committee_state.pending_dkg = Some(PendingCeremony {
+            ceremony_id: [0x77; 32],
+            members: vec![alice],
+            threshold: 1,
+            max_signers: 1,
+            proposed_epoch: 2,
+            ..Default::default()
+        });
+
+        // A dk targeting the stale pending_dkg, claiming the same vk
+        // (so the vk-mutation check doesn't catch it).
+        let dk_payload = DkgCompletePayload {
+            ceremony_id: [0x77; 32],
+            joint_verifying_key: active_vk,
+            verifying_shares: vec![MemberVerifyingShare {
+                member: alice,
+                verifying_share: [0xaa; 32],
+            }],
+            epoch: 2,
+            members: vec![alice],
+            threshold: 1,
+            max_signers: 1,
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&dk_payload, &mut pd).unwrap();
+        let result = log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::DkgComplete,
+            hlc: Hlc {
+                wall_ms: 16_000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: alice,
+            payload: pd,
+            sig: vec![0u8; 64],
+        });
+        assert_eq!(result, Err(ApplyError::InvariantViolation));
+        // Active committee state MUST remain unchanged.
+        assert_eq!(log.committee_state.current_epoch, 1);
     }
 
     /// R4 (Cursor Medium): two dk events for the same ceremony MUST
