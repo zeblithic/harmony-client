@@ -10,6 +10,7 @@
     CleanupRecommendation,
   } from '../types';
   import { FileManagerService, type IngestFolderTreeResult } from '../file-manager-service';
+  import type { TauriAdapter } from '../zenoh-service';
   import { tierTarget } from '../file-utils';
   import BrowserToolbar from './BrowserToolbar.svelte';
   import Breadcrumbs from './Breadcrumbs.svelte';
@@ -47,6 +48,7 @@
 
   let {
     service,
+    adapter = null,
     currentFolderCid = null,
     selectedCid = null,
     selectedSidecarId = null,
@@ -70,6 +72,7 @@
     serviceVersion = 0,
   }: {
     service: FileManagerService;
+    adapter?: TauriAdapter | null;
     currentFolderCid?: string | null;
     selectedCid?: string | null;
     selectedSidecarId?: string | null;
@@ -722,6 +725,33 @@
     if (!picked || typeof picked !== 'string') return; // cancelled
     void startFolderIngest(picked);
   }
+
+  $effect(() => {
+    if (!adapter) return;
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+    const pending = adapter.listen('os-folder-dropped', (event) => {
+      if (cancelled) return;
+      if (activeIngestProgress || pickerOpen) return;
+      const payload = event.payload as { path: string; x: number; y: number };
+      void startFolderIngest(payload.path);
+    });
+    if (pending && typeof (pending as Promise<unknown>).then === 'function') {
+      (pending as Promise<() => void>).then((fn) => {
+        if (cancelled) {
+          try { fn(); } catch { /* swallow */ }
+        } else {
+          unlisten = fn;
+        }
+      });
+    } else if (typeof pending === 'function') {
+      unlisten = pending as () => void;
+    }
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  });
 
   async function startFolderIngest(rootPath: string) {
     // Mirrors commitCreateFolder's parent resolution: nested ingests

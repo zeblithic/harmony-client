@@ -1438,6 +1438,7 @@
   {#snippet fileBrowser()}
     <FileBrowser
       service={fileManagerService}
+      adapter={tauriAdapter}
       {currentFolderCid}
       selectedCid={selectedFileCid}
       selectedSidecarId={selectedFileSidecarId}
