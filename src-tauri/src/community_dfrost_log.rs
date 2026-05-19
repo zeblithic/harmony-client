@@ -693,18 +693,28 @@ impl DfrostLog {
                     if pending.ceremony_id != payload.ceremony_id {
                         return Err(ApplyError::UnknownCeremony);
                     }
-                    if let Some(cts) = payload.recipient_ciphertexts {
-                        for ct in cts {
-                            if ct.recipient == *self_addr {
-                                let plaintext =
-                                    dm_signing::open_from_owner(self_x25519_priv, &ct.sealed)
-                                        .map_err(|_| ApplyError::PayloadDecode)?;
-                                pending
-                                    .round2_packages
-                                    .entry(event.actor)
-                                    .or_insert(plaintext);
-                                break;
-                            }
+                    // R3 (Cursor Medium): rn=2 MUST carry
+                    // recipient_ciphertexts. The broadcast `apply` path
+                    // (`apply_dkg_round`) already rejects rn=2 without
+                    // ciphertexts as InvariantViolation; this local path
+                    // must apply the same rule, otherwise an attacker
+                    // can broadcast a malformed rn=2 that lands on the
+                    // local replica (via this path) but is rejected by
+                    // every peer (via the broadcast path) — event-log
+                    // divergence.
+                    let cts = payload
+                        .recipient_ciphertexts
+                        .ok_or(ApplyError::InvariantViolation)?;
+                    for ct in cts {
+                        if ct.recipient == *self_addr {
+                            let plaintext =
+                                dm_signing::open_from_owner(self_x25519_priv, &ct.sealed)
+                                    .map_err(|_| ApplyError::PayloadDecode)?;
+                            pending
+                                .round2_packages
+                                .entry(event.actor)
+                                .or_insert(plaintext);
+                            break;
                         }
                     }
                     self.events.push(event);
@@ -717,27 +727,46 @@ impl DfrostLog {
                 let payload: RefreshRoundPayload = ciborium::de::from_reader(&event.payload[..])
                     .map_err(|_| ApplyError::PayloadDecode)?;
                 if payload.round_num == 1 {
-                    // Ensure pending_refresh exists (init via the broadcast
-                    // semantics) before decrypting our own ciphertext.
+                    // R3 (CodeRabbit Major): stage the local decrypt
+                    // BEFORE mutating pending_refresh. Previously
+                    // `apply_proactive_refresh(&event)` was called
+                    // first (which initializes pending_refresh), then
+                    // decrypt was attempted — if decrypt failed, the
+                    // event would be rejected but pending_refresh had
+                    // already advanced, leaving the materialized state
+                    // out of sync with the (rejected) event log.
+                    //
+                    // The broadcast `apply_proactive_refresh` already
+                    // requires recipient_ciphertexts.is_some() for rn=1,
+                    // so we can take that requirement here too — and
+                    // do the decrypt early so a decrypt failure short-
+                    // circuits before mutation.
+                    let cts = payload
+                        .recipient_ciphertexts
+                        .as_ref()
+                        .ok_or(ApplyError::InvariantViolation)?;
+                    let decrypted_for_self: Option<Vec<u8>> = cts
+                        .iter()
+                        .find(|ct| ct.recipient == *self_addr)
+                        .map(|ct| dm_signing::open_from_owner(self_x25519_priv, &ct.sealed))
+                        .transpose()
+                        .map_err(|_| ApplyError::PayloadDecode)?;
+
+                    // Decrypt succeeded (or no ciphertext targeted self
+                    // — non-committee replicas in this refresh round
+                    // legitimately have nothing to decrypt). Safe to
+                    // mutate state now.
                     self.apply_proactive_refresh(&event)?;
-                    let pending = self
-                        .committee_state
-                        .pending_refresh
-                        .as_mut()
-                        .ok_or(ApplyError::UnknownCeremony)?;
-                    if let Some(cts) = payload.recipient_ciphertexts {
-                        for ct in cts {
-                            if ct.recipient == *self_addr {
-                                let plaintext =
-                                    dm_signing::open_from_owner(self_x25519_priv, &ct.sealed)
-                                        .map_err(|_| ApplyError::PayloadDecode)?;
-                                pending
-                                    .round2_packages
-                                    .entry(event.actor)
-                                    .or_insert(plaintext);
-                                break;
-                            }
-                        }
+                    if let Some(plaintext) = decrypted_for_self {
+                        let pending = self
+                            .committee_state
+                            .pending_refresh
+                            .as_mut()
+                            .ok_or(ApplyError::UnknownCeremony)?;
+                        pending
+                            .round2_packages
+                            .entry(event.actor)
+                            .or_insert(plaintext);
                     }
                     self.events.push(event);
                     return Ok(());

@@ -202,7 +202,8 @@ pub struct ThresholdSignPayload {
 }
 
 /// Payload for `DfrostEventKind::VrfBeacon` (`vb`). Aggregated Schnorr
-/// signature plus derived VRF output (`SHA-256(b"dfrost-vrf-v1" || R)`).
+/// signature plus derived VRF output (`SHA-256(b"dfrost-vrf-output-v1" || R)`,
+/// where R is the first 32 bytes of the signature — see `VRF_OUTPUT_DS`).
 ///
 /// Note: the `sg` key here is the FROST Schnorr signature, NOT the
 /// outer envelope's Ed25519 actor signature.
@@ -256,7 +257,7 @@ pub fn derive_ceremony_id(community_id: &SpaceId, wall_ms: u64, tag: &[u8]) -> [
 }
 
 /// VRF-seed derivation for threshold signing:
-/// `SHA-256(b"dfrost-vrf-v1" || poll_event_hash || epoch_le8)`.
+/// `SHA-256(b"dfrost-vrf-seed-v1" || poll_event_hash || epoch_le8)`.
 ///
 /// Including the epoch prevents a beacon produced under one committee
 /// epoch from being replayed against a refreshed committee that shares
