@@ -359,19 +359,237 @@ impl DfrostLog {
         Ok(())
     }
 
-    /// Apply a `ts` event. Stub for Task 2; fleshed out in Task 6.
-    fn apply_threshold_sign(&mut self, _event: &SignedCommitteeEvent) -> Result<(), ApplyError> {
+    /// Apply a `ts` event: per-member threshold-sign contribution.
+    ///
+    /// Verify-side guarantees (signature + actor-is-member) are upstream;
+    /// here we accumulate `(commitment_bytes, share_bytes)` per actor in
+    /// `pending_sign[ceremony_id].contributions`, creating the session on
+    /// first contribution. Re-contributions from the same actor are
+    /// silently ignored (HLC LWW dedupes upstream).
+    fn apply_threshold_sign(&mut self, event: &SignedCommitteeEvent) -> Result<(), ApplyError> {
+        use crate::community_dfrost_types::ThresholdSignPayload;
+
+        let payload: ThresholdSignPayload =
+            ciborium::de::from_reader(&event.payload[..]).map_err(|_| ApplyError::PayloadDecode)?;
+
+        // A `ts` event before the committee is active is malformed.
+        if !self.committee_state.active {
+            return Err(ApplyError::InvariantViolation);
+        }
+
+        let session = self
+            .committee_state
+            .pending_sign
+            .entry(payload.ceremony_id)
+            .or_insert_with(|| PendingSignSession {
+                message_hash: payload.message_hash,
+                contributions: BTreeMap::new(),
+            });
+        // First-write-wins on message_hash — if a later `ts` claims a
+        // different message for the same ceremony, that's an invariant
+        // violation (the ceremony shape is set when the first contribution
+        // lands).
+        if session.message_hash != payload.message_hash {
+            return Err(ApplyError::InvariantViolation);
+        }
+        session
+            .contributions
+            .entry(event.actor)
+            .or_insert((payload.commitment_bytes, payload.share_bytes));
         Ok(())
     }
 
-    /// Apply a `vb` event. Stub for Task 2; fleshed out in Task 6.
-    fn apply_vrf_beacon(&mut self, _event: &SignedCommitteeEvent) -> Result<(), ApplyError> {
+    /// Apply a `vb` event: the committee's aggregated VRF beacon.
+    ///
+    /// Verifies that the payload's `vrf_output` matches the
+    /// `derive_vrf_output(R_compressed)` recomputation. `R_compressed` is
+    /// the first 32 bytes of the Schnorr signature (the R component). If
+    /// the binding fails, reject — a malformed beacon must not poison
+    /// downstream consumers.
+    fn apply_vrf_beacon(&mut self, event: &SignedCommitteeEvent) -> Result<(), ApplyError> {
+        use crate::community_dfrost_types::{derive_vrf_output, VrfBeaconPayload};
+
+        let payload: VrfBeaconPayload =
+            ciborium::de::from_reader(&event.payload[..]).map_err(|_| ApplyError::PayloadDecode)?;
+
+        if !self.committee_state.active {
+            return Err(ApplyError::InvariantViolation);
+        }
+
+        // Schnorr signature is 64 bytes: R (32) || s (32). Anything else
+        // is malformed.
+        if payload.signature.len() != 64 {
+            return Err(ApplyError::InvariantViolation);
+        }
+        let mut r_compressed = [0u8; 32];
+        r_compressed.copy_from_slice(&payload.signature[..32]);
+        if derive_vrf_output(&r_compressed) != payload.vrf_output {
+            return Err(ApplyError::InvariantViolation);
+        }
+
+        // Clear the pending sign session — the ceremony is now finalised
+        // on this replica.
+        self.committee_state
+            .pending_sign
+            .remove(&payload.ceremony_id);
         Ok(())
     }
 
-    /// Apply an `rf` event. Stub for Task 2; fleshed out in Task 8.
-    fn apply_proactive_refresh(&mut self, _event: &SignedCommitteeEvent) -> Result<(), ApplyError> {
+    /// Apply an `rf` event: proactive committee refresh round.
+    ///
+    /// rn=1: initialise `pending_refresh` with `proposed_epoch =
+    ///   current_epoch + 1`. Recipient ciphertext storage is reserved for
+    ///   the local node's apply path (`apply_with_identity`).
+    /// rn=2: store the broadcast round-2 package alongside the pending
+    ///   refresh state.
+    ///
+    /// The refresh ceremony FINISHES via a `dk` event whose
+    /// `joint_verifying_key` MUST equal the existing active vk
+    /// (`apply_dkg_complete`'s invariant check enforces this). The dk's
+    /// epoch must be `current_epoch + 1`.
+    fn apply_proactive_refresh(&mut self, event: &SignedCommitteeEvent) -> Result<(), ApplyError> {
+        use crate::community_dfrost_types::RefreshRoundPayload;
+
+        let payload: RefreshRoundPayload =
+            ciborium::de::from_reader(&event.payload[..]).map_err(|_| ApplyError::PayloadDecode)?;
+
+        if !self.committee_state.active {
+            return Err(ApplyError::InvariantViolation);
+        }
+
+        if payload.round_num == 1 {
+            // Initialise the pending refresh once on the first rn=1 event.
+            // Subsequent rn=1 events (from other actors) reuse the existing
+            // pending_refresh — only the local node's per-recipient
+            // ciphertext decode happens in `apply_with_identity`.
+            if self.committee_state.pending_refresh.is_none() {
+                self.committee_state.pending_refresh = Some(PendingCeremony {
+                    ceremony_id: payload.ceremony_id,
+                    members: self.committee_state.members.clone(),
+                    threshold: self.committee_state.threshold,
+                    max_signers: self.committee_state.max_signers,
+                    proposed_epoch: self.committee_state.current_epoch + 1,
+                    ..Default::default()
+                });
+            }
+            // Subsequent enforcement: ceremony_id must match. A divergent
+            // ceremony_id within the same refresh epoch indicates a forked
+            // proposer; reject to surface the protocol bug rather than
+            // silently apply.
+            if let Some(pr) = &self.committee_state.pending_refresh {
+                if pr.ceremony_id != payload.ceremony_id {
+                    return Err(ApplyError::InvariantViolation);
+                }
+            }
+        } else if payload.round_num == 2 {
+            // Round-2 is broadcast in the spec's wire shape but the actual
+            // share material is per-recipient encrypted via
+            // recipient_ciphertexts; the global apply path stores nothing
+            // here. Local decryption happens in `apply_with_identity`.
+            let pr = self
+                .committee_state
+                .pending_refresh
+                .as_ref()
+                .ok_or(ApplyError::UnknownCeremony)?;
+            if pr.ceremony_id != payload.ceremony_id {
+                return Err(ApplyError::UnknownCeremony);
+            }
+        }
         Ok(())
+    }
+
+    /// Local-node apply path. Identical to `apply` except DkgRound rn=2
+    /// (and ProactiveRefresh rn=1 with `recipient_ciphertexts`) decrypt
+    /// the per-recipient sealed package matching `self_addr` and store
+    /// the plaintext bytes in `pending_dkg.round2_packages[event.actor]`
+    /// (or `pending_refresh.round2_packages[event.actor]`).
+    ///
+    /// `self_x25519_priv` is this node's X25519 private key derived from
+    /// the device identity (see `dm_signing::derive_x25519_priv`). The
+    /// non-local broadcast apply path (`apply`) cannot decrypt these
+    /// ciphertexts, so this method is the only path that materialises the
+    /// local share material needed for DKG part2/part3.
+    pub fn apply_with_identity(
+        &mut self,
+        event: SignedCommitteeEvent,
+        self_addr: &OwnerAddr,
+        self_x25519_priv: &[u8; 32],
+    ) -> Result<(), ApplyError> {
+        use crate::community_dfrost_types::{DkgRoundPayload, RefreshRoundPayload};
+        use crate::dm_signing;
+
+        // Envelope checks duplicated from `apply` so the early-bail paths
+        // surface the same diagnostics.
+        if event.tag != 'd' || event.committee_tier != 0 {
+            return Err(ApplyError::UnexpectedEnvelope);
+        }
+
+        match event.kind {
+            DfrostEventKind::DkgRound => {
+                let payload: DkgRoundPayload = ciborium::de::from_reader(&event.payload[..])
+                    .map_err(|_| ApplyError::PayloadDecode)?;
+                if payload.round_num == 2 {
+                    let pending = self
+                        .committee_state
+                        .pending_dkg
+                        .as_mut()
+                        .ok_or(ApplyError::UnknownCeremony)?;
+                    if pending.ceremony_id != payload.ceremony_id {
+                        return Err(ApplyError::UnknownCeremony);
+                    }
+                    if let Some(cts) = payload.recipient_ciphertexts {
+                        for ct in cts {
+                            if ct.recipient == *self_addr {
+                                let plaintext =
+                                    dm_signing::open_from_owner(self_x25519_priv, &ct.sealed)
+                                        .map_err(|_| ApplyError::PayloadDecode)?;
+                                pending
+                                    .round2_packages
+                                    .entry(event.actor)
+                                    .or_insert(plaintext);
+                                break;
+                            }
+                        }
+                    }
+                    self.events.push(event);
+                    return Ok(());
+                }
+                // For round_num != 2, fall back to the broadcast apply path.
+                self.apply(event)
+            }
+            DfrostEventKind::ProactiveRefresh => {
+                let payload: RefreshRoundPayload = ciborium::de::from_reader(&event.payload[..])
+                    .map_err(|_| ApplyError::PayloadDecode)?;
+                if payload.round_num == 1 {
+                    // Ensure pending_refresh exists (init via the broadcast
+                    // semantics) before decrypting our own ciphertext.
+                    self.apply_proactive_refresh(&event)?;
+                    let pending = self
+                        .committee_state
+                        .pending_refresh
+                        .as_mut()
+                        .ok_or(ApplyError::UnknownCeremony)?;
+                    if let Some(cts) = payload.recipient_ciphertexts {
+                        for ct in cts {
+                            if ct.recipient == *self_addr {
+                                let plaintext =
+                                    dm_signing::open_from_owner(self_x25519_priv, &ct.sealed)
+                                        .map_err(|_| ApplyError::PayloadDecode)?;
+                                pending
+                                    .round2_packages
+                                    .entry(event.actor)
+                                    .or_insert(plaintext);
+                                break;
+                            }
+                        }
+                    }
+                    self.events.push(event);
+                    return Ok(());
+                }
+                self.apply(event)
+            }
+            _ => self.apply(event),
+        }
     }
 }
 
@@ -528,6 +746,273 @@ mod tests {
         assert_eq!(log.committee_state.verifying_shares[&alice], [0xaa; 32]);
         assert!(log.committee_state.pending_dkg.is_none());
         assert_eq!(log.events.len(), 2);
+    }
+
+    #[test]
+    fn apply_with_identity_decrypts_round2_package() {
+        use crate::community_dfrost_types::{
+            DfrostEventKind, DkgRoundPayload, SignedCommitteeEvent,
+        };
+        use crate::community_membership::RecipientCiphertext;
+        use crate::dm_signing;
+        use crate::owner_state_types::Hlc;
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let alice = OwnerAddr([0x01; 16]);
+        let alice_priv = [0x42u8; 32];
+        let alice_x25519_pub = *PublicKey::from(&StaticSecret::from(alice_priv)).as_bytes();
+
+        let fake_r2_pkg_bytes = vec![0xca, 0xfe, 0xba, 0xbe];
+        let sealed =
+            dm_signing::seal_to_owner(&alice_x25519_pub, &fake_r2_pkg_bytes).expect("seal");
+
+        let payload = DkgRoundPayload {
+            ceremony_id: [0x42u8; 32],
+            round_num: 2,
+            round1_package: None,
+            recipient_ciphertexts: Some(vec![RecipientCiphertext {
+                recipient: alice,
+                sealed,
+            }]),
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&payload, &mut pd).unwrap();
+        let ev = SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::DkgRound,
+            hlc: Hlc {
+                wall_ms: 3000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: OwnerAddr([0x02; 16]),
+            payload: pd,
+            sig: vec![0u8; 64],
+        };
+
+        let mut log = DfrostLog::new();
+        log.committee_state.pending_dkg = Some(PendingCeremony {
+            ceremony_id: [0x42u8; 32],
+            members: vec![alice, OwnerAddr([0x02; 16])],
+            threshold: 1,
+            max_signers: 2,
+            proposed_epoch: 1,
+            ..Default::default()
+        });
+
+        log.apply_with_identity(ev, &alice, &alice_priv)
+            .expect("apply with identity");
+
+        let r2_pkgs = &log
+            .committee_state
+            .pending_dkg
+            .as_ref()
+            .unwrap()
+            .round2_packages;
+        assert_eq!(
+            r2_pkgs.get(&OwnerAddr([0x02; 16])),
+            Some(&fake_r2_pkg_bytes)
+        );
+    }
+
+    #[test]
+    fn ts_contributions_accumulate_in_pending_sign() {
+        use crate::community_dfrost_types::{
+            DfrostEventKind, SignedCommitteeEvent, ThresholdSignPayload,
+        };
+        use crate::owner_state_types::Hlc;
+
+        let alice = OwnerAddr([0x01; 16]);
+        let ceremony_id = [0xcc; 32];
+        let msg_hash = [0xde; 32];
+
+        let mut log = DfrostLog::new();
+        log.committee_state.active = true;
+        log.committee_state.members = vec![alice];
+
+        let payload = ThresholdSignPayload {
+            ceremony_id,
+            message_hash: msg_hash,
+            commitment_bytes: vec![0x01, 0x02],
+            share_bytes: vec![0x03, 0x04],
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&payload, &mut pd).unwrap();
+
+        log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::ThresholdSign,
+            hlc: Hlc {
+                wall_ms: 4000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: alice,
+            payload: pd,
+            sig: vec![0u8; 64],
+        })
+        .expect("apply ts");
+
+        let session = log.committee_state.pending_sign.get(&ceremony_id).unwrap();
+        assert_eq!(session.message_hash, msg_hash);
+        let (cm, sh) = session.contributions.get(&alice).unwrap();
+        assert_eq!(cm, &vec![0x01u8, 0x02]);
+        assert_eq!(sh, &vec![0x03u8, 0x04]);
+    }
+
+    #[test]
+    fn vb_with_wrong_vrf_output_rejected() {
+        use crate::community_dfrost_types::{
+            derive_vrf_output, DfrostEventKind, SignedCommitteeEvent, VrfBeaconPayload,
+        };
+        use crate::owner_state_types::Hlc;
+
+        let mut log = DfrostLog::new();
+        log.committee_state.active = true;
+
+        let sig_bytes = vec![0xaau8; 64];
+        let correct_vrf = derive_vrf_output(&sig_bytes[..32].try_into().unwrap());
+        let wrong_vrf = [0xff; 32];
+        assert_ne!(correct_vrf, wrong_vrf);
+
+        let payload = VrfBeaconPayload {
+            ceremony_id: [0xcc; 32],
+            message_hash: [0xde; 32],
+            signature: sig_bytes,
+            vrf_output: wrong_vrf,
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&payload, &mut pd).unwrap();
+
+        let result = log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::VrfBeacon,
+            hlc: Hlc {
+                wall_ms: 5000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: OwnerAddr([0x01; 16]),
+            payload: pd,
+            sig: vec![0u8; 64],
+        });
+        assert_eq!(result, Err(ApplyError::InvariantViolation));
+    }
+
+    #[test]
+    fn rf_rn1_event_starts_pending_refresh() {
+        use crate::community_dfrost_types::{
+            DfrostEventKind, RefreshRoundPayload, SignedCommitteeEvent,
+        };
+        use crate::community_membership::RecipientCiphertext;
+        use crate::owner_state_types::Hlc;
+
+        let alice = OwnerAddr([0x01; 16]);
+        let ceremony_id = [0x77u8; 32];
+
+        let mut log = DfrostLog::new();
+        log.committee_state.active = true;
+        log.committee_state.current_epoch = 1;
+        log.committee_state.members = vec![alice];
+        log.committee_state.threshold = 1;
+        log.committee_state.max_signers = 1;
+
+        let payload = RefreshRoundPayload {
+            ceremony_id,
+            round_num: 1,
+            recipient_ciphertexts: Some(vec![RecipientCiphertext {
+                recipient: alice,
+                sealed: vec![0xde, 0xad],
+            }]),
+            round2_package: None,
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&payload, &mut pd).unwrap();
+
+        log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::ProactiveRefresh,
+            hlc: Hlc {
+                wall_ms: 6000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: alice,
+            payload: pd,
+            sig: vec![0u8; 64],
+        })
+        .expect("apply rf rn=1");
+
+        assert!(log.committee_state.pending_refresh.is_some());
+        let pr = log.committee_state.pending_refresh.as_ref().unwrap();
+        assert_eq!(pr.ceremony_id, ceremony_id);
+        assert_eq!(pr.proposed_epoch, 2);
+    }
+
+    #[test]
+    fn refresh_completion_preserves_joint_vk() {
+        use crate::community_dfrost_types::{
+            DfrostEventKind, DkgCompletePayload, MemberVerifyingShare, SignedCommitteeEvent,
+        };
+        use crate::owner_state_types::Hlc;
+
+        let alice = OwnerAddr([0x01; 16]);
+        let existing_vk = [0x11u8; 32];
+
+        let mut log = DfrostLog::new();
+        log.committee_state.active = true;
+        log.committee_state.current_epoch = 1;
+        log.committee_state.joint_verifying_key = Some(existing_vk);
+        log.committee_state.pending_dkg = Some(PendingCeremony {
+            ceremony_id: [0x88; 32],
+            members: vec![alice],
+            threshold: 1,
+            max_signers: 1,
+            proposed_epoch: 2,
+            ..Default::default()
+        });
+
+        let dk_payload = DkgCompletePayload {
+            ceremony_id: [0x88; 32],
+            joint_verifying_key: existing_vk,
+            verifying_shares: vec![MemberVerifyingShare {
+                member: alice,
+                verifying_share: [0xbb; 32],
+            }],
+            epoch: 2,
+            members: vec![alice],
+            threshold: 1,
+            max_signers: 1,
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&dk_payload, &mut pd).unwrap();
+
+        log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::DkgComplete,
+            hlc: Hlc {
+                wall_ms: 7000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: alice,
+            payload: pd,
+            sig: vec![0u8; 64],
+        })
+        .expect("refresh dk accepted");
+
+        assert_eq!(log.committee_state.current_epoch, 2);
+        assert_eq!(log.committee_state.joint_verifying_key, Some(existing_vk));
     }
 
     #[test]
