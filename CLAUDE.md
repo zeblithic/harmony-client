@@ -172,7 +172,7 @@ On macOS, `XprotectService` (the system malware/Gatekeeper scanner) synchronousl
 spctl developer-mode enable-terminal
 ```
 
-Then in **System Settings → Privacy & Security → Developer Tools**, toggle your terminal (Terminal.app, iTerm2, Warp, etc.) **ON** and **quit + relaunch** so the entitlement applies to child processes. Verified speedup: full-workspace `cargo nextest list --all-targets` went from `>20 min, hangs` → `~40 sec`.
+Then in **System Settings → Privacy & Security → Developer Tools**, toggle your terminal (Terminal.app, iTerm2, Warp, etc.) **ON** and **quit + relaunch** so the entitlement applies to child processes. Verified speedup: full-workspace `cargo nextest list --locked --all-targets --features test-fixtures` went from `>20 min, hangs` → `~40 sec`.
 
 If you skip this step, every cold cargo build will appear to hang. There is no workaround other than waiting out the XprotectService queue (which on a fresh checkout can take 30+ minutes).
 
