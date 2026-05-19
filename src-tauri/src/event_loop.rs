@@ -1720,9 +1720,21 @@ pub async fn run<R: Runtime>(
                         // ZEB-155: clear intent so a later fetch doesn't re-pin.
                         pin_intent.remove(&cid);
                         let root = ContentId::from_bytes(cid);
-                        let all = collect_descendants(runtime.storage_tier().cache(), root);
-                        for id in all {
-                            runtime.unpin_content(&id);
+                        let doomed = collect_descendants(runtime.storage_tier().cache(), root);
+
+                        // ZEB-156: any CID reachable from a still-pinned root
+                        // must stay pinned even when it sits in `doomed`. See
+                        // `compute_keep_set` for the cross-cutting rationale.
+                        let keep = compute_keep_set(
+                            runtime.storage_tier().cache(),
+                            &pin_intent,
+                            doomed.len(),
+                        );
+
+                        for id in doomed {
+                            if !keep.contains(&id) {
+                                runtime.unpin_content(&id);
+                            }
                         }
                         let _ = reply.send(Ok(true));
                     }
@@ -1735,9 +1747,30 @@ pub async fn run<R: Runtime>(
                         // the in-memory set consistent if the orders diverge).
                         pin_intent.remove(&cid);
                         let root = ContentId::from_bytes(cid);
-                        let all = collect_descendants(runtime.storage_tier().cache(), root);
-                        for id in all {
-                            runtime.unpin_content(&id);
+                        let doomed = collect_descendants(runtime.storage_tier().cache(), root);
+
+                        // ZEB-156: same keep-set logic as Unpin — burning one
+                        // root must not destroy bytes another pinned root
+                        // still relies on. See `compute_keep_set` for the
+                        // shared-subtree case the Tauri OR-join misses.
+                        let keep = compute_keep_set(
+                            runtime.storage_tier().cache(),
+                            &pin_intent,
+                            doomed.len(),
+                        );
+
+                        for id in doomed {
+                            if !keep.contains(&id) {
+                                runtime.unpin_content(&id);
+                                // Burn-specific: also evict the bytes from
+                                // the cache immediately rather than waiting
+                                // for W-TinyLFU pressure. This is the
+                                // "no really, destroy this" semantic.
+                                // `None` means the CID was not in the cache
+                                // (e.g. already evicted, never admitted) —
+                                // harmless.
+                                let _ = runtime.remove_content(&id);
+                            }
                         }
                         let _ = reply.send(Ok(true));
                     }
@@ -2523,6 +2556,33 @@ pub(crate) fn collect_descendants<S: BookStore>(
         }
     }
     out
+}
+
+/// Build the set of CIDs that must stay pinned because they are reachable
+/// from one of `pin_intent`'s remaining roots.
+///
+/// ZEB-156: shared keep-set computation for `ContentVerbRequest::Unpin` and
+/// `ContentVerbRequest::Burn`. The Tauri OR-join (`is_cid_pinned_by_any`)
+/// only spots sibling-root sharing; transitive sharing — where an unrelated
+/// sidecar entry's CID is a descendant of the verb's root — is invisible to
+/// it. Walking remaining roots here closes that gap.
+///
+/// Capacity hint matches the doomed-set size, since the caller's CIDs of
+/// interest are bounded by it (we only ever check `keep.contains(&id)` for
+/// `id` drawn from `doomed`); over-allocation is harmless and saves a few
+/// rehashes when the keep set is dense.
+pub(crate) fn compute_keep_set<S: BookStore>(
+    store: &ContentStore<S>,
+    pin_intent: &std::collections::HashSet<[u8; 32]>,
+    capacity_hint: usize,
+) -> std::collections::HashSet<ContentId> {
+    let mut keep: std::collections::HashSet<ContentId> =
+        std::collections::HashSet::with_capacity(capacity_hint);
+    for keep_root_bytes in pin_intent.iter() {
+        let kr = ContentId::from_bytes(*keep_root_bytes);
+        keep.extend(collect_descendants(store, kr));
+    }
+    keep
 }
 
 /// Fetch the bytes of a content tree by repeatedly calling `fetch_one` per
@@ -4044,6 +4104,487 @@ mod channel_log_adapter_tests {
             ParsedBackfillKey::Valid { .. } => {
                 panic!("malformed HLC field must surface as Invalid, not silently widen to full backfill");
             }
+        }
+    }
+}
+
+/// ZEB-156 unit tests: verify the Unpin and Burn arms' keep-set cascade.
+///
+/// These tests replicate the production cascade bodies from
+/// `ContentVerbRequest::Unpin` and `ContentVerbRequest::Burn` directly
+/// against a `ContentStore` — the arms themselves can't easily be driven
+/// without the full event-loop harness (`NodeRuntime` is `!Send` and
+/// requires a dedicated OS thread; see `tests/content_index_integration.rs`
+/// for the integration-level cascade coverage). Keeping the algorithm here
+/// means the tests catch regressions in the keep-set computation in
+/// isolation from the rest of the verb pipeline.
+///
+/// Both simulators call the production `compute_keep_set` helper directly,
+/// so the keep-set logic itself is single-sourced; the simulators just
+/// thread the post-keep loop (unpin vs unpin + remove) the way the verb
+/// arms do. If the production arm bodies diverge from the simulators
+/// (i.e. one of them adds another side effect inside the `!keep.contains`
+/// branch), both must be updated together — this is documented at the top
+/// of each `simulate_*_cascade` below.
+#[cfg(test)]
+mod pin_cascade_tests {
+    use super::{collect_descendants, compute_keep_set};
+    use harmony_content::book::{BookStore, MemoryBookStore};
+    use harmony_content::bundle::BundleBuilder;
+    use harmony_content::cache::ContentStore;
+    use harmony_content::cid::{ContentFlags, ContentId};
+    use std::collections::HashSet;
+
+    /// Mirror of the `ContentVerbRequest::Unpin` arm's cascade body
+    /// (event_loop.rs §"Content-verb requests"), refactored against a
+    /// `&mut ContentStore` instead of `&mut NodeRuntime` so unit tests can
+    /// drive it directly. KEEP IN SYNC with the arm — the per-id loop
+    /// body MUST match (currently `cache.unpin(&id)` only; if the arm adds
+    /// another effect, mirror it here too).
+    fn simulate_unpin_cascade(
+        cache: &mut ContentStore<MemoryBookStore>,
+        pin_intent: &mut HashSet<[u8; 32]>,
+        cid: [u8; 32],
+    ) {
+        pin_intent.remove(&cid);
+        let root = ContentId::from_bytes(cid);
+        let doomed = collect_descendants(cache, root);
+        let keep = compute_keep_set(cache, pin_intent, doomed.len());
+        for id in doomed {
+            if !keep.contains(&id) {
+                cache.unpin(&id);
+            }
+        }
+    }
+
+    /// Mirror of the `ContentVerbRequest::Burn` arm's cascade body
+    /// (event_loop.rs §"Content-verb requests"), refactored against a
+    /// `&mut ContentStore` instead of `&mut NodeRuntime`. KEEP IN SYNC
+    /// with the arm — the per-id loop body MUST match: unpin AND
+    /// `cache.remove`, both gated on `!keep.contains(&id)`. The arm's
+    /// `runtime.remove_content` resolves to `cache.remove` via the
+    /// `StorageTier::remove` → `<ContentStore as BookStore>::remove`
+    /// delegation chain, so the observable cache effect is identical to
+    /// `cache.remove` here.
+    fn simulate_burn_cascade(
+        cache: &mut ContentStore<MemoryBookStore>,
+        pin_intent: &mut HashSet<[u8; 32]>,
+        cid: [u8; 32],
+    ) {
+        pin_intent.remove(&cid);
+        let root = ContentId::from_bytes(cid);
+        let doomed = collect_descendants(cache, root);
+        let keep = compute_keep_set(cache, pin_intent, doomed.len());
+        for id in doomed {
+            if !keep.contains(&id) {
+                cache.unpin(&id);
+                let _ = cache.remove(&id);
+            }
+        }
+    }
+
+    fn new_cache() -> ContentStore<MemoryBookStore> {
+        ContentStore::new(MemoryBookStore::new(), 1024)
+    }
+
+    /// Pin a CID and all CIDs reachable from it, mirroring the
+    /// `ContentVerbRequest::Pin` arm's cascade (event_loop.rs §"Content-verb
+    /// requests"). Test-only helper — no keep-set logic since over-pinning
+    /// is idempotent at the cache layer.
+    fn cascade_pin(cache: &mut ContentStore<MemoryBookStore>, root: ContentId) {
+        for id in collect_descendants(cache, root) {
+            assert!(cache.pin(id), "pin quota exceeded in test fixture");
+        }
+    }
+
+    /// Test 1 (spec): Unpin with a single root and no sharing — regression
+    /// guard. All N+1 CIDs (root + descendants) must be unpinned after the
+    /// cascade, matching pre-fix behavior when nothing remains in
+    /// pin_intent.
+    #[test]
+    fn unpin_single_root_no_sharing_clears_full_subtree() {
+        let mut cache = new_cache();
+        let a = cache
+            .insert_with_flags(b"leaf-a", ContentFlags::default())
+            .unwrap();
+        let b = cache
+            .insert_with_flags(b"leaf-b", ContentFlags::default())
+            .unwrap();
+        let c = cache
+            .insert_with_flags(b"leaf-c", ContentFlags::default())
+            .unwrap();
+        let mut builder = BundleBuilder::new();
+        builder.add(a).add(b).add(c);
+        let (payload, root) = builder.build_with_flags(ContentFlags::default()).unwrap();
+        cache.store(root, payload);
+
+        // Sanity: 4 distinct CIDs (root + 3 leaves).
+        let descendants: HashSet<ContentId> =
+            collect_descendants(&cache, root).into_iter().collect();
+        assert_eq!(descendants.len(), 4);
+
+        let mut pin_intent: HashSet<[u8; 32]> = HashSet::new();
+        pin_intent.insert(root.to_bytes());
+        cascade_pin(&mut cache, root);
+        for cid in [root, a, b, c] {
+            assert!(cache.is_pinned(&cid), "precondition: {cid:?} pinned");
+        }
+
+        simulate_unpin_cascade(&mut cache, &mut pin_intent, root.to_bytes());
+
+        for cid in [root, a, b, c] {
+            assert!(
+                !cache.is_pinned(&cid),
+                "{cid:?} must be unpinned after Unpin(root) with no other roots in pin_intent"
+            );
+        }
+        assert!(pin_intent.is_empty(), "intent cleared");
+    }
+
+    /// Test 2 (spec): two roots sharing a leaf. Unpin one root, the shared
+    /// leaf must stay pinned because it is reachable from the remaining
+    /// root.
+    #[test]
+    fn unpin_with_shared_leaf_keeps_overlap_pinned() {
+        let mut cache = new_cache();
+
+        // Shared leaf `shared`. Plus a per-root leaf each, so the two
+        // bundle roots have distinct CIDs (otherwise the test's "two
+        // roots" precondition collapses to a single root).
+        let shared = cache
+            .insert_with_flags(b"shared-leaf", ContentFlags::default())
+            .unwrap();
+        let only_in_left = cache
+            .insert_with_flags(b"left-only", ContentFlags::default())
+            .unwrap();
+        let only_in_right = cache
+            .insert_with_flags(b"right-only", ContentFlags::default())
+            .unwrap();
+
+        let mut left_builder = BundleBuilder::new();
+        left_builder.add(shared).add(only_in_left);
+        let (left_payload, left_root) = left_builder
+            .build_with_flags(ContentFlags::default())
+            .unwrap();
+        cache.store(left_root, left_payload);
+
+        let mut right_builder = BundleBuilder::new();
+        right_builder.add(shared).add(only_in_right);
+        let (right_payload, right_root) = right_builder
+            .build_with_flags(ContentFlags::default())
+            .unwrap();
+        cache.store(right_root, right_payload);
+
+        assert_ne!(left_root, right_root, "two distinct bundle roots");
+
+        // Pin both roots and their cascades.
+        let mut pin_intent: HashSet<[u8; 32]> = HashSet::new();
+        pin_intent.insert(left_root.to_bytes());
+        pin_intent.insert(right_root.to_bytes());
+        cascade_pin(&mut cache, left_root);
+        cascade_pin(&mut cache, right_root);
+
+        for cid in [shared, only_in_left, only_in_right, left_root, right_root] {
+            assert!(cache.is_pinned(&cid), "precondition: {cid:?} pinned");
+        }
+
+        // Unpin the left root. The shared leaf is reachable from the
+        // remaining right root, so it must stay pinned. `only_in_left`
+        // is reachable only from the left root, so it must be unpinned.
+        simulate_unpin_cascade(&mut cache, &mut pin_intent, left_root.to_bytes());
+
+        assert!(
+            !cache.is_pinned(&left_root),
+            "left_root itself was the unpin target"
+        );
+        assert!(
+            !cache.is_pinned(&only_in_left),
+            "only_in_left has no other pinned root and must be unpinned"
+        );
+        assert!(
+            cache.is_pinned(&shared),
+            "shared leaf must stay pinned — it is in right_root's subtree (BUG GUARD: pre-ZEB-156, this would have been unpinned)"
+        );
+        assert!(
+            cache.is_pinned(&right_root),
+            "right_root is untouched and must stay pinned"
+        );
+        assert!(
+            cache.is_pinned(&only_in_right),
+            "only_in_right is still reachable from right_root"
+        );
+    }
+
+    /// Test 3 (spec): two roots sharing a full subtree. `C = bundle(A, B)`
+    /// where `A = bundle(a1, a2)`. Pin both A and C separately. Unpin C.
+    ///
+    /// Expected: C, B, and B's contents unpinned (B has no other pinned
+    /// root); A and a1, a2 stay pinned because A is still in pin_intent
+    /// and its cascade keeps a1 and a2 reachable.
+    #[test]
+    fn unpin_with_shared_subtree_keeps_overlap_pinned() {
+        let mut cache = new_cache();
+
+        // Leaves for A's subtree.
+        let a1 = cache
+            .insert_with_flags(b"a1-leaf", ContentFlags::default())
+            .unwrap();
+        let a2 = cache
+            .insert_with_flags(b"a2-leaf", ContentFlags::default())
+            .unwrap();
+        let mut a_builder = BundleBuilder::new();
+        a_builder.add(a1).add(a2);
+        let (a_payload, cid_a) = a_builder.build_with_flags(ContentFlags::default()).unwrap();
+        cache.store(cid_a, a_payload);
+
+        // B's subtree is just leaves so the test stays small.
+        let b1 = cache
+            .insert_with_flags(b"b1-leaf", ContentFlags::default())
+            .unwrap();
+        let b2 = cache
+            .insert_with_flags(b"b2-leaf", ContentFlags::default())
+            .unwrap();
+        let mut b_builder = BundleBuilder::new();
+        b_builder.add(b1).add(b2);
+        let (b_payload, cid_b) = b_builder.build_with_flags(ContentFlags::default()).unwrap();
+        cache.store(cid_b, b_payload);
+
+        // C = bundle(A, B).
+        let mut c_builder = BundleBuilder::new();
+        c_builder.add(cid_a).add(cid_b);
+        let (c_payload, cid_c) = c_builder.build_with_flags(ContentFlags::default()).unwrap();
+        cache.store(cid_c, c_payload);
+
+        // Pin both A and C. Both go into pin_intent (mirror of sidecar
+        // entries with pinned=true).
+        let mut pin_intent: HashSet<[u8; 32]> = HashSet::new();
+        pin_intent.insert(cid_a.to_bytes());
+        pin_intent.insert(cid_c.to_bytes());
+        cascade_pin(&mut cache, cid_a);
+        cascade_pin(&mut cache, cid_c);
+
+        for cid in [cid_a, cid_b, cid_c, a1, a2, b1, b2] {
+            assert!(cache.is_pinned(&cid), "precondition: {cid:?} pinned");
+        }
+
+        // Unpin C. A's subtree (cid_a, a1, a2) must stay pinned because
+        // pin_intent still contains cid_a and its cascade covers them.
+        simulate_unpin_cascade(&mut cache, &mut pin_intent, cid_c.to_bytes());
+
+        assert!(!cache.is_pinned(&cid_c), "cid_c unpinned (target)");
+        assert!(
+            !cache.is_pinned(&cid_b),
+            "cid_b unpinned — reachable only from cid_c"
+        );
+        assert!(!cache.is_pinned(&b1), "b1 unpinned");
+        assert!(!cache.is_pinned(&b2), "b2 unpinned");
+        assert!(
+            cache.is_pinned(&cid_a),
+            "cid_a stays pinned — still in pin_intent (BUG GUARD: pre-ZEB-156, this would have been unpinned because it's a descendant of cid_c)"
+        );
+        assert!(
+            cache.is_pinned(&a1),
+            "a1 stays pinned — reachable from cid_a's keep-set walk"
+        );
+        assert!(
+            cache.is_pinned(&a2),
+            "a2 stays pinned — reachable from cid_a's keep-set walk"
+        );
+    }
+
+    /// Test 4 (spec): Burn evicts from cache. Pin a synthetic root with
+    /// several descendants, burn it. Every descendant must be both
+    /// unpinned AND removed from the cache (`cache.get` returns `None`).
+    ///
+    /// `simulate_burn_cascade` mirrors the production `Burn` arm; this
+    /// catches a regression where Burn forgets to call `cache.remove`
+    /// (the bytes would linger in the cache until W-TinyLFU pressure
+    /// kicked in, which is the pre-ZEB-156 behavior).
+    #[test]
+    fn burn_evicts_descendants_from_cache() {
+        let mut cache = new_cache();
+        let a = cache
+            .insert_with_flags(b"burn-leaf-a", ContentFlags::default())
+            .unwrap();
+        let b = cache
+            .insert_with_flags(b"burn-leaf-b", ContentFlags::default())
+            .unwrap();
+        let c = cache
+            .insert_with_flags(b"burn-leaf-c", ContentFlags::default())
+            .unwrap();
+        let mut builder = BundleBuilder::new();
+        builder.add(a).add(b).add(c);
+        let (payload, root) = builder.build_with_flags(ContentFlags::default()).unwrap();
+        cache.store(root, payload);
+
+        let mut pin_intent: HashSet<[u8; 32]> = HashSet::new();
+        pin_intent.insert(root.to_bytes());
+        cascade_pin(&mut cache, root);
+
+        // Sanity: everything is present and pinned before the burn.
+        for cid in [root, a, b, c] {
+            assert!(cache.is_pinned(&cid), "precondition: {cid:?} pinned");
+            assert!(
+                cache.get(&cid).is_some(),
+                "precondition: {cid:?} present in cache"
+            );
+        }
+
+        simulate_burn_cascade(&mut cache, &mut pin_intent, root.to_bytes());
+
+        // Every descendant must be unpinned AND evicted.
+        for cid in [root, a, b, c] {
+            assert!(!cache.is_pinned(&cid), "{cid:?} unpinned after burn");
+            assert!(
+                cache.get(&cid).is_none(),
+                "{cid:?} evicted from cache after burn (BUG GUARD: pre-ZEB-156, Burn relied on W-TinyLFU pressure and the bytes would still be reachable here)"
+            );
+        }
+        assert!(pin_intent.is_empty(), "intent cleared");
+    }
+
+    /// Test 5 (spec): Burn respects the keep set. Same shared-subtree
+    /// fixture as Test 3 (`C = bundle(A, B)` where `A = bundle(a1, a2)`,
+    /// `B = bundle(b1, b2)`), with A and C pinned separately. Burn C.
+    ///
+    /// Expected: C unpinned + removed; A still pinned + still in cache;
+    /// a1, a2 still in cache (A's keep-set walk covers them);
+    /// B, b1, b2 unpinned + removed (B was C-only).
+    #[test]
+    fn burn_with_shared_subtree_keeps_overlap_in_cache() {
+        let mut cache = new_cache();
+
+        let a1 = cache
+            .insert_with_flags(b"a1-leaf-burn", ContentFlags::default())
+            .unwrap();
+        let a2 = cache
+            .insert_with_flags(b"a2-leaf-burn", ContentFlags::default())
+            .unwrap();
+        let mut a_builder = BundleBuilder::new();
+        a_builder.add(a1).add(a2);
+        let (a_payload, cid_a) = a_builder.build_with_flags(ContentFlags::default()).unwrap();
+        cache.store(cid_a, a_payload);
+
+        let b1 = cache
+            .insert_with_flags(b"b1-leaf-burn", ContentFlags::default())
+            .unwrap();
+        let b2 = cache
+            .insert_with_flags(b"b2-leaf-burn", ContentFlags::default())
+            .unwrap();
+        let mut b_builder = BundleBuilder::new();
+        b_builder.add(b1).add(b2);
+        let (b_payload, cid_b) = b_builder.build_with_flags(ContentFlags::default()).unwrap();
+        cache.store(cid_b, b_payload);
+
+        let mut c_builder = BundleBuilder::new();
+        c_builder.add(cid_a).add(cid_b);
+        let (c_payload, cid_c) = c_builder.build_with_flags(ContentFlags::default()).unwrap();
+        cache.store(cid_c, c_payload);
+
+        let mut pin_intent: HashSet<[u8; 32]> = HashSet::new();
+        pin_intent.insert(cid_a.to_bytes());
+        pin_intent.insert(cid_c.to_bytes());
+        cascade_pin(&mut cache, cid_a);
+        cascade_pin(&mut cache, cid_c);
+
+        for cid in [cid_a, cid_b, cid_c, a1, a2, b1, b2] {
+            assert!(cache.is_pinned(&cid), "precondition: {cid:?} pinned");
+            assert!(cache.get(&cid).is_some(), "precondition: {cid:?} in cache");
+        }
+
+        simulate_burn_cascade(&mut cache, &mut pin_intent, cid_c.to_bytes());
+
+        // cid_c is the burn target: unpinned + removed.
+        assert!(!cache.is_pinned(&cid_c), "cid_c unpinned (burn target)");
+        assert!(
+            cache.get(&cid_c).is_none(),
+            "cid_c removed from cache (burn target)"
+        );
+
+        // cid_a stays pinned because it's still in pin_intent; its
+        // descendants must also stay in the cache.
+        assert!(
+            cache.is_pinned(&cid_a),
+            "cid_a stays pinned — still in pin_intent (BUG GUARD: pre-ZEB-156, this would have been unpinned because it's a descendant of cid_c)"
+        );
+        assert!(
+            cache.get(&cid_a).is_some(),
+            "cid_a stays in cache — keep-set guard skipped cache.remove"
+        );
+        assert!(
+            cache.is_pinned(&a1),
+            "a1 stays pinned — reachable from cid_a's keep-set walk"
+        );
+        assert!(
+            cache.is_pinned(&a2),
+            "a2 stays pinned — reachable from cid_a's keep-set walk"
+        );
+        assert!(
+            cache.get(&a1).is_some(),
+            "a1 stays in cache — A still pins it"
+        );
+        assert!(
+            cache.get(&a2).is_some(),
+            "a2 stays in cache — A still pins it"
+        );
+
+        // B's subtree was reachable only from C — must be unpinned AND
+        // removed.
+        assert!(
+            !cache.is_pinned(&cid_b),
+            "cid_b unpinned — reachable only from cid_c"
+        );
+        assert!(!cache.is_pinned(&b1), "b1 unpinned");
+        assert!(!cache.is_pinned(&b2), "b2 unpinned");
+        assert!(
+            cache.get(&cid_b).is_none(),
+            "cid_b removed from cache (B was C-only)"
+        );
+        assert!(cache.get(&b1).is_none(), "b1 removed from cache");
+        assert!(cache.get(&b2).is_none(), "b2 removed from cache");
+    }
+
+    /// Test 6 (spec): Empty `pin_intent` corner case. Pin a single root,
+    /// burn it. After `pin_intent.remove(&cid)`, the set is empty so the
+    /// keep set is empty. Every descendant gets unpinned AND evicted.
+    ///
+    /// This matches the pre-fix cascade end-state (no keep set means no
+    /// guard), so the existing
+    /// `chunked_ingest_pin_cascade_fetch_burn_roundtrip` integration test
+    /// continues to pass. The unit test adds redundant unit-level
+    /// coverage for the empty-`pin_intent` branch in the keep-set loop.
+    #[test]
+    fn burn_with_empty_pin_intent_evicts_everything() {
+        let mut cache = new_cache();
+        let leaf1 = cache
+            .insert_with_flags(b"solo-leaf-1", ContentFlags::default())
+            .unwrap();
+        let leaf2 = cache
+            .insert_with_flags(b"solo-leaf-2", ContentFlags::default())
+            .unwrap();
+        let mut builder = BundleBuilder::new();
+        builder.add(leaf1).add(leaf2);
+        let (payload, root) = builder.build_with_flags(ContentFlags::default()).unwrap();
+        cache.store(root, payload);
+
+        let mut pin_intent: HashSet<[u8; 32]> = HashSet::new();
+        pin_intent.insert(root.to_bytes());
+        cascade_pin(&mut cache, root);
+
+        // The lone pinned root is exactly the one we're about to burn,
+        // so `pin_intent` will be empty inside the cascade. Sanity-check
+        // that precondition.
+        assert_eq!(pin_intent.len(), 1);
+
+        simulate_burn_cascade(&mut cache, &mut pin_intent, root.to_bytes());
+
+        assert!(
+            pin_intent.is_empty(),
+            "intent must be empty after burning the only entry"
+        );
+        for cid in [root, leaf1, leaf2] {
+            assert!(!cache.is_pinned(&cid), "{cid:?} unpinned");
+            assert!(cache.get(&cid).is_none(), "{cid:?} evicted from cache");
         }
     }
 }
