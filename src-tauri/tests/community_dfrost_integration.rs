@@ -29,7 +29,7 @@ use harmony_app::community_dfrost_crypto::{
 use harmony_app::community_dfrost_log::{CommitteeState, DfrostLog, PendingCeremony};
 use harmony_app::community_dfrost_types::{
     derive_vrf_output, DfrostEventKind, DkgCompletePayload, DkgRoundPayload, MemberVerifyingShare,
-    SignedCommitteeEvent, ThresholdSignPayload, VrfBeaconPayload,
+    RefreshRoundPayload, SignedCommitteeEvent, ThresholdSignPayload, VrfBeaconPayload,
 };
 use harmony_app::community_membership::RecipientCiphertext;
 use harmony_app::dm_signing;
@@ -123,6 +123,26 @@ fn build_ts_event(
         version: 1,
         committee_tier: 0,
         kind: DfrostEventKind::ThresholdSign,
+        hlc: hlc(wall_ms, node_id),
+        actor,
+        payload: pd,
+        sig: vec![0u8; 64],
+    }
+}
+
+fn build_rf_event(
+    actor: OwnerAddr,
+    wall_ms: u64,
+    node_id: &str,
+    payload: RefreshRoundPayload,
+) -> SignedCommitteeEvent {
+    let mut pd = Vec::new();
+    ciborium::into_writer(&payload, &mut pd).expect("encode rf payload");
+    SignedCommitteeEvent {
+        tag: 'd',
+        version: 1,
+        committee_tier: 0,
+        kind: DfrostEventKind::ProactiveRefresh,
         hlc: hlc(wall_ms, node_id),
         actor,
         payload: pd,
@@ -543,4 +563,156 @@ fn threshold_sign_two_engine_vrf_beacon_verifies() {
         c.engine_a.committee_state.joint_verifying_key,
         c.engine_b.committee_state.joint_verifying_key
     );
+}
+
+// ─── Task 4: Proactive refresh preserves joint vk ───────────────────────────
+
+/// Proactive refresh ceremony rotates secret shares within the same
+/// committee membership, advancing the epoch and (by protocol invariant)
+/// preserving the joint verifying key. Both engines apply the rf rn=1
+/// events + dk finalizations and must end up with current_epoch=2 and
+/// joint_verifying_key unchanged from epoch 1.
+///
+/// The apply layer enforces the vk-preservation invariant: while
+/// `committee_state.active`, any incoming `dk` payload whose
+/// `joint_verifying_key` differs from the existing vk is rejected with
+/// InvariantViolation. The refresh dk events here REUSE the epoch-1
+/// joint vk to satisfy this.
+///
+/// Note: the apply path does NOT verify that the per-member
+/// `verifying_shares` are cryptographically consistent with a new share
+/// polynomial — it only stores them. A real refresh would derive new
+/// shares via FROST repair / resharing protocol; the integration test
+/// scopes to the apply-layer convergence, not the FROST refresh primitive
+/// itself (which lives in `community_dfrost_crypto` and has its own unit
+/// coverage).
+#[test]
+fn refresh_two_engine_preserves_joint_vk() {
+    let mut c = dkg_2of2_setup();
+    let (alice_priv, alice_pub) = alice_x25519();
+    let (bob_priv, bob_pub) = bob_x25519();
+
+    let refresh_ceremony_id: [u8; 32] = [0xee; 32];
+    let preserved_vk = c.joint_vk;
+
+    // ── rf rn=1: proposer distributes sealed packages to each member ─────
+    // Synthetic sealed bytes — the apply path decrypts them but doesn't
+    // interpret the content. In a real refresh the sealed bytes carry the
+    // new share polynomial coefficients.
+    let synthetic_share_for_alice = vec![0xaa; 64];
+    let synthetic_share_for_bob = vec![0xbb; 64];
+    let sealed_for_alice =
+        dm_signing::seal_to_owner(&alice_pub, &synthetic_share_for_alice).expect("seal alice");
+    let sealed_for_bob =
+        dm_signing::seal_to_owner(&bob_pub, &synthetic_share_for_bob).expect("seal bob");
+
+    let rf1 = build_rf_event(
+        ALICE,
+        6_000,
+        "alice",
+        RefreshRoundPayload {
+            ceremony_id: refresh_ceremony_id,
+            round_num: 1,
+            round2_package: None,
+            recipient_ciphertexts: Some(vec![
+                RecipientCiphertext {
+                    recipient: ALICE,
+                    sealed: sealed_for_alice,
+                },
+                RecipientCiphertext {
+                    recipient: BOB,
+                    sealed: sealed_for_bob,
+                },
+            ]),
+        },
+    );
+    c.engine_a
+        .apply_with_identity(rf1.clone(), &ALICE, &alice_priv)
+        .expect("a applies rf1 + decrypts");
+    c.engine_b
+        .apply_with_identity(rf1, &BOB, &bob_priv)
+        .expect("b applies rf1 + decrypts");
+
+    // ── Both engines now have pending_refresh populated ──────────────────
+    let pr_a = c
+        .engine_a
+        .committee_state
+        .pending_refresh
+        .as_ref()
+        .expect("a pending_refresh");
+    let pr_b = c
+        .engine_b
+        .committee_state
+        .pending_refresh
+        .as_ref()
+        .expect("b pending_refresh");
+    assert_eq!(pr_a.ceremony_id, refresh_ceremony_id);
+    assert_eq!(pr_b.ceremony_id, refresh_ceremony_id);
+    assert_eq!(pr_a.proposed_epoch, 2);
+    assert_eq!(pr_b.proposed_epoch, 2);
+
+    // ── dk finalization: both members confirm, joint_vk preserved ────────
+    // Verifying_shares: reuse epoch-1 shares (the apply path doesn't
+    // verify shares-to-secret consistency).
+    let identifier_map = CommitteeState::build_identifier_map(&members());
+    let mut verifying_shares = Vec::with_capacity(2);
+    for member in members() {
+        let id = identifier_map[&member];
+        let vs = c
+            .pub_pkg
+            .verifying_shares()
+            .get(&id)
+            .expect("verifying share");
+        verifying_shares.push(MemberVerifyingShare {
+            member,
+            verifying_share: verifying_share_to_bytes(vs),
+        });
+    }
+    let dk_payload = DkgCompletePayload {
+        ceremony_id: refresh_ceremony_id,
+        joint_verifying_key: preserved_vk, // MUST equal existing for refresh
+        verifying_shares,
+        epoch: 2,
+        members: members(),
+        threshold: 2,
+        max_signers: 2,
+    };
+    let dk_alice = build_dk_event(ALICE, 7_000, "alice", dk_payload.clone());
+    let dk_bob = build_dk_event(BOB, 7_100, "bob", dk_payload);
+    c.engine_a
+        .apply(dk_alice.clone())
+        .expect("a applies refresh dk_alice");
+    c.engine_b
+        .apply(dk_alice)
+        .expect("b applies refresh dk_alice");
+    c.engine_a
+        .apply(dk_bob.clone())
+        .expect("a applies refresh dk_bob");
+    c.engine_b.apply(dk_bob).expect("b applies refresh dk_bob");
+
+    // ── Convergence assertions ───────────────────────────────────────────
+    assert!(
+        c.engine_a.committee_state.active,
+        "engine A remains active across refresh"
+    );
+    assert!(
+        c.engine_b.committee_state.active,
+        "engine B remains active across refresh"
+    );
+    assert_eq!(c.engine_a.committee_state.current_epoch, 2);
+    assert_eq!(c.engine_b.committee_state.current_epoch, 2);
+    // The point of refresh: joint_verifying_key unchanged.
+    assert_eq!(
+        c.engine_a.committee_state.joint_verifying_key,
+        Some(preserved_vk),
+        "refresh MUST preserve joint vk"
+    );
+    assert_eq!(
+        c.engine_b.committee_state.joint_verifying_key,
+        Some(preserved_vk),
+        "refresh MUST preserve joint vk on engine B too"
+    );
+    // pending_refresh cleared on both engines.
+    assert!(c.engine_a.committee_state.pending_refresh.is_none());
+    assert!(c.engine_b.committee_state.pending_refresh.is_none());
 }
