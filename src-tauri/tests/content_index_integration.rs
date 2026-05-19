@@ -503,9 +503,10 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
         }
     });
 
-    let root_cid = streaming_ingest(bytes.as_slice(), &capture_tx, ChunkerConfig::DEFAULT)
-        .await
-        .expect("streaming ingest must succeed");
+    let (root_cid, _streamed_bytes) =
+        streaming_ingest(bytes.as_slice(), &capture_tx, ChunkerConfig::DEFAULT, None)
+            .await
+            .expect("streaming ingest must succeed");
     drop(capture_tx);
     forwarder.await.expect("forwarder task joins cleanly");
 

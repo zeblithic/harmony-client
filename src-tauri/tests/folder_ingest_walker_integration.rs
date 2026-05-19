@@ -871,29 +871,66 @@ async fn nested_bundle_tree_round_trip() {
     // Captured-channel pattern (mirrors `spawn_ingest_drain` in
     // `streaming_ingest_tests` and the forwarder in
     // `chunked_ingest_pin_cascade_fetch_burn_roundtrip`): drive
-    // `streaming_ingest` through a channel we own, recording every
-    // (cid_hex, bytes) pair. The bytes are needed for the root bundle
-    // sentinel parse below; the CIDs alone drive the leaf-count assertion.
+    // `streaming_ingest` through a channel we own.
+    //
+    // Memory note: the obvious "record every (cid_hex, bytes) pair" pattern
+    // works for small fixtures but OOMs CI on 36 GiB inputs — every leaf's
+    // ~1 MiB payload is cloned into the captured Vec, retaining
+    // ~O(file_size) bytes for the lifetime of the test. The refactored
+    // drain below counts leaves and discards their bytes (only the CID type
+    // matters), and stores bundle payloads in a CID-keyed map so the root
+    // bundle's bytes can be parsed for the inline-metadata assertion. Total
+    // retained RAM is bounded by leaf-COUNT × 0 + bundle-count × bundle-size
+    // (~MAX_BUNDLE_ENTRIES × 32 B per bundle), well under a single MiB
+    // total at this scale.
+    struct DrainOutput {
+        leaf_count: usize,
+        /// CID hex → bundle payload bytes. Only Bundle CIDs are stored;
+        /// Book (leaf) payloads are counted via `leaf_count` and the
+        /// bytes are discarded immediately.
+        bundle_payloads: std::collections::HashMap<String, Vec<u8>>,
+    }
+
     let (capture_tx, mut capture_rx) =
         tokio::sync::mpsc::channel::<harmony_app::event_loop::IngestRequest>(1024);
-    let drain: tokio::task::JoinHandle<Vec<(String, Vec<u8>)>> = tokio::spawn(async move {
-        let mut captured: Vec<(String, Vec<u8>)> = Vec::new();
+    let drain: tokio::task::JoinHandle<DrainOutput> = tokio::spawn(async move {
+        let mut leaf_count = 0usize;
+        let mut bundle_payloads: std::collections::HashMap<String, Vec<u8>> = Default::default();
         while let Some(req) = capture_rx.recv().await {
-            captured.push((req.cid_hex.clone(), req.data.clone()));
+            let raw = hex::decode(&req.cid_hex).expect("captured cid_hex must decode");
+            let arr: [u8; 32] = raw.as_slice().try_into().expect("32-byte CID");
+            match ContentId::from_bytes(arr).cid_type() {
+                CidType::Book => {
+                    // Discard the bytes — only the count matters for the
+                    // leaf assertion below, and retaining them would push
+                    // the test into multi-GiB RSS.
+                    leaf_count += 1;
+                }
+                _ => {
+                    // Bundles (and any other non-Book CIDs) are tiny — keep
+                    // the bytes so the root's inline-metadata sentinel can
+                    // be parsed.
+                    bundle_payloads.insert(req.cid_hex.clone(), req.data.clone());
+                }
+            }
             // Ack immediately so streaming_ingest's send_ingest helper sees
             // a fast Ok — the runtime's storage tier is not involved here.
             let _ = req.reply.send(Ok(()));
         }
-        captured
+        DrainOutput {
+            leaf_count,
+            bundle_payloads,
+        }
     });
 
     let start = std::time::Instant::now();
     let reader = tokio::fs::File::open(&path)
         .await
         .expect("open sparse fixture for async read");
-    let root = harmony_app::streaming_ingest(reader, &capture_tx, ChunkerConfig::DEFAULT)
-        .await
-        .expect("streaming_ingest must succeed on the 36 GiB sparse fixture");
+    let (root, _total_bytes) =
+        harmony_app::streaming_ingest(reader, &capture_tx, ChunkerConfig::DEFAULT, None)
+            .await
+            .expect("streaming_ingest must succeed on the 36 GiB sparse fixture");
     drop(capture_tx);
     let captured = drain.await.expect("capture drain joins cleanly");
     let elapsed = start.elapsed();
@@ -924,27 +961,20 @@ async fn nested_bundle_tree_round_trip() {
     // a regression where the chunker starts producing many more cuts than
     // expected (e.g. min_chunk-sized cuts would yield 36 GiB / 256 KiB =
     // 147_456 leaves — still depth-2 but ~4× the expected count).
-    let leaf_count = captured
-        .iter()
-        .filter(|(cid_hex, _)| {
-            let raw = hex::decode(cid_hex).expect("captured cid_hex must decode");
-            let arr: [u8; 32] = raw.as_slice().try_into().expect("32-byte CID");
-            ContentId::from_bytes(arr).cid_type() == CidType::Book
-        })
-        .count();
+    let leaf_count = captured.leaf_count;
     assert!(
         leaf_count > 32_767 && leaf_count < 200_000,
         "expected leaf count in (32_767, 200_000) for 36 GiB sparse input, got {leaf_count}"
     );
 
     // ── Inline-metadata round-trip on the root bundle ───────────────────
-    // The captured log contains the bundle bytes — find the entry whose
-    // CID matches the root, parse it, and check that the first child CID
-    // is the InlineData sentinel with the original byte count + chunk count.
+    // The captured bundle map has the root's bytes — look it up by CID hex
+    // and parse it, then check that the first child CID is the InlineData
+    // sentinel with the original byte count + chunk count.
     let root_hex = hex::encode(root.to_bytes());
-    let (_, root_bytes) = captured
-        .iter()
-        .find(|(h, _)| *h == root_hex)
+    let root_bytes = captured
+        .bundle_payloads
+        .get(&root_hex)
         .expect("root bundle bytes must appear in the captured stream");
     let entries = parse_bundle(root_bytes).expect("root bundle bytes parse");
     assert!(

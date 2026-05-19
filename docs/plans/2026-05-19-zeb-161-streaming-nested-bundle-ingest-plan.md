@@ -7,7 +7,7 @@ Decomposed for subagent-driven execution. Each task is self-contained — implem
 
 ## Task ordering
 
-```
+```text
 Task 1: streaming_ingest + build_bundle_tree (pure helpers, unit-tested)
       ↓
 Task 2: wire send_ingest_bytes_only; drop Oversized + size gates
@@ -124,18 +124,18 @@ Tasks 1-3 are tightly serialized (each removes APIs the previous step establishe
 - `src-tauri/tests/folder_ingest_walker_integration.rs:473-494` — delete the oversized-leaf test (`set_len past FLAT_BUNDLE_MAX`).
 - `src-tauri/tests/folder_ingest_walker_integration.rs` (new test) — add `nested_bundle_tree_round_trip`:
   - Skip with `if std::env::var("HARMONY_LARGE_TESTS").is_err() { return; }` for local-dev opt-out.
-  - Open a tempfile, `set_len(9 * 1024 * 1024 * 1024 + 1)` — sparse 9 GiB.
+  - Open a tempfile, `set_len(36 * 1024 * 1024 * 1024 + 1)` — sparse 36 GiB.
   - Drive `streaming_ingest(tokio::fs::File::open(path).await?, &ingest_tx, ChunkerConfig::DEFAULT).await` — record the elapsed time as a smoke-test bound (warn at > 60 s).
   - Assert the returned CID is `CidType::Bundle(d)` with `d >= 2`.
-  - Walk via the runtime's fetch path; assert `walk_recursive(root)` returns the expected leaf count (~36864 leaves at 256 KiB chunks for 9 GiB).
-  - Parse the root bundle's first entry; assert `parse_inline_metadata` returns `(9 * 1024 * 1024 * 1024 + 1, 36864ish, _, _)`.
+  - Walk via the runtime's fetch path; assert `walk_recursive(root)` returns the expected leaf count (~36_864 leaves at ~1 MiB forced cuts for 36 GiB sparse-zero file — see the spec's chunker-on-zeros analysis for why DEFAULT config forces every cut at max_chunk).
+  - Parse the root bundle's first entry; assert `parse_inline_metadata` returns `(36 * 1024 * 1024 * 1024 + 1, 36864ish, _, _)`.
 
 **Constraints:**
-- The 9 GiB test must be opt-in (env-var gated). CI workflow can opt in via `HARMONY_LARGE_TESTS=1` in the `rust-test` job — that's a separate `.github/workflows/ci.yml` edit handled in this task.
-- The leaf-count assertion uses `> 32_767 && < 50_000` (loose bound; FastCDC distribution variance means exact count drifts) — not a tight equality.
+- The 36 GiB sparse-file test must be opt-in (env-var gated). CI workflow can opt in via `HARMONY_LARGE_TESTS=1` in the `rust-test` job — that's a separate `.github/workflows/ci.yml` edit handled in this task.
+- The leaf-count assertion uses `> 32_767 && < 200_000` (loose bound; FastCDC distribution variance means exact count drifts) — not a tight equality.
 
 **Test gates:**
-- `HARMONY_LARGE_TESTS=1 cargo nextest run --locked --features test-fixtures -E 'test(nested_bundle_tree_round_trip)'` — green locally on the Ildwyn dev machine (≥ 9 GiB free disk).
+- `HARMONY_LARGE_TESTS=1 cargo nextest run --locked --features test-fixtures -E 'test(nested_bundle_tree_round_trip)'` — green locally on the Ildwyn dev machine (≥ 36 GiB free disk for the sparse fixture; sparse files don't consume real disk, but the tempdir filesystem needs to support sparse holes).
 - Default `cargo nextest run` (without the env var) — test skipped, all others green.
 - CI `rust-test` job — green with `HARMONY_LARGE_TESTS=1` set.
 

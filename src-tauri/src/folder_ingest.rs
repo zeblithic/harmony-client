@@ -547,8 +547,20 @@ fn walk<'a, R: Runtime>(
                 Err(e) => return WalkOutcome::Failed(format!("open: {e}")),
             };
             let reader = tokio::io::BufReader::new(file);
-            match crate::streaming_ingest(reader, &ctx.ingest_tx, ChunkerConfig::DEFAULT).await {
-                Ok(root) => {
+            // Pass `Some(&ctx.cancel)` so an in-flight cancel observes within
+            // ~1 MiB of read time — without this, large-file ingest is
+            // effectively non-cancellable until EOF. The walker's top-of-
+            // recursion check already short-circuits between leaves; this
+            // closes the long-pole gap inside a single large file.
+            match crate::streaming_ingest(
+                reader,
+                &ctx.ingest_tx,
+                ChunkerConfig::DEFAULT,
+                Some(&ctx.cancel),
+            )
+            .await
+            {
+                Ok((root, _bytes)) => {
                     counters.succeeded = counters.succeeded.saturating_add(1);
                     ctx.emit_progress(counters, path);
                     WalkOutcome::Ingested(ManifestEntry {
@@ -557,6 +569,12 @@ fn walk<'a, R: Runtime>(
                         kind: ContentKind::Leaf,
                     })
                 }
+                // `IngestError::other("cancelled")` is the typed signal
+                // `streaming_ingest` emits when its cancel parameter fires.
+                // Route to `Cancelled` so the walker's outer state machine
+                // surfaces the right summary headline (and doesn't bucket it
+                // under `Failed`). Any other error stays in the failure list.
+                Err(e) if e.to_string() == "cancelled" => WalkOutcome::Cancelled,
                 Err(e) => WalkOutcome::Failed(e.to_string()),
             }
         } else {

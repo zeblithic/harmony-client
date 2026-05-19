@@ -140,7 +140,8 @@ pub async fn streaming_ingest<R>(
     reader: R,
     ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
     chunker_config: harmony_content::chunker::ChunkerConfig,
-) -> Result<harmony_content::cid::ContentId, IngestError>
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<(harmony_content::cid::ContentId, u64), IngestError>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -158,6 +159,15 @@ where
     let mut read_buf = vec![0u8; READ_WINDOW_SIZE];
 
     loop {
+        // Bounded cancel observation: checked once per ~1 MiB read window so a
+        // large file (multi-GiB) can be cancelled within a single read's worth
+        // of work rather than blocking until EOF. Relaxed ordering matches the
+        // folder walker's existing top-of-recursion checks.
+        if let Some(c) = cancel {
+            if c.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(IngestError::other("cancelled"));
+            }
+        }
         let n = reader.read(&mut read_buf).await.map_err(IngestError::Io)?;
         if n == 0 {
             break;
@@ -170,29 +180,57 @@ where
         let mut window_pos = 0;
         for cut in cuts {
             open_chunk.extend_from_slice(&window[window_pos..cut]);
-            let cid = ContentId::for_book(&open_chunk, ContentFlags::default())
+            // `mem::replace` here (rather than `clone()` + `clear()`) avoids a
+            // per-leaf memcpy of the chunk bytes on the hot path. `mem::take`
+            // would lose the pre-allocated `max_chunk` capacity invariant;
+            // `mem::replace` with a freshly-sized Vec preserves it. The
+            // replace happens BEFORE `for_book(&chunk, ...)` because we need
+            // the chunk bytes (now owned by `chunk`) to compute the hash.
+            let chunk = std::mem::replace(
+                &mut open_chunk,
+                Vec::with_capacity(chunker_config.max_chunk),
+            );
+            let cid = ContentId::for_book(&chunk, ContentFlags::default())
                 .map_err(|e| IngestError::other(format!("leaf CID: {e:?}")))?;
-            send_ingest(ingest_tx, hex::encode(cid.to_bytes()), open_chunk.clone())
+            send_ingest(ingest_tx, hex::encode(cid.to_bytes()), chunk)
                 .await
                 .map_err(IngestError::IngestChannel)?;
             leaf_cids.push(cid);
-            open_chunk.clear();
             window_pos = cut;
         }
         open_chunk.extend_from_slice(&window[window_pos..]);
     }
 
     if chunker.finalize().is_some() {
-        let cid = ContentId::for_book(&open_chunk, ContentFlags::default())
+        // Same `mem::replace` pattern as above — see comment in the cut loop.
+        let chunk = std::mem::replace(
+            &mut open_chunk,
+            Vec::with_capacity(chunker_config.max_chunk),
+        );
+        let cid = ContentId::for_book(&chunk, ContentFlags::default())
             .map_err(|e| IngestError::other(format!("leaf CID: {e:?}")))?;
-        send_ingest(ingest_tx, hex::encode(cid.to_bytes()), open_chunk.clone())
+        send_ingest(ingest_tx, hex::encode(cid.to_bytes()), chunk)
             .await
             .map_err(IngestError::IngestChannel)?;
         leaf_cids.push(cid);
-        open_chunk.clear();
     }
 
-    build_bundle_tree(leaf_cids, total_bytes, ingest_tx).await
+    if leaf_cids.is_empty() {
+        // Empty file (zero bytes) — emit a single Book CID for an empty
+        // payload. Matches the pre-ZEB-161 Single dispatch path so the folder
+        // walker doesn't mis-surface 0-byte placeholder files as failures.
+        // `build_bundle_tree`'s empty-input error path remains in place as a
+        // defensive guard for direct callers that bypass `streaming_ingest`.
+        let cid = ContentId::for_book(&[], ContentFlags::default())
+            .map_err(|e| IngestError::other(format!("empty-file CID: {e:?}")))?;
+        send_ingest(ingest_tx, hex::encode(cid.to_bytes()), Vec::new())
+            .await
+            .map_err(IngestError::IngestChannel)?;
+        return Ok((cid, 0));
+    }
+
+    let root = build_bundle_tree(leaf_cids, total_bytes, ingest_tx).await?;
+    Ok((root, total_bytes))
 }
 
 /// Build the nested-bundle tree bottom-up from a vector of leaf CIDs and
@@ -226,7 +264,17 @@ pub(crate) async fn build_bundle_tree(
         return Ok(leaf_cids[0]);
     }
 
-    let chunk_count = leaf_cids.len() as u32;
+    // Checked conversion: silent `as u32` truncation would write garbage to
+    // the root bundle's inline-metadata sentinel for ingests with > u32::MAX
+    // leaves. At default config (~1 MiB chunks) that's a >4 PiB single file —
+    // unreachable in practice, but the explicit error keeps the failure mode
+    // observable rather than corrupted.
+    let chunk_count: u32 = leaf_cids.len().try_into().map_err(|_| {
+        IngestError::other(format!(
+            "chunk count {} exceeds u32::MAX — file too large for inline metadata",
+            leaf_cids.len()
+        ))
+    })?;
     let mut current_level = leaf_cids;
 
     loop {
@@ -6057,8 +6105,10 @@ async fn ingest_content(
         .map_err(|_| "dialog error".to_string())?
         .ok_or_else(|| "upload cancelled".to_string())?;
 
-    // 2. Stat the file for the sidecar row's `size_bytes` (still needed
-    // post-ZEB-161; the streaming pipeline doesn't return a byte count).
+    // 2. Resolve file path + name. `size_bytes` is no longer derived from a
+    // pre-stream `metadata()` call — `streaming_ingest` now returns the
+    // actual bytes consumed, eliminating a TOCTOU window where the file
+    // could be truncated/appended between stat and read.
     let path = file_path
         .as_path()
         .ok_or_else(|| "unsupported file path".to_string())?;
@@ -6067,10 +6117,6 @@ async fn ingest_content(
         .and_then(|n| n.to_str())
         .unwrap_or("unknown")
         .to_string();
-    let meta = tokio::fs::metadata(path)
-        .await
-        .map_err(|e| format!("read failed: {e}"))?;
-    let size_bytes = meta.len();
 
     let (ingest_tx, content_index) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
@@ -6090,7 +6136,7 @@ async fn ingest_content(
         .await
         .map_err(|e| format!("read failed: {e}"))?;
     let reader = tokio::io::BufReader::new(file);
-    let root = streaming_ingest(reader, &ingest_tx, ChunkerConfig::DEFAULT)
+    let (root, size_bytes) = streaming_ingest(reader, &ingest_tx, ChunkerConfig::DEFAULT, None)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -6130,13 +6176,16 @@ pub(crate) async fn ingest_file_at_path(
     if meta.file_type().is_symlink() {
         return Err(IngestError::Symlink);
     }
-    let size_bytes = meta.len();
     // Stream the file through the chunker — bounded memory regardless of
     // size (ZEB-161). Replaces the pre-ZEB-161 `tokio::fs::read` that
-    // allocated the entire file into a Vec before chunking.
+    // allocated the entire file into a Vec before chunking. `size_bytes` is
+    // the actual streamed total (returned by `streaming_ingest`), not the
+    // pre-stream `meta.len()` — closes a TOCTOU window where the file could
+    // mutate between stat and stream.
     let file = tokio::fs::File::open(path).await?;
     let reader = tokio::io::BufReader::new(file);
-    let root = streaming_ingest(reader, ingest_tx, ChunkerConfig::DEFAULT).await?;
+    let (root, size_bytes) =
+        streaming_ingest(reader, ingest_tx, ChunkerConfig::DEFAULT, None).await?;
     send_ingest_with_name(
         content_index,
         root.to_bytes(),
@@ -22723,22 +22772,37 @@ mod streaming_ingest_tests {
     }
 
     #[tokio::test]
-    async fn streaming_ingest_empty_reader_returns_empty_input_error() {
+    async fn streaming_ingest_empty_reader_emits_empty_book_cid() {
+        // ZEB-161 fix-up Round 1: zero-byte files previously failed because
+        // the chunker emits no cuts, finalize returns None, and
+        // build_bundle_tree's empty-input guard rejected. The folder walker
+        // surfaced that as a Failed entry in the summary modal. Pre-ZEB-161
+        // the Single dispatch path emitted a Book CID for an empty payload.
+        // streaming_ingest now matches that behaviour — empty input returns
+        // a Book CID for `&[]` and 0 total bytes.
         let bytes: Vec<u8> = Vec::new();
         let (tx, rx) = mpsc::channel::<IngestRequest>(8);
         let drain = spawn_ingest_drain(rx);
 
-        let err = streaming_ingest(std::io::Cursor::new(bytes), &tx, small_chunker_config())
-            .await
-            .unwrap_err();
+        let (root, total) = streaming_ingest(
+            std::io::Cursor::new(bytes),
+            &tx,
+            small_chunker_config(),
+            None,
+        )
+        .await
+        .expect("empty input must succeed with a Book CID for the zero-length payload");
         drop(tx);
         let captured = drain.await.unwrap();
 
-        match err {
-            IngestError::Other(msg) => assert!(msg.contains("empty input"), "got: {msg}"),
-            other => panic!("expected IngestError::Other(\"empty...\"), got: {other:?}"),
-        }
-        assert!(captured.is_empty(), "no IPC sends on empty input");
+        assert_eq!(total, 0);
+        assert_eq!(root.cid_type(), CidType::Book);
+        let recomputed = ContentId::for_book(&[], ContentFlags::default()).unwrap();
+        assert_eq!(root, recomputed);
+        // One IPC send: the empty-payload Book CID with empty bytes.
+        assert_eq!(captured.len(), 1, "exactly one leaf send for empty input");
+        assert_eq!(captured[0].0, hex::encode(root.to_bytes()));
+        assert!(captured[0].1.is_empty());
     }
 
     #[tokio::test]
@@ -22748,16 +22812,18 @@ mod streaming_ingest_tests {
         let (tx, rx) = mpsc::channel::<IngestRequest>(8);
         let drain = spawn_ingest_drain(rx);
 
-        let root = streaming_ingest(
+        let (root, total) = streaming_ingest(
             std::io::Cursor::new(bytes.clone()),
             &tx,
             small_chunker_config(),
+            None,
         )
         .await
         .unwrap();
         drop(tx);
         let captured = drain.await.unwrap();
 
+        assert_eq!(total, 32);
         assert_eq!(root.cid_type(), CidType::Book);
         // The leaf was sent; no bundle send.
         assert_eq!(captured.len(), 1, "exactly one leaf, no bundle");
@@ -22776,9 +22842,15 @@ mod streaming_ingest_tests {
         let (tx, rx) = mpsc::channel::<IngestRequest>(64);
         let drain = spawn_ingest_drain(rx);
 
-        let root = streaming_ingest(std::io::Cursor::new(bytes), &tx, small_chunker_config())
-            .await
-            .unwrap();
+        let (root, total) = streaming_ingest(
+            std::io::Cursor::new(bytes),
+            &tx,
+            small_chunker_config(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(total, 2048);
         drop(tx);
         let captured = drain.await.unwrap();
 
@@ -22813,9 +22885,15 @@ mod streaming_ingest_tests {
         let (tx, rx) = mpsc::channel::<IngestRequest>(2048);
         let drain = spawn_ingest_drain(rx);
 
-        let root = streaming_ingest(std::io::Cursor::new(bytes), &tx, small_chunker_config())
-            .await
-            .unwrap();
+        let (root, total) = streaming_ingest(
+            std::io::Cursor::new(bytes),
+            &tx,
+            small_chunker_config(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(total, 64 * 1024);
         drop(tx);
         let captured = drain.await.unwrap();
 
@@ -22872,10 +22950,11 @@ mod streaming_ingest_tests {
 
         let (tx_a, rx_a) = mpsc::channel::<IngestRequest>(256);
         let drain_a = spawn_ingest_drain(rx_a);
-        let root_a = streaming_ingest(
+        let (root_a, total_a) = streaming_ingest(
             std::io::Cursor::new(bytes.clone()),
             &tx_a,
             small_chunker_config(),
+            None,
         )
         .await
         .unwrap();
@@ -22889,7 +22968,7 @@ mod streaming_ingest_tests {
             pos: 0,
             window: 100,
         };
-        let root_b = streaming_ingest(chunked, &tx_b, small_chunker_config())
+        let (root_b, total_b) = streaming_ingest(chunked, &tx_b, small_chunker_config(), None)
             .await
             .unwrap();
         drop(tx_b);
@@ -22899,6 +22978,8 @@ mod streaming_ingest_tests {
             root_a, root_b,
             "single-shot and 100-byte-chunked reads must agree on root CID"
         );
+        assert_eq!(total_a, total_b, "total_bytes must match across readers");
+        assert_eq!(total_a, 8192);
         assert_eq!(
             captured_a.len(),
             captured_b.len(),
