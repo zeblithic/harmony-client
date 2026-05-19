@@ -893,3 +893,314 @@ async fn fetch_complete_arm_pins_root_in_intent() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
+
+/// ZEB-156: unpinning a folder root must not unpin a leaf that is also
+/// independently pinned via a separate sidecar entry. This is the
+/// integration-level guard for the transitive-sharing keep-set fix in the
+/// event-loop Unpin arm — pre-fix, the cascade walked the folder bundle's
+/// subtree and unpinned every descendant indiscriminately, including the
+/// independently-pinned leaf. The Tauri OR-join only spots sibling-root
+/// sharing (two sidecar entries with the same root CID); transitive
+/// sharing (one sidecar entry's CID being a descendant of another's) is
+/// invisible to it, so the event loop must close that gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unpin_folder_leaves_independently_pinned_leaf_in_cache() {
+    use harmony_content::bundle::BundleBuilder;
+
+    // Fixture: a small leaf and a folder bundle that references it.
+    // Both are admitted into the runtime via the IngestRequest channel,
+    // then sidecar rows are written for each so the runtime treats them
+    // as independent pinnable roots.
+    let leaf_bytes = b"zeb-156 leaf payload - pinned standalone".to_vec();
+    let cid_a =
+        ContentId::for_book(&leaf_bytes, ContentFlags::default()).expect("CID for leaf fixture");
+    let cid_a_bytes: [u8; 32] = cid_a.to_bytes();
+    let cid_a_hex = hex::encode(cid_a_bytes);
+
+    // Folder bundle: single-child manifest referencing cid_A. The
+    // folder's root CID (cid_C) is structurally distinct from cid_A
+    // because the bundle payload is the serialized child list, not the
+    // child's bytes.
+    let mut builder = BundleBuilder::new();
+    builder.add(cid_a);
+    let (folder_payload, cid_c) = builder
+        .build_with_flags(ContentFlags::default())
+        .expect("bundle build");
+    let cid_c_bytes: [u8; 32] = cid_c.to_bytes();
+    let cid_c_hex = hex::encode(cid_c_bytes);
+    assert_ne!(
+        cid_a_bytes, cid_c_bytes,
+        "leaf and folder must have distinct CIDs"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let app_data_dir = tmp.path().to_path_buf();
+
+    let (ingest_tx, ingest_rx) = mpsc::channel::<IngestRequest>(4);
+    let (content_verb_tx, content_verb_rx) = mpsc::channel::<ContentVerbRequest>(16);
+    let (_publish_tx, publish_rx) = mpsc::channel(4);
+    let (_fetch_tx, fetch_rx) = mpsc::channel(4);
+    let (_follow_tx, follow_rx) = mpsc::channel(4);
+    let (_voice_tx, voice_rx) = mpsc::channel::<harmony_app::voice::VoiceOutbound>(4);
+    let (_voice_ch_tx, voice_ch_rx) = mpsc::channel::<harmony_app::voice::VoiceChannelRequest>(4);
+    let (_refresh_tx, refresh_rx) = mpsc::channel::<harmony_app::mail_sync::RefreshRequest>(4);
+    let (cas_op_tx, cas_op_rx) = mpsc::channel::<harmony_app::content_store::CasOp>(8);
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let followed_set = Arc::new(Mutex::new(std::collections::HashSet::<String>::default()));
+    let vine_feed_cache = Arc::new(Mutex::new(
+        harmony_app::vine_feed_cache::VineFeedCache::new(),
+    ));
+    let mail_mgr = Arc::new(Mutex::new(harmony_app::mail::MailManager::load(
+        &app_data_dir.join("mail"),
+        [0u8; 16],
+    )));
+
+    let app = tauri::test::mock_app();
+    let app_handle = app.handle().clone();
+
+    let config = NodeConfig {
+        storage_budget: StorageBudget {
+            cache_capacity: 512,
+            max_pinned_bytes: 50_000_000,
+        },
+        compute_budget: InstructionBudget { fuel: 100_000 },
+        schedule: Default::default(),
+        content_policy: ContentPolicy::default(),
+        filter_broadcast_config: FilterBroadcastConfig {
+            mutation_threshold: 10,
+            max_interval_ticks: 40,
+            expected_items: 512,
+            fp_rate: 0.001,
+        },
+        node_addr: "0000000000000000000000000000000000000000".to_string(),
+        local_identity_hash: [0u8; 16],
+        local_pq_identity_hash: [0u8; 16],
+        local_dsa_pubkey: vec![],
+        local_kem_pubkey: vec![],
+        reticulum_identity_bytes: None,
+        inference_gguf_cid: None,
+        inference_tokenizer_cid: None,
+        engram_manifest_cid: None,
+        disk_enabled: false,
+        disk_entries: Vec::new(),
+        disk_quota: None,
+        archive_enabled: false,
+        archive_entries: Vec::new(),
+        archive_quota: None,
+        archive_ingest_enabled: false,
+        eviction_push_enabled: false,
+        s3_enabled: false,
+    };
+
+    let (fetch_completion_tx, fetch_completion_rx) = mpsc::channel::<[u8; 32]>(4);
+    let pin_intent: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+
+    thread::Builder::new()
+        .name("harmony-runtime-zeb156".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_stack_size(8 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            rt.block_on(async move {
+                let (runtime, startup_actions) = NodeRuntime::new(config, MemoryBookStore::new());
+                harmony_app::event_loop::run(
+                    runtime,
+                    startup_actions,
+                    app_handle,
+                    None,
+                    ready_tx,
+                    shutdown_rx,
+                    publish_rx,
+                    fetch_rx,
+                    ingest_rx,
+                    content_verb_rx,
+                    cas_op_tx,
+                    cas_op_rx,
+                    follow_rx,
+                    voice_rx,
+                    voice_ch_rx,
+                    followed_set,
+                    vine_feed_cache,
+                    mail_mgr,
+                    None,
+                    refresh_rx,
+                    pin_intent,
+                    fetch_completion_tx,
+                    fetch_completion_rx,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                    {
+                        let (_tx, rx) = tokio::sync::mpsc::channel::<
+                            harmony_app::event_loop::CommunityAdapterRequest,
+                        >(1);
+                        rx
+                    },
+                    None,
+                    {
+                        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<
+                            harmony_app::event_loop::ChannelLogAdapterRequest,
+                        >();
+                        rx
+                    },
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            });
+        })
+        .expect("spawn runtime thread");
+
+    match ready_rx.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) if e.contains("Address already in use") => {
+            eprintln!("skipping test: {e}");
+            return;
+        }
+        Ok(Err(e)) => panic!("event loop failed to start: {e}"),
+        Err(_) => panic!("event loop dropped ready signal"),
+    }
+
+    // ── Step 1: ingest the leaf bytes ───────────────────────────────────
+    let (ack_tx, ack_rx) = oneshot::channel();
+    ingest_tx
+        .send(IngestRequest {
+            cid_hex: cid_a_hex.clone(),
+            data: leaf_bytes.clone(),
+            reply: ack_tx,
+        })
+        .await
+        .unwrap();
+    ack_rx.await.unwrap().expect("leaf ingest failed");
+
+    // ── Step 2: ingest the folder bundle (manifest referencing cid_A) ─
+    let (ack_tx, ack_rx) = oneshot::channel();
+    ingest_tx
+        .send(IngestRequest {
+            cid_hex: cid_c_hex.clone(),
+            data: folder_payload.clone(),
+            reply: ack_tx,
+        })
+        .await
+        .unwrap();
+    ack_rx.await.unwrap().expect("folder ingest failed");
+
+    // ── Step 3: write sidecar rows for both as independent pinnable roots
+    // (mimics what the Tauri ingest_content / folder upload paths do).
+    let index = Arc::new(Mutex::new(ContentIndex::load(&app_data_dir)));
+    let sid_a = SidecarId::new();
+    let sid_c = SidecarId::new();
+    {
+        let mut idx = index.lock().unwrap();
+        assert!(idx.insert(ContentIndexEntry {
+            sidecar_id: sid_a,
+            cid: cid_a_bytes,
+            file_name: "leaf.txt".into(),
+            size_bytes: leaf_bytes.len() as u64,
+            stored_at_ms: 1_700_000_000_000,
+            sensitivity: Sensitivity::Private,
+            replication_tier: ReplicationTier::Default,
+            licensed: false,
+            archived: false,
+            pinned: false,
+            kind: ContentKind::Leaf,
+        }));
+        assert!(idx.insert(ContentIndexEntry {
+            sidecar_id: sid_c,
+            cid: cid_c_bytes,
+            file_name: "folder".into(),
+            size_bytes: folder_payload.len() as u64,
+            stored_at_ms: 1_700_000_000_000,
+            sensitivity: Sensitivity::Private,
+            replication_tier: ReplicationTier::Default,
+            licensed: false,
+            archived: false,
+            pinned: false,
+            kind: ContentKind::Folder,
+        }));
+    }
+
+    // ── Step 4: Pin both sidecar entries via the runtime's Pin verb ──
+    // The Pin arm cascades over the bundle subtree, but the Pin for
+    // cid_A also seeds pin_intent so cid_A remains a recognized root
+    // when cid_C is later unpinned.
+    for cid in [cid_a_bytes, cid_c_bytes] {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        content_verb_tx
+            .send(ContentVerbRequest::Pin {
+                cid,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(
+            reply_rx.await.unwrap().unwrap(),
+            "Pin should succeed for {}",
+            hex::encode(cid),
+        );
+    }
+
+    // ── Step 5: confirm both CIDs are pinned in the cache (precondition).
+    let (reply_tx, reply_rx) = oneshot::channel();
+    content_verb_tx
+        .send(ContentVerbRequest::PinnedSet { reply: reply_tx })
+        .await
+        .unwrap();
+    let pinned_before = reply_rx.await.unwrap();
+    assert!(
+        pinned_before.contains(&cid_a_bytes),
+        "precondition: leaf must be pinned"
+    );
+    assert!(
+        pinned_before.contains(&cid_c_bytes),
+        "precondition: folder must be pinned"
+    );
+
+    // ── Step 6: send Unpin(cid_C) ───────────────────────────────────────
+    let (reply_tx, reply_rx) = oneshot::channel();
+    content_verb_tx
+        .send(ContentVerbRequest::Unpin {
+            cid: cid_c_bytes,
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+    assert!(
+        reply_rx.await.unwrap().unwrap(),
+        "Unpin(folder) verb should succeed"
+    );
+
+    // ── Step 7 + 8: cid_A still pinned, cid_C unpinned ───────────────────
+    let (reply_tx, reply_rx) = oneshot::channel();
+    content_verb_tx
+        .send(ContentVerbRequest::PinnedSet { reply: reply_tx })
+        .await
+        .unwrap();
+    let pinned_after = reply_rx.await.unwrap();
+    assert!(
+        pinned_after.contains(&cid_a_bytes),
+        "ZEB-156: leaf must STILL be pinned after folder unpin \
+         (its sidecar entry has pinned=true and its CID is reachable \
+         from the keep-set walk of remaining pin_intent roots; pre-fix \
+         the cascade indiscriminately walked cid_C's subtree and \
+         unpinned cid_A)",
+    );
+    assert!(
+        !pinned_after.contains(&cid_c_bytes),
+        "folder root itself must be unpinned (it was the Unpin target)",
+    );
+}
