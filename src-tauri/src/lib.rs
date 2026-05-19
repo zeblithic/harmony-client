@@ -5706,7 +5706,7 @@ pub async fn list_folder(
 /// subsequent calls return the cached Arc. The mutex-guard is held
 /// only across the cheap clone-or-init — never across DB operations
 /// or .await points.
-pub fn mint_db_handle(
+pub(crate) fn mint_db_handle(
     app: &tauri::AppHandle,
     state: &tauri::State<'_, std::sync::Mutex<NodeState>>,
 ) -> Result<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>, String> {

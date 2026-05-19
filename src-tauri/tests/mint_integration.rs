@@ -10,9 +10,7 @@ use harmony_app::mint::*;
 use rusqlite::Connection;
 
 fn fresh_in_memory_db() -> Connection {
-    let conn = Connection::open_in_memory().expect("open in_memory");
-    apply_migrations(&conn).expect("apply_migrations");
-    conn
+    harmony_app::mint::open_in_memory().expect("open_in_memory")
 }
 
 #[test]

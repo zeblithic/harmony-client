@@ -64,13 +64,22 @@ pub fn open_database(path: &std::path::Path) -> Result<Connection, MintError> {
     Ok(conn)
 }
 
+/// Opens a fresh in-memory SQLite database and applies all
+/// migrations. Useful for tests that don't need on-disk persistence.
+/// Production code should call `open_database` with a file path.
+pub fn open_in_memory() -> Result<Connection, MintError> {
+    let conn = Connection::open_in_memory()?;
+    apply_migrations(&conn)?;
+    Ok(conn)
+}
+
 /// Apply all schema migrations idempotently.
 ///
 /// Uses `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS` so this
 /// can be called on every app start without error.  The `accounts` table
 /// includes a `UNIQUE(name)` constraint; we are pre-launch so all test
 /// databases are in-memory and no on-disk migration is required.
-pub fn apply_migrations(conn: &Connection) -> Result<(), MintError> {
+pub(crate) fn apply_migrations(conn: &Connection) -> Result<(), MintError> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS accounts (
@@ -720,6 +729,11 @@ fn get_account_by_id(conn: &Connection, id: &str) -> Result<Option<Account>, Min
 // the connection is correct (not tokio::sync::Mutex) because the lock is
 // only held inside the spawn_blocking closure, never across an .await.
 // See spec § Architecture > Database connection lifecycle.
+//
+// `.expect` on the connection mutex matches the project's existing
+// poisoning policy (see pin_content): poisoning indicates a panic in
+// a prior critical section, and the safe response is to surface it
+// rather than silently swallow.
 
 #[tauri::command]
 pub async fn mint_list_accounts(
