@@ -3031,11 +3031,11 @@ pub fn local_actor_can_mint_set_power(mat: &MaterializedMembership, self_owner: 
     )
 }
 
-/// ZEB-297 R2 (CodeRabbit Major): mirrors `verify_event`'s second SetPower
+/// ZEB-297 R2 (CodeRabbit Major): mirrors `verify_event`'s third SetPower
 /// precondition — direct SetPower of an admin-affecting target is rejected
 /// when `admin_quorum > 1` (spec §4.5 / ZEB-250). Without this check, a
-/// Tier 2 auto-exec on an admin promotion (`new_power == 100`) or admin
-/// demotion (target currently holds power 100) in a multi-admin-quorum
+/// Tier 2 auto-exec on an admin promotion (`new_power == max`) or admin
+/// demotion (target currently holds power max) in a multi-admin-quorum
 /// community would mint a SetPower event that the verifier would reject
 /// with `SetPowerRequiresQuorum` — exactly the doomed-mint path the R1
 /// joined-member guard exists to eliminate, surfacing in a different
@@ -3047,6 +3047,16 @@ pub fn local_actor_can_mint_set_power(mat: &MaterializedMembership, self_owner: 
 /// than mint. Returns `false` when `admin_quorum <= 1` (single-admin
 /// community, direct SetPower allowed) or when the change is not
 /// admin-affecting (e.g., moderator-tier reassignment).
+///
+/// ZEB-297 R3 (Cursor Low): uses `POWER_THRESHOLDS.max` (the admin-tier
+/// power cap), NOT `POWER_THRESHOLDS.set_power` (the minimum power to
+/// call SetPower). These are coincidentally equal (100) in v1, but
+/// conceptually distinct — if `set_power` is ever lowered (e.g., to
+/// allow moderators to perform non-admin SetPower) while `max` remains
+/// the admin tier, the "admin-affecting" check still belongs on `max`.
+/// Matches the semantic intent of `verify_event:2570`'s `*level == 100`
+/// literal (which should ideally also move to `.max` — tracked as a
+/// follow-up readability cleanup, not blocking this fix).
 pub fn setpower_mint_admin_blocked_by_quorum(
     mat: &MaterializedMembership,
     target: OwnerAddr,
@@ -3056,7 +3066,7 @@ pub fn setpower_mint_admin_blocked_by_quorum(
         return false;
     }
     let target_power = mat.power_levels.get(&target).copied().unwrap_or(0);
-    level == POWER_THRESHOLDS.set_power || target_power == POWER_THRESHOLDS.set_power
+    level == POWER_THRESHOLDS.max || target_power == POWER_THRESHOLDS.max
 }
 
 /// ZEB-291 Phase 2 Task 10: auto-exec dispatch from a Tier 2 contestability finalize.
@@ -3164,6 +3174,23 @@ pub async fn apply_auto_exec_set_power(
     // follow-up ticket. Skipping here is correct (no doomed mint)
     // but means the Tier 2 outcome lands as a NoOp on every replica
     // until that follow-up ships.
+    //
+    // ZEB-297 R3 (CodeRabbit Major): the guard reads `mat` under the
+    // engine state lock then drops it, so a concurrent membership
+    // change can theoretically invalidate the precondition before
+    // `insert_local_event` runs below. This is benign — wire safety
+    // is enforced by `insert_local_event_with_resolved_pubs`
+    // (community_state_sync.rs:1444-1447), which runs verify_event
+    // atomically under `self.state.lock().await` immediately before
+    // CRDT apply. A race-and-rejected event surfaces as an
+    // `InsertOutcome::Rejected` here (caught at line 3175-3179), not
+    // a doomed event on the wire. The fast-path guard exists to (a)
+    // avoid burning an HLC for the common-case admin-replica
+    // dispatch, and (b) generate accurate skip-counter telemetry.
+    // Full atomicity (do guard + sign + insert under one critical
+    // section) would require holding the engine state lock across
+    // the dm_outbox signing await, a pattern not used elsewhere and
+    // out of scope for this fix.
     let (is_admin, blocked_by_quorum) = {
         let state_arc = engine_arc.state();
         let state_g = state_arc.lock().await;
@@ -3244,7 +3271,25 @@ mod auto_exec_tests {
         // Default power for `self_owner` is 0 (key absent) — non-admin.
         assert!(!local_actor_can_mint_set_power(&mat, self_owner));
 
-        // Power 99 is still below the 100 admin threshold.
+        // ZEB-297 R3 (CodeRabbit Nitpick): seed Joined status so the
+        // membership gate is satisfied. Without this, the test would
+        // pass even if the numeric threshold check were accidentally
+        // removed (because the membership check alone would still
+        // reject). Seeding Joined isolates the power-gate boundary.
+        mat.members.insert(
+            self_owner,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "test".to_string(),
+                },
+                left_at: None,
+            },
+        );
+        // Power 99 is still below the 100 admin threshold — Joined alone
+        // is not enough.
         mat.power_levels
             .insert(self_owner, POWER_THRESHOLDS.set_power - 1);
         assert!(!local_actor_can_mint_set_power(&mat, self_owner));
@@ -3371,13 +3416,13 @@ mod auto_exec_tests {
         let mat = MaterializedMembership::default();
         assert_eq!(mat.admin_quorum, 1, "default quorum is 1");
 
-        // level == 100 (admin promotion) — would block at quorum > 1.
+        // level == max (admin promotion) — would block at quorum > 1.
         assert!(!setpower_mint_admin_blocked_by_quorum(
             &mat,
             target,
-            POWER_THRESHOLDS.set_power
+            POWER_THRESHOLDS.max
         ));
-        // level < 100, target unknown — non-admin-affecting at any quorum.
+        // level < max, target unknown — non-admin-affecting at any quorum.
         assert!(!setpower_mint_admin_blocked_by_quorum(&mat, target, 50));
     }
 
@@ -3396,7 +3441,7 @@ mod auto_exec_tests {
         assert!(setpower_mint_admin_blocked_by_quorum(
             &mat,
             target,
-            POWER_THRESHOLDS.set_power
+            POWER_THRESHOLDS.max
         ));
     }
 
@@ -3410,7 +3455,7 @@ mod auto_exec_tests {
             admin_quorum: 2,
             ..Default::default()
         };
-        mat.power_levels.insert(target, POWER_THRESHOLDS.set_power);
+        mat.power_levels.insert(target, POWER_THRESHOLDS.max);
         assert!(setpower_mint_admin_blocked_by_quorum(&mat, target, 50));
     }
 

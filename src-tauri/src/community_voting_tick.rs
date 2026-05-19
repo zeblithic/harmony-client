@@ -987,6 +987,65 @@ mod tests {
         );
     }
 
+    /// ZEB-297 R3 (CodeRabbit Nitpick): when the auto-exec callback
+    /// returns `Err(_)` (e.g., NodeState handles missing, engine
+    /// rejected the local insert), the tick logs a warning and
+    /// continues — none of the three success/skip counters should
+    /// bump. Pins the Err branch so a future refactor that re-routes
+    /// failures into one of the skip buckets (and lies about how
+    /// often auto-exec actually succeeded) fails loudly.
+    #[tokio::test]
+    async fn community_voting_tick_tier2_auto_exec_set_power_err_path_bumps_no_counters() {
+        let cid = SpaceId([0x55; 16]);
+        let pid = PollId([0x66; 32]);
+        let target = OwnerAddr([0xcc; 16]);
+        let new_power = 50;
+        let cfg = make_tier2_config(AutoExecAction::SetPower {
+            target_pubkey: target,
+            new_power,
+        });
+        let mut t2 = Tier2ProposalState::new(cfg, 1);
+        use crate::community_voting_conviction::VoterConvictionState;
+        let mut vs = VoterConvictionState::default();
+        vs.apply_signal(true, 0, 0, 86_400_000);
+        t2.per_voter.insert(OwnerAddr([0xbb; 16]), vs);
+        let reached_at = 1_000i128;
+        t2.threshold_reached_at_ms = Some(reached_at);
+
+        let mut log = VotingLog::new();
+        log.polls.insert(
+            pid,
+            make_tier2_poll(cid, pid, Lifecycle::ThresholdReached, t2),
+        );
+
+        let mut logs = HashMap::new();
+        logs.insert(cid, Arc::new(Mutex::new(log)));
+        let now_ms = reached_at + 25 * 60 * 60 * 1000;
+        let (mut ctx, _events, _auto_exec_calls) = make_ctx_with_logs(logs, now_ms);
+
+        // Override the captured callback to simulate a downstream
+        // failure (e.g., engine rejected the insert, missing handles).
+        ctx.auto_exec_set_power = Arc::new(|_cid, _target, _power| {
+            Box::pin(async { Err("simulated apply_auto_exec_set_power failure".to_string()) })
+        });
+
+        let stats = run_voting_tick(&ctx, now_ms).await.unwrap();
+        assert_eq!(stats.tier2_proposals_finalized, 1);
+        assert_eq!(stats.tier2_auto_execs_attempted, 1);
+        assert_eq!(
+            stats.tier2_auto_execs_succeeded, 0,
+            "Err path must NOT bump the success counter"
+        );
+        assert_eq!(
+            stats.tier2_auto_execs_skipped_not_admin, 0,
+            "Err path must NOT bump the not-admin skip counter"
+        );
+        assert_eq!(
+            stats.tier2_auto_execs_skipped_requires_quorum, 0,
+            "Err path must NOT bump the quorum-skip counter"
+        );
+    }
+
     #[tokio::test]
     async fn community_voting_tick_archive_sweep_runs_after_24h() {
         let logs = HashMap::new();
