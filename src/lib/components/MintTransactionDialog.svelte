@@ -39,6 +39,18 @@
         description = tx.description;
         metadata = tx.metadata ?? '';
       });
+    } else {
+      // Defensive reset: if editingId transitions to null while the
+      // component is mounted (currently impossible because the dialog
+      // unmounts via {#if showAddEdit} in MintLedger, but kept robust
+      // against future refactors that might keep the dialog mounted).
+      date = new Date().toISOString().slice(0, 10);
+      amount = '';
+      currency = defaultCurrency;
+      accountId = accounts[0]?.id ?? '';
+      description = '';
+      metadata = '';
+      error = null;
     }
   });
 
@@ -120,7 +132,12 @@
 
     <label>
       Currency
-      <input type="text" bind:value={currency} maxlength={5} />
+      <input
+        type="text"
+        bind:value={currency}
+        oninput={(e) => { currency = (e.currentTarget as HTMLInputElement).value.toUpperCase(); }}
+        maxlength={5}
+      />
     </label>
 
     <label>

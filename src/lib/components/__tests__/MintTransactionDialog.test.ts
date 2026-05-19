@@ -124,6 +124,22 @@ describe('MintTransactionDialog', () => {
     expect(onSaved).toHaveBeenCalled();
   });
 
+  it('auto-uppercases currency input', async () => {
+    render(MintTransactionDialog, {
+      props: {
+        service: mockService(),
+        accounts: [{ id: 'a1', name: 'Chase', createdAt: '', transactionCount: 0 }],
+        defaultCurrency: 'USD',
+        editingId: null,
+        onClose: () => {},
+        onSaved: () => {},
+      },
+    });
+    const currencyInput = screen.getByLabelText(/Currency/) as HTMLInputElement;
+    await fireEvent.input(currencyInput, { target: { value: 'eur' } });
+    expect(currencyInput.value).toBe('EUR');
+  });
+
   it('calls updateTransaction with metadata: null when metadata field cleared in edit mode', async () => {
     const service = mockService();
     service.getTransaction.mockResolvedValueOnce({
