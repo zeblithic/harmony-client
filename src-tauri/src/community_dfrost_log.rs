@@ -173,14 +173,37 @@ impl CommitteeState {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct PendingCeremony {
     pub ceremony_id: [u8; 32],
-    /// Round-1 package bytes per actor (broadcast-shaped).
+    /// Round-1 package bytes per actor (broadcast-shaped). Public —
+    /// these are commitments to the secret polynomial, not the
+    /// secrets themselves; safe to persist.
     pub round1_packages: BTreeMap<OwnerAddr, Vec<u8>>,
     /// Decrypted round-2 package bytes per sender (this node's share).
     /// Populated only on the local node via `apply_with_identity`.
+    ///
+    /// R4 (CodeRabbit Critical): `#[serde(skip, default)]` — these are
+    /// the decrypted secret share material. Persisting them to disk
+    /// would leak signing-share inputs across restarts and any state
+    /// export. If restart recovery for in-flight DKG is needed later,
+    /// the device should re-request round-2 share distribution from
+    /// the committee (or abort + restart the ceremony); we MUST NOT
+    /// silently snapshot decrypted secrets onto the disk substrate.
+    #[serde(skip, default)]
     pub round2_packages: BTreeMap<OwnerAddr, Vec<u8>>,
     /// Per-member `dk` confirmations: actor → claimed joint VK bytes.
     /// Conflict (≥2 distinct values) is a protocol abort.
     pub dk_confirmations: BTreeMap<OwnerAddr, [u8; 32]>,
+    /// R4 (Cursor Medium): cross-confirmation consensus on per-member
+    /// verifying shares. Set on the first dk that arrives for this
+    /// ceremony and enforced as identical on every subsequent dk —
+    /// any divergence is an InvariantViolation. On promote, this map
+    /// (NOT the just-decoded payload) is the source of truth for the
+    /// active committee's verifying_shares. Without this check, the
+    /// dk event that happens to push confirmations to quorum can
+    /// substitute incorrect per-member shares.
+    ///
+    /// Empty until the first dk lands. Public data (verifying shares
+    /// are pubkeys, not secrets); safe to serialize.
+    pub consensus_verifying_shares: BTreeMap<OwnerAddr, [u8; 32]>,
     pub proposed_epoch: u64,
     pub members: Vec<OwnerAddr>,
     pub threshold: u16,
@@ -430,6 +453,19 @@ impl DfrostLog {
                 return Err(ApplyError::InvariantViolation);
             }
         }
+
+        // R4 (Cursor Medium): cross-confirmation consensus on per-member
+        // verifying shares. First dk sets the consensus; every subsequent
+        // dk MUST claim identical shares. Without this, a malicious
+        // committee member whose dk happens to trigger quorum can
+        // substitute incorrect per-member verifying_shares and poison
+        // CommitteeState.verifying_shares.
+        if pending.consensus_verifying_shares.is_empty() {
+            pending.consensus_verifying_shares = new_verifying_shares.clone();
+        } else if pending.consensus_verifying_shares != new_verifying_shares {
+            return Err(ApplyError::InvariantViolation);
+        }
+
         pending
             .dk_confirmations
             .insert(event.actor, payload.joint_verifying_key);
@@ -445,11 +481,20 @@ impl DfrostLog {
             let members = pending.members.clone();
             let threshold = pending.threshold;
             let max_signers = pending.max_signers;
+            // R4 (Cursor Medium): activate using the consensus shares
+            // (set on first dk and enforced as identical on every
+            // subsequent dk), NOT the just-decoded payload's shares.
+            // The two are guaranteed equal by the consensus check
+            // above, but reading from `pending` makes the source-of-
+            // truth explicit and prevents a future refactor of the
+            // payload-shape check from accidentally letting a divergent
+            // share map through.
+            let promoted_shares = pending.consensus_verifying_shares.clone();
 
             self.committee_state.active = true;
             self.committee_state.current_epoch = payload.epoch;
             self.committee_state.joint_verifying_key = Some(payload.joint_verifying_key);
-            self.committee_state.verifying_shares = new_verifying_shares;
+            self.committee_state.verifying_shares = promoted_shares;
             self.committee_state.members = members;
             self.committee_state.threshold = threshold;
             self.committee_state.max_signers = max_signers;
@@ -1407,6 +1452,115 @@ mod tests {
         // Pending sign session MUST NOT be cleared on rejection — it
         // remains in-flight so a legitimate beacon can still land.
         assert!(log.committee_state.pending_sign.contains_key(&ceremony_id));
+    }
+
+    /// R4 (Cursor Medium): two dk events for the same ceremony MUST
+    /// claim identical verifying_shares for every member. A malicious
+    /// committee member whose dk happens to push confirmation count
+    /// to quorum cannot substitute incorrect per-member shares —
+    /// the second dk's diverging shares get rejected as
+    /// InvariantViolation. The previously-recorded consensus
+    /// (set on the first dk) is the source of truth.
+    #[test]
+    fn dk_with_divergent_verifying_shares_across_confirmations_rejected() {
+        use crate::community_dfrost_types::{
+            DfrostEventKind, DkgCompletePayload, MemberVerifyingShare, SignedCommitteeEvent,
+        };
+        use crate::owner_state_types::Hlc;
+
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+
+        let mut log = DfrostLog::new();
+        log.committee_state.pending_dkg = Some(PendingCeremony {
+            ceremony_id: [0xab; 32],
+            members: vec![alice, bob],
+            threshold: 2,
+            max_signers: 2,
+            proposed_epoch: 1,
+            ..Default::default()
+        });
+
+        let joint_vk = [0x99u8; 32];
+
+        // Alice's dk: claims alice→[0xa1; 32], bob→[0xb2; 32].
+        let alice_dk = DkgCompletePayload {
+            ceremony_id: [0xab; 32],
+            joint_verifying_key: joint_vk,
+            verifying_shares: vec![
+                MemberVerifyingShare {
+                    member: alice,
+                    verifying_share: [0xa1; 32],
+                },
+                MemberVerifyingShare {
+                    member: bob,
+                    verifying_share: [0xb2; 32],
+                },
+            ],
+            epoch: 1,
+            members: vec![alice, bob],
+            threshold: 2,
+            max_signers: 2,
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&alice_dk, &mut pd).unwrap();
+        log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::DkgComplete,
+            hlc: Hlc {
+                wall_ms: 14_000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: alice,
+            payload: pd,
+            sig: vec![0u8; 64],
+        })
+        .expect("alice's dk sets consensus");
+
+        // Bob's dk: claims alice→[0xa1; 32], bob→[0xFF; 32] (different!).
+        let bob_dk = DkgCompletePayload {
+            ceremony_id: [0xab; 32],
+            joint_verifying_key: joint_vk,
+            verifying_shares: vec![
+                MemberVerifyingShare {
+                    member: alice,
+                    verifying_share: [0xa1; 32],
+                },
+                MemberVerifyingShare {
+                    member: bob,
+                    verifying_share: [0xFF; 32], // ← DIVERGES from alice's claim
+                },
+            ],
+            epoch: 1,
+            members: vec![alice, bob],
+            threshold: 2,
+            max_signers: 2,
+        };
+        let mut pd2 = Vec::new();
+        ciborium::into_writer(&bob_dk, &mut pd2).unwrap();
+        let result = log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::DkgComplete,
+            hlc: Hlc {
+                wall_ms: 15_000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: bob,
+            payload: pd2,
+            sig: vec![0u8; 64],
+        });
+        assert_eq!(result, Err(ApplyError::InvariantViolation));
+        // Committee MUST NOT promote on the divergent second dk.
+        assert!(
+            !log.committee_state.active,
+            "divergent dk must not promote committee"
+        );
     }
 
     /// R2 (CodeRabbit Major): `dk` payload with `verifying_shares` that
