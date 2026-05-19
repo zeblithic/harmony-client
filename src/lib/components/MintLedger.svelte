@@ -41,6 +41,14 @@
     }
   }
 
+  // Initial load on mount only. The effect does NOT re-fire when filter
+  // state changes because load() reads filterDateFrom/filterDateTo/
+  // filterAccountId only inside an async body after await — outside
+  // Svelte's synchronous reactivity tracking window. Filter changes
+  // trigger reloads via explicit `onchange={load}` handlers on each
+  // input. If load() is ever refactored to read filter state before the
+  // first await, this effect will start double-firing with the
+  // onchange handlers — preserve the async-read pattern.
   $effect(() => { load(); });
 
   // Add/Edit dialog state — wired in Task 8

@@ -53,6 +53,7 @@ describe('MintTransactionTable', () => {
     });
     const code = screen.getByTitle(longMeta);
     expect(code.textContent).toContain('…');
+    // 40 chars of metadata + 1 ellipsis character = 41 total.
     expect(code.textContent!.length).toBeLessThanOrEqual(41);
   });
 
