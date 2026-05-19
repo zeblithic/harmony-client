@@ -126,21 +126,19 @@ pub(crate) fn ingest_dispatch(size: u64) -> Result<IngestDispatch, String> {
 /// (`ingest_file_at_path`, `send_ingest_with_name`, `send_ingest_bytes_only`)
 /// and the ZEB-163 folder walker (`folder_ingest::walk`).
 ///
-/// Split into distinct variants so the walker can route each failure to the
-/// right summary bucket (oversized vs. failed) without parsing strings. The
-/// IPC seam in `ingest_content` collapses these to `String` via `to_string()`
-/// for backwards compatibility with the existing frontend.
+/// Split into distinct variants so the walker can distinguish IO errors,
+/// symlink rejections, sidecar collisions, channel failures, and manifest
+/// build errors without parsing strings. (The walker's `skipped.oversized`
+/// bucket is sourced from a pre-walk metadata predicate, not from this
+/// enum — ZEB-161 lifted the per-file size cap.) The IPC seam in
+/// `ingest_content` collapses these to `String` via `to_string()` for
+/// backwards compatibility with the existing frontend.
 #[derive(Debug, thiserror::Error)]
 pub enum IngestError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("path is a symlink; refuse to follow")]
     Symlink,
-    #[error(
-        "file too large ({size} bytes; v1 flat-bundle cap is {cap} bytes ~8 GiB). \
-         Support for larger files lands with folder/nested-bundle support."
-    )]
-    Oversized { size: u64, cap: u64 },
     #[error("sidecar_id collision")]
     SidecarCollision,
     /// Event-loop ingest channel returned an error (closed, dropped reply,
@@ -245,12 +243,6 @@ pub fn chunk_and_bundle(
 /// `pub` API — but we re-export through `pub use` if/when needed in later
 /// tasks; for Task 1 the only callers are the unit tests in this file).
 ///
-/// The `#[allow(dead_code)]` is temporary: Task 1 only adds the primitive
-/// and its unit tests; Tasks 2-3 wire the production callers
-/// (`send_ingest_bytes_only`, `ingest_content`, `ingest_file_at_path`) to
-/// route through it. Without the allow, lib-only (non-test) builds fail
-/// `-D dead_code` because no production caller exists yet.
-#[allow(dead_code)]
 pub(crate) async fn streaming_ingest<R>(
     reader: R,
     ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
@@ -323,9 +315,6 @@ where
 /// Split out from `streaming_ingest` so the tree-build logic can be
 /// unit-tested with synthetic CIDs (no chunker, no I/O).
 ///
-/// `#[allow(dead_code)]` is temporary — see the matching comment on
-/// `streaming_ingest`. Tasks 2-3 wire production callers.
-#[allow(dead_code)]
 pub(crate) async fn build_bundle_tree(
     leaf_cids: Vec<harmony_content::cid::ContentId>,
     total_size: u64,
@@ -6242,13 +6231,9 @@ pub(crate) async fn ingest_file_at_path(
     if meta.file_type().is_symlink() {
         return Err(IngestError::Symlink);
     }
-    let size = meta.len();
-    if size > FLAT_BUNDLE_MAX {
-        return Err(IngestError::Oversized {
-            size,
-            cap: FLAT_BUNDLE_MAX,
-        });
-    }
+    // FLAT_BUNDLE_MAX gate removed — streaming handles arbitrary sizes (ZEB-161).
+    // Task 3 converts this to true streaming (via `tokio::fs::File::open`); for
+    // now we still materialize the file into a Vec to keep the diff small.
     let bytes = tokio::fs::read(path).await?;
     send_ingest_with_name(
         ingest_tx,
@@ -6279,62 +6264,21 @@ pub(crate) async fn send_ingest_bytes_only(
     bytes: Vec<u8>,
     file_name: String,
 ) -> Result<[u8; 32], IngestError> {
-    use harmony_content::cid::{ContentFlags, ContentId};
+    use harmony_content::chunker::ChunkerConfig;
 
-    let size_bytes = bytes.len() as u64;
-    // Explicit oversize check BEFORE ingest_dispatch. `ingest_dispatch`
-    // returns an opaque `String` error for oversize, which the previous
-    // `.map_err(IngestError::other)` collapsed into `IngestError::Other`
-    // — that bucket lands in `failed` rather than `skipped.oversized`,
-    // mis-classifying the TOCTOU "file grew past cap between stat and
-    // read" case. Returning the typed `Oversized` here keeps the walker's
-    // routing honest (Bot finding 5).
-    if size_bytes > FLAT_BUNDLE_MAX {
-        return Err(IngestError::Oversized {
-            size: size_bytes,
-            cap: FLAT_BUNDLE_MAX,
-        });
-    }
-    // Final dispatch decision from the bytes actually read. With the
-    // oversize gate above this can no longer return the oversize error
-    // path; remaining failures (Chunked vs Single classification) are
-    // never user-facing so the `Other` collapse is acceptable.
-    let dispatch = ingest_dispatch(size_bytes).map_err(IngestError::other)?;
-
-    let root_cid_bytes: [u8; 32] = match dispatch {
-        IngestDispatch::Single => {
-            let cid = ContentId::for_book(&bytes, ContentFlags::default())
-                .map_err(|e| IngestError::other(format!("CID error: {e:?}")))?;
-            let cid_hex = hex::encode(cid.to_bytes());
-            send_ingest(ingest_tx, cid_hex, bytes)
-                .await
-                .map_err(IngestError::other)?;
-            cid.to_bytes()
-        }
-        IngestDispatch::Chunked => {
-            let (leaves, bundle_payload, root) =
-                chunk_and_bundle(&bytes).map_err(IngestError::other)?;
-            for (leaf_cid, leaf_bytes) in &leaves {
-                send_ingest(
-                    ingest_tx,
-                    hex::encode(leaf_cid.to_bytes()),
-                    leaf_bytes.to_vec(),
-                )
-                .await
-                .map_err(IngestError::other)?;
-            }
-            send_ingest(ingest_tx, hex::encode(root.to_bytes()), bundle_payload)
-                .await
-                .map_err(IngestError::other)?;
-            root.to_bytes()
-        }
-    };
-
+    // `&[u8]` implements `tokio::io::AsyncRead` via tokio's blanket impl
+    // for in-memory slices, so we can route the buffer straight through
+    // the streaming primitive without an intermediate sync→async shim.
+    // Task 3 converts file-path callers to true streaming (via
+    // `tokio::fs::File::open`) so this Vec materialization eventually
+    // goes away for the disk path.
+    let reader: &[u8] = &bytes;
+    let root = streaming_ingest(reader, ingest_tx, ChunkerConfig::DEFAULT).await?;
     // `file_name` is currently unused on the bytes-only path (no sidecar
     // row to label), but kept in the signature so callers don't have to
     // restructure when we plumb it through future per-CID telemetry.
     let _ = file_name;
-    Ok(root_cid_bytes)
+    Ok(root.to_bytes())
 }
 
 /// Drive a buffer of bytes through the chunked-or-flat dispatch, push it to
@@ -6484,21 +6428,6 @@ mod path_ingest_tests {
             .await
             .expect_err("must error on missing file");
         assert!(matches!(err, IngestError::Io(_)), "got: {err:?}");
-    }
-
-    /// Allocating an 8 GiB file in a unit test is unreasonable, so the
-    /// boundary check is exercised by constructing the error variant
-    /// directly and asserting its Display surfaces both numbers — that's
-    /// what the walker's failure-bucketing depends on.
-    #[test]
-    fn oversized_variant_shape() {
-        let err = IngestError::Oversized {
-            size: FLAT_BUNDLE_MAX + 1,
-            cap: FLAT_BUNDLE_MAX,
-        };
-        let rendered = format!("{err}");
-        assert!(rendered.contains("file too large"));
-        assert!(rendered.contains(&FLAT_BUNDLE_MAX.to_string()));
     }
 
     /// Symlink detection is platform-conditional: on Windows, creating a

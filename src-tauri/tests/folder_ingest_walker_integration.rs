@@ -467,6 +467,9 @@ async fn symlink_to_directory_is_not_followed() {
 /// Linux so the gate doesn't reduce coverage in practice.
 #[cfg(unix)]
 #[tokio::test]
+#[ignore = "ZEB-161: replaced by Task 5's nested_bundle_tree_round_trip integration test; \
+            the FLAT_BUNDLE_MAX metadata gate in the walker is removed in Task 3 and the \
+            sparse-8GiB+ ingest path is no longer the supported failure mode."]
 async fn oversized_file_is_skipped_via_sparse_extension() {
     use std::fs::OpenOptions;
 

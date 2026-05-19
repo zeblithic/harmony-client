@@ -34,7 +34,7 @@ use tauri::{AppHandle, Emitter, Runtime};
 use crate::content_index::{ContentIndex, ContentKind};
 use crate::event_loop::IngestRequest;
 use crate::folders::ManifestEntry;
-use crate::{send_ingest_bytes_only, IngestError, FLAT_BUNDLE_MAX};
+use crate::{send_ingest_bytes_only, FLAT_BUNDLE_MAX};
 
 /// Cap on individually-listed failed entries in the summary. Walks that
 /// exceed this bound roll up the rest under `overflow_count`; the modal
@@ -579,10 +579,6 @@ fn walk<'a, R: Runtime>(
                         name,
                         kind: ContentKind::Leaf,
                     })
-                }
-                Err(IngestError::Oversized { .. }) => {
-                    counters.skipped.oversized = counters.skipped.oversized.saturating_add(1);
-                    WalkOutcome::Skipped
                 }
                 Err(e) => WalkOutcome::Failed(e.to_string()),
             }
