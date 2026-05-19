@@ -601,6 +601,11 @@ pub struct NodeState {
     /// dispatch to a single-threaded event loop, so finer locking would
     /// not unlock parallelism beyond what the runtime already permits.
     pub pin_serial_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Mint personal-finance database. Lazily opened from
+    /// app_data_dir/mint/ledger.db on first invocation of any mint_*
+    /// command. None until first use; subsequent calls reuse the cached
+    /// connection.
+    mint_db: Option<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>>,
 }
 
 impl NodeState {
@@ -693,6 +698,8 @@ impl Default for NodeState {
             // event loop is single-threaded — but resetting it would
             // also work; keep it stable for simplicity).
             pin_serial_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            // Mint DB: lazily opened on first mint_* command call.
+            mint_db: None,
         }
     }
 }
@@ -5693,6 +5700,32 @@ pub async fn list_folder(
             kind: kind_wire(e.kind).to_string(),
         })
         .collect())
+}
+
+/// Lazily open `<app_data_dir>/mint/ledger.db` on first call;
+/// subsequent calls return the cached Arc. The mutex-guard is held
+/// only across the cheap clone-or-init — never across DB operations
+/// or .await points.
+pub fn mint_db_handle(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, std::sync::Mutex<NodeState>>,
+) -> Result<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>, String> {
+    let mut node = state.lock().expect("NodeState poisoned");
+    if let Some(arc) = &node.mint_db {
+        return Ok(arc.clone());
+    }
+    use tauri::Manager;
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app_data_dir: {e}"))?;
+    let mint_dir = app_data_dir.join("mint");
+    std::fs::create_dir_all(&mint_dir).map_err(|e| format!("create_dir mint: {e}"))?;
+    let db_path = mint_dir.join("ledger.db");
+    let conn = mint::open_database(&db_path).map_err(|e| e.to_string())?;
+    let arc = std::sync::Arc::new(std::sync::Mutex::new(conn));
+    node.mint_db = Some(arc.clone());
+    Ok(arc)
 }
 
 #[tauri::command]
@@ -21993,6 +22026,18 @@ pub fn run() {
             voting_list_delegations,
             #[cfg(debug_assertions)]
             e2e_close_window,
+            // Mint personal-finance commands.
+            mint::mint_list_transactions,
+            mint::mint_get_transaction,
+            mint::mint_create_transaction,
+            mint::mint_update_transaction,
+            mint::mint_delete_transaction,
+            mint::mint_list_accounts,
+            mint::mint_create_account,
+            mint::mint_rename_account,
+            mint::mint_delete_account,
+            mint::mint_get_default_currency,
+            mint::mint_set_default_currency,
         ])
         .run(tauri::generate_context!())
         .expect("error while running harmony");
@@ -25211,6 +25256,7 @@ mod start_node_race_tests {
                 std::collections::HashMap::new(),
             )),
             pin_serial_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            mint_db: None,
         })
     }
 

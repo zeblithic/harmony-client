@@ -70,7 +70,7 @@ pub fn open_database(path: &std::path::Path) -> Result<Connection, MintError> {
 /// can be called on every app start without error.  The `accounts` table
 /// includes a `UNIQUE(name)` constraint; we are pre-launch so all test
 /// databases are in-memory and no on-disk migration is required.
-fn apply_migrations(conn: &Connection) -> Result<(), MintError> {
+pub fn apply_migrations(conn: &Connection) -> Result<(), MintError> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS accounts (
@@ -711,6 +711,187 @@ fn get_account_by_id(conn: &Connection, id: &str) -> Result<Option<Account>, Min
     } else {
         Ok(None)
     }
+}
+
+// ── Tauri command layer ──────────────────────────────────────────────────────
+//
+// All commands wrap their sync rusqlite work in tokio::task::spawn_blocking
+// so the tokio executor never blocks on file I/O. The `std::sync::Mutex` on
+// the connection is correct (not tokio::sync::Mutex) because the lock is
+// only held inside the spawn_blocking closure, never across an .await.
+// See spec § Architecture > Database connection lifecycle.
+
+#[tauri::command]
+pub async fn mint_list_accounts(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
+) -> Result<Vec<Account>, String> {
+    let conn = crate::mint_db_handle(&app, &state)?;
+    tokio::task::spawn_blocking(move || {
+        let conn = conn.lock().expect("mint_db lock poisoned");
+        list_accounts(&conn).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn mint_create_account(
+    name: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
+) -> Result<Account, String> {
+    let conn = crate::mint_db_handle(&app, &state)?;
+    tokio::task::spawn_blocking(move || {
+        let conn = conn.lock().expect("mint_db lock poisoned");
+        create_account(&conn, &name).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn mint_rename_account(
+    id: String,
+    name: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
+) -> Result<Account, String> {
+    let conn = crate::mint_db_handle(&app, &state)?;
+    tokio::task::spawn_blocking(move || {
+        let conn = conn.lock().expect("mint_db lock poisoned");
+        rename_account(&conn, &id, &name).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn mint_delete_account(
+    id: String,
+    reassign_to: Option<String>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
+) -> Result<(), String> {
+    let conn = crate::mint_db_handle(&app, &state)?;
+    tokio::task::spawn_blocking(move || {
+        let conn = conn.lock().expect("mint_db lock poisoned");
+        delete_account(&conn, &id, reassign_to.as_deref()).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn mint_list_transactions(
+    date_from: Option<String>,
+    date_to: Option<String>,
+    account_id: Option<String>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
+) -> Result<Vec<Transaction>, String> {
+    let conn = crate::mint_db_handle(&app, &state)?;
+    tokio::task::spawn_blocking(move || {
+        let conn = conn.lock().expect("mint_db lock poisoned");
+        let filter = ListFilter {
+            date_from,
+            date_to,
+            account_id,
+        };
+        list_transactions(&conn, &filter).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn mint_get_transaction(
+    id: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
+) -> Result<Option<Transaction>, String> {
+    let conn = crate::mint_db_handle(&app, &state)?;
+    tokio::task::spawn_blocking(move || {
+        let conn = conn.lock().expect("mint_db lock poisoned");
+        get_transaction(&conn, &id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn mint_create_transaction(
+    payload: NewTransaction,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
+) -> Result<Transaction, String> {
+    let conn = crate::mint_db_handle(&app, &state)?;
+    tokio::task::spawn_blocking(move || {
+        let conn = conn.lock().expect("mint_db lock poisoned");
+        create_transaction(&conn, payload).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn mint_update_transaction(
+    id: String,
+    payload: UpdateTransaction,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
+) -> Result<Transaction, String> {
+    let conn = crate::mint_db_handle(&app, &state)?;
+    tokio::task::spawn_blocking(move || {
+        let conn = conn.lock().expect("mint_db lock poisoned");
+        update_transaction(&conn, &id, payload).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn mint_delete_transaction(
+    id: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
+) -> Result<(), String> {
+    let conn = crate::mint_db_handle(&app, &state)?;
+    tokio::task::spawn_blocking(move || {
+        let conn = conn.lock().expect("mint_db lock poisoned");
+        delete_transaction(&conn, &id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn mint_get_default_currency(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
+) -> Result<Option<String>, String> {
+    let conn = crate::mint_db_handle(&app, &state)?;
+    tokio::task::spawn_blocking(move || {
+        let conn = conn.lock().expect("mint_db lock poisoned");
+        get_default_currency(&conn).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn mint_set_default_currency(
+    currency: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
+) -> Result<(), String> {
+    let conn = crate::mint_db_handle(&app, &state)?;
+    tokio::task::spawn_blocking(move || {
+        let conn = conn.lock().expect("mint_db lock poisoned");
+        set_default_currency(&conn, &currency).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("join error: {e}"))?
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
