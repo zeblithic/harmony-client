@@ -14,8 +14,15 @@ use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Domain separator used when deriving the VRF seed for a poll.
-const VRF_SEED_DS: &[u8] = b"dfrost-vrf-v1";
+/// Domain separator for `derive_vrf_seed` — binds (poll_event_hash, epoch)
+/// to the per-ceremony message the committee threshold-signs.
+const VRF_SEED_DS: &[u8] = b"dfrost-vrf-seed-v1";
+
+/// Domain separator for `derive_vrf_output` — binds the R component of the
+/// aggregated Schnorr signature to the publicly verifiable VRF output.
+/// R1 fix (Cursor Low): distinct from `VRF_SEED_DS` so the two hash
+/// derivations are domain-independent under the random-oracle model.
+const VRF_OUTPUT_DS: &[u8] = b"dfrost-vrf-output-v1";
 
 /// Discriminator for the 5 D-FROST committee event kinds. Wire-encoded
 /// as a 2-char string in the envelope's `kd` field.
@@ -255,16 +262,19 @@ pub fn derive_vrf_seed(poll_event_hash: &[u8; 32], epoch: u64) -> [u8; 32] {
 }
 
 /// VRF-output derivation from the aggregated Schnorr nonce point R:
-/// `SHA-256(b"dfrost-vrf-v1" || R_compressed)`.
+/// `SHA-256(b"dfrost-vrf-output-v1" || R_compressed)`.
 ///
 /// `r_compressed` is the first 32 bytes of `aggregated_signature.serialize()`
 /// — the compressed Ristretto point representation of the nonce R from
 /// the FROST signing protocol. Hashing R (not the full signature) makes
 /// the output uniformly distributed even when adversarial signers
 /// influence `s`.
+///
+/// R1 (Cursor Low): uses `VRF_OUTPUT_DS`, distinct from `VRF_SEED_DS`,
+/// so the two hash derivations are domain-independent.
 pub fn derive_vrf_output(r_compressed: &[u8; 32]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(VRF_SEED_DS);
+    hasher.update(VRF_OUTPUT_DS);
     hasher.update(r_compressed);
     let mut out = [0u8; 32];
     out.copy_from_slice(&hasher.finalize());

@@ -152,10 +152,15 @@ impl CommitteeState {
         sorted.dedup();
         let mut map = BTreeMap::new();
         for (idx, addr) in sorted.into_iter().enumerate() {
-            // 1-indexed — FROST disallows Identifier(0). We cast through
-            // u16; the caller is responsible for staying within
-            // `max_signers <= u16::MAX` (enforced upstream at DKG-initiate).
-            let id = Identifier::try_from((idx as u16) + 1)
+            // 1-indexed — FROST disallows Identifier(0). R1 fix (CodeRabbit
+            // Major, Cursor Low): use u16::try_from to reject indices
+            // >= 65536 loudly rather than silently wrapping via `as u16`.
+            // Caller is responsible for staying within `max_signers <=
+            // u16::MAX` (enforced upstream at DKG initiate); this is
+            // defence-in-depth against a malformed pending ceremony.
+            let idx_u16: u16 = u16::try_from(idx)
+                .expect("committee size > u16::MAX; enforced upstream at DKG init");
+            let id = Identifier::try_from(idx_u16 + 1)
                 .expect("idx+1 fits u16 and is non-zero by construction");
             map.insert(addr, id);
         }
@@ -193,6 +198,16 @@ pub struct PendingSignSession {
     pub message_hash: [u8; 32],
     /// Per-actor (commitments_bytes, share_bytes) contributions.
     pub contributions: BTreeMap<OwnerAddr, (Vec<u8>, Vec<u8>)>,
+}
+
+/// Which pending-ceremony slot a `dk` event resolves to. R1 fix: refresh
+/// completes via the same `dk` event kind as initial DKG, so the dispatch
+/// has to inspect both slots before either rejecting (UnknownCeremony)
+/// or proceeding.
+#[derive(Debug, Clone, Copy)]
+enum PendingSlot {
+    Dkg,
+    Refresh,
 }
 
 /// Errors surfaced by `DfrostLog::apply`. Verify-time checks (signature
@@ -313,13 +328,54 @@ impl DfrostLog {
             }
         }
 
-        let pending = self
+        // R1 (CodeRabbit Critical + Qodo Bug): a `dk` event can finalize
+        // EITHER an in-flight DKG OR an in-flight proactive refresh —
+        // both flows complete via the same `dk` event kind per the spec
+        // (refresh = "DKG that preserves the joint vk"). Look up which
+        // pending slot the ceremony_id binds to.
+        let pending_slot = if self
             .committee_state
             .pending_dkg
-            .as_mut()
-            .ok_or(ApplyError::UnknownCeremony)?;
-        if pending.ceremony_id != payload.ceremony_id {
+            .as_ref()
+            .map(|p| p.ceremony_id == payload.ceremony_id)
+            .unwrap_or(false)
+        {
+            PendingSlot::Dkg
+        } else if self
+            .committee_state
+            .pending_refresh
+            .as_ref()
+            .map(|p| p.ceremony_id == payload.ceremony_id)
+            .unwrap_or(false)
+        {
+            PendingSlot::Refresh
+        } else {
             return Err(ApplyError::UnknownCeremony);
+        };
+
+        // Borrow the matching pending ceremony mutably. The branches are
+        // identical except for which slot we read; collapse via a small
+        // helper closure so the rest of the logic is one path.
+        let pending = match pending_slot {
+            PendingSlot::Dkg => self.committee_state.pending_dkg.as_mut().expect("checked"),
+            PendingSlot::Refresh => self
+                .committee_state
+                .pending_refresh
+                .as_mut()
+                .expect("checked"),
+        };
+
+        // R1 (CodeRabbit Critical + Cursor High): committee shape MUST
+        // match the pending ceremony's pre-declared shape. A malicious
+        // member cannot redefine threshold / members / max_signers via
+        // the `dk` payload — those are pinned at ceremony initiation in
+        // the proposer's signed initial event.
+        if payload.threshold != pending.threshold
+            || payload.max_signers != pending.max_signers
+            || payload.members != pending.members
+            || payload.epoch != pending.proposed_epoch
+        {
+            return Err(ApplyError::InvariantViolation);
         }
 
         // Cross-confirmation consensus: any disagreement on the vk among
@@ -334,26 +390,34 @@ impl DfrostLog {
             .insert(event.actor, payload.joint_verifying_key);
 
         // Quorum reached → promote the pending ceremony to the active
-        // committee state. We re-read threshold/members from the just-
-        // decoded `dk` payload (the proposer's snapshot) rather than from
-        // `pending`, mirroring the invariant that on-the-wire payload is
-        // authoritative for committee shape.
-        if pending.dk_confirmations.len() >= payload.threshold as usize {
+        // committee state. Threshold + members + max_signers come from
+        // `pending` (set at ceremony init), NOT the payload (R1 fix).
+        // verifying_shares + joint_verifying_key + epoch come from the
+        // payload because they're the OUTPUT of the ceremony — those
+        // can only be known after the protocol runs.
+        if pending.dk_confirmations.len() >= pending.threshold as usize {
             let mut new_verifying_shares: BTreeMap<OwnerAddr, [u8; 32]> = BTreeMap::new();
             for mvs in &payload.verifying_shares {
                 new_verifying_shares.insert(mvs.member, mvs.verifying_share);
             }
-            let identifier_map = CommitteeState::build_identifier_map(&payload.members);
+            let identifier_map = CommitteeState::build_identifier_map(&pending.members);
+            let members = pending.members.clone();
+            let threshold = pending.threshold;
+            let max_signers = pending.max_signers;
 
             self.committee_state.active = true;
             self.committee_state.current_epoch = payload.epoch;
             self.committee_state.joint_verifying_key = Some(payload.joint_verifying_key);
             self.committee_state.verifying_shares = new_verifying_shares;
-            self.committee_state.members = payload.members.clone();
-            self.committee_state.threshold = payload.threshold;
-            self.committee_state.max_signers = payload.max_signers;
+            self.committee_state.members = members;
+            self.committee_state.threshold = threshold;
+            self.committee_state.max_signers = max_signers;
             self.committee_state.identifier_map = identifier_map;
-            self.committee_state.pending_dkg = None;
+            // Clear whichever pending slot we just promoted.
+            match pending_slot {
+                PendingSlot::Dkg => self.committee_state.pending_dkg = None,
+                PendingSlot::Refresh => self.committee_state.pending_refresh = None,
+            }
         }
 
         Ok(())
@@ -413,6 +477,21 @@ impl DfrostLog {
             ciborium::de::from_reader(&event.payload[..]).map_err(|_| ApplyError::PayloadDecode)?;
 
         if !self.committee_state.active {
+            return Err(ApplyError::InvariantViolation);
+        }
+
+        // R1 (CodeRabbit Major): a `vb` event MUST reference a known
+        // pending sign session AND its claimed message_hash MUST match
+        // the session's pinned message_hash. Without these checks, a
+        // malicious peer can broadcast a `vb` for an unknown ceremony
+        // or for a different message than the committee actually
+        // signed, and the log silently accepts it.
+        let session = self
+            .committee_state
+            .pending_sign
+            .get(&payload.ceremony_id)
+            .ok_or(ApplyError::UnknownCeremony)?;
+        if session.message_hash != payload.message_hash {
             return Err(ApplyError::InvariantViolation);
         }
 
@@ -871,8 +950,22 @@ mod tests {
         };
         use crate::owner_state_types::Hlc;
 
+        let ceremony_id = [0xcc; 32];
+        let msg_hash = [0xde; 32];
+
         let mut log = DfrostLog::new();
         log.committee_state.active = true;
+        // R1 update (CodeRabbit Major): seed a matching pending_sign
+        // session so the new orphan-ceremony check passes and we
+        // exercise the VRF-output binding check specifically (this
+        // test's original target).
+        log.committee_state.pending_sign.insert(
+            ceremony_id,
+            PendingSignSession {
+                message_hash: msg_hash,
+                contributions: BTreeMap::new(),
+            },
+        );
 
         let sig_bytes = vec![0xaau8; 64];
         let correct_vrf = derive_vrf_output(&sig_bytes[..32].try_into().unwrap());
@@ -880,8 +973,8 @@ mod tests {
         assert_ne!(correct_vrf, wrong_vrf);
 
         let payload = VrfBeaconPayload {
-            ceremony_id: [0xcc; 32],
-            message_hash: [0xde; 32],
+            ceremony_id,
+            message_hash: msg_hash,
             signature: sig_bytes,
             vrf_output: wrong_vrf,
         };
@@ -957,6 +1050,13 @@ mod tests {
         assert_eq!(pr.proposed_epoch, 2);
     }
 
+    /// R1 (CodeRabbit Critical): refresh completion routes through
+    /// `pending_refresh`, NOT `pending_dkg`. The `dk` event kind is
+    /// shared between initial DKG and proactive refresh; the slot
+    /// resolution happens by ceremony_id lookup. Previously this test
+    /// (wrongly) seeded `pending_dkg` for refresh — that worked because
+    /// the bug under review was that ONLY `pending_dkg` was ever
+    /// consulted. Now we exercise the real refresh path.
     #[test]
     fn refresh_completion_preserves_joint_vk() {
         use crate::community_dfrost_types::{
@@ -971,7 +1071,11 @@ mod tests {
         log.committee_state.active = true;
         log.committee_state.current_epoch = 1;
         log.committee_state.joint_verifying_key = Some(existing_vk);
-        log.committee_state.pending_dkg = Some(PendingCeremony {
+        log.committee_state.members = vec![alice];
+        log.committee_state.threshold = 1;
+        log.committee_state.max_signers = 1;
+        // R1 fix: refresh uses pending_refresh, not pending_dkg.
+        log.committee_state.pending_refresh = Some(PendingCeremony {
             ceremony_id: [0x88; 32],
             members: vec![alice],
             threshold: 1,
@@ -1013,6 +1117,176 @@ mod tests {
 
         assert_eq!(log.committee_state.current_epoch, 2);
         assert_eq!(log.committee_state.joint_verifying_key, Some(existing_vk));
+        assert!(
+            log.committee_state.pending_refresh.is_none(),
+            "completed refresh clears its pending slot"
+        );
+    }
+
+    /// R1 (CodeRabbit Critical / Cursor High): `dk` payload MUST NOT
+    /// redefine committee shape. A malicious member sending threshold=1
+    /// against a pending ceremony with threshold=2 would otherwise
+    /// finalize the committee on a single confirmation. Reject as
+    /// InvariantViolation.
+    #[test]
+    fn dk_with_payload_threshold_mismatch_rejected() {
+        use crate::community_dfrost_types::{
+            DfrostEventKind, DkgCompletePayload, MemberVerifyingShare, SignedCommitteeEvent,
+        };
+        use crate::owner_state_types::Hlc;
+
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let mut log = DfrostLog::new();
+        // 2-of-2 ceremony pending.
+        log.committee_state.pending_dkg = Some(PendingCeremony {
+            ceremony_id: [0xab; 32],
+            members: vec![alice, bob],
+            threshold: 2,
+            max_signers: 2,
+            proposed_epoch: 1,
+            ..Default::default()
+        });
+
+        // Attacker dk claims threshold=1 against the threshold=2 ceremony.
+        let dk_payload = DkgCompletePayload {
+            ceremony_id: [0xab; 32],
+            joint_verifying_key: [0x99u8; 32],
+            verifying_shares: vec![
+                MemberVerifyingShare {
+                    member: alice,
+                    verifying_share: [0xa1; 32],
+                },
+                MemberVerifyingShare {
+                    member: bob,
+                    verifying_share: [0xb2; 32],
+                },
+            ],
+            epoch: 1,
+            members: vec![alice, bob],
+            threshold: 1, // ← MISMATCH against pending.threshold=2
+            max_signers: 2,
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&dk_payload, &mut pd).unwrap();
+
+        let result = log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::DkgComplete,
+            hlc: Hlc {
+                wall_ms: 8000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: alice,
+            payload: pd,
+            sig: vec![0u8; 64],
+        });
+        assert_eq!(result, Err(ApplyError::InvariantViolation));
+        assert!(
+            !log.committee_state.active,
+            "rejected dk must not promote the committee"
+        );
+    }
+
+    /// R1 (CodeRabbit Major): `vb` event for an unknown sign ceremony
+    /// is rejected. Previously such events silently appended to the log,
+    /// allowing a malicious peer to inject phantom beacons.
+    #[test]
+    fn vb_with_unknown_ceremony_rejected() {
+        use crate::community_dfrost_types::{
+            derive_vrf_output, DfrostEventKind, SignedCommitteeEvent, VrfBeaconPayload,
+        };
+        use crate::owner_state_types::Hlc;
+
+        let mut log = DfrostLog::new();
+        log.committee_state.active = true;
+        // No pending_sign session — beacon should be rejected.
+
+        let r_compressed = [0x77u8; 32];
+        let mut sig = vec![0u8; 64];
+        sig[..32].copy_from_slice(&r_compressed);
+        let payload = VrfBeaconPayload {
+            ceremony_id: [0xee; 32],
+            message_hash: [0xde; 32],
+            signature: sig,
+            vrf_output: derive_vrf_output(&r_compressed),
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&payload, &mut pd).unwrap();
+
+        let result = log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::VrfBeacon,
+            hlc: Hlc {
+                wall_ms: 9000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: OwnerAddr([0x01; 16]),
+            payload: pd,
+            sig: vec![0u8; 64],
+        });
+        assert_eq!(result, Err(ApplyError::UnknownCeremony));
+    }
+
+    /// R1 (CodeRabbit Major): `vb` event whose `message_hash` differs
+    /// from the pinned pending-sign-session message is rejected. Without
+    /// this, a malicious peer could broadcast a beacon for a different
+    /// message than the committee actually agreed to sign.
+    #[test]
+    fn vb_with_mismatched_message_hash_rejected() {
+        use crate::community_dfrost_types::{
+            derive_vrf_output, DfrostEventKind, SignedCommitteeEvent, VrfBeaconPayload,
+        };
+        use crate::owner_state_types::Hlc;
+
+        let ceremony_id = [0xcc; 32];
+        let agreed_msg = [0xaau8; 32];
+        let attacker_msg = [0xbbu8; 32];
+
+        let mut log = DfrostLog::new();
+        log.committee_state.active = true;
+        // Seed the pending sign session with the agreed message hash.
+        log.committee_state.pending_sign.insert(
+            ceremony_id,
+            PendingSignSession {
+                message_hash: agreed_msg,
+                contributions: BTreeMap::new(),
+            },
+        );
+
+        let r_compressed = [0x77u8; 32];
+        let mut sig = vec![0u8; 64];
+        sig[..32].copy_from_slice(&r_compressed);
+        let payload = VrfBeaconPayload {
+            ceremony_id,
+            message_hash: attacker_msg, // ← MISMATCH
+            signature: sig,
+            vrf_output: derive_vrf_output(&r_compressed),
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&payload, &mut pd).unwrap();
+
+        let result = log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::VrfBeacon,
+            hlc: Hlc {
+                wall_ms: 10_000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: OwnerAddr([0x01; 16]),
+            payload: pd,
+            sig: vec![0u8; 64],
+        });
+        assert_eq!(result, Err(ApplyError::InvariantViolation));
     }
 
     #[test]

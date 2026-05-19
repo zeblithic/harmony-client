@@ -22,9 +22,16 @@ use std::collections::BTreeMap;
 /// so callers MUST pass `index < u16::MAX - 1`. v1 committees cap at
 /// max_signers ≤ 7 so this is well within range.
 pub fn identifier_for_index(index: usize) -> Identifier {
-    let n: u16 = (index as u16)
+    // R1 fix (CodeRabbit Major, Cursor Low): use u16::try_from to reject
+    // indices >= 65536 loudly rather than letting `as u16` silently wrap
+    // them into the low-end and collide with legitimate identifiers.
+    // Caller is responsible for staying within `max_signers <= u16::MAX`
+    // (v1 committees cap at 7, so this is defence-in-depth).
+    let idx_u16: u16 =
+        u16::try_from(index).expect("committee index overflowed u16 — committee too large");
+    let n: u16 = idx_u16
         .checked_add(1)
-        .expect("committee index overflowed u16 — committee too large");
+        .expect("committee index +1 overflowed u16 — committee too large");
     Identifier::try_from(n).expect("FROST rejects identifier 0; index+1 guarantees non-zero")
 }
 
