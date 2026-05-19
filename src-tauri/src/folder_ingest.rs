@@ -181,9 +181,15 @@ fn pre_walk_count(root: &Path) -> Option<u64> {
             continue;
         }
         if metadata.is_dir() {
-            let read_dir = std::fs::read_dir(&path).ok()?;
+            // Skip unreadable subdirs (e.g. permission-denied) so a single
+            // hiccup degrades only the count, not the whole progress bar to
+            // indeterminate. The actual walker also tolerates per-entry I/O
+            // errors and continues; pre-walk should match its forgiveness.
+            let Ok(read_dir) = std::fs::read_dir(&path) else {
+                continue;
+            };
             for entry_res in read_dir {
-                let entry = entry_res.ok()?;
+                let Ok(entry) = entry_res else { continue };
                 stack.push(entry.path());
             }
         } else if metadata.is_file() && metadata.len() <= FLAT_BUNDLE_MAX {

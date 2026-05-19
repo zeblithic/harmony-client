@@ -46,7 +46,7 @@ From the codebase survey (2026-05-19):
 │            ▼                       ▼                                  │
 │       ┌─────────────────────────────────────────┐                    │
 │       │  service.ingestFolderTree(              │                    │
-│       │    path, parentSidecarId, parentPath    │                    │
+│       │    jobId, path, parentSidecarId, parent │                    │
 │       │  ) -> Promise<IngestFolderTreeResult>   │                    │
 │       └─────────────────────┬───────────────────┘                    │
 │                             │                                         │
@@ -518,7 +518,7 @@ Note: `activeIngestJobId` is set synchronously by `startFolderIngest` (frontend 
 | # | Test | What it asserts |
 |---|---|---|
 | 1 | "Add folder…" button click opens directory picker | `dialog.open({directory:true})` called |
-| 2 | Picker resolution fires `ingestFolderTree` IPC | adapter invoked with `{ rootPath, parentSidecarId, parentPath }` |
+| 2 | Picker resolution fires `ingestFolderTree` IPC | adapter invoked with `{ jobId, rootPath, parentSidecarId, parentPath }` |
 | 3 | OS-folder-drop event triggers ingest | listener fires `ingestFolderTree` |
 | 4 | Multiple drops while in-flight are ignored | only first call to `ingestFolderTree` |
 | 5 | Progress event updates modal state | rendered "X of Y" updates after listen callback |
