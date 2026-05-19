@@ -9,21 +9,27 @@
 //! `community_dfrost_log.rs` cover single-engine semantics.
 //!
 //! Tests use REAL FROST-Ristretto255 crypto (via `community_dfrost_crypto`
-//! wrappers) so DKG `dkg_part1` → `part2` → `part3` runs end-to-end.
+//! wrappers) so DKG `dkg_part1` → `part2` → `part3` and threshold-sign
+//! `round1::commit` → `round2::sign` → `aggregate` run end-to-end.
 //! Envelope sigs are synthetic `vec![0u8; 64]` because `apply()` does not
 //! verify the outer Ed25519 sig (caller's responsibility — IPC layer in
 //! Tasks 5-6). Only the FROST inner crypto matters for convergence.
 
 use std::collections::BTreeMap;
 
+use frost_ristretto255::{
+    self as frost,
+    keys::{KeyPackage, PublicKeyPackage},
+    rand_core, Identifier,
+};
 use harmony_app::community_dfrost_crypto::{
-    dkg_part1_local, dkg_part2_local, dkg_part3_local, verifying_key_to_bytes,
-    verifying_share_to_bytes,
+    dkg_part1_local, dkg_part2_local, dkg_part3_local, identifier_for_index,
+    verifying_key_to_bytes, verifying_share_to_bytes,
 };
 use harmony_app::community_dfrost_log::{CommitteeState, DfrostLog, PendingCeremony};
 use harmony_app::community_dfrost_types::{
-    DfrostEventKind, DkgCompletePayload, DkgRoundPayload, MemberVerifyingShare,
-    SignedCommitteeEvent,
+    derive_vrf_output, DfrostEventKind, DkgCompletePayload, DkgRoundPayload, MemberVerifyingShare,
+    SignedCommitteeEvent, ThresholdSignPayload, VrfBeaconPayload,
 };
 use harmony_app::community_membership::RecipientCiphertext;
 use harmony_app::dm_signing;
@@ -104,6 +110,46 @@ fn build_dk_event(
     }
 }
 
+fn build_ts_event(
+    actor: OwnerAddr,
+    wall_ms: u64,
+    node_id: &str,
+    payload: ThresholdSignPayload,
+) -> SignedCommitteeEvent {
+    let mut pd = Vec::new();
+    ciborium::into_writer(&payload, &mut pd).expect("encode ts payload");
+    SignedCommitteeEvent {
+        tag: 'd',
+        version: 1,
+        committee_tier: 0,
+        kind: DfrostEventKind::ThresholdSign,
+        hlc: hlc(wall_ms, node_id),
+        actor,
+        payload: pd,
+        sig: vec![0u8; 64],
+    }
+}
+
+fn build_vb_event(
+    actor: OwnerAddr,
+    wall_ms: u64,
+    node_id: &str,
+    payload: VrfBeaconPayload,
+) -> SignedCommitteeEvent {
+    let mut pd = Vec::new();
+    ciborium::into_writer(&payload, &mut pd).expect("encode vb payload");
+    SignedCommitteeEvent {
+        tag: 'd',
+        version: 1,
+        committee_tier: 0,
+        kind: DfrostEventKind::VrfBeacon,
+        hlc: hlc(wall_ms, node_id),
+        actor,
+        payload: pd,
+        sig: vec![0u8; 64],
+    }
+}
+
 /// Seed `pending_dkg` on a fresh log so the apply path has a ceremony to
 /// match against. In production this is populated by the
 /// `dfrost_initiate_dkg` IPC (Task 5); for the integration test we set it
@@ -121,50 +167,41 @@ fn fresh_log_with_pending() -> DfrostLog {
     log
 }
 
-// ─── Test ───────────────────────────────────────────────────────────────────
+// ─── Shared setup ───────────────────────────────────────────────────────────
 
-/// 2-of-2 DKG ceremony driven through real FROST crypto, with two engines
-/// observing the full broadcast/sealed message sequence. Asserts both
-/// engines materialize identical `CommitteeState` (joint vk + verifying
-/// shares + epoch + active flag).
-///
-/// Ceremony flow (each step applied on BOTH engines unless noted):
-///   1. dr(rn=1) from Alice with her round-1 package
-///   2. dr(rn=1) from Bob with his round-1 package
-///   3. dr(rn=2) from Alice — sealed package for Bob (decrypted on B's engine
-///      via apply_with_identity; A's engine has no ciphertext targeted at A
-///      so the decrypt is a no-op there)
-///   4. dr(rn=2) from Bob — sealed package for Alice (decrypted on A's engine)
-///   5. Each engine LOCALLY runs dkg_part3_local on its own r2_secret +
-///      received r1/r2 packages → PublicKeyPackage. Both engines MUST derive
-///      the same joint_verifying_key (FROST guarantees this — that's the
-///      whole point of DKG).
-///   6. dk from Alice (or anyone — any committee member can broadcast the
-///      finalization; the payload content is what's verified). Apply on both.
-///   7. Assert: both engines have `committee_state.active = true`,
-///      `current_epoch = 1`, identical `joint_verifying_key`, identical
-///      `verifying_shares` per member.
-#[test]
-fn dkg_two_engine_2of2_converges_on_joint_vk() {
+/// State left behind by a successful 2-of-2 DKG ceremony — both engines
+/// active on the same joint verifying key, plus the FROST `KeyPackage`s
+/// and `PublicKeyPackage` needed for downstream sign/refresh tests.
+struct ActivatedCommittee {
+    engine_a: DfrostLog,
+    engine_b: DfrostLog,
+    alice_key_pkg: KeyPackage,
+    bob_key_pkg: KeyPackage,
+    pub_pkg: PublicKeyPackage,
+    joint_vk: [u8; 32],
+    id_alice: Identifier,
+    id_bob: Identifier,
+}
+
+/// Drive a full 2-of-2 DKG ceremony cross-engine and return the activated
+/// state. Shared by Tasks 2, 3, and 4 so downstream tests don't reimplement
+/// the (long) DKG setup. The convergence assertions live in the Task 2
+/// test that calls this; Tasks 3 + 4 inherit the convergence as a
+/// precondition.
+fn dkg_2of2_setup() -> ActivatedCommittee {
     let (alice_priv, alice_pub) = alice_x25519();
     let (bob_priv, bob_pub) = bob_x25519();
 
-    // Two independent engines (one per node). Both seed pending_dkg with
-    // the same ceremony — in production this comes from observing the
-    // initiator's `dfrost_initiate_dkg` IPC or its corresponding broadcast.
     let mut engine_a = fresh_log_with_pending();
     let mut engine_b = fresh_log_with_pending();
 
-    // Identifier assignment is deterministic from sorted member list.
-    let id_alice = harmony_app::community_dfrost_crypto::identifier_for_index(0); // alice sorts first
-    let id_bob = harmony_app::community_dfrost_crypto::identifier_for_index(1);
+    let id_alice = identifier_for_index(0); // alice sorts first
+    let id_bob = identifier_for_index(1);
 
-    // ── Round 1 ──────────────────────────────────────────────────────────
+    // Round 1
     let (r1_secret_alice, r1_pkg_alice_bytes) =
         dkg_part1_local(id_alice, 2, 2).expect("alice part1");
     let (r1_secret_bob, r1_pkg_bob_bytes) = dkg_part1_local(id_bob, 2, 2).expect("bob part1");
-
-    // Broadcast dr(rn=1) from both nodes — both engines see both events.
     let dr1_alice = build_dr_event(
         ALICE,
         1_000,
@@ -187,34 +224,29 @@ fn dkg_two_engine_2of2_converges_on_joint_vk() {
             recipient_ciphertexts: None,
         },
     );
-    engine_a
-        .apply(dr1_alice.clone())
-        .expect("a applies dr1_alice");
-    engine_a.apply(dr1_bob.clone()).expect("a applies dr1_bob");
-    engine_b.apply(dr1_alice).expect("b applies dr1_alice");
-    engine_b.apply(dr1_bob).expect("b applies dr1_bob");
+    engine_a.apply(dr1_alice.clone()).expect("a applies dr1a");
+    engine_a.apply(dr1_bob.clone()).expect("a applies dr1b");
+    engine_b.apply(dr1_alice).expect("b applies dr1a");
+    engine_b.apply(dr1_bob).expect("b applies dr1b");
 
-    // ── Round 2 ──────────────────────────────────────────────────────────
-    // Each node runs part2 with the OTHER node's round-1 package; produces
-    // a per-recipient map of round-2 packages (one entry per other member).
-    let mut r1_recv_for_alice = BTreeMap::new();
-    r1_recv_for_alice.insert(id_bob, r1_pkg_bob_bytes.clone());
+    // Round 2
+    let r1_recv_for_alice: BTreeMap<_, _> =
+        [(id_bob, r1_pkg_bob_bytes.clone())].into_iter().collect();
     let (r2_secret_alice, r2_pkgs_from_alice) =
         dkg_part2_local(r1_secret_alice, &r1_recv_for_alice).expect("alice part2");
 
-    let mut r1_recv_for_bob = BTreeMap::new();
-    r1_recv_for_bob.insert(id_alice, r1_pkg_alice_bytes.clone());
+    let r1_recv_for_bob: BTreeMap<_, _> = [(id_alice, r1_pkg_alice_bytes.clone())]
+        .into_iter()
+        .collect();
     let (r2_secret_bob, r2_pkgs_from_bob) =
         dkg_part2_local(r1_secret_bob, &r1_recv_for_bob).expect("bob part2");
 
-    // Alice's r2 package destined for Bob: seal to Bob's x25519 pubkey.
     let r2_pkg_alice_to_bob = r2_pkgs_from_alice
         .get(&id_bob)
-        .expect("alice produced r2 pkg for bob")
+        .expect("alice r2 for bob")
         .clone();
     let sealed_alice_to_bob =
         dm_signing::seal_to_owner(&bob_pub, &r2_pkg_alice_to_bob).expect("seal a→b");
-
     let dr2_alice = build_dr_event(
         ALICE,
         2_000,
@@ -229,21 +261,16 @@ fn dkg_two_engine_2of2_converges_on_joint_vk() {
             }]),
         },
     );
-
-    // Alice's engine applies its own outgoing rn=2 via apply_with_identity
-    // (no decrypt for self since the ciphertext is for Bob).
     engine_a
         .apply_with_identity(dr2_alice.clone(), &ALICE, &alice_priv)
         .expect("a applies own dr2");
-    // Bob's engine applies + decrypts.
     engine_b
         .apply_with_identity(dr2_alice, &BOB, &bob_priv)
-        .expect("b applies+decrypts dr2 from alice");
+        .expect("b decrypts dr2 from alice");
 
-    // Symmetric for Bob → Alice
     let r2_pkg_bob_to_alice = r2_pkgs_from_bob
         .get(&id_alice)
-        .expect("bob produced r2 pkg for alice")
+        .expect("bob r2 for alice")
         .clone();
     let sealed_bob_to_alice =
         dm_signing::seal_to_owner(&alice_pub, &r2_pkg_bob_to_alice).expect("seal b→a");
@@ -263,34 +290,17 @@ fn dkg_two_engine_2of2_converges_on_joint_vk() {
     );
     engine_a
         .apply_with_identity(dr2_bob.clone(), &ALICE, &alice_priv)
-        .expect("a applies+decrypts dr2 from bob");
+        .expect("a decrypts dr2 from bob");
     engine_b
         .apply_with_identity(dr2_bob, &BOB, &bob_priv)
         .expect("b applies own dr2");
 
-    // ── Sanity: both engines have the same r1_packages map ───────────────
-    let pending_a = engine_a
-        .committee_state
-        .pending_dkg
-        .as_ref()
-        .expect("a pending");
-    let pending_b = engine_b
-        .committee_state
-        .pending_dkg
-        .as_ref()
-        .expect("b pending");
-    assert_eq!(pending_a.round1_packages, pending_b.round1_packages);
-
-    // ── Round 3 (local finalization on each engine) ──────────────────────
-    // dkg_part3_local takes the OTHER participants' r1 + r2 packages. Each
-    // engine has access to (a) the other's r1 package (from broadcast),
-    // (b) the other's r2 package addressed to self (decrypted via
-    // apply_with_identity above).
+    // Round 3 — local on each engine
     let alice_r1_recv: BTreeMap<_, _> = [(id_bob, r1_pkg_bob_bytes.clone())].into_iter().collect();
     let alice_r2_recv: BTreeMap<_, _> = [(id_bob, r2_pkg_bob_to_alice.clone())]
         .into_iter()
         .collect();
-    let (_key_pkg_alice, pub_pkg_alice) =
+    let (alice_key_pkg, pub_pkg) =
         dkg_part3_local(&r2_secret_alice, &alice_r1_recv, &alice_r2_recv).expect("alice part3");
 
     let bob_r1_recv: BTreeMap<_, _> = [(id_alice, r1_pkg_alice_bytes.clone())]
@@ -299,82 +309,238 @@ fn dkg_two_engine_2of2_converges_on_joint_vk() {
     let bob_r2_recv: BTreeMap<_, _> = [(id_alice, r2_pkg_alice_to_bob.clone())]
         .into_iter()
         .collect();
-    let (_key_pkg_bob, pub_pkg_bob) =
+    let (bob_key_pkg, _pub_pkg_bob) =
         dkg_part3_local(&r2_secret_bob, &bob_r1_recv, &bob_r2_recv).expect("bob part3");
 
-    // FROST guarantees this — the whole point of DKG.
-    let joint_vk_alice = verifying_key_to_bytes(pub_pkg_alice.verifying_key());
-    let joint_vk_bob = verifying_key_to_bytes(pub_pkg_bob.verifying_key());
-    assert_eq!(
-        joint_vk_alice, joint_vk_bob,
-        "FROST DKG cross-engine joint vk MUST match (this is the protocol's correctness criterion)"
-    );
+    let joint_vk = verifying_key_to_bytes(pub_pkg.verifying_key());
 
-    // ── dk broadcast finalization ────────────────────────────────────────
-    // Either party can build the dk event (the payload content, not the
-    // actor, is what's verified). Use Alice as the broadcaster.
+    // dk broadcast — BOTH members confirm (threshold=2 requires 2 confirmations)
     let identifier_map = CommitteeState::build_identifier_map(&members());
     let mut verifying_shares = Vec::with_capacity(2);
     for member in members() {
         let id = identifier_map[&member];
-        let vs = pub_pkg_alice
+        let vs = pub_pkg
             .verifying_shares()
             .get(&id)
-            .expect("verifying share for id");
+            .expect("verifying share");
         verifying_shares.push(MemberVerifyingShare {
             member,
             verifying_share: verifying_share_to_bytes(vs),
         });
     }
-
     let dk_payload = DkgCompletePayload {
         ceremony_id: CEREMONY_ID,
-        joint_verifying_key: joint_vk_alice,
+        joint_verifying_key: joint_vk,
         verifying_shares,
         epoch: 1,
         members: members(),
         threshold: 2,
         max_signers: 2,
     };
-    // Activation requires `dk_confirmations.len() >= threshold` (=2 here),
-    // so BOTH members must broadcast a `dk` event. Cross-confirmation
-    // consensus (R4) enforces both dk payloads have identical
-    // joint_vk + verifying_shares — guaranteed by FROST, but the apply
-    // path checks it loudly.
     let dk_alice = build_dk_event(ALICE, 3_000, "alice", dk_payload.clone());
     let dk_bob = build_dk_event(BOB, 3_100, "bob", dk_payload);
-    engine_a
-        .apply(dk_alice.clone())
-        .expect("a applies alice's dk");
-    engine_b.apply(dk_alice).expect("b applies alice's dk");
-    engine_a.apply(dk_bob.clone()).expect("a applies bob's dk");
-    engine_b.apply(dk_bob).expect("b applies bob's dk");
+    engine_a.apply(dk_alice.clone()).expect("a dk_alice");
+    engine_b.apply(dk_alice).expect("b dk_alice");
+    engine_a.apply(dk_bob.clone()).expect("a dk_bob");
+    engine_b.apply(dk_bob).expect("b dk_bob");
 
-    // ── Convergence assertions ───────────────────────────────────────────
-    assert!(engine_a.committee_state.active, "engine A must be active");
-    assert!(engine_b.committee_state.active, "engine B must be active");
-    assert_eq!(engine_a.committee_state.current_epoch, 1);
-    assert_eq!(engine_b.committee_state.current_epoch, 1);
-    assert_eq!(
-        engine_a.committee_state.joint_verifying_key,
-        engine_b.committee_state.joint_verifying_key
-    );
-    assert_eq!(
-        engine_a.committee_state.joint_verifying_key,
-        Some(joint_vk_alice)
-    );
-    assert_eq!(
-        engine_a.committee_state.verifying_shares,
-        engine_b.committee_state.verifying_shares
-    );
-    assert_eq!(
-        engine_a.committee_state.members,
-        engine_b.committee_state.members
-    );
-    assert_eq!(engine_a.committee_state.threshold, 2);
-    assert_eq!(engine_a.committee_state.max_signers, 2);
+    ActivatedCommittee {
+        engine_a,
+        engine_b,
+        alice_key_pkg,
+        bob_key_pkg,
+        pub_pkg,
+        joint_vk,
+        id_alice,
+        id_bob,
+    }
+}
 
-    // pending_dkg should be cleared after activation on BOTH engines.
-    assert!(engine_a.committee_state.pending_dkg.is_none());
-    assert!(engine_b.committee_state.pending_dkg.is_none());
+// ─── Task 2: DKG convergence ────────────────────────────────────────────────
+
+/// 2-of-2 DKG ceremony driven through real FROST crypto, with two engines
+/// observing the full broadcast/sealed message sequence. Asserts both
+/// engines materialize identical `CommitteeState` (joint vk + verifying
+/// shares + epoch + active flag).
+#[test]
+fn dkg_two_engine_2of2_converges_on_joint_vk() {
+    let c = dkg_2of2_setup();
+
+    assert!(c.engine_a.committee_state.active, "engine A must be active");
+    assert!(c.engine_b.committee_state.active, "engine B must be active");
+    assert_eq!(c.engine_a.committee_state.current_epoch, 1);
+    assert_eq!(c.engine_b.committee_state.current_epoch, 1);
+    assert_eq!(
+        c.engine_a.committee_state.joint_verifying_key,
+        c.engine_b.committee_state.joint_verifying_key
+    );
+    assert_eq!(
+        c.engine_a.committee_state.joint_verifying_key,
+        Some(c.joint_vk)
+    );
+    assert_eq!(
+        c.engine_a.committee_state.verifying_shares,
+        c.engine_b.committee_state.verifying_shares
+    );
+    assert_eq!(
+        c.engine_a.committee_state.members,
+        c.engine_b.committee_state.members
+    );
+    assert_eq!(c.engine_a.committee_state.threshold, 2);
+    assert_eq!(c.engine_a.committee_state.max_signers, 2);
+    assert!(c.engine_a.committee_state.pending_dkg.is_none());
+    assert!(c.engine_b.committee_state.pending_dkg.is_none());
+}
+
+// ─── Task 3: Threshold sign + VRF beacon ────────────────────────────────────
+
+/// Full FROST threshold-sign → aggregate → vb cycle driven cross-engine.
+/// After Task 2's DKG converges, both engines have an active committee on
+/// the same joint vk. This test runs `round1::commit` per signer, builds a
+/// SigningPackage, runs `round2::sign` per signer, aggregates into a real
+/// 64-byte Schnorr signature, and broadcasts a `vb` event. Both engines
+/// must apply the `vb` cleanly (the apply path verifies the Schnorr
+/// signature against the joint vk via `verify_schnorr_signature` — R2
+/// fix in PR #137).
+#[test]
+fn threshold_sign_two_engine_vrf_beacon_verifies() {
+    let mut c = dkg_2of2_setup();
+
+    // Choose a deterministic message hash for the signing ceremony.
+    let sign_ceremony_id: [u8; 32] = [0xab; 32];
+    let message_hash: [u8; 32] = [0x77; 32];
+
+    // ── Round 1: each signer commits ──────────────────────────────────────
+    let (alice_nonces, alice_commitments) =
+        frost::round1::commit(c.alice_key_pkg.signing_share(), &mut rand_core::OsRng);
+    let (bob_nonces, bob_commitments) =
+        frost::round1::commit(c.bob_key_pkg.signing_share(), &mut rand_core::OsRng);
+
+    // Encode commitments for the wire (`ts` event carries opaque commitment_bytes).
+    let mut alice_cm_bytes = Vec::new();
+    ciborium::into_writer(&alice_commitments, &mut alice_cm_bytes).expect("encode alice cm");
+    let mut bob_cm_bytes = Vec::new();
+    ciborium::into_writer(&bob_commitments, &mut bob_cm_bytes).expect("encode bob cm");
+
+    // ── SigningPackage: collected commitments + message ───────────────────
+    let mut commitments_map: BTreeMap<Identifier, frost::round1::SigningCommitments> =
+        BTreeMap::new();
+    commitments_map.insert(c.id_alice, alice_commitments);
+    commitments_map.insert(c.id_bob, bob_commitments);
+    let signing_package = frost::SigningPackage::new(commitments_map, &message_hash);
+
+    // ── Round 2: each signer produces a signature share ───────────────────
+    let alice_share = frost::round2::sign(&signing_package, &alice_nonces, &c.alice_key_pkg)
+        .expect("alice round2 sign");
+    let bob_share =
+        frost::round2::sign(&signing_package, &bob_nonces, &c.bob_key_pkg).expect("bob round2");
+
+    let mut alice_share_bytes = Vec::new();
+    ciborium::into_writer(&alice_share, &mut alice_share_bytes).expect("encode alice share");
+    let mut bob_share_bytes = Vec::new();
+    ciborium::into_writer(&bob_share, &mut bob_share_bytes).expect("encode bob share");
+
+    // ── ts events: both members contribute ────────────────────────────────
+    let ts_alice = build_ts_event(
+        ALICE,
+        4_000,
+        "alice",
+        ThresholdSignPayload {
+            ceremony_id: sign_ceremony_id,
+            message_hash,
+            commitment_bytes: alice_cm_bytes,
+            share_bytes: alice_share_bytes,
+        },
+    );
+    let ts_bob = build_ts_event(
+        BOB,
+        4_100,
+        "bob",
+        ThresholdSignPayload {
+            ceremony_id: sign_ceremony_id,
+            message_hash,
+            commitment_bytes: bob_cm_bytes,
+            share_bytes: bob_share_bytes,
+        },
+    );
+    c.engine_a.apply(ts_alice.clone()).expect("a ts_alice");
+    c.engine_a.apply(ts_bob.clone()).expect("a ts_bob");
+    c.engine_b.apply(ts_alice).expect("b ts_alice");
+    c.engine_b.apply(ts_bob).expect("b ts_bob");
+
+    // Both engines now have pending_sign[sign_ceremony_id] with two contributions.
+    let pending_a = c
+        .engine_a
+        .committee_state
+        .pending_sign
+        .get(&sign_ceremony_id)
+        .expect("a has pending sign session");
+    let pending_b = c
+        .engine_b
+        .committee_state
+        .pending_sign
+        .get(&sign_ceremony_id)
+        .expect("b has pending sign session");
+    assert_eq!(pending_a.contributions.len(), 2);
+    assert_eq!(pending_b.contributions.len(), 2);
+    assert_eq!(pending_a.message_hash, message_hash);
+    assert_eq!(pending_b.message_hash, message_hash);
+
+    // ── Aggregate the signature shares → final Schnorr sig ────────────────
+    let mut shares_map: BTreeMap<Identifier, frost::round2::SignatureShare> = BTreeMap::new();
+    shares_map.insert(c.id_alice, alice_share);
+    shares_map.insert(c.id_bob, bob_share);
+    let group_signature = frost::aggregate(&signing_package, &shares_map, &c.pub_pkg)
+        .expect("aggregate threshold sig");
+
+    let sig_bytes = group_signature.serialize().expect("serialize sig");
+    assert_eq!(sig_bytes.len(), 64, "Schnorr sig must be 64 bytes");
+
+    // Independently verify the signature against the joint vk (sanity check).
+    c.pub_pkg
+        .verifying_key()
+        .verify(&message_hash, &group_signature)
+        .expect("aggregated signature verifies under joint vk");
+
+    // ── Compute VRF output from R component (first 32 bytes of sig) ───────
+    let mut r_compressed = [0u8; 32];
+    r_compressed.copy_from_slice(&sig_bytes[..32]);
+    let vrf_output = derive_vrf_output(&r_compressed);
+
+    // ── vb event: broadcast the aggregated beacon ─────────────────────────
+    let vb = build_vb_event(
+        ALICE,
+        5_000,
+        "alice",
+        VrfBeaconPayload {
+            ceremony_id: sign_ceremony_id,
+            message_hash,
+            signature: sig_bytes.clone(),
+            vrf_output,
+        },
+    );
+    c.engine_a.apply(vb.clone()).expect("a applies vb");
+    c.engine_b.apply(vb).expect("b applies vb");
+
+    // ── Convergence: both engines cleared pending_sign for this ceremony ──
+    assert!(
+        !c.engine_a
+            .committee_state
+            .pending_sign
+            .contains_key(&sign_ceremony_id),
+        "engine A pending_sign must clear after successful vb"
+    );
+    assert!(
+        !c.engine_b
+            .committee_state
+            .pending_sign
+            .contains_key(&sign_ceremony_id),
+        "engine B pending_sign must clear after successful vb"
+    );
+
+    // Both engines retain the same active committee + joint vk.
+    assert_eq!(
+        c.engine_a.committee_state.joint_verifying_key,
+        c.engine_b.committee_state.joint_verifying_key
+    );
 }
