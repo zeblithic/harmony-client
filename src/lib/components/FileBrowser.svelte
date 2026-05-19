@@ -1,5 +1,6 @@
 <script lang="ts">
   import { untrack } from 'svelte';
+  import { open as openDialog } from '@tauri-apps/plugin-dialog';
   import type {
     FileViewMode,
     ContentSection,
@@ -8,13 +9,16 @@
     ContentItem,
     CleanupRecommendation,
   } from '../types';
-  import { FileManagerService } from '../file-manager-service';
+  import { FileManagerService, type IngestFolderTreeResult } from '../file-manager-service';
+  import type { TauriAdapter } from '../zenoh-service';
   import { tierTarget } from '../file-utils';
   import BrowserToolbar from './BrowserToolbar.svelte';
   import Breadcrumbs from './Breadcrumbs.svelte';
   import FileList from './FileList.svelte';
   import FileGrid from './FileGrid.svelte';
   import FolderLoadError from './FolderLoadError.svelte';
+  import FolderIngestProgressModal from './FolderIngestProgressModal.svelte';
+  import FolderIngestSummaryModal from './FolderIngestSummaryModal.svelte';
   import QuotaBar from './QuotaBar.svelte';
   import PublishedView from './PublishedView.svelte';
   import CleanupView from './CleanupView.svelte';
@@ -46,6 +50,7 @@
 
   let {
     service,
+    adapter = null,
     currentFolderCid = null,
     selectedCid = null,
     selectedSidecarId = null,
@@ -69,6 +74,7 @@
     serviceVersion = 0,
   }: {
     service: FileManagerService;
+    adapter?: TauriAdapter | null;
     currentFolderCid?: string | null;
     selectedCid?: string | null;
     selectedSidecarId?: string | null;
@@ -187,6 +193,26 @@
   // onNavigateFolder(null) for nested creates) and the catch's
   // newFolderError write must be discarded.
   let createCommitSeq = 0;
+
+  // Folder-ingest state. One in-flight walk at a time (entry handlers
+  // early-return on activeIngestProgress). activeIngestJobId is minted
+  // synchronously in startFolderIngest BEFORE the IPC call so the Cancel
+  // button works during the pre-walk window (pre-fix #3: jobId only
+  // arrived via the first progress event, leaving Cancel a no-op).
+  let activeIngestJobId = $state<string | null>(null);
+  let activeIngestProgress = $state<{
+    completed: number;
+    total: number;
+    currentPath: string;
+  } | null>(null);
+  let ingestSummary = $state<IngestFolderTreeResult | null>(null);
+  let cancelRequested = $state(false);
+  // Synchronous lock around the native folder picker: the
+  // activeIngestProgress guard alone races two fast clicks (both pass
+  // the guard before either await openDialog resolves and runs
+  // startFolderIngest). Set true before awaiting the dialog, reset in
+  // finally.
+  let pickerOpen = $state(false);
 
   // Tagged with the cid the failure belongs to so a fast nav-away
   // auto-discards the stale block (mirrors the folderItems.cid guard).
@@ -677,6 +703,203 @@
     }
   }
 
+  function resetIngestState() {
+    // Order matters: clear activeIngestJobId FIRST so a late
+    // folder-ingest-progress event for this job (delivered after the
+    // walker has already settled and emitted its final result) fails the
+    // jobId guard in the listener and doesn't reopen the progress modal
+    // (CodeRabbit finding 13).
+    activeIngestJobId = null;
+    activeIngestProgress = null;
+    cancelRequested = false;
+  }
+
+  function dismissIngestSummary() {
+    ingestSummary = null;
+  }
+
+  async function handleAddFolderClick() {
+    // Serialise: same triple-guard the OS-drop listener uses. pickerOpen
+    // covers the pre-startFolderIngest window where activeIngestProgress
+    // is still null but a previous click is still awaiting the dialog.
+    // activeIngestJobId catches the tail end of an ingest where
+    // activeIngestProgress has been cleared but the summary modal hasn't
+    // rendered yet.
+    if (activeIngestProgress || pickerOpen || activeIngestJobId) return;
+    pickerOpen = true;
+    let picked: string | string[] | null;
+    try {
+      picked = await openDialog({ directory: true, multiple: false });
+    } catch (err) {
+      const raw = err instanceof Error ? err.message : String(err);
+      error = `Could not open folder picker: ${raw.replace(/^Error:\s*/, '')}`;
+      return;
+    } finally {
+      pickerOpen = false;
+    }
+    if (!picked || typeof picked !== 'string') return; // cancelled
+    void startFolderIngest(picked);
+  }
+
+  // `adapter.listen` may return Promise<() => void> (production tauri) or a
+  // synchronous () => void (some test mocks) — branch on shape, mirroring
+  // the LibraryDirectoryBrowser precedent. The `cancelled` flag covers the
+  // race where the effect tears down before the Promise resolves: we fire
+  // the resolved unsubscribe immediately to avoid a leaked Tauri listener.
+  $effect(() => {
+    if (!adapter) return;
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+    const pending = adapter.listen('os-folder-dropped', (event) => {
+      if (cancelled) return;
+      // activeIngestJobId is set synchronously at the very start of
+      // startFolderIngest and only cleared by resetIngestState. Including
+      // it in the guard closes the gap where activeIngestProgress could
+      // briefly be null while a previous ingest is still in flight
+      // (defence in depth against the round-1 race window).
+      if (activeIngestProgress || pickerOpen || activeIngestJobId) return;
+      const payload = event.payload as { path: string; x: number; y: number };
+      void startFolderIngest(payload.path);
+    });
+    if (pending && typeof (pending as Promise<unknown>).then === 'function') {
+      (pending as Promise<() => void>)
+        .then((fn) => {
+          if (cancelled) {
+            try { fn(); } catch { /* swallow */ }
+          } else {
+            unlisten = fn;
+          }
+        })
+        .catch((err) => {
+          if (!cancelled) {
+            console.warn(
+              'os-folder-dropped listener registration failed:',
+              err,
+            );
+          }
+        });
+    } else if (typeof pending === 'function') {
+      unlisten = pending as () => void;
+    }
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  });
+
+  // Progress event listener. Same Promise-or-sync `adapter.listen` shape as
+  // above. activeIngestJobId is set synchronously by startFolderIngest
+  // BEFORE the IPC invoke, so we always compare against a known id — null
+  // means we already settled (resetIngestState clears it before the
+  // summary modal renders), and the comparison string !== null discards
+  // any tardy progress events that would otherwise reopen the modal.
+  $effect(() => {
+    if (!adapter) return;
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+    const pending = adapter.listen('folder-ingest-progress', (event) => {
+      if (cancelled) return;
+      const payload = event.payload as {
+        jobId: string;
+        completed: number;
+        total: number;
+        currentPath: string;
+      };
+      if (payload.jobId !== activeIngestJobId) return;
+      activeIngestProgress = {
+        completed: payload.completed,
+        total: payload.total,
+        currentPath: payload.currentPath,
+      };
+    });
+    if (pending && typeof (pending as Promise<unknown>).then === 'function') {
+      (pending as Promise<() => void>)
+        .then((fn) => {
+          if (cancelled) {
+            try { fn(); } catch { /* swallow */ }
+          } else {
+            unlisten = fn;
+          }
+        })
+        .catch((err) => {
+          if (!cancelled) {
+            console.warn(
+              'folder-ingest-progress listener registration failed:',
+              err,
+            );
+          }
+        });
+    } else if (typeof pending === 'function') {
+      unlisten = pending as () => void;
+    }
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  });
+
+  // Fire-and-forget cancel: the actual "ingest finished" signal comes from
+  // the ingest_folder_tree IPC Promise resolving with `cancelled: true`
+  // (Task 2's bail-completely semantic). Don't await the cancel IPC — its
+  // failure path (backend already settled, unknown job id) is benign.
+  function handleCancelIngest() {
+    if (!activeIngestJobId || cancelRequested) return;
+    cancelRequested = true;
+    service.cancelFolderIngest(activeIngestJobId).catch(() => {
+      // Best-effort; backend may have already settled.
+    });
+  }
+
+  async function startFolderIngest(rootPath: string) {
+    // Mirrors commitCreateFolder's parent resolution: nested ingests
+    // reuse the top-level sidecar (navStack[0]); root ingests pass null.
+    const isNestedIngest = breadcrumbStack.length > 0;
+    const parentSidecarId = isNestedIngest
+      ? navStack[0]?.sidecarId ?? null
+      : null;
+    // Mirror commitCreateFolder's nested-identity guard: a nested ingest
+    // needs a known top-level sidecar to cascade rekeys against. Without
+    // this guard a nested drop while navStack[0].sidecarId hasn't loaded
+    // would IPC null up the stack and the backend would reject with a
+    // less actionable message (CodeRabbit finding 14).
+    if (isNestedIngest && !parentSidecarId) {
+      error =
+        'Folder identity not yet loaded. Return to root and navigate back, then retry.';
+      return;
+    }
+    // Mint the jobId synchronously and set activeIngestJobId BEFORE the
+    // IPC call so the Cancel button works during the pre-walk window —
+    // pre-fix the jobId only landed via the first progress event, so a
+    // Cancel click during pre-walk was silently dropped (Bot finding 3).
+    const jobId = crypto.randomUUID();
+    activeIngestJobId = jobId;
+    // Open the placeholder immediately with an indeterminate marker
+    // (total=-1). The first folder-ingest-progress event fills in real
+    // counters; the IPC Promise resolves last with the final summary.
+    activeIngestProgress = { completed: 0, total: -1, currentPath: rootPath };
+    cancelRequested = false;
+    try {
+      const result = await service.ingestFolderTree(
+        jobId,
+        rootPath,
+        parentSidecarId,
+        breadcrumbStack,
+      );
+      // Set the summary FIRST so the modal is already rendered by the
+      // time resetIngestState clears the guards (activeIngestProgress /
+      // activeIngestJobId). Otherwise a queued os-folder-dropped event
+      // can slip through the now-clear guards before the summary modal
+      // is up, starting an unrelated ingest behind the user's back.
+      ingestSummary = result;
+      resetIngestState();
+      serviceVersion++; // refetch so the new folder appears in the list
+    } catch (err) {
+      resetIngestState();
+      const raw = err instanceof Error ? err.message : String(err);
+      error = `Folder ingest failed: ${raw.replace(/^Error:\s*/, '')}`;
+    }
+  }
+
   function retryFolderLoad() {
     folderLoadError = null;
     folderFetchRetryToken++; // re-trigger the fetch effect
@@ -777,6 +1000,9 @@
     onNewFolderClick={section === 'private' && !showCleanup
       ? handleNewFolder
       : undefined}
+    onAddFolderClick={section === 'private' && !showCleanup
+      ? handleAddFolderClick
+      : undefined}
     {showCleanup}
     {section}
     {onSectionChange}
@@ -808,6 +1034,22 @@
       {#if renameError}
         <div class="file-browser-error" role="alert">{renameError}</div>
       {/if}
+
+      <FolderIngestProgressModal
+        open={!!activeIngestProgress}
+        jobId={activeIngestJobId}
+        completed={activeIngestProgress?.completed ?? 0}
+        total={activeIngestProgress?.total ?? -1}
+        currentPath={activeIngestProgress?.currentPath ?? ''}
+        {cancelRequested}
+        onCancel={handleCancelIngest}
+      />
+
+      <FolderIngestSummaryModal
+        open={!!ingestSummary}
+        result={ingestSummary}
+        onDismiss={dismissIngestSummary}
+      />
 
       {#if folderLoadError && folderLoadError.cid === currentFolderCid}
         <FolderLoadError
@@ -885,5 +1127,11 @@
     border: 1px solid var(--danger, #ed4245);
     color: var(--text-primary, #f2f3f5);
     font-size: 0.85rem;
+  }
+
+  .visually-hidden {
+    position: absolute; width: 1px; height: 1px; padding: 0;
+    margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0);
+    white-space: nowrap; border: 0;
   }
 </style>

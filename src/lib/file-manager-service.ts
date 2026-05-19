@@ -61,6 +61,47 @@ export interface RenameContentResult {
   srcNewCid: string | null;
 }
 
+/** Skip buckets surfaced in the folder-ingest summary modal. Mirrors the
+ *  Rust `SkipCounts` struct (serde rename_all = "camelCase"). */
+export interface SkipCounts {
+  hidden: number;
+  symlink: number;
+  oversized: number;
+  /** FIFOs, sockets, block/char devices — non-addressable filesystem nodes
+   *  the walker can't ingest. Bucketed separately from the named cases so
+   *  the summary modal can render them without conflating "we don't follow
+   *  symlinks" with "we can't ingest a device node". */
+  other: number;
+}
+
+/** One entry in the bounded `failed` list of an ingest result. */
+export interface FailedEntry {
+  path: string;
+  message: string;
+}
+
+/** Wire format returned by the ingest_folder_tree Tauri command (ZEB-163).
+ *  Mirrors the Rust `IngestFolderTreeResult` struct (serde rename_all =
+ *  "camelCase"). `rootSidecarId` and `rootCid` are non-null iff the walker
+ *  reached the root manifest build before any cancel/abort. */
+export interface IngestFolderTreeResult {
+  jobId: string;
+  rootSidecarId: string | null;
+  rootCid: string | null;
+  rootName: string;
+  totalFilesSeen: number;
+  /** Pre-walk leaf count taken before the walker started. The cancelled
+   *  headline uses this as the denominator ("Cancelled — added 4 of 100
+   *  files") so a mid-walk cancel doesn't claim a truncated total. `-1`
+   *  when the pre-walk failed; the modal falls back to `totalFilesSeen`. */
+  preWalkTotal: number;
+  succeeded: number;
+  skipped: SkipCounts;
+  failed: FailedEntry[];
+  failedOverflow: number;
+  cancelled: boolean;
+}
+
 /** Wire format for entries returned by the list_content Tauri command. */
 interface ContentItemWire {
   sidecarId: string;
@@ -575,6 +616,56 @@ export class FileManagerService {
       );
     }
     return result;
+  }
+
+  /**
+   * Ingest a folder tree from the local filesystem (ZEB-163). Resolves
+   * when the walker settles (success, partial, or cancel). The IPC also
+   * emits `folder-ingest-progress` events for the modal to consume.
+   *
+   * @param rootPath          absolute filesystem path of the dropped /
+   *                          picked directory
+   * @param parentSidecarId   top-level sidecar entry id when ingesting
+   *                          into a nested folder; null at root
+   * @param parentPath        CID chain from top-level root (inclusive)
+   *                          down to the immediate parent; empty for
+   *                          root ingest. Matches `createFolder`'s shape.
+   */
+  async ingestFolderTree(
+    jobId: string,
+    rootPath: string,
+    parentSidecarId: string | null,
+    parentPath: string[],
+  ): Promise<IngestFolderTreeResult> {
+    if (!this.adapter) throw new Error('adapter not connected');
+    const result = (await this.adapter.invoke('ingest_folder_tree', {
+      jobId,
+      rootPath,
+      parentSidecarId,
+      parentPath,
+    })) as IngestFolderTreeResult;
+    // Mirror createFolder/moveContent/renameContent: re-list the root so
+    // other consumers of `privateContent` (not just FileBrowser via its
+    // serviceVersion++ on resolve) see the new sidecar entry. Refetch is
+    // best-effort — the ingest itself succeeded if we got here, so we
+    // only log on refresh failure rather than turning it into an error.
+    try {
+      await this.refetchRoot();
+    } catch (err) {
+      console.warn(
+        'ingestFolderTree: refetchRoot failed (ingest succeeded); UI may show stale list:',
+        err,
+      );
+    }
+    return result;
+  }
+
+  /** Flip the cancel flag on an in-flight `ingest_folder_tree` job
+   *  (ZEB-163). Best-effort — backend treats unknown job ids as a
+   *  no-op rather than an error. */
+  async cancelFolderIngest(jobId: string): Promise<void> {
+    if (!this.adapter) return;
+    await this.adapter.invoke('cancel_folder_ingest', { jobId });
   }
 
   /** Register an external unlisten handle so it gets cleaned up alongside the service. */

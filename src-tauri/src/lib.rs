@@ -30,6 +30,7 @@ pub mod dm_envelope;
 pub mod dm_outbox;
 pub mod dm_signing;
 pub mod event_loop;
+pub mod folder_ingest;
 pub mod folders;
 mod follows;
 pub mod identity;
@@ -115,6 +116,47 @@ pub(crate) fn ingest_dispatch(size: u64) -> Result<IngestDispatch, String> {
         Ok(IngestDispatch::Chunked)
     } else {
         Ok(IngestDispatch::Single)
+    }
+}
+
+/// Errors raised by the internal path-based ingest helpers
+/// (`ingest_file_at_path`, `send_ingest_with_name`, `send_ingest_bytes_only`)
+/// and the ZEB-163 folder walker (`folder_ingest::walk`).
+///
+/// Split into distinct variants so the walker can route each failure to the
+/// right summary bucket (oversized vs. failed) without parsing strings. The
+/// IPC seam in `ingest_content` collapses these to `String` via `to_string()`
+/// for backwards compatibility with the existing frontend.
+#[derive(Debug, thiserror::Error)]
+pub enum IngestError {
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("path is a symlink; refuse to follow")]
+    Symlink,
+    #[error(
+        "file too large ({size} bytes; v1 flat-bundle cap is {cap} bytes ~8 GiB). \
+         Support for larger files lands with folder/nested-bundle support."
+    )]
+    Oversized { size: u64, cap: u64 },
+    #[error("sidecar_id collision")]
+    SidecarCollision,
+    /// Event-loop ingest channel returned an error (closed, dropped reply,
+    /// etc). Typed so the walker doesn't have to string-parse send_ingest's
+    /// error path.
+    #[error("ingest channel: {0}")]
+    IngestChannel(String),
+    /// Folder manifest build failed (BundleBuilder rejection, serialization
+    /// error). Constructed by the walker when it can't build a manifest for
+    /// an interior directory.
+    #[error("manifest build: {0}")]
+    ManifestBuild(String),
+    #[error("{0}")]
+    Other(String),
+}
+
+impl IngestError {
+    fn other(msg: impl Into<String>) -> Self {
+        IngestError::Other(msg.into())
     }
 }
 
@@ -424,6 +466,15 @@ pub struct NodeState {
     /// spawned by `start_node`. `Some` while the node is running; `take()`
     /// + `abort()` during `stop_inner` so a restart starts a fresh tick.
     pub voting_tick_handle: std::sync::Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// ZEB-163 Task 2: per-job cancellation flags for in-flight folder-
+    /// tree ingests. `ingest_folder_tree` inserts a fresh `AtomicBool`
+    /// keyed by its minted `job_id` and removes it on settle;
+    /// `cancel_folder_ingest` flips the flag. The walker checks the flag
+    /// at the top of every recursive call. Persists across `stop_node`
+    /// because in-flight walks should already have settled by then
+    /// (caller serialises one walk at a time), but is never persisted
+    /// to disk.
+    pub folder_ingest_jobs: crate::folder_ingest::CancelRegistry,
 }
 
 impl NodeState {
@@ -502,6 +553,9 @@ impl Default for NodeState {
                 std::collections::HashMap::new(),
             )),
             voting_tick_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            folder_ingest_jobs: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 }
@@ -5931,7 +5985,6 @@ async fn ingest_content(
     app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<IngestResult, String> {
-    use harmony_content::cid::{ContentFlags, ContentId};
     use tauri_plugin_dialog::DialogExt;
 
     // 1. Open a native file picker dialog.
@@ -5957,8 +6010,8 @@ async fn ingest_content(
         .await
         .map_err(|e| format!("read failed: {e}"))?;
     // Early reject above the flat-bundle cap, before reading the file into
-    // memory. Dispatch is recomputed from actual bytes below in case the
-    // file changes size between this stat and the read that follows.
+    // memory. Dispatch is recomputed from actual bytes inside the helper in
+    // case the file changes size between this stat and the read that follows.
     ingest_dispatch(meta.len())?;
 
     // OOM caveat: this materializes the full file in RAM before chunking.
@@ -5970,59 +6023,176 @@ async fn ingest_content(
     let bytes = tokio::fs::read(path)
         .await
         .map_err(|e| format!("read failed: {e}"))?;
-    let size_bytes = bytes.len() as u64;
-    // Final dispatch decision from the bytes actually read. This closes the
-    // TOCTOU window between metadata() and read(): if the file grew past the
-    // cap we reject cleanly, and if it shrank below MAX_PAYLOAD_SIZE we take
-    // the single-book fast path instead of tripping chunk_and_bundle's
-    // precondition guard.
-    let dispatch = ingest_dispatch(size_bytes)?;
 
-    let ingest_tx = {
+    let (ingest_tx, content_index) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard
+        let tx = guard
             .ingest_tx
             .clone()
-            .ok_or_else(|| "not connected".to_string())?
+            .ok_or_else(|| "not connected".to_string())?;
+        (tx, guard.content_index.clone())
     };
+
+    send_ingest_with_name(&ingest_tx, &content_index, bytes, file_name, None)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Ingest a leaf file already present on disk through the same pipeline as
+/// `ingest_content`, but driven by an explicit path instead of an `rfd`
+/// dialog. Internal — kept for a future direct-leaf-ingest IPC (e.g. a
+/// "Send this file" share-sheet target on macOS/Windows) that needs the
+/// resulting sidecar entry. Not registered as an IPC and not currently
+/// called from anywhere except the tests below.
+///
+/// The ZEB-163 folder walker does NOT call this for descendant leaves
+/// (per task 2 fix): it uses `send_ingest_bytes_only` so leaf files only
+/// appear inside their parent folder's manifest, not as standalone root
+/// sidecar entries. Calling this from the walker would re-introduce the
+/// root-listing pollution bug.
+///
+/// Defends in depth against symlinks even though any walker caller would
+/// filter them upstream: a `symlink_metadata` check guarantees we never
+/// `tokio::fs::read` through a link that could resolve outside the walked
+/// tree.
+#[allow(dead_code)] // Tests cover it; production callers land with the share-sheet IPC.
+pub(crate) async fn ingest_file_at_path(
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    content_index: &std::sync::Arc<std::sync::Mutex<content_index::ContentIndex>>,
+    path: &std::path::Path,
+    _parent_sidecar_id: Option<content_index::SidecarId>,
+    file_name: String,
+) -> Result<IngestResult, IngestError> {
+    let meta = tokio::fs::symlink_metadata(path).await?;
+    if meta.file_type().is_symlink() {
+        return Err(IngestError::Symlink);
+    }
+    let size = meta.len();
+    if size > FLAT_BUNDLE_MAX {
+        return Err(IngestError::Oversized {
+            size,
+            cap: FLAT_BUNDLE_MAX,
+        });
+    }
+    let bytes = tokio::fs::read(path).await?;
+    send_ingest_with_name(
+        ingest_tx,
+        content_index,
+        bytes,
+        file_name,
+        _parent_sidecar_id,
+    )
+    .await
+}
+
+/// Drive a buffer of bytes through the chunked-or-flat dispatch and push it
+/// to the runtime's ingest channel, returning the resulting root CID
+/// WITHOUT creating a sidecar entry.
+///
+/// Used by the ZEB-163 folder walker for leaf files — leaves live inside
+/// their parent folder's manifest and must NOT appear as standalone root
+/// entries in `list_root`. Adding a per-leaf sidecar would surface the
+/// same file twice in the UI (once at root, once inside the new folder),
+/// matching the bug the manifest-only nested-folder path
+/// (`build_folder_manifest_only`) already sidesteps for interior dirs.
+///
+/// Callers that DO want a root-listing entry (`ingest_content` IPC for the
+/// single-file dialog, future direct-leaf-ingest IPCs) should use
+/// `send_ingest_with_name`, which wraps this and inserts the sidecar row.
+pub(crate) async fn send_ingest_bytes_only(
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    bytes: Vec<u8>,
+    file_name: String,
+) -> Result<[u8; 32], IngestError> {
+    use harmony_content::cid::{ContentFlags, ContentId};
+
+    let size_bytes = bytes.len() as u64;
+    // Explicit oversize check BEFORE ingest_dispatch. `ingest_dispatch`
+    // returns an opaque `String` error for oversize, which the previous
+    // `.map_err(IngestError::other)` collapsed into `IngestError::Other`
+    // — that bucket lands in `failed` rather than `skipped.oversized`,
+    // mis-classifying the TOCTOU "file grew past cap between stat and
+    // read" case. Returning the typed `Oversized` here keeps the walker's
+    // routing honest (Bot finding 5).
+    if size_bytes > FLAT_BUNDLE_MAX {
+        return Err(IngestError::Oversized {
+            size: size_bytes,
+            cap: FLAT_BUNDLE_MAX,
+        });
+    }
+    // Final dispatch decision from the bytes actually read. With the
+    // oversize gate above this can no longer return the oversize error
+    // path; remaining failures (Chunked vs Single classification) are
+    // never user-facing so the `Other` collapse is acceptable.
+    let dispatch = ingest_dispatch(size_bytes).map_err(IngestError::other)?;
 
     let root_cid_bytes: [u8; 32] = match dispatch {
         IngestDispatch::Single => {
             let cid = ContentId::for_book(&bytes, ContentFlags::default())
-                .map_err(|e| format!("CID error: {e:?}"))?;
+                .map_err(|e| IngestError::other(format!("CID error: {e:?}")))?;
             let cid_hex = hex::encode(cid.to_bytes());
-            send_ingest(&ingest_tx, cid_hex, bytes).await?;
+            send_ingest(ingest_tx, cid_hex, bytes)
+                .await
+                .map_err(IngestError::other)?;
             cid.to_bytes()
         }
         IngestDispatch::Chunked => {
-            let (leaves, bundle_payload, root) = chunk_and_bundle(&bytes)?;
-            // Ingest every leaf in order.
+            let (leaves, bundle_payload, root) =
+                chunk_and_bundle(&bytes).map_err(IngestError::other)?;
             for (leaf_cid, leaf_bytes) in &leaves {
                 send_ingest(
-                    &ingest_tx,
+                    ingest_tx,
                     hex::encode(leaf_cid.to_bytes()),
                     leaf_bytes.to_vec(),
                 )
-                .await?;
+                .await
+                .map_err(IngestError::other)?;
             }
-            // Ingest the bundle itself.
-            send_ingest(&ingest_tx, hex::encode(root.to_bytes()), bundle_payload).await?;
+            send_ingest(ingest_tx, hex::encode(root.to_bytes()), bundle_payload)
+                .await
+                .map_err(IngestError::other)?;
             root.to_bytes()
         }
     };
 
-    // Record sidecar metadata so list_content can surface this entry.
-    let index = {
-        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard.content_index.clone()
-    };
+    // `file_name` is currently unused on the bytes-only path (no sidecar
+    // row to label), but kept in the signature so callers don't have to
+    // restructure when we plumb it through future per-CID telemetry.
+    let _ = file_name;
+    Ok(root_cid_bytes)
+}
+
+/// Drive a buffer of bytes through the chunked-or-flat dispatch, push it to
+/// the runtime's ingest channel, and insert the resulting sidecar row.
+///
+/// Extracted from `ingest_content`'s post-dialog body so the dialog IPC and
+/// any future direct-leaf-ingest IPC can share the same pipeline. The
+/// caller is responsible for extracting `ingest_tx` and `content_index`
+/// from `NodeState` under its lock — the helper does not touch `NodeState`
+/// so it stays cheap to test.
+///
+/// NOTE: the ZEB-163 folder walker does NOT call this for descendant
+/// leaves; it calls `send_ingest_bytes_only` so leaf files only appear
+/// inside their parent folder's manifest, not as standalone root entries.
+pub(crate) async fn send_ingest_with_name(
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    content_index: &std::sync::Arc<std::sync::Mutex<content_index::ContentIndex>>,
+    bytes: Vec<u8>,
+    file_name: String,
+    _parent_sidecar_id: Option<content_index::SidecarId>,
+) -> Result<IngestResult, IngestError> {
+    let size_bytes = bytes.len() as u64;
+    let root_cid_bytes = send_ingest_bytes_only(ingest_tx, bytes, file_name.clone()).await?;
+
     let stored_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let sidecar_id = content_index::SidecarId::new();
     {
-        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        let mut idx = content_index
+            .lock()
+            .map_err(|e| IngestError::other(format!("index lock: {e}")))?;
         let inserted = idx.insert(content_index::ContentIndexEntry {
             sidecar_id,
             cid: root_cid_bytes,
@@ -6050,9 +6220,9 @@ async fn ingest_content(
             tracing::error!(
                 sidecar_id = %sidecar_id,
                 file_name = %file_name,
-                "ingest_content: sidecar_id collision (UUID v4 collision or construction bug); aborting ingest result",
+                "send_ingest_with_name: sidecar_id collision (UUID v4 collision or construction bug); aborting ingest result",
             );
-            return Err("sidecar_id collision".into());
+            return Err(IngestError::SidecarCollision);
         }
     }
 
@@ -6062,6 +6232,124 @@ async fn ingest_content(
         file_name,
         size_bytes,
     })
+}
+
+#[cfg(test)]
+mod path_ingest_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    type IngestLog = Arc<std::sync::Mutex<Vec<(String, usize)>>>;
+    type IngestSender = tokio::sync::mpsc::Sender<event_loop::IngestRequest>;
+
+    /// Spawn an in-test ingest handler that records each (cid_hex, len)
+    /// pair and ACKs success. The handler runs until `ingest_tx` is dropped.
+    fn spawn_recording_ingest_handler() -> (IngestSender, IngestLog) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<event_loop::IngestRequest>(8);
+        let log = Arc::new(std::sync::Mutex::new(Vec::<(String, usize)>::new()));
+        let log_clone = log.clone();
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                log_clone
+                    .lock()
+                    .unwrap()
+                    .push((req.cid_hex, req.data.len()));
+                let _ = req.reply.send(Ok(()));
+            }
+        });
+        (tx, log)
+    }
+
+    fn fresh_content_index() -> Arc<std::sync::Mutex<content_index::ContentIndex>> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let idx = content_index::ContentIndex::load(dir.path());
+        // Leak the TempDir so the persist directory survives the test body
+        // — we don't validate on-disk persistence here, only in-memory rows.
+        std::mem::forget(dir);
+        Arc::new(std::sync::Mutex::new(idx))
+    }
+
+    #[tokio::test]
+    async fn ingest_file_at_path_small_file_creates_sidecar_and_sends_one_book() {
+        let (tx, log) = spawn_recording_ingest_handler();
+        let index = fresh_content_index();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("hello.txt");
+        tokio::fs::write(&file_path, b"hello world")
+            .await
+            .expect("write");
+
+        let result = ingest_file_at_path(&tx, &index, &file_path, None, "hello.txt".into())
+            .await
+            .expect("ingest");
+
+        assert_eq!(result.file_name, "hello.txt");
+        assert_eq!(result.size_bytes, 11);
+        assert!(!result.cid.is_empty());
+        // Single-book path: exactly one (cid, data) pair pushed through.
+        let log_snapshot = log.lock().unwrap().clone();
+        assert_eq!(log_snapshot.len(), 1);
+        assert_eq!(log_snapshot[0].0, result.cid);
+        assert_eq!(log_snapshot[0].1, 11);
+        // Sidecar row was inserted with kind Leaf.
+        let idx = index.lock().unwrap();
+        let rows: Vec<_> = idx.entries().collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, content_index::ContentKind::Leaf);
+        assert_eq!(rows[0].file_name, "hello.txt");
+    }
+
+    #[tokio::test]
+    async fn ingest_file_at_path_missing_file_returns_io_error() {
+        let (tx, _log) = spawn_recording_ingest_handler();
+        let index = fresh_content_index();
+        let missing = std::path::Path::new("definitely-not-a-real-path-zeb163");
+
+        let err = ingest_file_at_path(&tx, &index, missing, None, "x".into())
+            .await
+            .expect_err("must error on missing file");
+        assert!(matches!(err, IngestError::Io(_)), "got: {err:?}");
+    }
+
+    /// Allocating an 8 GiB file in a unit test is unreasonable, so the
+    /// boundary check is exercised by constructing the error variant
+    /// directly and asserting its Display surfaces both numbers — that's
+    /// what the walker's failure-bucketing depends on.
+    #[test]
+    fn oversized_variant_shape() {
+        let err = IngestError::Oversized {
+            size: FLAT_BUNDLE_MAX + 1,
+            cap: FLAT_BUNDLE_MAX,
+        };
+        let rendered = format!("{err}");
+        assert!(rendered.contains("file too large"));
+        assert!(rendered.contains(&FLAT_BUNDLE_MAX.to_string()));
+    }
+
+    /// Symlink detection is platform-conditional: on Windows, creating a
+    /// symlink requires Developer Mode or admin rights. The test runs the
+    /// real assertion on Unix; on Windows we skip with a tracing note to
+    /// avoid CI flakes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ingest_file_at_path_symlink_is_rejected() {
+        let (tx, log) = spawn_recording_ingest_handler();
+        let index = fresh_content_index();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("target.txt");
+        let link = dir.path().join("link.txt");
+        tokio::fs::write(&target, b"payload").await.expect("write");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        let err = ingest_file_at_path(&tx, &index, &link, None, "link.txt".into())
+            .await
+            .expect_err("symlink must error");
+        assert!(matches!(err, IngestError::Symlink), "got: {err:?}");
+        // Nothing should have been pushed to the ingest channel.
+        assert!(log.lock().unwrap().is_empty());
+        // Sidecar must remain empty.
+        assert_eq!(index.lock().unwrap().entries().count(), 0);
+    }
 }
 
 /// Send one (cid_hex, data) pair through the ingest channel and await its ack.
@@ -6085,6 +6373,75 @@ pub async fn send_ingest(
         .await
         .map_err(|_| "event loop dropped ingest request".to_string())??;
     Ok(())
+}
+
+/// Build a nested folder manifest + bundle for `children` and ship both
+/// to the runtime's ingest channel, WITHOUT touching `ContentIndex`. The
+/// ZEB-163 folder walker uses this for interior directories (which are
+/// reachable through the root's manifest, not as their own sidecar rows).
+///
+/// Returns the bundle CID for the parent manifest to reference. Errors
+/// surface as `IngestError::ManifestBuild` (build failure) or
+/// `IngestError::IngestChannel` (send failure) so the walker bucketing
+/// can distinguish them without string-parsing.
+pub(crate) async fn build_folder_manifest_only(
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    name: &str,
+    children: &[folders::ManifestEntry],
+) -> Result<[u8; 32], IngestError> {
+    let built = folders::build_folder(name, children).map_err(IngestError::ManifestBuild)?;
+    send_ingest(
+        ingest_tx,
+        hex::encode(built.manifest_cid.to_bytes()),
+        built.manifest_bytes,
+    )
+    .await
+    .map_err(IngestError::IngestChannel)?;
+    send_ingest(
+        ingest_tx,
+        hex::encode(built.bundle_cid.to_bytes()),
+        built.bundle_bytes,
+    )
+    .await
+    .map_err(IngestError::IngestChannel)?;
+    Ok(built.bundle_cid.to_bytes())
+}
+
+/// Sidecar-creating analogue of `build_folder_manifest_only`: dispatches
+/// to the root or nested helper based on whether `parent_path` is empty.
+/// The ZEB-163 folder walker calls this once at the dropped root.
+pub(crate) async fn create_folder_with_children(
+    name: String,
+    children: Vec<folders::ManifestEntry>,
+    parent_sidecar_id: Option<String>,
+    parent_path: Vec<String>,
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    verb_tx: &tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>,
+    index: &std::sync::Arc<std::sync::Mutex<content_index::ContentIndex>>,
+) -> Result<CreateFolderResult, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("folder name cannot be empty".to_string());
+    }
+    if parent_path.is_empty() {
+        if parent_sidecar_id.is_some() {
+            return Err("root creates must not provide parent_sidecar_id".into());
+        }
+        create_folder_at_root_with_children(name, children, ingest_tx, index).await
+    } else {
+        let psid = parent_sidecar_id
+            .ok_or_else(|| "nested creates require parent_sidecar_id".to_string())?;
+        create_folder_nested_with_children(
+            name,
+            children,
+            psid,
+            parent_path,
+            ingest_tx,
+            verb_tx,
+            index,
+        )
+        .await
+    }
 }
 
 /// ZEB-164: create a new folder at the root or inside an existing folder.
@@ -6114,6 +6471,81 @@ async fn create_folder(
     let psid =
         parent_sidecar_id.ok_or_else(|| "nested creates require parent_sidecar_id".to_string())?;
     create_folder_nested(name, psid, parent_path, state).await
+}
+
+/// ZEB-163 entry point. Walks an OS-side directory tree starting at
+/// `root_path`, ingests every leaf file through the chunked-or-flat
+/// pipeline, builds nested folder manifests bottom-up, and creates a
+/// single new sidecar entry under `parent_sidecar_id` / `parent_path`.
+///
+/// The walker emits `folder-ingest-progress` Tauri events as it ingests
+/// each leaf and each interior manifest. Cancellation is best-effort
+/// via `cancel_folder_ingest(job_id)` — the walker checks a shared
+/// `AtomicBool` at the top of every recursive call and at the top of
+/// every per-child loop.
+///
+/// Returns a summary the frontend renders in `FolderIngestSummaryModal`:
+/// per-bucket skip counts, a capped list of failed entries, and the
+/// root's freshly-minted sidecar ID iff the walk reached its tail.
+#[tauri::command]
+async fn ingest_folder_tree(
+    app: AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    job_id: String,
+    root_path: String,
+    parent_sidecar_id: Option<String>,
+    parent_path: Vec<String>,
+) -> Result<folder_ingest::IngestFolderTreeResult, String> {
+    let (ingest_tx, verb_tx, index, registry) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        (
+            guard
+                .ingest_tx
+                .clone()
+                .ok_or_else(|| "not connected".to_string())?,
+            guard
+                .content_verb_tx
+                .clone()
+                .ok_or_else(|| "not connected".to_string())?,
+            guard.content_index.clone(),
+            guard.folder_ingest_jobs.clone(),
+        )
+    };
+    folder_ingest::ingest_folder_tree(
+        app,
+        ingest_tx,
+        verb_tx,
+        index,
+        registry,
+        job_id,
+        root_path,
+        parent_sidecar_id,
+        parent_path,
+    )
+    .await
+}
+
+/// ZEB-163: flip the cancel flag on an in-flight `ingest_folder_tree`
+/// job. Best-effort: if `job_id` isn't in the registry (already
+/// settled), returns `Ok(())` rather than an error — the frontend
+/// fires this on every Cancel-button click without first checking
+/// whether the IPC has resolved.
+#[tauri::command]
+fn cancel_folder_ingest(
+    state: tauri::State<'_, Mutex<NodeState>>,
+    job_id: String,
+) -> Result<(), String> {
+    let registry = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard.folder_ingest_jobs.clone()
+    };
+    let reg = registry
+        .lock()
+        .map_err(|e| format!("cancel registry lock: {e}"))?;
+    if let Some(flag) = reg.get(&job_id) {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
 }
 
 /// Per-ancestor manifest edit driving `walk_and_rebuild_chain`.
@@ -6326,10 +6758,6 @@ async fn create_folder_at_root(
     name: String,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<CreateFolderResult, String> {
-    // Build the (empty) manifest + bundle locally. No runtime state
-    // mutated yet — we can still bail cleanly on send_ingest failure.
-    let built = folders::build_folder(&name, &[])?;
-
     let (ingest_tx, index) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         (
@@ -6340,6 +6768,24 @@ async fn create_folder_at_root(
             guard.content_index.clone(),
         )
     };
+    create_folder_at_root_with_children(name, Vec::new(), &ingest_tx, &index).await
+}
+
+/// Build a folder manifest at the user-visible root (i.e. a new top-level
+/// sidecar entry) populated with `children`. Shared by `create_folder_at_root`
+/// (children: empty) and the ZEB-163 folder walker (children: pre-built from
+/// nested manifests + leaves).
+///
+/// Sidecar reservation happens BEFORE the byte ingests so an ingest failure
+/// rolls back the sidecar entry, leaving no entry that references missing
+/// bytes. Mirrors `create_folder_at_root`'s pre-children invariant.
+pub(crate) async fn create_folder_at_root_with_children(
+    name: String,
+    children: Vec<folders::ManifestEntry>,
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    index: &std::sync::Arc<std::sync::Mutex<content_index::ContentIndex>>,
+) -> Result<CreateFolderResult, String> {
+    let built = folders::build_folder(&name, &children)?;
     let bundle_size = built.bundle_bytes.len() as u64;
     let stored_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -6380,7 +6826,7 @@ async fn create_folder_at_root(
     // back the reservation on any ingest failure so the sidecar never
     // points at bytes that don't exist.
     if let Err(e) = send_ingest(
-        &ingest_tx,
+        ingest_tx,
         hex::encode(built.manifest_cid.to_bytes()),
         built.manifest_bytes,
     )
@@ -6392,7 +6838,7 @@ async fn create_folder_at_root(
         return Err(e);
     }
     if let Err(e) = send_ingest(
-        &ingest_tx,
+        ingest_tx,
         hex::encode(built.bundle_cid.to_bytes()),
         built.bundle_bytes,
     )
@@ -6416,15 +6862,6 @@ async fn create_folder_nested(
     parent_path: Vec<String>,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<CreateFolderResult, String> {
-    let parent_id = parse_sidecar_id(&parent_sidecar_id)?;
-
-    // Parse all path CIDs up-front; fail fast on malformed input.
-    let path_cids: Vec<[u8; 32]> = parent_path
-        .iter()
-        .map(|h| parse_cid_hex(h))
-        .collect::<Result<_, _>>()?;
-    let root_old = *path_cids.first().expect("non-empty by guard above");
-
     let (ingest_tx, verb_tx, index) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         (
@@ -6439,6 +6876,42 @@ async fn create_folder_nested(
             guard.content_index.clone(),
         )
     };
+    create_folder_nested_with_children(
+        name,
+        Vec::new(),
+        parent_sidecar_id,
+        parent_path,
+        &ingest_tx,
+        &verb_tx,
+        &index,
+    )
+    .await
+}
+
+/// Cascade-aware analogue of `create_folder_at_root_with_children` for
+/// when the new top-level folder lives inside an existing top-level. The
+/// ancestor chain `parent_path` is walked bottom-up and rebuilt; the new
+/// folder lands at the deepest ancestor's tail as an `Append` edit.
+///
+/// `children` is the new folder's contents — empty for `create_folder`'s
+/// path, pre-built from the recursive walker for ZEB-163's path.
+pub(crate) async fn create_folder_nested_with_children(
+    name: String,
+    children: Vec<folders::ManifestEntry>,
+    parent_sidecar_id: String,
+    parent_path: Vec<String>,
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    verb_tx: &tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>,
+    index: &std::sync::Arc<std::sync::Mutex<content_index::ContentIndex>>,
+) -> Result<CreateFolderResult, String> {
+    let parent_id = parse_sidecar_id(&parent_sidecar_id)?;
+
+    // Parse all path CIDs up-front; fail fast on malformed input.
+    let path_cids: Vec<[u8; 32]> = parent_path
+        .iter()
+        .map(|h| parse_cid_hex(h))
+        .collect::<Result<_, _>>()?;
+    let root_old = *path_cids.first().expect("non-empty by guard above");
 
     // Verify the caller's claim: parent_sidecar_id maps to root_old.
     {
@@ -6468,12 +6941,14 @@ async fn create_folder_nested(
     // from "ancestor reads" to "drain pending_ingests" — wide enough
     // that the CAS guard is now load-bearing rather than defensive.
 
-    // 1. Build the new empty sub-folder LOCALLY. Defer all ingests so
-    // that a downstream OldMissing during rekey doesn't leave orphan
-    // bytes in the runtime cache (which could be announced over Zenoh
-    // and waste capacity for content no sidecar entry will ever
-    // reference).
-    let new_child = folders::build_folder(&name, &[])?;
+    // 1. Build the new sub-folder LOCALLY. Defer all ingests so that a
+    // downstream OldMissing during rekey doesn't leave orphan bytes in
+    // the runtime cache (which could be announced over Zenoh and waste
+    // capacity for content no sidecar entry will ever reference). For
+    // the ZEB-163 folder walker path, `children` already enumerates the
+    // dropped tree's top-level children (their bundles + manifests have
+    // been ingested separately during the walk).
+    let new_child = folders::build_folder(&name, &children)?;
     let new_child_bundle_cid = new_child.bundle_cid;
 
     let mut pending_ingests: Vec<(String, Vec<u8>)> = Vec::new();
@@ -6491,7 +6966,7 @@ async fn create_folder_nested(
     // appends the new sub-folder; higher ancestors propagate the CID
     // change. `walk_and_rebuild_chain` is shared with `move_content`.
     let walked = walk_and_rebuild_chain(
-        &verb_tx,
+        verb_tx,
         &path_cids,
         AncestorEdit::Append {
             entry: folders::ManifestEntry {
@@ -6527,7 +7002,7 @@ async fn create_folder_nested(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     for (cid_hex, bytes) in pending_ingests {
-        send_ingest(&ingest_tx, cid_hex, bytes).await?;
+        send_ingest(ingest_tx, cid_hex, bytes).await?;
     }
 
     // 4. Rekey the top-level sidecar entry. CAS-style: pass root_old
@@ -21289,6 +21764,31 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(Mutex::new(NodeState::default()))
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, position }) =
+                event
+            {
+                for path in paths {
+                    let payload = serde_json::json!({
+                        "path": path.to_string_lossy().to_string(),
+                        "x": position.x,
+                        "y": position.y,
+                    });
+                    // `symlink_metadata` doesn't follow symlinks, so a
+                    // symlink-to-dir routes to the file event rather than
+                    // emitting `os-folder-dropped` and triggering an
+                    // immediate-failure modal flash in the walker (Bot
+                    // finding 10).
+                    let is_dir = path.symlink_metadata().map(|m| m.is_dir()).unwrap_or(false);
+                    let event_name = if is_dir {
+                        "os-folder-dropped"
+                    } else {
+                        "os-file-dropped"
+                    };
+                    let _ = window.emit(event_name, payload);
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             list_vine_videos,
             follow_vine_creator,
@@ -21318,6 +21818,8 @@ pub fn run() {
             export_content,
             ingest_content,
             create_folder,
+            ingest_folder_tree,
+            cancel_folder_ingest,
             move_content,
             rename_content,
             send_voice_frame,
@@ -24275,6 +24777,9 @@ mod start_node_race_tests {
                 std::collections::HashMap::new(),
             )),
             voting_tick_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            folder_ingest_jobs: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         })
     }
 
