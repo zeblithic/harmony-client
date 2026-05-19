@@ -851,6 +851,45 @@ impl DfrostLog {
     }
 }
 
+/// Build a fully-signed `SignedCommitteeEvent` for a D-FROST event, ready
+/// to broadcast / apply locally. Mirrors `community_voting_core::
+/// build_signed_poll_create_tier1` — encodes the kind-specific payload
+/// via ciborium, builds the envelope with a placeholder signature,
+/// computes `signing_bytes()`, signs with the supplied Ed25519 key, and
+/// returns the completed event.
+///
+/// The envelope `tag` is hardcoded to `'d'` (D-FROST) and `committee_tier`
+/// to `0`, matching the wire-format invariants enforced by
+/// `DfrostLog::apply` (which rejects any other tag / non-zero tier as
+/// `ApplyError::UnexpectedEnvelope`).
+pub fn build_signed_dfrost_event<P: serde::Serialize>(
+    keypair: &ed25519_dalek::SigningKey,
+    actor: crate::owner_state_types::OwnerAddr,
+    kind: crate::community_dfrost_types::DfrostEventKind,
+    payload: &P,
+    hlc: crate::owner_state_types::Hlc,
+) -> Result<crate::community_dfrost_types::SignedCommitteeEvent, String> {
+    use ed25519_dalek::Signer;
+    let mut payload_bytes = Vec::new();
+    ciborium::ser::into_writer(payload, &mut payload_bytes)
+        .map_err(|e| format!("encode payload: {e}"))?;
+    let mut ev = crate::community_dfrost_types::SignedCommitteeEvent {
+        tag: 'd',
+        version: 1,
+        committee_tier: 0,
+        kind,
+        hlc,
+        actor,
+        payload: payload_bytes,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev
+        .signing_bytes()
+        .map_err(|e| format!("signing_bytes: {e}"))?;
+    ev.sig = keypair.sign(&sb).to_bytes().to_vec();
+    Ok(ev)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1955,5 +1994,64 @@ mod tests {
             "local_nonces must be skipped during serialization (security)"
         );
         assert_eq!(decoded.message_hash, [0xBB; 32], "public fields preserved");
+    }
+
+    #[test]
+    fn build_signed_dfrost_event_round_trips_and_signs() {
+        use crate::community_dfrost_types::{DfrostEventKind, DkgRoundPayload};
+        use crate::owner_state_types::Hlc;
+        use ed25519_dalek::{SigningKey, Verifier};
+        use rand::rngs::OsRng;
+
+        let mut csprng = OsRng;
+        let keypair = SigningKey::generate(&mut csprng);
+        let actor = OwnerAddr([0xab; 16]);
+        let payload = DkgRoundPayload {
+            ceremony_id: [0x42u8; 32],
+            round_num: 1,
+            round1_package: Some(vec![0xde, 0xad, 0xbe, 0xef]),
+            recipient_ciphertexts: None,
+        };
+        let hlc = Hlc {
+            wall_ms: 1234,
+            logical: 0,
+            device_id: "t".into(),
+        };
+
+        let ev = build_signed_dfrost_event(
+            &keypair,
+            actor,
+            DfrostEventKind::DkgRound,
+            &payload,
+            hlc.clone(),
+        )
+        .expect("build signed event");
+
+        // Envelope shape: tag='d', committee_tier=0, kind/actor/hlc passthrough.
+        assert_eq!(ev.tag, 'd');
+        assert_eq!(ev.version, 1);
+        assert_eq!(ev.committee_tier, 0);
+        assert_eq!(ev.kind, DfrostEventKind::DkgRound);
+        assert_eq!(ev.actor, actor);
+        assert_eq!(ev.hlc, hlc);
+
+        // sig is non-zero (not the placeholder) AND is a valid Ed25519
+        // signature over signing_bytes() under the supplied keypair.
+        assert!(
+            ev.sig.iter().any(|b| *b != 0),
+            "sig must be the real Ed25519 signature, not the placeholder"
+        );
+        let sb = ev.signing_bytes().expect("signing bytes");
+        let sig_bytes: [u8; 64] = ev.sig.clone().try_into().expect("sig len");
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+        keypair
+            .verifying_key()
+            .verify(&sb, &sig)
+            .expect("sig verifies under signer's pubkey");
+
+        // Payload round-trips through ciborium.
+        let decoded: DkgRoundPayload =
+            ciborium::de::from_reader(&ev.payload[..]).expect("decode payload");
+        assert_eq!(decoded, payload);
     }
 }
