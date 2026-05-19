@@ -719,11 +719,13 @@
   }
 
   async function handleAddFolderClick() {
-    // Serialise: the same guard that the OS-drop listener will use, so a
-    // picker click + drop event can't race a second walker. pickerOpen
+    // Serialise: same triple-guard the OS-drop listener uses. pickerOpen
     // covers the pre-startFolderIngest window where activeIngestProgress
     // is still null but a previous click is still awaiting the dialog.
-    if (activeIngestProgress || pickerOpen) return;
+    // activeIngestJobId catches the tail end of an ingest where
+    // activeIngestProgress has been cleared but the summary modal hasn't
+    // rendered yet.
+    if (activeIngestProgress || pickerOpen || activeIngestJobId) return;
     pickerOpen = true;
     let picked: string | string[] | null;
     try {
