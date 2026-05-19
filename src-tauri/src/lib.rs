@@ -22101,6 +22101,496 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
     Ok(ceremony_id_hex)
 }
 
+/// Tauri IPC: committee member contributes to DKG round 2 OR round 3.
+///
+/// Called after peers' round-1 (round_num=2) or round-2 (round_num=3) events
+/// have been applied locally. Drives the FROST DKG protocol forward by
+/// reading pending-ceremony state, running the matching `frost::dkg::part2`
+/// or `part3`, and emitting the next signed event.
+///
+/// **round_num=2**: reads `pending_dkg.round1_packages` (from peers + self)
+/// and `local_dkg_secret` (stashed by `dfrost_initiate_dkg`), translates
+/// peers' OwnerAddrs to FROST Identifiers, runs `dkg_part2_local`, seals
+/// each output round-2 package to that recipient's X25519 pubkey (looked up
+/// via `community_registry.identity_resolver().resolve(addr)` →
+/// `ed25519_pub_to_x25519`), then builds + signs a `dr` rn=2 event with
+/// `recipient_ciphertexts` populated and applies it locally. Stashes the
+/// returned round-2 secret on `local_dkg_secret2` for the round-3 path.
+///
+/// **round_num=3**: reads `round1_packages` + `round2_packages` (the
+/// decrypted-for-self entries populated by `apply_with_identity` when peers'
+/// rn=2 events landed) and `local_dkg_secret2`, runs `dkg_part3_local`,
+/// extracts the joint VK + per-member verifying shares from the resulting
+/// `PublicKeyPackage`, builds + signs a `dk` event, applies it. Stashes
+/// the local `KeyPackage` + `PublicKeyPackage` on the log so the Task 4
+/// threshold-sign IPC can recover them.
+///
+/// Both paths emit `dfrost-dkg-progress` with the round_num and observed
+/// participant count.
+///
+/// Out of scope (per ZEB-305 Phase 4a-foundation): Zenoh broadcast of the
+/// emitted event to peer committee members — Phase 4a-main wires the
+/// `dfrost` topic. For now the event lives only on this node's local log.
+#[tauri::command]
+async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    app: tauri::AppHandle<R>,
+    community_id: String,
+    ceremony_id: String,
+    round_num: u8,
+) -> Result<(), String> {
+    if round_num != 2 && round_num != 3 {
+        return Err(format!(
+            "dfrost_contribute_dkg_round: round_num must be 2 or 3, got {round_num}"
+        ));
+    }
+
+    // 1. Decode hex args.
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("dfrost_contribute_dkg_round: invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "dfrost_contribute_dkg_round: community_id must be 16 bytes (32 hex chars)".to_string()
+        })?;
+    let space_id = crate::owner_state_types::SpaceId(cid_bytes);
+
+    let ceremony_bytes: [u8; 32] = hex::decode(&ceremony_id)
+        .map_err(|e| format!("dfrost_contribute_dkg_round: invalid ceremony_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "dfrost_contribute_dkg_round: ceremony_id must be 32 bytes (64 hex chars)".to_string()
+        })?;
+
+    // 2. Extract NodeState handles. community_registry is needed for the
+    //    OwnerAddr → identity_pub_64 → X25519 pubkey lookup used to seal
+    //    each round-2 package to its recipient (round_num=2 only, but
+    //    extracted up-front to keep the std::Mutex hold short).
+    let (hlc_tracker, device_id, self_owner, dm_outbox, dfrost_logs, community_registry) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("dfrost_contribute_dkg_round: NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker
+                .clone()
+                .ok_or("dfrost_contribute_dkg_round: hlc_tracker missing — node not running?")?,
+            g.dm_device_id
+                .clone()
+                .ok_or("dfrost_contribute_dkg_round: dm_device_id missing — no owner identity?")?,
+            g.dm_self_owner
+                .ok_or("dfrost_contribute_dkg_round: dm_self_owner missing — no owner identity?")?,
+            g.dm_outbox
+                .clone()
+                .ok_or("dfrost_contribute_dkg_round: dm_outbox missing — no owner identity?")?,
+            std::sync::Arc::clone(&g.dfrost_logs),
+            g.community_registry.clone().ok_or(
+                "dfrost_contribute_dkg_round: community_registry missing — node not running?",
+            )?,
+        )
+    };
+
+    // 3. Get the per-community DfrostLog Arc.
+    let log_arc = {
+        let mut map = dfrost_logs.lock().await;
+        map.entry(space_id)
+            .or_insert_with(|| {
+                std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::community_dfrost_log::DfrostLog::new(),
+                ))
+            })
+            .clone()
+    };
+
+    // 4. Reserve next HLC for this device. Same path the other voting /
+    //    dfrost IPCs use so cross-kind events stay monotonic per device.
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+
+    // 5. Build the round-specific event (sealed dr rn=2 OR dk).
+    let event_to_apply = if round_num == 2 {
+        // ─── ROUND 2 ──────────────────────────────────────────────────
+        //
+        // Snapshot pending state: members (for OwnerAddr↔Identifier
+        // mapping), the round-1 packages every peer (NOT self) broadcast,
+        // and our stashed round-1 secret.
+        let (members, r1_received_by_addr, r1_secret) = {
+            let log = log_arc.lock().await;
+            let pending = log
+                .committee_state
+                .pending_dkg
+                .as_ref()
+                .ok_or("dfrost_contribute_dkg_round: no pending DKG ceremony for community")?;
+            if pending.ceremony_id != ceremony_bytes {
+                return Err(format!(
+                    "dfrost_contribute_dkg_round: ceremony_id mismatch (pending={}, requested={})",
+                    hex::encode(pending.ceremony_id),
+                    hex::encode(ceremony_bytes)
+                ));
+            }
+            // Filter out self — FROST's dkg::part2 takes packages from
+            // OTHER members only (one's own package isn't an input).
+            let r1: std::collections::BTreeMap<crate::owner_state_types::OwnerAddr, Vec<u8>> =
+                pending
+                    .round1_packages
+                    .iter()
+                    .filter(|(addr, _)| **addr != self_owner)
+                    .map(|(addr, pkg)| (*addr, pkg.clone()))
+                    .collect();
+            let secret = log.local_dkg_secret.clone().ok_or(
+                "dfrost_contribute_dkg_round: local_dkg_secret missing — \
+                     was dfrost_initiate_dkg called on this node?",
+            )?;
+            (pending.members.clone(), r1, secret)
+        };
+
+        // Quorum gate: dkg::part2 requires round-1 packages from EVERY
+        // other committee member. If a peer hasn't broadcast yet, the
+        // FROST call would either error or produce a malformed share.
+        let expected_others = members.len().saturating_sub(1);
+        if r1_received_by_addr.len() != expected_others {
+            return Err(format!(
+                "dfrost_contribute_dkg_round: round 2 needs round-1 packages from all {expected_others} \
+                 other member(s); have {}",
+                r1_received_by_addr.len()
+            ));
+        }
+
+        // Translate OwnerAddr → FROST Identifier via the canonical
+        // sorted-index mapping (same as build_identifier_map). Both
+        // sides of the DKG must agree on identifier assignment.
+        let mut r1_by_id: std::collections::BTreeMap<frost_ristretto255::Identifier, Vec<u8>> =
+            std::collections::BTreeMap::new();
+        for (addr, pkg_bytes) in &r1_received_by_addr {
+            let idx = members.iter().position(|a| *a == *addr).ok_or_else(|| {
+                format!(
+                    "dfrost_contribute_dkg_round: peer addr {} not in member list",
+                    hex::encode(addr.0)
+                )
+            })?;
+            let id = crate::community_dfrost_crypto::identifier_for_index(idx);
+            r1_by_id.insert(id, pkg_bytes.clone());
+        }
+
+        // Run FROST DKG round-2. Output: secret state (kept on this
+        // node) + per-recipient round-2 package bytes (sealed and
+        // shipped pairwise).
+        let (r2_secret, r2_packages_by_id) =
+            crate::community_dfrost_crypto::dkg_part2_local(r1_secret, &r1_by_id)
+                .map_err(|e| format!("dfrost_contribute_dkg_round: dkg::part2: {e}"))?;
+
+        // Resolve every recipient's X25519 pubkey via the identity
+        // resolver (OwnerAddr → identity_pub_64; bytes 32..64 are the
+        // Ed25519 pub; ed25519_pub_to_x25519 maps to X25519 via the
+        // standard RFC 7748 §5 birational map). This is the same
+        // pattern build_sealed_epoch_recipients uses.
+        let resolver = community_registry.identity_resolver();
+        let mut recipient_ciphertexts: Vec<crate::community_membership::RecipientCiphertext> =
+            Vec::with_capacity(r2_packages_by_id.len());
+        for (recipient_id, r2_pkg_bytes) in &r2_packages_by_id {
+            // Identifier → OwnerAddr reverse lookup (find the index whose
+            // identifier_for_index matches).
+            let idx = members
+                .iter()
+                .enumerate()
+                .find_map(|(i, _addr)| {
+                    if crate::community_dfrost_crypto::identifier_for_index(i) == *recipient_id {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or("dfrost_contribute_dkg_round: FROST identifier→addr lookup failed")?;
+            let recipient_addr = members[idx];
+
+            let identity_pub_64 = resolver.resolve(&recipient_addr).await.ok_or_else(|| {
+                format!(
+                    "dfrost_contribute_dkg_round: identity_pub for recipient {} not resolvable \
+                         — peer device pub has not propagated yet",
+                    hex::encode(recipient_addr.0)
+                )
+            })?;
+            let ed_pub: &[u8; 32] = identity_pub_64[32..64].try_into().map_err(|_| {
+                "dfrost_contribute_dkg_round: identity_pub_64 slice 32..64 not 32 bytes \
+                 (should never happen)"
+            })?;
+            let recipient_x25519_pub =
+                crate::dm_signing::ed25519_pub_to_x25519(ed_pub).map_err(|e| {
+                    format!(
+                        "dfrost_contribute_dkg_round: ed25519_pub_to_x25519 for {}: {e}",
+                        hex::encode(recipient_addr.0)
+                    )
+                })?;
+            let sealed = crate::dm_signing::seal_to_owner(&recipient_x25519_pub, r2_pkg_bytes)
+                .map_err(|e| {
+                    format!(
+                        "dfrost_contribute_dkg_round: seal_to_owner for {}: {e:?}",
+                        hex::encode(recipient_addr.0)
+                    )
+                })?;
+            recipient_ciphertexts.push(crate::community_membership::RecipientCiphertext {
+                recipient: recipient_addr,
+                sealed,
+            });
+        }
+
+        // Stash r2_secret BEFORE building the event. If apply fails the
+        // secret remains so the caller can retry; if we stashed it
+        // after apply and apply succeeded but the IPC errored later,
+        // we'd lose the only copy of the round-2 secret and the
+        // ceremony would be unrecoverable.
+        {
+            let mut log = log_arc.lock().await;
+            log.local_dkg_secret2 = Some(r2_secret);
+        }
+
+        // Build the dr rn=2 payload + sign the envelope.
+        let payload = crate::community_dfrost_types::DkgRoundPayload {
+            ceremony_id: ceremony_bytes,
+            round_num: 2,
+            round1_package: None,
+            recipient_ciphertexts: Some(recipient_ciphertexts),
+        };
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        crate::community_dfrost_log::build_signed_dfrost_event(
+            signing_key,
+            self_owner,
+            crate::community_dfrost_types::DfrostEventKind::DkgRound,
+            &payload,
+            hlc,
+        )
+        .map_err(|e| format!("dfrost_contribute_dkg_round: build_signed: {e}"))?
+    } else {
+        // ─── ROUND 3 ──────────────────────────────────────────────────
+        //
+        // Snapshot pending state. round2_packages already contains the
+        // DECRYPTED-FOR-LOCAL plaintexts populated by
+        // `apply_with_identity` when peers' rn=2 events landed.
+        let (members, threshold, max_signers, proposed_epoch, r1_by_id, r2_by_id, secret2) = {
+            let log = log_arc.lock().await;
+            let pending = log
+                .committee_state
+                .pending_dkg
+                .as_ref()
+                .ok_or("dfrost_contribute_dkg_round: no pending DKG ceremony for community")?;
+            if pending.ceremony_id != ceremony_bytes {
+                return Err(format!(
+                    "dfrost_contribute_dkg_round: ceremony_id mismatch (pending={}, requested={})",
+                    hex::encode(pending.ceremony_id),
+                    hex::encode(ceremony_bytes)
+                ));
+            }
+
+            let members = pending.members.clone();
+
+            // Round-1: every OTHER member's broadcast r1 package.
+            let mut r1: std::collections::BTreeMap<frost_ristretto255::Identifier, Vec<u8>> =
+                std::collections::BTreeMap::new();
+            for (addr, pkg) in pending
+                .round1_packages
+                .iter()
+                .filter(|(a, _)| **a != self_owner)
+            {
+                let idx = members.iter().position(|a| *a == *addr).ok_or_else(|| {
+                    format!(
+                        "dfrost_contribute_dkg_round: peer addr {} not in member list",
+                        hex::encode(addr.0)
+                    )
+                })?;
+                r1.insert(
+                    crate::community_dfrost_crypto::identifier_for_index(idx),
+                    pkg.clone(),
+                );
+            }
+
+            // Round-2: per-sender decrypted r2 packages for self.
+            let mut r2: std::collections::BTreeMap<frost_ristretto255::Identifier, Vec<u8>> =
+                std::collections::BTreeMap::new();
+            for (addr, pkg) in &pending.round2_packages {
+                let idx = members.iter().position(|a| *a == *addr).ok_or_else(|| {
+                    format!(
+                        "dfrost_contribute_dkg_round: r2 sender addr {} not in member list",
+                        hex::encode(addr.0)
+                    )
+                })?;
+                r2.insert(
+                    crate::community_dfrost_crypto::identifier_for_index(idx),
+                    pkg.clone(),
+                );
+            }
+
+            let secret = log.local_dkg_secret2.clone().ok_or(
+                "dfrost_contribute_dkg_round: local_dkg_secret2 missing — \
+                     was round_num=2 contributed first on this node?",
+            )?;
+
+            (
+                members,
+                pending.threshold,
+                pending.max_signers,
+                pending.proposed_epoch,
+                r1,
+                r2,
+                secret,
+            )
+        };
+
+        // Quorum gate: dkg::part3 requires r1+r2 from EVERY other
+        // member. If a peer hasn't broadcast their rn=2 yet (or it
+        // hasn't been applied here), fail with a clear message rather
+        // than letting FROST surface an opaque KeygenError.
+        let expected_others = members.len().saturating_sub(1);
+        if r1_by_id.len() != expected_others || r2_by_id.len() != expected_others {
+            return Err(format!(
+                "dfrost_contribute_dkg_round: round 3 needs r1 + r2 from all {expected_others} \
+                 other member(s); have r1={}, r2={}",
+                r1_by_id.len(),
+                r2_by_id.len()
+            ));
+        }
+
+        // Run FROST DKG part-3 — produces this node's signing share
+        // (`KeyPackage`) and the committee's joint `PublicKeyPackage`.
+        let (key_package, pub_key_package) =
+            crate::community_dfrost_crypto::dkg_part3_local(&secret2, &r1_by_id, &r2_by_id)
+                .map_err(|e| format!("dfrost_contribute_dkg_round: dkg::part3: {e}"))?;
+
+        // Build per-member verifying-share list. PublicKeyPackage's
+        // verifying_shares() returns BTreeMap<Identifier, VerifyingShare>;
+        // map each Identifier back to its OwnerAddr through the same
+        // sorted-index lookup that produced it.
+        let joint_vk =
+            crate::community_dfrost_crypto::verifying_key_to_bytes(pub_key_package.verifying_key());
+        let mut verifying_shares: Vec<crate::community_dfrost_types::MemberVerifyingShare> =
+            Vec::with_capacity(members.len());
+        for (id, vs) in pub_key_package.verifying_shares() {
+            let idx = members
+                .iter()
+                .enumerate()
+                .find_map(|(i, _)| {
+                    if crate::community_dfrost_crypto::identifier_for_index(i) == *id {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or(
+                    "dfrost_contribute_dkg_round: VerifyingShare identifier→addr lookup failed",
+                )?;
+            verifying_shares.push(crate::community_dfrost_types::MemberVerifyingShare {
+                member: members[idx],
+                verifying_share: crate::community_dfrost_crypto::verifying_share_to_bytes(vs),
+            });
+        }
+
+        // Stash the local KeyPackage + PublicKeyPackage on the log so
+        // the Task 4 threshold-sign IPC can recover this node's signing
+        // share. Stash BEFORE building the event so a build/apply
+        // failure here doesn't leave the share material un-stashed
+        // (it'd require re-running the entire DKG to recover).
+        //
+        // R4 doc-comment guarantee: never persisted to disk (see
+        // DfrostLog::local_key_package field doc). The PublicKeyPackage
+        // half is duplicated into CommitteeState.verifying_shares +
+        // joint_verifying_key by apply_dkg_complete once quorum lands,
+        // so non-committee replicas don't need this stash.
+        {
+            let mut log = log_arc.lock().await;
+            log.local_key_package = Some(key_package);
+            log.local_pub_key_package = Some(pub_key_package);
+        }
+
+        let payload = crate::community_dfrost_types::DkgCompletePayload {
+            ceremony_id: ceremony_bytes,
+            joint_verifying_key: joint_vk,
+            verifying_shares,
+            epoch: proposed_epoch,
+            members: members.clone(),
+            threshold,
+            max_signers,
+        };
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        crate::community_dfrost_log::build_signed_dfrost_event(
+            signing_key,
+            self_owner,
+            crate::community_dfrost_types::DfrostEventKind::DkgComplete,
+            &payload,
+            hlc,
+        )
+        .map_err(|e| format!("dfrost_contribute_dkg_round: build_signed: {e}"))?
+    };
+
+    // 6. Derive self's X25519 priv (needed by apply_with_identity for the
+    //    rn=2 round-trip decrypt — apply_with_identity only touches the
+    //    decrypt path for incoming rn=2 events, but the local rn=2 event
+    //    we built above contains a ciphertext sealed-to-self for every
+    //    other recipient; apply_with_identity ignores those since none
+    //    target self_owner). For dk events apply_with_identity falls
+    //    through to apply() per the impl.
+    let self_x25519_priv: [u8; 32] = {
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        *crate::dm_signing::ed25519_priv_to_x25519(signing_key)
+    };
+
+    // 7. Apply locally.
+    {
+        let mut log = log_arc.lock().await;
+        log.apply_with_identity(event_to_apply, &self_owner, &self_x25519_priv)
+            .map_err(|e| format!("dfrost_contribute_dkg_round: apply: {e:?}"))?;
+    }
+
+    // 8. Emit progress event. participants_so_far reflects the
+    //    post-apply pending-ceremony state:
+    //      - rn=2: number of decrypted round-2 packages observed
+    //        (sealed-to-self apply path) — does NOT include this node's
+    //        own outgoing rn=2 (no ciphertext targeted self).
+    //      - rn=3: number of dk confirmations recorded so far.
+    let participants_count: u8 = {
+        let log = log_arc.lock().await;
+        // After a successful dk-quorum, pending_dkg is cleared and the
+        // committee is promoted; in that case the dk count we want to
+        // report is `threshold` (the quorum that just triggered
+        // promotion). Fall back to threshold-when-active to surface a
+        // sensible value.
+        if round_num == 3 && log.committee_state.pending_dkg.is_none() && log.committee_state.active
+        {
+            u8::try_from(log.committee_state.threshold).unwrap_or(u8::MAX)
+        } else {
+            log.committee_state
+                .pending_dkg
+                .as_ref()
+                .map(|p| {
+                    let c = if round_num == 2 {
+                        p.round2_packages.len()
+                    } else {
+                        p.dk_confirmations.len()
+                    };
+                    u8::try_from(c).unwrap_or(u8::MAX)
+                })
+                .unwrap_or(0)
+        }
+    };
+
+    let evt_payload = DfrostDkgProgressPayload {
+        ceremony_id: hex::encode(ceremony_bytes),
+        round_num,
+        participants_so_far: participants_count,
+    };
+    if let Err(e) = app.emit("dfrost-dkg-progress", &evt_payload) {
+        // Non-fatal: state is already mutated; the emit is a UI hint.
+        tracing::warn!(error = %e, "dfrost-dkg-progress emit failed");
+    }
+
+    Ok(())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -22248,6 +22738,7 @@ pub fn run() {
             voting_list_delegations,
             // ZEB-305 Phase 4a-foundation: D-FROST committee IPCs.
             dfrost_initiate_dkg,
+            dfrost_contribute_dkg_round,
             #[cfg(debug_assertions)]
             e2e_close_window,
         ])
@@ -22292,6 +22783,7 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         voting_list_delegations,
         // ZEB-305 Phase 4a-foundation: D-FROST committee IPCs.
         dfrost_initiate_dkg,
+        dfrost_contribute_dkg_round,
     ])
 }
 
