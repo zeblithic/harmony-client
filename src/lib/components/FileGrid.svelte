@@ -2,6 +2,7 @@
   import type { ContentItem } from '../types';
   import { matchesEditing } from '../file-utils';
   import FileCard from './FileCard.svelte';
+  import FilePlaceholderCard from './FilePlaceholderCard.svelte';
 
   let {
     items,
@@ -16,6 +17,12 @@
     onBeginRename,
     onCommitRename,
     onCancelRename,
+    creatingFolder = false,
+    newFolderName = $bindable(''),
+    newFolderError = null,
+    creatingFolderInFlight = false,
+    onCommitCreateFolder,
+    onCancelCreateFolder,
   }: {
     items: ContentItem[];
     selectedCid: string | null;
@@ -31,10 +38,27 @@
     onBeginRename?: (item: ContentItem) => void;
     onCommitRename?: () => void;
     onCancelRename?: () => void;
+    /** ZEB-166: inline new-folder placeholder — see FileList.svelte for
+     *  the contract. */
+    creatingFolder?: boolean;
+    newFolderName?: string;
+    newFolderError?: string | null;
+    creatingFolderInFlight?: boolean;
+    onCommitCreateFolder?: () => void;
+    onCancelCreateFolder?: () => void;
   } = $props();
 </script>
 
 <div class="file-grid" aria-label="File grid">
+  {#if creatingFolder}
+    <FilePlaceholderCard
+      bind:value={newFolderName}
+      error={newFolderError}
+      inFlight={creatingFolderInFlight}
+      onCommit={onCommitCreateFolder}
+      onCancel={onCancelCreateFolder}
+    />
+  {/if}
   {#each items as item (item.sidecarId || `nested:${item.cid}:${item.name}`)}
     <FileCard
       {item}
