@@ -90,7 +90,9 @@ tauri = { version = "2", features = ["test"] }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "test-util"] }
 
 # ZEB-156 (Task 2) TEMPORARY: the harmony git rev above points at the
-# feature-branch SHA `a38fbe50` from zeblithic/harmony PR #269 (the
+# feature-branch SHA `be429fb4` from zeblithic/harmony PR #269 (the
 # narrow `NodeRuntime::remove_content` + `StorageTier::remove` delegates
-# this branch's Burn arm depends on). When that PR merges to harmony main,
-# bump the rev above to the merged SHA — no other Cargo.toml change needed.
+# this branch's Burn arm depends on, plus the R1 fix that adds an
+# is_pinned guard to StorageTier::remove). When that PR merges to harmony
+# main, bump the rev above to the merged SHA — no other Cargo.toml
+# change needed.

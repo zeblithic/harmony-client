@@ -1437,7 +1437,14 @@ async fn rapid_pin_unpin_toggling_keeps_sidecar_and_runtime_consistent() {
                     })
                     .await
                     .expect("verb_tx send");
-                let _ = reply_rx.await.expect("pin reply");
+                // Assert the runtime's inner Result is also Ok so an
+                // event-loop-side Pin failure (cache full / quota
+                // exhaustion) doesn't get masked by the outer recv
+                // succeeding — CodeRabbit R2 finding.
+                reply_rx
+                    .await
+                    .expect("pin reply")
+                    .expect("runtime Pin returned Err");
             }
         }
     };
@@ -1467,7 +1474,11 @@ async fn rapid_pin_unpin_toggling_keeps_sidecar_and_runtime_consistent() {
                     })
                     .await
                     .expect("verb_tx send");
-                let _ = reply_rx.await.expect("unpin reply");
+                // Assert the runtime's inner Result — see Pin closure.
+                reply_rx
+                    .await
+                    .expect("unpin reply")
+                    .expect("runtime Unpin returned Err");
             }
         }
     };

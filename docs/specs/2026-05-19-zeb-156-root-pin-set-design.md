@@ -129,7 +129,7 @@ The three Tauri commands acquire this lock at the top and hold it until the verb
 
 ### Cache eviction primitive
 
-`harmony_content::cache::ContentStore::remove(&mut self, cid: &ContentId) -> Option<Vec<u8>>` already exists at `harmony/crates/harmony-content/src/cache.rs:424`. No new primitive needed. We expose it through `runtime.storage_tier_mut().cache_mut()` (the runtime's `&mut` accessor for the cache) — verify the exact method names against the runtime's current API in implementation.
+`harmony_content::cache::ContentStore::remove(&mut self, cid: &ContentId) -> Option<Vec<u8>>` already exists at `harmony/crates/harmony-content/src/cache.rs:424`, but `ContentStore::remove` is treated as an **internal implementation detail** — `NodeRuntime` deliberately gates `&mut StorageTier` access so callers can't reach the eviction-buffer + broadcast machinery. The canonical API for the burn verb to evict a CID is **`NodeRuntime::remove_content(&id)`** — a narrow public delegate added in upstream harmony#269 alongside `pin_content`/`unpin_content`. The delegate refuses pinned CIDs (returns `None`) to protect the pin-retention contract from caller misuse.
 
 ## Test plan
 
@@ -161,7 +161,7 @@ Unchanged. ZEB-157 will still need to clean up chunks from a failed ingest. The 
 
 - **R1 — Keep-set walk cost on large `pin_intent`.** Recomputing on every unpin/burn is O(|pin_intent| × avg_descendants). For 100 pinned items averaging 1000 chunks each, that's ~100k cache lookups per call. Each lookup is a HashMap hit (~µs), so total ~100ms worst case. Acceptable for v1; profile if it shows up in user-perceived latency.
 - **R2 — `pin_intent` and sidecar drift.** `pin_intent` is rebuilt from the sidecar on `start_node`, so steady-state drift is bounded by uptime. The ZEB-160 mutex tightens this further by preventing the dispatch reorder that was the main drift source.
-- **R3 — `tokio::sync::Mutex` held across `verb_tx.send()`.** The send is bounded by channel capacity (16-slot or whatever the event loop's `IngestRequest` / `ContentVerbRequest` channel sizes are) and the reply's `.await`. Worst case the lock holder waits for the event loop to drain. Lock contention is low because pin/unpin/burn are user-triggered, not autonomous.
+- **R3 — `tokio::sync::Mutex` held across `verb_tx.send()`.** The send is bounded by the `ContentVerbRequest` channel capacity (configured at event-loop spawn — see `event_loop::spawn` for the current channel-size constant) and the reply's `.await`. Worst case the lock holder waits for the event loop to drain. Lock contention is low because pin/unpin/burn are user-triggered, not autonomous.
 - **R4 — `cache.remove(cid)` failure semantics in `Burn`.** The current `remove` returns `Option<Vec<u8>>` — `None` if the CID isn't in the cache. We ignore the return (`let _ = ...`). For a bundle CID that was never fetched into the cache (e.g., the user burns a remote pin they never resolved), `remove` is a no-op; that's correct.
 
 ## Non-goals
