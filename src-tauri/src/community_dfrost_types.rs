@@ -5,9 +5,19 @@
 //! covers the five committee-ceremony events (`dr`/`dk`/`ts`/`vb`/`rf`).
 //!
 //! Same-length-keys invariant: every top-level CBOR map in this module
-//! uses 2-character keys so canonical-CBOR encoding stays byte-stable
-//! across language reimplementations (see `Hlc` rationale in
-//! `owner_state_types`).
+//! uses 2-character keys, matching the `SignedVotingEvent` envelope
+//! convention.
+//!
+//! R2 (CodeRabbit Major) — encoding caveat: this module uses ciborium's
+//! struct-derived serializer, which emits map entries in struct field
+//! declaration order (NOT RFC 8949 §4.2.1 lexicographic key order). Bytes
+//! are stable within this implementation but a strictly-RFC-8949 encoder
+//! would produce different output and signatures would fail to verify
+//! cross-implementation. This matches the existing `SignedVotingEvent`
+//! pattern and the project-wide ciborium-0.2 limitation acknowledged in
+//! `owner_state_crypto.rs` ("The strict RFC 8949 §4.2.1 cross-
+//! implementation encoder remains a separate followup"). Cross-impl
+//! interoperability is therefore out of scope for Phase 4a-foundation.
 
 use crate::community_membership::RecipientCiphertext;
 use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};

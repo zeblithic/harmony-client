@@ -127,6 +127,37 @@ pub fn verifying_share_to_bytes(vs: &VerifyingShare) -> [u8; 32] {
     out
 }
 
+/// Verify a 64-byte FROST-Schnorr signature against a 32-byte compressed
+/// joint verifying key and a message. Returns `Ok(())` iff the signature
+/// is a valid Schnorr signature on `msg` under `joint_vk_bytes`.
+///
+/// R2 (CodeRabbit Critical): the VRF beacon apply path was previously
+/// only validating `derive_vrf_output(R_compressed) == payload.vrf_output`,
+/// which any 64-byte blob with a matching SHA-256(R) prefix would
+/// trivially pass. The actual security guarantee — that the committee
+/// produced a valid threshold signature on the agreed message — requires
+/// the full Schnorr verify against the joint verifying key. Without
+/// this, an attacker can forge VRF beacons by feeding garbage signature
+/// bytes whose first 32 bytes hash to a chosen vrf_output.
+pub fn verify_schnorr_signature(
+    joint_vk_bytes: &[u8; 32],
+    msg: &[u8],
+    signature_bytes: &[u8],
+) -> Result<(), String> {
+    use frost_ristretto255::Signature;
+    if signature_bytes.len() != 64 {
+        return Err(format!(
+            "schnorr signature must be 64 bytes, got {}",
+            signature_bytes.len()
+        ));
+    }
+    let vk = VerifyingKey::deserialize(joint_vk_bytes)
+        .map_err(|e| format!("VerifyingKey::deserialize: {e}"))?;
+    let sig = Signature::deserialize(signature_bytes)
+        .map_err(|e| format!("Signature::deserialize: {e}"))?;
+    vk.verify(msg, &sig).map_err(|e| format!("verify: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

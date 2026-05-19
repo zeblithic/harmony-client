@@ -152,16 +152,13 @@ impl CommitteeState {
         sorted.dedup();
         let mut map = BTreeMap::new();
         for (idx, addr) in sorted.into_iter().enumerate() {
-            // 1-indexed — FROST disallows Identifier(0). R1 fix (CodeRabbit
-            // Major, Cursor Low): use u16::try_from to reject indices
-            // >= 65536 loudly rather than silently wrapping via `as u16`.
-            // Caller is responsible for staying within `max_signers <=
-            // u16::MAX` (enforced upstream at DKG initiate); this is
-            // defence-in-depth against a malformed pending ceremony.
-            let idx_u16: u16 = u16::try_from(idx)
-                .expect("committee size > u16::MAX; enforced upstream at DKG init");
-            let id = Identifier::try_from(idx_u16 + 1)
-                .expect("idx+1 fits u16 and is non-zero by construction");
+            // R2 (Cursor Low): delegate to `identifier_for_index` to
+            // avoid duplicated index→Identifier conversion logic. Both
+            // functions assign 1-indexed identifiers from sorted member
+            // order; using one canonical implementation ensures
+            // overflow handling (u16::try_from + checked_add) stays
+            // consistent across both call sites.
+            let id = crate::community_dfrost_crypto::identifier_for_index(idx);
             map.insert(addr, id);
         }
         map
@@ -289,10 +286,29 @@ impl DfrostLog {
             return Err(ApplyError::UnknownCeremony);
         }
 
-        if payload.round_num == 1 {
-            if let Some(pkg) = payload.round1_package {
+        // R2 (CodeRabbit Major): reject out-of-range round_num values
+        // and require the per-round-required field shape. Without these
+        // checks, a malformed `dr` event with round_num=99 or rn=1 with
+        // no round1_package gets appended to the log carrying no usable
+        // protocol state.
+        match payload.round_num {
+            1 => {
+                let pkg = payload
+                    .round1_package
+                    .ok_or(ApplyError::InvariantViolation)?;
                 pending.round1_packages.entry(event.actor).or_insert(pkg);
             }
+            2 => {
+                // Round 2 is per-recipient encrypted; the broadcast log
+                // path stores nothing. Local node decryption happens in
+                // `apply_with_identity`. Require at least the
+                // recipient_ciphertexts vector to be Some — an rn=2 dr
+                // with no ciphertexts carries no protocol state.
+                if payload.recipient_ciphertexts.is_none() {
+                    return Err(ApplyError::InvariantViolation);
+                }
+            }
+            _ => return Err(ApplyError::InvariantViolation),
         }
         // Round 2: the broadcast log path is intentionally inert here.
         // Per-recipient decryption + share storage happens in
@@ -378,6 +394,35 @@ impl DfrostLog {
             return Err(ApplyError::InvariantViolation);
         }
 
+        // R2 (CodeRabbit Major): EVERY dk event's verifying_shares MUST
+        // be a 1:1 match for pending.members — no missing, duplicate, or
+        // non-member entries. Validating up-front (before quorum check
+        // or dk_confirmations.insert) means a malformed dk is rejected
+        // before being recorded as a confirmation. Builds the
+        // `new_verifying_shares` map up-front so the promote branch
+        // below just consumes the pre-validated map.
+        let pending_member_set: std::collections::BTreeSet<OwnerAddr> =
+            pending.members.iter().copied().collect();
+        let mut new_verifying_shares: BTreeMap<OwnerAddr, [u8; 32]> = BTreeMap::new();
+        for mvs in &payload.verifying_shares {
+            if !pending_member_set.contains(&mvs.member) {
+                return Err(ApplyError::InvariantViolation);
+            }
+            // Duplicate member entries: BTreeMap::insert returns the
+            // previous value, so a Some(_) result means we just
+            // overwrote — reject loudly.
+            if new_verifying_shares
+                .insert(mvs.member, mvs.verifying_share)
+                .is_some()
+            {
+                return Err(ApplyError::InvariantViolation);
+            }
+        }
+        if new_verifying_shares.len() != pending_member_set.len() {
+            // Missing entries: every pending member must have a share.
+            return Err(ApplyError::InvariantViolation);
+        }
+
         // Cross-confirmation consensus: any disagreement on the vk among
         // already-recorded confirmations aborts.
         for existing_vk in pending.dk_confirmations.values() {
@@ -396,10 +441,6 @@ impl DfrostLog {
         // payload because they're the OUTPUT of the ceremony — those
         // can only be known after the protocol runs.
         if pending.dk_confirmations.len() >= pending.threshold as usize {
-            let mut new_verifying_shares: BTreeMap<OwnerAddr, [u8; 32]> = BTreeMap::new();
-            for mvs in &payload.verifying_shares {
-                new_verifying_shares.insert(mvs.member, mvs.verifying_share);
-            }
             let identifier_map = CommitteeState::build_identifier_map(&pending.members);
             let members = pending.members.clone();
             let threshold = pending.threshold;
@@ -506,6 +547,23 @@ impl DfrostLog {
             return Err(ApplyError::InvariantViolation);
         }
 
+        // R2 (CodeRabbit Critical): verify the full Schnorr signature
+        // against the committee's joint verifying key. Without this,
+        // any 64-byte blob whose first 32 bytes hash to `vrf_output`
+        // would be accepted — the VRF-output binding check alone is
+        // not sufficient to prove the committee actually produced a
+        // valid threshold signature on the agreed message.
+        let joint_vk = self
+            .committee_state
+            .joint_verifying_key
+            .ok_or(ApplyError::InvariantViolation)?;
+        crate::community_dfrost_crypto::verify_schnorr_signature(
+            &joint_vk,
+            &payload.message_hash,
+            &payload.signature,
+        )
+        .map_err(|_| ApplyError::InvariantViolation)?;
+
         // Clear the pending sign session — the ceremony is now finalised
         // on this replica.
         self.committee_state
@@ -536,43 +594,62 @@ impl DfrostLog {
             return Err(ApplyError::InvariantViolation);
         }
 
-        if payload.round_num == 1 {
-            // Initialise the pending refresh once on the first rn=1 event.
-            // Subsequent rn=1 events (from other actors) reuse the existing
-            // pending_refresh — only the local node's per-recipient
-            // ciphertext decode happens in `apply_with_identity`.
-            if self.committee_state.pending_refresh.is_none() {
-                self.committee_state.pending_refresh = Some(PendingCeremony {
-                    ceremony_id: payload.ceremony_id,
-                    members: self.committee_state.members.clone(),
-                    threshold: self.committee_state.threshold,
-                    max_signers: self.committee_state.max_signers,
-                    proposed_epoch: self.committee_state.current_epoch + 1,
-                    ..Default::default()
-                });
+        // R2 (CodeRabbit Major): exhaustive round_num match + per-round
+        // payload-shape validation. Out-of-range round_num is rejected
+        // with InvariantViolation rather than silently appended.
+        match payload.round_num {
+            1 => {
+                // rn=1 of refresh requires recipient_ciphertexts — the
+                // proposer is distributing new shares.
+                if payload.recipient_ciphertexts.is_none() {
+                    return Err(ApplyError::InvariantViolation);
+                }
+                // Initialise the pending refresh once on the first rn=1
+                // event. Subsequent rn=1 events (from other actors)
+                // reuse the existing pending_refresh — only the local
+                // node's per-recipient ciphertext decode happens in
+                // `apply_with_identity`.
+                if self.committee_state.pending_refresh.is_none() {
+                    self.committee_state.pending_refresh = Some(PendingCeremony {
+                        ceremony_id: payload.ceremony_id,
+                        members: self.committee_state.members.clone(),
+                        threshold: self.committee_state.threshold,
+                        max_signers: self.committee_state.max_signers,
+                        proposed_epoch: self.committee_state.current_epoch + 1,
+                        ..Default::default()
+                    });
+                }
+                // Subsequent enforcement: ceremony_id must match. A
+                // divergent ceremony_id within the same refresh epoch
+                // indicates a forked proposer; reject to surface the
+                // protocol bug rather than silently apply.
+                if let Some(pr) = &self.committee_state.pending_refresh {
+                    if pr.ceremony_id != payload.ceremony_id {
+                        return Err(ApplyError::InvariantViolation);
+                    }
+                }
             }
-            // Subsequent enforcement: ceremony_id must match. A divergent
-            // ceremony_id within the same refresh epoch indicates a forked
-            // proposer; reject to surface the protocol bug rather than
-            // silently apply.
-            if let Some(pr) = &self.committee_state.pending_refresh {
+            2 => {
+                // Round-2 is broadcast in the spec's wire shape but the
+                // actual share material is per-recipient encrypted via
+                // recipient_ciphertexts; the global apply path stores
+                // nothing here. Local decryption happens in
+                // `apply_with_identity`. Require the round2 package
+                // field shape to be present even if we don't process
+                // it here, so a wholly-malformed rn=2 is rejected.
+                let pr = self
+                    .committee_state
+                    .pending_refresh
+                    .as_ref()
+                    .ok_or(ApplyError::UnknownCeremony)?;
                 if pr.ceremony_id != payload.ceremony_id {
+                    return Err(ApplyError::UnknownCeremony);
+                }
+                if payload.round2_package.is_none() && payload.recipient_ciphertexts.is_none() {
                     return Err(ApplyError::InvariantViolation);
                 }
             }
-        } else if payload.round_num == 2 {
-            // Round-2 is broadcast in the spec's wire shape but the actual
-            // share material is per-recipient encrypted via
-            // recipient_ciphertexts; the global apply path stores nothing
-            // here. Local decryption happens in `apply_with_identity`.
-            let pr = self
-                .committee_state
-                .pending_refresh
-                .as_ref()
-                .ok_or(ApplyError::UnknownCeremony)?;
-            if pr.ceremony_id != payload.ceremony_id {
-                return Err(ApplyError::UnknownCeremony);
-            }
+            _ => return Err(ApplyError::InvariantViolation),
         }
         Ok(())
     }
@@ -1232,6 +1309,233 @@ mod tests {
             sig: vec![0u8; 64],
         });
         assert_eq!(result, Err(ApplyError::UnknownCeremony));
+    }
+
+    /// R2 (CodeRabbit Critical): `vb` event with bogus signature bytes
+    /// that happen to pass the VRF-output derivation check is now
+    /// rejected by the Schnorr verify step against the joint
+    /// verifying key. Pre-R2 fix, any 64-byte blob whose first 32
+    /// bytes hash to `payload.vrf_output` was accepted; that's a
+    /// trivial forgery primitive for VRF beacons.
+    #[test]
+    fn vb_with_bogus_signature_bytes_rejected_at_schnorr_verify() {
+        use crate::community_dfrost_types::{
+            derive_vrf_output, DfrostEventKind, SignedCommitteeEvent, VrfBeaconPayload,
+        };
+        use crate::owner_state_types::Hlc;
+
+        let ceremony_id = [0xcc; 32];
+        let msg_hash = [0xde; 32];
+
+        let mut log = DfrostLog::new();
+        log.committee_state.active = true;
+        // Seed a joint_verifying_key so the Schnorr-verify step has a
+        // key to deserialise. We use [0x55; 32] which is unlikely to
+        // be a valid Ristretto compressed point — `VerifyingKey::
+        // deserialize` returns Err, the wrapper returns Err, and the
+        // apply path maps Err to InvariantViolation. Either way, the
+        // bogus signature is rejected before clearing pending_sign.
+        log.committee_state.joint_verifying_key = Some([0x55u8; 32]);
+        log.committee_state.pending_sign.insert(
+            ceremony_id,
+            PendingSignSession {
+                message_hash: msg_hash,
+                contributions: BTreeMap::new(),
+            },
+        );
+
+        // Construct a payload where the VRF-output derivation check
+        // PASSES (vrf_output is the legitimate hash of R), but the
+        // Schnorr verify step MUST reject. Pre-R2, this would have
+        // landed the beacon.
+        let r_compressed = [0x77u8; 32];
+        let mut sig = vec![0u8; 64];
+        sig[..32].copy_from_slice(&r_compressed);
+        let payload = VrfBeaconPayload {
+            ceremony_id,
+            message_hash: msg_hash,
+            signature: sig,
+            vrf_output: derive_vrf_output(&r_compressed),
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&payload, &mut pd).unwrap();
+
+        let result = log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::VrfBeacon,
+            hlc: Hlc {
+                wall_ms: 11_000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: OwnerAddr([0x01; 16]),
+            payload: pd,
+            sig: vec![0u8; 64],
+        });
+        assert_eq!(result, Err(ApplyError::InvariantViolation));
+        // Pending sign session MUST NOT be cleared on rejection — it
+        // remains in-flight so a legitimate beacon can still land.
+        assert!(log.committee_state.pending_sign.contains_key(&ceremony_id));
+    }
+
+    /// R2 (CodeRabbit Major): `dk` payload with `verifying_shares` that
+    /// don't 1:1 match `pending.members` is rejected. Covers missing
+    /// entries (member without share), non-member entries (share for an
+    /// unknown OwnerAddr), and duplicate-member entries.
+    #[test]
+    fn dk_with_mismatched_verifying_shares_rejected() {
+        use crate::community_dfrost_types::{
+            DfrostEventKind, DkgCompletePayload, MemberVerifyingShare, SignedCommitteeEvent,
+        };
+        use crate::owner_state_types::Hlc;
+
+        let alice = OwnerAddr([0x01; 16]);
+        let bob = OwnerAddr([0x02; 16]);
+        let stranger = OwnerAddr([0x03; 16]);
+
+        // Test 1: missing member share (only alice's, bob is in pending).
+        let mut log = DfrostLog::new();
+        log.committee_state.pending_dkg = Some(PendingCeremony {
+            ceremony_id: [0xab; 32],
+            members: vec![alice, bob],
+            threshold: 2,
+            max_signers: 2,
+            proposed_epoch: 1,
+            ..Default::default()
+        });
+        let dk_payload = DkgCompletePayload {
+            ceremony_id: [0xab; 32],
+            joint_verifying_key: [0x99u8; 32],
+            verifying_shares: vec![MemberVerifyingShare {
+                member: alice,
+                verifying_share: [0xa1; 32],
+            }], // ← bob missing
+            epoch: 1,
+            members: vec![alice, bob],
+            threshold: 2,
+            max_signers: 2,
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&dk_payload, &mut pd).unwrap();
+        let result = log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::DkgComplete,
+            hlc: Hlc {
+                wall_ms: 12_000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: alice,
+            payload: pd,
+            sig: vec![0u8; 64],
+        });
+        assert_eq!(
+            result,
+            Err(ApplyError::InvariantViolation),
+            "missing member share must reject"
+        );
+
+        // Test 2: stranger entry (share for a non-member).
+        let mut log = DfrostLog::new();
+        log.committee_state.pending_dkg = Some(PendingCeremony {
+            ceremony_id: [0xab; 32],
+            members: vec![alice, bob],
+            threshold: 2,
+            max_signers: 2,
+            proposed_epoch: 1,
+            ..Default::default()
+        });
+        let dk_payload = DkgCompletePayload {
+            ceremony_id: [0xab; 32],
+            joint_verifying_key: [0x99u8; 32],
+            verifying_shares: vec![
+                MemberVerifyingShare {
+                    member: alice,
+                    verifying_share: [0xa1; 32],
+                },
+                MemberVerifyingShare {
+                    member: stranger, // ← not in pending.members
+                    verifying_share: [0xff; 32],
+                },
+            ],
+            epoch: 1,
+            members: vec![alice, bob],
+            threshold: 2,
+            max_signers: 2,
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&dk_payload, &mut pd).unwrap();
+        let result = log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::DkgComplete,
+            hlc: Hlc {
+                wall_ms: 12_000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: alice,
+            payload: pd,
+            sig: vec![0u8; 64],
+        });
+        assert_eq!(
+            result,
+            Err(ApplyError::InvariantViolation),
+            "stranger share must reject"
+        );
+    }
+
+    /// R2 (CodeRabbit Major): `dr` event with out-of-range round_num
+    /// (e.g., 99) is rejected. Pre-R2 the malformed event was silently
+    /// appended to `events` despite carrying no usable protocol state.
+    #[test]
+    fn dr_with_invalid_round_num_rejected() {
+        use crate::community_dfrost_types::{
+            DfrostEventKind, DkgRoundPayload, SignedCommitteeEvent,
+        };
+        use crate::owner_state_types::Hlc;
+
+        let mut log = DfrostLog::new();
+        log.committee_state.pending_dkg = Some(PendingCeremony {
+            ceremony_id: [0x42; 32],
+            members: vec![OwnerAddr([0x01; 16])],
+            threshold: 1,
+            max_signers: 1,
+            proposed_epoch: 1,
+            ..Default::default()
+        });
+        let payload = DkgRoundPayload {
+            ceremony_id: [0x42; 32],
+            round_num: 99, // ← out of range
+            round1_package: Some(vec![0xde]),
+            recipient_ciphertexts: None,
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&payload, &mut pd).unwrap();
+        let result = log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::DkgRound,
+            hlc: Hlc {
+                wall_ms: 13_000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: OwnerAddr([0x01; 16]),
+            payload: pd,
+            sig: vec![0u8; 64],
+        });
+        assert_eq!(result, Err(ApplyError::InvariantViolation));
+        assert!(
+            log.events.is_empty(),
+            "rejected event must NOT append to log"
+        );
     }
 
     /// R1 (CodeRabbit Major): `vb` event whose `message_hash` differs
