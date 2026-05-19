@@ -460,6 +460,30 @@ fn validate_metadata(s: &str) -> Result<(), MintError> {
 
 // ── Transaction CRUD ──────────────────────────────────────────────────────────
 
+/// Column list + JOIN used by all transaction reads. The 10-column
+/// projection order is: id, transaction_date, amount, currency,
+/// account_id, account_name (from JOIN), description, metadata,
+/// created_at, updated_at — matching the `Transaction` struct field
+/// order.
+const TRANSACTION_SELECT: &str = "SELECT t.id, t.transaction_date, t.amount, t.currency, \
+    t.account_id, a.name, t.description, t.metadata, t.created_at, t.updated_at \
+    FROM transactions t JOIN accounts a ON a.id = t.account_id";
+
+fn map_transaction_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Transaction> {
+    Ok(Transaction {
+        id: row.get(0)?,
+        transaction_date: row.get(1)?,
+        amount: row.get(2)?,
+        currency: row.get(3)?,
+        account_id: row.get(4)?,
+        account_name: row.get(5)?,
+        description: row.get(6)?,
+        metadata: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
+    })
+}
+
 /// Create a new transaction from the given payload.
 ///
 /// Validates all fields, verifies that `account_id` exists, then inserts and
@@ -513,27 +537,11 @@ pub fn create_transaction(
 
 /// Return the transaction with the given `id`, or `None` if no such row exists.
 pub fn get_transaction(conn: &Connection, id: &str) -> Result<Option<Transaction>, MintError> {
-    let mut stmt = conn.prepare(
-        "SELECT t.id, t.transaction_date, t.amount, t.currency, t.account_id, a.name, \
-         t.description, t.metadata, t.created_at, t.updated_at \
-         FROM transactions t \
-         JOIN accounts a ON a.id = t.account_id \
-         WHERE t.id = ?",
-    )?;
+    let sql = format!("{TRANSACTION_SELECT} WHERE t.id = ?");
+    let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query(params![id])?;
     if let Some(row) = rows.next()? {
-        Ok(Some(Transaction {
-            id: row.get(0)?,
-            transaction_date: row.get(1)?,
-            amount: row.get(2)?,
-            currency: row.get(3)?,
-            account_id: row.get(4)?,
-            account_name: row.get(5)?,
-            description: row.get(6)?,
-            metadata: row.get(7)?,
-            created_at: row.get(8)?,
-            updated_at: row.get(9)?,
-        }))
+        Ok(Some(map_transaction_row(row)?))
     } else {
         Ok(None)
     }
@@ -571,34 +579,15 @@ pub fn list_transactions(
     } else {
         format!("WHERE {}", conditions.join(" AND "))
     };
-    let sql = format!(
-        "SELECT t.id, t.transaction_date, t.amount, t.currency, t.account_id, a.name, \
-         t.description, t.metadata, t.created_at, t.updated_at \
-         FROM transactions t \
-         JOIN accounts a ON a.id = t.account_id \
-         {where_clause} \
-         ORDER BY t.transaction_date DESC, t.id DESC"
-    );
+    let sql =
+        format!("{TRANSACTION_SELECT} {where_clause} ORDER BY t.transaction_date DESC, t.id DESC");
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
         rusqlite::params_from_iter(params_vec.iter().map(|b| b.as_ref())),
-        |row| {
-            Ok(Transaction {
-                id: row.get(0)?,
-                transaction_date: row.get(1)?,
-                amount: row.get(2)?,
-                currency: row.get(3)?,
-                account_id: row.get(4)?,
-                account_name: row.get(5)?,
-                description: row.get(6)?,
-                metadata: row.get(7)?,
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
-            })
-        },
+        map_transaction_row,
     )?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    rows.collect::<Result<Vec<_>, _>>().map_err(MintError::from)
 }
 
 /// Update the given transaction with any present fields in `payload`.
@@ -1418,12 +1407,12 @@ mod tests {
     }
 
     #[test]
-    fn list_transactions_order_date_desc_then_id_desc() {
+    fn list_transactions_order_date_desc() {
         let conn = fresh_db();
         let acc = make_account(&conn, "Chase");
 
-        // Two transactions on the same date — they should come back newest-id-first.
-        let t_older = create_transaction(
+        // Two transactions on the same date — both should appear before the early one.
+        let t_a = create_transaction(
             &conn,
             NewTransaction {
                 transaction_date: "2026-05-19".into(),
@@ -1432,7 +1421,7 @@ mod tests {
             },
         )
         .unwrap();
-        let t_newer = create_transaction(
+        let t_b = create_transaction(
             &conn,
             NewTransaction {
                 transaction_date: "2026-05-19".into(),
@@ -1454,20 +1443,40 @@ mod tests {
 
         let results = list_transactions(&conn, &ListFilter::default()).unwrap();
         assert_eq!(results.len(), 3);
-        // Most recent date first.
+        // Most recent date first — earliest date must be last.
         assert_eq!(results[2].id, t_early.id, "earliest date should be last");
-        // Within the same date, newer id (UUIDv4 is random, but the second insert
-        // gets a later id in the ordering since id DESC gives us the second-created
-        // transaction first when dates are equal).
-        // We verify the relative order: t_newer and t_older must both appear before
-        // t_early. The exact relative order of the two same-date entries is tested
-        // by asserting t_newer appears before t_older when id DESC is applied.
-        let pos_newer = results.iter().position(|t| t.id == t_newer.id).unwrap();
-        let pos_older = results.iter().position(|t| t.id == t_older.id).unwrap();
-        // UUIDv4 order is random; we can only verify relative date ordering is correct.
-        // Both same-date txns should be before the early one.
-        assert!(pos_newer < 2, "newer same-date tx should appear in top 2");
-        assert!(pos_older < 2, "older same-date tx should appear in top 2");
+        // Both same-date txns should appear in the top two slots.
+        let pos_a = results.iter().position(|t| t.id == t_a.id).unwrap();
+        let pos_b = results.iter().position(|t| t.id == t_b.id).unwrap();
+        assert!(pos_a < 2, "same-date tx A should appear in top 2");
+        assert!(pos_b < 2, "same-date tx B should appear in top 2");
+    }
+
+    #[test]
+    fn list_transactions_order_secondary_id_desc() {
+        let conn = fresh_db();
+        let acc = make_account(&conn, "Chase");
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Hand-crafted IDs: "bbbb..." sorts lexicographically after "aaaa...",
+        // so with ORDER BY t.id DESC, "bbbb..." must appear first.
+        let id_lo = "aaaaaaaa-0000-0000-0000-000000000000";
+        let id_hi = "bbbbbbbb-0000-0000-0000-000000000000";
+
+        for id in &[id_lo, id_hi] {
+            conn.execute(
+                "INSERT INTO transactions \
+                 (id, transaction_date, amount, currency, account_id, description, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                params![id, "2026-05-19", "-1.00", "USD", acc, "det", now, now],
+            )
+            .unwrap();
+        }
+
+        let results = list_transactions(&conn, &ListFilter::default()).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id, id_hi, "higher id should sort first (DESC)");
+        assert_eq!(results[1].id, id_lo, "lower id should sort second (DESC)");
     }
 
     // ── update_transaction ────────────────────────────────────────────────────
