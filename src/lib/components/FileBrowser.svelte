@@ -191,10 +191,7 @@
 
   // Folder-ingest state. One in-flight walk at a time (entry handlers
   // early-return on activeIngestProgress). activeIngestJobId is captured
-  // from the first progress event the walker emits; a follow-up adds the
-  // progress-modal + cancel button (and the cancel-event listener that
-  // sets cancelRequested true), at which point the placeholders below
-  // the breadcrumbs get replaced.
+  // from the first progress event the walker emits.
   let activeIngestJobId = $state<string | null>(null);
   let activeIngestProgress = $state<{
     completed: number;
@@ -203,6 +200,12 @@
   } | null>(null);
   let ingestSummary = $state<IngestFolderTreeResult | null>(null);
   let cancelRequested = $state(false);
+  // Synchronous lock around the native folder picker: the
+  // activeIngestProgress guard alone races two fast clicks (both pass
+  // the guard before either await openDialog resolves and runs
+  // startFolderIngest). Set true before awaiting the dialog, reset in
+  // finally.
+  let pickerOpen = $state(false);
 
   // Tagged with the cid the failure belongs to so a fast nav-away
   // auto-discards the stale block (mirrors the folderItems.cid guard).
@@ -693,10 +696,19 @@
     }
   }
 
+  function resetIngestState() {
+    activeIngestJobId = null;
+    activeIngestProgress = null;
+    cancelRequested = false;
+  }
+
   async function handleAddFolderClick() {
     // Serialise: the same guard that the OS-drop listener will use, so a
-    // picker click + drop event can't race a second walker.
-    if (activeIngestProgress) return;
+    // picker click + drop event can't race a second walker. pickerOpen
+    // covers the pre-startFolderIngest window where activeIngestProgress
+    // is still null but a previous click is still awaiting the dialog.
+    if (activeIngestProgress || pickerOpen) return;
+    pickerOpen = true;
     let picked: string | string[] | null;
     try {
       picked = await openDialog({ directory: true, multiple: false });
@@ -704,6 +716,8 @@
       const raw = err instanceof Error ? err.message : String(err);
       error = `Could not open folder picker: ${raw.replace(/^Error:\s*/, '')}`;
       return;
+    } finally {
+      pickerOpen = false;
     }
     if (!picked || typeof picked !== 'string') return; // cancelled
     void startFolderIngest(picked);
@@ -726,13 +740,11 @@
         parentSidecarId,
         breadcrumbStack,
       );
-      activeIngestJobId = null;
-      activeIngestProgress = null;
+      resetIngestState();
       ingestSummary = result;
       serviceVersion++; // refetch so the new folder appears in the list
     } catch (err) {
-      activeIngestJobId = null;
-      activeIngestProgress = null;
+      resetIngestState();
       const raw = err instanceof Error ? err.message : String(err);
       error = `Folder ingest failed: ${raw.replace(/^Error:\s*/, '')}`;
     }
@@ -874,20 +886,16 @@
       {/if}
 
       {#if activeIngestProgress}
-        <div class="ingest-placeholder" role="status" aria-live="polite">
-          Ingesting from {activeIngestProgress.currentPath}…
-          {#if activeIngestProgress.total > 0}
-            ({activeIngestProgress.completed}/{activeIngestProgress.total})
-          {/if}
-          {#if activeIngestJobId !== null && !cancelRequested}
-            <span class="ingest-job-id">job {activeIngestJobId}</span>
-          {/if}
+        <div role="status" aria-live="polite" class="visually-hidden">
+          Ingesting folder ({activeIngestProgress.completed} of {activeIngestProgress.total})
+          {cancelRequested ? '— cancelling' : ''}
+          {#if activeIngestJobId} (job {activeIngestJobId}){/if}
         </div>
       {/if}
 
       {#if ingestSummary}
-        <div class="ingest-placeholder" role="status">
-          Added folder {ingestSummary.rootName}: {ingestSummary.succeeded} files
+        <div role="status" aria-live="polite" class="visually-hidden">
+          Folder ingest complete: {ingestSummary.succeeded} files
         </div>
       {/if}
 
@@ -967,5 +975,11 @@
     border: 1px solid var(--danger, #ed4245);
     color: var(--text-primary, #f2f3f5);
     font-size: 0.85rem;
+  }
+
+  .visually-hidden {
+    position: absolute; width: 1px; height: 1px; padding: 0;
+    margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0);
+    white-space: nowrap; border: 0;
   }
 </style>

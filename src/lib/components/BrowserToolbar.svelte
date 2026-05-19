@@ -82,7 +82,7 @@
             onclick={onAddFolderClick}
             aria-label="Add folder from disk"
             title="Add folder from disk"
-          >📁⬇ Add folder…</button>
+          >📥 Add folder…</button>
         {/if}
       {/if}
       <button class="action-btn" class:active={showCleanup} onclick={onCleanupClick} aria-label="Cleanup" aria-pressed={showCleanup}>🧹 Cleanup</button>
