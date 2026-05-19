@@ -581,6 +581,25 @@ pub struct NodeState {
     /// (caller serialises one walk at a time), but is never persisted
     /// to disk.
     pub folder_ingest_jobs: crate::folder_ingest::CancelRegistry,
+    /// ZEB-160: process-wide serialization lock for pin/unpin/burn IPCs.
+    /// All three Tauri commands (`pin_content`, `unpin_content`,
+    /// `burn_content`) acquire this lock at the top and hold it across
+    /// the sidecar mutation, the `content_verb_tx.send().await`, and the
+    /// reply-oneshot await. Without it, rapid toggling could let two
+    /// verbs land at the event loop in a different order than their
+    /// sidecar mutations were committed (e.g., Pin/Unpin race ending
+    /// with sidecar=unpinned but runtime cache=pinned).
+    ///
+    /// Must be `tokio::sync::Mutex` because the critical section spans
+    /// `.await`s — `std::sync::Mutex` held across `.await` blocks the
+    /// executor thread (clippy warning + correctness risk). The lock
+    /// is held by binding the guard as `_serial_guard` through the rest
+    /// of each IPC body; drop happens automatically at function exit.
+    ///
+    /// Single coarse lock (not per-CID): the three IPCs already
+    /// dispatch to a single-threaded event loop, so finer locking would
+    /// not unlock parallelism beyond what the runtime already permits.
+    pub pin_serial_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 impl NodeState {
@@ -667,6 +686,12 @@ impl Default for NodeState {
             folder_ingest_jobs: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            // ZEB-160: fresh `tokio::sync::Mutex<()>` shared by all three
+            // pin/unpin/burn IPCs. Survives stop_node so a restart picks
+            // up the same lock (no IPC can race a restart anyway — the
+            // event loop is single-threaded — but resetting it would
+            // also work; keep it stable for simplicity).
+            pin_serial_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }
@@ -5676,6 +5701,19 @@ async fn pin_content(
 ) -> Result<bool, String> {
     let id = parse_sidecar_id(&sidecar_id)?;
 
+    // ZEB-160: serialize pin/unpin/burn IPCs so the sidecar mutation and
+    // the runtime verb dispatch land in the same order. Without this
+    // lock, rapid toggling could let two verbs reach the event loop in
+    // a different order than their sidecar mutations were committed
+    // (final state: sidecar disagrees with runtime cache). Clone the
+    // Arc out under the sync `state.lock()`, then drop the sync guard
+    // before acquiring the tokio Mutex (the latter spans `.await`s).
+    let serial_lock = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard.pin_serial_lock.clone()
+    };
+    let _serial_guard = serial_lock.lock().await;
+
     // ZEB-155 + ZEB-164: persist pin intent on the sidecar BEFORE the
     // runtime verb. After flipping the bit, look up the entry's CID so
     // we can dispatch Pin against it. The Pin verb is idempotent for
@@ -5769,6 +5807,15 @@ async fn unpin_content(
 ) -> Result<bool, String> {
     let id = parse_sidecar_id(&sidecar_id)?;
 
+    // ZEB-160: serialize against pin_content/burn_content. See pin_content
+    // for the rationale. Held across the OR-join sidecar mutation + the
+    // (possibly skipped) verb dispatch + reply await.
+    let serial_lock = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard.pin_serial_lock.clone()
+    };
+    let _serial_guard = serial_lock.lock().await;
+
     // ZEB-164: clear sidecar intent. Then check OR-join: if some other
     // sidecar entry STILL pins this CID, leave runtime pin_intent alone
     // (the bytes are still wanted). Only dispatch Unpin to the runtime
@@ -5842,6 +5889,18 @@ async fn burn_content(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<bool, String> {
     let id = parse_sidecar_id(&sidecar_id)?;
+
+    // ZEB-160: serialize against pin_content/unpin_content. The three-
+    // branch decision below (Burn / Unpin / Nothing) must observe the
+    // same sidecar state that its verb dispatch reaches the event loop
+    // with — otherwise a concurrent pin_content could re-pin a CID
+    // between our `remove`+post-state inspection and our `Burn` send,
+    // leaving the runtime cache out of sync with the sidecar.
+    let serial_lock = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard.pin_serial_lock.clone()
+    };
+    let _serial_guard = serial_lock.lock().await;
 
     // Match pin_content/unpin_content's best-effort pattern: clone
     // maybe_verb_tx without erroring on None. The pre-existing upfront
@@ -25150,6 +25209,7 @@ mod start_node_race_tests {
             folder_ingest_jobs: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            pin_serial_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
