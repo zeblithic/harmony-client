@@ -117,8 +117,13 @@
       onEdit={(id) => { editingTxId = id; showAddEdit = true; }}
       onDelete={async (id) => {
         if (!confirm('Delete this transaction?')) return;
-        await service.deleteTransaction(id);
-        await load();
+        error = null;
+        try {
+          await service.deleteTransaction(id);
+          await load();
+        } catch (e) {
+          error = e instanceof Error ? e.message : String(e);
+        }
       }}
     />
   {/if}
