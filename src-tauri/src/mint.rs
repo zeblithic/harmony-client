@@ -733,54 +733,74 @@ pub fn export_csv(
     // Ensure parent directory exists. If the caller passed a path inside
     // a directory that doesn't exist, create it. This matches the
     // behavior of `open_database`.
-    if let Some(parent) = output_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
+    let parent = output_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    std::fs::create_dir_all(&parent)?;
 
-    let file = std::fs::File::create(output_path)?;
-    let mut writer = csv::WriterBuilder::new()
-        .terminator(csv::Terminator::Any(b'\n'))
-        .from_writer(file);
+    // Write to a sibling tempfile and atomically rename on success so a
+    // query failure never leaves a partial file at `output_path`.
+    // NamedTempFile::new_in places the temp file in the same directory
+    // as the target — required for the rename in `.persist()` to be
+    // atomic (cross-device renames aren't atomic on POSIX).
+    let tmp = tempfile::NamedTempFile::new_in(&parent)
+        .map_err(|e| MintError::Other(format!("temp file: {e}")))?;
 
-    writer
-        .write_record([
-            "date",
-            "account_name",
-            "amount",
-            "currency",
-            "description",
-            "metadata",
-        ])
-        .map_err(|e| MintError::Other(format!("csv header: {e}")))?;
-
-    let sql = "SELECT t.transaction_date, a.name, t.amount, t.currency, \
-        t.description, COALESCE(t.metadata, '') \
-        FROM transactions t JOIN accounts a ON a.id = t.account_id \
-        WHERE (?1 IS NULL OR t.transaction_date >= ?1) \
-          AND (?2 IS NULL OR t.transaction_date <= ?2) \
-        ORDER BY t.transaction_date ASC, t.id ASC";
-
-    let mut stmt = conn.prepare(sql)?;
-    let mut rows = stmt.query(rusqlite::params![date_from, date_to])?;
+    // csv::Writer takes ownership of the writer. Use a &File reference
+    // borrowed from the NamedTempFile so the tempfile guard outlives the
+    // writer and we can `.persist(...)` it after the writer is dropped.
     let mut count: u64 = 0;
-    while let Some(row) = rows.next()? {
-        let date: String = row.get(0)?;
-        let account: String = row.get(1)?;
-        let amount: String = row.get(2)?;
-        let currency: String = row.get(3)?;
-        let description: String = row.get(4)?;
-        let metadata: String = row.get(5)?;
+    {
+        let mut writer = csv::WriterBuilder::new()
+            .terminator(csv::Terminator::Any(b'\n'))
+            .from_writer(tmp.as_file());
+
         writer
-            .write_record([&date, &account, &amount, &currency, &description, &metadata])
-            .map_err(|e| MintError::Other(format!("csv row: {e}")))?;
-        count += 1;
+            .write_record([
+                "date",
+                "account_name",
+                "amount",
+                "currency",
+                "description",
+                "metadata",
+            ])
+            .map_err(|e| MintError::Other(format!("csv header: {e}")))?;
+
+        let sql = "SELECT t.transaction_date, a.name, t.amount, t.currency, \
+            t.description, COALESCE(t.metadata, '') \
+            FROM transactions t JOIN accounts a ON a.id = t.account_id \
+            WHERE (?1 IS NULL OR t.transaction_date >= ?1) \
+              AND (?2 IS NULL OR t.transaction_date <= ?2) \
+            ORDER BY t.transaction_date ASC, t.id ASC";
+
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = stmt.query(rusqlite::params![date_from, date_to])?;
+        while let Some(row) = rows.next()? {
+            let date: String = row.get(0)?;
+            let account: String = row.get(1)?;
+            let amount: String = row.get(2)?;
+            let currency: String = row.get(3)?;
+            let description: String = row.get(4)?;
+            let metadata: String = row.get(5)?;
+            writer
+                .write_record([&date, &account, &amount, &currency, &description, &metadata])
+                .map_err(|e| MintError::Other(format!("csv row: {e}")))?;
+            count += 1;
+        }
+
+        writer
+            .flush()
+            .map_err(|e| MintError::Other(format!("csv flush: {e}")))?;
+        // writer drops here, releasing the &File borrow
     }
 
-    writer
-        .flush()
-        .map_err(|e| MintError::Other(format!("csv flush: {e}")))?;
+    // Atomically rename the tempfile into place. persist returns an error
+    // if the rename fails (e.g., disk full, permissions); the temp file is
+    // then automatically cleaned up on Drop.
+    tmp.persist(output_path)
+        .map_err(|e| MintError::Other(format!("persist: {}", e.error)))?;
 
     let byte_size = std::fs::metadata(output_path)?.len();
     Ok(ExportSummary {

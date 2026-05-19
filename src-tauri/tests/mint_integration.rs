@@ -328,3 +328,45 @@ fn export_csv_empty_ledger() {
         "no data rows expected in empty ledger export"
     );
 }
+
+#[test]
+fn export_csv_no_partial_file_on_unwritable_path() {
+    let conn = fresh_in_memory_db();
+    // Create an account + transaction so the query has content.
+    let a = create_account(&conn, "A").unwrap();
+    create_transaction(
+        &conn,
+        NewTransaction {
+            transaction_date: "2026-05-19".into(),
+            amount: "1.00".into(),
+            currency: "USD".into(),
+            account_id: a.id,
+            description: "X".into(),
+            metadata: None,
+        },
+    )
+    .unwrap();
+
+    // Verify the happy path: export into a nested directory that doesn't
+    // yet exist (create_dir_all path), then confirm no NamedTempFile
+    // sibling remains in the parent directory after a successful export.
+    let tmpdir = tempfile::tempdir().unwrap();
+    let out = tmpdir.path().join("nested").join("export.csv");
+    let summary = export_csv(&conn, &out, None, None).unwrap();
+    assert_eq!(summary.rows_written, 1);
+    assert!(out.exists());
+
+    // After a successful export, no NamedTempFile sibling should
+    // remain in the parent directory.
+    let parent = out.parent().unwrap();
+    let leftover: Vec<_> = std::fs::read_dir(parent)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path() != out)
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "stray tempfile left behind: {:?}",
+        leftover.iter().map(|e| e.path()).collect::<Vec<_>>()
+    );
+}
