@@ -144,3 +144,187 @@ fn migration_idempotent_across_reopens() {
         "default_currency should persist across close/reopen"
     );
 }
+
+// ── CSV export integration tests ──────────────────────────────────────────────
+
+#[test]
+fn export_csv_round_trips_via_csv_reader() {
+    let conn = fresh_in_memory_db();
+
+    // Create 5 accounts.
+    let mut account_ids = Vec::new();
+    for i in 0..5u32 {
+        let acc = create_account(&conn, &format!("Account {i}")).unwrap();
+        account_ids.push(acc.id);
+    }
+
+    // Create 50 transactions spread across the accounts with varied dates.
+    for i in 0..50u32 {
+        let account_id = account_ids[(i as usize) % account_ids.len()].clone();
+        // Dates cycle over 2026-05-01 through 2026-05-28 (i % 28 + 1).
+        let day = (i % 28) + 1;
+        create_transaction(
+            &conn,
+            NewTransaction {
+                transaction_date: format!("2026-05-{day:02}"),
+                amount: format!("-{}.00", i + 1),
+                currency: "USD".into(),
+                account_id,
+                description: format!("Transaction {i}"),
+                metadata: None,
+            },
+        )
+        .unwrap();
+    }
+
+    let tmpdir = tempfile::tempdir().unwrap();
+    let csv_path = tmpdir.path().join("export.csv");
+
+    let summary = export_csv(&conn, &csv_path, None, None).unwrap();
+    assert_eq!(summary.rows_written, 50, "should have written 50 data rows");
+    assert!(summary.byte_size > 0, "file should be non-empty");
+
+    // Re-read with csv::Reader and verify header + row count.
+    let mut reader = csv::Reader::from_path(&csv_path).unwrap();
+    let headers = reader.headers().unwrap().clone();
+    assert_eq!(
+        headers.iter().collect::<Vec<_>>(),
+        vec![
+            "date",
+            "account_name",
+            "amount",
+            "currency",
+            "description",
+            "metadata"
+        ],
+        "header row must match spec"
+    );
+    let data_rows: Vec<_> = reader.records().collect::<Result<_, _>>().unwrap();
+    assert_eq!(data_rows.len(), 50, "csv reader should see 50 data rows");
+}
+
+#[test]
+fn export_csv_escapes_special_characters() {
+    let conn = fresh_in_memory_db();
+    let acc = create_account(&conn, "Test Account").unwrap();
+
+    // Description with literal comma, double-quotes, and embedded newline.
+    let description = "Lunch, \"deluxe\" combo\nwith soup";
+    // Metadata with an embedded newline in a JSON string value.
+    let metadata = "{\"note\":\"line\nbreak\"}";
+
+    create_transaction(
+        &conn,
+        NewTransaction {
+            transaction_date: "2026-05-19".into(),
+            amount: "-12.50".into(),
+            currency: "USD".into(),
+            account_id: acc.id.clone(),
+            description: description.into(),
+            metadata: Some(metadata.into()),
+        },
+    )
+    .unwrap();
+
+    let tmpdir = tempfile::tempdir().unwrap();
+    let csv_path = tmpdir.path().join("escape_test.csv");
+
+    let summary = export_csv(&conn, &csv_path, None, None).unwrap();
+    assert_eq!(summary.rows_written, 1);
+
+    // Re-read and verify the special characters round-trip byte-exactly.
+    let mut reader = csv::Reader::from_path(&csv_path).unwrap();
+    let records: Vec<_> = reader.records().collect::<Result<_, _>>().unwrap();
+    assert_eq!(records.len(), 1, "expected exactly one data row");
+    let record = &records[0];
+    // Column 4 is description, column 5 is metadata.
+    assert_eq!(
+        &record[4], description,
+        "description must round-trip byte-exactly through RFC 4180 escaping"
+    );
+    assert_eq!(
+        &record[5], metadata,
+        "metadata must round-trip byte-exactly through RFC 4180 escaping"
+    );
+}
+
+#[test]
+fn export_csv_respects_date_filter() {
+    let conn = fresh_in_memory_db();
+    let acc = create_account(&conn, "Filter Account").unwrap();
+
+    // Create 10 transactions on dates 2026-05-10 through 2026-05-19.
+    for day in 10u32..=19 {
+        create_transaction(
+            &conn,
+            NewTransaction {
+                transaction_date: format!("2026-05-{day:02}"),
+                amount: "-1.00".into(),
+                currency: "USD".into(),
+                account_id: acc.id.clone(),
+                description: format!("Day {day}"),
+                metadata: None,
+            },
+        )
+        .unwrap();
+    }
+
+    let tmpdir = tempfile::tempdir().unwrap();
+    let csv_path = tmpdir.path().join("date_filter.csv");
+
+    // Export only 2026-05-15 through 2026-05-17 (inclusive).
+    let summary = export_csv(&conn, &csv_path, Some("2026-05-15"), Some("2026-05-17")).unwrap();
+    assert_eq!(
+        summary.rows_written, 3,
+        "date filter should include exactly 3 rows (May 15, 16, 17)"
+    );
+
+    // Verify the dates in the CSV are exactly the 3 expected ones.
+    let mut reader = csv::Reader::from_path(&csv_path).unwrap();
+    let dates: Vec<String> = reader
+        .records()
+        .map(|r| r.unwrap()[0].to_string())
+        .collect();
+    assert_eq!(
+        dates,
+        vec!["2026-05-15", "2026-05-16", "2026-05-17"],
+        "exported dates must be exactly 15, 16, 17 in ascending order"
+    );
+}
+
+#[test]
+fn export_csv_empty_ledger() {
+    // Fresh DB with no accounts and no transactions.
+    let conn = fresh_in_memory_db();
+
+    let tmpdir = tempfile::tempdir().unwrap();
+    let csv_path = tmpdir.path().join("empty.csv");
+
+    let summary = export_csv(&conn, &csv_path, None, None).unwrap();
+    assert_eq!(summary.rows_written, 0, "no data rows expected");
+    assert!(
+        summary.byte_size > 0,
+        "file should still contain the header row (non-zero bytes)"
+    );
+
+    // Re-read: must have exactly the header and zero data rows.
+    let mut reader = csv::Reader::from_path(&csv_path).unwrap();
+    let headers = reader.headers().unwrap().clone();
+    assert_eq!(
+        headers.iter().collect::<Vec<_>>(),
+        vec![
+            "date",
+            "account_name",
+            "amount",
+            "currency",
+            "description",
+            "metadata"
+        ],
+        "header must be present even in empty ledger"
+    );
+    let data_rows: Vec<_> = reader.records().collect::<Result<_, _>>().unwrap();
+    assert!(
+        data_rows.is_empty(),
+        "no data rows expected in empty ledger export"
+    );
+}

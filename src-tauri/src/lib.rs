@@ -22038,6 +22038,7 @@ pub fn run() {
             mint::mint_delete_account,
             mint::mint_get_default_currency,
             mint::mint_set_default_currency,
+            mint::mint_export_csv,
         ])
         .run(tauri::generate_context!())
         .expect("error while running harmony");

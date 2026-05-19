@@ -351,6 +351,15 @@ fn map_account_name_constraint(e: rusqlite::Error) -> MintError {
 
 // ── Transaction types ─────────────────────────────────────────────────────────
 
+/// Summary returned by `export_csv` and `mint_export_csv`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportSummary {
+    pub rows_written: u64,
+    pub output_path: String,
+    pub byte_size: u64,
+}
+
 /// A posted transaction.
 ///
 /// `account_name` is derived from the accounts JOIN — it is never stored in the
@@ -697,6 +706,90 @@ pub fn delete_transaction(conn: &Connection, id: &str) -> Result<(), MintError> 
     Ok(())
 }
 
+// ── CSV export ────────────────────────────────────────────────────────────────
+
+/// Streams the transaction ledger to a CSV file at `output_path`.
+///
+/// Header row is always emitted. Date filters are inclusive on both
+/// bounds and validated up front. The query joins accounts for the
+/// human-readable account name. RFC 4180 escaping is handled by the
+/// `csv` crate.
+///
+/// Streams row-by-row from the SQLite cursor into csv::Writer to keep
+/// memory bounded regardless of ledger size.
+pub fn export_csv(
+    conn: &Connection,
+    output_path: &std::path::Path,
+    date_from: Option<&str>,
+    date_to: Option<&str>,
+) -> Result<ExportSummary, MintError> {
+    if let Some(d) = date_from {
+        validate_date(d)?;
+    }
+    if let Some(d) = date_to {
+        validate_date(d)?;
+    }
+
+    // Ensure parent directory exists. If the caller passed a path inside
+    // a directory that doesn't exist, create it. This matches the
+    // behavior of `open_database`.
+    if let Some(parent) = output_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    let file = std::fs::File::create(output_path)?;
+    let mut writer = csv::WriterBuilder::new()
+        .terminator(csv::Terminator::Any(b'\n'))
+        .from_writer(file);
+
+    writer
+        .write_record([
+            "date",
+            "account_name",
+            "amount",
+            "currency",
+            "description",
+            "metadata",
+        ])
+        .map_err(|e| MintError::Other(format!("csv header: {e}")))?;
+
+    let sql = "SELECT t.transaction_date, a.name, t.amount, t.currency, \
+        t.description, COALESCE(t.metadata, '') \
+        FROM transactions t JOIN accounts a ON a.id = t.account_id \
+        WHERE (?1 IS NULL OR t.transaction_date >= ?1) \
+          AND (?2 IS NULL OR t.transaction_date <= ?2) \
+        ORDER BY t.transaction_date ASC, t.id ASC";
+
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = stmt.query(rusqlite::params![date_from, date_to])?;
+    let mut count: u64 = 0;
+    while let Some(row) = rows.next()? {
+        let date: String = row.get(0)?;
+        let account: String = row.get(1)?;
+        let amount: String = row.get(2)?;
+        let currency: String = row.get(3)?;
+        let description: String = row.get(4)?;
+        let metadata: String = row.get(5)?;
+        writer
+            .write_record([&date, &account, &amount, &currency, &description, &metadata])
+            .map_err(|e| MintError::Other(format!("csv row: {e}")))?;
+        count += 1;
+    }
+
+    writer
+        .flush()
+        .map_err(|e| MintError::Other(format!("csv flush: {e}")))?;
+
+    let byte_size = std::fs::metadata(output_path)?.len();
+    Ok(ExportSummary {
+        rows_written: count,
+        output_path: output_path.display().to_string(),
+        byte_size,
+    })
+}
+
 // ── Account helpers (private) ─────────────────────────────────────────────────
 
 /// Return the account with the given `id`, annotated with its transaction
@@ -903,6 +996,29 @@ pub async fn mint_set_default_currency(
     tokio::task::spawn_blocking(move || {
         let conn = conn.lock().expect("mint_db lock poisoned");
         set_default_currency(&conn, &currency).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn mint_export_csv(
+    output_path: String,
+    date_from: Option<String>,
+    date_to: Option<String>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
+) -> Result<ExportSummary, String> {
+    let conn = crate::mint_db_handle(&app, &state)?;
+    tokio::task::spawn_blocking(move || {
+        let conn = conn.lock().expect("mint_db lock poisoned");
+        export_csv(
+            &conn,
+            std::path::Path::new(&output_path),
+            date_from.as_deref(),
+            date_to.as_deref(),
+        )
+        .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
