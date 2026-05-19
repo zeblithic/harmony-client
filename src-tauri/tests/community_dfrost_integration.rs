@@ -315,6 +315,51 @@ fn dkg_2of2_setup() -> ActivatedCommittee {
         .apply_with_identity(dr2_bob, &BOB, &bob_priv)
         .expect("b applies own dr2");
 
+    // Qodo R3 (Bug): explicitly assert that `apply_with_identity` actually
+    // decrypted the round-2 packages addressed to each engine and stored
+    // the resulting plaintexts in `pending_dkg.round2_packages[sender]`.
+    // Without this check, a regression in recipient matching or the
+    // X25519 decrypt path would slip past the test — the FROST
+    // finalization below uses the LOCALLY-produced plaintexts (which the
+    // test holds out-of-band), so a broken decrypt would still produce
+    // a converged committee in this test. Compare the decrypted bytes
+    // against the originals to prove the round-2 cross-engine path
+    // round-trips cleanly.
+    {
+        let pending_a = engine_a
+            .committee_state
+            .pending_dkg
+            .as_ref()
+            .expect("a pending after r2");
+        let pending_b = engine_b
+            .committee_state
+            .pending_dkg
+            .as_ref()
+            .expect("b pending after r2");
+        // Alice's engine should have decrypted Bob's r2 package for her.
+        assert_eq!(
+            pending_a.round2_packages.get(&BOB),
+            Some(&r2_pkg_bob_to_alice),
+            "engine A must have decrypted Bob's sealed r2 package via apply_with_identity"
+        );
+        // Bob's engine should have decrypted Alice's r2 package for him.
+        assert_eq!(
+            pending_b.round2_packages.get(&ALICE),
+            Some(&r2_pkg_alice_to_bob),
+            "engine B must have decrypted Alice's sealed r2 package via apply_with_identity"
+        );
+        // Each engine should NOT have stored a decrypt for its own
+        // outgoing package (no ciphertext was targeted at self).
+        assert!(
+            !pending_a.round2_packages.contains_key(&ALICE),
+            "engine A must not have a self-addressed r2 decrypt"
+        );
+        assert!(
+            !pending_b.round2_packages.contains_key(&BOB),
+            "engine B must not have a self-addressed r2 decrypt"
+        );
+    }
+
     // Round 3 — local on each engine
     let alice_r1_recv: BTreeMap<_, _> = [(id_bob, r1_pkg_bob_bytes.clone())].into_iter().collect();
     let alice_r2_recv: BTreeMap<_, _> = [(id_bob, r2_pkg_bob_to_alice.clone())]
