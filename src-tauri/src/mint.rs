@@ -173,24 +173,17 @@ pub struct Account {
 /// Returns a `MintError::Validation` if the name fails validation or if an
 /// account with the same name already exists.
 pub fn create_account(conn: &Connection, name: &str) -> Result<Account, MintError> {
-    validate_account_name(name)?;
+    let trimmed_name = validate_account_name(name)?;
     let id = uuid::Uuid::new_v4().to_string();
     let created_at = chrono::Utc::now().to_rfc3339();
     conn.execute(
         "INSERT INTO accounts (id, name, created_at) VALUES (?, ?, ?)",
-        params![id, name, created_at],
+        params![id, trimmed_name, created_at],
     )
-    .map_err(|e| match e {
-        rusqlite::Error::SqliteFailure(ref fe, _)
-            if fe.code == rusqlite::ErrorCode::ConstraintViolation =>
-        {
-            MintError::Validation("account name already exists".into())
-        }
-        other => MintError::Sqlite(other),
-    })?;
+    .map_err(map_account_name_constraint)?;
     Ok(Account {
         id,
-        name: name.to_string(),
+        name: trimmed_name,
         created_at,
         transaction_count: 0,
     })
@@ -225,29 +218,19 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>, MintError> {
 /// `MintError::Validation` if the new name fails validation or is already
 /// taken by another account.
 pub fn rename_account(conn: &Connection, id: &str, new_name: &str) -> Result<Account, MintError> {
-    validate_account_name(new_name)?;
+    let trimmed_name = validate_account_name(new_name)?;
     let affected = conn
         .execute(
             "UPDATE accounts SET name = ? WHERE id = ?",
-            params![new_name, id],
+            params![trimmed_name, id],
         )
-        .map_err(|e| match e {
-            rusqlite::Error::SqliteFailure(ref fe, _)
-                if fe.code == rusqlite::ErrorCode::ConstraintViolation =>
-            {
-                MintError::Validation("account name already exists".into())
-            }
-            other => MintError::Sqlite(other),
-        })?;
+        .map_err(map_account_name_constraint)?;
     if affected == 0 {
         return Err(MintError::NotFound("account not found".into()));
     }
-    // Re-fetch the updated account (includes accurate transaction_count).
-    let accounts = list_accounts(conn)?;
-    accounts
-        .into_iter()
-        .find(|a| a.id == id)
-        .ok_or_else(|| MintError::NotFound("account not found after rename".into()))
+    // Point-query re-fetch (includes accurate transaction_count).
+    get_account_by_id(conn, id)?
+        .ok_or_else(|| MintError::Other("account vanished between rename and read".into()))
 }
 
 /// Delete an account.
@@ -297,30 +280,28 @@ pub fn delete_account(
         }
     }
 
-    // ── Mutations ─────────────────────────────────────────────────────────────
-
-    match reassign_to {
-        None => {
-            let tx_count: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM transactions WHERE account_id = ?",
-                params![id],
-                |r| r.get(0),
-            )?;
-            if tx_count > 0 {
-                return Err(MintError::Validation(
-                    "account has transactions; pass reassign_to".into(),
-                ));
-            }
-            tx.execute("DELETE FROM accounts WHERE id = ?", params![id])?;
-        }
-        Some(target) => {
-            tx.execute(
-                "UPDATE transactions SET account_id = ? WHERE account_id = ?",
-                params![target, id],
-            )?;
-            tx.execute("DELETE FROM accounts WHERE id = ?", params![id])?;
+    if reassign_to.is_none() {
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM transactions WHERE account_id = ?",
+            params![id],
+            |r| r.get(0),
+        )?;
+        if count > 0 {
+            return Err(MintError::Validation(
+                "account has transactions; pass reassign_to".into(),
+            ));
         }
     }
+
+    // ── Mutations ─────────────────────────────────────────────────────────────
+
+    if let Some(target) = reassign_to {
+        tx.execute(
+            "UPDATE transactions SET account_id = ? WHERE account_id = ?",
+            params![target, id],
+        )?;
+    }
+    tx.execute("DELETE FROM accounts WHERE id = ?", params![id])?;
 
     tx.commit()?;
     Ok(())
@@ -329,16 +310,57 @@ pub fn delete_account(
 // ── Account validators ────────────────────────────────────────────────────────
 
 /// Validate an account name: non-empty after trim, max 256 bytes.
-pub fn validate_account_name(s: &str) -> Result<(), MintError> {
-    if s.trim().is_empty() {
+///
+/// Returns the trimmed string so callers store the canonical form, which
+/// ensures `" Chase "` and `"Chase"` are treated as duplicates by the
+/// `UNIQUE(name)` constraint.
+pub fn validate_account_name(s: &str) -> Result<String, MintError> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
         return Err(MintError::Validation("account name cannot be empty".into()));
     }
-    if s.len() > 256 {
+    if trimmed.len() > 256 {
         return Err(MintError::Validation(
             "account name exceeds 256 bytes".into(),
         ));
     }
-    Ok(())
+    Ok(trimmed.to_string())
+}
+
+/// Maps SQLite UNIQUE-constraint violations to a friendly validation error
+/// for the `accounts.name` column.  Other rusqlite errors pass through.
+fn map_account_name_constraint(e: rusqlite::Error) -> MintError {
+    match e {
+        rusqlite::Error::SqliteFailure(ref fe, _)
+            if fe.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            MintError::Validation("account name already exists".into())
+        }
+        other => other.into(),
+    }
+}
+
+/// Return the account with the given `id`, annotated with its transaction
+/// count.  Returns `Ok(None)` if no such account exists.
+fn get_account_by_id(conn: &Connection, id: &str) -> Result<Option<Account>, MintError> {
+    let mut stmt = conn.prepare(
+        "SELECT a.id, a.name, a.created_at, COUNT(t.id)
+         FROM accounts a
+         LEFT JOIN transactions t ON t.account_id = a.id
+         WHERE a.id = ?
+         GROUP BY a.id, a.name, a.created_at",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![id])?;
+    if let Some(row) = rows.next()? {
+        Ok(Some(Account {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            created_at: row.get(2)?,
+            transaction_count: row.get::<_, i64>(3)? as u64,
+        }))
+    } else {
+        Ok(None)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
