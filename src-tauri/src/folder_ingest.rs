@@ -108,7 +108,10 @@ pub struct IngestFolderTreeResult {
 }
 
 /// Tauri event payload for `folder-ingest-progress`. Emitted once per
-/// settled leaf-file ingest and once per directory manifest build.
+/// settled leaf-file ingest. Directory manifest builds are deliberately
+/// NOT counted here — `pre_walk_count` only enumerates non-filtered leaf
+/// files, so emitting on dir builds would push `completed` past `total`
+/// for any tree with subdirectories.
 ///
 /// `total` is `-1` when the pre-walk couldn't enumerate the tree (e.g. the
 /// root was unreadable mid-flight); the frontend's progress modal
@@ -196,6 +199,10 @@ struct WalkCtx<R: Runtime> {
     app: AppHandle<R>,
     ingest_tx: tokio::sync::mpsc::Sender<IngestRequest>,
     content_index: Arc<Mutex<ContentIndex>>,
+    /// Relaxed ordering is sufficient — this is a one-way "asked to stop"
+    /// flag with no companion data being published; we just need eventual
+    /// visibility across threads, not a happens-before relationship with
+    /// any other write.
     cancel: Arc<AtomicBool>,
     job_id: String,
     root_path: PathBuf,
@@ -442,7 +449,11 @@ fn walk<'a, R: Runtime>(
                                 ));
                             }
                         };
-                        ctx.emit_progress(counters, path);
+                        // Intentionally NO emit_progress here: dir-manifest
+                        // builds aren't counted in `pre_walk_count`'s total,
+                        // so firing here would push `completed` past `total`
+                        // (e.g. dir/{a,b,sub/{c}} → total=3 but completed
+                        // would reach 5). Progress fires only on leaf settle.
                         WalkOutcome::Ingested(ManifestEntry {
                             cid: cid_bytes,
                             name,
@@ -457,7 +468,10 @@ fn walk<'a, R: Runtime>(
                 // pointer.
                 match crate::build_folder_manifest_only(&ctx.ingest_tx, &name, &children).await {
                     Ok(cid) => {
-                        ctx.emit_progress(counters, path);
+                        // Intentionally NO emit_progress here — see the
+                        // root-build branch above. Only leaf settles fire
+                        // progress so `completed` stays bounded by
+                        // `pre_walk_count`'s leaf-only `total`.
                         WalkOutcome::Ingested(ManifestEntry {
                             cid,
                             name,
@@ -585,49 +599,161 @@ mod tests {
         assert_eq!(c.overflow_count, 7);
     }
 
-    /// Regression: the walker's leaf branch must NOT add sidecar entries
-    /// per leaf — leaves live in their parent folder's manifest, and a
-    /// per-leaf root row would surface "cat.jpg" AND "dog.jpg" AND the
-    /// new folder all at the root listing after a 2-file folder drop.
-    ///
-    /// This drives `send_ingest_bytes_only` (what the walker now calls for
-    /// each leaf) directly across two files and asserts the content index
-    /// gained zero rows. Combined with the existing
-    /// `ingest_file_at_path_small_file_creates_sidecar_and_sends_one_book`
-    /// in lib.rs which proves the sidecar-creating path still creates +1,
-    /// this pins the invariant from both sides.
-    #[tokio::test]
-    async fn walker_leaf_ingest_does_not_pollute_root_listing() {
-        let index = {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let idx = crate::content_index::ContentIndex::load(dir.path());
-            std::mem::forget(dir);
-            Arc::new(Mutex::new(idx))
-        };
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<IngestRequest>(8);
-        // Drain the channel so send_ingest's oneshot reply doesn't stall.
+    /// Spawn a draining ingest handler so `send_ingest`'s oneshot reply
+    /// doesn't stall the walker. Returns the sender plus a join handle
+    /// (dropped at end of test — channel closes when sender is dropped).
+    fn spawn_draining_ingest_handler() -> tokio::sync::mpsc::Sender<IngestRequest> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<IngestRequest>(64);
         tokio::spawn(async move {
             while let Some(req) = rx.recv().await {
                 let _ = req.reply.send(Ok(()));
             }
         });
+        tx
+    }
+
+    /// Build a fresh shared `ContentIndex` backed by a leaked tempdir
+    /// (matches the lib.rs `path_ingest_tests::fresh_content_index` pattern).
+    fn fresh_content_index() -> Arc<Mutex<ContentIndex>> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let idx = ContentIndex::load(dir.path());
+        std::mem::forget(dir);
+        Arc::new(Mutex::new(idx))
+    }
+
+    /// Regression for ZEB-163 task 2: dropping a folder with N leaf files
+    /// must add exactly ONE sidecar entry (the root folder), not N+1.
+    /// Before the bytes-only-leaf fix (b52fef6), the walker called
+    /// `send_ingest_with_name` per leaf, which inserted a sidecar row each
+    /// time and surfaced "cat.jpg" and "dog.jpg" as standalone root rows
+    /// alongside the new folder.
+    ///
+    /// This drives the real walker via `ingest_folder_tree` over a 2-leaf
+    /// tmpdir and inspects the shared sidecar index before/after. The
+    /// previous version of this test only called `send_ingest_bytes_only`
+    /// against a local index that the function under test couldn't touch
+    /// even in a buggy implementation, so it asserted nothing.
+    #[tokio::test]
+    async fn walker_leaf_ingest_does_not_pollute_root_listing() {
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+
+        let ingest_tx = spawn_draining_ingest_handler();
+        // Walker only routes through verb_tx for nested-parent creates
+        // (non-empty parent_path). Root drops never touch it, so a
+        // dropped receiver is fine — we just need a live sender.
+        let (verb_tx, _verb_rx) =
+            tokio::sync::mpsc::channel::<crate::event_loop::ContentVerbRequest>(8);
+        let index = fresh_content_index();
+        let registry: CancelRegistry = Arc::new(Mutex::new(Default::default()));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("cat.jpg"), b"meow").expect("write cat");
+        std::fs::write(dir.path().join("dog.jpg"), b"woof").expect("write dog");
 
         let before = index.lock().unwrap().entries().count();
 
-        // Two leaf payloads — what the walker would feed for cat.jpg and
-        // dog.jpg inside a dropped folder.
-        let _cid_cat = crate::send_ingest_bytes_only(&tx, b"meow".to_vec(), "cat.jpg".into())
-            .await
-            .expect("cat ingest");
-        let _cid_dog = crate::send_ingest_bytes_only(&tx, b"woof".to_vec(), "dog.jpg".into())
-            .await
-            .expect("dog ingest");
+        let result = ingest_folder_tree(
+            handle,
+            ingest_tx,
+            verb_tx,
+            index.clone(),
+            registry,
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect("ingest_folder_tree");
 
         let after = index.lock().unwrap().entries().count();
         assert_eq!(
-            after, before,
-            "send_ingest_bytes_only must NOT create sidecar rows — \
-             leaves live in the parent manifest only (see ZEB-163 task 2 fix)"
+            after - before,
+            1,
+            "walker must add exactly ONE sidecar (the dropped root folder), \
+             not N+1 for N leaf files — got delta {} for 2-leaf tree",
+            after - before
+        );
+        assert_eq!(result.succeeded, 2, "both leaves should have settled");
+        assert!(result.root_sidecar_id.is_some(), "root sidecar must mint");
+        assert!(!result.cancelled, "no cancel flag was set");
+    }
+
+    /// Pins the cancellation contract: when the cancel flag is true before
+    /// any work runs, `walk` returns `WalkOutcome::Cancelled` immediately
+    /// (checked at top-of-recursion, line ~357) and the IPC surface
+    /// reports `cancelled: true` with the registry entry stripped on
+    /// settle (the `ingest_folder_tree` epilogue removes the slot
+    /// unconditionally — see lines ~307-311).
+    ///
+    /// We drive both contracts in one test by calling `walk` directly
+    /// for the cancel-result assertion (avoids racing the registry to
+    /// pre-seed the flag) and `ingest_folder_tree` separately for the
+    /// registry-cleanup assertion against a normal-settle walk.
+    #[tokio::test]
+    async fn walker_honors_cancel_flag_and_cleans_up_registry() {
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+
+        let ingest_tx = spawn_draining_ingest_handler();
+        let (verb_tx, _verb_rx) =
+            tokio::sync::mpsc::channel::<crate::event_loop::ContentVerbRequest>(8);
+        let index = fresh_content_index();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.txt"), b"a").expect("write a");
+        std::fs::write(dir.path().join("b.txt"), b"b").expect("write b");
+
+        // --- Part 1: cancel-before-walk returns WalkOutcome::Cancelled.
+        let cancel = Arc::new(AtomicBool::new(true));
+        let ctx = WalkCtx {
+            app: handle.clone(),
+            ingest_tx: ingest_tx.clone(),
+            content_index: index.clone(),
+            cancel: cancel.clone(),
+            job_id: "test-job".to_string(),
+            root_path: dir.path().to_path_buf(),
+            total: 2,
+        };
+        let mut counters = WalkCounters::default();
+        let outcome = walk(
+            &ctx,
+            dir.path(),
+            "root".to_string(),
+            /* is_root = */ true,
+            None,
+            &[],
+            &verb_tx,
+            &mut counters,
+        )
+        .await;
+        assert!(
+            matches!(outcome, WalkOutcome::Cancelled),
+            "pre-set cancel flag must short-circuit at top-of-recursion"
+        );
+
+        // --- Part 2: a normal-settle IPC strips its registry entry.
+        let registry: CancelRegistry = Arc::new(Mutex::new(Default::default()));
+        let result = ingest_folder_tree(
+            handle,
+            ingest_tx,
+            verb_tx,
+            index.clone(),
+            registry.clone(),
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            Vec::new(),
+        )
+        .await
+        .expect("ingest_folder_tree");
+        assert!(
+            !result.cancelled,
+            "normal settle must report cancelled=false"
+        );
+        assert!(
+            registry.lock().unwrap().is_empty(),
+            "registry entry must be stripped after settle, got {} entries",
+            registry.lock().unwrap().len()
         );
     }
 }
