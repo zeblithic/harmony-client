@@ -218,6 +218,22 @@ pub struct PendingSignSession {
     pub message_hash: [u8; 32],
     /// Per-actor (commitments_bytes, share_bytes) contributions.
     pub contributions: BTreeMap<OwnerAddr, (Vec<u8>, Vec<u8>)>,
+    /// Local node's secret FROST signing nonces (CBOR-encoded
+    /// `frost::round1::SigningNonces`). Populated by
+    /// `dfrost_request_vrf_beacon` (which calls `frost::round1::commit`
+    /// to produce both the public commitments + the secret nonces);
+    /// consumed by `dfrost_contribute_threshold_sign` (which feeds them
+    /// into `frost::round2::sign`).
+    ///
+    /// ZEB-305 security: `#[serde(skip, default)]` — these are the
+    /// local node's secret nonces. Persisting them to disk would leak
+    /// signing inputs across restarts. Same security justification as
+    /// `PendingDkg::round2_packages`. Restart recovery for in-flight
+    /// threshold-sign ceremonies requires re-requesting (re-running
+    /// `dfrost_request_vrf_beacon`); we MUST NOT silently snapshot
+    /// secret nonces onto the disk substrate.
+    #[serde(skip, default)]
+    pub local_nonces: Option<Vec<u8>>,
 }
 
 /// Which pending-ceremony slot a `dk` event resolves to. R1 fix: refresh
@@ -545,6 +561,7 @@ impl DfrostLog {
             .or_insert_with(|| PendingSignSession {
                 message_hash: payload.message_hash,
                 contributions: BTreeMap::new(),
+                local_nonces: None,
             });
         // First-write-wins on message_hash — if a later `ts` claims a
         // different message for the same ceremony, that's an invariant
@@ -1126,6 +1143,7 @@ mod tests {
             PendingSignSession {
                 message_hash: msg_hash,
                 contributions: BTreeMap::new(),
+                local_nonces: None,
             },
         );
 
@@ -1426,6 +1444,7 @@ mod tests {
             PendingSignSession {
                 message_hash: msg_hash,
                 contributions: BTreeMap::new(),
+                local_nonces: None,
             },
         );
 
@@ -1828,6 +1847,7 @@ mod tests {
             PendingSignSession {
                 message_hash: agreed_msg,
                 contributions: BTreeMap::new(),
+                local_nonces: None,
             },
         );
 
@@ -1911,5 +1931,29 @@ mod tests {
             sig: vec![0u8; 64],
         });
         assert_eq!(result, Err(ApplyError::InvariantViolation));
+    }
+
+    #[test]
+    fn pending_sign_session_local_nonces_serde_skipped() {
+        // local_nonces holds the local node's secret FROST signing nonces
+        // between dfrost_request_vrf_beacon and dfrost_contribute_threshold_sign.
+        // It MUST be marked #[serde(skip)] — persisting decrypted secret nonce
+        // material across restarts leaks signing inputs (same security
+        // posture as PendingDkg::round2_packages).
+        let session = PendingSignSession {
+            local_nonces: Some(vec![0xAA; 64]),
+            message_hash: [0xBB; 32],
+            ..Default::default()
+        };
+
+        // CBOR-encode → decode; local_nonces MUST round-trip as None.
+        let mut buf = Vec::new();
+        ciborium::into_writer(&session, &mut buf).expect("encode");
+        let decoded: PendingSignSession = ciborium::from_reader(&buf[..]).expect("decode");
+        assert_eq!(
+            decoded.local_nonces, None,
+            "local_nonces must be skipped during serialization (security)"
+        );
+        assert_eq!(decoded.message_hash, [0xBB; 32], "public fields preserved");
     }
 }
