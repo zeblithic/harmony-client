@@ -42,8 +42,18 @@ pub struct TickStats {
     /// Distinct from `tier2_auto_execs_succeeded` (admin minted the
     /// event) and the implicit error-counted-by-warn path (callback
     /// returned `Err`). Each Tier 2 finalization with a SetPower auto-
-    /// exec increments exactly one of these three on every replica.
+    /// exec increments exactly one of these four on every replica.
     pub tier2_auto_execs_skipped_not_admin: u32,
+    /// ZEB-297 R2: number of `AutoExecAction::SetPower` dispatches
+    /// skipped because the community has `admin_quorum > 1` AND the
+    /// outcome is admin-affecting (would require AdminProposal routing
+    /// per spec §4.5). Direct SetPower would self-reject at
+    /// `verify_event` with `SetPowerRequiresQuorum`; the auto-exec
+    /// path declines to mint a doomed event. Tier 2 cannot currently
+    /// route through AdminProposal — a follow-up ticket tracks that
+    /// architectural gap. Until then, the outcome lands as a NoOp on
+    /// every replica.
+    pub tier2_auto_execs_skipped_requires_quorum: u32,
     pub archive_swept: bool,
 }
 
@@ -313,6 +323,16 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
                             // propagates here via the existing
                             // membership log sync.
                             stats.tier2_auto_execs_skipped_not_admin += 1;
+                        }
+                        Ok(crate::community_membership::AutoExecOutcome::SkippedRequiresQuorum) => {
+                            // ZEB-297 R2: community has admin_quorum > 1
+                            // and the outcome is admin-affecting; direct
+                            // SetPower would be rejected with
+                            // SetPowerRequiresQuorum. Tier 2 auto-exec
+                            // cannot route through AdminProposal yet —
+                            // tracked as a follow-up. Skip with telemetry
+                            // so the gap is visible in stats.
+                            stats.tier2_auto_execs_skipped_requires_quorum += 1;
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -900,6 +920,70 @@ mod tests {
         assert_eq!(
             stats.tier2_auto_execs_skipped_not_admin, 1,
             "skip path must bump the dedicated skip counter exactly once"
+        );
+    }
+
+    /// ZEB-297 R2: when the auto-exec callback returns
+    /// `SkippedRequiresQuorum` (community has `admin_quorum > 1` and the
+    /// outcome is admin-affecting), the tick must increment
+    /// `tier2_auto_execs_skipped_requires_quorum` rather than
+    /// `tier2_auto_execs_succeeded` or `tier2_auto_execs_skipped_not_admin`.
+    /// Pins the dispatch's three-way branch so a future variant addition
+    /// or counter-name rename can't silently re-route quorum-blocked
+    /// dispatches into the wrong bucket.
+    #[tokio::test]
+    async fn community_voting_tick_tier2_auto_exec_set_power_skipped_when_quorum_blocks() {
+        let cid = SpaceId([0x55; 16]);
+        let pid = PollId([0x66; 32]);
+        let target = OwnerAddr([0xcc; 16]);
+        let new_power = 100; // admin-affecting (promotion)
+        let cfg = make_tier2_config(AutoExecAction::SetPower {
+            target_pubkey: target,
+            new_power,
+        });
+        let mut t2 = Tier2ProposalState::new(cfg, 1);
+        use crate::community_voting_conviction::VoterConvictionState;
+        let mut vs = VoterConvictionState::default();
+        vs.apply_signal(true, 0, 0, 86_400_000);
+        t2.per_voter.insert(OwnerAddr([0xbb; 16]), vs);
+        let reached_at = 1_000i128;
+        t2.threshold_reached_at_ms = Some(reached_at);
+
+        let mut log = VotingLog::new();
+        log.polls.insert(
+            pid,
+            make_tier2_poll(cid, pid, Lifecycle::ThresholdReached, t2),
+        );
+
+        let mut logs = HashMap::new();
+        logs.insert(cid, Arc::new(Mutex::new(log)));
+        let now_ms = reached_at + 25 * 60 * 60 * 1000;
+        let (mut ctx, _events, _auto_exec_calls) = make_ctx_with_logs(logs, now_ms);
+
+        // Override the captured callback to simulate an admin replica in
+        // a multi-admin-quorum community: return SkippedRequiresQuorum
+        // instead of Applied. The real helper does this via
+        // setpower_mint_admin_blocked_by_quorum at the engine boundary.
+        ctx.auto_exec_set_power = Arc::new(|_cid, _target, _power| {
+            Box::pin(async {
+                Ok(crate::community_membership::AutoExecOutcome::SkippedRequiresQuorum)
+            })
+        });
+
+        let stats = run_voting_tick(&ctx, now_ms).await.unwrap();
+        assert_eq!(stats.tier2_proposals_finalized, 1);
+        assert_eq!(stats.tier2_auto_execs_attempted, 1);
+        assert_eq!(
+            stats.tier2_auto_execs_succeeded, 0,
+            "quorum-skip path must NOT bump the success counter"
+        );
+        assert_eq!(
+            stats.tier2_auto_execs_skipped_not_admin, 0,
+            "quorum-skip path must NOT collide with the not-admin counter"
+        );
+        assert_eq!(
+            stats.tier2_auto_execs_skipped_requires_quorum, 1,
+            "quorum-skip path must bump the dedicated quorum-skip counter exactly once"
         );
     }
 
