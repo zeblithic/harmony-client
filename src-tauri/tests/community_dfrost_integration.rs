@@ -584,6 +584,51 @@ fn threshold_sign_two_engine_vrf_beacon_verifies() {
             vrf_output,
         },
     );
+
+    // R4 (CodeRabbit): negative subcase — a tampered vb MUST be rejected
+    // AND must leave pending_sign untouched. Without this check, a
+    // regression that disabled the Schnorr-verify or the VRF-output
+    // binding step inside apply_vrf_beacon would still pass this test
+    // (the happy path below would just clear pending_sign).
+    //
+    // Tamper one byte of the signature; apply_vrf_beacon should reject
+    // with InvariantViolation (either the SHA-256(R) binding check fails
+    // because R bytes differ, OR the Schnorr verify against joint_vk
+    // fails). Either way, pending_sign must be intact for the happy-path
+    // apply below.
+    {
+        let mut tampered_sig = sig_bytes.clone();
+        tampered_sig[0] ^= 0x01; // flip lowest bit of R's first byte
+        let vb_tampered = build_vb_event(
+            ALICE,
+            4_500,
+            "alice",
+            VrfBeaconPayload {
+                ceremony_id: sign_ceremony_id,
+                message_hash,
+                signature: tampered_sig,
+                vrf_output, // unchanged — binding check will fail
+            },
+        );
+        let err = c
+            .engine_a
+            .apply(vb_tampered)
+            .expect_err("tampered vb must be rejected");
+        assert!(
+            matches!(err, ApplyError::InvariantViolation),
+            "expected InvariantViolation for tampered vb, got {err:?}"
+        );
+        // pending_sign on engine A still intact — the tampered apply failed
+        // BEFORE the pending_sign.remove() at the end of apply_vrf_beacon.
+        assert!(
+            c.engine_a
+                .committee_state
+                .pending_sign
+                .contains_key(&sign_ceremony_id),
+            "engine A pending_sign must be intact after rejected vb"
+        );
+    }
+
     c.engine_a.apply(vb.clone()).expect("a applies vb");
     c.engine_b.apply(vb).expect("b applies vb");
 
@@ -783,6 +828,36 @@ fn refresh_two_engine_preserves_joint_vk() {
     assert_eq!(pr_b.ceremony_id, refresh_ceremony_id);
     assert_eq!(pr_a.proposed_epoch, 2);
     assert_eq!(pr_b.proposed_epoch, 2);
+
+    // R4 (CodeRabbit): mirror the R3 DKG round-2 decrypt assertion for the
+    // refresh path. Without this check, a regression in apply_with_identity
+    // for ProactiveRefresh (e.g., wrong recipient match, decrypt skip,
+    // wrong actor key) would still pass — the dk finalization below reuses
+    // epoch-1 verifying_shares and never consumes the refresh's decrypted
+    // bytes. Read back pending_refresh.round2_packages (keyed by sender =
+    // ALICE since she's the proposer of rf rn=1) and assert each engine
+    // decrypted its targeted ciphertext.
+    assert_eq!(
+        pr_a.round2_packages.get(&ALICE),
+        Some(&synthetic_share_for_alice),
+        "engine A must have decrypted refresh share targeted at ALICE"
+    );
+    assert_eq!(
+        pr_b.round2_packages.get(&ALICE),
+        Some(&synthetic_share_for_bob),
+        "engine B must have decrypted refresh share targeted at BOB"
+    );
+    // Each engine stored exactly one entry (only one proposer's rf rn=1).
+    assert_eq!(
+        pr_a.round2_packages.len(),
+        1,
+        "engine A round2_packages must have exactly one entry"
+    );
+    assert_eq!(
+        pr_b.round2_packages.len(),
+        1,
+        "engine B round2_packages must have exactly one entry"
+    );
 
     // ── dk finalization: both members confirm, joint_vk preserved ────────
     // Verifying_shares: reuse epoch-1 shares (the apply path doesn't
