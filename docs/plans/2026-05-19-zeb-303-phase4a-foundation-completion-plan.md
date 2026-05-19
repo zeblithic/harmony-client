@@ -23,6 +23,20 @@ The merged code diverged from the original ZEB-301 plan during R1-R6 bot review.
 
 These 8 deltas are LOAD-BEARING for the integration tests + IPC signing flows.
 
+### Coverage notes for deltas #3 + #8
+
+* **Delta `#3`** (post-activation `pending_dkg` rejection): integration test `dk_rejected_after_active_with_pending_dkg_slot` (added in Task 2) constructs an active committee and then attempts a fresh `dk` against a stale `pending_dkg`, asserting `InvariantViolation`. The unit test `dk_against_pending_dkg_after_activation_rejected` in `community_dfrost_log.rs` covers the same path single-engine.
+* **Delta `#8`** (refresh decrypt-before-mutate): exhaustively unit-tested in `community_dfrost_log.rs::apply_proactive_refresh_decrypts_before_mutating` (PR #137). The integration test for refresh (Task 4) exercises the happy path; the failure-staging path is single-engine by construction (the local decrypt would fail before any peer state is touched).
+
+### Security notes for IPC-layer fields (Tasks 5-6 / ZEB-305)
+
+When the IPC layer (deferred to ZEB-305) introduces in-memory secret fields on `DfrostLog`:
+
+- **`local_dkg_secret`** (`round1::SecretPackage`, `round2::SecretPackage`): MUST NOT be serialized (`#[serde(skip)]` mandatory — analogous to delta `#6` for `round2_packages`). Clear after `dk` succeeds and `apply_dkg_complete` activates the committee.
+- **`local_signing_nonces`** (`round1::SigningNonces`): nonce reuse with a different message is catastrophic Schnorr-key recovery. MUST `#[serde(skip)]`. Clear IMMEDIATELY after `frost::round2::sign` consumes them — never persist past a single signing round.
+- **`local_key_package`** (`KeyPackage`): the long-lived signing share. `#[serde(skip)]`; ZEB-305 must define a separate persistence path (the on-disk store should be encrypted-at-rest under the device's identity key, not the in-memory `DfrostLog`).
+- **Where possible**, wrap these fields in `zeroize::Zeroizing<...>` or implement `ZeroizeOnDrop` so panics + drops don't leak share material via memory dump.
+
 ---
 
 ## File Structure
@@ -172,9 +186,9 @@ git commit -m "test(zeb-303): pin canonical CBOR fixtures for dfrost events (dr/
 
 Pattern source: `src-tauri/tests/community_admin_quorum_integration.rs` (engine fixtures, `ev()` helpers, snapshot helpers).
 
-Goal: build a 1-of-1 DKG ceremony where two engines (A as committee, B as observer) both end up with `committee_state.active == true` and identical `joint_verifying_key`.
+Goal: build a 2-of-2 DKG ceremony where two engines both participate as committee members and converge on `committee_state.active == true` with identical `joint_verifying_key` AND identical per-member `verifying_shares` (delta `#2` cross-confirmation invariant).
 
-NOTE: 1-of-1 is the simplest representative test. 2-of-2 (and 5-of-7) extensions are deferred to a follow-up — the data-layer apply tests already exercise multi-member paths via unit tests; the cross-engine focus here is on convergence.
+NOTE: 2-of-2 (rather than 1-of-1) is used because FROST `dkg::part1` requires `min_signers ≥ 2` and because 2-of-2 exercises the round-2 sealed-package cross-engine exchange path that 1-of-1 would skip. Higher thresholds (5-of-7) are deferred to a follow-up.
 
 - [ ] **Step 1: Build engine fixtures**
 
@@ -188,12 +202,11 @@ fn fresh_engine() -> (Ed25519Keypair, OwnerAddr, DfrostLog) {
 }
 ```
 
-- [ ] **Step 2: Drive a 1-of-1 ceremony through `apply_with_identity` on engine A**
+- [ ] **Step 2: Drive a 2-of-2 ceremony through `apply` + `apply_with_identity` on both engines**
 
-Use `community_dfrost_crypto::dkg_part1_local`, `dkg_part3_local` (round-2 has no other recipients in 1-of-1).
-Build signed `dr` rn=1 + `dk` events; both apply on engine A and engine B.
+Use `community_dfrost_crypto::{dkg_part1_local, dkg_part2_local, dkg_part3_local}`. Both members run part1, broadcast `dr` rn=1; both run part2 against the other's r1 package, seal r2 packages per-recipient via `dm_signing::seal_to_owner`, broadcast `dr` rn=2; each engine decrypts the targeted ciphertext via `apply_with_identity`; both engines locally run `dkg_part3_local` to derive `KeyPackage` + `PublicKeyPackage`. Activation requires both members' `dk` confirmations (threshold=2) — both broadcast `dk` with the FROST-guaranteed-identical payloads.
 
-- [ ] **Step 3: Assert both engines converge on identical `joint_verifying_key`**
+- [ ] **Step 3: Assert both engines converge on identical `joint_verifying_key` AND `verifying_shares`**
 
 ```rust
 assert!(engine_a.committee_state.active);
@@ -204,6 +217,11 @@ assert_eq!(
 );
 assert_eq!(engine_a.committee_state.current_epoch, 1);
 assert_eq!(engine_b.committee_state.current_epoch, 1);
+// Delta #2: cross-confirmation invariant — per-member verifying_shares MUST match.
+assert_eq!(
+    engine_a.committee_state.verifying_shares,
+    engine_b.committee_state.verifying_shares,
+);
 ```
 
 - [ ] **Step 4: Run test, verify pass**
@@ -217,7 +235,7 @@ cargo nextest run --locked --features test-fixtures -E 'test(dfrost_integration:
 
 ```bash
 git add src-tauri/tests/community_dfrost_integration.rs
-git commit -m "test(zeb-303): two-engine 1-of-1 DKG convergence"
+git commit -m "test(zeb-303): two-engine 2-of-2 DKG convergence via real FROST crypto"
 ```
 
 ---
@@ -271,16 +289,16 @@ git commit -m "test(zeb-303): two-engine threshold-sign + VRF beacon"
 **Files:**
 - Modify: `src-tauri/tests/community_dfrost_integration.rs`
 
-Goal: 1-of-1 epoch rotation preserves `joint_verifying_key` across the refresh (ZEB-301 acceptance criterion #4 surfaced empirically).
+Goal: 2-of-2 epoch rotation preserves `joint_verifying_key` across the refresh (ZEB-301 acceptance criterion #4 surfaced empirically).
 
 - [ ] **Step 1: Add `refresh_preserves_joint_vk_two_engine` test**
 
-Continuing from Task 2's converged state (both engines active at epoch 1):
-1. Build `rf` rn=1 event with `proposed_epoch = 2` and a fresh round-1 package from `dkg_part1_local` (1-of-1, identifier=1)
-2. Apply on both engines via `apply()` (broadcast path)
-3. Both engines should have `pending_refresh[ceremony_id]` populated
-4. Build `dk` event with the SAME joint_verifying_key as epoch 1 (per refresh invariant) — extract from `engine_a.committee_state.joint_verifying_key`
-5. Apply `dk` on both engines via `apply_with_identity` (in 1-of-1 the round-3 finalization runs locally on A; B applies the broadcast `dk`)
+Continuing from Task 2's converged 2-of-2 state (both engines active at epoch 1):
+1. Build `rf` rn=1 event with `proposed_epoch = 2` and per-recipient sealed packages (synthetic share bytes sealed to each member's X25519 pubkey via `dm_signing::seal_to_owner`)
+2. Apply on both engines via `apply_with_identity` (decrypts the targeted ciphertext on each engine)
+3. Both engines should have `pending_refresh[ceremony_id]` populated with `proposed_epoch = 2`
+4. Build `dk` events (one per member, threshold=2 requires both) with the SAME joint_verifying_key as epoch 1 (per refresh invariant — `apply_dkg_complete` rejects any drift)
+5. Apply both `dk` events on both engines via `apply()` (broadcast path)
 6. Assert `engine_a.committee_state.current_epoch == 2 && joint_verifying_key == epoch_1_vk`
 7. Assert same on engine B
 
@@ -295,7 +313,7 @@ cargo nextest run --locked --features test-fixtures -E 'test(dfrost_integration:
 
 ```bash
 git add src-tauri/tests/community_dfrost_integration.rs
-git commit -m "test(zeb-303): two-engine 1-of-1 refresh preserves joint vk"
+git commit -m "test(zeb-303): two-engine 2-of-2 refresh preserves joint vk across epoch rotation"
 ```
 
 ---
@@ -481,7 +499,7 @@ Ensure all three Tauri events fire from the IPC handlers added in Tasks 5-6:
 
 ```bash
 grep -n 'emit.*dfrost-' src-tauri/src/lib.rs
-# Expect: at least 4 emit calls (rn=1, rn=2, rn=3, beacon-ready, refresh-progress)
+# Expect: at least 5 emit calls (rn=1, rn=2, rn=3, beacon-ready, refresh-progress)
 ```
 
 - [ ] **Step 2: Add a TS-side type contract for each event payload**

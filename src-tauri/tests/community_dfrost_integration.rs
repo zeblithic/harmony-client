@@ -26,7 +26,7 @@ use harmony_app::community_dfrost_crypto::{
     dkg_part1_local, dkg_part2_local, dkg_part3_local, identifier_for_index,
     verifying_key_to_bytes, verifying_share_to_bytes,
 };
-use harmony_app::community_dfrost_log::{CommitteeState, DfrostLog, PendingCeremony};
+use harmony_app::community_dfrost_log::{ApplyError, CommitteeState, DfrostLog, PendingCeremony};
 use harmony_app::community_dfrost_types::{
     derive_vrf_output, DfrostEventKind, DkgCompletePayload, DkgRoundPayload, MemberVerifyingShare,
     RefreshRoundPayload, SignedCommitteeEvent, ThresholdSignPayload, VrfBeaconPayload,
@@ -563,6 +563,94 @@ fn threshold_sign_two_engine_vrf_beacon_verifies() {
         c.engine_a.committee_state.joint_verifying_key,
         c.engine_b.committee_state.joint_verifying_key
     );
+}
+
+// ─── Delta #3 coverage: post-activation pending_dkg rejection ──────────────
+
+/// R5 invariant from PR #137: once `committee_state.active`, a `dk` event
+/// finalizing a `pending_dkg` (vs. `pending_refresh`) slot MUST be rejected
+/// with `InvariantViolation`. Without this guard, a stale or race-condition
+/// `pending_dkg` could silently rewrite the active committee's members /
+/// threshold / max_signers / current_epoch while reusing the existing
+/// joint vk — a covert committee-shape swap.
+///
+/// This integration test reproduces the cross-engine scenario: after a
+/// successful 2-of-2 DKG activates both engines, simulate a stale
+/// `pending_dkg` slot lingering on engine A and attempt a `dk` against it.
+/// `apply_dkg_complete` must reject with `InvariantViolation` and leave the
+/// active committee state untouched.
+///
+/// Single-engine coverage of the same invariant lives at
+/// `community_dfrost_log.rs::dk_against_pending_dkg_after_activation_rejected`
+/// (PR #137 R5 fix). This integration test confirms the same guard is
+/// reachable from the cross-engine apply path.
+#[test]
+fn dk_rejected_after_active_with_pending_dkg_slot() {
+    let mut c = dkg_2of2_setup();
+    assert!(c.engine_a.committee_state.active, "precondition: active");
+    let original_vk = c.engine_a.committee_state.joint_verifying_key;
+    let original_epoch = c.engine_a.committee_state.current_epoch;
+    let original_members = c.engine_a.committee_state.members.clone();
+
+    // Simulate a stale pending_dkg lingering on engine A (e.g., race or
+    // corrupted state). Use a DIFFERENT ceremony_id from the activating
+    // ceremony so the lookup actually finds this slot vs. mismatching.
+    let stale_ceremony_id: [u8; 32] = [0xff; 32];
+    c.engine_a.committee_state.pending_dkg = Some(PendingCeremony {
+        ceremony_id: stale_ceremony_id,
+        members: members(),
+        threshold: 2,
+        max_signers: 2,
+        proposed_epoch: 99, // arbitrary, would silently overwrite if guard missing
+        ..Default::default()
+    });
+
+    // Build a dk that would otherwise be valid (joint_vk matches the
+    // active vk — passes the "no vk drift" check at apply_dkg_complete:362).
+    let identifier_map = CommitteeState::build_identifier_map(&members());
+    let mut verifying_shares = Vec::with_capacity(2);
+    for member in members() {
+        let id = identifier_map[&member];
+        let vs = c
+            .pub_pkg
+            .verifying_shares()
+            .get(&id)
+            .expect("verifying share");
+        verifying_shares.push(MemberVerifyingShare {
+            member,
+            verifying_share: verifying_share_to_bytes(vs),
+        });
+    }
+    let stale_dk = build_dk_event(
+        ALICE,
+        9_000,
+        "alice",
+        DkgCompletePayload {
+            ceremony_id: stale_ceremony_id,
+            joint_verifying_key: original_vk.expect("active vk"),
+            verifying_shares,
+            epoch: 99,
+            members: members(),
+            threshold: 2,
+            max_signers: 2,
+        },
+    );
+
+    // R5 invariant fires: active + PendingSlot::Dkg → InvariantViolation
+    let err = c
+        .engine_a
+        .apply(stale_dk)
+        .expect_err("post-activation pending_dkg dk must be rejected");
+    assert!(
+        matches!(err, ApplyError::InvariantViolation),
+        "expected InvariantViolation, got {err:?}"
+    );
+
+    // Active committee state untouched — no covert rewrite.
+    assert!(c.engine_a.committee_state.active);
+    assert_eq!(c.engine_a.committee_state.joint_verifying_key, original_vk);
+    assert_eq!(c.engine_a.committee_state.current_epoch, original_epoch);
+    assert_eq!(c.engine_a.committee_state.members, original_members);
 }
 
 // ─── Task 4: Proactive refresh preserves joint vk ───────────────────────────
