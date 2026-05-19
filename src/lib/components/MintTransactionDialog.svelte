@@ -30,15 +30,19 @@
   // Load existing transaction when in edit mode.
   $effect(() => {
     if (editingId) {
-      service.getTransaction(editingId).then((tx: Transaction | null) => {
-        if (!tx) return;
-        date = tx.transactionDate;
-        amount = tx.amount;
-        currency = tx.currency;
-        accountId = tx.accountId;
-        description = tx.description;
-        metadata = tx.metadata ?? '';
-      });
+      service.getTransaction(editingId)
+        .then((tx: Transaction | null) => {
+          if (!tx) return;
+          date = tx.transactionDate;
+          amount = tx.amount;
+          currency = tx.currency;
+          accountId = tx.accountId;
+          description = tx.description;
+          metadata = tx.metadata ?? '';
+        })
+        .catch((e) => {
+          error = e instanceof Error ? e.message : String(e);
+        });
     } else {
       // Defensive reset: if editingId transitions to null while the
       // component is mounted (currently impossible because the dialog

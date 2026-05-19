@@ -14,7 +14,8 @@
   let accounts = $state<Account[]>([]);
   let defaultCurrency = $state<string>('USD');
   let loading = $state(true);
-  let error = $state<string | null>(null);
+  let loadError = $state<string | null>(null);
+  let operationError = $state<string | null>(null);
 
   // Filters
   let filterDateFrom = $state<string>('');
@@ -23,7 +24,7 @@
 
   async function load() {
     loading = true;
-    error = null;
+    loadError = null;
     try {
       const [txs, accs, def] = await Promise.all([
         service.listTransactions({
@@ -38,7 +39,7 @@
       accounts = accs;
       defaultCurrency = def ?? 'USD';
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      loadError = e instanceof Error ? e.message : String(e);
     } finally {
       loading = false;
     }
@@ -55,21 +56,21 @@
   $effect(() => { load(); });
 
   async function exportCsv() {
-    const path = await saveDialog({
-      defaultPath: `mint-export-${new Date().toISOString().slice(0, 10)}.csv`,
-      filters: [{ name: 'CSV', extensions: ['csv'] }],
-    });
-    if (!path) return; // user cancelled
+    operationError = null;
     exportInProgress = true;
-    error = null;
     try {
+      const path = await saveDialog({
+        defaultPath: `mint-export-${new Date().toISOString().slice(0, 10)}.csv`,
+        filters: [{ name: 'CSV', extensions: ['csv'] }],
+      });
+      if (!path) return; // user cancelled — exits try cleanly, finally still resets exportInProgress
       const summary = await service.exportCsv(path, {
         dateFrom: filterDateFrom || undefined,
         dateTo: filterDateTo || undefined,
       });
       alert(`Exported ${summary.rowsWritten} transactions to ${summary.outputPath} (${summary.byteSize} bytes)`);
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      operationError = e instanceof Error ? e.message : String(e);
     } finally {
       exportInProgress = false;
     }
@@ -109,20 +110,31 @@
 
   {#if loading}
     <p>Loading…</p>
-  {:else if error}
-    <p role="alert" class="error">{error}</p>
+  {:else if loadError}
+    <p role="alert" class="error">{loadError}</p>
   {:else}
+    {#if operationError}
+      <p role="alert" class="error operation-error">
+        {operationError}
+        <button
+          type="button"
+          aria-label="Dismiss error"
+          class="dismiss"
+          onclick={() => { operationError = null; }}
+        >×</button>
+      </p>
+    {/if}
     <MintTransactionTable
       {transactions}
       onEdit={(id) => { editingTxId = id; showAddEdit = true; }}
       onDelete={async (id) => {
         if (!confirm('Delete this transaction?')) return;
-        error = null;
+        operationError = null;
         try {
           await service.deleteTransaction(id);
           await load();
         } catch (e) {
-          error = e instanceof Error ? e.message : String(e);
+          operationError = e instanceof Error ? e.message : String(e);
         }
       }}
     />
@@ -156,4 +168,21 @@
   .default-currency { color: var(--color-text-secondary, #888); font-size: 0.9rem; }
   .actions { display: flex; gap: 0.5rem; }
   .error { color: var(--color-error, #c53030); }
+  .operation-error {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0.75rem;
+    background: var(--color-bg-warning, #fff8e1);
+    border-radius: 4px;
+    margin-bottom: 0.75rem;
+  }
+  .dismiss {
+    margin-left: auto;
+    background: none;
+    border: none;
+    font-size: 1.2rem;
+    cursor: pointer;
+    padding: 0 0.25rem;
+  }
 </style>
