@@ -61,6 +61,37 @@ export interface RenameContentResult {
   srcNewCid: string | null;
 }
 
+/** Skip buckets surfaced in the folder-ingest summary modal. Mirrors the
+ *  Rust `SkipCounts` struct (serde rename_all = "camelCase"). */
+export interface SkipCounts {
+  hidden: number;
+  symlink: number;
+  oversized: number;
+}
+
+/** One entry in the bounded `failed` list of an ingest result. */
+export interface FailedEntry {
+  path: string;
+  message: string;
+}
+
+/** Wire format returned by the ingest_folder_tree Tauri command (ZEB-163).
+ *  Mirrors the Rust `IngestFolderTreeResult` struct (serde rename_all =
+ *  "camelCase"). `rootSidecarId` and `rootCid` are non-null iff the walker
+ *  reached the root manifest build before any cancel/abort. */
+export interface IngestFolderTreeResult {
+  jobId: string;
+  rootSidecarId: string | null;
+  rootCid: string | null;
+  rootName: string;
+  totalFilesSeen: number;
+  succeeded: number;
+  skipped: SkipCounts;
+  failed: FailedEntry[];
+  failedOverflow: number;
+  cancelled: boolean;
+}
+
 /** Wire format for entries returned by the list_content Tauri command. */
 interface ContentItemWire {
   sidecarId: string;
@@ -575,6 +606,40 @@ export class FileManagerService {
       );
     }
     return result;
+  }
+
+  /**
+   * Ingest a folder tree from the local filesystem (ZEB-163). Resolves
+   * when the walker settles (success, partial, or cancel). The IPC also
+   * emits `folder-ingest-progress` events for the modal to consume.
+   *
+   * @param rootPath          absolute filesystem path of the dropped /
+   *                          picked directory
+   * @param parentSidecarId   top-level sidecar entry id when ingesting
+   *                          into a nested folder; null at root
+   * @param parentPath        CID chain from top-level root (inclusive)
+   *                          down to the immediate parent; empty for
+   *                          root ingest. Matches `createFolder`'s shape.
+   */
+  async ingestFolderTree(
+    rootPath: string,
+    parentSidecarId: string | null,
+    parentPath: string[],
+  ): Promise<IngestFolderTreeResult> {
+    if (!this.adapter) throw new Error('adapter not connected');
+    return (await this.adapter.invoke('ingest_folder_tree', {
+      rootPath,
+      parentSidecarId,
+      parentPath,
+    })) as IngestFolderTreeResult;
+  }
+
+  /** Flip the cancel flag on an in-flight `ingest_folder_tree` job
+   *  (ZEB-163). Best-effort — backend treats unknown job ids as a
+   *  no-op rather than an error. */
+  async cancelFolderIngest(jobId: string): Promise<void> {
+    if (!this.adapter) return;
+    await this.adapter.invoke('cancel_folder_ingest', { jobId });
   }
 
   /** Register an external unlisten handle so it gets cleaned up alongside the service. */

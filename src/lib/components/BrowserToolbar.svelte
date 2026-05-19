@@ -9,6 +9,7 @@
     onUploadClick,
     onCleanupClick,
     onNewFolderClick,
+    onAddFolderClick,
     showCleanup = false,
     section,
     onSectionChange,
@@ -20,6 +21,7 @@
     onUploadClick: () => void;
     onCleanupClick: () => void;
     onNewFolderClick?: () => void;
+    onAddFolderClick?: () => void;
     showCleanup?: boolean;
     section: ContentSection;
     onSectionChange: (section: ContentSection) => void;
@@ -73,6 +75,14 @@
         <button class="action-btn" onclick={onUploadClick} aria-label="Upload">⬆ Upload</button>
         {#if onNewFolderClick}
           <button class="action-btn" onclick={onNewFolderClick} aria-label="New Folder">📁 New Folder</button>
+        {/if}
+        {#if onAddFolderClick}
+          <button
+            class="action-btn"
+            onclick={onAddFolderClick}
+            aria-label="Add folder from disk"
+            title="Add folder from disk"
+          >📁⬇ Add folder…</button>
         {/if}
       {/if}
       <button class="action-btn" class:active={showCleanup} onclick={onCleanupClick} aria-label="Cleanup" aria-pressed={showCleanup}>🧹 Cleanup</button>

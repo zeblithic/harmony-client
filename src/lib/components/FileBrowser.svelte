@@ -1,5 +1,6 @@
 <script lang="ts">
   import { untrack } from 'svelte';
+  import { open as openDialog } from '@tauri-apps/plugin-dialog';
   import type {
     FileViewMode,
     ContentSection,
@@ -8,7 +9,7 @@
     ContentItem,
     CleanupRecommendation,
   } from '../types';
-  import { FileManagerService } from '../file-manager-service';
+  import { FileManagerService, type IngestFolderTreeResult } from '../file-manager-service';
   import { tierTarget } from '../file-utils';
   import BrowserToolbar from './BrowserToolbar.svelte';
   import Breadcrumbs from './Breadcrumbs.svelte';
@@ -187,6 +188,21 @@
   // onNavigateFolder(null) for nested creates) and the catch's
   // newFolderError write must be discarded.
   let createCommitSeq = 0;
+
+  // Folder-ingest state. One in-flight walk at a time (entry handlers
+  // early-return on activeIngestProgress). activeIngestJobId is captured
+  // from the first progress event the walker emits; a follow-up adds the
+  // progress-modal + cancel button (and the cancel-event listener that
+  // sets cancelRequested true), at which point the placeholders below
+  // the breadcrumbs get replaced.
+  let activeIngestJobId = $state<string | null>(null);
+  let activeIngestProgress = $state<{
+    completed: number;
+    total: number;
+    currentPath: string;
+  } | null>(null);
+  let ingestSummary = $state<IngestFolderTreeResult | null>(null);
+  let cancelRequested = $state(false);
 
   // Tagged with the cid the failure belongs to so a fast nav-away
   // auto-discards the stale block (mirrors the folderItems.cid guard).
@@ -677,6 +693,51 @@
     }
   }
 
+  async function handleAddFolderClick() {
+    // Serialise: the same guard that the OS-drop listener will use, so a
+    // picker click + drop event can't race a second walker.
+    if (activeIngestProgress) return;
+    let picked: string | string[] | null;
+    try {
+      picked = await openDialog({ directory: true, multiple: false });
+    } catch (err) {
+      const raw = err instanceof Error ? err.message : String(err);
+      error = `Could not open folder picker: ${raw.replace(/^Error:\s*/, '')}`;
+      return;
+    }
+    if (!picked || typeof picked !== 'string') return; // cancelled
+    void startFolderIngest(picked);
+  }
+
+  async function startFolderIngest(rootPath: string) {
+    // Mirrors commitCreateFolder's parent resolution: nested ingests
+    // reuse the top-level sidecar (navStack[0]); root ingests pass null.
+    const parentSidecarId =
+      breadcrumbStack.length > 0 ? navStack[0]?.sidecarId ?? null : null;
+    // Open the placeholder immediately with an indeterminate marker
+    // (total=-1). The first folder-ingest-progress event fills in real
+    // counters + the job id; the IPC Promise resolves last with the
+    // final summary.
+    activeIngestProgress = { completed: 0, total: -1, currentPath: rootPath };
+    cancelRequested = false;
+    try {
+      const result = await service.ingestFolderTree(
+        rootPath,
+        parentSidecarId,
+        breadcrumbStack,
+      );
+      activeIngestJobId = null;
+      activeIngestProgress = null;
+      ingestSummary = result;
+      serviceVersion++; // refetch so the new folder appears in the list
+    } catch (err) {
+      activeIngestJobId = null;
+      activeIngestProgress = null;
+      const raw = err instanceof Error ? err.message : String(err);
+      error = `Folder ingest failed: ${raw.replace(/^Error:\s*/, '')}`;
+    }
+  }
+
   function retryFolderLoad() {
     folderLoadError = null;
     folderFetchRetryToken++; // re-trigger the fetch effect
@@ -777,6 +838,9 @@
     onNewFolderClick={section === 'private' && !showCleanup
       ? handleNewFolder
       : undefined}
+    onAddFolderClick={section === 'private' && !showCleanup
+      ? handleAddFolderClick
+      : undefined}
     {showCleanup}
     {section}
     {onSectionChange}
@@ -807,6 +871,24 @@
 
       {#if renameError}
         <div class="file-browser-error" role="alert">{renameError}</div>
+      {/if}
+
+      {#if activeIngestProgress}
+        <div class="ingest-placeholder" role="status" aria-live="polite">
+          Ingesting from {activeIngestProgress.currentPath}…
+          {#if activeIngestProgress.total > 0}
+            ({activeIngestProgress.completed}/{activeIngestProgress.total})
+          {/if}
+          {#if activeIngestJobId !== null && !cancelRequested}
+            <span class="ingest-job-id">job {activeIngestJobId}</span>
+          {/if}
+        </div>
+      {/if}
+
+      {#if ingestSummary}
+        <div class="ingest-placeholder" role="status">
+          Added folder {ingestSummary.rootName}: {ingestSummary.succeeded} files
+        </div>
       {/if}
 
       {#if folderLoadError && folderLoadError.cid === currentFolderCid}
