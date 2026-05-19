@@ -21750,6 +21750,25 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(Mutex::new(NodeState::default()))
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, position }) =
+                event
+            {
+                for path in paths {
+                    let payload = serde_json::json!({
+                        "path": path.to_string_lossy().to_string(),
+                        "x": position.x,
+                        "y": position.y,
+                    });
+                    let event_name = if path.is_dir() {
+                        "os-folder-dropped"
+                    } else {
+                        "os-file-dropped"
+                    };
+                    let _ = window.emit(event_name, payload);
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             list_vine_videos,
             follow_vine_creator,
