@@ -46,13 +46,13 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Harmony crates — harmony-runtime is the core sans-I/O runtime.
 # harmony-identity and harmony-content are direct deps because we use
 # their types (PrivateIdentity, PqPrivateIdentity, MemoryBookStore, etc.).
-harmony-runtime = { git = "https://github.com/zeblithic/harmony.git", rev = "a38fbe50a0c5af1f6a24d339e953d75e1b3571c3" }
-harmony-identity = { git = "https://github.com/zeblithic/harmony.git", rev = "a38fbe50a0c5af1f6a24d339e953d75e1b3571c3" }
-harmony-content = { git = "https://github.com/zeblithic/harmony.git", rev = "a38fbe50a0c5af1f6a24d339e953d75e1b3571c3" }
-harmony-compute = { git = "https://github.com/zeblithic/harmony.git", rev = "a38fbe50a0c5af1f6a24d339e953d75e1b3571c3" }
-harmony-telemetry = { git = "https://github.com/zeblithic/harmony.git", rev = "a38fbe50a0c5af1f6a24d339e953d75e1b3571c3" }
-harmony-mailbox = { git = "https://github.com/zeblithic/harmony.git", rev = "a38fbe50a0c5af1f6a24d339e953d75e1b3571c3" }
-harmony-owner = { git = "https://github.com/zeblithic/harmony.git", rev = "a38fbe50a0c5af1f6a24d339e953d75e1b3571c3", features = ["recovery"] }
+harmony-runtime = { git = "https://github.com/zeblithic/harmony.git", rev = "be429fb40c3b11b4bd37ffcf707c0e6a5b647bbb" }
+harmony-identity = { git = "https://github.com/zeblithic/harmony.git", rev = "be429fb40c3b11b4bd37ffcf707c0e6a5b647bbb" }
+harmony-content = { git = "https://github.com/zeblithic/harmony.git", rev = "be429fb40c3b11b4bd37ffcf707c0e6a5b647bbb" }
+harmony-compute = { git = "https://github.com/zeblithic/harmony.git", rev = "be429fb40c3b11b4bd37ffcf707c0e6a5b647bbb" }
+harmony-telemetry = { git = "https://github.com/zeblithic/harmony.git", rev = "be429fb40c3b11b4bd37ffcf707c0e6a5b647bbb" }
+harmony-mailbox = { git = "https://github.com/zeblithic/harmony.git", rev = "be429fb40c3b11b4bd37ffcf707c0e6a5b647bbb" }
+harmony-owner = { git = "https://github.com/zeblithic/harmony.git", rev = "be429fb40c3b11b4bd37ffcf707c0e6a5b647bbb", features = ["recovery"] }
 blake3 = "1"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"

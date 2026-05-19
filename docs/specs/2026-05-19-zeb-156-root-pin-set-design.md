@@ -146,12 +146,12 @@ The event-loop's `#[cfg(test)] mod tests` (if present) gains:
 
 ### Integration test — `content_index_integration.rs` or new `pin_cascade_integration.rs`
 
-7. **Two-root sidecar fixture**: ingest a folder containing one leaf, separately ingest the same leaf as a standalone file. Pin both sidecar entries. Verify runtime cache has both pinned. Unpin the folder. Verify the leaf is still pinned in the cache.
-8. **ZEB-160 race regression**: concurrently call `pin_content(X)` and `unpin_content(X)` 100 times in rapid succession; assert final state matches the last-issued command (sidecar and runtime cache agree).
+- **Test 7 — Two-root sidecar fixture**: ingest a folder containing one leaf, separately ingest the same leaf as a standalone file. Pin both sidecar entries. Verify runtime cache has both pinned. Unpin the folder. Verify the leaf is still pinned in the cache.
+- **Test 8 — ZEB-160 race regression**: concurrently call `pin_content(X)` and `unpin_content(X)` 100 times in rapid succession; assert final state matches the last-issued command (sidecar and runtime cache agree).
 
 ### Tauri-command tests in `lib.rs`
 
-9. **`pin_serial_lock` held across await**: assert that two concurrent `pin_content` calls don't interleave their sidecar mutations and verb dispatches (test via a recorded verb-tx + `tokio::join!` pattern).
+- **Test 9 — `pin_serial_lock` held across await**: assert that two concurrent `pin_content` calls don't interleave their sidecar mutations and verb dispatches (test via a recorded verb-tx + `tokio::join!` pattern).
 
 ## ZEB-157 (partial-ingest rollback) interaction
 

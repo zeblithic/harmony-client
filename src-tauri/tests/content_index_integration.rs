@@ -1478,26 +1478,20 @@ async fn rapid_pin_unpin_toggling_keeps_sidecar_and_runtime_consistent() {
     // same pin_serial_lock, so the event loop sees a fully linearised
     // sequence.
     //
-    // Pin-then-unpin parity (50 of each) is the easiest way to assert
-    // a clean expected end-state: the final operation is the one with
-    // index 99 in the interleaved sequence. We track that explicitly
-    // and assert sidecar + runtime cache agree with it.
-    use std::sync::atomic::{AtomicI64, Ordering};
-    let last_op = Arc::new(AtomicI64::new(0)); // -1 = unpin, +1 = pin
+    // Pin-then-unpin parity (50 of each) keeps the schedule symmetric;
+    // the deterministic tail-pin at Step 5 below (not any task-side
+    // bookkeeping) is what disambiguates the final expected state.
     let mut handles = Vec::with_capacity(100);
     for i in 0..100 {
-        let last_op = last_op.clone();
         if i % 2 == 0 {
             let pin = do_pin.clone();
             handles.push(tokio::spawn(async move {
                 pin().await;
-                last_op.store(1, Ordering::SeqCst);
             }));
         } else {
             let unpin = do_unpin.clone();
             handles.push(tokio::spawn(async move {
                 unpin().await;
-                last_op.store(-1, Ordering::SeqCst);
             }));
         }
     }
