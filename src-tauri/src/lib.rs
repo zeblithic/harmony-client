@@ -23146,7 +23146,7 @@ mod chunked_ingest_tests {
     }
 
     #[tokio::test]
-    async fn streaming_ingest_multi_bundle_level_returns_deep_tree() {
+    async fn streaming_ingest_64kib_input_produces_bundle_root_with_many_leaves() {
         // 64 KiB at small_chunker_config produces hundreds of leaves at
         // avg_chunk=128. With MAX_BUNDLE_ENTRIES = 32_768 the resulting
         // tree is depth-1, so we verify at least depth-1 + a large fanout.
