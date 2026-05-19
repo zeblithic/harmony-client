@@ -25,10 +25,10 @@
       // `preWalkTotal` is the count taken BEFORE the walker started, so a
       // mid-walk cancel still reports against the full tree. `-1` means
       // the pre-walk failed (rare: unreadable root) — in that case we
-      // can't report a denominator at all: `totalFilesSeen` includes
-      // oversized files that `preWalkTotal` excludes, so substituting it
-      // would silently change the meaning of the headline depending on
-      // whether the pre-walk succeeded.
+      // can't report a denominator at all: `totalFilesSeen` counts only
+      // leaves the walker actually touched, so substituting it would
+      // silently change the meaning of the headline depending on whether
+      // the pre-walk succeeded.
       if (result.preWalkTotal > 0) {
         return `Cancelled — added ${result.succeeded} of ${result.preWalkTotal} files`;
       }
@@ -45,10 +45,7 @@
 
   let skippedTotal = $derived(
     result
-      ? result.skipped.hidden +
-        result.skipped.symlink +
-        result.skipped.oversized +
-        result.skipped.other
+      ? result.skipped.hidden + result.skipped.symlink + result.skipped.other
       : 0,
   );
   let hasSkipped = $derived(skippedTotal > 0);
@@ -74,9 +71,6 @@
             {/if}
             {#if result.skipped.symlink > 0}
               <li>{result.skipped.symlink} symlinks (not followed)</li>
-            {/if}
-            {#if result.skipped.oversized > 0}
-              <li>{result.skipped.oversized} files too large (&gt;8 GiB)</li>
             {/if}
             {#if result.skipped.other > 0}
               <li>{result.skipped.other} other special files (FIFOs/sockets/devices)</li>

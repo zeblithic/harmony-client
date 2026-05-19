@@ -5,6 +5,17 @@
 **Depends on:** ZEB-146 (merged in harmony-client PR #51)
 **Related follow-ups:** [ZEB-155](https://linear.app/zeblith/issue/ZEB-155), [ZEB-156](https://linear.app/zeblith/issue/ZEB-156)
 
+> **Status (2026-05-19):** Superseded by [ZEB-161](https://linear.app/zeblith/issue/ZEB-161)
+> *streaming nested-bundle ingest*. The ~8 GiB `FLAT_BUNDLE_MAX` cap and
+> the `chunk_and_bundle` / `IngestDispatch` machinery described below have
+> been replaced by a true streaming pipeline (`streaming_ingest` +
+> `build_bundle_tree` in `src/lib.rs`) that builds depth-2+ nested-bundle
+> trees on the fly. The `IngestError::Oversized` variant and
+> `SkipCounts.oversized` field were also removed end-to-end. This document
+> is retained for the original ZEB-154 design rationale; the runtime shape
+> is now bounded by the chunker buffer (~1 MiB) + the leaf-CID vector, not
+> by `FLAT_BUNDLE_MAX`.
+
 ---
 
 ## Goal

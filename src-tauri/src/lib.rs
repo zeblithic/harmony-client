@@ -77,70 +77,25 @@ impl<R: tauri::Runtime> crate::community_invite::AppHandleEmit for tauri::AppHan
     }
 }
 
-// ── Chunked ingest (ZEB-154) ──────────────────────────────────────────────
-
-/// Maximum bytes supported by the v1 flat-bundle chunked-ingest path.
-///
-/// Derived from the chunker's **minimum** chunk size — not the payload
-/// maximum — because FastCDC with `ChunkerConfig::DEFAULT` emits at most
-/// `ceil(N / min_chunk)` chunks. Using `min_chunk` guarantees the leaf
-/// count can never exceed `MAX_BUNDLE_ENTRIES`, so `BundleBuilder` never
-/// fails with a confusing "bundle full" error just below the true cap.
-///
-/// With the current defaults (MAX_BUNDLE_ENTRIES ≈ 32 767, min_chunk =
-/// 256 KiB) this lands at ~8 GiB. Files larger than this need nested
-/// bundles, which land with folder/directory support (ZEB-156 et al).
-/// A flat-bundle-only v1 is intentional; see
-/// docs/specs/2026-04-23-chunked-ingest-design.md (Q1).
-pub(crate) const FLAT_BUNDLE_MAX: u64 = (harmony_content::bundle::MAX_BUNDLE_ENTRIES as u64)
-    * (harmony_content::chunker::ChunkerConfig::DEFAULT.min_chunk as u64);
-
-/// Dispatch decision for `ingest_content`, derived purely from file size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IngestDispatch {
-    /// File fits in a single `for_book` CID — use the existing path.
-    Single,
-    /// File is larger than `MAX_PAYLOAD_SIZE` and must be chunked through
-    /// the FastCDC chunker into a root bundle.
-    Chunked,
-}
-
-/// Classify a file size into an ingest strategy, or return an error message
-/// suitable for surfacing to the frontend if the file exceeds the v1 cap.
-pub(crate) fn ingest_dispatch(size: u64) -> Result<IngestDispatch, String> {
-    if size > FLAT_BUNDLE_MAX {
-        return Err(format!(
-            "file too large ({} bytes). v1 flat-bundle cap is {} bytes (~8 GiB). \
-             Support for larger files lands with folder/nested-bundle support.",
-            size, FLAT_BUNDLE_MAX
-        ));
-    }
-    if size > harmony_content::cid::MAX_PAYLOAD_SIZE as u64 {
-        Ok(IngestDispatch::Chunked)
-    } else {
-        Ok(IngestDispatch::Single)
-    }
-}
+// ── Chunked ingest (ZEB-154 + ZEB-161 nested-bundle streaming) ───────────
 
 /// Errors raised by the internal path-based ingest helpers
-/// (`ingest_file_at_path`, `send_ingest_with_name`, `send_ingest_bytes_only`)
-/// and the ZEB-163 folder walker (`folder_ingest::walk`).
+/// (`ingest_file_at_path`, `send_ingest_with_name`) and the ZEB-163 folder
+/// walker (`folder_ingest::walk`).
 ///
-/// Split into distinct variants so the walker can route each failure to the
-/// right summary bucket (oversized vs. failed) without parsing strings. The
-/// IPC seam in `ingest_content` collapses these to `String` via `to_string()`
-/// for backwards compatibility with the existing frontend.
+/// Split into distinct variants so the walker can distinguish IO errors,
+/// symlink rejections, sidecar collisions, channel failures, and manifest
+/// build errors without parsing strings. (ZEB-161 lifted the per-file size
+/// cap — there is no longer a per-file oversized rejection path; arbitrary
+/// file sizes are handled by the streaming nested-bundle ingest pipeline.)
+/// The IPC seam in `ingest_content` collapses these to `String` via
+/// `to_string()` for backwards compatibility with the existing frontend.
 #[derive(Debug, thiserror::Error)]
 pub enum IngestError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("path is a symlink; refuse to follow")]
     Symlink,
-    #[error(
-        "file too large ({size} bytes; v1 flat-bundle cap is {cap} bytes ~8 GiB). \
-         Support for larger files lands with folder/nested-bundle support."
-    )]
-    Oversized { size: u64, cap: u64 },
     #[error("sidecar_id collision")]
     SidecarCollision,
     /// Event-loop ingest channel returned an error (closed, dropped reply,
@@ -153,6 +108,12 @@ pub enum IngestError {
     /// an interior directory.
     #[error("manifest build: {0}")]
     ManifestBuild(String),
+    /// `streaming_ingest`'s `cancel` parameter fired mid-stream. Typed
+    /// (rather than a `Other("cancelled")` string sentinel) so the folder
+    /// walker can route this structurally to `WalkOutcome::Cancelled`
+    /// without coupling to the exact error-message string across two files.
+    #[error("ingest cancelled")]
+    Cancelled,
     #[error("{0}")]
     Other(String),
 }
@@ -163,67 +124,191 @@ impl IngestError {
     }
 }
 
-/// Chunk `bytes` via FastCDC and assemble the resulting leaf CIDs into a
-/// flat bundle. Returns the ordered leaf (CID, slice) pairs, the raw bundle
-/// payload, and the root bundle CID.
+/// Drives a byte stream through FastCDC, ingests each leaf, builds the
+/// bundle tree bottom-up, and returns the root CID. Memory is bounded by
+/// the chunker buffer (~1 MiB) + the leaf-CID vec (32 B × leaf_count).
 ///
-/// The caller is responsible for driving each `(cid, bytes)` pair through
-/// the runtime's ingest channel in order, and for one final ingest of the
-/// bundle payload under the root CID.
+/// Returns:
+///   - `CidType::Book` for inputs that fit in a single chunk (no bundle wrap).
+///   - `CidType::Bundle(depth)` with `depth >= 1` for multi-chunk inputs.
 ///
-/// Expects `bytes.len() > MAX_PAYLOAD_SIZE` — for smaller inputs use the
-/// existing single-book path.
+/// The first entry of the root bundle (when present) is a sentinel
+/// `InlineData` CID carrying `(total_size, chunk_count, 0, [0; 8])` —
+/// matches `harmony_content::dag::ingest` so root reassembly can pre-size
+/// its output buffer.
 ///
 /// Visibility is `pub` rather than `pub(crate)` so the integration tests
-/// under `src-tauri/tests/` can drive the chunk + bundle construction
-/// directly. `pub(crate)` would hide the symbol from the external test
-/// crate and break `content_index_integration::chunked_ingest_pin_cascade_
-/// fetch_burn_roundtrip`. Treat this as crate-internal — no external
-/// consumers are expected.
-#[allow(clippy::type_complexity)] // pre-existing; tracked for cleanup
-pub fn chunk_and_bundle(
-    bytes: &[u8],
-) -> Result<
-    (
-        Vec<(harmony_content::cid::ContentId, &[u8])>,
-        Vec<u8>,
-        harmony_content::cid::ContentId,
-    ),
-    String,
-> {
-    use harmony_content::bundle::BundleBuilder;
-    use harmony_content::chunker::{chunk_all, ChunkerConfig};
-    use harmony_content::cid::{ContentFlags, ContentId, MAX_PAYLOAD_SIZE};
+/// under `src-tauri/tests/` can drive a stream through the full pipeline
+/// directly (mirrors the pre-ZEB-161 `chunk_and_bundle` visibility note).
+/// Treat as crate-internal — no external production consumers are expected.
+///
+pub async fn streaming_ingest<R>(
+    reader: R,
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    chunker_config: harmony_content::chunker::ChunkerConfig,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<(harmony_content::cid::ContentId, u64), IngestError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use harmony_content::chunker::Chunker;
+    use harmony_content::cid::{ContentFlags, ContentId};
+    use tokio::io::AsyncReadExt;
 
-    if bytes.len() <= MAX_PAYLOAD_SIZE {
-        return Err(format!(
-            "chunk_and_bundle requires input larger than MAX_PAYLOAD_SIZE ({} bytes); \
-             got {} bytes — use the single-book path instead",
-            MAX_PAYLOAD_SIZE,
-            bytes.len()
-        ));
+    let mut reader = reader;
+    let mut chunker = Chunker::new(chunker_config)
+        .map_err(|e| IngestError::other(format!("chunker init: {e:?}")))?;
+    let mut open_chunk: Vec<u8> = Vec::with_capacity(chunker_config.max_chunk);
+    let mut leaf_cids: Vec<ContentId> = Vec::new();
+    let mut total_bytes = 0u64;
+    const READ_WINDOW_SIZE: usize = 1024 * 1024; // 1 MiB
+    let mut read_buf = vec![0u8; READ_WINDOW_SIZE];
+
+    loop {
+        // Bounded cancel observation: checked once per ~1 MiB read window so a
+        // large file (multi-GiB) can be cancelled within a single read's worth
+        // of work rather than blocking until EOF. Relaxed ordering matches the
+        // folder walker's existing top-of-recursion checks.
+        if let Some(c) = cancel {
+            if c.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(IngestError::Cancelled);
+            }
+        }
+        let n = reader.read(&mut read_buf).await.map_err(IngestError::Io)?;
+        if n == 0 {
+            break;
+        }
+        let window = &read_buf[..n];
+        total_bytes += n as u64;
+
+        let cuts = chunker.feed(window);
+
+        let mut window_pos = 0;
+        for cut in cuts {
+            open_chunk.extend_from_slice(&window[window_pos..cut]);
+            // `mem::replace` here (rather than `clone()` + `clear()`) avoids a
+            // per-leaf memcpy of the chunk bytes on the hot path. `mem::take`
+            // would lose the pre-allocated `max_chunk` capacity invariant;
+            // `mem::replace` with a freshly-sized Vec preserves it. The
+            // replace happens BEFORE `for_book(&chunk, ...)` because we need
+            // the chunk bytes (now owned by `chunk`) to compute the hash.
+            let chunk = std::mem::replace(
+                &mut open_chunk,
+                Vec::with_capacity(chunker_config.max_chunk),
+            );
+            let cid = ContentId::for_book(&chunk, ContentFlags::default())
+                .map_err(|e| IngestError::other(format!("leaf CID: {e:?}")))?;
+            send_ingest(ingest_tx, hex::encode(cid.to_bytes()), chunk)
+                .await
+                .map_err(IngestError::IngestChannel)?;
+            leaf_cids.push(cid);
+            window_pos = cut;
+        }
+        open_chunk.extend_from_slice(&window[window_pos..]);
     }
 
-    let ranges =
-        chunk_all(bytes, &ChunkerConfig::DEFAULT).map_err(|e| format!("chunker error: {e:?}"))?;
-
-    let mut leaves: Vec<(ContentId, &[u8])> = Vec::with_capacity(ranges.len());
-    for range in ranges {
-        let chunk = &bytes[range];
-        let cid = ContentId::for_book(chunk, ContentFlags::default())
-            .map_err(|e| format!("leaf CID error: {e:?}"))?;
-        leaves.push((cid, chunk));
+    if chunker.finalize().is_some() {
+        // Same `mem::replace` pattern as above — see comment in the cut loop.
+        let chunk = std::mem::replace(
+            &mut open_chunk,
+            Vec::with_capacity(chunker_config.max_chunk),
+        );
+        let cid = ContentId::for_book(&chunk, ContentFlags::default())
+            .map_err(|e| IngestError::other(format!("leaf CID: {e:?}")))?;
+        send_ingest(ingest_tx, hex::encode(cid.to_bytes()), chunk)
+            .await
+            .map_err(IngestError::IngestChannel)?;
+        leaf_cids.push(cid);
     }
 
-    let mut builder = BundleBuilder::new();
-    for (cid, _) in &leaves {
-        builder.add(*cid);
+    if leaf_cids.is_empty() {
+        // Empty file (zero bytes) — emit a single Book CID for an empty
+        // payload. Matches the pre-ZEB-161 Single dispatch path so the folder
+        // walker doesn't mis-surface 0-byte placeholder files as failures.
+        // `build_bundle_tree`'s empty-input error path remains in place as a
+        // defensive guard for direct callers that bypass `streaming_ingest`.
+        let cid = ContentId::for_book(&[], ContentFlags::default())
+            .map_err(|e| IngestError::other(format!("empty-file CID: {e:?}")))?;
+        send_ingest(ingest_tx, hex::encode(cid.to_bytes()), Vec::new())
+            .await
+            .map_err(IngestError::IngestChannel)?;
+        return Ok((cid, 0));
     }
-    let (bundle_payload, root) = builder
-        .build_with_flags(ContentFlags::default())
-        .map_err(|e| format!("bundle build error: {e:?}"))?;
 
-    Ok((leaves, bundle_payload, root))
+    let root = build_bundle_tree(leaf_cids, total_bytes, ingest_tx).await?;
+    Ok((root, total_bytes))
+}
+
+/// Build the nested-bundle tree bottom-up from a vector of leaf CIDs and
+/// ingest each interior bundle. Returns the root CID.
+///
+/// - Empty `leaf_cids` is an error (matches `dag::ingest`'s `EmptyData`).
+/// - A single leaf returns its CID directly (no bundle wrapper, no IPC send).
+/// - Multi-leaf inputs build the tree in `MAX_BUNDLE_ENTRIES`-wide groups,
+///   bottom-up. The root level's first bundle carries an
+///   `InlineData` metadata sentinel with `(total_size, chunk_count, 0,
+///   [0; 8])`.
+///
+/// Split out from `streaming_ingest` so the tree-build logic can be
+/// unit-tested with synthetic CIDs (no chunker, no I/O).
+///
+pub(crate) async fn build_bundle_tree(
+    leaf_cids: Vec<harmony_content::cid::ContentId>,
+    total_size: u64,
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+) -> Result<harmony_content::cid::ContentId, IngestError> {
+    use harmony_content::bundle::{BundleBuilder, MAX_BUNDLE_ENTRIES};
+    use harmony_content::cid::ContentFlags;
+
+    // Empty input is an error (matches dag::ingest's EmptyData).
+    if leaf_cids.is_empty() {
+        return Err(IngestError::other("empty input — no leaves to ingest"));
+    }
+
+    // Single-chunk degenerate case: no bundle wrapper, no IPC send.
+    if leaf_cids.len() == 1 {
+        return Ok(leaf_cids[0]);
+    }
+
+    // Checked conversion: silent `as u32` truncation would write garbage to
+    // the root bundle's inline-metadata sentinel for ingests with > u32::MAX
+    // leaves. At default config (~1 MiB chunks) that's a >4 PiB single file —
+    // unreachable in practice, but the explicit error keeps the failure mode
+    // observable rather than corrupted.
+    let chunk_count: u32 = leaf_cids.len().try_into().map_err(|_| {
+        IngestError::other(format!(
+            "chunk count {} exceeds u32::MAX — file too large for inline metadata",
+            leaf_cids.len()
+        ))
+    })?;
+    let mut current_level = leaf_cids;
+
+    loop {
+        let is_root_level = current_level.len() <= MAX_BUNDLE_ENTRIES;
+        let mut next_level = Vec::with_capacity(current_level.len().div_ceil(MAX_BUNDLE_ENTRIES));
+
+        for group in current_level.chunks(MAX_BUNDLE_ENTRIES) {
+            let mut builder = BundleBuilder::new();
+            for cid in group {
+                builder.add(*cid);
+            }
+            if is_root_level && next_level.is_empty() {
+                builder.with_metadata(total_size, chunk_count, 0, [0u8; 8]);
+            }
+            let (bundle_bytes, bundle_cid) = builder
+                .build_with_flags(ContentFlags::default())
+                .map_err(|e| IngestError::ManifestBuild(format!("{e:?}")))?;
+            send_ingest(ingest_tx, hex::encode(bundle_cid.to_bytes()), bundle_bytes)
+                .await
+                .map_err(IngestError::IngestChannel)?;
+            next_level.push(bundle_cid);
+        }
+
+        if next_level.len() == 1 {
+            return Ok(next_level[0]);
+        }
+        current_level = next_level;
+    }
 }
 
 // ── Managed Tauri state ──────────────────────────────────────────────────
@@ -6003,14 +6088,17 @@ async fn export_content(
 
 /// Ingest a local file into the content store via a native open-file dialog.
 ///
-/// Opens a file picker, reads the selected file, computes a CID, and stores
-/// the content in the runtime's storage tier (which handles announcement to
-/// the mesh). Returns metadata so the frontend can add it to the file list.
+/// Opens a file picker, streams the selected file through the FastCDC
+/// chunker and nested-bundle tree builder (bounded memory ~1 MiB regardless
+/// of file size — ZEB-161), and inserts a sidecar row pointing at the
+/// resulting root CID. Returns metadata so the frontend can add it to the
+/// file list.
 #[tauri::command]
 async fn ingest_content(
     app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<IngestResult, String> {
+    use harmony_content::chunker::ChunkerConfig;
     use tauri_plugin_dialog::DialogExt;
 
     // 1. Open a native file picker dialog.
@@ -6023,7 +6111,10 @@ async fn ingest_content(
         .map_err(|_| "dialog error".to_string())?
         .ok_or_else(|| "upload cancelled".to_string())?;
 
-    // 2. Read file bytes (with size guard to avoid OOM on large files).
+    // 2. Resolve file path + name. `size_bytes` is no longer derived from a
+    // pre-stream `metadata()` call — `streaming_ingest` now returns the
+    // actual bytes consumed, eliminating a TOCTOU window where the file
+    // could be truncated/appended between stat and read.
     let path = file_path
         .as_path()
         .ok_or_else(|| "unsupported file path".to_string())?;
@@ -6032,23 +6123,6 @@ async fn ingest_content(
         .and_then(|n| n.to_str())
         .unwrap_or("unknown")
         .to_string();
-    let meta = tokio::fs::metadata(path)
-        .await
-        .map_err(|e| format!("read failed: {e}"))?;
-    // Early reject above the flat-bundle cap, before reading the file into
-    // memory. Dispatch is recomputed from actual bytes inside the helper in
-    // case the file changes size between this stat and the read that follows.
-    ingest_dispatch(meta.len())?;
-
-    // OOM caveat: this materializes the full file in RAM before chunking.
-    // Acceptable for v1 (FLAT_BUNDLE_MAX is ~8 GiB and realistic uploads
-    // are far smaller) but a near-cap file would consume ~8 GiB of heap.
-    // Streaming ingest pairs with the disk-backed storage tier — see the
-    // spec's out-of-scope section. If you raise FLAT_BUNDLE_MAX without
-    // landing streaming first, you are asking for OOMs.
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|e| format!("read failed: {e}"))?;
 
     let (ingest_tx, content_index) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
@@ -6059,7 +6133,21 @@ async fn ingest_content(
         (tx, guard.content_index.clone())
     };
 
-    send_ingest_with_name(&ingest_tx, &content_index, bytes, file_name, None)
+    // 3. Stream the file through the chunker into a nested-bundle tree.
+    // Memory is bounded by the chunker buffer (~1 MiB) + the leaf-CID vec
+    // (32 B × leaf count); for an 8 GiB file at 256 KiB min-chunk that's
+    // ~1 MiB of CID overhead — orders of magnitude below the pre-ZEB-161
+    // materialise-then-chunk path that allocated the entire file into RAM.
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| format!("read failed: {e}"))?;
+    let reader = tokio::io::BufReader::new(file);
+    let (root, size_bytes) = streaming_ingest(reader, &ingest_tx, ChunkerConfig::DEFAULT, None)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // 4. Insert the sidecar row pointing at the streamed root CID.
+    send_ingest_with_name(&content_index, root.to_bytes(), file_name, size_bytes, None)
         .await
         .map_err(|e| e.to_string())
 }
@@ -6071,16 +6159,15 @@ async fn ingest_content(
 /// resulting sidecar entry. Not registered as an IPC and not currently
 /// called from anywhere except the tests below.
 ///
-/// The ZEB-163 folder walker does NOT call this for descendant leaves
-/// (per task 2 fix): it uses `send_ingest_bytes_only` so leaf files only
+/// The ZEB-163 folder walker does NOT call this for descendant leaves — it
+/// streams each leaf via `streaming_ingest` directly so leaf files only
 /// appear inside their parent folder's manifest, not as standalone root
 /// sidecar entries. Calling this from the walker would re-introduce the
 /// root-listing pollution bug.
 ///
 /// Defends in depth against symlinks even though any walker caller would
 /// filter them upstream: a `symlink_metadata` check guarantees we never
-/// `tokio::fs::read` through a link that could resolve outside the walked
-/// tree.
+/// open a link that could resolve outside the walked tree.
 #[allow(dead_code)] // Tests cover it; production callers land with the share-sheet IPC.
 pub(crate) async fn ingest_file_at_path(
     ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
@@ -6089,127 +6176,55 @@ pub(crate) async fn ingest_file_at_path(
     _parent_sidecar_id: Option<content_index::SidecarId>,
     file_name: String,
 ) -> Result<IngestResult, IngestError> {
+    use harmony_content::chunker::ChunkerConfig;
+
     let meta = tokio::fs::symlink_metadata(path).await?;
     if meta.file_type().is_symlink() {
         return Err(IngestError::Symlink);
     }
-    let size = meta.len();
-    if size > FLAT_BUNDLE_MAX {
-        return Err(IngestError::Oversized {
-            size,
-            cap: FLAT_BUNDLE_MAX,
-        });
-    }
-    let bytes = tokio::fs::read(path).await?;
+    // Stream the file through the chunker — bounded memory regardless of
+    // size (ZEB-161). Replaces the pre-ZEB-161 `tokio::fs::read` that
+    // allocated the entire file into a Vec before chunking. `size_bytes` is
+    // the actual streamed total (returned by `streaming_ingest`), not the
+    // pre-stream `meta.len()` — closes a TOCTOU window where the file could
+    // mutate between stat and stream.
+    let file = tokio::fs::File::open(path).await?;
+    let reader = tokio::io::BufReader::new(file);
+    let (root, size_bytes) =
+        streaming_ingest(reader, ingest_tx, ChunkerConfig::DEFAULT, None).await?;
     send_ingest_with_name(
-        ingest_tx,
         content_index,
-        bytes,
+        root.to_bytes(),
         file_name,
+        size_bytes,
         _parent_sidecar_id,
     )
     .await
 }
 
-/// Drive a buffer of bytes through the chunked-or-flat dispatch and push it
-/// to the runtime's ingest channel, returning the resulting root CID
-/// WITHOUT creating a sidecar entry.
+/// Insert a sidecar row for an already-ingested root CID.
 ///
-/// Used by the ZEB-163 folder walker for leaf files — leaves live inside
-/// their parent folder's manifest and must NOT appear as standalone root
-/// entries in `list_root`. Adding a per-leaf sidecar would surface the
-/// same file twice in the UI (once at root, once inside the new folder),
-/// matching the bug the manifest-only nested-folder path
-/// (`build_folder_manifest_only`) already sidesteps for interior dirs.
+/// Pure sidecar insertion — the caller has already pushed all leaves and
+/// interior bundles through the ingest channel via `streaming_ingest`, so
+/// this helper just records the resulting root CID in `ContentIndex`.
 ///
-/// Callers that DO want a root-listing entry (`ingest_content` IPC for the
-/// single-file dialog, future direct-leaf-ingest IPCs) should use
-/// `send_ingest_with_name`, which wraps this and inserts the sidecar row.
-pub(crate) async fn send_ingest_bytes_only(
-    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
-    bytes: Vec<u8>,
-    file_name: String,
-) -> Result<[u8; 32], IngestError> {
-    use harmony_content::cid::{ContentFlags, ContentId};
-
-    let size_bytes = bytes.len() as u64;
-    // Explicit oversize check BEFORE ingest_dispatch. `ingest_dispatch`
-    // returns an opaque `String` error for oversize, which the previous
-    // `.map_err(IngestError::other)` collapsed into `IngestError::Other`
-    // — that bucket lands in `failed` rather than `skipped.oversized`,
-    // mis-classifying the TOCTOU "file grew past cap between stat and
-    // read" case. Returning the typed `Oversized` here keeps the walker's
-    // routing honest (Bot finding 5).
-    if size_bytes > FLAT_BUNDLE_MAX {
-        return Err(IngestError::Oversized {
-            size: size_bytes,
-            cap: FLAT_BUNDLE_MAX,
-        });
-    }
-    // Final dispatch decision from the bytes actually read. With the
-    // oversize gate above this can no longer return the oversize error
-    // path; remaining failures (Chunked vs Single classification) are
-    // never user-facing so the `Other` collapse is acceptable.
-    let dispatch = ingest_dispatch(size_bytes).map_err(IngestError::other)?;
-
-    let root_cid_bytes: [u8; 32] = match dispatch {
-        IngestDispatch::Single => {
-            let cid = ContentId::for_book(&bytes, ContentFlags::default())
-                .map_err(|e| IngestError::other(format!("CID error: {e:?}")))?;
-            let cid_hex = hex::encode(cid.to_bytes());
-            send_ingest(ingest_tx, cid_hex, bytes)
-                .await
-                .map_err(IngestError::other)?;
-            cid.to_bytes()
-        }
-        IngestDispatch::Chunked => {
-            let (leaves, bundle_payload, root) =
-                chunk_and_bundle(&bytes).map_err(IngestError::other)?;
-            for (leaf_cid, leaf_bytes) in &leaves {
-                send_ingest(
-                    ingest_tx,
-                    hex::encode(leaf_cid.to_bytes()),
-                    leaf_bytes.to_vec(),
-                )
-                .await
-                .map_err(IngestError::other)?;
-            }
-            send_ingest(ingest_tx, hex::encode(root.to_bytes()), bundle_payload)
-                .await
-                .map_err(IngestError::other)?;
-            root.to_bytes()
-        }
-    };
-
-    // `file_name` is currently unused on the bytes-only path (no sidecar
-    // row to label), but kept in the signature so callers don't have to
-    // restructure when we plumb it through future per-CID telemetry.
-    let _ = file_name;
-    Ok(root_cid_bytes)
-}
-
-/// Drive a buffer of bytes through the chunked-or-flat dispatch, push it to
-/// the runtime's ingest channel, and insert the resulting sidecar row.
-///
-/// Extracted from `ingest_content`'s post-dialog body so the dialog IPC and
-/// any future direct-leaf-ingest IPC can share the same pipeline. The
-/// caller is responsible for extracting `ingest_tx` and `content_index`
-/// from `NodeState` under its lock — the helper does not touch `NodeState`
-/// so it stays cheap to test.
+/// Extracted from `ingest_content`'s post-streaming body so the dialog IPC
+/// and any future direct-leaf-ingest IPC can share the same sidecar-insert
+/// pipeline. The caller is responsible for extracting `content_index` from
+/// `NodeState` under its lock — the helper does not touch `NodeState` so
+/// it stays cheap to test.
 ///
 /// NOTE: the ZEB-163 folder walker does NOT call this for descendant
-/// leaves; it calls `send_ingest_bytes_only` so leaf files only appear
-/// inside their parent folder's manifest, not as standalone root entries.
+/// leaves; it streams them via `streaming_ingest` directly so leaf files
+/// only appear inside their parent folder's manifest, not as standalone
+/// root entries.
 pub(crate) async fn send_ingest_with_name(
-    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
     content_index: &std::sync::Arc<std::sync::Mutex<content_index::ContentIndex>>,
-    bytes: Vec<u8>,
+    root_cid: [u8; 32],
     file_name: String,
+    size_bytes: u64,
     _parent_sidecar_id: Option<content_index::SidecarId>,
 ) -> Result<IngestResult, IngestError> {
-    let size_bytes = bytes.len() as u64;
-    let root_cid_bytes = send_ingest_bytes_only(ingest_tx, bytes, file_name.clone()).await?;
-
     let stored_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -6221,7 +6236,7 @@ pub(crate) async fn send_ingest_with_name(
             .map_err(|e| IngestError::other(format!("index lock: {e}")))?;
         let inserted = idx.insert(content_index::ContentIndexEntry {
             sidecar_id,
-            cid: root_cid_bytes,
+            cid: root_cid,
             file_name: file_name.clone(),
             size_bytes,
             stored_at_ms,
@@ -6254,7 +6269,7 @@ pub(crate) async fn send_ingest_with_name(
 
     Ok(IngestResult {
         sidecar_id: sidecar_id.to_string(),
-        cid: hex::encode(root_cid_bytes),
+        cid: hex::encode(root_cid),
         file_name,
         size_bytes,
     })
@@ -6335,21 +6350,6 @@ mod path_ingest_tests {
             .await
             .expect_err("must error on missing file");
         assert!(matches!(err, IngestError::Io(_)), "got: {err:?}");
-    }
-
-    /// Allocating an 8 GiB file in a unit test is unreasonable, so the
-    /// boundary check is exercised by constructing the error variant
-    /// directly and asserting its Display surfaces both numbers — that's
-    /// what the walker's failure-bucketing depends on.
-    #[test]
-    fn oversized_variant_shape() {
-        let err = IngestError::Oversized {
-            size: FLAT_BUNDLE_MAX + 1,
-            cap: FLAT_BUNDLE_MAX,
-        };
-        let rendered = format!("{err}");
-        assert!(rendered.contains("file too large"));
-        assert!(rendered.contains(&FLAT_BUNDLE_MAX.to_string()));
     }
 
     /// Symlink detection is platform-conditional: on Windows, creating a
@@ -22517,143 +22517,484 @@ mod tests {
 }
 
 #[cfg(test)]
-mod chunked_ingest_tests {
+mod streaming_ingest_tests {
     use super::*;
     use harmony_content::bundle::MAX_BUNDLE_ENTRIES;
-    use harmony_content::cid::MAX_PAYLOAD_SIZE;
-
-    #[test]
-    fn ingest_dispatch_picks_single_for_small_sizes() {
-        assert!(matches!(
-            ingest_dispatch(0).unwrap(),
-            IngestDispatch::Single
-        ));
-        assert!(matches!(
-            ingest_dispatch(MAX_PAYLOAD_SIZE as u64).unwrap(),
-            IngestDispatch::Single
-        ));
-    }
-
-    #[test]
-    fn ingest_dispatch_picks_chunked_above_single_book_ceiling() {
-        assert!(matches!(
-            ingest_dispatch(MAX_PAYLOAD_SIZE as u64 + 1).unwrap(),
-            IngestDispatch::Chunked
-        ));
-    }
-
-    #[test]
-    fn ingest_dispatch_rejects_above_flat_bundle_cap() {
-        let too_big = FLAT_BUNDLE_MAX + 1;
-        let err = ingest_dispatch(too_big).unwrap_err();
-        assert!(err.contains("file too large"), "got: {err}");
-        assert!(
-            err.contains("flat-bundle"),
-            "message should explain the cap origin, got: {err}"
-        );
-    }
-
-    #[test]
-    fn ingest_dispatch_rejects_u64_max() {
-        // Guard against accidental reintroduction of a `size as usize`
-        // comparison — on 32-bit targets that would wrap and misclassify
-        // multi-GiB sizes as Single.
-        let err = ingest_dispatch(u64::MAX).unwrap_err();
-        assert!(err.contains("file too large"), "got: {err}");
-    }
-
-    #[test]
-    fn ingest_dispatch_accepts_exactly_flat_bundle_max() {
-        // FLAT_BUNDLE_MAX is the last accepted byte count (condition is strict >).
-        assert!(matches!(
-            ingest_dispatch(FLAT_BUNDLE_MAX).unwrap(),
-            IngestDispatch::Chunked
-        ));
-    }
-
-    #[test]
-    fn flat_bundle_max_matches_spec() {
-        // Sanity-check the constant so a refactor of the underlying
-        // harmony-content limits surfaces here. The cap uses the chunker's
-        // min_chunk (not MAX_PAYLOAD_SIZE) so the leaf count can never
-        // exceed MAX_BUNDLE_ENTRIES.
-        assert_eq!(
-            FLAT_BUNDLE_MAX,
-            (MAX_BUNDLE_ENTRIES as u64)
-                * (harmony_content::chunker::ChunkerConfig::DEFAULT.min_chunk as u64)
-        );
-    }
-
-    use harmony_content::bundle;
     use harmony_content::cid::{CidType, ContentFlags, ContentId};
 
-    fn synthetic_bytes(len: usize) -> Vec<u8> {
-        // Deterministic, non-trivially-compressible content — cycle through
-        // a small prime to force the chunker to find real cut points.
-        (0..len).map(|i| ((i * 37) % 251) as u8).collect()
+    use crate::event_loop::IngestRequest;
+    use harmony_content::bundle::parse_bundle;
+    use harmony_content::chunker::ChunkerConfig;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::sync::mpsc;
+
+    /// Spawn a background task that drains the `IngestRequest` channel and
+    /// immediately acks each request with `Ok(())`. Returns a join handle
+    /// that yields the captured `(cid_hex, data)` pairs in arrival order
+    /// once the sender is dropped.
+    fn spawn_ingest_drain(
+        mut rx: mpsc::Receiver<IngestRequest>,
+    ) -> tokio::task::JoinHandle<Vec<(String, Vec<u8>)>> {
+        tokio::spawn(async move {
+            let mut captured = Vec::new();
+            while let Some(req) = rx.recv().await {
+                captured.push((req.cid_hex.clone(), req.data.clone()));
+                let _ = req.reply.send(Ok(()));
+            }
+            captured
+        })
     }
 
-    #[test]
-    fn chunk_and_bundle_produces_bundle_root_over_leaf_cids() {
-        let bytes = synthetic_bytes(3 * 1024 * 1024); // 3 MiB
-        let (leaves, bundle_payload, root) =
-            chunk_and_bundle(&bytes).expect("chunking must succeed");
-
-        // Bundle root has CidType::Bundle(depth) with depth >= 1.
-        match root.cid_type() {
-            CidType::Bundle(d) => assert!(d >= 1, "root depth should be >= 1"),
-            other => panic!("expected bundle, got {other:?}"),
-        }
-
-        // Every leaf is a book CID.
-        for (leaf_cid, _data) in &leaves {
-            assert_eq!(leaf_cid.cid_type(), CidType::Book, "leaves must be books");
-        }
-
-        // The bundle payload parses back to exactly those leaf CIDs in order.
-        let parsed = bundle::parse_bundle(&bundle_payload).expect("bundle payload must parse");
-        let expected: Vec<ContentId> = leaves.iter().map(|(c, _)| *c).collect();
-        assert_eq!(parsed.to_vec(), expected);
+    /// Build N distinct synthetic Book CIDs (one byte per CID, varying
+    /// content) for tree-builder tests. The bytes are NOT actually
+    /// ingested — only the resulting CIDs feed `build_bundle_tree`.
+    fn synthetic_leaf_cids(n: usize) -> Vec<ContentId> {
+        (0..n)
+            .map(|i| {
+                // 8-byte payload encoding the index — distinct CIDs without
+                // hashing huge buffers.
+                let bytes = (i as u64).to_be_bytes();
+                ContentId::for_book(&bytes, ContentFlags::default()).unwrap()
+            })
+            .collect()
     }
 
-    #[test]
-    fn chunk_and_bundle_leaf_bytes_sum_to_input() {
-        let bytes = synthetic_bytes(3 * 1024 * 1024);
-        let (leaves, _bundle_payload, _root) = chunk_and_bundle(&bytes).unwrap();
-        let total: usize = leaves.iter().map(|(_, d)| d.len()).sum();
-        assert_eq!(
-            total,
-            bytes.len(),
-            "leaves must cover the full input exactly"
+    // ── build_bundle_tree tests ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn build_bundle_tree_single_leaf_returns_leaf_directly() {
+        let leaves = synthetic_leaf_cids(1);
+        let leaf = leaves[0];
+        let (tx, rx) = mpsc::channel::<IngestRequest>(8);
+        let drain = spawn_ingest_drain(rx);
+
+        let root = build_bundle_tree(leaves, 12345, &tx).await.unwrap();
+        drop(tx);
+        let captured = drain.await.unwrap();
+
+        assert_eq!(root, leaf, "single leaf must be returned unchanged");
+        assert!(
+            captured.is_empty(),
+            "single-leaf path must NOT touch the IPC channel"
         );
-        let reassembled: Vec<u8> = leaves.iter().flat_map(|(_, d)| d.iter().copied()).collect();
-        assert_eq!(reassembled, bytes, "leaves in order must equal original");
     }
 
-    #[test]
-    fn chunk_and_bundle_leaf_cid_matches_for_book_of_its_bytes() {
-        let bytes = synthetic_bytes(3 * 1024 * 1024);
-        let (leaves, _bundle_payload, _root) = chunk_and_bundle(&bytes).unwrap();
-        for (leaf_cid, data) in &leaves {
-            let recomputed = ContentId::for_book(data, ContentFlags::default()).unwrap();
-            assert_eq!(*leaf_cid, recomputed);
+    #[tokio::test]
+    async fn build_bundle_tree_two_leaves_returns_depth_one_bundle_with_metadata() {
+        let leaves = synthetic_leaf_cids(2);
+        let leaf_0 = leaves[0];
+        let leaf_1 = leaves[1];
+        let total_size = 9_999u64;
+        let (tx, rx) = mpsc::channel::<IngestRequest>(8);
+        let drain = spawn_ingest_drain(rx);
+
+        let root = build_bundle_tree(leaves, total_size, &tx).await.unwrap();
+        drop(tx);
+        let captured = drain.await.unwrap();
+
+        match root.cid_type() {
+            CidType::Bundle(1) => {}
+            other => panic!("expected Bundle(1), got {other:?}"),
+        }
+        assert_eq!(
+            captured.len(),
+            1,
+            "two-leaf tree sends exactly one bundle (the root)"
+        );
+        let (root_hex, root_bytes) = &captured[0];
+        assert_eq!(*root_hex, hex::encode(root.to_bytes()));
+
+        let entries = parse_bundle(root_bytes).unwrap();
+        assert_eq!(
+            entries.len(),
+            3,
+            "root bundle entries = [metadata, leaf_0, leaf_1]"
+        );
+        assert_eq!(entries[0].cid_type(), CidType::InlineData);
+        assert_eq!(entries[1], leaf_0);
+        assert_eq!(entries[2], leaf_1);
+    }
+
+    #[tokio::test]
+    async fn build_bundle_tree_max_entries_returns_single_depth_one_bundle() {
+        let leaves = synthetic_leaf_cids(MAX_BUNDLE_ENTRIES);
+        let total_size = (MAX_BUNDLE_ENTRIES as u64) * 256;
+        let (tx, rx) = mpsc::channel::<IngestRequest>(MAX_BUNDLE_ENTRIES + 4);
+        let drain = spawn_ingest_drain(rx);
+
+        let root = build_bundle_tree(leaves.clone(), total_size, &tx)
+            .await
+            .unwrap();
+        drop(tx);
+        let captured = drain.await.unwrap();
+
+        match root.cid_type() {
+            CidType::Bundle(1) => {}
+            other => panic!("expected Bundle(1) for MAX_BUNDLE_ENTRIES leaves, got {other:?}"),
+        }
+        assert_eq!(
+            captured.len(),
+            1,
+            "single root bundle covers all MAX_BUNDLE_ENTRIES leaves"
+        );
+
+        let entries = parse_bundle(&captured[0].1).unwrap();
+        // Metadata sentinel + MAX_BUNDLE_ENTRIES leaves
+        assert_eq!(entries.len(), MAX_BUNDLE_ENTRIES + 1);
+        assert_eq!(entries[0].cid_type(), CidType::InlineData);
+        // First and last leaves match the synthetic input ordering.
+        assert_eq!(entries[1], leaves[0]);
+        assert_eq!(entries[MAX_BUNDLE_ENTRIES], leaves[MAX_BUNDLE_ENTRIES - 1]);
+    }
+
+    #[tokio::test]
+    async fn build_bundle_tree_max_entries_plus_one_returns_depth_two_root_with_metadata() {
+        let leaves = synthetic_leaf_cids(MAX_BUNDLE_ENTRIES + 1);
+        let total_size = ((MAX_BUNDLE_ENTRIES + 1) as u64) * 256;
+        let (tx, rx) = mpsc::channel::<IngestRequest>(MAX_BUNDLE_ENTRIES + 8);
+        let drain = spawn_ingest_drain(rx);
+
+        let root = build_bundle_tree(leaves.clone(), total_size, &tx)
+            .await
+            .unwrap();
+        drop(tx);
+        let captured = drain.await.unwrap();
+
+        match root.cid_type() {
+            CidType::Bundle(2) => {}
+            other => panic!("expected Bundle(2), got {other:?}"),
+        }
+
+        // Sends: 2 depth-1 bundles + 1 depth-2 bundle = 3
+        assert_eq!(captured.len(), 3, "expected 3 bundle sends (2 + 1)");
+
+        // The last send is the root.
+        let (root_hex, root_bytes) = captured.last().unwrap();
+        assert_eq!(*root_hex, hex::encode(root.to_bytes()));
+        let root_entries = parse_bundle(root_bytes).unwrap();
+        assert_eq!(
+            root_entries.len(),
+            3,
+            "root has [metadata, child_0, child_1]"
+        );
+        assert_eq!(
+            root_entries[0].cid_type(),
+            CidType::InlineData,
+            "root's first entry is the metadata sentinel"
+        );
+
+        // The two depth-1 children: first holds MAX_BUNDLE_ENTRIES leaves,
+        // second holds 1 leaf — and NEITHER carries metadata.
+        let (_, child0_bytes) = &captured[0];
+        let (_, child1_bytes) = &captured[1];
+        let child0_entries = parse_bundle(child0_bytes).unwrap();
+        let child1_entries = parse_bundle(child1_bytes).unwrap();
+        assert_eq!(
+            child0_entries.len(),
+            MAX_BUNDLE_ENTRIES,
+            "depth-1 first child must have NO metadata sentinel"
+        );
+        assert_eq!(
+            child1_entries.len(),
+            1,
+            "depth-1 second child holds the lone overflow leaf, no metadata"
+        );
+        // Verify the depth-1 children are NOT carrying an InlineData sentinel.
+        assert_ne!(child0_entries[0].cid_type(), CidType::InlineData);
+        assert_ne!(child1_entries[0].cid_type(), CidType::InlineData);
+        // First and last leaves are preserved across the partition.
+        assert_eq!(child0_entries[0], leaves[0]);
+        assert_eq!(child1_entries[0], leaves[MAX_BUNDLE_ENTRIES]);
+    }
+
+    #[tokio::test]
+    async fn build_bundle_tree_double_max_entries_returns_depth_two_root_with_two_full_children() {
+        // Note: the spec said `MAX_BUNDLE_ENTRIES^2` (~1B CIDs) — way too
+        // many for a unit test. `MAX_BUNDLE_ENTRIES * 2` still validates
+        // the depth-2 path with two full depth-1 children. Surfaced as a
+        // DONE_WITH_CONCERNS in the task report.
+        let leaf_count = MAX_BUNDLE_ENTRIES * 2;
+        let leaves = synthetic_leaf_cids(leaf_count);
+        let total_size = (leaf_count as u64) * 256;
+        let (tx, rx) = mpsc::channel::<IngestRequest>(leaf_count + 8);
+        let drain = spawn_ingest_drain(rx);
+
+        let root = build_bundle_tree(leaves.clone(), total_size, &tx)
+            .await
+            .unwrap();
+        drop(tx);
+        let captured = drain.await.unwrap();
+
+        match root.cid_type() {
+            CidType::Bundle(2) => {}
+            other => panic!("expected Bundle(2), got {other:?}"),
+        }
+        // Sends: 2 depth-1 bundles + 1 depth-2 root = 3.
+        assert_eq!(captured.len(), 3);
+
+        let root_entries = parse_bundle(&captured.last().unwrap().1).unwrap();
+        assert_eq!(root_entries.len(), 3, "root = [metadata, child_0, child_1]");
+        assert_eq!(root_entries[0].cid_type(), CidType::InlineData);
+
+        let child0_entries = parse_bundle(&captured[0].1).unwrap();
+        let child1_entries = parse_bundle(&captured[1].1).unwrap();
+        assert_eq!(child0_entries.len(), MAX_BUNDLE_ENTRIES);
+        assert_eq!(child1_entries.len(), MAX_BUNDLE_ENTRIES);
+        assert_ne!(child0_entries[0].cid_type(), CidType::InlineData);
+        assert_ne!(child1_entries[0].cid_type(), CidType::InlineData);
+    }
+
+    #[tokio::test]
+    async fn build_bundle_tree_metadata_round_trips_through_parse_inline_metadata() {
+        let leaves = synthetic_leaf_cids(3);
+        let total_size = 1_234_567_890u64;
+        let (tx, rx) = mpsc::channel::<IngestRequest>(8);
+        let drain = spawn_ingest_drain(rx);
+
+        let _root = build_bundle_tree(leaves, total_size, &tx).await.unwrap();
+        drop(tx);
+        let captured = drain.await.unwrap();
+
+        // The root is the last (and only) bundle sent for a 3-leaf input.
+        let root_entries = parse_bundle(&captured.last().unwrap().1).unwrap();
+        let (parsed_size, parsed_count, parsed_ts, parsed_mime) =
+            root_entries[0].parse_inline_metadata().unwrap();
+        assert_eq!(parsed_size, total_size);
+        assert_eq!(parsed_count, 3);
+        assert_eq!(parsed_ts, 0);
+        assert_eq!(parsed_mime, [0u8; 8]);
+    }
+
+    // ── streaming_ingest tests ──────────────────────────────────────────
+
+    /// Small chunker config so multi-level trees fit in unit-test budgets.
+    fn small_chunker_config() -> ChunkerConfig {
+        ChunkerConfig {
+            min_chunk: 64,
+            avg_chunk: 128,
+            max_chunk: 256,
         }
     }
 
-    #[test]
-    fn chunk_and_bundle_rejects_single_book_sized_input() {
-        // MAX_PAYLOAD_SIZE is the single-book ceiling; chunk_and_bundle
-        // must reject inputs that should have gone through the single-book path.
-        let bytes = synthetic_bytes(harmony_content::cid::MAX_PAYLOAD_SIZE);
-        let err = chunk_and_bundle(&bytes).unwrap_err();
-        assert!(err.contains("single-book"), "got: {err}");
+    #[tokio::test]
+    async fn streaming_ingest_empty_reader_emits_empty_book_cid() {
+        // ZEB-161 fix-up Round 1: zero-byte files previously failed because
+        // the chunker emits no cuts, finalize returns None, and
+        // build_bundle_tree's empty-input guard rejected. The folder walker
+        // surfaced that as a Failed entry in the summary modal. Pre-ZEB-161
+        // the Single dispatch path emitted a Book CID for an empty payload.
+        // streaming_ingest now matches that behaviour — empty input returns
+        // a Book CID for `&[]` and 0 total bytes.
+        let bytes: Vec<u8> = Vec::new();
+        let (tx, rx) = mpsc::channel::<IngestRequest>(8);
+        let drain = spawn_ingest_drain(rx);
+
+        let (root, total) = streaming_ingest(
+            std::io::Cursor::new(bytes),
+            &tx,
+            small_chunker_config(),
+            None,
+        )
+        .await
+        .expect("empty input must succeed with a Book CID for the zero-length payload");
+        drop(tx);
+        let captured = drain.await.unwrap();
+
+        assert_eq!(total, 0);
+        assert_eq!(root.cid_type(), CidType::Book);
+        let recomputed = ContentId::for_book(&[], ContentFlags::default()).unwrap();
+        assert_eq!(root, recomputed);
+        // One IPC send: the empty-payload Book CID with empty bytes.
+        assert_eq!(captured.len(), 1, "exactly one leaf send for empty input");
+        assert_eq!(captured[0].0, hex::encode(root.to_bytes()));
+        assert!(captured[0].1.is_empty());
     }
 
-    #[test]
-    fn chunk_and_bundle_accepts_exactly_max_payload_plus_one() {
-        // The smallest valid input: MAX_PAYLOAD_SIZE + 1 bytes.
-        let bytes = synthetic_bytes(harmony_content::cid::MAX_PAYLOAD_SIZE + 1);
-        chunk_and_bundle(&bytes).expect("must succeed at the minimum valid size");
+    #[tokio::test]
+    async fn streaming_ingest_single_chunk_returns_book_cid() {
+        // 32 bytes is below min_chunk=64 → exactly one leaf, no bundle wrap.
+        let bytes: Vec<u8> = (0..32u8).collect();
+        let (tx, rx) = mpsc::channel::<IngestRequest>(8);
+        let drain = spawn_ingest_drain(rx);
+
+        let (root, total) = streaming_ingest(
+            std::io::Cursor::new(bytes.clone()),
+            &tx,
+            small_chunker_config(),
+            None,
+        )
+        .await
+        .unwrap();
+        drop(tx);
+        let captured = drain.await.unwrap();
+
+        assert_eq!(total, 32);
+        assert_eq!(root.cid_type(), CidType::Book);
+        // The leaf was sent; no bundle send.
+        assert_eq!(captured.len(), 1, "exactly one leaf, no bundle");
+        assert_eq!(captured[0].0, hex::encode(root.to_bytes()));
+        assert_eq!(captured[0].1, bytes);
+        // Verify the CID matches recomputed for_book.
+        let recomputed = ContentId::for_book(&bytes, ContentFlags::default()).unwrap();
+        assert_eq!(root, recomputed);
+    }
+
+    #[tokio::test]
+    async fn streaming_ingest_multi_chunk_returns_bundle_cid() {
+        // 2 KiB at small_chunker_config (max_chunk=256) → at least 8 chunks
+        // → guaranteed multi-chunk → Bundle root.
+        let bytes: Vec<u8> = (0..2048).map(|i| ((i * 37) % 251) as u8).collect();
+        let (tx, rx) = mpsc::channel::<IngestRequest>(64);
+        let drain = spawn_ingest_drain(rx);
+
+        let (root, total) = streaming_ingest(
+            std::io::Cursor::new(bytes),
+            &tx,
+            small_chunker_config(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(total, 2048);
+        drop(tx);
+        let captured = drain.await.unwrap();
+
+        match root.cid_type() {
+            CidType::Bundle(d) => assert!(d >= 1, "got depth {d}"),
+            other => panic!("expected Bundle, got {other:?}"),
+        }
+        // Must have sent at least leaves + 1 root bundle.
+        assert!(
+            captured.len() >= 2,
+            "expected leaves + root, got {}",
+            captured.len()
+        );
+        // The last send is the root.
+        assert_eq!(
+            captured.last().unwrap().0,
+            hex::encode(root.to_bytes()),
+            "root bundle is sent last"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_ingest_64kib_input_produces_bundle_root_with_many_leaves() {
+        // 64 KiB at small_chunker_config produces hundreds of leaves at
+        // avg_chunk=128. With MAX_BUNDLE_ENTRIES = 32_768 the resulting
+        // tree is depth-1, so we verify at least depth-1 + a large fanout.
+        // (Forcing depth-2 from a unit test would need either a huge
+        // input or a tighter MAX_BUNDLE_ENTRIES override — neither is
+        // ergonomic; depth-2 coverage lives in build_bundle_tree tests
+        // and the Task-5 integration test.)
+        let bytes: Vec<u8> = (0..(64 * 1024)).map(|i| ((i * 37) % 251) as u8).collect();
+        let (tx, rx) = mpsc::channel::<IngestRequest>(2048);
+        let drain = spawn_ingest_drain(rx);
+
+        let (root, total) = streaming_ingest(
+            std::io::Cursor::new(bytes),
+            &tx,
+            small_chunker_config(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(total, 64 * 1024);
+        drop(tx);
+        let captured = drain.await.unwrap();
+
+        match root.cid_type() {
+            CidType::Bundle(d) => assert!(d >= 1, "got depth {d}"),
+            other => panic!("expected Bundle, got {other:?}"),
+        }
+        // The root must be the LAST send (bundles sent bottom-up; root
+        // ships last because it's the final level).
+        assert_eq!(captured.last().unwrap().0, hex::encode(root.to_bytes()));
+        // Plenty of leaves at this size.
+        assert!(
+            captured.len() >= 100,
+            "expected many leaves, got {}",
+            captured.len()
+        );
+    }
+
+    /// `AsyncRead` that returns at most `window` bytes per `poll_read` call.
+    /// Replaces the missing `tokio_test::io::Builder` dep — same purpose:
+    /// force `streaming_ingest` through many small `read()` calls so the
+    /// multi-feed code path is exercised.
+    struct ChunkedReader {
+        data: Vec<u8>,
+        pos: usize,
+        window: usize,
+    }
+
+    impl tokio::io::AsyncRead for ChunkedReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let remaining = self.data.len().saturating_sub(self.pos);
+            if remaining == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            let take = remaining.min(self.window).min(buf.remaining());
+            let start = self.pos;
+            let end = start + take;
+            buf.put_slice(&self.data[start..end]);
+            self.pos = end;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_ingest_multi_feed_equivalence_with_single_shot() {
+        // Same bytes via Cursor (one big read) vs. ChunkedReader (100-byte
+        // reads) MUST produce the same root CID and the same leaf CID
+        // sequence — proves the chunker bridge handles split reads.
+        let bytes: Vec<u8> = (0..8192).map(|i| ((i * 37) % 251) as u8).collect();
+
+        let (tx_a, rx_a) = mpsc::channel::<IngestRequest>(256);
+        let drain_a = spawn_ingest_drain(rx_a);
+        let (root_a, total_a) = streaming_ingest(
+            std::io::Cursor::new(bytes.clone()),
+            &tx_a,
+            small_chunker_config(),
+            None,
+        )
+        .await
+        .unwrap();
+        drop(tx_a);
+        let captured_a = drain_a.await.unwrap();
+
+        let (tx_b, rx_b) = mpsc::channel::<IngestRequest>(256);
+        let drain_b = spawn_ingest_drain(rx_b);
+        let chunked = ChunkedReader {
+            data: bytes,
+            pos: 0,
+            window: 100,
+        };
+        let (root_b, total_b) = streaming_ingest(chunked, &tx_b, small_chunker_config(), None)
+            .await
+            .unwrap();
+        drop(tx_b);
+        let captured_b = drain_b.await.unwrap();
+
+        assert_eq!(
+            root_a, root_b,
+            "single-shot and 100-byte-chunked reads must agree on root CID"
+        );
+        assert_eq!(total_a, total_b, "total_bytes must match across readers");
+        assert_eq!(total_a, 8192);
+        assert_eq!(
+            captured_a.len(),
+            captured_b.len(),
+            "same number of IPC sends"
+        );
+        for ((a_hex, a_data), (b_hex, b_data)) in captured_a.iter().zip(captured_b.iter()) {
+            assert_eq!(a_hex, b_hex, "IPC ordering must match");
+            assert_eq!(a_data, b_data, "leaf/bundle bytes must match");
+        }
     }
 }
 
