@@ -134,6 +134,7 @@ pub struct SkipCounts {
     pub hidden: u64,    // dotfiles + .DS_Store + Thumbs.db + .git/**
     pub symlink: u64,
     pub oversized: u64, // > FLAT_BUNDLE_MAX
+    pub other: u64,     // FIFOs, sockets, block/char devices — non-addressable nodes
 }
 
 #[derive(Serialize)]

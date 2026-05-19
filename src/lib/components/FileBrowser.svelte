@@ -750,7 +750,12 @@
     let unlisten: (() => void) | null = null;
     const pending = adapter.listen('os-folder-dropped', (event) => {
       if (cancelled) return;
-      if (activeIngestProgress || pickerOpen) return;
+      // activeIngestJobId is set synchronously at the very start of
+      // startFolderIngest and only cleared by resetIngestState. Including
+      // it in the guard closes the gap where activeIngestProgress could
+      // briefly be null while a previous ingest is still in flight
+      // (defence in depth against the round-1 race window).
+      if (activeIngestProgress || pickerOpen || activeIngestJobId) return;
       const payload = event.payload as { path: string; x: number; y: number };
       void startFolderIngest(payload.path);
     });
@@ -878,8 +883,13 @@
         parentSidecarId,
         breadcrumbStack,
       );
-      resetIngestState();
+      // Set the summary FIRST so the modal is already rendered by the
+      // time resetIngestState clears the guards (activeIngestProgress /
+      // activeIngestJobId). Otherwise a queued os-folder-dropped event
+      // can slip through the now-clear guards before the summary modal
+      // is up, starting an unrelated ingest behind the user's back.
       ingestSummary = result;
+      resetIngestState();
       serviceVersion++; // refetch so the new folder appears in the list
     } catch (err) {
       resetIngestState();

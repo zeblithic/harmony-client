@@ -117,7 +117,7 @@ function makeResult(overrides: Partial<IngestFolderTreeResult> = {}): IngestFold
     totalFilesSeen: 3,
     preWalkTotal: 3,
     succeeded: 3,
-    skipped: { hidden: 0, symlink: 0, oversized: 0 },
+    skipped: { hidden: 0, symlink: 0, oversized: 0, other: 0 },
     failed: [],
     failedOverflow: 0,
     cancelled: false,
@@ -474,8 +474,8 @@ describe('FileBrowser folder ingest UI (ZEB-163)', () => {
     });
   });
 
-  // ── 10. Summary skipped section renders all three rows when > 0 ──────
-  it('summary modal renders hidden / symlink / oversized rows when each count is > 0', async () => {
+  // ── 10. Summary skipped section renders all four rows when > 0 ──────
+  it('summary modal renders hidden / symlink / oversized / other rows when each count is > 0', async () => {
     const { service, adapter } = await setupBrowserWithMockData();
     const ingest = deferred<IngestFolderTreeResult>();
     (adapter.invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) => {
@@ -496,7 +496,7 @@ describe('FileBrowser folder ingest UI (ZEB-163)', () => {
 
     ingest.resolve(
       makeResult({
-        skipped: { hidden: 3, symlink: 1, oversized: 2 },
+        skipped: { hidden: 3, symlink: 1, oversized: 2, other: 4 },
       }),
     );
 
@@ -508,13 +508,14 @@ describe('FileBrowser folder ingest UI (ZEB-163)', () => {
 
     const summaryText =
       document.querySelector('details summary')?.textContent ?? '';
-    expect(summaryText).toMatch(/Skipped: 6 items/);
+    expect(summaryText).toMatch(/Skipped: 10 items/);
     const rows = Array.from(document.querySelectorAll('details li')).map(
       (li) => li.textContent ?? '',
     );
     expect(rows.some((t) => /3 hidden files/.test(t))).toBe(true);
     expect(rows.some((t) => /1 symlinks/.test(t))).toBe(true);
     expect(rows.some((t) => /2 files too large/.test(t))).toBe(true);
+    expect(rows.some((t) => /4 other special files/.test(t))).toBe(true);
   });
 
   // ── 11. Summary failed section + overflow row ────────────────────────

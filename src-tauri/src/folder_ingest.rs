@@ -76,6 +76,11 @@ pub struct SkipCounts {
     pub hidden: u64,
     pub symlink: u64,
     pub oversized: u64,
+    /// FIFOs, sockets, block/char devices — entries that aren't addressable
+    /// in the ingest model. Bucketed separately so they don't vanish from
+    /// summary accounting (a stray Unix socket in a project tree shouldn't
+    /// silently disappear).
+    pub other: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -298,10 +303,17 @@ pub async fn ingest_folder_tree<R: Runtime>(
     }
 
     // Pre-walk for determinate progress. A failure here is non-fatal — we
-    // ship total = -1 and the modal degrades to indeterminate. Doing the
-    // pre-walk synchronously (on the tokio runtime thread) is acceptable
-    // because it's a stat-only pass; no large reads.
-    let total: i64 = pre_walk_count(&root_pathbuf)
+    // ship total = -1 and the modal degrades to indeterminate. The pre-walk
+    // does synchronous `std::fs::symlink_metadata` + `std::fs::read_dir` at
+    // every node, so on massive trees or network-mounted FS the call can
+    // block a tokio worker for seconds. Offload to a blocking thread so the
+    // runtime stays responsive (cancel IPCs, progress emits, other IO can
+    // still make progress).
+    let root_for_pre_walk = root_pathbuf.clone();
+    let total: i64 = tokio::task::spawn_blocking(move || pre_walk_count(&root_for_pre_walk))
+        .await
+        .ok()
+        .flatten()
         .map(|n| n.try_into().unwrap_or(i64::MAX))
         .unwrap_or(-1);
 
@@ -560,7 +572,9 @@ fn walk<'a, R: Runtime>(
             // FIFOs, sockets, block/char devices: not addressable in the
             // ingest model; treat as a quiet skip rather than a failure
             // so a stray Unix socket in a project tree doesn't blow up
-            // the summary.
+            // the summary. Bucketed under `other` so the summary
+            // accounting reflects them rather than silently dropping.
+            counters.skipped.other = counters.skipped.other.saturating_add(1);
             WalkOutcome::Skipped
         }
     })

@@ -39,7 +39,12 @@
   });
 
   let skippedTotal = $derived(
-    result ? result.skipped.hidden + result.skipped.symlink + result.skipped.oversized : 0,
+    result
+      ? result.skipped.hidden +
+        result.skipped.symlink +
+        result.skipped.oversized +
+        result.skipped.other
+      : 0,
   );
   let hasSkipped = $derived(skippedTotal > 0);
   let hasFailed = $derived(!!result && result.failed.length > 0);
@@ -65,6 +70,9 @@
             {/if}
             {#if result.skipped.oversized > 0}
               <li>{result.skipped.oversized} files too large (&gt;8 GiB)</li>
+            {/if}
+            {#if result.skipped.other > 0}
+              <li>{result.skipped.other} other special files (FIFOs/sockets/devices)</li>
             {/if}
           </ul>
         </details>

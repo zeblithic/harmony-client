@@ -179,6 +179,10 @@ async fn flat_dir_three_leaves_sorted_alphabetically() {
     assert_eq!(result.skipped.hidden, 0, "no hidden files in fixture");
     assert_eq!(result.skipped.symlink, 0, "no symlinks in fixture");
     assert_eq!(result.skipped.oversized, 0, "no oversized files in fixture");
+    assert_eq!(
+        result.skipped.other, 0,
+        "no FIFOs/sockets/devices in fixture"
+    );
     assert!(result.failed.is_empty(), "no failures expected");
     assert!(!result.cancelled, "walker was not cancelled");
     assert!(

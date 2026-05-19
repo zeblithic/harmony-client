@@ -67,6 +67,11 @@ export interface SkipCounts {
   hidden: number;
   symlink: number;
   oversized: number;
+  /** FIFOs, sockets, block/char devices — non-addressable filesystem nodes
+   *  the walker can't ingest. Bucketed separately from the named cases so
+   *  the summary modal can render them without conflating "we don't follow
+   *  symlinks" with "we can't ingest a device node". */
+  other: number;
 }
 
 /** One entry in the bounded `failed` list of an ingest result. */
