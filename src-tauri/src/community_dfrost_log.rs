@@ -252,9 +252,13 @@ impl DfrostLog {
 
     /// Apply a `dr` event (DKG round 1 broadcast or round 2 encrypted shares).
     ///
-    /// Task 2 skeleton: only checks that the referenced ceremony exists
-    /// in `pending_dkg`; full round-1 accumulation + round-2 decryption
-    /// + completion arrives in Task 4 / Task 5.
+    /// Round 1 (broadcast): records the actor's `round1_package` bytes in
+    /// the pending ceremony's `round1_packages` map. Idempotent — a duplicate
+    /// from the same actor is silently ignored (HLC LWW deduped upstream).
+    ///
+    /// Round 2 (encrypted shares): bytes here are encrypted to per-recipient
+    /// pubkeys, so the global `apply` path can't decrypt them. The local-
+    /// node path (`apply_with_identity`, Task 5) handles round-2 decryption.
     fn apply_dkg_round(&mut self, event: &SignedCommitteeEvent) -> Result<(), ApplyError> {
         use crate::community_dfrost_types::DkgRoundPayload;
 
@@ -264,17 +268,94 @@ impl DfrostLog {
         let pending = self
             .committee_state
             .pending_dkg
-            .as_ref()
+            .as_mut()
             .ok_or(ApplyError::UnknownCeremony)?;
         if pending.ceremony_id != payload.ceremony_id {
             return Err(ApplyError::UnknownCeremony);
         }
-        // Tasks 4/5 fill in the round-1 / round-2 accumulation logic.
+
+        if payload.round_num == 1 {
+            if let Some(pkg) = payload.round1_package {
+                pending.round1_packages.entry(event.actor).or_insert(pkg);
+            }
+        }
+        // Round 2: the broadcast log path is intentionally inert here.
+        // Per-recipient decryption + share storage happens in
+        // `apply_with_identity` (Task 5). Returning Ok keeps the dr(rn=2)
+        // event flowing into `self.events` so non-committee replicas
+        // still observe the protocol progress.
         Ok(())
     }
 
-    /// Apply a `dk` event. Stub for Task 2; fleshed out in Task 4.
-    fn apply_dkg_complete(&mut self, _event: &SignedCommitteeEvent) -> Result<(), ApplyError> {
+    /// Apply a `dk` (DKG complete) event. Records this actor's claimed
+    /// joint verifying key into `dk_confirmations`; on quorum (count >=
+    /// pending.threshold) and consensus (all confirmations equal), finalize
+    /// the committee. Rejects with `InvariantViolation` when:
+    ///
+    /// * the committee is already active AND the dk's vk differs from the
+    ///   active vk (a DKG cannot mutate the joint pubkey — that's what
+    ///   proactive refresh is for, and the spec requires vk identity).
+    /// * two dk confirmations disagree on the vk for the same ceremony.
+    fn apply_dkg_complete(&mut self, event: &SignedCommitteeEvent) -> Result<(), ApplyError> {
+        use crate::community_dfrost_types::DkgCompletePayload;
+
+        let payload: DkgCompletePayload =
+            ciborium::de::from_reader(&event.payload[..]).map_err(|_| ApplyError::PayloadDecode)?;
+
+        // Reject any dk that would mutate an already-active joint vk.
+        // (Tier 3a contract: DKG runs at most once per committee epoch
+        // boundary; once `active`, refresh is the only path forward.)
+        if self.committee_state.active {
+            if let Some(existing_vk) = self.committee_state.joint_verifying_key {
+                if existing_vk != payload.joint_verifying_key {
+                    return Err(ApplyError::InvariantViolation);
+                }
+            }
+        }
+
+        let pending = self
+            .committee_state
+            .pending_dkg
+            .as_mut()
+            .ok_or(ApplyError::UnknownCeremony)?;
+        if pending.ceremony_id != payload.ceremony_id {
+            return Err(ApplyError::UnknownCeremony);
+        }
+
+        // Cross-confirmation consensus: any disagreement on the vk among
+        // already-recorded confirmations aborts.
+        for existing_vk in pending.dk_confirmations.values() {
+            if *existing_vk != payload.joint_verifying_key {
+                return Err(ApplyError::InvariantViolation);
+            }
+        }
+        pending
+            .dk_confirmations
+            .insert(event.actor, payload.joint_verifying_key);
+
+        // Quorum reached → promote the pending ceremony to the active
+        // committee state. We re-read threshold/members from the just-
+        // decoded `dk` payload (the proposer's snapshot) rather than from
+        // `pending`, mirroring the invariant that on-the-wire payload is
+        // authoritative for committee shape.
+        if pending.dk_confirmations.len() >= payload.threshold as usize {
+            let mut new_verifying_shares: BTreeMap<OwnerAddr, [u8; 32]> = BTreeMap::new();
+            for mvs in &payload.verifying_shares {
+                new_verifying_shares.insert(mvs.member, mvs.verifying_share);
+            }
+            let identifier_map = CommitteeState::build_identifier_map(&payload.members);
+
+            self.committee_state.active = true;
+            self.committee_state.current_epoch = payload.epoch;
+            self.committee_state.joint_verifying_key = Some(payload.joint_verifying_key);
+            self.committee_state.verifying_shares = new_verifying_shares;
+            self.committee_state.members = payload.members.clone();
+            self.committee_state.threshold = payload.threshold;
+            self.committee_state.max_signers = payload.max_signers;
+            self.committee_state.identifier_map = identifier_map;
+            self.committee_state.pending_dkg = None;
+        }
+
         Ok(())
     }
 
@@ -352,5 +433,153 @@ mod tests {
         };
         let mut log = DfrostLog::new();
         assert_eq!(log.apply(ev), Err(ApplyError::UnknownCeremony));
+    }
+
+    #[test]
+    fn full_1of1_dkg_ceremony_finalizes() {
+        // 1-of-1 committee: single member posts dr(rn=1) then dk → committee active.
+        use crate::community_dfrost_types::{
+            DfrostEventKind, DkgCompletePayload, DkgRoundPayload, MemberVerifyingShare,
+            SignedCommitteeEvent,
+        };
+        use crate::owner_state_types::Hlc;
+
+        let alice = OwnerAddr([0x01; 16]);
+        let ceremony_id = [0x42u8; 32];
+        let fake_vk = [0x55u8; 32];
+
+        let mut log = DfrostLog::new();
+        // Seed pending_dkg (normally done by initiate_dkg IPC).
+        log.committee_state.pending_dkg = Some(PendingCeremony {
+            ceremony_id,
+            members: vec![alice],
+            threshold: 1,
+            max_signers: 1,
+            proposed_epoch: 1,
+            ..Default::default()
+        });
+
+        // Apply dr(rn=1)
+        let r1_payload = DkgRoundPayload {
+            ceremony_id,
+            round_num: 1,
+            round1_package: Some(vec![0xde, 0xad]),
+            recipient_ciphertexts: None,
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&r1_payload, &mut pd).unwrap();
+        log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::DkgRound,
+            hlc: Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: alice,
+            payload: pd,
+            sig: vec![0u8; 64],
+        })
+        .expect("apply dr rn=1");
+        assert!(log
+            .committee_state
+            .pending_dkg
+            .as_ref()
+            .unwrap()
+            .round1_packages
+            .contains_key(&alice));
+
+        // Apply dk
+        let dk_payload = DkgCompletePayload {
+            ceremony_id,
+            joint_verifying_key: fake_vk,
+            verifying_shares: vec![MemberVerifyingShare {
+                member: alice,
+                verifying_share: [0xaa; 32],
+            }],
+            epoch: 1,
+            members: vec![alice],
+            threshold: 1,
+            max_signers: 1,
+        };
+        let mut pd2 = Vec::new();
+        ciborium::into_writer(&dk_payload, &mut pd2).unwrap();
+        log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::DkgComplete,
+            hlc: Hlc {
+                wall_ms: 2000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: alice,
+            payload: pd2,
+            sig: vec![0u8; 64],
+        })
+        .expect("apply dk");
+
+        assert!(log.committee_state.active);
+        assert_eq!(log.committee_state.current_epoch, 1);
+        assert_eq!(log.committee_state.joint_verifying_key, Some(fake_vk));
+        assert_eq!(log.committee_state.verifying_shares[&alice], [0xaa; 32]);
+        assert!(log.committee_state.pending_dkg.is_none());
+        assert_eq!(log.events.len(), 2);
+    }
+
+    #[test]
+    fn dk_with_wrong_vk_after_active_returns_invariant_violation() {
+        // After a committee is active, a dk with a different vk must be rejected.
+        use crate::community_dfrost_types::{
+            DfrostEventKind, DkgCompletePayload, MemberVerifyingShare, SignedCommitteeEvent,
+        };
+        use crate::owner_state_types::Hlc;
+
+        let mut log = DfrostLog::new();
+        log.committee_state.active = true;
+        log.committee_state.current_epoch = 1;
+        log.committee_state.joint_verifying_key = Some([0x11u8; 32]);
+        log.committee_state.pending_dkg = Some(PendingCeremony {
+            ceremony_id: [0xcc; 32],
+            members: vec![OwnerAddr([0x01; 16])],
+            threshold: 1,
+            max_signers: 1,
+            proposed_epoch: 2,
+            ..Default::default()
+        });
+
+        let dk_payload = DkgCompletePayload {
+            ceremony_id: [0xcc; 32],
+            joint_verifying_key: [0x22u8; 32], // DIFFERENT from active [0x11]
+            verifying_shares: vec![MemberVerifyingShare {
+                member: OwnerAddr([0x01; 16]),
+                verifying_share: [0; 32],
+            }],
+            epoch: 2,
+            members: vec![OwnerAddr([0x01; 16])],
+            threshold: 1,
+            max_signers: 1,
+        };
+        let mut pd = Vec::new();
+        ciborium::into_writer(&dk_payload, &mut pd).unwrap();
+
+        let result = log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::DkgComplete,
+            hlc: Hlc {
+                wall_ms: 3000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: OwnerAddr([0x01; 16]),
+            payload: pd,
+            sig: vec![0u8; 64],
+        });
+        assert_eq!(result, Err(ApplyError::InvariantViolation));
     }
 }
