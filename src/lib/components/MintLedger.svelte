@@ -4,6 +4,7 @@
   import type { Transaction, Account } from '../mint-types';
   import MintTransactionTable from './MintTransactionTable.svelte';
   import MintTransactionDialog from './MintTransactionDialog.svelte';
+  import MintAccountManager from './MintAccountManager.svelte';
 
   let { adapter }: { adapter: TauriAdapter } = $props();
 
@@ -111,7 +112,14 @@
     />
   {/if}
 
-  <!-- Account manager dialog: rendered in Task 9 -->
+  {#if showAccountManager}
+    <MintAccountManager
+      {service}
+      {accounts}
+      onClose={() => { showAccountManager = false; }}
+      onChanged={load}
+    />
+  {/if}
 </section>
 
 <style>
