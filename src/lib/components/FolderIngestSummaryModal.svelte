@@ -24,10 +24,15 @@
     if (result.cancelled) {
       // `preWalkTotal` is the count taken BEFORE the walker started, so a
       // mid-walk cancel still reports against the full tree. `-1` means
-      // the pre-walk failed (rare: unreadable root) — fall back to
-      // `totalFilesSeen` (counters of leaves the walker actually touched).
-      const denom = result.preWalkTotal > 0 ? result.preWalkTotal : result.totalFilesSeen;
-      return `Cancelled — added ${result.succeeded} of ${denom} files`;
+      // the pre-walk failed (rare: unreadable root) — in that case we
+      // can't report a denominator at all: `totalFilesSeen` includes
+      // oversized files that `preWalkTotal` excludes, so substituting it
+      // would silently change the meaning of the headline depending on
+      // whether the pre-walk succeeded.
+      if (result.preWalkTotal > 0) {
+        return `Cancelled — added ${result.succeeded} of ${result.preWalkTotal} files`;
+      }
+      return `Cancelled — added ${result.succeeded} files (total unknown)`;
     }
     if (result.rootSidecarId === null) {
       return 'Folder ingest failed before completing';

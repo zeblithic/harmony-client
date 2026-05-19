@@ -723,6 +723,88 @@ async fn per_leaf_io_error_is_recorded_and_walk_continues() {
     );
 }
 
+// ── Test 10a: walk-fails-at-root surfaces the message in `failed` ──────────
+
+/// Round-4 bot fix regression: when the root walk itself fails (e.g.
+/// `create_folder_with_children` errors on the root's manifest send),
+/// the failure message used to be silently dropped — `result.failed`
+/// stayed empty, `root_sidecar_id` was None, `cancelled` was false, and
+/// the frontend rendered a generic "failed before completing" headline
+/// with zero diagnostic info. The walker now pushes the message into
+/// `result.failed` so the summary modal's Failed section renders the
+/// real error.
+///
+/// We drive the root-fail by closing the ingest_tx receiver before the
+/// walker starts: the very first send for the root's manifest book
+/// returns Err("event loop not running"), bubbling up as a
+/// `WalkOutcome::Failed` from the root call.
+#[tokio::test]
+async fn root_walk_failure_message_is_surfaced_in_failed_list() {
+    // Custom harness: live sender, dropped receiver. The walker's
+    // pre-walk uses sync `std::fs::*` (no channel), so it completes; the
+    // root manifest send is the first thing that hits the closed channel.
+    let app = tauri::test::mock_app();
+    let app_handle = app.handle().clone();
+    let (ingest_tx, ingest_rx) = tokio::sync::mpsc::channel::<IngestRequest>(8);
+    drop(ingest_rx);
+    let (verb_tx, _verb_rx) = tokio::sync::mpsc::channel::<ContentVerbRequest>(8);
+    let index = fresh_content_index();
+    let registry: CancelRegistry = Arc::new(Mutex::new(Default::default()));
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Empty root — the only ingest sends are for the root manifest
+    // book + bundle. Both fail at the closed channel.
+    let result = folder_ingest::ingest_folder_tree(
+        app_handle,
+        ingest_tx,
+        verb_tx,
+        index.clone(),
+        registry,
+        uuid::Uuid::new_v4().to_string(),
+        dir.path().to_string_lossy().into_owned(),
+        None,
+        Vec::new(),
+    )
+    .await
+    .expect("ingest_folder_tree must return Ok even when the root walk fails");
+
+    assert!(
+        result.root_sidecar_id.is_none(),
+        "root_sidecar_id must be None when the root walk fails; got {:?}",
+        result.root_sidecar_id
+    );
+    assert!(
+        !result.cancelled,
+        "root failure must NOT flip the cancelled flag — that's reserved for explicit cancel"
+    );
+    assert_eq!(
+        result.failed.len(),
+        1,
+        "the root failure message must be surfaced as exactly one entry in `failed`; \
+         got {} entries ({:?})",
+        result.failed.len(),
+        result.failed
+    );
+    let entry = &result.failed[0];
+    assert_eq!(
+        entry.path,
+        dir.path().to_string_lossy(),
+        "the failed entry's path must point at the root that failed; got {}",
+        entry.path
+    );
+    assert!(
+        !entry.message.is_empty(),
+        "the failed entry's message must carry diagnostic info; got empty string"
+    );
+
+    // Sidecar count is unchanged — the root manifest never landed.
+    assert_eq!(
+        index.lock().unwrap().entries().count(),
+        0,
+        "root manifest failure must not leave a partial sidecar"
+    );
+}
+
 // ── Test 10: pre-walk fails on a missing root path ─────────────────────────
 
 #[tokio::test]

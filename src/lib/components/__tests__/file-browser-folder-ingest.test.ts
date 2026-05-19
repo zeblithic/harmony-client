@@ -474,6 +474,51 @@ describe('FileBrowser folder ingest UI (ZEB-163)', () => {
     });
   });
 
+  // ── 9b. Cancelled headline omits the denominator when the pre-walk failed
+  //       (Round-4 bot fix: totalFilesSeen excludes oversized but
+  //       preWalkTotal includes only under-cap files, so substituting one
+  //       for the other silently changed the meaning of the headline).
+  it('summary modal cancelled headline omits denominator when preWalkTotal is -1', async () => {
+    const { service, adapter } = await setupBrowserWithMockData();
+    const ingest = deferred<IngestFolderTreeResult>();
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockImplementation((cmd: string) => {
+      if (cmd === 'ingest_folder_tree') return ingest.promise;
+      if (cmd === 'list_content') return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+    mockOpenDialog.mockResolvedValueOnce('/tmp/abort-pre-walk-fail');
+
+    const { container } = renderBrowser(service, adapter);
+    await fireEvent.click(
+      container.querySelector('button[aria-label="Add folder from disk"]') as HTMLButtonElement,
+    );
+
+    await waitFor(() => {
+      expect(document.querySelector('.counter')).not.toBeNull();
+    });
+
+    ingest.resolve(
+      makeResult({
+        cancelled: true,
+        succeeded: 7,
+        totalFilesSeen: 9,
+        preWalkTotal: -1,
+      }),
+    );
+
+    await waitFor(() => {
+      const headline = document.querySelector('.title');
+      const text = headline?.textContent ?? '';
+      if (!/Cancelled — added 7 files \(total unknown\)/.test(text)) {
+        throw new Error(`pre-walk-fail cancelled headline not yet: "${text}"`);
+      }
+      // Guard against the old fallback to totalFilesSeen sneaking back.
+      if (/of 9 files/.test(text)) {
+        throw new Error(`headline still uses totalFilesSeen denominator: "${text}"`);
+      }
+    });
+  });
+
   // ── 10. Summary skipped section renders all four rows when > 0 ──────
   it('summary modal renders hidden / symlink / oversized / other rows when each count is > 0', async () => {
     const { service, adapter } = await setupBrowserWithMockData();

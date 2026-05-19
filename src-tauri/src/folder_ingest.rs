@@ -182,7 +182,8 @@ fn pre_walk_count(root: &Path) -> Option<u64> {
         }
         if metadata.is_dir() {
             let read_dir = std::fs::read_dir(&path).ok()?;
-            for entry in read_dir.flatten() {
+            for entry_res in read_dir {
+                let entry = entry_res.ok()?;
                 stack.push(entry.path());
             }
         } else if metadata.is_file() && metadata.len() <= FLAT_BUNDLE_MAX {
@@ -356,6 +357,17 @@ pub async fn ingest_folder_tree<R: Runtime>(
     // the cancel arrived after the work was complete.
     let cancelled = matches!(walk_outcome, WalkOutcome::Cancelled)
         || (cancel.load(Ordering::Relaxed) && counters.root_sidecar_id.is_none());
+
+    // When the walker fails AT the root (e.g. create_folder_with_children
+    // errors, or collect_sorted_dir_entries errors on root), the message
+    // would otherwise be silently dropped — the result would have no root
+    // sidecar, an empty failed list, and `cancelled = false`, leaving the
+    // frontend to render a generic "failed before completing" headline
+    // with zero diagnostic info. Push the message into `failed` so the
+    // Failed section in the summary modal renders the real error.
+    if let WalkOutcome::Failed(msg) = walk_outcome {
+        counters.record_fail(&root_pathbuf, msg);
+    }
 
     // total_files_seen is the count of leaves the walker actually touched
     // (succeeded + skipped.oversized + failed) — distinct from the

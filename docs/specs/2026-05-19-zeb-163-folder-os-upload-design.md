@@ -128,6 +128,7 @@ pub struct IngestFolderTreeResult {
     pub succeeded: u64,
     pub skipped: SkipCounts,
     pub failed: Vec<FailedEntry>, // path + message; bounded list (cap at 50, overflow counter)
+    pub failed_overflow: u64, // count of failed entries beyond the 50-entry cap
     pub cancelled: bool,
 }
 
