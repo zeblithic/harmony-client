@@ -4,6 +4,8 @@
 
 **Goal:** Complete the D-FROST foundation by adding wire-format fixtures, multi-engine integration tests, the 5 IPC commands, and the 3 Tauri events. Picks up the 6 deferred tasks from PR [#137](https://github.com/zeblithic/harmony-client/pull/137)'s ZEB-301 plan (Tasks 8-10, 12-14 of `docs/plans/2026-05-18-zeb-301-phase4a-foundation-dfrost-committee-plan.md`).
 
+> **Scope narrowing — this plan was authored at full ZEB-303 scope but Tasks 5-7 (IPCs + Tauri events) were split out mid-implementation to keep the PR reviewable.** The PR shipping under this plan ([#140](https://github.com/zeblithic/harmony-client/pull/140)) ships ONLY Tasks 1-4 (wire-format fixtures + 3 multi-engine integration tests + 1 delta-#3 negative test). Tasks 5-7 (5 IPC handlers + 3 Tauri events + TS payload contracts + final 5-gate sweep) are tracked under [ZEB-305](https://linear.app/zeblith/issue/ZEB-305) and will ship in a follow-up PR. The Tasks 5-7 sections below remain as the design contract that ZEB-305 implements.
+
 **Architecture:** Builds on the merged data layer (`community_dfrost_types.rs`, `community_dfrost_log.rs`, `community_dfrost_crypto.rs`). No new modules — fixtures + integration tests sit in `src-tauri/tests/`, IPC handlers extend `src-tauri/src/lib.rs`. Tauri events emitted from inside the IPC handlers after successful apply.
 
 **Tech stack:** FROST-Ristretto255 v3.0.0 (already in `Cargo.toml`); ciborium for CBOR; existing `dm_outbox` for signing-key extraction; existing `community_admin_quorum_integration.rs` for engine-fixture idiom; tokio for async.
@@ -92,7 +94,7 @@ Expected: all 8 delta markers from "Deltas from ZEB-301 plan" section above reso
 
 Pattern source: `src-tauri/tests/wire_format_zeb250_fixtures.rs` (regen-on-first-run; structural CBOR key checks via `ciborium::Value`).
 
-Five fixtures (one per kind): `dr_round1.cbor`, `dk_complete.cbor`, `ts_contribution.cbor`, `vb_beacon.cbor`, `rf_round1.cbor`. Stored at `tests/fixtures/dfrost/<name>.cbor`.
+Per-variant coverage of all 5 `DfrostEventKind` kinds — 7 payload fixtures + 7 envelope fixtures total. `dr` and `rf` each get round-1 + round-2 variants (different on-wire shape: rn=1 carries `round1_package`, rn=2 carries `recipient_ciphertexts`), so the full variant set is: `dr_round1`, `dr_round2`, `dk`, `ts`, `vb`, `rf_round1`, `rf_round2`. Following the hex-pinned-constants idiom from `wire_format_zeb290_fixtures.rs` (not file-based fixtures).
 
 - [ ] **Step 1: Write the regen-on-first-run helper**
 
@@ -320,6 +322,8 @@ git commit -m "test(zeb-303): two-engine 2-of-2 refresh preserves joint vk acros
 
 ## Task 5 — IPC Handlers: `dfrost_initiate_dkg` + `dfrost_contribute_dkg_round`
 
+> **Deferred to [ZEB-305](https://linear.app/zeblith/issue/ZEB-305).** Not in scope for this PR. The sections below remain as the design contract that ZEB-305 implements.
+
 **Files:**
 - Modify: `src-tauri/src/lib.rs`
 
@@ -399,6 +403,8 @@ git commit -m "feat(zeb-303): IPCs dfrost_initiate_dkg + dfrost_contribute_dkg_r
 ---
 
 ## Task 6 — IPC Handlers: `dfrost_request_vrf_beacon` + `dfrost_contribute_threshold_sign` + `dfrost_propose_refresh`
+
+> **Deferred to [ZEB-305](https://linear.app/zeblith/issue/ZEB-305).** Not in scope for this PR.
 
 **Files:**
 - Modify: `src-tauri/src/lib.rs`
@@ -485,6 +491,8 @@ git commit -m "feat(zeb-303): IPCs dfrost_request_vrf_beacon + dfrost_contribute
 ---
 
 ## Task 7 — Tauri Event Emission Audit
+
+> **Deferred to [ZEB-305](https://linear.app/zeblith/issue/ZEB-305).** Not in scope for this PR.
 
 **Files:**
 - Modify: `src-tauri/src/lib.rs`
@@ -576,7 +584,7 @@ After this lands, the D-FROST foundation is fully accessible from the frontend; 
 ## What ships
 
 - `tests/wire_format_zeb303_dfrost_fixtures.rs` — 5 fixtures (`dr`/`dk`/`ts`/`vb`/`rf`), structural CBOR-key checks
-- `tests/community_dfrost_integration.rs` — 4 two-engine tests (DKG convergence, threshold-sign + VRF beacon, refresh preserves joint vk)
+- `tests/community_dfrost_integration.rs` — 4 integration tests: DKG convergence (`dkg_two_engine_2of2_converges_on_joint_vk`), threshold-sign + VRF beacon (`threshold_sign_two_engine_vrf_beacon_verifies`), refresh preserves joint vk (`refresh_two_engine_preserves_joint_vk`), delta `#3` post-activation pending_dkg rejection (`dk_rejected_after_active_with_pending_dkg_slot`)
 - `src/lib.rs` — 5 new IPCs + 3 new Tauri events
 - `src/lib/types/dfrost-events.ts` — TS payload contracts
 
