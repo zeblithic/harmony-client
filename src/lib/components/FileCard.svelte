@@ -12,6 +12,7 @@
     onRowDrop,
     editing = false,
     editValue = $bindable(''),
+    renameInFlight = false,
     onBeginRename,
     onCommitRename,
     onCancelRename,
@@ -25,6 +26,10 @@
     /** ZEB-299: inline rename. See FileRow.svelte for the contract. */
     editing?: boolean;
     editValue?: string;
+    /** Round 5: see FileRow.svelte — suppresses blur-cancel while
+     *  commitRename's IPC is in flight so a failure keeps the input
+     *  visible for retry. */
+    renameInFlight?: boolean;
     onBeginRename?: (item: ContentItem) => void;
     onCommitRename?: () => void;
     onCancelRename?: () => void;
@@ -93,7 +98,7 @@
         type="text"
         bind:value={editValue}
         onkeydown={handleEditKey}
-        onblur={() => onCancelRename?.()}
+        onblur={() => { if (!renameInFlight) onCancelRename?.(); }}
         onclick={(e) => e.stopPropagation()}
         use:autoFocus
       />

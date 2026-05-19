@@ -134,6 +134,21 @@
   let editingItem = $state<ContentItem | null>(null);
   let editingValue = $state('');
   let renameError = $state<string | null>(null);
+  // Round 5: in-flight tracking for commitRename's await window.
+  //
+  // `renameInFlight` (reactive) suppresses the blur-cancel on the
+  // inline input so a click-away during the IPC keeps edit mode open
+  // for the user to retry after a failure (the alternative — closing
+  // edit mode on blur — orphaned the error banner with no input
+  // visible).
+  //
+  // `renameCommitSeq` (plain) is a generation token. beginRename and
+  // cancelRename bump it; commitRename captures it before its await
+  // and discards the post-await state mutation if the captured token
+  // is stale — covering folder navigation, blur-cancel, or a new
+  // rename starting mid-IPC.
+  let renameInFlight = $state(false);
+  let renameCommitSeq = 0;
 
   // Sync navStack with currentFolderCid (driven by the parent component).
   // The effect's only reactive dependency is currentFolderCid; navStack /
@@ -459,12 +474,14 @@
   // FileRow/FileCard). The trio of helpers is the only place that
   // mutates editingItem/editingValue/renameError.
   function beginRename(item: ContentItem) {
+    renameCommitSeq++;
     editingItem = item;
     editingValue = item.name;
     renameError = null;
   }
 
   function cancelRename() {
+    renameCommitSeq++;
     editingItem = null;
     editingValue = '';
     renameError = null;
@@ -495,6 +512,13 @@
       renameError = 'Cannot rename: folder identity not loaded';
       return;
     }
+    // Capture a generation token before the await so a folder nav,
+    // blur-cancel, or new rename that fires mid-IPC discards this
+    // call's tail mutations. renameInFlight stays true for the await
+    // window so the input's onblur handler skips its cancel (keeping
+    // edit mode open for retry on failure).
+    const mySeq = ++renameCommitSeq;
+    renameInFlight = true;
     try {
       await service.renameContent({
         srcSidecarId,
@@ -503,11 +527,15 @@
         srcChildName: item.name,
         newName: trimmed,
       });
+      if (mySeq !== renameCommitSeq) return; // stale — context changed during await
       cancelRename();
     } catch (e) {
+      if (mySeq !== renameCommitSeq) return; // stale — discard the rejection
       const raw = e instanceof Error ? e.message : String(e);
       renameError = raw.replace(/^Error:\s*/, '');
       // Keep edit mode open so the user can fix the name and retry.
+    } finally {
+      renameInFlight = false;
     }
   }
 
@@ -697,6 +725,7 @@
           onRowDrop={handleRowDrop}
           {editingItem}
           bind:editingValue
+          {renameInFlight}
           onBeginRename={beginRename}
           onCommitRename={commitRename}
           onCancelRename={cancelRename}
@@ -711,6 +740,7 @@
           onRowDrop={handleRowDrop}
           {editingItem}
           bind:editingValue
+          {renameInFlight}
           onBeginRename={beginRename}
           onCommitRename={commitRename}
           onCancelRename={cancelRename}

@@ -12,6 +12,7 @@
     onRowDrop,
     editing = false,
     editValue = $bindable(''),
+    renameInFlight = false,
     onBeginRename,
     onCommitRename,
     onCancelRename,
@@ -26,6 +27,11 @@
      *  input; `editValue` two-way-binds the text back to FileBrowser. */
     editing?: boolean;
     editValue?: string;
+    /** Round 5: true while commitRename's IPC is awaiting. Suppresses
+     *  the blur-cancel so the input survives a click-away during the
+     *  in-flight window — without this, an IPC failure leaves only the
+     *  error banner with no input to retry in. */
+    renameInFlight?: boolean;
     onBeginRename?: (item: ContentItem) => void;
     onCommitRename?: () => void;
     onCancelRename?: () => void;
@@ -94,7 +100,7 @@
       type="text"
       bind:value={editValue}
       onkeydown={handleEditKey}
-      onblur={() => onCancelRename?.()}
+      onblur={() => { if (!renameInFlight) onCancelRename?.(); }}
       onclick={(e) => e.stopPropagation()}
       use:autoFocus
     />

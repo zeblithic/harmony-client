@@ -41,13 +41,18 @@ impl Drop for TestHarness {
         // pattern into the shared harness extraction.
         let _ = self._shutdown_tx.send(true);
         if let Some(handle) = self.runtime_thread.take() {
-            // Surface a runtime-thread panic via eprintln rather than
-            // propagating it: panicking from Drop while a test is
-            // already failing aborts the process with a double-panic,
-            // hiding the original failure. The eprintln lands in
-            // nextest's per-test log so the cause isn't lost.
+            // Surface a runtime-thread panic as a test failure when
+            // the test is otherwise green; downgrade to eprintln if
+            // Drop runs during unwinding so we don't double-panic and
+            // abort the process. resume_unwind preserves the original
+            // payload (and Backtrace, if any) — strictly better than
+            // re-raising via panic!.
             if let Err(payload) = handle.join() {
-                eprintln!("TestHarness runtime thread panicked: {:?}", payload);
+                if std::thread::panicking() {
+                    eprintln!("TestHarness runtime thread panicked: {:?}", payload);
+                } else {
+                    std::panic::resume_unwind(payload);
+                }
             }
         }
     }
@@ -272,15 +277,15 @@ fn insert_top_level(
     sid
 }
 
-fn fresh_index() -> Arc<Mutex<ContentIndex>> {
-    // Each test owns its own tempdir-backed sidecar.
+fn fresh_index() -> (Arc<Mutex<ContentIndex>>, tempfile::TempDir) {
+    // Each test owns its own tempdir-backed sidecar. The TempDir is
+    // returned alongside the index so callers can keep it alive for
+    // the duration of the test — without that, ContentIndex::save
+    // writes vanish into a deleted directory and on-disk persistence
+    // regressions slip past tests that only assert in-memory state.
     let dir = tempdir().unwrap();
     let idx = ContentIndex::load(dir.path());
-    // dir is dropped here, but ContentIndex retains the path and will
-    // try to save into it — which is fine for tests where we only
-    // care about the in-memory state. The save() warnings are harmless.
-    let _ = dir; // explicit drop
-    Arc::new(Mutex::new(idx))
+    (Arc::new(Mutex::new(idx)), dir)
 }
 
 // ── Test 1: rename_top_level_file ─────────────────────────────────────────
@@ -294,7 +299,7 @@ async fn rename_top_level_file() {
     let harness = spawn_test_runtime().await;
     ingest_leaf(&harness, l_cid, l_bytes.clone()).await;
 
-    let index = fresh_index();
+    let (index, _index_dir) = fresh_index();
     let l_sid = insert_top_level(
         &index,
         l_cid,
@@ -346,7 +351,7 @@ async fn rename_top_level_folder() {
     ingest_leaf(&harness, l_cid, l_bytes).await;
     ingest_folder(&harness, &f_old).await;
 
-    let index = fresh_index();
+    let (index, _index_dir) = fresh_index();
     let f_sid = insert_top_level(
         &index,
         f_old.bundle_cid.to_bytes(),
@@ -402,7 +407,7 @@ async fn rename_nested_one_level_deep() {
     ingest_folder(&harness, &f_old).await;
     ingest_folder(&harness, &t_old).await;
 
-    let index = fresh_index();
+    let (index, _index_dir) = fresh_index();
     let t_sid = insert_top_level(
         &index,
         t_old.bundle_cid.to_bytes(),
@@ -479,7 +484,7 @@ async fn rename_nested_two_levels_deep() {
     ingest_folder(&harness, &a_old).await;
     ingest_folder(&harness, &t_old).await;
 
-    let index = fresh_index();
+    let (index, _index_dir) = fresh_index();
     let t_sid = insert_top_level(
         &index,
         t_old.bundle_cid.to_bytes(),
@@ -564,7 +569,7 @@ async fn rename_disambiguates_siblings_with_shared_cid() {
     ingest_folder(&harness, &empty).await;
     ingest_folder(&harness, &t_old).await;
 
-    let index = fresh_index();
+    let (index, _index_dir) = fresh_index();
     let t_sid = insert_top_level(
         &index,
         t_old.bundle_cid.to_bytes(),
@@ -621,7 +626,7 @@ async fn rename_empty_name_rejected() {
     let harness = spawn_test_runtime().await;
     ingest_leaf(&harness, l_cid, l_bytes.clone()).await;
 
-    let index = fresh_index();
+    let (index, _index_dir) = fresh_index();
     let l_sid = insert_top_level(
         &index,
         l_cid,
@@ -677,7 +682,7 @@ async fn rename_same_name_nested_no_op() {
     ingest_folder(&harness, &f_old).await;
     ingest_folder(&harness, &t_old).await;
 
-    let index = fresh_index();
+    let (index, _index_dir) = fresh_index();
     let t_sid = insert_top_level(
         &index,
         t_old.bundle_cid.to_bytes(),
@@ -720,7 +725,7 @@ async fn rename_same_name_top_level_no_op() {
     let harness = spawn_test_runtime().await;
     ingest_leaf(&harness, l_cid, l_bytes.clone()).await;
 
-    let index = fresh_index();
+    let (index, _index_dir) = fresh_index();
     let l_sid = insert_top_level(
         &index,
         l_cid,
@@ -779,7 +784,7 @@ async fn rename_duplicate_sibling_rejected_nested() {
     ingest_folder(&harness, &b_old).await;
     ingest_folder(&harness, &t_old).await;
 
-    let index = fresh_index();
+    let (index, _index_dir) = fresh_index();
     let t_sid = insert_top_level(
         &index,
         t_old.bundle_cid.to_bytes(),
@@ -823,7 +828,7 @@ async fn rename_duplicate_sibling_rejected_top_level() {
     ingest_leaf(&harness, a_cid, a_bytes.clone()).await;
     ingest_leaf(&harness, b_cid, b_bytes.clone()).await;
 
-    let index = fresh_index();
+    let (index, _index_dir) = fresh_index();
     let a_sid = insert_top_level(
         &index,
         a_cid,
@@ -873,7 +878,7 @@ async fn rename_name_mismatch_rejected() {
     let harness = spawn_test_runtime().await;
     ingest_leaf(&harness, l_cid, l_bytes.clone()).await;
 
-    let index = fresh_index();
+    let (index, _index_dir) = fresh_index();
     let l_sid = insert_top_level(
         &index,
         l_cid,
@@ -965,7 +970,7 @@ async fn rename_concurrent_rekey_conflict() {
     ingest_folder(&harness, &f_old).await;
     ingest_folder(&harness, &t_old).await;
 
-    let index = fresh_index();
+    let (index, _index_dir) = fresh_index();
     let t_sid = insert_top_level(
         &index,
         t_old.bundle_cid.to_bytes(),
@@ -1003,5 +1008,58 @@ async fn rename_concurrent_rekey_conflict() {
     assert_eq!(
         entry.cid, t_old_cid,
         "T sidecar CID unchanged after rejected rename",
+    );
+}
+
+// ── Test 13: rename_nested_preserves_pinned_status ───────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rename_nested_preserves_pinned_status() {
+    // Top-level T (pinned) contains F. Renaming F rekeys T's sidecar.
+    // The rekey path must preserve the `pinned` flag — losing it would
+    // silently demote pinned content to evictable on every rename.
+    let f_old = folders::build_folder("foo", &[]).expect("build F");
+    let t_old = folders::build_folder(
+        "T",
+        &[folders::ManifestEntry {
+            cid: f_old.bundle_cid.to_bytes(),
+            name: "foo".into(),
+            kind: ContentKind::Folder,
+        }],
+    )
+    .expect("build T");
+
+    let harness = spawn_test_runtime().await;
+    ingest_folder(&harness, &f_old).await;
+    ingest_folder(&harness, &t_old).await;
+
+    let (index, _index_dir) = fresh_index();
+    let t_sid = insert_top_level(
+        &index,
+        t_old.bundle_cid.to_bytes(),
+        "T",
+        ContentKind::Folder,
+        true, // pinned
+        t_old.bundle_bytes.len() as u64,
+    );
+
+    harmony_app::rename_content_impl(
+        t_sid.to_string(),
+        vec![hex::encode(t_old.bundle_cid.to_bytes())],
+        hex::encode(f_old.bundle_cid.to_bytes()),
+        "foo".to_string(),
+        "bar".to_string(),
+        harness.ingest_tx.clone(),
+        harness.verb_tx.clone(),
+        index.clone(),
+    )
+    .await
+    .expect("rename nested preserves pinned");
+
+    let idx = index.lock().unwrap();
+    let entry = idx.get(&t_sid).expect("T entry still present after rekey");
+    assert!(
+        entry.pinned,
+        "pinned flag must survive the rekey — sidecar rekey is not a re-insert",
     );
 }

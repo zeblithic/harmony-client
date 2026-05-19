@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { ContentItem } from '../types';
+  import { matchesEditing } from '../file-utils';
   import FileRow from './FileRow.svelte';
 
   let {
@@ -11,6 +12,7 @@
     onRowDrop,
     editingItem = null,
     editingValue = $bindable(''),
+    renameInFlight = false,
     onBeginRename,
     onCommitRename,
     onCancelRename,
@@ -24,29 +26,16 @@
     onRowDrop?: (e: DragEvent, targetCid: string, targetSidecarId: string | null) => void;
     /** ZEB-299: inline rename. `editingItem` toggles the matching row
      *  into edit mode; `editingValue` two-way-binds the input back up
-     *  to FileBrowser. */
+     *  to FileBrowser. `renameInFlight` (round 5) suppresses the blur
+     *  cancel while the commit IPC is awaiting so a failure keeps the
+     *  input visible for retry. */
     editingItem?: ContentItem | null;
     editingValue?: string;
+    renameInFlight?: boolean;
     onBeginRename?: (item: ContentItem) => void;
     onCommitRename?: () => void;
     onCancelRename?: () => void;
   } = $props();
-
-  // Edit-mode match: top-level rows carry a non-empty sidecarId (the
-  // sidecar's unique key); manifest-derived nested rows carry "". For
-  // top-level use sidecarId (two sidecar entries CAN share name+cid
-  // because insert only dedupes by id). For nested fall back to
-  // name+cid, which manifest invariants make unique within a folder.
-  function matchesEditing(item: ContentItem): boolean {
-    if (editingItem === null) return false;
-    if (editingItem.sidecarId && item.sidecarId) {
-      return editingItem.sidecarId === item.sidecarId;
-    }
-    if (!editingItem.sidecarId && !item.sidecarId) {
-      return editingItem.name === item.name && editingItem.cid === item.cid;
-    }
-    return false;
-  }
 </script>
 
 <div class="file-list" role="table" aria-label="File list">
@@ -66,8 +55,9 @@
       selected={selectedSidecarId !== null ? selectedSidecarId === item.sidecarId : selectedCid === item.cid}
       {onRowDragStart}
       {onRowDrop}
-      editing={matchesEditing(item)}
+      editing={matchesEditing(editingItem, item)}
       bind:editValue={editingValue}
+      {renameInFlight}
       {onBeginRename}
       {onCommitRename}
       {onCancelRename}

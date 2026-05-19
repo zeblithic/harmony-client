@@ -269,4 +269,59 @@ describe('FileBrowser inline rename (ZEB-299)', () => {
       expect.any(Object),
     );
   });
+
+  // ── Round 5: blur during in-flight commit must NOT cancel ─────────
+
+  it('blurring while the rename IPC is in flight keeps edit mode (error still retryable)', async () => {
+    // Wire a manually-controlled deferred so the blur fires during the
+    // await window. Without the in-flight guard, blur would cancel
+    // edit mode and the catch's renameError would orphan a banner
+    // with no input to retry in.
+    const service = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    let rejectRename!: (err: unknown) => void;
+    const renamePending = new Promise((_resolve, reject) => {
+      rejectRename = reject;
+    });
+    adapter.invoke = vi.fn().mockImplementation((cmd: string) => {
+      if (cmd === 'list_content') return Promise.resolve([]);
+      if (cmd === 'rename_content') return renamePending;
+      return Promise.resolve(undefined);
+    });
+    await service.connectAdapter(adapter);
+    (service as unknown as { privateContent: unknown[] }).privateContent = (
+      await import('../../mock-file-data')
+    ).mockPrivateContent.slice();
+
+    const { container, findByRole } = renderBrowser(service, {
+      selectedSidecarId: 'mock-sidecar-4',
+    });
+
+    const browser = container.querySelector('.file-browser') as HTMLElement;
+    await fireEvent.keyDown(browser, { key: 'F2' });
+
+    const input = await waitFor(() => {
+      const el = container.querySelector(
+        '.file-row-name-input',
+      ) as HTMLInputElement | null;
+      if (!el) throw new Error('rename input not rendered');
+      return el;
+    });
+
+    await fireEvent.input(input, { target: { value: 'in-flight.flac' } });
+    await fireEvent.keyDown(input, { key: 'Enter' });
+
+    // Blur fires while the IPC is still awaiting — must be a no-op.
+    await fireEvent.blur(input);
+
+    // Now resolve the IPC with a rejection so the catch block runs.
+    rejectRename(new Error('name already in use'));
+
+    const banner = await findByRole('alert');
+    expect(banner.textContent).toContain('name already in use');
+
+    // Input must still be in the DOM — user has to be able to fix and retry.
+    const stillThere = container.querySelector('.file-row-name-input');
+    expect(stillThere).not.toBeNull();
+  });
 });

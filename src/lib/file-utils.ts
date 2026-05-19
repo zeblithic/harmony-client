@@ -1,4 +1,4 @@
-import type { ContentCategory, ContentSensitivity, ReplicationTier } from './types';
+import type { ContentCategory, ContentItem, ContentSensitivity, ReplicationTier } from './types';
 
 const CATEGORY_ICONS: Record<ContentCategory, string> = {
   music: '\u266A',
@@ -42,6 +42,27 @@ export function formatBytes(bytes: number): string {
   if (bytes >= 1_000_000) return (bytes / 1_000_000).toFixed(1) + ' MB';
   if (bytes >= 1_000) return (bytes / 1_000).toFixed(1) + ' KB';
   return bytes + ' B';
+}
+
+// ZEB-299 inline-rename edit-mode match. Top-level rows carry a
+// non-empty sidecarId (the sidecar's unique key); manifest-derived
+// nested rows carry "". For top-level use sidecarId — two sidecar
+// entries CAN share name+cid because ContentIndex::insert only dedupes
+// by id. For nested fall back to (name, cid), which manifest
+// invariants make unique within a folder. Shared by FileList and
+// FileGrid to keep their per-row matching in lockstep.
+export function matchesEditing(
+  editingItem: ContentItem | null,
+  item: ContentItem,
+): boolean {
+  if (editingItem === null) return false;
+  if (editingItem.sidecarId && item.sidecarId) {
+    return editingItem.sidecarId === item.sidecarId;
+  }
+  if (!editingItem.sidecarId && !item.sidecarId) {
+    return editingItem.name === item.name && editingItem.cid === item.cid;
+  }
+  return false;
 }
 
 export function relativeTime(timestamp: number): string {

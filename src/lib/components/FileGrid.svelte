@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { ContentItem } from '../types';
+  import { matchesEditing } from '../file-utils';
   import FileCard from './FileCard.svelte';
 
   let {
@@ -11,6 +12,7 @@
     onRowDrop,
     editingItem = null,
     editingValue = $bindable(''),
+    renameInFlight = false,
     onBeginRename,
     onCommitRename,
     onCancelRename,
@@ -25,24 +27,11 @@
     /** ZEB-299: inline rename — see FileList.svelte for the contract. */
     editingItem?: ContentItem | null;
     editingValue?: string;
+    renameInFlight?: boolean;
     onBeginRename?: (item: ContentItem) => void;
     onCommitRename?: () => void;
     onCancelRename?: () => void;
   } = $props();
-
-  // See FileList.svelte for the rationale — top-level uses sidecarId
-  // (insert dedupes by id only), nested uses (name, cid) (manifest
-  // invariants make name unique within a folder).
-  function matchesEditing(item: ContentItem): boolean {
-    if (editingItem === null) return false;
-    if (editingItem.sidecarId && item.sidecarId) {
-      return editingItem.sidecarId === item.sidecarId;
-    }
-    if (!editingItem.sidecarId && !item.sidecarId) {
-      return editingItem.name === item.name && editingItem.cid === item.cid;
-    }
-    return false;
-  }
 </script>
 
 <div class="file-grid" aria-label="File grid">
@@ -53,8 +42,9 @@
       selected={selectedSidecarId !== null ? selectedSidecarId === item.sidecarId : selectedCid === item.cid}
       {onRowDragStart}
       {onRowDrop}
-      editing={matchesEditing(item)}
+      editing={matchesEditing(editingItem, item)}
       bind:editValue={editingValue}
+      {renameInFlight}
       {onBeginRename}
       {onCommitRename}
       {onCancelRename}
