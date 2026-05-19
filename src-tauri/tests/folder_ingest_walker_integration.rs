@@ -13,8 +13,8 @@
 //!   leaf-not-polluting-root, and pre-set cancel flag short-circuits).
 //! - This file pins **walker-shape** invariants that need an end-to-end
 //!   ingest + sidecar inspection: sorted order, bottom-up build order,
-//!   empty subdir, deny-list, symlinks, oversized files, mid-walk cancel,
-//!   per-leaf I/O failure, and pre-walk failure on a missing root.
+//!   empty subdir, deny-list, symlinks, mid-walk cancel, per-leaf I/O
+//!   failure, and pre-walk failure on a missing root.
 //!
 //! The walker is driven with `parent_path = []` (root drops) throughout,
 //! so the `content_verb_tx` channel is never exercised — the test handler
@@ -178,7 +178,6 @@ async fn flat_dir_three_leaves_sorted_alphabetically() {
     );
     assert_eq!(result.skipped.hidden, 0, "no hidden files in fixture");
     assert_eq!(result.skipped.symlink, 0, "no symlinks in fixture");
-    assert_eq!(result.skipped.oversized, 0, "no oversized files in fixture");
     assert_eq!(
         result.skipped.other, 0,
         "no FIFOs/sockets/devices in fixture"
@@ -454,72 +453,7 @@ async fn symlink_to_directory_is_not_followed() {
     );
 }
 
-// ── Test 7: oversized file via sparse `set_len` (unix-only) ────────────────
-
-/// `set_len` on Linux/macOS creates a sparse file: the on-disk allocation
-/// stays at a few extents while the apparent size matches what we set. The
-/// walker's oversized check reads `metadata().len()` (apparent size), so the
-/// skip path fires without us actually allocating ~8 GiB.
-///
-/// Windows is excluded because NTFS does not auto-sparse via std `set_len`
-/// — the operation would zero-fill and run for minutes (or fail under disk
-/// pressure). The spec's Task 8 note flags this exact fallback; CI runs on
-/// Linux so the gate doesn't reduce coverage in practice.
-#[cfg(unix)]
-#[tokio::test]
-#[ignore = "ZEB-161: replaced by Task 5's nested_bundle_tree_round_trip integration test; \
-            the FLAT_BUNDLE_MAX metadata gate in the walker is removed in Task 3 and the \
-            sparse-8GiB+ ingest path is no longer the supported failure mode."]
-async fn oversized_file_is_skipped_via_sparse_extension() {
-    use std::fs::OpenOptions;
-
-    // FLAT_BUNDLE_MAX is `pub(crate)` in lib.rs and not visible to
-    // integration tests; recompute it here from the same public
-    // harmony-content constants the lib uses. Keeping this expression in
-    // sync with `lib.rs::FLAT_BUNDLE_MAX` is a manual contract — if the
-    // upstream constants drift, this test will silently produce a
-    // too-small "oversized" file. Both sides come from harmony-content's
-    // public API so the drift surface is small.
-    let flat_bundle_max: u64 = (harmony_content::bundle::MAX_BUNDLE_ENTRIES as u64)
-        * (harmony_content::chunker::ChunkerConfig::DEFAULT.min_chunk as u64);
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    // One survivor + one oversized sparse file. Survivor proves the walk
-    // continues past the skip; oversized proves the skip is counted.
-    std::fs::write(dir.path().join("ok.txt"), b"ok").expect("write ok");
-    let big_path = dir.path().join("huge.bin");
-    let big = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&big_path)
-        .expect("open huge.bin");
-    big.set_len(flat_bundle_max + 1)
-        .expect("sparse set_len past FLAT_BUNDLE_MAX");
-    drop(big);
-
-    let h = fresh_harness();
-    let result = run_walker(&h, dir.path().to_path_buf())
-        .await
-        .expect("ingest_folder_tree succeeds with an oversized file in the tree");
-
-    assert_eq!(
-        result.skipped.oversized, 1,
-        "oversized file must increment the oversized skip bucket; got {}",
-        result.skipped.oversized
-    );
-    assert_eq!(result.succeeded, 1, "ok.txt must still settle");
-
-    let root_cid = result.root_cid.as_ref().expect("root_cid set");
-    let entries = parse_root_manifest(&h.log, root_cid);
-    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-    assert_eq!(
-        names,
-        vec!["ok.txt"],
-        "oversized file name must NOT appear in the root manifest; got {names:?}"
-    );
-}
-
-// ── Test 8: cancel mid-walk via a gated ingest handler ─────────────────────
+// ── Test 7: cancel mid-walk via a gated ingest handler ─────────────────────
 
 /// Cancel mid-walk needs a determinism guarantee: the cancel flag must be
 /// set *after* the walker has done at least some work but *before* the
@@ -658,7 +592,7 @@ async fn cancel_mid_walk_settles_with_cancelled_true_and_no_root_sidecar() {
     );
 }
 
-// ── Test 9: per-leaf I/O error via chmod 000 (unix-only) ───────────────────
+// ── Test 8: per-leaf I/O error via chmod 000 (unix-only) ───────────────────
 
 /// Drops read permissions on a single file so `tokio::fs::read` returns
 /// `PermissionDenied`. The walker must record the failure against that
@@ -726,7 +660,7 @@ async fn per_leaf_io_error_is_recorded_and_walk_continues() {
     );
 }
 
-// ── Test 10a: walk-fails-at-root surfaces the message in `failed` ──────────
+// ── Test 9a: walk-fails-at-root surfaces the message in `failed` ──────────
 
 /// Round-4 bot fix regression: when the root walk itself fails (e.g.
 /// `create_folder_with_children` errors on the root's manifest send),
@@ -808,7 +742,7 @@ async fn root_walk_failure_message_is_surfaced_in_failed_list() {
     );
 }
 
-// ── Test 10: pre-walk fails on a missing root path ─────────────────────────
+// ── Test 9: pre-walk fails on a missing root path ─────────────────────────
 
 #[tokio::test]
 async fn missing_root_path_errors_without_inserting_sidecar() {

@@ -73,7 +73,6 @@ impl WalkCounters {
 pub struct SkipCounts {
     pub hidden: u64,
     pub symlink: u64,
-    pub oversized: u64,
     /// FIFOs, sockets, block/char devices — entries that aren't addressable
     /// in the ingest model. Bucketed separately so they don't vanish from
     /// summary accounting (a stray Unix socket in a project tree shouldn't
@@ -374,12 +373,11 @@ pub async fn ingest_folder_tree<R: Runtime>(
     }
 
     // total_files_seen is the count of leaves the walker actually touched
-    // (succeeded + skipped.oversized + failed) — distinct from the
-    // pre-walk's `total`, which estimates from the on-disk tree. The two
-    // can disagree if files appear or disappear mid-walk.
+    // (succeeded + failed) — distinct from the pre-walk's `total`, which
+    // estimates from the on-disk tree. The two can disagree if files
+    // appear or disappear mid-walk.
     let total_files_seen = counters
         .succeeded
-        .saturating_add(counters.skipped.oversized)
         .saturating_add(counters.failed.len() as u64)
         .saturating_add(counters.overflow_count);
 

@@ -85,11 +85,11 @@ impl<R: tauri::Runtime> crate::community_invite::AppHandleEmit for tauri::AppHan
 ///
 /// Split into distinct variants so the walker can distinguish IO errors,
 /// symlink rejections, sidecar collisions, channel failures, and manifest
-/// build errors without parsing strings. (The walker's `skipped.oversized`
-/// bucket is sourced from a pre-walk metadata predicate, not from this
-/// enum — ZEB-161 lifted the per-file size cap.) The IPC seam in
-/// `ingest_content` collapses these to `String` via `to_string()` for
-/// backwards compatibility with the existing frontend.
+/// build errors without parsing strings. (ZEB-161 lifted the per-file size
+/// cap — there is no longer a per-file oversized rejection path; arbitrary
+/// file sizes are handled by the streaming nested-bundle ingest pipeline.)
+/// The IPC seam in `ingest_content` collapses these to `String` via
+/// `to_string()` for backwards compatibility with the existing frontend.
 #[derive(Debug, thiserror::Error)]
 pub enum IngestError {
     #[error("io error: {0}")]
