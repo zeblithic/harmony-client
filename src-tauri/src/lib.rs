@@ -42,6 +42,7 @@ pub mod inbound_packet;
 pub mod library_directory;
 pub mod mail;
 pub mod mail_sync;
+pub mod mint;
 pub mod owner_commands;
 pub mod owner_state;
 pub mod owner_state_crdt;
