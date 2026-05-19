@@ -18,6 +18,7 @@
   import FileGrid from './FileGrid.svelte';
   import FolderLoadError from './FolderLoadError.svelte';
   import FolderIngestProgressModal from './FolderIngestProgressModal.svelte';
+  import FolderIngestSummaryModal from './FolderIngestSummaryModal.svelte';
   import QuotaBar from './QuotaBar.svelte';
   import PublishedView from './PublishedView.svelte';
   import CleanupView from './CleanupView.svelte';
@@ -706,6 +707,10 @@
     cancelRequested = false;
   }
 
+  function dismissIngestSummary() {
+    ingestSummary = null;
+  }
+
   async function handleAddFolderClick() {
     // Serialise: the same guard that the OS-drop listener will use, so a
     // picker click + drop event can't race a second walker. pickerOpen
@@ -997,11 +1002,11 @@
         onCancel={handleCancelIngest}
       />
 
-      {#if ingestSummary}
-        <div role="status" aria-live="polite" class="visually-hidden">
-          Folder ingest complete: {ingestSummary.succeeded} files
-        </div>
-      {/if}
+      <FolderIngestSummaryModal
+        open={!!ingestSummary}
+        result={ingestSummary}
+        onDismiss={dismissIngestSummary}
+      />
 
       {#if folderLoadError && folderLoadError.cid === currentFolderCid}
         <FolderLoadError
