@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { ContentItem } from '../types';
+  import { matchesEditing } from '../file-utils';
   import FileRow from './FileRow.svelte';
 
   let {
@@ -9,6 +10,12 @@
     onItemClick,
     onRowDragStart,
     onRowDrop,
+    editingItem = null,
+    editingValue = $bindable(''),
+    renameInFlight = false,
+    onBeginRename,
+    onCommitRename,
+    onCancelRename,
   }: {
     items: ContentItem[];
     selectedCid: string | null;
@@ -17,6 +24,17 @@
     /** ZEB-162: per-row drag handlers, wired by FileBrowser. */
     onRowDragStart?: (e: DragEvent, item: ContentItem) => void;
     onRowDrop?: (e: DragEvent, targetCid: string, targetSidecarId: string | null) => void;
+    /** ZEB-299: inline rename. `editingItem` toggles the matching row
+     *  into edit mode; `editingValue` two-way-binds the input back up
+     *  to FileBrowser. `renameInFlight` (round 5) suppresses the blur
+     *  cancel while the commit IPC is awaiting so a failure keeps the
+     *  input visible for retry. */
+    editingItem?: ContentItem | null;
+    editingValue?: string;
+    renameInFlight?: boolean;
+    onBeginRename?: (item: ContentItem) => void;
+    onCommitRename?: () => void;
+    onCancelRename?: () => void;
   } = $props();
 </script>
 
@@ -30,13 +48,19 @@
     <span class="header-replicas" role="columnheader">Replicas</span>
     <span class="header-sensitivity" aria-hidden="true"></span>
   </div>
-  {#each items as item (item.sidecarId || item.cid)}
+  {#each items as item (item.sidecarId || `nested:${item.cid}:${item.name}`)}
     <FileRow
       {item}
       onClick={onItemClick}
       selected={selectedSidecarId !== null ? selectedSidecarId === item.sidecarId : selectedCid === item.cid}
       {onRowDragStart}
       {onRowDrop}
+      editing={matchesEditing(editingItem, item)}
+      bind:editValue={editingValue}
+      {renameInFlight}
+      {onBeginRename}
+      {onCommitRename}
+      {onCancelRename}
     />
   {/each}
 </div>

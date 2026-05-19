@@ -297,6 +297,24 @@ impl ContentIndex {
         true
     }
 
+    /// Update the `file_name` of an existing sidecar entry. Returns
+    /// `true` if the name changed, `false` if the sidecar_id is unknown OR
+    /// the name was already at the target value. Not CAS-protected on the
+    /// name field — consistent with set_archived / set_pinned /
+    /// set_replication_tier (all non-CID field mutations on the sidecar
+    /// are non-CAS).
+    pub fn set_file_name(&mut self, id: &SidecarId, new_name: String) -> bool {
+        let Some(entry) = self.entries.get_mut(id) else {
+            return false;
+        };
+        if entry.file_name == new_name {
+            return false;
+        }
+        entry.file_name = new_name;
+        self.save();
+        true
+    }
+
     /// Atomically replace an entry's CID while preserving user-state
     /// (file_name, sensitivity, replication_tier, licensed, archived,
     /// pinned, kind). Used when a folder mutation produces a new top-level
@@ -621,6 +639,45 @@ mod tests {
         let mut idx = ContentIndex::load(dir.path());
         let bogus = SidecarId::new();
         assert!(!idx.set_archived(&bogus, true));
+    }
+
+    #[test]
+    fn set_file_name_updates_name_and_reports_change() {
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(dir.path());
+        let entry = sample_entry([0xF1; 32]);
+        let id = entry.sidecar_id;
+        idx.insert(entry);
+
+        assert!(idx.set_file_name(&id, "renamed.txt".into()));
+        assert_eq!(idx.get(&id).unwrap().file_name, "renamed.txt");
+        assert!(!idx.set_file_name(&id, "renamed.txt".into())); // idempotent
+    }
+
+    #[test]
+    fn set_file_name_missing_id_returns_false() {
+        let dir = tempdir().unwrap();
+        let mut idx = ContentIndex::load(dir.path());
+        let bogus = SidecarId::new();
+        assert!(!idx.set_file_name(&bogus, "new.txt".into()));
+    }
+
+    #[test]
+    fn set_file_name_persists_change() {
+        let dir = tempdir().unwrap();
+        let saved_id;
+        {
+            let mut idx = ContentIndex::load(dir.path());
+            let entry = sample_entry([0xF2; 32]);
+            saved_id = entry.sidecar_id;
+            idx.insert(entry);
+            assert!(idx.set_file_name(&saved_id, "persisted.txt".into()));
+        }
+        let reloaded = ContentIndex::load(dir.path());
+        assert_eq!(
+            reloaded.get(&saved_id).expect("entry persisted").file_name,
+            "persisted.txt",
+        );
     }
 
     #[test]

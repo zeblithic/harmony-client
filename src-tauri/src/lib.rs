@@ -6130,6 +6130,15 @@ enum AncestorEdit {
     Append {
         entry: folders::ManifestEntry,
     },
+    /// Rename an existing entry in place — find the entry by
+    /// `(child_name, child_cid)` and change its `name` to `new_name`. CID
+    /// and kind are unchanged. The lookup uses both name and CID for the
+    /// same shared-CID disambiguation reason `Remove` does.
+    Rename {
+        child_cid: [u8; 32],
+        child_name: String,
+        new_name: String,
+    },
 }
 
 /// Outcome of a successful `walk_and_rebuild_chain`.
@@ -6237,6 +6246,26 @@ async fn walk_and_rebuild_chain(
                             )
                         })?;
                     manifest.folder_manifest.entries[target_idx].cid = new_child_cid;
+                }
+                AncestorEdit::Rename {
+                    child_cid,
+                    child_name,
+                    new_name,
+                } => {
+                    let target_idx = manifest
+                        .folder_manifest
+                        .entries
+                        .iter()
+                        .position(|e| e.name == child_name && e.cid == child_cid)
+                        .ok_or_else(|| {
+                            format!(
+                                "ancestor {} has no entry named '{}' pointing to child {}",
+                                hex::encode(anc_cid),
+                                child_name,
+                                hex::encode(child_cid)
+                            )
+                        })?;
+                    manifest.folder_manifest.entries[target_idx].name = new_name;
                 }
             }
         } else {
@@ -6946,6 +6975,247 @@ pub async fn move_content_impl(
         )
         .await
     }
+}
+
+/// Result returned by `rename_content`. `src_new_cid` is `None` for the
+/// top-level case (rename of a sidecar `file_name` doesn't change any
+/// CID); `Some(_)` for the nested case (the immediate parent's manifest
+/// was rebuilt, every ancestor's CID is new).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameContentResult {
+    pub src_new_cid: Option<String>,
+}
+
+/// ZEB-299: rename a file or folder in place — only the name changes,
+/// the CID is preserved. Top-level case (`src_path == [src_child_cid]`)
+/// is a single sidecar field write; nested case rebuilds the immediate
+/// parent's manifest, walks every ancestor up to the top-level root, and
+/// CAS-rekeys the top-level sidecar.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn rename_content(
+    src_sidecar_id: String,
+    src_path: Vec<String>,
+    src_child_cid: String,
+    src_child_name: String,
+    new_name: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<RenameContentResult, String> {
+    let (ingest_tx, verb_tx, index) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        (
+            guard
+                .ingest_tx
+                .clone()
+                .ok_or_else(|| "not connected".to_string())?,
+            guard
+                .content_verb_tx
+                .clone()
+                .ok_or_else(|| "not connected".to_string())?,
+            guard.content_index.clone(),
+        )
+    };
+    rename_content_impl(
+        src_sidecar_id,
+        src_path,
+        src_child_cid,
+        src_child_name,
+        new_name,
+        ingest_tx,
+        verb_tx,
+        index,
+    )
+    .await
+}
+
+/// Inner implementation of [`rename_content`] decoupled from
+/// `tauri::State` so integration tests can drive it with a raw
+/// `(ingest_tx, verb_tx, ContentIndex)` triple. Production callers go
+/// through the `#[tauri::command]` wrapper.
+#[allow(clippy::too_many_arguments)]
+pub async fn rename_content_impl(
+    src_sidecar_id: String,
+    src_path: Vec<String>,
+    src_child_cid: String,
+    src_child_name: String,
+    new_name: String,
+    ingest_tx: tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    verb_tx: tokio::sync::mpsc::Sender<event_loop::ContentVerbRequest>,
+    index: std::sync::Arc<Mutex<content_index::ContentIndex>>,
+) -> Result<RenameContentResult, String> {
+    let new_name_trimmed = new_name.trim();
+    if new_name_trimmed.is_empty() {
+        return Err("name cannot be empty".to_string());
+    }
+    if src_path.is_empty() {
+        return Err("src_path cannot be empty".to_string());
+    }
+    let src_sid = parse_sidecar_id(&src_sidecar_id)?;
+    let child_cid = parse_cid_hex(&src_child_cid)?;
+    let src_cids: Vec<[u8; 32]> = src_path
+        .iter()
+        .map(|h| parse_cid_hex(h))
+        .collect::<Result<_, _>>()?;
+    let src_root_old = src_cids[0];
+
+    // Snapshot sidecar state we need to validate against. Done once
+    // up-front so subsequent reads can't race with sidecar mutations on
+    // other commands.
+    let (src_entry_cid, src_entry_name) = {
+        let idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        let entry = idx
+            .get(&src_sid)
+            .ok_or_else(|| "src_sidecar_id not in sidecar".to_string())?;
+        (entry.cid, entry.file_name.clone())
+    };
+    if src_entry_cid != src_root_old {
+        return Err(format!(
+            "src_sidecar_id refers to cid {} but src_path[0] is {}",
+            hex::encode(src_entry_cid),
+            hex::encode(src_root_old),
+        ));
+    }
+
+    // Top-level vs nested dispatch — mirror move_content's Case C
+    // ("source IS the top-level") shape check.
+    let is_top_level = src_cids.len() == 1 && src_cids[0] == child_cid;
+
+    if is_top_level {
+        // Verify the caller's claimed current name matches the sidecar
+        // FIRST. A stale caller passing `src_child_name="wrong"` but
+        // `new_name=<current name>` must error on the mismatch, not
+        // silently no-op — the mismatch is a signal the frontend's view
+        // is stale and a refresh is needed before retrying.
+        if src_entry_name != src_child_name {
+            return Err(format!(
+                "src_child_name '{src_child_name}' does not match src sidecar entry name '{src_entry_name}'",
+            ));
+        }
+        // Same-name no-op (defensive — frontend short-circuits).
+        if src_entry_name == new_name_trimmed {
+            return Ok(RenameContentResult { src_new_cid: None });
+        }
+        // Duplicate-sibling check across top-level entries; skip self by
+        // sidecar_id (not by name).
+        {
+            let idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+            if idx
+                .entries()
+                .any(|e| e.sidecar_id != src_sid && e.file_name == new_name_trimmed)
+            {
+                return Err(format!(
+                    "a top-level entry named '{new_name_trimmed}' already exists"
+                ));
+            }
+        }
+        // Single sidecar field write — no ingest, no rekey, no pin
+        // cascade. Bundle bytes are unchanged.
+        let changed = {
+            let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+            idx.set_file_name(&src_sid, new_name_trimmed.to_string())
+        };
+        if !changed {
+            return Err("rename failed: sidecar entry disappeared mid-flight".to_string());
+        }
+        return Ok(RenameContentResult { src_new_cid: None });
+    }
+
+    // Nested case. The renamed item lives in the immediate parent's
+    // manifest — rebuild that manifest, walk every ancestor up to root,
+    // single CAS rekey on the top-level sidecar.
+    let immediate_parent = src_cids[src_cids.len() - 1];
+    let parent_entries = read_manifest_entries(&verb_tx, immediate_parent).await?;
+
+    // Entry-exists check at (name, cid). Same error wording as
+    // read_child_manifest_entry so the IPC surface is consistent.
+    if !parent_entries
+        .iter()
+        .any(|e| e.name == src_child_name && e.cid == child_cid)
+    {
+        return Err(format!(
+            "src_path's immediate parent {} has no entry named '{}' pointing to child {}",
+            hex::encode(immediate_parent),
+            src_child_name,
+            hex::encode(child_cid),
+        ));
+    }
+
+    // Same-name no-op (defensive). Return the current top-level CID so
+    // the frontend's CID-replacement logic stays uniform.
+    if src_child_name == new_name_trimmed {
+        return Ok(RenameContentResult {
+            src_new_cid: Some(hex::encode(src_root_old)),
+        });
+    }
+
+    // Duplicate-sibling check, skip self by (name, cid).
+    if parent_entries
+        .iter()
+        .any(|e| e.name == new_name_trimmed && !(e.name == src_child_name && e.cid == child_cid))
+    {
+        return Err(format!(
+            "parent folder already has an entry named '{new_name_trimmed}'"
+        ));
+    }
+
+    let mut pending_ingests: Vec<(String, Vec<u8>)> = Vec::new();
+    let walked = walk_and_rebuild_chain(
+        &verb_tx,
+        &src_cids,
+        AncestorEdit::Rename {
+            child_cid,
+            child_name: src_child_name,
+            new_name: new_name_trimmed.to_string(),
+        },
+        &mut pending_ingests,
+    )
+    .await?;
+
+    // Drain-then-rekey ordering — same correctness reasoning as
+    // move_content and create_folder_nested.
+    for (cid_hex, bytes) in pending_ingests {
+        send_ingest(&ingest_tx, cid_hex, bytes).await?;
+    }
+
+    let stored_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    {
+        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        match idx.rekey(
+            &src_sid,
+            src_root_old,
+            walked.new_top_level_cid,
+            walked.new_top_level_size,
+            stored_at_ms,
+        ) {
+            Ok(()) => {}
+            Err(content_index::RekeyError::OldMissing) => {
+                return Err("src_sidecar_id removed mid-flight — nothing to rekey".to_string());
+            }
+            Err(content_index::RekeyError::Conflict { actual }) => {
+                return Err(format!(
+                    "concurrent rekey on src_sidecar_id (now at cid {}); retry from refreshed state",
+                    hex::encode(actual)
+                ));
+            }
+        }
+    }
+
+    maintain_pin_invariant(
+        &verb_tx,
+        &index,
+        src_root_old,
+        Some(walked.new_top_level_cid),
+    )
+    .await;
+
+    Ok(RenameContentResult {
+        src_new_cid: Some(hex::encode(walked.new_top_level_cid)),
+    })
 }
 
 /// Read an ancestor folder's bundle + manifest and return the
@@ -8057,6 +8327,76 @@ mod walk_and_rebuild_chain_tests {
         );
         // 4 pushed pairs (inner manifest+bundle, then outer manifest+bundle).
         assert_eq!(pending.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn walk_and_rebuild_chain_rename_deepest() {
+        // Folder F contains leaf L named "leaf". Walk [F] with
+        // Rename(L → "renamed"). Verify the rebuild has the new name
+        // and the leaf's CID is unchanged.
+        let leaf_cid = [0x11; 32];
+        let f = build_one_leaf_folder(leaf_cid);
+
+        let mut store = HashMap::new();
+        store.insert(f.bundle_cid.to_bytes(), f.bundle_bytes.clone());
+        store.insert(f.manifest_cid.to_bytes(), f.manifest_bytes.clone());
+
+        let verb_tx = spawn_seeded_verb_handler(store);
+        let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
+        let walked = walk_and_rebuild_chain(
+            &verb_tx,
+            &[f.bundle_cid.to_bytes()],
+            AncestorEdit::Rename {
+                child_cid: leaf_cid,
+                child_name: "leaf".into(),
+                new_name: "renamed".into(),
+            },
+            &mut pending,
+        )
+        .await
+        .expect("walk");
+
+        let expected = folders::build_folder(
+            "",
+            &[folders::ManifestEntry {
+                cid: leaf_cid,
+                name: "renamed".into(),
+                kind: content_index::ContentKind::Leaf,
+            }],
+        )
+        .expect("build expected");
+        assert_eq!(walked.new_top_level_cid, expected.bundle_cid.to_bytes());
+        assert_eq!(pending.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn walk_and_rebuild_chain_rename_missing_child() {
+        let leaf_cid = [0x22; 32];
+        let f = build_one_leaf_folder(leaf_cid);
+
+        let mut store = HashMap::new();
+        store.insert(f.bundle_cid.to_bytes(), f.bundle_bytes.clone());
+        store.insert(f.manifest_cid.to_bytes(), f.manifest_bytes.clone());
+
+        let verb_tx = spawn_seeded_verb_handler(store);
+        let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
+        let err = walk_and_rebuild_chain(
+            &verb_tx,
+            &[f.bundle_cid.to_bytes()],
+            AncestorEdit::Rename {
+                child_cid: [0xEE; 32],
+                child_name: "leaf".into(),
+                new_name: "renamed".into(),
+            },
+            &mut pending,
+        )
+        .await
+        .expect_err("missing child must error");
+        assert!(
+            err.contains("has no entry named 'leaf' pointing to child"),
+            "got: {err}"
+        );
+        assert!(pending.is_empty(), "pending must be untouched on error");
     }
 
     // Pin a couple of synthetic CIDs to prove our [0x11;32] fixtures
@@ -20964,6 +21304,7 @@ pub fn run() {
             ingest_content,
             create_folder,
             move_content,
+            rename_content,
             send_voice_frame,
             join_voice_channel,
             leave_voice_channel,

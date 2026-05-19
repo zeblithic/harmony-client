@@ -53,6 +53,14 @@ export interface MoveContentResult {
   dstNewCid: string;
 }
 
+/** Wire format returned by the rename_content Tauri command (ZEB-299). */
+export interface RenameContentResult {
+  /** New top-level CID after the ancestor walk + rekey. Null for the
+   *  top-level case — renaming a sidecar row's file_name doesn't change
+   *  the top-level CID (the name lives in the sidecar, not the manifest). */
+  srcNewCid: string | null;
+}
+
 /** Wire format for entries returned by the list_content Tauri command. */
 interface ContentItemWire {
   sidecarId: string;
@@ -522,6 +530,47 @@ export class FileManagerService {
     } catch (err) {
       console.warn(
         'moveContent: refetchRoot failed (move succeeded); UI may show stale list:',
+        err,
+      );
+    }
+    return result;
+  }
+
+  /**
+   * Rename a file or folder in place (ZEB-299). Two cases dispatch on
+   * the backend by input shape:
+   * - Top-level (srcPath.length === 1 && srcPath[0] === srcChildCid):
+   *   single sidecar `file_name` write, returns `{ srcNewCid: null }`.
+   * - Nested: walks ancestor chain, CAS-rekeys the top-level sidecar,
+   *   returns `{ srcNewCid: <new top-level cid> }`.
+   *
+   * Same refresh shape as moveContent — re-list the root so top-level
+   * CIDs reflect the rekey, and onChange propagates so any in-folder
+   * view re-fetches via the serviceVersion-tracking effect.
+   */
+  async renameContent(args: {
+    srcSidecarId: string;
+    srcPath: string[];
+    srcChildCid: string;
+    /** Current name on the manifest entry / sidecar — disambiguator for
+     *  shared-CID siblings, same role as in moveContent. Mismatch with
+     *  the on-disk manifest aborts the rename. */
+    srcChildName: string;
+    newName: string;
+  }): Promise<RenameContentResult> {
+    if (!this.adapter) throw new Error('adapter not connected');
+    const result = (await this.adapter.invoke('rename_content', {
+      srcSidecarId: args.srcSidecarId,
+      srcPath: args.srcPath,
+      srcChildCid: args.srcChildCid,
+      srcChildName: args.srcChildName,
+      newName: args.newName,
+    })) as RenameContentResult;
+    try {
+      await this.refetchRoot();
+    } catch (err) {
+      console.warn(
+        'renameContent: refetchRoot failed (rename succeeded); UI may show stale list:',
         err,
       );
     }

@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { ContentItem } from '../types';
+  import { matchesEditing } from '../file-utils';
   import FileCard from './FileCard.svelte';
 
   let {
@@ -9,6 +10,12 @@
     onItemClick,
     onRowDragStart,
     onRowDrop,
+    editingItem = null,
+    editingValue = $bindable(''),
+    renameInFlight = false,
+    onBeginRename,
+    onCommitRename,
+    onCancelRename,
   }: {
     items: ContentItem[];
     selectedCid: string | null;
@@ -17,17 +24,30 @@
     /** ZEB-162: per-card drag handlers, wired by FileBrowser. */
     onRowDragStart?: (e: DragEvent, item: ContentItem) => void;
     onRowDrop?: (e: DragEvent, targetCid: string, targetSidecarId: string | null) => void;
+    /** ZEB-299: inline rename — see FileList.svelte for the contract. */
+    editingItem?: ContentItem | null;
+    editingValue?: string;
+    renameInFlight?: boolean;
+    onBeginRename?: (item: ContentItem) => void;
+    onCommitRename?: () => void;
+    onCancelRename?: () => void;
   } = $props();
 </script>
 
 <div class="file-grid" aria-label="File grid">
-  {#each items as item (item.sidecarId || item.cid)}
+  {#each items as item (item.sidecarId || `nested:${item.cid}:${item.name}`)}
     <FileCard
       {item}
       onClick={onItemClick}
       selected={selectedSidecarId !== null ? selectedSidecarId === item.sidecarId : selectedCid === item.cid}
       {onRowDragStart}
       {onRowDrop}
+      editing={matchesEditing(editingItem, item)}
+      bind:editValue={editingValue}
+      {renameInFlight}
+      {onBeginRename}
+      {onCommitRename}
+      {onCancelRename}
     />
   {/each}
 </div>
