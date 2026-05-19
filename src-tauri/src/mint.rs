@@ -1,13 +1,15 @@
 //! Mint — personal-finance transaction tracker backend.
 //!
 //! This module owns the SQLite layer for the Mint feature: schema
-//! migration, database connection lifecycle, and settings management.
-//! Account and transaction CRUD are added in subsequent tasks.
+//! migration, database connection lifecycle, settings management, and
+//! account CRUD.  Transaction CRUD and IPC wiring are added in subsequent
+//! tasks.
 //!
 //! Spec: `docs/specs/2026-05-19-mint-mvp-design.md`
 //! Plan: `docs/plans/2026-05-19-mint-mvp-plan.md`
 
 use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 
 const DEFAULT_CURRENCY_KEY: &str = "default_currency";
 
@@ -65,14 +67,15 @@ pub fn open_database(path: &std::path::Path) -> Result<Connection, MintError> {
 /// Apply all schema migrations idempotently.
 ///
 /// Uses `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS` so this
-/// can be called on every app start without error.  Task 2 will add the
-/// `UNIQUE(name)` constraint on `accounts` via an `ALTER TABLE` migration.
+/// can be called on every app start without error.  The `accounts` table
+/// includes a `UNIQUE(name)` constraint; we are pre-launch so all test
+/// databases are in-memory and no on-disk migration is required.
 fn apply_migrations(conn: &Connection) -> Result<(), MintError> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS accounts (
             id          TEXT PRIMARY KEY,
-            name        TEXT NOT NULL,
+            name        TEXT NOT NULL UNIQUE,
             created_at  TEXT NOT NULL
         );
 
@@ -146,6 +149,196 @@ pub fn validate_currency(s: &str) -> Result<(), MintError> {
             "currency must be 1-5 ASCII uppercase letters".into(),
         ))
     }
+}
+
+// ── Account types ─────────────────────────────────────────────────────────────
+
+/// A named account that transactions are posted against.
+///
+/// `rename_all = "camelCase"` ensures the Tauri IPC seam emits camelCase field
+/// names to the frontend (matches CLAUDE.md doctrine).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Account {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
+    pub transaction_count: u64,
+}
+
+// ── Account CRUD ──────────────────────────────────────────────────────────────
+
+/// Create a new account with the given name.
+///
+/// Returns a `MintError::Validation` if the name fails validation or if an
+/// account with the same name already exists.
+pub fn create_account(conn: &Connection, name: &str) -> Result<Account, MintError> {
+    validate_account_name(name)?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let created_at = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO accounts (id, name, created_at) VALUES (?, ?, ?)",
+        params![id, name, created_at],
+    )
+    .map_err(|e| match e {
+        rusqlite::Error::SqliteFailure(ref fe, _)
+            if fe.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            MintError::Validation("account name already exists".into())
+        }
+        other => MintError::Sqlite(other),
+    })?;
+    Ok(Account {
+        id,
+        name: name.to_string(),
+        created_at,
+        transaction_count: 0,
+    })
+}
+
+/// Return all accounts ordered case-insensitively by name, each annotated with
+/// the number of transactions posted to it.
+pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>, MintError> {
+    let mut stmt = conn.prepare(
+        "SELECT a.id, a.name, a.created_at, COUNT(t.id) AS tx_count
+         FROM accounts a
+         LEFT JOIN transactions t ON t.account_id = a.id
+         GROUP BY a.id, a.name, a.created_at
+         ORDER BY a.name COLLATE NOCASE",
+    )?;
+    let accounts = stmt
+        .query_map([], |row| {
+            Ok(Account {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                created_at: row.get(2)?,
+                transaction_count: row.get::<_, u64>(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(accounts)
+}
+
+/// Rename an existing account.
+///
+/// Returns `MintError::NotFound` if `id` does not exist, or
+/// `MintError::Validation` if the new name fails validation or is already
+/// taken by another account.
+pub fn rename_account(conn: &Connection, id: &str, new_name: &str) -> Result<Account, MintError> {
+    validate_account_name(new_name)?;
+    let affected = conn
+        .execute(
+            "UPDATE accounts SET name = ? WHERE id = ?",
+            params![new_name, id],
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::SqliteFailure(ref fe, _)
+                if fe.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                MintError::Validation("account name already exists".into())
+            }
+            other => MintError::Sqlite(other),
+        })?;
+    if affected == 0 {
+        return Err(MintError::NotFound("account not found".into()));
+    }
+    // Re-fetch the updated account (includes accurate transaction_count).
+    let accounts = list_accounts(conn)?;
+    accounts
+        .into_iter()
+        .find(|a| a.id == id)
+        .ok_or_else(|| MintError::NotFound("account not found after rename".into()))
+}
+
+/// Delete an account.
+///
+/// If `reassign_to` is `None` and the account has any transactions the call
+/// fails with `MintError::Validation`.  If `reassign_to` is `Some(target_id)`
+/// all transactions are moved to the target before deletion, atomically.
+///
+/// All preconditions are checked before any mutation so that a validation
+/// failure always leaves the database unchanged.
+pub fn delete_account(
+    conn: &Connection,
+    id: &str,
+    reassign_to: Option<&str>,
+) -> Result<(), MintError> {
+    // `unchecked_transaction` is correct here: `conn` is a `&Connection`
+    // already obtained from the `Mutex<Connection>` guard, so we know we
+    // are the sole user of this connection.
+    let tx = conn.unchecked_transaction()?;
+
+    // ── Validate first, before any mutation ───────────────────────────────────
+
+    let exists: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM accounts WHERE id = ?",
+        params![id],
+        |r| r.get(0),
+    )?;
+    if exists == 0 {
+        return Err(MintError::NotFound("account not found".into()));
+    }
+
+    if let Some(target) = reassign_to {
+        if target == id {
+            return Err(MintError::Validation(
+                "cannot reassign to the account being deleted".into(),
+            ));
+        }
+        let target_exists: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM accounts WHERE id = ?",
+            params![target],
+            |r| r.get(0),
+        )?;
+        if target_exists == 0 {
+            return Err(MintError::Validation(
+                "reassign_to target does not exist".into(),
+            ));
+        }
+    }
+
+    // ── Mutations ─────────────────────────────────────────────────────────────
+
+    match reassign_to {
+        None => {
+            let tx_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM transactions WHERE account_id = ?",
+                params![id],
+                |r| r.get(0),
+            )?;
+            if tx_count > 0 {
+                return Err(MintError::Validation(
+                    "account has transactions; pass reassign_to".into(),
+                ));
+            }
+            tx.execute("DELETE FROM accounts WHERE id = ?", params![id])?;
+        }
+        Some(target) => {
+            tx.execute(
+                "UPDATE transactions SET account_id = ? WHERE account_id = ?",
+                params![target, id],
+            )?;
+            tx.execute("DELETE FROM accounts WHERE id = ?", params![id])?;
+        }
+    }
+
+    tx.commit()?;
+    Ok(())
+}
+
+// ── Account validators ────────────────────────────────────────────────────────
+
+/// Validate an account name: non-empty after trim, max 256 bytes.
+pub fn validate_account_name(s: &str) -> Result<(), MintError> {
+    if s.trim().is_empty() {
+        return Err(MintError::Validation("account name cannot be empty".into()));
+    }
+    if s.len() > 256 {
+        return Err(MintError::Validation(
+            "account name exceeds 256 bytes".into(),
+        ));
+    }
+    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -240,5 +433,243 @@ mod tests {
                 code
             );
         }
+    }
+
+    // ── Account CRUD tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn create_account_basic() {
+        let conn = fresh_db();
+        let account = create_account(&conn, "Chase").unwrap();
+        assert!(!account.id.is_empty(), "id must be a non-empty UUID");
+        assert_eq!(account.name, "Chase");
+        assert_eq!(account.transaction_count, 0);
+
+        let list = list_accounts(&conn).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "Chase");
+    }
+
+    #[test]
+    fn create_account_rejects_empty_name() {
+        let conn = fresh_db();
+        assert!(matches!(
+            create_account(&conn, ""),
+            Err(MintError::Validation(_))
+        ));
+        assert!(matches!(
+            create_account(&conn, "   "),
+            Err(MintError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn create_account_rejects_oversized_name() {
+        let conn = fresh_db();
+        let long_name = "a".repeat(257);
+        assert!(matches!(
+            create_account(&conn, &long_name),
+            Err(MintError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn create_account_rejects_duplicate_name() {
+        let conn = fresh_db();
+        create_account(&conn, "Chase").unwrap();
+        let err = create_account(&conn, "Chase").unwrap_err();
+        assert!(
+            matches!(err, MintError::Validation(ref s) if s.contains("already exists")),
+            "expected 'already exists' in Validation error, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn list_accounts_empty_initially() {
+        let conn = fresh_db();
+        let list = list_accounts(&conn).unwrap();
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn list_accounts_includes_transaction_count() {
+        let conn = fresh_db();
+        let account = create_account(&conn, "Chase").unwrap();
+
+        // Insert two raw transactions directly.
+        for i in 0..2u32 {
+            let tx_id = uuid::Uuid::new_v4().to_string();
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO transactions \
+                 (id, transaction_date, amount, currency, account_id, description, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    tx_id,
+                    "2026-05-19",
+                    format!("-{}.00", i + 1),
+                    "USD",
+                    account.id,
+                    format!("test txn {}", i),
+                    now,
+                    now,
+                ],
+            )
+            .unwrap();
+        }
+
+        let list = list_accounts(&conn).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].transaction_count, 2);
+    }
+
+    #[test]
+    fn rename_account_round_trip() {
+        let conn = fresh_db();
+        let account = create_account(&conn, "Chase").unwrap();
+        let renamed = rename_account(&conn, &account.id, "Chase Checking").unwrap();
+        assert_eq!(renamed.name, "Chase Checking");
+
+        let list = list_accounts(&conn).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "Chase Checking");
+    }
+
+    #[test]
+    fn rename_account_not_found() {
+        let conn = fresh_db();
+        let err =
+            rename_account(&conn, "00000000-0000-0000-0000-000000000000", "New Name").unwrap_err();
+        assert!(matches!(err, MintError::NotFound(_)));
+    }
+
+    #[test]
+    fn rename_account_rejects_duplicate() {
+        let conn = fresh_db();
+        let a = create_account(&conn, "A").unwrap();
+        create_account(&conn, "B").unwrap();
+        let err = rename_account(&conn, &a.id, "B").unwrap_err();
+        assert!(
+            matches!(err, MintError::Validation(ref s) if s.contains("already exists")),
+            "expected 'already exists' in Validation error, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn delete_account_empty_succeeds() {
+        let conn = fresh_db();
+        let account = create_account(&conn, "Chase").unwrap();
+        delete_account(&conn, &account.id, None).unwrap();
+
+        let list = list_accounts(&conn).unwrap();
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn delete_account_with_txns_no_reassign_fails() {
+        let conn = fresh_db();
+        let account = create_account(&conn, "Chase").unwrap();
+
+        let tx_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO transactions \
+             (id, transaction_date, amount, currency, account_id, description, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![tx_id, "2026-05-19", "-10.00", "USD", account.id, "test", now, now],
+        )
+        .unwrap();
+
+        let err = delete_account(&conn, &account.id, None).unwrap_err();
+        assert!(
+            matches!(err, MintError::Validation(ref s) if s.contains("has transactions")),
+            "expected 'has transactions' in Validation error, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn delete_account_with_reassign_moves_transactions() {
+        let conn = fresh_db();
+        let a = create_account(&conn, "A").unwrap();
+        let b = create_account(&conn, "B").unwrap();
+
+        // Insert 3 transactions into A.
+        for i in 0..3u32 {
+            let tx_id = uuid::Uuid::new_v4().to_string();
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO transactions \
+                 (id, transaction_date, amount, currency, account_id, description, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    tx_id,
+                    "2026-05-19",
+                    format!("-{}.00", i + 1),
+                    "USD",
+                    a.id,
+                    format!("txn {}", i),
+                    now,
+                    now,
+                ],
+            )
+            .unwrap();
+        }
+
+        delete_account(&conn, &a.id, Some(&b.id)).unwrap();
+
+        let list = list_accounts(&conn).unwrap();
+        assert_eq!(list.len(), 1, "only B should remain");
+        assert_eq!(list[0].id, b.id);
+        assert_eq!(
+            list[0].transaction_count, 3,
+            "B should have inherited A's 3 txns"
+        );
+    }
+
+    #[test]
+    fn delete_account_reassign_to_same_id_fails() {
+        let conn = fresh_db();
+        let a = create_account(&conn, "A").unwrap();
+        let err = delete_account(&conn, &a.id, Some(&a.id)).unwrap_err();
+        assert!(
+            matches!(err, MintError::Validation(ref s) if s.contains("cannot reassign")),
+            "expected 'cannot reassign' in Validation error, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn delete_account_reassign_to_missing_target_fails() {
+        let conn = fresh_db();
+        let a = create_account(&conn, "A").unwrap();
+
+        // Insert a transaction so we'd need reassign_to in normal flow.
+        let tx_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO transactions \
+             (id, transaction_date, amount, currency, account_id, description, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![tx_id, "2026-05-19", "-5.00", "USD", a.id, "test", now, now],
+        )
+        .unwrap();
+
+        let err =
+            delete_account(&conn, &a.id, Some("00000000-0000-0000-0000-000000000000")).unwrap_err();
+        assert!(
+            matches!(err, MintError::Validation(ref s) if s.contains("does not exist")),
+            "expected 'does not exist' in Validation error, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn delete_account_not_found() {
+        let conn = fresh_db();
+        let err = delete_account(&conn, "00000000-0000-0000-0000-000000000000", None).unwrap_err();
+        assert!(matches!(err, MintError::NotFound(_)));
     }
 }
