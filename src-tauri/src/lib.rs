@@ -118,6 +118,36 @@ pub(crate) fn ingest_dispatch(size: u64) -> Result<IngestDispatch, String> {
     }
 }
 
+/// Errors raised by the internal path-based ingest helpers
+/// (`ingest_file_at_path`, `send_ingest_with_name`).
+///
+/// Split into distinct variants so the ZEB-163 folder walker can route each
+/// failure to the right summary bucket (oversized vs. failed) without parsing
+/// strings. The IPC seam in `ingest_content` collapses these to `String` via
+/// `to_string()` for backwards compatibility with the existing frontend.
+#[derive(Debug, thiserror::Error)]
+pub enum IngestError {
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("path is a symlink; refuse to follow")]
+    Symlink,
+    #[error(
+        "file too large ({size} bytes; v1 flat-bundle cap is {cap} bytes ~8 GiB). \
+         Support for larger files lands with folder/nested-bundle support."
+    )]
+    Oversized { size: u64, cap: u64 },
+    #[error("sidecar_id collision")]
+    SidecarCollision,
+    #[error("{0}")]
+    Other(String),
+}
+
+impl IngestError {
+    fn other(msg: impl Into<String>) -> Self {
+        IngestError::Other(msg.into())
+    }
+}
+
 /// Chunk `bytes` via FastCDC and assemble the resulting leaf CIDs into a
 /// flat bundle. Returns the ordered leaf (CID, slice) pairs, the raw bundle
 /// payload, and the root bundle CID.
@@ -5931,7 +5961,6 @@ async fn ingest_content(
     app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<IngestResult, String> {
-    use harmony_content::cid::{ContentFlags, ContentId};
     use tauri_plugin_dialog::DialogExt;
 
     // 1. Open a native file picker dialog.
@@ -5957,8 +5986,8 @@ async fn ingest_content(
         .await
         .map_err(|e| format!("read failed: {e}"))?;
     // Early reject above the flat-bundle cap, before reading the file into
-    // memory. Dispatch is recomputed from actual bytes below in case the
-    // file changes size between this stat and the read that follows.
+    // memory. Dispatch is recomputed from actual bytes inside the helper in
+    // case the file changes size between this stat and the read that follows.
     ingest_dispatch(meta.len())?;
 
     // OOM caveat: this materializes the full file in RAM before chunking.
@@ -5970,59 +5999,124 @@ async fn ingest_content(
     let bytes = tokio::fs::read(path)
         .await
         .map_err(|e| format!("read failed: {e}"))?;
+
+    let (ingest_tx, content_index) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        let tx = guard
+            .ingest_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?;
+        (tx, guard.content_index.clone())
+    };
+
+    send_ingest_with_name(&ingest_tx, &content_index, bytes, file_name, None)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Ingest a leaf file already present on disk through the same pipeline as
+/// `ingest_content`, but driven by an explicit path instead of an `rfd`
+/// dialog. Internal — the ZEB-163 folder walker calls this per discovered
+/// leaf file. Not registered as an IPC.
+///
+/// Defends in depth against symlinks even though the walker filters them
+/// upstream: a `symlink_metadata` check guarantees we never `tokio::fs::read`
+/// through a link that could resolve outside the walked tree.
+// Consumer (folder walker) lands in a follow-up; the seam is published
+// now so the walker can call it without going through an IPC.
+#[allow(dead_code)]
+pub(crate) async fn ingest_file_at_path(
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    content_index: &std::sync::Arc<std::sync::Mutex<content_index::ContentIndex>>,
+    path: &std::path::Path,
+    _parent_sidecar_id: Option<content_index::SidecarId>,
+    file_name: String,
+) -> Result<IngestResult, IngestError> {
+    let meta = tokio::fs::symlink_metadata(path).await?;
+    if meta.file_type().is_symlink() {
+        return Err(IngestError::Symlink);
+    }
+    let size = meta.len();
+    if size > FLAT_BUNDLE_MAX {
+        return Err(IngestError::Oversized {
+            size,
+            cap: FLAT_BUNDLE_MAX,
+        });
+    }
+    let bytes = tokio::fs::read(path).await?;
+    send_ingest_with_name(
+        ingest_tx,
+        content_index,
+        bytes,
+        file_name,
+        _parent_sidecar_id,
+    )
+    .await
+}
+
+/// Drive a buffer of bytes through the chunked-or-flat dispatch, push it to
+/// the runtime's ingest channel, and insert the resulting sidecar row.
+///
+/// Extracted from `ingest_content`'s post-dialog body so both the dialog
+/// IPC and the ZEB-163 folder walker can share the same pipeline. The
+/// caller is responsible for extracting `ingest_tx` and `content_index`
+/// from `NodeState` under its lock — the helper does not touch `NodeState`
+/// so it stays cheap to test.
+pub(crate) async fn send_ingest_with_name(
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    content_index: &std::sync::Arc<std::sync::Mutex<content_index::ContentIndex>>,
+    bytes: Vec<u8>,
+    file_name: String,
+    _parent_sidecar_id: Option<content_index::SidecarId>,
+) -> Result<IngestResult, IngestError> {
+    use harmony_content::cid::{ContentFlags, ContentId};
+
     let size_bytes = bytes.len() as u64;
     // Final dispatch decision from the bytes actually read. This closes the
     // TOCTOU window between metadata() and read(): if the file grew past the
     // cap we reject cleanly, and if it shrank below MAX_PAYLOAD_SIZE we take
     // the single-book fast path instead of tripping chunk_and_bundle's
     // precondition guard.
-    let dispatch = ingest_dispatch(size_bytes)?;
-
-    let ingest_tx = {
-        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard
-            .ingest_tx
-            .clone()
-            .ok_or_else(|| "not connected".to_string())?
-    };
+    let dispatch = ingest_dispatch(size_bytes).map_err(IngestError::other)?;
 
     let root_cid_bytes: [u8; 32] = match dispatch {
         IngestDispatch::Single => {
             let cid = ContentId::for_book(&bytes, ContentFlags::default())
-                .map_err(|e| format!("CID error: {e:?}"))?;
+                .map_err(|e| IngestError::other(format!("CID error: {e:?}")))?;
             let cid_hex = hex::encode(cid.to_bytes());
-            send_ingest(&ingest_tx, cid_hex, bytes).await?;
+            send_ingest(ingest_tx, cid_hex, bytes)
+                .await
+                .map_err(IngestError::other)?;
             cid.to_bytes()
         }
         IngestDispatch::Chunked => {
-            let (leaves, bundle_payload, root) = chunk_and_bundle(&bytes)?;
-            // Ingest every leaf in order.
+            let (leaves, bundle_payload, root) =
+                chunk_and_bundle(&bytes).map_err(IngestError::other)?;
             for (leaf_cid, leaf_bytes) in &leaves {
                 send_ingest(
-                    &ingest_tx,
+                    ingest_tx,
                     hex::encode(leaf_cid.to_bytes()),
                     leaf_bytes.to_vec(),
                 )
-                .await?;
+                .await
+                .map_err(IngestError::other)?;
             }
-            // Ingest the bundle itself.
-            send_ingest(&ingest_tx, hex::encode(root.to_bytes()), bundle_payload).await?;
+            send_ingest(ingest_tx, hex::encode(root.to_bytes()), bundle_payload)
+                .await
+                .map_err(IngestError::other)?;
             root.to_bytes()
         }
     };
 
-    // Record sidecar metadata so list_content can surface this entry.
-    let index = {
-        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard.content_index.clone()
-    };
     let stored_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let sidecar_id = content_index::SidecarId::new();
     {
-        let mut idx = index.lock().map_err(|e| format!("index lock: {e}"))?;
+        let mut idx = content_index
+            .lock()
+            .map_err(|e| IngestError::other(format!("index lock: {e}")))?;
         let inserted = idx.insert(content_index::ContentIndexEntry {
             sidecar_id,
             cid: root_cid_bytes,
@@ -6050,9 +6144,9 @@ async fn ingest_content(
             tracing::error!(
                 sidecar_id = %sidecar_id,
                 file_name = %file_name,
-                "ingest_content: sidecar_id collision (UUID v4 collision or construction bug); aborting ingest result",
+                "send_ingest_with_name: sidecar_id collision (UUID v4 collision or construction bug); aborting ingest result",
             );
-            return Err("sidecar_id collision".into());
+            return Err(IngestError::SidecarCollision);
         }
     }
 
@@ -6062,6 +6156,124 @@ async fn ingest_content(
         file_name,
         size_bytes,
     })
+}
+
+#[cfg(test)]
+mod path_ingest_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    type IngestLog = Arc<std::sync::Mutex<Vec<(String, usize)>>>;
+    type IngestSender = tokio::sync::mpsc::Sender<event_loop::IngestRequest>;
+
+    /// Spawn an in-test ingest handler that records each (cid_hex, len)
+    /// pair and ACKs success. The handler runs until `ingest_tx` is dropped.
+    fn spawn_recording_ingest_handler() -> (IngestSender, IngestLog) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<event_loop::IngestRequest>(8);
+        let log = Arc::new(std::sync::Mutex::new(Vec::<(String, usize)>::new()));
+        let log_clone = log.clone();
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                log_clone
+                    .lock()
+                    .unwrap()
+                    .push((req.cid_hex, req.data.len()));
+                let _ = req.reply.send(Ok(()));
+            }
+        });
+        (tx, log)
+    }
+
+    fn fresh_content_index() -> Arc<std::sync::Mutex<content_index::ContentIndex>> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let idx = content_index::ContentIndex::load(dir.path());
+        // Leak the TempDir so the persist directory survives the test body
+        // — we don't validate on-disk persistence here, only in-memory rows.
+        std::mem::forget(dir);
+        Arc::new(std::sync::Mutex::new(idx))
+    }
+
+    #[tokio::test]
+    async fn ingest_file_at_path_small_file_creates_sidecar_and_sends_one_book() {
+        let (tx, log) = spawn_recording_ingest_handler();
+        let index = fresh_content_index();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("hello.txt");
+        tokio::fs::write(&file_path, b"hello world")
+            .await
+            .expect("write");
+
+        let result = ingest_file_at_path(&tx, &index, &file_path, None, "hello.txt".into())
+            .await
+            .expect("ingest");
+
+        assert_eq!(result.file_name, "hello.txt");
+        assert_eq!(result.size_bytes, 11);
+        assert!(!result.cid.is_empty());
+        // Single-book path: exactly one (cid, data) pair pushed through.
+        let log_snapshot = log.lock().unwrap().clone();
+        assert_eq!(log_snapshot.len(), 1);
+        assert_eq!(log_snapshot[0].0, result.cid);
+        assert_eq!(log_snapshot[0].1, 11);
+        // Sidecar row was inserted with kind Leaf.
+        let idx = index.lock().unwrap();
+        let rows: Vec<_> = idx.entries().collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, content_index::ContentKind::Leaf);
+        assert_eq!(rows[0].file_name, "hello.txt");
+    }
+
+    #[tokio::test]
+    async fn ingest_file_at_path_missing_file_returns_io_error() {
+        let (tx, _log) = spawn_recording_ingest_handler();
+        let index = fresh_content_index();
+        let missing = std::path::Path::new("definitely-not-a-real-path-zeb163");
+
+        let err = ingest_file_at_path(&tx, &index, missing, None, "x".into())
+            .await
+            .expect_err("must error on missing file");
+        assert!(matches!(err, IngestError::Io(_)), "got: {err:?}");
+    }
+
+    /// Allocating an 8 GiB file in a unit test is unreasonable, so the
+    /// boundary check is exercised by constructing the error variant
+    /// directly and asserting its Display surfaces both numbers — that's
+    /// what the walker's failure-bucketing depends on.
+    #[test]
+    fn oversized_variant_shape() {
+        let err = IngestError::Oversized {
+            size: FLAT_BUNDLE_MAX + 1,
+            cap: FLAT_BUNDLE_MAX,
+        };
+        let rendered = format!("{err}");
+        assert!(rendered.contains("file too large"));
+        assert!(rendered.contains(&FLAT_BUNDLE_MAX.to_string()));
+    }
+
+    /// Symlink detection is platform-conditional: on Windows, creating a
+    /// symlink requires Developer Mode or admin rights. The test runs the
+    /// real assertion on Unix; on Windows we skip with a tracing note to
+    /// avoid CI flakes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ingest_file_at_path_symlink_is_rejected() {
+        let (tx, log) = spawn_recording_ingest_handler();
+        let index = fresh_content_index();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("target.txt");
+        let link = dir.path().join("link.txt");
+        tokio::fs::write(&target, b"payload").await.expect("write");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        let err = ingest_file_at_path(&tx, &index, &link, None, "link.txt".into())
+            .await
+            .expect_err("symlink must error");
+        assert!(matches!(err, IngestError::Symlink), "got: {err:?}");
+        // Nothing should have been pushed to the ingest channel.
+        assert!(log.lock().unwrap().is_empty());
+        // Sidecar must remain empty.
+        assert_eq!(index.lock().unwrap().entries().count(), 0);
+    }
 }
 
 /// Send one (cid_hex, data) pair through the ingest channel and await its ack.
