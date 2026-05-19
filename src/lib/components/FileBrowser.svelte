@@ -166,11 +166,19 @@
   let creatingFolder = $state(false);
   let newFolderName = $state('');
   let newFolderError = $state<string | null>(null);
-  // Counter mirrors renameInFlightCount (round-6 multi-commit fix) —
-  // the create IPC can be in-flight while the user clicks elsewhere;
-  // suppress the placeholder-row blur-cancel during the await window.
-  let creatingFolderInFlightCount = $state(0);
-  let creatingFolderInFlight = $derived(creatingFolderInFlightCount > 0);
+  // Per-session boolean (not a counter like rename's
+  // renameInFlightCount): the placeholder's Enter gate now also reads
+  // inFlight (round-2 fix), so the flag MUST belong to the current
+  // session — a stale count carried over from a nav-away mid-IPC would
+  // block the new session's first Enter. Begin/cancel reset it to
+  // false; commitCreateFolder's finally only clears it when the seq
+  // token confirms we're still the current session, so a stale
+  // commit's finally can't clear the live session's flag. Rename
+  // needs a counter because slow-click is a true intra-session
+  // multi-commit vector; create's only entry point is the toolbar
+  // "+" and Enter-gating prevents intra-session concurrency, so a
+  // boolean is the right tool here.
+  let creatingFolderInFlight = $state(false);
 
   // Generation token mirrors renameCommitSeq — captured before the
   // await in commitCreateFolder, bumped by begin/cancel. A stale
@@ -609,6 +617,10 @@
     creatingFolder = true;
     newFolderName = '';
     newFolderError = null;
+    // Fresh session — discard any inFlight signal left over from a
+    // prior session's still-pending IPC (the stale commit will see
+    // mySeq mismatch and exit early in its catch/then).
+    creatingFolderInFlight = false;
   }
 
   function cancelCreateFolder() {
@@ -616,6 +628,7 @@
     creatingFolder = false;
     newFolderName = '';
     newFolderError = null;
+    creatingFolderInFlight = false;
   }
 
   async function commitCreateFolder() {
@@ -645,7 +658,7 @@
     // path would call onNavigateFolder(null) and yank the user to
     // root from a different folder they navigated to.
     const mySeq = ++createCommitSeq;
-    creatingFolderInFlightCount++;
+    creatingFolderInFlight = true;
     try {
       await service.createFolder(trimmed, parentSidecarId, breadcrumbStack);
       if (mySeq !== createCommitSeq) return; // stale — context changed during await
@@ -657,7 +670,10 @@
       newFolderError = raw.replace(/^Error:\s*/, '');
       // Keep placeholder open so the user can fix and retry.
     } finally {
-      creatingFolderInFlightCount--;
+      // Only clear the flag if we're still the current session. A
+      // stale commit's finally would otherwise reset the live
+      // session's inFlight to false, mis-gating its blur/Enter.
+      if (mySeq === createCommitSeq) creatingFolderInFlight = false;
     }
   }
 

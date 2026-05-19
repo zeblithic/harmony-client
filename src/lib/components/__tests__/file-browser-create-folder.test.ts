@@ -676,4 +676,123 @@ describe('FileBrowser inline new-folder + load error (ZEB-166)', () => {
     // before-rerender snapshot.)
     expect(onNavigateFolder.mock.calls.length).toBe(navCallsBeforeRerender);
   });
+
+  // ── Round 3: stale in-flight signal must not block new session ────
+
+  it('opening a new create session after a stale in-flight IPC does not block Enter', async () => {
+    // Reproduces the round-3 bot finding: round-2 added Enter-gating
+    // on !inFlight, but a per-session boolean (rather than a global
+    // counter) is required so that opening a new placeholder in a
+    // different folder after a still-pending create IPC doesn't
+    // inherit the prior session's in-flight signal and silently
+    // swallow the user's Enter.
+    const service = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    let resolveFirstCreate!: (value: unknown) => void;
+    const firstCreatePending = new Promise((resolve) => {
+      resolveFirstCreate = resolve;
+    });
+    let secondCreateInvoked = false;
+    adapter.invoke = vi.fn().mockImplementation((cmd: string, args: unknown) => {
+      if (cmd === 'list_content') return Promise.resolve([]);
+      if (cmd === 'create_folder') {
+        const name = (args as { name?: string })?.name;
+        if (name === 'first') return firstCreatePending;
+        if (name === 'second') {
+          secondCreateInvoked = true;
+          return Promise.resolve({ sidecarId: 'second-sid', cid: 'second-cid' });
+        }
+      }
+      return Promise.resolve(undefined);
+    });
+    await service.connectAdapter(adapter);
+    (service as unknown as { privateContent: unknown[] }).privateContent = (
+      await import('../../mock-file-data')
+    ).mockPrivateContent.slice();
+
+    const { container, rerender } = render(FileBrowser, {
+      props: {
+        service,
+        currentFolderCid: 'cid-folder-projects',
+        selectedCid: null,
+        selectedSidecarId: null,
+        viewMode: 'list' as const,
+        section: 'private' as const,
+        searchQuery: '',
+        showCleanup: false,
+        serviceVersion: 0,
+        onItemClick: vi.fn(),
+        onNavigateFolder: vi.fn(),
+        onViewModeChange: vi.fn(),
+        onSearchChange: vi.fn(),
+        onSectionChange: vi.fn(),
+        onUploadClick: vi.fn(),
+        onCleanupClick: vi.fn(),
+      },
+    });
+
+    // Session 1: open placeholder, type 'first', Enter → commit starts
+    // and hangs on the deferred promise. The placeholder is now
+    // inFlight=true.
+    const newFolderBtn = () =>
+      container.querySelector('[aria-label="New Folder"]') as HTMLButtonElement;
+    await fireEvent.click(newFolderBtn());
+    let input = await waitFor(() => {
+      const el = container.querySelector(
+        '.file-row-name-input',
+      ) as HTMLInputElement | null;
+      if (!el) throw new Error('first placeholder not rendered');
+      return el;
+    });
+    await fireEvent.input(input, { target: { value: 'first' } });
+    await fireEvent.keyDown(input, { key: 'Enter' });
+
+    // Navigate away (the first create's IPC is still pending). The
+    // nav effect calls cancelCreateFolder which must reset the
+    // inFlight flag so the next session starts clean.
+    await rerender({
+      service,
+      currentFolderCid: null,
+      selectedCid: null,
+      selectedSidecarId: null,
+      viewMode: 'list' as const,
+      section: 'private' as const,
+      searchQuery: '',
+      showCleanup: false,
+      serviceVersion: 0,
+      onItemClick: vi.fn(),
+      onNavigateFolder: vi.fn(),
+      onViewModeChange: vi.fn(),
+      onSearchChange: vi.fn(),
+      onSectionChange: vi.fn(),
+      onUploadClick: vi.fn(),
+      onCleanupClick: vi.fn(),
+    });
+
+    // Session 2: open new placeholder. Without the per-session
+    // boolean reset, inFlight would still be true from the still-
+    // pending first IPC and the Enter below would no-op.
+    await fireEvent.click(newFolderBtn());
+    input = await waitFor(() => {
+      const el = container.querySelector(
+        '.file-row-name-input',
+      ) as HTMLInputElement | null;
+      if (!el) throw new Error('second placeholder not rendered');
+      return el;
+    });
+    await fireEvent.input(input, { target: { value: 'second' } });
+    await fireEvent.keyDown(input, { key: 'Enter' });
+
+    // The second create IPC must have fired (Enter was NOT swallowed
+    // by a stale inFlight from session 1).
+    await waitFor(() => {
+      expect(secondCreateInvoked).toBe(true);
+    });
+
+    // Belt-and-suspenders: resolve the first IPC so its `finally` runs
+    // through. With the mySeq-gated finally, this MUST NOT clear the
+    // current session's inFlight (which is now session 2's).
+    resolveFirstCreate({ sidecarId: 'first-sid', cid: 'first-cid' });
+    await new Promise((r) => setTimeout(r, 0));
+  });
 });
