@@ -150,7 +150,20 @@ jobs:
       # test in favor of nextest is loss-free coverage-wise. If the
       # project gains Rust doctests later, add a `cargo test --doc` step
       # to this job before relying on nextest as the sole test gate.
+      # ZEB-161 Task 5: `HARMONY_LARGE_TESTS=1` opts in to the depth-2+
+      # nested-bundle round-trip in `tests/folder_ingest_walker_integration.rs`,
+      # which creates a 36 GiB + 1 byte sparse tempfile and streams it through
+      # `streaming_ingest` to validate the multi-level tree-build path. The
+      # test is gated locally because the sparse-zero chunker path on default
+      # config only produces depth-2 at ≥ 32 GiB input (~MAX_BUNDLE_ENTRIES of
+      # max_chunk cuts). CI runners have the disk + time budget and we want
+      # the coverage on every PR. The sparse-file body consumes ~0 disk bytes
+      # on ext4 (set_len creates a hole), but it does cost wall-clock time
+      # hashing zeros through FastCDC; that's the documented cost of catching
+      # depth-2 regressions.
       - name: cargo nextest run --workspace --all-targets
+        env:
+          HARMONY_LARGE_TESTS: "1"
         run: cargo nextest run --locked --workspace --all-targets --features test-fixtures --no-fail-fast
 
   # Validates `rust-version` declared in src-tauri/Cargo.toml. The `rust-check`

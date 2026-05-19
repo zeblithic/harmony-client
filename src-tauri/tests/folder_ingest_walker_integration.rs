@@ -790,3 +790,189 @@ async fn missing_root_path_errors_without_inserting_sidecar() {
         h.registry.lock().unwrap().len()
     );
 }
+
+// ── Test 10: depth-2+ nested-bundle round-trip on a 36 GiB sparse file ─────
+//
+// ZEB-161 Task 5: end-to-end pin for the streaming + tree-build path. The
+// `streaming_ingest_tests` block inside `src/lib.rs` exercises
+// `build_bundle_tree` against synthetic leaf CIDs (no chunker, no I/O); the
+// `chunked_ingest_pin_cascade_fetch_burn_roundtrip` integration test pins
+// the *depth-1* shape on a small in-memory buffer. Neither covers the
+// depth-2+ tree that streaming_ingest must build when the chunk count
+// exceeds `MAX_BUNDLE_ENTRIES` (= 32_767 at MAX_PAYLOAD_SIZE / CID_SIZE).
+//
+// The fixture is a 36 GiB + 1 byte sparse tempfile. Sized to GUARANTEE
+// depth-2 on sparse-zero input: with `ChunkerConfig::DEFAULT` (min=256 KiB,
+// avg=512 KiB, max ≈ 1 MiB), the FastCDC gear hash on a pure-zero stream
+// never satisfies the mask check (the deterministic hash settles to a
+// non-zero residue mod 2^19 and mod 2^20), so every cut is forced at
+// max_chunk. 36 GiB / 1 MiB ≈ 36_864 leaves > MAX_BUNDLE_ENTRIES (32_767),
+// forcing the tree-build loop to add a second level. 9 GiB (the original
+// planned size, symbolic of the old FLAT_BUNDLE_MAX) only produced ~9_216
+// max_chunks — depth-1 — and would not exercise this code path.
+//
+// Real-world non-zero data hits the gear-hash mask more often and produces
+// many more chunks per byte, so a 36 GiB sparse-zero fixture is a much
+// LARGER input than typical depth-2 production cases. That's intentional:
+// it's the only way to reach depth-2 with `ChunkerConfig::DEFAULT` on a
+// sparse fixture that doesn't consume real disk.
+//
+// Gated behind HARMONY_LARGE_TESTS=1 — disk + wall-clock cost is too high
+// for the default `cargo nextest run` flow. CI's `rust-test` job sets the
+// env var so this still runs there. Local devs opt in when they want to
+// validate streaming behaviour without the full E2E suite.
+//
+// Captured-channel pattern: we route `streaming_ingest`'s ingest sends into
+// an mpsc the test owns, recording every (CID, bytes) pair on the way past.
+// That gives us:
+//   - the root CID (returned by streaming_ingest) — used for the depth
+//     assertion and to find the root bundle bytes in the captured log;
+//   - the leaf count (CIDs whose `cid_type() == CidType::Book`);
+//   - the root bundle's inline-metadata sentinel, parsed via
+//     `parse_inline_metadata` to confirm the size/chunk-count round-trip.
+//
+// No NodeRuntime is needed — that's covered by
+// `chunked_ingest_pin_cascade_fetch_burn_roundtrip` for the depth-1 case.
+// Standing doctrine (see plan): don't try to expose `walk_recursive` from
+// `harmony_content` cross-crate; the captured channel is the right seam.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nested_bundle_tree_round_trip() {
+    use harmony_content::bundle::parse_bundle;
+    use harmony_content::chunker::ChunkerConfig;
+    use harmony_content::cid::{CidType, ContentId};
+
+    if std::env::var("HARMONY_LARGE_TESTS").is_err() {
+        eprintln!(
+            "Skipping nested_bundle_tree_round_trip: set HARMONY_LARGE_TESTS=1 to enable \
+             (needs sparse-file support on the tempdir filesystem; ≈0 real disk \
+             consumed, but the file appears as 36 GiB to userspace)"
+        );
+        return;
+    }
+
+    // 36 GiB + 1 byte — see the section header comment for the sizing
+    // rationale. The +1 byte also pins the total_size sentinel to a value
+    // that's not a clean GiB boundary, catching off-by-one bugs in the
+    // chunker's tail-byte accounting.
+    const EXPECTED_SIZE: u64 = 36 * 1024 * 1024 * 1024 + 1;
+
+    // Sparse tempfile. `set_len` on most modern filesystems (NTFS, ext4,
+    // APFS, ZFS) creates a hole rather than allocating zeros; the file
+    // *appears* 36 GiB but actually consumes ~0 bytes until written to. The
+    // chunker reads it as a continuous run of zero bytes via tokio::fs::File.
+    let tmp_dir = tempfile::tempdir().expect("tempdir for sparse 36 GiB fixture");
+    let path = tmp_dir.path().join("sparse_36gib_plus_one.bin");
+    {
+        let file = std::fs::File::create(&path).expect("create sparse fixture");
+        file.set_len(EXPECTED_SIZE).expect("set_len 36 GiB + 1");
+        // Drop closes the handle before the async reader opens it.
+    }
+
+    // Captured-channel pattern (mirrors `spawn_ingest_drain` in
+    // `streaming_ingest_tests` and the forwarder in
+    // `chunked_ingest_pin_cascade_fetch_burn_roundtrip`): drive
+    // `streaming_ingest` through a channel we own, recording every
+    // (cid_hex, bytes) pair. The bytes are needed for the root bundle
+    // sentinel parse below; the CIDs alone drive the leaf-count assertion.
+    let (capture_tx, mut capture_rx) =
+        tokio::sync::mpsc::channel::<harmony_app::event_loop::IngestRequest>(1024);
+    let drain: tokio::task::JoinHandle<Vec<(String, Vec<u8>)>> = tokio::spawn(async move {
+        let mut captured: Vec<(String, Vec<u8>)> = Vec::new();
+        while let Some(req) = capture_rx.recv().await {
+            captured.push((req.cid_hex.clone(), req.data.clone()));
+            // Ack immediately so streaming_ingest's send_ingest helper sees
+            // a fast Ok — the runtime's storage tier is not involved here.
+            let _ = req.reply.send(Ok(()));
+        }
+        captured
+    });
+
+    let start = std::time::Instant::now();
+    let reader = tokio::fs::File::open(&path)
+        .await
+        .expect("open sparse fixture for async read");
+    let root = harmony_app::streaming_ingest(reader, &capture_tx, ChunkerConfig::DEFAULT)
+        .await
+        .expect("streaming_ingest must succeed on the 36 GiB sparse fixture");
+    drop(capture_tx);
+    let captured = drain.await.expect("capture drain joins cleanly");
+    let elapsed = start.elapsed();
+
+    // Smoke-test bound: streaming ingest of a sparse-zero 36 GiB tempfile is
+    // I/O-bound (zeros are cheap to hash). Slow disks can legitimately
+    // exceed 60 s — warn rather than fail to keep CI green on shared hosts.
+    if elapsed.as_secs() > 60 {
+        eprintln!("WARNING: nested_bundle_tree_round_trip ingest took {elapsed:?} (>60s)");
+    }
+
+    // ── Depth assertion: depth-2 or deeper ─────────────────────────────
+    match root.cid_type() {
+        CidType::Bundle(depth) => {
+            assert!(
+                depth >= 2,
+                "expected Bundle(>=2) for 36 GiB input (chunk count must exceed MAX_BUNDLE_ENTRIES), got Bundle({depth})"
+            );
+        }
+        other => panic!("expected Bundle CID for multi-chunk input, got {other:?}"),
+    }
+
+    // ── Leaf-count assertion: > 32_767, < 200_000 ──────────────────────
+    // Expected for 36 GiB sparse-zero at default config: chunker forces
+    // ~36_864 max_chunk cuts (36 GiB / ~1 MiB). The lower bound > 32_767
+    // is the only value that strictly proves depth-2 was forced by chunk
+    // count exceeding MAX_BUNDLE_ENTRIES. Upper bound < 200_000 catches
+    // a regression where the chunker starts producing many more cuts than
+    // expected (e.g. min_chunk-sized cuts would yield 36 GiB / 256 KiB =
+    // 147_456 leaves — still depth-2 but ~4× the expected count).
+    let leaf_count = captured
+        .iter()
+        .filter(|(cid_hex, _)| {
+            let raw = hex::decode(cid_hex).expect("captured cid_hex must decode");
+            let arr: [u8; 32] = raw.as_slice().try_into().expect("32-byte CID");
+            ContentId::from_bytes(arr).cid_type() == CidType::Book
+        })
+        .count();
+    assert!(
+        leaf_count > 32_767 && leaf_count < 200_000,
+        "expected leaf count in (32_767, 200_000) for 36 GiB sparse input, got {leaf_count}"
+    );
+
+    // ── Inline-metadata round-trip on the root bundle ───────────────────
+    // The captured log contains the bundle bytes — find the entry whose
+    // CID matches the root, parse it, and check that the first child CID
+    // is the InlineData sentinel with the original byte count + chunk count.
+    let root_hex = hex::encode(root.to_bytes());
+    let (_, root_bytes) = captured
+        .iter()
+        .find(|(h, _)| *h == root_hex)
+        .expect("root bundle bytes must appear in the captured stream");
+    let entries = parse_bundle(root_bytes).expect("root bundle bytes parse");
+    assert!(
+        !entries.is_empty(),
+        "root bundle must have at least the metadata sentinel + one child"
+    );
+    assert_eq!(
+        entries[0].cid_type(),
+        CidType::InlineData,
+        "root bundle's first entry must be the inline-metadata sentinel"
+    );
+    let (total_size, chunk_count, _ts, _mime) = entries[0]
+        .parse_inline_metadata()
+        .expect("first entry parses as inline metadata");
+    assert_eq!(
+        total_size, EXPECTED_SIZE,
+        "inline metadata's total_size must match the sparse file's set_len"
+    );
+    assert!(
+        chunk_count > 32_767 && chunk_count < 200_000,
+        "inline metadata's chunk_count must be in (32_767, 200_000); got {chunk_count}"
+    );
+    // Chunk count in the metadata should match the count of Book leaves we
+    // observed on the captured channel — this is the round-trip that pins
+    // streaming_ingest's bookkeeping to the build_bundle_tree metadata.
+    assert_eq!(
+        chunk_count as usize, leaf_count,
+        "inline metadata's chunk_count must equal the number of Book leaves captured \
+         (metadata = {chunk_count}, captured leaves = {leaf_count})"
+    );
+}

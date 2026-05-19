@@ -241,7 +241,7 @@ Existing 3 MB test: switch the driver from `chunk_and_bundle` to `streaming_inge
 ### Integration — depth-2+ tree round-trip (new)
 
 `folder_ingest_walker_integration::nested_bundle_tree_round_trip`:
-- Build a sparse ~9 GiB file via `set_len` on a tempfile.
+- Build a sparse ~36 GiB file via `set_len` on a tempfile. 36 GiB is the smallest size that GUARANTEES depth-2 with `ChunkerConfig::DEFAULT` on sparse-zero input — the FastCDC gear hash never satisfies the mask check on pure-zero bytes (deterministic non-zero residue mod 2^19 / 2^20), so every cut is forced at `max_chunk` (≈1 MiB). 36 GiB / 1 MiB ≈ 36_864 leaves > `MAX_BUNDLE_ENTRIES` (32_767).
 - Drive `streaming_ingest(tokio::fs::File::open(path), ingest_tx, DEFAULT)`.
 - Assert root is `CidType::Bundle(2)` (or greater).
 - Assert `walk_recursive` over the root produces all leaves.
@@ -315,4 +315,4 @@ For multi-TB files, leaf CIDs become the bottleneck (~128 MB per TB). A future o
 - **R2 — `SkipCounts.oversized` field removal breaks deserialization of any persisted summary.** No call site persists `IngestFolderTreeResult` — it's a one-shot IPC return delivered to a Svelte component and discarded. Safe to remove.
 - **R3 — Bot reviewers may flag the missing `Oversized` case as a regression on R-class size limits.** Defense: ticket explicitly removes the cap; no per-file size limit exists post-ZEB-161. The cap is the filesystem.
 - **R4 — `chunked_ingest_pin_cascade_fetch_burn_roundtrip` root CID changes (because metadata is now attached).** The test re-derives the root via the helper; no fixed value pinned. Verified at design time.
-- **R5 — 9 GiB sparse-file integration test is slow on small machines.** Gated behind `HARMONY_LARGE_TESTS=1`. CI runs it on the full job; local dev defaults to skip.
+- **R5 — 36 GiB sparse-file integration test is slow on small machines.** Gated behind `HARMONY_LARGE_TESTS=1`. CI runs it on the full job; local dev defaults to skip. The file is sparse (set_len, no allocation) so disk consumption is ~0 — only the kernel zero-page reads contribute to wall-clock.
