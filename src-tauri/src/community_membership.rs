@@ -2994,15 +2994,31 @@ pub enum AutoExecOutcome {
 /// testable without spinning up a full `CommunitySyncEngine` +
 /// `NodeState` + registry fixture.
 ///
-/// Returns `true` iff the local actor's materialized `power_levels`
-/// entry is `>= POWER_THRESHOLDS.set_power` (currently 100). Treats a
-/// missing entry as 0 (default per spec §4 power table).
+/// Mirrors `verify_event`'s two SetPower preconditions (so the guard
+/// never lets through an event the verifier would reject):
+/// 1. `power_levels[self_owner] >= POWER_THRESHOLDS.set_power`
+///    (currently 100). Missing entry treated as 0 per spec §4.
+/// 2. `members[self_owner].status == MemberStatus::Joined`. Kick and
+///    Leave intentionally do NOT clean up `power_levels` (see the
+///    materialize comments on the SetPower / Kick arms), so a former
+///    admin who was kicked or who left voluntarily would otherwise
+///    sail past a power-only check, mint a SetPower locally, and then
+///    have it self-reject at `verify_event` with `ActorNotJoined` —
+///    exactly the doomed-mint path this guard exists to prevent
+///    (CodeRabbit R1 Major on PR #135).
 ///
 /// Boundary condition: `actor_power == POWER_THRESHOLDS.set_power` is
-/// allowed (admins at exactly 100 can mint SetPower).
+/// allowed (admins at exactly 100 can mint SetPower) AND the actor
+/// must be currently Joined.
 pub fn local_actor_can_mint_set_power(mat: &MaterializedMembership, self_owner: OwnerAddr) -> bool {
     let actor_power = mat.power_levels.get(&self_owner).copied().unwrap_or(0);
-    actor_power >= POWER_THRESHOLDS.set_power
+    if actor_power < POWER_THRESHOLDS.set_power {
+        return false;
+    }
+    matches!(
+        mat.members.get(&self_owner).map(|state| state.status),
+        Some(MemberStatus::Joined)
+    )
 }
 
 /// ZEB-291 Phase 2 Task 10: auto-exec dispatch from a Tier 2 contestability finalize.
@@ -3168,17 +3184,112 @@ mod auto_exec_tests {
 
     /// ZEB-297: positive-path companion — `local_actor_can_mint_set_power`
     /// returns true at exactly `POWER_THRESHOLDS.set_power` (100) and
-    /// above. Pins the boundary condition so a future refactor that
-    /// accidentally uses `>` instead of `>=` would fail loudly.
+    /// above WHEN the actor is currently Joined. Pins the boundary
+    /// condition so a future refactor that accidentally uses `>`
+    /// instead of `>=` would fail loudly.
     #[test]
     fn local_actor_can_mint_set_power_returns_true_when_at_or_above_threshold() {
         let self_owner = OwnerAddr([0xaa; 16]);
         let mut mat = MaterializedMembership::default();
 
-        // Power == threshold (100): admin can mint.
+        // Power == threshold (100) AND Joined: admin can mint.
         mat.power_levels
             .insert(self_owner, POWER_THRESHOLDS.set_power);
+        mat.members.insert(
+            self_owner,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "test".to_string(),
+                },
+                left_at: None,
+            },
+        );
         assert!(local_actor_can_mint_set_power(&mat, self_owner));
+    }
+
+    /// ZEB-297 R1 (CodeRabbit Major): the guard must mirror
+    /// `verify_event`'s joined-member check, not just its power check.
+    /// Kick/Leave intentionally leave stale `power_levels` entries in
+    /// place (so a kicked admin's prior signed events still validate
+    /// at their original HLC), which means a former admin who is now
+    /// `Left` or `Banned` retains power 100 in the materialized view.
+    /// Without the Joined check, the guard would let such an actor
+    /// mint a SetPower locally, then `verify_event` would self-reject
+    /// with `ActorNotJoined` — the exact doomed-mint path ZEB-297 was
+    /// filed to eliminate.
+    #[test]
+    fn local_actor_can_mint_set_power_returns_false_for_former_admin_who_left() {
+        let self_owner = OwnerAddr([0xaa; 16]);
+        let mut mat = MaterializedMembership::default();
+        mat.power_levels
+            .insert(self_owner, POWER_THRESHOLDS.set_power);
+        mat.members.insert(
+            self_owner,
+            MemberState {
+                status: MemberStatus::Left,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "test".to_string(),
+                },
+                left_at: Some(Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "test".to_string(),
+                }),
+            },
+        );
+        assert!(
+            !local_actor_can_mint_set_power(&mat, self_owner),
+            "Left former admin must NOT pass the guard"
+        );
+    }
+
+    /// Same as the `Left` case but for `Banned` — a kicked former
+    /// admin retains power 100 by spec but must not be allowed to mint.
+    #[test]
+    fn local_actor_can_mint_set_power_returns_false_for_former_admin_who_was_banned() {
+        let self_owner = OwnerAddr([0xaa; 16]);
+        let mut mat = MaterializedMembership::default();
+        mat.power_levels
+            .insert(self_owner, POWER_THRESHOLDS.set_power);
+        mat.members.insert(
+            self_owner,
+            MemberState {
+                status: MemberStatus::Banned,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "test".to_string(),
+                },
+                left_at: Some(Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "test".to_string(),
+                }),
+            },
+        );
+        assert!(
+            !local_actor_can_mint_set_power(&mat, self_owner),
+            "Banned former admin must NOT pass the guard"
+        );
+    }
+
+    /// Missing-from-members rejection: a `power_levels` entry without
+    /// a corresponding `members` entry shouldn't happen in practice,
+    /// but defense-in-depth ensures the guard's two-part predicate
+    /// fails closed.
+    #[test]
+    fn local_actor_can_mint_set_power_returns_false_when_member_record_missing() {
+        let self_owner = OwnerAddr([0xaa; 16]);
+        let mut mat = MaterializedMembership::default();
+        mat.power_levels
+            .insert(self_owner, POWER_THRESHOLDS.set_power);
+        // No mat.members.insert(...) — power but no member record.
+        assert!(!local_actor_can_mint_set_power(&mat, self_owner));
     }
 
     /// Apply-auto-exec helper test: bounds-check on `new_power > 100`.
