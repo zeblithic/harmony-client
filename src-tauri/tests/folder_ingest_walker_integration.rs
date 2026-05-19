@@ -841,7 +841,10 @@ async fn nested_bundle_tree_round_trip() {
     use harmony_content::chunker::ChunkerConfig;
     use harmony_content::cid::{CidType, ContentId};
 
-    if std::env::var("HARMONY_LARGE_TESTS").is_err() {
+    // Require exact "1" rather than just-set — keeps `HARMONY_LARGE_TESTS=0`
+    // (common pattern for opting OUT of expensive opt-in tests) from
+    // accidentally running the 36 GiB path.
+    if std::env::var("HARMONY_LARGE_TESTS").ok().as_deref() != Some("1") {
         eprintln!(
             "Skipping nested_bundle_tree_round_trip: set HARMONY_LARGE_TESTS=1 to enable \
              (needs sparse-file support on the tempdir filesystem; ≈0 real disk \
@@ -953,18 +956,18 @@ async fn nested_bundle_tree_round_trip() {
         other => panic!("expected Bundle CID for multi-chunk input, got {other:?}"),
     }
 
-    // ── Leaf-count assertion: > 32_767, < 200_000 ──────────────────────
+    // ── Leaf-count assertion: > 32_767, < 50_000 ──────────────────────
     // Expected for 36 GiB sparse-zero at default config: chunker forces
     // ~36_864 max_chunk cuts (36 GiB / ~1 MiB). The lower bound > 32_767
     // is the only value that strictly proves depth-2 was forced by chunk
-    // count exceeding MAX_BUNDLE_ENTRIES. Upper bound < 200_000 catches
+    // count exceeding MAX_BUNDLE_ENTRIES. Upper bound < 50_000 catches
     // a regression where the chunker starts producing many more cuts than
     // expected (e.g. min_chunk-sized cuts would yield 36 GiB / 256 KiB =
     // 147_456 leaves — still depth-2 but ~4× the expected count).
     let leaf_count = captured.leaf_count;
     assert!(
-        leaf_count > 32_767 && leaf_count < 200_000,
-        "expected leaf count in (32_767, 200_000) for 36 GiB sparse input, got {leaf_count}"
+        leaf_count > 32_767 && leaf_count < 50_000,
+        "expected leaf count in (32_767, 50_000) for 36 GiB sparse input, got {leaf_count}"
     );
 
     // ── Inline-metadata round-trip on the root bundle ───────────────────
@@ -994,8 +997,8 @@ async fn nested_bundle_tree_round_trip() {
         "inline metadata's total_size must match the sparse file's set_len"
     );
     assert!(
-        chunk_count > 32_767 && chunk_count < 200_000,
-        "inline metadata's chunk_count must be in (32_767, 200_000); got {chunk_count}"
+        chunk_count > 32_767 && chunk_count < 50_000,
+        "inline metadata's chunk_count must be in (32_767, 50_000); got {chunk_count}"
     );
     // Chunk count in the metadata should match the count of Book leaves we
     // observed on the captured channel — this is the round-trip that pins

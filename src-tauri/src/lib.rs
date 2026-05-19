@@ -108,6 +108,12 @@ pub enum IngestError {
     /// an interior directory.
     #[error("manifest build: {0}")]
     ManifestBuild(String),
+    /// `streaming_ingest`'s `cancel` parameter fired mid-stream. Typed
+    /// (rather than a `Other("cancelled")` string sentinel) so the folder
+    /// walker can route this structurally to `WalkOutcome::Cancelled`
+    /// without coupling to the exact error-message string across two files.
+    #[error("ingest cancelled")]
+    Cancelled,
     #[error("{0}")]
     Other(String),
 }
@@ -165,7 +171,7 @@ where
         // folder walker's existing top-of-recursion checks.
         if let Some(c) = cancel {
             if c.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err(IngestError::other("cancelled"));
+                return Err(IngestError::Cancelled);
             }
         }
         let n = reader.read(&mut read_buf).await.map_err(IngestError::Io)?;

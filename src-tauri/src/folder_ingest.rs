@@ -569,12 +569,13 @@ fn walk<'a, R: Runtime>(
                         kind: ContentKind::Leaf,
                     })
                 }
-                // `IngestError::other("cancelled")` is the typed signal
-                // `streaming_ingest` emits when its cancel parameter fires.
-                // Route to `Cancelled` so the walker's outer state machine
-                // surfaces the right summary headline (and doesn't bucket it
-                // under `Failed`). Any other error stays in the failure list.
-                Err(e) if e.to_string() == "cancelled" => WalkOutcome::Cancelled,
+                // Structural match on the typed `IngestError::Cancelled`
+                // variant — `streaming_ingest` returns it when its cancel
+                // parameter fires. Route to `WalkOutcome::Cancelled` so the
+                // summary modal shows the cancelled headline (and doesn't
+                // bucket it under `Failed`). Any other error stays in the
+                // failure list.
+                Err(crate::IngestError::Cancelled) => WalkOutcome::Cancelled,
                 Err(e) => WalkOutcome::Failed(e.to_string()),
             }
         } else {

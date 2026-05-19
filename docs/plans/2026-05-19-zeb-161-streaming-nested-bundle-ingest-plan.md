@@ -73,7 +73,7 @@ Tasks 1-3 are tightly serialized (each removes APIs the previous step establishe
 **Spec sections:** "API surface > Modified" entries for `ingest_content` and `ingest_file_at_path`; "Demolitions" rows for lib.rs:92-93, 96-103, 107-120, 181-224, 6085-6111, 5984-..
 
 **Files:**
-- `src-tauri/src/lib.rs` (`ingest_content` IPC handler, line ~5984) — after the picker returns a `path`, open the file via `tokio::fs::File::open(path).await?`, wrap in `tokio::io::BufReader::new(...)`, call `streaming_ingest(reader, ingest_tx, ChunkerConfig::DEFAULT).await?`. Then look up `total_size` from `tokio::fs::metadata(path).await?.len()` (already done) and pass the result to `send_ingest_with_name` (which now only does the sidecar-row insertion, given the CID). The intermediate `Vec<u8>` and the `let bytes = tokio::fs::read(path).await?` line at ~6009 are gone.
+- `src-tauri/src/lib.rs` (`ingest_content` IPC handler, line ~5984) — after the picker returns a `path`, open the file via `tokio::fs::File::open(path).await?`, wrap in `tokio::io::BufReader::new(...)`, call `streaming_ingest(reader, ingest_tx, ChunkerConfig::DEFAULT, None).await?` which returns `(root_cid, total_size)`. Pass both to `send_ingest_with_name` (which now only does the sidecar-row insertion). The streamed `total_size` eliminates the pre-ZEB-161 stat-then-read TOCTOU window where a concurrent truncate/append between `tokio::fs::metadata()` and the actual read could land a stale size on the sidecar row. The intermediate `Vec<u8>` and the `let bytes = tokio::fs::read(path).await?` line at ~6009 are gone.
 - `src-tauri/src/lib.rs:6085-6111` (`ingest_file_at_path`) — same restructure as `ingest_content`: open file, stream, insert sidecar from returned CID.
 - `src-tauri/src/lib.rs` (`send_ingest_with_name`) — refactor to take the precomputed root CID instead of computing it internally. The new shape: `async fn send_ingest_with_name(content_index, root_cid: [u8; 32], file_name, size_bytes, parent_sidecar_id) -> Result<IngestResult, IngestError>` — pure sidecar insertion. Update the two call sites.
 - `src-tauri/src/lib.rs:181-224` — **delete** `chunk_and_bundle`.
@@ -132,7 +132,7 @@ Tasks 1-3 are tightly serialized (each removes APIs the previous step establishe
 
 **Constraints:**
 - The 36 GiB sparse-file test must be opt-in (env-var gated). CI workflow can opt in via `HARMONY_LARGE_TESTS=1` in the `rust-test` job — that's a separate `.github/workflows/ci.yml` edit handled in this task.
-- The leaf-count assertion uses `> 32_767 && < 200_000` (loose bound; FastCDC distribution variance means exact count drifts) — not a tight equality.
+- The leaf-count assertion uses `> 32_767 && < 50_000` (loose bound; FastCDC distribution variance means exact count drifts) — not a tight equality. The expected count for the 36 GiB sparse fixture is ~36_864 (forced max_chunk cuts on pure-zero input — see the gear-hash analysis in the design spec); `< 50_000` is ~1.36× headroom which catches pathological chunker misconfiguration without false-failing on routine drift.
 
 **Test gates:**
 - `HARMONY_LARGE_TESTS=1 cargo nextest run --locked --features test-fixtures -E 'test(nested_bundle_tree_round_trip)'` — green locally on the Ildwyn dev machine (≥ 36 GiB free disk for the sparse fixture; sparse files don't consume real disk, but the tempdir filesystem needs to support sparse holes).
