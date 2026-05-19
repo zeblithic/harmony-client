@@ -1032,12 +1032,13 @@ git commit -m "test(zeb-305): refresh IPC round-trip — joint_vk preserved acro
 ```bash
 cd src-tauri && cargo fmt --all -- --check 2>&1 | tail -5
 cd src-tauri && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings 2>&1 | tail -10
+cd src-tauri && cargo check --locked --all-targets --features test-fixtures 2>&1 | tail -10
 cd src-tauri && cargo nextest run --locked --workspace --all-targets --features test-fixtures 2>&1 | tail -20
 npx tsc --noEmit 2>&1 | tail -10
 npx vitest run 2>&1 | tail -10
 ```
 
-All five must be clean: 0 fmt diffs, 0 clippy warnings, 0 test failures, 0 type errors, 0 frontend test failures.
+All six must be clean: 0 fmt diffs, 0 clippy warnings, 0 MSRV check errors, 0 test failures, 0 type errors, 0 frontend test failures. (The `cargo check` invocation is the MSRV gate from CLAUDE.md's quick-reference table — `cargo clippy` runs against stable, but the `msrv` CI job runs `cargo check` against the declared MSRV toolchain; running it locally catches MSRV regressions before push.)
 
 **If any pre-existing test failures surface that are NOT introduced by this PR (e.g., known ZEB-302 flake class):** file a follow-up Linear ticket (do NOT invent a ZEB-NNN; use `mcp__plugin_linear_linear__save_issue` and use the returned ID). Document in the PR body. Do NOT bundle unrelated fixes into the active PR (per `feedback_unrelated_test_failures` memory rule).
 
@@ -1083,6 +1084,7 @@ Closes ZEB-305.
 
 - [x] `cargo fmt --all -- --check` clean
 - [x] `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings` clean
+- [x] `cargo check --locked --all-targets --features test-fixtures` clean (MSRV gate)
 - [x] `cargo nextest run --locked --workspace --all-targets --features test-fixtures` all green
 - [x] `npx tsc --noEmit` clean
 - [x] `npx vitest run` all green

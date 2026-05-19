@@ -22904,6 +22904,17 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
     // 4. Read state, decode nonces + commitments, build SigningPackage.
     //    Snapshot the KeyPackage + PublicKeyPackage now so we don't hold
     //    the log lock across the FROST signing call.
+    //
+    //    R2 CRITICAL: the nonce extraction MUST happen via
+    //    `Option::take()` under the SAME lock that performs the quorum
+    //    check. Previously this used `as_ref().clone()` (under lock) and
+    //    cleared `local_nonces = None` in a SECOND lock acquisition
+    //    AFTER `round2::sign`. Two concurrent IPC calls would both
+    //    observe `local_nonces = Some(_)` in the first lock window and
+    //    both invoke `round2::sign` with the same nonces — FROST nonce
+    //    reuse is secret-share-extracting per spec §6.2. `take()` swaps
+    //    to `None` atomically under the same lock, so the second caller
+    //    bails on the None-check below.
     let (
         key_package,
         pub_key_package,
@@ -22914,23 +22925,24 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
         nonces,
         signing_package,
     ) = {
-        let log = log_arc.lock().await;
+        let mut log = log_arc.lock().await;
         if !log.committee_state.active {
             return Err(
                 "dfrost_contribute_threshold_sign: no active committee — DKG must complete first"
                     .to_string(),
             );
         }
+        let members = log.committee_state.members.clone();
+        let threshold = log.committee_state.threshold;
+
         let pending = log
             .committee_state
             .pending_sign
-            .get(&ceremony_bytes)
+            .get_mut(&ceremony_bytes)
             .ok_or(
                 "dfrost_contribute_threshold_sign: no pending sign session — \
                  dfrost_request_vrf_beacon must run first",
             )?;
-        let members = log.committee_state.members.clone();
-        let threshold = log.committee_state.threshold;
 
         // R1 (round-1 bot-review CRITICAL): refuse to sign until quorum's
         // worth of peer commitments have landed. FROST `round2::sign`
@@ -22949,16 +22961,17 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
             ));
         }
 
-        // Decode stashed local nonces. `#[serde(skip)]` on local_nonces
-        // means a process restart wipes them — that branch requires
-        // re-running `dfrost_request_vrf_beacon` for this ceremony.
+        // R2 CRITICAL: atomic single-use nonce consumption. `take()`
+        // replaces `Some(_)` with `None` in a single &mut access — any
+        // concurrent IPC racing past the quorum check above will see
+        // `None` here and bail. `#[serde(skip)]` on local_nonces means a
+        // process restart also wipes them; both branches require
+        // re-running `dfrost_request_vrf_beacon` for a fresh round-1.
         //
-        // R1 CRITICAL: a `None` here on a re-call means we already
-        // consumed the nonces against this ceremony — silently re-signing
-        // with the same nonces leaks the signing share per FROST spec
-        // §6.2. Emit a discriminable error so the caller knows to start
-        // a fresh ceremony rather than retrying.
-        let nonces_cbor = pending.local_nonces.as_ref().ok_or(
+        // NOTE: even if a later step in this function fails (e.g.,
+        // share-bearing `ts` apply), the nonces stay `None`. That's the
+        // correct FROST semantics — reuse on retry is catastrophic.
+        let nonces_cbor = pending.local_nonces.take().ok_or(
             "dfrost_contribute_threshold_sign: local_nonces already consumed for this ceremony — \
              call dfrost_request_vrf_beacon again to start a fresh round-1",
         )?;
@@ -23021,22 +23034,12 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
     };
 
     // 5. Run FROST round-2. `frost::round2::sign` CONSUMES the nonces by
-    //    value — single-use enforcement by the type system. After
-    //    signing succeeds we MUST clear the stashed CBOR so a retry
-    //    cannot re-decode and re-sign with the same nonces (FROST nonce
-    //    reuse is secret-key-extracting — spec §6.2).
+    //    value — single-use enforcement by the type system. The stashed
+    //    CBOR was already cleared via `take()` under the same lock as
+    //    the quorum check above (R2 CRITICAL: no race window where two
+    //    concurrent callers could re-sign with the same nonces).
     let sig_share = frost_ristretto255::round2::sign(&signing_package, &nonces, &key_package)
         .map_err(|e| format!("dfrost_contribute_threshold_sign: round2::sign: {e}"))?;
-
-    // R1 CRITICAL: clear local_nonces immediately after consumption. The
-    // step-4 None-check above raises a discriminable error on the next
-    // call against this ceremony.
-    {
-        let mut log = log_arc.lock().await;
-        if let Some(pending) = log.committee_state.pending_sign.get_mut(&ceremony_bytes) {
-            pending.local_nonces = None;
-        }
-    }
 
     let mut share_bytes = Vec::new();
     ciborium::into_writer(&sig_share, &mut share_bytes)
@@ -23086,7 +23089,19 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
     {
         let mut log = log_arc.lock().await;
         log.apply_with_identity(event, &self_owner, &self_x25519_priv)
-            .map_err(|e| format!("dfrost_contribute_threshold_sign: apply ts: {e:?}"))?;
+            .map_err(|e| {
+                // R2-3: if apply fails after `round2::sign` already
+                // consumed the nonces, the ceremony state is inconsistent
+                // — the share was computed but never landed in
+                // pending_sign.contributions, and the single-use nonces
+                // are correctly gone (FROST §6.2 forbids reuse even on
+                // failure). The caller must restart from a fresh
+                // round-1.
+                format!(
+                    "dfrost_contribute_threshold_sign: share computed but apply ts failed; \
+                     ceremony state inconsistent — restart via dfrost_request_vrf_beacon: {e:?}"
+                )
+            })?;
     }
 
     // 7. Post-apply: did this share push the contribution-with-share count
@@ -23113,36 +23128,85 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
 
     // 8. Aggregate: build SignatureShare map, call frost::aggregate, derive
     //    VRF output, build + apply `vb`, emit dfrost-beacon-ready.
-    let shares_map = {
+    //
+    //    R2-2 MEDIUM: select EXACTLY `threshold` actors and build BOTH
+    //    the SigningPackage and the shares_map from the SAME selection.
+    //    The earlier signing_package (built in step 4) iterates every
+    //    contribution and so may have more commitments than there are
+    //    shares once race-y peers contribute past quorum; passing
+    //    mismatched maps to `frost::aggregate` is rejected. Re-deriving
+    //    both maps here from one filtered selection guarantees
+    //    `commitments_map.keys() == shares_map.keys()`.
+    //
+    //    Selection rule: filter to non-empty `share_bytes` (only signers
+    //    that posted a share can aggregate), then take the first
+    //    `threshold` in BTreeMap iteration order (sorted by OwnerAddr
+    //    deterministically across replicas). Self is guaranteed in the
+    //    set because we just applied our own share above.
+    let (selection_signing_package, shares_map) = {
         let log = log_arc.lock().await;
         let pending = log
             .committee_state
             .pending_sign
             .get(&ceremony_bytes)
             .expect("pending_sign verified non-empty above under same log lock pattern");
+        let selected: Vec<_> = pending
+            .contributions
+            .iter()
+            .filter(|(_, (_, share))| !share.is_empty())
+            .take(threshold as usize)
+            .map(|(addr, (commit, share))| (*addr, commit.clone(), share.clone()))
+            .collect();
+        if selected.len() < threshold as usize {
+            return Err(format!(
+                "dfrost_contribute_threshold_sign: internal: aggregation triggered with {} \
+                 shares, need {threshold}",
+                selected.len(),
+            ));
+        }
+
+        let mut commitments_map: std::collections::BTreeMap<
+            frost_ristretto255::Identifier,
+            frost_ristretto255::round1::SigningCommitments,
+        > = std::collections::BTreeMap::new();
         let mut shares_map: std::collections::BTreeMap<
             frost_ristretto255::Identifier,
             frost_ristretto255::round2::SignatureShare,
         > = std::collections::BTreeMap::new();
-        for (addr, (_commit, share_b)) in &pending.contributions {
-            if share_b.is_empty() {
-                continue;
-            }
+
+        for (addr, commit_bytes, share_bytes) in &selected {
             let idx = members.iter().position(|a| *a == *addr).ok_or(
                 "dfrost_contribute_threshold_sign: share contribution from non-committee member",
             )?;
             let id = crate::community_dfrost_crypto::identifier_for_index(idx);
+            let commit: frost_ristretto255::round1::SigningCommitments =
+                ciborium::from_reader(&commit_bytes[..]).map_err(|e| {
+                    format!(
+                        "dfrost_contribute_threshold_sign: decode peer commitment for aggregate: \
+                         {e}"
+                    )
+                })?;
             let share: frost_ristretto255::round2::SignatureShare =
-                ciborium::from_reader(&share_b[..]).map_err(|e| {
+                ciborium::from_reader(&share_bytes[..]).map_err(|e| {
                     format!("dfrost_contribute_threshold_sign: decode SignatureShare: {e}")
                 })?;
+            commitments_map.insert(id, commit);
             shares_map.insert(id, share);
         }
-        shares_map
+
+        let selection_signing_package =
+            frost_ristretto255::SigningPackage::new(commitments_map, &message_hash);
+        (selection_signing_package, shares_map)
     };
 
-    let signature = frost_ristretto255::aggregate(&signing_package, &shares_map, &pub_key_package)
-        .map_err(|e| format!("dfrost_contribute_threshold_sign: aggregate: {e}"))?;
+    // Drop the now-stale signing_package built in step 4 (it iterated
+    // every contribution, which may exceed the threshold-sized
+    // shares_map).
+    let _ = signing_package;
+
+    let signature =
+        frost_ristretto255::aggregate(&selection_signing_package, &shares_map, &pub_key_package)
+            .map_err(|e| format!("dfrost_contribute_threshold_sign: aggregate: {e}"))?;
     let sig_bytes: Vec<u8> = signature
         .serialize()
         .map_err(|e| format!("dfrost_contribute_threshold_sign: serialize signature: {e}"))?;
@@ -23187,7 +23251,16 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
     {
         let mut log = log_arc.lock().await;
         log.apply_with_identity(vb_event, &self_owner, &self_x25519_priv)
-            .map_err(|e| format!("dfrost_contribute_threshold_sign: apply vb: {e:?}"))?;
+            .map_err(|e| {
+                // R2-3: aggregate succeeded but the `vb` apply failed —
+                // the threshold signature was computed correctly but the
+                // beacon never landed. Restart from a fresh round-1
+                // since nonces are gone (FROST single-use).
+                format!(
+                    "dfrost_contribute_threshold_sign: aggregate succeeded but apply vb failed; \
+                     ceremony state inconsistent — restart via dfrost_request_vrf_beacon: {e:?}"
+                )
+            })?;
     }
 
     let evt = DfrostBeaconReadyPayload {
