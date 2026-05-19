@@ -195,8 +195,10 @@
   let createCommitSeq = 0;
 
   // Folder-ingest state. One in-flight walk at a time (entry handlers
-  // early-return on activeIngestProgress). activeIngestJobId is captured
-  // from the first progress event the walker emits.
+  // early-return on activeIngestProgress). activeIngestJobId is minted
+  // synchronously in startFolderIngest BEFORE the IPC call so the Cancel
+  // button works during the pre-walk window (pre-fix #3: jobId only
+  // arrived via the first progress event, leaving Cancel a no-op).
   let activeIngestJobId = $state<string | null>(null);
   let activeIngestProgress = $state<{
     completed: number;
@@ -702,6 +704,11 @@
   }
 
   function resetIngestState() {
+    // Order matters: clear activeIngestJobId FIRST so a late
+    // folder-ingest-progress event for this job (delivered after the
+    // walker has already settled and emitted its final result) fails the
+    // jobId guard in the listener and doesn't reopen the progress modal
+    // (CodeRabbit finding 13).
     activeIngestJobId = null;
     activeIngestProgress = null;
     cancelRequested = false;
@@ -748,13 +755,22 @@
       void startFolderIngest(payload.path);
     });
     if (pending && typeof (pending as Promise<unknown>).then === 'function') {
-      (pending as Promise<() => void>).then((fn) => {
-        if (cancelled) {
-          try { fn(); } catch { /* swallow */ }
-        } else {
-          unlisten = fn;
-        }
-      });
+      (pending as Promise<() => void>)
+        .then((fn) => {
+          if (cancelled) {
+            try { fn(); } catch { /* swallow */ }
+          } else {
+            unlisten = fn;
+          }
+        })
+        .catch((err) => {
+          if (!cancelled) {
+            console.warn(
+              'os-folder-dropped listener registration failed:',
+              err,
+            );
+          }
+        });
     } else if (typeof pending === 'function') {
       unlisten = pending as () => void;
     }
@@ -765,13 +781,11 @@
   });
 
   // Progress event listener. Same Promise-or-sync `adapter.listen` shape as
-  // above. The first event captures the backend-minted jobId (the IPC
-  // Promise doesn't resolve until the walker settles, so we can't get it
-  // from the invoke return value). Cross-talk guard: if a payload arrives
-  // for a different jobId after we've already captured one, the backend
-  // has somehow let two ingests overlap (shouldn't happen — we serialise
-  // via activeIngestProgress / pickerOpen). Log and ignore as defence in
-  // depth.
+  // above. activeIngestJobId is set synchronously by startFolderIngest
+  // BEFORE the IPC invoke, so we always compare against a known id — null
+  // means we already settled (resetIngestState clears it before the
+  // summary modal renders), and the comparison string !== null discards
+  // any tardy progress events that would otherwise reopen the modal.
   $effect(() => {
     if (!adapter) return;
     let cancelled = false;
@@ -784,17 +798,7 @@
         total: number;
         currentPath: string;
       };
-      if (
-        activeIngestJobId !== null &&
-        payload.jobId !== activeIngestJobId
-      ) {
-        console.warn(
-          'folder-ingest-progress: jobId mismatch (ignoring stale/cross-talk event)',
-          { incoming: payload.jobId, active: activeIngestJobId },
-        );
-        return;
-      }
-      activeIngestJobId = payload.jobId;
+      if (payload.jobId !== activeIngestJobId) return;
       activeIngestProgress = {
         completed: payload.completed,
         total: payload.total,
@@ -802,13 +806,22 @@
       };
     });
     if (pending && typeof (pending as Promise<unknown>).then === 'function') {
-      (pending as Promise<() => void>).then((fn) => {
-        if (cancelled) {
-          try { fn(); } catch { /* swallow */ }
-        } else {
-          unlisten = fn;
-        }
-      });
+      (pending as Promise<() => void>)
+        .then((fn) => {
+          if (cancelled) {
+            try { fn(); } catch { /* swallow */ }
+          } else {
+            unlisten = fn;
+          }
+        })
+        .catch((err) => {
+          if (!cancelled) {
+            console.warn(
+              'folder-ingest-progress listener registration failed:',
+              err,
+            );
+          }
+        });
     } else if (typeof pending === 'function') {
       unlisten = pending as () => void;
     }
@@ -833,16 +846,34 @@
   async function startFolderIngest(rootPath: string) {
     // Mirrors commitCreateFolder's parent resolution: nested ingests
     // reuse the top-level sidecar (navStack[0]); root ingests pass null.
-    const parentSidecarId =
-      breadcrumbStack.length > 0 ? navStack[0]?.sidecarId ?? null : null;
+    const isNestedIngest = breadcrumbStack.length > 0;
+    const parentSidecarId = isNestedIngest
+      ? navStack[0]?.sidecarId ?? null
+      : null;
+    // Mirror commitCreateFolder's nested-identity guard: a nested ingest
+    // needs a known top-level sidecar to cascade rekeys against. Without
+    // this guard a nested drop while navStack[0].sidecarId hasn't loaded
+    // would IPC null up the stack and the backend would reject with a
+    // less actionable message (CodeRabbit finding 14).
+    if (isNestedIngest && !parentSidecarId) {
+      error =
+        'Folder identity not yet loaded. Return to root and navigate back, then retry.';
+      return;
+    }
+    // Mint the jobId synchronously and set activeIngestJobId BEFORE the
+    // IPC call so the Cancel button works during the pre-walk window —
+    // pre-fix the jobId only landed via the first progress event, so a
+    // Cancel click during pre-walk was silently dropped (Bot finding 3).
+    const jobId = crypto.randomUUID();
+    activeIngestJobId = jobId;
     // Open the placeholder immediately with an indeterminate marker
     // (total=-1). The first folder-ingest-progress event fills in real
-    // counters + the job id; the IPC Promise resolves last with the
-    // final summary.
+    // counters; the IPC Promise resolves last with the final summary.
     activeIngestProgress = { completed: 0, total: -1, currentPath: rootPath };
     cancelRequested = false;
     try {
       const result = await service.ingestFolderTree(
+        jobId,
         rootPath,
         parentSidecarId,
         breadcrumbStack,

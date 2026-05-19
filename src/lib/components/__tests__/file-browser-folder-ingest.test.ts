@@ -96,6 +96,18 @@ function deferred<T>(): {
   return { promise, resolve, reject };
 }
 
+/** Extract the jobId the frontend minted for the most recent
+ *  `ingest_folder_tree` invoke. ZEB-163 round-1 fix: the frontend
+ *  generates the UUID synchronously before the IPC so the Cancel button
+ *  works during the pre-walk window; tests that emit progress events
+ *  need to match against this real id. */
+function getMintedJobId(adapter: { invoke: unknown }): string {
+  const invoke = adapter.invoke as { mock: { calls: unknown[][] } };
+  const call = invoke.mock.calls.find((c) => c[0] === 'ingest_folder_tree');
+  if (!call) throw new Error('ingest_folder_tree not invoked yet');
+  return (call[1] as { jobId: string }).jobId;
+}
+
 function makeResult(overrides: Partial<IngestFolderTreeResult> = {}): IngestFolderTreeResult {
   return {
     jobId: 'job-1',
@@ -103,6 +115,7 @@ function makeResult(overrides: Partial<IngestFolderTreeResult> = {}): IngestFold
     rootCid: 'cid-new-root',
     rootName: 'Dropped',
     totalFilesSeen: 3,
+    preWalkTotal: 3,
     succeeded: 3,
     skipped: { hidden: 0, symlink: 0, oversized: 0 },
     failed: [],
@@ -296,7 +309,7 @@ describe('FileBrowser folder ingest UI (ZEB-163)', () => {
     });
 
     emit('folder-ingest-progress', {
-      jobId: 'job-X',
+      jobId: getMintedJobId(adapter),
       completed: 7,
       total: 20,
       currentPath: '/tmp/work/file7.txt',
@@ -306,6 +319,17 @@ describe('FileBrowser folder ingest UI (ZEB-163)', () => {
       const counter = document.querySelector('.counter');
       if (!counter || !/7 of 20/.test(counter.textContent ?? '')) {
         throw new Error(`counter not yet updated: "${counter?.textContent}"`);
+      }
+    });
+
+    // Bot finding 11: the currentPath also has to render. The
+    // FolderIngestProgressModal middle-truncates long paths, so we match
+    // a substring distinctive enough to identify the file (the leaf
+    // name) rather than the whole path.
+    await waitFor(() => {
+      const path = document.querySelector('.current-path');
+      if (!path || !/file7\.txt/.test(path.textContent ?? '')) {
+        throw new Error(`current-path not rendered: "${path?.textContent}"`);
       }
     });
 
@@ -329,13 +353,16 @@ describe('FileBrowser folder ingest UI (ZEB-163)', () => {
       container.querySelector('button[aria-label="Add folder from disk"]') as HTMLButtonElement,
     );
 
-    // Wait for the progress modal to mount, then emit a progress event
-    // so activeIngestJobId is captured — Cancel is gated on a known job id.
+    // Wait for the progress modal to mount. jobId is minted synchronously
+    // by startFolderIngest BEFORE the IPC call (round-1 fix #3), so Cancel
+    // is targetable from the moment the modal renders — no need to wait
+    // for the first progress event.
     await waitFor(() => {
       expect(document.querySelector('.cancel-btn')).not.toBeNull();
     });
+    const mintedJobId = getMintedJobId(adapter);
     emit('folder-ingest-progress', {
-      jobId: 'job-cancel-1',
+      jobId: mintedJobId,
       completed: 1,
       total: 50,
       currentPath: '/tmp/cancel-me/a',
@@ -352,7 +379,7 @@ describe('FileBrowser folder ingest UI (ZEB-163)', () => {
 
     await waitFor(() => {
       expect(adapter.invoke).toHaveBeenCalledWith('cancel_folder_ingest', {
-        jobId: 'job-cancel-1',
+        jobId: mintedJobId,
       });
     });
 
@@ -363,7 +390,7 @@ describe('FileBrowser folder ingest UI (ZEB-163)', () => {
       }
     });
 
-    ingest.resolve(makeResult({ jobId: 'job-cancel-1', cancelled: true }));
+    ingest.resolve(makeResult({ jobId: mintedJobId, cancelled: true }));
   });
 
   // ── 8. Promise resolution closes progress, opens summary ─────────────
@@ -431,6 +458,11 @@ describe('FileBrowser folder ingest UI (ZEB-163)', () => {
         cancelled: true,
         succeeded: 4,
         totalFilesSeen: 10,
+        // Round-1 fix: cancelled headline now uses preWalkTotal as the
+        // denominator (the pre-walk count taken before the walker
+        // started), not totalFilesSeen (counters of leaves the walker
+        // actually touched before the cancel). preWalkTotal > 0 wins.
+        preWalkTotal: 10,
       }),
     );
 
@@ -558,7 +590,7 @@ describe('FileBrowser folder ingest UI (ZEB-163)', () => {
       expect(document.querySelector('.counter')).not.toBeNull();
     });
     emit('folder-ingest-progress', {
-      jobId: 'job-walk',
+      jobId: getMintedJobId(adapter),
       completed: 2,
       total: 100,
       currentPath: '/tmp/long-walk/x',
@@ -689,7 +721,7 @@ describe('FileBrowser folder ingest UI (ZEB-163)', () => {
     // it's already set synchronously by startFolderIngest, but the
     // event also captures the jobId.
     emit('folder-ingest-progress', {
-      jobId: 'job-inflight',
+      jobId: getMintedJobId(adapter),
       completed: 1,
       total: 10,
       currentPath: '/tmp/first-walk/a',

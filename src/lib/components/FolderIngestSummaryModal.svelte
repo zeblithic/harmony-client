@@ -22,7 +22,12 @@
   let headline = $derived.by(() => {
     if (!result) return '';
     if (result.cancelled) {
-      return `Cancelled — added ${result.succeeded} of ${result.totalFilesSeen} files`;
+      // `preWalkTotal` is the count taken BEFORE the walker started, so a
+      // mid-walk cancel still reports against the full tree. `-1` means
+      // the pre-walk failed (rare: unreadable root) — fall back to
+      // `totalFilesSeen` (counters of leaves the walker actually touched).
+      const denom = result.preWalkTotal > 0 ? result.preWalkTotal : result.totalFilesSeen;
+      return `Cancelled — added ${result.succeeded} of ${denom} files`;
     }
     if (result.rootSidecarId === null) {
       return 'Folder ingest failed before completing';

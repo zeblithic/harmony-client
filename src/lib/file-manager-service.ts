@@ -85,6 +85,11 @@ export interface IngestFolderTreeResult {
   rootCid: string | null;
   rootName: string;
   totalFilesSeen: number;
+  /** Pre-walk leaf count taken before the walker started. The cancelled
+   *  headline uses this as the denominator ("Cancelled — added 4 of 100
+   *  files") so a mid-walk cancel doesn't claim a truncated total. `-1`
+   *  when the pre-walk failed; the modal falls back to `totalFilesSeen`. */
+  preWalkTotal: number;
   succeeded: number;
   skipped: SkipCounts;
   failed: FailedEntry[];
@@ -622,16 +627,32 @@ export class FileManagerService {
    *                          root ingest. Matches `createFolder`'s shape.
    */
   async ingestFolderTree(
+    jobId: string,
     rootPath: string,
     parentSidecarId: string | null,
     parentPath: string[],
   ): Promise<IngestFolderTreeResult> {
     if (!this.adapter) throw new Error('adapter not connected');
-    return (await this.adapter.invoke('ingest_folder_tree', {
+    const result = (await this.adapter.invoke('ingest_folder_tree', {
+      jobId,
       rootPath,
       parentSidecarId,
       parentPath,
     })) as IngestFolderTreeResult;
+    // Mirror createFolder/moveContent/renameContent: re-list the root so
+    // other consumers of `privateContent` (not just FileBrowser via its
+    // serviceVersion++ on resolve) see the new sidecar entry. Refetch is
+    // best-effort — the ingest itself succeeded if we got here, so we
+    // only log on refresh failure rather than turning it into an error.
+    try {
+      await this.refetchRoot();
+    } catch (err) {
+      console.warn(
+        'ingestFolderTree: refetchRoot failed (ingest succeeded); UI may show stale list:',
+        err,
+      );
+    }
+    return result;
   }
 
   /** Flip the cancel flag on an in-flight `ingest_folder_tree` job

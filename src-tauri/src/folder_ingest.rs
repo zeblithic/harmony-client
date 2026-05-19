@@ -98,6 +98,13 @@ pub struct IngestFolderTreeResult {
     pub root_cid: Option<String>,
     pub root_name: String,
     pub total_files_seen: u64,
+    /// Pre-walk leaf count taken before the walker started. Used by the
+    /// frontend's cancelled headline as the denominator ("Cancelled —
+    /// added 4 of 100 files") so a mid-walk cancel doesn't claim a
+    /// truncated total. `-1` when the pre-walk failed (unreadable root,
+    /// permission errors); the modal falls back to `total_files_seen`
+    /// in that case.
+    pub pre_walk_total: i64,
     pub succeeded: u64,
     pub skipped: SkipCounts,
     pub failed: Vec<FailedEntry>,
@@ -162,11 +169,10 @@ fn pre_walk_count(root: &Path) -> Option<u64> {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        // The root's own name is not subject to the filter — a user is
-        // free to drop a `.config` folder if they want — but every
-        // descendant is.
-        let is_root = path == root;
-        if !is_root && should_filter_name(&name) {
+        // Deny-list applies to every entry including the root — the IPC
+        // entrypoint rejects deny-listed roots up-front, so this branch
+        // is defence-in-depth for internal callers.
+        if should_filter_name(&name) {
             continue;
         }
         if metadata.is_dir() {
@@ -243,6 +249,7 @@ pub async fn ingest_folder_tree<R: Runtime>(
     content_verb_tx: tokio::sync::mpsc::Sender<crate::event_loop::ContentVerbRequest>,
     content_index: Arc<Mutex<ContentIndex>>,
     cancel_registry: CancelRegistry,
+    job_id: String,
     root_path: String,
     parent_sidecar_id: Option<String>,
     parent_path: Vec<String>,
@@ -267,8 +274,21 @@ pub async fn ingest_folder_tree<R: Runtime>(
     if !meta.is_dir() {
         return Err("root_path is not a directory".into());
     }
+    // Bot finding 4: the deny-list applies to the root too. A user
+    // dropping `.git` silently ingesting its non-hidden children would
+    // be a confusing data-leak. Reject at the IPC boundary with a clear
+    // message rather than silently filtering — the user explicitly chose
+    // this directory.
+    if should_filter_name(&root_name) {
+        return Err(format!(
+            "Cannot ingest hidden/system folder as root: {root_name}"
+        ));
+    }
 
-    let job_id = uuid::Uuid::new_v4().to_string();
+    // job_id is minted by the frontend before invoking this IPC so the
+    // Cancel button can target the in-flight walk during the pre-walk
+    // window (Bot finding 3). The walker uses the supplied id verbatim
+    // for the registry insert, progress emits, and the result field.
     let cancel = Arc::new(AtomicBool::new(false));
     {
         let mut reg = cancel_registry
@@ -317,8 +337,13 @@ pub async fn ingest_folder_tree<R: Runtime>(
         }
     }
 
-    let cancelled =
-        matches!(walk_outcome, WalkOutcome::Cancelled) || cancel.load(Ordering::Relaxed);
+    // Only count the post-walk cancel flag if the walker never reached the
+    // root manifest build — a late `cancel_folder_ingest` racing the result
+    // assembly mustn't flip a successful ingest's `cancelled` flag (Bot
+    // finding 8). `root_sidecar_id.is_some()` means the root settled, so
+    // the cancel arrived after the work was complete.
+    let cancelled = matches!(walk_outcome, WalkOutcome::Cancelled)
+        || (cancel.load(Ordering::Relaxed) && counters.root_sidecar_id.is_none());
 
     // total_files_seen is the count of leaves the walker actually touched
     // (succeeded + skipped.oversized + failed) — distinct from the
@@ -336,6 +361,7 @@ pub async fn ingest_folder_tree<R: Runtime>(
         root_cid: counters.root_cid,
         root_name,
         total_files_seen,
+        pre_walk_total: total,
         succeeded: counters.succeeded,
         skipped: counters.skipped,
         failed: counters.failed,
@@ -373,9 +399,11 @@ fn walk<'a, R: Runtime>(
             counters.skipped.symlink = counters.skipped.symlink.saturating_add(1);
             return WalkOutcome::Skipped;
         }
-        // The root's own name is exempt — a user dropping `.config` did so
-        // deliberately; every descendant still goes through the filter.
-        if !is_root && should_filter_name(&name) {
+        // Deny-list applies to every entry. The IPC entrypoint already
+        // rejects deny-listed roots with a clear error before the walker
+        // starts; this guard is defence-in-depth for internal callers
+        // and covers every descendant.
+        if should_filter_name(&name) {
             counters.skipped.hidden = counters.skipped.hidden.saturating_add(1);
             return WalkOutcome::Skipped;
         }
@@ -482,23 +510,33 @@ fn walk<'a, R: Runtime>(
                 }
             }
         } else if metadata.is_file() {
-            // Cheap oversized check from metadata. The bytes-only helper
-            // doesn't re-check (no sidecar to corrupt), so a file that
-            // grows past the cap between this stat and the `read` below
-            // will simply ingest at whatever size it ends up — acceptable
-            // because the bundle is content-addressed and the resulting
-            // manifest entry will reference the actual bytes hashed.
+            // Cheap oversized pre-check from metadata. The capped read
+            // below is the authoritative gate — a file that grows past
+            // the cap between stat and read is rejected by the read
+            // limit (Bot finding 9: TOCTOU).
             if metadata.len() > FLAT_BUNDLE_MAX {
                 counters.skipped.oversized = counters.skipped.oversized.saturating_add(1);
                 return WalkOutcome::Skipped;
             }
-            // Symlink defence-in-depth: the outer is_symlink() arm above
-            // already handles the walker-facing case, so we don't repeat
-            // the check here. Read directly via tokio::fs::read.
-            let bytes = match tokio::fs::read(path).await {
-                Ok(b) => b,
-                Err(e) => return WalkOutcome::Failed(format!("read: {e}")),
+            // Capped read: `take(FLAT_BUNDLE_MAX + 1)` lets us distinguish
+            // "exactly at cap" (allowed) from "grew past cap mid-read"
+            // (rejected). Without the cap a file that doubled in size
+            // between stat and read would allocate the full grown size
+            // into a Vec.
+            use tokio::io::AsyncReadExt;
+            let mut file = match tokio::fs::File::open(path).await {
+                Ok(f) => f,
+                Err(e) => return WalkOutcome::Failed(format!("open: {e}")),
             };
+            let max_plus_one = FLAT_BUNDLE_MAX.saturating_add(1);
+            let mut bytes = Vec::new();
+            if let Err(e) = (&mut file).take(max_plus_one).read_to_end(&mut bytes).await {
+                return WalkOutcome::Failed(format!("read: {e}"));
+            }
+            if (bytes.len() as u64) > FLAT_BUNDLE_MAX {
+                counters.skipped.oversized = counters.skipped.oversized.saturating_add(1);
+                return WalkOutcome::Skipped;
+            }
             // CRITICAL: bytes-only — no sidecar entry. Leaves live in the
             // parent folder's manifest only; a per-leaf sidecar here would
             // pollute the root listing (see send_ingest_bytes_only docs).
@@ -659,6 +697,7 @@ mod tests {
             verb_tx,
             index.clone(),
             registry,
+            "test-job-pollute".to_string(),
             dir.path().to_string_lossy().into_owned(),
             None,
             Vec::new(),
@@ -740,6 +779,7 @@ mod tests {
             verb_tx,
             index.clone(),
             registry.clone(),
+            "test-job-cleanup".to_string(),
             dir.path().to_string_lossy().into_owned(),
             None,
             Vec::new(),

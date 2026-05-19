@@ -32,7 +32,7 @@ From the codebase survey (2026-05-19):
 
 ## Architecture
 
-```
+```text
 ┌──────────────────────────────────────────────────────────────────────┐
 │  Frontend (FileBrowser.svelte)                                        │
 │                                                                       │
@@ -122,6 +122,7 @@ pub struct IngestFolderTreeResult {
     pub root_cid: Option<String>,
     pub root_name: String,
     pub total_files_seen: u64,
+    pub pre_walk_total: i64, // pre-walk leaf count; -1 if pre-walk failed
     pub succeeded: u64,
     pub skipped: SkipCounts,
     pub failed: Vec<FailedEntry>, // path + message; bounded list (cap at 50, overflow counter)
@@ -145,12 +146,14 @@ pub struct FailedEntry {
 ### Progress events
 
 ```rust
-// Emitted per leaf-file ingest AND per dir-manifest ingest.
+// Emitted per leaf-file ingest. Directory manifest builds are NOT
+// counted here — pre_walk_count only enumerates non-filtered leaf
+// files, so emitting on dir builds would push `completed` past `total`.
 #[derive(Clone, Serialize)]
 struct FolderIngestProgressEvent {
     job_id: String,
     completed: u64,
-    total: u64,             // pre-walk count of non-filtered leaves; -1 if not pre-counted
+    total: i64,             // pre-walk count of non-filtered leaves; -1 if pre-walk failed
     current_path: String,   // relative to root_path
 }
 ```

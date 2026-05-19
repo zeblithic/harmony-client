@@ -6107,11 +6107,23 @@ pub(crate) async fn send_ingest_bytes_only(
     use harmony_content::cid::{ContentFlags, ContentId};
 
     let size_bytes = bytes.len() as u64;
-    // Final dispatch decision from the bytes actually read. This closes the
-    // TOCTOU window between metadata() and read(): if the file grew past the
-    // cap we reject cleanly, and if it shrank below MAX_PAYLOAD_SIZE we take
-    // the single-book fast path instead of tripping chunk_and_bundle's
-    // precondition guard.
+    // Explicit oversize check BEFORE ingest_dispatch. `ingest_dispatch`
+    // returns an opaque `String` error for oversize, which the previous
+    // `.map_err(IngestError::other)` collapsed into `IngestError::Other`
+    // — that bucket lands in `failed` rather than `skipped.oversized`,
+    // mis-classifying the TOCTOU "file grew past cap between stat and
+    // read" case. Returning the typed `Oversized` here keeps the walker's
+    // routing honest (Bot finding 5).
+    if size_bytes > FLAT_BUNDLE_MAX {
+        return Err(IngestError::Oversized {
+            size: size_bytes,
+            cap: FLAT_BUNDLE_MAX,
+        });
+    }
+    // Final dispatch decision from the bytes actually read. With the
+    // oversize gate above this can no longer return the oversize error
+    // path; remaining failures (Chunked vs Single classification) are
+    // never user-facing so the `Other` collapse is acceptable.
     let dispatch = ingest_dispatch(size_bytes).map_err(IngestError::other)?;
 
     let root_cid_bytes: [u8; 32] = match dispatch {
@@ -6479,6 +6491,7 @@ async fn create_folder(
 async fn ingest_folder_tree(
     app: AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
+    job_id: String,
     root_path: String,
     parent_sidecar_id: Option<String>,
     parent_path: Vec<String>,
@@ -6504,6 +6517,7 @@ async fn ingest_folder_tree(
         verb_tx,
         index,
         registry,
+        job_id,
         root_path,
         parent_sidecar_id,
         parent_path,
@@ -21760,7 +21774,13 @@ pub fn run() {
                         "x": position.x,
                         "y": position.y,
                     });
-                    let event_name = if path.is_dir() {
+                    // `symlink_metadata` doesn't follow symlinks, so a
+                    // symlink-to-dir routes to the file event rather than
+                    // emitting `os-folder-dropped` and triggering an
+                    // immediate-failure modal flash in the walker (Bot
+                    // finding 10).
+                    let is_dir = path.symlink_metadata().map(|m| m.is_dir()).unwrap_or(false);
+                    let event_name = if is_dir {
                         "os-folder-dropped"
                     } else {
                         "os-file-dropped"
