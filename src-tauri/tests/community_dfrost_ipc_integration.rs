@@ -69,6 +69,13 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 const ALICE: OwnerAddr = OwnerAddr([0x01; 16]);
 const BOB: OwnerAddr = OwnerAddr([0x02; 16]);
+// Test-wide community handle used by ceremony_id derivation. The actual
+// bytes don't matter for the test contract; what matters is that BOTH
+// engines hash the SAME space_id into the ceremony_id (so they converge
+// on the same id) and that the helper mirrors the IPC's derivation
+// shape (R1 round-1 bot-review MAJOR: ceremony_id now includes
+// hlc.logical + space_id).
+const TEST_SPACE_ID: SpaceId = SpaceId([0x55; 16]);
 
 fn sorted_members() -> Vec<OwnerAddr> {
     // ALICE < BOB byte-wise → sorted order matches initiator ordering in
@@ -115,15 +122,24 @@ fn hlc_at(wall_ms: u64, node: &str) -> Hlc {
 }
 
 /// IPC-canonical `ceremony_id` derivation:
-/// `blake3(sorted_members || threshold_le || hlc.wall_ms_le)`.
+/// `blake3(sorted_members || threshold_le || hlc.wall_ms_le ||
+/// hlc.logical_le || space_id)`.
 /// Lifted verbatim from `dfrost_initiate_dkg` step 6.
-fn derive_ceremony_id(members: &[OwnerAddr], threshold: u16, hlc_wall_ms: u64) -> [u8; 32] {
-    let mut hasher_input: Vec<u8> = Vec::with_capacity(members.len() * 16 + 2 + 8);
+fn derive_ceremony_id(
+    members: &[OwnerAddr],
+    threshold: u16,
+    hlc_wall_ms: u64,
+    hlc_logical: u32,
+    space_id: &SpaceId,
+) -> [u8; 32] {
+    let mut hasher_input: Vec<u8> = Vec::with_capacity(members.len() * 16 + 2 + 8 + 4 + 16);
     for a in members {
         hasher_input.extend_from_slice(&a.0);
     }
     hasher_input.extend_from_slice(&threshold.to_le_bytes());
     hasher_input.extend_from_slice(&hlc_wall_ms.to_le_bytes());
+    hasher_input.extend_from_slice(&hlc_logical.to_le_bytes());
+    hasher_input.extend_from_slice(&space_id.0);
     blake3::hash(&hasher_input).into()
 }
 
@@ -485,7 +501,13 @@ async fn dkg_ipc_round_trip_two_engine_2of2() {
     // id; both engines must agree on this value (in production the dr rn=1
     // event carries Alice's HLC and Bob seeds his pending_dkg from it).
     let alice_init_hlc = hlc_at(1_000, "alice");
-    let ceremony_id = derive_ceremony_id(&members, threshold, alice_init_hlc.wall_ms);
+    let ceremony_id = derive_ceremony_id(
+        &members,
+        threshold,
+        alice_init_hlc.wall_ms,
+        alice_init_hlc.logical,
+        &TEST_SPACE_ID,
+    );
 
     let dr1_alice = initiate_dkg_local(
         &mut log_a,
@@ -804,7 +826,13 @@ fn dkg_complete_two_engine_via_ipc_path() -> (
 
     // ── Round 1
     let alice_init_hlc = hlc_at(1_000, "alice");
-    let ceremony_id = derive_ceremony_id(&members, threshold, alice_init_hlc.wall_ms);
+    let ceremony_id = derive_ceremony_id(
+        &members,
+        threshold,
+        alice_init_hlc.wall_ms,
+        alice_init_hlc.logical,
+        &TEST_SPACE_ID,
+    );
 
     let dr1_alice = initiate_dkg_local(
         &mut log_a,
@@ -1104,30 +1132,23 @@ fn contribute_threshold_sign_local(
 /// under the joint vk), and the aggregated signature independently
 /// verifies via `verify_schnorr_signature`.
 ///
-/// ## Why we re-clear `pending_sign[…].contributions[actor]` before each
-/// apply
+/// ## Empty-then-filled `ts` upsert (apply_threshold_sign R1 fix)
 ///
-/// `apply_threshold_sign` records the `(commitment, share)` tuple on
-/// FIRST write per `(actor, ceremony_id)` (the `.entry(...).or_insert(...)`
-/// pattern in `community_dfrost_log.rs`). The IPC handlers compose this
-/// in production by emitting TWO distinct `ts` events per node — first
-/// with empty share, then with the share — and the IPC code currently
-/// relies on the share being added by the second event arriving with a
-/// different HLC. But the apply path's `or_insert` only writes the FIRST
-/// tuple; the second `ts` from the same actor is silently dropped.
-///
-/// In a real federated setting peers see the second `ts` as a re-broadcast
-/// and dedupe it via HLC LWW upstream of apply, so this is a non-issue;
-/// for the local single-process test path we have to either (a) clear the
-/// contribution between the empty-share and share-bearing apply calls so
-/// the second ts effectively replaces the first, or (b) skip the empty-
-/// share ts on the originator and just emit the share-bearing one. We
-/// pick (a) to keep the event-construction order identical to the IPC's
-/// two-step shape — see the explicit clear in the test body below.
+/// `apply_threshold_sign` UPSERTS the `(commitment, share)` tuple per
+/// `(actor, ceremony_id)`: round-1 ts (empty share) inserts; round-2 ts
+/// (filled share, same commitment) updates the share_bytes in place.
+/// Reuse of a filled share or commitment swap is rejected as
+/// `InvariantViolation` — see the unit tests
+/// `ts_round2_filled_share_upserts_over_round1_empty_share` /
+/// `ts_second_filled_share_with_different_bytes_rejected` /
+/// `ts_with_mismatched_commitment_bytes_rejected` /
+/// `ts_late_empty_share_does_not_downgrade_existing_filled_share` in
+/// `community_dfrost_log.rs`. The test follows the natural two-step
+/// IPC flow without any direct mutation of `pending_sign.contributions`.
 #[tokio::test]
 async fn threshold_sign_ipc_round_trip_vrf_beacon_two_engine() {
     // ── Precondition: both engines DKG-complete + active on identical vk ──
-    let (mut log_a, mut log_b, key_pkg_a, key_pkg_b, pub_pkg_a, _pub_pkg_b, members) =
+    let (mut log_a, mut log_b, key_pkg_a, key_pkg_b, _pub_pkg_a, pub_pkg_b, members) =
         dkg_complete_two_engine_via_ipc_path();
 
     // ── Step 1: derive sign-session ceremony_id (mirrors IPC step 5) ──
@@ -1237,14 +1258,10 @@ async fn threshold_sign_ipc_round_trip_vrf_beacon_two_engine() {
 
     // ── Step 4: Alice runs contribute_threshold_sign ──
     //
-    // Per the doc-comment on this test, apply_threshold_sign records the
-    // first (commitment, share) tuple per (actor, ceremony_id). Alice's
-    // round-1 ts populated her contribution with an EMPTY share; for the
-    // round-2 share-bearing ts to be applied as the new state we must
-    // first clear the stale empty-share contribution slot for the
-    // originating actor on both engines. This matches the IPC's intent
-    // (the share-bearing ts is the canonical contribution from this
-    // actor; the round-1 ts is just the commitment-distribution event).
+    // Alice's round-1 ts populated her contribution with an EMPTY share;
+    // her round-2 share-bearing ts upserts the share_bytes in place via
+    // `apply_threshold_sign`'s upsert path (R1 fix). No direct mutation
+    // of `pending_sign.contributions` needed.
     let (ts_alice_with_share, _signing_package_a) = contribute_threshold_sign_local(
         &log_a,
         ALICE,
@@ -1254,23 +1271,6 @@ async fn threshold_sign_ipc_round_trip_vrf_beacon_two_engine() {
         hlc_at(5_000, "alice"),
         &alice_sk,
     );
-
-    // Clear alice's contribution on BOTH engines before applying the
-    // share-bearing ts (see doc-comment for why).
-    log_a
-        .committee_state
-        .pending_sign
-        .get_mut(&sign_ceremony_id)
-        .unwrap()
-        .contributions
-        .remove(&ALICE);
-    log_b
-        .committee_state
-        .pending_sign
-        .get_mut(&sign_ceremony_id)
-        .unwrap()
-        .contributions
-        .remove(&ALICE);
 
     log_a
         .apply_with_identity(ts_alice_with_share.clone(), &ALICE, &alice_x_priv)
@@ -1309,12 +1309,11 @@ async fn threshold_sign_ipc_round_trip_vrf_beacon_two_engine() {
     // ── Step 5: Bob runs contribute_threshold_sign — hits threshold ──
     //
     // This is the share that crosses 2-of-2 quorum on Bob's engine; the
-    // IPC's post-apply count of contributions-with-share would become 2,
-    // triggering aggregation + vb emit. We mirror that path: clear bob's
-    // stale empty-share contribution, apply his share-bearing ts on both
-    // engines, then aggregate on the engine that hits threshold (here we
-    // aggregate on Bob's side since he's the one whose apply pushes the
-    // count to threshold).
+    // IPC's post-apply count of contributions-with-share becomes 2,
+    // triggering aggregation + vb emit. Bob's round-2 ts upserts over
+    // his round-1 empty-share contribution via `apply_threshold_sign`
+    // (R1 fix). Aggregate on Bob's side since he's the one whose apply
+    // pushes the count to threshold.
     let (ts_bob_with_share, signing_package_b) = contribute_threshold_sign_local(
         &log_b,
         BOB,
@@ -1324,21 +1323,6 @@ async fn threshold_sign_ipc_round_trip_vrf_beacon_two_engine() {
         hlc_at(5_100, "bob"),
         &bob_sk,
     );
-
-    log_a
-        .committee_state
-        .pending_sign
-        .get_mut(&sign_ceremony_id)
-        .unwrap()
-        .contributions
-        .remove(&BOB);
-    log_b
-        .committee_state
-        .pending_sign
-        .get_mut(&sign_ceremony_id)
-        .unwrap()
-        .contributions
-        .remove(&BOB);
 
     log_b
         .apply_with_identity(ts_bob_with_share.clone(), &BOB, &bob_x_priv)
@@ -1384,8 +1368,12 @@ async fn threshold_sign_ipc_round_trip_vrf_beacon_two_engine() {
 
     // PublicKeyPackage on Bob is byte-identical to Alice's (DKG invariant);
     // either works for aggregate. The IPC uses `local_pub_key_package` on
-    // the aggregating node — we mirror by passing pub_pkg_a (same bytes).
-    let group_signature = frost::aggregate(&signing_package_b, &shares_map, &pub_pkg_a)
+    // the aggregating node — Bob aggregates here, so we use Bob's
+    // pub_pkg_b (R1 round-1 bot-review MAJOR: previously this passed
+    // pub_pkg_a, which happened to work because both engines converge
+    // on identical PublicKeyPackage bytes after DKG, but the assertion
+    // shape was wrong — the aggregating node must use its OWN copy).
+    let group_signature = frost::aggregate(&signing_package_b, &shares_map, &pub_pkg_b)
         .expect("aggregate threshold signature");
     let sig_bytes: Vec<u8> = group_signature.serialize().expect("serialize signature");
     assert_eq!(
@@ -1520,17 +1508,22 @@ async fn threshold_sign_ipc_round_trip_vrf_beacon_two_engine() {
 /// `dfrost_propose_refresh` step 8:
 ///
 /// `blake3(sorted_members || proposed_epoch_le || threshold_le ||
-///   b"refresh-v1" || hlc.wall_ms_le)`.
+///   b"refresh-v1" || hlc.wall_ms_le || hlc.logical_le || space_id)`.
 ///
 /// The `b"refresh-v1"` domain separator + `proposed_epoch` ensures no
 /// collision with `dfrost_initiate_dkg`'s ceremony-id tag space.
+/// `hlc.logical` + `space_id` close the same wall_ms / cross-space
+/// collision windows as on the DKG side (R1 round-1 bot-review MAJOR).
 fn derive_refresh_ceremony_id(
     members: &[OwnerAddr],
     proposed_epoch: u64,
     threshold: u16,
     hlc_wall_ms: u64,
+    hlc_logical: u32,
+    space_id: &SpaceId,
 ) -> [u8; 32] {
-    let mut hasher_input: Vec<u8> = Vec::with_capacity(members.len() * 16 + 8 + 2 + 10 + 8);
+    let mut hasher_input: Vec<u8> =
+        Vec::with_capacity(members.len() * 16 + 8 + 2 + 10 + 8 + 4 + 16);
     for a in members {
         hasher_input.extend_from_slice(&a.0);
     }
@@ -1538,6 +1531,8 @@ fn derive_refresh_ceremony_id(
     hasher_input.extend_from_slice(&threshold.to_le_bytes());
     hasher_input.extend_from_slice(b"refresh-v1");
     hasher_input.extend_from_slice(&hlc_wall_ms.to_le_bytes());
+    hasher_input.extend_from_slice(&hlc_logical.to_le_bytes());
+    hasher_input.extend_from_slice(&space_id.0);
     blake3::hash(&hasher_input).into()
 }
 
@@ -1713,6 +1708,8 @@ async fn refresh_ipc_round_trip_two_engine_preserves_joint_vk() {
         proposed_epoch,
         threshold,
         alice_propose_hlc.wall_ms,
+        alice_propose_hlc.logical,
+        &TEST_SPACE_ID,
     );
 
     // ── Step 2: Alice proposes refresh ────────────────────────────────────

@@ -58,7 +58,7 @@ git log --oneline -1  # expect: 82a5c4f Dev workflow: ... (PR #142)
 - [ ] **Step 2: Confirm baseline gates are green (focused, not full workspace)**
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri
+cd src-tauri
 cargo nextest run --locked --features test-fixtures -E 'binary(community_dfrost_integration)'
 ```
 
@@ -924,7 +924,6 @@ export const DFROST_REFRESH_PROGRESS = 'dfrost-refresh-progress' as const;
 - [ ] **Step 2: Run frontend gates**
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony-client
 npx tsc --noEmit 2>&1 | tail -10
 npx vitest run 2>&1 | tail -10
 ```
@@ -1034,8 +1033,8 @@ git commit -m "test(zeb-305): refresh IPC round-trip — joint_vk preserved acro
 cd src-tauri && cargo fmt --all -- --check 2>&1 | tail -5
 cd src-tauri && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings 2>&1 | tail -10
 cd src-tauri && cargo nextest run --locked --workspace --all-targets --features test-fixtures 2>&1 | tail -20
-cd /Users/zeblith/work/zeblithic/harmony-client && npx tsc --noEmit 2>&1 | tail -10
-cd /Users/zeblith/work/zeblithic/harmony-client && npx vitest run 2>&1 | tail -10
+npx tsc --noEmit 2>&1 | tail -10
+npx vitest run 2>&1 | tail -10
 ```
 
 All five must be clean: 0 fmt diffs, 0 clippy warnings, 0 test failures, 0 type errors, 0 frontend test failures.

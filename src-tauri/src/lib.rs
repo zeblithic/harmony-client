@@ -21876,7 +21876,7 @@ pub struct DfrostBeaconReadyPayload {
 /// Tauri IPC: admin initiates a fresh D-FROST committee DKG ceremony.
 ///
 /// Derives `ceremony_id` deterministically from `blake3(sorted_members ||
-/// threshold || hlc.wall_ms)`, runs `frost::dkg::part1` locally to produce
+/// threshold || hlc.wall_ms || hlc.logical || space_id)`, runs `frost::dkg::part1` locally to produce
 /// this node's round-1 secret + public package, seeds `pending_dkg` with
 /// the committee shape (members / threshold / max_signers / proposed_epoch),
 /// builds + signs a `dr` rn=1 event via `build_signed_dfrost_event`, and
@@ -21983,18 +21983,27 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
         crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
 
     // 6. Derive ceremony_id = blake3(sorted_members || threshold_le ||
-    //    hlc.wall_ms_le). All inputs are agreed-upon-by-construction
-    //    between initiator and peers (peers learn members/threshold from
-    //    the dr rn=1 ceremony bootstrap once Zenoh broadcast lands; the
-    //    HLC is signed-into the event envelope). Deterministic so any
-    //    two nodes computing it from the same inputs land on the same
-    //    32-byte id.
-    let mut hasher_input: Vec<u8> = Vec::with_capacity(member_addrs.len() * 16 + 2 + 8);
+    //    hlc.wall_ms_le || hlc.logical_le || space_id). All inputs are
+    //    agreed-upon-by-construction between initiator and peers (peers
+    //    learn members/threshold from the dr rn=1 ceremony bootstrap once
+    //    Zenoh broadcast lands; the HLC is signed-into the event
+    //    envelope; space_id scopes the id out of any other community's
+    //    namespace). Deterministic so any two nodes computing it from
+    //    the same inputs land on the same 32-byte id.
+    //
+    //    R1 (round-1 bot-review MAJOR): hlc.logical + space_id were
+    //    previously omitted. Without hlc.logical, two ceremonies that
+    //    materialise at the same wall_ms but different HLC ticks
+    //    collide; without space_id, two ceremonies in different
+    //    communities at the same HLC collide cross-space.
+    let mut hasher_input: Vec<u8> = Vec::with_capacity(member_addrs.len() * 16 + 2 + 8 + 4 + 16);
     for a in &member_addrs {
         hasher_input.extend_from_slice(&a.0);
     }
     hasher_input.extend_from_slice(&threshold.to_le_bytes());
     hasher_input.extend_from_slice(&hlc.wall_ms.to_le_bytes());
+    hasher_input.extend_from_slice(&hlc.logical.to_le_bytes());
+    hasher_input.extend_from_slice(&space_id.0);
     let ceremony_id: [u8; 32] = blake3::hash(&hasher_input).into();
 
     // 7. Run DKG round 1 for self. The secret half stays on this node;
@@ -22923,12 +22932,35 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
         let members = log.committee_state.members.clone();
         let threshold = log.committee_state.threshold;
 
+        // R1 (round-1 bot-review CRITICAL): refuse to sign until quorum's
+        // worth of peer commitments have landed. FROST `round2::sign`
+        // would technically produce a share against an under-quorum
+        // SigningPackage, but `aggregate` would reject the result; worse,
+        // it would CONSUME our single-use nonces against a transcript
+        // that never finalises — wasting the round-1 commit and forcing
+        // the caller to re-run `dfrost_request_vrf_beacon` for a fresh
+        // nonce pair. Better to bail before consuming nonces.
+        if pending.contributions.len() < threshold as usize {
+            return Err(format!(
+                "dfrost_contribute_threshold_sign: insufficient commitments — \
+                 have {} peer ts events, need {threshold}; wait for {} more",
+                pending.contributions.len(),
+                (threshold as usize).saturating_sub(pending.contributions.len()),
+            ));
+        }
+
         // Decode stashed local nonces. `#[serde(skip)]` on local_nonces
         // means a process restart wipes them — that branch requires
         // re-running `dfrost_request_vrf_beacon` for this ceremony.
+        //
+        // R1 CRITICAL: a `None` here on a re-call means we already
+        // consumed the nonces against this ceremony — silently re-signing
+        // with the same nonces leaks the signing share per FROST spec
+        // §6.2. Emit a discriminable error so the caller knows to start
+        // a fresh ceremony rather than retrying.
         let nonces_cbor = pending.local_nonces.as_ref().ok_or(
-            "dfrost_contribute_threshold_sign: local_nonces missing — \
-             was dfrost_request_vrf_beacon called in this process?",
+            "dfrost_contribute_threshold_sign: local_nonces already consumed for this ceremony — \
+             call dfrost_request_vrf_beacon again to start a fresh round-1",
         )?;
         let nonces: frost_ristretto255::round1::SigningNonces =
             ciborium::from_reader(&nonces_cbor[..]).map_err(|e| {
@@ -22989,14 +23021,22 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
     };
 
     // 5. Run FROST round-2. `frost::round2::sign` CONSUMES the nonces by
-    //    value — single-use enforcement by the type system. Re-running
-    //    this IPC would fail at step 4 (nonces decoded fresh from the
-    //    stashed CBOR), but the CBOR itself does not get cleared, so an
-    //    intentional duplicate call would currently re-sign and re-emit
-    //    a duplicate `ts` event. The apply path's idempotency check (same
-    //    `(actor, ceremony_id, hlc)`) is the backstop.
+    //    value — single-use enforcement by the type system. After
+    //    signing succeeds we MUST clear the stashed CBOR so a retry
+    //    cannot re-decode and re-sign with the same nonces (FROST nonce
+    //    reuse is secret-key-extracting — spec §6.2).
     let sig_share = frost_ristretto255::round2::sign(&signing_package, &nonces, &key_package)
         .map_err(|e| format!("dfrost_contribute_threshold_sign: round2::sign: {e}"))?;
+
+    // R1 CRITICAL: clear local_nonces immediately after consumption. The
+    // step-4 None-check above raises a discriminable error on the next
+    // call against this ceremony.
+    {
+        let mut log = log_arc.lock().await;
+        if let Some(pending) = log.committee_state.pending_sign.get_mut(&ceremony_bytes) {
+            pending.local_nonces = None;
+        }
+    }
 
     let mut share_bytes = Vec::new();
     ciborium::into_writer(&sig_share, &mut share_bytes)
@@ -23375,11 +23415,17 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
         crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
 
     // 8. Derive ceremony_id = blake3(sorted_members || proposed_epoch_le ||
-    //    threshold_le || b"refresh-v1" || hlc.wall_ms_le). The "refresh-v1"
-    //    domain separator + proposed_epoch ensures no collision with the
-    //    `dfrost_initiate_dkg` derivation tag space, even if a node ever
-    //    re-derives a ceremony id using the same inputs.
-    let mut hasher_input: Vec<u8> = Vec::with_capacity(member_addrs.len() * 16 + 8 + 2 + 10 + 8);
+    //    threshold_le || b"refresh-v1" || hlc.wall_ms_le ||
+    //    hlc.logical_le || space_id). The "refresh-v1" domain separator +
+    //    proposed_epoch scopes refresh ceremony_ids out of the DKG
+    //    derivation; hlc.logical + space_id close the same wall_ms /
+    //    cross-space collision windows as on the DKG side.
+    //
+    //    R1 (round-1 bot-review MAJOR): hlc.logical + space_id added
+    //    here in lockstep with `dfrost_initiate_dkg` so the two
+    //    namespaces stay symmetrically scoped.
+    let mut hasher_input: Vec<u8> =
+        Vec::with_capacity(member_addrs.len() * 16 + 8 + 2 + 10 + 8 + 4 + 16);
     for a in &member_addrs {
         hasher_input.extend_from_slice(&a.0);
     }
@@ -23387,6 +23433,8 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
     hasher_input.extend_from_slice(&threshold.to_le_bytes());
     hasher_input.extend_from_slice(b"refresh-v1");
     hasher_input.extend_from_slice(&hlc.wall_ms.to_le_bytes());
+    hasher_input.extend_from_slice(&hlc.logical.to_le_bytes());
+    hasher_input.extend_from_slice(&space_id.0);
     let ceremony_id: [u8; 32] = blake3::hash(&hasher_input).into();
 
     // 9. Run DKG round-1 to mint a fresh round-1 secret + public round-1
