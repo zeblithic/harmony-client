@@ -37,8 +37,12 @@
   }
 
   function startRename(a: Account) {
+    // Close any open delete-confirm — only one inline edit UI at a time.
+    confirmDeleteId = null;
+    reassignTo = '';
     editingId = a.id;
     editingName = a.name;
+    error = null;
   }
 
   async function commitRename() {
@@ -54,8 +58,12 @@
   }
 
   function startDelete(a: Account) {
+    // Close any open rename session — a user shouldn't have rename
+    // and delete-confirm UI visible at the same time.
+    editingId = null;
     confirmDeleteId = a.id;
     reassignTo = '';
+    error = null;
   }
 
   async function commitDelete() {
@@ -76,7 +84,9 @@
   <div class="dialog-body">
     <h2>Manage accounts</h2>
     <div class="new-account">
+      <label for="mint-new-account-name" class="sr-only">New account name</label>
       <input
+        id="mint-new-account-name"
         type="text"
         bind:value={newName}
         placeholder="New account name"
@@ -140,4 +150,5 @@
   .confirm-delete { padding: 0.75rem; background: var(--color-bg-warning, #fff8e1); border-radius: 4px; }
   .dialog-actions { display: flex; justify-content: flex-end; }
   .error { color: var(--color-error, #c53030); }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 </style>
