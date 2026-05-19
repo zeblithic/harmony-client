@@ -164,7 +164,7 @@ First compile after install populates the cache; subsequent compiles of the same
 
 ## macOS XprotectService — REQUIRED one-time setup
 
-On macOS, `XprotectService` (the system malware/Gatekeeper scanner) synchronously inspects every freshly-linked Mach-O binary on its first execution. For this workspace's 55+ integration test binaries, that means `cargo nextest run --all-targets` from a fresh build can hang indefinitely — each binary blocks in `_dyld_start` for several minutes while XprotectService inspects it. Investigated and fixed in [ZEB-304](https://linear.app/zeblith/issue/ZEB-304).
+On macOS, `XprotectService` (the system malware/Gatekeeper scanner) synchronously inspects every freshly-linked Mach-O binary on its first execution. For this workspace's 55+ integration test binaries, that means `cargo nextest run --locked --workspace --all-targets --features test-fixtures` from a fresh build can hang indefinitely — each binary blocks in `_dyld_start` for several minutes while XprotectService inspects it. Investigated and fixed in [ZEB-304](https://linear.app/zeblith/issue/ZEB-304).
 
 **Required one-time setup for any macOS contributor:**
 
