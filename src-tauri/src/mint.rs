@@ -9,6 +9,8 @@
 
 use rusqlite::{params, Connection};
 
+const DEFAULT_CURRENCY_KEY: &str = "default_currency";
+
 // ── Error type ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
@@ -93,9 +95,11 @@ fn apply_migrations(conn: &Connection) -> Result<(), MintError> {
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
-
-        INSERT OR IGNORE INTO settings (key, value) VALUES ('default_currency', 'USD');
         ",
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES (?, 'USD')",
+        params![DEFAULT_CURRENCY_KEY],
     )?;
     Ok(())
 }
@@ -107,8 +111,8 @@ fn apply_migrations(conn: &Connection) -> Result<(), MintError> {
 /// Returns `None` if the row has been deleted (unlikely in normal operation
 /// because `apply_migrations` seeds it, but defensive is correct here).
 pub fn get_default_currency(conn: &Connection) -> Result<Option<String>, MintError> {
-    let mut stmt = conn.prepare("SELECT value FROM settings WHERE key = 'default_currency'")?;
-    let mut rows = stmt.query([])?;
+    let mut stmt = conn.prepare("SELECT value FROM settings WHERE key = ?")?;
+    let mut rows = stmt.query(params![DEFAULT_CURRENCY_KEY])?;
     match rows.next()? {
         Some(row) => Ok(Some(row.get(0)?)),
         None => Ok(None),
@@ -122,8 +126,8 @@ pub fn get_default_currency(conn: &Connection) -> Result<Option<String>, MintErr
 pub fn set_default_currency(conn: &Connection, currency: &str) -> Result<(), MintError> {
     validate_currency(currency)?;
     conn.execute(
-        "INSERT OR REPLACE INTO settings (key, value) VALUES ('default_currency', ?)",
-        params![currency],
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+        params![DEFAULT_CURRENCY_KEY, currency],
     )?;
     Ok(())
 }
@@ -179,6 +183,15 @@ mod tests {
         apply_migrations(&conn).unwrap();
         // Second call must not error.
         apply_migrations(&conn).unwrap();
+        // Idempotency means more than "no error" — the seed row must not duplicate.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM settings WHERE key = ?",
+                rusqlite::params![DEFAULT_CURRENCY_KEY],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "seed row must not duplicate on repeat migration");
     }
 
     #[test]
