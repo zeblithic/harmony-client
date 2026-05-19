@@ -69,8 +69,8 @@ From the codebase survey (2026-05-19):
 │  Backend (Tauri)                                                      │
 │                                                                       │
 │   ingest_folder_tree IPC                                             │
-│   - mints jobId (UUID)                                                │
-│   - registers CancellationToken in shared registry                    │
+│   - receives jobId (UUID) minted by frontend                          │
+│   - registers CancellationToken keyed by incoming jobId               │
 │   - spawns walker task                                                │
 │   - returns Promise that resolves with summary when walker settles    │
 │                                                                       │
@@ -95,11 +95,13 @@ From the codebase survey (2026-05-19):
 ### New IPCs
 
 ```rust
-// Returns immediately with a job_id; resolves with summary when walker settles.
+// Frontend mints jobId via crypto.randomUUID() before invoking, so Cancel
+// works from the first frame. Promise resolves with summary when walker settles.
 #[tauri::command]
 async fn ingest_folder_tree(
     app: AppHandle,
     state: State<'_, AppState>,
+    job_id: String, // camelCase `jobId` in JS payload; minted by frontend
     root_path: String,
     parent_sidecar_id: Option<SidecarId>,
     parent_path: Vec<String>, // breadcrumbStack
@@ -168,7 +170,7 @@ We do a **pre-walk** (just `walkdir` + filter, no I/O beyond stat) to compute `t
 pub folder_ingest_jobs: Arc<DashMap<String, Arc<AtomicBool>>>,
 ```
 
-`ingest_folder_tree` inserts a fresh `AtomicBool` keyed by `job_id`; walker holds an `Arc<AtomicBool>` and checks it at each node entry. `cancel_folder_ingest` sets the flag. On walker exit (success/cancel/fail), it removes the entry from the registry.
+`ingest_folder_tree` inserts a fresh `AtomicBool` keyed by the incoming `job_id`; walker holds an `Arc<AtomicBool>` and checks it at each node entry. `cancel_folder_ingest` sets the flag. On walker exit (success/cancel/fail), it removes the entry from the registry.
 
 ### Internal helpers (Task 1)
 
@@ -332,12 +334,13 @@ let cancelRequested = $state(false);
 
 ```ts
 async ingestFolderTree(
+  jobId: string, // frontend-minted via crypto.randomUUID()
   rootPath: string,
   parentSidecarId: string | null,
   parentPath: string[],
 ): Promise<IngestFolderTreeResult> {
   return this.adapter.invoke('ingest_folder_tree', {
-    rootPath, parentSidecarId, parentPath,
+    jobId, rootPath, parentSidecarId, parentPath,
   });
 }
 
@@ -367,22 +370,26 @@ async function handleAddFolderClick() {
 }
 
 async function startFolderIngest(rootPath: string) {
-  const parentSidecarId = breadcrumbStack.length > 0
-    ? navStack[0]?.sidecarId ?? null
-    : null;
-  // No "begin" event; backend assigns job_id and emits first progress.
-  // We optimistically open progress modal with completed=0, total=-1.
+  const isNestedIngest = breadcrumbStack.length > 0;
+  const parentSidecarId = isNestedIngest ? navStack[0]?.sidecarId ?? null : null;
+  if (isNestedIngest && !parentSidecarId) {
+    error = 'Folder identity not yet loaded. Return to root and navigate back, then retry.';
+    return;
+  }
+  // Frontend mints jobId synchronously so Cancel works from frame 1
+  // (before the first progress event arrives). Listener guards on this
+  // value to discard stale events from prior ingests.
+  const jobId = crypto.randomUUID();
+  activeIngestJobId = jobId;
   activeIngestProgress = { completed: 0, total: -1, currentPath: rootPath };
   cancelRequested = false;
   try {
-    const result = await service.ingestFolderTree(rootPath, parentSidecarId, breadcrumbStack);
-    activeIngestJobId = null;
-    activeIngestProgress = null;
-    ingestSummary = result;
-    serviceVersion++; // re-fetch folder listing
+    const result = await service.ingestFolderTree(jobId, rootPath, parentSidecarId, breadcrumbStack);
+    ingestSummary = result;       // render summary BEFORE clearing guards
+    resetIngestState();           // clears jobId/progress/cancelRequested
+    serviceVersion++;             // re-fetch folder listing
   } catch (err) {
-    activeIngestJobId = null;
-    activeIngestProgress = null;
+    resetIngestState();
     error = `Folder ingest failed: ${err instanceof Error ? err.message : String(err)}`;
   }
 }
@@ -430,7 +437,7 @@ $effect(() => {
 });
 ```
 
-Note: `activeIngestJobId` is set from the **first** progress event's `jobId` (the IPC returns the job_id but the Promise doesn't resolve until the walker settles, so we need to capture it early via the first emitted progress event).
+Note: `activeIngestJobId` is set synchronously by `startFolderIngest` (frontend mints the UUID via `crypto.randomUUID()` before invoking the IPC), so the progress-event guard `payload.jobId !== activeIngestJobId` is meaningful from the very first emit. This also makes Cancel work during the pre-walk window before any progress event would have arrived.
 
 ### Components
 
