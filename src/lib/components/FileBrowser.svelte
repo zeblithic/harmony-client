@@ -17,6 +17,7 @@
   import FileList from './FileList.svelte';
   import FileGrid from './FileGrid.svelte';
   import FolderLoadError from './FolderLoadError.svelte';
+  import FolderIngestProgressModal from './FolderIngestProgressModal.svelte';
   import QuotaBar from './QuotaBar.svelte';
   import PublishedView from './PublishedView.svelte';
   import CleanupView from './CleanupView.svelte';
@@ -726,6 +727,11 @@
     void startFolderIngest(picked);
   }
 
+  // `adapter.listen` may return Promise<() => void> (production tauri) or a
+  // synchronous () => void (some test mocks) — branch on shape, mirroring
+  // the LibraryDirectoryBrowser precedent. The `cancelled` flag covers the
+  // race where the effect tears down before the Promise resolves: we fire
+  // the resolved unsubscribe immediately to avoid a leaked Tauri listener.
   $effect(() => {
     if (!adapter) return;
     let cancelled = false;
@@ -752,6 +758,72 @@
       if (unlisten) unlisten();
     };
   });
+
+  // Progress event listener. Same Promise-or-sync `adapter.listen` shape as
+  // above. The first event captures the backend-minted jobId (the IPC
+  // Promise doesn't resolve until the walker settles, so we can't get it
+  // from the invoke return value). Cross-talk guard: if a payload arrives
+  // for a different jobId after we've already captured one, the backend
+  // has somehow let two ingests overlap (shouldn't happen — we serialise
+  // via activeIngestProgress / pickerOpen). Log and ignore as defence in
+  // depth.
+  $effect(() => {
+    if (!adapter) return;
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+    const pending = adapter.listen('folder-ingest-progress', (event) => {
+      if (cancelled) return;
+      const payload = event.payload as {
+        jobId: string;
+        completed: number;
+        total: number;
+        currentPath: string;
+      };
+      if (
+        activeIngestJobId !== null &&
+        payload.jobId !== activeIngestJobId
+      ) {
+        console.warn(
+          'folder-ingest-progress: jobId mismatch (ignoring stale/cross-talk event)',
+          { incoming: payload.jobId, active: activeIngestJobId },
+        );
+        return;
+      }
+      activeIngestJobId = payload.jobId;
+      activeIngestProgress = {
+        completed: payload.completed,
+        total: payload.total,
+        currentPath: payload.currentPath,
+      };
+    });
+    if (pending && typeof (pending as Promise<unknown>).then === 'function') {
+      (pending as Promise<() => void>).then((fn) => {
+        if (cancelled) {
+          try { fn(); } catch { /* swallow */ }
+        } else {
+          unlisten = fn;
+        }
+      });
+    } else if (typeof pending === 'function') {
+      unlisten = pending as () => void;
+    }
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  });
+
+  // Fire-and-forget cancel: the actual "ingest finished" signal comes from
+  // the ingest_folder_tree IPC Promise resolving with `cancelled: true`
+  // (Task 2's bail-completely semantic). Don't await the cancel IPC — its
+  // failure path (backend already settled, unknown job id) is benign.
+  function handleCancelIngest() {
+    if (!activeIngestJobId || cancelRequested) return;
+    cancelRequested = true;
+    service.cancelFolderIngest(activeIngestJobId).catch(() => {
+      // Best-effort; backend may have already settled.
+    });
+  }
 
   async function startFolderIngest(rootPath: string) {
     // Mirrors commitCreateFolder's parent resolution: nested ingests
@@ -915,13 +987,15 @@
         <div class="file-browser-error" role="alert">{renameError}</div>
       {/if}
 
-      {#if activeIngestProgress}
-        <div role="status" aria-live="polite" class="visually-hidden">
-          Ingesting folder ({activeIngestProgress.completed} of {activeIngestProgress.total})
-          {cancelRequested ? '— cancelling' : ''}
-          {#if activeIngestJobId} (job {activeIngestJobId}){/if}
-        </div>
-      {/if}
+      <FolderIngestProgressModal
+        open={!!activeIngestProgress}
+        jobId={activeIngestJobId}
+        completed={activeIngestProgress?.completed ?? 0}
+        total={activeIngestProgress?.total ?? -1}
+        currentPath={activeIngestProgress?.currentPath ?? ''}
+        {cancelRequested}
+        onCancel={handleCancelIngest}
+      />
 
       {#if ingestSummary}
         <div role="status" aria-live="polite" class="visually-hidden">
