@@ -33,7 +33,7 @@
   }
 </script>
 
-<div class="file-card" role="gridcell">
+<div class="file-card">
   <div class="file-card-thumbnail" aria-hidden="true">
     <span class="file-card-icon">{icon}</span>
   </div>

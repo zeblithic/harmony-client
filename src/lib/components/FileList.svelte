@@ -2,6 +2,7 @@
   import type { ContentItem } from '../types';
   import { matchesEditing } from '../file-utils';
   import FileRow from './FileRow.svelte';
+  import FilePlaceholderRow from './FilePlaceholderRow.svelte';
 
   let {
     items,
@@ -16,6 +17,12 @@
     onBeginRename,
     onCommitRename,
     onCancelRename,
+    creatingFolder = false,
+    newFolderName = $bindable(''),
+    newFolderError = null,
+    creatingFolderInFlight = false,
+    onCommitCreateFolder,
+    onCancelCreateFolder,
   }: {
     items: ContentItem[];
     selectedCid: string | null;
@@ -35,6 +42,16 @@
     onBeginRename?: (item: ContentItem) => void;
     onCommitRename?: () => void;
     onCancelRename?: () => void;
+    /** ZEB-166: inline new-folder placeholder. `creatingFolder` toggles
+     *  a FilePlaceholderRow at the top of the list; `newFolderName`
+     *  two-way-binds the input back up to FileBrowser. The pair of
+     *  callbacks mirror the ZEB-299 commit/cancel shape. */
+    creatingFolder?: boolean;
+    newFolderName?: string;
+    newFolderError?: string | null;
+    creatingFolderInFlight?: boolean;
+    onCommitCreateFolder?: () => void;
+    onCancelCreateFolder?: () => void;
   } = $props();
 </script>
 
@@ -48,6 +65,15 @@
     <span class="header-replicas" role="columnheader">Replicas</span>
     <span class="header-sensitivity" aria-hidden="true"></span>
   </div>
+  {#if creatingFolder}
+    <FilePlaceholderRow
+      bind:value={newFolderName}
+      error={newFolderError}
+      inFlight={creatingFolderInFlight}
+      onCommit={onCommitCreateFolder}
+      onCancel={onCancelCreateFolder}
+    />
+  {/if}
   {#each items as item (item.sidecarId || `nested:${item.cid}:${item.name}`)}
     <FileRow
       {item}
