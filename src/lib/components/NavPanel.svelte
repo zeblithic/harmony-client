@@ -261,6 +261,9 @@
         <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'spellbook'}
           aria-label="Spellbook" aria-pressed={appMode === 'spellbook'}
           onclick={() => onModeChange?.('spellbook')}>Spellbook</button>
+        <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'mint'}
+          aria-label="Mint" aria-pressed={appMode === 'mint'}
+          onclick={() => onModeChange?.('mint')}>💰 Mint</button>
       </div>
       <button
         type="button"

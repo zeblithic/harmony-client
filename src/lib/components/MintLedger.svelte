@@ -2,6 +2,7 @@
   import type { TauriAdapter } from '../zenoh-service';
   import { MintService } from '../mint-service';
   import type { Transaction, Account } from '../mint-types';
+  import { save as saveDialog } from '@tauri-apps/plugin-dialog';
   import MintTransactionTable from './MintTransactionTable.svelte';
   import MintTransactionDialog from './MintTransactionDialog.svelte';
   import MintAccountManager from './MintAccountManager.svelte';
@@ -53,6 +54,27 @@
   // onchange handlers — preserve the async-read pattern.
   $effect(() => { load(); });
 
+  async function exportCsv() {
+    const path = await saveDialog({
+      defaultPath: `mint-export-${new Date().toISOString().slice(0, 10)}.csv`,
+      filters: [{ name: 'CSV', extensions: ['csv'] }],
+    });
+    if (!path) return; // user cancelled
+    exportInProgress = true;
+    error = null;
+    try {
+      const summary = await service.exportCsv(path, {
+        dateFrom: filterDateFrom || undefined,
+        dateTo: filterDateTo || undefined,
+      });
+      alert(`Exported ${summary.rowsWritten} transactions to ${summary.outputPath} (${summary.byteSize} bytes)`);
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    } finally {
+      exportInProgress = false;
+    }
+  }
+
   // Add/Edit dialog state — wired in Task 8
   let showAddEdit = $state(false);
   let editingTxId = $state<string | null>(null);
@@ -81,7 +103,7 @@
     <div class="actions">
       <button onclick={() => { editingTxId = null; showAddEdit = true; }}>+ Add Transaction</button>
       <button onclick={() => { showAccountManager = true; }}>Manage Accounts</button>
-      <button onclick={() => { /* Task 10 */ }} disabled={exportInProgress}>Export CSV</button>
+      <button onclick={exportCsv} disabled={exportInProgress}>Export CSV</button>
     </div>
   </header>
 

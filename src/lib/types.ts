@@ -150,7 +150,7 @@ export interface VineVideo {
   viewed: boolean;
 }
 
-export type AppMode = 'messages' | 'vines' | 'files' | 'spellbook' | 'mail';
+export type AppMode = 'messages' | 'vines' | 'files' | 'spellbook' | 'mail' | 'mint';
 
 // ── Mail Types ────────────────────────────────────────────────────────
 
