@@ -162,6 +162,20 @@ export RUSTC_WRAPPER=sccache
 
 First compile after install populates the cache; subsequent compiles of the same dep graph are near-instant. CI does not use sccache (yet — see ZEB-273 Tier 2 follow-up).
 
+## macOS XprotectService — REQUIRED one-time setup
+
+On macOS, `XprotectService` (the system malware/Gatekeeper scanner) synchronously inspects every freshly-linked Mach-O binary on its first execution. For this workspace's 55+ integration test binaries, that means `cargo nextest run --all-targets` from a fresh build can hang indefinitely — each binary blocks in `_dyld_start` for several minutes while XprotectService inspects it. Investigated and fixed in [ZEB-304](https://linear.app/zeblith/issue/ZEB-304).
+
+**Required one-time setup for any macOS contributor:**
+
+```bash
+spctl developer-mode enable-terminal
+```
+
+Then in **System Settings → Privacy & Security → Developer Tools**, toggle your terminal (Terminal.app, iTerm2, Warp, etc.) **ON** and **quit + relaunch** so the entitlement applies to child processes. Verified speedup: full-workspace `nextest list --all-targets` went from `>20 min, hangs` → `~40 sec`.
+
+If you skip this step, every cold cargo build will appear to hang. There is no workaround other than waiting out the XprotectService queue (which on a fresh checkout can take 30+ minutes).
+
 ## References
 
 - Active CI workflow: [`.github/workflows/ci.yml`](.github/workflows/ci.yml)

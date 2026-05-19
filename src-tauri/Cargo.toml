@@ -93,3 +93,13 @@ tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", 
 # — it includes the narrow `NodeRuntime::remove_content` +
 # `StorageTier::remove` delegates this branch's Burn arm uses, with the
 # is_pinned guard on remove() that protects the pin-retention contract.
+
+# Slim debug profile (ZEB-304 secondary speedup). Full DWARF (debug = 2) inflates
+# each test binary by ~10x and dramatically increases link wall-clock on macOS
+# (where ld64 dedupes symbols across every dependent binary). "line-tables-only"
+# preserves file:line in backtraces — what we actually need for cargo test
+# failures — at a fraction of the size. Devs who need richer debugger state
+# (variable inspection, type names) can override locally via
+# `CARGO_PROFILE_DEV_DEBUG=2 cargo build`.
+[profile.dev]
+debug = "line-tables-only"
