@@ -136,18 +136,27 @@
   let renameError = $state<string | null>(null);
   // Round 5: in-flight tracking for commitRename's await window.
   //
-  // `renameInFlight` (reactive) suppresses the blur-cancel on the
+  // `renameInFlight` (derived) suppresses the blur-cancel on the
   // inline input so a click-away during the IPC keeps edit mode open
   // for the user to retry after a failure (the alternative — closing
   // edit mode on blur — orphaned the error banner with no input
   // visible).
+  //
+  // Round 6: count concurrent in-flight commits, not a single bool.
+  // Slow-click on a different row CAN start a second commit before
+  // the first resolves (Cursor finding 9a721e56). With a bool, the
+  // first commit's `finally` would clear it while the second is
+  // still awaiting, so a blur on the second commit would erroneously
+  // cancel its edit mode. The counter makes the derived flag accurate
+  // whenever any commit is pending.
   //
   // `renameCommitSeq` (plain) is a generation token. beginRename and
   // cancelRename bump it; commitRename captures it before its await
   // and discards the post-await state mutation if the captured token
   // is stale — covering folder navigation, blur-cancel, or a new
   // rename starting mid-IPC.
-  let renameInFlight = $state(false);
+  let renameInFlightCount = $state(0);
+  let renameInFlight = $derived(renameInFlightCount > 0);
   let renameCommitSeq = 0;
 
   // Sync navStack with currentFolderCid (driven by the parent component).
@@ -514,11 +523,11 @@
     }
     // Capture a generation token before the await so a folder nav,
     // blur-cancel, or new rename that fires mid-IPC discards this
-    // call's tail mutations. renameInFlight stays true for the await
-    // window so the input's onblur handler skips its cancel (keeping
-    // edit mode open for retry on failure).
+    // call's tail mutations. The in-flight count keeps the derived
+    // flag accurate even with concurrent commits — see the field
+    // comment above for the round-6 multi-commit hazard.
     const mySeq = ++renameCommitSeq;
-    renameInFlight = true;
+    renameInFlightCount++;
     try {
       await service.renameContent({
         srcSidecarId,
@@ -535,7 +544,7 @@
       renameError = raw.replace(/^Error:\s*/, '');
       // Keep edit mode open so the user can fix the name and retry.
     } finally {
-      renameInFlight = false;
+      renameInFlightCount--;
     }
   }
 
