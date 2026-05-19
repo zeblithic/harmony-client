@@ -103,7 +103,8 @@ function deferred<T>(): {
  *  need to match against this real id. */
 function getMintedJobId(adapter: { invoke: unknown }): string {
   const invoke = adapter.invoke as { mock: { calls: unknown[][] } };
-  const call = invoke.mock.calls.find((c) => c[0] === 'ingest_folder_tree');
+  const calls = invoke.mock.calls.filter((c) => c[0] === 'ingest_folder_tree');
+  const call = calls[calls.length - 1];
   if (!call) throw new Error('ingest_folder_tree not invoked yet');
   return (call[1] as { jobId: string }).jobId;
 }

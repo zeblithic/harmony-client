@@ -356,10 +356,11 @@ async cancelFolderIngest(jobId: string): Promise<void> {
 async function handleAddFolderClick() {
   // Guard MUST set a synchronous lock before the picker await, otherwise
   // two fast clicks both pass the in-flight check and both spawn ingests.
-  // activeIngestJobId is set only by the first progress event (async), so
-  // we use activeIngestProgress (set synchronously in startFolderIngest)
-  // OR a pickerOpen flag here.
-  if (activeIngestProgress || pickerOpen) return;
+  // startFolderIngest mints activeIngestJobId synchronously (crypto.randomUUID)
+  // before invoking the IPC, so the in-flight check below catches even a
+  // re-click during the pre-walk window. pickerOpen blocks the picker-open
+  // race specifically.
+  if (activeIngestProgress || pickerOpen || activeIngestJobId) return;
   pickerOpen = true;
   try {
     const picked = await dialog.open({ directory: true, multiple: false });
@@ -508,7 +509,7 @@ Note: `activeIngestJobId` is set synchronously by `startFolderIngest` (frontend 
 | 7 | File > FLAT_BUNDLE_MAX (use a stub or env-var-overridden cap for the test) | skipped; counters.skipped.oversized == 1 |
 | 8 | Cancel mid-walk | walker exits cleanly; partial result returned; `cancelled: true`; `root_sidecar_id: None` if cancel before root settled |
 | 9 | Per-leaf I/O error (e.g., remove permission) | counted in `failed`; walk continues; parent manifest built with surviving children |
-| 10 | Pre-walk fails (unreadable root) | IPC returns error before emitting any progress; no partial sidecar |
+| 10 | Pre-walk fails (unreadable root) | IPC returns Ok with `root_sidecar_id: None`, `result.failed` populated with the error, `cancelled: false`; no partial sidecar inserted; frontend's summary modal surfaces the message in its Failed section |
 
 ### Frontend (Task 9)
 

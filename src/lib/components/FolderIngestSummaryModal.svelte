@@ -52,7 +52,9 @@
       : 0,
   );
   let hasSkipped = $derived(skippedTotal > 0);
-  let hasFailed = $derived(!!result && result.failed.length > 0);
+  let hasFailed = $derived(
+    !!result && (result.failed.length > 0 || result.failedOverflow > 0),
+  );
   let failedTotal = $derived(
     result ? result.failed.length + result.failedOverflow : 0,
   );
