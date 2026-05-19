@@ -120,8 +120,8 @@ pub(crate) fn ingest_dispatch(size: u64) -> Result<IngestDispatch, String> {
 }
 
 /// Errors raised by the internal path-based ingest helpers
-/// (`ingest_file_at_path`, `send_ingest_with_name`) and the ZEB-163 folder
-/// walker (`folder_ingest::walk`).
+/// (`ingest_file_at_path`, `send_ingest_with_name`, `send_ingest_bytes_only`)
+/// and the ZEB-163 folder walker (`folder_ingest::walk`).
 ///
 /// Split into distinct variants so the walker can route each failure to the
 /// right summary bucket (oversized vs. failed) without parsing strings. The
@@ -6040,12 +6040,22 @@ async fn ingest_content(
 
 /// Ingest a leaf file already present on disk through the same pipeline as
 /// `ingest_content`, but driven by an explicit path instead of an `rfd`
-/// dialog. Internal — the ZEB-163 folder walker (`folder_ingest::walk`)
-/// calls this per discovered leaf file. Not registered as an IPC.
+/// dialog. Internal — kept for a future direct-leaf-ingest IPC (e.g. a
+/// "Send this file" share-sheet target on macOS/Windows) that needs the
+/// resulting sidecar entry. Not registered as an IPC and not currently
+/// called from anywhere except the tests below.
 ///
-/// Defends in depth against symlinks even though the walker filters them
-/// upstream: a `symlink_metadata` check guarantees we never `tokio::fs::read`
-/// through a link that could resolve outside the walked tree.
+/// The ZEB-163 folder walker does NOT call this for descendant leaves
+/// (per task 2 fix): it uses `send_ingest_bytes_only` so leaf files only
+/// appear inside their parent folder's manifest, not as standalone root
+/// sidecar entries. Calling this from the walker would re-introduce the
+/// root-listing pollution bug.
+///
+/// Defends in depth against symlinks even though any walker caller would
+/// filter them upstream: a `symlink_metadata` check guarantees we never
+/// `tokio::fs::read` through a link that could resolve outside the walked
+/// tree.
+#[allow(dead_code)] // Tests cover it; production callers land with the share-sheet IPC.
 pub(crate) async fn ingest_file_at_path(
     ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
     content_index: &std::sync::Arc<std::sync::Mutex<content_index::ContentIndex>>,
@@ -6075,21 +6085,25 @@ pub(crate) async fn ingest_file_at_path(
     .await
 }
 
-/// Drive a buffer of bytes through the chunked-or-flat dispatch, push it to
-/// the runtime's ingest channel, and insert the resulting sidecar row.
+/// Drive a buffer of bytes through the chunked-or-flat dispatch and push it
+/// to the runtime's ingest channel, returning the resulting root CID
+/// WITHOUT creating a sidecar entry.
 ///
-/// Extracted from `ingest_content`'s post-dialog body so both the dialog
-/// IPC and the ZEB-163 folder walker can share the same pipeline. The
-/// caller is responsible for extracting `ingest_tx` and `content_index`
-/// from `NodeState` under its lock — the helper does not touch `NodeState`
-/// so it stays cheap to test.
-pub(crate) async fn send_ingest_with_name(
+/// Used by the ZEB-163 folder walker for leaf files — leaves live inside
+/// their parent folder's manifest and must NOT appear as standalone root
+/// entries in `list_root`. Adding a per-leaf sidecar would surface the
+/// same file twice in the UI (once at root, once inside the new folder),
+/// matching the bug the manifest-only nested-folder path
+/// (`build_folder_manifest_only`) already sidesteps for interior dirs.
+///
+/// Callers that DO want a root-listing entry (`ingest_content` IPC for the
+/// single-file dialog, future direct-leaf-ingest IPCs) should use
+/// `send_ingest_with_name`, which wraps this and inserts the sidecar row.
+pub(crate) async fn send_ingest_bytes_only(
     ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
-    content_index: &std::sync::Arc<std::sync::Mutex<content_index::ContentIndex>>,
     bytes: Vec<u8>,
     file_name: String,
-    _parent_sidecar_id: Option<content_index::SidecarId>,
-) -> Result<IngestResult, IngestError> {
+) -> Result<[u8; 32], IngestError> {
     use harmony_content::cid::{ContentFlags, ContentId};
 
     let size_bytes = bytes.len() as u64;
@@ -6128,6 +6142,35 @@ pub(crate) async fn send_ingest_with_name(
             root.to_bytes()
         }
     };
+
+    // `file_name` is currently unused on the bytes-only path (no sidecar
+    // row to label), but kept in the signature so callers don't have to
+    // restructure when we plumb it through future per-CID telemetry.
+    let _ = file_name;
+    Ok(root_cid_bytes)
+}
+
+/// Drive a buffer of bytes through the chunked-or-flat dispatch, push it to
+/// the runtime's ingest channel, and insert the resulting sidecar row.
+///
+/// Extracted from `ingest_content`'s post-dialog body so the dialog IPC and
+/// any future direct-leaf-ingest IPC can share the same pipeline. The
+/// caller is responsible for extracting `ingest_tx` and `content_index`
+/// from `NodeState` under its lock — the helper does not touch `NodeState`
+/// so it stays cheap to test.
+///
+/// NOTE: the ZEB-163 folder walker does NOT call this for descendant
+/// leaves; it calls `send_ingest_bytes_only` so leaf files only appear
+/// inside their parent folder's manifest, not as standalone root entries.
+pub(crate) async fn send_ingest_with_name(
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    content_index: &std::sync::Arc<std::sync::Mutex<content_index::ContentIndex>>,
+    bytes: Vec<u8>,
+    file_name: String,
+    _parent_sidecar_id: Option<content_index::SidecarId>,
+) -> Result<IngestResult, IngestError> {
+    let size_bytes = bytes.len() as u64;
+    let root_cid_bytes = send_ingest_bytes_only(ingest_tx, bytes, file_name.clone()).await?;
 
     let stored_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

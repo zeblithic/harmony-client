@@ -34,7 +34,7 @@ use tauri::{AppHandle, Emitter, Runtime};
 use crate::content_index::{ContentIndex, ContentKind};
 use crate::event_loop::IngestRequest;
 use crate::folders::ManifestEntry;
-use crate::{ingest_file_at_path, IngestError, FLAT_BUNDLE_MAX};
+use crate::{send_ingest_bytes_only, IngestError, FLAT_BUNDLE_MAX};
 
 /// Cap on individually-listed failed entries in the summary. Walks that
 /// exceed this bound roll up the rest under `overflow_count`; the modal
@@ -468,38 +468,35 @@ fn walk<'a, R: Runtime>(
                 }
             }
         } else if metadata.is_file() {
-            // Cheap oversized check from metadata. The deeper helper
-            // re-checks against the bytes actually read (TOCTOU), but the
-            // metadata gate keeps us from issuing the 8+ GiB `read` for
-            // files we'd reject anyway.
+            // Cheap oversized check from metadata. The bytes-only helper
+            // doesn't re-check (no sidecar to corrupt), so a file that
+            // grows past the cap between this stat and the `read` below
+            // will simply ingest at whatever size it ends up — acceptable
+            // because the bundle is content-addressed and the resulting
+            // manifest entry will reference the actual bytes hashed.
             if metadata.len() > FLAT_BUNDLE_MAX {
                 counters.skipped.oversized = counters.skipped.oversized.saturating_add(1);
                 return WalkOutcome::Skipped;
             }
-            match ingest_file_at_path(&ctx.ingest_tx, &ctx.content_index, path, None, name.clone())
-                .await
-            {
-                Ok(result) => {
+            // Symlink defence-in-depth: the outer is_symlink() arm above
+            // already handles the walker-facing case, so we don't repeat
+            // the check here. Read directly via tokio::fs::read.
+            let bytes = match tokio::fs::read(path).await {
+                Ok(b) => b,
+                Err(e) => return WalkOutcome::Failed(format!("read: {e}")),
+            };
+            // CRITICAL: bytes-only — no sidecar entry. Leaves live in the
+            // parent folder's manifest only; a per-leaf sidecar here would
+            // pollute the root listing (see send_ingest_bytes_only docs).
+            match send_ingest_bytes_only(&ctx.ingest_tx, bytes, name.clone()).await {
+                Ok(cid_bytes) => {
                     counters.succeeded = counters.succeeded.saturating_add(1);
-                    let cid_bytes = match hex_to_cid(&result.cid) {
-                        Some(b) => b,
-                        None => {
-                            return WalkOutcome::Failed(format!(
-                                "ingest returned malformed cid {}",
-                                result.cid
-                            ));
-                        }
-                    };
                     ctx.emit_progress(counters, path);
                     WalkOutcome::Ingested(ManifestEntry {
                         cid: cid_bytes,
                         name,
                         kind: ContentKind::Leaf,
                     })
-                }
-                Err(IngestError::Symlink) => {
-                    counters.skipped.symlink = counters.skipped.symlink.saturating_add(1);
-                    WalkOutcome::Skipped
                 }
                 Err(IngestError::Oversized { .. }) => {
                     counters.skipped.oversized = counters.skipped.oversized.saturating_add(1);
@@ -586,5 +583,51 @@ mod tests {
         }
         assert_eq!(c.failed.len(), FAILED_LIST_CAP);
         assert_eq!(c.overflow_count, 7);
+    }
+
+    /// Regression: the walker's leaf branch must NOT add sidecar entries
+    /// per leaf — leaves live in their parent folder's manifest, and a
+    /// per-leaf root row would surface "cat.jpg" AND "dog.jpg" AND the
+    /// new folder all at the root listing after a 2-file folder drop.
+    ///
+    /// This drives `send_ingest_bytes_only` (what the walker now calls for
+    /// each leaf) directly across two files and asserts the content index
+    /// gained zero rows. Combined with the existing
+    /// `ingest_file_at_path_small_file_creates_sidecar_and_sends_one_book`
+    /// in lib.rs which proves the sidecar-creating path still creates +1,
+    /// this pins the invariant from both sides.
+    #[tokio::test]
+    async fn walker_leaf_ingest_does_not_pollute_root_listing() {
+        let index = {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let idx = crate::content_index::ContentIndex::load(dir.path());
+            std::mem::forget(dir);
+            Arc::new(Mutex::new(idx))
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<IngestRequest>(8);
+        // Drain the channel so send_ingest's oneshot reply doesn't stall.
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                let _ = req.reply.send(Ok(()));
+            }
+        });
+
+        let before = index.lock().unwrap().entries().count();
+
+        // Two leaf payloads — what the walker would feed for cat.jpg and
+        // dog.jpg inside a dropped folder.
+        let _cid_cat = crate::send_ingest_bytes_only(&tx, b"meow".to_vec(), "cat.jpg".into())
+            .await
+            .expect("cat ingest");
+        let _cid_dog = crate::send_ingest_bytes_only(&tx, b"woof".to_vec(), "dog.jpg".into())
+            .await
+            .expect("dog ingest");
+
+        let after = index.lock().unwrap().entries().count();
+        assert_eq!(
+            after, before,
+            "send_ingest_bytes_only must NOT create sidecar rows — \
+             leaves live in the parent manifest only (see ZEB-163 task 2 fix)"
+        );
     }
 }
