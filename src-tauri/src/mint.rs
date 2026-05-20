@@ -69,6 +69,7 @@ pub fn open_database(path: &std::path::Path) -> Result<Connection, MintError> {
 /// Production code should call `open_database` with a file path.
 pub fn open_in_memory() -> Result<Connection, MintError> {
     let conn = Connection::open_in_memory()?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
     apply_migrations(&conn)?;
     Ok(conn)
 }

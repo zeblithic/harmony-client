@@ -5703,17 +5703,34 @@ pub async fn list_folder(
 }
 
 /// Lazily open `<app_data_dir>/mint/ledger.db` on first call;
-/// subsequent calls return the cached Arc. The mutex-guard is held
-/// only across the cheap clone-or-init — never across DB operations
-/// or .await points.
+/// subsequent calls return the cached Arc.
+///
+/// Uses a double-checked pattern so that the slow work (create_dir_all,
+/// SQLite open, migrations — up to 10-100 ms on a cold disk) is done
+/// *outside* the NodeState lock.  The lock is taken twice:
+///
+/// 1. **Fast path** — lock, check cache, clone Arc if present, return.
+/// 2. **Slow path** — lock dropped, I/O performed, lock re-acquired to
+///    install the Arc.  A race-check handles the case where two
+///    concurrent first-callers both reach the slow path; the loser
+///    discards its freshly-opened connection and returns the winner's Arc.
 pub(crate) fn mint_db_handle(
     app: &tauri::AppHandle,
     state: &tauri::State<'_, std::sync::Mutex<NodeState>>,
 ) -> Result<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>, String> {
-    let mut node = state.lock().expect("NodeState poisoned");
-    if let Some(arc) = &node.mint_db {
-        return Ok(arc.clone());
+    // Fast path: existing connection cached.
+    {
+        let node = state.lock().expect("NodeState poisoned");
+        if let Some(arc) = &node.mint_db {
+            return Ok(arc.clone());
+        }
     }
+
+    // Slow path: do all I/O outside the NodeState lock so unrelated
+    // Tauri commands can keep using NodeState while the mint DB opens
+    // for the first time. SQLite open + migrations can be 10-100ms on
+    // slow disks; that's an unacceptable stall for the global app
+    // state lock.
     use tauri::Manager;
     let app_data_dir = app
         .path()
@@ -5723,9 +5740,19 @@ pub(crate) fn mint_db_handle(
     std::fs::create_dir_all(&mint_dir).map_err(|e| format!("create_dir mint: {e}"))?;
     let db_path = mint_dir.join("ledger.db");
     let conn = mint::open_database(&db_path).map_err(|e| e.to_string())?;
-    let arc = std::sync::Arc::new(std::sync::Mutex::new(conn));
-    node.mint_db = Some(arc.clone());
-    Ok(arc)
+    let new_arc = std::sync::Arc::new(std::sync::Mutex::new(conn));
+
+    // Re-lock briefly to install. Double-check first to handle a race
+    // where another concurrent first-caller already initialized; in
+    // that case we discard our freshly-opened connection (the OS will
+    // close it on drop) and return the winner's Arc.
+    let mut node = state.lock().expect("NodeState poisoned");
+    if let Some(existing) = &node.mint_db {
+        Ok(existing.clone())
+    } else {
+        node.mint_db = Some(new_arc.clone());
+        Ok(new_arc)
+    }
 }
 
 #[tauri::command]
