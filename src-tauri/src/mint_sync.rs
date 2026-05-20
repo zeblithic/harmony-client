@@ -493,12 +493,27 @@ async fn internal_task(
     mut shutdown_rx: mpsc::Receiver<()>,
     debounce: std::time::Duration,
 ) {
+    // Pin the `Notified` future OUTSIDE the loop so its state persists across
+    // iterations. If constructed inside the loop, a select! arm that doesn't
+    // match the dirty branch drops the future and silently consumes the pending
+    // notification permit without delivering it. Pinning outside ensures the
+    // underlying `Notified` survives the dropped &mut, retains its state, and
+    // the next iteration's poll returns Ready — the permit's effect is
+    // preserved. After successfully observing the notification, replace the
+    // pinned future with a fresh `Notified` to start waiting for the next one.
+    // Mirrors owner_state_sync::internal_task's pinning idiom exactly.
+    let notified = dirty.notified();
+    tokio::pin!(notified);
+
     let mut scheduled: Option<tokio::time::Instant> = None;
     loop {
         let next_wake = scheduled
             .unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(3600));
         tokio::select! {
-            _ = dirty.notified() => {
+            _ = notified.as_mut() => {
+                // Re-pin a fresh Notified so the next iteration waits for a
+                // new notification rather than immediately returning Ready.
+                notified.set(dirty.notified());
                 scheduled = Some(tokio::time::Instant::now() + debounce);
             }
             _ = tokio::time::sleep_until(next_wake), if scheduled.is_some() => {
@@ -584,11 +599,26 @@ async fn internal_task_zenoh(
     let mut inbound_closed = false;
     let mut scheduled: Option<tokio::time::Instant> = None;
 
+    // Pin the `Notified` future OUTSIDE the loop so its state persists across
+    // iterations. If constructed inside the loop, a select! arm that doesn't
+    // match the dirty branch drops the future and silently consumes the pending
+    // notification permit without delivering it. Pinning outside ensures the
+    // underlying `Notified` survives the dropped &mut, retains its state, and
+    // the next iteration's poll returns Ready — the permit's effect is
+    // preserved. After successfully observing the notification, replace the
+    // pinned future with a fresh `Notified` to start waiting for the next one.
+    // Mirrors owner_state_sync::internal_task's pinning idiom exactly.
+    let notified = dirty.notified();
+    tokio::pin!(notified);
+
     loop {
         let next_wake = scheduled
             .unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(3600));
         tokio::select! {
-            _ = dirty.notified() => {
+            _ = notified.as_mut() => {
+                // Re-pin a fresh Notified so the next iteration waits for a
+                // new notification rather than immediately returning Ready.
+                notified.set(dirty.notified());
                 scheduled = Some(tokio::time::Instant::now() + debounce);
             }
             _ = tokio::time::sleep_until(next_wake), if scheduled.is_some() => {

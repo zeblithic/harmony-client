@@ -991,6 +991,18 @@ pub async fn mint_rename_account(
     Ok(result)
 }
 
+/// Delete an account from the mint ledger.
+///
+/// **Constraint:** the mint sync engine must already be initialized (i.e.
+/// identity bootstrap must have completed) before this command is called.
+/// This is a deliberate safety requirement: if we allowed deletion while the
+/// engine is uninitialized, the `account_deletion_floor` entry written by
+/// `delete_account` would be discarded with the temporary map, leaving the
+/// floor empty after engine init. On the next sync, any peer that still
+/// holds a copy of the deleted account would replay it — a silent zombie
+/// resurrect. Returning an error here lets the UI surface the constraint
+/// clearly and retry once identity bootstrap has finished (typically < 500 ms
+/// after node start).
 #[tauri::command]
 pub async fn mint_delete_account(
     id: String,
@@ -998,35 +1010,32 @@ pub async fn mint_delete_account(
     app: tauri::AppHandle,
     state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
 ) -> Result<(), String> {
-    // Extract the sync_state handle from the engine so we can lock
-    // account_deletion_floor inside spawn_blocking without holding the
-    // NodeState Mutex across the await.
+    // Extract the sync_state handle from the engine — required; we do NOT
+    // fall back to a temporary floor when the engine is absent (see above).
     let sync_state_handle = {
         let node = state.lock().expect("NodeState poisoned");
-        node.mint_sync.as_ref().map(|e| e.sync_state_handle())
+        match node.mint_sync.as_ref() {
+            Some(e) => e.sync_state_handle(),
+            None => {
+                return Err(
+                    "mint sync engine not yet initialized — cannot delete account safely \
+                     (deletion floor would be lost). Retry after identity bootstrap completes."
+                        .to_string(),
+                );
+            }
+        }
     };
     let conn = crate::mint_db_handle(&app, &state)?;
     tokio::task::spawn_blocking(move || {
         let conn = conn.lock().expect("mint_db lock poisoned");
-        if let Some(handle) = sync_state_handle {
-            let mut st = handle.blocking_lock();
-            delete_account(
-                &conn,
-                &id,
-                reassign_to.as_deref(),
-                &mut st.account_deletion_floor,
-            )
-            .map_err(|e| e.to_string())
-        } else {
-            // Engine not yet initialized (pre-identity-bootstrap). Use a
-            // temporary empty floor; the real floor will be populated once
-            // the engine starts. This matches the Task-5 pre-engine
-            // behaviour: deletions before engine init still work, they
-            // just won't be synced until the engine is live.
-            let mut temp_floor = std::collections::HashMap::new();
-            delete_account(&conn, &id, reassign_to.as_deref(), &mut temp_floor)
-                .map_err(|e| e.to_string())
-        }
+        let mut st = sync_state_handle.blocking_lock();
+        delete_account(
+            &conn,
+            &id,
+            reassign_to.as_deref(),
+            &mut st.account_deletion_floor,
+        )
+        .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("join error: {e}"))??;
