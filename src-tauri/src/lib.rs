@@ -22302,9 +22302,19 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
         // `or_insert` kept `pkg_A` in `round1_packages`, breaking the
         // round-2 invariant (stashed secret must match broadcast pkg).
         //
-        // The outbox lock is acquired in a nested inner block; the
-        // codebase's other dfrost IPCs all release the outbox before
-        // touching the log, so this is a no-deadlock log→outbox ordering.
+        // R8 (Cursor MEDIUM "Nested locks invert ordering"): clone the
+        // `Arc<SigningKey>` out of `dm_outbox` BEFORE acquiring the log
+        // lock, so the critical section uses the local clone and never
+        // nests outbox under log. Other dfrost IPCs acquire outbox THEN
+        // (release-then) log; if R7's log-then-outbox-nested ordering
+        // stayed, two concurrent tasks could deadlock. Cloning the Arc
+        // is cheap (refcount bump) and lets us hold the log lock across
+        // build_signed without holding the outbox lock at all.
+        let signing_key_arc: std::sync::Arc<ed25519_dalek::SigningKey> = {
+            let outbox_g = dm_outbox.lock().await;
+            std::sync::Arc::clone(&outbox_g.signing_key)
+        };
+
         let participants_after: usize = {
             let mut log = log_arc.lock().await;
             // ─── Snapshot + validate inside the lock ──
@@ -22351,27 +22361,25 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
                 crate::community_dfrost_crypto::dkg_part1_local(self_id, max_signers, threshold)
                     .map_err(|e| format!("dfrost_contribute_dkg_round: dkg::part1: {e}"))?;
 
-            // ─── Build + sign event (outbox lock nested inside log lock) ──
+            // ─── Build + sign event using the pre-cloned signing key ──
+            //     (R8: no outbox lock acquisition here — `signing_key_arc`
+            //     is the clone we made before acquiring the log lock.)
             let payload = crate::community_dfrost_types::DkgRoundPayload {
                 ceremony_id: ceremony_bytes,
                 round_num: 1,
                 round1_package: Some(r1_pkg_bytes),
                 recipient_ciphertexts: None,
             };
-            let (event, self_x25519_priv) = {
-                let outbox_g = dm_outbox.lock().await;
-                let signing_key = outbox_g.signing_key.as_ref();
-                let ev = crate::community_dfrost_log::build_signed_dfrost_event(
-                    signing_key,
-                    self_owner,
-                    crate::community_dfrost_types::DfrostEventKind::DkgRound,
-                    &payload,
-                    hlc,
-                )
-                .map_err(|e| format!("dfrost_contribute_dkg_round: build_signed: {e}"))?;
-                let x_priv: [u8; 32] = *crate::dm_signing::ed25519_priv_to_x25519(signing_key);
-                (ev, x_priv)
-            };
+            let event = crate::community_dfrost_log::build_signed_dfrost_event(
+                signing_key_arc.as_ref(),
+                self_owner,
+                crate::community_dfrost_types::DfrostEventKind::DkgRound,
+                &payload,
+                hlc,
+            )
+            .map_err(|e| format!("dfrost_contribute_dkg_round: build_signed: {e}"))?;
+            let self_x25519_priv: [u8; 32] =
+                *crate::dm_signing::ed25519_priv_to_x25519(signing_key_arc.as_ref());
 
             // ─── Stash secret + apply, rollback on apply failure ──
             let prior_secret = log.local_dkg_secret.take();
