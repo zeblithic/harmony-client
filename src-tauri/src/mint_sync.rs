@@ -80,13 +80,17 @@ pub(crate) fn snapshot_current_db(conn: &mut Connection) -> Result<MintSnapshot,
 ///
 /// `account_deletion_floor` is the per-device map of hard-deleted
 /// account IDs → deletion timestamp; peer rows older than the floor
-/// are dropped to prevent zombie-resurrect. Pass an empty map until
-/// Task 5 wires the real one.
+/// are dropped to prevent zombie-resurrect.
+///
+/// Returns a `HashMap<String, String>` of floor entries from the remote
+/// snapshot that the caller must merge into local `MintSyncState.account_deletion_floor`.
+/// Returning them (rather than merging in-place) keeps this function
+/// SQLite-only with no reference to async state.
 pub(crate) fn apply_remote_snapshot(
     conn: &mut Connection,
     remote: &MintSnapshot,
     account_deletion_floor: &HashMap<String, String>,
-) -> Result<(), MintSyncError> {
+) -> Result<HashMap<String, String>, MintSyncError> {
     let tx = conn.transaction()?;
     // Collect account IDs suppressed by the deletion floor so we can skip
     // transactions that reference them (MAJOR 7: prevents FK violations /
@@ -109,8 +113,45 @@ pub(crate) fn apply_remote_snapshot(
     for r in &remote.settings {
         upsert_setting_lww(&tx, r)?;
     }
+
+    // Apply remote deletion floor: hard-delete local accounts that the remote
+    // device has deleted, and collect floor entries to merge into local state.
+    // Note: this does NOT go through delete_account (which requires a reassign
+    // target). The user already deleted the account on the other device; the
+    // transactions are stale and the cascade is expected. Explicit DELETE is
+    // required because the schema has no ON DELETE CASCADE for transactions.
+    let mut floor_to_merge: HashMap<String, String> = HashMap::new();
+    for (id, remote_ts) in &remote.account_deletion_floor {
+        // Check whether the local account exists and whether it's stale.
+        let local_updated_at: Option<String> = tx
+            .query_row(
+                "SELECT updated_at FROM accounts WHERE id = ?",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(local_ts) = local_updated_at {
+            if &local_ts <= remote_ts {
+                // Account is stale w.r.t. the remote deletion — hard-delete it
+                // and its orphan transactions in the same SQLite transaction.
+                tx.execute("DELETE FROM transactions WHERE account_id = ?", [id])?;
+                tx.execute("DELETE FROM accounts WHERE id = ?", [id])?;
+            }
+            // If local_ts > remote_ts the account was re-created after the
+            // remote delete; leave it in place. Still merge the floor entry
+            // so this device won't silently resurrect the old version later.
+        }
+        // Merge into the to-merge map: keep the later timestamp.
+        let entry = floor_to_merge
+            .entry(id.clone())
+            .or_insert_with(|| remote_ts.clone());
+        if remote_ts > entry {
+            *entry = remote_ts.clone();
+        }
+    }
+
     tx.commit()?;
-    Ok(())
+    Ok(floor_to_merge)
 }
 
 /// Outcome of a single account upsert — used to propagate suppression
@@ -493,13 +534,29 @@ impl EngineShared {
         }
         let mint_db = self.mint_db.clone();
         let sync_state = self.sync_state.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), MintSyncError> {
-            let mut conn = mint_db.lock().expect("mint_db lock poisoned");
-            let st = sync_state.blocking_lock();
-            apply_remote_snapshot(&mut conn, &remote, &st.account_deletion_floor)
-        })
+        let floor_to_merge = tokio::task::spawn_blocking(
+            move || -> Result<HashMap<String, String>, MintSyncError> {
+                let mut conn = mint_db.lock().expect("mint_db lock poisoned");
+                let st = sync_state.blocking_lock();
+                apply_remote_snapshot(&mut conn, &remote, &st.account_deletion_floor)
+            },
+        )
         .await
         .map_err(|e| MintSyncError::Other(format!("spawn_blocking: {e}")))??;
+        // Merge the remote deletion floor entries into local sync_state so this
+        // device also blocks future zombie-resurrects from other stale peers.
+        {
+            let mut st = self.sync_state.lock().await;
+            for (id, remote_ts) in floor_to_merge {
+                let entry = st
+                    .account_deletion_floor
+                    .entry(id)
+                    .or_insert_with(|| remote_ts.clone());
+                if remote_ts > *entry {
+                    *entry = remote_ts;
+                }
+            }
+        }
         if let Some(app) = &self.app_handle {
             use tauri::Emitter;
             if let Err(e) = app.emit("mint-changed", ()) {
