@@ -3,10 +3,21 @@
 //! runoff_votes → total_score → candidate_event_hash lex ASC.
 
 use crate::community_voting_core::{CandidateEventHash, RatificationBallotPayload};
+use crate::owner_state_types::{deserialize_bytes_from_bstr, serialize_bytes_as_bstr};
+use serde::{Deserialize, Serialize};
 
 /// A reference to a draft candidate identified by its event hash.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` are added in ZEB-309 Phase 4a-main so that
+/// `Tier3PollResultPayload` can encode the full `StarResult` in the kd=rs
+/// payload — required for SR1 verify (any node re-computes and compares).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CandidateRef {
+    #[serde(
+        rename = "eh",
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
     pub event_hash: CandidateEventHash,
 }
 
@@ -19,11 +30,15 @@ pub struct CandidateRef {
 ///   same position as the `candidates` input slice.
 /// - `runoff_votes`: number of runoff votes each finalist received,
 ///   indexed by the same position as the `finalists` output vec.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StarResult {
+    #[serde(rename = "wn")]
     pub winner: CandidateRef,
+    #[serde(rename = "fn")]
     pub finalists: Vec<CandidateRef>,
+    #[serde(rename = "ts")]
     pub total_scores: Vec<u32>,
+    #[serde(rename = "rv")]
     pub runoff_votes: Vec<u32>,
 }
 
