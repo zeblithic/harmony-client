@@ -891,6 +891,76 @@ pub fn check_eligibility(
     Ok(())
 }
 
+/// Resolves `OwnerAddr` (16-byte truncated hash) to the full Ed25519
+/// `VerifyingKey` needed for signature verification on inbound voting
+/// events. Production impl reads from `harmony_identity` state; tests
+/// use a fixed `HashMap`-backed resolver. Mirrors `ChannelIdentityResolver`
+/// shape with a deliberate divergence: voting events only need Ed25519
+/// verification, so we return `VerifyingKey` directly rather than
+/// `[u8; 64]`.
+#[async_trait::async_trait]
+pub trait VotingIdentityResolver: Send + Sync {
+    /// Look up the Ed25519 public key for `owner`. Returns `None` if the
+    /// owner is not known to this node (e.g. local state is behind on
+    /// joins). Callers MUST treat `None` as "cannot verify, reject" —
+    /// never as "accept anyway".
+    async fn verifying_key_for(&self, owner: &OwnerAddr) -> Option<ed25519_dalek::VerifyingKey>;
+}
+
+/// Why a voting event failed verification.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum VotingVerifyError {
+    #[error("actor not in membership snapshot")]
+    ActorNotInMembership,
+    #[error("identity not resolvable for actor (resolver returned None)")]
+    IdentityNotResolvable,
+    #[error("invalid Ed25519 signature")]
+    InvalidSignature,
+    #[error("malformed event (signing_bytes encode failed)")]
+    MalformedEvent,
+    #[error("signature length is not 64 bytes")]
+    BadSignatureLength,
+}
+
+/// Verify an inbound voting event:
+///   1. Actor is in the membership snapshot (V6 per spec §8).
+///   2. Resolver returns a `VerifyingKey` for the actor.
+///   3. The Ed25519 signature on the envelope's `signing_bytes()` checks
+///      out against that key.
+///
+/// Eligibility is NOT checked here — apply layer handles that with the
+/// same snapshot via `check_eligibility`.
+pub async fn verify_voting_event(
+    event: &SignedVotingEvent,
+    snapshot: &MembershipSnapshot,
+    resolver: &dyn VotingIdentityResolver,
+) -> Result<(), VotingVerifyError> {
+    use ed25519_dalek::Verifier;
+
+    if !snapshot.members.contains_key(&event.actor) {
+        return Err(VotingVerifyError::ActorNotInMembership);
+    }
+
+    let vk = resolver
+        .verifying_key_for(&event.actor)
+        .await
+        .ok_or(VotingVerifyError::IdentityNotResolvable)?;
+
+    let sb = event
+        .signing_bytes()
+        .map_err(|_| VotingVerifyError::MalformedEvent)?;
+
+    let sig_bytes: [u8; 64] = event
+        .sig
+        .clone()
+        .try_into()
+        .map_err(|_| VotingVerifyError::BadSignatureLength)?;
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+
+    vk.verify(&sb, &sig)
+        .map_err(|_| VotingVerifyError::InvalidSignature)
+}
+
 #[cfg(test)]
 mod eligibility_tests {
     use super::*;
@@ -1935,5 +2005,136 @@ mod lifecycle_tests {
                 Ok(Lifecycle::Open)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod voting_verify_tests {
+    use super::*;
+    use crate::community_membership::ChannelId;
+    use crate::community_voting_approval::Tier1PollConfig;
+    use crate::owner_state_types::{Hlc, OwnerAddr};
+    use ed25519_dalek::{SigningKey, VerifyingKey};
+    use rand::rngs::OsRng;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    struct FixedVotingIdentityResolver {
+        map: HashMap<OwnerAddr, VerifyingKey>,
+    }
+
+    #[async_trait::async_trait]
+    impl VotingIdentityResolver for FixedVotingIdentityResolver {
+        async fn verifying_key_for(&self, owner: &OwnerAddr) -> Option<VerifyingKey> {
+            self.map.get(owner).copied()
+        }
+    }
+
+    fn snapshot_of(addrs: &[OwnerAddr]) -> MembershipSnapshot {
+        let mut members = HashMap::new();
+        for a in addrs {
+            members.insert(
+                *a,
+                MemberAttrs {
+                    power: 1,
+                    vouching_depth: 1,
+                },
+            );
+        }
+        MembershipSnapshot { members }
+    }
+
+    fn sample_tier1_event(keypair: &SigningKey, actor: OwnerAddr) -> SignedVotingEvent {
+        let cfg = Tier1PollConfig {
+            options: vec!["a".into(), "b".into()],
+            window_seconds: 600,
+            quorum: None,
+            threshold_percent: None,
+            multi_winner: None,
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            channel_id: ChannelId([0; 16]),
+        };
+        let hlc = Hlc {
+            wall_ms: 1,
+            logical: 0,
+            device_id: "a".into(),
+        };
+        build_signed_poll_create_tier1(keypair, actor, &cfg, hlc).expect("build")
+    }
+
+    #[tokio::test]
+    async fn verify_voting_event_accepts_valid_event() {
+        let keypair = SigningKey::generate(&mut OsRng);
+        let vk = keypair.verifying_key();
+        let actor = OwnerAddr([0xaa; 16]);
+        let ev = sample_tier1_event(&keypair, actor);
+
+        let snapshot = snapshot_of(&[actor]);
+        let resolver = Arc::new(FixedVotingIdentityResolver {
+            map: HashMap::from([(actor, vk)]),
+        });
+
+        assert!(verify_voting_event(&ev, &snapshot, resolver.as_ref())
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn verify_voting_event_rejects_actor_not_in_membership() {
+        let keypair = SigningKey::generate(&mut OsRng);
+        let vk = keypair.verifying_key();
+        let actor = OwnerAddr([0xbb; 16]);
+        let ev = sample_tier1_event(&keypair, actor);
+
+        let snapshot = snapshot_of(&[OwnerAddr([0xcc; 16])]);
+        let resolver = Arc::new(FixedVotingIdentityResolver {
+            map: HashMap::from([(actor, vk)]),
+        });
+
+        assert!(matches!(
+            verify_voting_event(&ev, &snapshot, resolver.as_ref()).await,
+            Err(VotingVerifyError::ActorNotInMembership)
+        ));
+    }
+
+    #[tokio::test]
+    async fn verify_voting_event_rejects_forged_signature() {
+        let actor = OwnerAddr([0xdd; 16]);
+        let real_keypair = SigningKey::generate(&mut OsRng);
+        let forger_keypair = SigningKey::generate(&mut OsRng);
+
+        // Forger signs the event but claims actor identity. Resolver maps actor →
+        // real_keypair's verifying key, so the forger_keypair signature won't verify.
+        let ev = sample_tier1_event(&forger_keypair, actor);
+        let snapshot = snapshot_of(&[actor]);
+        let resolver = Arc::new(FixedVotingIdentityResolver {
+            map: HashMap::from([(actor, real_keypair.verifying_key())]),
+        });
+
+        assert!(matches!(
+            verify_voting_event(&ev, &snapshot, resolver.as_ref()).await,
+            Err(VotingVerifyError::InvalidSignature)
+        ));
+    }
+
+    #[tokio::test]
+    async fn verify_voting_event_rejects_no_resolver_entry() {
+        let keypair = SigningKey::generate(&mut OsRng);
+        let actor = OwnerAddr([0xee; 16]);
+        let ev = sample_tier1_event(&keypair, actor);
+
+        let snapshot = snapshot_of(&[actor]);
+        let resolver = Arc::new(FixedVotingIdentityResolver {
+            map: HashMap::new(),
+        });
+
+        assert!(matches!(
+            verify_voting_event(&ev, &snapshot, resolver.as_ref()).await,
+            Err(VotingVerifyError::IdentityNotResolvable)
+        ));
     }
 }
