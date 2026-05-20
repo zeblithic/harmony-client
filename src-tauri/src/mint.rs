@@ -116,6 +116,12 @@ pub fn apply_migrations(conn: &Connection) -> Result<(), MintError> {
     )?;
 
     // --- Schema v2 (Phase 2 sync) ---
+    //
+    // `let _ = conn.execute("ALTER TABLE ...")` swallows the "column already
+    // exists" error that SQLite fires on every run after the first. This is
+    // the idempotency idiom for ADD COLUMN — do NOT replace `let _ =` with
+    // `?`. The subsequent CREATE INDEX IF NOT EXISTS and UPDATE statements are
+    // safe to chain with `?` because they are inherently idempotent.
 
     // transactions.deleted_at — tombstone column for soft-delete.
     let _ = conn.execute(

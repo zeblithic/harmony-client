@@ -385,11 +385,19 @@ fn export_csv_no_partial_file_on_unwritable_path() {
 #[test]
 fn migration_v2_adds_columns_and_backfills() {
     let db_path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-    // First open: schema v1 lands.
+    // First open: open_database internally calls apply_migrations (v1 + v2
+    // both land). The explicit apply_migrations call here is redundant with
+    // what open_database already did; it documents that calling it a second
+    // time in the same session is safe (same-process idempotency).
+    //
+    // The INSERT statements use only the v1 column set intentionally: they
+    // simulate rows that were written before the v2 backfill UPDATE ran (i.e.
+    // rows that will have updated_at = '' until the next migration pass).
     {
-        let mut conn = harmony_app::mint::open_database(&db_path).unwrap();
-        harmony_app::mint::apply_migrations(&mut conn).unwrap();
-        // Insert v1-shaped rows (without the new columns).
+        let conn = harmony_app::mint::open_database(&db_path).unwrap();
+        harmony_app::mint::apply_migrations(&conn).unwrap();
+        // Insert rows that intentionally omit the v2 columns (updated_at),
+        // simulating pre-v2 row state to verify the backfill UPDATEs fire.
         conn.execute(
             "INSERT INTO accounts (id, name, created_at) VALUES (?, ?, ?)",
             rusqlite::params!["acct-1", "Chase", "2026-05-01T00:00:00Z"],
@@ -401,9 +409,11 @@ fn migration_v2_adds_columns_and_backfills() {
         )
         .unwrap();
     }
-    // Second open: v2 migration runs.
-    let mut conn = harmony_app::mint::open_database(&db_path).unwrap();
-    harmony_app::mint::apply_migrations(&mut conn).unwrap();
+    // Second open: close and reopen the DB, then migrate again. This verifies
+    // that the backfill UPDATEs in apply_migrations correctly handle rows that
+    // were inserted with updated_at = '' (the DEFAULT for pre-v2 rows).
+    let conn = harmony_app::mint::open_database(&db_path).unwrap();
+    harmony_app::mint::apply_migrations(&conn).unwrap();
 
     // accounts now has updated_at, backfilled from created_at.
     let updated_at: String = conn
@@ -445,7 +455,7 @@ fn migration_v2_adds_columns_and_backfills() {
     assert_eq!(deleted_at, None);
 
     // Idempotency: a third migration is a no-op.
-    harmony_app::mint::apply_migrations(&mut conn).unwrap();
+    harmony_app::mint::apply_migrations(&conn).unwrap();
 }
 
 #[test]
