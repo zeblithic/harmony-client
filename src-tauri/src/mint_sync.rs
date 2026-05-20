@@ -71,6 +71,13 @@ pub(crate) fn snapshot_current_db(conn: &mut Connection) -> Result<MintSnapshot,
 /// Apply a remote snapshot to the local DB. Runs in a single SQLite
 /// transaction — either all rows merge or none do.
 ///
+/// **Caller contract:** the caller must verify
+/// `remote.schema_version <= LOCAL_MAX_SCHEMA_VERSION` BEFORE calling this
+/// function. The subscriber (Task 9) does this check; direct callers
+/// (tests, future code paths) must replicate it. This function does NOT
+/// re-check schema_version — silent application of an unknown version
+/// risks silent data corruption.
+///
 /// `account_deletion_floor` is the per-device map of hard-deleted
 /// account IDs → deletion timestamp; peer rows older than the floor
 /// are dropped to prevent zombie-resurrect. Pass an empty map until
@@ -199,12 +206,11 @@ fn upsert_setting_lww(tx: &rusqlite::Transaction, r: &SettingRow) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mint::{apply_migrations, open_in_memory};
+    use crate::mint::open_in_memory;
 
     fn fresh_db() -> Connection {
-        let conn = open_in_memory().unwrap();
-        apply_migrations(&conn).unwrap();
-        conn
+        // open_in_memory() already runs apply_migrations internally.
+        open_in_memory().unwrap()
     }
 
     fn seed_account(conn: &mut Connection, id: &str, name: &str, updated_at: &str) {
