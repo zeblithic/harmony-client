@@ -1025,7 +1025,14 @@ fn request_vrf_beacon_local(
 /// won't verify under the recomputed Fiat-Shamir challenge).
 #[allow(clippy::too_many_arguments)]
 fn contribute_threshold_sign_local(
-    log: &DfrostLog,
+    // R5-5 (MAJOR test): take `&mut DfrostLog` so we can `.take()` the
+    // stashed `local_nonces` — mirrors the production IPC's
+    // `Option::take()` single-use invariant (R2 atomic-take fix). With a
+    // shared `&DfrostLog` ref the helper used to borrow nonces by `&`
+    // and leave them in place, so a buggy test path could effectively
+    // reuse the same nonces twice even though production refuses to.
+    // FROST §6.2: nonce reuse leaks the secret signing share.
+    log: &mut DfrostLog,
     self_addr: OwnerAddr,
     sign_ceremony_id: [u8; 32],
     members: &[OwnerAddr],
@@ -1043,12 +1050,16 @@ fn contribute_threshold_sign_local(
         let pending = log
             .committee_state
             .pending_sign
-            .get(&sign_ceremony_id)
+            .get_mut(&sign_ceremony_id)
             .expect("pending_sign present (request_vrf_beacon ran)");
 
+        // R5-5: consume the stashed nonces via Option::take() so a
+        // second call to this helper for the same ceremony surfaces a
+        // missing-nonces panic instead of silently re-signing with
+        // already-consumed nonces.
         let nonces_cbor = pending
             .local_nonces
-            .as_ref()
+            .take()
             .expect("local_nonces stashed by request_vrf_beacon");
         let nonces: frost::round1::SigningNonces =
             ciborium::from_reader(&nonces_cbor[..]).expect("decode local nonces");
@@ -1285,7 +1296,7 @@ async fn threshold_sign_ipc_round_trip_vrf_beacon_two_engine() {
     // `apply_threshold_sign`'s upsert path (R1 fix). No direct mutation
     // of `pending_sign.contributions` needed.
     let (ts_alice_with_share, _signing_package_a) = contribute_threshold_sign_local(
-        &log_a,
+        &mut log_a,
         ALICE,
         sign_ceremony_id,
         &members,
@@ -1337,7 +1348,7 @@ async fn threshold_sign_ipc_round_trip_vrf_beacon_two_engine() {
     // (R1 fix). Aggregate on Bob's side since he's the one whose apply
     // pushes the count to threshold.
     let (ts_bob_with_share, signing_package_b) = contribute_threshold_sign_local(
-        &log_b,
+        &mut log_b,
         BOB,
         sign_ceremony_id,
         &members,
@@ -2396,7 +2407,7 @@ async fn threshold_sign_ipc_2of3_canonical_set_aggregates() {
     // {ALICE, BOB} — Carol is excluded. Alice's round2::sign therefore
     // binds to the {ALICE, BOB} SigningPackage's Fiat-Shamir challenge.
     let (ts_alice_with_share, signing_package_alice) = contribute_threshold_sign_local(
-        &log_a,
+        &mut log_a,
         ALICE,
         sign_ceremony_id,
         &members,
@@ -2418,7 +2429,7 @@ async fn threshold_sign_ipc_2of3_canonical_set_aggregates() {
     //    IDENTICAL SigningPackage as Alice's (sorted-key BTreeMap is
     //    deterministic across replicas).
     let (ts_bob_with_share, signing_package_bob) = contribute_threshold_sign_local(
-        &log_b,
+        &mut log_b,
         BOB,
         sign_ceremony_id,
         &members,
@@ -2574,16 +2585,24 @@ async fn threshold_sign_ipc_2of3_canonical_set_aggregates() {
     // so her ts(empty) lingers harmlessly in pending_sign. Confirms
     // the canonical-set selection ignores extra contributors that
     // aren't in the first-threshold-sorted-addr window.
-    let pa = log_a
-        .committee_state
-        .pending_sign
-        .get(&sign_ceremony_id)
-        .unwrap();
-    assert!(
-        pa.contributions
-            .get(&CAROL)
-            .map(|(_, share)| share.is_empty())
-            .unwrap_or(false),
-        "carol's contribution still empty (she's not in canonical signing set)"
-    );
+    //
+    // R5-6: replicate the empty-share assertion across all three logs.
+    // A replica-specific bug in Bob's or Carol's apply / upsert path
+    // could populate Carol's share locally on those engines even while
+    // log_a stays clean — a single-replica check would silently miss
+    // it.
+    for (log, name) in [(&log_a, "alice"), (&log_b, "bob"), (&log_c, "carol")] {
+        let p = log
+            .committee_state
+            .pending_sign
+            .get(&sign_ceremony_id)
+            .unwrap_or_else(|| panic!("{name} pending_sign present"));
+        assert!(
+            p.contributions
+                .get(&CAROL)
+                .map(|(_, share)| share.is_empty())
+                .unwrap_or(false),
+            "carol's contribution still empty on {name} (she's not in canonical signing set)"
+        );
+    }
 }

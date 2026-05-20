@@ -22082,6 +22082,17 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
             );
         }
 
+        // R5-1 (HIGH): snapshot prior pending_dkg + local_dkg_secret so
+        // an apply failure below can roll back the pre-mutation. Without
+        // rollback, a transient apply error leaves a phantom in-flight
+        // ceremony — every subsequent `dfrost_initiate_dkg` then bails on
+        // the "ceremony already in flight" guard above, locking the
+        // community out of DKG via IPC. Both fields are pre-apply
+        // invariants of this function, so snapshotting them here covers
+        // every mutation that needs to be reversed.
+        let prior_pending_dkg = log.committee_state.pending_dkg.clone();
+        let prior_local_dkg_secret = log.local_dkg_secret.clone();
+
         log.committee_state.pending_dkg = Some(crate::community_dfrost_log::PendingCeremony {
             ceremony_id,
             members: member_addrs.clone(),
@@ -22103,8 +22114,15 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
         // directly — using apply_with_identity here keeps a single
         // local-node apply call-site so future rn=2 IPCs can mirror it
         // verbatim.
-        log.apply_with_identity(event, &self_owner, &self_x25519_priv)
-            .map_err(|e| format!("dfrost_initiate_dkg: apply: {e:?}"))?;
+        if let Err(e) = log.apply_with_identity(event, &self_owner, &self_x25519_priv) {
+            // R5-1: restore pre-mutation state so the next initiate
+            // attempt can proceed. Without this, the phantom pending_dkg
+            // from the failed attempt would trip the "already in flight"
+            // guard on retry.
+            log.committee_state.pending_dkg = prior_pending_dkg;
+            log.local_dkg_secret = prior_local_dkg_secret;
+            return Err(format!("dfrost_initiate_dkg: apply: {e:?}"));
+        }
     }
 
     // 10. Emit progress event. participants_so_far = 1 because the
@@ -22200,13 +22218,22 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
             "dfrost_contribute_dkg_round: ceremony_id must be 32 bytes (64 hex chars)".to_string()
         })?;
 
-    // 2. Extract NodeState handles. community_registry is needed for the
-    //    OwnerAddr → identity_pub_64 → X25519 pubkey lookup used to seal
-    //    each round-2 package to its recipient (round_num=2 only). For
-    //    round_num=1 (peer submission) and round_num=3 it's unused, but
-    //    extracted up-front keeps the std::Mutex hold short for the common
-    //    case. The Arc is cheap to clone.
-    let (hlc_tracker, device_id, self_owner, dm_outbox, dfrost_logs, community_registry) = {
+    // 2. Extract NodeState handles. R5-4 (MEDIUM): community_registry is
+    //    needed ONLY for the OwnerAddr → identity_pub_64 → X25519 pubkey
+    //    lookup used to seal each round-2 package to its recipient
+    //    (round_num=2 only — round_num=3 reads pending state populated by
+    //    apply, not the registry). round_num=1 (peer submission) doesn't
+    //    use it either. Extracting up-front blocked multi-member DKG
+    //    whenever the community_registry hadn't been initialised yet —
+    //    even though round-1 peers strictly don't need it. Hoisted into
+    //    the round-2/3 (else) branch below; the round-1 path now
+    //    proceeds without requiring registry initialisation.
+    //
+    //    NodeState (std::Mutex) and community_registry's std::Mutex aren't
+    //    the same lock, so deferring the registry pull until after the
+    //    round-1 branch doesn't change locking semantics — it just narrows
+    //    the precondition for the round-1 IPC.
+    let (hlc_tracker, device_id, self_owner, dm_outbox, dfrost_logs) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("dfrost_contribute_dkg_round: NodeState poisoned: {e}"))?;
@@ -22223,9 +22250,6 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
                 .clone()
                 .ok_or("dfrost_contribute_dkg_round: dm_outbox missing — no owner identity?")?,
             std::sync::Arc::clone(&g.dfrost_logs),
-            g.community_registry.clone().ok_or(
-                "dfrost_contribute_dkg_round: community_registry missing — node not running?",
-            )?,
         )
     };
 
@@ -22407,6 +22431,21 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
     ) = if round_num == 2 {
         // ─── ROUND 2 ──────────────────────────────────────────────────
         //
+        // R5-4 (MEDIUM): pull community_registry HERE — round-2 is the
+        // only branch that needs it (X25519 lookup for sealing per-
+        // recipient round-2 packages). Round-1 and round-3 don't touch
+        // the registry, so the early extraction in step 2 used to block
+        // round-1 peer submissions whenever the registry wasn't yet
+        // initialised.
+        let community_registry = {
+            let g = state_lock
+                .lock()
+                .map_err(|e| format!("dfrost_contribute_dkg_round: NodeState poisoned: {e}"))?;
+            g.community_registry.clone().ok_or(
+                "dfrost_contribute_dkg_round: community_registry missing — node not running?",
+            )?
+        };
+
         // Snapshot pending state: members (for OwnerAddr↔Identifier
         // mapping), the round-1 packages every peer (NOT self) broadcast,
         // and our stashed round-1 secret.
@@ -22423,6 +22462,21 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
                     hex::encode(pending.ceremony_id),
                     hex::encode(ceremony_bytes)
                 ));
+            }
+            // R5-3 (MEDIUM): round-2 idempotency / double-submit gate.
+            // Mirrors the round-1 "already submitted" guard. Without
+            // this, a repeat round_num=2 call would overwrite
+            // `local_dkg_secret2` with fresh material; peers' apply path
+            // uses or_insert for round2_packages so peers keep the FIRST
+            // set, but this node has now stashed the SECOND
+            // `local_dkg_secret2`. When round_num=3 runs
+            // `dkg_part3_local(secret2, ...)` it would feed the NEW
+            // secret against the OLD round-1 / round-2 received maps —
+            // protocol mismatch, bricks part3.
+            if log.local_dkg_secret2.is_some() {
+                return Err(
+                    "dfrost_contribute_dkg_round: round 2 already submitted by self".to_string(),
+                );
             }
             // Filter out self — FROST's dkg::part2 takes packages from
             // OTHER members only (one's own package isn't an input).
@@ -22904,6 +22958,28 @@ async fn dfrost_request_vrf_beacon<R: tauri::Runtime>(
     sign_tag.extend_from_slice(&seed_bytes);
     let ceremony_id =
         crate::community_dfrost_types::derive_ceremony_id(&space_id, epoch, &sign_tag);
+
+    // 5a. R5-2 (MEDIUM): reject a repeat call for the same ceremony_id
+    //     when this node has already stashed local_nonces. Overwriting
+    //     them with fresh randomness would orphan the original
+    //     commitment (already broadcast in the first call) — the round-2
+    //     `dfrost_contribute_threshold_sign` path would load the
+    //     replacement nonces and produce a signature share that doesn't
+    //     bind to the broadcast commitments, so FROST aggregate would
+    //     reject this signer. Caller should proceed straight to
+    //     `dfrost_contribute_threshold_sign` for an in-flight ceremony.
+    {
+        let log = log_arc.lock().await;
+        if let Some(existing) = log.committee_state.pending_sign.get(&ceremony_id) {
+            if existing.local_nonces.is_some() {
+                return Err(format!(
+                    "dfrost_request_vrf_beacon: VRF beacon ceremony already initiated for \
+                     this ceremony_id ({}); call dfrost_contribute_threshold_sign to complete",
+                    hex::encode(ceremony_id)
+                ));
+            }
+        }
+    }
 
     // 6. Run FROST round-1 commit. Returns the secret nonces (must be
     //    stashed for round-2; one-shot use, re-use leaks the signing
@@ -23820,11 +23896,24 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
     //     still recoverable; if we stashed after apply and apply
     //     succeeded but the stash errored, the round-1 secret would be
     //     lost and the refresh would be unrecoverable.
+    //
+    //     R5-1 (HIGH, paired with dfrost_initiate_dkg): snapshot the
+    //     prior `local_dkg_secret` so an apply failure rolls back the
+    //     pre-mutation. Without rollback, a transient apply error leaves
+    //     a stale local_dkg_secret that could collide with a subsequent
+    //     concurrent DKG / refresh attempt. The `pending_refresh` field
+    //     is NOT pre-mutated here (apply auto-initialises it), so no
+    //     snapshot is needed for that field.
     {
         let mut log = log_arc.lock().await;
+        let prior_local_dkg_secret = log.local_dkg_secret.clone();
         log.local_dkg_secret = Some(r1_secret);
-        log.apply_with_identity(event, &self_owner, &self_x25519_priv)
-            .map_err(|e| format!("dfrost_propose_refresh: apply: {e:?}"))?;
+        if let Err(e) = log.apply_with_identity(event, &self_owner, &self_x25519_priv) {
+            // R5-1: restore prior secret so retry isn't fighting a stale
+            // stash from this failed attempt.
+            log.local_dkg_secret = prior_local_dkg_secret;
+            return Err(format!("dfrost_propose_refresh: apply: {e:?}"));
+        }
     }
 
     // 13. Emit progress event.
