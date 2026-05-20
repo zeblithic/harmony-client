@@ -1232,15 +1232,116 @@ mod tests {
             }],
             transactions: vec![],
             settings: vec![],
-            account_deletion_floor: HashMap::new(),
+            account_deletion_floor: {
+                let mut m = HashMap::new();
+                // Remote also carries its floor entry for a1.
+                m.insert("a1".to_string(), "2026-05-02T00:00:00Z".to_string());
+                m
+            },
             captured_at: "2026-05-19T12:00:00Z".into(),
         };
-        apply_remote_snapshot(&mut local, &remote, &floor).unwrap();
+        let floor_to_merge = apply_remote_snapshot(&mut local, &remote, &floor).unwrap();
         let exists: Option<String> = local
             .query_row("SELECT id FROM accounts WHERE id = ?", ["a1"], |r| r.get(0))
             .optional()
             .unwrap();
         assert!(exists.is_none(), "floor should have blocked the resurrect");
+        // The returned floor map must contain the remote's a1 entry so the caller
+        // can merge it into local sync_state.
+        assert_eq!(
+            floor_to_merge.get("a1").map(String::as_str),
+            Some("2026-05-02T00:00:00Z"),
+            "floor_to_merge must carry the remote's deletion entry for a1"
+        );
+    }
+
+    #[test]
+    fn apply_remote_floor_deletes_local_account() {
+        // Scenario: B has account a1 with updated_at = "2026-05-01".
+        // B receives a snapshot from A whose floor contains (a1, "2026-05-02")
+        // (A deleted a1 after B last synced). B's apply must hard-delete a1 and
+        // its transactions, and return a floor_to_merge entry for a1.
+        let mut local = fresh_db();
+        seed_account(&mut local, "a1", "Chase", "2026-05-01T00:00:00Z");
+        seed_tx(&mut local, "t1", "a1", "Coffee", "2026-05-01T00:00:00Z");
+
+        let remote = MintSnapshot {
+            schema_version: 1,
+            accounts: vec![], // a1 is absent — A deleted it.
+            transactions: vec![],
+            settings: vec![],
+            account_deletion_floor: {
+                let mut m = HashMap::new();
+                m.insert("a1".to_string(), "2026-05-02T00:00:00Z".to_string());
+                m
+            },
+            captured_at: "2026-05-19T12:00:00Z".into(),
+        };
+
+        let floor_to_merge =
+            apply_remote_snapshot(&mut local, &remote, &HashMap::new()).unwrap();
+
+        // Account must be gone.
+        let acct_exists: Option<String> = local
+            .query_row("SELECT id FROM accounts WHERE id = ?", ["a1"], |r| r.get(0))
+            .optional()
+            .unwrap();
+        assert!(
+            acct_exists.is_none(),
+            "account a1 must be hard-deleted after remote floor apply"
+        );
+
+        // Orphan transaction must also be gone.
+        let tx_count: i64 = local
+            .query_row(
+                "SELECT COUNT(*) FROM transactions WHERE account_id = ?",
+                ["a1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            tx_count, 0,
+            "orphan transactions for a1 must be hard-deleted"
+        );
+
+        // floor_to_merge must contain the a1 entry so the caller merges it into
+        // local sync_state (prevents future zombie-resurrects from other peers).
+        assert_eq!(
+            floor_to_merge.get("a1").map(String::as_str),
+            Some("2026-05-02T00:00:00Z"),
+            "floor_to_merge must carry the remote deletion entry for a1"
+        );
+    }
+
+    #[test]
+    fn apply_remote_floor_merges_into_local_floor() {
+        // Scenario: local floor has a1 → "2026-05-01" (older).
+        // Remote snapshot floor has a1 → "2026-05-03" (newer).
+        // floor_to_merge must carry "2026-05-03" so the caller picks the max.
+        let mut local = fresh_db();
+        let mut local_floor = HashMap::new();
+        local_floor.insert("a1".to_string(), "2026-05-01T00:00:00Z".to_string());
+
+        let remote = MintSnapshot {
+            schema_version: 1,
+            accounts: vec![],
+            transactions: vec![],
+            settings: vec![],
+            account_deletion_floor: {
+                let mut m = HashMap::new();
+                m.insert("a1".to_string(), "2026-05-03T00:00:00Z".to_string());
+                m
+            },
+            captured_at: "2026-05-19T12:00:00Z".into(),
+        };
+
+        let floor_to_merge = apply_remote_snapshot(&mut local, &remote, &local_floor).unwrap();
+
+        assert_eq!(
+            floor_to_merge.get("a1").map(String::as_str),
+            Some("2026-05-03T00:00:00Z"),
+            "floor_to_merge must carry the newer remote timestamp"
+        );
     }
 
     use std::sync::Arc;
