@@ -42,8 +42,8 @@ use harmony_app::community_voting_log_engine::{VotingLogEngine, VotingLogEngineP
 use harmony_app::community_voting_sortition::fisher_yates_select;
 use harmony_app::community_voting_star::tally_star;
 use harmony_app::community_voting_tier3::{
-    drafting_advancers, ratification_candidates_ordering, synthesize_status_quo, Stage,
-    Tier3PollResultPayload,
+    drafting_advancers, ratification_candidates_ordering, synthesize_status_quo, verify_sd, Stage,
+    Tier3PollResultPayload, VerifyError,
 };
 use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 use tokio::sync::{mpsc, Mutex};
@@ -1085,6 +1085,336 @@ async fn tier3_full_lifecycle_4_stage_convergence() {
 
     drop(engines);
 }
+/// Multi-engine decline + backup promotion test.
+///
+/// Design spec §3 (decline flow) + §6 (materialize on kd=md auto-promotes backup)
+/// + §10 (failure modes / rejection path).
+///
+/// ## Scenario
+///
+/// 1. Two engines + 50 fixture identities + sortition_size=20.
+/// 2. kd=cr + kd=ss injected (same pattern as Task 13).
+/// 3. 3 primary members publish kd=md decline events.
+/// 4. Both engines converge: declines.len()==3, current_mini_public = primary[remaining] + backup[0..3].
+/// 5. A promoted backup member publishes kd=dc → SD1 verify accepts.
+/// 6. A non-mini-public, non-backup identity tries kd=dc → SD1 verify rejects NotInMiniPublic.
+/// 7. A kd=md from a non-primary member → SD1 verify rejects NotInMiniPublic.
+#[tokio::test]
+async fn tier3_decline_triggers_backup_promotion_across_engines() {
+    const SORTITION_SIZE: u16 = 20;
+    const N_IDENTITIES: usize = 50;
+    const COMMUNITY_ID: SpaceId = SpaceId([0xD3; 16]);
+
+    // ── Step 1: electorate ────────────────────────────────────────────────────
+
+    let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
+    let electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
+
+    // ── Step 2: two-engine bridge ─────────────────────────────────────────────
+
+    let engines = setup_two_voting_engine_bridge(COMMUNITY_ID).await;
+
+    // ── Step 3: PollCreate ─────────────────────────────────────────────────────
+
+    let t0: u64 = 2_000_000;
+    let proposer = &identities[0];
+
+    let config = Tier3PollConfigPayload {
+        proposal_text: "Decline + backup promotion test proposal".into(),
+        sortition_size: SORTITION_SIZE,
+        deliberation_window_seconds: 60,
+        drafting_window_seconds: 60,
+        ratification_window_seconds: 60,
+        privacy_mode: "pu".into(),
+        incentive_mode: "d".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+    };
+
+    let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
+
+    let create_signing_bytes = create_event
+        .signing_bytes()
+        .expect("create event signing_bytes");
+    let poll_id = derive_poll_id(&COMMUNITY_ID, &create_signing_bytes);
+
+    let snapshot = MembershipSnapshot {
+        members: electorate
+            .iter()
+            .map(|addr| {
+                (
+                    *addr,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )
+            })
+            .collect(),
+    };
+
+    // Apply PollCreate to both logs directly (same pattern as Task 13 happy path).
+    {
+        let mut log = engines.log_a.lock().await;
+        log.apply_with_snapshot(create_event.clone(), &COMMUNITY_ID, Some(snapshot.clone()))
+            .expect("engine_a: PollCreate apply");
+    }
+    {
+        let mut log = engines.log_b.lock().await;
+        log.apply_with_snapshot(create_event, &COMMUNITY_ID, Some(snapshot))
+            .expect("engine_b: PollCreate apply");
+    }
+
+    // ── Step 4: inject kd=ss (deterministic VRF output [0xCD; 32]) ───────────
+
+    let vrf_output: [u8; 32] = [0xCD; 32];
+    let sortition_result = fisher_yates_select(
+        &vrf_output,
+        &electorate,
+        SORTITION_SIZE as usize,
+        SORTITION_SIZE as usize,
+    );
+
+    let ss_event = build_sortition_selection_event(
+        poll_id,
+        sortition_result.primary.clone(),
+        sortition_result.backup.clone(),
+        hlc_at(t0 + 1, "engine"),
+    );
+
+    engines
+        .engine_a
+        .publish_event(ss_event)
+        .await
+        .expect("engine_a: publish kd=ss");
+
+    // Wait for engine_b to see the kd=ss via bridge.
+    wait_for_log("engine_b: sortition_result set", &engines.log_b, |log| {
+        log.polls
+            .get(&poll_id)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .map(|t3| t3.sortition_result.is_some())
+            .unwrap_or(false)
+    })
+    .await
+    .expect("engine_b: kd=ss must arrive via bridge within 5s");
+
+    // Confirm primary + backup sizes.
+    {
+        let log = engines.log_a.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        let sr = t3.sortition_result.as_ref().unwrap();
+        assert_eq!(sr.primary.len(), SORTITION_SIZE as usize);
+        assert_eq!(sr.backup.len(), SORTITION_SIZE as usize);
+    }
+
+    // ── Step 5: 3 primary members decline ────────────────────────────────────
+    //
+    // We need actual primary members (from fisher_yates_select output).
+    // Resolve their TestIdentity objects.
+    let primary_owners: Vec<OwnerAddr> = sortition_result.primary.clone();
+    let primary_ids: Vec<&TestIdentity> = primary_owners
+        .iter()
+        .map(|owner| {
+            identities
+                .iter()
+                .find(|id| id.owner == *owner)
+                .expect("primary member must be in identities list")
+        })
+        .collect();
+
+    // Have primary_ids[0..3] decline (HLC within deliberation window).
+    let t_decline_base = t0 + 100;
+    for (i, decliner) in primary_ids[0..3].iter().enumerate() {
+        let decline_ev = build_decline_event(
+            decliner,
+            poll_id,
+            hlc_at(t_decline_base + i as u64 * 10, &format!("primary-{i}-dev")),
+        );
+        engines
+            .engine_a
+            .publish_event(decline_ev)
+            .await
+            .expect("engine_a: publish kd=md decline");
+    }
+
+    // Wait for engine_b to receive all 3 decline events.
+    wait_for_log("engine_b: 3 declines applied", &engines.log_b, |log| {
+        log.polls
+            .get(&poll_id)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .map(|t3| t3.declines.len() >= 3)
+            .unwrap_or(false)
+    })
+    .await
+    .expect("engine_b: must receive 3 decline events within 5s");
+
+    // Give async tasks a moment to settle.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // ── Step 6: assert convergence on BOTH engines ────────────────────────────
+
+    let t_after_declines = hlc_at(t_decline_base + 200, "observer");
+
+    let (t3_a, t3_b) = {
+        let log_a = engines.log_a.lock().await;
+        let log_b = engines.log_b.lock().await;
+        let t3_a = log_a.polls[&poll_id]
+            .tier_state
+            .as_tier3()
+            .expect("engine_a tier3")
+            .clone();
+        let t3_b = log_b.polls[&poll_id]
+            .tier_state
+            .as_tier3()
+            .expect("engine_b tier3")
+            .clone();
+        (t3_a, t3_b)
+    };
+
+    // Both engines: declines.len() == 3.
+    assert_eq!(t3_a.declines.len(), 3, "engine_a: must have 3 declines");
+    assert_eq!(t3_b.declines.len(), 3, "engine_b: must have 3 declines");
+
+    // Both engines: current_mini_public at t_after_declines has same size (still 20).
+    let mp_a = t3_a.current_mini_public(&t_after_declines);
+    let mp_b = t3_b.current_mini_public(&t_after_declines);
+    assert_eq!(
+        mp_a.len(),
+        SORTITION_SIZE as usize,
+        "engine_a: mini-public still has 20 members (3 removed + 3 promoted)"
+    );
+    assert_eq!(
+        mp_b.len(),
+        SORTITION_SIZE as usize,
+        "engine_b: mini-public still has 20 members (3 removed + 3 promoted)"
+    );
+    assert_eq!(
+        mp_a, mp_b,
+        "CONVERGENCE: current_mini_public must be identical on both engines"
+    );
+
+    // The 3 decliners must NOT be in the current mini-public.
+    for decliner_id in &primary_ids[0..3] {
+        assert!(
+            !mp_a.contains(&decliner_id.owner),
+            "decliner {:?} must not be in current_mini_public",
+            decliner_id.owner
+        );
+    }
+
+    // The first 3 backup members MUST now be in the current mini-public.
+    let backup_owners: Vec<OwnerAddr> = sortition_result.backup.clone();
+    for (i, backup_owner) in backup_owners[0..3].iter().enumerate() {
+        assert!(
+            mp_a.contains(backup_owner),
+            "backup[{i}] ({backup_owner:?}) must be promoted into current_mini_public"
+        );
+    }
+
+    // The remaining primary members (non-decliners) must still be in the set.
+    for remaining_id in &primary_ids[3..] {
+        assert!(
+            mp_a.contains(&remaining_id.owner),
+            "non-declining primary {:?} must remain in current_mini_public",
+            remaining_id.owner
+        );
+    }
+
+    // ── Step 7: promoted backup publishes kd=dc → SD1 verify ACCEPTS ─────────
+
+    // Find the TestIdentity for backup[0].
+    let promoted_backup_id = identities
+        .iter()
+        .find(|id| id.owner == backup_owners[0])
+        .expect("backup[0] must be in identities list");
+
+    let t_drafting = t0 + 60_001; // past deliberation window
+
+    let dc_event_promoted = build_draft_candidate_event(
+        promoted_backup_id,
+        poll_id,
+        "Draft from promoted backup member",
+        hlc_at(t_drafting, "promoted-backup-dev"),
+    );
+
+    // SD1 verify on engine_a's state — promoted backup IS in current_mini_public.
+    {
+        let log = engines.log_a.lock().await;
+        let poll_state = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        let verify_result = verify_sd(&dc_event_promoted, poll_state);
+        assert_eq!(
+            verify_result,
+            Ok(()),
+            "SD1 verify must ACCEPT kd=dc from promoted backup member"
+        );
+    }
+
+    // ── Step 8: non-mini-public identity tries kd=dc → SD1 verify REJECTS ────
+    //
+    // We need an identity that is genuinely outside both the primary and backup
+    // pools. With 50 identities and sortition_size=20, fisher_yates_select picks
+    // 40 total (20 primary + 20 backup), leaving 10 outside. We scan to find one.
+    let outsider_id = identities
+        .iter()
+        .find(|id| {
+            !primary_owners.contains(&id.owner) && !backup_owners.contains(&id.owner)
+        })
+        .expect("at least one identity is outside both primary and backup pools");
+
+    // Confirm outsider is not in current_mini_public.
+    assert!(
+        !mp_a.contains(&outsider_id.owner),
+        "outsider must not be in current_mini_public"
+    );
+
+    let dc_event_outsider = build_draft_candidate_event(
+        outsider_id,
+        poll_id,
+        "Draft from outsider — should be rejected",
+        hlc_at(t_drafting + 10, "outsider-dev"),
+    );
+
+    {
+        let log = engines.log_a.lock().await;
+        let poll_state = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        let verify_result = verify_sd(&dc_event_outsider, poll_state);
+        assert_eq!(
+            verify_result,
+            Err(VerifyError::NotInMiniPublic(outsider_id.owner)),
+            "SD1 verify must REJECT kd=dc from non-mini-public outsider"
+        );
+    }
+
+    // ── Step 9: kd=md from non-primary member → SD1 verify REJECTS ──────────
+    //
+    // The non-primary outsider tries to publish a decline event.
+    // SD1 verify checks current_mini_public at event.hlc, and the outsider
+    // was never in primary, so they are not in the mini-public set.
+    let decline_event_outsider = build_decline_event(
+        outsider_id,
+        poll_id,
+        hlc_at(t_decline_base + 300, "outsider-dev"),
+    );
+
+    {
+        let log = engines.log_a.lock().await;
+        let poll_state = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        let verify_result = verify_sd(&decline_event_outsider, poll_state);
+        assert_eq!(
+            verify_result,
+            Err(VerifyError::NotInMiniPublic(outsider_id.owner)),
+            "SD1 verify must REJECT kd=md from non-primary member"
+        );
+    }
+
+    drop(engines);
+}
+
 #[tokio::test]
 async fn smoke_tier3_event_builders_encode_without_panic() {
     let alice = fixture_identity(0xA2);
