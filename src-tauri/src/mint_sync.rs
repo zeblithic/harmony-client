@@ -5,9 +5,12 @@
 // the engine wires them in.
 #![allow(dead_code)]
 
+use crate::mint_sync_types::MintSyncState;
 use crate::mint_sync_types::{AccountRow, MintSnapshot, MintSyncError, SettingRow, TransactionRow};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex as TokioMutex, Notify};
 
 /// Read the full ledger state into a [`MintSnapshot`].
 ///
@@ -203,6 +206,96 @@ fn upsert_setting_lww(tx: &rusqlite::Transaction, r: &SettingRow) -> Result<(), 
     Ok(())
 }
 
+/// Mint Phase 2 sync engine. Mirrors owner_state_sync's shape.
+pub struct MintSyncEngine {
+    dirty: Arc<Notify>,
+    flush_now: mpsc::Sender<()>,
+    shutdown: mpsc::Sender<()>,
+}
+
+pub struct MintSyncEngineHandle(tokio::task::JoinHandle<()>);
+
+impl std::future::Future for MintSyncEngineHandle {
+    type Output = Result<(), tokio::task::JoinError>;
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+impl MintSyncEngine {
+    /// Test constructor: no Zenoh, just an in-memory ContentStore.
+    /// The real `new` (Task 11) takes a Zenoh session + identity key.
+    pub async fn new_for_test(
+        mint_db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+        content_store: Arc<dyn crate::content_store::ContentStore>,
+        sync_state: Arc<TokioMutex<MintSyncState>>,
+    ) -> (Self, MintSyncEngineHandle) {
+        let dirty = Arc::new(Notify::new());
+        let (flush_tx, flush_rx) = mpsc::channel::<()>(1);
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
+        let dirty_for_task = dirty.clone();
+        let handle = tokio::spawn(internal_task(
+            mint_db,
+            content_store,
+            sync_state,
+            dirty_for_task,
+            flush_rx,
+            shutdown_rx,
+        ));
+        (
+            Self {
+                dirty,
+                flush_now: flush_tx,
+                shutdown: shutdown_tx,
+            },
+            MintSyncEngineHandle(handle),
+        )
+    }
+
+    pub fn notify_dirty(&self) {
+        self.dirty.notify_one();
+    }
+
+    pub async fn flush_now(&self) -> Result<(), MintSyncError> {
+        self.flush_now
+            .send(())
+            .await
+            .map_err(|_| MintSyncError::Other("flush channel closed".into()))?;
+        Ok(())
+    }
+
+    pub async fn shutdown(&self) -> Result<(), MintSyncError> {
+        let _ = self.shutdown.send(()).await;
+        Ok(())
+    }
+}
+
+/// Internal task loop. Task 8 fills in publish_root_now; for now this just
+/// drains the channels and exits cleanly on shutdown.
+async fn internal_task(
+    _mint_db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    _content_store: Arc<dyn crate::content_store::ContentStore>,
+    _sync_state: Arc<TokioMutex<MintSyncState>>,
+    dirty: Arc<Notify>,
+    mut flush_rx: mpsc::Receiver<()>,
+    mut shutdown_rx: mpsc::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            _ = dirty.notified() => {
+                // Task 8 will schedule a debounced publish here.
+            }
+            _ = flush_rx.recv() => {
+                // Task 8 will fire publish_root_now here.
+            }
+            _ = shutdown_rx.recv() => break,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,6 +488,21 @@ mod tests {
             .optional()
             .unwrap();
         assert!(exists.is_none(), "floor should have blocked the resurrect");
+    }
+
+    use std::sync::Arc;
+    use tokio::sync::Mutex as TokioMutex;
+
+    #[tokio::test]
+    async fn engine_new_and_shutdown_no_publish() {
+        let conn = Arc::new(std::sync::Mutex::new(fresh_db()));
+        let cs: Arc<dyn crate::content_store::ContentStore> =
+            Arc::new(crate::content_store::InMemoryStub::default());
+        let sync_state = Arc::new(TokioMutex::new(MintSyncState::default()));
+        let (engine, handle) = MintSyncEngine::new_for_test(conn, cs, sync_state).await;
+        engine.shutdown().await.unwrap();
+        // Handle joins without panic.
+        handle.await.unwrap();
     }
 
     #[test]
