@@ -258,6 +258,12 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
     /// key during `start_node`; tests install it via the multi-engine
     /// setup helper. Replacing an installed key is intentionally
     /// allowed (e.g. on identity rotation).
+    ///
+    /// Must be paired with `hlc_tracker` + `device_id` installed via
+    /// `VotingLogEngineParams`; otherwise orchestration is dormant
+    /// (`maybe_trigger_engine_auto_orchestration` short-circuits when
+    /// any of the three is missing). Without this pairing,
+    /// `reserve_next_local_hlc` would panic on its `.expect(...)`.
     pub async fn install_local_signing_key(
         &self,
         key: Arc<ed25519_dalek::SigningKey>,
@@ -617,6 +623,18 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                 None => return,
             }
         };
+        // Additional gate: orchestration also requires hlc_tracker AND
+        // device_id installed via VotingLogEngineParams. A caller could
+        // install a signing key without these (e.g. partial fixture);
+        // without this gate `reserve_next_local_hlc` would panic on its
+        // .expect(...). All three must be present for orchestration to
+        // proceed.
+        if self.hlc_tracker.is_none() || self.device_id.is_none() {
+            tracing::debug!(
+                "engine-auto: hlc_tracker or device_id missing; skipping orchestration"
+            );
+            return;
+        }
 
         // (2) Inspect the affected poll's state. Snapshot the values we
         // need under the lock then drop it before the recursive
