@@ -13,6 +13,7 @@ pub mod community_channel_log;
 pub mod community_channel_log_engine;
 pub mod community_dfrost_crypto;
 pub mod community_dfrost_log;
+pub mod community_dfrost_log_engine;
 pub mod community_dfrost_types;
 pub mod community_fork;
 pub mod community_invite;
