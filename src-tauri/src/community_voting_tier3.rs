@@ -833,6 +833,46 @@ impl BeaconOracle for NoBeaconOracle {
     }
 }
 
+// ── DfrostBeaconOracle ────────────────────────────────────────────────────────
+
+/// Production `BeaconOracle` backed by a `DfrostLogRegistry<R>`. Looks up
+/// the VRF output for a beacon seed by querying the engine's `beacon_index`.
+///
+/// The oracle computes `message_hash = derive_vrf_seed(seed, current_epoch)` —
+/// using the engine's current committee epoch. This is correct for recent
+/// beacons: the committee epoch at beacon time must equal the epoch at which
+/// sortition was triggered (dfrost_request_vrf_beacon_inner enforces this).
+///
+/// Requires `cfg(not(test))` to be `pub` — in tests, `MockBeaconOracle` is
+/// used directly. Both are `pub` at module level for integration use.
+///
+/// Task 10 architectural decision: DfrostBeaconOracle lives in
+/// community_voting_tier3.rs alongside BeaconOracle so all oracle impls are
+/// co-located with the trait definition.
+pub struct DfrostBeaconOracle<R: tauri::Runtime> {
+    pub registry: std::sync::Arc<crate::community_dfrost_log_engine::DfrostLogRegistry<R>>,
+}
+
+#[async_trait::async_trait]
+impl<R: tauri::Runtime> BeaconOracle for DfrostBeaconOracle<R> {
+    async fn vrf_output_for(
+        &self,
+        community_id: &crate::owner_state_types::SpaceId,
+        seed: &[u8; 32],
+    ) -> Option<[u8; 32]> {
+        let engine = self.registry.get(*community_id).await?;
+        // Derive message_hash using the engine's current epoch. This epoch is
+        // authoritative at verify-time (assumes same committee epoch as beacon).
+        let epoch = {
+            // Access dfrost_log via the engine's public find_vrf_beacon_output_by_seed
+            // helper, which already takes (seed, epoch). We need the epoch first.
+            // Expose current_epoch via a dedicated method on DfrostLogEngine.
+            engine.current_epoch().await
+        };
+        engine.find_vrf_beacon_output_by_seed(seed, epoch).await
+    }
+}
+
 // ── Tier 3 PollResult payload ─────────────────────────────────────────────────
 
 /// Payload for kd=rs PollResult when tier == Tier::Sortition.

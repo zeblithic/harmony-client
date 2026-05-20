@@ -582,7 +582,7 @@ pub struct NodeState {
         std::sync::Mutex<
             std::collections::HashMap<
                 crate::owner_state_types::SpaceId,
-                std::sync::Arc<crate::community_voting_log_engine::VotingLogEngine>,
+                std::sync::Arc<crate::community_voting_log_engine::VotingLogEngine<tauri::Wry>>,
             >,
         >,
     >,
@@ -1000,6 +1000,10 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
                 // self-owned receive task observes via channel close
                 // and exits cleanly. See VotingLogRegistry::shutdown
                 // for the same pattern.
+                let engines: &mut std::collections::HashMap<
+                    crate::owner_state_types::SpaceId,
+                    std::sync::Arc<crate::community_voting_log_engine::VotingLogEngine<tauri::Wry>>,
+                > = &mut engines;
                 engines.clear();
             }
         }
@@ -20929,7 +20933,7 @@ type VotingLogEnginesMap = std::sync::Arc<
     std::sync::Mutex<
         std::collections::HashMap<
             crate::owner_state_types::SpaceId,
-            std::sync::Arc<crate::community_voting_log_engine::VotingLogEngine>,
+            std::sync::Arc<crate::community_voting_log_engine::VotingLogEngine<tauri::Wry>>,
         >,
     >,
 >;

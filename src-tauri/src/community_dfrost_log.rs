@@ -64,6 +64,18 @@ pub struct DfrostLog {
     /// when the corresponding `vb` event lands or the ceremony is
     /// abandoned.
     pub local_signing_nonces: HashMap<[u8; 32], SigningNonces>,
+
+    /// Index of completed VRF beacons: `message_hash → vrf_output`.
+    ///
+    /// Populated in `apply_vrf_beacon` so that `find_vrf_beacon_output_by_seed`
+    /// can answer oracle lookups without re-scanning `events`. The key is
+    /// the `VrfBeaconPayload.message_hash` field (= `derive_vrf_seed(seed, epoch)`).
+    /// Given a poll's beacon seed and the committee's epoch, callers compute
+    /// the expected `message_hash = derive_vrf_seed(seed, epoch)` and look it up here.
+    ///
+    /// Not persisted (same as `local_key_package`): rebuilt on replay.
+    /// Task 10: consulted by `DfrostBeaconOracle<R>` for `verify_ss`.
+    pub beacon_index: HashMap<[u8; 32], [u8; 32]>,
 }
 
 /// Persisted (CBOR) committee state for a community. The
@@ -366,6 +378,26 @@ pub async fn verify_signed_committee_event(
 impl DfrostLog {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Look up the VRF output for a completed beacon identified by its beacon
+    /// seed and committee epoch.
+    ///
+    /// Computes `message_hash = derive_vrf_seed(seed, epoch)` and checks
+    /// `beacon_index[message_hash]`. Returns `Some(vrf_output)` if a
+    /// beacon with that message_hash was previously applied (and indexed by
+    /// `apply_vrf_beacon`), `None` otherwise.
+    ///
+    /// Called by `DfrostBeaconOracle<R>::vrf_output_for` to service SS1
+    /// verify (Task 10). The oracle derives `epoch` from the engine's
+    /// `committee_state.current_epoch` — correct for recent beacons; an
+    /// epoch change (committee refresh) would cause the oracle to miss old
+    /// beacons, which is the correct security posture (old-committee beacons
+    /// should not drive new-committee sortition).
+    pub fn find_vrf_beacon_output_by_seed(&self, seed: &[u8; 32], epoch: u64) -> Option<[u8; 32]> {
+        use crate::community_dfrost_types::derive_vrf_seed;
+        let message_hash = derive_vrf_seed(seed, epoch);
+        self.beacon_index.get(&message_hash).copied()
     }
 
     /// Apply a single committee event. Caller has already verified the
@@ -798,6 +830,13 @@ impl DfrostLog {
             &payload.signature,
         )
         .map_err(|_| ApplyError::InvariantViolation)?;
+
+        // Index the completed beacon so `find_vrf_beacon_output_by_seed` can
+        // answer oracle lookups without re-scanning `events`. Key is
+        // `message_hash` (= `derive_vrf_seed(seed_bytes, epoch)`); value is
+        // the verified `vrf_output`. Inserted before clearing pending_sign.
+        self.beacon_index
+            .insert(payload.message_hash, payload.vrf_output);
 
         // Clear the pending sign session — the ceremony is now finalised
         // on this replica.
