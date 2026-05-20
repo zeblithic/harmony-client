@@ -143,15 +143,19 @@ pub fn apply_migrations(conn: &Connection) -> Result<(), MintError> {
         [],
     )?;
 
-    // settings.updated_at — backfilled to migration time for legacy rows.
+    // settings.updated_at — backfilled to epoch for legacy rows.
+    // Use epoch (1970-01-01T00:00:00Z) rather than wall-clock now() so that
+    // any explicit user change (which always carries chrono::Utc::now()) wins
+    // unconditionally in LWW merge. Per-device wall-clock backfill was causing
+    // a peer whose migration ran later (T_B > T_A) to silently revert another
+    // peer's earlier intentional edit (T_A) on next sync.
     let _ = conn.execute(
         "ALTER TABLE settings ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''",
         [],
     );
-    let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
-        "UPDATE settings SET updated_at = ?1 WHERE updated_at = ''",
-        params![now],
+        "UPDATE settings SET updated_at = '1970-01-01T00:00:00Z' WHERE updated_at = ''",
+        [],
     )?;
 
     Ok(())
@@ -298,11 +302,17 @@ pub fn delete_account(
     conn: &Connection,
     id: &str,
     reassign_to: Option<&str>,
-    floor: &mut std::collections::HashMap<String, String>,
 ) -> Result<(), MintError> {
     // `unchecked_transaction` is correct here: `conn` is a `&Connection`
     // already obtained from the `Mutex<Connection>` guard, so we know we
     // are the sole user of this connection.
+    //
+    // NOTE: the caller (mint_delete_account IPC handler) is responsible for
+    // inserting the deletion-floor entry and persisting it to disk BEFORE
+    // calling this function. This ordering ensures that a crash between floor
+    // persist and SQLite commit leaves a "phantom" floor entry (minor
+    // inconvenience) rather than a committed SQLite delete with no floor entry
+    // (zombie resurrection risk).
     let tx = conn.unchecked_transaction()?;
 
     // ── Validate first, before any mutation ───────────────────────────────────
@@ -359,9 +369,6 @@ pub fn delete_account(
     tx.execute("DELETE FROM accounts WHERE id = ?", params![id])?;
 
     tx.commit()?;
-
-    let now = chrono::Utc::now().to_rfc3339();
-    floor.insert(id.to_string(), now);
 
     Ok(())
 }
@@ -995,14 +1002,12 @@ pub async fn mint_rename_account(
 ///
 /// **Constraint:** the mint sync engine must already be initialized (i.e.
 /// identity bootstrap must have completed) before this command is called.
-/// This is a deliberate safety requirement: if we allowed deletion while the
-/// engine is uninitialized, the `account_deletion_floor` entry written by
-/// `delete_account` would be discarded with the temporary map, leaving the
-/// floor empty after engine init. On the next sync, any peer that still
-/// holds a copy of the deleted account would replay it — a silent zombie
-/// resurrect. Returning an error here lets the UI surface the constraint
-/// clearly and retry once identity bootstrap has finished (typically < 500 ms
-/// after node start).
+/// This is a deliberate safety requirement: the deletion floor entry must be
+/// persisted to disk before the SQLite delete is committed (crash-safety
+/// ordering). If the engine is absent there is no durable floor path, so we
+/// refuse the delete rather than risk zombie resurrection. Returning an error
+/// here lets the UI surface the constraint clearly and retry once identity
+/// bootstrap has finished (typically < 500 ms after node start).
 #[tauri::command]
 pub async fn mint_delete_account(
     id: String,
@@ -1033,27 +1038,43 @@ pub async fn mint_delete_account(
     tokio::task::spawn_blocking(move || {
         let conn = conn.lock().expect("mint_db lock poisoned");
         let mut st = sync_state_handle.blocking_lock();
-        delete_account(
-            &conn,
-            &id,
-            reassign_to.as_deref(),
-            &mut st.account_deletion_floor,
-        )
-        .map_err(|e| e.to_string())?;
-        // Persist the updated deletion floor so a restart doesn't lose it
-        // (CRITICAL 2: without this, a peer's stale snapshot could resurrect
-        // the deleted account on next sync after restart).
-        if let Some(path) = sync_state_path_opt {
+
+        // ── Ordering matters for crash-safety ─────────────────────────────────
+        // 1. Insert floor entry in memory.
+        // 2. Persist floor to disk.
+        // 3. Commit SQLite delete.
+        //
+        // A crash between steps 2 and 3 leaves a "phantom" floor entry for an
+        // account that's still present locally. That's minor: the account
+        // remains usable and a subsequent delete attempt will succeed normally.
+        //
+        // The previous order (SQLite commit FIRST, then floor insert) had the
+        // opposite risk: a crash left the SQLite delete committed but the floor
+        // empty — on next sync, a peer that still held the account would replay
+        // it (zombie resurrection). This ordering eliminates that risk entirely.
+        let now = chrono::Utc::now().to_rfc3339();
+        st.account_deletion_floor.insert(id.clone(), now);
+
+        if let Some(ref path) = sync_state_path_opt {
             let st_snap = st.clone();
-            if let Err(e) = crate::mint_sync_persist::save(&path, &st_snap) {
-                // Log a warning but don't fail the delete — the in-memory
-                // state is still correct and the delete has already committed.
-                tracing::warn!(
-                    target: "mint_sync",
-                    "persist sync_state after account deletion failed: {e}"
-                );
+            if let Err(e) = crate::mint_sync_persist::save(path, &st_snap) {
+                // Floor persist failed. Abort — do NOT proceed with the SQLite
+                // delete, because if we did and then crashed, the floor entry
+                // would vanish on restart (the in-memory insert is not durable
+                // without the persist). Rolling back the in-memory insert and
+                // returning an error is the safe choice: the account is still
+                // present, and the user can retry.
+                st.account_deletion_floor.remove(&id);
+                return Err(format!(
+                    "persist sync_state before account deletion failed: {e} — \
+                     delete aborted to prevent zombie resurrection risk"
+                ));
             }
         }
+
+        // Floor is now durable. Proceed with the SQLite delete.
+        delete_account(&conn, &id, reassign_to.as_deref()).map_err(|e| e.to_string())?;
+
         Ok::<(), String>(())
     })
     .await
@@ -1427,8 +1448,7 @@ mod tests {
     fn delete_account_empty_succeeds() {
         let conn = fresh_db();
         let account = create_account(&conn, "Chase").unwrap();
-        let mut floor = std::collections::HashMap::new();
-        delete_account(&conn, &account.id, None, &mut floor).unwrap();
+        delete_account(&conn, &account.id, None).unwrap();
 
         let list = list_accounts(&conn).unwrap();
         assert!(list.is_empty());
@@ -1449,8 +1469,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut floor = std::collections::HashMap::new();
-        let err = delete_account(&conn, &account.id, None, &mut floor).unwrap_err();
+        let err = delete_account(&conn, &account.id, None).unwrap_err();
         assert!(
             matches!(err, MintError::Validation(ref s) if s.contains("has transactions")),
             "expected 'has transactions' in Validation error, got: {:?}",
@@ -1486,8 +1505,7 @@ mod tests {
             .unwrap();
         }
 
-        let mut floor = std::collections::HashMap::new();
-        delete_account(&conn, &a.id, Some(&b.id), &mut floor).unwrap();
+        delete_account(&conn, &a.id, Some(&b.id)).unwrap();
 
         let list = list_accounts(&conn).unwrap();
         assert_eq!(list.len(), 1, "only B should remain");
@@ -1502,8 +1520,7 @@ mod tests {
     fn delete_account_reassign_to_same_id_fails() {
         let conn = fresh_db();
         let a = create_account(&conn, "A").unwrap();
-        let mut floor = std::collections::HashMap::new();
-        let err = delete_account(&conn, &a.id, Some(&a.id), &mut floor).unwrap_err();
+        let err = delete_account(&conn, &a.id, Some(&a.id)).unwrap_err();
         assert!(
             matches!(err, MintError::Validation(ref s) if s.contains("cannot reassign")),
             "expected 'cannot reassign' in Validation error, got: {:?}",
@@ -1527,14 +1544,8 @@ mod tests {
         )
         .unwrap();
 
-        let mut floor = std::collections::HashMap::new();
-        let err = delete_account(
-            &conn,
-            &a.id,
-            Some("00000000-0000-0000-0000-000000000000"),
-            &mut floor,
-        )
-        .unwrap_err();
+        let err =
+            delete_account(&conn, &a.id, Some("00000000-0000-0000-0000-000000000000")).unwrap_err();
         assert!(
             matches!(err, MintError::Validation(ref s) if s.contains("does not exist")),
             "expected 'does not exist' in Validation error, got: {:?}",
@@ -1545,14 +1556,7 @@ mod tests {
     #[test]
     fn delete_account_not_found() {
         let conn = fresh_db();
-        let mut floor = std::collections::HashMap::new();
-        let err = delete_account(
-            &conn,
-            "00000000-0000-0000-0000-000000000000",
-            None,
-            &mut floor,
-        )
-        .unwrap_err();
+        let err = delete_account(&conn, "00000000-0000-0000-0000-000000000000", None).unwrap_err();
         assert!(matches!(err, MintError::NotFound(_)));
     }
 
@@ -1575,8 +1579,7 @@ mod tests {
         .unwrap();
         let original_updated_at = t.updated_at.clone();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        let mut floor = std::collections::HashMap::new();
-        delete_account(&conn, &a.id, Some(&b.id), &mut floor).unwrap();
+        delete_account(&conn, &a.id, Some(&b.id)).unwrap();
         let after = get_transaction(&conn, &t.id).unwrap().unwrap();
         assert!(
             after.updated_at > original_updated_at,

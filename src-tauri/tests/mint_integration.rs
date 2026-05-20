@@ -107,8 +107,7 @@ fn account_delete_with_reassign_moves_transactions() {
         )
         .unwrap();
     }
-    let mut floor = std::collections::HashMap::new();
-    delete_account(&conn, &a.id, Some(&b.id), &mut floor).unwrap();
+    delete_account(&conn, &a.id, Some(&b.id)).unwrap();
     let on_b = list_transactions(
         &conn,
         &ListFilter {
@@ -426,7 +425,8 @@ fn migration_v2_adds_columns_and_backfills() {
         .unwrap();
     assert_eq!(updated_at, "2026-05-01T00:00:00Z");
 
-    // settings now has updated_at, backfilled to non-empty.
+    // settings now has updated_at, backfilled to epoch so any explicit user
+    // change (with a real timestamp) always wins in LWW merge.
     let setting_updated: String = conn
         .query_row(
             "SELECT updated_at FROM settings WHERE key = ?",
@@ -434,7 +434,10 @@ fn migration_v2_adds_columns_and_backfills() {
             |r| r.get(0),
         )
         .unwrap();
-    assert!(!setting_updated.is_empty());
+    assert_eq!(
+        setting_updated, "1970-01-01T00:00:00Z",
+        "v2 migration must backfill settings.updated_at to epoch, not wall-clock now()"
+    );
 
     // transactions has the deleted_at column (NULL by default).
     conn.execute(

@@ -183,4 +183,36 @@ mod tests {
         let decoded: MintRootPublishPayload = from_reader(&bytes[..]).unwrap();
         assert_eq!(payload, decoded);
     }
+
+    /// Verify that `#[serde(default)]` on `account_deletion_floor` correctly
+    /// handles CBOR payloads from older peers that don't include the field.
+    /// Without the annotation, decoding a v1 snapshot (pre-floor) would fail.
+    #[test]
+    fn mint_snapshot_decodes_without_floor_field() {
+        // Construct a CBOR payload for the v1 shape (no account_deletion_floor
+        // field) by serializing a struct that lacks the field.
+        #[derive(serde::Serialize)]
+        struct LegacyMintSnapshot {
+            schema_version: u32,
+            accounts: Vec<AccountRow>,
+            transactions: Vec<TransactionRow>,
+            settings: Vec<SettingRow>,
+            captured_at: String,
+        }
+        let legacy = LegacyMintSnapshot {
+            schema_version: MINT_SCHEMA_VERSION,
+            accounts: vec![],
+            transactions: vec![],
+            settings: vec![],
+            captured_at: "2026-05-19T12:00:00Z".into(),
+        };
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&legacy, &mut cbor).unwrap();
+        let decoded: MintSnapshot = ciborium::from_reader(&cbor[..]).unwrap();
+        assert!(
+            decoded.account_deletion_floor.is_empty(),
+            "missing account_deletion_floor field should default to empty map, got: {:?}",
+            decoded.account_deletion_floor
+        );
+    }
 }

@@ -141,13 +141,12 @@ pub(crate) fn apply_remote_snapshot(
             // remote delete; leave it in place. Still merge the floor entry
             // so this device won't silently resurrect the old version later.
         }
-        // Merge into the to-merge map: keep the later timestamp.
-        let entry = floor_to_merge
+        // Collect into the to-merge map. Each id in remote.account_deletion_floor
+        // is unique so entry() never collides within this loop — or_insert_with
+        // always inserts.
+        floor_to_merge
             .entry(id.clone())
             .or_insert_with(|| remote_ts.clone());
-        if remote_ts > entry {
-            *entry = remote_ts.clone();
-        }
     }
 
     tx.commit()?;
@@ -655,12 +654,17 @@ async fn publish_root_now(
         snap.account_deletion_floor = st.account_deletion_floor.clone();
     }
 
-    if snap.accounts.is_empty() && snap.transactions.is_empty() && snap.settings.is_empty() {
+    if snap.accounts.is_empty()
+        && snap.transactions.is_empty()
+        && snap.settings.is_empty()
+        && snap.account_deletion_floor.is_empty()
+    {
         tracing::debug!(
             target: "mint_sync",
             accounts = snap.accounts.len(),
             transactions = snap.transactions.len(),
             settings = snap.settings.len(),
+            floor = snap.account_deletion_floor.len(),
             "empty snapshot — skipping publish",
         );
         return Ok(());
@@ -860,9 +864,17 @@ async fn publish_root_now_zenoh(
         snap.account_deletion_floor = st.account_deletion_floor.clone();
     }
 
-    if snap.accounts.is_empty() && snap.transactions.is_empty() && snap.settings.is_empty() {
+    if snap.accounts.is_empty()
+        && snap.transactions.is_empty()
+        && snap.settings.is_empty()
+        && snap.account_deletion_floor.is_empty()
+    {
         tracing::debug!(
             target: "mint_sync",
+            accounts = snap.accounts.len(),
+            transactions = snap.transactions.len(),
+            settings = snap.settings.len(),
+            floor = snap.account_deletion_floor.len(),
             "empty snapshot — skipping zenoh publish",
         );
         return Ok(());

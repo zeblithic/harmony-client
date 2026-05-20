@@ -2097,21 +2097,34 @@ async fn start_node(
                     // (mirrors owner_state_sync): mint_out_tx / mint_in_rx are
                     // bridged to Zenoh by event_loop on the
                     // `harmony/owner/{addr_hex}/mint-root-v1` topic.
-                    {
+                    'mint_init: {
                         let mint_sync_state_path = app_data_dir
                             .join("mint")
                             .join(crate::mint_sync_persist::MINT_SYNC_STATE_FILENAME);
-                        // MAJOR 6: only fall back to Default when the file is
-                        // genuinely absent. Any other error (corrupt CBOR,
-                        // schema-too-new, I/O glitch) silently resetting the
-                        // replay tracker and deletion floor would be a
-                        // safety regression — both are correctness-critical state.
-                        // `mint_sync_persist::load` already returns Ok(default)
-                        // for NotFound and propagates all other errors, so we
-                        // propagate them here too.
+                        // `mint_sync_persist::load` returns Ok(default) for
+                        // NotFound. Any other error (corrupt CBOR, schema-too-new,
+                        // I/O glitch) means the file exists but can't be trusted.
+                        // Rather than crashing the whole node, we log at error
+                        // level, break out of the init block leaving
+                        // mint_sync_engine_opt as None, and let the rest of the
+                        // node start normally. The user will see mint sync disabled
+                        // but all other features keep working.
                         let initial_sync_state =
-                            crate::mint_sync_persist::load(&mint_sync_state_path)
-                                .map_err(|e| format!("load mint_sync_state failed: {e}"))?;
+                            match crate::mint_sync_persist::load(&mint_sync_state_path) {
+                                Ok(state) => state,
+                                Err(e) => {
+                                    tracing::error!(
+                                        target: "mint_sync",
+                                        path = %mint_sync_state_path.display(),
+                                        error = %e,
+                                        "failed to load mint_sync_state.cbor — mint sync disabled \
+                                         for this session, but other features will start normally. \
+                                         Delete or fix the file to re-enable mint sync."
+                                    );
+                                    // Skip engine init; mint_sync_engine_opt stays None.
+                                    break 'mint_init;
+                                }
+                            };
                         let mint_sync_state =
                             std::sync::Arc::new(tokio::sync::Mutex::new(initial_sync_state));
                         let (mint_out_tx, mint_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
