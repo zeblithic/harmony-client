@@ -234,6 +234,10 @@ impl MintSyncEngine {
         sync_state: Arc<TokioMutex<MintSyncState>>,
     ) -> (Self, MintSyncEngineHandle) {
         let dirty = Arc::new(Notify::new());
+        // Channels:
+        // - `flush_now` capacity 1 is fine for the Task 7 scaffold; Task 8 will
+        //   revisit (owner_state_sync uses capacity 8 + oneshot response pattern
+        //   to surface publish results back to the caller).
         let (flush_tx, flush_rx) = mpsc::channel::<()>(1);
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
         let dirty_for_task = dirty.clone();
@@ -259,6 +263,12 @@ impl MintSyncEngine {
         self.dirty.notify_one();
     }
 
+    /// Synchronously enqueue a flush request. Blocks until the internal task
+    /// accepts the message (capacity 1 — see `new_for_test`).
+    ///
+    /// Returns `Err(MintSyncError::Other(...))` if the channel is closed
+    /// (i.e. the engine has been shut down). Callers must treat that as a
+    /// "no-op, engine is gone" outcome rather than a retryable failure.
     pub async fn flush_now(&self) -> Result<(), MintSyncError> {
         self.flush_now
             .send(())
@@ -267,7 +277,13 @@ impl MintSyncEngine {
         Ok(())
     }
 
+    /// Signal the internal task to exit. Idempotent: if the engine has
+    /// already shut down (channel closed), this is silently treated as
+    /// success. Callers awaiting the engine handle should observe
+    /// completion regardless.
     pub async fn shutdown(&self) -> Result<(), MintSyncError> {
+        // `let _`: channel-closed is the "already shut down" case, which is
+        // a successful no-op from the caller's perspective.
         let _ = self.shutdown.send(()).await;
         Ok(())
     }
