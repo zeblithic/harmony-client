@@ -20624,6 +20624,163 @@ pub struct VotingBallotCastPayload {
     pub approved_count: u8,
 }
 
+/// Tauri event payload for `"voting-tier3-poll-created"`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VotingTier3PollCreatedPayload {
+    pub poll_id: String,
+    pub channel_id: String,
+    pub community_id: String,
+    pub proposer: String,
+    pub sortition_size: u16,
+    pub deliberation_window_seconds: u32,
+    pub drafting_window_seconds: u32,
+    pub ratification_window_seconds: u32,
+}
+
+/// Tauri event payload for `"voting-tier3-sortition-complete"`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VotingTier3SortitionCompletePayload {
+    pub poll_id: String,
+    pub community_id: String,
+    pub primary: Vec<String>,
+    pub backup: Vec<String>,
+}
+
+/// Tauri event payload for `"voting-tier3-drafting-open"`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VotingTier3DraftingOpenPayload {
+    pub poll_id: String,
+    pub community_id: String,
+}
+
+/// One candidate in the ratification ordering (DTO mirroring `CandidateRef`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateRefDto {
+    pub event_hash: String,
+    pub text: String,
+    pub approval_count: u32,
+}
+
+/// Tauri event payload for `"voting-tier3-ratification-open"`. Includes
+/// the synthesized status_quo candidate at the end of `candidate_ordering`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VotingTier3RatificationOpenPayload {
+    pub poll_id: String,
+    pub community_id: String,
+    pub candidate_ordering: Vec<CandidateRefDto>,
+}
+
+/// One per-candidate STAR tally summary (DTO).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateScoreDto {
+    pub event_hash: String,
+    pub total_score: u32,
+    pub runoff_votes: u32,
+}
+
+/// Tauri event payload for `"voting-tier3-finalized"`. Carries enough for
+/// the UI to render the winner without re-querying the poll.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VotingTier3FinalizedPayload {
+    pub poll_id: String,
+    pub community_id: String,
+    pub winner_event_hash: String,
+    pub winner_text: String,
+    pub runner_up_event_hash: Option<String>,
+    pub scores_summary: Vec<CandidateScoreDto>,
+}
+
+#[cfg(test)]
+mod tier3_payload_struct_tests {
+    use super::*;
+
+    #[test]
+    fn tier3_poll_created_payload_serializes_camel_case() {
+        let p = VotingTier3PollCreatedPayload {
+            poll_id: "00".repeat(32),
+            channel_id: "11".repeat(16),
+            community_id: "22".repeat(16),
+            proposer: "33".repeat(16),
+            sortition_size: 20,
+            deliberation_window_seconds: 600,
+            drafting_window_seconds: 600,
+            ratification_window_seconds: 600,
+        };
+        let json = serde_json::to_string(&p).expect("serialize");
+        assert!(json.contains("\"pollId\""));
+        assert!(json.contains("\"channelId\""));
+        assert!(json.contains("\"sortitionSize\":20"));
+        assert!(json.contains("\"deliberationWindowSeconds\":600"));
+    }
+
+    #[test]
+    fn tier3_sortition_complete_payload_serializes_camel_case() {
+        let p = VotingTier3SortitionCompletePayload {
+            poll_id: "aa".repeat(32),
+            community_id: "bb".repeat(16),
+            primary: vec!["cc".repeat(16)],
+            backup: vec!["dd".repeat(16)],
+        };
+        let json = serde_json::to_string(&p).expect("serialize");
+        assert!(json.contains("\"pollId\""));
+        assert!(json.contains("\"primary\""));
+    }
+
+    #[test]
+    fn tier3_drafting_open_payload_serializes_camel_case() {
+        let p = VotingTier3DraftingOpenPayload {
+            poll_id: "ee".repeat(32),
+            community_id: "ff".repeat(16),
+        };
+        let json = serde_json::to_string(&p).expect("serialize");
+        assert!(json.contains("\"pollId\""));
+        assert!(json.contains("\"communityId\""));
+    }
+
+    #[test]
+    fn tier3_ratification_open_payload_serializes_camel_case() {
+        let p = VotingTier3RatificationOpenPayload {
+            poll_id: "01".repeat(32),
+            community_id: "02".repeat(16),
+            candidate_ordering: vec![CandidateRefDto {
+                event_hash: "03".repeat(32),
+                text: "candidate a".into(),
+                approval_count: 5,
+            }],
+        };
+        let json = serde_json::to_string(&p).expect("serialize");
+        assert!(json.contains("\"candidateOrdering\""));
+        assert!(json.contains("\"approvalCount\":5"));
+    }
+
+    #[test]
+    fn tier3_finalized_payload_serializes_camel_case() {
+        let p = VotingTier3FinalizedPayload {
+            poll_id: "04".repeat(32),
+            community_id: "05".repeat(16),
+            winner_event_hash: "06".repeat(32),
+            winner_text: "the winner".into(),
+            runner_up_event_hash: Some("07".repeat(32)),
+            scores_summary: vec![CandidateScoreDto {
+                event_hash: "08".repeat(32),
+                total_score: 12,
+                runoff_votes: 3,
+            }],
+        };
+        let json = serde_json::to_string(&p).expect("serialize");
+        assert!(json.contains("\"winnerEventHash\""));
+        assert!(json.contains("\"runnerUpEventHash\""));
+        assert!(json.contains("\"totalScore\":12"));
+    }
+}
+
 /// Tauri IPC: create a Tier 1 (Approval) poll. Returns the new
 /// `PollId` as a hex string (32 bytes → 64 chars).
 ///
