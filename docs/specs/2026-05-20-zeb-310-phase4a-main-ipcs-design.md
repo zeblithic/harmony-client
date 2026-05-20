@@ -8,7 +8,7 @@
 
 | Layer | Additions |
 |---|---|
-| `community_voting_core.rs` | 8 `pub fn build_signed_*_tier3` constructors |
+| `community_voting_core.rs` | 9 `pub fn build_signed_*_tier3` constructors |
 | `community_voting_log_engine.rs` | post-apply orchestration for kd=sf / kd=cl / kd=rs |
 | `lib.rs` | 6 `#[tauri::command]` handlers + 5 emit sites + 5 payload structs |
 | `src/lib/voting-adapter.ts` | 6 IPC methods + 5 subscriber methods + connectAdapter wiring |

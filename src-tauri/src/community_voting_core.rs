@@ -1147,7 +1147,7 @@ pub fn build_signed_ballot_tier1(
 
 /// Build a fully-signed `kd=cr` PollCreate event for Tier 3 (Sortition).
 ///
-/// Used by the `voting_create_tier3_poll` IPC and any test fixture that
+/// Used by the `voting_create_tier3_proposal` IPC and any test fixture that
 /// needs to mint a Tier 3 PollCreate event. Tier is hardcoded to
 /// `Tier::Sortition` (parity with `build_signed_poll_create_tier1`).
 pub fn build_signed_poll_create_tier3(
