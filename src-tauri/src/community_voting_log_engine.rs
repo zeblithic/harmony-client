@@ -1397,15 +1397,13 @@ mod tests {
         let (publisher_tx, _pub_rx) = mpsc::channel::<Vec<u8>>(32);
         let (_sub_tx, subscriber_rx) = mpsc::channel::<Vec<u8>>(32);
 
-        let engine = Arc::new(
-            VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
-                community_id,
-                voting_log: Arc::clone(&voting_log),
-                publisher_tx,
-                subscriber_rx,
-            })
-            .await,
-        );
+        let engine = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+            community_id,
+            voting_log: Arc::clone(&voting_log),
+            publisher_tx,
+            subscriber_rx,
+        })
+        .await;
 
         // Install a minimal DfrostLogRegistry with a running engine for community_id.
         // This satisfies the Cluster E check (DfrostNotReady guard) without needing
@@ -1492,15 +1490,13 @@ mod tests {
         let (publisher_tx, _pub_rx) = mpsc::channel::<Vec<u8>>(32);
         let (_sub_tx, subscriber_rx) = mpsc::channel::<Vec<u8>>(32);
 
-        let engine = Arc::new(
-            VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
-                community_id,
-                voting_log: Arc::clone(&voting_log),
-                publisher_tx,
-                subscriber_rx,
-            })
-            .await,
-        );
+        let engine = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+            community_id,
+            voting_log: Arc::clone(&voting_log),
+            publisher_tx,
+            subscriber_rx,
+        })
+        .await;
 
         let (create_event, electorate) =
             tier3_poll_create_event(actor, "dev-e", 5_000, sortition_size);
@@ -1596,15 +1592,13 @@ mod tests {
         let (publisher_tx, _pub_rx) = mpsc::channel::<Vec<u8>>(32);
         let (_sub_tx, subscriber_rx) = mpsc::channel::<Vec<u8>>(32);
 
-        let engine = Arc::new(
-            VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
-                community_id,
-                voting_log: Arc::clone(&voting_log),
-                publisher_tx,
-                subscriber_rx,
-            })
-            .await,
-        );
+        let engine = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+            community_id,
+            voting_log: Arc::clone(&voting_log),
+            publisher_tx,
+            subscriber_rx,
+        })
+        .await;
 
         let (create_event, electorate) =
             tier3_poll_create_event(actor, "dev-f", 6_000, sortition_size);
