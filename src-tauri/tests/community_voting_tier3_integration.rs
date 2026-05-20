@@ -905,6 +905,7 @@ async fn tier3_full_lifecycle_4_stage_convergence() {
         let mut all_candidates = t3.candidates.clone();
         all_candidates.push(sq.clone());
         drafting_advancers(&all_candidates, mini_public_size, sq_hash)
+            .expect("status_quo is in all_candidates")
     };
     assert_eq!(
         advancers.len(),

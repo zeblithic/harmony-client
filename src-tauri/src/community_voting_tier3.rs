@@ -410,8 +410,10 @@ impl Tier3PollState {
 
     /// Compute the current mini-public set at HLC watermark `now`.
     ///
-    /// Primary minus members who declined at or before `now`, plus backup
-    /// auto-promotions (one backup promoted per decline, in backup order).
+    /// The mini-public is the first `sortition_size` non-declined members from the
+    /// ordered concat of `primary || backup`. This naturally handles cascading declines
+    /// (Cluster B fix, R2 bot review): if a promoted backup member also declines, the
+    /// next backup takes their slot — both are skipped in the same walk.
     ///
     /// Returns empty set if sortition_result is None.
     pub fn current_mini_public(&self, now: &Hlc) -> HashSet<OwnerAddr> {
@@ -420,7 +422,11 @@ impl Tier3PollState {
             None => return HashSet::new(),
         };
 
-        let decline_count = self.decline_count_at(now);
+        // The target mini-public size is the length of the primary slice (which equals
+        // sortition_size in a well-formed sortition). Using sr.primary.len() directly means
+        // the logic is correct even in tests that construct a primary slice shorter than
+        // meta.config.sortition_size.
+        let target_size = sr.primary.len();
 
         // Collect declined actors (those who declined up to `now`).
         let declined: HashSet<OwnerAddr> = self
@@ -434,15 +440,19 @@ impl Tier3PollState {
             .map(|(addr, _)| *addr)
             .collect();
 
-        // Start from primary, remove declines.
-        let mut set: HashSet<OwnerAddr> = sr.primary.iter().copied().collect();
-        for d in &declined {
-            set.remove(d);
-        }
-
-        // Auto-promote backups in order (one per decline).
-        for backup in sr.backup.iter().take(decline_count) {
-            set.insert(*backup);
+        // Walk primary || backup in order; collect non-declined until we have target_size.
+        // Handles promoted-then-declined backups correctly (Cluster B fix, R2 bot review):
+        // both declined primaries and declined backups are skipped in a single unified pass.
+        // A backup that was promoted (because a primary declined) and then itself declined
+        // is simply skipped in the walk — the next backup takes the slot.
+        let mut set = HashSet::new();
+        for member in sr.primary.iter().chain(sr.backup.iter()) {
+            if set.len() >= target_size {
+                break;
+            }
+            if !declined.contains(member) {
+                set.insert(*member);
+            }
         }
 
         set
@@ -524,6 +534,11 @@ pub enum VerifyError {
     UnknownCandidate,
     #[error("poll lifecycle not Closed at HLC (PollResult R1)")]
     NotInClosedStage,
+    /// verify_sr / verify_ratification_ballot called before status_quo synthesized.
+    /// This means the poll has not yet reached the Drafting/Ratification stage,
+    /// so a PollResult or RatificationBallot event arriving now is premature.
+    #[error("status_quo not yet synthesized (poll not in Drafting/Ratification stage)")]
+    StatusQuoNotSynthesized,
 }
 
 // ── Verify functions ──────────────────────────────────────────────────────────
@@ -654,8 +669,11 @@ pub fn verify_sr(
 
     // Build candidate list from state (same as the ordered list used at ratification open).
     // For SR1, we re-derive the ordered candidate set from the stored candidates.
+    // If status_quo is not yet present, the poll hasn't reached Drafting/Ratification
+    // stage — the PollResult event is premature; reject with StatusQuoNotSynthesized.
     let primary_size = poll_state.meta.config.sortition_size as usize;
-    let advancers = drafting_advancers(&poll_state.candidates, primary_size, sq_hash);
+    let advancers = drafting_advancers(&poll_state.candidates, primary_size, sq_hash)
+        .ok_or(VerifyError::StatusQuoNotSynthesized)?;
     let ordered_candidates = ratification_candidates_ordering(&advancers, sq_hash);
 
     let recomputed = tally_star(&ordered_candidates, &poll_state.ratification_ballots);
@@ -696,10 +714,13 @@ pub fn verify_ratification_ballot(
         decode_payload(&event.payload).map_err(VerifyError::PayloadDecode)?;
 
     // Compute the ratification candidate count from state.
+    // If status_quo is not yet present, the poll hasn't reached Drafting/Ratification
+    // stage — a RatificationBallot arriving now is premature.
     let sq = synthesize_status_quo(&poll_state.meta.poll_id);
     let sq_hash = sq.event_hash;
     let primary_size = poll_state.meta.config.sortition_size as usize;
-    let advancers = drafting_advancers(&poll_state.candidates, primary_size, sq_hash);
+    let advancers = drafting_advancers(&poll_state.candidates, primary_size, sq_hash)
+        .ok_or(VerifyError::StatusQuoNotSynthesized)?;
     let expected_candidate_count = advancers.len();
 
     validate_ratification_ballot(&payload, expected_candidate_count)?;
@@ -741,15 +762,17 @@ pub fn synthesize_status_quo(poll_id: &PollId) -> DraftCandidateState {
 /// Non-status-quo candidates are filtered by threshold, sorted by
 /// `approval_count DESC`, ties by `candidate_event_hash lex ASC`.
 ///
-/// # Panics
-///
-/// Panics if `status_quo_hash` is not found in `candidates`. The contract
-/// is that `materialize()` synthesizes status_quo before calling this.
+/// Returns `None` if `status_quo_hash` is not present in `candidates`.
+/// This happens when the poll has not yet reached the Drafting stage
+/// (status_quo is synthesized by `materialize()` at drafting open). Callers
+/// that require status_quo — e.g. `verify_sr` and `verify_ratification_ballot`
+/// — must return an appropriate error (`VerifyError::StatusQuoNotSynthesized`)
+/// rather than panicking.
 pub fn drafting_advancers(
     candidates: &[DraftCandidateState],
     mini_public_size: usize,
     status_quo_hash: CandidateEventHash,
-) -> Vec<crate::community_voting_star::CandidateRef> {
+) -> Option<Vec<crate::community_voting_star::CandidateRef>> {
     use crate::community_voting_star::CandidateRef;
 
     let threshold = mini_public_size.div_ceil(2); // ceil(N/2)
@@ -780,16 +803,16 @@ pub fn drafting_advancers(
         .collect();
 
     // Step 4: status_quo always advances, always last.
+    // Return None if not present (poll not yet at Drafting stage).
     let status_quo = candidates
         .iter()
-        .find(|c| c.event_hash == status_quo_hash)
-        .expect("materialize() guarantees status_quo synthesis at drafting open");
+        .find(|c| c.event_hash == status_quo_hash)?;
     advancers.push(CandidateRef {
         event_hash: status_quo.event_hash,
         approval_count: status_quo.approvals.len() as u32,
     });
 
-    advancers
+    Some(advancers)
 }
 
 /// Final ratification candidate ordering: `approval_count DESC`,
@@ -1574,7 +1597,8 @@ mod tests {
         let sq_hash = sq.event_hash;
         // mini_public_size=4, threshold=2; candidates have 1 approval each (below 2)
         let candidates = vec![make_candidate(0x01, &[1]), make_candidate(0x02, &[2]), sq];
-        let result = drafting_advancers(&candidates, 4, sq_hash);
+        let result =
+            drafting_advancers(&candidates, 4, sq_hash).expect("status_quo is in candidates");
         assert_eq!(result.len(), 1, "only status_quo should advance");
         assert_eq!(result[0].event_hash, sq_hash);
     }
@@ -1590,7 +1614,8 @@ mod tests {
             make_candidate(0x02, &[2]),
             sq,
         ];
-        let result = drafting_advancers(&candidates, 4, sq_hash);
+        let result =
+            drafting_advancers(&candidates, 4, sq_hash).expect("status_quo is in candidates");
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].event_hash, [0x01; 32]);
         assert_eq!(result[1].event_hash, sq_hash, "status_quo must be last");
@@ -1606,7 +1631,8 @@ mod tests {
             (1u8..=10).map(|b| make_candidate(b, &[1, 2, 3])).collect();
         candidates.push(sq);
 
-        let result = drafting_advancers(&candidates, 4, sq_hash);
+        let result =
+            drafting_advancers(&candidates, 4, sq_hash).expect("status_quo is in candidates");
         assert_eq!(
             result.len(),
             MAX_RATIFICATION_CANDIDATES,
@@ -1630,7 +1656,8 @@ mod tests {
             make_candidate(0x20, &[1, 2, 3]),
             sq,
         ];
-        let result = drafting_advancers(&candidates, 4, sq_hash);
+        let result =
+            drafting_advancers(&candidates, 4, sq_hash).expect("status_quo is in candidates");
         assert!(result.len() >= 2);
         assert_eq!(
             result.last().unwrap().event_hash,
@@ -1653,7 +1680,8 @@ mod tests {
             sq,
         ];
         // mini_public=4, threshold=2; all three pass
-        let result = drafting_advancers(&candidates, 4, sq_hash);
+        let result =
+            drafting_advancers(&candidates, 4, sq_hash).expect("status_quo is in candidates");
         // Expected order: 0x10 (3 approvals, lower hash), 0x30 (3 approvals, higher hash),
         // 0x20 (2 approvals), status_quo (last)
         assert_eq!(result[0].event_hash, [0x10; 32]);
@@ -1675,7 +1703,8 @@ mod tests {
             make_candidate(0x02, &[1, 2, 3]), // 3 approvals — at threshold=3
             sq,
         ];
-        let result = drafting_advancers(&candidates, 5, sq_hash);
+        let result =
+            drafting_advancers(&candidates, 5, sq_hash).expect("status_quo is in candidates");
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].event_hash, [0x02; 32], "0x02 should advance");
         assert_eq!(result[1].event_hash, sq_hash, "status_quo last");
@@ -1694,7 +1723,8 @@ mod tests {
             make_candidate(0x02, &[1, 2]), // 2 approvals — at threshold=2
             sq,
         ];
-        let result = drafting_advancers(&candidates, 4, sq_hash);
+        let result =
+            drafting_advancers(&candidates, 4, sq_hash).expect("status_quo is in candidates");
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].event_hash, [0x02; 32], "0x02 should advance");
         assert_eq!(result[1].event_hash, sq_hash, "status_quo last");
@@ -1710,7 +1740,8 @@ mod tests {
             make_candidate(0x20, &[1, 2]),
             sq,
         ];
-        let advancers = drafting_advancers(&candidates, 4, sq_hash);
+        let advancers =
+            drafting_advancers(&candidates, 4, sq_hash).expect("status_quo is in candidates");
         let order1 = ratification_candidates_ordering(&advancers, sq_hash);
         let order2 = ratification_candidates_ordering(&advancers, sq_hash);
         assert_eq!(order1, order2, "ordering must be deterministic");
@@ -1728,7 +1759,8 @@ mod tests {
             make_candidate(0x10, &[1, 2, 3]),
             sq,
         ];
-        let advancers = drafting_advancers(&candidates, 4, sq_hash);
+        let advancers =
+            drafting_advancers(&candidates, 4, sq_hash).expect("status_quo is in candidates");
         let ordered = ratification_candidates_ordering(&advancers, sq_hash);
         assert_eq!(ordered[0].event_hash, [0x10; 32], "highest approvals first");
         assert_eq!(ordered[1].event_hash, [0x20; 32]);
@@ -1752,7 +1784,8 @@ mod tests {
             make_candidate(0x03, &[1, 2, 3, 4]), // 4 — above
             sq,
         ];
-        let result = drafting_advancers(&candidates, 6, sq_hash);
+        let result =
+            drafting_advancers(&candidates, 6, sq_hash).expect("status_quo is in candidates");
         let hashes: Vec<u8> = result.iter().map(|c| c.event_hash[0]).collect();
         assert!(
             !hashes.contains(&0x01),
@@ -2315,7 +2348,8 @@ mod tests {
         let sq = synthesize_status_quo(&poll.meta.poll_id);
         let sq_hash = sq.event_hash;
         let primary_size = poll.meta.config.sortition_size as usize;
-        let advancers = drafting_advancers(&poll.candidates, primary_size, sq_hash);
+        let advancers = drafting_advancers(&poll.candidates, primary_size, sq_hash)
+            .expect("status_quo is in candidates (poll_at_closed_with_ballots synthesizes it)");
         let ordered = ratification_candidates_ordering(&advancers, sq_hash);
         let expected_result = tally_star(&ordered, &poll.ratification_ballots);
         let payload = Tier3PollResultPayload {
@@ -2566,5 +2600,132 @@ mod tests {
             verify_da_candidate_exists(&ev, &poll),
             Err(VerifyError::UnknownCandidate)
         );
+    }
+
+    // ── Cluster A regression tests ────────────────────────────────────────────
+
+    // A1: verify_sr on a Stage 2 (Deliberation) poll with no status_quo synthesized
+    //     must NOT panic — must return StatusQuoNotSynthesized.
+    #[test]
+    fn verify_sr_on_stage_2_poll_rejects_with_status_quo_not_synthesized() {
+        // Poll in Stage::Deliberation (sortition done, dw not elapsed).
+        // status_quo has NOT been synthesized into candidates yet.
+        let mut poll = new_poll(0); // create at 0, dw=10s, fw=10s
+        poll.apply_event(&ss_event(10, vec![addr(1), addr(2), addr(3)], vec![]))
+            .expect("ss");
+        // Apply kd=cl so NotInClosedStage is bypassed (we want to hit StatusQuoNotSynthesized).
+        let cl_ev = make_event(PollEventKindCode::PollClose, 5000, addr(0xff));
+        poll.apply_event(&cl_ev).expect("cl");
+        // No status_quo in candidates — poll hasn't reached Drafting yet.
+        assert!(poll.candidates.is_empty());
+
+        let payload = Tier3PollResultPayload {
+            poll_id: poll_id(),
+            result: star_result(),
+        };
+        let ev = make_event_with_payload(
+            PollEventKindCode::PollResult,
+            5500,
+            addr(0xfe),
+            encode(&payload),
+        );
+        // Must not panic; must return StatusQuoNotSynthesized.
+        let result = verify_sr(&ev, &poll);
+        assert_eq!(
+            result,
+            Err(VerifyError::StatusQuoNotSynthesized),
+            "expected StatusQuoNotSynthesized, got {result:?}"
+        );
+    }
+
+    // A2: verify_ratification_ballot on a Stage 1 (Sortition) poll with no status_quo
+    //     must NOT panic — must return StatusQuoNotSynthesized.
+    #[test]
+    fn verify_ratification_ballot_on_stage_1_poll_rejects_with_status_quo_not_synthesized() {
+        // Poll in Stage::Ratification time window, but status_quo NOT synthesized.
+        let mut meta = meta_at(0);
+        meta.config.sortition_size = 3;
+        let mut poll = Tier3PollState::new_from_create(meta, electorate(20));
+        poll.apply_event(&ss_event(10, vec![addr(1), addr(2), addr(3)], vec![]))
+            .expect("ss");
+        // Wall_ms=25000 → past dw+fw threshold (20000) → Ratification stage.
+        // But no candidates / status_quo synthesized.
+        assert!(poll.candidates.is_empty());
+
+        let rb_payload = RatificationBallotPayload {
+            poll_id: poll_id(),
+            scores: vec![3, 1], // 2 scores — but no status_quo yet
+        };
+        let ev = make_event_with_payload(
+            PollEventKindCode::RatificationBallot,
+            25000,
+            addr(5), // in electorate
+            encode(&rb_payload),
+        );
+        // Must not panic; must return StatusQuoNotSynthesized.
+        let result = verify_ratification_ballot(&ev, &poll);
+        assert_eq!(
+            result,
+            Err(VerifyError::StatusQuoNotSynthesized),
+            "expected StatusQuoNotSynthesized, got {result:?}"
+        );
+    }
+
+    // ── Cluster B regression test ────────────────────────────────────────────
+
+    // B1: primary[i] declines → backup[0] promoted; then backup[0] declines →
+    //     backup[1] takes their slot; set size stays = sortition_size and
+    //     backup[0] is NOT in the set.
+    #[test]
+    fn current_mini_public_promoted_backup_decline_cascades_correctly() {
+        // primary=[addr(1), addr(2)], backup=[addr(10), addr(11), addr(12)]
+        // sortition_size=2 (so mini-public should always be 2 members)
+        let mut meta = meta_at(0);
+        meta.config.sortition_size = 2;
+        let electorate_addrs = vec![
+            addr(1),
+            addr(2),
+            addr(10),
+            addr(11),
+            addr(12),
+            addr(20),
+            addr(21),
+        ];
+        let mut poll = Tier3PollState::new_from_create(meta, electorate_addrs);
+        poll.apply_event(&ss_event(
+            10,
+            vec![addr(1), addr(2)],
+            vec![addr(10), addr(11), addr(12)],
+        ))
+        .expect("ss");
+
+        // Step 1: addr(1) (primary) declines → addr(10) (backup[0]) promoted.
+        poll.apply_event(&md_event(20, addr(1)))
+            .expect("md addr(1)");
+        let mp = poll.current_mini_public(&hlc(30));
+        assert_eq!(mp.len(), 2, "mini-public size must stay 2");
+        assert!(mp.contains(&addr(2)), "addr(2) still primary");
+        assert!(mp.contains(&addr(10)), "addr(10) promoted from backup");
+        assert!(!mp.contains(&addr(1)), "addr(1) declined");
+
+        // Step 2: addr(10) (promoted backup) declines → addr(11) (backup[1]) takes slot.
+        poll.apply_event(&md_event(40, addr(10)))
+            .expect("md addr(10)");
+        let mp2 = poll.current_mini_public(&hlc(50));
+        assert_eq!(
+            mp2.len(),
+            2,
+            "mini-public size must stay 2 after second decline"
+        );
+        assert!(mp2.contains(&addr(2)), "addr(2) still primary");
+        assert!(
+            mp2.contains(&addr(11)),
+            "addr(11) must be promoted (backup[1])"
+        );
+        assert!(
+            !mp2.contains(&addr(10)),
+            "addr(10) declined — must not be in mini-public"
+        );
+        assert!(!mp2.contains(&addr(1)), "addr(1) still declined");
     }
 }
