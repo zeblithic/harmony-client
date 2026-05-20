@@ -331,6 +331,24 @@ impl VotingLog {
                     ApplyError::PayloadDecode
                 }
             })?;
+
+            // Cluster K fix: sync PollMeta.lifecycle from tier3 stage after a
+            // terminal transition (Finalized / Failed).  Must happen BEFORE
+            // pushing the event so archive_finalized_polls() sees the synced state.
+            match tier3_state.stage {
+                crate::community_voting_tier3::Stage::Finalized => {
+                    state.meta.lifecycle = Lifecycle::Finalized;
+                    // Stamp finalized_at_ms so archive_finalized_polls() can age it.
+                    state.meta.finalized_at_ms = Some(event.hlc.wall_ms);
+                }
+                crate::community_voting_tier3::Stage::Failed => {
+                    // No Lifecycle::Failed variant; Closed is the closest match
+                    // and prevents the poll from appearing Open after failure.
+                    state.meta.lifecycle = Lifecycle::Closed;
+                }
+                _ => {} // Non-terminal stages: lifecycle stays Open.
+            }
+
             state.events.push(event.clone());
             self.events.push(event);
             return Ok(poll_id);
@@ -1712,6 +1730,108 @@ mod tier3_dispatch_tests {
 
         let t3 = log.polls[&pid].tier_state.as_tier3().unwrap();
         assert_eq!(t3.stage, Stage::Failed);
+    }
+
+    // ── Test 5a: Cluster K regression — kd=rs sets lifecycle=Finalized ──────────
+    //
+    // After kd=rs is applied to a Tier 3 poll, state.meta.lifecycle must be
+    // Lifecycle::Finalized (not stuck at Lifecycle::Open). This is required so
+    // archive_finalized_polls() can identify and archive the poll.
+
+    #[test]
+    fn dispatch_tier3_kd_rs_syncs_lifecycle_to_finalized() {
+        use crate::community_voting_star::{CandidateRef, StarResult};
+        use crate::community_voting_tier3::{Stage, Tier3PollResultPayload};
+
+        let mut log = VotingLog::new();
+        let creator = addr(0xaa);
+        let cfg = tier3_config();
+        let create_ev = tier3_create_event(creator, &cfg);
+        let pid = log.apply(create_ev, &cid()).expect("tier3 create");
+
+        // Lifecycle starts Open.
+        assert_eq!(
+            log.polls[&pid].meta.lifecycle,
+            Lifecycle::Open,
+            "lifecycle must start Open"
+        );
+
+        // Build a minimal Tier3PollResultPayload (apply doesn't re-verify tally).
+        let dummy_hash = [0x42u8; 32];
+        let dummy_candidate = CandidateRef {
+            event_hash: dummy_hash,
+            approval_count: 0,
+        };
+        let star_result = StarResult {
+            winner: dummy_candidate.clone(),
+            finalists: vec![dummy_candidate.clone()],
+            total_scores: vec![0],
+            runoff_votes: vec![1],
+        };
+        let rs_payload = Tier3PollResultPayload {
+            poll_id: pid,
+            result: star_result,
+        };
+
+        log.apply(
+            tier3_event_with_payload(
+                PollEventKindCode::PollResult,
+                5000,
+                creator,
+                encode(&rs_payload),
+            ),
+            &cid(),
+        )
+        .expect("kd=rs apply must succeed");
+
+        // Cluster K fix: lifecycle must be synced to Finalized.
+        assert_eq!(
+            log.polls[&pid].meta.lifecycle,
+            Lifecycle::Finalized,
+            "lifecycle must be Finalized after kd=rs"
+        );
+        // Tier 3 stage also Finalized.
+        let t3 = log.polls[&pid].tier_state.as_tier3().unwrap();
+        assert_eq!(t3.stage, Stage::Finalized, "tier3 stage must be Finalized");
+        // finalized_at_ms must be set (kd=rs hlc.wall_ms = 5000).
+        assert_eq!(
+            log.polls[&pid].meta.finalized_at_ms,
+            Some(5000),
+            "finalized_at_ms must be set to kd=rs event wall_ms"
+        );
+    }
+
+    // ── Test 5b: Cluster K regression — kd=sf sets lifecycle=Closed ─────────────
+    //
+    // After kd=sf, lifecycle must be Closed (not Open). Failed polls cannot be
+    // archived the same way as finalized ones, but they must leave the Open state.
+
+    #[test]
+    fn dispatch_tier3_kd_sf_syncs_lifecycle_to_closed() {
+        let mut log = VotingLog::new();
+        let creator = addr(0xaa);
+        let cfg = tier3_config();
+        let create_ev = tier3_create_event(creator, &cfg);
+        let pid = log.apply(create_ev, &cid()).expect("tier3 create");
+
+        let sf_payload = SortitionFailedPayload { poll_id: pid };
+        log.apply(
+            tier3_event_with_payload(
+                PollEventKindCode::SortitionFailed,
+                3000,
+                creator,
+                encode(&sf_payload),
+            ),
+            &cid(),
+        )
+        .expect("kd=sf");
+
+        // Cluster K fix: lifecycle must be Closed (not Open) after failure.
+        assert_eq!(
+            log.polls[&pid].meta.lifecycle,
+            Lifecycle::Closed,
+            "lifecycle must be Closed after kd=sf (poll failed)"
+        );
     }
 
     // ── Test 6: invalid kind for Tier 3 is rejected at dispatch ─────────────────
