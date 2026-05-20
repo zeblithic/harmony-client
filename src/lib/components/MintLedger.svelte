@@ -110,6 +110,7 @@
   let editingCurrency = $state(false);
   let currencyDraft = $state('');
   let currencyError = $state<string | null>(null);
+  let savingCurrency = $state(false);
 
   async function startEditCurrency() {
     currencyDraft = defaultCurrency;
@@ -118,17 +119,24 @@
   }
 
   async function saveCurrency() {
+    if (savingCurrency) return;
     const trimmed = currencyDraft.trim().toUpperCase();
     if (!/^[A-Z]{1,5}$/.test(trimmed)) {
       currencyError = 'Currency must be 1-5 uppercase ASCII letters';
       return;
     }
+    savingCurrency = true;
     try {
       await service.setDefaultCurrency(trimmed);
+      // Invalidate any in-flight load() — its epoch guard will now skip the
+      // stale defaultCurrency assignment instead of clobbering our save.
+      loadEpoch++;
       defaultCurrency = trimmed;
       editingCurrency = false;
     } catch (e) {
       currencyError = e instanceof Error ? e.message : String(e);
+    } finally {
+      savingCurrency = false;
     }
   }
 
@@ -158,14 +166,18 @@
             bind:value={currencyDraft}
             maxlength="5"
             aria-label="Default currency"
+            disabled={savingCurrency}
             oninput={(e) => { currencyDraft = (e.currentTarget as HTMLInputElement).value.toUpperCase(); }}
             onkeydown={(e) => {
-              if (e.key === 'Enter') saveCurrency();
-              else if (e.key === 'Escape') cancelEditCurrency();
+              if (e.key === 'Enter') {
+                if (!savingCurrency) saveCurrency();
+              } else if (e.key === 'Escape') {
+                if (!savingCurrency) cancelEditCurrency();
+              }
             }}
           />
-          <button type="button" onclick={saveCurrency} aria-label="Save default currency">Save</button>
-          <button type="button" onclick={cancelEditCurrency} aria-label="Cancel">Cancel</button>
+          <button type="button" onclick={saveCurrency} disabled={savingCurrency} aria-label="Save default currency">{savingCurrency ? 'Saving…' : 'Save'}</button>
+          <button type="button" onclick={cancelEditCurrency} disabled={savingCurrency} aria-label="Cancel">Cancel</button>
           {#if currencyError}<span role="alert" class="error">{currencyError}</span>{/if}
         </span>
       {:else}
