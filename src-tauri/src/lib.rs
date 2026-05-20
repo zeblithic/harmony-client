@@ -22421,13 +22421,17 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
         crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
 
     // 5. Build the round-specific event (sealed dr rn=2 OR dk). Each
-    //    branch returns `(event, self_x25519_priv)` — the outbox lock
-    //    is acquired ONCE per branch to produce both values together
-    //    (R4-2 Greptile P2: avoid double-lock; both reads access the
-    //    same `Arc<SigningKey>` and neither mutates the outbox).
-    let (event_to_apply, self_x25519_priv): (
+    //    branch returns `(event, self_x25519_priv, r2_secret_to_stash)`
+    //    — the outbox lock is acquired ONCE per branch to produce both
+    //    values together (R4-2 Greptile P2: avoid double-lock; both
+    //    reads access the same `Arc<SigningKey>` and neither mutates
+    //    the outbox). The Option<r2_secret> is Some only for round 2
+    //    and is stashed AFTER successful apply at the common site below
+    //    — see R6 fix at the apply block for the rollback rationale.
+    let (event_to_apply, self_x25519_priv, r2_secret_to_stash): (
         crate::community_dfrost_types::SignedCommitteeEvent,
         [u8; 32],
+        Option<frost_ristretto255::keys::dkg::round2::SecretPackage>,
     ) = if round_num == 2 {
         // ─── ROUND 2 ──────────────────────────────────────────────────
         //
@@ -22584,16 +22588,15 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
             });
         }
 
-        // Stash r2_secret BEFORE building the event. If apply fails the
-        // secret remains so the caller can retry; if we stashed it
-        // after apply and apply succeeded but the IPC errored later,
-        // we'd lose the only copy of the round-2 secret and the
-        // ceremony would be unrecoverable.
-        {
-            let mut log = log_arc.lock().await;
-            log.local_dkg_secret2 = Some(r2_secret);
-        }
-
+        // R6 (Cursor MEDIUM "Round two blocks failed retry"): defer the
+        // `local_dkg_secret2` stash until AFTER the round-2 event lands
+        // via `apply_with_identity` below. Stashing before apply meant
+        // any failure in build_signed or apply left `local_dkg_secret2`
+        // populated; the next round-2 attempt then hit the
+        // "already submitted" idempotency guard above and the node was
+        // stuck in DKG. Thread r2_secret through the if-else and let the
+        // common apply site stash on success only.
+        //
         // Build the dr rn=2 payload + sign the envelope. R4-2: consolidate
         // outbox lock — produce signed event + self's X25519 priv (needed
         // by apply_with_identity below) in a single lock acquisition.
@@ -22614,7 +22617,7 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
         )
         .map_err(|e| format!("dfrost_contribute_dkg_round: build_signed: {e}"))?;
         let x_priv: [u8; 32] = *crate::dm_signing::ed25519_priv_to_x25519(signing_key);
-        (ev, x_priv)
+        (ev, x_priv, Some(r2_secret))
     } else {
         // ─── ROUND 3 ──────────────────────────────────────────────────
         //
@@ -22780,7 +22783,8 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
         )
         .map_err(|e| format!("dfrost_contribute_dkg_round: build_signed: {e}"))?;
         let x_priv: [u8; 32] = *crate::dm_signing::ed25519_priv_to_x25519(signing_key);
-        (ev, x_priv)
+        // Round 3 never mutates `local_dkg_secret2`; only round 2 stashes.
+        (ev, x_priv, None)
     };
 
     // 6. (Apply path below uses the X25519 priv derived in the same
@@ -22789,11 +22793,26 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
     //    the local rn=2 event the ciphertexts target peers only, so the
     //    decrypt branch is also a no-op for self.)
 
-    // 7. Apply locally.
+    // 7. Apply locally. For round 2, the r2_secret stash and the apply
+    //    happen in the SAME lock window so a failed apply rolls back the
+    //    stash atomically (R6 Cursor MEDIUM). For round 3, no
+    //    `local_dkg_secret2` mutation happens here — the field is only
+    //    cloned upstream — so failure simply propagates.
     {
         let mut log = log_arc.lock().await;
-        log.apply_with_identity(event_to_apply, &self_owner, &self_x25519_priv)
-            .map_err(|e| format!("dfrost_contribute_dkg_round: apply: {e:?}"))?;
+        let prior_secret2 = if r2_secret_to_stash.is_some() {
+            let prior = log.local_dkg_secret2.take();
+            log.local_dkg_secret2 = r2_secret_to_stash;
+            Some(prior)
+        } else {
+            None
+        };
+        if let Err(e) = log.apply_with_identity(event_to_apply, &self_owner, &self_x25519_priv) {
+            if let Some(prior) = prior_secret2 {
+                log.local_dkg_secret2 = prior;
+            }
+            return Err(format!("dfrost_contribute_dkg_round: apply: {e:?}"));
+        }
     }
 
     // 8. Emit progress event. participants_so_far reflects the
