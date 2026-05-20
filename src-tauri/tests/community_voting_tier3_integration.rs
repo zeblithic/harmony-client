@@ -2668,3 +2668,154 @@ async fn engine_auto_sf_on_mass_decline_from_proposer() {
 
     drop(engines);
 }
+
+/// ZEB-310 Task 10: engine-auto orchestration of kd=cl PollClose.
+///
+/// Verifies the post-apply hook on `VotingLogEngine` mints + publishes a
+/// signed kd=cl when:
+///
+///   (1) the poll is in `Stage::Ratification` per `current_stage_at(now_hlc)`
+///       — i.e. sortition_result is Some AND now ≥ create + dw + fw,
+///   (2) `close_event_hash.is_none()` (no prior kd=cl applied), AND
+///   (3) the ratification window has expired (now ≥ create + dw + fw + rw).
+///
+/// Setup: build a Tier 3 poll with the minimum-valid 60-second windows.
+/// Inject kd=ss with `hlc.wall_ms = t0 + 500_000` (320s past the ratification
+/// deadline) so the hook's HLC-driven "now" view sees the deadline as
+/// expired. engine_a.publish_event(kd=ss) applies kd=ss locally, fires the
+/// post-apply hook, which mints + broadcasts kd=cl.
+///
+/// The plan's "≥1 ballot" guideline is satisfied implicitly: with 0 ballots
+/// + 1 candidate (status_quo, always synthesized), `tally_star` still
+/// produces a deterministic result on the kd=rs leg (Task 11). For kd=cl
+/// alone, no ballots are required — only the window-expiry guards above.
+#[tokio::test]
+async fn engine_auto_cl_when_ratification_window_expires() {
+    const COMMUNITY_ID: SpaceId = SpaceId([0xC2; 16]);
+    const SORTITION_SIZE: u16 = 20;
+    const N_IDENTITIES: usize = 50;
+
+    let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
+    let proposer = &identities[49];
+    let full_electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
+    let sortition_pool: Vec<OwnerAddr> = identities[..49].iter().map(|id| id.owner).collect();
+
+    // engine_a holds the proposer's signing key → orchestration hook active.
+    let engines = setup_two_voting_engine_bridge_with_signing(COMMUNITY_ID, proposer).await;
+
+    // Synthetic t0 — the kd=cl trigger is HLC-driven (uses
+    // `t3.last_hlc.wall_ms`, NOT wall-clock — see hook comments in
+    // community_voting_log_engine.rs). The kd=ss event below is minted
+    // with `hlc.wall_ms = t0 + 500_000`, well past the ratification
+    // deadline (`t0 + 180_000`).
+    let t0: u64 = 6_000_000;
+
+    let config = Tier3PollConfigPayload {
+        proposal_text: "Engine-auto kd=cl test".into(),
+        sortition_size: SORTITION_SIZE,
+        // Minimum-valid windows per validate_tier3_poll_config (60s floor).
+        // total_window_ms = 180_000 — well under the t0 offset above.
+        deliberation_window_seconds: 60,
+        drafting_window_seconds: 60,
+        ratification_window_seconds: 60,
+        privacy_mode: "pu".into(),
+        incentive_mode: "a".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+    };
+
+    let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
+    let create_signing_bytes = create_event
+        .signing_bytes()
+        .expect("create event signing_bytes");
+    let poll_id = derive_poll_id(&COMMUNITY_ID, &create_signing_bytes);
+
+    let snapshot = MembershipSnapshot {
+        members: full_electorate
+            .iter()
+            .map(|addr| {
+                (
+                    *addr,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )
+            })
+            .collect(),
+    };
+
+    // Apply PollCreate directly to both logs (skip publish_event to avoid
+    // D-FROST wiring requirement; the kd=ss publish below exercises the hook).
+    {
+        let mut log = engines.log_a.lock().await;
+        log.apply_with_snapshot(create_event.clone(), &COMMUNITY_ID, Some(snapshot.clone()))
+            .expect("engine_a: PollCreate apply");
+    }
+    {
+        let mut log = engines.log_b.lock().await;
+        log.apply_with_snapshot(create_event, &COMMUNITY_ID, Some(snapshot))
+            .expect("engine_b: PollCreate apply");
+    }
+
+    // Inject kd=ss via engine_a.publish_event. This applies kd=ss locally
+    // (setting sortition_result), then fires the engine-auto hook. The hook
+    // is HLC-driven (uses `t3.last_hlc.wall_ms` as the "now" estimate, NOT
+    // real wall-clock — see community_voting_log_engine.rs comments). So
+    // the kd=ss HLC must already be past the ratification deadline
+    // (t0 + total_window = t0 + 180_000 ms) for current_stage_at to return
+    // Ratification AND for the deadline check to fire. We set
+    // `ss_hlc.wall_ms = t0 + 500_000` so the deadline is 320_000 ms past
+    // — well clear of any ordering subtleties.
+    let vrf_output: [u8; 32] = [0xC2; 32];
+    let sortition_result = fisher_yates_select(
+        &vrf_output,
+        &sortition_pool,
+        SORTITION_SIZE as usize,
+        SORTITION_SIZE as usize,
+    );
+    let ss_hlc_wall = t0 + 500_000;
+    let ss_event = build_sortition_selection_event(
+        poll_id,
+        sortition_result.primary.clone(),
+        sortition_result.backup.clone(),
+        hlc_at(ss_hlc_wall, "engine"),
+    );
+    engines
+        .engine_a
+        .publish_event(ss_event)
+        .await
+        .expect("engine_a: publish kd=ss");
+
+    // Wait for engine_b to see close_event_hash become Some, which means
+    // the engine-auto kd=cl crossed the bridge.
+    wait_for_log(
+        "engine_b: close_event_hash set (engine-auto kd=cl propagated)",
+        &engines.log_b,
+        |log| {
+            log.polls
+                .get(&poll_id)
+                .and_then(|ps| ps.tier_state.as_tier3())
+                .map(|t3| t3.close_event_hash.is_some())
+                .unwrap_or(false)
+        },
+    )
+    .await
+    .expect("engine-auto kd=cl must propagate to engine_b within 5s");
+
+    // engine_a applied kd=cl locally as part of the recursive publish_event.
+    {
+        let log = engines.log_a.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        assert!(
+            t3.close_event_hash.is_some(),
+            "engine_a: close_event_hash must be set after engine-auto kd=cl"
+        );
+    }
+
+    drop(engines);
+}

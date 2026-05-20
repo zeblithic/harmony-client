@@ -275,6 +275,26 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         crate::dm_outbox::reserve_next_hlc_for_device(tracker, device_id, wall_now_ms).await
     }
 
+    /// ZEB-310 Task 10: read-only "now" HLC estimate.
+    ///
+    /// Returns the engine's best estimate of "now" as an `Hlc` derived from
+    /// real wall-clock time. Does NOT advance the tracker or reserve a lane —
+    /// callers use this purely for deadline checks (e.g. has the ratification
+    /// window expired?). Compare directly against stored HLC `wall_ms` fields;
+    /// the `logical` and `device_id` placeholders are sentinels for comparison
+    /// only and must NOT be used as a real event HLC.
+    pub async fn current_hlc_estimate(&self) -> Hlc {
+        let wall_now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        Hlc {
+            wall_ms: wall_now_ms,
+            logical: 0,
+            device_id: String::new(),
+        }
+    }
+
     /// Wire in the DfrostLogRegistry + beacon_requester closure after construction.
     ///
     /// Task 10 Option A (injected callbacks): called from `start_node` / test
@@ -629,37 +649,151 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             }
         };
 
-        if !trigger_kd_sf {
+        if trigger_kd_sf {
+            // (3) Mint a signed kd=sf event using the local signing key.
+            let hlc = self.reserve_next_local_hlc().await;
+            let sf_ev = match crate::community_voting_core::build_signed_sortition_failed(
+                &signing_key,
+                self_owner,
+                *pid,
+                hlc,
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        poll_id = %hex::encode(pid.0),
+                        "engine-auto kd=sf build_signed_sortition_failed failed"
+                    );
+                    return;
+                }
+            };
+
+            // (4) Publish recursively. `Box::pin` breaks the async-fn
+            // return-type cycle (publish_event → orchestration → publish_event).
+            if let Err(e) = Box::pin(self.publish_event(sf_ev)).await {
+                tracing::warn!(
+                    error = %e,
+                    poll_id = %hex::encode(pid.0),
+                    "engine-auto kd=sf publish_event failed"
+                );
+            }
+            // kd=sf moves the poll to Stage::Failed, so no further
+            // orchestration trigger can fire on this poll — return early.
             return;
         }
 
-        // (3) Mint a signed kd=sf event using the local signing key.
-        let hlc = self.reserve_next_local_hlc().await;
-        let sf_ev = match crate::community_voting_core::build_signed_sortition_failed(
-            &signing_key,
-            self_owner,
-            *pid,
-            hlc,
-        ) {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!(
-                    error = ?e,
-                    poll_id = %hex::encode(pid.0),
-                    "engine-auto kd=sf build_signed_sortition_failed failed"
-                );
-                return;
+        // ── ZEB-310 Task 10: kd=cl PollClose orchestration ───────────────
+        //
+        // Fires when the poll is in Ratification stage (HLC-aware via
+        // `current_stage_at`) AND no kd=cl has been applied yet AND the
+        // ratification window has expired (relative to the engine's real
+        // wall-clock estimate). Re-reads the poll state under a fresh lock
+        // because the kd=sf branch above may already have released and
+        // re-acquired the log lock through the recursive `publish_event`.
+        //
+        // Race tolerance: multiple engines may simultaneously meet the kd=cl
+        // trigger. The first valid arrival by HLC wins — duplicates are
+        // dropped by the replay tracker on each engine. We log a `debug` line
+        // on rejection instead of `warn` because a race loss is not a fault.
+        //
+        // Note: any signer (with `local_signing` installed) can publish kd=cl
+        // per L1 lifecycle; we do NOT gate on `proposer == self`. The kd=sf
+        // branch above is proposer-gated because SF1 verify is, but kd=cl
+        // is a public timeout event.
+        // Time reference: use `t3.last_hlc.wall_ms` — the latest applied
+        // event's HLC — as the "now" estimate. This is purely HLC-driven
+        // (NOT wall-clock based) for two reasons:
+        //
+        //   1. **Test determinism.** Tests mint events with synthetic HLCs
+        //      that can be hours / days before the test's real wall-clock.
+        //      A wall-clock-based trigger would always think the deadline
+        //      has expired and prematurely close polls in tests that
+        //      target other orchestration paths (e.g. ZEB-310 Task 9's
+        //      kd=sf-from-mass-decline test).
+        //
+        //   2. **Eventual production correctness.** In production, real
+        //      kd=rb events carry real wall-clock HLCs; once enough time
+        //      has passed for `last_hlc.wall_ms ≥ created + total_window`
+        //      to hold, the trigger fires on the NEXT apply. The explicit
+        //      user-driven kd=cl IPC remains the canonical path; the
+        //      engine-auto kd=cl is the safety net for polls where no one
+        //      explicitly closes after the deadline.
+        //
+        // If `last_hlc` is None (no event applied yet, which shouldn't
+        // happen given we just applied the triggering event), treat the
+        // window as not yet expired.
+        let trigger_kd_cl: bool = {
+            let log = self.voting_log.lock().await;
+            let state = match log.polls.get(pid) {
+                Some(s) => s,
+                None => return,
+            };
+            let t3 = match state.tier_state.as_tier3() {
+                Some(t) => t,
+                None => return,
+            };
+            // Cheap guards first.
+            if t3.close_event_hash.is_some() {
+                false
+            } else {
+                let last_wall = match t3.last_hlc.as_ref() {
+                    Some(h) => h.wall_ms,
+                    None => return,
+                };
+                let now_hlc_cl = Hlc {
+                    wall_ms: last_wall,
+                    logical: 0,
+                    device_id: String::new(),
+                };
+                let stage_now = t3.current_stage_at(&now_hlc_cl);
+                if !matches!(
+                    stage_now,
+                    crate::community_voting_tier3::Stage::Ratification
+                ) {
+                    false
+                } else {
+                    // Total window = deliberation + drafting + ratification.
+                    // Engine fires kd=cl once `last_hlc.wall_ms` (HLC-driven
+                    // "now") is past `created_wall + total_window_ms`.
+                    let total_window_ms: u64 = (t3.meta.config.deliberation_window_seconds as u64
+                        + t3.meta.config.drafting_window_seconds as u64
+                        + t3.meta.config.ratification_window_seconds as u64)
+                        * 1000;
+                    let created_wall = t3.meta.poll_create_hlc.wall_ms;
+                    last_wall >= created_wall.saturating_add(total_window_ms)
+                }
             }
         };
 
-        // (4) Publish recursively. `Box::pin` breaks the async-fn
-        // return-type cycle (publish_event → orchestration → publish_event).
-        if let Err(e) = Box::pin(self.publish_event(sf_ev)).await {
-            tracing::warn!(
-                error = %e,
-                poll_id = %hex::encode(pid.0),
-                "engine-auto kd=sf publish_event failed"
-            );
+        if trigger_kd_cl {
+            let hlc = self.reserve_next_local_hlc().await;
+            let cl_ev = match crate::community_voting_core::build_signed_poll_close_tier3(
+                &signing_key,
+                self_owner,
+                *pid,
+                hlc,
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        poll_id = %hex::encode(pid.0),
+                        "engine-auto kd=cl build_signed_poll_close_tier3 failed"
+                    );
+                    return;
+                }
+            };
+            if let Err(e) = Box::pin(self.publish_event(cl_ev)).await {
+                // L1 / replay-dedup rejection on race loss is expected.
+                tracing::debug!(
+                    error = %e,
+                    poll_id = %hex::encode(pid.0),
+                    "engine-auto kd=cl publish rejected (race loser?)"
+                );
+            }
+            // The kd=rs trigger (Task 11) will hook into the recursive
+            // publish_event call above; no further work at this scope.
         }
     }
 
@@ -760,16 +894,6 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         // Fire-and-forget; errors are logged inside maybe_trigger_beacon_for_tier3_create.
         self.maybe_trigger_beacon_for_tier3_create(&event).await;
 
-        // (3b) ZEB-310 Task 9: engine-auto orchestration post-apply hook.
-        // Only Tier 3 events can drive sortition / drafting / ratification
-        // stage transitions, so cheaply gate on tier first. The hook itself
-        // is race-tolerant — late duplicates are rejected by the L1
-        // lifecycle gate in apply.
-        if event.tier == Tier::Sortition {
-            self.maybe_trigger_engine_auto_orchestration(&applied_poll_id)
-                .await;
-        }
-
         // (4) Broadcast. `send().await` waits for adapter capacity rather
         // than dropping on a full channel — Phase 2 has no backfill, so
         // a silently-dropped publish would mean peers permanently miss
@@ -778,10 +902,33 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         // an error to the caller; the local apply has already happened
         // so callers can decide whether to surface this. Backfill is
         // tracked as a follow-up (ZEB-291 Task 19.1).
+        //
+        // ZEB-310 Tasks 10/11 ordering note: broadcast MUST run before the
+        // engine-auto orchestration hook so peers receive the just-applied
+        // event before any hook-triggered follow-ups (kd=cl, kd=rs). If the
+        // hook recursed first, the outer event's broadcast would land AFTER
+        // the inner events on the wire — peers would then apply the
+        // follow-ups (e.g. kd=rs) onto an outdated state and reject the
+        // outer event via the terminal-state apply gate
+        // (`PollInFinalizedState`). The self-loopback fix is preserved
+        // because `tracker.record` already ran above (step 2) before this
+        // broadcast.
         self.publisher_tx
             .send(packet)
             .await
             .map_err(|e| format!("voting publisher_tx closed: {e}"))?;
+
+        // (5) ZEB-310 Task 9: engine-auto orchestration post-apply hook.
+        // Only Tier 3 events can drive sortition / drafting / ratification
+        // stage transitions, so cheaply gate on tier first. The hook itself
+        // is race-tolerant — late duplicates are rejected by the L1
+        // lifecycle gate in apply. Runs AFTER broadcast so any recursive
+        // publish_event the hook triggers broadcasts in the natural order:
+        // outer event first on the wire, then any follow-ups.
+        if event.tier == Tier::Sortition {
+            self.maybe_trigger_engine_auto_orchestration(&applied_poll_id)
+                .await;
+        }
         Ok(())
     }
 
