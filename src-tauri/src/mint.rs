@@ -306,9 +306,10 @@ pub fn delete_account(
     // ── Mutations ─────────────────────────────────────────────────────────────
 
     if let Some(target) = reassign_to {
+        let now = chrono::Utc::now().to_rfc3339();
         tx.execute(
-            "UPDATE transactions SET account_id = ? WHERE account_id = ?",
-            params![target, id],
+            "UPDATE transactions SET account_id = ?, updated_at = ? WHERE account_id = ?",
+            rusqlite::params![target, now, id],
         )?;
     }
     tx.execute("DELETE FROM accounts WHERE id = ?", params![id])?;
@@ -1375,6 +1376,35 @@ mod tests {
         let conn = fresh_db();
         let err = delete_account(&conn, "00000000-0000-0000-0000-000000000000", None).unwrap_err();
         assert!(matches!(err, MintError::NotFound(_)));
+    }
+
+    #[test]
+    fn delete_account_reassign_bumps_updated_at_on_moved_txns() {
+        let conn = fresh_db();
+        let a = create_account(&conn, "A").unwrap();
+        let b = create_account(&conn, "B").unwrap();
+        let t = create_transaction(
+            &conn,
+            NewTransaction {
+                transaction_date: "2026-05-19".into(),
+                amount: "10.00".into(),
+                currency: "USD".into(),
+                account_id: a.id.clone(),
+                description: "X".into(),
+                metadata: None,
+            },
+        )
+        .unwrap();
+        let original_updated_at = t.updated_at.clone();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        delete_account(&conn, &a.id, Some(&b.id)).unwrap();
+        let after = get_transaction(&conn, &t.id).unwrap().unwrap();
+        assert!(
+            after.updated_at > original_updated_at,
+            "reassigned transaction should have a newer updated_at; before={}, after={}",
+            original_updated_at,
+            after.updated_at
+        );
     }
 
     // ── validate_date ─────────────────────────────────────────────────────────
