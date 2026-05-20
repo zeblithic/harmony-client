@@ -23216,6 +23216,18 @@ async fn dfrost_request_vrf_beacon<R: tauri::Runtime>(
             "dfrost_request_vrf_beacon: seed must be 32 bytes (64 hex chars)".to_string()
         })?;
 
+    dfrost_request_vrf_beacon_inner(&state_lock, space_id, seed_bytes, epoch).await
+}
+
+/// Rust-callable inner: voting engine calls this directly from
+/// apply(kd=cr Tier 3) to trigger a VRF beacon ceremony. Takes
+/// already-decoded community_id + seed (caller decodes hex).
+pub(crate) async fn dfrost_request_vrf_beacon_inner(
+    state_lock: &Mutex<NodeState>,
+    space_id: crate::owner_state_types::SpaceId,
+    seed_bytes: [u8; 32],
+    epoch: u64,
+) -> Result<String, String> {
     // 2. Extract NodeState handles. No community_registry needed: a `ts`
     //    event does NOT seal to per-recipient X25519 pubkeys (the
     //    commitments + share fields are public scalars). We still need
