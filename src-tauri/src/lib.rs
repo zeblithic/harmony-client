@@ -21663,6 +21663,91 @@ async fn voting_propose_draft_candidate<R: tauri::Runtime>(
     Ok(event_hash)
 }
 
+/// Tauri IPC: approve someone else's draft candidate (kd=da). Mini-public
+/// members only (enforced at verify via SD1). Proposer of the candidate
+/// implicitly approves their own via the kd=dc apply path; this IPC
+/// handles all other approvals.
+#[tauri::command]
+async fn voting_approve_draft_candidate<R: tauri::Runtime>(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    _app: tauri::AppHandle<R>,
+    poll_id: String,
+    candidate_event_hash: String,
+) -> Result<(), String> {
+    let pid_bytes: [u8; 32] = hex::decode(&poll_id)
+        .map_err(|e| format!("voting_approve_draft_candidate: invalid poll_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "voting_approve_draft_candidate: poll_id must be 32 bytes (64 hex chars)".to_string()
+        })?;
+    let pid = crate::community_voting_core::PollId(pid_bytes);
+
+    let ceh: crate::community_voting_core::CandidateEventHash = hex::decode(&candidate_event_hash)
+        .map_err(|e| {
+            format!("voting_approve_draft_candidate: invalid candidate_event_hash hex: {e}")
+        })?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "voting_approve_draft_candidate: candidate_event_hash must be 32 bytes (64 hex chars)"
+                .to_string()
+        })?;
+
+    let (hlc_tracker, device_id, self_owner, dm_outbox, voting_logs) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner
+                .ok_or("dm_self_owner missing — no owner identity?")?,
+            g.dm_outbox
+                .clone()
+                .ok_or("dm_outbox missing — no owner identity?")?,
+            std::sync::Arc::clone(&g.voting_logs),
+        )
+    };
+
+    let space_id = voting_resolve_community_for_poll(&voting_logs, &pid).await?;
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+
+    let event = {
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        crate::community_voting_core::build_signed_draft_approval(
+            signing_key,
+            self_owner,
+            pid,
+            ceh,
+            hlc,
+        )
+        .map_err(|e| format!("voting_approve_draft_candidate: build_signed: {e:?}"))?
+    };
+
+    let log_arc = {
+        let mut map = voting_logs.lock().await;
+        map.entry(space_id)
+            .or_insert_with(|| {
+                std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::community_voting_log::VotingLog::new(),
+                ))
+            })
+            .clone()
+    };
+    let mut log = log_arc.lock().await;
+    log.apply_with_snapshot(event, &space_id, None)
+        .map_err(|e| format!("voting_approve_draft_candidate: apply: {e:?}"))?;
+    Ok(())
+}
+
 // ─── ZEB-291 Phase 2 Task 18 — Tier 2 (Conviction) IPCs ────────────────────
 
 /// Serialize / deserialize `i128` as a decimal JSON string. Required for
@@ -25567,6 +25652,7 @@ pub fn run() {
             voting_create_tier3_proposal,
             voting_submit_deliberation_statement,
             voting_propose_draft_candidate,
+            voting_approve_draft_candidate,
             // ZEB-291 Phase 2 Task 18: Tier 2 (Conviction) voting IPCs.
             voting_create_tier2_proposal,
             voting_signal_tier2,
@@ -25632,6 +25718,7 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         voting_create_tier3_proposal,
         voting_submit_deliberation_statement,
         voting_propose_draft_candidate,
+        voting_approve_draft_candidate,
         // ZEB-291 Phase 2 Task 18: Tier 2 (Conviction) voting IPCs.
         voting_create_tier2_proposal,
         voting_signal_tier2,
