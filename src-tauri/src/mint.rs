@@ -80,7 +80,7 @@ pub fn open_in_memory() -> Result<Connection, MintError> {
 /// can be called on every app start without error.  The `accounts` table
 /// includes a `UNIQUE(name)` constraint; we are pre-launch so all test
 /// databases are in-memory and no on-disk migration is required.
-pub(crate) fn apply_migrations(conn: &Connection) -> Result<(), MintError> {
+pub fn apply_migrations(conn: &Connection) -> Result<(), MintError> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS accounts (
@@ -114,6 +114,40 @@ pub(crate) fn apply_migrations(conn: &Connection) -> Result<(), MintError> {
         "INSERT OR IGNORE INTO settings (key, value) VALUES (?, 'USD')",
         params![DEFAULT_CURRENCY_KEY],
     )?;
+
+    // --- Schema v2 (Phase 2 sync) ---
+
+    // transactions.deleted_at — tombstone column for soft-delete.
+    let _ = conn.execute(
+        "ALTER TABLE transactions ADD COLUMN deleted_at TEXT NULL",
+        [],
+    );
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tx_deleted_at ON transactions(deleted_at)",
+        [],
+    )?;
+
+    // accounts.updated_at — backfilled from created_at for legacy rows.
+    let _ = conn.execute(
+        "ALTER TABLE accounts ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    conn.execute(
+        "UPDATE accounts SET updated_at = created_at WHERE updated_at = ''",
+        [],
+    )?;
+
+    // settings.updated_at — backfilled to migration time for legacy rows.
+    let _ = conn.execute(
+        "ALTER TABLE settings ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE settings SET updated_at = ?1 WHERE updated_at = ''",
+        params![now],
+    )?;
+
     Ok(())
 }
 

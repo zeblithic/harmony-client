@@ -379,6 +379,72 @@ fn export_csv_no_partial_file_on_unwritable_path() {
 }
 
 #[test]
+fn migration_v2_adds_columns_and_backfills() {
+    let db_path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+    // First open: schema v1 lands.
+    {
+        let mut conn = harmony_app::mint::open_database(&db_path).unwrap();
+        harmony_app::mint::apply_migrations(&mut conn).unwrap();
+        // Insert v1-shaped rows (without the new columns).
+        conn.execute(
+            "INSERT INTO accounts (id, name, created_at) VALUES (?, ?, ?)",
+            rusqlite::params!["acct-1", "Chase", "2026-05-01T00:00:00Z"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            rusqlite::params!["default_currency", "USD"],
+        )
+        .unwrap();
+    }
+    // Second open: v2 migration runs.
+    let mut conn = harmony_app::mint::open_database(&db_path).unwrap();
+    harmony_app::mint::apply_migrations(&mut conn).unwrap();
+
+    // accounts now has updated_at, backfilled from created_at.
+    let updated_at: String = conn
+        .query_row(
+            "SELECT updated_at FROM accounts WHERE id = ?",
+            ["acct-1"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(updated_at, "2026-05-01T00:00:00Z");
+
+    // settings now has updated_at, backfilled to non-empty.
+    let setting_updated: String = conn
+        .query_row(
+            "SELECT updated_at FROM settings WHERE key = ?",
+            ["default_currency"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!setting_updated.is_empty());
+
+    // transactions has the deleted_at column (NULL by default).
+    conn.execute(
+        "INSERT INTO transactions (id, transaction_date, amount, currency, account_id, description, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        rusqlite::params![
+            "tx-1", "2026-05-01", "-12.34", "USD", "acct-1", "Coffee",
+            "2026-05-01T00:00:00Z", "2026-05-01T00:00:00Z"
+        ],
+    )
+    .unwrap();
+    let deleted_at: Option<String> = conn
+        .query_row(
+            "SELECT deleted_at FROM transactions WHERE id = ?",
+            ["tx-1"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(deleted_at, None);
+
+    // Idempotency: a third migration is a no-op.
+    harmony_app::mint::apply_migrations(&mut conn).unwrap();
+}
+
+#[test]
 fn export_csv_respects_account_filter() {
     let conn = fresh_in_memory_db();
 
