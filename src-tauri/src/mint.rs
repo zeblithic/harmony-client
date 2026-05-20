@@ -724,6 +724,7 @@ pub fn export_csv(
     output_path: &std::path::Path,
     date_from: Option<&str>,
     date_to: Option<&str>,
+    account_id: Option<&str>,
 ) -> Result<ExportSummary, MintError> {
     if let Some(d) = date_from {
         validate_date(d)?;
@@ -775,10 +776,11 @@ pub fn export_csv(
             FROM transactions t JOIN accounts a ON a.id = t.account_id \
             WHERE (?1 IS NULL OR t.transaction_date >= ?1) \
               AND (?2 IS NULL OR t.transaction_date <= ?2) \
+              AND (?3 IS NULL OR t.account_id = ?3) \
             ORDER BY t.transaction_date ASC, t.id ASC";
 
         let mut stmt = conn.prepare(sql)?;
-        let mut rows = stmt.query(rusqlite::params![date_from, date_to])?;
+        let mut rows = stmt.query(rusqlite::params![date_from, date_to, account_id])?;
         while let Some(row) = rows.next()? {
             let date: String = row.get(0)?;
             let account: String = row.get(1)?;
@@ -1028,6 +1030,7 @@ pub async fn mint_export_csv(
     output_path: String,
     date_from: Option<String>,
     date_to: Option<String>,
+    account_id: Option<String>,
     app: tauri::AppHandle,
     state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
 ) -> Result<ExportSummary, String> {
@@ -1039,6 +1042,7 @@ pub async fn mint_export_csv(
             std::path::Path::new(&output_path),
             date_from.as_deref(),
             date_to.as_deref(),
+            account_id.as_deref(),
         )
         .map_err(|e| e.to_string())
     })

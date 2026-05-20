@@ -86,6 +86,7 @@
       const summary = await service.exportCsv(path, {
         dateFrom: filterDateFrom || undefined,
         dateTo: filterDateTo || undefined,
+        accountId: filterAccountId || undefined,
       });
       alert(`Exported ${summary.rowsWritten} transactions to ${summary.outputPath} (${summary.byteSize} bytes)`);
     } catch (e) {
@@ -104,6 +105,45 @@
 
   // CSV export state.
   let exportInProgress = $state(false);
+
+  // Default-currency edit state.
+  let editingCurrency = $state(false);
+  let currencyDraft = $state('');
+  let currencyError = $state<string | null>(null);
+  let savingCurrency = $state(false);
+
+  async function startEditCurrency() {
+    currencyDraft = defaultCurrency;
+    currencyError = null;
+    editingCurrency = true;
+  }
+
+  async function saveCurrency() {
+    if (savingCurrency) return;
+    const trimmed = currencyDraft.trim().toUpperCase();
+    if (!/^[A-Z]{1,5}$/.test(trimmed)) {
+      currencyError = 'Currency must be 1-5 uppercase ASCII letters';
+      return;
+    }
+    savingCurrency = true;
+    try {
+      await service.setDefaultCurrency(trimmed);
+      // Invalidate any in-flight load() — its epoch guard will now skip the
+      // stale defaultCurrency assignment instead of clobbering our save.
+      loadEpoch++;
+      defaultCurrency = trimmed;
+      editingCurrency = false;
+    } catch (e) {
+      currencyError = e instanceof Error ? e.message : String(e);
+    } finally {
+      savingCurrency = false;
+    }
+  }
+
+  function cancelEditCurrency() {
+    editingCurrency = false;
+    currencyError = null;
+  }
 </script>
 
 <section aria-label="Mint personal finance ledger" class="mint-ledger">
@@ -118,7 +158,38 @@
           {#each accounts as a}<option value={a.id}>{a.name}</option>{/each}
         </select>
       </label>
-      <span class="default-currency">Default: {defaultCurrency}</span>
+      {#if editingCurrency}
+        <span class="default-currency-edit">
+          Default:
+          <input
+            type="text"
+            bind:value={currencyDraft}
+            maxlength="5"
+            aria-label="Default currency"
+            disabled={savingCurrency}
+            oninput={(e) => { currencyDraft = (e.currentTarget as HTMLInputElement).value.toUpperCase(); }}
+            onkeydown={(e) => {
+              if (e.key === 'Enter') {
+                if (!savingCurrency) saveCurrency();
+              } else if (e.key === 'Escape') {
+                if (!savingCurrency) cancelEditCurrency();
+              }
+            }}
+          />
+          <button type="button" onclick={saveCurrency} disabled={savingCurrency} aria-label="Save default currency">{savingCurrency ? 'Saving…' : 'Save'}</button>
+          <button type="button" onclick={cancelEditCurrency} disabled={savingCurrency} aria-label="Cancel">Cancel</button>
+          {#if currencyError}<span role="alert" class="error">{currencyError}</span>{/if}
+        </span>
+      {:else}
+        <button
+          type="button"
+          class="default-currency"
+          onclick={startEditCurrency}
+          aria-label="Edit default currency"
+        >
+          Default: {defaultCurrency}
+        </button>
+      {/if}
     </div>
     <div class="actions">
       <button onclick={() => { editingTxId = null; showAddEdit = true; }}>+ Add Transaction</button>
@@ -184,7 +255,27 @@
   .mint-ledger { display: flex; flex-direction: column; height: 100%; padding: 1rem; }
   .mint-toolbar { display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem; }
   .filters { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
-  .default-currency { color: var(--color-text-secondary, #888); font-size: 0.9rem; }
+  .default-currency {
+    background: none;
+    border: 1px dashed transparent;
+    padding: 0.2rem 0.4rem;
+    color: var(--color-text-secondary, #888);
+    font-size: 0.9rem;
+    cursor: pointer;
+    border-radius: 4px;
+  }
+  .default-currency:hover {
+    border-color: var(--color-border, #ccc);
+  }
+  .default-currency-edit {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    font-size: 0.9rem;
+  }
+  .default-currency-edit input {
+    width: 4.5rem;
+  }
   .actions { display: flex; gap: 0.5rem; }
   .error { color: var(--color-error, #c53030); }
   .operation-error {
