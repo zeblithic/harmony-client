@@ -516,6 +516,12 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         // so we can store it atomically with the new poll state. This avoids the
         // epoch-refresh race where a CHURP refresh could land between apply and
         // beacon request, causing epoch mismatch (Cluster 1+2 fix, R1 bot review).
+        //
+        // Cluster E fix (CodeRabbit major, R2 bot review): if the D-FROST registry or engine
+        // is not ready, REJECT the PollCreate rather than accepting it with epoch=0. A poll
+        // with epoch=0 will stall — no beacon will ever match a seed derived from epoch=0
+        // unless the community happened to use epoch 0 (which is only possible at inception).
+        // The caller (IPC layer) receives a meaningful error and can retry after D-FROST starts.
         let tier3_create_epoch: Option<(PollId, u32)> =
             if event.kind == PollEventKindCode::PollCreate && event.tier == Tier::Sortition {
                 let epoch = {
@@ -524,10 +530,18 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                         if let Some(engine) = reg.get(self.community_id).await {
                             engine.current_epoch().await as u32
                         } else {
-                            0
+                            return Err(
+                                "DfrostNotReady: no D-FROST engine running for this community; \
+                                 retry Tier 3 PollCreate after D-FROST is initialized"
+                                    .into(),
+                            );
                         }
                     } else {
-                        0
+                        return Err(
+                            "DfrostNotReady: D-FROST registry not installed; \
+                             retry Tier 3 PollCreate after install_dfrost_handle"
+                                .into(),
+                        );
                     }
                 };
                 // Derive poll_id from signing bytes (same derivation as apply_with_snapshot).
@@ -1368,8 +1382,15 @@ mod tests {
 
     /// maybe_trigger_beacon_for_tier3_create fires the beacon_requester when
     /// a Tier 3 PollCreate event is published.
+    ///
+    /// Cluster E update: publish_event now requires a DfrostLogRegistry with a
+    /// running engine (rejects with DfrostNotReady otherwise). This test installs
+    /// a minimal DfrostLogEngine for the community via install_dfrost_handle so
+    /// the epoch pre-read succeeds. epoch=0 is acceptable here (fresh engine).
     #[tokio::test]
     async fn voting_engine_apply_tier3_create_triggers_beacon_request() {
+        use crate::community_dfrost_log_engine::{DfrostLogEngineParams, DfrostLogRegistry};
+        use crate::community_state_sync::IdentityResolver;
         use std::sync::atomic::{AtomicU32, Ordering};
 
         let community_id = SpaceId([0xC4; 16]);
@@ -1390,6 +1411,43 @@ mod tests {
             .await,
         );
 
+        // Install a minimal DfrostLogRegistry with a running engine for community_id.
+        // This satisfies the Cluster E check (DfrostNotReady guard) without needing
+        // a real D-FROST ceremony. The engine's current_epoch() returns 0 for a fresh log.
+        let dfrost_reg = Arc::new(DfrostLogRegistry::<tauri::test::MockRuntime>::new());
+        {
+            let dfrost_log = Arc::new(Mutex::new(crate::community_dfrost_log::DfrostLog::new()));
+            let (dtx, _drx) = mpsc::channel::<Vec<u8>>(4);
+            let (_dstx, dsrx) = mpsc::channel::<Vec<u8>>(4);
+            let app = tauri::test::mock_app();
+            let app_handle = app.handle().clone();
+            struct NoopResolver;
+            #[async_trait::async_trait]
+            impl IdentityResolver for NoopResolver {
+                async fn resolve(
+                    &self,
+                    _addr: &crate::owner_state_types::OwnerAddr,
+                ) -> Option<[u8; 64]> {
+                    None
+                }
+            }
+            DfrostLogRegistry::register(
+                &dfrost_reg,
+                DfrostLogEngineParams {
+                    community_id,
+                    dfrost_log,
+                    publisher_tx: dtx,
+                    subscriber_rx: dsrx,
+                    app_handle,
+                    self_addr: OwnerAddr([0u8; 16]),
+                    self_x25519_priv: [0u8; 32],
+                    identity_resolver: Arc::new(NoopResolver),
+                    registry_weak: None,
+                },
+            )
+            .await;
+        }
+
         // Install a fake beacon_requester that counts calls.
         let call_count = Arc::new(AtomicU32::new(0));
         let call_count_clone = Arc::clone(&call_count);
@@ -1397,10 +1455,7 @@ mod tests {
             call_count_clone.fetch_add(1, Ordering::Relaxed);
             Box::pin(async { Ok("ok".to_string()) })
         });
-        {
-            let mut br = engine.beacon_requester.lock().await;
-            *br = Some(requester);
-        }
+        VotingLogEngine::install_dfrost_handle(&engine, dfrost_reg, requester).await;
 
         // publish_event a Tier 3 PollCreate → should trigger the requester.
         let (create_event, _electorate) =
@@ -1625,6 +1680,50 @@ mod tests {
         assert!(
             t3.sortition_result.is_none(),
             "sortition_result must remain None when beacon epoch mismatches stored epoch"
+        );
+    }
+
+    // ── Cluster E regression test ────────────────────────────────────────────
+
+    /// publish_event must reject a Tier 3 PollCreate when no D-FROST registry is installed,
+    /// returning a DfrostNotReady error rather than silently accepting with epoch=0.
+    #[tokio::test]
+    async fn publish_tier3_poll_create_without_dfrost_registry_returns_error() {
+        let community_id = SpaceId([0xE0; 16]);
+        let actor = OwnerAddr([0xBB; 16]);
+        let sortition_size: u16 = 20;
+
+        let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+        let (publisher_tx, _pub_rx) = mpsc::channel::<Vec<u8>>(32);
+        let (_sub_tx, subscriber_rx) = mpsc::channel::<Vec<u8>>(32);
+
+        let engine = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+            community_id,
+            voting_log: Arc::clone(&voting_log),
+            publisher_tx,
+            subscriber_rx,
+        })
+        .await;
+        // Do NOT call install_dfrost_handle — dfrost_registry is None.
+
+        let (create_ev, _electorate) = tier3_poll_create_event(actor, "dev-e", 1_000, sortition_size);
+
+        let result = engine.publish_event(create_ev).await;
+        assert!(
+            result.is_err(),
+            "publish_event must fail when D-FROST registry is not installed"
+        );
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("DfrostNotReady"),
+            "error must mention DfrostNotReady; got: {err_msg:?}"
+        );
+
+        // Confirm: no poll was applied to the log (apply never ran).
+        let log = voting_log.lock().await;
+        assert!(
+            log.polls.is_empty(),
+            "no poll must be stored when PollCreate is rejected"
         );
     }
 }
