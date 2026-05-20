@@ -14,8 +14,8 @@
 
 use harmony_app::community_voting_core::{
     DeliberationStatementPayload, DraftApprovalPayload, DraftCandidatePayload, Eligibility,
-    MiniPublicDeclinePayload, PollId, RatificationBallotPayload, SortitionFailedPayload,
-    SortitionSelectionPayload, Tier3PollConfigPayload,
+    MiniPublicDeclinePayload, PollClosePayload, PollId, RatificationBallotPayload,
+    SortitionFailedPayload, SortitionSelectionPayload, Tier3PollConfigPayload,
 };
 use harmony_app::community_voting_star::{CandidateRef, StarResult};
 use harmony_app::community_voting_tier3::Tier3PollResultPayload;
@@ -91,7 +91,7 @@ fn assert_two_char_keys(bytes: &[u8], expected_keys: &[&str]) {
     }
 }
 
-// ─── 9 fixtures ───────────────────────────────────────────────────
+// ─── 11 fixtures ──────────────────────────────────────────────────
 
 #[test]
 fn fixture_tier3_poll_create_payload() {
@@ -239,6 +239,17 @@ fn fixture_ratification_ballot() {
     let mut bytes = Vec::new();
     ciborium::ser::into_writer(&pd, &mut bytes).expect("encode");
     assert_two_char_keys(&bytes, &["pi", "sc"]);
+}
+
+#[test]
+fn fixture_tier3_poll_close() {
+    let pd = PollClosePayload {
+        poll_id: PollId([0x42; 32]),
+    };
+    round_trip_or_regen("tier3_poll_close.cbor", &pd);
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(&pd, &mut bytes).expect("encode");
+    assert_two_char_keys(&bytes, &["pi"]);
 }
 
 #[test]
