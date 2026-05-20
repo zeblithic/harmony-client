@@ -79,6 +79,10 @@ async-trait = "0.1"
 base64 = "0.22"
 thiserror = "1"
 tempfile = "3"
+rusqlite = { version = "0.31", features = ["bundled"] }
+rust_decimal = "1"
+csv = "1"
+chrono = "0.4"
 frost-ristretto255 = { version = "3.0.0", features = ["serde"] }
 
 [dev-dependencies]

@@ -2,7 +2,7 @@
   import type { Snippet } from 'svelte';
   import type { AppMode } from '../types';
 
-  let { nav, textFeed, mediaFeed, vineFeed, fileBrowser, fileDetailPanel, spellbookContent, spellbookDetail, mailInbox, mailDetail, settingsPanel, collapsed = false, showSettings = false, mode = 'messages', mailSelected = false }: {
+  let { nav, textFeed, mediaFeed, vineFeed, fileBrowser, fileDetailPanel, spellbookContent, spellbookDetail, mailInbox, mailDetail, mintLedger, settingsPanel, collapsed = false, showSettings = false, mode = 'messages', mailSelected = false }: {
     nav: Snippet;
     textFeed: Snippet;
     mediaFeed: Snippet;
@@ -13,6 +13,7 @@
     spellbookDetail?: Snippet;
     mailInbox?: Snippet;
     mailDetail?: Snippet;
+    mintLedger?: Snippet;
     settingsPanel?: Snippet;
     collapsed?: boolean;
     showSettings?: boolean;
@@ -21,7 +22,7 @@
   } = $props();
 </script>
 
-<div class="layout" class:collapsed class:files-mode={mode === 'files' && fileBrowser} class:vine-mode={mode === 'vines' && vineFeed} class:spellbook-mode={mode === 'spellbook' && spellbookContent} class:mail-mode={mode === 'mail' && mailInbox}>
+<div class="layout" class:collapsed class:files-mode={mode === 'files' && fileBrowser} class:vine-mode={mode === 'vines' && vineFeed} class:spellbook-mode={mode === 'spellbook' && spellbookContent} class:mail-mode={mode === 'mail' && mailInbox} class:mint-mode={mode === 'mint' && mintLedger}>
   <aside class="nav-area">
     {@render nav()}
   </aside>
@@ -62,6 +63,10 @@
         {@render spellbookDetail()}
       </section>
     {/if}
+  {:else if mode === 'mint' && mintLedger}
+    <main class="mint-area">
+      {@render mintLedger()}
+    </main>
   {:else}
     <main class="text-area">
       {@render textFeed()}
@@ -181,6 +186,22 @@
   }
   .mail-list-area {
     grid-area: mail-list;
+    background: var(--bg-primary);
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .layout.mint-mode {
+    grid-template-columns: var(--nav-width) 1fr;
+    grid-template-areas: "nav mint";
+  }
+  .layout.mint-mode.collapsed {
+    grid-template-columns: var(--nav-width-collapsed) 1fr;
+    grid-template-areas: "nav mint";
+  }
+  .mint-area {
+    grid-area: mint;
     background: var(--bg-primary);
     overflow-y: auto;
     display: flex;

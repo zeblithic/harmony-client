@@ -42,6 +42,7 @@ pub mod inbound_packet;
 pub mod library_directory;
 pub mod mail;
 pub mod mail_sync;
+pub mod mint;
 pub mod owner_commands;
 pub mod owner_state;
 pub mod owner_state_crdt;
@@ -600,6 +601,11 @@ pub struct NodeState {
     /// dispatch to a single-threaded event loop, so finer locking would
     /// not unlock parallelism beyond what the runtime already permits.
     pub pin_serial_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Mint personal-finance database. Lazily opened from
+    /// app_data_dir/mint/ledger.db on first invocation of any mint_*
+    /// command. None until first use; subsequent calls reuse the cached
+    /// connection.
+    mint_db: Option<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>>,
 }
 
 impl NodeState {
@@ -692,6 +698,8 @@ impl Default for NodeState {
             // event loop is single-threaded — but resetting it would
             // also work; keep it stable for simplicity).
             pin_serial_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            // Mint DB: lazily opened on first mint_* command call.
+            mint_db: None,
         }
     }
 }
@@ -5692,6 +5700,59 @@ pub async fn list_folder(
             kind: kind_wire(e.kind).to_string(),
         })
         .collect())
+}
+
+/// Lazily open `<app_data_dir>/mint/ledger.db` on first call;
+/// subsequent calls return the cached Arc.
+///
+/// Uses a double-checked pattern so that the slow work (create_dir_all,
+/// SQLite open, migrations — up to 10-100 ms on a cold disk) is done
+/// *outside* the NodeState lock.  The lock is taken twice:
+///
+/// 1. **Fast path** — lock, check cache, clone Arc if present, return.
+/// 2. **Slow path** — lock dropped, I/O performed, lock re-acquired to
+///    install the Arc.  A race-check handles the case where two
+///    concurrent first-callers both reach the slow path; the loser
+///    discards its freshly-opened connection and returns the winner's Arc.
+pub(crate) fn mint_db_handle(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, std::sync::Mutex<NodeState>>,
+) -> Result<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>, String> {
+    // Fast path: existing connection cached.
+    {
+        let node = state.lock().expect("NodeState poisoned");
+        if let Some(arc) = &node.mint_db {
+            return Ok(arc.clone());
+        }
+    }
+
+    // Slow path: do all I/O outside the NodeState lock so unrelated
+    // Tauri commands can keep using NodeState while the mint DB opens
+    // for the first time. SQLite open + migrations can be 10-100ms on
+    // slow disks; that's an unacceptable stall for the global app
+    // state lock.
+    use tauri::Manager;
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app_data_dir: {e}"))?;
+    let mint_dir = app_data_dir.join("mint");
+    std::fs::create_dir_all(&mint_dir).map_err(|e| format!("create_dir mint: {e}"))?;
+    let db_path = mint_dir.join("ledger.db");
+    let conn = mint::open_database(&db_path).map_err(|e| e.to_string())?;
+    let new_arc = std::sync::Arc::new(std::sync::Mutex::new(conn));
+
+    // Re-lock briefly to install. Double-check first to handle a race
+    // where another concurrent first-caller already initialized; in
+    // that case we discard our freshly-opened connection (the OS will
+    // close it on drop) and return the winner's Arc.
+    let mut node = state.lock().expect("NodeState poisoned");
+    if let Some(existing) = &node.mint_db {
+        Ok(existing.clone())
+    } else {
+        node.mint_db = Some(new_arc.clone());
+        Ok(new_arc)
+    }
 }
 
 #[tauri::command]
@@ -21992,6 +22053,19 @@ pub fn run() {
             voting_list_delegations,
             #[cfg(debug_assertions)]
             e2e_close_window,
+            // Mint personal-finance commands.
+            mint::mint_list_transactions,
+            mint::mint_get_transaction,
+            mint::mint_create_transaction,
+            mint::mint_update_transaction,
+            mint::mint_delete_transaction,
+            mint::mint_list_accounts,
+            mint::mint_create_account,
+            mint::mint_rename_account,
+            mint::mint_delete_account,
+            mint::mint_get_default_currency,
+            mint::mint_set_default_currency,
+            mint::mint_export_csv,
         ])
         .run(tauri::generate_context!())
         .expect("error while running harmony");
@@ -25210,6 +25284,7 @@ mod start_node_race_tests {
                 std::collections::HashMap::new(),
             )),
             pin_serial_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            mint_db: None,
         })
     }
 
