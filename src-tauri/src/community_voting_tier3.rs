@@ -481,7 +481,7 @@ impl Tier3PollState {
 
 // ── BeaconOracle trait ────────────────────────────────────────────────────────
 
-/// Trait for looking up VRF beacon output by `(community_id, seed)`.
+/// Trait for looking up VRF beacon output by `(community_id, seed, epoch)`.
 ///
 /// SS1 verify reconstructs sortition deterministically from VRF output, so
 /// `verify_ss` must query the local DfrostLog state. This trait decouples
@@ -494,12 +494,17 @@ impl Tier3PollState {
 ///
 /// `community_id` is the community space-id (not the poll). `seed` is the
 /// seed value derived from `PollCreate.event_hash + community_epoch`.
+/// `epoch` is the POLL'S community epoch at PollCreate time — NOT the live
+/// engine epoch (Cluster D fix, R2 bot review). Using the poll's stored epoch
+/// prevents a CHURP committee refresh between beacon creation and verify_ss
+/// invocation from causing a message_hash mismatch and stalling the poll.
 #[async_trait::async_trait]
 pub trait BeaconOracle: Send + Sync {
     async fn vrf_output_for(
         &self,
         community_id: &crate::owner_state_types::SpaceId,
         seed: &[u8; 32],
+        epoch: u64,
     ) -> Option<[u8; 32]>;
 }
 
@@ -567,9 +572,13 @@ pub async fn verify_ss(
         poll_state.meta.community_epoch,
     );
 
-    // 3. Look up VRF output.
+    // 3. Look up VRF output using the POLL'S epoch (Cluster D fix, R2 bot review).
+    // Using the poll's stored epoch rather than the live engine epoch prevents a
+    // CHURP committee refresh between beacon creation and verify_ss invocation from
+    // causing a message_hash mismatch (live epoch != poll's epoch → lookup fails).
+    let poll_epoch = poll_state.meta.community_epoch as u64;
     let vrf_output = beacon_oracle
-        .vrf_output_for(community_id, &seed)
+        .vrf_output_for(community_id, &seed, poll_epoch)
         .await
         .ok_or(VerifyError::BeaconNotYetAvailable)?;
 
@@ -859,6 +868,7 @@ impl BeaconOracle for NoBeaconOracle {
         &self,
         _community_id: &crate::owner_state_types::SpaceId,
         _seed: &[u8; 32],
+        _epoch: u64,
     ) -> Option<[u8; 32]> {
         None
     }
@@ -869,10 +879,11 @@ impl BeaconOracle for NoBeaconOracle {
 /// Production `BeaconOracle` backed by a `DfrostLogRegistry<R>`. Looks up
 /// the VRF output for a beacon seed by querying the engine's `beacon_index`.
 ///
-/// The oracle computes `message_hash = derive_vrf_seed(seed, current_epoch)` —
-/// using the engine's current committee epoch. This is correct for recent
-/// beacons: the committee epoch at beacon time must equal the epoch at which
-/// sortition was triggered (dfrost_request_vrf_beacon_inner enforces this).
+/// Cluster D fix (R2 bot review): `vrf_output_for` now takes `epoch` from the
+/// CALLER (i.e., the poll's stored epoch at PollCreate time) rather than
+/// querying `engine.current_epoch()`. This prevents a CHURP committee refresh
+/// between beacon creation and verify_ss invocation from causing the oracle to
+/// look up the beacon under the wrong epoch → message_hash mismatch → poll stalls.
 ///
 /// Requires `cfg(not(test))` to be `pub` — in tests, `MockBeaconOracle` is
 /// used directly. Both are `pub` at module level for integration use.
@@ -890,16 +901,13 @@ impl<R: tauri::Runtime> BeaconOracle for DfrostBeaconOracle<R> {
         &self,
         community_id: &crate::owner_state_types::SpaceId,
         seed: &[u8; 32],
+        epoch: u64,
     ) -> Option<[u8; 32]> {
         let engine = self.registry.get(*community_id).await?;
-        // Derive message_hash using the engine's current epoch. This epoch is
-        // authoritative at verify-time (assumes same committee epoch as beacon).
-        let epoch = {
-            // Access dfrost_log via the engine's public find_vrf_beacon_output_by_seed
-            // helper, which already takes (seed, epoch). We need the epoch first.
-            // Expose current_epoch via a dedicated method on DfrostLogEngine.
-            engine.current_epoch().await
-        };
+        // Use the caller-supplied epoch (the poll's stored community_epoch at PollCreate time),
+        // NOT engine.current_epoch(). This is the Cluster D fix: if a CHURP refresh happens
+        // between beacon creation and verify_ss, the live epoch != poll's epoch; using the
+        // poll's epoch ensures we look up the beacon under the epoch it was originally indexed.
         engine.find_vrf_beacon_output_by_seed(seed, epoch).await
     }
 }
@@ -2044,6 +2052,7 @@ mod tests {
             &self,
             community_id: &SpaceId,
             seed: &[u8; 32],
+            _epoch: u64, // tests match on (community_id, seed) only; epoch is caller-supplied
         ) -> Option<[u8; 32]> {
             self.outputs
                 .iter()
@@ -2727,5 +2736,72 @@ mod tests {
             "addr(10) declined — must not be in mini-public"
         );
         assert!(!mp2.contains(&addr(1)), "addr(1) still declined");
+    }
+
+    // ── Cluster D regression test ────────────────────────────────────────────
+
+    // D1: verify_ss uses the poll's stored epoch, not a live epoch from the oracle.
+    // Simulates a committee refresh between beacon creation and verify_ss invocation:
+    // the MockBeaconOracle is indexed by (community_id, seed) only, ignoring epoch,
+    // confirming that verify_ss passes the poll's epoch (not a stale live epoch) to
+    // the oracle.
+    #[tokio::test]
+    async fn verify_ss_uses_poll_epoch_not_live_epoch() {
+        // Build an EpochTrackingOracle that records the epoch it receives.
+        struct EpochTrackingOracle {
+            seed: [u8; 32],
+            vrf: [u8; 32],
+            received_epoch: std::sync::Arc<tokio::sync::Mutex<Option<u64>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl BeaconOracle for EpochTrackingOracle {
+            async fn vrf_output_for(
+                &self,
+                _community_id: &crate::owner_state_types::SpaceId,
+                seed: &[u8; 32],
+                epoch: u64,
+            ) -> Option<[u8; 32]> {
+                if seed == &self.seed {
+                    *self.received_epoch.lock().await = Some(epoch);
+                    Some(self.vrf)
+                } else {
+                    None
+                }
+            }
+        }
+
+        let poll = poll_state_with_electorate(0, 10);
+        // poll.meta.community_epoch = 1 (set by meta_at).
+        let expected_epoch: u64 = poll.meta.community_epoch as u64;
+        assert_eq!(expected_epoch, 1, "fixture epoch is 1");
+
+        let seed = default_seed();
+        let vrf = [0x55u8; 32];
+        let received = std::sync::Arc::new(tokio::sync::Mutex::new(None::<u64>));
+        let oracle = EpochTrackingOracle {
+            seed,
+            vrf,
+            received_epoch: std::sync::Arc::clone(&received),
+        };
+
+        let payload = correct_ss_payload(&poll, &vrf);
+        let ev = make_event_with_payload(
+            PollEventKindCode::SortitionSelection,
+            100,
+            addr(0xfe),
+            encode(&payload),
+        );
+        let result = verify_ss(&ev, &poll, &oracle, &community_id()).await;
+        assert_eq!(result, Ok(()), "verify_ss must succeed");
+
+        // Confirm that the epoch passed to the oracle was the POLL's epoch (1),
+        // not any other value.
+        let epoch_seen = received.lock().await;
+        assert_eq!(
+            *epoch_seen,
+            Some(expected_epoch),
+            "verify_ss must pass poll's stored epoch to BeaconOracle::vrf_output_for"
+        );
     }
 }

@@ -1610,7 +1610,7 @@ mod tests {
         let oracle = DfrostBeaconOracle { registry: reg };
         let cid = SpaceId([0xAB; 16]);
         let seed = [0x99u8; 32];
-        let result = oracle.vrf_output_for(&cid, &seed).await;
+        let result = oracle.vrf_output_for(&cid, &seed, 0).await;
         assert!(
             result.is_none(),
             "oracle must return None when no engine registered"
@@ -1664,7 +1664,8 @@ mod tests {
         let oracle = DfrostBeaconOracle {
             registry: Arc::clone(&reg),
         };
-        let result = oracle.vrf_output_for(&community_id, &seed).await;
+        // Pass the poll's epoch (3) — Cluster D fix: oracle uses caller-supplied epoch.
+        let result = oracle.vrf_output_for(&community_id, &seed, epoch).await;
         assert_eq!(
             result,
             Some(vrf_output),
