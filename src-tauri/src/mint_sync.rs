@@ -63,6 +63,7 @@ pub(crate) fn snapshot_current_db(conn: &mut Connection) -> Result<MintSnapshot,
         accounts,
         transactions,
         settings,
+        account_deletion_floor: HashMap::new(), // populated by publish path from sync_state
         captured_at: chrono::Utc::now().to_rfc3339(),
     })
 }
@@ -1050,6 +1051,7 @@ mod tests {
                 deleted_at: None,
             }],
             settings: vec![],
+            account_deletion_floor: HashMap::new(),
             captured_at: "2026-05-19T12:00:00Z".into(),
         };
         apply_remote_snapshot(&mut local, &remote, &HashMap::new()).unwrap();
@@ -1072,6 +1074,7 @@ mod tests {
             }],
             transactions: vec![],
             settings: vec![],
+            account_deletion_floor: HashMap::new(),
             captured_at: "2026-05-19T12:00:00Z".into(),
         };
         apply_remote_snapshot(&mut local, &remote, &HashMap::new()).unwrap();
@@ -1097,6 +1100,7 @@ mod tests {
             }],
             transactions: vec![],
             settings: vec![],
+            account_deletion_floor: HashMap::new(),
             captured_at: "2026-05-19T12:00:00Z".into(),
         };
         apply_remote_snapshot(&mut local, &remote, &HashMap::new()).unwrap();
@@ -1129,6 +1133,7 @@ mod tests {
                 deleted_at: Some("2026-05-02T00:00:00Z".into()),
             }],
             settings: vec![],
+            account_deletion_floor: HashMap::new(),
             captured_at: "2026-05-19T12:00:00Z".into(),
         };
         apply_remote_snapshot(&mut local, &remote, &HashMap::new()).unwrap();
@@ -1158,6 +1163,7 @@ mod tests {
             }],
             transactions: vec![],
             settings: vec![],
+            account_deletion_floor: HashMap::new(),
             captured_at: "2026-05-19T12:00:00Z".into(),
         };
         apply_remote_snapshot(&mut local, &remote, &floor).unwrap();
@@ -1260,6 +1266,7 @@ mod tests {
             }],
             transactions: vec![],
             settings: vec![],
+            account_deletion_floor: HashMap::new(),
             captured_at: "2026-05-19T12:00:00Z".into(),
         };
         apply_remote_snapshot(&mut local, &remote, &floor).unwrap();
@@ -1350,6 +1357,7 @@ mod tests {
                 deleted_at: None,
             }],
             settings: vec![],
+            account_deletion_floor: HashMap::new(),
             captured_at: "2026-05-19T12:00:00Z".into(),
         };
         apply_remote_snapshot(&mut local, &remote, &HashMap::new()).unwrap();

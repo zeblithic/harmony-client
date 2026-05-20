@@ -12,6 +12,11 @@ pub struct MintSnapshot {
     pub accounts: Vec<AccountRow>,
     pub transactions: Vec<TransactionRow>,
     pub settings: Vec<SettingRow>,
+    /// Per-device account deletion floor. Synced so peers learn about hard
+    /// deletes and converge. `#[serde(default)]` preserves backward compat
+    /// with old snapshots that lack this field.
+    #[serde(default)]
+    pub account_deletion_floor: std::collections::HashMap<String, String>,
     /// ISO 8601 snapshot timestamp. Debugging/observability only — NOT used in
     /// merge logic. Per-row LWW uses each row's own `updated_at`.
     pub captured_at: String,
@@ -130,6 +135,11 @@ mod tests {
                 value: "USD".into(),
                 updated_at: "2026-05-01T00:00:00Z".into(),
             }],
+            account_deletion_floor: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("old-acct".into(), "2026-05-01T00:00:00Z".into());
+                m
+            },
             captured_at: "2026-05-19T12:00:00Z".into(),
         };
         let mut bytes = Vec::new();
