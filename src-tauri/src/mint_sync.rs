@@ -251,8 +251,14 @@ impl MintSyncEngine {
         debounce: std::time::Duration,
     ) -> (Self, MintSyncEngineHandle) {
         let dirty = Arc::new(Notify::new());
-        // TODO(Task 8): capacity already bumped via TODO from Task 7
-        let (flush_tx, flush_rx) = mpsc::channel::<()>(1);
+        // Flush channel capacity 4: enough headroom for a small burst of
+        // flush requests without blocking the caller. Still NOT load-bearing
+        // for ordering — flush_now() returns when the send completes, NOT
+        // when publish_root_now finishes. A future refactor (likely Task 9 or
+        // Task 11) should add an oneshot::Sender<Result<()>> in each flush
+        // message so callers can await the actual publish result. Tracked as
+        // a follow-up; tests currently work around this via sleep().
+        let (flush_tx, flush_rx) = mpsc::channel::<()>(4);
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
         let dirty_for_task = dirty.clone();
         let handle = tokio::spawn(internal_task(
@@ -279,7 +285,7 @@ impl MintSyncEngine {
     }
 
     /// Synchronously enqueue a flush request. Blocks until the internal task
-    /// accepts the message (capacity 1 — see `new_for_test`).
+    /// accepts the message (capacity 4 — see `new_for_test`).
     ///
     /// Returns `Err(MintSyncError::Other(...))` if the channel is closed
     /// (i.e. the engine has been shut down). Callers must treat that as a
@@ -352,7 +358,13 @@ async fn publish_root_now(
     .map_err(|e| MintSyncError::Other(format!("spawn_blocking: {e}")))??;
 
     if snap.accounts.is_empty() && snap.transactions.is_empty() {
-        tracing::debug!(target: "mint_sync", "empty snapshot — skipping publish");
+        tracing::debug!(
+            target: "mint_sync",
+            accounts = snap.accounts.len(),
+            transactions = snap.transactions.len(),
+            settings = snap.settings.len(),
+            "empty snapshot — skipping publish",
+        );
         return Ok(());
     }
 
