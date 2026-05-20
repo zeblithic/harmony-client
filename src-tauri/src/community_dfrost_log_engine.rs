@@ -6,11 +6,15 @@
 //! a follow-up ships the adapter).
 
 use crate::community_dfrost_log::{verify_signed_committee_event, DfrostLog};
-use crate::community_dfrost_types::SignedCommitteeEvent;
+use crate::community_dfrost_types::{
+    DfrostEventKind, DkgRoundPayload, RefreshRoundPayload, SignedCommitteeEvent, VrfBeaconPayload,
+};
 use crate::community_state_sync::IdentityResolver;
 use crate::owner_state_types::{OwnerAddr, SpaceId};
+use crate::{DfrostBeaconReadyPayload, DfrostDkgProgressPayload, DfrostRefreshProgressPayload};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tauri::Emitter;
 use tokio::sync::{mpsc, Mutex};
 
 /// Replay-defense tracker keyed on `(actor, device_id)`. Records the
@@ -117,7 +121,7 @@ async fn process_inbound<R: tauri::Runtime>(
     community_id: SpaceId,
     dfrost_log: &Arc<Mutex<DfrostLog>>,
     tracker: &Arc<Mutex<DfrostReplayTracker>>,
-    _app_handle: &tauri::AppHandle<R>, // unused this task; Task 4 wires emit
+    app_handle: &tauri::AppHandle<R>,
     self_addr: &OwnerAddr,
     self_x25519_priv: &[u8; 32],
     identity_resolver: &Arc<dyn IdentityResolver + Send + Sync>,
@@ -183,6 +187,111 @@ async fn process_inbound<R: tauri::Runtime>(
     {
         let mut t = tracker.lock().await;
         t.record(&event);
+    }
+
+    // 6. Emit Tauri event to mirror local-driven progress emitted by the
+    //    IPC layer (`dfrost_initiate_dkg`, `dfrost_contribute_dkg_round`,
+    //    `dfrost_contribute_threshold_sign`, `dfrost_propose_refresh`).
+    //    Inner CBOR-payload decode failures here are non-fatal: the
+    //    outer event already applied successfully, so any decode error
+    //    indicates a producer / apply invariant mismatch worth a warn
+    //    rather than a silent drop. Off-by-one between local and peer
+    //    `participants_so_far` counts is acceptable — both reflect the
+    //    pending_dkg map AFTER the just-applied event, so they
+    //    converge once both sides have observed the same prefix.
+    match event.kind {
+        DfrostEventKind::DkgRound => {
+            match ciborium::de::from_reader::<DkgRoundPayload, _>(&event.payload[..]) {
+                Ok(payload) => {
+                    let participants_so_far: u8 = {
+                        let log = dfrost_log.lock().await;
+                        let count = log
+                            .committee_state
+                            .pending_dkg
+                            .as_ref()
+                            .map(|p| match payload.round_num {
+                                1 => p.round1_packages.len(),
+                                2 => p.round2_packages.len(),
+                                _ => p.dk_confirmations.len(),
+                            })
+                            .unwrap_or(0);
+                        u8::try_from(count).unwrap_or(u8::MAX)
+                    };
+                    let evt = DfrostDkgProgressPayload {
+                        ceremony_id: hex::encode(payload.ceremony_id),
+                        round_num: payload.round_num,
+                        participants_so_far,
+                    };
+                    if let Err(e) = app_handle.emit("dfrost-dkg-progress", &evt) {
+                        tracing::warn!(
+                            community_id = %hex::encode(community_id.0),
+                            error = %e,
+                            "dfrost-dkg-progress emit failed (inbound)",
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        community_id = %hex::encode(community_id.0),
+                        error = %e,
+                        "dfrost inbound: DkgRound payload decode failed post-apply",
+                    );
+                }
+            }
+        }
+        DfrostEventKind::VrfBeacon => {
+            match ciborium::de::from_reader::<VrfBeaconPayload, _>(&event.payload[..]) {
+                Ok(payload) => {
+                    let evt = DfrostBeaconReadyPayload {
+                        ceremony_id: hex::encode(payload.ceremony_id),
+                        vrf_output: hex::encode(payload.vrf_output),
+                    };
+                    if let Err(e) = app_handle.emit("dfrost-beacon-ready", &evt) {
+                        tracing::warn!(
+                            community_id = %hex::encode(community_id.0),
+                            error = %e,
+                            "dfrost-beacon-ready emit failed (inbound)",
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        community_id = %hex::encode(community_id.0),
+                        error = %e,
+                        "dfrost inbound: VrfBeacon payload decode failed post-apply",
+                    );
+                }
+            }
+        }
+        DfrostEventKind::ProactiveRefresh => {
+            match ciborium::de::from_reader::<RefreshRoundPayload, _>(&event.payload[..]) {
+                Ok(payload) => {
+                    let evt = DfrostRefreshProgressPayload {
+                        ceremony_id: hex::encode(payload.ceremony_id),
+                        round_num: payload.round_num,
+                    };
+                    if let Err(e) = app_handle.emit("dfrost-refresh-progress", &evt) {
+                        tracing::warn!(
+                            community_id = %hex::encode(community_id.0),
+                            error = %e,
+                            "dfrost-refresh-progress emit failed (inbound)",
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        community_id = %hex::encode(community_id.0),
+                        error = %e,
+                        "dfrost inbound: ProactiveRefresh payload decode failed post-apply",
+                    );
+                }
+            }
+        }
+        // DkgComplete (`dk`), ThresholdSign (`ts`), Close — no event mirror.
+        // DkgComplete is the silent finalisation handled by `apply`; ts is
+        // per-member share collection that aggregates into the VrfBeacon
+        // emit above; Close is not yet defined as a kind.
+        _ => {}
     }
 }
 
@@ -549,6 +658,131 @@ mod tests {
         assert!(
             pending.round1_packages.is_empty(),
             "round1_packages must remain empty when sig verify fails"
+        );
+    }
+
+    /// Task 4: after a successful inbound DKG rn=1 apply, the engine
+    /// MUST emit `dfrost-dkg-progress` on the Tauri event bus with the
+    /// same payload shape the IPC local-drive path emits
+    /// (`DfrostDkgProgressPayload` with hex ceremony_id, round_num,
+    /// participants_so_far). Mirrors the
+    /// `publish_emits_channel_message_received_event` pattern in
+    /// `community_channel_log_engine`.
+    #[tokio::test]
+    async fn engine_emits_dkg_progress_on_inbound_apply() {
+        use crate::community_dfrost_log::{build_signed_dfrost_event, DfrostLog, PendingCeremony};
+        use crate::community_dfrost_types::DkgRoundPayload;
+        use crate::owner_state_types::SpaceId;
+        use std::sync::Mutex as StdMutex;
+        use std::time::Duration;
+        use tauri::Listener;
+
+        // Identity + log setup mirrors engine_processes_valid_inbound_event.
+        let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xA1);
+        let alice_x_priv = *crate::dm_signing::ed25519_priv_to_x25519(&alice_sk);
+
+        let mut resolver_map = HashMap::new();
+        resolver_map.insert(alice_addr, alice_pub64);
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(resolver_map));
+
+        let community_id = SpaceId([0xC0; 16]);
+        let ceremony_id = [0x42u8; 32];
+        let mut initial_log = DfrostLog::new();
+        initial_log.committee_state.pending_dkg = Some(PendingCeremony {
+            ceremony_id,
+            members: vec![alice_addr],
+            threshold: 1,
+            max_signers: 1,
+            proposed_epoch: 1,
+            ..Default::default()
+        });
+        let log = Arc::new(tokio::sync::Mutex::new(initial_log));
+
+        let payload = DkgRoundPayload {
+            ceremony_id,
+            round_num: 1,
+            round1_package: Some(vec![0xde, 0xad, 0xbe, 0xef]),
+            recipient_ciphertexts: None,
+        };
+        let event = build_signed_dfrost_event(
+            &alice_sk,
+            alice_addr,
+            DfrostEventKind::DkgRound,
+            &payload,
+            Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        )
+        .expect("build_signed_dfrost_event rn=1");
+
+        let mut packet = Vec::new();
+        ciborium::ser::into_writer(&event, &mut packet).expect("ciborium encode");
+
+        let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let app = tauri::test::mock_app();
+        let app_handle = app.handle().clone();
+
+        // Register listener BEFORE starting the engine so we don't race
+        // the inbound apply.
+        let captured: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let captured_for_listener = Arc::clone(&captured);
+        app_handle.listen("dfrost-dkg-progress", move |evt| {
+            captured_for_listener
+                .lock()
+                .expect("captured lock")
+                .push(evt.payload().to_string());
+        });
+
+        let _engine = DfrostLogEngine::start(DfrostLogEngineParams {
+            community_id,
+            dfrost_log: log.clone(),
+            publisher_tx: pub_tx,
+            subscriber_rx: sub_rx,
+            app_handle,
+            self_addr: alice_addr,
+            self_x25519_priv: alice_x_priv,
+            identity_resolver: resolver,
+        })
+        .await;
+
+        sub_tx.send(packet).await.expect("send inbound");
+
+        // Poll for the listener to fire — receive loop is an independent
+        // tokio task and the Tauri event bus has its own dispatch latency.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let captured_payload = loop {
+            {
+                let v = captured.lock().expect("captured lock");
+                if let Some(first) = v.first().cloned() {
+                    break first;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("dfrost-dkg-progress event not received within 1s");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&captured_payload).expect("payload is JSON");
+        assert_eq!(
+            parsed["ceremonyId"].as_str(),
+            Some(hex::encode(ceremony_id).as_str()),
+            "ceremonyId must be hex of payload.ceremony_id",
+        );
+        assert_eq!(
+            parsed["roundNum"].as_u64(),
+            Some(1),
+            "roundNum must be 1 for rn=1 inbound",
+        );
+        assert_eq!(
+            parsed["participantsSoFar"].as_u64(),
+            Some(1),
+            "participantsSoFar reflects pending_dkg.round1_packages.len() after apply",
         );
     }
 }
