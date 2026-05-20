@@ -2819,3 +2819,166 @@ async fn engine_auto_cl_when_ratification_window_expires() {
 
     drop(engines);
 }
+
+/// ZEB-310 Task 11: engine-auto orchestration of kd=rs PollResult.
+///
+/// Verifies that after the kd=cl trigger fires (per Task 10), the same
+/// post-apply hook re-fires from inside the recursive `publish_event`
+/// call and mints + publishes a signed kd=rs with a deterministic STAR
+/// tally. Both engines must converge on:
+///
+///   1. `Stage::Finalized` (kd=rs applied),
+///   2. bit-identical `Tier3PollResultPayload.winner.event_hash`.
+///
+/// Setup is the same as `engine_auto_cl_when_ratification_window_expires`
+/// (Task 10) — minimum-valid 60-second windows, synthetic t0, kd=ss
+/// minted with hlc.wall_ms = t0 + 500_000 (320s past the ratification
+/// deadline). With 0 ratification ballots and 1 candidate (status_quo,
+/// always synthesized by `synthesize_status_quo`), `tally_star` returns
+/// a deterministic result: status_quo wins the (degenerate) STAR runoff.
+#[tokio::test]
+async fn engine_auto_rs_after_cl_with_bit_identical_tally() {
+    use harmony_app::community_voting_tier3::synthesize_status_quo;
+
+    const COMMUNITY_ID: SpaceId = SpaceId([0xC3; 16]);
+    const SORTITION_SIZE: u16 = 20;
+    const N_IDENTITIES: usize = 50;
+
+    let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
+    let proposer = &identities[49];
+    let full_electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
+    let sortition_pool: Vec<OwnerAddr> = identities[..49].iter().map(|id| id.owner).collect();
+
+    let engines = setup_two_voting_engine_bridge_with_signing(COMMUNITY_ID, proposer).await;
+
+    let t0: u64 = 6_000_000;
+
+    let config = Tier3PollConfigPayload {
+        proposal_text: "Engine-auto kd=rs test".into(),
+        sortition_size: SORTITION_SIZE,
+        deliberation_window_seconds: 60,
+        drafting_window_seconds: 60,
+        ratification_window_seconds: 60,
+        privacy_mode: "pu".into(),
+        incentive_mode: "a".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+    };
+
+    let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
+    let create_signing_bytes = create_event
+        .signing_bytes()
+        .expect("create event signing_bytes");
+    let poll_id = derive_poll_id(&COMMUNITY_ID, &create_signing_bytes);
+
+    let snapshot = MembershipSnapshot {
+        members: full_electorate
+            .iter()
+            .map(|addr| {
+                (
+                    *addr,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )
+            })
+            .collect(),
+    };
+
+    {
+        let mut log = engines.log_a.lock().await;
+        log.apply_with_snapshot(create_event.clone(), &COMMUNITY_ID, Some(snapshot.clone()))
+            .expect("engine_a: PollCreate apply");
+    }
+    {
+        let mut log = engines.log_b.lock().await;
+        log.apply_with_snapshot(create_event, &COMMUNITY_ID, Some(snapshot))
+            .expect("engine_b: PollCreate apply");
+    }
+
+    let vrf_output: [u8; 32] = [0xC3; 32];
+    let sortition_result = fisher_yates_select(
+        &vrf_output,
+        &sortition_pool,
+        SORTITION_SIZE as usize,
+        SORTITION_SIZE as usize,
+    );
+    let ss_hlc_wall = t0 + 500_000;
+    let ss_event = build_sortition_selection_event(
+        poll_id,
+        sortition_result.primary.clone(),
+        sortition_result.backup.clone(),
+        hlc_at(ss_hlc_wall, "engine"),
+    );
+    engines
+        .engine_a
+        .publish_event(ss_event)
+        .await
+        .expect("engine_a: publish kd=ss");
+
+    // Wait for engine_b to see Stage::Finalized — the recursive hook on
+    // engine_a fired kd=cl → applied → re-fired hook → fired kd=rs →
+    // applied → Stage = Finalized. Both events broadcast across the bridge
+    // in apply order.
+    wait_for_log(
+        "engine_b: stage == Finalized (engine-auto kd=rs propagated)",
+        &engines.log_b,
+        |log| {
+            log.polls
+                .get(&poll_id)
+                .and_then(|ps| ps.tier_state.as_tier3())
+                .map(|t3| t3.stage == Stage::Finalized)
+                .unwrap_or(false)
+        },
+    )
+    .await
+    .expect("engine-auto kd=rs must propagate to engine_b within 5s");
+
+    // Bit-identical convergence: same StarResult on both engines.
+    let (t3_a, t3_b) = {
+        let log_a = engines.log_a.lock().await;
+        let log_b = engines.log_b.lock().await;
+        (
+            log_a.polls[&poll_id]
+                .tier_state
+                .as_tier3()
+                .expect("log_a tier3")
+                .clone(),
+            log_b.polls[&poll_id]
+                .tier_state
+                .as_tier3()
+                .expect("log_b tier3")
+                .clone(),
+        )
+    };
+    assert_eq!(t3_a.stage, Stage::Finalized);
+    assert_eq!(t3_b.stage, Stage::Finalized);
+    assert!(
+        t3_a.close_event_hash.is_some(),
+        "engine_a: close_event_hash must be Some"
+    );
+    assert!(
+        t3_b.close_event_hash.is_some(),
+        "engine_b: close_event_hash must be Some"
+    );
+    let result_a = t3_a.result.as_ref().expect("engine_a result");
+    let result_b = t3_b.result.as_ref().expect("engine_b result");
+    assert_eq!(
+        result_a, result_b,
+        "CONVERGENCE: both engines must have bit-identical StarResult"
+    );
+    // With 0 ballots + 1 candidate (status_quo), the STAR runoff has a
+    // single finalist — status_quo — which trivially wins.
+    let sq_hash = synthesize_status_quo(&poll_id).event_hash;
+    assert_eq!(
+        result_a.winner.event_hash, sq_hash,
+        "winner must be status_quo in the degenerate 0-ballot path"
+    );
+
+    drop(engines);
+}

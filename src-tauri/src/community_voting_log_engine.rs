@@ -792,8 +792,105 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                     "engine-auto kd=cl publish rejected (race loser?)"
                 );
             }
-            // The kd=rs trigger (Task 11) will hook into the recursive
-            // publish_event call above; no further work at this scope.
+            // Fall through to the kd=rs trigger: the recursive publish_event
+            // above applied kd=cl locally and re-fired this hook from inside
+            // the recursion (which sees `close_event_hash.is_some()` and
+            // falls through to the kd=rs branch below). We still attempt
+            // kd=rs at the outer level for defensive convergence; the
+            // apply-time `PollInFinalizedState` gate cleanly rejects
+            // duplicates.
+        }
+
+        // ── ZEB-310 Task 11: kd=rs PollResult orchestration ──────────────
+        //
+        // Fires when kd=cl has been applied (`close_event_hash.is_some()`) AND
+        // no kd=rs has been applied yet (`result.is_none()`). Deterministically
+        // computes the STAR tally and publishes signed kd=rs. The kd=rs apply
+        // moves the poll to `Stage::Finalized`; subsequent kd=rs events from
+        // race losers are rejected by the apply-time terminal-state gate
+        // (`PollInFinalizedState` → `IllegalTransition`).
+        //
+        // The ratification candidate ordering is computed the same way as
+        // `verify_sr`: synthesize status_quo, push onto a temp candidates
+        // slice, derive advancers via `drafting_advancers`, then sort via
+        // `ratification_candidates_ordering`. This ensures bit-identical
+        // tally inputs across all engines that ever drive this code path.
+        let trigger_kd_rs_args: Option<crate::community_voting_star::StarResult> = {
+            let log = self.voting_log.lock().await;
+            let state = match log.polls.get(pid) {
+                Some(s) => s,
+                None => return,
+            };
+            let t3 = match state.tier_state.as_tier3() {
+                Some(t) => t,
+                None => return,
+            };
+            if t3.close_event_hash.is_none() || t3.result.is_some() {
+                None
+            } else {
+                // Build candidate ordering. Same pattern as verify_sr.
+                let sq = crate::community_voting_tier3::synthesize_status_quo(&t3.meta.poll_id);
+                let sq_hash = sq.event_hash;
+                // status_quo is NOT inserted into t3.candidates by apply()
+                // (no materialize step today); push it onto a temp slice so
+                // drafting_advancers returns Some.
+                let mut all_candidates = t3.candidates.clone();
+                all_candidates.push(sq);
+                let primary_size = t3.meta.config.sortition_size as usize;
+                let advancers = match crate::community_voting_tier3::drafting_advancers(
+                    &all_candidates,
+                    primary_size,
+                    sq_hash,
+                ) {
+                    Some(a) => a,
+                    None => {
+                        // status_quo missing — pre-Drafting stage, can't
+                        // happen given close_event_hash.is_some() invariant
+                        // (kd=cl is only minted after Drafting → Ratification),
+                        // but bail defensively rather than panicking.
+                        tracing::warn!(
+                            poll_id = %hex::encode(pid.0),
+                            "engine-auto kd=rs: drafting_advancers returned None despite kd=cl applied"
+                        );
+                        return;
+                    }
+                };
+                let ordered = crate::community_voting_tier3::ratification_candidates_ordering(
+                    &advancers, sq_hash,
+                );
+                let ballots = crate::community_voting_tier3::collect_ratification_ballots(t3);
+                let result = crate::community_voting_star::tally_star(&ordered, ballots);
+                Some(result)
+            }
+        };
+
+        if let Some(result) = trigger_kd_rs_args {
+            let hlc = self.reserve_next_local_hlc().await;
+            let rs_ev = match crate::community_voting_core::build_signed_poll_result_tier3(
+                &signing_key,
+                self_owner,
+                *pid,
+                result,
+                hlc,
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        poll_id = %hex::encode(pid.0),
+                        "engine-auto kd=rs build_signed_poll_result_tier3 failed"
+                    );
+                    return;
+                }
+            };
+            if let Err(e) = Box::pin(self.publish_event(rs_ev)).await {
+                // PollInFinalizedState (race loser) is expected.
+                tracing::debug!(
+                    error = %e,
+                    poll_id = %hex::encode(pid.0),
+                    "engine-auto kd=rs publish rejected (race loser?)"
+                );
+            }
         }
     }
 

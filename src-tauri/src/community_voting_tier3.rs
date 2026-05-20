@@ -846,6 +846,27 @@ pub fn drafting_advancers(
     Some(advancers)
 }
 
+/// Collect all RatificationBallot ballots applied to a Tier 3 poll.
+///
+/// Returns a reference to the underlying `ratification_ballots` slice,
+/// which is appended to in event-arrival order — equivalent to HLC order
+/// because `Tier3PollState::apply_event` enforces a monotonic-HLC check
+/// before mutating state.
+///
+/// Used by ZEB-310 Task 11's engine-auto kd=rs orchestration: the hook
+/// calls this helper to get the ballot slice, then re-runs `tally_star`
+/// over it to produce a deterministic STAR result that converges
+/// bit-identically across all engines.
+///
+/// Note: this helper is intentionally a `&[RatificationBallotPayload]`
+/// reference rather than a copy. `tally_star` takes a borrowed slice;
+/// no allocation needed.
+pub fn collect_ratification_ballots(
+    t3: &Tier3PollState,
+) -> &[crate::community_voting_core::RatificationBallotPayload] {
+    &t3.ratification_ballots
+}
+
 /// Final ratification candidate ordering: `approval_count DESC`,
 /// ties by `candidate_event_hash lex ASC`.
 ///
