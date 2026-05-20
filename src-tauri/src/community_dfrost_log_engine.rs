@@ -263,8 +263,18 @@ async fn process_inbound<R: tauri::Runtime>(
                             .as_ref()
                             .map(|p| match payload.round_num {
                                 1 => p.round1_packages.len(),
-                                2 => p.round2_packages.len(),
-                                _ => p.dk_confirmations.len(),
+                                // round2_packages is #[serde(skip, default)]
+                                // and locally-populated only (decrypted shares
+                                // addressed to self); it does NOT count how
+                                // many members have broadcast their rn=2
+                                // contribution. For peer-driven rn=2
+                                // progress, round1_packages.len() is the best
+                                // broadcast-level proxy available. Round 3+
+                                // is unreachable here — apply_dkg_round
+                                // rejects round_num outside {1, 2} before the
+                                // tracker.record() call that gates this
+                                // emission.
+                                _ => p.round1_packages.len(),
                             })
                             .unwrap_or(0);
                         u8::try_from(count).unwrap_or(u8::MAX)
@@ -691,6 +701,36 @@ mod tests {
         (signing, owner, pub_64)
     }
 
+    /// Poll `predicate(log)` at 5ms intervals up to a 2s deadline. Mirrors
+    /// the `wait_for` helper in
+    /// `tests/community_dfrost_transport_integration.rs`. Used instead of
+    /// a fixed `sleep` to wait for the engine's receive task to drain a
+    /// just-injected packet — sleep-based waits are CI-fragile because
+    /// verify + resolver + apply are dominated by lock-acquisition jitter,
+    /// not constant-time crypto. Panics on timeout with `label` so the
+    /// failing assertion is identifiable.
+    async fn wait_for_log<F>(
+        label: &str,
+        log: &Arc<tokio::sync::Mutex<crate::community_dfrost_log::DfrostLog>>,
+        mut predicate: F,
+    ) where
+        F: FnMut(&crate::community_dfrost_log::DfrostLog) -> bool,
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            {
+                let guard = log.lock().await;
+                if predicate(&guard) {
+                    return;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("wait_for_log({label}) timed out after 2s");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
     /// Inbound chain end-to-end: a CBOR-encoded `dr rn=1` event signed
     /// by Alice lands on the subscriber, the receive loop verifies +
     /// applies it, and `pending_dkg.round1_packages` gains Alice's
@@ -768,14 +808,19 @@ mod tests {
         })
         .await;
 
-        // 5. Push the inbound packet + wait for the receive loop to drain.
+        // 5. Push the inbound packet + poll for the receive loop to drain.
+        //    Polling beats a fixed sleep — under CI load the verify +
+        //    resolver + apply chain can easily exceed a 50ms budget when
+        //    the runtime is contended, but 5ms-poll-against-observable
+        //    converges as soon as the work is actually done.
         sub_tx.send(packet).await.expect("send inbound");
-        // Yield + small sleep — the receive loop is an independent tokio
-        // task, so we need to surrender the runtime long enough for it
-        // to pull the packet, run async resolver + verify, and acquire
-        // the log lock. 50ms is well above the actual processing budget
-        // (verify is microseconds; lock acquisition is unblocked).
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        wait_for_log("alice rn=1 lands in pending_dkg", &log, |l| {
+            l.committee_state
+                .pending_dkg
+                .as_ref()
+                .is_some_and(|p| p.round1_packages.contains_key(&alice_addr))
+        })
+        .await;
 
         // 6. Assert: Alice's rn=1 contribution lands in pending_dkg.
         let log_guard = log.lock().await;
@@ -822,31 +867,65 @@ mod tests {
         });
         let log = Arc::new(tokio::sync::Mutex::new(initial_log));
 
-        let payload = DkgRoundPayload {
+        // Two distinct payloads so we can disambiguate which one landed:
+        // BAD_BYTES is the 2-byte payload on the corrupted-sig event, and
+        // GOOD_BYTES is the 4-byte payload on the follow-up correctly-
+        // signed event. After the good event applies, the entry MUST be
+        // GOOD_BYTES — if it were BAD_BYTES, the bad-sig event leaked
+        // through the verify gate.
+        const BAD_BYTES: [u8; 2] = [0xde, 0xad];
+        const GOOD_BYTES: [u8; 4] = [0xbe, 0xef, 0xca, 0xfe];
+
+        let bad_payload = DkgRoundPayload {
             ceremony_id,
             round_num: 1,
-            round1_package: Some(vec![0xde, 0xad]),
+            round1_package: Some(BAD_BYTES.to_vec()),
             recipient_ciphertexts: None,
         };
-        let mut event = build_signed_dfrost_event(
+        let mut bad_event = build_signed_dfrost_event(
             &alice_sk,
             alice_addr,
             DfrostEventKind::DkgRound,
-            &payload,
+            &bad_payload,
             Hlc {
                 wall_ms: 1000,
                 logical: 0,
-                device_id: "alice-dev".into(),
+                device_id: "alice-dev-bad".into(),
             },
         )
-        .expect("build_signed_dfrost_event rn=1");
+        .expect("build_signed_dfrost_event bad rn=1");
 
         // Tamper the signature — flipping a single bit is enough for
         // verify_strict to reject.
-        event.sig[0] ^= 0x01;
+        bad_event.sig[0] ^= 0x01;
 
-        let mut packet = Vec::new();
-        ciborium::ser::into_writer(&event, &mut packet).expect("ciborium encode");
+        let mut bad_packet = Vec::new();
+        ciborium::ser::into_writer(&bad_event, &mut bad_packet).expect("ciborium encode bad");
+
+        // Correctly-signed sentinel follow-up. Distinct device_id so the
+        // replay tracker treats it as independent of the dropped bad
+        // event. Once this lands, the receive loop has demonstrably
+        // drained past the bad packet.
+        let good_payload = DkgRoundPayload {
+            ceremony_id,
+            round_num: 1,
+            round1_package: Some(GOOD_BYTES.to_vec()),
+            recipient_ciphertexts: None,
+        };
+        let good_event = build_signed_dfrost_event(
+            &alice_sk,
+            alice_addr,
+            DfrostEventKind::DkgRound,
+            &good_payload,
+            Hlc {
+                wall_ms: 2000,
+                logical: 0,
+                device_id: "alice-dev-good".into(),
+            },
+        )
+        .expect("build_signed_dfrost_event good rn=1");
+        let mut good_packet = Vec::new();
+        ciborium::ser::into_writer(&good_event, &mut good_packet).expect("ciborium encode good");
 
         let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
@@ -865,20 +944,45 @@ mod tests {
         })
         .await;
 
-        sub_tx.send(packet).await.expect("send inbound");
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Push bad packet first, then the good sentinel. Channel ordering
+        // is FIFO, so by the time the good packet's effect is observable
+        // the bad packet has already been processed (and dropped at
+        // verify).
+        sub_tx.send(bad_packet).await.expect("send bad inbound");
+        sub_tx.send(good_packet).await.expect("send good inbound");
 
-        // Assert: pending_dkg.round1_packages is still empty — the
-        // bad-sig event was dropped at the verify gate.
+        // Poll for the GOOD sentinel's payload to land — this proves the
+        // receive loop has drained past the bad packet without applying
+        // it. `apply_dkg_round` uses `entry().or_insert()`, so whichever
+        // event applies FIRST wins; if the bad packet leaked through,
+        // the entry would be BAD_BYTES and this predicate would never
+        // become true with GOOD_BYTES.
+        wait_for_log("alice good rn=1 sentinel lands", &log, |l| {
+            l.committee_state
+                .pending_dkg
+                .as_ref()
+                .and_then(|p| p.round1_packages.get(&alice_addr))
+                .is_some_and(|pkg| pkg.as_slice() == GOOD_BYTES)
+        })
+        .await;
+
+        // Assert: the entry under alice_addr is exactly GOOD_BYTES — not
+        // BAD_BYTES. If the bad-sig event had bypassed the verify gate,
+        // its 2-byte payload would have won the `or_insert` race.
         let log_guard = log.lock().await;
         let pending = log_guard
             .committee_state
             .pending_dkg
             .as_ref()
             .expect("pending_dkg still present");
-        assert!(
-            pending.round1_packages.is_empty(),
-            "round1_packages must remain empty when sig verify fails"
+        let entry = pending
+            .round1_packages
+            .get(&alice_addr)
+            .expect("good sentinel applied");
+        assert_eq!(
+            entry.as_slice(),
+            GOOD_BYTES,
+            "round1_packages[alice] must hold GOOD_BYTES — if it holds BAD_BYTES, the bad-sig event leaked through verify",
         );
     }
 
@@ -1081,11 +1185,18 @@ mod tests {
         use crate::owner_state_types::SpaceId;
 
         // Identity + log setup so the loopback would otherwise apply.
+        // Bob is a sentinel actor whose correctly-signed rn=1 event we
+        // feed through `subscriber_rx` AFTER the self-loopback so we
+        // can poll-on-observable instead of sleeping: once Bob's entry
+        // lands, the receive loop has demonstrably processed both the
+        // loopback (drop at dedup) and the sentinel (apply).
         let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xA1);
         let alice_x_priv = *crate::dm_signing::ed25519_priv_to_x25519(&alice_sk);
+        let (bob_sk, bob_addr, bob_pub64) = fixture_identity(0xB2);
 
         let mut resolver_map = HashMap::new();
         resolver_map.insert(alice_addr, alice_pub64);
+        resolver_map.insert(bob_addr, bob_pub64);
         let resolver: Arc<dyn IdentityResolver + Send + Sync> =
             Arc::new(StaticResolver(resolver_map));
 
@@ -1094,9 +1205,9 @@ mod tests {
         let mut initial_log = DfrostLog::new();
         initial_log.committee_state.pending_dkg = Some(PendingCeremony {
             ceremony_id,
-            members: vec![alice_addr],
-            threshold: 1,
-            max_signers: 1,
+            members: vec![alice_addr, bob_addr],
+            threshold: 2,
+            max_signers: 2,
             proposed_epoch: 1,
             ..Default::default()
         });
@@ -1121,6 +1232,30 @@ mod tests {
         )
         .expect("build_signed_dfrost_event rn=1");
 
+        // Bob's sentinel: correctly-signed rn=1 from a different actor.
+        // Lands in `round1_packages[bob_addr]`, so polling for its
+        // presence is independent of Alice's loopback state.
+        let bob_payload = DkgRoundPayload {
+            ceremony_id,
+            round_num: 1,
+            round1_package: Some(vec![0xca, 0xfe]),
+            recipient_ciphertexts: None,
+        };
+        let bob_event = build_signed_dfrost_event(
+            &bob_sk,
+            bob_addr,
+            DfrostEventKind::DkgRound,
+            &bob_payload,
+            Hlc {
+                wall_ms: 2000,
+                logical: 0,
+                device_id: "bob-dev".into(),
+            },
+        )
+        .expect("build_signed_dfrost_event bob rn=1");
+        let mut bob_packet = Vec::new();
+        ciborium::ser::into_writer(&bob_event, &mut bob_packet).expect("ciborium encode bob");
+
         let (pub_tx, mut pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let app = tauri::test::mock_app();
@@ -1143,15 +1278,24 @@ mod tests {
         let loopback_bytes = pub_rx.recv().await.expect("packet emitted");
 
         // Simulate the Zenoh adapter's self-loopback: feed the same
-        // bytes back through subscriber_rx.
+        // bytes back through subscriber_rx. Follow with Bob's sentinel
+        // — once Bob's entry lands the receive loop has drained past
+        // the loopback (FIFO mpsc).
         sub_tx.send(loopback_bytes).await.expect("loopback inbound");
+        sub_tx.send(bob_packet).await.expect("send bob sentinel");
 
-        // Give the receive loop time to process (verify + dedup-drop).
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        wait_for_log("bob sentinel rn=1 lands", &log, |l| {
+            l.committee_state
+                .pending_dkg
+                .as_ref()
+                .is_some_and(|p| p.round1_packages.contains_key(&bob_addr))
+        })
+        .await;
 
-        // Assert: pending_dkg.round1_packages is still EMPTY — the
-        // loopback was dropped at the dedup gate because publish_event
-        // already advanced the tracker.
+        // Assert: Alice's entry is absent — the loopback was dropped at
+        // the dedup gate because publish_event already advanced the
+        // tracker. Bob's entry confirms the receive loop is fully
+        // drained past the loopback packet.
         let log_guard = log.lock().await;
         let pending = log_guard
             .committee_state
@@ -1159,8 +1303,12 @@ mod tests {
             .as_ref()
             .expect("pending_dkg still present");
         assert!(
-            pending.round1_packages.is_empty(),
+            !pending.round1_packages.contains_key(&alice_addr),
             "self-loopback must be dropped at dedup gate (publish_event records first)",
+        );
+        assert!(
+            pending.round1_packages.contains_key(&bob_addr),
+            "bob's sentinel must apply (proves receive loop drained past loopback)",
         );
     }
 
