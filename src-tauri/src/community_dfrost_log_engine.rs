@@ -5,8 +5,9 @@
 //! (deferred — out of scope for ZEB-307; this ticket ships the engine,
 //! a follow-up ships the adapter).
 
-use crate::community_dfrost_log::DfrostLog;
+use crate::community_dfrost_log::{verify_signed_committee_event, DfrostLog};
 use crate::community_dfrost_types::SignedCommitteeEvent;
+use crate::community_state_sync::IdentityResolver;
 use crate::owner_state_types::{OwnerAddr, SpaceId};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -61,6 +62,11 @@ pub struct DfrostLogEngineParams<R: tauri::Runtime> {
     pub app_handle: tauri::AppHandle<R>,
     pub self_addr: OwnerAddr,
     pub self_x25519_priv: [u8; 32],
+    /// OwnerAddr → 64-byte identity composite (X25519 || Ed25519). Same
+    /// trait shape as `community_state_sync::IdentityResolver`; in
+    /// production the engine passes the existing `OwnerDeviceCacheResolver`
+    /// directly so no second identity cache is introduced.
+    pub identity_resolver: Arc<dyn IdentityResolver + Send + Sync>,
 }
 
 /// Per-community D-FROST signed-event engine. Owns the inbound receive loop
@@ -84,6 +90,102 @@ pub struct DfrostLogEngine<R: tauri::Runtime> {
     _phantom: std::marker::PhantomData<R>,
 }
 
+/// Full inbound chain: decode → sig-verify → dedup → apply → record.
+/// Every gate-failure logs + drops the packet silently. NEVER propagates
+/// up — a malicious peer publishing garbage MUST NOT terminate the
+/// receive loop for the whole community.
+///
+/// Step ordering rationale:
+/// 1. **Decode first**: cheapest gate, kills the bulk of malformed traffic
+///    before any async resolver I/O.
+/// 2. **Sig verify next**: O(1) Ed25519 verify; resolves async but the
+///    resolver is a HashMap lookup in practice. MUST precede apply —
+///    unverified bytes never touch the materialised log.
+/// 3. **Dedup before apply**: dedup is cheap (BTreeMap lookup); avoids
+///    the apply-then-rollback cost on self-loopback (common case).
+/// 4. **Apply (irreversible)**: only reached on verified, non-replay
+///    events. Failure here means apply-level invariant violation
+///    (unknown ceremony, payload decode of inner CBOR, etc.) — log
+///    and drop, but do NOT advance the replay tracker (so a peer who
+///    later sends a valid follow-up event is not blocked by the
+///    failed-apply'd ancestor).
+/// 5. **Record AFTER apply**: same stash-after-apply pattern as PR
+///    #143 R6 — only events that successfully landed in the log
+///    advance the replay tracker.
+#[allow(clippy::too_many_arguments)]
+async fn process_inbound<R: tauri::Runtime>(
+    community_id: SpaceId,
+    dfrost_log: &Arc<Mutex<DfrostLog>>,
+    tracker: &Arc<Mutex<DfrostReplayTracker>>,
+    _app_handle: &tauri::AppHandle<R>, // unused this task; Task 4 wires emit
+    self_addr: &OwnerAddr,
+    self_x25519_priv: &[u8; 32],
+    identity_resolver: &Arc<dyn IdentityResolver + Send + Sync>,
+    packet: &[u8],
+) {
+    // 1. Decode.
+    let event: SignedCommitteeEvent = match ciborium::de::from_reader(packet) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(
+                community_id = %hex::encode(community_id.0),
+                error = %e,
+                "dfrost inbound: CBOR decode failed",
+            );
+            return;
+        }
+    };
+
+    // 2. Verify envelope sig (defence-in-depth: every byte we apply has
+    //    been signed by an identity whose address_hash binds to event.actor).
+    if let Err(e) = verify_signed_committee_event(&event, identity_resolver.as_ref()).await {
+        tracing::warn!(
+            community_id = %hex::encode(community_id.0),
+            actor = ?event.actor,
+            error = %e,
+            "dfrost inbound: signature verify failed",
+        );
+        return;
+    }
+
+    // 3. Dedup. Read-only check — does NOT advance the tracker. We
+    //    only `record` after successful apply (step 5), so a verified
+    //    event that fails apply (unknown ceremony, etc.) does not
+    //    permanently block a same-HLC replay from re-applying after
+    //    the precondition lands. Lock + immediate drop — no awaits
+    //    across the guard.
+    {
+        let t = tracker.lock().await;
+        if t.contains(&event) {
+            // Silent: self-loopback is the common case and not worth
+            // a log entry per inbound packet.
+            return;
+        }
+    }
+
+    // 4. Apply. Hold the log lock only across the apply call itself.
+    let apply_result = {
+        let mut log = dfrost_log.lock().await;
+        log.apply_with_identity(event.clone(), self_addr, self_x25519_priv)
+    };
+    if let Err(e) = apply_result {
+        tracing::warn!(
+            community_id = %hex::encode(community_id.0),
+            actor = ?event.actor,
+            kind = ?event.kind,
+            error = ?e,
+            "dfrost inbound: apply failed",
+        );
+        return;
+    }
+
+    // 5. Record. Replay tracker advances ONLY after a successful apply.
+    {
+        let mut t = tracker.lock().await;
+        t.record(&event);
+    }
+}
+
 impl<R: tauri::Runtime> DfrostLogEngine<R> {
     pub fn community_id(&self) -> SpaceId {
         self.community_id
@@ -97,23 +199,22 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
         let app_for_loop = params.app_handle;
         let self_addr_for_loop = params.self_addr;
         let self_x_priv_for_loop = params.self_x25519_priv;
+        let resolver_for_loop = params.identity_resolver.clone();
         let mut rx = params.subscriber_rx;
 
         let receive_handle = tokio::spawn(async move {
             while let Some(packet) = rx.recv().await {
-                // Task 3+ will populate `process_inbound`. For now drop the
-                // packet to validate the startup shape and capture every
-                // future-used dependency by reference so the closure type
-                // is stable.
-                let _ = (
-                    &community_id,
+                process_inbound(
+                    community_id,
                     &log_for_loop,
                     &tracker_for_loop,
                     &app_for_loop,
                     &self_addr_for_loop,
                     &self_x_priv_for_loop,
-                    packet,
-                );
+                    &resolver_for_loop,
+                    &packet,
+                )
+                .await;
             }
         });
 
@@ -136,7 +237,23 @@ mod tests {
     use crate::community_dfrost_types::{
         DfrostEventKind, SignedCommitteeEvent, ThresholdSignPayload,
     };
+    use crate::community_state_sync::IdentityResolver;
     use crate::owner_state_types::{Hlc, OwnerAddr};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// Minimal in-test `IdentityResolver` backed by a `HashMap`. Used by
+    /// both the startup test (with an empty map — never queried because
+    /// the test never drives an inbound event) and the inbound-apply
+    /// test (populated with Alice's identity composite).
+    struct StaticResolver(HashMap<OwnerAddr, [u8; 64]>);
+
+    #[async_trait::async_trait]
+    impl IdentityResolver for StaticResolver {
+        async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+            self.0.get(addr).copied()
+        }
+    }
 
     fn test_event(actor: OwnerAddr, wall_ms: u64, logical: u32) -> SignedCommitteeEvent {
         let payload = ThresholdSignPayload {
@@ -208,6 +325,8 @@ mod tests {
         let app = tauri::test::mock_app();
         let app_handle = app.handle().clone();
 
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(HashMap::new()));
         let engine = DfrostLogEngine::start(DfrostLogEngineParams {
             community_id,
             dfrost_log: log.clone(),
@@ -216,11 +335,220 @@ mod tests {
             app_handle,
             self_addr: crate::owner_state_types::OwnerAddr([0u8; 16]),
             self_x25519_priv: [0u8; 32],
+            identity_resolver: resolver,
         })
         .await;
 
         assert_eq!(engine.community_id(), community_id);
         drop(sub_tx); // signal end-of-stream
         drop(engine);
+    }
+
+    /// Build an `(SigningKey, OwnerAddr, identity_pub_64)` triple from a
+    /// seed where `address_hash` binds correctly — mirrors
+    /// `community_channel_log::tests::fixture_identity`. Required for any
+    /// test exercising `verify_signed_committee_event`'s binding chain.
+    fn fixture_identity(seed: u8) -> (ed25519_dalek::SigningKey, OwnerAddr, [u8; 64]) {
+        let priv_id = harmony_identity::PrivateIdentity::from_seed(&[seed; 32]);
+        let owner = OwnerAddr(priv_id.identity.address_hash);
+        let pub_64 = priv_id.identity.to_public_bytes();
+        // PrivateIdentity::signing_key is private; round-trip through
+        // to_private_bytes (X25519_secret(32) || Ed25519_secret(32)).
+        let private_bytes = priv_id.to_private_bytes();
+        let mut ed_secret = [0u8; 32];
+        ed_secret.copy_from_slice(&private_bytes[32..64]);
+        let signing = ed25519_dalek::SigningKey::from_bytes(&ed_secret);
+        (signing, owner, pub_64)
+    }
+
+    /// Inbound chain end-to-end: a CBOR-encoded `dr rn=1` event signed
+    /// by Alice lands on the subscriber, the receive loop verifies +
+    /// applies it, and `pending_dkg.round1_packages` gains Alice's
+    /// entry. Single-member committee (Alice only) keeps the setup
+    /// minimal; the cross-engine multi-member case is covered by the
+    /// Task 10 integration test.
+    #[tokio::test]
+    async fn engine_processes_valid_inbound_event() {
+        use crate::community_dfrost_log::{build_signed_dfrost_event, DfrostLog, PendingCeremony};
+        use crate::community_dfrost_types::DkgRoundPayload;
+        use crate::owner_state_types::SpaceId;
+
+        // 1. Identity setup: Alice with proper address_hash binding.
+        let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xA1);
+        let alice_x_priv = *crate::dm_signing::ed25519_priv_to_x25519(&alice_sk);
+
+        let mut resolver_map = HashMap::new();
+        resolver_map.insert(alice_addr, alice_pub64);
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(resolver_map));
+
+        // 2. Log + pending DKG seeded so the apply path has a ceremony
+        //    to attach the rn=1 contribution to.
+        let community_id = SpaceId([0xC0; 16]);
+        let ceremony_id = [0x42u8; 32];
+        let mut initial_log = DfrostLog::new();
+        initial_log.committee_state.pending_dkg = Some(PendingCeremony {
+            ceremony_id,
+            members: vec![alice_addr],
+            threshold: 1,
+            max_signers: 1,
+            proposed_epoch: 1,
+            ..Default::default()
+        });
+        let log = Arc::new(tokio::sync::Mutex::new(initial_log));
+
+        // 3. Build a properly-signed dr rn=1 event.
+        let payload = DkgRoundPayload {
+            ceremony_id,
+            round_num: 1,
+            round1_package: Some(vec![0xde, 0xad, 0xbe, 0xef]),
+            recipient_ciphertexts: None,
+        };
+        let event = build_signed_dfrost_event(
+            &alice_sk,
+            alice_addr,
+            DfrostEventKind::DkgRound,
+            &payload,
+            Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        )
+        .expect("build_signed_dfrost_event rn=1");
+
+        let mut packet = Vec::new();
+        ciborium::ser::into_writer(&event, &mut packet).expect("ciborium encode");
+
+        // 4. Spin up the engine.
+        let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let app = tauri::test::mock_app();
+        let app_handle = app.handle().clone();
+
+        let _engine = DfrostLogEngine::start(DfrostLogEngineParams {
+            community_id,
+            dfrost_log: log.clone(),
+            publisher_tx: pub_tx,
+            subscriber_rx: sub_rx,
+            app_handle,
+            self_addr: alice_addr,
+            self_x25519_priv: alice_x_priv,
+            identity_resolver: resolver,
+        })
+        .await;
+
+        // 5. Push the inbound packet + wait for the receive loop to drain.
+        sub_tx.send(packet).await.expect("send inbound");
+        // Yield + small sleep — the receive loop is an independent tokio
+        // task, so we need to surrender the runtime long enough for it
+        // to pull the packet, run async resolver + verify, and acquire
+        // the log lock. 50ms is well above the actual processing budget
+        // (verify is microseconds; lock acquisition is unblocked).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // 6. Assert: Alice's rn=1 contribution lands in pending_dkg.
+        let log_guard = log.lock().await;
+        let pending = log_guard
+            .committee_state
+            .pending_dkg
+            .as_ref()
+            .expect("pending_dkg still present after rn=1 apply");
+        assert!(
+            pending.round1_packages.contains_key(&alice_addr),
+            "Alice's rn=1 package must land in pending_dkg.round1_packages after inbound apply"
+        );
+    }
+
+    /// Negative: a SignedCommitteeEvent with a corrupted signature MUST
+    /// be dropped at the verify gate — no apply, no replay-tracker
+    /// advance, no state mutation. Defence against an attacker injecting
+    /// a malformed/forged envelope onto the topic.
+    #[tokio::test]
+    async fn engine_drops_event_with_bad_signature() {
+        use crate::community_dfrost_log::{build_signed_dfrost_event, DfrostLog, PendingCeremony};
+        use crate::community_dfrost_types::DkgRoundPayload;
+        use crate::owner_state_types::SpaceId;
+
+        // Same identity setup as the positive test.
+        let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xA1);
+        let alice_x_priv = *crate::dm_signing::ed25519_priv_to_x25519(&alice_sk);
+
+        let mut resolver_map = HashMap::new();
+        resolver_map.insert(alice_addr, alice_pub64);
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(resolver_map));
+
+        let community_id = SpaceId([0xC0; 16]);
+        let ceremony_id = [0x42u8; 32];
+        let mut initial_log = DfrostLog::new();
+        initial_log.committee_state.pending_dkg = Some(PendingCeremony {
+            ceremony_id,
+            members: vec![alice_addr],
+            threshold: 1,
+            max_signers: 1,
+            proposed_epoch: 1,
+            ..Default::default()
+        });
+        let log = Arc::new(tokio::sync::Mutex::new(initial_log));
+
+        let payload = DkgRoundPayload {
+            ceremony_id,
+            round_num: 1,
+            round1_package: Some(vec![0xde, 0xad]),
+            recipient_ciphertexts: None,
+        };
+        let mut event = build_signed_dfrost_event(
+            &alice_sk,
+            alice_addr,
+            DfrostEventKind::DkgRound,
+            &payload,
+            Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        )
+        .expect("build_signed_dfrost_event rn=1");
+
+        // Tamper the signature — flipping a single bit is enough for
+        // verify_strict to reject.
+        event.sig[0] ^= 0x01;
+
+        let mut packet = Vec::new();
+        ciborium::ser::into_writer(&event, &mut packet).expect("ciborium encode");
+
+        let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let app = tauri::test::mock_app();
+        let app_handle = app.handle().clone();
+
+        let _engine = DfrostLogEngine::start(DfrostLogEngineParams {
+            community_id,
+            dfrost_log: log.clone(),
+            publisher_tx: pub_tx,
+            subscriber_rx: sub_rx,
+            app_handle,
+            self_addr: alice_addr,
+            self_x25519_priv: alice_x_priv,
+            identity_resolver: resolver,
+        })
+        .await;
+
+        sub_tx.send(packet).await.expect("send inbound");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Assert: pending_dkg.round1_packages is still empty — the
+        // bad-sig event was dropped at the verify gate.
+        let log_guard = log.lock().await;
+        let pending = log_guard
+            .committee_state
+            .pending_dkg
+            .as_ref()
+            .expect("pending_dkg still present");
+        assert!(
+            pending.round1_packages.is_empty(),
+            "round1_packages must remain empty when sig verify fails"
+        );
     }
 }
