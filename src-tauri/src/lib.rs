@@ -22117,6 +22117,34 @@ type VotingLogEnginesMap = std::sync::Arc<
 /// Lazy-register a `VotingLogEngine` for `community_id` if none exists,
 /// sharing the per-community `Arc<Mutex<VotingLog>>` from `voting_logs`.
 ///
+/// Production `MembershipSnapshotResolver` that reads from the live
+/// `NodeState` handles (`community_registry` + `crdt_state`). Wraps
+/// `voting_build_snapshot_for_community`.
+pub struct NodeStateMembershipResolver {
+    pub community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
+    pub crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+}
+
+#[async_trait::async_trait]
+impl crate::community_voting_log::MembershipSnapshotResolver for NodeStateMembershipResolver {
+    async fn snapshot_at(
+        &self,
+        community_id: crate::owner_state_types::SpaceId,
+        _hlc: &crate::owner_state_types::Hlc,
+    ) -> Result<
+        crate::community_voting_core::MembershipSnapshot,
+        crate::community_voting_log::SnapshotResolverError,
+    > {
+        voting_build_snapshot_for_community(
+            self.crdt_state.clone(),
+            self.community_registry.clone(),
+            community_id,
+        )
+        .await
+        .map_err(crate::community_voting_log::SnapshotResolverError::BackendError)
+    }
+}
+
 /// ZEB-309 Phase 4a-main Task 11: `dfrost_log_registry` and `beacon_requester`
 /// are optional; when both are `Some`, `install_dfrost_handle` is called on
 /// any newly-created engine so Tier 3 PollCreate events trigger VRF beacon

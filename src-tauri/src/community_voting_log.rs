@@ -21,6 +21,33 @@ use crate::community_voting_sortition::canonical_electorate_order;
 use crate::community_voting_tier3::{Tier3PollMeta, Tier3PollState};
 use crate::owner_state_types::Hlc;
 
+/// Resolves the community's membership snapshot at a specific HLC,
+/// used by `process_inbound` for `PollCreate` events. Non-`PollCreate`
+/// inbound events reuse the snapshot frozen on the poll's state at
+/// create time. Production impl reads from `community_registry` +
+/// `crdt_state` via `NodeState`; tests use a fixed snapshot.
+#[async_trait::async_trait]
+pub trait MembershipSnapshotResolver: Send + Sync {
+    /// Resolve the per-community membership snapshot at (or as of) `hlc`.
+    /// Returns `Err` if the community is not loaded locally (e.g. we
+    /// never joined). Apply layer treats this as "reject the inbound
+    /// event" rather than "accept anyway".
+    async fn snapshot_at(
+        &self,
+        community_id: crate::owner_state_types::SpaceId,
+        hlc: &crate::owner_state_types::Hlc,
+    ) -> Result<crate::community_voting_core::MembershipSnapshot, SnapshotResolverError>;
+}
+
+/// Why `MembershipSnapshotResolver::snapshot_at` failed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SnapshotResolverError {
+    #[error("community {0:?} not loaded locally")]
+    CommunityNotLoaded(crate::owner_state_types::SpaceId),
+    #[error("failed to read membership state: {0}")]
+    BackendError(String),
+}
+
 /// All voting events for a single community, plus the materialized
 /// per-poll state derived from them.
 ///
