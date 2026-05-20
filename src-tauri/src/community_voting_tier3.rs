@@ -116,6 +116,8 @@ pub enum ValidateError {
     BallotLengthMismatch { scores: usize, expected: usize },
     #[error("ratification ballot score {0} > 5")]
     BallotScoreOutOfRange(u8),
+    #[error("decline reason must be exactly 2 ASCII alphanumeric chars")]
+    BadDeclineReason,
 }
 
 // ── Validate functions ────────────────────────────────────────────────────────
@@ -180,6 +182,20 @@ pub fn validate_ratification_ballot(
     for &s in &pd.scores {
         if s > 5 {
             return Err(ValidateError::BallotScoreOutOfRange(s));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the optional `reason` field on a `kd=md` MiniPublicDecline event.
+///
+/// Per spec §3 same-length-keys invariant: if `Some`, the reason must be
+/// exactly 2 ASCII alphanumeric chars (e.g., `"u1"`, `"co"`). `None` is
+/// always accepted (signals decline without a coded reason).
+pub fn validate_decline_reason(reason: &Option<String>) -> Result<(), ValidateError> {
+    if let Some(r) = reason {
+        if r.len() != 2 || !r.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(ValidateError::BadDeclineReason);
         }
     }
     Ok(())
@@ -2917,5 +2933,45 @@ mod tests {
             Some(expected_epoch),
             "verify_ss must pass poll's stored epoch to BeaconOracle::vrf_output_for"
         );
+    }
+}
+
+#[cfg(test)]
+mod validate_decline_reason_tests {
+    use super::*;
+
+    #[test]
+    fn none_accepted() {
+        assert!(validate_decline_reason(&None).is_ok());
+    }
+
+    #[test]
+    fn two_char_alphanumeric_accepted() {
+        assert!(validate_decline_reason(&Some("u1".into())).is_ok());
+        assert!(validate_decline_reason(&Some("co".into())).is_ok());
+    }
+
+    #[test]
+    fn empty_rejected() {
+        assert!(matches!(
+            validate_decline_reason(&Some(String::new())),
+            Err(ValidateError::BadDeclineReason)
+        ));
+    }
+
+    #[test]
+    fn three_chars_rejected() {
+        assert!(matches!(
+            validate_decline_reason(&Some("abc".into())),
+            Err(ValidateError::BadDeclineReason)
+        ));
+    }
+
+    #[test]
+    fn non_ascii_rejected() {
+        assert!(matches!(
+            validate_decline_reason(&Some("é!".into())),
+            Err(ValidateError::BadDeclineReason)
+        ));
     }
 }
