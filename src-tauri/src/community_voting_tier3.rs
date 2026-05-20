@@ -448,7 +448,13 @@ impl Tier3PollState {
         set
     }
 
-    /// Count of declines at or before `now`.
+    /// Count of UNIQUE actors who declined at or before `now`.
+    ///
+    /// Cluster 4 fix (Qodo bug #3, R1 bot review): counts unique decliners
+    /// rather than decline events. Without deduplication, repeated kd=md events
+    /// from the same actor inflate the decline count, causing `current_mini_public`
+    /// to over-promote backups (`.take(decline_count)` promotes one extra backup per
+    /// repeat) and `verify_sf`'s backup-exhaustion check to fire prematurely.
     pub fn decline_count_at(&self, now: &Hlc) -> usize {
         self.declines
             .iter()
@@ -457,7 +463,9 @@ impl Tier3PollState {
                 let n = (now.wall_ms, now.logical, now.device_id.as_str());
                 h <= n
             })
-            .count()
+            .map(|(addr, _)| addr)
+            .collect::<HashSet<_>>()
+            .len()
     }
 }
 

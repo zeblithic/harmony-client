@@ -24110,6 +24110,22 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
             })?;
     }
 
+    // Cluster 5 fix (CodeAnt incomplete-implementation MAJOR, R1 bot review):
+    // dispatch beacon callbacks for the AGGREGATING node. The inbound path
+    // (`process_inbound`) dispatches callbacks after applying a peer's VrfBeacon
+    // event, but the aggregating node applied the beacon locally via
+    // `apply_with_identity` above, bypassing `process_inbound`. Without this
+    // dispatch, the VotingLogEngine on the aggregating node never receives the
+    // beacon notification → never publishes kd=ss → Tier 3 polls stall.
+    //
+    // Dispatch AFTER the log lock is released (above) so beacon callbacks
+    // can safely re-acquire locks without deadlocking.
+    if let Some(registry) = dfrost_log_registry.as_ref() {
+        registry
+            .dispatch_beacon_callbacks(&vb_payload, &space_id)
+            .await;
+    }
+
     // T8: broadcast the vb aggregate event (best-effort; local apply
     // already succeeded). Lock ordering: this runs OUTSIDE the log lock
     // scope above. Failure here logs + continues so the beacon-ready UI

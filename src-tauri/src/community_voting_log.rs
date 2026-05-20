@@ -145,6 +145,10 @@ pub enum ApplyError {
     /// A Tier 3 event arrived for a poll that is not a Tier 3 poll (the
     /// tier_state is not `Tier3`).
     WrongTierStateForTier3Event,
+    /// Tier 3 PollCreate with `retry_of = Some(prev)` but `prev` is a non-Tier3
+    /// poll (the tier_state is not `Tier3`). Distinct from `RetryOfPollNotFailed`
+    /// which applies when the predecessor is Tier 3 but not in Failed stage.
+    RetryOfPollNotTier3,
 }
 
 impl VotingLog {
@@ -459,7 +463,7 @@ impl VotingLog {
                     let prev_t3 = prev_state
                         .tier_state
                         .as_tier3()
-                        .ok_or(ApplyError::RetryOfPollNotFailed)?;
+                        .ok_or(ApplyError::RetryOfPollNotTier3)?;
                     if prev_t3.stage != crate::community_voting_tier3::Stage::Failed {
                         return Err(ApplyError::RetryOfPollNotFailed);
                     }
@@ -477,10 +481,28 @@ impl VotingLog {
                 // received PollCreate events pending Task 12, default to empty.
                 // The verify layer (Task 6) and engine (Task 10) supply the real
                 // snapshot for locally-originated events.
+                //
+                // Cluster 3 fix (Qodo bug #2): filter by eligibility predicate
+                // so only members who pass `check_eligibility` are included.
+                // Without filtering, ineligible members could appear in the
+                // snapshot and pass `verify_ratification_ballot`'s authz check.
                 let eligible_electorate_snapshot: Vec<crate::owner_state_types::OwnerAddr> =
                     snapshot
                         .as_ref()
-                        .map(|snap| snap.members.keys().copied().collect())
+                        .map(|snap| {
+                            snap.members
+                                .keys()
+                                .copied()
+                                .filter(|addr| {
+                                    crate::community_voting_core::check_eligibility(
+                                        snap,
+                                        addr,
+                                        &cfg.eligibility,
+                                    )
+                                    .is_ok()
+                                })
+                                .collect()
+                        })
                         .unwrap_or_default();
 
                 let tier3_meta = Tier3PollMeta {
@@ -489,11 +511,9 @@ impl VotingLog {
                     poll_create_hlc: event.hlc.clone(),
                     config: cfg.clone(),
                     poll_create_event_hash,
-                    // community_epoch: Task 10 will wire the real value via
-                    // DfrostLogRegistry. For Phase 4a-main (before Task 10),
-                    // default to 0. The verify_ss path will fetch the real
-                    // epoch from the oracle, so this value is unused until
-                    // Task 10 supplies it.
+                    // community_epoch is set to 0 here; the engine calls
+                    // `set_tier3_poll_epoch` immediately after apply to store
+                    // the real epoch read from DfrostLogRegistry (Cluster 1 fix).
                     community_epoch: 0,
                 };
                 let tier3_state =
@@ -548,6 +568,31 @@ impl VotingLog {
 
         self.events.push(event);
         Ok(poll_id)
+    }
+
+    /// Patch the `community_epoch` on an existing Tier 3 poll.
+    ///
+    /// Called by `VotingLogEngine::publish_event` immediately after a successful
+    /// Tier 3 PollCreate apply to store the real D-FROST epoch read from
+    /// `DfrostLogRegistry` (Cluster 1 fix, R1 bot review).
+    ///
+    /// Reading epoch BEFORE apply and storing here is atomic within a single
+    /// engine task — there is no TOCTOU risk for `community_epoch` because the
+    /// epoch is only used as a seed input to `derive_beacon_seed`, and the beacon
+    /// request is issued after this call with the value that was read once.
+    ///
+    /// Returns `false` if the poll does not exist or is not Tier 3 (no-op).
+    pub fn set_tier3_poll_epoch(&mut self, poll_id: &PollId, epoch: u32) -> bool {
+        match self.polls.get_mut(poll_id) {
+            Some(ps) => match ps.tier_state.as_tier3_mut() {
+                Some(t3) => {
+                    t3.meta.community_epoch = epoch;
+                    true
+                }
+                None => false,
+            },
+            None => false,
+        }
     }
 }
 
@@ -1824,5 +1869,209 @@ mod tier3_dispatch_tests {
             .apply(create_ev2, &cid())
             .expect_err("retry_of non-failed must fail");
         assert_eq!(err, ApplyError::RetryOfPollNotFailed);
+    }
+
+    // ── Test 11: retry_of with non-Tier3 poll returns RetryOfPollNotTier3 (Cluster 10 nit) ──
+
+    #[test]
+    fn dispatch_retry_of_non_tier3_poll_returns_not_tier3() {
+        use crate::community_membership::ChannelId;
+        use crate::community_voting_approval::Tier1PollConfig;
+
+        let mut log = VotingLog::new();
+        let creator = addr(0xaa);
+        let cid = cid();
+
+        // Create a Tier 1 poll to serve as the (wrong-tier) predecessor.
+        let t1_cfg = Tier1PollConfig {
+            options: vec!["A".into(), "B".into()],
+            window_seconds: 3600,
+            quorum: None,
+            threshold_percent: None,
+            multi_winner: None,
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            channel_id: ChannelId([0x11; 16]),
+        };
+        let mut t1_payload = Vec::new();
+        ciborium::into_writer(&t1_cfg, &mut t1_payload).expect("encode t1");
+        let t1_create = SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Approval,
+            kind: PollEventKindCode::PollCreate,
+            hlc: hlc(1000),
+            actor: creator,
+            payload: t1_payload,
+            sig: vec![0u8; 64],
+        };
+        let t1_pid = log.apply(t1_create, &cid).expect("t1 create");
+
+        // Try a Tier 3 retry_of pointing at the Tier 1 poll.
+        let mut cfg = tier3_config();
+        cfg.retry_of = Some(t1_pid);
+        let retry_ev = SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::PollCreate,
+            hlc: hlc(2000),
+            actor: creator,
+            payload: encode(&cfg),
+            sig: vec![0u8; 64],
+        };
+        let err = log
+            .apply(retry_ev, &cid)
+            .expect_err("retry_of non-Tier3 must fail");
+        assert_eq!(
+            err,
+            ApplyError::RetryOfPollNotTier3,
+            "retry_of referencing a non-Tier3 poll must return RetryOfPollNotTier3"
+        );
+    }
+
+    // ── Test 12: Cluster 3 regression — eligibility filter in electorate snapshot ──
+
+    #[test]
+    fn dispatch_tier3_electorate_snapshot_filters_ineligible_members() {
+        use crate::community_voting_core::{MemberAttrs, MembershipSnapshot};
+
+        let mut log = VotingLog::new();
+        let creator = addr(0xaa);
+        let cid = cid();
+
+        // Build a config requiring min_power=10.
+        let mut cfg = tier3_config();
+        cfg.eligibility = Eligibility {
+            min_power: 10,
+            min_vouching_depth: None,
+            sortition_size: None,
+        };
+        let create_ev = tier3_create_event(creator, &cfg);
+
+        // Snapshot: eligible member (power=100) + ineligible member (power=5).
+        let eligible = addr(0xE0);
+        let ineligible = addr(0xE1);
+        let mut members = std::collections::HashMap::new();
+        members.insert(
+            eligible,
+            MemberAttrs {
+                power: 100,
+                vouching_depth: 0,
+            },
+        );
+        members.insert(
+            ineligible,
+            MemberAttrs {
+                power: 5,
+                vouching_depth: 0,
+            },
+        );
+        let snapshot = MembershipSnapshot { members };
+
+        let pid = log
+            .apply_with_snapshot(create_ev, &cid, Some(snapshot))
+            .expect("apply with snapshot");
+
+        let ps = log.polls.get(&pid).expect("poll");
+        let t3 = ps.tier_state.as_tier3().expect("tier3 state");
+
+        // Only the eligible member should be in the electorate.
+        assert_eq!(
+            t3.eligible_electorate_snapshot.len(),
+            1,
+            "only members meeting eligibility must be included in electorate snapshot"
+        );
+        assert!(
+            t3.eligible_electorate_snapshot.contains(&eligible),
+            "eligible member must be in snapshot"
+        );
+        assert!(
+            !t3.eligible_electorate_snapshot.contains(&ineligible),
+            "ineligible member must NOT be in snapshot (Cluster 3 fix)"
+        );
+    }
+
+    // ── Test 13: Cluster 4 regression — decline_count_at deduplicates actors ──
+
+    #[test]
+    fn decline_count_at_deduplicates_same_actor_repeated_declines() {
+        let mut log = VotingLog::new();
+        let creator = addr(0xaa);
+        let cfg = tier3_config();
+        let create_ev = tier3_create_event(creator, &cfg);
+        let pid = log.apply(create_ev, &cid()).expect("tier3 create");
+
+        // Apply kd=ss so sortition_result is set (required for decline to be meaningful).
+        let ss_payload = SortitionSelectionPayload {
+            poll_id: pid,
+            primary: vec![addr(1), addr(2)],
+            backup: vec![addr(3), addr(4)],
+        };
+        log.apply(
+            tier3_event_with_payload(
+                PollEventKindCode::SortitionSelection,
+                2000,
+                addr(0xfe),
+                encode(&ss_payload),
+            ),
+            &cid(),
+        )
+        .expect("apply kd=ss");
+
+        // Same actor declines TWICE — should only count as 1 unique decliner.
+        let same_actor = addr(1);
+        let md_payload = crate::community_voting_core::MiniPublicDeclinePayload {
+            poll_id: pid,
+            reason: None,
+        };
+        log.apply(
+            tier3_event_with_payload(
+                PollEventKindCode::MiniPublicDecline,
+                3000,
+                same_actor,
+                encode(&md_payload),
+            ),
+            &cid(),
+        )
+        .expect("first decline");
+        log.apply(
+            tier3_event_with_payload(
+                PollEventKindCode::MiniPublicDecline,
+                4000,
+                same_actor,
+                encode(&md_payload),
+            ),
+            &cid(),
+        )
+        .expect("second decline (same actor)");
+
+        let ps = log.polls.get(&pid).expect("poll");
+        let t3 = ps.tier_state.as_tier3().expect("tier3");
+
+        // Two kd=md events from same actor → unique count is 1, not 2.
+        let now = Hlc {
+            wall_ms: 99_999,
+            logical: 0,
+            device_id: "test".into(),
+        };
+        assert_eq!(
+            t3.decline_count_at(&now),
+            1,
+            "decline_count_at must deduplicate same-actor repeat declines (Cluster 4 fix)"
+        );
+
+        // The mini-public set should have 1 backup promoted (for the 1 unique decline).
+        let mp = t3.current_mini_public(&now);
+        // primary=[1,2] minus [1]=declined → {2}; 1 backup promoted → {addr(3)}.
+        assert!(mp.contains(&addr(2)), "non-decliner stays in mini-public");
+        assert!(
+            mp.contains(&addr(3)),
+            "exactly 1 backup promoted for 1 unique decline"
+        );
+        assert!(!mp.contains(&addr(4)), "second backup must NOT be promoted");
     }
 }
