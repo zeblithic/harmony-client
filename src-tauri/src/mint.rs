@@ -922,6 +922,16 @@ fn get_account_by_id(conn: &Connection, id: &str) -> Result<Option<Account>, Min
 // ── Tauri command layer ──────────────────────────────────────────────────────
 //
 // All commands wrap their sync rusqlite work in tokio::task::spawn_blocking
+
+/// Extract the mint sync engine handle (if running) and call `notify_dirty()`.
+/// Non-blocking — the debounce window coalesces rapid mutation bursts.
+fn notify_mint_dirty(state: &tauri::State<'_, std::sync::Mutex<crate::NodeState>>) {
+    if let Ok(guard) = state.lock() {
+        if let Some(engine) = guard.mint_sync.as_ref() {
+            engine.notify_dirty();
+        }
+    }
+}
 // so the tokio executor never blocks on file I/O. The `std::sync::Mutex` on
 // the connection is correct (not tokio::sync::Mutex) because the lock is
 // only held inside the spawn_blocking closure, never across an .await.
@@ -953,12 +963,14 @@ pub async fn mint_create_account(
     state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
 ) -> Result<Account, String> {
     let conn = crate::mint_db_handle(&app, &state)?;
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         let conn = conn.lock().expect("mint_db lock poisoned");
         create_account(&conn, &name).map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("join error: {e}"))?
+    .map_err(|e| format!("join error: {e}"))??;
+    notify_mint_dirty(&state);
+    Ok(result)
 }
 
 #[tauri::command]
@@ -969,12 +981,14 @@ pub async fn mint_rename_account(
     state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
 ) -> Result<Account, String> {
     let conn = crate::mint_db_handle(&app, &state)?;
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         let conn = conn.lock().expect("mint_db lock poisoned");
         rename_account(&conn, &id, &name).map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("join error: {e}"))?
+    .map_err(|e| format!("join error: {e}"))??;
+    notify_mint_dirty(&state);
+    Ok(result)
 }
 
 #[tauri::command]
@@ -984,18 +998,40 @@ pub async fn mint_delete_account(
     app: tauri::AppHandle,
     state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
 ) -> Result<(), String> {
-    let floor_arc = {
+    // Extract the sync_state handle from the engine so we can lock
+    // account_deletion_floor inside spawn_blocking without holding the
+    // NodeState Mutex across the await.
+    let sync_state_handle = {
         let node = state.lock().expect("NodeState poisoned");
-        node.mint_pending_account_floor.clone()
+        node.mint_sync.as_ref().map(|e| e.sync_state_handle())
     };
     let conn = crate::mint_db_handle(&app, &state)?;
     tokio::task::spawn_blocking(move || {
         let conn = conn.lock().expect("mint_db lock poisoned");
-        let mut floor = floor_arc.lock().expect("floor lock poisoned");
-        delete_account(&conn, &id, reassign_to.as_deref(), &mut floor).map_err(|e| e.to_string())
+        if let Some(handle) = sync_state_handle {
+            let mut st = handle.blocking_lock();
+            delete_account(
+                &conn,
+                &id,
+                reassign_to.as_deref(),
+                &mut st.account_deletion_floor,
+            )
+            .map_err(|e| e.to_string())
+        } else {
+            // Engine not yet initialized (pre-identity-bootstrap). Use a
+            // temporary empty floor; the real floor will be populated once
+            // the engine starts. This matches the Task-5 pre-engine
+            // behaviour: deletions before engine init still work, they
+            // just won't be synced until the engine is live.
+            let mut temp_floor = std::collections::HashMap::new();
+            delete_account(&conn, &id, reassign_to.as_deref(), &mut temp_floor)
+                .map_err(|e| e.to_string())
+        }
     })
     .await
-    .map_err(|e| format!("join error: {e}"))?
+    .map_err(|e| format!("join error: {e}"))??;
+    notify_mint_dirty(&state);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1042,12 +1078,14 @@ pub async fn mint_create_transaction(
     state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
 ) -> Result<Transaction, String> {
     let conn = crate::mint_db_handle(&app, &state)?;
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         let conn = conn.lock().expect("mint_db lock poisoned");
         create_transaction(&conn, payload).map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("join error: {e}"))?
+    .map_err(|e| format!("join error: {e}"))??;
+    notify_mint_dirty(&state);
+    Ok(result)
 }
 
 #[tauri::command]
@@ -1058,12 +1096,14 @@ pub async fn mint_update_transaction(
     state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
 ) -> Result<Transaction, String> {
     let conn = crate::mint_db_handle(&app, &state)?;
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         let conn = conn.lock().expect("mint_db lock poisoned");
         update_transaction(&conn, &id, payload).map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("join error: {e}"))?
+    .map_err(|e| format!("join error: {e}"))??;
+    notify_mint_dirty(&state);
+    Ok(result)
 }
 
 #[tauri::command]
@@ -1078,7 +1118,9 @@ pub async fn mint_delete_transaction(
         delete_transaction(&conn, &id).map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("join error: {e}"))?
+    .map_err(|e| format!("join error: {e}"))??;
+    notify_mint_dirty(&state);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1107,7 +1149,9 @@ pub async fn mint_set_default_currency(
         set_default_currency(&conn, &currency).map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("join error: {e}"))?
+    .map_err(|e| format!("join error: {e}"))??;
+    notify_mint_dirty(&state);
+    Ok(())
 }
 
 #[tauri::command]

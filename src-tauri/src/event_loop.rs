@@ -38,6 +38,19 @@ pub struct SyncEngineHandles {
     pub inbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
 
+/// Mint sync Zenoh adapter handles. Mirrors `SyncEngineHandles` — constructed
+/// in `start_node` alongside `MintSyncEngine::new`, consumed inside
+/// `event_loop::run` once the Zenoh session is open.
+pub struct MintSyncHandles {
+    /// Hex-encoded OWNER identity address — forms the mint topic key
+    /// `harmony/owner/{addr_hex}/mint-root-v1`.
+    pub addr_hex: String,
+    /// Encrypted bytes from MintSyncEngine's publish path → Zenoh put.
+    pub outbound_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    /// Encrypted bytes from Zenoh → MintSyncEngine's subscribe path.
+    pub inbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
 /// One per-community adapter request handed from `start_node` (lib.rs)
 /// into the event loop's Zenoh-session scope.
 ///
@@ -382,6 +395,9 @@ pub async fn run<R: Runtime>(
     // announce subscriber). `None` when `profile_broadcast_cache` is
     // `None`.
     profile_broadcast_request_rx: Option<mpsc::Receiver<ProfileBroadcastRequest>>,
+    // Mint Phase 2 sync: channel pair bridging MintSyncEngine to Zenoh.
+    // `None` when no owner identity is loaded.
+    mut mint_sync_handles: Option<MintSyncHandles>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -582,6 +598,94 @@ pub async fn run<R: Runtime>(
                 emit_degraded("key_expr_invalid");
                 // handles.outbound_rx and handles.inbound_tx drop at end
                 // of this arm; engine sees both channels close.
+            }
+        }
+    }
+
+    // ── Mint Phase 2 sync: Zenoh adapter for mint-root-v1 topic ────────
+    // Mirrors the owner-state `sync_handles` wiring above: outbound bytes
+    // from MintSyncEngine's publish path → Zenoh put; inbound bytes from
+    // Zenoh → MintSyncEngine's subscriber path. `None` when no owner
+    // identity is loaded.
+    if let Some(handles) = mint_sync_handles.take() {
+        let topic = format!("harmony/owner/{}/mint-root-v1", handles.addr_hex);
+        let emit_mint_degraded = |reason: &str| {
+            let _ = app.emit(
+                "mint-root-sync-degraded",
+                serde_json::json!({
+                    "reason": reason,
+                    "topic": &topic,
+                }),
+            );
+        };
+        match zenoh::key_expr::KeyExpr::try_from(topic.clone()) {
+            Ok(key_expr) => {
+                // Outbound: drain MintSyncEngine publisher → Zenoh put.
+                let session_pub = session.clone();
+                let key_pub = key_expr.clone();
+                let mut outbound_rx = handles.outbound_rx;
+                let closing_pub = Arc::clone(&closing);
+                tokio::spawn(async move {
+                    while let Some(bytes) = outbound_rx.recv().await {
+                        if let Err(e) = session_pub.put(&key_pub, bytes).await {
+                            if !closing_pub.load(Ordering::SeqCst) {
+                                tracing::warn!(error = %e, "mint-root publish failed");
+                            }
+                        }
+                    }
+                });
+
+                // Inbound: Zenoh subscriber → MintSyncEngine subscriber_rx.
+                match session.declare_subscriber(&key_expr).await {
+                    Ok(sub) => {
+                        let inbound_tx = handles.inbound_tx;
+                        let closing_sub = Arc::clone(&closing);
+                        let app_late = app.clone();
+                        let topic_late = topic.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                match sub.recv_async().await {
+                                    Ok(sample) => {
+                                        let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
+                                        if inbound_tx.send(bytes).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => {
+                                        if !closing_sub.load(Ordering::SeqCst) {
+                                            tracing::warn!(
+                                                "mint-root subscriber closed unexpectedly"
+                                            );
+                                            let _ = app_late.emit(
+                                                "mint-root-sync-degraded",
+                                                serde_json::json!({
+                                                    "reason": "subscriber_closed",
+                                                    "topic": &topic_late,
+                                                }),
+                                            );
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "failed to declare mint-root subscriber"
+                        );
+                        emit_mint_degraded("declare_subscriber_failed");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    %topic,
+                    "mint-root key_expr invalid; MintSyncEngine Zenoh adapter skipped"
+                );
+                emit_mint_degraded("key_expr_invalid");
             }
         }
     }

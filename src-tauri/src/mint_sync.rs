@@ -1,12 +1,8 @@
 //! Mint Phase 2 sync engine. Mirrors owner_state_sync's shape.
 
-// These functions are the Task 4 public API consumed by Tasks 7+ (engine
-// scaffold). They are intentionally not called yet; suppress dead_code until
-// the engine wires them in.
-#![allow(dead_code)]
-
 use crate::mint_sync_types::MintSyncState;
 use crate::mint_sync_types::{AccountRow, MintSnapshot, MintSyncError, SettingRow, TransactionRow};
+use crate::owner_state_crypto::KeyTree;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -227,7 +223,17 @@ pub struct MintSyncEngine {
     shared: EngineShared,
 }
 
-pub struct MintSyncEngineHandle(tokio::task::JoinHandle<()>);
+/// Handle wrapping one or two task JoinHandles (internal task + optional
+/// subscriber task for the real Zenoh engine). Implements `Future` by
+/// polling the first handle; the subscriber task is fire-and-forget.
+pub struct MintSyncEngineHandle {
+    primary: tokio::task::JoinHandle<()>,
+    /// Optional secondary task (real-engine subscriber task). Dropped
+    /// when the MintSyncEngineHandle is dropped; the subscriber task
+    /// exits when its shutdown channel closes.
+    #[allow(dead_code)]
+    secondary: Option<tokio::task::JoinHandle<()>>,
+}
 
 impl std::future::Future for MintSyncEngineHandle {
     type Output = Result<(), tokio::task::JoinError>;
@@ -235,7 +241,7 @@ impl std::future::Future for MintSyncEngineHandle {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        std::pin::Pin::new(&mut self.0).poll(cx)
+        std::pin::Pin::new(&mut self.primary).poll(cx)
     }
 }
 
@@ -318,7 +324,67 @@ impl MintSyncEngine {
                 shutdown: shutdown_tx,
                 shared,
             },
-            MintSyncEngineHandle(handle),
+            MintSyncEngineHandle {
+                primary: handle,
+                secondary: None,
+            },
+        )
+    }
+
+    /// Production constructor. Mirrors owner_state_sync::SyncEngine::new —
+    /// channel-based: encryption happens inside the engine; Zenoh I/O is
+    /// bridged externally by event_loop via `publisher_tx` / `subscriber_rx`.
+    ///
+    /// `publisher_tx`: bytes written here are forwarded by event_loop to Zenoh put.
+    /// `subscriber_rx`: encrypted bytes received from Zenoh are fed here by event_loop.
+    /// `content_store`: shared CAS used to put (publish side) and get (subscribe side)
+    ///   encrypted snapshot blobs. In production this is RuntimeContentStore.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new(
+        kt: Arc<KeyTree>,
+        device_id: String,
+        mint_db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+        content_store: Arc<dyn crate::content_store::ContentStore>,
+        sync_state: Arc<TokioMutex<MintSyncState>>,
+        sync_state_path: std::path::PathBuf,
+        publisher_tx: mpsc::Sender<Vec<u8>>,
+        subscriber_rx: mpsc::Receiver<Vec<u8>>,
+        debounce_ms: u64,
+    ) -> (Self, MintSyncEngineHandle) {
+        let dirty = Arc::new(Notify::new());
+        let (flush_tx, flush_rx) = mpsc::channel::<()>(4);
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
+        let shared = EngineShared {
+            mint_db: mint_db.clone(),
+            content_store: content_store.clone(),
+            sync_state: sync_state.clone(),
+        };
+        let dirty_for_task = dirty.clone();
+        let handle = tokio::spawn(internal_task_zenoh(
+            mint_db,
+            content_store,
+            sync_state,
+            sync_state_path,
+            kt,
+            device_id,
+            dirty_for_task,
+            flush_rx,
+            shutdown_rx,
+            std::time::Duration::from_millis(debounce_ms),
+            publisher_tx,
+            subscriber_rx,
+        ));
+        (
+            Self {
+                dirty,
+                flush_now: flush_tx,
+                shutdown: shutdown_tx,
+                shared,
+            },
+            MintSyncEngineHandle {
+                primary: handle,
+                secondary: None,
+            },
         )
     }
 
@@ -354,38 +420,37 @@ impl MintSyncEngine {
 
 impl MintSyncEngine {
     /// Test entry point that simulates a Zenoh-delivered envelope.
-    /// Task 11 replaces this with a real Zenoh subscriber.
+    /// Used by Task 8/9 tests; the real Zenoh subscriber path goes directly
+    /// through `handle_incoming_decoded` after decryption.
     pub async fn handle_incoming_envelope_for_test(
         &self,
         root_cid: crate::owner_state_types::ContentId,
     ) -> Result<(), MintSyncError> {
         self.shared.handle_incoming(root_cid).await
     }
+
+    /// Returns the shared sync-state handle so callers (e.g. delete_account
+    /// IPC) can lock the account deletion floor without going through the
+    /// engine's event loop.
+    pub fn sync_state_handle(&self) -> Arc<TokioMutex<MintSyncState>> {
+        self.shared.sync_state.clone()
+    }
 }
 
 impl EngineShared {
-    async fn handle_incoming(
+    /// Inner merge path: takes a pre-decoded snapshot, runs schema check
+    /// and apply_remote_snapshot inside spawn_blocking. Used by both the
+    /// real Zenoh subscriber (Task 11) and the test entry point.
+    async fn handle_incoming_decoded(
         &self,
-        root_cid: crate::owner_state_types::ContentId,
+        remote: crate::mint_sync_types::MintSnapshot,
     ) -> Result<(), MintSyncError> {
-        let blob = self
-            .content_store
-            .get(&root_cid)
-            .await
-            .map_err(|e| MintSyncError::Other(format!("content_store.get: {e}")))?
-            .ok_or(MintSyncError::MissingBlob(root_cid))?;
-        // TODO(Task 11): decrypt blob via decrypt_entry(&kt, &mint_ledger_lookup_key, &blob).
-        // For Task 9, we read cleartext (matching Task 8's stubbed publish).
-        let remote: crate::mint_sync_types::MintSnapshot = ciborium::from_reader(&blob[..])
-            .map_err(|e| MintSyncError::Cbor(format!("subscriber decode: {e}")))?;
-
         if remote.schema_version > crate::mint_sync_types::LOCAL_MAX_SCHEMA_VERSION {
             return Err(MintSyncError::SchemaTooNew {
                 remote: remote.schema_version,
                 local_max: crate::mint_sync_types::LOCAL_MAX_SCHEMA_VERSION,
             });
         }
-
         let mint_db = self.mint_db.clone();
         let sync_state = self.sync_state.clone();
         tokio::task::spawn_blocking(move || -> Result<(), MintSyncError> {
@@ -396,6 +461,26 @@ impl EngineShared {
         .await
         .map_err(|e| MintSyncError::Other(format!("spawn_blocking: {e}")))??;
         Ok(())
+    }
+
+    /// Test path: fetches a cleartext-CBOR blob from ContentStore by CID and merges.
+    /// The real Zenoh subscriber path uses handle_incoming_decoded directly
+    /// after decrypting the blob.
+    async fn handle_incoming(
+        &self,
+        root_cid: crate::owner_state_types::ContentId,
+    ) -> Result<(), MintSyncError> {
+        let blob = self
+            .content_store
+            .get(&root_cid)
+            .await
+            .map_err(|e| MintSyncError::Other(format!("content_store.get: {e}")))?
+            .ok_or(MintSyncError::MissingBlob(root_cid))?;
+        // Task 9 test path: cleartext blob (matching Task 8's stubbed publish).
+        // Real Zenoh path decrypts before calling handle_incoming_decoded.
+        let remote: crate::mint_sync_types::MintSnapshot = ciborium::from_reader(&blob[..])
+            .map_err(|e| MintSyncError::Cbor(format!("subscriber decode: {e}")))?;
+        self.handle_incoming_decoded(remote).await
     }
 }
 
@@ -471,6 +556,314 @@ async fn publish_root_now(
 
     // TODO(Task 11): publish (root_cid, hlc) via Zenoh after encrypt_root_publish.
     tracing::info!(target: "mint_sync", root_cid = ?root_cid, "published mint snapshot");
+    Ok(())
+}
+
+// ── Real Zenoh engine internals ──────────────────────────────────────────────
+
+/// Internal task for the production Zenoh-backed engine. Mirrors
+/// owner_state_sync::internal_task but uses `publisher_tx` for outbound bytes
+/// and `subscriber_rx` for inbound encrypted bytes from the event loop bridge.
+#[allow(clippy::too_many_arguments)]
+async fn internal_task_zenoh(
+    mint_db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    content_store: Arc<dyn crate::content_store::ContentStore>,
+    sync_state: Arc<TokioMutex<MintSyncState>>,
+    sync_state_path: std::path::PathBuf,
+    kt: Arc<KeyTree>,
+    device_id: String,
+    dirty: Arc<Notify>,
+    mut flush_rx: mpsc::Receiver<()>,
+    mut shutdown_rx: mpsc::Receiver<()>,
+    debounce: std::time::Duration,
+    publisher_tx: mpsc::Sender<Vec<u8>>,
+    mut subscriber_rx: mpsc::Receiver<Vec<u8>>,
+) {
+    // Latched after subscriber_rx closes (event_loop shut down or engine
+    // cleanly stopped). Mirrors owner_state_sync's `inbound_closed` latch.
+    let mut inbound_closed = false;
+    let mut scheduled: Option<tokio::time::Instant> = None;
+
+    loop {
+        let next_wake = scheduled
+            .unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(3600));
+        tokio::select! {
+            _ = dirty.notified() => {
+                scheduled = Some(tokio::time::Instant::now() + debounce);
+            }
+            _ = tokio::time::sleep_until(next_wake), if scheduled.is_some() => {
+                scheduled = None;
+                if let Err(e) = publish_root_now_zenoh(
+                    &mint_db,
+                    &content_store,
+                    &sync_state,
+                    &kt,
+                    &device_id,
+                    &publisher_tx,
+                )
+                .await
+                {
+                    tracing::warn!(target: "mint_sync", "publish_root_now_zenoh failed: {e}");
+                }
+            }
+            _ = flush_rx.recv() => {
+                scheduled = None;
+                if let Err(e) = publish_root_now_zenoh(
+                    &mint_db,
+                    &content_store,
+                    &sync_state,
+                    &kt,
+                    &device_id,
+                    &publisher_tx,
+                )
+                .await
+                {
+                    tracing::warn!(target: "mint_sync", "flush publish_zenoh failed: {e}");
+                }
+            }
+            maybe_bytes = subscriber_rx.recv(), if !inbound_closed => {
+                let Some(bytes) = maybe_bytes else {
+                    tracing::error!(
+                        target: "mint_sync",
+                        "mint inbound subscriber channel closed; continuing in publish-only mode"
+                    );
+                    inbound_closed = true;
+                    continue;
+                };
+                if let Err(e) = handle_incoming_publish_zenoh(
+                    &bytes,
+                    &mint_db,
+                    &content_store,
+                    &sync_state,
+                    &kt,
+                    &device_id,
+                    &sync_state_path,
+                )
+                .await
+                {
+                    tracing::warn!(target: "mint_sync", "incoming publish dropped: {e}");
+                }
+            }
+            _ = shutdown_rx.recv() => {
+                // Final flush on shutdown if there's pending dirty state.
+                if let Err(e) = publish_root_now_zenoh(
+                    &mint_db,
+                    &content_store,
+                    &sync_state,
+                    &kt,
+                    &device_id,
+                    &publisher_tx,
+                )
+                .await
+                {
+                    tracing::warn!(target: "mint_sync", "shutdown flush failed: {e}");
+                }
+                break;
+            }
+        }
+    }
+}
+
+/// Build a strictly-newer HLC for the local device, using the replay tracker
+/// inside `sync_state` as the monotonic counter (same device-id key as
+/// owner_state_sync::next_hlc). Mirrors owner_state_sync::next_hlc exactly.
+async fn next_hlc_mint(
+    sync_state: &Arc<TokioMutex<MintSyncState>>,
+    device_id: &str,
+) -> crate::owner_state_types::Hlc {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let wall_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut st = sync_state.lock().await;
+    let prev = st.replay_tracker.get(device_id).cloned();
+    let (logical, prev_wall) = match prev.as_ref() {
+        Some(p) if p.wall_ms == wall_ms => (p.logical.saturating_add(1), p.wall_ms),
+        Some(p) if p.wall_ms > wall_ms => (p.logical.saturating_add(1), p.wall_ms),
+        Some(p) => (0, p.wall_ms),
+        None => (0, 0),
+    };
+    let effective_wall = std::cmp::max(wall_ms, prev_wall);
+    let now = crate::owner_state_types::Hlc {
+        wall_ms: effective_wall,
+        logical,
+        device_id: device_id.to_owned(),
+    };
+    st.replay_tracker.insert(device_id.to_owned(), now.clone());
+    now
+}
+
+/// Encrypt and publish the current mint snapshot. Called by internal_task_zenoh.
+async fn publish_root_now_zenoh(
+    mint_db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    content_store: &Arc<dyn crate::content_store::ContentStore>,
+    sync_state: &Arc<TokioMutex<MintSyncState>>,
+    kt: &Arc<KeyTree>,
+    device_id: &str,
+    publisher_tx: &mpsc::Sender<Vec<u8>>,
+) -> Result<(), MintSyncError> {
+    // 1. Snapshot the DB.
+    let mint_db_c = mint_db.clone();
+    let snap = tokio::task::spawn_blocking(move || {
+        let mut conn = mint_db_c.lock().expect("mint_db lock poisoned");
+        snapshot_current_db(&mut conn)
+    })
+    .await
+    .map_err(|e| MintSyncError::Other(format!("spawn_blocking: {e}")))??;
+
+    if snap.accounts.is_empty() && snap.transactions.is_empty() {
+        tracing::debug!(
+            target: "mint_sync",
+            "empty snapshot — skipping zenoh publish",
+        );
+        return Ok(());
+    }
+
+    // 2. CBOR-encode the snapshot.
+    let mut cbor = Vec::new();
+    ciborium::into_writer(&snap, &mut cbor)
+        .map_err(|e| MintSyncError::Cbor(format!("zenoh publish encode: {e}")))?;
+
+    // 3. Encrypt the snapshot blob (deterministic nonce, for CID stability).
+    let lookup = crate::owner_state_crypto::space_lookup_key(kt, b"mint-ledger-v1");
+    let ciphertext = crate::owner_state_crypto::encrypt_entry(kt, &lookup, &cbor)
+        .map_err(|e| MintSyncError::Crypto(format!("encrypt_entry: {e}")))?;
+
+    // 4. Derive CID from ciphertext (not cleartext — mirrors decrypt side).
+    let root_cid =
+        crate::owner_state_types::ContentId::from_bytes(blake3::hash(&ciphertext).into());
+
+    // 5. Store encrypted blob in CAS so peers can fetch via root_cid.
+    content_store
+        .put(root_cid, ciphertext)
+        .await
+        .map_err(|e| MintSyncError::Other(format!("content_store.put: {e}")))?;
+
+    // 6. Build state-root payload with a fresh HLC.
+    let at = next_hlc_mint(sync_state, device_id).await;
+    let payload = crate::mint_sync_types::MintRootPublishPayload { root_cid, at };
+    let mut payload_bytes = Vec::new();
+    ciborium::into_writer(&payload, &mut payload_bytes)
+        .map_err(|e| MintSyncError::Cbor(format!("zenoh payload encode: {e}")))?;
+
+    // 7. Encrypt the envelope (random nonce).
+    let wire = crate::owner_state_crypto::encrypt_root_publish(kt, &payload_bytes)
+        .map_err(|e| MintSyncError::Crypto(format!("encrypt_root_publish: {e}")))?;
+
+    // 8. Forward to event_loop's Zenoh bridge.
+    publisher_tx
+        .send(wire)
+        .await
+        .map_err(|_| MintSyncError::Other("publisher channel closed".into()))?;
+
+    tracing::info!(target: "mint_sync", root_cid = ?root_cid, "published encrypted mint snapshot");
+    Ok(())
+}
+
+/// Process an inbound encrypted envelope from Zenoh. Mirrors
+/// owner_state_sync::handle_incoming_publish.
+async fn handle_incoming_publish_zenoh(
+    wire: &[u8],
+    mint_db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    content_store: &Arc<dyn crate::content_store::ContentStore>,
+    sync_state: &Arc<TokioMutex<MintSyncState>>,
+    kt: &Arc<KeyTree>,
+    device_id: &str,
+    sync_state_path: &std::path::Path,
+) -> Result<(), MintSyncError> {
+    // 1. Decrypt the root-publish envelope.
+    let payload_bytes = crate::owner_state_crypto::decrypt_root_publish(kt, wire)
+        .map_err(|e| MintSyncError::Crypto(format!("decrypt_root_publish: {e}")))?;
+    let payload: crate::mint_sync_types::MintRootPublishPayload =
+        ciborium::from_reader(&payload_bytes[..])
+            .map_err(|e| MintSyncError::Cbor(format!("envelope decode: {e}")))?;
+
+    // 2. Echo suppression — own publishes loop back through Zenoh.
+    if payload.at.device_id == device_id {
+        return Ok(());
+    }
+
+    // 3. Replay protection + tracker advance. The tracker advance is the
+    //    "post-mutation boundary" — everything after this must persist.
+    {
+        let mut st = sync_state.lock().await;
+        let accept = match st.replay_tracker.get(&payload.at.device_id) {
+            None => true,
+            Some(existing) => payload.at.is_strictly_newer_than(existing),
+        };
+        if !accept {
+            return Ok(()); // duplicate; already seen
+        }
+        st.replay_tracker
+            .insert(payload.at.device_id.clone(), payload.at.clone());
+    }
+
+    // 4. Persist replay tracker asynchronously (post-mutation so a
+    //    restart doesn't replay the same publish on next boot).
+    {
+        let st_snap = sync_state.lock().await.clone();
+        let path = sync_state_path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = crate::mint_sync_persist::save(&path, &st_snap) {
+                tracing::warn!(target: "mint_sync", "persist sync_state failed: {e}");
+            }
+        });
+    }
+
+    // 5. Fetch the encrypted blob from CAS using root_cid.
+    let blob_ciphertext = match content_store.get(&payload.root_cid).await {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            // Blob missing — peer's CAS hasn't replicated yet, or fetch timed
+            // out. Drop this publish; CRDT eventual consistency recovers on
+            // next peer publish. Mirrors owner_state_sync's ErrPostMutation
+            // handling for missing blobs.
+            tracing::warn!(
+                target: "mint_sync",
+                root_cid = ?payload.root_cid,
+                "missing mint blob (fetch timeout or not yet replicated)"
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(MintSyncError::Other(format!("content_store.get: {e}")));
+        }
+    };
+
+    // 6. Decrypt the blob.
+    let lookup = crate::owner_state_crypto::space_lookup_key(kt, b"mint-ledger-v1");
+    let blob_cleartext = crate::owner_state_crypto::decrypt_entry(kt, &lookup, &blob_ciphertext)
+        .map_err(|e| MintSyncError::Crypto(format!("decrypt_entry: {e}")))?;
+
+    // 7. Decode and merge.
+    let remote: crate::mint_sync_types::MintSnapshot =
+        ciborium::from_reader(&blob_cleartext[..])
+            .map_err(|e| MintSyncError::Cbor(format!("blob decode: {e}")))?;
+
+    if remote.schema_version > crate::mint_sync_types::LOCAL_MAX_SCHEMA_VERSION {
+        return Err(MintSyncError::SchemaTooNew {
+            remote: remote.schema_version,
+            local_max: crate::mint_sync_types::LOCAL_MAX_SCHEMA_VERSION,
+        });
+    }
+
+    let mint_db_c = mint_db.clone();
+    let sync_state_c = sync_state.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), MintSyncError> {
+        let mut conn = mint_db_c.lock().expect("mint_db lock poisoned");
+        let st = sync_state_c.blocking_lock();
+        apply_remote_snapshot(&mut conn, &remote, &st.account_deletion_floor)
+    })
+    .await
+    .map_err(|e| MintSyncError::Other(format!("spawn_blocking: {e}")))??;
+
+    tracing::info!(
+        target: "mint_sync",
+        root_cid = ?payload.root_cid,
+        peer = %payload.at.device_id,
+        "merged remote mint snapshot"
+    );
     Ok(())
 }
 

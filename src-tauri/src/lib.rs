@@ -609,11 +609,11 @@ pub struct NodeState {
     /// command. None until first use; subsequent calls reuse the cached
     /// connection.
     mint_db: Option<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>>,
-    /// TEMPORARY (until Task 11): per-device account deletion floor.
-    /// Task 11 folds this into MintSyncState.account_deletion_floor and
-    /// removes this field.
-    pub mint_pending_account_floor:
-        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    /// Mint Phase 2 sync engine. `Some` while the node is running and an
+    /// owner identity (master_seed) is available. `None` before identity
+    /// bootstrap or after stop_node. Shutdown is called in stop_inner
+    /// before the event-loop thread is joined.
+    pub mint_sync: Option<std::sync::Arc<crate::mint_sync::MintSyncEngine>>,
 }
 
 impl NodeState {
@@ -708,9 +708,8 @@ impl Default for NodeState {
             pin_serial_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             // Mint DB: lazily opened on first mint_* command call.
             mint_db: None,
-            mint_pending_account_floor: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            // Mint sync engine: initialized in identity bootstrap.
+            mint_sync: None,
         }
     }
 }
@@ -869,6 +868,9 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     let profile_broadcast_publisher_for_shutdown: Option<
         std::sync::Arc<crate::profile_broadcast::ProfileBroadcastPublisher>,
     >;
+    // Mint Phase 2 sync: taken outside the lock so shutdown() can be
+    // awaited on an ephemeral runtime after the MutexGuard is dropped.
+    let mint_sync_for_shutdown: Option<std::sync::Arc<crate::mint_sync::MintSyncEngine>>;
     let (
         shutdown_tx,
         thread,
@@ -995,6 +997,9 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         guard.profile_broadcast_request_tx = None;
         guard.profile_broadcast_next_subscription_id =
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        // Mint Phase 2 sync: take before releasing the lock so a concurrent
+        // IPC doesn't race to call notify_dirty on a shutting-down engine.
+        mint_sync_for_shutdown = guard.mint_sync.take();
         tup
     };
 
@@ -1228,6 +1233,35 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
             });
         });
     }
+    // Mint Phase 2 sync: shut down the engine after owner-state SyncEngine
+    // so any pending dirty-flagged publishes from the identity bootstrap
+    // still make it out. Uses the same ephemeral-runtime pattern as above.
+    if let Some(mint_engine) = mint_sync_for_shutdown {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => {
+                        if let Err(e) = rt.block_on(mint_engine.shutdown()) {
+                            tracing::error!(
+                                error = %e,
+                                "MintSyncEngine shutdown failed during stop_inner"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "could not build ephemeral tokio runtime for MintSyncEngine \
+                             shutdown — final flush skipped"
+                        );
+                    }
+                }
+            });
+        });
+    }
     stop_handles(shutdown_tx, thread);
     had_node
 }
@@ -1417,6 +1451,9 @@ async fn start_node(
     // outlive the lock scope and can be used in the drain block.
     let old_dm_send_inflight: Option<std::sync::Arc<tokio::sync::Semaphore>>;
     let old_dm_send_stopping: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>;
+    // Mint Phase 2 sync: outer-scope binding for the previous identity's
+    // MintSyncEngine. Awaited outside the std `MutexGuard` scope.
+    let old_mint_sync_engine: Option<std::sync::Arc<crate::mint_sync::MintSyncEngine>>;
     // ZEB-221: reserve our start-attempt sequence via the dedicated helper
     // BEFORE the lock-1 tuple-take block. Acquires + releases its own lock;
     // the subsequent lock-1 acquisition observes the bumped install_seq.
@@ -1534,6 +1571,9 @@ async fn start_node(
         guard.profile_broadcast_request_tx = None;
         guard.profile_broadcast_next_subscription_id =
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        // Mint Phase 2 sync: take the prior identity's engine so it can be
+        // shut down outside the lock below (same pattern as sync_engine).
+        old_mint_sync_engine = guard.mint_sync.take();
         tup
     };
 
@@ -1636,6 +1676,15 @@ async fn start_node(
             );
         }
     }
+    // Mint Phase 2 sync: shut down the previous identity's MintSyncEngine.
+    if let Some(mint_engine) = old_mint_sync_engine {
+        if let Err(e) = mint_engine.shutdown().await {
+            tracing::error!(
+                error = %e,
+                "previous MintSyncEngine shutdown failed during start_node restart"
+            );
+        }
+    }
     stop_handles(old_shutdown, old_thread);
 
     let our_gen = {
@@ -1724,6 +1773,10 @@ async fn start_node(
         )?;
 
         let mut sync_handles_opt: Option<crate::event_loop::SyncEngineHandles> = None;
+        // Mint Phase 2 sync: built alongside SyncEngine when owner identity loads.
+        let mut mint_sync_engine_opt: Option<std::sync::Arc<crate::mint_sync::MintSyncEngine>> =
+            None;
+        let mut mint_sync_handles_opt: Option<crate::event_loop::MintSyncHandles> = None;
         // ZEB-225 Sub-B Phase 2: lift the per-identity handles SyncEngine
         // depends on (device_id, self_owner, crdt_state, tracker,
         // content_store) out of the `if let Some(seed)` block so the
@@ -1944,10 +1997,105 @@ async fn start_node(
                     // topic `harmony/owner/{addr_hex}/state-root-v1`.
                     let owner_addr_hex = hex::encode(loaded.state.owner_id);
                     sync_handles_opt = Some(crate::event_loop::SyncEngineHandles {
-                        addr_hex: owner_addr_hex,
+                        addr_hex: owner_addr_hex.clone(),
                         outbound_rx: out_rx,
                         inbound_tx: in_tx,
                     });
+
+                    // ── Mint Phase 2 sync engine ─────────────────────────────
+                    //
+                    // Construct MintSyncEngine now that kt, device_id, and
+                    // content_store are available. The engine is channel-based
+                    // (mirrors owner_state_sync): mint_out_tx / mint_in_rx are
+                    // bridged to Zenoh by event_loop on the
+                    // `harmony/owner/{addr_hex}/mint-root-v1` topic.
+                    {
+                        let mint_sync_state_path = app_data_dir
+                            .join("mint")
+                            .join(crate::mint_sync_persist::MINT_SYNC_STATE_FILENAME);
+                        let initial_sync_state = crate::mint_sync_persist::load(
+                            &mint_sync_state_path,
+                        )
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(
+                                target: "mint_sync",
+                                path = %mint_sync_state_path.display(),
+                                "load mint_sync_state failed: {e}; using default"
+                            );
+                            crate::mint_sync_types::MintSyncState::default()
+                        });
+                        let mint_sync_state =
+                            std::sync::Arc::new(tokio::sync::Mutex::new(initial_sync_state));
+                        let (mint_out_tx, mint_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                        let (mint_in_tx, mint_in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                        // Open (or reuse cached) mint DB for the engine.
+                        // We can't call `mint_db_handle` here because that
+                        // function takes a `tauri::State` wrapper; instead
+                        // mirror its logic directly.
+                        let mint_db_for_engine = {
+                            // Fast path: already cached.
+                            let cached = {
+                                let node = state.lock().map_err(|e| format!("lock: {e}"))?;
+                                node.mint_db.clone()
+                            };
+                            if let Some(arc) = cached {
+                                arc
+                            } else {
+                                let mint_dir = app_data_dir.join("mint");
+                                std::fs::create_dir_all(&mint_dir)
+                                    .map_err(|e| format!("create_dir mint: {e}"))?;
+                                let db_path = mint_dir.join("ledger.db");
+                                let conn = crate::mint::open_database(&db_path)
+                                    .map_err(|e| e.to_string())?;
+                                let arc = std::sync::Arc::new(std::sync::Mutex::new(conn));
+                                let mut node = state.lock().map_err(|e| format!("lock: {e}"))?;
+                                if let Some(existing) = node.mint_db.as_ref() {
+                                    existing.clone()
+                                } else {
+                                    node.mint_db = Some(arc.clone());
+                                    arc
+                                }
+                            }
+                        };
+                        let (mint_engine, _mint_handle) = crate::mint_sync::MintSyncEngine::new(
+                            std::sync::Arc::clone(&kt),
+                            device_id.clone(),
+                            mint_db_for_engine,
+                            std::sync::Arc::clone(&content_store),
+                            mint_sync_state,
+                            mint_sync_state_path,
+                            mint_out_tx,
+                            mint_in_rx,
+                            crate::mint_sync::DEFAULT_DEBOUNCE_MS,
+                        )
+                        .await;
+                        // Boot-hook flush: emit the local snapshot shortly
+                        // after startup so peers that are already online
+                        // receive our current state. Mirrors the
+                        // new_for_test_with_boot_delay pattern.
+                        let mint_engine_arc = std::sync::Arc::new(mint_engine);
+                        // Boot-hook flush: emit the local snapshot shortly after
+                        // startup so peers that are already online receive our
+                        // current state. Mirrors new_for_test_with_boot_delay.
+                        {
+                            let boot_engine = std::sync::Arc::clone(&mint_engine_arc);
+                            tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    crate::mint_sync::DEFAULT_BOOT_FLUSH_DELAY_MS,
+                                ))
+                                .await;
+                                // Ignore error — engine may have shut down
+                                // before the boot delay elapsed.
+                                let _ = boot_engine.flush_now().await;
+                            });
+                        }
+                        mint_sync_engine_opt = Some(mint_engine_arc);
+                        mint_sync_handles_opt = Some(crate::event_loop::MintSyncHandles {
+                            addr_hex: owner_addr_hex.clone(),
+                            outbound_rx: mint_out_rx,
+                            inbound_tx: mint_in_tx,
+                        });
+                    }
 
                     // ── ZEB-217 Sub-C Phase 2 + Phase 3 Task 8: per-community state CRDT sync ─
                     //
@@ -3081,6 +3229,8 @@ async fn start_node(
                 let profile_broadcast_cache_for_loop =
                     Some(std::sync::Arc::clone(&profile_broadcast_cache_arc));
                 let profile_broadcast_request_rx_for_loop = Some(profile_broadcast_request_rx);
+                // Mint Phase 2 sync: thread handles into event_loop::run.
+                let mint_sync_handles_for_loop = mint_sync_handles_opt;
                 let thread_result = thread::Builder::new()
                     .name("harmony-runtime".to_string())
                     // Windows debug builds overflow the default ~2 MiB stack inside
@@ -3182,6 +3332,7 @@ async fn start_node(
                                 library_request_rx_for_loop,
                                 profile_broadcast_cache_for_loop,
                                 profile_broadcast_request_rx_for_loop,
+                                mint_sync_handles_for_loop,
                             )
                             .await;
                         });
@@ -3294,6 +3445,9 @@ async fn start_node(
                         guard.profile_broadcast_request_tx = Some(profile_broadcast_request_tx);
                         guard.profile_broadcast_next_subscription_id =
                             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+                        // Mint Phase 2 sync: store the engine Arc so IPC handlers
+                        // can call notify_dirty() after mutations.
+                        guard.mint_sync = mint_sync_engine_opt.clone();
                         thread_install_failure = None;
                     }
                     Err(e) => {
@@ -25296,9 +25450,7 @@ mod start_node_race_tests {
             )),
             pin_serial_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             mint_db: None,
-            mint_pending_account_floor: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            mint_sync: None,
         })
     }
 

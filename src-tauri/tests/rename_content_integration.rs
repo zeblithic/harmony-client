@@ -188,6 +188,7 @@ async fn spawn_test_runtime() -> TestHarness {
                     None,
                     None,
                     None,
+                    None, // Mint Phase 2 sync: not exercised in this test
                 )
                 .await;
             });
