@@ -1978,11 +1978,8 @@ mod tier3_dispatch_tests {
         let pred_ev = tier3_create_event(creator, &pred_cfg);
         // Derive the predecessor poll_id using the same derivation apply uses:
         // sha256(community_id || signing_bytes).
-        let pred_signing = pred_ev
-            .signing_bytes()
-            .expect("signing_bytes for pred_ev");
-        let pred_poll_id =
-            crate::community_voting_core::derive_poll_id(&c, &pred_signing);
+        let pred_signing = pred_ev.signing_bytes().expect("signing_bytes for pred_ev");
+        let pred_poll_id = crate::community_voting_core::derive_poll_id(&c, &pred_signing);
 
         // Build the retry poll referencing the not-yet-applied predecessor.
         let mut retry_cfg = tier3_config();
@@ -2150,7 +2147,10 @@ mod tier3_dispatch_tests {
             mp.contains(&addr(3)),
             "backup[0] fills the vacant slot from addr(1) declining"
         );
-        assert!(!mp.contains(&addr(1)), "addr(1) declined — must not be in mini-public");
+        assert!(
+            !mp.contains(&addr(1)),
+            "addr(1) declined — must not be in mini-public"
+        );
         // Note: addr(4) also enters set because sortition_size(20) > available non-declined(3).
         // The key invariant is: decline_count_at correctly deduplicates the same actor (tested above).
     }
@@ -2219,16 +2219,14 @@ mod tier3_dispatch_tests {
 
         // Both snapshots contain the same 3 members, both should produce the same sorted snapshot.
         assert_eq!(
-            t3_1.eligible_electorate_snapshot,
-            t3_2.eligible_electorate_snapshot,
+            t3_1.eligible_electorate_snapshot, t3_2.eligible_electorate_snapshot,
             "eligible_electorate_snapshot must be identical regardless of HashMap insertion order"
         );
 
         // Expected: lex-sorted by OwnerAddr bytes → [addr(0x01), addr(0x03), addr(0x05)]
         let expected: Vec<_> = vec![member_b, member_c, member_a];
         assert_eq!(
-            t3_1.eligible_electorate_snapshot,
-            expected,
+            t3_1.eligible_electorate_snapshot, expected,
             "eligible_electorate_snapshot must be sorted OwnerAddr lex ASC"
         );
     }

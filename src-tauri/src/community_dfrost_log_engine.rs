@@ -1647,10 +1647,7 @@ mod tests {
         )
         .await;
 
-        let engine = reg
-            .get(community_id)
-            .await
-            .expect("engine registered");
+        let engine = reg.get(community_id).await.expect("engine registered");
 
         // Build a minimal VrfBeacon event — payload bytes don't need to be
         // valid CBOR for this test; publish_event only CBOR-encodes the
@@ -1671,7 +1668,9 @@ mod tests {
 
         reg.subscribe_beacons(move |_payload, _cid| {
             // Non-blocking peek: if the packet is already queued, T8 ran first.
-            let mut rx = pub_rx_clone.try_lock().expect("pub_rx not contended in callback");
+            let mut rx = pub_rx_clone
+                .try_lock()
+                .expect("pub_rx not contended in callback");
             flag_clone.store(rx.try_recv().is_ok(), Ordering::SeqCst);
         })
         .await;

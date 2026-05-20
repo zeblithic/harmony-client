@@ -535,11 +535,9 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                             );
                         }
                     } else {
-                        return Err(
-                            "DfrostNotReady: D-FROST registry not installed; \
+                        return Err("DfrostNotReady: D-FROST registry not installed; \
                              retry Tier 3 PollCreate after install_dfrost_handle"
-                                .into(),
-                        );
+                            .into());
                     }
                 };
                 // Derive poll_id from signing bytes (same derivation as apply_with_snapshot).
@@ -1704,7 +1702,8 @@ mod tests {
         .await;
         // Do NOT call install_dfrost_handle — dfrost_registry is None.
 
-        let (create_ev, _electorate) = tier3_poll_create_event(actor, "dev-e", 1_000, sortition_size);
+        let (create_ev, _electorate) =
+            tier3_poll_create_event(actor, "dev-e", 1_000, sortition_size);
 
         let result = engine.publish_event(create_ev).await;
         assert!(
