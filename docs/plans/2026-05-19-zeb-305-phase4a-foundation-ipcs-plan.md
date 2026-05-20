@@ -796,6 +796,22 @@ The handler:
 - Builds a `ts` event with this share, applies it
 - If threshold reached after apply: runs `frost::aggregate(...)` → 64-byte sig, builds a `vb` event with `vrf_output = derive_vrf_output(&sig[..32])`, applies that too, then emits `dfrost-beacon-ready`.
 
+**SECURITY (R2/R3 fixup — atomic nonce consumption):** FROST `round2::sign`
+CONSUMES `SigningNonces` by value, and the FROST spec §6.2 is explicit that
+**reusing nonces across two signatures lets any observer recover the signer's
+secret share** (it's an algebraic consequence of the Schnorr structure: two
+sigs `(R, s1)` and `(R, s2)` with the same `R = r·G` give `s1 - s2 =
+c1·share - c2·share`, hence `share = (s1 - s2)/(c1 - c2)`). The IPC MUST
+take the stashed `local_nonces` via `Option::take()` UNDER THE SAME LOCK
+that performs the quorum check, then drop the lock before `round2::sign`.
+A two-phase pattern (read nonces, drop lock, sign, re-acquire lock to set
+`None`) creates a race window where two concurrent IPC calls both observe
+`Some(_)` in their first acquisition, both call `round2::sign` with the
+same nonces, and surface both shares — the protocol breaks. `take()` swaps
+to `None` atomically in a single `&mut` access; the second caller bails on
+the resulting `None` and is told to re-run `dfrost_request_vrf_beacon` for
+a fresh round-1.
+
 ```rust
 #[tauri::command]
 async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
@@ -808,24 +824,47 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
     // plan; implementer should follow the same extraction pattern.)
     //
     // Then:
-    //   1. Load PendingSignSession, decode local_nonces → SigningNonces.
-    //   2. Build BTreeMap<Identifier, SigningCommitments> from
-    //      pending_sign.contributions (each contribution = (commitments_bytes, share_bytes);
-    //      decode the commitments_bytes per peer).
-    //   3. signing_package = frost::SigningPackage::new(commitments_map, &message_hash)
-    //   4. share = frost::round2::sign(&signing_package, &nonces, &key_package)?
-    //   5. Encode share → CBOR bytes.
-    //   6. Build ts event with `share = share_bytes`, apply.
-    //   7. Check log.pending_sign[ceremony_id].contributions.len() vs threshold.
-    //   8. If >= threshold:
-    //      - Build sig = frost::aggregate(&signing_package, &shares_map, &pubkey_package)?
+    //   1. UNDER ONE log lock acquisition:
+    //      a. Verify committee active + pending_sign[ceremony_id] exists.
+    //      b. Quorum gate: pending.contributions.len() >= threshold (refuse
+    //         to consume nonces below quorum — `aggregate` would reject
+    //         the under-quorum result anyway and the nonces would be
+    //         wasted, forcing a fresh round-1).
+    //      c. `let nonces_cbor = pending.local_nonces.take().ok_or(...)?;`
+    //         — CRITICAL: must be `.take()`, NOT `.as_ref().clone()` with a
+    //         later set-to-None in a second lock window. See SECURITY note
+    //         above.
+    //      d. Decode nonces_cbor → SigningNonces; snapshot KeyPackage,
+    //         PublicKeyPackage, members, threshold, message_hash, and the
+    //         commitments_map built from EVERY contribution.
+    //   2. Drop the log lock; build `signing_package = SigningPackage::new(
+    //      commitments_map, &message_hash)`.
+    //   3. share = frost::round2::sign(&signing_package, &nonces, &key_package)?
+    //      — consumes `nonces` by value (type-system single-use enforcement).
+    //   4. Encode share → CBOR bytes.
+    //   5. Build ts event with `share = share_bytes` + the existing
+    //      commitment_bytes for self, apply.
+    //   6. Check log.pending_sign[ceremony_id].contributions where
+    //      `share_bytes.is_empty() == false` — count vs threshold.
+    //   7. If aggregation possible:
+    //      - Re-acquire log lock; snapshot the FIRST `threshold` shares
+    //        (sorted-by-OwnerAddr BTreeMap order) and build BOTH the
+    //        commitments_map AND shares_map from THAT SAME SELECTION
+    //        (R2: passing mismatched maps to `aggregate` is rejected).
+    //        If `pending_sign[ceremony]` has been drained by a concurrent
+    //        IPC between the two acquisitions, return `ok_or(...)?` —
+    //        NOT `.expect(...)` — so the caller gets a clean error.
+    //      - Build sig = frost::aggregate(&selection_signing_package,
+    //        &shares_map, &pubkey_package)?
     //      - Encode sig → 64-byte bytes (frost::Signature::serialize).
     //      - r_compressed = sig_bytes[..32].try_into()?
     //      - vrf_output = derive_vrf_output(&r_compressed)
-    //      - Build vb event payload {ceremony_id, message_hash, vrf_output, signature: sig_bytes, joint_vk: active.joint_vk}
+    //      - Build vb event payload {ceremony_id, message_hash,
+    //        signature: sig_bytes, vrf_output}.
     //      - Apply vb event.
-    //      - Emit "dfrost-beacon-ready" with payload {ceremony_id_hex, vrf_output_hex}.
-    todo!("implementer: fill in body per plan steps 1-8")
+    //      - Emit "dfrost-beacon-ready" with payload
+    //        {ceremony_id_hex, vrf_output_hex}.
+    todo!("implementer: fill in body per plan steps 1-7")
 }
 ```
 
