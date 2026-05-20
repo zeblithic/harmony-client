@@ -57,6 +57,29 @@ pub struct MintRootPublishPayload {
     pub at: crate::owner_state_types::Hlc,
 }
 
+/// On-disk persisted state for the mint sync engine.
+/// Stored at `<app_data_dir>/mint/mint_sync_state.cbor`.
+///
+/// `replay_tracker` mirrors the `BTreeMap<String, Hlc>` representation used
+/// by `owner_state_persist::save_replay`/`load_replay` — `RootReplayTracker`
+/// itself is not serializable, so we persist its inner map directly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MintSyncState {
+    pub schema_version: u32,
+    pub replay_tracker: std::collections::BTreeMap<String, crate::owner_state_types::Hlc>,
+    pub account_deletion_floor: std::collections::HashMap<String, String>,
+}
+
+impl Default for MintSyncState {
+    fn default() -> Self {
+        Self {
+            schema_version: MINT_SCHEMA_VERSION,
+            replay_tracker: std::collections::BTreeMap::new(),
+            account_deletion_floor: std::collections::HashMap::new(),
+        }
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum MintSyncError {
     #[error("mint sync IO: {0}")]
