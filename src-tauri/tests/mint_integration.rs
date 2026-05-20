@@ -210,8 +210,12 @@ fn export_csv_escapes_special_characters() {
 
     // Description with literal comma, double-quotes, and embedded newline.
     let description = "Lunch, \"deluxe\" combo\nwith soup";
-    // Metadata with an embedded newline in a JSON string value.
-    let metadata = "{\"note\":\"line\nbreak\"}";
+    // Metadata uses the JSON `\n` escape (two characters: backslash + n)
+    // rather than a raw newline byte — RFC 8259 forbids raw control chars
+    // inside JSON string values, and our validator rejects them. RFC 4180
+    // CSV escaping has no special treatment for backslash-n, so the field
+    // still round-trips byte-exactly.
+    let metadata = "{\"note\":\"line\\nbreak\"}";
 
     create_transaction(
         &conn,
