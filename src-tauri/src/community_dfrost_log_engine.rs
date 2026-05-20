@@ -321,8 +321,8 @@ async fn process_inbound<R: tauri::Runtime>(
                             "dfrost-beacon-ready emit failed (inbound)",
                         );
                     }
-                    // Task 10: dispatch beacon callbacks to notify the
-                    // VotingLogEngine so it can compute + publish kd=ss.
+                    // Dispatch beacon callbacks to notify the VotingLogEngine
+                    // so it can compute + publish kd=ss.
                     if let Some(weak) = registry_weak {
                         if let Some(registry) = weak.upgrade() {
                             registry
@@ -570,7 +570,7 @@ impl<R: tauri::Runtime> DfrostLogRegistry<R> {
     /// Returns the fresh `Arc` so callers can immediately `publish_event`
     /// without re-doing the `get`.
     ///
-    /// Task 10: accepts `this: &Arc<Self>` so a `Weak` reference can be
+    /// Accepts `this: &Arc<Self>` so a `Weak` reference can be
     /// injected into the params before handing them off to `DfrostLogEngine::start`.
     /// This lets the receive loop dispatch beacon callbacks via the registry.
     pub async fn register(

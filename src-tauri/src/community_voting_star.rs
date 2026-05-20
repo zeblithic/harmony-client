@@ -84,6 +84,11 @@ pub fn tally_star(
     let n = candidates.len();
 
     // --- Score round ---
+    // Note (Cluster 10, CodeRabbit minor): `u32` accumulator overflows at
+    // approximately 16.8M ballots × max score 255 (≈ 4.3B total). This is
+    // intentional for Phase 4a-main (public community polls are orders of
+    // magnitude smaller). If ever applied to global-scale elections, switch
+    // to `u64` accumulator before deploying.
     let mut total_scores = vec![0u32; n];
     for ballot in ballots {
         for (i, &score) in ballot.scores.iter().enumerate().take(n) {
