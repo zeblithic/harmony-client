@@ -35,6 +35,8 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
+use tauri::{AppHandle, Emitter};
+
 use crate::community_dfrost_log_engine::DfrostLogRegistry;
 use crate::community_voting_core::{PollEventKindCode, PollId, SignedVotingEvent, Tier};
 use crate::community_voting_log::VotingLog;
@@ -119,7 +121,7 @@ impl VotingReplayTracker {
 /// The adapter (Task 19 — full NodeState wiring) owns the other ends of
 /// `publisher_tx` / `subscriber_rx` and binds them to Zenoh `put` /
 /// subscribe on `harmony/community/{community_id}/voting`.
-pub struct VotingLogEngineParams {
+pub struct VotingLogEngineParams<R: tauri::Runtime = tauri::Wry> {
     pub community_id: SpaceId,
     pub voting_log: Arc<Mutex<VotingLog>>,
     /// Engine → adapter → Zenoh `put`.
@@ -135,6 +137,13 @@ pub struct VotingLogEngineParams {
     /// Local device_id string, paired with `hlc_tracker` above.
     /// Optional for the same reason as `hlc_tracker`.
     pub device_id: Option<String>,
+    /// ZEB-310 Task 12: optional Tauri `AppHandle` used by the post-apply
+    /// hook to emit the four Tier 3 lifecycle events
+    /// (`voting-tier3-sortition-complete`, `voting-tier3-drafting-open`,
+    /// `voting-tier3-ratification-open`, `voting-tier3-finalized`). `None`
+    /// disables emission — used by tests / lightweight harnesses that don't
+    /// drive the UI.
+    pub app_handle: Option<AppHandle<R>>,
     // No backfill_req_tx in Phase 2 — sparse event volume, deferred.
 }
 
@@ -174,6 +183,10 @@ pub struct VotingLogEngine<R: tauri::Runtime> {
     /// ZEB-310 Task 9: local device_id paired with `hlc_tracker`.
     /// `None` follows the same gating as `hlc_tracker`.
     device_id: Option<String>,
+    /// ZEB-310 Task 12: optional Tauri AppHandle used by the post-apply
+    /// hook to emit Tier 3 lifecycle events. `None` ⇒ engine runs without
+    /// emitting Tauri events (tests + dormant production wiring).
+    app_handle: Option<AppHandle<R>>,
     /// ZEB-310 Task 9: local signing key + owner for engine-auto
     /// orchestration paths. `None` ⇒ read-only peer mode (no
     /// orchestration). Installed via `install_local_signing_key`
@@ -197,7 +210,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
 
     /// Construct an engine, spawn its inbound receive loop, and return
     /// an `Arc<Self>` suitable for registry storage.
-    pub async fn start(params: VotingLogEngineParams) -> Arc<Self> {
+    pub async fn start(params: VotingLogEngineParams<R>) -> Arc<Self> {
         let tracker = Arc::new(Mutex::new(VotingReplayTracker::new()));
 
         // Spawn the inbound loop. It takes ownership of subscriber_rx
@@ -231,6 +244,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             beacon_requester: Mutex::new(None),
             hlc_tracker: params.hlc_tracker,
             device_id: params.device_id,
+            app_handle: params.app_handle,
             local_signing: RwLock::new(None),
             _phantom: PhantomData,
         })
@@ -967,6 +981,42 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                 None
             };
 
+        // ZEB-310 Task 12: snapshot the affected poll's current stage BEFORE
+        // apply so the post-apply hook can detect Deliberation→Drafting and
+        // Drafting→Ratification transitions and emit Tauri lifecycle events.
+        //
+        // Computed only when an `app_handle` is wired and the event targets
+        // Tier 3 (the only tier with materialized stage transitions). For
+        // PollCreate (no prior poll state) the snapshot is `None`. The
+        // derivation is identical to the `tier3_create_epoch` branch above:
+        // signing_bytes → derive_poll_id. Re-uses
+        // `current_stage_at(current_hlc_estimate)` so the snapshot reflects
+        // the same HLC-aware "now" the post-apply emit will use, giving
+        // bit-identical previous/new comparisons across the apply boundary.
+        let previous_stage_for_emit: Option<crate::community_voting_tier3::Stage> =
+            if self.app_handle.is_some()
+                && event.tier == Tier::Sortition
+                && event.kind != PollEventKindCode::PollCreate
+            {
+                // Derive pid from signing bytes (cheap; same derivation as apply).
+                let pid_opt: Option<PollId> = event.signing_bytes().ok().map(|sb| {
+                    crate::community_voting_core::derive_poll_id(&self.community_id, &sb)
+                });
+                match pid_opt {
+                    Some(pid) => {
+                        let now = self.current_hlc_estimate().await;
+                        let log = self.voting_log.lock().await;
+                        log.polls
+                            .get(&pid)
+                            .and_then(|ps| ps.tier_state.as_tier3())
+                            .map(|t3| t3.current_stage_at(&now))
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+
         // Apply locally. Capture the returned `PollId` so the engine-auto
         // post-apply hook (ZEB-310 Task 9) can inspect the affected poll's
         // state without re-deriving the id from signing_bytes.
@@ -1025,8 +1075,303 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         if event.tier == Tier::Sortition {
             self.maybe_trigger_engine_auto_orchestration(&applied_poll_id)
                 .await;
+            // ZEB-310 Task 12: emit Tauri lifecycle events for Tier 3.
+            // Runs AFTER orchestration so any kd=cl / kd=rs minted by the
+            // hook above has already applied locally — the new_stage we
+            // observe here reflects the post-orchestration end state, not
+            // the intermediate one. (E.g. when kd=ss arrives past the
+            // ratification deadline, orchestration races through
+            // kd=cl + kd=rs and we want Finalized to be the emitted state.)
+            self.maybe_emit_tier3_lifecycle_events(
+                &applied_poll_id,
+                &event,
+                previous_stage_for_emit,
+            )
+            .await;
         }
         Ok(())
+    }
+
+    /// ZEB-310 Task 12: emit the four Tier 3 lifecycle Tauri events from
+    /// the post-apply hook. Companion to
+    /// `maybe_trigger_engine_auto_orchestration` — both run from the same
+    /// hook point in `publish_event` but emit is intentionally a separate
+    /// concern (Tauri event delivery is purely a UI hint, while
+    /// orchestration mutates log state).
+    ///
+    /// Events fired (each guarded by its own condition; multiple may fire
+    /// in a single hook invocation, e.g. when kd=ss past the ratification
+    /// deadline triggers cascaded kd=cl + kd=rs orchestration):
+    ///
+    /// - `voting-tier3-sortition-complete` — applied event was kd=ss
+    /// - `voting-tier3-drafting-open` — stage transitioned Deliberation→Drafting
+    /// - `voting-tier3-ratification-open` — stage transitioned Drafting→Ratification
+    /// - `voting-tier3-finalized` — applied event was kd=rs (Tier 3)
+    ///
+    /// All emit failures are non-fatal — logged at WARN and ignored. The
+    /// local log + broadcast already succeeded; failing to notify the UI
+    /// is a degraded path, not a state divergence.
+    ///
+    /// `previous_stage` was snapshotted in `publish_event` BEFORE apply;
+    /// `None` for PollCreate / when no AppHandle is wired / when the poll
+    /// did not yet exist. The stage-transition guards (`Some(Deliberation)
+    /// → Drafting`, etc.) require a `Some(_)` previous to fire.
+    async fn maybe_emit_tier3_lifecycle_events(
+        self: &Arc<Self>,
+        pid: &PollId,
+        applied_event: &SignedVotingEvent,
+        previous_stage: Option<crate::community_voting_tier3::Stage>,
+    ) {
+        let app_handle = match &self.app_handle {
+            Some(h) => h.clone(),
+            None => return, // test-only mode without Tauri runtime
+        };
+
+        // Snapshot the post-apply tier3 state.
+        let now = self.current_hlc_estimate().await;
+        let (sortition_result, new_stage, candidates, result) = {
+            let log = self.voting_log.lock().await;
+            let t3 = match log.polls.get(pid).and_then(|ps| ps.tier_state.as_tier3()) {
+                Some(t) => t,
+                None => return,
+            };
+            (
+                t3.sortition_result.clone(),
+                t3.current_stage_at(&now),
+                t3.candidates.clone(),
+                t3.result.clone(),
+            )
+        };
+
+        let pid_hex = hex::encode(pid.0);
+        let community_id_hex = hex::encode(self.community_id.0);
+
+        // 1. Sortition complete (any apply of kd=ss). Pulls from the now-set
+        // sortition_result. If it's still None despite the kind code matching,
+        // the apply must have been rejected mid-flight — skip silently.
+        if applied_event.kind == PollEventKindCode::SortitionSelection {
+            if let Some(sr) = &sortition_result {
+                let payload = crate::VotingTier3SortitionCompletePayload {
+                    poll_id: pid_hex.clone(),
+                    community_id: community_id_hex.clone(),
+                    primary: sr.primary.iter().map(|o| hex::encode(o.0)).collect(),
+                    backup: sr.backup.iter().map(|o| hex::encode(o.0)).collect(),
+                };
+                if let Err(e) = app_handle.emit("voting-tier3-sortition-complete", &payload) {
+                    tracing::warn!(
+                        error = %e,
+                        poll_id = %pid_hex,
+                        "voting-tier3-sortition-complete emit failed (non-fatal)"
+                    );
+                }
+            }
+        }
+
+        // 2. Drafting open (stage transition 2 → 3).
+        if matches!(
+            previous_stage,
+            Some(crate::community_voting_tier3::Stage::Deliberation)
+        ) && matches!(new_stage, crate::community_voting_tier3::Stage::Drafting)
+        {
+            let payload = crate::VotingTier3DraftingOpenPayload {
+                poll_id: pid_hex.clone(),
+                community_id: community_id_hex.clone(),
+            };
+            if let Err(e) = app_handle.emit("voting-tier3-drafting-open", &payload) {
+                tracing::warn!(
+                    error = %e,
+                    poll_id = %pid_hex,
+                    "voting-tier3-drafting-open emit failed (non-fatal)"
+                );
+            }
+        }
+
+        // 3. Ratification open (stage transition 3 → 4). Build the
+        // deterministic candidate ordering the same way verify_sr / the
+        // kd=rs orchestrator does: synthesize status_quo, derive advancers,
+        // then sort. The text lookup pulls from the just-snapshotted
+        // `candidates` (status_quo's text is "<status quo>" by
+        // `synthesize_status_quo`).
+        if matches!(
+            previous_stage,
+            Some(crate::community_voting_tier3::Stage::Drafting)
+        ) && matches!(
+            new_stage,
+            crate::community_voting_tier3::Stage::Ratification
+        ) {
+            // Lookup map: event_hash → text. status_quo is synthesized,
+            // never present in candidates (until materialize lands); we
+            // hard-code its text here to match `synthesize_status_quo`.
+            let sq = crate::community_voting_tier3::synthesize_status_quo(pid);
+            let sq_hash = sq.event_hash;
+            let mut all_candidates = candidates.clone();
+            all_candidates.push(sq);
+            // sortition_size from the just-snapshotted state — fall back
+            // to a sentinel if (somehow) the poll vanished. Re-acquire the
+            // lock briefly: cheap; the snapshot already happened above
+            // but we did not capture sortition_size.
+            let primary_size: usize = {
+                let log = self.voting_log.lock().await;
+                log.polls
+                    .get(pid)
+                    .and_then(|ps| ps.tier_state.as_tier3())
+                    .map(|t3| t3.meta.config.sortition_size as usize)
+                    .unwrap_or(0)
+            };
+            if let Some(advancers) = crate::community_voting_tier3::drafting_advancers(
+                &all_candidates,
+                primary_size,
+                sq_hash,
+            ) {
+                let ordered = crate::community_voting_tier3::ratification_candidates_ordering(
+                    &advancers, sq_hash,
+                );
+                let candidate_ordering: Vec<crate::CandidateRefDto> = ordered
+                    .iter()
+                    .map(|c| {
+                        let text = all_candidates
+                            .iter()
+                            .find(|cs| cs.event_hash == c.event_hash)
+                            .map(|cs| cs.text.clone())
+                            .unwrap_or_default();
+                        crate::CandidateRefDto {
+                            event_hash: hex::encode(c.event_hash),
+                            text,
+                            approval_count: c.approval_count,
+                        }
+                    })
+                    .collect();
+                let payload = crate::VotingTier3RatificationOpenPayload {
+                    poll_id: pid_hex.clone(),
+                    community_id: community_id_hex.clone(),
+                    candidate_ordering,
+                };
+                if let Err(e) = app_handle.emit("voting-tier3-ratification-open", &payload) {
+                    tracing::warn!(
+                        error = %e,
+                        poll_id = %pid_hex,
+                        "voting-tier3-ratification-open emit failed (non-fatal)"
+                    );
+                }
+            }
+        }
+
+        // 4. Finalized (apply of kd=rs Tier 3). `StarResult` carries
+        // `winner`, `finalists`, `total_scores` (indexed by candidate
+        // position in the ratification ordering), and `runoff_votes`
+        // (indexed by finalist position). To populate the DTO's
+        // `scores_summary` we need the candidate ordering — pull it from
+        // `t3.candidates` via the same derivation as the ratification-open
+        // branch above so positions line up.
+        if applied_event.kind == PollEventKindCode::PollResult
+            && applied_event.tier == Tier::Sortition
+        {
+            if let Some(star_result) = &result {
+                // Re-derive the ratification ordering to align scores by
+                // position. This is the same `drafting_advancers +
+                // ratification_candidates_ordering` chain the engine-auto
+                // kd=rs branch uses, so the positions are bit-identical to
+                // what `total_scores` indexes against.
+                let sq = crate::community_voting_tier3::synthesize_status_quo(pid);
+                let sq_hash = sq.event_hash;
+                let mut all_candidates = candidates.clone();
+                all_candidates.push(sq);
+                let primary_size: usize = {
+                    let log = self.voting_log.lock().await;
+                    log.polls
+                        .get(pid)
+                        .and_then(|ps| ps.tier_state.as_tier3())
+                        .map(|t3| t3.meta.config.sortition_size as usize)
+                        .unwrap_or(0)
+                };
+                let ordered: Vec<crate::community_voting_star::CandidateRef> =
+                    match crate::community_voting_tier3::drafting_advancers(
+                        &all_candidates,
+                        primary_size,
+                        sq_hash,
+                    ) {
+                        Some(advancers) => {
+                            crate::community_voting_tier3::ratification_candidates_ordering(
+                                &advancers, sq_hash,
+                            )
+                        }
+                        None => Vec::new(),
+                    };
+
+                // Lookup winner text + build per-candidate score summary.
+                let winner_text = all_candidates
+                    .iter()
+                    .find(|cs| cs.event_hash == star_result.winner.event_hash)
+                    .map(|cs| cs.text.clone())
+                    .unwrap_or_default();
+
+                // Runner-up = highest-runoff-votes finalist that is NOT
+                // the winner. `StarResult.finalists` is unordered (a Vec
+                // of CandidateRefs); the matching `runoff_votes` slice is
+                // positionally aligned. Pick the finalist with max
+                // runoff_votes among non-winners, breaking ties on
+                // event_hash ASC to match the deterministic tiebreaker
+                // used by `tally_star`.
+                let runner_up_event_hash: Option<String> = {
+                    let mut best: Option<(u32, [u8; 32])> = None;
+                    for (i, f) in star_result.finalists.iter().enumerate() {
+                        if f.event_hash == star_result.winner.event_hash {
+                            continue;
+                        }
+                        let rv = star_result.runoff_votes.get(i).copied().unwrap_or(0);
+                        let candidate = (rv, f.event_hash);
+                        best = Some(match best {
+                            None => candidate,
+                            Some((b_rv, b_eh)) => {
+                                if rv > b_rv || (rv == b_rv && f.event_hash < b_eh) {
+                                    candidate
+                                } else {
+                                    (b_rv, b_eh)
+                                }
+                            }
+                        });
+                    }
+                    best.map(|(_, eh)| hex::encode(eh))
+                };
+
+                let scores_summary: Vec<crate::CandidateScoreDto> = ordered
+                    .iter()
+                    .enumerate()
+                    .map(|(i, cand)| {
+                        let total_score = star_result.total_scores.get(i).copied().unwrap_or(0);
+                        // runoff_votes is indexed by finalist position, not by candidate
+                        // position. Look up by event_hash to align.
+                        let runoff_votes = star_result
+                            .finalists
+                            .iter()
+                            .position(|f| f.event_hash == cand.event_hash)
+                            .and_then(|fi| star_result.runoff_votes.get(fi).copied())
+                            .unwrap_or(0);
+                        crate::CandidateScoreDto {
+                            event_hash: hex::encode(cand.event_hash),
+                            total_score,
+                            runoff_votes,
+                        }
+                    })
+                    .collect();
+
+                let payload = crate::VotingTier3FinalizedPayload {
+                    poll_id: pid_hex.clone(),
+                    community_id: community_id_hex.clone(),
+                    winner_event_hash: hex::encode(star_result.winner.event_hash),
+                    winner_text,
+                    runner_up_event_hash,
+                    scores_summary,
+                };
+                if let Err(e) = app_handle.emit("voting-tier3-finalized", &payload) {
+                    tracing::warn!(
+                        error = %e,
+                        poll_id = %pid_hex,
+                        "voting-tier3-finalized emit failed (non-fatal)"
+                    );
+                }
+            }
+        }
     }
 
     /// Inbound packet processing: decode, dedup, apply, record.
@@ -1130,7 +1475,7 @@ impl<R: tauri::Runtime> VotingLogRegistry<R> {
     /// replaced — the caller is responsible for shutting the old one
     /// down by dropping their `Arc` (the receive loop will then exit
     /// when the adapter's publisher sender is dropped).
-    pub async fn register(&self, params: VotingLogEngineParams) -> Arc<VotingLogEngine<R>> {
+    pub async fn register(&self, params: VotingLogEngineParams<R>) -> Arc<VotingLogEngine<R>> {
         let cid = params.community_id;
         let engine = VotingLogEngine::start(params).await;
         let mut engines = self.engines.lock().await;
@@ -1302,6 +1647,7 @@ mod tests {
             subscriber_rx,
             hlc_tracker: None,
             device_id: None,
+            app_handle: None,
         })
         .await;
 
@@ -1365,6 +1711,7 @@ mod tests {
             subscriber_rx,
             hlc_tracker: None,
             device_id: None,
+            app_handle: None,
         })
         .await;
 
@@ -1421,6 +1768,7 @@ mod tests {
                 subscriber_rx: sub_rx_a,
                 hlc_tracker: None,
                 device_id: None,
+                app_handle: None,
             })
             .await;
 
@@ -1434,6 +1782,7 @@ mod tests {
                 subscriber_rx: sub_rx_b,
                 hlc_tracker: None,
                 device_id: None,
+                app_handle: None,
             })
             .await;
 
@@ -1555,6 +1904,7 @@ mod tests {
             subscriber_rx,
             hlc_tracker: None,
             device_id: None,
+            app_handle: None,
         })
         .await;
 
@@ -1651,6 +2001,7 @@ mod tests {
             subscriber_rx,
             hlc_tracker: None,
             device_id: None,
+            app_handle: None,
         })
         .await;
 
@@ -1735,6 +2086,7 @@ mod tests {
             subscriber_rx,
             hlc_tracker: None,
             device_id: None,
+            app_handle: None,
         })
         .await;
 
@@ -1862,6 +2214,7 @@ mod tests {
             subscriber_rx,
             hlc_tracker: None,
             device_id: None,
+            app_handle: None,
         })
         .await;
 
@@ -1957,6 +2310,7 @@ mod tests {
             subscriber_rx,
             hlc_tracker: None,
             device_id: None,
+            app_handle: None,
         })
         .await;
 
@@ -2061,6 +2415,7 @@ mod tests {
             subscriber_rx,
             hlc_tracker: None,
             device_id: None,
+            app_handle: None,
         })
         .await;
 
@@ -2158,6 +2513,7 @@ mod tests {
             subscriber_rx,
             hlc_tracker: None,
             device_id: None,
+            app_handle: None,
         })
         .await;
         // Do NOT call install_dfrost_handle — dfrost_registry is None.

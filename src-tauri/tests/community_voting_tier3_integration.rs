@@ -45,6 +45,7 @@ use harmony_app::community_voting_tier3::{
     verify_sf, Stage, VerifyError,
 };
 use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+use tauri::Listener;
 use tokio::sync::{mpsc, Mutex};
 
 // ─── Identity-resolver helper ──────────────────────────────────────────────────
@@ -175,6 +176,7 @@ pub async fn setup_two_voting_engine_bridge(community_id: SpaceId) -> TwoVotingE
         subscriber_rx: a_sub_rx,
         hlc_tracker: Some(a_hlc_tracker),
         device_id: Some("engine-a".into()),
+        app_handle: None,
     })
     .await;
 
@@ -185,6 +187,7 @@ pub async fn setup_two_voting_engine_bridge(community_id: SpaceId) -> TwoVotingE
         subscriber_rx: b_sub_rx,
         hlc_tracker: Some(b_hlc_tracker),
         device_id: Some("engine-b".into()),
+        app_handle: None,
     })
     .await;
 
@@ -216,6 +219,84 @@ pub async fn setup_two_voting_engine_bridge_with_signing(
         .install_local_signing_key(signing_key, proposer.owner)
         .await;
     engines
+}
+
+/// ZEB-310 Task 12 fixture: like `setup_two_voting_engine_bridge_with_signing`
+/// but also installs an `app_handle` on `engine_a` so the engine's post-apply
+/// hook emits the four Tier 3 lifecycle Tauri events
+/// (`voting-tier3-sortition-complete`, `voting-tier3-drafting-open`,
+/// `voting-tier3-ratification-open`, `voting-tier3-finalized`) to a
+/// `tauri::test::MockRuntime` event bus that tests can `listen` to.
+///
+/// `engine_b` keeps `app_handle: None` so emit code only runs on the
+/// authoritative side — mirrors the realistic UX shape (only the user's
+/// device fires UI notifications, not every peer).
+pub async fn setup_two_voting_engine_bridge_with_signing_and_app(
+    community_id: SpaceId,
+    proposer: &TestIdentity,
+    app_handle: tauri::AppHandle<tauri::test::MockRuntime>,
+) -> TwoVotingEngines {
+    let (a_pub_tx, mut a_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (b_pub_tx, mut b_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (a_sub_tx, a_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (b_sub_tx, b_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+
+    let b_sub_tx_clone = b_sub_tx.clone();
+    tokio::spawn(async move {
+        while let Some(packet) = a_pub_rx.recv().await {
+            if b_sub_tx_clone.send(packet).await.is_err() {
+                break;
+            }
+        }
+    });
+    let a_sub_tx_clone = a_sub_tx.clone();
+    tokio::spawn(async move {
+        while let Some(packet) = b_pub_rx.recv().await {
+            if a_sub_tx_clone.send(packet).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let log_a = Arc::new(Mutex::new(VotingLog::new()));
+    let log_b = Arc::new(Mutex::new(VotingLog::new()));
+
+    let a_hlc_tracker = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+    let b_hlc_tracker = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+
+    let engine_a = VotingLogEngine::start(VotingLogEngineParams {
+        community_id,
+        voting_log: Arc::clone(&log_a),
+        publisher_tx: a_pub_tx,
+        subscriber_rx: a_sub_rx,
+        hlc_tracker: Some(a_hlc_tracker),
+        device_id: Some("engine-a".into()),
+        app_handle: Some(app_handle),
+    })
+    .await;
+
+    let engine_b = VotingLogEngine::start(VotingLogEngineParams {
+        community_id,
+        voting_log: Arc::clone(&log_b),
+        publisher_tx: b_pub_tx,
+        subscriber_rx: b_sub_rx,
+        hlc_tracker: Some(b_hlc_tracker),
+        device_id: Some("engine-b".into()),
+        app_handle: None,
+    })
+    .await;
+
+    let signing_key = Arc::new(proposer.signing_key.clone());
+    engine_a
+        .install_local_signing_key(signing_key, proposer.owner)
+        .await;
+
+    TwoVotingEngines {
+        engine_a,
+        engine_b,
+        log_a,
+        log_b,
+    }
 }
 
 // ─── Polling helper ────────────────────────────────────────────────────────────
@@ -2978,6 +3059,224 @@ async fn engine_auto_rs_after_cl_with_bit_identical_tally() {
     assert_eq!(
         result_a.winner.event_hash, sq_hash,
         "winner must be status_quo in the degenerate 0-ballot path"
+    );
+
+    drop(engines);
+}
+
+/// ZEB-310 Task 12: verify the engine's post-apply hook emits the Tier 3
+/// lifecycle Tauri events at the expected lifecycle points.
+///
+/// Scenario: drive a Tier 3 poll through the kd=ss → engine-auto kd=cl →
+/// engine-auto kd=rs cascade (same shape as `engine_auto_rs_after_cl…`
+/// above) and assert:
+///
+///   - `voting-tier3-sortition-complete` fires exactly once (kd=ss apply)
+///   - `voting-tier3-finalized` fires exactly once (kd=rs apply, cascaded
+///      from inside the recursive `publish_event` from the engine-auto hook)
+///
+/// `voting-tier3-drafting-open` and `voting-tier3-ratification-open` are NOT
+/// asserted in this scenario — the hook uses `current_hlc_estimate()`
+/// (real wall-clock) for the previous/new stage diff, and the synthetic
+/// `t0 = 6_000_000ms` poll create HLC is decades behind real wall-clock,
+/// so `current_stage_at(now)` collapses straight to Ratification (skipping
+/// the Deliberation and Drafting transitions). The IPC-emitted version of
+/// these two events (Tasks 7 / 8 of the broader plan) covers the real
+/// transition path explicitly. Here we cover the always-fires-on-kind
+/// events (sortition-complete + finalized).
+#[tokio::test]
+async fn engine_auto_tier3_tauri_events_fire_at_expected_lifecycle_points() {
+    use std::sync::Mutex as StdMutex;
+
+    const COMMUNITY_ID: SpaceId = SpaceId([0xC4; 16]);
+    const SORTITION_SIZE: u16 = 20;
+    const N_IDENTITIES: usize = 50;
+
+    let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
+    let proposer = &identities[49];
+    let full_electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
+    let sortition_pool: Vec<OwnerAddr> = identities[..49].iter().map(|id| id.owner).collect();
+
+    // Mock Tauri app + handle, plus listeners for the two events we assert on.
+    // Listeners must be registered BEFORE the events fire — the engine's
+    // emit happens inside `publish_event`, and Tauri's bus delivers
+    // asynchronously to listeners attached at emit time only if the
+    // listener was registered prior.
+    let app = tauri::test::mock_app();
+    let app_handle = app.handle().clone();
+
+    let sortition_complete_payloads: Arc<StdMutex<Vec<String>>> =
+        Arc::new(StdMutex::new(Vec::new()));
+    let finalized_payloads: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+
+    {
+        let sink = Arc::clone(&sortition_complete_payloads);
+        app_handle.listen("voting-tier3-sortition-complete", move |evt| {
+            sink.lock()
+                .expect("sortition_complete sink")
+                .push(evt.payload().to_string());
+        });
+    }
+    {
+        let sink = Arc::clone(&finalized_payloads);
+        app_handle.listen("voting-tier3-finalized", move |evt| {
+            sink.lock()
+                .expect("finalized sink")
+                .push(evt.payload().to_string());
+        });
+    }
+
+    let engines = setup_two_voting_engine_bridge_with_signing_and_app(
+        COMMUNITY_ID,
+        proposer,
+        app_handle.clone(),
+    )
+    .await;
+
+    let t0: u64 = 6_000_000;
+    let config = Tier3PollConfigPayload {
+        proposal_text: "Engine-auto Tauri events test".into(),
+        sortition_size: SORTITION_SIZE,
+        deliberation_window_seconds: 60,
+        drafting_window_seconds: 60,
+        ratification_window_seconds: 60,
+        privacy_mode: "pu".into(),
+        incentive_mode: "a".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+    };
+
+    let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
+    let create_signing_bytes = create_event
+        .signing_bytes()
+        .expect("create event signing_bytes");
+    let poll_id = derive_poll_id(&COMMUNITY_ID, &create_signing_bytes);
+
+    let snapshot = MembershipSnapshot {
+        members: full_electorate
+            .iter()
+            .map(|addr| {
+                (
+                    *addr,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )
+            })
+            .collect(),
+    };
+
+    // Apply PollCreate directly (no Tauri events emitted by the engine for
+    // this event — `voting-tier3-poll-created` is emitted by the IPC, not
+    // the engine).
+    {
+        let mut log = engines.log_a.lock().await;
+        log.apply_with_snapshot(create_event.clone(), &COMMUNITY_ID, Some(snapshot.clone()))
+            .expect("engine_a: PollCreate apply");
+    }
+    {
+        let mut log = engines.log_b.lock().await;
+        log.apply_with_snapshot(create_event, &COMMUNITY_ID, Some(snapshot))
+            .expect("engine_b: PollCreate apply");
+    }
+
+    // Publish kd=ss via engine_a. This:
+    //   1. emits `voting-tier3-sortition-complete` (kd=ss kind match), then
+    //   2. fires engine-auto orchestration → kd=cl recursive publish → kd=rs
+    //      recursive publish → poll Finalized → `voting-tier3-finalized`
+    //      emitted from the kd=rs inner publish_event's post-apply hook.
+    let vrf_output: [u8; 32] = [0xC4; 32];
+    let sortition_result = fisher_yates_select(
+        &vrf_output,
+        &sortition_pool,
+        SORTITION_SIZE as usize,
+        SORTITION_SIZE as usize,
+    );
+    let ss_hlc_wall = t0 + 500_000;
+    let ss_event = build_sortition_selection_event(
+        poll_id,
+        sortition_result.primary.clone(),
+        sortition_result.backup.clone(),
+        hlc_at(ss_hlc_wall, "engine"),
+    );
+    engines
+        .engine_a
+        .publish_event(ss_event)
+        .await
+        .expect("engine_a: publish kd=ss");
+
+    // Wait for engine_a to reach Stage::Finalized so we know the full
+    // cascade has applied + both events have been emitted onto the Tauri
+    // bus. The bus delivery is async; we then poll the listener sinks.
+    wait_for_log(
+        "engine_a: stage == Finalized (kd=ss → kd=cl → kd=rs cascade)",
+        &engines.log_a,
+        |log| {
+            log.polls
+                .get(&poll_id)
+                .and_then(|ps| ps.tier_state.as_tier3())
+                .map(|t3| t3.stage == Stage::Finalized)
+                .unwrap_or(false)
+        },
+    )
+    .await
+    .expect("engine_a: full Finalized cascade must complete within 5s");
+
+    // Poll until BOTH events have been delivered (Tauri bus has its own
+    // dispatch latency). Bounded at 2s.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let sc_count = sortition_complete_payloads.lock().expect("sc lock").len();
+        let fin_count = finalized_payloads.lock().expect("fin lock").len();
+        if sc_count >= 1 && fin_count >= 1 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "Tauri events did not deliver in time: sortition-complete={sc_count}, \
+                 finalized={fin_count} (each must be >= 1)"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Exact-once assertions: each event fired exactly once on engine_a.
+    let sc_payloads = sortition_complete_payloads
+        .lock()
+        .expect("sc lock final")
+        .clone();
+    let fin_payloads = finalized_payloads.lock().expect("fin lock final").clone();
+    assert_eq!(
+        sc_payloads.len(),
+        1,
+        "voting-tier3-sortition-complete must fire exactly once; got {} payloads: {:?}",
+        sc_payloads.len(),
+        sc_payloads
+    );
+    assert_eq!(
+        fin_payloads.len(),
+        1,
+        "voting-tier3-finalized must fire exactly once; got {} payloads: {:?}",
+        fin_payloads.len(),
+        fin_payloads
+    );
+
+    // Spot-check payload shape: poll_id field should contain our hex.
+    let poll_id_hex = hex::encode(poll_id.0);
+    assert!(
+        sc_payloads[0].contains(&poll_id_hex),
+        "sortition-complete payload missing pollId hex: {}",
+        sc_payloads[0]
+    );
+    assert!(
+        fin_payloads[0].contains(&poll_id_hex),
+        "finalized payload missing pollId hex: {}",
+        fin_payloads[0]
     );
 
     drop(engines);

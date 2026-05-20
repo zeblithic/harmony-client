@@ -22147,6 +22147,13 @@ async fn ensure_voting_engine_for(
             // once IPC mints route through the engine.
             hlc_tracker: None,
             device_id: None,
+            // ZEB-310 Task 12: engine-auto Tier 3 lifecycle events are
+            // dormant in this wiring too. Once the IPC layer routes Tier 3
+            // mints through `engine.publish_event`, plumb `app_handle`
+            // here so the four post-apply lifecycle events
+            // (sortition-complete / drafting-open / ratification-open /
+            // finalized) fire to the UI.
+            app_handle: None,
         },
     )
     .await;
