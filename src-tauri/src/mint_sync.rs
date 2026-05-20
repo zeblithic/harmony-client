@@ -778,13 +778,19 @@ mod tests {
             .await
             .unwrap();
 
-        // B's DB should now contain a1 + t1.
+        // B's DB should now contain a1 + t1 with matching identifiers and
+        // descriptions (assert identity, not just row counts — a regression
+        // that merged the wrong rows would slip past length-only checks).
         let snap_b = {
             let mut conn = conn_b.lock().unwrap();
             snapshot_current_db(&mut conn).unwrap()
         };
         assert_eq!(snap_b.accounts.len(), 1);
+        assert_eq!(snap_b.accounts[0].id, "a1");
+        assert_eq!(snap_b.accounts[0].name, "Chase");
         assert_eq!(snap_b.transactions.len(), 1);
+        assert_eq!(snap_b.transactions[0].id, "t1");
+        assert_eq!(snap_b.transactions[0].description, "Coffee");
 
         engine_a.shutdown().await.unwrap();
         engine_b.shutdown().await.unwrap();
