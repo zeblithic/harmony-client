@@ -266,6 +266,103 @@ pub enum ApplyError {
     UnexpectedEnvelope,
 }
 
+/// Errors surfaced by `verify_signed_committee_event`. Mirrors the
+/// channel-log `ChannelEventError` shape (subset) for the envelope
+/// verify chain — every variant maps to a structurally identical
+/// channel-log error case (`UnknownAuthor`, `AuthorPubkeyMismatch`,
+/// `BadSignature`). Decode + replay + apply errors are NOT carried
+/// here — those live one level up in `process_inbound`.
+#[derive(thiserror::Error, Debug)]
+pub enum DfrostVerifyError {
+    /// Identity resolution failed for `event.actor`. Mirrors
+    /// `ChannelEventError::UnknownAuthor`.
+    #[error("identity not resolvable for actor {0:?}")]
+    UnknownActor(OwnerAddr),
+    /// Resolver returned bytes that failed `Identity::from_public_bytes`
+    /// (wrong length, or `VerifyingKey::from_bytes` rejected — non-
+    /// canonical Ed25519 point). Folds into `AuthorPubkeyMismatch` on
+    /// the channel-log side. Distinct here because the resolver shape
+    /// is shared with `community_state_sync` and we want a clear log
+    /// at the verify boundary.
+    #[error("resolver returned bytes that do not parse as a 64-byte identity composite")]
+    BadIdentityBytes,
+    /// `identity.address_hash != event.actor.0` — the resolver
+    /// returned the wrong identity for this actor (cache substitution,
+    /// stale entry, or malicious resolver). Mirrors
+    /// `ChannelEventError::AuthorPubkeyMismatch`.
+    #[error("identity-pubkey-to-actor binding mismatch")]
+    ActorAddressMismatch,
+    /// `event.sig` was not 64 bytes (Ed25519 signature width).
+    /// Decoder accepts arbitrary-length `Vec<u8>`; this is the first
+    /// place the length is enforced.
+    #[error("signature is not 64 bytes")]
+    BadSignatureBytes,
+    /// `signing_bytes()` re-encode failed. Should be unreachable in
+    /// practice (the same struct just round-tripped through ciborium
+    /// to decode), but propagated for completeness.
+    #[error("signing_bytes re-encode failed: {0}")]
+    SigningBytesEncode(String),
+    /// Ed25519 `verify_strict` rejected the signature. Mirrors
+    /// `ChannelEventError::BadSignature`.
+    #[error("signature verify failed")]
+    SignatureVerifyFailed,
+}
+
+/// Verify the Ed25519 envelope signature on a `SignedCommitteeEvent`.
+/// Mirrors `community_channel_log::verify_channel_event` lines 628-698
+/// — the resolver-shape, address-hash-binding, and `verify_strict`
+/// posture are identical, modulo the channel-log-specific misroute /
+/// replay / authorization steps which live one level up here (replay
+/// in `DfrostReplayTracker`, apply-level membership/ceremony checks
+/// in `DfrostLog::apply`).
+///
+/// On Ok the event is wire-valid + identity-valid + signature-valid.
+/// The caller (Phase 4a engine) is responsible for the
+/// replay-then-apply chain.
+pub async fn verify_signed_committee_event(
+    event: &SignedCommitteeEvent,
+    resolver: &dyn crate::community_state_sync::IdentityResolver,
+) -> Result<(), DfrostVerifyError> {
+    // 1. Resolve actor → 64-byte identity composite.
+    let identity_pub = resolver
+        .resolve(&event.actor)
+        .await
+        .ok_or(DfrostVerifyError::UnknownActor(event.actor))?;
+
+    // 2. Parse → Identity; verify address-hash binding (defence vs
+    //    a buggy/compromised resolver that pairs an OwnerAddr with
+    //    the wrong key — same threat model as channel-log Step 4b).
+    let identity = harmony_identity::Identity::from_public_bytes(&identity_pub)
+        .map_err(|_| DfrostVerifyError::BadIdentityBytes)?;
+    if identity.address_hash != event.actor.0 {
+        return Err(DfrostVerifyError::ActorAddressMismatch);
+    }
+
+    // 3. Parse signature into a fixed 64-byte array. `Signature::from_bytes`
+    //    in `ed25519-dalek` 2.x is infallible given a `&[u8; 64]`, so the
+    //    length-gate sits at the `try_into` boundary.
+    let sig_bytes: [u8; 64] = event
+        .sig
+        .as_slice()
+        .try_into()
+        .map_err(|_| DfrostVerifyError::BadSignatureBytes)?;
+    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+
+    // 4. `verify_strict` over canonical signing bytes (RFC 8032 strict
+    //    subset — rejects non-canonical S and small-order R points,
+    //    matching channel-log Step 5 and community_membership::
+    //    verify_signature posture).
+    let signing_bytes = event
+        .signing_bytes()
+        .map_err(|e| DfrostVerifyError::SigningBytesEncode(e.to_string()))?;
+    identity
+        .verifying_key
+        .verify_strict(&signing_bytes, &signature)
+        .map_err(|_| DfrostVerifyError::SignatureVerifyFailed)?;
+
+    Ok(())
+}
+
 impl DfrostLog {
     pub fn new() -> Self {
         Self::default()
