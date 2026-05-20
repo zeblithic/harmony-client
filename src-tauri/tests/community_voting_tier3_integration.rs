@@ -32,9 +32,8 @@ use harmony_app::community_membership::ChannelId;
 use harmony_app::community_state_sync::IdentityResolver;
 use harmony_app::community_voting_approval::Tier1PollConfig;
 use harmony_app::community_voting_core::{
-    build_signed_poll_create_tier1, derive_poll_id, CandidateEventHash, DraftApprovalPayload,
-    DraftCandidatePayload, Eligibility, MemberAttrs, MembershipSnapshot, MiniPublicDeclinePayload,
-    PollEventKindCode, RatificationBallotPayload, SignedVotingEvent, SortitionFailedPayload,
+    build_signed_poll_create_tier1, derive_poll_id, CandidateEventHash, Eligibility, MemberAttrs,
+    MembershipSnapshot, PollEventKindCode, RatificationBallotPayload, SignedVotingEvent,
     SortitionSelectionPayload, Tier, Tier3PollConfigPayload,
 };
 use harmony_app::community_voting_log::{ApplyError, VotingLog};
@@ -43,7 +42,7 @@ use harmony_app::community_voting_sortition::fisher_yates_select;
 use harmony_app::community_voting_star::tally_star;
 use harmony_app::community_voting_tier3::{
     drafting_advancers, ratification_candidates_ordering, synthesize_status_quo, verify_sd,
-    verify_sf, Stage, Tier3PollResultPayload, VerifyError,
+    verify_sf, Stage, VerifyError,
 };
 use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 use tokio::sync::{mpsc, Mutex};
@@ -252,27 +251,22 @@ pub fn default_tier3_config() -> Tier3PollConfigPayload {
 }
 
 /// Build a signed Tier 3 PollCreate (kd=cr, tier=Sortition) event.
+///
+/// Thin `&TestIdentity` adapter over the core
+/// `build_signed_poll_create_tier3` — see `community_voting_core.rs` for
+/// the canonical `(&SigningKey, OwnerAddr)` shape used by the IPC layer.
 pub fn build_tier3_poll_create_event(
     proposer: &TestIdentity,
     config: &Tier3PollConfigPayload,
     hlc: Hlc,
 ) -> SignedVotingEvent {
-    use ed25519_dalek::Signer;
-    let mut payload = Vec::new();
-    ciborium::into_writer(config, &mut payload).expect("encode Tier3PollConfigPayload");
-    let mut ev = SignedVotingEvent {
-        tag: 'p',
-        version: 1,
-        tier: Tier::Sortition,
-        kind: PollEventKindCode::PollCreate,
+    harmony_app::community_voting_core::build_signed_poll_create_tier3(
+        &proposer.signing_key,
+        proposer.owner,
+        config,
         hlc,
-        actor: proposer.owner,
-        payload,
-        sig: vec![0u8; 64],
-    };
-    let sb = ev.signing_bytes().expect("signing_bytes for tier3 create");
-    ev.sig = proposer.signing_key.sign(&sb).to_bytes().to_vec();
-    ev
+    )
+    .expect("build_signed_poll_create_tier3")
 }
 
 /// Build a signed kd=md MiniPublicDecline event.
@@ -281,26 +275,14 @@ pub fn build_decline_event(
     poll_id: harmony_app::community_voting_core::PollId,
     hlc: Hlc,
 ) -> SignedVotingEvent {
-    use ed25519_dalek::Signer;
-    let payload_struct = MiniPublicDeclinePayload {
+    harmony_app::community_voting_core::build_signed_mini_public_decline(
+        &actor.signing_key,
+        actor.owner,
         poll_id,
-        reason: None,
-    };
-    let mut payload = Vec::new();
-    ciborium::into_writer(&payload_struct, &mut payload).expect("encode MiniPublicDeclinePayload");
-    let mut ev = SignedVotingEvent {
-        tag: 'p',
-        version: 1,
-        tier: Tier::Sortition,
-        kind: PollEventKindCode::MiniPublicDecline,
+        None,
         hlc,
-        actor: actor.owner,
-        payload,
-        sig: vec![0u8; 64],
-    };
-    let sb = ev.signing_bytes().expect("signing_bytes for decline");
-    ev.sig = actor.signing_key.sign(&sb).to_bytes().to_vec();
-    ev
+    )
+    .expect("build_signed_mini_public_decline")
 }
 
 /// Build a signed kd=dc DraftCandidate event.
@@ -310,28 +292,14 @@ pub fn build_draft_candidate_event(
     text: &str,
     hlc: Hlc,
 ) -> SignedVotingEvent {
-    use ed25519_dalek::Signer;
-    let payload_struct = DraftCandidatePayload {
+    harmony_app::community_voting_core::build_signed_draft_candidate(
+        &actor.signing_key,
+        actor.owner,
         poll_id,
-        text: text.into(),
-    };
-    let mut payload = Vec::new();
-    ciborium::into_writer(&payload_struct, &mut payload).expect("encode DraftCandidatePayload");
-    let mut ev = SignedVotingEvent {
-        tag: 'p',
-        version: 1,
-        tier: Tier::Sortition,
-        kind: PollEventKindCode::DraftCandidate,
+        text.into(),
         hlc,
-        actor: actor.owner,
-        payload,
-        sig: vec![0u8; 64],
-    };
-    let sb = ev
-        .signing_bytes()
-        .expect("signing_bytes for draft candidate");
-    ev.sig = actor.signing_key.sign(&sb).to_bytes().to_vec();
-    ev
+    )
+    .expect("build_signed_draft_candidate")
 }
 
 /// Build a signed kd=da DraftApproval event.
@@ -341,28 +309,14 @@ pub fn build_draft_approval_event(
     candidate_event_hash: CandidateEventHash,
     hlc: Hlc,
 ) -> SignedVotingEvent {
-    use ed25519_dalek::Signer;
-    let payload_struct = DraftApprovalPayload {
+    harmony_app::community_voting_core::build_signed_draft_approval(
+        &actor.signing_key,
+        actor.owner,
         poll_id,
         candidate_event_hash,
-    };
-    let mut payload = Vec::new();
-    ciborium::into_writer(&payload_struct, &mut payload).expect("encode DraftApprovalPayload");
-    let mut ev = SignedVotingEvent {
-        tag: 'p',
-        version: 1,
-        tier: Tier::Sortition,
-        kind: PollEventKindCode::DraftApproval,
         hlc,
-        actor: actor.owner,
-        payload,
-        sig: vec![0u8; 64],
-    };
-    let sb = ev
-        .signing_bytes()
-        .expect("signing_bytes for draft approval");
-    ev.sig = actor.signing_key.sign(&sb).to_bytes().to_vec();
-    ev
+    )
+    .expect("build_signed_draft_approval")
 }
 
 /// Build a signed kd=rb RatificationBallot event.
@@ -373,25 +327,14 @@ pub fn build_ratification_ballot_event(
     scores: Vec<u8>,
     hlc: Hlc,
 ) -> SignedVotingEvent {
-    use ed25519_dalek::Signer;
-    let payload_struct = RatificationBallotPayload { poll_id, scores };
-    let mut payload = Vec::new();
-    ciborium::into_writer(&payload_struct, &mut payload).expect("encode RatificationBallotPayload");
-    let mut ev = SignedVotingEvent {
-        tag: 'p',
-        version: 1,
-        tier: Tier::Sortition,
-        kind: PollEventKindCode::RatificationBallot,
+    harmony_app::community_voting_core::build_signed_ratification_ballot(
+        &actor.signing_key,
+        actor.owner,
+        poll_id,
+        scores,
         hlc,
-        actor: actor.owner,
-        payload,
-        sig: vec![0u8; 64],
-    };
-    let sb = ev
-        .signing_bytes()
-        .expect("signing_bytes for ratification ballot");
-    ev.sig = actor.signing_key.sign(&sb).to_bytes().to_vec();
-    ev
+    )
+    .expect("build_signed_ratification_ballot")
 }
 
 /// Build a signed kd=sf SortitionFailed event.
@@ -400,30 +343,24 @@ pub fn build_sortition_failed_event(
     poll_id: harmony_app::community_voting_core::PollId,
     hlc: Hlc,
 ) -> SignedVotingEvent {
-    use ed25519_dalek::Signer;
-    let payload_struct = SortitionFailedPayload { poll_id };
-    let mut payload = Vec::new();
-    ciborium::into_writer(&payload_struct, &mut payload).expect("encode SortitionFailedPayload");
-    let mut ev = SignedVotingEvent {
-        tag: 'p',
-        version: 1,
-        tier: Tier::Sortition,
-        kind: PollEventKindCode::SortitionFailed,
+    harmony_app::community_voting_core::build_signed_sortition_failed(
+        &proposer.signing_key,
+        proposer.owner,
+        poll_id,
         hlc,
-        actor: proposer.owner,
-        payload,
-        sig: vec![0u8; 64],
-    };
-    let sb = ev
-        .signing_bytes()
-        .expect("signing_bytes for sortition failed");
-    ev.sig = proposer.signing_key.sign(&sb).to_bytes().to_vec();
-    ev
+    )
+    .expect("build_signed_sortition_failed")
 }
 
 /// Build a signed kd=ss SortitionSelection event (engine-generated shape:
 /// zero-sig actor is `OwnerAddr([0; 16])`). Used in tests that inject a
 /// pre-computed sortition result without a real DKG/beacon.
+///
+/// NOTE: this helper is intentionally retained in the integration test
+/// file (no core counterpart) because the engine-generated shape uses a
+/// zero actor + zero sig, which has no signing-key analogue. Task 19
+/// will wire real signing and at that point the function will move into
+/// the engine-side surface.
 pub fn build_sortition_selection_event(
     poll_id: harmony_app::community_voting_core::PollId,
     primary: Vec<OwnerAddr>,
@@ -458,30 +395,13 @@ pub fn build_poll_close_event(
     poll_id: harmony_app::community_voting_core::PollId,
     hlc: Hlc,
 ) -> SignedVotingEvent {
-    use ed25519_dalek::Signer;
-    // PollClose for Tier 3 carries a minimal payload with just the poll_id reference.
-    // The payload is a CBOR map with key "pi" → poll_id bytes.
-    #[derive(serde::Serialize)]
-    struct PollClosePayload {
-        #[serde(rename = "pi")]
-        pi: harmony_app::community_voting_core::PollId,
-    }
-    let payload_struct = PollClosePayload { pi: poll_id };
-    let mut payload = Vec::new();
-    ciborium::into_writer(&payload_struct, &mut payload).expect("encode PollClosePayload");
-    let mut ev = SignedVotingEvent {
-        tag: 'p',
-        version: 1,
-        tier: Tier::Sortition,
-        kind: PollEventKindCode::PollClose,
+    harmony_app::community_voting_core::build_signed_poll_close_tier3(
+        &actor.signing_key,
+        actor.owner,
+        poll_id,
         hlc,
-        actor: actor.owner,
-        payload,
-        sig: vec![0u8; 64],
-    };
-    let sb = ev.signing_bytes().expect("signing_bytes for poll close");
-    ev.sig = actor.signing_key.sign(&sb).to_bytes().to_vec();
-    ev
+    )
+    .expect("build_signed_poll_close_tier3")
 }
 
 /// Build a signed kd=rs PollResult event (Tier 3).
@@ -491,23 +411,14 @@ pub fn build_poll_result_event(
     result: harmony_app::community_voting_star::StarResult,
     hlc: Hlc,
 ) -> SignedVotingEvent {
-    use ed25519_dalek::Signer;
-    let payload_struct = Tier3PollResultPayload { poll_id, result };
-    let mut payload = Vec::new();
-    ciborium::into_writer(&payload_struct, &mut payload).expect("encode Tier3PollResultPayload");
-    let mut ev = SignedVotingEvent {
-        tag: 'p',
-        version: 1,
-        tier: Tier::Sortition,
-        kind: PollEventKindCode::PollResult,
+    harmony_app::community_voting_core::build_signed_poll_result_tier3(
+        &actor.signing_key,
+        actor.owner,
+        poll_id,
+        result,
         hlc,
-        actor: actor.owner,
-        payload,
-        sig: vec![0u8; 64],
-    };
-    let sb = ev.signing_bytes().expect("signing_bytes for poll result");
-    ev.sig = actor.signing_key.sign(&sb).to_bytes().to_vec();
-    ev
+    )
+    .expect("build_signed_poll_result_tier3")
 }
 
 // ─── SMOKE TESTS ───────────────────────────────────────────────────────────────
