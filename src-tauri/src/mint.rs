@@ -298,6 +298,7 @@ pub fn delete_account(
     conn: &Connection,
     id: &str,
     reassign_to: Option<&str>,
+    floor: &mut std::collections::HashMap<String, String>,
 ) -> Result<(), MintError> {
     // `unchecked_transaction` is correct here: `conn` is a `&Connection`
     // already obtained from the `Mutex<Connection>` guard, so we know we
@@ -358,6 +359,10 @@ pub fn delete_account(
     tx.execute("DELETE FROM accounts WHERE id = ?", params![id])?;
 
     tx.commit()?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    floor.insert(id.to_string(), now);
+
     Ok(())
 }
 
@@ -979,10 +984,15 @@ pub async fn mint_delete_account(
     app: tauri::AppHandle,
     state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
 ) -> Result<(), String> {
+    let floor_arc = {
+        let node = state.lock().expect("NodeState poisoned");
+        node.mint_pending_account_floor.clone()
+    };
     let conn = crate::mint_db_handle(&app, &state)?;
     tokio::task::spawn_blocking(move || {
         let conn = conn.lock().expect("mint_db lock poisoned");
-        delete_account(&conn, &id, reassign_to.as_deref()).map_err(|e| e.to_string())
+        let mut floor = floor_arc.lock().expect("floor lock poisoned");
+        delete_account(&conn, &id, reassign_to.as_deref(), &mut floor).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
@@ -1345,7 +1355,8 @@ mod tests {
     fn delete_account_empty_succeeds() {
         let conn = fresh_db();
         let account = create_account(&conn, "Chase").unwrap();
-        delete_account(&conn, &account.id, None).unwrap();
+        let mut floor = std::collections::HashMap::new();
+        delete_account(&conn, &account.id, None, &mut floor).unwrap();
 
         let list = list_accounts(&conn).unwrap();
         assert!(list.is_empty());
@@ -1366,7 +1377,8 @@ mod tests {
         )
         .unwrap();
 
-        let err = delete_account(&conn, &account.id, None).unwrap_err();
+        let mut floor = std::collections::HashMap::new();
+        let err = delete_account(&conn, &account.id, None, &mut floor).unwrap_err();
         assert!(
             matches!(err, MintError::Validation(ref s) if s.contains("has transactions")),
             "expected 'has transactions' in Validation error, got: {:?}",
@@ -1402,7 +1414,8 @@ mod tests {
             .unwrap();
         }
 
-        delete_account(&conn, &a.id, Some(&b.id)).unwrap();
+        let mut floor = std::collections::HashMap::new();
+        delete_account(&conn, &a.id, Some(&b.id), &mut floor).unwrap();
 
         let list = list_accounts(&conn).unwrap();
         assert_eq!(list.len(), 1, "only B should remain");
@@ -1417,7 +1430,8 @@ mod tests {
     fn delete_account_reassign_to_same_id_fails() {
         let conn = fresh_db();
         let a = create_account(&conn, "A").unwrap();
-        let err = delete_account(&conn, &a.id, Some(&a.id)).unwrap_err();
+        let mut floor = std::collections::HashMap::new();
+        let err = delete_account(&conn, &a.id, Some(&a.id), &mut floor).unwrap_err();
         assert!(
             matches!(err, MintError::Validation(ref s) if s.contains("cannot reassign")),
             "expected 'cannot reassign' in Validation error, got: {:?}",
@@ -1441,8 +1455,14 @@ mod tests {
         )
         .unwrap();
 
-        let err =
-            delete_account(&conn, &a.id, Some("00000000-0000-0000-0000-000000000000")).unwrap_err();
+        let mut floor = std::collections::HashMap::new();
+        let err = delete_account(
+            &conn,
+            &a.id,
+            Some("00000000-0000-0000-0000-000000000000"),
+            &mut floor,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, MintError::Validation(ref s) if s.contains("does not exist")),
             "expected 'does not exist' in Validation error, got: {:?}",
@@ -1453,7 +1473,14 @@ mod tests {
     #[test]
     fn delete_account_not_found() {
         let conn = fresh_db();
-        let err = delete_account(&conn, "00000000-0000-0000-0000-000000000000", None).unwrap_err();
+        let mut floor = std::collections::HashMap::new();
+        let err = delete_account(
+            &conn,
+            "00000000-0000-0000-0000-000000000000",
+            None,
+            &mut floor,
+        )
+        .unwrap_err();
         assert!(matches!(err, MintError::NotFound(_)));
     }
 
@@ -1476,7 +1503,8 @@ mod tests {
         .unwrap();
         let original_updated_at = t.updated_at.clone();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        delete_account(&conn, &a.id, Some(&b.id)).unwrap();
+        let mut floor = std::collections::HashMap::new();
+        delete_account(&conn, &a.id, Some(&b.id), &mut floor).unwrap();
         let after = get_transaction(&conn, &t.id).unwrap().unwrap();
         assert!(
             after.updated_at > original_updated_at,

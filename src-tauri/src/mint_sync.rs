@@ -372,6 +372,59 @@ mod tests {
     }
 
     #[test]
+    fn deletion_floor_blocks_stale_account_resurrect() {
+        let mut local = fresh_db();
+        // local has NO record of a1 (it was previously hard-deleted).
+        let mut floor = HashMap::new();
+        floor.insert("a1".to_string(), "2026-05-02T00:00:00Z".to_string());
+        let remote = MintSnapshot {
+            schema_version: 1,
+            accounts: vec![AccountRow {
+                id: "a1".into(),
+                name: "Chase Zombie".into(),
+                created_at: "2026-05-01T00:00:00Z".into(),
+                updated_at: "2026-05-01T00:00:00Z".into(), // older than floor
+            }],
+            transactions: vec![],
+            settings: vec![],
+            captured_at: "2026-05-19T12:00:00Z".into(),
+        };
+        apply_remote_snapshot(&mut local, &remote, &floor).unwrap();
+        let exists: Option<String> = local
+            .query_row("SELECT id FROM accounts WHERE id = ?", ["a1"], |r| r.get(0))
+            .optional()
+            .unwrap();
+        assert!(exists.is_none(), "floor should have blocked the resurrect");
+    }
+
+    #[test]
+    fn deletion_floor_allows_newer_remote_through() {
+        let mut local = fresh_db();
+        let mut floor = HashMap::new();
+        floor.insert("a1".to_string(), "2026-05-02T00:00:00Z".to_string());
+        let remote = MintSnapshot {
+            schema_version: 1,
+            accounts: vec![AccountRow {
+                id: "a1".into(),
+                name: "Chase Re-created".into(),
+                created_at: "2026-05-03T00:00:00Z".into(),
+                updated_at: "2026-05-03T00:00:00Z".into(), // newer than floor
+            }],
+            transactions: vec![],
+            settings: vec![],
+            captured_at: "2026-05-19T12:00:00Z".into(),
+        };
+        apply_remote_snapshot(&mut local, &remote, &floor).unwrap();
+        let name: Option<String> = local
+            .query_row("SELECT name FROM accounts WHERE id = ?", ["a1"], |r| {
+                r.get(0)
+            })
+            .optional()
+            .unwrap();
+        assert_eq!(name.as_deref(), Some("Chase Re-created"));
+    }
+
+    #[test]
     fn apply_resurrects_after_tombstone() {
         let mut local = fresh_db();
         seed_account(&mut local, "a1", "Chase", "2026-05-01T00:00:00Z");

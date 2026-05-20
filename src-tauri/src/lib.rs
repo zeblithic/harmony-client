@@ -608,6 +608,11 @@ pub struct NodeState {
     /// command. None until first use; subsequent calls reuse the cached
     /// connection.
     mint_db: Option<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>>,
+    /// TEMPORARY (until Task 11): per-device account deletion floor.
+    /// Task 11 folds this into MintSyncState.account_deletion_floor and
+    /// removes this field.
+    pub mint_pending_account_floor:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
 }
 
 impl NodeState {
@@ -702,6 +707,9 @@ impl Default for NodeState {
             pin_serial_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             // Mint DB: lazily opened on first mint_* command call.
             mint_db: None,
+            mint_pending_account_floor: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 }
@@ -25287,6 +25295,9 @@ mod start_node_race_tests {
             )),
             pin_serial_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             mint_db: None,
+            mint_pending_account_floor: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         })
     }
 

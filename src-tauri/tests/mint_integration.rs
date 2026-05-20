@@ -107,7 +107,8 @@ fn account_delete_with_reassign_moves_transactions() {
         )
         .unwrap();
     }
-    delete_account(&conn, &a.id, Some(&b.id)).unwrap();
+    let mut floor = std::collections::HashMap::new();
+    delete_account(&conn, &a.id, Some(&b.id), &mut floor).unwrap();
     let on_b = list_transactions(
         &conn,
         &ListFilter {
