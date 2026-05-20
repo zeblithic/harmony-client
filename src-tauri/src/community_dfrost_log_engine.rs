@@ -78,14 +78,13 @@ pub struct DfrostLogEngineParams<R: tauri::Runtime> {
 /// in a follow-up ticket.
 pub struct DfrostLogEngine<R: tauri::Runtime> {
     community_id: SpaceId,
-    // `dfrost_log`, `tracker`, and `publisher_tx` are wired into IPC commands
-    // and the receive loop in Tasks 3+. Holding them on the engine now keeps
-    // the public construction shape stable across the task sequence.
+    // `dfrost_log` is wired into IPC commands in Tasks 6+. Holding it on
+    // the engine now keeps the public construction shape stable across
+    // the task sequence. `tracker` + `publisher_tx` are both load-bearing
+    // for `publish_event` (record-before-send).
     #[allow(dead_code)]
     dfrost_log: Arc<Mutex<DfrostLog>>,
-    #[allow(dead_code)]
     tracker: Arc<Mutex<DfrostReplayTracker>>,
-    #[allow(dead_code)]
     publisher_tx: mpsc::Sender<Vec<u8>>,
     // JoinHandle held to abort-on-drop the receive task. Read in Task 6 when
     // we add a shutdown path; for now the implicit Drop is sufficient.
@@ -335,6 +334,29 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
             _receive_handle: receive_handle,
             _phantom: std::marker::PhantomData,
         })
+    }
+
+    /// Publish a locally-signed event onto the Zenoh-bridged publisher
+    /// channel. Records the event in the dedup tracker BEFORE sending,
+    /// so the inevitable loopback (Zenoh adapter subscribes to its own
+    /// published topic) hits the inbound dedup gate and is silently
+    /// dropped instead of double-applied.
+    pub async fn publish_event(&self, event: SignedCommitteeEvent) -> Result<(), String> {
+        // 1. Record in tracker FIRST so self-loopback is dropped at the
+        //    `process_inbound` dedup step.
+        {
+            let mut t = self.tracker.lock().await;
+            t.record(&event);
+        }
+        // 2. CBOR-encode.
+        let mut packet = Vec::new();
+        ciborium::ser::into_writer(&event, &mut packet)
+            .map_err(|e| format!("publish_event encode: {e}"))?;
+        // 3. Send.
+        self.publisher_tx
+            .send(packet)
+            .await
+            .map_err(|e| format!("publish_event send: {e}"))
     }
 }
 
@@ -783,6 +805,163 @@ mod tests {
             parsed["participantsSoFar"].as_u64(),
             Some(1),
             "participantsSoFar reflects pending_dkg.round1_packages.len() after apply",
+        );
+    }
+
+    /// Task 5: `publish_event` must CBOR-encode the event and forward
+    /// the bytes on the publisher channel. The round-trip decode here
+    /// pins the on-wire format (CBOR of `SignedCommitteeEvent`) for
+    /// the eventual Zenoh adapter.
+    #[tokio::test]
+    async fn engine_publish_event_sends_cbor_on_publisher_tx() {
+        use crate::owner_state_types::SpaceId;
+
+        let (pub_tx, mut pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let log = Arc::new(tokio::sync::Mutex::new(
+            crate::community_dfrost_log::DfrostLog::new(),
+        ));
+        let community_id = SpaceId([0u8; 16]);
+        let app = tauri::test::mock_app();
+        let app_handle = app.handle().clone();
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(HashMap::new()));
+
+        let engine = DfrostLogEngine::start(DfrostLogEngineParams {
+            community_id,
+            dfrost_log: log,
+            publisher_tx: pub_tx,
+            subscriber_rx: sub_rx,
+            app_handle,
+            self_addr: OwnerAddr([0u8; 16]),
+            self_x25519_priv: [0u8; 32],
+            identity_resolver: resolver,
+        })
+        .await;
+
+        let payload = ThresholdSignPayload {
+            ceremony_id: [7u8; 32],
+            message_hash: [8u8; 32],
+            commitment_bytes: vec![],
+            share_bytes: vec![],
+        };
+        let mut payload_bytes = Vec::new();
+        ciborium::ser::into_writer(&payload, &mut payload_bytes).unwrap();
+        let event = SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::ThresholdSign,
+            hlc: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "dev-a".into(),
+            },
+            actor: OwnerAddr([1u8; 16]),
+            payload: payload_bytes,
+            sig: vec![0u8; 64],
+        };
+
+        engine.publish_event(event.clone()).await.expect("publish");
+        let bytes = pub_rx.recv().await.expect("packet");
+        let decoded: SignedCommitteeEvent = ciborium::de::from_reader(&bytes[..]).expect("decode");
+        assert_eq!(decoded.actor, event.actor);
+        assert_eq!(decoded.kind as u8, event.kind as u8);
+        assert_eq!(decoded.hlc.wall_ms, event.hlc.wall_ms);
+        assert_eq!(decoded.hlc.device_id, event.hlc.device_id);
+    }
+
+    /// Task 5: `publish_event` MUST record the event in the dedup
+    /// tracker BEFORE sending. The Zenoh adapter subscribes to its own
+    /// published topic, so the loopback packet comes back through
+    /// `subscriber_rx` — the inbound dedup gate must drop it.
+    #[tokio::test]
+    async fn engine_publish_event_records_in_tracker_before_send() {
+        use crate::community_dfrost_log::{build_signed_dfrost_event, DfrostLog, PendingCeremony};
+        use crate::community_dfrost_types::DkgRoundPayload;
+        use crate::owner_state_types::SpaceId;
+
+        // Identity + log setup so the loopback would otherwise apply.
+        let (alice_sk, alice_addr, alice_pub64) = fixture_identity(0xA1);
+        let alice_x_priv = *crate::dm_signing::ed25519_priv_to_x25519(&alice_sk);
+
+        let mut resolver_map = HashMap::new();
+        resolver_map.insert(alice_addr, alice_pub64);
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(resolver_map));
+
+        let community_id = SpaceId([0xC0; 16]);
+        let ceremony_id = [0x42u8; 32];
+        let mut initial_log = DfrostLog::new();
+        initial_log.committee_state.pending_dkg = Some(PendingCeremony {
+            ceremony_id,
+            members: vec![alice_addr],
+            threshold: 1,
+            max_signers: 1,
+            proposed_epoch: 1,
+            ..Default::default()
+        });
+        let log = Arc::new(tokio::sync::Mutex::new(initial_log));
+
+        let payload = DkgRoundPayload {
+            ceremony_id,
+            round_num: 1,
+            round1_package: Some(vec![0xde, 0xad, 0xbe, 0xef]),
+            recipient_ciphertexts: None,
+        };
+        let event = build_signed_dfrost_event(
+            &alice_sk,
+            alice_addr,
+            DfrostEventKind::DkgRound,
+            &payload,
+            Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        )
+        .expect("build_signed_dfrost_event rn=1");
+
+        let (pub_tx, mut pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let app = tauri::test::mock_app();
+        let app_handle = app.handle().clone();
+
+        let engine = DfrostLogEngine::start(DfrostLogEngineParams {
+            community_id,
+            dfrost_log: log.clone(),
+            publisher_tx: pub_tx,
+            subscriber_rx: sub_rx,
+            app_handle,
+            self_addr: alice_addr,
+            self_x25519_priv: alice_x_priv,
+            identity_resolver: resolver,
+        })
+        .await;
+
+        // Publish — this should record-then-send.
+        engine.publish_event(event.clone()).await.expect("publish");
+        let loopback_bytes = pub_rx.recv().await.expect("packet emitted");
+
+        // Simulate the Zenoh adapter's self-loopback: feed the same
+        // bytes back through subscriber_rx.
+        sub_tx.send(loopback_bytes).await.expect("loopback inbound");
+
+        // Give the receive loop time to process (verify + dedup-drop).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Assert: pending_dkg.round1_packages is still EMPTY — the
+        // loopback was dropped at the dedup gate because publish_event
+        // already advanced the tracker.
+        let log_guard = log.lock().await;
+        let pending = log_guard
+            .committee_state
+            .pending_dkg
+            .as_ref()
+            .expect("pending_dkg still present");
+        assert!(
+            pending.round1_packages.is_empty(),
+            "self-loopback must be dropped at dedup gate (publish_event records first)",
         );
     }
 }
