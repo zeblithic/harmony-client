@@ -164,6 +164,38 @@ impl VotingLog {
         self.polls.contains_key(pid)
     }
 
+    /// Return the number of ratification candidates for a Tier 3 poll
+    /// once it has reached the Drafting stage (i.e., status_quo has been
+    /// synthesized into the candidate set). Used by
+    /// `voting_cast_ratification_ballot` for pre-flight ballot validation
+    /// against the canonical candidate ordering.
+    ///
+    /// Returns `None` if:
+    /// - the poll does not exist,
+    /// - the poll is not Tier 3, or
+    /// - the poll has not yet reached Drafting/Ratification (status_quo
+    ///   not yet synthesized — `drafting_advancers` returns `None`).
+    ///
+    /// Caller is expected to additionally gate on `current_stage_at(&now)
+    /// == Stage::Ratification` if it needs strict Ratification-stage
+    /// pre-flight; the count itself is HLC-independent once
+    /// status_quo exists.
+    pub fn tier3_ratification_candidate_count(
+        &self,
+        pid: &crate::community_voting_core::PollId,
+    ) -> Option<usize> {
+        let state = self.polls.get(pid)?;
+        let t3 = state.tier_state.as_tier3()?;
+        let sq = crate::community_voting_tier3::synthesize_status_quo(&t3.meta.poll_id);
+        let primary_size = t3.meta.config.sortition_size as usize;
+        let advancers = crate::community_voting_tier3::drafting_advancers(
+            &t3.candidates,
+            primary_size,
+            sq.event_hash,
+        )?;
+        Some(advancers.len())
+    }
+
     /// Apply a new event to the log. Caller has already done verify
     /// (V1-V6, kind-specific) — this function only handles materialize
     /// (lifecycle transition + tier-specific apply).

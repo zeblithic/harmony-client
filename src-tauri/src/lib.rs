@@ -21825,6 +21825,112 @@ async fn voting_decline_sortition<R: tauri::Runtime>(
     Ok(())
 }
 
+/// Tauri IPC: cast a ratification (STAR) ballot (kd=rb) on a Tier 3 poll.
+/// Pre-flight validates `scores` against the current ratification
+/// candidate ordering length (per spec §5 B4) so we don't sign + apply
+/// invalid ballots locally. Verify-side will re-check on receive.
+#[tauri::command]
+async fn voting_cast_ratification_ballot<R: tauri::Runtime>(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    _app: tauri::AppHandle<R>,
+    poll_id: String,
+    scores: Vec<u8>,
+) -> Result<(), String> {
+    let pid_bytes: [u8; 32] = hex::decode(&poll_id)
+        .map_err(|e| format!("voting_cast_ratification_ballot: invalid poll_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "voting_cast_ratification_ballot: poll_id must be 32 bytes (64 hex chars)".to_string()
+        })?;
+    let pid = crate::community_voting_core::PollId(pid_bytes);
+
+    let (hlc_tracker, device_id, self_owner, dm_outbox, voting_logs) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner
+                .ok_or("dm_self_owner missing — no owner identity?")?,
+            g.dm_outbox
+                .clone()
+                .ok_or("dm_outbox missing — no owner identity?")?,
+            std::sync::Arc::clone(&g.voting_logs),
+        )
+    };
+
+    let space_id = voting_resolve_community_for_poll(&voting_logs, &pid).await?;
+
+    // Pre-flight: look up current ratification candidate count from the
+    // owning community's voting log, then re-use the canonical
+    // `validate_ratification_ballot` validator. Returns None when the poll
+    // is not Tier 3 or has not yet reached Drafting/Ratification.
+    {
+        let log_arc = {
+            let map = voting_logs.lock().await;
+            map.get(&space_id).cloned().ok_or_else(|| {
+                format!(
+                    "voting_cast_ratification_ballot: no log for community {}",
+                    hex::encode(space_id.0)
+                )
+            })?
+        };
+        let log = log_arc.lock().await;
+        let candidate_count = log
+            .tier3_ratification_candidate_count(&pid)
+            .ok_or_else(|| {
+                "voting_cast_ratification_ballot: poll not in Ratification stage or not Tier 3"
+                    .to_string()
+            })?;
+        let preflight_payload = crate::community_voting_core::RatificationBallotPayload {
+            poll_id: pid,
+            scores: scores.clone(),
+        };
+        crate::community_voting_tier3::validate_ratification_ballot(
+            &preflight_payload,
+            candidate_count,
+        )
+        .map_err(|e| format!("voting_cast_ratification_ballot: invalid ballot: {e:?}"))?;
+    }
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+
+    let event = {
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        crate::community_voting_core::build_signed_ratification_ballot(
+            signing_key,
+            self_owner,
+            pid,
+            scores,
+            hlc,
+        )
+        .map_err(|e| format!("voting_cast_ratification_ballot: build_signed: {e:?}"))?
+    };
+
+    let log_arc = {
+        let mut map = voting_logs.lock().await;
+        map.entry(space_id)
+            .or_insert_with(|| {
+                std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::community_voting_log::VotingLog::new(),
+                ))
+            })
+            .clone()
+    };
+    let mut log = log_arc.lock().await;
+    log.apply_with_snapshot(event, &space_id, None)
+        .map_err(|e| format!("voting_cast_ratification_ballot: apply: {e:?}"))?;
+    Ok(())
+}
+
 // ─── ZEB-291 Phase 2 Task 18 — Tier 2 (Conviction) IPCs ────────────────────
 
 /// Serialize / deserialize `i128` as a decimal JSON string. Required for
@@ -25731,6 +25837,7 @@ pub fn run() {
             voting_propose_draft_candidate,
             voting_approve_draft_candidate,
             voting_decline_sortition,
+            voting_cast_ratification_ballot,
             // ZEB-291 Phase 2 Task 18: Tier 2 (Conviction) voting IPCs.
             voting_create_tier2_proposal,
             voting_signal_tier2,
@@ -25798,6 +25905,7 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         voting_propose_draft_candidate,
         voting_approve_draft_candidate,
         voting_decline_sortition,
+        voting_cast_ratification_ballot,
         // ZEB-291 Phase 2 Task 18: Tier 2 (Conviction) voting IPCs.
         voting_create_tier2_proposal,
         voting_signal_tier2,
