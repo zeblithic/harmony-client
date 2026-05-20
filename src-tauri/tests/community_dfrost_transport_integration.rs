@@ -53,9 +53,7 @@ use harmony_app::community_dfrost_crypto::{
     dkg_part1_local, dkg_part2_local, dkg_part3_local, identifier_for_index,
     verifying_key_to_bytes, verifying_share_to_bytes,
 };
-use harmony_app::community_dfrost_log::{
-    build_signed_dfrost_event, DfrostLog, PendingCeremony,
-};
+use harmony_app::community_dfrost_log::{build_signed_dfrost_event, DfrostLog, PendingCeremony};
 use harmony_app::community_dfrost_log_engine::{DfrostLogEngine, DfrostLogEngineParams};
 use harmony_app::community_dfrost_types::{
     DfrostEventKind, DkgCompletePayload, DkgRoundPayload, MemberVerifyingShare,
@@ -166,6 +164,7 @@ fn initiate_dkg_local(
 /// Build (and locally apply) Bob's rn=1 contribution. Bob's
 /// `pending_dkg` is seeded by the inbound apply of Alice's rn=1 (via
 /// the engine bridge), not by `initiate_dkg_local`'s seed path.
+#[allow(clippy::too_many_arguments)]
 fn contribute_rn1_local(
     log: &mut DfrostLog,
     self_addr: OwnerAddr,
@@ -605,17 +604,13 @@ async fn dkg_two_engine_peer_driven_via_transport_bridge_converges() {
         .publish_event(dr1_alice)
         .await
         .expect("alice publishes dr rn=1");
-    wait_for(
-        "bob applies alice's dr rn=1",
-        &bob_log,
-        |log| {
-            log.committee_state
-                .pending_dkg
-                .as_ref()
-                .map(|p| p.round1_packages.contains_key(&alice_addr))
-                .unwrap_or(false)
-        },
-    )
+    wait_for("bob applies alice's dr rn=1", &bob_log, |log| {
+        log.committee_state
+            .pending_dkg
+            .as_ref()
+            .map(|p| p.round1_packages.contains_key(&alice_addr))
+            .unwrap_or(false)
+    })
     .await
     .expect("bob's inbound applies alice's dr rn=1");
 
@@ -639,17 +634,13 @@ async fn dkg_two_engine_peer_driven_via_transport_bridge_converges() {
         .publish_event(dr1_bob)
         .await
         .expect("bob publishes dr rn=1");
-    wait_for(
-        "alice applies bob's dr rn=1",
-        &alice_log,
-        |log| {
-            log.committee_state
-                .pending_dkg
-                .as_ref()
-                .map(|p| p.round1_packages.contains_key(&bob_addr))
-                .unwrap_or(false)
-        },
-    )
+    wait_for("alice applies bob's dr rn=1", &alice_log, |log| {
+        log.committee_state
+            .pending_dkg
+            .as_ref()
+            .map(|p| p.round1_packages.contains_key(&bob_addr))
+            .unwrap_or(false)
+    })
     .await
     .expect("alice's inbound applies bob's dr rn=1");
 
@@ -697,17 +688,13 @@ async fn dkg_two_engine_peer_driven_via_transport_bridge_converges() {
         .publish_event(dr2_alice)
         .await
         .expect("alice publishes dr rn=2");
-    wait_for(
-        "bob decrypts alice's dr rn=2",
-        &bob_log,
-        |log| {
-            log.committee_state
-                .pending_dkg
-                .as_ref()
-                .map(|p| p.round2_packages.contains_key(&alice_addr))
-                .unwrap_or(false)
-        },
-    )
+    wait_for("bob decrypts alice's dr rn=2", &bob_log, |log| {
+        log.committee_state
+            .pending_dkg
+            .as_ref()
+            .map(|p| p.round2_packages.contains_key(&alice_addr))
+            .unwrap_or(false)
+    })
     .await
     .expect("bob's inbound applies alice's dr rn=2");
 
@@ -728,17 +715,13 @@ async fn dkg_two_engine_peer_driven_via_transport_bridge_converges() {
         .publish_event(dr2_bob)
         .await
         .expect("bob publishes dr rn=2");
-    wait_for(
-        "alice decrypts bob's dr rn=2",
-        &alice_log,
-        |log| {
-            log.committee_state
-                .pending_dkg
-                .as_ref()
-                .map(|p| p.round2_packages.contains_key(&bob_addr))
-                .unwrap_or(false)
-        },
-    )
+    wait_for("alice decrypts bob's dr rn=2", &alice_log, |log| {
+        log.committee_state
+            .pending_dkg
+            .as_ref()
+            .map(|p| p.round2_packages.contains_key(&bob_addr))
+            .unwrap_or(false)
+    })
     .await
     .expect("alice's inbound applies bob's dr rn=2");
 
@@ -787,11 +770,9 @@ async fn dkg_two_engine_peer_driven_via_transport_bridge_converges() {
     )
     .await
     .expect("alice promotes to active");
-    wait_for(
-        "bob committee active after dk quorum",
-        &bob_log,
-        |log| log.committee_state.active,
-    )
+    wait_for("bob committee active after dk quorum", &bob_log, |log| {
+        log.committee_state.active
+    })
     .await
     .expect("bob promotes to active");
 
