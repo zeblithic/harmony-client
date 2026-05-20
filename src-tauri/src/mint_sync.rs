@@ -208,11 +208,22 @@ fn upsert_setting_lww(tx: &rusqlite::Transaction, r: &SettingRow) -> Result<(), 
 
 pub const DEFAULT_DEBOUNCE_MS: u64 = 250;
 
+/// Shared state needed by both the internal task and the test-only subscriber
+/// path. Cloned at construction so `handle_incoming_envelope_for_test` can
+/// fetch + merge without going through the internal task's event loop.
+#[derive(Clone)]
+struct EngineShared {
+    mint_db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    content_store: Arc<dyn crate::content_store::ContentStore>,
+    sync_state: Arc<TokioMutex<MintSyncState>>,
+}
+
 /// Mint Phase 2 sync engine. Mirrors owner_state_sync's shape.
 pub struct MintSyncEngine {
     dirty: Arc<Notify>,
     flush_now: mpsc::Sender<()>,
     shutdown: mpsc::Sender<()>,
+    shared: EngineShared,
 }
 
 pub struct MintSyncEngineHandle(tokio::task::JoinHandle<()>);
@@ -260,6 +271,11 @@ impl MintSyncEngine {
         // a follow-up; tests currently work around this via sleep().
         let (flush_tx, flush_rx) = mpsc::channel::<()>(4);
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
+        let shared = EngineShared {
+            mint_db: mint_db.clone(),
+            content_store: content_store.clone(),
+            sync_state: sync_state.clone(),
+        };
         let dirty_for_task = dirty.clone();
         let handle = tokio::spawn(internal_task(
             mint_db,
@@ -275,6 +291,7 @@ impl MintSyncEngine {
                 dirty,
                 flush_now: flush_tx,
                 shutdown: shutdown_tx,
+                shared,
             },
             MintSyncEngineHandle(handle),
         )
@@ -306,6 +323,53 @@ impl MintSyncEngine {
         // `let _`: channel-closed is the "already shut down" case, which is
         // a successful no-op from the caller's perspective.
         let _ = self.shutdown.send(()).await;
+        Ok(())
+    }
+}
+
+impl MintSyncEngine {
+    /// Test entry point that simulates a Zenoh-delivered envelope.
+    /// Task 11 replaces this with a real Zenoh subscriber.
+    pub async fn handle_incoming_envelope_for_test(
+        &self,
+        root_cid: crate::owner_state_types::ContentId,
+    ) -> Result<(), MintSyncError> {
+        self.shared.handle_incoming(root_cid).await
+    }
+}
+
+impl EngineShared {
+    async fn handle_incoming(
+        &self,
+        root_cid: crate::owner_state_types::ContentId,
+    ) -> Result<(), MintSyncError> {
+        let blob = self
+            .content_store
+            .get(&root_cid)
+            .await
+            .map_err(|e| MintSyncError::Other(format!("content_store.get: {e}")))?
+            .ok_or(MintSyncError::MissingBlob(root_cid))?;
+        // TODO(Task 11): decrypt blob via decrypt_entry(&kt, &mint_ledger_lookup_key, &blob).
+        // For Task 9, we read cleartext (matching Task 8's stubbed publish).
+        let remote: crate::mint_sync_types::MintSnapshot = ciborium::from_reader(&blob[..])
+            .map_err(|e| MintSyncError::Cbor(format!("subscriber decode: {e}")))?;
+
+        if remote.schema_version > crate::mint_sync_types::LOCAL_MAX_SCHEMA_VERSION {
+            return Err(MintSyncError::SchemaTooNew {
+                remote: remote.schema_version,
+                local_max: crate::mint_sync_types::LOCAL_MAX_SCHEMA_VERSION,
+            });
+        }
+
+        let mint_db = self.mint_db.clone();
+        let sync_state = self.sync_state.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), MintSyncError> {
+            let mut conn = mint_db.lock().expect("mint_db lock poisoned");
+            let st = sync_state.blocking_lock();
+            apply_remote_snapshot(&mut conn, &remote, &st.account_deletion_floor)
+        })
+        .await
+        .map_err(|e| MintSyncError::Other(format!("spawn_blocking: {e}")))??;
         Ok(())
     }
 }
@@ -680,6 +744,52 @@ mod tests {
             })
             .unwrap();
         assert_eq!(name, "Chase Re-created");
+    }
+
+    #[tokio::test]
+    async fn subscriber_applies_remote_snapshot_to_local() {
+        // Two DBs, one shared ContentStore. Engine A publishes; engine B's
+        // subscriber-for-test pulls and merges.
+        let mut conn_a = fresh_db();
+        seed_account(&mut conn_a, "a1", "Chase", "2026-05-01T00:00:00Z");
+        seed_tx(&mut conn_a, "t1", "a1", "Coffee", "2026-05-01T00:00:00Z");
+        let conn_a = Arc::new(std::sync::Mutex::new(conn_a));
+        let conn_b = Arc::new(std::sync::Mutex::new(fresh_db()));
+        // Hold both the concrete and the trait-object Arcs (Task 8 pattern).
+        let cs_stub = Arc::new(crate::content_store::InMemoryStub::default());
+        let cs: Arc<dyn crate::content_store::ContentStore> = cs_stub.clone();
+        let sync_state_a = Arc::new(TokioMutex::new(MintSyncState::default()));
+        let sync_state_b = Arc::new(TokioMutex::new(MintSyncState::default()));
+
+        let (engine_a, handle_a) =
+            MintSyncEngine::new_for_test(conn_a, cs.clone(), sync_state_a).await;
+        let (engine_b, handle_b) =
+            MintSyncEngine::new_for_test(conn_b.clone(), cs.clone(), sync_state_b).await;
+
+        // A publishes.
+        engine_a.flush_now().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Drive B's subscriber by replaying every CID that A put into the stub.
+        let cids = cs_stub.debug_all_cids().await;
+        assert_eq!(cids.len(), 1);
+        engine_b
+            .handle_incoming_envelope_for_test(cids[0])
+            .await
+            .unwrap();
+
+        // B's DB should now contain a1 + t1.
+        let snap_b = {
+            let mut conn = conn_b.lock().unwrap();
+            snapshot_current_db(&mut conn).unwrap()
+        };
+        assert_eq!(snap_b.accounts.len(), 1);
+        assert_eq!(snap_b.transactions.len(), 1);
+
+        engine_a.shutdown().await.unwrap();
+        engine_b.shutdown().await.unwrap();
+        handle_a.await.unwrap();
+        handle_b.await.unwrap();
     }
 
     #[test]
