@@ -767,13 +767,12 @@ pub fn delete_transaction(conn: &Connection, id: &str) -> Result<(), MintError> 
         // from the caller's perspective. Distinguish so we can return NotFound
         // for the "never existed" case (matches v1 hard-delete semantics for
         // missing rows).
-        let exists: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM transactions WHERE id = ?",
-                [id],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
+        // No TOCTOU concern in practice: Mint is single-writer and UUIDs are not reused.
+        let exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM transactions WHERE id = ?",
+            [id],
+            |r| r.get(0),
+        )?;
         if exists == 0 {
             return Err(MintError::NotFound(format!("transaction {id}")));
         }

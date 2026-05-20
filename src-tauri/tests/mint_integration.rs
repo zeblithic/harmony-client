@@ -642,3 +642,79 @@ fn set_default_currency_bumps_updated_at() {
         .unwrap();
     assert!(after > before, "set_default_currency must bump updated_at");
 }
+
+#[test]
+fn update_transaction_on_tombstoned_row_returns_not_found() {
+    let conn = fresh_in_memory_db();
+    let acct = create_account(&conn, "Chase").unwrap();
+    let tx = create_transaction(
+        &conn,
+        NewTransaction {
+            transaction_date: "2026-05-01".into(),
+            amount: "1".into(),
+            currency: "USD".into(),
+            account_id: acct.id.clone(),
+            description: "x".into(),
+            metadata: None,
+        },
+    )
+    .unwrap();
+    delete_transaction(&conn, &tx.id).unwrap();
+    let result = update_transaction(
+        &conn,
+        &tx.id,
+        UpdateTransaction {
+            transaction_date: None,
+            amount: Some("999".into()),
+            currency: None,
+            account_id: None,
+            description: None,
+            metadata: None,
+        },
+    );
+    assert!(
+        matches!(result, Err(MintError::NotFound(_))),
+        "updating a tombstoned row must return NotFound, got: {result:?}"
+    );
+}
+
+#[test]
+fn export_csv_excludes_tombstoned_transactions() {
+    let conn = fresh_in_memory_db();
+    let acct = create_account(&conn, "Chase").unwrap();
+    let live = create_transaction(
+        &conn,
+        NewTransaction {
+            transaction_date: "2026-05-01".into(),
+            amount: "1".into(),
+            currency: "USD".into(),
+            account_id: acct.id.clone(),
+            description: "live".into(),
+            metadata: None,
+        },
+    )
+    .unwrap();
+    let tombstone = create_transaction(
+        &conn,
+        NewTransaction {
+            transaction_date: "2026-05-02".into(),
+            amount: "2".into(),
+            currency: "USD".into(),
+            account_id: acct.id.clone(),
+            description: "soon-to-be-tombstoned".into(),
+            metadata: None,
+        },
+    )
+    .unwrap();
+    delete_transaction(&conn, &tombstone.id).unwrap();
+
+    let tmpdir = tempfile::tempdir().unwrap();
+    let csv_path = tmpdir.path().join("export.csv");
+    let summary = export_csv(&conn, &csv_path, None, None, None).unwrap();
+
+    assert_eq!(
+        summary.rows_written, 1,
+        "export_csv should exclude tombstoned rows"
+    );
+    let _ = live; // suppress unused warning if any
+}
