@@ -7,6 +7,7 @@ use harmony_app::mint::{
 };
 use harmony_app::mint_sync::MintSyncEngine;
 use harmony_app::mint_sync_types::MintSyncState;
+use rusqlite::OptionalExtension;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
@@ -319,5 +320,121 @@ async fn concurrent_writes_to_distinct_rows_both_land() {
             .unwrap();
         assert_eq!(n, 2);
     }
+    shutdown(h).await;
+}
+
+#[tokio::test]
+async fn floor_propagation_deletes_account_on_peer() {
+    // Setup: A has account a1 deleted (floor entry set). B has a1 live.
+    // After A publishes and B applies, B's a1 must be gone.
+    let h = setup().await;
+
+    // Seed a1 on B directly (simulates B having synced a1 before A deleted it).
+    {
+        let conn = h.conn_b.lock().unwrap();
+        conn.execute(
+            "INSERT INTO accounts (id, name, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                "a1",
+                "Chase",
+                "2026-05-01T00:00:00Z",
+                "2026-05-01T00:00:00Z",
+            ],
+        )
+        .unwrap();
+        // Also seed a transaction on a1 to verify cascade hard-delete.
+        conn.execute(
+            "INSERT INTO transactions \
+             (id, transaction_date, amount, currency, account_id, \
+              description, created_at, updated_at) \
+             VALUES (?1, '2026-05-01', '1', 'USD', ?2, 'Coffee', \
+                    '2026-05-01T00:00:00Z', '2026-05-01T00:00:00Z')",
+            rusqlite::params!["t1", "a1"],
+        )
+        .unwrap();
+    }
+
+    // Set A's floor: a1 was deleted at "2026-05-02".
+    // A's DB does NOT contain a1 (it was hard-deleted on A).
+    // Seed a different account on A so the snapshot is non-empty (the empty-
+    // snapshot guard would otherwise skip publish).
+    {
+        let conn = h.conn_a.lock().unwrap();
+        create_account(&conn, "Seed for non-empty").unwrap();
+    }
+    {
+        let handle = h.engine_a.sync_state_handle();
+        let mut st = handle.lock().await;
+        st.account_deletion_floor
+            .insert("a1".to_string(), "2026-05-02T00:00:00Z".to_string());
+    }
+
+    // A publishes (snapshot carries floor entry for a1).
+    sync_a_to_b(&h).await;
+
+    // B's a1 must be gone.
+    {
+        let conn = h.conn_b.lock().unwrap();
+        let acct: Option<String> = conn
+            .query_row(
+                "SELECT id FROM accounts WHERE id = 'a1'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(
+            acct.is_none(),
+            "a1 must be hard-deleted on B after receiving A's floor"
+        );
+        let tx_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transactions WHERE account_id = 'a1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            tx_count, 0,
+            "orphan transactions for a1 must also be deleted on B"
+        );
+    }
+
+    shutdown(h).await;
+}
+
+#[tokio::test]
+async fn floor_propagation_merges_floor_into_peer_state() {
+    // After B applies A's snapshot (which carries the a1 floor entry),
+    // B's sync_state.account_deletion_floor must contain the a1 entry.
+    // This ensures B won't zombie-resurrect a1 if another peer republishes it.
+    let h = setup().await;
+
+    // Seed a non-empty account on A and set floor for a1.
+    {
+        let conn = h.conn_a.lock().unwrap();
+        create_account(&conn, "Seed").unwrap();
+    }
+    {
+        let handle = h.engine_a.sync_state_handle();
+        let mut st = handle.lock().await;
+        st.account_deletion_floor
+            .insert("a1".to_string(), "2026-05-02T00:00:00Z".to_string());
+    }
+
+    sync_a_to_b(&h).await;
+
+    // B's sync_state must now contain the a1 floor entry.
+    {
+        let handle = h.engine_b.sync_state_handle();
+        let st = handle.lock().await;
+        assert_eq!(
+            st.account_deletion_floor.get("a1").map(String::as_str),
+            Some("2026-05-02T00:00:00Z"),
+            "B's floor must contain the a1 entry received from A's snapshot"
+        );
+    }
+
     shutdown(h).await;
 }
