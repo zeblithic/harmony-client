@@ -176,6 +176,15 @@ pub struct RatificationBallotPayload {
     pub scores: Vec<u8>,
 }
 
+/// Payload for `kd=cl` PollClose events (Tier 3). Wire format is a CBOR
+/// map with a single 2-char same-length key `pi` → 32-byte `poll_id`.
+/// Per spec §3 same-length-keys invariant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PollClosePayload {
+    #[serde(rename = "pi")]
+    pub poll_id: PollId,
+}
+
 /// Payload for `kd=cr` PollCreate when `tier == Tier::Sortition`.
 /// Contains the full Tier 3 poll configuration.
 ///
@@ -1136,6 +1145,261 @@ pub fn build_signed_ballot_tier1(
     Ok(ev)
 }
 
+/// Build a fully-signed `kd=cr` PollCreate event for Tier 3 (Sortition).
+///
+/// Used by the `voting_create_tier3_proposal` IPC and any test fixture that
+/// needs to mint a Tier 3 PollCreate event. Tier is hardcoded to
+/// `Tier::Sortition` (parity with `build_signed_poll_create_tier1`).
+pub fn build_signed_poll_create_tier3(
+    keypair: &ed25519_dalek::SigningKey,
+    actor: OwnerAddr,
+    config: &Tier3PollConfigPayload,
+    hlc: Hlc,
+) -> Result<SignedVotingEvent, BuildError> {
+    use ed25519_dalek::Signer;
+    let mut payload = Vec::new();
+    ciborium::ser::into_writer(config, &mut payload).map_err(|_| BuildError::EncodePayload)?;
+    let mut ev = SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier: Tier::Sortition,
+        kind: PollEventKindCode::PollCreate,
+        hlc,
+        actor,
+        payload,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev.signing_bytes().map_err(|_| BuildError::SigningBytes)?;
+    ev.sig = keypair.sign(&sb).to_bytes().to_vec();
+    Ok(ev)
+}
+
+/// Build a fully-signed `kd=ds` DeliberationStatement event.
+pub fn build_signed_deliberation_statement(
+    keypair: &ed25519_dalek::SigningKey,
+    actor: OwnerAddr,
+    poll_id: PollId,
+    text: String,
+    hlc: Hlc,
+) -> Result<SignedVotingEvent, BuildError> {
+    use ed25519_dalek::Signer;
+    let payload_struct = DeliberationStatementPayload { poll_id, text };
+    let mut payload = Vec::new();
+    ciborium::ser::into_writer(&payload_struct, &mut payload)
+        .map_err(|_| BuildError::EncodePayload)?;
+    let mut ev = SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier: Tier::Sortition,
+        kind: PollEventKindCode::DeliberationStatement,
+        hlc,
+        actor,
+        payload,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev.signing_bytes().map_err(|_| BuildError::SigningBytes)?;
+    ev.sig = keypair.sign(&sb).to_bytes().to_vec();
+    Ok(ev)
+}
+
+/// Build a fully-signed `kd=md` MiniPublicDecline event.
+pub fn build_signed_mini_public_decline(
+    keypair: &ed25519_dalek::SigningKey,
+    actor: OwnerAddr,
+    poll_id: PollId,
+    reason: Option<String>,
+    hlc: Hlc,
+) -> Result<SignedVotingEvent, BuildError> {
+    use ed25519_dalek::Signer;
+    let payload_struct = MiniPublicDeclinePayload { poll_id, reason };
+    let mut payload = Vec::new();
+    ciborium::ser::into_writer(&payload_struct, &mut payload)
+        .map_err(|_| BuildError::EncodePayload)?;
+    let mut ev = SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier: Tier::Sortition,
+        kind: PollEventKindCode::MiniPublicDecline,
+        hlc,
+        actor,
+        payload,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev.signing_bytes().map_err(|_| BuildError::SigningBytes)?;
+    ev.sig = keypair.sign(&sb).to_bytes().to_vec();
+    Ok(ev)
+}
+
+/// Build a fully-signed `kd=dc` DraftCandidate event.
+pub fn build_signed_draft_candidate(
+    keypair: &ed25519_dalek::SigningKey,
+    actor: OwnerAddr,
+    poll_id: PollId,
+    text: String,
+    hlc: Hlc,
+) -> Result<SignedVotingEvent, BuildError> {
+    use ed25519_dalek::Signer;
+    let payload_struct = DraftCandidatePayload { poll_id, text };
+    let mut payload = Vec::new();
+    ciborium::ser::into_writer(&payload_struct, &mut payload)
+        .map_err(|_| BuildError::EncodePayload)?;
+    let mut ev = SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier: Tier::Sortition,
+        kind: PollEventKindCode::DraftCandidate,
+        hlc,
+        actor,
+        payload,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev.signing_bytes().map_err(|_| BuildError::SigningBytes)?;
+    ev.sig = keypair.sign(&sb).to_bytes().to_vec();
+    Ok(ev)
+}
+
+/// Build a fully-signed `kd=da` DraftApproval event.
+pub fn build_signed_draft_approval(
+    keypair: &ed25519_dalek::SigningKey,
+    actor: OwnerAddr,
+    poll_id: PollId,
+    candidate_event_hash: CandidateEventHash,
+    hlc: Hlc,
+) -> Result<SignedVotingEvent, BuildError> {
+    use ed25519_dalek::Signer;
+    let payload_struct = DraftApprovalPayload {
+        poll_id,
+        candidate_event_hash,
+    };
+    let mut payload = Vec::new();
+    ciborium::ser::into_writer(&payload_struct, &mut payload)
+        .map_err(|_| BuildError::EncodePayload)?;
+    let mut ev = SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier: Tier::Sortition,
+        kind: PollEventKindCode::DraftApproval,
+        hlc,
+        actor,
+        payload,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev.signing_bytes().map_err(|_| BuildError::SigningBytes)?;
+    ev.sig = keypair.sign(&sb).to_bytes().to_vec();
+    Ok(ev)
+}
+
+/// Build a fully-signed `kd=rb` RatificationBallot event.
+pub fn build_signed_ratification_ballot(
+    keypair: &ed25519_dalek::SigningKey,
+    actor: OwnerAddr,
+    poll_id: PollId,
+    scores: Vec<u8>,
+    hlc: Hlc,
+) -> Result<SignedVotingEvent, BuildError> {
+    use ed25519_dalek::Signer;
+    let payload_struct = RatificationBallotPayload { poll_id, scores };
+    let mut payload = Vec::new();
+    ciborium::ser::into_writer(&payload_struct, &mut payload)
+        .map_err(|_| BuildError::EncodePayload)?;
+    let mut ev = SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier: Tier::Sortition,
+        kind: PollEventKindCode::RatificationBallot,
+        hlc,
+        actor,
+        payload,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev.signing_bytes().map_err(|_| BuildError::SigningBytes)?;
+    ev.sig = keypair.sign(&sb).to_bytes().to_vec();
+    Ok(ev)
+}
+
+/// Build a fully-signed `kd=sf` SortitionFailed event. Only the proposer
+/// should sign (enforced at the verify layer via SF1).
+pub fn build_signed_sortition_failed(
+    keypair: &ed25519_dalek::SigningKey,
+    actor: OwnerAddr,
+    poll_id: PollId,
+    hlc: Hlc,
+) -> Result<SignedVotingEvent, BuildError> {
+    use ed25519_dalek::Signer;
+    let payload_struct = SortitionFailedPayload { poll_id };
+    let mut payload = Vec::new();
+    ciborium::ser::into_writer(&payload_struct, &mut payload)
+        .map_err(|_| BuildError::EncodePayload)?;
+    let mut ev = SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier: Tier::Sortition,
+        kind: PollEventKindCode::SortitionFailed,
+        hlc,
+        actor,
+        payload,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev.signing_bytes().map_err(|_| BuildError::SigningBytes)?;
+    ev.sig = keypair.sign(&sb).to_bytes().to_vec();
+    Ok(ev)
+}
+
+/// Build a fully-signed `kd=cl` PollClose event (Tier 3).
+pub fn build_signed_poll_close_tier3(
+    keypair: &ed25519_dalek::SigningKey,
+    actor: OwnerAddr,
+    poll_id: PollId,
+    hlc: Hlc,
+) -> Result<SignedVotingEvent, BuildError> {
+    use ed25519_dalek::Signer;
+    let payload_struct = PollClosePayload { poll_id };
+    let mut payload = Vec::new();
+    ciborium::ser::into_writer(&payload_struct, &mut payload)
+        .map_err(|_| BuildError::EncodePayload)?;
+    let mut ev = SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier: Tier::Sortition,
+        kind: PollEventKindCode::PollClose,
+        hlc,
+        actor,
+        payload,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev.signing_bytes().map_err(|_| BuildError::SigningBytes)?;
+    ev.sig = keypair.sign(&sb).to_bytes().to_vec();
+    Ok(ev)
+}
+
+/// Build a fully-signed `kd=rs` PollResult event (Tier 3).
+pub fn build_signed_poll_result_tier3(
+    keypair: &ed25519_dalek::SigningKey,
+    actor: OwnerAddr,
+    poll_id: PollId,
+    result: crate::community_voting_star::StarResult,
+    hlc: Hlc,
+) -> Result<SignedVotingEvent, BuildError> {
+    use ed25519_dalek::Signer;
+    let payload_struct = crate::community_voting_tier3::Tier3PollResultPayload { poll_id, result };
+    let mut payload = Vec::new();
+    ciborium::ser::into_writer(&payload_struct, &mut payload)
+        .map_err(|_| BuildError::EncodePayload)?;
+    let mut ev = SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier: Tier::Sortition,
+        kind: PollEventKindCode::PollResult,
+        hlc,
+        actor,
+        payload,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev.signing_bytes().map_err(|_| BuildError::SigningBytes)?;
+    ev.sig = keypair.sign(&sb).to_bytes().to_vec();
+    Ok(ev)
+}
+
 /// Frontend-friendly subset of `PollState` for IPC return values.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PollStateExport {
@@ -1162,8 +1426,17 @@ mod build_tests {
     use super::*;
     use crate::community_membership::ChannelId;
     use crate::community_voting_approval::Tier1PollConfig;
+    use crate::community_voting_star::{CandidateRef, StarResult};
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
+
+    fn verify_sig(keypair: &SigningKey, ev: &SignedVotingEvent) {
+        let sb = ev.signing_bytes().expect("signing bytes");
+        let sig_bytes: [u8; 64] = ev.sig.clone().try_into().expect("sig len");
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+        use ed25519_dalek::Verifier;
+        keypair.verifying_key().verify(&sb, &sig).expect("verify");
+    }
 
     #[test]
     fn signed_poll_create_round_trip() {
@@ -1191,11 +1464,7 @@ mod build_tests {
         let ev = build_signed_poll_create_tier1(&keypair, actor, &cfg, hlc).expect("build");
         assert_eq!(ev.kind, PollEventKindCode::PollCreate);
         assert_eq!(ev.actor, actor);
-        let sb = ev.signing_bytes().expect("signing bytes");
-        let sig_bytes: [u8; 64] = ev.sig.clone().try_into().expect("sig len");
-        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-        use ed25519_dalek::Verifier;
-        keypair.verifying_key().verify(&sb, &sig).expect("verify");
+        verify_sig(&keypair, &ev);
     }
 
     #[test]
@@ -1211,11 +1480,172 @@ mod build_tests {
         };
         let ev = build_signed_ballot_tier1(&keypair, actor, pid, vec![0, 2], hlc).expect("build");
         assert_eq!(ev.kind, PollEventKindCode::BallotCast);
-        let sb = ev.signing_bytes().expect("signing bytes");
-        let sig_bytes: [u8; 64] = ev.sig.clone().try_into().expect("sig len");
-        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-        use ed25519_dalek::Verifier;
-        keypair.verifying_key().verify(&sb, &sig).expect("verify");
+        verify_sig(&keypair, &ev);
+    }
+
+    #[test]
+    fn signed_tier3_poll_create_round_trip() {
+        let keypair = SigningKey::generate(&mut OsRng);
+        let actor = OwnerAddr([0x33; 16]);
+        let cfg = Tier3PollConfigPayload {
+            proposal_text: "test proposal".into(),
+            sortition_size: 20,
+            deliberation_window_seconds: 600,
+            drafting_window_seconds: 600,
+            ratification_window_seconds: 600,
+            privacy_mode: "pu".into(),
+            incentive_mode: "dp".into(),
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: Some(20),
+            },
+            retry_of: None,
+        };
+        let hlc = Hlc {
+            wall_ms: 1,
+            logical: 0,
+            device_id: "d".into(),
+        };
+        let ev = build_signed_poll_create_tier3(&keypair, actor, &cfg, hlc).expect("build");
+        assert_eq!(ev.kind, PollEventKindCode::PollCreate);
+        assert_eq!(ev.tier, Tier::Sortition);
+        verify_sig(&keypair, &ev);
+    }
+
+    #[test]
+    fn signed_deliberation_statement_round_trip() {
+        let keypair = SigningKey::generate(&mut OsRng);
+        let actor = OwnerAddr([0x44; 16]);
+        let pid = PollId([0x55; 32]);
+        let hlc = Hlc {
+            wall_ms: 2,
+            logical: 0,
+            device_id: "d".into(),
+        };
+        let ev = build_signed_deliberation_statement(&keypair, actor, pid, "hello".into(), hlc)
+            .expect("build");
+        assert_eq!(ev.kind, PollEventKindCode::DeliberationStatement);
+        verify_sig(&keypair, &ev);
+    }
+
+    #[test]
+    fn signed_mini_public_decline_round_trip() {
+        let keypair = SigningKey::generate(&mut OsRng);
+        let actor = OwnerAddr([0x66; 16]);
+        let pid = PollId([0x77; 32]);
+        let hlc = Hlc {
+            wall_ms: 3,
+            logical: 0,
+            device_id: "d".into(),
+        };
+        let ev = build_signed_mini_public_decline(&keypair, actor, pid, Some("u1".into()), hlc)
+            .expect("build");
+        assert_eq!(ev.kind, PollEventKindCode::MiniPublicDecline);
+        verify_sig(&keypair, &ev);
+    }
+
+    #[test]
+    fn signed_draft_candidate_round_trip() {
+        let keypair = SigningKey::generate(&mut OsRng);
+        let actor = OwnerAddr([0x88; 16]);
+        let pid = PollId([0x99; 32]);
+        let hlc = Hlc {
+            wall_ms: 4,
+            logical: 0,
+            device_id: "d".into(),
+        };
+        let ev =
+            build_signed_draft_candidate(&keypair, actor, pid, "draft".into(), hlc).expect("build");
+        assert_eq!(ev.kind, PollEventKindCode::DraftCandidate);
+        verify_sig(&keypair, &ev);
+    }
+
+    #[test]
+    fn signed_draft_approval_round_trip() {
+        let keypair = SigningKey::generate(&mut OsRng);
+        let actor = OwnerAddr([0xaa; 16]);
+        let pid = PollId([0xbb; 32]);
+        let ceh: CandidateEventHash = [0xcc; 32];
+        let hlc = Hlc {
+            wall_ms: 5,
+            logical: 0,
+            device_id: "d".into(),
+        };
+        let ev = build_signed_draft_approval(&keypair, actor, pid, ceh, hlc).expect("build");
+        assert_eq!(ev.kind, PollEventKindCode::DraftApproval);
+        verify_sig(&keypair, &ev);
+    }
+
+    #[test]
+    fn signed_ratification_ballot_round_trip() {
+        let keypair = SigningKey::generate(&mut OsRng);
+        let actor = OwnerAddr([0xdd; 16]);
+        let pid = PollId([0xee; 32]);
+        let hlc = Hlc {
+            wall_ms: 6,
+            logical: 0,
+            device_id: "d".into(),
+        };
+        let ev = build_signed_ratification_ballot(&keypair, actor, pid, vec![5, 3, 1], hlc)
+            .expect("build");
+        assert_eq!(ev.kind, PollEventKindCode::RatificationBallot);
+        verify_sig(&keypair, &ev);
+    }
+
+    #[test]
+    fn signed_sortition_failed_round_trip() {
+        let keypair = SigningKey::generate(&mut OsRng);
+        let actor = OwnerAddr([0xff; 16]);
+        let pid = PollId([0x11; 32]);
+        let hlc = Hlc {
+            wall_ms: 7,
+            logical: 0,
+            device_id: "d".into(),
+        };
+        let ev = build_signed_sortition_failed(&keypair, actor, pid, hlc).expect("build");
+        assert_eq!(ev.kind, PollEventKindCode::SortitionFailed);
+        verify_sig(&keypair, &ev);
+    }
+
+    #[test]
+    fn signed_poll_close_tier3_round_trip() {
+        let keypair = SigningKey::generate(&mut OsRng);
+        let actor = OwnerAddr([0x22; 16]);
+        let pid = PollId([0x33; 32]);
+        let hlc = Hlc {
+            wall_ms: 8,
+            logical: 0,
+            device_id: "d".into(),
+        };
+        let ev = build_signed_poll_close_tier3(&keypair, actor, pid, hlc).expect("build");
+        assert_eq!(ev.kind, PollEventKindCode::PollClose);
+        verify_sig(&keypair, &ev);
+    }
+
+    #[test]
+    fn signed_poll_result_tier3_round_trip() {
+        let keypair = SigningKey::generate(&mut OsRng);
+        let actor = OwnerAddr([0x44; 16]);
+        let pid = PollId([0x55; 32]);
+        let hlc = Hlc {
+            wall_ms: 9,
+            logical: 0,
+            device_id: "d".into(),
+        };
+        let winner = CandidateRef {
+            event_hash: [0xaa; 32],
+            approval_count: 0,
+        };
+        let result = StarResult {
+            winner: winner.clone(),
+            finalists: vec![winner],
+            total_scores: vec![0],
+            runoff_votes: vec![0],
+        };
+        let ev = build_signed_poll_result_tier3(&keypair, actor, pid, result, hlc).expect("build");
+        assert_eq!(ev.kind, PollEventKindCode::PollResult);
+        verify_sig(&keypair, &ev);
     }
 }
 

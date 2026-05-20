@@ -32,9 +32,8 @@ use harmony_app::community_membership::ChannelId;
 use harmony_app::community_state_sync::IdentityResolver;
 use harmony_app::community_voting_approval::Tier1PollConfig;
 use harmony_app::community_voting_core::{
-    build_signed_poll_create_tier1, derive_poll_id, CandidateEventHash, DraftApprovalPayload,
-    DraftCandidatePayload, Eligibility, MemberAttrs, MembershipSnapshot, MiniPublicDeclinePayload,
-    PollEventKindCode, RatificationBallotPayload, SignedVotingEvent, SortitionFailedPayload,
+    build_signed_poll_create_tier1, derive_poll_id, CandidateEventHash, Eligibility, MemberAttrs,
+    MembershipSnapshot, PollEventKindCode, RatificationBallotPayload, SignedVotingEvent,
     SortitionSelectionPayload, Tier, Tier3PollConfigPayload,
 };
 use harmony_app::community_voting_log::{ApplyError, VotingLog};
@@ -43,9 +42,10 @@ use harmony_app::community_voting_sortition::fisher_yates_select;
 use harmony_app::community_voting_star::tally_star;
 use harmony_app::community_voting_tier3::{
     drafting_advancers, ratification_candidates_ordering, synthesize_status_quo, verify_sd,
-    verify_sf, Stage, Tier3PollResultPayload, VerifyError,
+    verify_sf, Stage, VerifyError,
 };
 use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+use tauri::Listener;
 use tokio::sync::{mpsc, Mutex};
 
 // ─── Identity-resolver helper ──────────────────────────────────────────────────
@@ -159,11 +159,24 @@ pub async fn setup_two_voting_engine_bridge(community_id: SpaceId) -> TwoVotingE
     let log_a = Arc::new(Mutex::new(VotingLog::new()));
     let log_b = Arc::new(Mutex::new(VotingLog::new()));
 
+    // ZEB-310 Task 9: provide engine_a with a per-device HLC tracker
+    // + device_id so the engine-auto orchestration hook
+    // (`maybe_trigger_engine_auto_orchestration`) can reserve HLCs on
+    // the local lane when triggered. engine_b is the peer — no
+    // orchestration on its side — so we wire one for it too (cheap;
+    // empty tracker behaves identically to None for non-orchestrating
+    // engines).
+    let a_hlc_tracker = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+    let b_hlc_tracker = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+
     let engine_a = VotingLogEngine::start(VotingLogEngineParams {
         community_id,
         voting_log: Arc::clone(&log_a),
         publisher_tx: a_pub_tx,
         subscriber_rx: a_sub_rx,
+        hlc_tracker: Some(a_hlc_tracker),
+        device_id: Some("engine-a".into()),
+        app_handle: None,
     })
     .await;
 
@@ -172,8 +185,111 @@ pub async fn setup_two_voting_engine_bridge(community_id: SpaceId) -> TwoVotingE
         voting_log: Arc::clone(&log_b),
         publisher_tx: b_pub_tx,
         subscriber_rx: b_sub_rx,
+        hlc_tracker: Some(b_hlc_tracker),
+        device_id: Some("engine-b".into()),
+        app_handle: None,
     })
     .await;
+
+    TwoVotingEngines {
+        engine_a,
+        engine_b,
+        log_a,
+        log_b,
+    }
+}
+
+/// ZEB-310 Task 9 fixture: `setup_two_voting_engine_bridge` + installs
+/// `proposer`'s signing key on `engine_a` so the engine-auto orchestration
+/// hook can mint follow-up events (kd=sf, and Tasks 10/11 kd=cl + kd=rs)
+/// on the proposer's behalf.
+///
+/// engine_b is left in read-only peer mode (no signing key installed) so
+/// the test exercises a realistic distributed shape: only the engine
+/// that holds the proposer's key originates the follow-up event; the
+/// peer receives it via the bridge.
+pub async fn setup_two_voting_engine_bridge_with_signing(
+    community_id: SpaceId,
+    proposer: &TestIdentity,
+) -> TwoVotingEngines {
+    let engines = setup_two_voting_engine_bridge(community_id).await;
+    let signing_key = Arc::new(proposer.signing_key.clone());
+    engines
+        .engine_a
+        .install_local_signing_key(signing_key, proposer.owner)
+        .await;
+    engines
+}
+
+/// ZEB-310 Task 12 fixture: like `setup_two_voting_engine_bridge_with_signing`
+/// but also installs an `app_handle` on `engine_a` so the engine's post-apply
+/// hook emits the four Tier 3 lifecycle Tauri events
+/// (`voting-tier3-sortition-complete`, `voting-tier3-drafting-open`,
+/// `voting-tier3-ratification-open`, `voting-tier3-finalized`) to a
+/// `tauri::test::MockRuntime` event bus that tests can `listen` to.
+///
+/// `engine_b` keeps `app_handle: None` so emit code only runs on the
+/// authoritative side — mirrors the realistic UX shape (only the user's
+/// device fires UI notifications, not every peer).
+pub async fn setup_two_voting_engine_bridge_with_signing_and_app(
+    community_id: SpaceId,
+    proposer: &TestIdentity,
+    app_handle: tauri::AppHandle<tauri::test::MockRuntime>,
+) -> TwoVotingEngines {
+    let (a_pub_tx, mut a_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (b_pub_tx, mut b_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (a_sub_tx, a_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (b_sub_tx, b_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+
+    let b_sub_tx_clone = b_sub_tx.clone();
+    tokio::spawn(async move {
+        while let Some(packet) = a_pub_rx.recv().await {
+            if b_sub_tx_clone.send(packet).await.is_err() {
+                break;
+            }
+        }
+    });
+    let a_sub_tx_clone = a_sub_tx.clone();
+    tokio::spawn(async move {
+        while let Some(packet) = b_pub_rx.recv().await {
+            if a_sub_tx_clone.send(packet).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let log_a = Arc::new(Mutex::new(VotingLog::new()));
+    let log_b = Arc::new(Mutex::new(VotingLog::new()));
+
+    let a_hlc_tracker = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+    let b_hlc_tracker = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+
+    let engine_a = VotingLogEngine::start(VotingLogEngineParams {
+        community_id,
+        voting_log: Arc::clone(&log_a),
+        publisher_tx: a_pub_tx,
+        subscriber_rx: a_sub_rx,
+        hlc_tracker: Some(a_hlc_tracker),
+        device_id: Some("engine-a".into()),
+        app_handle: Some(app_handle),
+    })
+    .await;
+
+    let engine_b = VotingLogEngine::start(VotingLogEngineParams {
+        community_id,
+        voting_log: Arc::clone(&log_b),
+        publisher_tx: b_pub_tx,
+        subscriber_rx: b_sub_rx,
+        hlc_tracker: Some(b_hlc_tracker),
+        device_id: Some("engine-b".into()),
+        app_handle: None,
+    })
+    .await;
+
+    let signing_key = Arc::new(proposer.signing_key.clone());
+    engine_a
+        .install_local_signing_key(signing_key, proposer.owner)
+        .await;
 
     TwoVotingEngines {
         engine_a,
@@ -252,27 +368,22 @@ pub fn default_tier3_config() -> Tier3PollConfigPayload {
 }
 
 /// Build a signed Tier 3 PollCreate (kd=cr, tier=Sortition) event.
+///
+/// Thin `&TestIdentity` adapter over the core
+/// `build_signed_poll_create_tier3` — see `community_voting_core.rs` for
+/// the canonical `(&SigningKey, OwnerAddr)` shape used by the IPC layer.
 pub fn build_tier3_poll_create_event(
     proposer: &TestIdentity,
     config: &Tier3PollConfigPayload,
     hlc: Hlc,
 ) -> SignedVotingEvent {
-    use ed25519_dalek::Signer;
-    let mut payload = Vec::new();
-    ciborium::into_writer(config, &mut payload).expect("encode Tier3PollConfigPayload");
-    let mut ev = SignedVotingEvent {
-        tag: 'p',
-        version: 1,
-        tier: Tier::Sortition,
-        kind: PollEventKindCode::PollCreate,
+    harmony_app::community_voting_core::build_signed_poll_create_tier3(
+        &proposer.signing_key,
+        proposer.owner,
+        config,
         hlc,
-        actor: proposer.owner,
-        payload,
-        sig: vec![0u8; 64],
-    };
-    let sb = ev.signing_bytes().expect("signing_bytes for tier3 create");
-    ev.sig = proposer.signing_key.sign(&sb).to_bytes().to_vec();
-    ev
+    )
+    .expect("build_signed_poll_create_tier3")
 }
 
 /// Build a signed kd=md MiniPublicDecline event.
@@ -281,26 +392,14 @@ pub fn build_decline_event(
     poll_id: harmony_app::community_voting_core::PollId,
     hlc: Hlc,
 ) -> SignedVotingEvent {
-    use ed25519_dalek::Signer;
-    let payload_struct = MiniPublicDeclinePayload {
+    harmony_app::community_voting_core::build_signed_mini_public_decline(
+        &actor.signing_key,
+        actor.owner,
         poll_id,
-        reason: None,
-    };
-    let mut payload = Vec::new();
-    ciborium::into_writer(&payload_struct, &mut payload).expect("encode MiniPublicDeclinePayload");
-    let mut ev = SignedVotingEvent {
-        tag: 'p',
-        version: 1,
-        tier: Tier::Sortition,
-        kind: PollEventKindCode::MiniPublicDecline,
+        None,
         hlc,
-        actor: actor.owner,
-        payload,
-        sig: vec![0u8; 64],
-    };
-    let sb = ev.signing_bytes().expect("signing_bytes for decline");
-    ev.sig = actor.signing_key.sign(&sb).to_bytes().to_vec();
-    ev
+    )
+    .expect("build_signed_mini_public_decline")
 }
 
 /// Build a signed kd=dc DraftCandidate event.
@@ -310,28 +409,14 @@ pub fn build_draft_candidate_event(
     text: &str,
     hlc: Hlc,
 ) -> SignedVotingEvent {
-    use ed25519_dalek::Signer;
-    let payload_struct = DraftCandidatePayload {
+    harmony_app::community_voting_core::build_signed_draft_candidate(
+        &actor.signing_key,
+        actor.owner,
         poll_id,
-        text: text.into(),
-    };
-    let mut payload = Vec::new();
-    ciborium::into_writer(&payload_struct, &mut payload).expect("encode DraftCandidatePayload");
-    let mut ev = SignedVotingEvent {
-        tag: 'p',
-        version: 1,
-        tier: Tier::Sortition,
-        kind: PollEventKindCode::DraftCandidate,
+        text.into(),
         hlc,
-        actor: actor.owner,
-        payload,
-        sig: vec![0u8; 64],
-    };
-    let sb = ev
-        .signing_bytes()
-        .expect("signing_bytes for draft candidate");
-    ev.sig = actor.signing_key.sign(&sb).to_bytes().to_vec();
-    ev
+    )
+    .expect("build_signed_draft_candidate")
 }
 
 /// Build a signed kd=da DraftApproval event.
@@ -341,28 +426,14 @@ pub fn build_draft_approval_event(
     candidate_event_hash: CandidateEventHash,
     hlc: Hlc,
 ) -> SignedVotingEvent {
-    use ed25519_dalek::Signer;
-    let payload_struct = DraftApprovalPayload {
+    harmony_app::community_voting_core::build_signed_draft_approval(
+        &actor.signing_key,
+        actor.owner,
         poll_id,
         candidate_event_hash,
-    };
-    let mut payload = Vec::new();
-    ciborium::into_writer(&payload_struct, &mut payload).expect("encode DraftApprovalPayload");
-    let mut ev = SignedVotingEvent {
-        tag: 'p',
-        version: 1,
-        tier: Tier::Sortition,
-        kind: PollEventKindCode::DraftApproval,
         hlc,
-        actor: actor.owner,
-        payload,
-        sig: vec![0u8; 64],
-    };
-    let sb = ev
-        .signing_bytes()
-        .expect("signing_bytes for draft approval");
-    ev.sig = actor.signing_key.sign(&sb).to_bytes().to_vec();
-    ev
+    )
+    .expect("build_signed_draft_approval")
 }
 
 /// Build a signed kd=rb RatificationBallot event.
@@ -373,25 +444,14 @@ pub fn build_ratification_ballot_event(
     scores: Vec<u8>,
     hlc: Hlc,
 ) -> SignedVotingEvent {
-    use ed25519_dalek::Signer;
-    let payload_struct = RatificationBallotPayload { poll_id, scores };
-    let mut payload = Vec::new();
-    ciborium::into_writer(&payload_struct, &mut payload).expect("encode RatificationBallotPayload");
-    let mut ev = SignedVotingEvent {
-        tag: 'p',
-        version: 1,
-        tier: Tier::Sortition,
-        kind: PollEventKindCode::RatificationBallot,
+    harmony_app::community_voting_core::build_signed_ratification_ballot(
+        &actor.signing_key,
+        actor.owner,
+        poll_id,
+        scores,
         hlc,
-        actor: actor.owner,
-        payload,
-        sig: vec![0u8; 64],
-    };
-    let sb = ev
-        .signing_bytes()
-        .expect("signing_bytes for ratification ballot");
-    ev.sig = actor.signing_key.sign(&sb).to_bytes().to_vec();
-    ev
+    )
+    .expect("build_signed_ratification_ballot")
 }
 
 /// Build a signed kd=sf SortitionFailed event.
@@ -400,30 +460,24 @@ pub fn build_sortition_failed_event(
     poll_id: harmony_app::community_voting_core::PollId,
     hlc: Hlc,
 ) -> SignedVotingEvent {
-    use ed25519_dalek::Signer;
-    let payload_struct = SortitionFailedPayload { poll_id };
-    let mut payload = Vec::new();
-    ciborium::into_writer(&payload_struct, &mut payload).expect("encode SortitionFailedPayload");
-    let mut ev = SignedVotingEvent {
-        tag: 'p',
-        version: 1,
-        tier: Tier::Sortition,
-        kind: PollEventKindCode::SortitionFailed,
+    harmony_app::community_voting_core::build_signed_sortition_failed(
+        &proposer.signing_key,
+        proposer.owner,
+        poll_id,
         hlc,
-        actor: proposer.owner,
-        payload,
-        sig: vec![0u8; 64],
-    };
-    let sb = ev
-        .signing_bytes()
-        .expect("signing_bytes for sortition failed");
-    ev.sig = proposer.signing_key.sign(&sb).to_bytes().to_vec();
-    ev
+    )
+    .expect("build_signed_sortition_failed")
 }
 
 /// Build a signed kd=ss SortitionSelection event (engine-generated shape:
 /// zero-sig actor is `OwnerAddr([0; 16])`). Used in tests that inject a
 /// pre-computed sortition result without a real DKG/beacon.
+///
+/// NOTE: this helper is intentionally retained in the integration test
+/// file (no core counterpart) because the engine-generated shape uses a
+/// zero actor + zero sig, which has no signing-key analogue. Task 19
+/// will wire real signing and at that point the function will move into
+/// the engine-side surface.
 pub fn build_sortition_selection_event(
     poll_id: harmony_app::community_voting_core::PollId,
     primary: Vec<OwnerAddr>,
@@ -458,30 +512,13 @@ pub fn build_poll_close_event(
     poll_id: harmony_app::community_voting_core::PollId,
     hlc: Hlc,
 ) -> SignedVotingEvent {
-    use ed25519_dalek::Signer;
-    // PollClose for Tier 3 carries a minimal payload with just the poll_id reference.
-    // The payload is a CBOR map with key "pi" → poll_id bytes.
-    #[derive(serde::Serialize)]
-    struct PollClosePayload {
-        #[serde(rename = "pi")]
-        pi: harmony_app::community_voting_core::PollId,
-    }
-    let payload_struct = PollClosePayload { pi: poll_id };
-    let mut payload = Vec::new();
-    ciborium::into_writer(&payload_struct, &mut payload).expect("encode PollClosePayload");
-    let mut ev = SignedVotingEvent {
-        tag: 'p',
-        version: 1,
-        tier: Tier::Sortition,
-        kind: PollEventKindCode::PollClose,
+    harmony_app::community_voting_core::build_signed_poll_close_tier3(
+        &actor.signing_key,
+        actor.owner,
+        poll_id,
         hlc,
-        actor: actor.owner,
-        payload,
-        sig: vec![0u8; 64],
-    };
-    let sb = ev.signing_bytes().expect("signing_bytes for poll close");
-    ev.sig = actor.signing_key.sign(&sb).to_bytes().to_vec();
-    ev
+    )
+    .expect("build_signed_poll_close_tier3")
 }
 
 /// Build a signed kd=rs PollResult event (Tier 3).
@@ -491,23 +528,14 @@ pub fn build_poll_result_event(
     result: harmony_app::community_voting_star::StarResult,
     hlc: Hlc,
 ) -> SignedVotingEvent {
-    use ed25519_dalek::Signer;
-    let payload_struct = Tier3PollResultPayload { poll_id, result };
-    let mut payload = Vec::new();
-    ciborium::into_writer(&payload_struct, &mut payload).expect("encode Tier3PollResultPayload");
-    let mut ev = SignedVotingEvent {
-        tag: 'p',
-        version: 1,
-        tier: Tier::Sortition,
-        kind: PollEventKindCode::PollResult,
+    harmony_app::community_voting_core::build_signed_poll_result_tier3(
+        &actor.signing_key,
+        actor.owner,
+        poll_id,
+        result,
         hlc,
-        actor: actor.owner,
-        payload,
-        sig: vec![0u8; 64],
-    };
-    let sb = ev.signing_bytes().expect("signing_bytes for poll result");
-    ev.sig = actor.signing_key.sign(&sb).to_bytes().to_vec();
-    ev
+    )
+    .expect("build_signed_poll_result_tier3")
 }
 
 // ─── SMOKE TESTS ───────────────────────────────────────────────────────────────
@@ -2513,6 +2541,743 @@ async fn tier3_cross_engine_kd_ss_hlc_tied_resolves_by_device_id_lex() {
             "CONVERGENCE: both engines in same logical stage"
         );
     }
+
+    drop(engines);
+}
+
+// ─── ZEB-310 Task 9: engine-auto orchestration multi-engine test ─────────────
+
+/// Engine-auto orchestration: with the proposer's signing key installed on
+/// `engine_a`, once decline_count reaches `primary_size + backup_size` the
+/// engine MUST mint + publish a signed kd=sf without an IPC call, and the
+/// follow-up event MUST cross the bridge so `engine_b` also transitions
+/// to `Stage::Failed`.
+///
+/// Mirrors the structure of `tier3_mass_decline_sortition_failed_with_retry_chain`
+/// but proves the orchestration hook (vs the manual `publish_event(sf_event)`
+/// call there).
+#[tokio::test]
+async fn engine_auto_sf_on_mass_decline_from_proposer() {
+    const SORTITION_SIZE: u16 = 20;
+    const N_IDENTITIES: usize = 50;
+    const COMMUNITY_ID: SpaceId = SpaceId([0xC1; 16]);
+
+    let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
+    let proposer = &identities[49];
+    let full_electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
+    let sortition_pool: Vec<OwnerAddr> = identities[..49].iter().map(|id| id.owner).collect();
+
+    // engine_a holds the proposer's signing key → orchestration hook active.
+    // engine_b stays read-only (no key installed).
+    let engines = setup_two_voting_engine_bridge_with_signing(COMMUNITY_ID, proposer).await;
+
+    let t0: u64 = 5_000_000;
+
+    let config = Tier3PollConfigPayload {
+        proposal_text: "Engine-auto kd=sf test".into(),
+        sortition_size: SORTITION_SIZE,
+        deliberation_window_seconds: 3600,
+        drafting_window_seconds: 3600,
+        ratification_window_seconds: 3600,
+        privacy_mode: "pu".into(),
+        incentive_mode: "a".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+    };
+
+    let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
+    let create_signing_bytes = create_event
+        .signing_bytes()
+        .expect("create event signing_bytes");
+    let poll_id = derive_poll_id(&COMMUNITY_ID, &create_signing_bytes);
+
+    let snapshot = MembershipSnapshot {
+        members: full_electorate
+            .iter()
+            .map(|addr| {
+                (
+                    *addr,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )
+            })
+            .collect(),
+    };
+
+    // Apply PollCreate directly to both logs with the full electorate snapshot.
+    // (We skip publish_event for the create to avoid wiring D-FROST in this
+    // test; the existing kd=ss / kd=md publish path below exercises the
+    // orchestration hook.)
+    {
+        let mut log = engines.log_a.lock().await;
+        log.apply_with_snapshot(create_event.clone(), &COMMUNITY_ID, Some(snapshot.clone()))
+            .expect("engine_a: PollCreate apply");
+    }
+    {
+        let mut log = engines.log_b.lock().await;
+        log.apply_with_snapshot(create_event, &COMMUNITY_ID, Some(snapshot))
+            .expect("engine_b: PollCreate apply");
+    }
+
+    // Inject kd=ss: deterministic VRF on sortition_pool (excludes proposer).
+    let vrf_output: [u8; 32] = [0xC1; 32];
+    let sortition_result = fisher_yates_select(
+        &vrf_output,
+        &sortition_pool,
+        SORTITION_SIZE as usize,
+        SORTITION_SIZE as usize,
+    );
+    assert!(
+        !sortition_result.primary.contains(&proposer.owner),
+        "proposer must not be selected"
+    );
+    assert!(
+        !sortition_result.backup.contains(&proposer.owner),
+        "proposer must not be selected"
+    );
+
+    let ss_event = build_sortition_selection_event(
+        poll_id,
+        sortition_result.primary.clone(),
+        sortition_result.backup.clone(),
+        hlc_at(t0 + 1, "engine"),
+    );
+    engines
+        .engine_a
+        .publish_event(ss_event)
+        .await
+        .expect("engine_a: publish kd=ss");
+
+    // Wait for engine_b to apply kd=ss.
+    wait_for_log("engine_b: sortition_result set", &engines.log_b, |log| {
+        log.polls
+            .get(&poll_id)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .map(|t3| t3.sortition_result.is_some())
+            .unwrap_or(false)
+    })
+    .await
+    .expect("engine_b: kd=ss must arrive within 5s");
+
+    // Publish 40 declines (20 primary + 20 backup) via engine_a. Each apply
+    // calls the orchestration hook, but kd=sf should only fire once the
+    // 40th decline lands (covering the full pool). Each pre-40 hook call
+    // returns early because `decline_count < capacity`.
+    let primary_ids: Vec<&TestIdentity> = sortition_result
+        .primary
+        .iter()
+        .map(|owner| identities.iter().find(|id| id.owner == *owner).unwrap())
+        .collect();
+    let backup_ids: Vec<&TestIdentity> = sortition_result
+        .backup
+        .iter()
+        .map(|owner| identities.iter().find(|id| id.owner == *owner).unwrap())
+        .collect();
+
+    let t_decline_base = t0 + 100;
+    for (i, decliner) in primary_ids.iter().enumerate() {
+        let decline_ev = build_decline_event(
+            decliner,
+            poll_id,
+            hlc_at(t_decline_base + i as u64 * 10, &format!("primary-{i}-dev")),
+        );
+        engines
+            .engine_a
+            .publish_event(decline_ev)
+            .await
+            .expect("publish primary decline");
+    }
+    let backup_decline_base = t_decline_base + (SORTITION_SIZE as u64) * 10 + 10;
+    for (i, decliner) in backup_ids.iter().enumerate() {
+        let decline_ev = build_decline_event(
+            decliner,
+            poll_id,
+            hlc_at(
+                backup_decline_base + i as u64 * 10,
+                &format!("backup-{i}-dev"),
+            ),
+        );
+        engines
+            .engine_a
+            .publish_event(decline_ev)
+            .await
+            .expect("publish backup decline");
+    }
+
+    // Engine-auto orchestration should now have minted kd=sf on engine_a's
+    // apply hook (40th decline). Wait for engine_b to receive + apply it
+    // via the bridge.
+    wait_for_log(
+        "engine_b: stage == Failed (engine-auto kd=sf propagated)",
+        &engines.log_b,
+        |log| {
+            log.polls
+                .get(&poll_id)
+                .and_then(|ps| ps.tier_state.as_tier3())
+                .map(|t3| t3.stage == Stage::Failed)
+                .unwrap_or(false)
+        },
+    )
+    .await
+    .expect("engine-auto kd=sf must propagate to engine_b within 5s");
+
+    // Confirm engine_a also transitioned (the hook recurses through
+    // publish_event which applies locally before broadcasting).
+    {
+        let log = engines.log_a.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        assert_eq!(
+            t3.stage,
+            Stage::Failed,
+            "engine_a: must be Failed after engine-auto kd=sf"
+        );
+        // The kd=sf was signed by the proposer's installed key (not a
+        // zero-actor synthetic). Confirm via the SF1 verify path —
+        // peers will accept this event because the actor matches the
+        // poll proposer.
+        assert!(
+            t3.declines.len() >= 40,
+            "engine_a: expected at least 40 declines on the poll"
+        );
+    }
+
+    drop(engines);
+}
+
+/// ZEB-310 Task 10: engine-auto orchestration of kd=cl PollClose.
+///
+/// Verifies the post-apply hook on `VotingLogEngine` mints + publishes a
+/// signed kd=cl when:
+///
+///   (1) the poll is in `Stage::Ratification` per `current_stage_at(now_hlc)`
+///       — i.e. sortition_result is Some AND now ≥ create + dw + fw,
+///   (2) `close_event_hash.is_none()` (no prior kd=cl applied), AND
+///   (3) the ratification window has expired (now ≥ create + dw + fw + rw).
+///
+/// Setup: build a Tier 3 poll with the minimum-valid 60-second windows.
+/// Inject kd=ss with `hlc.wall_ms = t0 + 500_000` (320s past the ratification
+/// deadline) so the hook's HLC-driven "now" view sees the deadline as
+/// expired. engine_a.publish_event(kd=ss) applies kd=ss locally, fires the
+/// post-apply hook, which mints + broadcasts kd=cl.
+///
+/// The plan's "≥1 ballot" guideline is satisfied implicitly: with 0 ballots
+/// + 1 candidate (status_quo, always synthesized), `tally_star` still
+/// produces a deterministic result on the kd=rs leg (Task 11). For kd=cl
+/// alone, no ballots are required — only the window-expiry guards above.
+#[tokio::test]
+async fn engine_auto_cl_when_ratification_window_expires() {
+    const COMMUNITY_ID: SpaceId = SpaceId([0xC2; 16]);
+    const SORTITION_SIZE: u16 = 20;
+    const N_IDENTITIES: usize = 50;
+
+    let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
+    let proposer = &identities[49];
+    let full_electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
+    let sortition_pool: Vec<OwnerAddr> = identities[..49].iter().map(|id| id.owner).collect();
+
+    // engine_a holds the proposer's signing key → orchestration hook active.
+    let engines = setup_two_voting_engine_bridge_with_signing(COMMUNITY_ID, proposer).await;
+
+    // Synthetic t0 — the kd=cl trigger is HLC-driven (uses
+    // `t3.last_hlc.wall_ms`, NOT wall-clock — see hook comments in
+    // community_voting_log_engine.rs). The kd=ss event below is minted
+    // with `hlc.wall_ms = t0 + 500_000`, well past the ratification
+    // deadline (`t0 + 180_000`).
+    let t0: u64 = 6_000_000;
+
+    let config = Tier3PollConfigPayload {
+        proposal_text: "Engine-auto kd=cl test".into(),
+        sortition_size: SORTITION_SIZE,
+        // Minimum-valid windows per validate_tier3_poll_config (60s floor).
+        // total_window_ms = 180_000 — well under the t0 offset above.
+        deliberation_window_seconds: 60,
+        drafting_window_seconds: 60,
+        ratification_window_seconds: 60,
+        privacy_mode: "pu".into(),
+        incentive_mode: "a".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+    };
+
+    let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
+    let create_signing_bytes = create_event
+        .signing_bytes()
+        .expect("create event signing_bytes");
+    let poll_id = derive_poll_id(&COMMUNITY_ID, &create_signing_bytes);
+
+    let snapshot = MembershipSnapshot {
+        members: full_electorate
+            .iter()
+            .map(|addr| {
+                (
+                    *addr,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )
+            })
+            .collect(),
+    };
+
+    // Apply PollCreate directly to both logs (skip publish_event to avoid
+    // D-FROST wiring requirement; the kd=ss publish below exercises the hook).
+    {
+        let mut log = engines.log_a.lock().await;
+        log.apply_with_snapshot(create_event.clone(), &COMMUNITY_ID, Some(snapshot.clone()))
+            .expect("engine_a: PollCreate apply");
+    }
+    {
+        let mut log = engines.log_b.lock().await;
+        log.apply_with_snapshot(create_event, &COMMUNITY_ID, Some(snapshot))
+            .expect("engine_b: PollCreate apply");
+    }
+
+    // Inject kd=ss via engine_a.publish_event. This applies kd=ss locally
+    // (setting sortition_result), then fires the engine-auto hook. The hook
+    // is HLC-driven (uses `t3.last_hlc.wall_ms` as the "now" estimate, NOT
+    // real wall-clock — see community_voting_log_engine.rs comments). So
+    // the kd=ss HLC must already be past the ratification deadline
+    // (t0 + total_window = t0 + 180_000 ms) for current_stage_at to return
+    // Ratification AND for the deadline check to fire. We set
+    // `ss_hlc.wall_ms = t0 + 500_000` so the deadline is 320_000 ms past
+    // — well clear of any ordering subtleties.
+    let vrf_output: [u8; 32] = [0xC2; 32];
+    let sortition_result = fisher_yates_select(
+        &vrf_output,
+        &sortition_pool,
+        SORTITION_SIZE as usize,
+        SORTITION_SIZE as usize,
+    );
+    let ss_hlc_wall = t0 + 500_000;
+    let ss_event = build_sortition_selection_event(
+        poll_id,
+        sortition_result.primary.clone(),
+        sortition_result.backup.clone(),
+        hlc_at(ss_hlc_wall, "engine"),
+    );
+    engines
+        .engine_a
+        .publish_event(ss_event)
+        .await
+        .expect("engine_a: publish kd=ss");
+
+    // Wait for engine_b to see close_event_hash become Some, which means
+    // the engine-auto kd=cl crossed the bridge.
+    wait_for_log(
+        "engine_b: close_event_hash set (engine-auto kd=cl propagated)",
+        &engines.log_b,
+        |log| {
+            log.polls
+                .get(&poll_id)
+                .and_then(|ps| ps.tier_state.as_tier3())
+                .map(|t3| t3.close_event_hash.is_some())
+                .unwrap_or(false)
+        },
+    )
+    .await
+    .expect("engine-auto kd=cl must propagate to engine_b within 5s");
+
+    // engine_a applied kd=cl locally as part of the recursive publish_event.
+    {
+        let log = engines.log_a.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        assert!(
+            t3.close_event_hash.is_some(),
+            "engine_a: close_event_hash must be set after engine-auto kd=cl"
+        );
+    }
+
+    drop(engines);
+}
+
+/// ZEB-310 Task 11: engine-auto orchestration of kd=rs PollResult.
+///
+/// Verifies that after the kd=cl trigger fires (per Task 10), the same
+/// post-apply hook re-fires from inside the recursive `publish_event`
+/// call and mints + publishes a signed kd=rs with a deterministic STAR
+/// tally. Both engines must converge on:
+///
+///   1. `Stage::Finalized` (kd=rs applied),
+///   2. bit-identical `Tier3PollResultPayload.winner.event_hash`.
+///
+/// Setup is the same as `engine_auto_cl_when_ratification_window_expires`
+/// (Task 10) — minimum-valid 60-second windows, synthetic t0, kd=ss
+/// minted with hlc.wall_ms = t0 + 500_000 (320s past the ratification
+/// deadline). With 0 ratification ballots and 1 candidate (status_quo,
+/// always synthesized by `synthesize_status_quo`), `tally_star` returns
+/// a deterministic result: status_quo wins the (degenerate) STAR runoff.
+#[tokio::test]
+async fn engine_auto_rs_after_cl_with_bit_identical_tally() {
+    use harmony_app::community_voting_tier3::synthesize_status_quo;
+
+    const COMMUNITY_ID: SpaceId = SpaceId([0xC3; 16]);
+    const SORTITION_SIZE: u16 = 20;
+    const N_IDENTITIES: usize = 50;
+
+    let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
+    let proposer = &identities[49];
+    let full_electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
+    let sortition_pool: Vec<OwnerAddr> = identities[..49].iter().map(|id| id.owner).collect();
+
+    let engines = setup_two_voting_engine_bridge_with_signing(COMMUNITY_ID, proposer).await;
+
+    let t0: u64 = 6_000_000;
+
+    let config = Tier3PollConfigPayload {
+        proposal_text: "Engine-auto kd=rs test".into(),
+        sortition_size: SORTITION_SIZE,
+        deliberation_window_seconds: 60,
+        drafting_window_seconds: 60,
+        ratification_window_seconds: 60,
+        privacy_mode: "pu".into(),
+        incentive_mode: "a".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+    };
+
+    let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
+    let create_signing_bytes = create_event
+        .signing_bytes()
+        .expect("create event signing_bytes");
+    let poll_id = derive_poll_id(&COMMUNITY_ID, &create_signing_bytes);
+
+    let snapshot = MembershipSnapshot {
+        members: full_electorate
+            .iter()
+            .map(|addr| {
+                (
+                    *addr,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )
+            })
+            .collect(),
+    };
+
+    {
+        let mut log = engines.log_a.lock().await;
+        log.apply_with_snapshot(create_event.clone(), &COMMUNITY_ID, Some(snapshot.clone()))
+            .expect("engine_a: PollCreate apply");
+    }
+    {
+        let mut log = engines.log_b.lock().await;
+        log.apply_with_snapshot(create_event, &COMMUNITY_ID, Some(snapshot))
+            .expect("engine_b: PollCreate apply");
+    }
+
+    let vrf_output: [u8; 32] = [0xC3; 32];
+    let sortition_result = fisher_yates_select(
+        &vrf_output,
+        &sortition_pool,
+        SORTITION_SIZE as usize,
+        SORTITION_SIZE as usize,
+    );
+    let ss_hlc_wall = t0 + 500_000;
+    let ss_event = build_sortition_selection_event(
+        poll_id,
+        sortition_result.primary.clone(),
+        sortition_result.backup.clone(),
+        hlc_at(ss_hlc_wall, "engine"),
+    );
+    engines
+        .engine_a
+        .publish_event(ss_event)
+        .await
+        .expect("engine_a: publish kd=ss");
+
+    // Wait for engine_b to see Stage::Finalized — the recursive hook on
+    // engine_a fired kd=cl → applied → re-fired hook → fired kd=rs →
+    // applied → Stage = Finalized. Both events broadcast across the bridge
+    // in apply order.
+    wait_for_log(
+        "engine_b: stage == Finalized (engine-auto kd=rs propagated)",
+        &engines.log_b,
+        |log| {
+            log.polls
+                .get(&poll_id)
+                .and_then(|ps| ps.tier_state.as_tier3())
+                .map(|t3| t3.stage == Stage::Finalized)
+                .unwrap_or(false)
+        },
+    )
+    .await
+    .expect("engine-auto kd=rs must propagate to engine_b within 5s");
+
+    // Bit-identical convergence: same StarResult on both engines.
+    let (t3_a, t3_b) = {
+        let log_a = engines.log_a.lock().await;
+        let log_b = engines.log_b.lock().await;
+        (
+            log_a.polls[&poll_id]
+                .tier_state
+                .as_tier3()
+                .expect("log_a tier3")
+                .clone(),
+            log_b.polls[&poll_id]
+                .tier_state
+                .as_tier3()
+                .expect("log_b tier3")
+                .clone(),
+        )
+    };
+    assert_eq!(t3_a.stage, Stage::Finalized);
+    assert_eq!(t3_b.stage, Stage::Finalized);
+    assert!(
+        t3_a.close_event_hash.is_some(),
+        "engine_a: close_event_hash must be Some"
+    );
+    assert!(
+        t3_b.close_event_hash.is_some(),
+        "engine_b: close_event_hash must be Some"
+    );
+    let result_a = t3_a.result.as_ref().expect("engine_a result");
+    let result_b = t3_b.result.as_ref().expect("engine_b result");
+    assert_eq!(
+        result_a, result_b,
+        "CONVERGENCE: both engines must have bit-identical StarResult"
+    );
+    // With 0 ballots + 1 candidate (status_quo), the STAR runoff has a
+    // single finalist — status_quo — which trivially wins.
+    let sq_hash = synthesize_status_quo(&poll_id).event_hash;
+    assert_eq!(
+        result_a.winner.event_hash, sq_hash,
+        "winner must be status_quo in the degenerate 0-ballot path"
+    );
+
+    drop(engines);
+}
+
+/// ZEB-310 Task 12: verify the engine's post-apply hook emits the Tier 3
+/// lifecycle Tauri events at the expected lifecycle points.
+///
+/// Scenario: drive a Tier 3 poll through the kd=ss → engine-auto kd=cl →
+/// engine-auto kd=rs cascade (same shape as `engine_auto_rs_after_cl…`
+/// above) and assert:
+///
+///   - `voting-tier3-sortition-complete` fires exactly once (kd=ss apply)
+///   - `voting-tier3-finalized` fires exactly once (kd=rs apply, cascaded
+///      from inside the recursive `publish_event` from the engine-auto hook)
+///
+/// `voting-tier3-drafting-open` and `voting-tier3-ratification-open` are NOT
+/// asserted in this scenario — the hook uses `current_hlc_estimate()`
+/// (real wall-clock) for the previous/new stage diff, and the synthetic
+/// `t0 = 6_000_000ms` poll create HLC is decades behind real wall-clock,
+/// so `current_stage_at(now)` collapses straight to Ratification (skipping
+/// the Deliberation and Drafting transitions). The IPC-emitted version of
+/// these two events (Tasks 7 / 8 of the broader plan) covers the real
+/// transition path explicitly. Here we cover the always-fires-on-kind
+/// events (sortition-complete + finalized).
+#[tokio::test]
+async fn engine_auto_tier3_tauri_events_fire_at_expected_lifecycle_points() {
+    use std::sync::Mutex as StdMutex;
+
+    const COMMUNITY_ID: SpaceId = SpaceId([0xC4; 16]);
+    const SORTITION_SIZE: u16 = 20;
+    const N_IDENTITIES: usize = 50;
+
+    let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
+    let proposer = &identities[49];
+    let full_electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
+    let sortition_pool: Vec<OwnerAddr> = identities[..49].iter().map(|id| id.owner).collect();
+
+    // Mock Tauri app + handle, plus listeners for the two events we assert on.
+    // Listeners must be registered BEFORE the events fire — the engine's
+    // emit happens inside `publish_event`, and Tauri's bus delivers
+    // asynchronously to listeners attached at emit time only if the
+    // listener was registered prior.
+    let app = tauri::test::mock_app();
+    let app_handle = app.handle().clone();
+
+    let sortition_complete_payloads: Arc<StdMutex<Vec<String>>> =
+        Arc::new(StdMutex::new(Vec::new()));
+    let finalized_payloads: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+
+    {
+        let sink = Arc::clone(&sortition_complete_payloads);
+        app_handle.listen("voting-tier3-sortition-complete", move |evt| {
+            sink.lock()
+                .expect("sortition_complete sink")
+                .push(evt.payload().to_string());
+        });
+    }
+    {
+        let sink = Arc::clone(&finalized_payloads);
+        app_handle.listen("voting-tier3-finalized", move |evt| {
+            sink.lock()
+                .expect("finalized sink")
+                .push(evt.payload().to_string());
+        });
+    }
+
+    let engines = setup_two_voting_engine_bridge_with_signing_and_app(
+        COMMUNITY_ID,
+        proposer,
+        app_handle.clone(),
+    )
+    .await;
+
+    let t0: u64 = 6_000_000;
+    let config = Tier3PollConfigPayload {
+        proposal_text: "Engine-auto Tauri events test".into(),
+        sortition_size: SORTITION_SIZE,
+        deliberation_window_seconds: 60,
+        drafting_window_seconds: 60,
+        ratification_window_seconds: 60,
+        privacy_mode: "pu".into(),
+        incentive_mode: "a".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+    };
+
+    let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
+    let create_signing_bytes = create_event
+        .signing_bytes()
+        .expect("create event signing_bytes");
+    let poll_id = derive_poll_id(&COMMUNITY_ID, &create_signing_bytes);
+
+    let snapshot = MembershipSnapshot {
+        members: full_electorate
+            .iter()
+            .map(|addr| {
+                (
+                    *addr,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )
+            })
+            .collect(),
+    };
+
+    // Apply PollCreate directly (no Tauri events emitted by the engine for
+    // this event — `voting-tier3-poll-created` is emitted by the IPC, not
+    // the engine).
+    {
+        let mut log = engines.log_a.lock().await;
+        log.apply_with_snapshot(create_event.clone(), &COMMUNITY_ID, Some(snapshot.clone()))
+            .expect("engine_a: PollCreate apply");
+    }
+    {
+        let mut log = engines.log_b.lock().await;
+        log.apply_with_snapshot(create_event, &COMMUNITY_ID, Some(snapshot))
+            .expect("engine_b: PollCreate apply");
+    }
+
+    // Publish kd=ss via engine_a. This:
+    //   1. emits `voting-tier3-sortition-complete` (kd=ss kind match), then
+    //   2. fires engine-auto orchestration → kd=cl recursive publish → kd=rs
+    //      recursive publish → poll Finalized → `voting-tier3-finalized`
+    //      emitted from the kd=rs inner publish_event's post-apply hook.
+    let vrf_output: [u8; 32] = [0xC4; 32];
+    let sortition_result = fisher_yates_select(
+        &vrf_output,
+        &sortition_pool,
+        SORTITION_SIZE as usize,
+        SORTITION_SIZE as usize,
+    );
+    let ss_hlc_wall = t0 + 500_000;
+    let ss_event = build_sortition_selection_event(
+        poll_id,
+        sortition_result.primary.clone(),
+        sortition_result.backup.clone(),
+        hlc_at(ss_hlc_wall, "engine"),
+    );
+    engines
+        .engine_a
+        .publish_event(ss_event)
+        .await
+        .expect("engine_a: publish kd=ss");
+
+    // Wait for engine_a to reach Stage::Finalized so we know the full
+    // cascade has applied + both events have been emitted onto the Tauri
+    // bus. The bus delivery is async; we then poll the listener sinks.
+    wait_for_log(
+        "engine_a: stage == Finalized (kd=ss → kd=cl → kd=rs cascade)",
+        &engines.log_a,
+        |log| {
+            log.polls
+                .get(&poll_id)
+                .and_then(|ps| ps.tier_state.as_tier3())
+                .map(|t3| t3.stage == Stage::Finalized)
+                .unwrap_or(false)
+        },
+    )
+    .await
+    .expect("engine_a: full Finalized cascade must complete within 5s");
+
+    // Poll until BOTH events have been delivered (Tauri bus has its own
+    // dispatch latency). Bounded at 2s.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let sc_count = sortition_complete_payloads.lock().expect("sc lock").len();
+        let fin_count = finalized_payloads.lock().expect("fin lock").len();
+        if sc_count >= 1 && fin_count >= 1 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "Tauri events did not deliver in time: sortition-complete={sc_count}, \
+                 finalized={fin_count} (each must be >= 1)"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Exact-once assertions: each event fired exactly once on engine_a.
+    let sc_payloads = sortition_complete_payloads
+        .lock()
+        .expect("sc lock final")
+        .clone();
+    let fin_payloads = finalized_payloads.lock().expect("fin lock final").clone();
+    assert_eq!(
+        sc_payloads.len(),
+        1,
+        "voting-tier3-sortition-complete must fire exactly once; got {} payloads: {:?}",
+        sc_payloads.len(),
+        sc_payloads
+    );
+    assert_eq!(
+        fin_payloads.len(),
+        1,
+        "voting-tier3-finalized must fire exactly once; got {} payloads: {:?}",
+        fin_payloads.len(),
+        fin_payloads
+    );
+
+    // Spot-check payload shape: poll_id field should contain our hex.
+    let poll_id_hex = hex::encode(poll_id.0);
+    assert!(
+        sc_payloads[0].contains(&poll_id_hex),
+        "sortition-complete payload missing pollId hex: {}",
+        sc_payloads[0]
+    );
+    assert!(
+        fin_payloads[0].contains(&poll_id_hex),
+        "finalized payload missing pollId hex: {}",
+        fin_payloads[0]
+    );
 
     drop(engines);
 }

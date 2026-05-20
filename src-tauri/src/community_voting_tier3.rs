@@ -116,6 +116,8 @@ pub enum ValidateError {
     BallotLengthMismatch { scores: usize, expected: usize },
     #[error("ratification ballot score {0} > 5")]
     BallotScoreOutOfRange(u8),
+    #[error("decline reason must be exactly 2 ASCII alphanumeric chars")]
+    BadDeclineReason,
 }
 
 // ── Validate functions ────────────────────────────────────────────────────────
@@ -180,6 +182,20 @@ pub fn validate_ratification_ballot(
     for &s in &pd.scores {
         if s > 5 {
             return Err(ValidateError::BallotScoreOutOfRange(s));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the optional `reason` field on a `kd=md` MiniPublicDecline event.
+///
+/// Per spec §3 same-length-keys invariant: if `Some`, the reason must be
+/// exactly 2 ASCII alphanumeric chars (e.g., `"u1"`, `"co"`). `None` is
+/// always accepted (signals decline without a coded reason).
+pub fn validate_decline_reason(reason: &Option<String>) -> Result<(), ValidateError> {
+    if let Some(r) = reason {
+        if r.len() != 2 || !r.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(ValidateError::BadDeclineReason);
         }
     }
     Ok(())
@@ -830,6 +846,27 @@ pub fn drafting_advancers(
     Some(advancers)
 }
 
+/// Collect all RatificationBallot ballots applied to a Tier 3 poll.
+///
+/// Returns a reference to the underlying `ratification_ballots` slice,
+/// which is appended to in event-arrival order — equivalent to HLC order
+/// because `Tier3PollState::apply_event` enforces a monotonic-HLC check
+/// before mutating state.
+///
+/// Used by ZEB-310 Task 11's engine-auto kd=rs orchestration: the hook
+/// calls this helper to get the ballot slice, then re-runs `tally_star`
+/// over it to produce a deterministic STAR result that converges
+/// bit-identically across all engines.
+///
+/// Note: this helper is intentionally a `&[RatificationBallotPayload]`
+/// reference rather than a copy. `tally_star` takes a borrowed slice;
+/// no allocation needed.
+pub fn collect_ratification_ballots(
+    t3: &Tier3PollState,
+) -> &[crate::community_voting_core::RatificationBallotPayload] {
+    &t3.ratification_ballots
+}
+
 /// Final ratification candidate ordering: `approval_count DESC`,
 /// ties by `candidate_event_hash lex ASC`.
 ///
@@ -941,6 +978,14 @@ where
     T: for<'de> serde::Deserialize<'de>,
 {
     ciborium::from_reader(bytes).map_err(|e| e.to_string())
+}
+
+/// SHA-256 of `signing_bytes` for the event. Public wrapper around
+/// `sha256_of_signing_bytes` exposed for the IPC layer (Tasks 4-8) so
+/// callers can return the event_hash hex for chaining (DraftApproval
+/// references DraftCandidate hashes; PollClose references statement hashes).
+pub fn event_hash_of(event: &SignedVotingEvent) -> [u8; 32] {
+    sha256_of_signing_bytes(event)
 }
 
 /// Compute SHA-256 of the signing bytes of a SignedVotingEvent.
@@ -2909,5 +2954,45 @@ mod tests {
             Some(expected_epoch),
             "verify_ss must pass poll's stored epoch to BeaconOracle::vrf_output_for"
         );
+    }
+}
+
+#[cfg(test)]
+mod validate_decline_reason_tests {
+    use super::*;
+
+    #[test]
+    fn none_accepted() {
+        assert!(validate_decline_reason(&None).is_ok());
+    }
+
+    #[test]
+    fn two_char_alphanumeric_accepted() {
+        assert!(validate_decline_reason(&Some("u1".into())).is_ok());
+        assert!(validate_decline_reason(&Some("co".into())).is_ok());
+    }
+
+    #[test]
+    fn empty_rejected() {
+        assert!(matches!(
+            validate_decline_reason(&Some(String::new())),
+            Err(ValidateError::BadDeclineReason)
+        ));
+    }
+
+    #[test]
+    fn three_chars_rejected() {
+        assert!(matches!(
+            validate_decline_reason(&Some("abc".into())),
+            Err(ValidateError::BadDeclineReason)
+        ));
+    }
+
+    #[test]
+    fn non_ascii_rejected() {
+        assert!(matches!(
+            validate_decline_reason(&Some("é!".into())),
+            Err(ValidateError::BadDeclineReason)
+        ));
     }
 }

@@ -25,6 +25,7 @@
 import type { TauriAdapter } from './zenoh-service';
 import type {
   AutoExecAction,
+  CreateTier3ProposalArgs,
   DelegationEdgeExport,
   PollMeta,
   PollStateExport,
@@ -39,6 +40,11 @@ import type {
   VotingThresholdRevertedPayload,
   VotingTier2ProposalCreatedPayload,
   VotingTier2SignalCastPayload,
+  VotingTier3DraftingOpenPayload,
+  VotingTier3FinalizedPayload,
+  VotingTier3PollCreatedPayload,
+  VotingTier3RatificationOpenPayload,
+  VotingTier3SortitionCompletePayload,
 } from './types/voting';
 
 /** Args for `createTier1Poll`. Mirrors the Rust IPC signature 1:1. */
@@ -103,6 +109,17 @@ export class VotingAdapter {
   private delegateSignaledOnYourBehalfSubs: Array<
     (p: VotingDelegateSignaledOnYourBehalfPayload) => void
   > = [];
+
+  // ZEB-310 Phase 4a-main — Tier 3 (Sortition + STAR) event subscribers.
+  private tier3PollCreatedSubs: Array<(p: VotingTier3PollCreatedPayload) => void> = [];
+  private tier3SortitionCompleteSubs: Array<
+    (p: VotingTier3SortitionCompletePayload) => void
+  > = [];
+  private tier3DraftingOpenSubs: Array<(p: VotingTier3DraftingOpenPayload) => void> = [];
+  private tier3RatificationOpenSubs: Array<
+    (p: VotingTier3RatificationOpenPayload) => void
+  > = [];
+  private tier3FinalizedSubs: Array<(p: VotingTier3FinalizedPayload) => void> = [];
 
   subscribePollCreated(handler: (p: VotingPollCreatedPayload) => void): () => void {
     this.pollCreatedSubs.push(handler);
@@ -190,6 +207,53 @@ export class VotingAdapter {
     return () => {
       const i = this.delegateSignaledOnYourBehalfSubs.indexOf(handler);
       if (i >= 0) this.delegateSignaledOnYourBehalfSubs.splice(i, 1);
+    };
+  }
+
+  // ─── ZEB-310 Phase 4a-main — Tier 3 event subscribers ───────────────
+  subscribeTier3PollCreated(
+    handler: (p: VotingTier3PollCreatedPayload) => void,
+  ): () => void {
+    this.tier3PollCreatedSubs.push(handler);
+    return () => {
+      const i = this.tier3PollCreatedSubs.indexOf(handler);
+      if (i >= 0) this.tier3PollCreatedSubs.splice(i, 1);
+    };
+  }
+  subscribeTier3SortitionComplete(
+    handler: (p: VotingTier3SortitionCompletePayload) => void,
+  ): () => void {
+    this.tier3SortitionCompleteSubs.push(handler);
+    return () => {
+      const i = this.tier3SortitionCompleteSubs.indexOf(handler);
+      if (i >= 0) this.tier3SortitionCompleteSubs.splice(i, 1);
+    };
+  }
+  subscribeTier3DraftingOpen(
+    handler: (p: VotingTier3DraftingOpenPayload) => void,
+  ): () => void {
+    this.tier3DraftingOpenSubs.push(handler);
+    return () => {
+      const i = this.tier3DraftingOpenSubs.indexOf(handler);
+      if (i >= 0) this.tier3DraftingOpenSubs.splice(i, 1);
+    };
+  }
+  subscribeTier3RatificationOpen(
+    handler: (p: VotingTier3RatificationOpenPayload) => void,
+  ): () => void {
+    this.tier3RatificationOpenSubs.push(handler);
+    return () => {
+      const i = this.tier3RatificationOpenSubs.indexOf(handler);
+      if (i >= 0) this.tier3RatificationOpenSubs.splice(i, 1);
+    };
+  }
+  subscribeTier3Finalized(
+    handler: (p: VotingTier3FinalizedPayload) => void,
+  ): () => void {
+    this.tier3FinalizedSubs.push(handler);
+    return () => {
+      const i = this.tier3FinalizedSubs.indexOf(handler);
+      if (i >= 0) this.tier3FinalizedSubs.splice(i, 1);
     };
   }
 
@@ -311,6 +375,52 @@ export class VotingAdapter {
           },
         );
         stagedUnlisteners.push(unlistenDelegateOnBehalf);
+
+        // ZEB-310 Phase 4a-main — Tier 3 (Sortition + STAR) events.
+        const unlistenTier3PollCreated = await adapter.listen(
+          'voting-tier3-poll-created',
+          (event) => {
+            const payload = event.payload as VotingTier3PollCreatedPayload;
+            for (const sub of [...this.tier3PollCreatedSubs]) sub(payload);
+          },
+        );
+        stagedUnlisteners.push(unlistenTier3PollCreated);
+
+        const unlistenTier3SortitionComplete = await adapter.listen(
+          'voting-tier3-sortition-complete',
+          (event) => {
+            const payload = event.payload as VotingTier3SortitionCompletePayload;
+            for (const sub of [...this.tier3SortitionCompleteSubs]) sub(payload);
+          },
+        );
+        stagedUnlisteners.push(unlistenTier3SortitionComplete);
+
+        const unlistenTier3DraftingOpen = await adapter.listen(
+          'voting-tier3-drafting-open',
+          (event) => {
+            const payload = event.payload as VotingTier3DraftingOpenPayload;
+            for (const sub of [...this.tier3DraftingOpenSubs]) sub(payload);
+          },
+        );
+        stagedUnlisteners.push(unlistenTier3DraftingOpen);
+
+        const unlistenTier3RatificationOpen = await adapter.listen(
+          'voting-tier3-ratification-open',
+          (event) => {
+            const payload = event.payload as VotingTier3RatificationOpenPayload;
+            for (const sub of [...this.tier3RatificationOpenSubs]) sub(payload);
+          },
+        );
+        stagedUnlisteners.push(unlistenTier3RatificationOpen);
+
+        const unlistenTier3Finalized = await adapter.listen(
+          'voting-tier3-finalized',
+          (event) => {
+            const payload = event.payload as VotingTier3FinalizedPayload;
+            for (const sub of [...this.tier3FinalizedSubs]) sub(payload);
+          },
+        );
+        stagedUnlisteners.push(unlistenTier3Finalized);
 
         this.adapter = adapter;
         this.unlisteners.push(...stagedUnlisteners);
@@ -459,6 +569,59 @@ export class VotingAdapter {
     return this.invoke<Tier2ProposalExport>('voting_get_tier2_proposal', {
       proposalId,
     });
+  }
+
+  // ─── ZEB-310 Phase 4a-main — Tier 3 (Sortition + STAR) IPC wrappers ────
+  // Param names use camelCase per the Tauri snake_case ↔ camelCase boundary
+  // convention (see harmony-client/CLAUDE.md). The Rust IPC functions in
+  // src-tauri/src/lib.rs declare these as snake_case; Tauri auto-converts.
+
+  /** Create a Tier 3 (Sortition + STAR) governance proposal. Returns the new
+   *  PollId as a hex string (32 bytes → 64 chars). */
+  async createTier3Proposal(args: CreateTier3ProposalArgs): Promise<string> {
+    return this.invoke<string>('voting_create_tier3_proposal', {
+      communityId: args.communityId,
+      channelId: args.channelId,
+      proposalText: args.proposalText,
+      sortitionSize: args.sortitionSize,
+      deliberationWindowSeconds: args.deliberationWindowSeconds,
+      draftingWindowSeconds: args.draftingWindowSeconds,
+      ratificationWindowSeconds: args.ratificationWindowSeconds,
+      incentiveMode: args.incentiveMode,
+      minPower: args.minPower,
+      minVouchingDepth: args.minVouchingDepth,
+      retryOf: args.retryOf,
+    });
+  }
+
+  /** Submit a deliberation statement (kd=ds) for a Tier 3 poll. Phase 5
+   *  scaffold — emits valid events but no clustering yet. Returns event_hash hex. */
+  async submitDeliberationStatement(pollId: string, text: string): Promise<string> {
+    return this.invoke<string>('voting_submit_deliberation_statement', { pollId, text });
+  }
+
+  /** Propose a draft candidate (kd=dc). Returns candidate_event_hash hex
+   *  for downstream approval references. */
+  async proposeDraftCandidate(pollId: string, candidateText: string): Promise<string> {
+    return this.invoke<string>('voting_propose_draft_candidate', { pollId, candidateText });
+  }
+
+  /** Approve someone else's draft candidate (kd=da). Mini-public only
+   *  (verify-side enforces SD1 + candidate-exists). */
+  async approveDraftCandidate(pollId: string, candidateEventHash: string): Promise<void> {
+    await this.invoke<void>('voting_approve_draft_candidate', { pollId, candidateEventHash });
+  }
+
+  /** Decline a sortition invitation (kd=md). Optional 2-char ASCII
+   *  alphanumeric reason tag (e.g., "u1", "co"). */
+  async declineSortition(pollId: string, reason?: string): Promise<void> {
+    await this.invoke<void>('voting_decline_sortition', { pollId, reason });
+  }
+
+  /** Cast a ratification ballot (kd=rb). `scores` is one byte per
+   *  ratification candidate in `candidateOrdering` (0..=5). */
+  async castRatificationBallot(pollId: string, scores: number[]): Promise<void> {
+    await this.invoke<void>('voting_cast_ratification_ballot', { pollId, scores });
   }
 
   private async invoke<T>(cmd: string, args: Record<string, unknown>): Promise<T> {

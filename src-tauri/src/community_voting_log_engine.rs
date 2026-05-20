@@ -28,17 +28,19 @@
 //! Without that ordering, the local event loops back via the subscriber path
 //! and gets double-applied. See `publish_event` below.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, RwLock};
+
+use tauri::{AppHandle, Emitter};
 
 use crate::community_dfrost_log_engine::DfrostLogRegistry;
 use crate::community_voting_core::{PollEventKindCode, PollId, SignedVotingEvent, Tier};
 use crate::community_voting_log::VotingLog;
-use crate::owner_state_types::{OwnerAddr, SpaceId};
+use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 
 // ── BeaconRequester type alias ───────────────────────────────────────────────
 
@@ -119,13 +121,29 @@ impl VotingReplayTracker {
 /// The adapter (Task 19 — full NodeState wiring) owns the other ends of
 /// `publisher_tx` / `subscriber_rx` and binds them to Zenoh `put` /
 /// subscribe on `harmony/community/{community_id}/voting`.
-pub struct VotingLogEngineParams {
+pub struct VotingLogEngineParams<R: tauri::Runtime = tauri::Wry> {
     pub community_id: SpaceId,
     pub voting_log: Arc<Mutex<VotingLog>>,
     /// Engine → adapter → Zenoh `put`.
     pub publisher_tx: mpsc::Sender<Vec<u8>>,
     /// Zenoh subscriber → adapter → engine receive loop.
     pub subscriber_rx: mpsc::Receiver<Vec<u8>>,
+    /// Shared per-device HLC tracker (ZEB-267). Used by
+    /// `reserve_next_local_hlc` so engine-auto-orchestrated events
+    /// (kd=sf / Task 9, kd=cl / Task 10, kd=rs / Task 11) get HLCs
+    /// monotone with the IPC layer's mints on the same lane.
+    /// Optional so tests that never trigger engine-auto can pass `None`.
+    pub hlc_tracker: Option<Arc<Mutex<BTreeMap<String, Hlc>>>>,
+    /// Local device_id string, paired with `hlc_tracker` above.
+    /// Optional for the same reason as `hlc_tracker`.
+    pub device_id: Option<String>,
+    /// ZEB-310 Task 12: optional Tauri `AppHandle` used by the post-apply
+    /// hook to emit the four Tier 3 lifecycle events
+    /// (`voting-tier3-sortition-complete`, `voting-tier3-drafting-open`,
+    /// `voting-tier3-ratification-open`, `voting-tier3-finalized`). `None`
+    /// disables emission — used by tests / lightweight harnesses that don't
+    /// drive the UI.
+    pub app_handle: Option<AppHandle<R>>,
     // No backfill_req_tx in Phase 2 — sparse event volume, deferred.
 }
 
@@ -155,6 +173,29 @@ pub struct VotingLogEngine<R: tauri::Runtime> {
     /// Optional injected closure for triggering a VRF beacon ceremony.
     /// Populated by `install_dfrost_handle`. None until wired by Task 19.
     beacon_requester: Mutex<Option<BeaconRequester>>,
+    /// ZEB-310 Task 9: shared per-device HLC tracker for engine-auto
+    /// orchestration (kd=sf / kd=cl / kd=rs). `None` until installed
+    /// via `VotingLogEngineParams::hlc_tracker`; the orchestration
+    /// hook skips when `None`. Same shape + reuse semantics as the
+    /// IPC layer's tracker so engine-auto HLCs are monotone with IPC
+    /// mints on the local device's lane.
+    hlc_tracker: Option<Arc<Mutex<BTreeMap<String, Hlc>>>>,
+    /// ZEB-310 Task 9: local device_id paired with `hlc_tracker`.
+    /// `None` follows the same gating as `hlc_tracker`.
+    device_id: Option<String>,
+    /// ZEB-310 Task 12: optional Tauri AppHandle used by the post-apply
+    /// hook to emit Tier 3 lifecycle events. `None` ⇒ engine runs without
+    /// emitting Tauri events (tests + dormant production wiring).
+    app_handle: Option<AppHandle<R>>,
+    /// ZEB-310 Task 9: local signing key + owner for engine-auto
+    /// orchestration paths. `None` ⇒ read-only peer mode (no
+    /// orchestration). Installed via `install_local_signing_key`
+    /// from the IPC layer at runtime and from tests via the
+    /// equivalent setup helper.
+    ///
+    /// Wrapped in `RwLock<Option<...>>` so the install is one-shot
+    /// from outside and reads are non-blocking on the common path.
+    local_signing: RwLock<Option<(Arc<ed25519_dalek::SigningKey>, OwnerAddr)>>,
     /// ZEB-307 PhantomData<fn() -> R>: makes VotingLogEngine<R> unconditionally
     /// Send + Sync even when R = tauri::Wry (which is !Send because its
     /// EventLoop holds Rc<>). The engine only owns R through this marker,
@@ -169,7 +210,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
 
     /// Construct an engine, spawn its inbound receive loop, and return
     /// an `Arc<Self>` suitable for registry storage.
-    pub async fn start(params: VotingLogEngineParams) -> Arc<Self> {
+    pub async fn start(params: VotingLogEngineParams<R>) -> Arc<Self> {
         let tracker = Arc::new(Mutex::new(VotingReplayTracker::new()));
 
         // Spawn the inbound loop. It takes ownership of subscriber_rx
@@ -201,8 +242,77 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             _receive_handle: receive_handle,
             dfrost_registry: Mutex::new(None),
             beacon_requester: Mutex::new(None),
+            hlc_tracker: params.hlc_tracker,
+            device_id: params.device_id,
+            app_handle: params.app_handle,
+            local_signing: RwLock::new(None),
             _phantom: PhantomData,
         })
+    }
+
+    /// ZEB-310 Task 9: install (or replace) the local signing key + owner
+    /// used by engine-auto orchestration paths (`maybe_trigger_engine_auto_orchestration`).
+    ///
+    /// When unset (the default), engine-auto paths skip orchestration —
+    /// the engine acts as a read-only peer. The IPC layer installs the
+    /// key during `start_node`; tests install it via the multi-engine
+    /// setup helper. Replacing an installed key is intentionally
+    /// allowed (e.g. on identity rotation).
+    ///
+    /// Must be paired with `hlc_tracker` + `device_id` installed via
+    /// `VotingLogEngineParams`; otherwise orchestration is dormant
+    /// (`maybe_trigger_engine_auto_orchestration` short-circuits when
+    /// any of the three is missing). Without this pairing,
+    /// `reserve_next_local_hlc` would panic on its `.expect(...)`.
+    pub async fn install_local_signing_key(
+        &self,
+        key: Arc<ed25519_dalek::SigningKey>,
+        owner: OwnerAddr,
+    ) {
+        let mut w = self.local_signing.write().await;
+        *w = Some((key, owner));
+    }
+
+    /// ZEB-310 Task 9: reserve the next HLC on the local device's lane,
+    /// using the same atomic-reservation primitive the IPC layer uses.
+    /// Pre-condition: `hlc_tracker` and `device_id` were installed via
+    /// `VotingLogEngineParams`. Panics in tests if they weren't (which
+    /// indicates a misconfigured fixture — orchestration should be
+    /// short-circuited earlier by `local_signing.is_none()`).
+    pub async fn reserve_next_local_hlc(&self) -> Hlc {
+        let wall_now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let tracker = self
+            .hlc_tracker
+            .as_ref()
+            .expect("reserve_next_local_hlc called without hlc_tracker installed");
+        let device_id = self
+            .device_id
+            .as_deref()
+            .expect("reserve_next_local_hlc called without device_id installed");
+        crate::dm_outbox::reserve_next_hlc_for_device(tracker, device_id, wall_now_ms).await
+    }
+
+    /// ZEB-310 Task 10: read-only "now" HLC estimate.
+    ///
+    /// Returns the engine's best estimate of "now" as an `Hlc` derived from
+    /// real wall-clock time. Does NOT advance the tracker or reserve a lane —
+    /// callers use this purely for deadline checks (e.g. has the ratification
+    /// window expired?). Compare directly against stored HLC `wall_ms` fields;
+    /// the `logical` and `device_id` placeholders are sentinels for comparison
+    /// only and must NOT be used as a real event HLC.
+    pub async fn current_hlc_estimate(&self) -> Hlc {
+        let wall_now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        Hlc {
+            wall_ms: wall_now_ms,
+            logical: 0,
+            device_id: String::new(),
+        }
     }
 
     /// Wire in the DfrostLogRegistry + beacon_requester closure after construction.
@@ -256,7 +366,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
     /// This method is spawned by the dfrost beacon callback (see
     /// `install_dfrost_handle`). Errors are logged and dropped.
     async fn on_dfrost_beacon(
-        &self,
+        self: &Arc<Self>,
         payload: &crate::community_dfrost_types::VrfBeaconPayload,
         community_id: SpaceId,
     ) {
@@ -313,7 +423,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
 
     /// Compute Fisher-Yates sortition and publish a kd=ss SortitionSelection event.
     async fn publish_sortition_selection(
-        &self,
+        self: &Arc<Self>,
         poll_id: crate::community_voting_core::PollId,
         electorate: &[OwnerAddr],
         sortition_size: usize,
@@ -477,6 +587,345 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         });
     }
 
+    /// ZEB-310 Task 9: post-apply engine-auto orchestration hook.
+    ///
+    /// Called from `publish_event` after a successful Tier 3 apply
+    /// (gated on `event.tier == Tier::Sortition`). Inspects the affected
+    /// poll's state and, if a follow-up engine-auto event is warranted
+    /// (kd=sf, and in Tasks 10/11 also kd=cl + kd=rs), mints + publishes
+    /// it as if it were locally originated.
+    ///
+    /// The recursion into `publish_event` is broken with `Box::pin` so
+    /// the async-fn return-type cycle compiles. Mutual recursion is
+    /// bounded by the L1 lifecycle gate: a kd=sf published from this
+    /// hook moves the poll to `Stage::Failed`, after which no further
+    /// orchestration trigger fires on that poll.
+    ///
+    /// Race tolerance: the same poll may simultaneously meet the
+    /// trigger condition on multiple devices (e.g. two proposers, in
+    /// theory only one but defensive). The follow-up apply is keyed by
+    /// `decode_poll_id_ref` + L1 lifecycle, so the second arrival
+    /// rejects cleanly without state divergence.
+    ///
+    /// Skipped silently when `local_signing` is unset (read-only peer
+    /// mode), when the poll is not Tier 3 / not in Stage::Sortition,
+    /// or when the local owner is not the poll's proposer.
+    ///
+    /// In Phase 4a-main this implements kd=sf only. ZEB-310 Tasks 10 + 11
+    /// extend with kd=cl (drafting timeout / approval threshold) and
+    /// kd=rs (ratification window close → STAR tally).
+    async fn maybe_trigger_engine_auto_orchestration(self: &Arc<Self>, pid: &PollId) {
+        // (1) Short-circuit: no local signing key ⇒ read-only peer.
+        let (signing_key, self_owner) = {
+            let r = self.local_signing.read().await;
+            match r.as_ref() {
+                Some((k, o)) => (k.clone(), *o),
+                None => return,
+            }
+        };
+        // Additional gate: orchestration also requires hlc_tracker AND
+        // device_id installed via VotingLogEngineParams. A caller could
+        // install a signing key without these (e.g. partial fixture);
+        // without this gate `reserve_next_local_hlc` would panic on its
+        // .expect(...). All three must be present for orchestration to
+        // proceed.
+        if self.hlc_tracker.is_none() || self.device_id.is_none() {
+            tracing::debug!(
+                "engine-auto: hlc_tracker or device_id missing; skipping orchestration"
+            );
+            return;
+        }
+
+        // (2) Inspect the affected poll's state. Snapshot the values we
+        // need under the lock then drop it before the recursive
+        // publish_event (which re-acquires the same lock).
+        let trigger_kd_sf: bool = {
+            let log = self.voting_log.lock().await;
+            let state = match log.polls.get(pid) {
+                Some(s) => s,
+                None => return,
+            };
+            let t3 = match state.tier_state.as_tier3() {
+                Some(t) => t,
+                None => return,
+            };
+            // kd=sf trigger: Stage::Sortition + proposer == self + decline_count
+            // covers the full sortition + backup pool. Mirrors `verify_sf`'s
+            // SF1 invariant so peer engines reject the kd=sf only when the
+            // local engine would have rejected it too.
+            let stage_ok = matches!(t3.stage, crate::community_voting_tier3::Stage::Sortition);
+            let proposer_ok = t3.meta.proposer == self_owner;
+            if !stage_ok || !proposer_ok {
+                false
+            } else {
+                // Use the maximum possible HLC sentinel — we want to count
+                // EVERY decline applied so far, not filter by some now-of-event.
+                // Per `Tier3PollState::decline_count_at`, declines are
+                // included when `(wall_ms, logical, device_id) <= now`.
+                let now_sentinel = Hlc {
+                    wall_ms: u64::MAX,
+                    logical: u32::MAX,
+                    // Lexicographically-maximal device_id placeholder; any
+                    // real device_id collates ≤ this in the (wall, logical,
+                    // device_id) tuple.
+                    device_id: "\u{10ffff}".into(),
+                };
+                let decline_count = t3.decline_count_at(&now_sentinel);
+                let capacity = t3
+                    .sortition_result
+                    .as_ref()
+                    .map(|sr| sr.primary.len() + sr.backup.len())
+                    .unwrap_or(0);
+                // capacity == 0 ⇒ no kd=ss yet ⇒ orchestration cannot fire.
+                capacity > 0 && decline_count >= capacity
+            }
+        };
+
+        if trigger_kd_sf {
+            // (3) Mint a signed kd=sf event using the local signing key.
+            let hlc = self.reserve_next_local_hlc().await;
+            let sf_ev = match crate::community_voting_core::build_signed_sortition_failed(
+                &signing_key,
+                self_owner,
+                *pid,
+                hlc,
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        poll_id = %hex::encode(pid.0),
+                        "engine-auto kd=sf build_signed_sortition_failed failed"
+                    );
+                    return;
+                }
+            };
+
+            // (4) Publish recursively. `Box::pin` breaks the async-fn
+            // return-type cycle (publish_event → orchestration → publish_event).
+            if let Err(e) = Box::pin(self.publish_event(sf_ev)).await {
+                tracing::warn!(
+                    error = %e,
+                    poll_id = %hex::encode(pid.0),
+                    "engine-auto kd=sf publish_event failed"
+                );
+            }
+            // kd=sf moves the poll to Stage::Failed, so no further
+            // orchestration trigger can fire on this poll — return early.
+            return;
+        }
+
+        // ── ZEB-310 Task 10: kd=cl PollClose orchestration ───────────────
+        //
+        // Fires when the poll is in Ratification stage (HLC-aware via
+        // `current_stage_at`) AND no kd=cl has been applied yet AND the
+        // ratification window has expired (relative to the engine's real
+        // wall-clock estimate). Re-reads the poll state under a fresh lock
+        // because the kd=sf branch above may already have released and
+        // re-acquired the log lock through the recursive `publish_event`.
+        //
+        // Race tolerance: multiple engines may simultaneously meet the kd=cl
+        // trigger. The first valid arrival by HLC wins — duplicates are
+        // dropped by the replay tracker on each engine. We log a `debug` line
+        // on rejection instead of `warn` because a race loss is not a fault.
+        //
+        // Note: any signer (with `local_signing` installed) can publish kd=cl
+        // per L1 lifecycle; we do NOT gate on `proposer == self`. The kd=sf
+        // branch above is proposer-gated because SF1 verify is, but kd=cl
+        // is a public timeout event.
+        // Time reference: use `t3.last_hlc.wall_ms` — the latest applied
+        // event's HLC — as the "now" estimate. This is purely HLC-driven
+        // (NOT wall-clock based) for two reasons:
+        //
+        //   1. **Test determinism.** Tests mint events with synthetic HLCs
+        //      that can be hours / days before the test's real wall-clock.
+        //      A wall-clock-based trigger would always think the deadline
+        //      has expired and prematurely close polls in tests that
+        //      target other orchestration paths (e.g. ZEB-310 Task 9's
+        //      kd=sf-from-mass-decline test).
+        //
+        //   2. **Eventual production correctness.** In production, real
+        //      kd=rb events carry real wall-clock HLCs; once enough time
+        //      has passed for `last_hlc.wall_ms ≥ created + total_window`
+        //      to hold, the trigger fires on the NEXT apply. The explicit
+        //      user-driven kd=cl IPC remains the canonical path; the
+        //      engine-auto kd=cl is the safety net for polls where no one
+        //      explicitly closes after the deadline.
+        //
+        // If `last_hlc` is None (no event applied yet, which shouldn't
+        // happen given we just applied the triggering event), treat the
+        // window as not yet expired.
+        let trigger_kd_cl: bool = {
+            let log = self.voting_log.lock().await;
+            let state = match log.polls.get(pid) {
+                Some(s) => s,
+                None => return,
+            };
+            let t3 = match state.tier_state.as_tier3() {
+                Some(t) => t,
+                None => return,
+            };
+            // Cheap guards first.
+            if t3.close_event_hash.is_some() {
+                false
+            } else {
+                let last_wall = match t3.last_hlc.as_ref() {
+                    Some(h) => h.wall_ms,
+                    None => return,
+                };
+                let now_hlc_cl = Hlc {
+                    wall_ms: last_wall,
+                    logical: 0,
+                    device_id: String::new(),
+                };
+                let stage_now = t3.current_stage_at(&now_hlc_cl);
+                if !matches!(
+                    stage_now,
+                    crate::community_voting_tier3::Stage::Ratification
+                ) {
+                    false
+                } else {
+                    // Total window = deliberation + drafting + ratification.
+                    // Engine fires kd=cl once `last_hlc.wall_ms` (HLC-driven
+                    // "now") is past `created_wall + total_window_ms`.
+                    let total_window_ms: u64 = (t3.meta.config.deliberation_window_seconds as u64
+                        + t3.meta.config.drafting_window_seconds as u64
+                        + t3.meta.config.ratification_window_seconds as u64)
+                        * 1000;
+                    let created_wall = t3.meta.poll_create_hlc.wall_ms;
+                    last_wall >= created_wall.saturating_add(total_window_ms)
+                }
+            }
+        };
+
+        if trigger_kd_cl {
+            let hlc = self.reserve_next_local_hlc().await;
+            let cl_ev = match crate::community_voting_core::build_signed_poll_close_tier3(
+                &signing_key,
+                self_owner,
+                *pid,
+                hlc,
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        poll_id = %hex::encode(pid.0),
+                        "engine-auto kd=cl build_signed_poll_close_tier3 failed"
+                    );
+                    return;
+                }
+            };
+            if let Err(e) = Box::pin(self.publish_event(cl_ev)).await {
+                // L1 / replay-dedup rejection on race loss is expected.
+                tracing::debug!(
+                    error = %e,
+                    poll_id = %hex::encode(pid.0),
+                    "engine-auto kd=cl publish rejected (race loser?)"
+                );
+            }
+            // Fall through to the kd=rs trigger: the recursive publish_event
+            // above applied kd=cl locally and re-fired this hook from inside
+            // the recursion (which sees `close_event_hash.is_some()` and
+            // falls through to the kd=rs branch below). We still attempt
+            // kd=rs at the outer level for defensive convergence; the
+            // apply-time `PollInFinalizedState` gate cleanly rejects
+            // duplicates.
+        }
+
+        // ── ZEB-310 Task 11: kd=rs PollResult orchestration ──────────────
+        //
+        // Fires when kd=cl has been applied (`close_event_hash.is_some()`) AND
+        // no kd=rs has been applied yet (`result.is_none()`). Deterministically
+        // computes the STAR tally and publishes signed kd=rs. The kd=rs apply
+        // moves the poll to `Stage::Finalized`; subsequent kd=rs events from
+        // race losers are rejected by the apply-time terminal-state gate
+        // (`PollInFinalizedState` → `IllegalTransition`).
+        //
+        // The ratification candidate ordering is computed the same way as
+        // `verify_sr`: synthesize status_quo, push onto a temp candidates
+        // slice, derive advancers via `drafting_advancers`, then sort via
+        // `ratification_candidates_ordering`. This ensures bit-identical
+        // tally inputs across all engines that ever drive this code path.
+        let trigger_kd_rs_args: Option<crate::community_voting_star::StarResult> = {
+            let log = self.voting_log.lock().await;
+            let state = match log.polls.get(pid) {
+                Some(s) => s,
+                None => return,
+            };
+            let t3 = match state.tier_state.as_tier3() {
+                Some(t) => t,
+                None => return,
+            };
+            if t3.close_event_hash.is_none() || t3.result.is_some() {
+                None
+            } else {
+                // Build candidate ordering. Same pattern as verify_sr.
+                let sq = crate::community_voting_tier3::synthesize_status_quo(&t3.meta.poll_id);
+                let sq_hash = sq.event_hash;
+                // status_quo is NOT inserted into t3.candidates by apply()
+                // (no materialize step today); push it onto a temp slice so
+                // drafting_advancers returns Some.
+                let mut all_candidates = t3.candidates.clone();
+                all_candidates.push(sq);
+                let primary_size = t3.meta.config.sortition_size as usize;
+                let advancers = match crate::community_voting_tier3::drafting_advancers(
+                    &all_candidates,
+                    primary_size,
+                    sq_hash,
+                ) {
+                    Some(a) => a,
+                    None => {
+                        // status_quo missing — pre-Drafting stage, can't
+                        // happen given close_event_hash.is_some() invariant
+                        // (kd=cl is only minted after Drafting → Ratification),
+                        // but bail defensively rather than panicking.
+                        tracing::warn!(
+                            poll_id = %hex::encode(pid.0),
+                            "engine-auto kd=rs: drafting_advancers returned None despite kd=cl applied"
+                        );
+                        return;
+                    }
+                };
+                let ordered = crate::community_voting_tier3::ratification_candidates_ordering(
+                    &advancers, sq_hash,
+                );
+                let ballots = crate::community_voting_tier3::collect_ratification_ballots(t3);
+                let result = crate::community_voting_star::tally_star(&ordered, ballots);
+                Some(result)
+            }
+        };
+
+        if let Some(result) = trigger_kd_rs_args {
+            let hlc = self.reserve_next_local_hlc().await;
+            let rs_ev = match crate::community_voting_core::build_signed_poll_result_tier3(
+                &signing_key,
+                self_owner,
+                *pid,
+                result,
+                hlc,
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        poll_id = %hex::encode(pid.0),
+                        "engine-auto kd=rs build_signed_poll_result_tier3 failed"
+                    );
+                    return;
+                }
+            };
+            if let Err(e) = Box::pin(self.publish_event(rs_ev)).await {
+                // PollInFinalizedState (race loser) is expected.
+                tracing::debug!(
+                    error = %e,
+                    poll_id = %hex::encode(pid.0),
+                    "engine-auto kd=rs publish rejected (race loser?)"
+                );
+            }
+        }
+    }
+
     /// Publish a locally-minted, already-signed voting event.
     ///
     /// Pipeline:
@@ -495,7 +944,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
     ///
     /// Note: the caller is responsible for verify (V1-V6 + kind-specific)
     /// before invoking this. Phase 2's IPC layer always does that.
-    pub async fn publish_event(&self, event: SignedVotingEvent) -> Result<(), String> {
+    pub async fn publish_event(self: &Arc<Self>, event: SignedVotingEvent) -> Result<(), String> {
         // (1) Encode first so we don't mutate any state on a malformed event.
         let mut packet = Vec::new();
         ciborium::into_writer(&event, &mut packet).map_err(|e| format!("encode: {e}"))?;
@@ -550,10 +999,49 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                 None
             };
 
-        // Apply locally.
-        {
+        // ZEB-310 Task 12: snapshot the affected poll's current stage BEFORE
+        // apply so the post-apply hook can detect Deliberation→Drafting and
+        // Drafting→Ratification transitions and emit Tauri lifecycle events.
+        //
+        // Computed only when an `app_handle` is wired and the event targets
+        // Tier 3 (the only tier with materialized stage transitions). For
+        // PollCreate (no prior poll state) the snapshot is `None`. The
+        // derivation is identical to the `tier3_create_epoch` branch above:
+        // signing_bytes → derive_poll_id. Re-uses
+        // `current_stage_at(current_hlc_estimate)` so the snapshot reflects
+        // the same HLC-aware "now" the post-apply emit will use, giving
+        // bit-identical previous/new comparisons across the apply boundary.
+        let previous_stage_for_emit: Option<crate::community_voting_tier3::Stage> =
+            if self.app_handle.is_some()
+                && event.tier == Tier::Sortition
+                && event.kind != PollEventKindCode::PollCreate
+            {
+                // Derive pid from signing bytes (cheap; same derivation as apply).
+                let pid_opt: Option<PollId> = event.signing_bytes().ok().map(|sb| {
+                    crate::community_voting_core::derive_poll_id(&self.community_id, &sb)
+                });
+                match pid_opt {
+                    Some(pid) => {
+                        let now = self.current_hlc_estimate().await;
+                        let log = self.voting_log.lock().await;
+                        log.polls
+                            .get(&pid)
+                            .and_then(|ps| ps.tier_state.as_tier3())
+                            .map(|t3| t3.current_stage_at(&now))
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+
+        // Apply locally. Capture the returned `PollId` so the engine-auto
+        // post-apply hook (ZEB-310 Task 9) can inspect the affected poll's
+        // state without re-deriving the id from signing_bytes.
+        let applied_poll_id: PollId = {
             let mut log = self.voting_log.lock().await;
-            log.apply_with_snapshot(event.clone(), &self.community_id, None)
+            let pid = log
+                .apply_with_snapshot(event.clone(), &self.community_id, None)
                 .map_err(|e| format!("apply: {e:?}"))?;
 
             // Store the pre-read epoch on the newly-created Tier 3 poll.
@@ -562,7 +1050,8 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             if let Some((poll_id, epoch)) = tier3_create_epoch {
                 log.set_tier3_poll_epoch(&poll_id, epoch);
             }
-        }
+            pid
+        };
 
         // (3a) After a Tier 3 PollCreate is applied, trigger a VRF beacon
         // request. The stored poll epoch is now authoritative; the beacon
@@ -578,11 +1067,329 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         // an error to the caller; the local apply has already happened
         // so callers can decide whether to surface this. Backfill is
         // tracked as a follow-up (ZEB-291 Task 19.1).
+        //
+        // ZEB-310 Tasks 10/11 ordering note: broadcast MUST run before the
+        // engine-auto orchestration hook so peers receive the just-applied
+        // event before any hook-triggered follow-ups (kd=cl, kd=rs). If the
+        // hook recursed first, the outer event's broadcast would land AFTER
+        // the inner events on the wire — peers would then apply the
+        // follow-ups (e.g. kd=rs) onto an outdated state and reject the
+        // outer event via the terminal-state apply gate
+        // (`PollInFinalizedState`). The self-loopback fix is preserved
+        // because `tracker.record` already ran above (step 2) before this
+        // broadcast.
         self.publisher_tx
             .send(packet)
             .await
             .map_err(|e| format!("voting publisher_tx closed: {e}"))?;
+
+        // (5) ZEB-310 Task 9: engine-auto orchestration post-apply hook.
+        // Only Tier 3 events can drive sortition / drafting / ratification
+        // stage transitions, so cheaply gate on tier first. The hook itself
+        // is race-tolerant — late duplicates are rejected by the L1
+        // lifecycle gate in apply. Runs AFTER broadcast so any recursive
+        // publish_event the hook triggers broadcasts in the natural order:
+        // outer event first on the wire, then any follow-ups.
+        if event.tier == Tier::Sortition {
+            self.maybe_trigger_engine_auto_orchestration(&applied_poll_id)
+                .await;
+            // ZEB-310 Task 12: emit Tauri lifecycle events for Tier 3.
+            // Runs AFTER orchestration so any kd=cl / kd=rs minted by the
+            // hook above has already applied locally — the new_stage we
+            // observe here reflects the post-orchestration end state, not
+            // the intermediate one. (E.g. when kd=ss arrives past the
+            // ratification deadline, orchestration races through
+            // kd=cl + kd=rs and we want Finalized to be the emitted state.)
+            self.maybe_emit_tier3_lifecycle_events(
+                &applied_poll_id,
+                &event,
+                previous_stage_for_emit,
+            )
+            .await;
+        }
         Ok(())
+    }
+
+    /// ZEB-310 Task 12: emit the four Tier 3 lifecycle Tauri events from
+    /// the post-apply hook. Companion to
+    /// `maybe_trigger_engine_auto_orchestration` — both run from the same
+    /// hook point in `publish_event` but emit is intentionally a separate
+    /// concern (Tauri event delivery is purely a UI hint, while
+    /// orchestration mutates log state).
+    ///
+    /// Events fired (each guarded by its own condition; multiple may fire
+    /// in a single hook invocation, e.g. when kd=ss past the ratification
+    /// deadline triggers cascaded kd=cl + kd=rs orchestration):
+    ///
+    /// - `voting-tier3-sortition-complete` — applied event was kd=ss
+    /// - `voting-tier3-drafting-open` — stage transitioned Deliberation→Drafting
+    /// - `voting-tier3-ratification-open` — stage transitioned Drafting→Ratification
+    /// - `voting-tier3-finalized` — applied event was kd=rs (Tier 3)
+    ///
+    /// All emit failures are non-fatal — logged at WARN and ignored. The
+    /// local log + broadcast already succeeded; failing to notify the UI
+    /// is a degraded path, not a state divergence.
+    ///
+    /// `previous_stage` was snapshotted in `publish_event` BEFORE apply;
+    /// `None` for PollCreate / when no AppHandle is wired / when the poll
+    /// did not yet exist. The stage-transition guards (`Some(Deliberation)
+    /// → Drafting`, etc.) require a `Some(_)` previous to fire.
+    async fn maybe_emit_tier3_lifecycle_events(
+        self: &Arc<Self>,
+        pid: &PollId,
+        applied_event: &SignedVotingEvent,
+        previous_stage: Option<crate::community_voting_tier3::Stage>,
+    ) {
+        let app_handle = match &self.app_handle {
+            Some(h) => h.clone(),
+            None => return, // test-only mode without Tauri runtime
+        };
+
+        // Snapshot the post-apply tier3 state.
+        let now = self.current_hlc_estimate().await;
+        let (sortition_result, new_stage, candidates, result) = {
+            let log = self.voting_log.lock().await;
+            let t3 = match log.polls.get(pid).and_then(|ps| ps.tier_state.as_tier3()) {
+                Some(t) => t,
+                None => return,
+            };
+            (
+                t3.sortition_result.clone(),
+                t3.current_stage_at(&now),
+                t3.candidates.clone(),
+                t3.result.clone(),
+            )
+        };
+
+        let pid_hex = hex::encode(pid.0);
+        let community_id_hex = hex::encode(self.community_id.0);
+
+        // 1. Sortition complete (any apply of kd=ss). Pulls from the now-set
+        // sortition_result. If it's still None despite the kind code matching,
+        // the apply must have been rejected mid-flight — skip silently.
+        if applied_event.kind == PollEventKindCode::SortitionSelection {
+            if let Some(sr) = &sortition_result {
+                let payload = crate::VotingTier3SortitionCompletePayload {
+                    poll_id: pid_hex.clone(),
+                    community_id: community_id_hex.clone(),
+                    primary: sr.primary.iter().map(|o| hex::encode(o.0)).collect(),
+                    backup: sr.backup.iter().map(|o| hex::encode(o.0)).collect(),
+                };
+                if let Err(e) = app_handle.emit("voting-tier3-sortition-complete", &payload) {
+                    tracing::warn!(
+                        error = %e,
+                        poll_id = %pid_hex,
+                        "voting-tier3-sortition-complete emit failed (non-fatal)"
+                    );
+                }
+            }
+        }
+
+        // 2. Drafting open (stage transition 2 → 3).
+        if matches!(
+            previous_stage,
+            Some(crate::community_voting_tier3::Stage::Deliberation)
+        ) && matches!(new_stage, crate::community_voting_tier3::Stage::Drafting)
+        {
+            let payload = crate::VotingTier3DraftingOpenPayload {
+                poll_id: pid_hex.clone(),
+                community_id: community_id_hex.clone(),
+            };
+            if let Err(e) = app_handle.emit("voting-tier3-drafting-open", &payload) {
+                tracing::warn!(
+                    error = %e,
+                    poll_id = %pid_hex,
+                    "voting-tier3-drafting-open emit failed (non-fatal)"
+                );
+            }
+        }
+
+        // 3. Ratification open (stage transition 3 → 4). Build the
+        // deterministic candidate ordering the same way verify_sr / the
+        // kd=rs orchestrator does: synthesize status_quo, derive advancers,
+        // then sort. The text lookup pulls from the just-snapshotted
+        // `candidates` (status_quo's text is "<status quo>" by
+        // `synthesize_status_quo`).
+        if matches!(
+            previous_stage,
+            Some(crate::community_voting_tier3::Stage::Drafting)
+        ) && matches!(
+            new_stage,
+            crate::community_voting_tier3::Stage::Ratification
+        ) {
+            // Lookup map: event_hash → text. status_quo is synthesized,
+            // never present in candidates (until materialize lands); we
+            // hard-code its text here to match `synthesize_status_quo`.
+            let sq = crate::community_voting_tier3::synthesize_status_quo(pid);
+            let sq_hash = sq.event_hash;
+            let mut all_candidates = candidates.clone();
+            all_candidates.push(sq);
+            // sortition_size from the just-snapshotted state — fall back
+            // to a sentinel if (somehow) the poll vanished. Re-acquire the
+            // lock briefly: cheap; the snapshot already happened above
+            // but we did not capture sortition_size.
+            let primary_size: usize = {
+                let log = self.voting_log.lock().await;
+                log.polls
+                    .get(pid)
+                    .and_then(|ps| ps.tier_state.as_tier3())
+                    .map(|t3| t3.meta.config.sortition_size as usize)
+                    .unwrap_or(0)
+            };
+            if let Some(advancers) = crate::community_voting_tier3::drafting_advancers(
+                &all_candidates,
+                primary_size,
+                sq_hash,
+            ) {
+                let ordered = crate::community_voting_tier3::ratification_candidates_ordering(
+                    &advancers, sq_hash,
+                );
+                let candidate_ordering: Vec<crate::CandidateRefDto> = ordered
+                    .iter()
+                    .map(|c| {
+                        let text = all_candidates
+                            .iter()
+                            .find(|cs| cs.event_hash == c.event_hash)
+                            .map(|cs| cs.text.clone())
+                            .unwrap_or_default();
+                        crate::CandidateRefDto {
+                            event_hash: hex::encode(c.event_hash),
+                            text,
+                            approval_count: c.approval_count,
+                        }
+                    })
+                    .collect();
+                let payload = crate::VotingTier3RatificationOpenPayload {
+                    poll_id: pid_hex.clone(),
+                    community_id: community_id_hex.clone(),
+                    candidate_ordering,
+                };
+                if let Err(e) = app_handle.emit("voting-tier3-ratification-open", &payload) {
+                    tracing::warn!(
+                        error = %e,
+                        poll_id = %pid_hex,
+                        "voting-tier3-ratification-open emit failed (non-fatal)"
+                    );
+                }
+            }
+        }
+
+        // 4. Finalized (apply of kd=rs Tier 3). `StarResult` carries
+        // `winner`, `finalists`, `total_scores` (indexed by candidate
+        // position in the ratification ordering), and `runoff_votes`
+        // (indexed by finalist position). To populate the DTO's
+        // `scores_summary` we need the candidate ordering — pull it from
+        // `t3.candidates` via the same derivation as the ratification-open
+        // branch above so positions line up.
+        if applied_event.kind == PollEventKindCode::PollResult
+            && applied_event.tier == Tier::Sortition
+        {
+            if let Some(star_result) = &result {
+                // Re-derive the ratification ordering to align scores by
+                // position. This is the same `drafting_advancers +
+                // ratification_candidates_ordering` chain the engine-auto
+                // kd=rs branch uses, so the positions are bit-identical to
+                // what `total_scores` indexes against.
+                let sq = crate::community_voting_tier3::synthesize_status_quo(pid);
+                let sq_hash = sq.event_hash;
+                let mut all_candidates = candidates.clone();
+                all_candidates.push(sq);
+                let primary_size: usize = {
+                    let log = self.voting_log.lock().await;
+                    log.polls
+                        .get(pid)
+                        .and_then(|ps| ps.tier_state.as_tier3())
+                        .map(|t3| t3.meta.config.sortition_size as usize)
+                        .unwrap_or(0)
+                };
+                let ordered: Vec<crate::community_voting_star::CandidateRef> =
+                    match crate::community_voting_tier3::drafting_advancers(
+                        &all_candidates,
+                        primary_size,
+                        sq_hash,
+                    ) {
+                        Some(advancers) => {
+                            crate::community_voting_tier3::ratification_candidates_ordering(
+                                &advancers, sq_hash,
+                            )
+                        }
+                        None => Vec::new(),
+                    };
+
+                // Lookup winner text + build per-candidate score summary.
+                let winner_text = all_candidates
+                    .iter()
+                    .find(|cs| cs.event_hash == star_result.winner.event_hash)
+                    .map(|cs| cs.text.clone())
+                    .unwrap_or_default();
+
+                // Runner-up = highest-runoff-votes finalist that is NOT
+                // the winner. `StarResult.finalists` is unordered (a Vec
+                // of CandidateRefs); the matching `runoff_votes` slice is
+                // positionally aligned. Pick the finalist with max
+                // runoff_votes among non-winners, breaking ties on
+                // event_hash ASC to match the deterministic tiebreaker
+                // used by `tally_star`.
+                let runner_up_event_hash: Option<String> = {
+                    let mut best: Option<(u32, [u8; 32])> = None;
+                    for (i, f) in star_result.finalists.iter().enumerate() {
+                        if f.event_hash == star_result.winner.event_hash {
+                            continue;
+                        }
+                        let rv = star_result.runoff_votes.get(i).copied().unwrap_or(0);
+                        let candidate = (rv, f.event_hash);
+                        best = Some(match best {
+                            None => candidate,
+                            Some((b_rv, b_eh)) => {
+                                if rv > b_rv || (rv == b_rv && f.event_hash < b_eh) {
+                                    candidate
+                                } else {
+                                    (b_rv, b_eh)
+                                }
+                            }
+                        });
+                    }
+                    best.map(|(_, eh)| hex::encode(eh))
+                };
+
+                let scores_summary: Vec<crate::CandidateScoreDto> = ordered
+                    .iter()
+                    .enumerate()
+                    .map(|(i, cand)| {
+                        let total_score = star_result.total_scores.get(i).copied().unwrap_or(0);
+                        // runoff_votes is indexed by finalist position, not by candidate
+                        // position. Look up by event_hash to align.
+                        let runoff_votes = star_result
+                            .finalists
+                            .iter()
+                            .position(|f| f.event_hash == cand.event_hash)
+                            .and_then(|fi| star_result.runoff_votes.get(fi).copied())
+                            .unwrap_or(0);
+                        crate::CandidateScoreDto {
+                            event_hash: hex::encode(cand.event_hash),
+                            total_score,
+                            runoff_votes,
+                        }
+                    })
+                    .collect();
+
+                let payload = crate::VotingTier3FinalizedPayload {
+                    poll_id: pid_hex.clone(),
+                    community_id: community_id_hex.clone(),
+                    winner_event_hash: hex::encode(star_result.winner.event_hash),
+                    winner_text,
+                    runner_up_event_hash,
+                    scores_summary,
+                };
+                if let Err(e) = app_handle.emit("voting-tier3-finalized", &payload) {
+                    tracing::warn!(
+                        error = %e,
+                        poll_id = %pid_hex,
+                        "voting-tier3-finalized emit failed (non-fatal)"
+                    );
+                }
+            }
+        }
     }
 
     /// Inbound packet processing: decode, dedup, apply, record.
@@ -686,7 +1493,7 @@ impl<R: tauri::Runtime> VotingLogRegistry<R> {
     /// replaced — the caller is responsible for shutting the old one
     /// down by dropping their `Arc` (the receive loop will then exit
     /// when the adapter's publisher sender is dropped).
-    pub async fn register(&self, params: VotingLogEngineParams) -> Arc<VotingLogEngine<R>> {
+    pub async fn register(&self, params: VotingLogEngineParams<R>) -> Arc<VotingLogEngine<R>> {
         let cid = params.community_id;
         let engine = VotingLogEngine::start(params).await;
         let mut engines = self.engines.lock().await;
@@ -856,6 +1663,9 @@ mod tests {
             voting_log: Arc::clone(&voting_log),
             publisher_tx,
             subscriber_rx,
+            hlc_tracker: None,
+            device_id: None,
+            app_handle: None,
         })
         .await;
 
@@ -917,6 +1727,9 @@ mod tests {
             voting_log: Arc::clone(&voting_log),
             publisher_tx,
             subscriber_rx,
+            hlc_tracker: None,
+            device_id: None,
+            app_handle: None,
         })
         .await;
 
@@ -971,6 +1784,9 @@ mod tests {
                 voting_log: Arc::clone(&log_a),
                 publisher_tx: pub_tx_a,
                 subscriber_rx: sub_rx_a,
+                hlc_tracker: None,
+                device_id: None,
+                app_handle: None,
             })
             .await;
 
@@ -982,6 +1798,9 @@ mod tests {
                 voting_log: Arc::clone(&log_b),
                 publisher_tx: pub_tx_b,
                 subscriber_rx: sub_rx_b,
+                hlc_tracker: None,
+                device_id: None,
+                app_handle: None,
             })
             .await;
 
@@ -1101,6 +1920,9 @@ mod tests {
             voting_log: Arc::clone(&voting_log),
             publisher_tx,
             subscriber_rx,
+            hlc_tracker: None,
+            device_id: None,
+            app_handle: None,
         })
         .await;
 
@@ -1195,6 +2017,9 @@ mod tests {
             voting_log: Arc::clone(&voting_log),
             publisher_tx,
             subscriber_rx,
+            hlc_tracker: None,
+            device_id: None,
+            app_handle: None,
         })
         .await;
 
@@ -1277,6 +2102,9 @@ mod tests {
             voting_log: Arc::clone(&voting_log),
             publisher_tx,
             subscriber_rx,
+            hlc_tracker: None,
+            device_id: None,
+            app_handle: None,
         })
         .await;
 
@@ -1402,6 +2230,9 @@ mod tests {
             voting_log: Arc::clone(&voting_log),
             publisher_tx,
             subscriber_rx,
+            hlc_tracker: None,
+            device_id: None,
+            app_handle: None,
         })
         .await;
 
@@ -1495,6 +2326,9 @@ mod tests {
             voting_log: Arc::clone(&voting_log),
             publisher_tx,
             subscriber_rx,
+            hlc_tracker: None,
+            device_id: None,
+            app_handle: None,
         })
         .await;
 
@@ -1597,6 +2431,9 @@ mod tests {
             voting_log: Arc::clone(&voting_log),
             publisher_tx,
             subscriber_rx,
+            hlc_tracker: None,
+            device_id: None,
+            app_handle: None,
         })
         .await;
 
@@ -1692,6 +2529,9 @@ mod tests {
             voting_log: Arc::clone(&voting_log),
             publisher_tx,
             subscriber_rx,
+            hlc_tracker: None,
+            device_id: None,
+            app_handle: None,
         })
         .await;
         // Do NOT call install_dfrost_handle — dfrost_registry is None.
