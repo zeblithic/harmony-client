@@ -21712,6 +21712,41 @@ async fn voting_approve_draft_candidate<R: tauri::Runtime>(
 
     let space_id = voting_resolve_community_for_poll(&voting_logs, &pid).await?;
 
+    // Pre-flight: verify the referenced candidate exists in the poll's
+    // Tier 3 draft candidates set. Without this check, the Tier 3 apply
+    // path silently no-ops unknown candidate_event_hash and the IPC would
+    // report Ok(()) while recording no approval. Drop the per-log lock
+    // before any await to avoid holding a lock across the signing path.
+    {
+        let log_arc = {
+            let map = voting_logs.lock().await;
+            map.get(&space_id).cloned().ok_or_else(|| {
+                format!(
+                    "voting_approve_draft_candidate: no log for community {}",
+                    hex::encode(space_id.0)
+                )
+            })?
+        };
+        let log = log_arc.lock().await;
+        let poll_state = log.polls.get(&pid).ok_or_else(|| {
+            format!(
+                "voting_approve_draft_candidate: poll {} not loaded",
+                hex::encode(pid.0)
+            )
+        })?;
+        let t3 = poll_state.tier_state.as_tier3().ok_or_else(|| {
+            "voting_approve_draft_candidate: poll is not Tier 3 (kd=da only valid on Tier 3)"
+                .to_string()
+        })?;
+        if !t3.candidates.iter().any(|c| c.event_hash == ceh) {
+            return Err(format!(
+                "voting_approve_draft_candidate: candidate_event_hash {} not found in poll's draft candidates",
+                hex::encode(ceh)
+            ));
+        }
+        // Lock dropped at end of scope, before the async signing/apply.
+    }
+
     let wall_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
