@@ -22114,12 +22114,11 @@ type VotingLogEnginesMap = std::sync::Arc<
     >,
 >;
 
-/// Lazy-register a `VotingLogEngine` for `community_id` if none exists,
-/// sharing the per-community `Arc<Mutex<VotingLog>>` from `voting_logs`.
-///
 /// Production `MembershipSnapshotResolver` that reads from the live
 /// `NodeState` handles (`community_registry` + `crdt_state`). Wraps
-/// `voting_build_snapshot_for_community`.
+/// `voting_build_snapshot_for_community`. The HLC parameter is currently
+/// unused — the underlying helper returns an at-HEAD snapshot. Plumb
+/// through historical HLC resolution when a consumer needs it.
 pub struct NodeStateMembershipResolver {
     pub community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
     pub crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
@@ -22145,6 +22144,9 @@ impl crate::community_voting_log::MembershipSnapshotResolver for NodeStateMember
     }
 }
 
+/// Lazy-register a `VotingLogEngine` for `community_id` if none exists,
+/// sharing the per-community `Arc<Mutex<VotingLog>>` from `voting_logs`.
+///
 /// ZEB-309 Phase 4a-main Task 11: `dfrost_log_registry` and `beacon_requester`
 /// are optional; when both are `Some`, `install_dfrost_handle` is called on
 /// any newly-created engine so Tier 3 PollCreate events trigger VRF beacon
