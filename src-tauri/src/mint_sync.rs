@@ -415,13 +415,12 @@ mod tests {
             captured_at: "2026-05-19T12:00:00Z".into(),
         };
         apply_remote_snapshot(&mut local, &remote, &floor).unwrap();
-        let name: Option<String> = local
+        let name: String = local
             .query_row("SELECT name FROM accounts WHERE id = ?", ["a1"], |r| {
                 r.get(0)
             })
-            .optional()
             .unwrap();
-        assert_eq!(name.as_deref(), Some("Chase Re-created"));
+        assert_eq!(name, "Chase Re-created");
     }
 
     #[test]
