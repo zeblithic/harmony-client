@@ -17,6 +17,7 @@ use crate::community_voting_core::{
     derive_poll_id, next_lifecycle, Lifecycle, MembershipSnapshot, PollEventKindCode, PollId,
     PollMeta, SignedVotingEvent, Tier, Tier3PollConfigPayload,
 };
+use crate::community_voting_sortition::canonical_electorate_order;
 use crate::community_voting_tier3::{Tier3PollMeta, Tier3PollState};
 use crate::owner_state_types::Hlc;
 
@@ -486,11 +487,17 @@ impl VotingLog {
                 // so only members who pass `check_eligibility` are included.
                 // Without filtering, ineligible members could appear in the
                 // snapshot and pass `verify_ratification_ballot`'s authz check.
+                //
+                // Cluster C fix (CodeRabbit major, R2 bot review): HashMap iteration is
+                // non-deterministic. Sorting via canonical_electorate_order (OwnerAddr lex ASC)
+                // guarantees that both engines derive identical eligible_electorate_snapshot from
+                // the same beacon, so fisher_yates_select produces identical SortitionResult.
                 let eligible_electorate_snapshot: Vec<crate::owner_state_types::OwnerAddr> =
                     snapshot
                         .as_ref()
                         .map(|snap| {
-                            snap.members
+                            let filtered: Vec<_> = snap
+                                .members
                                 .keys()
                                 .copied()
                                 .filter(|addr| {
@@ -501,7 +508,8 @@ impl VotingLog {
                                     )
                                     .is_ok()
                                 })
-                                .collect()
+                                .collect();
+                            canonical_electorate_order(&filtered)
                         })
                         .unwrap_or_default();
 
@@ -2077,5 +2085,83 @@ mod tier3_dispatch_tests {
         assert!(!mp.contains(&addr(1)), "addr(1) declined — must not be in mini-public");
         // Note: addr(4) also enters set because sortition_size(20) > available non-declined(3).
         // The key invariant is: decline_count_at correctly deduplicates the same actor (tested above).
+    }
+
+    // ── Cluster C regression test ────────────────────────────────────────────
+
+    // C1: two engines applying the same PollCreate event with members in different
+    // HashMap iteration orders must produce identical eligible_electorate_snapshots.
+    // Without canonical sort, fisher_yates_select would produce different SortitionResults.
+    #[test]
+    fn eligible_electorate_snapshot_is_deterministically_sorted_regardless_of_hashmap_order() {
+        use crate::community_voting_core::{MemberAttrs, MembershipSnapshot};
+        use std::collections::HashMap;
+
+        // Build two snapshots with the same members but inserted in different orders.
+        let member_a = addr(0x05);
+        let member_b = addr(0x01);
+        let member_c = addr(0x03);
+
+        let make_snapshot = |order: &[u8]| {
+            let mut members = HashMap::new();
+            for &b in order {
+                members.insert(
+                    addr(b),
+                    MemberAttrs {
+                        power: 10,
+                        vouching_depth: 0,
+                    },
+                );
+            }
+            MembershipSnapshot { members }
+        };
+
+        let cfg = tier3_config();
+
+        // Snapshot 1: members inserted in order [0x05, 0x01, 0x03].
+        let snap1 = make_snapshot(&[0x05, 0x01, 0x03]);
+        // Snapshot 2: same members in reversed order [0x03, 0x01, 0x05].
+        let snap2 = make_snapshot(&[0x03, 0x01, 0x05]);
+
+        // Apply the same PollCreate event through two separate VotingLogs with different snapshots.
+        let cid = cid();
+        let creator = addr(0xaa);
+        let create_ev = tier3_create_event(creator, &cfg);
+
+        let mut log1 = VotingLog::new();
+        let pid1 = log1
+            .apply_with_snapshot(create_ev.clone(), &cid, Some(snap1))
+            .expect("log1 apply");
+
+        let mut log2 = VotingLog::new();
+        let pid2 = log2
+            .apply_with_snapshot(create_ev.clone(), &cid, Some(snap2))
+            .expect("log2 apply");
+
+        assert_eq!(pid1, pid2, "poll_id must be identical");
+
+        let t3_1 = log1.polls[&pid1]
+            .tier_state
+            .as_tier3()
+            .expect("tier3 in log1");
+        let t3_2 = log2.polls[&pid2]
+            .tier_state
+            .as_tier3()
+            .expect("tier3 in log2");
+
+        // Both snapshots contain the same 3 members, both should produce the same sorted snapshot.
+        assert_eq!(
+            t3_1.eligible_electorate_snapshot,
+            t3_2.eligible_electorate_snapshot,
+            "eligible_electorate_snapshot must be identical regardless of HashMap insertion order"
+        );
+
+        // Expected: lex-sorted by OwnerAddr bytes → [addr(0x01), addr(0x03), addr(0x05)]
+        let expected: Vec<_> = vec![member_b, member_c, member_a];
+        assert_eq!(
+            t3_1.eligible_electorate_snapshot,
+            expected,
+            "eligible_electorate_snapshot must be sorted OwnerAddr lex ASC"
+        );
     }
 }
