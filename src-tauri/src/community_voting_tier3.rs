@@ -62,7 +62,8 @@ pub struct Tier3PollMeta {
     /// via `derive_beacon_seed(poll_create_event_hash, community_epoch)`.
     /// Populated by the caller (Task 8 dispatch) at apply-create time;
     /// Task 10 wires the real epoch from DfrostLogRegistry.
-    pub community_epoch: u32,
+    /// `u64` to match `DfrostLogEngine::current_epoch()` return type.
+    pub community_epoch: u64,
 }
 
 /// Full state of an in-progress or terminal Tier 3 poll.
@@ -576,9 +577,8 @@ pub async fn verify_ss(
     // Using the poll's stored epoch rather than the live engine epoch prevents a
     // CHURP committee refresh between beacon creation and verify_ss invocation from
     // causing a message_hash mismatch (live epoch != poll's epoch → lookup fails).
-    let poll_epoch = poll_state.meta.community_epoch as u64;
     let vrf_output = beacon_oracle
-        .vrf_output_for(community_id, &seed, poll_epoch)
+        .vrf_output_for(community_id, &seed, poll_state.meta.community_epoch)
         .await
         .ok_or(VerifyError::BeaconNotYetAvailable)?;
 
@@ -2773,7 +2773,7 @@ mod tests {
 
         let poll = poll_state_with_electorate(0, 10);
         // poll.meta.community_epoch = 1 (set by meta_at).
-        let expected_epoch: u64 = poll.meta.community_epoch as u64;
+        let expected_epoch = poll.meta.community_epoch;
         assert_eq!(expected_epoch, 1, "fixture epoch is 1");
 
         let seed = default_seed();

@@ -602,7 +602,7 @@ impl VotingLog {
     /// request is issued after this call with the value that was read once.
     ///
     /// Returns `false` if the poll does not exist or is not Tier 3 (no-op).
-    pub fn set_tier3_poll_epoch(&mut self, poll_id: &PollId, epoch: u32) -> bool {
+    pub fn set_tier3_poll_epoch(&mut self, poll_id: &PollId, epoch: u64) -> bool {
         match self.polls.get_mut(poll_id) {
             Some(ps) => match ps.tier_state.as_tier3_mut() {
                 Some(t3) => {

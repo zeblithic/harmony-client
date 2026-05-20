@@ -287,8 +287,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                     );
                     // Check if the arriving beacon's message_hash matches.
                     use crate::community_dfrost_types::derive_vrf_seed;
-                    let epoch_u64 = t3.meta.community_epoch as u64;
-                    let expected_mh = derive_vrf_seed(&seed, epoch_u64);
+                    let expected_mh = derive_vrf_seed(&seed, t3.meta.community_epoch);
                     if expected_mh != payload.message_hash {
                         return None; // not our beacon
                     }
@@ -463,13 +462,12 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             &poll_create_event_hash,
             community_epoch,
         );
-        let epoch = community_epoch as u64;
         let community_id = self.community_id;
 
         // Fire-and-forget: the beacon request may fail (no active committee,
         // ceremony already in flight). Log the error but don't propagate.
         tokio::spawn(async move {
-            if let Err(e) = (requester)(community_id, seed, epoch).await {
+            if let Err(e) = (requester)(community_id, seed, community_epoch).await {
                 tracing::warn!(
                     community_id = ?community_id,
                     error = %e,
@@ -522,13 +520,13 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         // with epoch=0 will stall — no beacon will ever match a seed derived from epoch=0
         // unless the community happened to use epoch 0 (which is only possible at inception).
         // The caller (IPC layer) receives a meaningful error and can retry after D-FROST starts.
-        let tier3_create_epoch: Option<(PollId, u32)> =
+        let tier3_create_epoch: Option<(PollId, u64)> =
             if event.kind == PollEventKindCode::PollCreate && event.tier == Tier::Sortition {
                 let epoch = {
                     let dr = self.dfrost_registry.lock().await;
                     if let Some(reg) = dr.as_ref() {
                         if let Some(engine) = reg.get(self.community_id).await {
-                            engine.current_epoch().await as u32
+                            engine.current_epoch().await
                         } else {
                             return Err(
                                 "DfrostNotReady: no D-FROST engine running for this community; \
@@ -1077,12 +1075,12 @@ mod tests {
     /// Mirrors the logic in on_dfrost_beacon.
     fn expected_beacon_message_hash(
         poll_create_event_hash: &[u8; 32],
-        community_epoch: u32,
+        community_epoch: u64,
     ) -> [u8; 32] {
         use crate::community_dfrost_types::derive_vrf_seed;
         use crate::community_voting_sortition::derive_beacon_seed;
         let seed = derive_beacon_seed(poll_create_event_hash, community_epoch);
-        derive_vrf_seed(&seed, community_epoch as u64)
+        derive_vrf_seed(&seed, community_epoch)
     }
 
     /// on_dfrost_beacon publishes a kd=ss event when the beacon matches an
@@ -1150,7 +1148,7 @@ mod tests {
         }
 
         // Build a matching VrfBeaconPayload (community_epoch = 0 since log uses 0).
-        let community_epoch: u32 = 0;
+        let community_epoch: u64 = 0;
         let message_hash = expected_beacon_message_hash(&poll_create_event_hash, community_epoch);
         let payload = VrfBeaconPayload {
             ceremony_id: [0x01u8; 32],
@@ -1356,7 +1354,7 @@ mod tests {
         }
 
         // Fire a matching beacon.
-        let community_epoch: u32 = 0;
+        let community_epoch: u64 = 0;
         let message_hash = expected_beacon_message_hash(&poll_create_event_hash, community_epoch);
         let payload = VrfBeaconPayload {
             ceremony_id: [0x03u8; 32],
@@ -1543,7 +1541,7 @@ mod tests {
         }
 
         // Build a matching VrfBeaconPayload for epoch=1.
-        let community_epoch: u32 = 1;
+        let community_epoch: u64 = 1;
         let message_hash = expected_beacon_message_hash(&poll_create_event_hash, community_epoch);
         let payload = VrfBeaconPayload {
             ceremony_id: [0x10u8; 32],
@@ -1643,7 +1641,7 @@ mod tests {
         }
 
         // Build a VrfBeaconPayload for epoch=0 (wrong epoch for this poll).
-        let wrong_epoch: u32 = 0;
+        let wrong_epoch: u64 = 0;
         let message_hash_wrong_epoch =
             expected_beacon_message_hash(&poll_create_event_hash, wrong_epoch);
         let payload_wrong_epoch = VrfBeaconPayload {

@@ -26,10 +26,11 @@ pub struct SortitionResult {
 
 /// Derive the beacon seed used to parameterise the VRF input.
 ///
-/// `beacon = SHA-256( poll_create_hash || u32::to_le_bytes(community_epoch) )`
+/// `beacon = SHA-256( poll_create_hash || u64::to_le_bytes(community_epoch) )`
 ///
 /// Deterministic: identical inputs always produce identical output.
-pub fn derive_beacon_seed(poll_create_hash: &[u8; 32], community_epoch: u32) -> [u8; 32] {
+/// `community_epoch` is `u64` to match `DfrostLogEngine::current_epoch()`.
+pub fn derive_beacon_seed(poll_create_hash: &[u8; 32], community_epoch: u64) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(poll_create_hash);
     hasher.update(community_epoch.to_le_bytes());
