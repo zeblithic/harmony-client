@@ -644,11 +644,48 @@ mod envelope_tests {
             PollEventKindCode::Signal,
             PollEventKindCode::Delegate,
             PollEventKindCode::Undelegate,
+            // Tier 3 (Sortition) variants added Phase 4a-main (ZEB-309).
+            // Cluster 7 fix (CodeRabbit major, R1 bot review): cover all 7
+            // new variants so wire-string renames surface immediately.
+            PollEventKindCode::SortitionSelection,
+            PollEventKindCode::DeliberationStatement,
+            PollEventKindCode::MiniPublicDecline,
+            PollEventKindCode::DraftCandidate,
+            PollEventKindCode::DraftApproval,
+            PollEventKindCode::SortitionFailed,
+            PollEventKindCode::RatificationBallot,
         ] {
             let mut encoded = Vec::new();
             ciborium::into_writer(kind, &mut encoded).expect("encode");
             let decoded: PollEventKindCode = ciborium::from_reader(&encoded[..]).expect("decode");
             assert_eq!(*kind, decoded);
+        }
+    }
+
+    /// Pin Tier 3 wire codes so a future enum rename can't silently change them.
+    /// Cluster 7 fix (CodeRabbit major, R1 bot review): matches the existing
+    /// Tier 2 wire-string pin test pattern.
+    #[test]
+    fn tier3_kind_codes_have_expected_wire_strings() {
+        let cases = [
+            (PollEventKindCode::SortitionSelection, "ss"),
+            (PollEventKindCode::DeliberationStatement, "ds"),
+            (PollEventKindCode::MiniPublicDecline, "md"),
+            (PollEventKindCode::DraftCandidate, "dc"),
+            (PollEventKindCode::DraftApproval, "da"),
+            (PollEventKindCode::SortitionFailed, "sf"),
+            (PollEventKindCode::RatificationBallot, "rb"),
+        ];
+        for (kind, expected) in cases {
+            let mut encoded = Vec::new();
+            ciborium::into_writer(&kind, &mut encoded).expect("encode");
+            let value: ciborium::Value =
+                ciborium::from_reader(&encoded[..]).expect("decode as value");
+            assert_eq!(
+                value.as_text(),
+                Some(expected),
+                "wire code for {kind:?} must be {expected:?}"
+            );
         }
     }
 

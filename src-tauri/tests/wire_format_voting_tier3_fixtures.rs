@@ -137,6 +137,14 @@ fn fixture_tier3_poll_create_with_retry_of() {
         retry_of: Some(PollId([0xab; 32])),
     };
     round_trip_or_regen("tier3_poll_create_retry.cbor", &pd);
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(&pd, &mut bytes).expect("encode");
+    // "ro" key is present when retry_of is Some; all keys must be 2-char.
+    // Cluster 8 fix (CodeRabbit minor, R1 bot review): add missing 2-char key check.
+    assert_two_char_keys(
+        &bytes,
+        &["pt", "ss", "dw", "fw", "rw", "pm", "im", "el", "ro"],
+    );
 }
 
 #[test]
@@ -191,6 +199,10 @@ fn fixture_draft_candidate() {
         text: "Adopt a 2/3 supermajority threshold for moderator dismissals.".into(),
     };
     round_trip_or_regen("draft_candidate.cbor", &pd);
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(&pd, &mut bytes).expect("encode");
+    // Cluster 8 fix (CodeRabbit minor, R1 bot review): add missing 2-char key check.
+    assert_two_char_keys(&bytes, &["pi", "tx"]);
 }
 
 #[test]
@@ -211,6 +223,10 @@ fn fixture_sortition_failed() {
         poll_id: PollId([0x42; 32]),
     };
     round_trip_or_regen("sortition_failed.cbor", &pd);
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(&pd, &mut bytes).expect("encode");
+    // Cluster 8 fix (CodeRabbit minor, R1 bot review): add missing 2-char key check.
+    assert_two_char_keys(&bytes, &["pi"]);
 }
 
 #[test]
