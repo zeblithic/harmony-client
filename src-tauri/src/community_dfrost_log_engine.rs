@@ -360,6 +360,60 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
     }
 }
 
+// ── Registry ────────────────────────────────────────────────────────────────
+
+/// Per-`SpaceId` map of running `DfrostLogEngine<R>` instances. Mirrors
+/// `VotingLogRegistry` (see `community_voting_log_engine.rs`). Wired into
+/// `NodeState` alongside the existing channel-log and voting-log registries
+/// in a follow-up task.
+pub struct DfrostLogRegistry<R: tauri::Runtime> {
+    engines: Mutex<HashMap<SpaceId, Arc<DfrostLogEngine<R>>>>,
+}
+
+impl<R: tauri::Runtime> DfrostLogRegistry<R> {
+    pub fn new() -> Self {
+        Self {
+            engines: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Start an engine for `params.community_id` and stash it in the
+    /// registry. If an engine already exists for that community it is
+    /// replaced — the caller is responsible for shutting the old one
+    /// down by dropping their `Arc` (the receive loop will then exit
+    /// when the adapter's publisher sender is dropped). Returns the
+    /// fresh `Arc` so callers can immediately `publish_event` without
+    /// re-doing the `get`.
+    pub async fn register(&self, params: DfrostLogEngineParams<R>) -> Arc<DfrostLogEngine<R>> {
+        let cid = params.community_id;
+        let engine = DfrostLogEngine::start(params).await;
+        let mut engines = self.engines.lock().await;
+        engines.insert(cid, Arc::clone(&engine));
+        engine
+    }
+
+    pub async fn get(&self, community_id: SpaceId) -> Option<Arc<DfrostLogEngine<R>>> {
+        let engines = self.engines.lock().await;
+        engines.get(&community_id).cloned()
+    }
+
+    /// Drop every engine. Each engine's receive task is owned by the
+    /// engine itself (`_receive_handle`); dropping the engine `Arc`
+    /// causes the task handle to drop, which aborts the task. The
+    /// matching `publisher_tx` sender held by the adapter is the
+    /// adapter's to drop.
+    pub async fn shutdown(&self) {
+        let mut engines = self.engines.lock().await;
+        engines.clear();
+    }
+}
+
+impl<R: tauri::Runtime> Default for DfrostLogRegistry<R> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::community_dfrost_log_engine::{
@@ -963,5 +1017,72 @@ mod tests {
             pending.round1_packages.is_empty(),
             "self-loopback must be dropped at dedup gate (publish_event records first)",
         );
+    }
+
+    // ── Registry tests ─────────────────────────────────────────────────────
+
+    use crate::community_dfrost_log_engine::DfrostLogRegistry;
+    use crate::owner_state_types::SpaceId;
+
+    /// Build a minimal `DfrostLogEngineParams` for a given `community_id`.
+    /// Uses an empty resolver / zero keys; never drives an inbound event so
+    /// the resolver is never queried. The discarded peer ends (`_sub_tx` /
+    /// `_pub_rx`) drop at end-of-function — the receive loop will exit on
+    /// end-of-stream but the engine itself remains valid in the registry,
+    /// which is what these tests are exercising.
+    fn registry_test_params(
+        community_id: SpaceId,
+        app_handle: tauri::AppHandle<tauri::test::MockRuntime>,
+    ) -> DfrostLogEngineParams<tauri::test::MockRuntime> {
+        let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let log = Arc::new(tokio::sync::Mutex::new(
+            crate::community_dfrost_log::DfrostLog::new(),
+        ));
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(HashMap::new()));
+        DfrostLogEngineParams {
+            community_id,
+            dfrost_log: log,
+            publisher_tx: pub_tx,
+            subscriber_rx: sub_rx,
+            app_handle,
+            self_addr: OwnerAddr([0u8; 16]),
+            self_x25519_priv: [0u8; 32],
+            identity_resolver: resolver,
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_register_and_get_round_trips() {
+        let reg: DfrostLogRegistry<tauri::test::MockRuntime> = DfrostLogRegistry::new();
+        let community_id = SpaceId([7u8; 16]);
+        let app = tauri::test::mock_app();
+        let app_handle = app.handle().clone();
+
+        let _engine = reg
+            .register(registry_test_params(community_id, app_handle))
+            .await;
+        assert!(reg.get(community_id).await.is_some());
+        assert!(reg.get(SpaceId([99u8; 16])).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn registry_shutdown_drops_all_engines() {
+        let reg: DfrostLogRegistry<tauri::test::MockRuntime> = DfrostLogRegistry::new();
+        let community_id_a = SpaceId([1u8; 16]);
+        let community_id_b = SpaceId([2u8; 16]);
+        let app = tauri::test::mock_app();
+
+        reg.register(registry_test_params(community_id_a, app.handle().clone()))
+            .await;
+        reg.register(registry_test_params(community_id_b, app.handle().clone()))
+            .await;
+        assert!(reg.get(community_id_a).await.is_some());
+        assert!(reg.get(community_id_b).await.is_some());
+
+        reg.shutdown().await;
+        assert!(reg.get(community_id_a).await.is_none());
+        assert!(reg.get(community_id_b).await.is_none());
     }
 }
