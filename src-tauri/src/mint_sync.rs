@@ -213,6 +213,11 @@ struct EngineShared {
     mint_db: Arc<std::sync::Mutex<rusqlite::Connection>>,
     content_store: Arc<dyn crate::content_store::ContentStore>,
     sync_state: Arc<TokioMutex<MintSyncState>>,
+    /// Production passes `Some(app_handle)` so successful subscriber merges
+    /// can fire a `"mint-changed"` Tauri event. Test constructors pass `None`
+    /// — the emit is a best-effort UI notification, not a correctness
+    /// requirement, so skipping it in tests is safe.
+    app_handle: Option<tauri::AppHandle>,
 }
 
 /// Mint Phase 2 sync engine. Mirrors owner_state_sync's shape.
@@ -306,6 +311,7 @@ impl MintSyncEngine {
             mint_db: mint_db.clone(),
             content_store: content_store.clone(),
             sync_state: sync_state.clone(),
+            app_handle: None,
         };
         let dirty_for_task = dirty.clone();
         let handle = tokio::spawn(internal_task(
@@ -350,6 +356,7 @@ impl MintSyncEngine {
         publisher_tx: mpsc::Sender<Vec<u8>>,
         subscriber_rx: mpsc::Receiver<Vec<u8>>,
         debounce_ms: u64,
+        app_handle: tauri::AppHandle,
     ) -> (Self, MintSyncEngineHandle) {
         let dirty = Arc::new(Notify::new());
         let (flush_tx, flush_rx) = mpsc::channel::<()>(4);
@@ -358,6 +365,7 @@ impl MintSyncEngine {
             mint_db: mint_db.clone(),
             content_store: content_store.clone(),
             sync_state: sync_state.clone(),
+            app_handle: Some(app_handle),
         };
         let dirty_for_task = dirty.clone();
         let handle = tokio::spawn(internal_task_zenoh(
@@ -460,6 +468,12 @@ impl EngineShared {
         })
         .await
         .map_err(|e| MintSyncError::Other(format!("spawn_blocking: {e}")))??;
+        if let Some(app) = &self.app_handle {
+            use tauri::Emitter;
+            if let Err(e) = app.emit("mint-changed", ()) {
+                tracing::warn!(target: "mint_sync", "failed to emit mint-changed: {e}");
+            }
+        }
         Ok(())
     }
 

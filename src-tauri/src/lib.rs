@@ -2067,6 +2067,7 @@ async fn start_node(
                             mint_out_tx,
                             mint_in_rx,
                             crate::mint_sync::DEFAULT_DEBOUNCE_MS,
+                            app.clone(),
                         )
                         .await;
                         // Boot-hook flush: emit the local snapshot shortly
