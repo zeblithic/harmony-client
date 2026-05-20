@@ -21,20 +21,32 @@ pub fn load(path: &Path) -> Result<MintSyncState, MintSyncError> {
         }
         Err(e) => return Err(e.into()),
     };
-    let state: MintSyncState =
-        ciborium::from_reader(&bytes[..]).map_err(|e| MintSyncError::Cbor(format!("load: {e}")))?;
+    let state: MintSyncState = ciborium::from_reader(&bytes[..])
+        .map_err(|e| MintSyncError::Cbor(format!("load {}: {e}", path.display())))?;
+    if state.schema_version > crate::mint_sync_types::MINT_SCHEMA_VERSION {
+        return Err(MintSyncError::SchemaTooNew {
+            remote: state.schema_version,
+            local_max: crate::mint_sync_types::MINT_SCHEMA_VERSION,
+        });
+    }
     Ok(state)
 }
 
-/// Save state to disk via atomic-rename. Writes to a sibling tempfile,
-/// fsyncs, then renames over `path`. The directory is created if absent.
+/// Save state to disk via atomic-rename. Writes a tempfile in the
+/// parent directory, fsyncs, then atomically renames over `<path>`.
+///
+/// **Caller contract:** this function is NOT internally synchronized.
+/// Callers must serialize concurrent invocations on the same path
+/// (e.g. via the engine's `TokioMutex` around `MintSyncState`).
+/// Concurrent unprotected calls will race and the later `persist()` to
+/// complete will silently clobber the earlier.
 pub fn save(path: &Path, state: &MintSyncState) -> Result<(), MintSyncError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut bytes = Vec::new();
     ciborium::into_writer(state, &mut bytes)
-        .map_err(|e| MintSyncError::Cbor(format!("save: {e}")))?;
+        .map_err(|e| MintSyncError::Cbor(format!("save {}: {e}", path.display())))?;
     let dir = path.parent().expect("save: path has no parent");
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     tmp.write_all(&bytes)?;
@@ -67,6 +79,28 @@ mod tests {
         save(&path, &state).unwrap();
         let loaded = load(&path).unwrap();
         assert_eq!(state, loaded);
+    }
+
+    #[test]
+    fn load_returns_schema_too_new_for_future_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MINT_SYNC_STATE_FILENAME);
+        let future = MintSyncState {
+            schema_version: 999,
+            ..MintSyncState::default()
+        };
+        save(&path, &future).unwrap();
+        let result = load(&path);
+        assert!(
+            matches!(
+                result,
+                Err(MintSyncError::SchemaTooNew {
+                    remote: 999,
+                    local_max: _,
+                })
+            ),
+            "expected SchemaTooNew error, got: {result:?}"
+        );
     }
 
     #[test]
