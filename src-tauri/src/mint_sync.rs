@@ -837,14 +837,22 @@ async fn publish_root_now_zenoh(
 
     // 9. Persist replay tracker so that on restart the local HLC for this
     //    device is remembered, preventing stale HLC re-use (MAJOR 5).
+    //    Awaited (not detached) to prevent concurrent saves from racing and
+    //    overwriting newer state with an older snapshot.
     {
         let st_snap = sync_state.lock().await.clone();
         let path = sync_state_path.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            if let Err(e) = crate::mint_sync_persist::save(&path, &st_snap) {
+        match tokio::task::spawn_blocking(move || crate::mint_sync_persist::save(&path, &st_snap))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
                 tracing::warn!(target: "mint_sync", "persist sync_state after publish failed: {e}");
             }
-        });
+            Err(e) => {
+                tracing::warn!(target: "mint_sync", "persist sync_state after publish join failed: {e}");
+            }
+        }
     }
 
     tracing::info!(target: "mint_sync", root_cid = ?root_cid, "published encrypted mint snapshot");
@@ -942,17 +950,25 @@ async fn handle_incoming_publish_zenoh(
     // 6. Advance replay tracker + persist AFTER successful apply (CRITICAL 3).
     //    A failure in any earlier step leaves the tracker un-advanced so the
     //    peer's republish will be retried.
+    //    Awaited (not detached) to prevent concurrent saves from racing and
+    //    overwriting newer state with an older snapshot.
     {
         let mut st = sync_state.lock().await;
         st.replay_tracker
             .insert(payload.at.device_id.clone(), payload.at.clone());
         let st_snap = st.clone();
         let path = sync_state_path.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            if let Err(e) = crate::mint_sync_persist::save(&path, &st_snap) {
+        match tokio::task::spawn_blocking(move || crate::mint_sync_persist::save(&path, &st_snap))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
                 tracing::warn!(target: "mint_sync", "persist sync_state failed: {e}");
             }
-        });
+            Err(e) => {
+                tracing::warn!(target: "mint_sync", "persist sync_state join failed: {e}");
+            }
+        }
     }
 
     Ok(())

@@ -3470,6 +3470,8 @@ async fn start_node(
           // `MutexGuard` across an await (the guard is `!Send`). On
           // success these Arcs are discarded; NodeState already owns its
           // own clone of each.
+          // Mint engine is also carried out so the failure-cleanup path can
+          // call engine.shutdown() if thread spawn fails (CURSOR MEDIUM fix).
         (
             current_generation,
             thread_install_failure,
@@ -3479,6 +3481,7 @@ async fn start_node(
             community_registry_arc.clone(),
             channel_log_registry_arc.clone(),
             profile_broadcast_publisher_arc.clone(),
+            mint_sync_engine_opt,
         )
     };
     let (
@@ -3490,6 +3493,7 @@ async fn start_node(
         registry_for_cleanup,
         channel_log_registry_for_cleanup,
         profile_broadcast_publisher_for_cleanup,
+        mint_engine_for_cleanup,
     ) = our_gen;
 
     // ZEB-221 + thread-spawn-failure cleanup + lock-poison cleanup: all
@@ -3542,6 +3546,19 @@ async fn start_node(
                 tracing::error!(
                     error = %e,
                     "SyncEngine cleanup after start_node failure"
+                );
+            }
+        }
+        // CURSOR MEDIUM fix: drain the MintSyncEngine + its boot-hook task
+        // if construction succeeded but a later step (thread spawn, lock
+        // failure, supersede) means we never install to NodeState. Without
+        // this, the engine and its boot-flush task remain live on the tokio
+        // runtime until the process exits.
+        if let Some(mint_engine) = mint_engine_for_cleanup {
+            if let Err(e) = mint_engine.shutdown().await {
+                tracing::error!(
+                    error = %e,
+                    "MintSyncEngine cleanup after start_node failure"
                 );
             }
         }
