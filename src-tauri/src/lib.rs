@@ -22324,7 +22324,7 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
                 }
             }
             None => {
-                tracing::warn!(
+                tracing::debug!(
                     space_id = ?space_id,
                     "dfrost_initiate_dkg: no engine registered for community — \
                      broadcast skipped (Zenoh adapter not yet wired)",
@@ -22643,7 +22643,7 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
                     }
                 }
                 None => {
-                    tracing::warn!(
+                    tracing::debug!(
                         space_id = ?space_id,
                         "dfrost_contribute_dkg_round (rn=1): no engine \
                          registered for community — broadcast skipped \
@@ -23098,7 +23098,7 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
                 }
             }
             None => {
-                tracing::warn!(
+                tracing::debug!(
                     space_id = ?space_id,
                     round_num = round_num,
                     "dfrost_contribute_dkg_round (rn=2/3): no engine \
@@ -23411,7 +23411,7 @@ async fn dfrost_request_vrf_beacon<R: tauri::Runtime>(
                 }
             }
             None => {
-                tracing::warn!(
+                tracing::debug!(
                     space_id = ?space_id,
                     "dfrost_request_vrf_beacon: no engine registered for \
                      community — broadcast skipped (Zenoh adapter not yet wired)",
@@ -23795,7 +23795,7 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
                 }
             }
             None => {
-                tracing::warn!(
+                tracing::debug!(
                     space_id = ?space_id,
                     "dfrost_contribute_threshold_sign (ts share): no engine \
                      registered for community — broadcast skipped \
@@ -23986,7 +23986,7 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
                 }
             }
             None => {
-                tracing::warn!(
+                tracing::debug!(
                     space_id = ?space_id,
                     "dfrost_contribute_threshold_sign (vb aggregate): no engine \
                      registered for community — broadcast skipped \
@@ -24435,7 +24435,7 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
                 }
             }
             None => {
-                tracing::warn!(
+                tracing::debug!(
                     space_id = ?space_id,
                     "dfrost_propose_refresh: no engine registered for \
                      community — broadcast skipped (Zenoh adapter not yet wired)",

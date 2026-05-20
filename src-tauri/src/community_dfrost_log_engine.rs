@@ -19,15 +19,17 @@ use tokio::sync::{mpsc, Mutex};
 
 /// Maximum number of `device_id` entries the replay tracker keeps per
 /// actor. Bounds memory growth when a misbehaving peer publishes events
-/// from many unique device_ids. Eviction is lowest-HLC-first (the
-/// stale-device-id assumption).
+/// from many unique device_ids. Eviction is lowest-HLC-first — a
+/// defence boundary, not an expected operation.
 ///
-/// Defence-in-depth: even if a replay slips through after eviction, the
-/// apply layer's per-ceremony and per-nonce gates prevent harmful
-/// state effects (DKG rejects unknown ceremonies; threshold-sign
-/// nonces are single-use; refresh epochs validate). The tracker is
-/// the cheap first line, not the only one.
-pub(crate) const MAX_DEVICES_PER_ACTOR: usize = 64;
+/// At 256, the cap is far beyond the practical device count per
+/// identity (multi-device-binding CRDT limits realistic active devices
+/// to single digits with ~50 archived); eviction only fires under
+/// adversarial conditions. When it does, the apply layer's per-
+/// ceremony, per-nonce, and per-epoch gates are the ultimate
+/// replay defence: DKG rejects unknown ceremonies; threshold-sign
+/// nonces are single-use; refresh epochs validate.
+pub(crate) const MAX_DEVICES_PER_ACTOR: usize = 256;
 
 /// Replay-defense tracker keyed on `(actor, device_id)`. Records the
 /// max-observed `(wall_ms, logical)` HLC per signer; any inbound event
@@ -67,7 +69,7 @@ impl DfrostReplayTracker {
 
         // New entry — enforce per-actor cap by evicting the lowest-HLC
         // device_id for this actor if the cap is reached. Linear scan at
-        // cap=64 is fine; switch to BTreeMap only if clippy / profile
+        // cap=256 is fine; switch to BTreeMap only if clippy / profile
         // flags it.
         let device_count = self
             .seen_max
@@ -81,8 +83,16 @@ impl DfrostReplayTracker {
                 .filter(|((a, _), _)| *a == event.actor)
                 .min_by_key(|(_, &v)| v)
                 .map(|((a, d), _)| (*a, d.clone()));
-            if let Some(k) = evict {
-                self.seen_max.remove(&k);
+            if let Some((evicted_actor, evicted_device)) = evict {
+                tracing::warn!(
+                    actor = ?evicted_actor,
+                    evicted_device_id = %evicted_device,
+                    cap = MAX_DEVICES_PER_ACTOR,
+                    "dfrost replay tracker: per-actor cap exceeded — \
+                     evicting lowest-HLC device_id; apply-layer gates \
+                     remain authoritative",
+                );
+                self.seen_max.remove(&(evicted_actor, evicted_device));
             }
         }
         self.seen_max.insert(key, new_hlc);
@@ -379,6 +389,27 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
         })
     }
 
+    /// Abort the receive loop without waiting for the last `Arc` clone
+    /// to drop. Safe to call multiple times (`JoinHandle::abort` is
+    /// idempotent). Called by `DfrostLogRegistry::register` when
+    /// replacing an engine and by `DfrostLogRegistry::shutdown` when
+    /// clearing all engines — ensures the old engine's receive task
+    /// stops even if some external code retains an `Arc` clone past
+    /// the registry transition (which would otherwise defer `Drop`
+    /// and leave the loop consuming packets).
+    pub(crate) fn abort(&self) {
+        self.receive_handle.abort();
+    }
+
+    /// Test-only helper: observe whether the receive task has finished
+    /// (e.g. via `abort()` or end-of-stream). Used by the explicit-
+    /// abort test to assert the loop stops even when an external Arc
+    /// keeps the engine alive past registry replacement.
+    #[cfg(test)]
+    pub(crate) fn receive_handle_is_finished(&self) -> bool {
+        self.receive_handle.is_finished()
+    }
+
     /// Publish a locally-signed event onto the Zenoh-bridged publisher
     /// channel. Records the event in the dedup tracker BEFORE sending,
     /// so the inevitable loopback (Zenoh adapter subscribes to its own
@@ -403,14 +434,21 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
     }
 }
 
-/// Abort the receive task when the last `Arc<DfrostLogEngine<R>>` is
-/// dropped. Without this, `tokio::task::JoinHandle` detaches on drop and
-/// the receive loop continues running against an `mpsc::Receiver` whose
-/// matching `Sender` may still be alive elsewhere (e.g. inside the
-/// adapter), leaking the task indefinitely. Reachable on:
-///   - `DfrostLogRegistry::shutdown` (clears the engines map → last Arc)
-///   - `DfrostLogRegistry::register` replacement (insert() drops old Arc)
-///   - process shutdown via `stop_inner` (NodeState releases its clone)
+/// Last-line-of-defence abort: fires when the LAST `Arc<DfrostLogEngine<R>>`
+/// clone is dropped. The first lines of defence are the explicit
+/// `DfrostLogEngine::abort()` calls inside `DfrostLogRegistry::register`
+/// (when replacing an engine) and `DfrostLogRegistry::shutdown` (when
+/// clearing every engine). Those guarantee the receive loop stops
+/// regardless of whether external code holds extra `Arc` clones from
+/// a prior `registry.get(cid).await`. This Drop impl handles the
+/// residual case where all Arc clones eventually fall out of scope
+/// without `abort()` having been called (e.g. a test that drops its
+/// engine clone directly without going through the registry).
+///
+/// Without an abort path at all, `tokio::task::JoinHandle` would detach
+/// on drop and the receive loop could continue running against an
+/// `mpsc::Receiver` whose matching `Sender` is still alive (in the
+/// adapter), leaking the task indefinitely.
 impl<R: tauri::Runtime> Drop for DfrostLogEngine<R> {
     fn drop(&mut self) {
         self.receive_handle.abort();
@@ -436,16 +474,21 @@ impl<R: tauri::Runtime> DfrostLogRegistry<R> {
 
     /// Start an engine for `params.community_id` and stash it in the
     /// registry. If an engine already exists for that community it is
-    /// replaced — the caller is responsible for shutting the old one
-    /// down by dropping their `Arc` (the receive loop will then exit
-    /// when the adapter's publisher sender is dropped). Returns the
-    /// fresh `Arc` so callers can immediately `publish_event` without
-    /// re-doing the `get`.
+    /// replaced — and the old engine's receive task is explicitly
+    /// aborted here, not deferred to `Drop`. The explicit abort is
+    /// load-bearing: if any external code retains an `Arc` clone of
+    /// the old engine (from a prior `registry.get(cid).await`), the
+    /// `Drop` impl would only fire when that external Arc eventually
+    /// drops, leaving the old loop consuming packets in the meantime.
+    /// Returns the fresh `Arc` so callers can immediately `publish_event`
+    /// without re-doing the `get`.
     pub async fn register(&self, params: DfrostLogEngineParams<R>) -> Arc<DfrostLogEngine<R>> {
         let cid = params.community_id;
         let engine = DfrostLogEngine::start(params).await;
         let mut engines = self.engines.lock().await;
-        engines.insert(cid, Arc::clone(&engine));
+        if let Some(old) = engines.insert(cid, Arc::clone(&engine)) {
+            old.abort();
+        }
         engine
     }
 
@@ -454,13 +497,17 @@ impl<R: tauri::Runtime> DfrostLogRegistry<R> {
         engines.get(&community_id).cloned()
     }
 
-    /// Drop every engine. Each engine's receive task is owned by the
-    /// engine itself (`receive_handle`); dropping the last `Arc` runs the
-    /// engine's `Drop` impl which calls `JoinHandle::abort()` and ends
-    /// the receive loop. The matching `publisher_tx` sender held by the
-    /// adapter is the adapter's to drop.
+    /// Drop every engine. Each engine's receive task is explicitly
+    /// aborted here, independent of `Drop`: external code that retained
+    /// an `Arc` clone from a prior `registry.get(cid).await` would
+    /// otherwise keep the old receive loop alive past shutdown. The
+    /// matching `publisher_tx` sender held by the adapter is the
+    /// adapter's to drop.
     pub async fn shutdown(&self) {
         let mut engines = self.engines.lock().await;
+        for engine in engines.values() {
+            engine.abort();
+        }
         engines.clear();
     }
 }
@@ -1163,6 +1210,69 @@ mod tests {
             .await;
         assert!(reg.get(community_id).await.is_some());
         assert!(reg.get(SpaceId([99u8; 16])).await.is_none());
+    }
+
+    /// R2 fix: when `register()` replaces an existing engine, the OLD
+    /// engine's receive task MUST be aborted explicitly — not deferred
+    /// to `Drop` — so that external code retaining an `Arc` clone of
+    /// the old engine (from a prior `registry.get(cid).await`) does
+    /// not keep the old receive loop alive against the same channel
+    /// stream.
+    #[tokio::test]
+    async fn registry_register_replacement_aborts_old_engine() {
+        let reg: DfrostLogRegistry<tauri::test::MockRuntime> = DfrostLogRegistry::new();
+        let cid = SpaceId([1u8; 16]);
+        let app = tauri::test::mock_app();
+
+        let engine1 = reg
+            .register(registry_test_params(cid, app.handle().clone()))
+            .await;
+
+        // Hold an external Arc to the old engine — this would normally
+        // prevent `Drop` from firing on replacement.
+        let retained_old = Arc::clone(&engine1);
+
+        // Register a second engine for the same community.
+        let _engine2 = reg
+            .register(registry_test_params(cid, app.handle().clone()))
+            .await;
+
+        // The old engine's receive task should be aborted even though
+        // `retained_old` keeps the Arc alive. Poll the JoinHandle's
+        // `is_finished()` state — abort propagates after a brief yield
+        // back to the runtime.
+        for _ in 0..50 {
+            if retained_old.receive_handle_is_finished() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("old engine's receive task did not abort within deadline");
+    }
+
+    /// R2 fix: `shutdown()` MUST abort every engine's receive task
+    /// explicitly, independent of whether external `Arc` clones survive
+    /// the `engines.clear()`.
+    #[tokio::test]
+    async fn registry_shutdown_aborts_engines_with_external_arcs() {
+        let reg: DfrostLogRegistry<tauri::test::MockRuntime> = DfrostLogRegistry::new();
+        let cid = SpaceId([3u8; 16]);
+        let app = tauri::test::mock_app();
+
+        let engine = reg
+            .register(registry_test_params(cid, app.handle().clone()))
+            .await;
+        let retained = Arc::clone(&engine);
+
+        reg.shutdown().await;
+
+        for _ in 0..50 {
+            if retained.receive_handle_is_finished() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("shutdown did not abort engine receive task within deadline");
     }
 
     #[tokio::test]
