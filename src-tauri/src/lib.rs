@@ -43,6 +43,7 @@ pub mod library_directory;
 pub mod mail;
 pub mod mail_sync;
 pub mod mint;
+pub mod mint_sync;
 pub mod mint_sync_types;
 pub mod owner_commands;
 pub mod owner_state;
