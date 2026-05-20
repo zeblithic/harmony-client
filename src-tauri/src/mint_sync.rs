@@ -206,6 +206,8 @@ fn upsert_setting_lww(tx: &rusqlite::Transaction, r: &SettingRow) -> Result<(), 
     Ok(())
 }
 
+pub const DEFAULT_DEBOUNCE_MS: u64 = 250;
+
 /// Mint Phase 2 sync engine. Mirrors owner_state_sync's shape.
 pub struct MintSyncEngine {
     dirty: Arc<Notify>,
@@ -233,11 +235,23 @@ impl MintSyncEngine {
         content_store: Arc<dyn crate::content_store::ContentStore>,
         sync_state: Arc<TokioMutex<MintSyncState>>,
     ) -> (Self, MintSyncEngineHandle) {
+        Self::new_for_test_with_debounce(
+            mint_db,
+            content_store,
+            sync_state,
+            std::time::Duration::from_millis(DEFAULT_DEBOUNCE_MS),
+        )
+        .await
+    }
+
+    pub async fn new_for_test_with_debounce(
+        mint_db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+        content_store: Arc<dyn crate::content_store::ContentStore>,
+        sync_state: Arc<TokioMutex<MintSyncState>>,
+        debounce: std::time::Duration,
+    ) -> (Self, MintSyncEngineHandle) {
         let dirty = Arc::new(Notify::new());
-        // Channels:
-        // - `flush_now` capacity 1 is fine for the Task 7 scaffold; Task 8 will
-        //   revisit (owner_state_sync uses capacity 8 + oneshot response pattern
-        //   to surface publish results back to the caller).
+        // TODO(Task 8): capacity already bumped via TODO from Task 7
         let (flush_tx, flush_rx) = mpsc::channel::<()>(1);
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
         let dirty_for_task = dirty.clone();
@@ -248,6 +262,7 @@ impl MintSyncEngine {
             dirty_for_task,
             flush_rx,
             shutdown_rx,
+            debounce,
         ));
         (
             Self {
@@ -289,27 +304,73 @@ impl MintSyncEngine {
     }
 }
 
-/// Internal task loop. Task 8 fills in publish_root_now; for now this just
-/// drains the channels and exits cleanly on shutdown.
 async fn internal_task(
-    _mint_db: Arc<std::sync::Mutex<rusqlite::Connection>>,
-    _content_store: Arc<dyn crate::content_store::ContentStore>,
-    _sync_state: Arc<TokioMutex<MintSyncState>>,
+    mint_db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    content_store: Arc<dyn crate::content_store::ContentStore>,
+    sync_state: Arc<TokioMutex<MintSyncState>>,
     dirty: Arc<Notify>,
     mut flush_rx: mpsc::Receiver<()>,
     mut shutdown_rx: mpsc::Receiver<()>,
+    debounce: std::time::Duration,
 ) {
+    let mut scheduled: Option<tokio::time::Instant> = None;
     loop {
+        let next_wake = scheduled
+            .unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(3600));
         tokio::select! {
             _ = dirty.notified() => {
-                // Task 8 will schedule a debounced publish here.
+                scheduled = Some(tokio::time::Instant::now() + debounce);
+            }
+            _ = tokio::time::sleep_until(next_wake), if scheduled.is_some() => {
+                scheduled = None;
+                if let Err(e) = publish_root_now(&mint_db, &content_store, &sync_state).await {
+                    tracing::warn!(target: "mint_sync", "publish_root_now failed: {e}");
+                }
             }
             _ = flush_rx.recv() => {
-                // Task 8 will fire publish_root_now here.
+                scheduled = None;
+                if let Err(e) = publish_root_now(&mint_db, &content_store, &sync_state).await {
+                    tracing::warn!(target: "mint_sync", "flush publish failed: {e}");
+                }
             }
             _ = shutdown_rx.recv() => break,
         }
     }
+}
+
+async fn publish_root_now(
+    mint_db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    content_store: &Arc<dyn crate::content_store::ContentStore>,
+    _sync_state: &Arc<TokioMutex<MintSyncState>>,
+) -> Result<(), MintSyncError> {
+    let mint_db = mint_db.clone();
+    let snap = tokio::task::spawn_blocking(move || {
+        let mut conn = mint_db.lock().expect("mint_db lock poisoned");
+        snapshot_current_db(&mut conn)
+    })
+    .await
+    .map_err(|e| MintSyncError::Other(format!("spawn_blocking: {e}")))??;
+
+    if snap.accounts.is_empty() && snap.transactions.is_empty() {
+        tracing::debug!(target: "mint_sync", "empty snapshot — skipping publish");
+        return Ok(());
+    }
+
+    let mut cbor = Vec::new();
+    ciborium::into_writer(&snap, &mut cbor)
+        .map_err(|e| MintSyncError::Cbor(format!("publish encode: {e}")))?;
+    // TODO(Task 11): encrypt via space_lookup_key(&kt, b"mint-ledger-v1")
+    // For Task 8, we put cleartext into the stub — encryption lands when the
+    // engine is wired with identity. The InMemoryStub doesn't care.
+    let root_cid = crate::owner_state_types::ContentId::from_bytes(blake3::hash(&cbor).into());
+    content_store
+        .put(root_cid, cbor)
+        .await
+        .map_err(|e| MintSyncError::Other(format!("content_store.put: {e}")))?;
+
+    // TODO(Task 11): publish (root_cid, hlc) via Zenoh after encrypt_root_publish.
+    tracing::info!(target: "mint_sync", root_cid = ?root_cid, "published mint snapshot");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -508,6 +569,68 @@ mod tests {
 
     use std::sync::Arc;
     use tokio::sync::Mutex as TokioMutex;
+
+    #[tokio::test]
+    async fn publish_writes_to_content_store_and_zenoh_stub() {
+        let mut conn = fresh_db();
+        seed_account(&mut conn, "a1", "Chase", "2026-05-01T00:00:00Z");
+        seed_tx(&mut conn, "t1", "a1", "x", "2026-05-01T00:00:00Z");
+        let conn = Arc::new(std::sync::Mutex::new(conn));
+        let cs_stub = Arc::new(crate::content_store::InMemoryStub::default());
+        let cs: Arc<dyn crate::content_store::ContentStore> = cs_stub.clone();
+        let sync_state = Arc::new(TokioMutex::new(MintSyncState::default()));
+
+        let (engine, handle) = MintSyncEngine::new_for_test(conn, cs, sync_state).await;
+        engine.flush_now().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(cs_stub.debug_count().await, 1);
+
+        engine.shutdown().await.unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn publish_skips_when_snapshot_is_empty() {
+        let conn = Arc::new(std::sync::Mutex::new(fresh_db()));
+        let cs_stub = Arc::new(crate::content_store::InMemoryStub::default());
+        let cs: Arc<dyn crate::content_store::ContentStore> = cs_stub.clone();
+        let sync_state = Arc::new(TokioMutex::new(MintSyncState::default()));
+
+        let (engine, handle) = MintSyncEngine::new_for_test(conn, cs, sync_state).await;
+        engine.flush_now().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(cs_stub.debug_count().await, 0);
+
+        engine.shutdown().await.unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn notify_dirty_triggers_debounced_publish() {
+        let mut conn = fresh_db();
+        seed_account(&mut conn, "a1", "Chase", "2026-05-01T00:00:00Z");
+        let conn = Arc::new(std::sync::Mutex::new(conn));
+        let cs_stub = Arc::new(crate::content_store::InMemoryStub::default());
+        let cs: Arc<dyn crate::content_store::ContentStore> = cs_stub.clone();
+        let sync_state = Arc::new(TokioMutex::new(MintSyncState::default()));
+
+        let (engine, handle) = MintSyncEngine::new_for_test_with_debounce(
+            conn,
+            cs,
+            sync_state,
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+
+        engine.notify_dirty();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(cs_stub.debug_count().await, 1);
+
+        engine.shutdown().await.unwrap();
+        handle.await.unwrap();
+    }
 
     #[tokio::test]
     async fn engine_new_and_shutdown_no_publish() {

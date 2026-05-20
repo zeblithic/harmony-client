@@ -150,6 +150,13 @@ impl ContentStore for RuntimeContentStore {
     }
 }
 
+#[cfg(any(test, feature = "test-fixtures"))]
+impl InMemoryStub {
+    pub async fn debug_count(&self) -> usize {
+        self.inner.lock().unwrap().len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
