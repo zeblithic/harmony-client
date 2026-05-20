@@ -483,6 +483,19 @@ pub struct NodeState {
     /// — a larger refactor).
     channel_log_registry:
         Option<std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry<tauri::Wry>>>,
+    /// ZEB-307 Task 7: D-FROST community-log registry. `Some` while the
+    /// node is running; populated by `start_node` (Task 8) and consumed by
+    /// the D-FROST IPC handlers. Mirrors `channel_log_registry` exactly —
+    /// typed `tauri::Wry` because Wry is the production runtime; tests
+    /// construct registries directly against `tauri::test::MockRuntime`
+    /// without going through `NodeState`.
+    ///
+    /// `#[allow(dead_code)]` is load-bearing only until ZEB-307 Task 8 wires
+    /// the field; Task 8 reads it from IPC handlers and the allow can be
+    /// dropped at that point.
+    #[allow(dead_code)]
+    dfrost_log_registry:
+        Option<std::sync::Arc<crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>>>,
     /// ZEB-218 Sub-D Phase 1: aggregated library-directory state. `Some`
     /// while the node is running; the matching `request_rx` is consumed
     /// by an event-loop task that declares per-library Zenoh
@@ -661,6 +674,10 @@ impl Default for NodeState {
             // ZEB-270 Task 4C: registry stays None until start_node
             // wires it (see follow-up Task 4C deferred work).
             channel_log_registry: None,
+            // ZEB-307 Task 7: D-FROST registry stays None until start_node
+            // wires it (Task 8). IPC handlers will reject with
+            // "dfrost_log_registry missing — node not running" while None.
+            dfrost_log_registry: None,
             // ZEB-218 Sub-D Phase 1: directory stays None until
             // start_node wires it.
             library_directory: None,
@@ -27440,6 +27457,7 @@ mod start_node_race_tests {
             dm_identity_pub_64: None,
             community_adapter_request_tx: None,
             channel_log_registry: None,
+            dfrost_log_registry: None,
             library_directory: None,
             profile_broadcast_publisher: None,
             profile_broadcast_cache: None,

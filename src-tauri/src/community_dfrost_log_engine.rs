@@ -90,7 +90,12 @@ pub struct DfrostLogEngine<R: tauri::Runtime> {
     // we add a shutdown path; for now the implicit Drop is sufficient.
     #[allow(dead_code)]
     _receive_handle: tokio::task::JoinHandle<()>,
-    _phantom: std::marker::PhantomData<R>,
+    // ZEB-307 Task 7: `PhantomData<fn() -> R>` (not `PhantomData<R>`) so the
+    // engine is unconditionally `Send + Sync` when wired into
+    // `NodeState<tauri::Wry>` — `tauri::Wry` itself is not `Send`
+    // (its `EventLoop` holds `Rc`s), but the engine only ever owns the
+    // type parameter through this marker, not a real `Wry` value.
+    _phantom: std::marker::PhantomData<fn() -> R>,
 }
 
 /// Full inbound chain: decode → sig-verify → dedup → apply → record.
