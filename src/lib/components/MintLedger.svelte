@@ -46,6 +46,18 @@
       transactions = txs;
       accounts = accs;
       defaultCurrency = def ?? 'USD';
+      // Drop stale account filter if the account no longer exists. Avoids
+      // the "table mysteriously empty after delete" UX trap.
+      if (filterAccountId && !accs.some((a) => a.id === filterAccountId)) {
+        filterAccountId = '';
+        // We've changed a filter — but DON'T recurse into load() here,
+        // because the current load() result (with the now-invalid filter)
+        // returned 0 transactions. Just clear `transactions` and let the
+        // user's next interaction (or the next onChanged via account
+        // manager) drive a clean reload.
+        transactions = [];
+        return;
+      }
     } catch (e) {
       if (myEpoch !== loadEpoch) return;
       loadError = e instanceof Error ? e.message : String(e);
@@ -88,14 +100,14 @@
     }
   }
 
-  // Add/Edit dialog state — wired in Task 8
+  // Add/Edit dialog state.
   let showAddEdit = $state(false);
   let editingTxId = $state<string | null>(null);
 
-  // Account manager state — wired in Task 9
+  // Account manager state.
   let showAccountManager = $state(false);
 
-  // CSV export state — wired in Task 10
+  // CSV export state.
   let exportInProgress = $state(false);
 </script>
 

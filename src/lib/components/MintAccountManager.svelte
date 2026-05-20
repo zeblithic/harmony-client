@@ -99,7 +99,12 @@
       {#each accounts as a (a.id)}
         <li>
           {#if editingId === a.id}
-            <input type="text" bind:value={editingName} aria-label="New name for {a.name}" />
+            <input
+              type="text"
+              bind:value={editingName}
+              aria-label="New name for {a.name}"
+              onkeydown={(e) => { if (e.key === 'Enter') commitRename(); }}
+            />
             <button onclick={commitRename}>Save</button>
             <button onclick={() => { editingId = null; }}>Cancel</button>
           {:else}

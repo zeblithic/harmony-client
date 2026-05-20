@@ -38,35 +38,32 @@
   let error = $state<string | null>(null);
   let saving = $state(false);
 
-  // Load existing transaction when in edit mode.
+  let editLoadEpoch = 0;
+
+  // Initial load when in edit mode. The dialog is unmounted by parent
+  // when showAddEdit becomes false, so on the next open we get fresh
+  // $state defaults — no else-branch reset needed. (Previous defensive
+  // reset wrote to accounts/defaultCurrency-derived state, making them
+  // reactive deps and causing the form to wipe on parent load().)
   $effect(() => {
-    if (editingId) {
-      service.getTransaction(editingId)
-        .then((tx: Transaction | null) => {
-          if (!tx) return;
-          date = tx.transactionDate;
-          amount = tx.amount;
-          currency = tx.currency;
-          accountId = tx.accountId;
-          description = tx.description;
-          metadata = tx.metadata ?? '';
-        })
-        .catch((e) => {
-          error = e instanceof Error ? e.message : String(e);
-        });
-    } else {
-      // Defensive reset: if editingId transitions to null while the
-      // component is mounted (currently impossible because the dialog
-      // unmounts via {#if showAddEdit} in MintLedger, but kept robust
-      // against future refactors that might keep the dialog mounted).
-      date = todayLocal();
-      amount = '';
-      currency = defaultCurrency;
-      accountId = accounts[0]?.id ?? '';
-      description = '';
-      metadata = '';
-      error = null;
-    }
+    const myEpoch = ++editLoadEpoch;
+    if (!editingId) return;
+    error = null;  // clear stale error from a previous failed fetch
+    service.getTransaction(editingId)
+      .then((tx: Transaction | null) => {
+        if (myEpoch !== editLoadEpoch) return;  // stale completion
+        if (!tx) return;
+        date = tx.transactionDate;
+        amount = tx.amount;
+        currency = tx.currency;
+        accountId = tx.accountId;
+        description = tx.description;
+        metadata = tx.metadata ?? '';
+      })
+      .catch((e) => {
+        if (myEpoch !== editLoadEpoch) return;  // stale rejection
+        error = e instanceof Error ? e.message : String(e);
+      });
   });
 
   function isJsonValid(s: string): boolean {
