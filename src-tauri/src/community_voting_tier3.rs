@@ -813,6 +813,26 @@ pub fn ratification_candidates_ordering(
     ordered
 }
 
+// ── NoBeaconOracle stub ───────────────────────────────────────────────────────
+
+/// A `BeaconOracle` that always returns `None` (beacon not yet available).
+///
+/// Used in Phase 4a-main tests and in the dispatch layer before Task 10 wires
+/// the real `DfrostLogRegistry` handle. `verify_ss` returns
+/// `VerifyError::BeaconNotYetAvailable` when this oracle is in use.
+pub struct NoBeaconOracle;
+
+#[async_trait::async_trait]
+impl BeaconOracle for NoBeaconOracle {
+    async fn vrf_output_for(
+        &self,
+        _community_id: &crate::owner_state_types::SpaceId,
+        _seed: &[u8; 32],
+    ) -> Option<[u8; 32]> {
+        None
+    }
+}
+
 // ── Tier 3 PollResult payload ─────────────────────────────────────────────────
 
 /// Payload for kd=rs PollResult when tier == Tier::Sortition.

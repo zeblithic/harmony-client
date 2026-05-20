@@ -5,6 +5,7 @@
 //! state map. Zenoh sync wiring lives in Task 12; this file is the
 //! pure data structure + apply/materialize logic.
 
+use sha2::Digest;
 use std::collections::HashMap;
 
 use crate::community_voting_approval::{validate_poll_config, Tier1PollConfig, Tier1TallyState};
@@ -13,9 +14,10 @@ use crate::community_voting_conviction::{
     UndelegatePayload,
 };
 use crate::community_voting_core::{
-    derive_poll_id, next_lifecycle, Eligibility, Lifecycle, MembershipSnapshot, PollEventKindCode,
-    PollId, PollMeta, SignedVotingEvent, Tier,
+    derive_poll_id, next_lifecycle, Lifecycle, MembershipSnapshot, PollEventKindCode, PollId,
+    PollMeta, SignedVotingEvent, Tier, Tier3PollConfigPayload,
 };
+use crate::community_voting_tier3::{Tier3PollMeta, Tier3PollState};
 use crate::owner_state_types::Hlc;
 
 /// All voting events for a single community, plus the materialized
@@ -65,11 +67,16 @@ pub struct PollState {
 /// Tier-specific tally state. Each variant holds the materialized
 /// per-tier aggregate; the apply path picks the right variant at
 /// `PollCreate` time based on `event.tier`. Phase 1 ships only
-/// `Tier1`; Phase 2 adds `Tier2`.
+/// `Tier1`; Phase 2 adds `Tier2`; Phase 4a-main adds `Tier3`.
+///
+/// `Tier3` is boxed to avoid inflating every enum value to the size of the
+/// largest variant — `Tier3PollState` is significantly larger than `Tier1` +
+/// `Tier2` combined (clippy::large_enum_variant).
 #[derive(Debug, Clone)]
 pub enum TierState {
     Tier1(Tier1TallyState),
     Tier2(Tier2ProposalState),
+    Tier3(Box<Tier3PollState>),
 }
 
 impl TierState {
@@ -97,6 +104,18 @@ impl TierState {
             _ => None,
         }
     }
+    pub fn as_tier3(&self) -> Option<&Tier3PollState> {
+        match self {
+            TierState::Tier3(s) => Some(s),
+            _ => None,
+        }
+    }
+    pub fn as_tier3_mut(&mut self) -> Option<&mut Tier3PollState> {
+        match self {
+            TierState::Tier3(s) => Some(s),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +133,18 @@ pub enum ApplyError {
     /// Tier 2 Delegate event rejected by `DelegationGraph::apply_delegate`
     /// (cycle in the graph or HLC-LWW stale).
     DelegationRejected,
+    /// Tier 3 event kind not valid for the Tier 3 state machine
+    /// (e.g., BallotCast, PollOpen, PollExtend on a Sortition poll).
+    InvalidKindForTier3,
+    /// Tier 3 PollCreate with `retry_of = Some(prev)` but `prev` does not
+    /// exist in this log.
+    RetryOfPollNotFound,
+    /// Tier 3 PollCreate with `retry_of = Some(prev)` but `prev` is not in
+    /// Stage::Failed (only failed polls may be retried).
+    RetryOfPollNotFailed,
+    /// A Tier 3 event arrived for a poll that is not a Tier 3 poll (the
+    /// tier_state is not `Tier3`).
+    WrongTierStateForTier3Event,
 }
 
 impl VotingLog {
@@ -265,6 +296,41 @@ impl VotingLog {
             return Ok(poll_id);
         }
 
+        // ---- Tier 3 non-create events: route to Tier3PollState::apply_event ----
+        //
+        // Tier 3 polls have their own 4-stage state machine (Stage::Sortition /
+        // Deliberation / Drafting / Ratification / Finalized / Failed) that
+        // does NOT use the generic Lifecycle + next_lifecycle path.  All Tier 3
+        // event kinds except PollCreate are routed here and delegated to
+        // `Tier3PollState::apply_event`.
+        if event.tier == Tier::Sortition && event.kind != PollEventKindCode::PollCreate {
+            let state = self
+                .polls
+                .get_mut(&poll_id)
+                .ok_or(ApplyError::EventBeforePollCreate)?;
+            let tier3_state = state
+                .tier_state
+                .as_tier3_mut()
+                .ok_or(ApplyError::WrongTierStateForTier3Event)?;
+            tier3_state.apply_event(&event).map_err(|e| match e {
+                crate::community_voting_tier3::ApplyError::InvalidKindForTier3(_) => {
+                    ApplyError::InvalidKindForTier3
+                }
+                // Terminal-state rejections map to IllegalTransition.
+                crate::community_voting_tier3::ApplyError::PollInFailedState
+                | crate::community_voting_tier3::ApplyError::PollInFinalizedState
+                | crate::community_voting_tier3::ApplyError::HlcNotMonotonic => {
+                    ApplyError::IllegalTransition
+                }
+                crate::community_voting_tier3::ApplyError::PayloadDecode(_) => {
+                    ApplyError::PayloadDecode
+                }
+            })?;
+            state.events.push(event.clone());
+            self.events.push(event);
+            return Ok(poll_id);
+        }
+
         // ---- All other event kinds: existing lifecycle-driven path ----
 
         // For non-create events, require an existing poll. We check this
@@ -289,8 +355,9 @@ impl VotingLog {
             // (Conviction) decodes Tier2PollConfig, computes total_supply
             // from the caller-supplied snapshot (filtered by the
             // config's Eligibility), and seeds a `Tier2(Tier2ProposalState)`.
-            // Other tiers fall through to a minimal Tier1-shaped placeholder
-            // — they'll be replaced in their respective phases.
+            // Tier 3 (Sortition) decodes Tier3PollConfigPayload, validates it,
+            // checks retry_of predecessor (if any), and seeds a
+            // `Tier3(Tier3PollState)` with the supplied electorate snapshot.
             let (meta, tier1_cfg, tier_state) = if event.tier == Tier::Approval {
                 let cfg: Tier1PollConfig = ciborium::de::from_reader(&event.payload[..])
                     .map_err(|_| ApplyError::PayloadDecode)?;
@@ -371,26 +438,92 @@ impl VotingLog {
                 let proposal_state = Tier2ProposalState::new(cfg, total_supply);
                 (meta, None, TierState::Tier2(proposal_state))
             } else {
-                // Sortition (Tier 3) and future tiers: minimal placeholder.
+                // Tier 3 (Sortition) PollCreate: decode Tier3PollConfigPayload,
+                // validate it, check retry_of predecessor, build Tier3PollState.
+                debug_assert_eq!(event.tier, Tier::Sortition);
+                let cfg: Tier3PollConfigPayload = ciborium::de::from_reader(&event.payload[..])
+                    .map_err(|_| ApplyError::PayloadDecode)?;
+                crate::community_voting_tier3::validate_tier3_poll_config(&cfg)
+                    .map_err(|_| ApplyError::PayloadValidate)?;
+
+                // retry_of validation: if Some(prev_poll_id), the predecessor
+                // must exist and be in Stage::Failed. Predecessor may be in this
+                // log (local) or will be wired in Task 12 (peer-received path).
+                // For Phase 4a-main we validate against the local log only.
+                if let Some(prev_id) = cfg.retry_of {
+                    let prev_state = self
+                        .polls
+                        .get(&prev_id)
+                        .ok_or(ApplyError::RetryOfPollNotFound)?;
+                    // Check that the predecessor is a Tier 3 poll in Failed stage.
+                    let prev_t3 = prev_state
+                        .tier_state
+                        .as_tier3()
+                        .ok_or(ApplyError::RetryOfPollNotFailed)?;
+                    if prev_t3.stage != crate::community_voting_tier3::Stage::Failed {
+                        return Err(ApplyError::RetryOfPollNotFailed);
+                    }
+                }
+
+                // Derive the poll_create_event_hash from signing bytes.
+                let sb = event
+                    .signing_bytes()
+                    .map_err(|_| ApplyError::SigningBytesError)?;
+                let mut hasher = sha2::Sha256::new();
+                hasher.update(&sb);
+                let poll_create_event_hash: [u8; 32] = hasher.finalize().into();
+
+                // Electorate snapshot: callers pass it via `snapshot`. For peer-
+                // received PollCreate events pending Task 12, default to empty.
+                // The verify layer (Task 6) and engine (Task 10) supply the real
+                // snapshot for locally-originated events.
+                let eligible_electorate_snapshot: Vec<crate::owner_state_types::OwnerAddr> =
+                    snapshot
+                        .as_ref()
+                        .map(|snap| snap.members.keys().copied().collect())
+                        .unwrap_or_default();
+
+                let tier3_meta = Tier3PollMeta {
+                    poll_id,
+                    proposer: event.actor,
+                    poll_create_hlc: event.hlc.clone(),
+                    config: cfg.clone(),
+                    poll_create_event_hash,
+                    // community_epoch: Task 10 will wire the real value via
+                    // DfrostLogRegistry. For Phase 4a-main (before Task 10),
+                    // default to 0. The verify_ss path will fetch the real
+                    // epoch from the oracle, so this value is unused until
+                    // Task 10 supplies it.
+                    community_epoch: 0,
+                };
+                let tier3_state =
+                    Tier3PollState::new_from_create(tier3_meta, eligible_electorate_snapshot);
+
                 let meta = PollMeta {
                     poll_id,
                     community_id: *community_id,
                     creator: event.actor,
                     tier: event.tier,
-                    eligibility: Eligibility {
-                        min_power: 0,
-                        min_vouching_depth: None,
-                        sortition_size: None,
-                    },
+                    eligibility: cfg.eligibility,
                     lifecycle: next,
                     created_at: event.hlc.clone(),
                     opens_at: event.hlc.clone(),
-                    closes_at: event.hlc.clone(),
+                    // Tier 3 has a ratification window; closes_at is set to
+                    // `opens_at + dw + fw + rw` for display. The engine tick
+                    // does not use closes_at for Tier 3 (it uses Stage watermarks).
+                    closes_at: Hlc {
+                        wall_ms: event.hlc.wall_ms
+                            + (cfg.deliberation_window_seconds as u64 * 1000)
+                            + (cfg.drafting_window_seconds as u64 * 1000)
+                            + (cfg.ratification_window_seconds as u64 * 1000),
+                        logical: 0,
+                        device_id: event.hlc.device_id.clone(),
+                    },
                     extends_at: None,
                     channel_id: None,
                     finalized_at_ms: None,
                 };
-                (meta, None, TierState::Tier1(Tier1TallyState::empty(0)))
+                (meta, None, TierState::Tier3(Box::new(tier3_state)))
             };
             // Snapshot is only meaningful for Tier 1 in Phase 1; other
             // tiers have their own eligibility paths and we discard.
@@ -434,6 +567,7 @@ mod tests {
     use super::*;
     use crate::community_membership::ChannelId;
     use crate::community_voting_approval::Tier1PollConfig;
+    use crate::community_voting_core::Eligibility;
     use crate::owner_state_types::OwnerAddr;
     use crate::owner_state_types::SpaceId;
 
@@ -925,7 +1059,7 @@ impl VotingLog {
 #[cfg(test)]
 mod archive_tests {
     use super::*;
-    use crate::community_voting_core::Tier;
+    use crate::community_voting_core::{Eligibility, Tier};
     use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 
     fn make_event(kind: PollEventKindCode, wall_ms: u64) -> SignedVotingEvent {
@@ -1214,5 +1348,481 @@ mod archive_tests {
         );
         let archived = log.archive_finalized_polls(999 * 24 * 60 * 60 * 1000);
         assert!(archived.is_empty());
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// Task 8: Tier 3 dispatch smoke tests
+// ────────────────────────────────────────────────────────────────────────────────
+//
+// These tests verify that Tier 3 event kinds route correctly through
+// VotingLog::apply (the dispatch surface) and that the resulting Tier3PollState
+// holds the expected materialized state. Tier 1 and Tier 2 regression guards
+// are also included.
+//
+// verify_ss is async and needs a BeaconOracle. The NoBeaconOracle stub always
+// returns BeaconNotYetAvailable — that path is exercised in
+// `dispatch_tier3_kd_ss_without_beacon_returns_beacon_not_yet_available` below
+// directly via the verify_ss function (not via dispatch). The apply path for
+// kd=ss (materialize only) is exercised via Tier3PollState::apply_event, which
+// is what the dispatch routes to.
+#[cfg(test)]
+mod tier3_dispatch_tests {
+    use super::*;
+    use crate::community_voting_core::{
+        Eligibility, MiniPublicDeclinePayload, SortitionFailedPayload, SortitionSelectionPayload,
+        Tier, Tier3PollConfigPayload,
+    };
+    use crate::community_voting_tier3::{NoBeaconOracle, Stage, VerifyError};
+    use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+
+    // Local helper for encoding a pi-keyed CBOR map (mirrors the one in `mod tests`).
+    #[derive(serde::Serialize)]
+    struct PollIdRefHelper {
+        #[serde(rename = "pi")]
+        pi: PollId,
+    }
+
+    fn hlc(wall_ms: u64) -> Hlc {
+        Hlc {
+            wall_ms,
+            logical: 0,
+            device_id: "test".into(),
+        }
+    }
+
+    fn addr(byte: u8) -> OwnerAddr {
+        OwnerAddr([byte; 16])
+    }
+
+    fn cid() -> SpaceId {
+        SpaceId([0xcc; 16])
+    }
+
+    fn encode<T: serde::Serialize>(v: &T) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(v, &mut buf).expect("encode");
+        buf
+    }
+
+    fn tier3_config() -> Tier3PollConfigPayload {
+        Tier3PollConfigPayload {
+            proposal_text: "Charter amendment".into(),
+            sortition_size: 20,
+            deliberation_window_seconds: 100,
+            drafting_window_seconds: 100,
+            ratification_window_seconds: 100,
+            privacy_mode: "pu".into(),
+            incentive_mode: "a".into(),
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            retry_of: None,
+        }
+    }
+
+    fn tier3_create_event(
+        creator: OwnerAddr,
+        config: &Tier3PollConfigPayload,
+    ) -> SignedVotingEvent {
+        SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::PollCreate,
+            hlc: hlc(1000),
+            actor: creator,
+            payload: encode(config),
+            sig: vec![0u8; 64],
+        }
+    }
+
+    fn tier3_event_with_payload(
+        kind: PollEventKindCode,
+        wall_ms: u64,
+        actor: OwnerAddr,
+        payload: Vec<u8>,
+    ) -> SignedVotingEvent {
+        SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind,
+            hlc: hlc(wall_ms),
+            actor,
+            payload,
+            sig: vec![0u8; 64],
+        }
+    }
+
+    // ── Test 1: Tier 3 PollCreate creates a Tier3PollState ──────────────────────
+
+    #[test]
+    fn dispatch_tier3_poll_create_creates_tier3_poll_state() {
+        let mut log = VotingLog::new();
+        let creator = addr(0xaa);
+        let cfg = tier3_config();
+        let ev = tier3_create_event(creator, &cfg);
+        let pid = log.apply(ev, &cid()).expect("apply tier3 create");
+
+        let state = &log.polls[&pid];
+        assert_eq!(state.meta.tier, Tier::Sortition);
+        assert_eq!(state.meta.lifecycle, Lifecycle::Open);
+        let t3 = state
+            .tier_state
+            .as_tier3()
+            .expect("tier_state must be Tier3 variant");
+        assert_eq!(t3.stage, Stage::Sortition);
+        assert!(t3.sortition_result.is_none());
+        assert!(t3.candidates.is_empty());
+        assert!(t3.declines.is_empty());
+    }
+
+    // ── Test 2: kd=ss routes to Tier3PollState and sets sortition_result ────────
+
+    #[test]
+    fn dispatch_tier3_kd_ss_routes_to_tier3_poll_state() {
+        let mut log = VotingLog::new();
+        let creator = addr(0xaa);
+        let cfg = tier3_config();
+        let create_ev = tier3_create_event(creator, &cfg);
+        let pid = log.apply(create_ev, &cid()).expect("tier3 create");
+
+        let primary = vec![addr(1), addr(2)];
+        let backup = vec![addr(3), addr(4)];
+        let ss_payload = SortitionSelectionPayload {
+            poll_id: pid,
+            primary: primary.clone(),
+            backup: backup.clone(),
+        };
+        let ss_ev = tier3_event_with_payload(
+            PollEventKindCode::SortitionSelection,
+            2000,
+            addr(0xfe),
+            encode(&ss_payload),
+        );
+        log.apply(ss_ev, &cid()).expect("apply kd=ss");
+
+        let t3 = log.polls[&pid].tier_state.as_tier3().unwrap();
+        let sr = t3.sortition_result.as_ref().expect("sortition_result set");
+        assert_eq!(sr.primary, primary);
+        assert_eq!(sr.backup, backup);
+    }
+
+    // ── Test 3: verify_ss without oracle returns BeaconNotYetAvailable ──────────
+    //
+    // This test calls verify_ss directly (it's async) rather than through
+    // dispatch (which is sync and does not call verify_ss — verify is a
+    // separate concern from apply per the architecture).
+
+    #[test]
+    fn dispatch_tier3_kd_ss_without_beacon_returns_beacon_not_yet_available() {
+        // verify_ss is async; run it in a sync test via block_on.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            use crate::community_voting_tier3::{verify_ss, Tier3PollMeta, Tier3PollState};
+
+            let pid = PollId([0x01; 32]);
+            let meta = Tier3PollMeta {
+                poll_id: pid,
+                proposer: addr(0xff),
+                poll_create_hlc: hlc(1000),
+                config: Tier3PollConfigPayload {
+                    proposal_text: "test".into(),
+                    sortition_size: 5,
+                    deliberation_window_seconds: 100,
+                    drafting_window_seconds: 100,
+                    ratification_window_seconds: 100,
+                    privacy_mode: "pu".into(),
+                    incentive_mode: "a".into(),
+                    eligibility: Eligibility {
+                        min_power: 0,
+                        min_vouching_depth: None,
+                        sortition_size: None,
+                    },
+                    retry_of: None,
+                },
+                poll_create_event_hash: [0xaa; 32],
+                community_epoch: 0,
+            };
+            let electorate: Vec<OwnerAddr> = (0u8..10).map(|b| OwnerAddr([b; 16])).collect();
+            let poll_state = Tier3PollState::new_from_create(meta, electorate.clone());
+
+            let ss_payload = SortitionSelectionPayload {
+                poll_id: pid,
+                primary: vec![addr(0), addr(1)],
+                backup: vec![addr(2), addr(3)],
+            };
+            let ss_ev = SignedVotingEvent {
+                tag: 'p',
+                version: 1,
+                tier: Tier::Sortition,
+                kind: PollEventKindCode::SortitionSelection,
+                hlc: hlc(2000),
+                actor: addr(0xfe),
+                payload: encode(&ss_payload),
+                sig: vec![0u8; 64],
+            };
+
+            let oracle = NoBeaconOracle;
+            let community_id = cid();
+            let result = verify_ss(&ss_ev, &poll_state, &oracle, &community_id).await;
+            assert_eq!(result, Err(VerifyError::BeaconNotYetAvailable));
+        });
+    }
+
+    // ── Test 4: kd=md routes to apply_event and appends to declines ─────────────
+
+    #[test]
+    fn dispatch_tier3_kd_md_routes_to_apply_event() {
+        let mut log = VotingLog::new();
+        let creator = addr(0xaa);
+        let cfg = tier3_config();
+        let create_ev = tier3_create_event(creator, &cfg);
+        let pid = log.apply(create_ev, &cid()).expect("tier3 create");
+
+        // Apply kd=ss so sortition_result is set (not strictly needed for decline).
+        let ss_payload = SortitionSelectionPayload {
+            poll_id: pid,
+            primary: vec![addr(1)],
+            backup: vec![addr(2)],
+        };
+        log.apply(
+            tier3_event_with_payload(
+                PollEventKindCode::SortitionSelection,
+                1500,
+                addr(0xfe),
+                encode(&ss_payload),
+            ),
+            &cid(),
+        )
+        .expect("kd=ss");
+
+        let decline_payload = MiniPublicDeclinePayload {
+            poll_id: pid,
+            reason: None,
+        };
+        log.apply(
+            tier3_event_with_payload(
+                PollEventKindCode::MiniPublicDecline,
+                2000,
+                addr(1),
+                encode(&decline_payload),
+            ),
+            &cid(),
+        )
+        .expect("kd=md");
+
+        let t3 = log.polls[&pid].tier_state.as_tier3().unwrap();
+        assert_eq!(t3.declines.len(), 1);
+        assert_eq!(t3.declines[0].0, addr(1));
+    }
+
+    // ── Test 5: kd=sf transitions to Stage::Failed ───────────────────────────────
+
+    #[test]
+    fn dispatch_tier3_kd_sf_transitions_to_failed() {
+        let mut log = VotingLog::new();
+        let creator = addr(0xaa);
+        let cfg = tier3_config();
+        let create_ev = tier3_create_event(creator, &cfg);
+        let pid = log.apply(create_ev, &cid()).expect("tier3 create");
+
+        let sf_payload = SortitionFailedPayload { poll_id: pid };
+        log.apply(
+            tier3_event_with_payload(
+                PollEventKindCode::SortitionFailed,
+                2000,
+                creator,
+                encode(&sf_payload),
+            ),
+            &cid(),
+        )
+        .expect("kd=sf");
+
+        let t3 = log.polls[&pid].tier_state.as_tier3().unwrap();
+        assert_eq!(t3.stage, Stage::Failed);
+    }
+
+    // ── Test 6: invalid kind for Tier 3 is rejected at dispatch ─────────────────
+
+    #[test]
+    fn dispatch_tier3_invalid_kind_for_tier3_rejected() {
+        let mut log = VotingLog::new();
+        let creator = addr(0xaa);
+        let cfg = tier3_config();
+        let create_ev = tier3_create_event(creator, &cfg);
+        let pid = log.apply(create_ev, &cid()).expect("tier3 create");
+
+        // PollOpen is a Tier 1 only kind — invalid for Tier 3.
+        let open_ev = SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::PollOpen,
+            hlc: hlc(2000),
+            actor: creator,
+            // kd=op payload is a { "pi": ... } ref — encode with the pid.
+            payload: encode(&PollIdRefHelper { pi: pid }),
+            sig: vec![0u8; 64],
+        };
+        let err = log
+            .apply(open_ev, &cid())
+            .expect_err("PollOpen on Tier3 must fail");
+        assert_eq!(err, ApplyError::InvalidKindForTier3);
+    }
+
+    // ── Test 7: Tier 1 path still works after adding Tier 3 ─────────────────────
+
+    #[test]
+    fn dispatch_tier1_paths_unchanged() {
+        let mut log = VotingLog::new();
+        let cid = cid();
+        let creator = addr(0xaa);
+
+        // Use the Tier 1 helpers from the existing tests module.
+        use crate::community_membership::ChannelId;
+        use crate::community_voting_approval::Tier1PollConfig;
+
+        let t1_cfg = Tier1PollConfig {
+            options: vec!["A".into(), "B".into()],
+            window_seconds: 3600,
+            quorum: None,
+            threshold_percent: None,
+            multi_winner: None,
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            channel_id: ChannelId([0x11; 16]),
+        };
+        let mut payload = Vec::new();
+        ciborium::into_writer(&t1_cfg, &mut payload).expect("encode t1 cfg");
+
+        let create_ev = SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Approval,
+            kind: PollEventKindCode::PollCreate,
+            hlc: hlc(1000),
+            actor: creator,
+            payload,
+            sig: vec![0u8; 64],
+        };
+        let pid = log.apply(create_ev, &cid).expect("tier1 create");
+        let state = &log.polls[&pid];
+        assert_eq!(state.meta.tier, Tier::Approval);
+        assert_eq!(state.meta.lifecycle, Lifecycle::Open);
+        assert!(state.tier_state.as_tier1().is_some());
+        assert!(state.tier_state.as_tier3().is_none());
+    }
+
+    // ── Test 8: retry_of with existing Failed poll accepted ──────────────────────
+
+    #[test]
+    fn dispatch_retry_of_existing_failed_poll_accepted() {
+        let mut log = VotingLog::new();
+        let creator = addr(0xaa);
+
+        // Create the first poll (predecessor).
+        let cfg1 = tier3_config();
+        let create_ev1 = tier3_create_event(creator, &cfg1);
+        let prev_pid = log.apply(create_ev1, &cid()).expect("first create");
+
+        // Apply kd=sf to fail it.
+        let sf_payload = SortitionFailedPayload { poll_id: prev_pid };
+        log.apply(
+            tier3_event_with_payload(
+                PollEventKindCode::SortitionFailed,
+                2000,
+                creator,
+                encode(&sf_payload),
+            ),
+            &cid(),
+        )
+        .expect("kd=sf");
+
+        // Retry poll references the failed predecessor.
+        let mut cfg2 = tier3_config();
+        cfg2.retry_of = Some(prev_pid);
+        let create_ev2 = SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::PollCreate,
+            hlc: hlc(3000),
+            actor: creator,
+            payload: encode(&cfg2),
+            sig: vec![0u8; 64],
+        };
+        let retry_pid = log.apply(create_ev2, &cid()).expect("retry create");
+        // Should be a different poll_id.
+        assert_ne!(retry_pid, prev_pid);
+        // The retry poll should be in Sortition stage.
+        let t3 = log.polls[&retry_pid].tier_state.as_tier3().unwrap();
+        assert_eq!(t3.stage, Stage::Sortition);
+    }
+
+    // ── Test 9: retry_of with nonexistent poll rejected ──────────────────────────
+
+    #[test]
+    fn dispatch_retry_of_nonexistent_poll_rejected() {
+        let mut log = VotingLog::new();
+        let creator = addr(0xaa);
+        let phantom_pid = PollId([0x99; 32]);
+
+        let mut cfg = tier3_config();
+        cfg.retry_of = Some(phantom_pid);
+        let create_ev = SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::PollCreate,
+            hlc: hlc(1000),
+            actor: creator,
+            payload: encode(&cfg),
+            sig: vec![0u8; 64],
+        };
+        let err = log
+            .apply(create_ev, &cid())
+            .expect_err("retry_of nonexistent must fail");
+        assert_eq!(err, ApplyError::RetryOfPollNotFound);
+    }
+
+    // ── Test 10: retry_of with non-failed poll rejected ───────────────────────────
+
+    #[test]
+    fn dispatch_retry_of_non_failed_poll_rejected() {
+        let mut log = VotingLog::new();
+        let creator = addr(0xaa);
+
+        // Create the predecessor poll but do NOT fail it (leave it in Sortition stage).
+        let cfg1 = tier3_config();
+        let create_ev1 = tier3_create_event(creator, &cfg1);
+        let prev_pid = log.apply(create_ev1, &cid()).expect("first create");
+
+        // Retry poll references the still-active predecessor.
+        let mut cfg2 = tier3_config();
+        cfg2.retry_of = Some(prev_pid);
+        let create_ev2 = SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::PollCreate,
+            hlc: hlc(2000),
+            actor: creator,
+            payload: encode(&cfg2),
+            sig: vec![0u8; 64],
+        };
+        let err = log
+            .apply(create_ev2, &cid())
+            .expect_err("retry_of non-failed must fail");
+        assert_eq!(err, ApplyError::RetryOfPollNotFailed);
     }
 }
