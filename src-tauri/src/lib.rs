@@ -22396,8 +22396,15 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
     let hlc =
         crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
 
-    // 5. Build the round-specific event (sealed dr rn=2 OR dk).
-    let event_to_apply = if round_num == 2 {
+    // 5. Build the round-specific event (sealed dr rn=2 OR dk). Each
+    //    branch returns `(event, self_x25519_priv)` — the outbox lock
+    //    is acquired ONCE per branch to produce both values together
+    //    (R4-2 Greptile P2: avoid double-lock; both reads access the
+    //    same `Arc<SigningKey>` and neither mutates the outbox).
+    let (event_to_apply, self_x25519_priv): (
+        crate::community_dfrost_types::SignedCommitteeEvent,
+        [u8; 32],
+    ) = if round_num == 2 {
         // ─── ROUND 2 ──────────────────────────────────────────────────
         //
         // Snapshot pending state: members (for OwnerAddr↔Identifier
@@ -22533,7 +22540,9 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
             log.local_dkg_secret2 = Some(r2_secret);
         }
 
-        // Build the dr rn=2 payload + sign the envelope.
+        // Build the dr rn=2 payload + sign the envelope. R4-2: consolidate
+        // outbox lock — produce signed event + self's X25519 priv (needed
+        // by apply_with_identity below) in a single lock acquisition.
         let payload = crate::community_dfrost_types::DkgRoundPayload {
             ceremony_id: ceremony_bytes,
             round_num: 2,
@@ -22542,14 +22551,16 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
         };
         let outbox_g = dm_outbox.lock().await;
         let signing_key = outbox_g.signing_key.as_ref();
-        crate::community_dfrost_log::build_signed_dfrost_event(
+        let ev = crate::community_dfrost_log::build_signed_dfrost_event(
             signing_key,
             self_owner,
             crate::community_dfrost_types::DfrostEventKind::DkgRound,
             &payload,
             hlc,
         )
-        .map_err(|e| format!("dfrost_contribute_dkg_round: build_signed: {e}"))?
+        .map_err(|e| format!("dfrost_contribute_dkg_round: build_signed: {e}"))?;
+        let x_priv: [u8; 32] = *crate::dm_signing::ed25519_priv_to_x25519(signing_key);
+        (ev, x_priv)
     } else {
         // ─── ROUND 3 ──────────────────────────────────────────────────
         //
@@ -22699,30 +22710,30 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
             threshold,
             max_signers,
         };
+        // R4-2 (Greptile P2): consolidate the outbox lock for the dk
+        // event path — one acquisition produces both the signed event
+        // AND self's X25519 priv (used by apply_with_identity below).
+        // Both reads access the same `Arc<SigningKey>` and neither
+        // mutates the outbox.
         let outbox_g = dm_outbox.lock().await;
         let signing_key = outbox_g.signing_key.as_ref();
-        crate::community_dfrost_log::build_signed_dfrost_event(
+        let ev = crate::community_dfrost_log::build_signed_dfrost_event(
             signing_key,
             self_owner,
             crate::community_dfrost_types::DfrostEventKind::DkgComplete,
             &payload,
             hlc,
         )
-        .map_err(|e| format!("dfrost_contribute_dkg_round: build_signed: {e}"))?
+        .map_err(|e| format!("dfrost_contribute_dkg_round: build_signed: {e}"))?;
+        let x_priv: [u8; 32] = *crate::dm_signing::ed25519_priv_to_x25519(signing_key);
+        (ev, x_priv)
     };
 
-    // 6. Derive self's X25519 priv (needed by apply_with_identity for the
-    //    rn=2 round-trip decrypt — apply_with_identity only touches the
-    //    decrypt path for incoming rn=2 events, but the local rn=2 event
-    //    we built above contains a ciphertext sealed-to-self for every
-    //    other recipient; apply_with_identity ignores those since none
-    //    target self_owner). For dk events apply_with_identity falls
-    //    through to apply() per the impl.
-    let self_x25519_priv: [u8; 32] = {
-        let outbox_g = dm_outbox.lock().await;
-        let signing_key = outbox_g.signing_key.as_ref();
-        *crate::dm_signing::ed25519_priv_to_x25519(signing_key)
-    };
+    // 6. (Apply path below uses the X25519 priv derived in the same
+    //    outbox-lock window as build_signed above. For dk events
+    //    apply_with_identity falls through to apply() per the impl; for
+    //    the local rn=2 event the ciphertexts target peers only, so the
+    //    decrypt branch is also a no-op for self.)
 
     // 7. Apply locally.
     {
@@ -22928,25 +22939,26 @@ async fn dfrost_request_vrf_beacon<R: tauri::Runtime>(
     let hlc =
         crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
 
-    let event = {
+    // R4-2 (Greptile P2): consolidate the outbox lock — previously this
+    // acquired the lock twice (once to sign the event, once to derive
+    // self's X25519 priv for `apply_with_identity`). Both reads access
+    // the same `Arc<SigningKey>` and neither mutates the outbox; one
+    // acquisition produces both values. The X25519 priv is required by
+    // the apply signature but `ts` falls through to `apply()` without
+    // using it (no per-recipient seal on a ts event).
+    let (event, self_x25519_priv) = {
         let outbox_g = dm_outbox.lock().await;
         let signing_key = outbox_g.signing_key.as_ref();
-        crate::community_dfrost_log::build_signed_dfrost_event(
+        let ev = crate::community_dfrost_log::build_signed_dfrost_event(
             signing_key,
             self_owner,
             crate::community_dfrost_types::DfrostEventKind::ThresholdSign,
             &payload,
             hlc,
         )
-        .map_err(|e| format!("dfrost_request_vrf_beacon: build_signed: {e}"))?
-    };
-
-    // 8. Derive self's X25519 priv for `apply_with_identity` (required
-    //    by signature; `ts` falls through to `apply()` without using it).
-    let self_x25519_priv: [u8; 32] = {
-        let outbox_g = dm_outbox.lock().await;
-        let signing_key = outbox_g.signing_key.as_ref();
-        *crate::dm_signing::ed25519_priv_to_x25519(signing_key)
+        .map_err(|e| format!("dfrost_request_vrf_beacon: build_signed: {e}"))?;
+        let x_priv: [u8; 32] = *crate::dm_signing::ed25519_priv_to_x25519(signing_key);
+        (ev, x_priv)
     };
 
     // 9. Apply locally, then stash the secret nonces on the freshly-
@@ -23063,29 +23075,44 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
             .clone()
     };
 
-    // 4. Read state, decode nonces + commitments, build SigningPackage.
-    //    Snapshot the KeyPackage + PublicKeyPackage now so we don't hold
-    //    the log lock across the FROST signing call.
+    // 4. Read state, decode nonces + commitments, build the canonical
+    //    SigningPackage. Snapshot the KeyPackage + PublicKeyPackage now so
+    //    we don't hold the log lock across the FROST signing call.
     //
-    //    R2 CRITICAL: the nonce extraction MUST happen via
-    //    `Option::take()` under the SAME lock that performs the quorum
-    //    check. Previously this used `as_ref().clone()` (under lock) and
-    //    cleared `local_nonces = None` in a SECOND lock acquisition
-    //    AFTER `round2::sign`. Two concurrent IPC calls would both
-    //    observe `local_nonces = Some(_)` in the first lock window and
-    //    both invoke `round2::sign` with the same nonces — FROST nonce
-    //    reuse is secret-share-extracting per spec §6.2. `take()` swaps
-    //    to `None` atomically under the same lock, so the second caller
-    //    bails on the None-check below.
+    //    R4 CRITICAL (Greptile P1): both `round2::sign` AND
+    //    `frost::aggregate` MUST use the SAME `SigningPackage`. FROST
+    //    signature shares bind to the package's Fiat-Shamir challenge
+    //    `c = H(R || M || X)` where R is the AGGREGATE commitment over
+    //    the signing set — recomputing the challenge from a different
+    //    commitment set means `s_aggregate != R + c · X` and aggregation
+    //    fails verification. Before this fix, step 4 built the package
+    //    from EVERY contribution, but step 8 rebuilt a smaller selection
+    //    package for aggregate; invisible at 2-of-2 (selection == full
+    //    set) but broken for every real-world threshold < max_signers.
+    //
+    //    Fix — deterministic canonical signing set: take the first
+    //    `threshold` peers by sorted OwnerAddr (all peers' BTreeMap
+    //    iteration order is identical, so every replica selects the
+    //    same set). Self MUST be in the selection set to produce a
+    //    share; aggregation rebuilds the same package from the same
+    //    selection. By construction, signing-package matches across
+    //    every signer + the aggregator.
+    //
+    //    R2 CRITICAL (preserved): nonce extraction is `Option::take()`
+    //    under the SAME lock as the quorum check. Two concurrent IPC
+    //    calls can't both witness `Some(_)` and race into
+    //    `round2::sign` with the same nonces (FROST nonce reuse is
+    //    secret-share-extracting per spec §6.2).
     let (
         key_package,
         pub_key_package,
         members,
-        threshold,
+        _threshold,
         message_hash,
         my_commitment_bytes,
         nonces,
         signing_package,
+        signing_set,
     ) = {
         let mut log = log_arc.lock().await;
         if !log.committee_state.active {
@@ -23123,6 +23150,33 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
             ));
         }
 
+        // R4 CRITICAL: compute the canonical signing set = first
+        // `threshold` peers by sorted OwnerAddr among those who've
+        // committed. BTreeMap iteration is sorted-by-key already, so
+        // every replica (signer + aggregator) sees the same ordering.
+        let signing_set: Vec<crate::owner_state_types::OwnerAddr> = pending
+            .contributions
+            .keys()
+            .copied()
+            .take(threshold as usize)
+            .collect();
+        debug_assert_eq!(
+            signing_set.len(),
+            threshold as usize,
+            "len-check above guarantees ≥ threshold contributions"
+        );
+
+        // If self isn't in the canonical signing set, don't produce a
+        // share — another signer will. Bail BEFORE consuming nonces.
+        if !signing_set.contains(&self_owner) {
+            return Err(format!(
+                "dfrost_contribute_threshold_sign: not selected as threshold signer for this \
+                 ceremony — canonical set = first {threshold} sorted OwnerAddrs among \
+                 contributors; self not present. Wait for a beacon-ready event from a \
+                 selected signer.",
+            ));
+        }
+
         // R2 CRITICAL: atomic single-use nonce consumption. `take()`
         // replaces `Some(_)` with `None` in a single &mut access — any
         // concurrent IPC racing past the quorum check above will see
@@ -23142,15 +23196,20 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
                 format!("dfrost_contribute_threshold_sign: decode local_nonces: {e}")
             })?;
 
-        // Build commitments_map: Identifier → SigningCommitments. Iterate
-        // EVERY contribution, not just self's — the SigningPackage must
-        // include each signer that will provide a share. Members without
-        // a contribution cannot sign this ceremony.
+        // Build commitments_map for the CANONICAL signing set only —
+        // NOT every contribution. This is the load-bearing R4 fix: every
+        // signer + the aggregator builds an identical SigningPackage
+        // from the same selected subset, so the Fiat-Shamir challenge
+        // matches across all parties.
         let mut commitments_map: std::collections::BTreeMap<
             frost_ristretto255::Identifier,
             frost_ristretto255::round1::SigningCommitments,
         > = std::collections::BTreeMap::new();
-        for (addr, (commitment_bytes, _share_bytes)) in &pending.contributions {
+        for addr in &signing_set {
+            let (commitment_bytes, _share_bytes) = pending.contributions.get(addr).ok_or(
+                "dfrost_contribute_threshold_sign: signing-set member missing from contributions \
+                 (should be unreachable — signing_set is derived from contributions.keys())",
+            )?;
             let idx = members.iter().position(|a| *a == *addr).ok_or(
                 "dfrost_contribute_threshold_sign: contribution from non-committee member",
             )?;
@@ -23192,6 +23251,7 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
             my_commitment_bytes,
             nonces,
             signing_package,
+            signing_set,
         )
     };
 
@@ -23226,26 +23286,26 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
     let hlc =
         crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
 
-    let event = {
+    // R4-2 (Greptile P2): consolidate the outbox lock — previously this
+    // acquired the lock twice (once to sign the event, once to derive
+    // self's X25519 priv). Both reads access the same `Arc<SigningKey>`
+    // and neither mutates the outbox; one acquisition produces both
+    // values. Self's X25519 priv is required by `apply_with_identity`
+    // (the `ts` apply path never decrypts since there's no per-recipient
+    // seal, but the signature requires the parameter).
+    let (event, self_x25519_priv) = {
         let outbox_g = dm_outbox.lock().await;
         let signing_key = outbox_g.signing_key.as_ref();
-        crate::community_dfrost_log::build_signed_dfrost_event(
+        let ev = crate::community_dfrost_log::build_signed_dfrost_event(
             signing_key,
             self_owner,
             crate::community_dfrost_types::DfrostEventKind::ThresholdSign,
             &payload,
             hlc,
         )
-        .map_err(|e| format!("dfrost_contribute_threshold_sign: build_signed: {e}"))?
-    };
-
-    // Self's X25519 priv for `apply_with_identity`. The `ts` apply path
-    // never touches the decrypt branch (no per-recipient seal), but the
-    // signature requires the parameter.
-    let self_x25519_priv: [u8; 32] = {
-        let outbox_g = dm_outbox.lock().await;
-        let signing_key = outbox_g.signing_key.as_ref();
-        *crate::dm_signing::ed25519_priv_to_x25519(signing_key)
+        .map_err(|e| format!("dfrost_contribute_threshold_sign: build_signed: {e}"))?;
+        let x_priv: [u8; 32] = *crate::dm_signing::ed25519_priv_to_x25519(signing_key);
+        (ev, x_priv)
     };
 
     {
@@ -23266,9 +23326,14 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
             })?;
     }
 
-    // 7. Post-apply: did this share push the contribution-with-share count
-    //    over threshold? The initial Task 4 `ts(empty share)` events from
-    //    request_vrf_beacon do NOT count — they have `share_bytes.is_empty()`.
+    // 7. Post-apply: do ALL members of the canonical signing set have
+    //    filled shares? Aggregation can only proceed when every member of
+    //    the deterministically-selected set has posted their share-bearing
+    //    `ts`. Earlier code only counted TOTAL filled shares across ALL
+    //    contributions (R4 bug): with a 2-of-3 ceremony, if Alice + Carol
+    //    (set {A,B} canonical, Carol extra) both posted shares while Bob
+    //    hadn't, the count == 2 would trigger aggregation against shares
+    //    that don't match the canonical-set commitments.
     let aggregation_possible = {
         let log = log_arc.lock().await;
         let pending = log
@@ -23276,36 +23341,38 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
             .pending_sign
             .get(&ceremony_bytes)
             .ok_or("dfrost_contribute_threshold_sign: pending_sign vanished after share apply")?;
-        let with_share = pending
-            .contributions
-            .values()
-            .filter(|(_, share)| !share.is_empty())
-            .count();
-        with_share >= threshold as usize
+        signing_set.iter().all(|addr| {
+            pending
+                .contributions
+                .get(addr)
+                .map(|(_, share)| !share.is_empty())
+                .unwrap_or(false)
+        })
     };
 
     if !aggregation_possible {
         return Ok(());
     }
 
-    // 8. Aggregate: build SignatureShare map, call frost::aggregate, derive
-    //    VRF output, build + apply `vb`, emit dfrost-beacon-ready.
+    // 8. Aggregate. R4 CRITICAL: build the SignatureShare map from the
+    //    SAME canonical `signing_set` we selected in step 4, and REUSE
+    //    the `signing_package` from step 4 (NOT a freshly-built one). By
+    //    construction:
     //
-    //    R2-2 MEDIUM: select EXACTLY `threshold` actors and build BOTH
-    //    the SigningPackage and the shares_map from the SAME selection.
-    //    The earlier signing_package (built in step 4) iterates every
-    //    contribution and so may have more commitments than there are
-    //    shares once race-y peers contribute past quorum; passing
-    //    mismatched maps to `frost::aggregate` is rejected. Re-deriving
-    //    both maps here from one filtered selection guarantees
-    //    `commitments_map.keys() == shares_map.keys()`.
+    //      * Every signer's `round2::sign` ran against this same
+    //        `signing_package` (they all derived the same canonical
+    //        signing_set from sorted contribution keys).
+    //      * The aggregator's `signing_package` (built here, same as
+    //        every signer's) produces the same Fiat-Shamir challenge.
+    //      * `commitments_map.keys() == shares_map.keys()` = identifiers
+    //        of the canonical signing set.
     //
-    //    Selection rule: filter to non-empty `share_bytes` (only signers
-    //    that posted a share can aggregate), then take the first
-    //    `threshold` in BTreeMap iteration order (sorted by OwnerAddr
-    //    deterministically across replicas). Self is guaranteed in the
-    //    set because we just applied our own share above.
-    let (selection_signing_package, shares_map) = {
+    //    Before the R4 fix this rebuilt a separate `selection_signing_package`
+    //    from non-empty-share contributions — which could match a
+    //    DIFFERENT subset than each signer ran `round2::sign` against,
+    //    silently breaking aggregation for every threshold < max_signers
+    //    scheme. The 2-of-2 test couldn't expose it (full set == selection).
+    let shares_map = {
         let log = log_arc.lock().await;
         // R3 (round-3 bot-review MINOR): NOT an expect(). The
         // `aggregation_possible` check above released the log lock before
@@ -23321,65 +23388,44 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
             .get(&ceremony_bytes)
             .ok_or(
                 "dfrost_contribute_threshold_sign: pending_sign vanished between quorum check \
-             and aggregation snapshot — concurrent ceremony state change",
+                 and aggregation snapshot — concurrent ceremony state change",
             )?;
-        let selected: Vec<_> = pending
-            .contributions
-            .iter()
-            .filter(|(_, (_, share))| !share.is_empty())
-            .take(threshold as usize)
-            .map(|(addr, (commit, share))| (*addr, commit.clone(), share.clone()))
-            .collect();
-        if selected.len() < threshold as usize {
-            return Err(format!(
-                "dfrost_contribute_threshold_sign: internal: aggregation triggered with {} \
-                 shares, need {threshold}",
-                selected.len(),
-            ));
-        }
 
-        let mut commitments_map: std::collections::BTreeMap<
-            frost_ristretto255::Identifier,
-            frost_ristretto255::round1::SigningCommitments,
-        > = std::collections::BTreeMap::new();
         let mut shares_map: std::collections::BTreeMap<
             frost_ristretto255::Identifier,
             frost_ristretto255::round2::SignatureShare,
         > = std::collections::BTreeMap::new();
 
-        for (addr, commit_bytes, share_bytes) in &selected {
+        for addr in &signing_set {
+            let (_, share_bytes) = pending.contributions.get(addr).ok_or(
+                "dfrost_contribute_threshold_sign: canonical-signing-set member vanished from \
+                 contributions between quorum check and aggregation — concurrent ceremony \
+                 state change",
+            )?;
+            if share_bytes.is_empty() {
+                return Err(format!(
+                    "dfrost_contribute_threshold_sign: canonical-signing-set member {} share \
+                     emptied between quorum check and aggregation — concurrent ceremony state \
+                     change",
+                    hex::encode(addr.0)
+                ));
+            }
             let idx = members.iter().position(|a| *a == *addr).ok_or(
                 "dfrost_contribute_threshold_sign: share contribution from non-committee member",
             )?;
             let id = crate::community_dfrost_crypto::identifier_for_index(idx);
-            let commit: frost_ristretto255::round1::SigningCommitments =
-                ciborium::from_reader(&commit_bytes[..]).map_err(|e| {
-                    format!(
-                        "dfrost_contribute_threshold_sign: decode peer commitment for aggregate: \
-                         {e}"
-                    )
-                })?;
             let share: frost_ristretto255::round2::SignatureShare =
                 ciborium::from_reader(&share_bytes[..]).map_err(|e| {
                     format!("dfrost_contribute_threshold_sign: decode SignatureShare: {e}")
                 })?;
-            commitments_map.insert(id, commit);
             shares_map.insert(id, share);
         }
 
-        let selection_signing_package =
-            frost_ristretto255::SigningPackage::new(commitments_map, &message_hash);
-        (selection_signing_package, shares_map)
+        shares_map
     };
 
-    // Drop the now-stale signing_package built in step 4 (it iterated
-    // every contribution, which may exceed the threshold-sized
-    // shares_map).
-    let _ = signing_package;
-
-    let signature =
-        frost_ristretto255::aggregate(&selection_signing_package, &shares_map, &pub_key_package)
-            .map_err(|e| format!("dfrost_contribute_threshold_sign: aggregate: {e}"))?;
+    let signature = frost_ristretto255::aggregate(&signing_package, &shares_map, &pub_key_package)
+        .map_err(|e| format!("dfrost_contribute_threshold_sign: aggregate: {e}"))?;
     let sig_bytes: Vec<u8> = signature
         .serialize()
         .map_err(|e| format!("dfrost_contribute_threshold_sign: serialize signature: {e}"))?;

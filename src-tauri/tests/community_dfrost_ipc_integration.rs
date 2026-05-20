@@ -1012,14 +1012,17 @@ fn request_vrf_beacon_local(
 }
 
 /// Mirror `dfrost_contribute_threshold_sign` step 4-6 for a single node:
-/// decode stashed nonces, build the `commitments_map` from every
-/// `pending_sign.contributions` entry, build the `SigningPackage`, run
+/// decode stashed nonces, build the `commitments_map` from the canonical
+/// signing set (first `threshold` peers by sorted OwnerAddr among
+/// contributors — R4 Greptile P1 fix), build the `SigningPackage`, run
 /// `frost::round2::sign`, then build + apply a share-bearing `ts` event
 /// reusing the existing `commitment_bytes`.
 ///
 /// Returns `(event, signing_package)` — the caller cross-applies the
-/// event on peers, and feeds `signing_package` into `frost::aggregate`
-/// once threshold is reached.
+/// event on peers, and feeds the SAME `signing_package` into
+/// `frost::aggregate` once threshold is reached (R4 critical: signers +
+/// aggregator must use byte-identical SigningPackages or FROST shares
+/// won't verify under the recomputed Fiat-Shamir challenge).
 #[allow(clippy::too_many_arguments)]
 fn contribute_threshold_sign_local(
     log: &DfrostLog,
@@ -1033,7 +1036,8 @@ fn contribute_threshold_sign_local(
     harmony_app::community_dfrost_types::SignedCommitteeEvent,
     frost::SigningPackage,
 ) {
-    // 1. Snapshot: decode nonces + every contribution's commitments,
+    let threshold = log.committee_state.threshold;
+    // 1. Snapshot: decode nonces + the canonical-signing-set's commitments,
     //    grab message_hash and self's commitment_bytes for reuse.
     let (nonces, signing_package, my_commitment_bytes, message_hash) = {
         let pending = log
@@ -1049,12 +1053,30 @@ fn contribute_threshold_sign_local(
         let nonces: frost::round1::SigningNonces =
             ciborium::from_reader(&nonces_cbor[..]).expect("decode local nonces");
 
-        // Build commitments_map: Identifier → SigningCommitments. Iterate
-        // every contribution, not just self's — the SigningPackage must
-        // include every signer that will provide a share.
+        // R4 Greptile P1 fix: build commitments_map from the canonical
+        // signing set — first `threshold` peers by sorted OwnerAddr
+        // (BTreeMap iteration is sorted by key). Every signer + the
+        // aggregator computes the SAME set deterministically, so every
+        // party's SigningPackage is byte-identical — Fiat-Shamir
+        // challenge matches across signers and the aggregator.
+        let signing_set: Vec<OwnerAddr> = pending
+            .contributions
+            .keys()
+            .copied()
+            .take(threshold as usize)
+            .collect();
+        assert!(
+            signing_set.contains(&self_addr),
+            "test helper requires self to be in canonical signing set"
+        );
+
         let mut commitments_map: BTreeMap<Identifier, frost::round1::SigningCommitments> =
             BTreeMap::new();
-        for (addr, (commitment_bytes, _share_bytes)) in &pending.contributions {
+        for addr in &signing_set {
+            let (commitment_bytes, _share_bytes) = pending
+                .contributions
+                .get(addr)
+                .expect("canonical signer present (derived from contributions.keys())");
             let idx = members
                 .iter()
                 .position(|a| *a == *addr)
@@ -1929,4 +1951,639 @@ async fn refresh_ipc_round_trip_two_engine_preserves_joint_vk() {
     );
     assert_eq!(log_a.committee_state.threshold, threshold);
     assert_eq!(log_b.committee_state.threshold, threshold);
+}
+
+// ─── R4-1 regression: threshold-sign with `threshold < max_signers` ────────
+//
+// The R4 (round-4 Greptile P1 CRITICAL) bug: `round2::sign` was called with
+// a `SigningPackage` built from EVERY contribution in `pending.contributions`
+// (full set), but `frost::aggregate` rebuilt a SMALLER `selection_signing_package`
+// from the first `threshold` non-empty-share contributions. FROST partial
+// signature shares bind to the package's Fiat-Shamir challenge
+// `c = H(R || M || X)`, where R is the aggregate commitment over the
+// signing set; a different signing set yields a different R, a different c,
+// and `s_aggregate != R + c · X` — aggregate fails verification.
+//
+// Invisible at 2-of-2 because selection == full set, but breaks every
+// real-world threshold scheme. This test exercises 2-of-3 to lock the fix
+// in: BEFORE R4 fix this test FAILS at `frost::aggregate`; AFTER R4 fix it
+// PASSES because every signer + the aggregator builds the SAME signing
+// package from the canonical signing set (first `threshold` sorted-addr
+// contributors).
+
+const CAROL: OwnerAddr = OwnerAddr([0x03; 16]);
+
+fn carol_ed25519_sk() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[0xCCu8; 32])
+}
+fn carol_x25519_priv() -> [u8; 32] {
+    *dm_signing::ed25519_priv_to_x25519(&carol_ed25519_sk())
+}
+fn carol_x25519_pub() -> [u8; 32] {
+    *PublicKey::from(&StaticSecret::from(carol_x25519_priv())).as_bytes()
+}
+
+fn sorted_members_3() -> Vec<OwnerAddr> {
+    // ALICE < BOB < CAROL byte-wise — sorted order matches the IPC's
+    // `member_addrs.sort()`. Canonical signing set for threshold=2 is
+    // therefore {ALICE, BOB}: the first two by sorted OwnerAddr.
+    vec![ALICE, BOB, CAROL]
+}
+
+/// 3-engine 2-of-3 DKG ceremony via the IPC event-construction path.
+/// Mirrors `dkg_complete_two_engine_via_ipc_path()` but adds a third
+/// member; returns all three engines + their KeyPackages + a shared
+/// PublicKeyPackage (every DKG member converges on byte-identical pub
+/// pkg per the DKG invariant) + the sorted member list.
+#[allow(clippy::type_complexity)]
+fn dkg_complete_three_engine_2of3_via_ipc_path() -> (
+    DfrostLog,
+    DfrostLog,
+    DfrostLog,
+    KeyPackage,
+    KeyPackage,
+    KeyPackage,
+    PublicKeyPackage,
+    Vec<OwnerAddr>,
+) {
+    let mut log_a = DfrostLog::new();
+    let mut log_b = DfrostLog::new();
+    let mut log_c = DfrostLog::new();
+
+    let members = sorted_members_3();
+    let threshold: u16 = 2;
+    let max_signers: u16 = 3;
+    let proposed_epoch: u64 = 1;
+
+    let id_alice = identifier_for_index(0);
+    let id_bob = identifier_for_index(1);
+    let id_carol = identifier_for_index(2);
+
+    let recipient_pubs: BTreeMap<OwnerAddr, [u8; 32]> = [
+        (ALICE, alice_x25519_pub()),
+        (BOB, bob_x25519_pub()),
+        (CAROL, carol_x25519_pub()),
+    ]
+    .into_iter()
+    .collect();
+
+    let alice_sk = alice_ed25519_sk();
+    let bob_sk = bob_ed25519_sk();
+    let carol_sk = carol_ed25519_sk();
+    let alice_x_priv = alice_x25519_priv();
+    let bob_x_priv = bob_x25519_priv();
+    let carol_x_priv = carol_x25519_priv();
+
+    // ── Round 1: Alice initiates; Bob + Carol contribute their own dr rn=1
+    let alice_init_hlc = hlc_at(1_000, "alice");
+    let ceremony_id = derive_ceremony_id(
+        &members,
+        threshold,
+        alice_init_hlc.wall_ms,
+        alice_init_hlc.logical,
+        &TEST_SPACE_ID,
+    );
+
+    let dr1_alice = initiate_dkg_local(
+        &mut log_a,
+        ALICE,
+        id_alice,
+        &members,
+        threshold,
+        max_signers,
+        proposed_epoch,
+        ceremony_id,
+        alice_init_hlc,
+        &alice_sk,
+        &alice_x_priv,
+    );
+
+    // Bob + Carol need pending_dkg pre-seeded (in production Phase 4a-main
+    // will broadcast it; in this test we seed it directly).
+    for (log, x_priv, addr) in [
+        (&mut log_b, &bob_x_priv, BOB),
+        (&mut log_c, &carol_x_priv, CAROL),
+    ] {
+        log.committee_state.pending_dkg = Some(PendingCeremony {
+            ceremony_id,
+            members: members.clone(),
+            threshold,
+            max_signers,
+            proposed_epoch,
+            ..Default::default()
+        });
+        log.apply_with_identity(dr1_alice.clone(), &addr, x_priv)
+            .expect("peer applies alice's dr rn=1");
+    }
+
+    // Bob's own dr rn=1.
+    let bob_init_hlc = hlc_at(1_100, "bob");
+    let (bob_r1_secret, bob_r1_pkg_bytes) =
+        dkg_part1_local(id_bob, max_signers, threshold).expect("bob dkg_part1");
+    log_b.local_dkg_secret = Some(bob_r1_secret);
+    let bob_r1_payload = DkgRoundPayload {
+        ceremony_id,
+        round_num: 1,
+        round1_package: Some(bob_r1_pkg_bytes),
+        recipient_ciphertexts: None,
+    };
+    let dr1_bob = build_signed_dfrost_event(
+        &bob_sk,
+        BOB,
+        DfrostEventKind::DkgRound,
+        &bob_r1_payload,
+        bob_init_hlc,
+    )
+    .expect("build_signed dr rn=1 (bob)");
+    log_b
+        .apply_with_identity(dr1_bob.clone(), &BOB, &bob_x_priv)
+        .expect("bob applies own dr rn=1");
+    log_a
+        .apply_with_identity(dr1_bob.clone(), &ALICE, &alice_x_priv)
+        .expect("alice applies bob's dr rn=1");
+    log_c
+        .apply_with_identity(dr1_bob, &CAROL, &carol_x_priv)
+        .expect("carol applies bob's dr rn=1");
+
+    // Carol's own dr rn=1.
+    let carol_init_hlc = hlc_at(1_200, "carol");
+    let (carol_r1_secret, carol_r1_pkg_bytes) =
+        dkg_part1_local(id_carol, max_signers, threshold).expect("carol dkg_part1");
+    log_c.local_dkg_secret = Some(carol_r1_secret);
+    let carol_r1_payload = DkgRoundPayload {
+        ceremony_id,
+        round_num: 1,
+        round1_package: Some(carol_r1_pkg_bytes),
+        recipient_ciphertexts: None,
+    };
+    let dr1_carol = build_signed_dfrost_event(
+        &carol_sk,
+        CAROL,
+        DfrostEventKind::DkgRound,
+        &carol_r1_payload,
+        carol_init_hlc,
+    )
+    .expect("build_signed dr rn=1 (carol)");
+    log_c
+        .apply_with_identity(dr1_carol.clone(), &CAROL, &carol_x_priv)
+        .expect("carol applies own dr rn=1");
+    log_a
+        .apply_with_identity(dr1_carol.clone(), &ALICE, &alice_x_priv)
+        .expect("alice applies carol's dr rn=1");
+    log_b
+        .apply_with_identity(dr1_carol, &BOB, &bob_x_priv)
+        .expect("bob applies carol's dr rn=1");
+
+    // ── Round 2: each engine emits its rn=2 + cross-applies to the other two.
+    let dr2_alice = contribute_dkg_round2_local(
+        &mut log_a,
+        ALICE,
+        ceremony_id,
+        &members,
+        &recipient_pubs,
+        hlc_at(2_000, "alice"),
+        &alice_sk,
+        &alice_x_priv,
+    );
+    let dr2_bob = contribute_dkg_round2_local(
+        &mut log_b,
+        BOB,
+        ceremony_id,
+        &members,
+        &recipient_pubs,
+        hlc_at(2_100, "bob"),
+        &bob_sk,
+        &bob_x_priv,
+    );
+    let dr2_carol = contribute_dkg_round2_local(
+        &mut log_c,
+        CAROL,
+        ceremony_id,
+        &members,
+        &recipient_pubs,
+        hlc_at(2_200, "carol"),
+        &carol_sk,
+        &carol_x_priv,
+    );
+
+    log_b
+        .apply_with_identity(dr2_alice.clone(), &BOB, &bob_x_priv)
+        .expect("bob applies alice's dr rn=2");
+    log_c
+        .apply_with_identity(dr2_alice, &CAROL, &carol_x_priv)
+        .expect("carol applies alice's dr rn=2");
+    log_a
+        .apply_with_identity(dr2_bob.clone(), &ALICE, &alice_x_priv)
+        .expect("alice applies bob's dr rn=2");
+    log_c
+        .apply_with_identity(dr2_bob, &CAROL, &carol_x_priv)
+        .expect("carol applies bob's dr rn=2");
+    log_a
+        .apply_with_identity(dr2_carol.clone(), &ALICE, &alice_x_priv)
+        .expect("alice applies carol's dr rn=2");
+    log_b
+        .apply_with_identity(dr2_carol, &BOB, &bob_x_priv)
+        .expect("bob applies carol's dr rn=2");
+
+    // ── Round 3: each engine finalises; cross-apply dk events.
+    let (dk_alice, alice_key_pkg, alice_pub_pkg) = contribute_dkg_round3_local(
+        &mut log_a,
+        ALICE,
+        ceremony_id,
+        &members,
+        hlc_at(3_000, "alice"),
+        &alice_sk,
+        &alice_x_priv,
+    );
+    let (dk_bob, bob_key_pkg, _bob_pub_pkg) = contribute_dkg_round3_local(
+        &mut log_b,
+        BOB,
+        ceremony_id,
+        &members,
+        hlc_at(3_100, "bob"),
+        &bob_sk,
+        &bob_x_priv,
+    );
+    let (dk_carol, carol_key_pkg, _carol_pub_pkg) = contribute_dkg_round3_local(
+        &mut log_c,
+        CAROL,
+        ceremony_id,
+        &members,
+        hlc_at(3_200, "carol"),
+        &carol_sk,
+        &carol_x_priv,
+    );
+
+    // Threshold=2 promotes the committee at 2 dk confirmations; after
+    // promotion `pending_dkg` is cleared, so any further dk against the
+    // same ceremony_id returns `UnknownCeremony`. `contribute_dkg_round3_local`
+    // already applies each engine's OWN dk locally (1 confirmation), so
+    // each engine only needs to cross-apply ONE peer's dk to reach
+    // quorum (2 confirmations) and promote.
+    log_a
+        .apply_with_identity(dk_bob.clone(), &ALICE, &alice_x_priv)
+        .expect("alice applies bob's dk → promotes");
+    log_b
+        .apply_with_identity(dk_alice.clone(), &BOB, &bob_x_priv)
+        .expect("bob applies alice's dk → promotes");
+    // Carol cross-applies alice's dk to reach quorum (her own dk_carol
+    // already counts as 1 confirmation).
+    log_c
+        .apply_with_identity(dk_alice, &CAROL, &carol_x_priv)
+        .expect("carol applies alice's dk → promotes");
+    // dk_carol + dk_bob are intentionally not cross-applied beyond what's
+    // needed — every engine already promoted on a 2-of-3 quorum. Carol's
+    // KeyPackage is stashed locally by `contribute_dkg_round3_local`,
+    // which is what threshold-sign needs.
+    let _ = (dk_bob, dk_carol);
+
+    // Convergence: all three engines active with identical joint VK.
+    assert!(log_a.committee_state.active);
+    assert!(log_b.committee_state.active);
+    assert!(log_c.committee_state.active);
+    assert_eq!(
+        log_a.committee_state.joint_verifying_key, log_b.committee_state.joint_verifying_key,
+        "alice + bob converge on joint VK"
+    );
+    assert_eq!(
+        log_a.committee_state.joint_verifying_key, log_c.committee_state.joint_verifying_key,
+        "alice + carol converge on joint VK"
+    );
+
+    (
+        log_a,
+        log_b,
+        log_c,
+        alice_key_pkg,
+        bob_key_pkg,
+        carol_key_pkg,
+        alice_pub_pkg,
+        members,
+    )
+}
+
+/// R4-1 regression: 2-of-3 threshold-sign exercises the canonical
+/// signing-set selection END-TO-END via `contribute_threshold_sign_local`
+/// (which now mirrors the IPC's R4 fix: build SigningPackage from the
+/// canonical signing set — first `threshold` peers by sorted OwnerAddr
+/// — for both round2::sign AND aggregate).
+///
+/// Two assertions:
+///   1. **Positive (post-fix)**: Alice + Bob use the helper to sign
+///      against the canonical {A, B} SigningPackage; aggregation with
+///      the SAME package succeeds → produces a valid threshold sig.
+///   2. **Negative (pre-fix simulation)**: build a separate "full-set"
+///      SigningPackage from {A, B, C}'s commitments, simulate signers
+///      using THAT (the pre-fix behaviour). Aggregating against the
+///      canonical {A, B} package — which the pre-fix aggregator did —
+///      MUST fail. This is the bug-trigger: locked in here so any
+///      future regression that re-introduces the mismatch is caught.
+#[tokio::test]
+async fn threshold_sign_ipc_2of3_canonical_set_aggregates() {
+    let (mut log_a, mut log_b, mut log_c, key_pkg_a, key_pkg_b, key_pkg_c, pub_pkg_shared, members) =
+        dkg_complete_three_engine_2of3_via_ipc_path();
+
+    // ── Sign-session ceremony_id (mirrors IPC step 5).
+    let seed_bytes: [u8; 32] = [0x77; 32];
+    let epoch: u64 = 1;
+    let space_id = SpaceId([0xAA; 16]);
+
+    let mut sign_tag = Vec::with_capacity(b"sign-v1:".len() + seed_bytes.len());
+    sign_tag.extend_from_slice(b"sign-v1:");
+    sign_tag.extend_from_slice(&seed_bytes);
+    let sign_ceremony_id = derive_ceremony_id_canonical(&space_id, epoch, &sign_tag);
+    let message_hash = derive_vrf_seed(&seed_bytes, epoch);
+
+    let alice_sk = alice_ed25519_sk();
+    let bob_sk = bob_ed25519_sk();
+    let carol_sk = carol_ed25519_sk();
+    let alice_x_priv = alice_x25519_priv();
+    let bob_x_priv = bob_x25519_priv();
+    let carol_x_priv = carol_x25519_priv();
+
+    // ── Round 1: every member commits + cross-applies. Carol's commitment
+    //    is what makes this test load-bearing: it lands in every engine's
+    //    `pending_sign.contributions`, so a buggy implementation that
+    //    iterates ALL contributions for SigningPackage construction will
+    //    build a different package than the aggregator's canonical-set
+    //    package, producing a Fiat-Shamir-challenge mismatch.
+    let mut rng = frost::rand_core::OsRng;
+    let (nonces_a, commitments_a) = frost::round1::commit(key_pkg_a.signing_share(), &mut rng);
+    let (nonces_b, commitments_b) = frost::round1::commit(key_pkg_b.signing_share(), &mut rng);
+    let (nonces_c, commitments_c) = frost::round1::commit(key_pkg_c.signing_share(), &mut rng);
+
+    let mut nonces_a_cbor = Vec::new();
+    ciborium::into_writer(&nonces_a, &mut nonces_a_cbor).expect("encode alice nonces");
+    let mut commitments_a_cbor = Vec::new();
+    ciborium::into_writer(&commitments_a, &mut commitments_a_cbor).expect("encode alice cm");
+    let mut nonces_b_cbor = Vec::new();
+    ciborium::into_writer(&nonces_b, &mut nonces_b_cbor).expect("encode bob nonces");
+    let mut commitments_b_cbor = Vec::new();
+    ciborium::into_writer(&commitments_b, &mut commitments_b_cbor).expect("encode bob cm");
+    let mut nonces_c_cbor = Vec::new();
+    ciborium::into_writer(&nonces_c, &mut nonces_c_cbor).expect("encode carol nonces");
+    let mut commitments_c_cbor = Vec::new();
+    ciborium::into_writer(&commitments_c, &mut commitments_c_cbor).expect("encode carol cm");
+
+    let ts_alice_empty = request_vrf_beacon_local(
+        &mut log_a,
+        ALICE,
+        sign_ceremony_id,
+        message_hash,
+        commitments_a_cbor.clone(),
+        nonces_a_cbor,
+        hlc_at(4_000, "alice"),
+        &alice_sk,
+        &alice_x_priv,
+    );
+    let ts_bob_empty = request_vrf_beacon_local(
+        &mut log_b,
+        BOB,
+        sign_ceremony_id,
+        message_hash,
+        commitments_b_cbor.clone(),
+        nonces_b_cbor,
+        hlc_at(4_100, "bob"),
+        &bob_sk,
+        &bob_x_priv,
+    );
+    let ts_carol_empty = request_vrf_beacon_local(
+        &mut log_c,
+        CAROL,
+        sign_ceremony_id,
+        message_hash,
+        commitments_c_cbor.clone(),
+        nonces_c_cbor,
+        hlc_at(4_200, "carol"),
+        &carol_sk,
+        &carol_x_priv,
+    );
+
+    // Cross-apply round-1 commitments across all three engines.
+    log_b
+        .apply_with_identity(ts_alice_empty.clone(), &BOB, &bob_x_priv)
+        .expect("bob applies alice's ts(empty)");
+    log_c
+        .apply_with_identity(ts_alice_empty, &CAROL, &carol_x_priv)
+        .expect("carol applies alice's ts(empty)");
+    log_a
+        .apply_with_identity(ts_bob_empty.clone(), &ALICE, &alice_x_priv)
+        .expect("alice applies bob's ts(empty)");
+    log_c
+        .apply_with_identity(ts_bob_empty, &CAROL, &carol_x_priv)
+        .expect("carol applies bob's ts(empty)");
+    log_a
+        .apply_with_identity(ts_carol_empty.clone(), &ALICE, &alice_x_priv)
+        .expect("alice applies carol's ts(empty)");
+    log_b
+        .apply_with_identity(ts_carol_empty, &BOB, &bob_x_priv)
+        .expect("bob applies carol's ts(empty)");
+
+    // After round-1: all three engines have 3 contributions (all empty).
+    for (log, name) in [(&log_a, "alice"), (&log_b, "bob"), (&log_c, "carol")] {
+        let p = log
+            .committee_state
+            .pending_sign
+            .get(&sign_ceremony_id)
+            .unwrap_or_else(|| panic!("{name} pending_sign present"));
+        assert_eq!(p.contributions.len(), 3, "{name} sees 3 commitments");
+    }
+
+    // ── Alice signs via the canonical-set helper.
+    //
+    // `contribute_threshold_sign_local` (R4 fix) derives canonical
+    // signing set = first 2 sorted addrs from contribution keys =
+    // {ALICE, BOB} — Carol is excluded. Alice's round2::sign therefore
+    // binds to the {ALICE, BOB} SigningPackage's Fiat-Shamir challenge.
+    let (ts_alice_with_share, signing_package_alice) = contribute_threshold_sign_local(
+        &log_a,
+        ALICE,
+        sign_ceremony_id,
+        &members,
+        &key_pkg_a,
+        hlc_at(5_000, "alice"),
+        &alice_sk,
+    );
+    log_a
+        .apply_with_identity(ts_alice_with_share.clone(), &ALICE, &alice_x_priv)
+        .expect("alice applies own ts(share)");
+    log_b
+        .apply_with_identity(ts_alice_with_share.clone(), &BOB, &bob_x_priv)
+        .expect("bob applies alice's ts(share)");
+    log_c
+        .apply_with_identity(ts_alice_with_share, &CAROL, &carol_x_priv)
+        .expect("carol applies alice's ts(share)");
+
+    // ── Bob signs via the same canonical-set helper — produces the
+    //    IDENTICAL SigningPackage as Alice's (sorted-key BTreeMap is
+    //    deterministic across replicas).
+    let (ts_bob_with_share, signing_package_bob) = contribute_threshold_sign_local(
+        &log_b,
+        BOB,
+        sign_ceremony_id,
+        &members,
+        &key_pkg_b,
+        hlc_at(5_100, "bob"),
+        &bob_sk,
+    );
+    log_a
+        .apply_with_identity(ts_bob_with_share.clone(), &ALICE, &alice_x_priv)
+        .expect("alice applies bob's ts(share)");
+    log_b
+        .apply_with_identity(ts_bob_with_share.clone(), &BOB, &bob_x_priv)
+        .expect("bob applies own ts(share)");
+    log_c
+        .apply_with_identity(ts_bob_with_share, &CAROL, &carol_x_priv)
+        .expect("carol applies bob's ts(share)");
+
+    // Sanity: Alice's and Bob's SigningPackages must serialize identically
+    // (the canonical-set rule guarantees this; without it the Fiat-Shamir
+    // challenge differs per signer and aggregate fails). Implements the
+    // load-bearing constraint via a byte-equality check.
+    {
+        let mut a_bytes = Vec::new();
+        let mut b_bytes = Vec::new();
+        ciborium::into_writer(&signing_package_alice, &mut a_bytes)
+            .expect("encode alice signing_package");
+        ciborium::into_writer(&signing_package_bob, &mut b_bytes)
+            .expect("encode bob signing_package");
+        assert_eq!(
+            a_bytes, b_bytes,
+            "R4 invariant: every signer builds the same canonical-set SigningPackage \
+             (sorted-addr BTreeMap iteration is deterministic across replicas)"
+        );
+    }
+
+    // ── Positive aggregation (post-fix): use the SAME canonical
+    //    signing_package + shares_map from the canonical set → succeeds.
+    let canonical_signing_set = vec![ALICE, BOB];
+    let shares_map_canonical: BTreeMap<Identifier, frost::round2::SignatureShare> = {
+        let pending = log_a
+            .committee_state
+            .pending_sign
+            .get(&sign_ceremony_id)
+            .unwrap();
+        let mut sm = BTreeMap::new();
+        for addr in &canonical_signing_set {
+            let (_, share_bytes) = pending
+                .contributions
+                .get(addr)
+                .expect("canonical signer present");
+            assert!(
+                !share_bytes.is_empty(),
+                "canonical signer must have non-empty share"
+            );
+            let idx = members.iter().position(|a| a == addr).unwrap();
+            let id = identifier_for_index(idx);
+            let share: frost::round2::SignatureShare =
+                ciborium::from_reader(&share_bytes[..]).expect("decode share");
+            sm.insert(id, share);
+        }
+        sm
+    };
+
+    let group_signature = frost::aggregate(
+        &signing_package_alice,
+        &shares_map_canonical,
+        &pub_pkg_shared,
+    )
+    .expect("R4 post-fix: canonical signing_package + canonical shares → aggregate OK");
+    let sig_bytes: Vec<u8> = group_signature.serialize().expect("serialize signature");
+    assert_eq!(
+        sig_bytes.len(),
+        64,
+        "Schnorr signature must be R(32) || s(32)"
+    );
+
+    let vk = log_a.committee_state.joint_verifying_key.expect("joint vk");
+    verify_schnorr_signature(&vk, &message_hash, &sig_bytes)
+        .expect("aggregated Schnorr sig verifies under joint vk");
+
+    let mut r_check = [0u8; 32];
+    r_check.copy_from_slice(&sig_bytes[..32]);
+    let _vrf_output = derive_vrf_output(&r_check);
+
+    // ── Negative bug-trigger (pre-fix simulation): build a full-set
+    //    SigningPackage (what the buggy IPC used to construct), have
+    //    BOTH signers sign against it, then aggregate against the
+    //    canonical-set package (what the buggy aggregator built).
+    //    This MUST fail — locks the bug in regression-test form.
+    //
+    //    Fresh nonces so the signers don't reuse the canonical-path
+    //    ones (FROST §6.2: nonce reuse leaks the secret share — even
+    //    in a test, reusing once-consumed nonces would crash).
+    let (nonces_a_full, commitments_a_full) =
+        frost::round1::commit(key_pkg_a.signing_share(), &mut rng);
+    let (nonces_b_full, commitments_b_full) =
+        frost::round1::commit(key_pkg_b.signing_share(), &mut rng);
+    let (_nonces_c_full, commitments_c_full) =
+        frost::round1::commit(key_pkg_c.signing_share(), &mut rng);
+
+    let mut full_commitments_map: BTreeMap<Identifier, frost::round1::SigningCommitments> =
+        BTreeMap::new();
+    full_commitments_map.insert(identifier_for_index(0), commitments_a_full);
+    full_commitments_map.insert(identifier_for_index(1), commitments_b_full);
+    full_commitments_map.insert(identifier_for_index(2), commitments_c_full);
+    let full_signing_package = frost::SigningPackage::new(full_commitments_map, &message_hash);
+
+    let alice_share_buggy = frost::round2::sign(&full_signing_package, &nonces_a_full, &key_pkg_a)
+        .expect("round2::sign against full-set package");
+    let bob_share_buggy = frost::round2::sign(&full_signing_package, &nonces_b_full, &key_pkg_b)
+        .expect("round2::sign against full-set package");
+
+    // Aggregator builds a canonical-only package from {A, B}'s commitments
+    // — mirroring the pre-fix aggregator's "selection_signing_package"
+    // path. Since the commitments inside the FULL package include Carol's
+    // (which the partial package omits), the recomputed challenge differs,
+    // and Alice's/Bob's shares (which bound to the full challenge)
+    // don't verify under the partial one.
+    let mut partial_commitments_map: BTreeMap<Identifier, frost::round1::SigningCommitments> =
+        BTreeMap::new();
+    let alice_commit_from_full: frost::round1::SigningCommitments = full_signing_package
+        .signing_commitments()
+        .get(&identifier_for_index(0))
+        .cloned()
+        .expect("alice commitment");
+    let bob_commit_from_full: frost::round1::SigningCommitments = full_signing_package
+        .signing_commitments()
+        .get(&identifier_for_index(1))
+        .cloned()
+        .expect("bob commitment");
+    partial_commitments_map.insert(identifier_for_index(0), alice_commit_from_full);
+    partial_commitments_map.insert(identifier_for_index(1), bob_commit_from_full);
+    let partial_signing_package =
+        frost::SigningPackage::new(partial_commitments_map, &message_hash);
+
+    let mut buggy_shares_map: BTreeMap<Identifier, frost::round2::SignatureShare> = BTreeMap::new();
+    buggy_shares_map.insert(identifier_for_index(0), alice_share_buggy);
+    buggy_shares_map.insert(identifier_for_index(1), bob_share_buggy);
+
+    let buggy_result =
+        frost::aggregate(&partial_signing_package, &buggy_shares_map, &pub_pkg_shared);
+    assert!(
+        buggy_result.is_err(),
+        "R4 bug-trigger: aggregating canonical-set package against shares signed under \
+         full-set package MUST fail — Fiat-Shamir challenge mismatch. If this assertion \
+         starts passing, the canonical-set selection has regressed: every signer + the \
+         aggregator must use a byte-identical SigningPackage. Got: {:?}",
+        buggy_result.map(|sig| sig.serialize())
+    );
+
+    // Carol's contribution remained an empty-share commitment on every
+    // engine — the canonical-set rule never picks her up for signing,
+    // so her ts(empty) lingers harmlessly in pending_sign. Confirms
+    // the canonical-set selection ignores extra contributors that
+    // aren't in the first-threshold-sorted-addr window.
+    let pa = log_a
+        .committee_state
+        .pending_sign
+        .get(&sign_ceremony_id)
+        .unwrap();
+    assert!(
+        pa.contributions
+            .get(&CAROL)
+            .map(|(_, share)| share.is_empty())
+            .unwrap_or(false),
+        "carol's contribution still empty (she's not in canonical signing set)"
+    );
 }
