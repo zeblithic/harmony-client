@@ -37,13 +37,13 @@ use harmony_app::community_voting_core::{
     PollEventKindCode, RatificationBallotPayload, SignedVotingEvent, SortitionFailedPayload,
     SortitionSelectionPayload, Tier, Tier3PollConfigPayload,
 };
-use harmony_app::community_voting_log::VotingLog;
+use harmony_app::community_voting_log::{ApplyError, VotingLog};
 use harmony_app::community_voting_log_engine::{VotingLogEngine, VotingLogEngineParams};
 use harmony_app::community_voting_sortition::fisher_yates_select;
 use harmony_app::community_voting_star::tally_star;
 use harmony_app::community_voting_tier3::{
-    drafting_advancers, ratification_candidates_ordering, synthesize_status_quo, verify_sd, Stage,
-    Tier3PollResultPayload, VerifyError,
+    drafting_advancers, ratification_candidates_ordering, synthesize_status_quo, verify_sd,
+    verify_sf, Stage, Tier3PollResultPayload, VerifyError,
 };
 use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 use tokio::sync::{mpsc, Mutex};
@@ -1361,9 +1361,7 @@ async fn tier3_decline_triggers_backup_promotion_across_engines() {
     // 40 total (20 primary + 20 backup), leaving 10 outside. We scan to find one.
     let outsider_id = identities
         .iter()
-        .find(|id| {
-            !primary_owners.contains(&id.owner) && !backup_owners.contains(&id.owner)
-        })
+        .find(|id| !primary_owners.contains(&id.owner) && !backup_owners.contains(&id.owner))
         .expect("at least one identity is outside both primary and backup pools");
 
     // Confirm outsider is not in current_mini_public.
@@ -1409,6 +1407,541 @@ async fn tier3_decline_triggers_backup_promotion_across_engines() {
             verify_result,
             Err(VerifyError::NotInMiniPublic(outsider_id.owner)),
             "SD1 verify must REJECT kd=md from non-primary member"
+        );
+    }
+
+    drop(engines);
+}
+
+/// Multi-engine mass-decline + SortitionFailed + retry chain test.
+///
+/// Design spec §3 (Failed = terminal state) + §6 (kd=sf apply rules + retry_of) +
+/// §10 (failure modes + retry chain).
+///
+/// ## Scenario
+///
+/// 1. Two engines + 50 fixture identities + sortition_size=20 + proposer = identities[49].
+/// 2. kd=cr + kd=ss injected (proposer is identities[49], outside primary/backup pools).
+/// 3. ALL 20 primary + ALL 20 backup members (40 total) publish kd=md decline events.
+/// 4. Both engines converge: declines.len()==40, decline_count_at==40.
+/// 5. SF1 verify accepts: decline_count(40) >= backup_pool_size(20).
+/// 6. Proposer publishes kd=sf; both engines transition to Stage::Failed.
+/// 7. Subsequent events for the failed poll are rejected (PollInFailedState).
+/// 8. Proposer publishes new kd=cr with retry_of=Some(prev_poll_id) → accepted.
+/// 9. Negative: retry_of=Some(nonexistent) → RetryOfPollNotFound.
+/// 10. Negative: retry_of=Some(retry_poll_id) (non-Failed) → RetryOfPollNotFailed.
+#[tokio::test]
+async fn tier3_mass_decline_sortition_failed_with_retry_chain() {
+    const SORTITION_SIZE: u16 = 20;
+    const N_IDENTITIES: usize = 50;
+    const COMMUNITY_ID: SpaceId = SpaceId([0xEF; 16]);
+
+    // ── Step 1: electorate ────────────────────────────────────────────────────
+    //
+    // Proposer = identities[49] (outside the primary/backup pool selection since
+    // Fisher-Yates picks 40 from [0..49] — identities[49] is in the pool but may
+    // still be selected. Use a deterministic VRF seed and verify post-hoc, or
+    // simply include identities[49] in the electorate but verify it's not in the
+    // primary/backup pools. Cleanest: exclude identities[49] from the electorate
+    // that fisher_yates_select operates on; include them in the snapshot for
+    // eligibility, but use only identities[0..49] for the sortition electorate.)
+    //
+    // Simplest correct approach: proposer = identities[49]. The electorate passed
+    // to fisher_yates_select uses all 50 identities. We verify post-hoc that
+    // identities[49] is not in primary or backup (if it is, we adjust; but with
+    // seed [0xEF; 32] and 50 identities selecting 40, there's a 10/50 = 20% chance
+    // it IS selected. To guarantee it, we exclude it from the Fisher-Yates pool by
+    // passing only identities[0..49] to fisher_yates_select while still including
+    // all 50 in the PollCreate snapshot).
+
+    let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
+
+    // Proposer is identities[49] — separate from the sortition pool.
+    let proposer = &identities[49];
+
+    // Electorate for PollCreate snapshot: all 50 members.
+    let full_electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
+
+    // Sortition pool: only identities[0..49] (49 members), so proposer is never selected.
+    let sortition_pool: Vec<OwnerAddr> = identities[..49].iter().map(|id| id.owner).collect();
+
+    // ── Step 2: two-engine bridge ─────────────────────────────────────────────
+
+    let engines = setup_two_voting_engine_bridge(COMMUNITY_ID).await;
+
+    // ── Step 3: PollCreate (proposer = identities[49]) ────────────────────────
+
+    let t0: u64 = 3_000_000;
+
+    let config = Tier3PollConfigPayload {
+        proposal_text: "Mass-decline failure + retry chain test".into(),
+        sortition_size: SORTITION_SIZE,
+        deliberation_window_seconds: 3600,
+        drafting_window_seconds: 3600,
+        ratification_window_seconds: 3600,
+        privacy_mode: "pu".into(),
+        incentive_mode: "a".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+    };
+
+    let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
+
+    let create_signing_bytes = create_event
+        .signing_bytes()
+        .expect("create event signing_bytes");
+    let poll_id = derive_poll_id(&COMMUNITY_ID, &create_signing_bytes);
+
+    let snapshot = MembershipSnapshot {
+        members: full_electorate
+            .iter()
+            .map(|addr| {
+                (
+                    *addr,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )
+            })
+            .collect(),
+    };
+
+    // Apply PollCreate directly to both logs with the full snapshot.
+    {
+        let mut log = engines.log_a.lock().await;
+        log.apply_with_snapshot(create_event.clone(), &COMMUNITY_ID, Some(snapshot.clone()))
+            .expect("engine_a: PollCreate apply");
+    }
+    {
+        let mut log = engines.log_b.lock().await;
+        log.apply_with_snapshot(create_event, &COMMUNITY_ID, Some(snapshot))
+            .expect("engine_b: PollCreate apply");
+    }
+
+    // Verify both logs: poll in Sortition stage, proposer = identities[49].
+    {
+        let log = engines.log_a.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        assert_eq!(t3.stage, Stage::Sortition, "engine_a: starts in Sortition");
+        assert_eq!(
+            t3.meta.proposer, proposer.owner,
+            "engine_a: proposer = identities[49]"
+        );
+        assert_eq!(
+            t3.eligible_electorate_snapshot.len(),
+            N_IDENTITIES,
+            "engine_a: full electorate snapshotted"
+        );
+    }
+
+    // ── Step 4: inject kd=ss (VRF seed [0xEF; 32], sortition from pool[0..49]) ─
+
+    let vrf_output: [u8; 32] = [0xEF; 32];
+    let sortition_result = fisher_yates_select(
+        &vrf_output,
+        &sortition_pool,
+        SORTITION_SIZE as usize,
+        SORTITION_SIZE as usize,
+    );
+
+    // Sanity: proposer must NOT be in primary or backup (by construction).
+    assert!(
+        !sortition_result.primary.contains(&proposer.owner),
+        "proposer must not be in primary pool"
+    );
+    assert!(
+        !sortition_result.backup.contains(&proposer.owner),
+        "proposer must not be in backup pool"
+    );
+
+    let ss_event = build_sortition_selection_event(
+        poll_id,
+        sortition_result.primary.clone(),
+        sortition_result.backup.clone(),
+        hlc_at(t0 + 1, "engine"),
+    );
+
+    engines
+        .engine_a
+        .publish_event(ss_event)
+        .await
+        .expect("engine_a: publish kd=ss");
+
+    // Wait for engine_b to receive kd=ss via bridge.
+    wait_for_log("engine_b: sortition_result set", &engines.log_b, |log| {
+        log.polls
+            .get(&poll_id)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .map(|t3| t3.sortition_result.is_some())
+            .unwrap_or(false)
+    })
+    .await
+    .expect("engine_b: kd=ss must arrive via bridge within 5s");
+
+    // Confirm 20 primary + 20 backup.
+    {
+        let log = engines.log_a.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        let sr = t3.sortition_result.as_ref().unwrap();
+        assert_eq!(sr.primary.len(), SORTITION_SIZE as usize);
+        assert_eq!(sr.backup.len(), SORTITION_SIZE as usize);
+    }
+
+    // ── Step 5: ALL 40 primary + backup members publish kd=md declines ────────
+
+    let primary_owners: Vec<OwnerAddr> = sortition_result.primary.clone();
+    let backup_owners: Vec<OwnerAddr> = sortition_result.backup.clone();
+
+    // Resolve TestIdentity for each primary member.
+    let primary_ids: Vec<&TestIdentity> = primary_owners
+        .iter()
+        .map(|owner| {
+            identities
+                .iter()
+                .find(|id| id.owner == *owner)
+                .expect("primary member must be in identities list")
+        })
+        .collect();
+
+    // Resolve TestIdentity for each backup member.
+    let backup_ids: Vec<&TestIdentity> = backup_owners
+        .iter()
+        .map(|owner| {
+            identities
+                .iter()
+                .find(|id| id.owner == *owner)
+                .expect("backup member must be in identities list")
+        })
+        .collect();
+
+    let t_decline_base = t0 + 100;
+
+    // All 20 primary members decline.
+    for (i, decliner) in primary_ids.iter().enumerate() {
+        let decline_ev = build_decline_event(
+            decliner,
+            poll_id,
+            hlc_at(t_decline_base + i as u64 * 10, &format!("primary-{i}-dev")),
+        );
+        engines
+            .engine_a
+            .publish_event(decline_ev)
+            .await
+            .expect("engine_a: publish primary kd=md decline");
+    }
+
+    // All 20 backup members decline (HLC continues ascending, per-actor).
+    let backup_decline_base = t_decline_base + (SORTITION_SIZE as u64) * 10 + 10;
+    for (i, decliner) in backup_ids.iter().enumerate() {
+        let decline_ev = build_decline_event(
+            decliner,
+            poll_id,
+            hlc_at(
+                backup_decline_base + i as u64 * 10,
+                &format!("backup-{i}-dev"),
+            ),
+        );
+        engines
+            .engine_a
+            .publish_event(decline_ev)
+            .await
+            .expect("engine_a: publish backup kd=md decline");
+    }
+
+    // Wait for engine_b to receive all 40 decline events via bridge.
+    wait_for_log("engine_b: 40 declines applied", &engines.log_b, |log| {
+        log.polls
+            .get(&poll_id)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .map(|t3| t3.declines.len() >= 40)
+            .unwrap_or(false)
+    })
+    .await
+    .expect("engine_b: must receive all 40 decline events within 5s");
+
+    // Give async tasks a moment to settle.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // ── Step 6: assert convergence on both engines: declines.len()==40 ────────
+
+    let t_after_all_declines = hlc_at(
+        backup_decline_base + (SORTITION_SIZE as u64) * 10 + 1,
+        "observer",
+    );
+
+    let (t3_a, t3_b) = {
+        let log_a = engines.log_a.lock().await;
+        let log_b = engines.log_b.lock().await;
+        let t3_a = log_a.polls[&poll_id]
+            .tier_state
+            .as_tier3()
+            .expect("engine_a tier3")
+            .clone();
+        let t3_b = log_b.polls[&poll_id]
+            .tier_state
+            .as_tier3()
+            .expect("engine_b tier3")
+            .clone();
+        (t3_a, t3_b)
+    };
+
+    // Both engines: 40 total declines (20 primary + 20 backup).
+    assert_eq!(t3_a.declines.len(), 40, "engine_a: must have 40 declines");
+    assert_eq!(t3_b.declines.len(), 40, "engine_b: must have 40 declines");
+
+    // decline_count_at returns 40 for both engines.
+    let count_a = t3_a.decline_count_at(&t_after_all_declines);
+    let count_b = t3_b.decline_count_at(&t_after_all_declines);
+    assert_eq!(count_a, 40, "engine_a: decline_count_at must be 40");
+    assert_eq!(count_b, 40, "engine_b: decline_count_at must be 40");
+
+    // ── Step 7: SF1 verify accepts (decline_count ≥ backup_pool_size) ─────────
+
+    let t_sf = backup_decline_base + (SORTITION_SIZE as u64) * 10 + 100;
+    let sf_event = build_sortition_failed_event(proposer, poll_id, hlc_at(t_sf, "proposer-dev"));
+
+    // verify_sf must accept: proposer is correct, decline_count(40) ≥ backup_size(20).
+    {
+        let log = engines.log_a.lock().await;
+        let poll_state = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        let verify_result = verify_sf(&sf_event, poll_state);
+        assert_eq!(
+            verify_result,
+            Ok(()),
+            "SF1 verify must ACCEPT: decline_count=40 >= backup_pool_size=20"
+        );
+    }
+
+    // ── Step 8: proposer publishes kd=sf; both engines transition to Failed ───
+
+    engines
+        .engine_a
+        .publish_event(sf_event)
+        .await
+        .expect("engine_a: publish kd=sf SortitionFailed");
+
+    // Wait for engine_b to apply kd=sf → Stage::Failed.
+    wait_for_log("engine_b: stage == Failed", &engines.log_b, |log| {
+        log.polls
+            .get(&poll_id)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .map(|t3| t3.stage == Stage::Failed)
+            .unwrap_or(false)
+    })
+    .await
+    .expect("engine_b: stage must transition to Failed within 5s");
+
+    // Give engine_a a moment to settle (it applied synchronously, but confirm).
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // Assert both engines are in Failed stage.
+    {
+        let log_a = engines.log_a.lock().await;
+        let log_b = engines.log_b.lock().await;
+        let t3_a = log_a.polls[&poll_id].tier_state.as_tier3().unwrap();
+        let t3_b = log_b.polls[&poll_id].tier_state.as_tier3().unwrap();
+        assert_eq!(
+            t3_a.stage,
+            Stage::Failed,
+            "engine_a: stage must be Failed after kd=sf"
+        );
+        assert_eq!(
+            t3_b.stage,
+            Stage::Failed,
+            "engine_b: stage must be Failed after kd=sf"
+        );
+    }
+
+    // ── Step 9: subsequent events on the failed poll are rejected ─────────────
+    //
+    // Try publishing another kd=md from a primary member. Tier3PollState::apply_event
+    // returns PollInFailedState; VotingLog maps that to ApplyError::IllegalTransition.
+    let extra_decline_ev =
+        build_decline_event(primary_ids[0], poll_id, hlc_at(t_sf + 10, "primary-0-dev"));
+
+    // Apply directly to log_a to check the rejection (without going through engine
+    // since publish_event would propagate the error up as a string).
+    {
+        let mut log = engines.log_a.lock().await;
+        let err = log
+            .apply_with_snapshot(extra_decline_ev, &COMMUNITY_ID, None)
+            .expect_err("extra kd=md after Failed must be rejected");
+        assert_eq!(
+            err,
+            ApplyError::IllegalTransition,
+            "extra kd=md after Failed must return IllegalTransition (PollInFailedState mapped)"
+        );
+    }
+
+    // ── Step 10: retry chain — new kd=cr with retry_of=Some(prev_poll_id) ─────
+
+    let t_retry = t_sf + 1000;
+
+    let retry_config = Tier3PollConfigPayload {
+        proposal_text: "Retry of mass-decline poll".into(),
+        sortition_size: SORTITION_SIZE,
+        deliberation_window_seconds: 3600,
+        drafting_window_seconds: 3600,
+        ratification_window_seconds: 3600,
+        privacy_mode: "pu".into(),
+        incentive_mode: "a".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: Some(poll_id),
+    };
+
+    let retry_create_event =
+        build_tier3_poll_create_event(proposer, &retry_config, hlc_at(t_retry, "proposer-dev"));
+
+    let retry_signing_bytes = retry_create_event
+        .signing_bytes()
+        .expect("retry create event signing_bytes");
+    let retry_poll_id = derive_poll_id(&COMMUNITY_ID, &retry_signing_bytes);
+
+    let retry_snapshot = MembershipSnapshot {
+        members: full_electorate
+            .iter()
+            .map(|addr| {
+                (
+                    *addr,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )
+            })
+            .collect(),
+    };
+
+    // Apply retry kd=cr to both logs: must be accepted (predecessor is in Failed).
+    {
+        let mut log = engines.log_a.lock().await;
+        log.apply_with_snapshot(
+            retry_create_event.clone(),
+            &COMMUNITY_ID,
+            Some(retry_snapshot.clone()),
+        )
+        .expect("engine_a: retry kd=cr must be accepted (predecessor is Failed)");
+    }
+    {
+        let mut log = engines.log_b.lock().await;
+        log.apply_with_snapshot(retry_create_event, &COMMUNITY_ID, Some(retry_snapshot))
+            .expect("engine_b: retry kd=cr must be accepted (predecessor is Failed)");
+    }
+
+    // Both engines must have the new poll in their state.
+    {
+        let log_a = engines.log_a.lock().await;
+        let log_b = engines.log_b.lock().await;
+        assert!(
+            log_a.polls.contains_key(&retry_poll_id),
+            "engine_a: retry poll must be present"
+        );
+        assert!(
+            log_b.polls.contains_key(&retry_poll_id),
+            "engine_b: retry poll must be present"
+        );
+        // New poll starts in Sortition stage.
+        let retry_t3_a = log_a.polls[&retry_poll_id].tier_state.as_tier3().unwrap();
+        let retry_t3_b = log_b.polls[&retry_poll_id].tier_state.as_tier3().unwrap();
+        assert_eq!(
+            retry_t3_a.stage,
+            Stage::Sortition,
+            "engine_a: retry poll must start in Sortition"
+        );
+        assert_eq!(
+            retry_t3_b.stage,
+            Stage::Sortition,
+            "engine_b: retry poll must start in Sortition"
+        );
+        // New poll has a fresh poll_create_event_hash (different beacon seed).
+        assert_ne!(
+            retry_t3_a.meta.poll_create_event_hash, t3_a.meta.poll_create_event_hash,
+            "retry poll must have a different poll_create_event_hash (fresh beacon seed)"
+        );
+    }
+
+    // ── Step 11: negative — retry_of pointing to nonexistent poll → rejected ──
+
+    let phantom_poll_id = harmony_app::community_voting_core::PollId([0xFF; 32]);
+    let bad_retry_config_nonexistent = Tier3PollConfigPayload {
+        proposal_text: "Bad retry — nonexistent predecessor".into(),
+        sortition_size: SORTITION_SIZE,
+        deliberation_window_seconds: 3600,
+        drafting_window_seconds: 3600,
+        ratification_window_seconds: 3600,
+        privacy_mode: "pu".into(),
+        incentive_mode: "a".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: Some(phantom_poll_id),
+    };
+
+    let bad_nonexistent_event = build_tier3_poll_create_event(
+        proposer,
+        &bad_retry_config_nonexistent,
+        hlc_at(t_retry + 10, "proposer-dev"),
+    );
+
+    {
+        let mut log = engines.log_a.lock().await;
+        let err = log
+            .apply_with_snapshot(bad_nonexistent_event, &COMMUNITY_ID, None)
+            .expect_err("retry_of nonexistent poll must be rejected");
+        assert_eq!(
+            err,
+            ApplyError::RetryOfPollNotFound,
+            "retry_of nonexistent must return RetryOfPollNotFound"
+        );
+    }
+
+    // ── Step 12: negative — retry_of pointing to non-Failed poll → rejected ───
+    //
+    // The retry poll (retry_poll_id) is in Stage::Sortition, not Failed.
+    // A kd=cr with retry_of=Some(retry_poll_id) must be rejected.
+
+    let bad_retry_config_nonfailed = Tier3PollConfigPayload {
+        proposal_text: "Bad retry — predecessor is not Failed".into(),
+        sortition_size: SORTITION_SIZE,
+        deliberation_window_seconds: 3600,
+        drafting_window_seconds: 3600,
+        ratification_window_seconds: 3600,
+        privacy_mode: "pu".into(),
+        incentive_mode: "a".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: Some(retry_poll_id),
+    };
+
+    let bad_nonfailed_event = build_tier3_poll_create_event(
+        proposer,
+        &bad_retry_config_nonfailed,
+        hlc_at(t_retry + 20, "proposer-dev"),
+    );
+
+    {
+        let mut log = engines.log_a.lock().await;
+        let err = log
+            .apply_with_snapshot(bad_nonfailed_event, &COMMUNITY_ID, None)
+            .expect_err("retry_of non-Failed poll must be rejected");
+        assert_eq!(
+            err,
+            ApplyError::RetryOfPollNotFailed,
+            "retry_of non-Failed must return RetryOfPollNotFailed"
         );
     }
 
