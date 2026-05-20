@@ -876,6 +876,13 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     let profile_broadcast_publisher_for_shutdown: Option<
         std::sync::Arc<crate::profile_broadcast::ProfileBroadcastPublisher>,
     >;
+    // ZEB-307 Task 8 (R1 fix — wire registry): declared in outer scope so
+    // we can drive the registry's async `shutdown()` on an ephemeral
+    // runtime after the std `MutexGuard` is released. Mirrors
+    // `channel_log_registry_for_shutdown`'s pattern exactly.
+    let dfrost_log_registry_for_shutdown: Option<
+        std::sync::Arc<crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>>,
+    >;
     let (
         shutdown_tx,
         thread,
@@ -970,6 +977,11 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         // scope via a separate binding rather than trying to thread
         // it through the already-saturated `tup`.
         channel_log_registry_for_shutdown = guard.channel_log_registry.take();
+        // ZEB-307 Task 8 (R1 fix — wire registry): take the D-FROST
+        // registry into the outer-scope binding so its async `shutdown()`
+        // can run on an ephemeral runtime (the std `MutexGuard` is
+        // `!Send`). Mirrors `channel_log_registry`'s take pattern.
+        dfrost_log_registry_for_shutdown = guard.dfrost_log_registry.take();
         // ZEB-291 Phase 2 Task 20: abort the voting tick task. Done
         // under the lock so a racing start_node can't re-spawn a new
         // tick that we'd then orphan. Engines clear in the same scope.
@@ -1109,6 +1121,34 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
                             error = %e,
                             "could not build ephemeral tokio runtime for \
                              ChannelLogRegistry shutdown — final flush/persist skipped"
+                        );
+                    }
+                }
+            });
+        });
+    }
+    // ZEB-307 Task 8 (R1 fix — wire registry): shut down all D-FROST
+    // engines. Each engine's receive task aborts via the new Drop impl
+    // (see `DfrostLogEngine::drop`) once the last Arc reference is
+    // released by `engines.clear()`. Mirrors `ChannelLogRegistry`'s
+    // shutdown sequencing — runs before the community engine pool tears
+    // down so D-FROST engines see a live identity resolver in any final
+    // inbound packet they might process before drop.
+    if let Some(registry) = dfrost_log_registry_for_shutdown {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => {
+                        rt.block_on(registry.shutdown());
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "could not build ephemeral tokio runtime for \
+                             DfrostLogRegistry shutdown — receive tasks abort on drop"
                         );
                     }
                 }
@@ -1411,6 +1451,13 @@ async fn start_node(
     let old_channel_log_registry: Option<
         std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry<tauri::Wry>>,
     >;
+    // ZEB-307 Task 8 (R1 fix — wire registry): outer-scope binding for
+    // the prior identity's D-FROST registry. Taken inside the lock-1
+    // block; awaited via `shutdown()` outside the std `MutexGuard` scope
+    // (the guard is `!Send`). Mirrors `old_channel_log_registry`.
+    let old_dfrost_log_registry: Option<
+        std::sync::Arc<crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>>,
+    >;
     // ZEB-281 Sub-D Phase 4: outer-scope binding for the previous
     // identity's profile-broadcast publisher. Awaited outside the std
     // `MutexGuard` scope (the guard is `!Send`) — mirrors
@@ -1526,6 +1573,10 @@ async fn start_node(
         // community engine pool shuts down (verify-chain dependency,
         // same ordering as stop_inner).
         old_channel_log_registry = guard.channel_log_registry.take();
+        // ZEB-307 Task 8 (R1 fix — wire registry): take the prior
+        // identity's D-FROST registry into the outer-scope binding;
+        // shutdown runs below outside the std `MutexGuard`.
+        old_dfrost_log_registry = guard.dfrost_log_registry.take();
         // ZEB-218 Sub-D Phase 1: drop the previous identity's library
         // directory handle. The matching event_loop consumer task
         // observes the request_tx close on next recv and exits.
@@ -1610,6 +1661,13 @@ async fn start_node(
                 "previous ChannelLogRegistry shutdown_all failed during start_node restart"
             );
         }
+    }
+    // ZEB-307 Task 8 (R1 fix — wire registry): shut down the previous
+    // identity's D-FROST registry. `shutdown()` clears the engines map;
+    // each engine's `Drop` impl aborts its receive task. Runs in async
+    // context (we're in async start_node) so no thread::scope juggling.
+    if let Some(registry) = old_dfrost_log_registry {
+        registry.shutdown().await;
     }
     // ZEB-217 Sub-C Phase 2: explicitly await the previous community
     // engine pool's shutdown BEFORE the owner SyncEngine. Mirrors
@@ -1800,6 +1858,18 @@ async fn start_node(
         let mut channel_log_registry_arc: Option<
             std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry<tauri::Wry>>,
         > = None;
+        // ZEB-307 Task 8 (R1 fix — wire registry): D-FROST log registry holder.
+        // The registry is the empty container; per-community engines get
+        // registered when the Zenoh adapter wiring ticket lands. Built
+        // unconditionally outside the owner-loaded branch so the 5 D-FROST
+        // IPCs can find a non-None registry even before any community has
+        // an engine (registry.get(space_id) returns None until an engine is
+        // registered, and the IPC broadcast sites already tolerate that).
+        let dfrost_log_registry_arc: std::sync::Arc<
+            crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>,
+        > = std::sync::Arc::new(crate::community_dfrost_log_engine::DfrostLogRegistry::<
+            tauri::Wry,
+        >::new());
 
         // ── ZEB-281 Sub-D Phase 4: profile-broadcast publisher + cache + request channel ──
         //
@@ -3283,6 +3353,18 @@ async fn start_node(
                         // no owner identity is loaded — the registry is gated
                         // on owner-load above.
                         guard.channel_log_registry = channel_log_registry_arc.clone();
+                        // ZEB-307 Task 8 (R1 fix — wire registry): stash the
+                        // D-FROST log registry handle so the 5 D-FROST IPC
+                        // handlers can reach it post-apply to broadcast each
+                        // signed committee event. `Some(_)` while node is
+                        // running; cleared in stop_inner / restart paths
+                        // alongside `channel_log_registry`. Per-community
+                        // engines are registered on-demand by the Zenoh
+                        // adapter wiring (deferred follow-up); the registry
+                        // itself is just an empty container until then —
+                        // `registry.get(space_id)` returning None is expected
+                        // and the IPC broadcast sites already log + skip.
+                        guard.dfrost_log_registry = Some(dfrost_log_registry_arc.clone());
                         // ZEB-218 Sub-D Phase 1: stash the library_directory Arc
                         // so future IPC handlers (Task 4) can reach `request_tx`
                         // to add / remove libraries. The matching rx was moved
@@ -3331,6 +3413,10 @@ async fn start_node(
             community_registry_arc.clone(),
             channel_log_registry_arc.clone(),
             profile_broadcast_publisher_arc.clone(),
+            // ZEB-307 Task 8 (R1 fix — wire registry): also surface the
+            // D-FROST registry to the failure-cleanup branch so its
+            // shutdown can run before this start_node attempt errors out.
+            dfrost_log_registry_arc.clone(),
         )
     };
     let (
@@ -3342,6 +3428,7 @@ async fn start_node(
         registry_for_cleanup,
         channel_log_registry_for_cleanup,
         profile_broadcast_publisher_for_cleanup,
+        dfrost_log_registry_for_cleanup,
     ) = our_gen;
 
     // ZEB-221 + thread-spawn-failure cleanup + lock-poison cleanup: all
@@ -3378,6 +3465,15 @@ async fn start_node(
                 );
             }
         }
+        // ZEB-307 Task 8 (R1 fix — wire registry): shutdown the D-FROST
+        // registry so each engine's receive task aborts on drop (per
+        // engine `Drop` impl) before the matching community engines
+        // (which back the verify chain) tear down. The registry was
+        // built unconditionally outside the owner-loaded branch so this
+        // is always `Some(_)` here — wrapping in `if let` mirrors the
+        // sibling cleanup shape and lets the destructured binding go
+        // unused without warning if the engines map was empty.
+        dfrost_log_registry_for_cleanup.shutdown().await;
         // ZEB-217 Sub-C Phase 2: shutdown the registry FIRST so each
         // community engine's final flush completes before the owner
         // SyncEngine tears down. Mirrors stop_inner's ordering.
@@ -22216,15 +22312,32 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
     // logs + continues so a transient transport hiccup never reverses the
     // local-apply success. Skipped entirely if `dfrost_log_registry` is
     // `None` (test contexts that bypass `start_node`).
-    if let Some(registry) = dfrost_log_registry.as_ref() {
-        if let Some(engine) = registry.get(space_id).await {
-            if let Err(e) = engine.publish_event(event).await {
+    match dfrost_log_registry.as_ref() {
+        Some(registry) => match registry.get(space_id).await {
+            Some(engine) => {
+                if let Err(e) = engine.publish_event(event).await {
+                    tracing::warn!(
+                        space_id = ?space_id,
+                        error = %e,
+                        "dfrost_initiate_dkg: broadcast failed (local apply succeeded)",
+                    );
+                }
+            }
+            None => {
                 tracing::warn!(
                     space_id = ?space_id,
-                    error = %e,
-                    "dfrost_initiate_dkg: broadcast failed (local apply succeeded)",
+                    "dfrost_initiate_dkg: no engine registered for community — \
+                     broadcast skipped (Zenoh adapter not yet wired)",
                 );
             }
+        },
+        None => {
+            // Registry None is expected pre-`start_node` (test contexts);
+            // log at debug not warn so test output stays clean.
+            tracing::debug!(
+                "dfrost_initiate_dkg: dfrost_log_registry is None — \
+                 broadcast skipped (test context?)",
+            );
         }
     }
 
@@ -22517,16 +22630,32 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
         // T8: broadcast the dr rn=1 peer event (best-effort; local apply
         // already succeeded). Lock ordering: this runs AFTER the log lock
         // released above (the `{ let mut log = ... }` block ended).
-        if let Some(registry) = dfrost_log_registry.as_ref() {
-            if let Some(engine) = registry.get(space_id).await {
-                if let Err(e) = engine.publish_event(event_for_broadcast).await {
+        match dfrost_log_registry.as_ref() {
+            Some(registry) => match registry.get(space_id).await {
+                Some(engine) => {
+                    if let Err(e) = engine.publish_event(event_for_broadcast).await {
+                        tracing::warn!(
+                            space_id = ?space_id,
+                            error = %e,
+                            "dfrost_contribute_dkg_round (rn=1): broadcast failed \
+                             (local apply succeeded)",
+                        );
+                    }
+                }
+                None => {
                     tracing::warn!(
                         space_id = ?space_id,
-                        error = %e,
-                        "dfrost_contribute_dkg_round (rn=1): broadcast failed \
-                         (local apply succeeded)",
+                        "dfrost_contribute_dkg_round (rn=1): no engine \
+                         registered for community — broadcast skipped \
+                         (Zenoh adapter not yet wired)",
                     );
                 }
+            },
+            None => {
+                tracing::debug!(
+                    "dfrost_contribute_dkg_round (rn=1): dfrost_log_registry \
+                     is None — broadcast skipped (test context?)",
+                );
             }
         }
 
@@ -22955,17 +23084,35 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
     // T8: broadcast the dr rn=2 OR dk rn=3 event (best-effort; local apply
     // already succeeded). Lock ordering: this runs OUTSIDE the log lock
     // scope above (R8 + R10 from PR #143). Failure here logs + continues.
-    if let Some(registry) = dfrost_log_registry.as_ref() {
-        if let Some(engine) = registry.get(space_id).await {
-            if let Err(e) = engine.publish_event(event_to_apply).await {
+    match dfrost_log_registry.as_ref() {
+        Some(registry) => match registry.get(space_id).await {
+            Some(engine) => {
+                if let Err(e) = engine.publish_event(event_to_apply).await {
+                    tracing::warn!(
+                        space_id = ?space_id,
+                        round_num = round_num,
+                        error = %e,
+                        "dfrost_contribute_dkg_round (rn=2/3): broadcast failed \
+                         (local apply succeeded)",
+                    );
+                }
+            }
+            None => {
                 tracing::warn!(
                     space_id = ?space_id,
                     round_num = round_num,
-                    error = %e,
-                    "dfrost_contribute_dkg_round (rn=2/3): broadcast failed \
-                     (local apply succeeded)",
+                    "dfrost_contribute_dkg_round (rn=2/3): no engine \
+                     registered for community — broadcast skipped \
+                     (Zenoh adapter not yet wired)",
                 );
             }
+        },
+        None => {
+            tracing::debug!(
+                round_num = round_num,
+                "dfrost_contribute_dkg_round (rn=2/3): dfrost_log_registry \
+                 is None — broadcast skipped (test context?)",
+            );
         }
     }
 
@@ -23252,15 +23399,30 @@ async fn dfrost_request_vrf_beacon<R: tauri::Runtime>(
     // already succeeded and local_nonces have been stashed). Lock
     // ordering: this runs OUTSIDE the log lock scope above. R10 epoch
     // validation already happened pre-apply — broadcast does NOT move it.
-    if let Some(registry) = dfrost_log_registry.as_ref() {
-        if let Some(engine) = registry.get(space_id).await {
-            if let Err(e) = engine.publish_event(event).await {
+    match dfrost_log_registry.as_ref() {
+        Some(registry) => match registry.get(space_id).await {
+            Some(engine) => {
+                if let Err(e) = engine.publish_event(event).await {
+                    tracing::warn!(
+                        space_id = ?space_id,
+                        error = %e,
+                        "dfrost_request_vrf_beacon: broadcast failed (local apply succeeded)",
+                    );
+                }
+            }
+            None => {
                 tracing::warn!(
                     space_id = ?space_id,
-                    error = %e,
-                    "dfrost_request_vrf_beacon: broadcast failed (local apply succeeded)",
+                    "dfrost_request_vrf_beacon: no engine registered for \
+                     community — broadcast skipped (Zenoh adapter not yet wired)",
                 );
             }
+        },
+        None => {
+            tracing::debug!(
+                "dfrost_request_vrf_beacon: dfrost_log_registry is None — \
+                 broadcast skipped (test context?)",
+            );
         }
     }
 
@@ -23620,16 +23782,32 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
     // already succeeded). Lock ordering: this runs OUTSIDE the log lock
     // scope above. Failure here logs + continues so the aggregation path
     // below still proceeds locally.
-    if let Some(registry) = dfrost_log_registry.as_ref() {
-        if let Some(engine) = registry.get(space_id).await {
-            if let Err(e) = engine.publish_event(event).await {
+    match dfrost_log_registry.as_ref() {
+        Some(registry) => match registry.get(space_id).await {
+            Some(engine) => {
+                if let Err(e) = engine.publish_event(event).await {
+                    tracing::warn!(
+                        space_id = ?space_id,
+                        error = %e,
+                        "dfrost_contribute_threshold_sign (ts share): broadcast failed \
+                         (local apply succeeded)",
+                    );
+                }
+            }
+            None => {
                 tracing::warn!(
                     space_id = ?space_id,
-                    error = %e,
-                    "dfrost_contribute_threshold_sign (ts share): broadcast failed \
-                     (local apply succeeded)",
+                    "dfrost_contribute_threshold_sign (ts share): no engine \
+                     registered for community — broadcast skipped \
+                     (Zenoh adapter not yet wired)",
                 );
             }
+        },
+        None => {
+            tracing::debug!(
+                "dfrost_contribute_threshold_sign (ts share): \
+                 dfrost_log_registry is None — broadcast skipped (test context?)",
+            );
         }
     }
 
@@ -23795,16 +23973,32 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
     // already succeeded). Lock ordering: this runs OUTSIDE the log lock
     // scope above. Failure here logs + continues so the beacon-ready UI
     // event below still emits.
-    if let Some(registry) = dfrost_log_registry.as_ref() {
-        if let Some(engine) = registry.get(space_id).await {
-            if let Err(e) = engine.publish_event(vb_event).await {
+    match dfrost_log_registry.as_ref() {
+        Some(registry) => match registry.get(space_id).await {
+            Some(engine) => {
+                if let Err(e) = engine.publish_event(vb_event).await {
+                    tracing::warn!(
+                        space_id = ?space_id,
+                        error = %e,
+                        "dfrost_contribute_threshold_sign (vb aggregate): broadcast failed \
+                         (local apply succeeded)",
+                    );
+                }
+            }
+            None => {
                 tracing::warn!(
                     space_id = ?space_id,
-                    error = %e,
-                    "dfrost_contribute_threshold_sign (vb aggregate): broadcast failed \
-                     (local apply succeeded)",
+                    "dfrost_contribute_threshold_sign (vb aggregate): no engine \
+                     registered for community — broadcast skipped \
+                     (Zenoh adapter not yet wired)",
                 );
             }
+        },
+        None => {
+            tracing::debug!(
+                "dfrost_contribute_threshold_sign (vb aggregate): \
+                 dfrost_log_registry is None — broadcast skipped (test context?)",
+            );
         }
     }
 
@@ -24229,15 +24423,30 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
     // succeeded). Lock ordering: this runs OUTSIDE the log lock scope
     // above (R8 + R10 from PR #143). R9 per-actor idempotency gate
     // happens INSIDE the log lock pre-apply — broadcast does NOT move it.
-    if let Some(registry) = dfrost_log_registry.as_ref() {
-        if let Some(engine) = registry.get(space_id).await {
-            if let Err(e) = engine.publish_event(event).await {
+    match dfrost_log_registry.as_ref() {
+        Some(registry) => match registry.get(space_id).await {
+            Some(engine) => {
+                if let Err(e) = engine.publish_event(event).await {
+                    tracing::warn!(
+                        space_id = ?space_id,
+                        error = %e,
+                        "dfrost_propose_refresh: broadcast failed (local apply succeeded)",
+                    );
+                }
+            }
+            None => {
                 tracing::warn!(
                     space_id = ?space_id,
-                    error = %e,
-                    "dfrost_propose_refresh: broadcast failed (local apply succeeded)",
+                    "dfrost_propose_refresh: no engine registered for \
+                     community — broadcast skipped (Zenoh adapter not yet wired)",
                 );
             }
+        },
+        None => {
+            tracing::debug!(
+                "dfrost_propose_refresh: dfrost_log_registry is None — \
+                 broadcast skipped (test context?)",
+            );
         }
     }
 

@@ -17,6 +17,18 @@ use std::sync::Arc;
 use tauri::Emitter;
 use tokio::sync::{mpsc, Mutex};
 
+/// Maximum number of `device_id` entries the replay tracker keeps per
+/// actor. Bounds memory growth when a misbehaving peer publishes events
+/// from many unique device_ids. Eviction is lowest-HLC-first (the
+/// stale-device-id assumption).
+///
+/// Defence-in-depth: even if a replay slips through after eviction, the
+/// apply layer's per-ceremony and per-nonce gates prevent harmful
+/// state effects (DKG rejects unknown ceremonies; threshold-sign
+/// nonces are single-use; refresh epochs validate). The tracker is
+/// the cheap first line, not the only one.
+pub(crate) const MAX_DEVICES_PER_ACTOR: usize = 64;
+
 /// Replay-defense tracker keyed on `(actor, device_id)`. Records the
 /// max-observed `(wall_ms, logical)` HLC per signer; any inbound event
 /// whose HLC is at-or-below the recorded max is considered a replay /
@@ -44,14 +56,36 @@ impl DfrostReplayTracker {
     pub fn record(&mut self, event: &SignedCommitteeEvent) {
         let key = (event.actor, event.hlc.device_id.clone());
         let new_hlc = (event.hlc.wall_ms, event.hlc.logical);
-        self.seen_max
-            .entry(key)
-            .and_modify(|cur| {
-                if new_hlc > *cur {
-                    *cur = new_hlc;
-                }
-            })
-            .or_insert(new_hlc);
+
+        // Fast path: existing entry, just advance the max.
+        if let Some(cur) = self.seen_max.get_mut(&key) {
+            if new_hlc > *cur {
+                *cur = new_hlc;
+            }
+            return;
+        }
+
+        // New entry — enforce per-actor cap by evicting the lowest-HLC
+        // device_id for this actor if the cap is reached. Linear scan at
+        // cap=64 is fine; switch to BTreeMap only if clippy / profile
+        // flags it.
+        let device_count = self
+            .seen_max
+            .keys()
+            .filter(|(a, _)| *a == event.actor)
+            .count();
+        if device_count >= MAX_DEVICES_PER_ACTOR {
+            let evict = self
+                .seen_max
+                .iter()
+                .filter(|((a, _), _)| *a == event.actor)
+                .min_by_key(|(_, &v)| v)
+                .map(|((a, d), _)| (*a, d.clone()));
+            if let Some(k) = evict {
+                self.seen_max.remove(&k);
+            }
+        }
+        self.seen_max.insert(key, new_hlc);
     }
 }
 
@@ -86,10 +120,14 @@ pub struct DfrostLogEngine<R: tauri::Runtime> {
     dfrost_log: Arc<Mutex<DfrostLog>>,
     tracker: Arc<Mutex<DfrostReplayTracker>>,
     publisher_tx: mpsc::Sender<Vec<u8>>,
-    // JoinHandle held to abort-on-drop the receive task. Read in Task 6 when
-    // we add a shutdown path; for now the implicit Drop is sufficient.
-    #[allow(dead_code)]
-    _receive_handle: tokio::task::JoinHandle<()>,
+    // JoinHandle for the receive task. Aborted explicitly in `Drop` below —
+    // Tokio JoinHandles otherwise detach on drop, leaking the spawned task
+    // even after the engine's `Arc` reference count reaches zero. The
+    // explicit abort is the only reliable shutdown path for engines
+    // displaced via `DfrostLogRegistry::register` (which `insert()` over
+    // the existing entry) and for `DfrostLogRegistry::shutdown` (which
+    // clears the engines map, releasing the last Arc).
+    receive_handle: tokio::task::JoinHandle<()>,
     // ZEB-307 Task 7: `PhantomData<fn() -> R>` (not `PhantomData<R>`) so the
     // engine is unconditionally `Send + Sync` when wired into
     // `NodeState<tauri::Wry>` — `tauri::Wry` itself is not `Send`
@@ -336,7 +374,7 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
             dfrost_log: params.dfrost_log,
             tracker,
             publisher_tx: params.publisher_tx,
-            _receive_handle: receive_handle,
+            receive_handle,
             _phantom: std::marker::PhantomData,
         })
     }
@@ -362,6 +400,20 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
             .send(packet)
             .await
             .map_err(|e| format!("publish_event send: {e}"))
+    }
+}
+
+/// Abort the receive task when the last `Arc<DfrostLogEngine<R>>` is
+/// dropped. Without this, `tokio::task::JoinHandle` detaches on drop and
+/// the receive loop continues running against an `mpsc::Receiver` whose
+/// matching `Sender` may still be alive elsewhere (e.g. inside the
+/// adapter), leaking the task indefinitely. Reachable on:
+///   - `DfrostLogRegistry::shutdown` (clears the engines map → last Arc)
+///   - `DfrostLogRegistry::register` replacement (insert() drops old Arc)
+///   - process shutdown via `stop_inner` (NodeState releases its clone)
+impl<R: tauri::Runtime> Drop for DfrostLogEngine<R> {
+    fn drop(&mut self) {
+        self.receive_handle.abort();
     }
 }
 
@@ -403,10 +455,10 @@ impl<R: tauri::Runtime> DfrostLogRegistry<R> {
     }
 
     /// Drop every engine. Each engine's receive task is owned by the
-    /// engine itself (`_receive_handle`); dropping the engine `Arc`
-    /// causes the task handle to drop, which aborts the task. The
-    /// matching `publisher_tx` sender held by the adapter is the
-    /// adapter's to drop.
+    /// engine itself (`receive_handle`); dropping the last `Arc` runs the
+    /// engine's `Drop` impl which calls `JoinHandle::abort()` and ends
+    /// the receive loop. The matching `publisher_tx` sender held by the
+    /// adapter is the adapter's to drop.
     pub async fn shutdown(&self) {
         let mut engines = self.engines.lock().await;
         engines.clear();
@@ -502,6 +554,47 @@ mod tests {
         t.record(&later);
         assert!(t.contains(&later), "advanced event recorded");
         assert!(t.contains(&test_event(addr, 100, 0)));
+    }
+
+    /// DoS defence: when a single actor exceeds the per-actor device cap,
+    /// the lowest-HLC `device_id` entry must be evicted to bound memory.
+    /// Subsequent inserts must continue to evict (not grow).
+    #[test]
+    fn replay_tracker_evicts_lowest_hlc_at_per_actor_cap() {
+        use crate::community_dfrost_log_engine::MAX_DEVICES_PER_ACTOR;
+        let mut t = DfrostReplayTracker::new();
+        let addr = OwnerAddr([1u8; 16]);
+
+        // Fill up to cap with ascending HLC + distinct device_ids.
+        for i in 0..MAX_DEVICES_PER_ACTOR {
+            let mut e = test_event(addr, 100 + i as u64, 0);
+            e.hlc.device_id = format!("dev-{i}");
+            t.record(&e);
+        }
+
+        // Adding one more must evict device 0 (lowest HLC) and admit the
+        // new entry — total count stays at MAX_DEVICES_PER_ACTOR.
+        let mut e_new = test_event(addr, 1000, 0);
+        e_new.hlc.device_id = "dev-new".into();
+        t.record(&e_new);
+
+        let mut e_evicted = test_event(addr, 100, 0);
+        e_evicted.hlc.device_id = "dev-0".into();
+        assert!(
+            !t.contains(&e_evicted),
+            "dev-0 (lowest HLC) should have been evicted"
+        );
+        assert!(
+            t.contains(&e_new),
+            "newly-inserted dev-new should be present"
+        );
+
+        // Entries for a different actor are not affected by the cap.
+        let addr_b = OwnerAddr([2u8; 16]);
+        let mut e_b = test_event(addr_b, 50, 0);
+        e_b.hlc.device_id = "dev-b".into();
+        t.record(&e_b);
+        assert!(t.contains(&e_b), "different actor unaffected by cap");
     }
 
     #[tokio::test]
