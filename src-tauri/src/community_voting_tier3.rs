@@ -80,7 +80,102 @@ pub struct Tier3PollState {
     pub last_hlc: Option<Hlc>,
 }
 
-// ── Error type ────────────────────────────────────────────────────────────────
+// ── Validate error type ───────────────────────────────────────────────────────
+
+/// Validation errors for Tier 3 PollCreate config and RatificationBallot payloads.
+/// Returned by [`validate_tier3_poll_config`] and [`validate_ratification_ballot`].
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ValidateError {
+    #[error("proposal_text is empty")]
+    EmptyProposalText,
+    #[error("sortition_size {0} out of range [20, 300]")]
+    SortitionSizeOutOfRange(u16),
+    #[error("deliberation_window_seconds {0} below floor 60")]
+    DeliberationWindowTooSmall(u32),
+    #[error("drafting_window_seconds {0} below floor 60")]
+    DraftingWindowTooSmall(u32),
+    #[error("ratification_window_seconds {0} below floor 60")]
+    RatificationWindowTooSmall(u32),
+    #[error("unknown privacy_mode {0:?}; Phase 4a-main only accepts \"pu\"")]
+    UnknownPrivacyMode(String),
+    #[error("unknown incentive_mode {0:?}; must be one of a/b/c/d")]
+    UnknownIncentiveMode(String),
+    #[error(
+        "ratification ballot scores length {scores} != ratification_candidates length {expected}"
+    )]
+    BallotLengthMismatch { scores: usize, expected: usize },
+    #[error("ratification ballot score {0} > 5")]
+    BallotScoreOutOfRange(u8),
+}
+
+// ── Validate functions ────────────────────────────────────────────────────────
+
+/// Validate Tier 3 PollCreate config payload BEFORE signing/applying/broadcasting.
+///
+/// Per design spec §5 (verify rule C1) and feedback_metadata_before_irreversible_write:
+/// read-only validation precedes irreversible writes.
+///
+/// Note: `retry_of` integrity (predecessor must exist and be in Failed state)
+/// cannot be validated here without state context; the caller (community_voting_core
+/// dispatch in Task 8) handles that check.
+pub fn validate_tier3_poll_config(pd: &Tier3PollConfigPayload) -> Result<(), ValidateError> {
+    if pd.proposal_text.is_empty() {
+        return Err(ValidateError::EmptyProposalText);
+    }
+    if !(20..=300).contains(&pd.sortition_size) {
+        return Err(ValidateError::SortitionSizeOutOfRange(pd.sortition_size));
+    }
+    if pd.deliberation_window_seconds < 60 {
+        return Err(ValidateError::DeliberationWindowTooSmall(
+            pd.deliberation_window_seconds,
+        ));
+    }
+    if pd.drafting_window_seconds < 60 {
+        return Err(ValidateError::DraftingWindowTooSmall(
+            pd.drafting_window_seconds,
+        ));
+    }
+    if pd.ratification_window_seconds < 60 {
+        return Err(ValidateError::RatificationWindowTooSmall(
+            pd.ratification_window_seconds,
+        ));
+    }
+    if pd.privacy_mode != "pu" {
+        // "se" reserved for Phase 6; "rf" reserved for Phase 7.
+        return Err(ValidateError::UnknownPrivacyMode(pd.privacy_mode.clone()));
+    }
+    if !["a", "b", "c", "d"].contains(&pd.incentive_mode.as_str()) {
+        return Err(ValidateError::UnknownIncentiveMode(
+            pd.incentive_mode.clone(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a Tier 3 RatificationBallot payload against the poll's
+/// ratification candidate set. Per design spec §5 (verify rule B4).
+///
+/// `expected_candidate_count` is looked up by the caller from
+/// `poll_state.ratification_candidate_count()` (Task 8).
+pub fn validate_ratification_ballot(
+    pd: &RatificationBallotPayload,
+    expected_candidate_count: usize,
+) -> Result<(), ValidateError> {
+    if pd.scores.len() != expected_candidate_count {
+        return Err(ValidateError::BallotLengthMismatch {
+            scores: pd.scores.len(),
+            expected: expected_candidate_count,
+        });
+    }
+    for &s in &pd.scores {
+        if s > 5 {
+            return Err(ValidateError::BallotScoreOutOfRange(s));
+        }
+    }
+    Ok(())
+}
+
+// ── Apply error type ──────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyError {
@@ -1356,5 +1451,214 @@ mod tests {
             sq_hash,
             "status_quo last"
         );
+    }
+
+    // ── validate_tier3_poll_config tests ──────────────────────────────────────
+
+    fn valid_config() -> Tier3PollConfigPayload {
+        use crate::community_voting_core::Eligibility;
+        Tier3PollConfigPayload {
+            proposal_text: "Amend charter §3 to allow remote governance".into(),
+            sortition_size: 100,
+            deliberation_window_seconds: 3600,
+            drafting_window_seconds: 3600,
+            ratification_window_seconds: 3600,
+            privacy_mode: "pu".into(),
+            incentive_mode: "a".into(),
+            eligibility: Eligibility {
+                min_power: 1,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            retry_of: None,
+        }
+    }
+
+    // Test 1: happy path — all fields valid → Ok
+    #[test]
+    fn validate_config_happy_path() {
+        assert_eq!(validate_tier3_poll_config(&valid_config()), Ok(()));
+    }
+
+    // Test 2: empty proposal_text rejected
+    #[test]
+    fn validate_config_empty_proposal_text_rejected() {
+        let mut c = valid_config();
+        c.proposal_text = String::new();
+        assert_eq!(
+            validate_tier3_poll_config(&c),
+            Err(ValidateError::EmptyProposalText)
+        );
+    }
+
+    // Test 3: sortition_size below 20 rejected
+    #[test]
+    fn validate_config_sortition_size_below_20_rejected() {
+        let mut c = valid_config();
+        c.sortition_size = 19;
+        assert_eq!(
+            validate_tier3_poll_config(&c),
+            Err(ValidateError::SortitionSizeOutOfRange(19))
+        );
+    }
+
+    // Test 4: sortition_size above 300 rejected
+    #[test]
+    fn validate_config_sortition_size_above_300_rejected() {
+        let mut c = valid_config();
+        c.sortition_size = 301;
+        assert_eq!(
+            validate_tier3_poll_config(&c),
+            Err(ValidateError::SortitionSizeOutOfRange(301))
+        );
+    }
+
+    // Test 5: sortition_size = 20 accepted (lower boundary)
+    #[test]
+    fn validate_config_sortition_size_20_accepted() {
+        let mut c = valid_config();
+        c.sortition_size = 20;
+        assert_eq!(validate_tier3_poll_config(&c), Ok(()));
+    }
+
+    // Test 6: sortition_size = 300 accepted (upper boundary)
+    #[test]
+    fn validate_config_sortition_size_300_accepted() {
+        let mut c = valid_config();
+        c.sortition_size = 300;
+        assert_eq!(validate_tier3_poll_config(&c), Ok(()));
+    }
+
+    // Test 7: window below 60s rejected — tests all three windows
+    #[test]
+    fn validate_config_window_below_60s_rejected() {
+        let mut c = valid_config();
+        c.deliberation_window_seconds = 59;
+        assert_eq!(
+            validate_tier3_poll_config(&c),
+            Err(ValidateError::DeliberationWindowTooSmall(59))
+        );
+
+        let mut c = valid_config();
+        c.drafting_window_seconds = 0;
+        assert_eq!(
+            validate_tier3_poll_config(&c),
+            Err(ValidateError::DraftingWindowTooSmall(0))
+        );
+
+        let mut c = valid_config();
+        c.ratification_window_seconds = 1;
+        assert_eq!(
+            validate_tier3_poll_config(&c),
+            Err(ValidateError::RatificationWindowTooSmall(1))
+        );
+    }
+
+    // Test 8: privacy_mode "se" rejected (Phase 6 forward-compat)
+    #[test]
+    fn validate_config_privacy_mode_se_rejected_with_unknown_privacy_mode() {
+        let mut c = valid_config();
+        c.privacy_mode = "se".into();
+        assert_eq!(
+            validate_tier3_poll_config(&c),
+            Err(ValidateError::UnknownPrivacyMode("se".into()))
+        );
+    }
+
+    // Test 9: privacy_mode "rf" rejected (Phase 7 forward-compat)
+    #[test]
+    fn validate_config_privacy_mode_rf_rejected_with_unknown_privacy_mode() {
+        let mut c = valid_config();
+        c.privacy_mode = "rf".into();
+        assert_eq!(
+            validate_tier3_poll_config(&c),
+            Err(ValidateError::UnknownPrivacyMode("rf".into()))
+        );
+    }
+
+    // Test 10: privacy_mode "pu" accepted
+    #[test]
+    fn validate_config_privacy_mode_pu_accepted() {
+        let mut c = valid_config();
+        c.privacy_mode = "pu".into();
+        assert_eq!(validate_tier3_poll_config(&c), Ok(()));
+    }
+
+    // Test 11: unknown incentive_mode rejected
+    #[test]
+    fn validate_config_incentive_mode_unknown_rejected() {
+        let mut c = valid_config();
+        c.incentive_mode = "z".into();
+        assert_eq!(
+            validate_tier3_poll_config(&c),
+            Err(ValidateError::UnknownIncentiveMode("z".into()))
+        );
+    }
+
+    // Test 12: all four valid incentive modes accepted (a/b/c/d)
+    #[test]
+    fn validate_config_all_four_incentive_modes_accepted() {
+        for mode in ["a", "b", "c", "d"] {
+            let mut c = valid_config();
+            c.incentive_mode = mode.into();
+            assert_eq!(
+                validate_tier3_poll_config(&c),
+                Ok(()),
+                "incentive_mode {mode:?} should be accepted"
+            );
+        }
+    }
+
+    // ── validate_ratification_ballot tests ────────────────────────────────────
+
+    fn ballot(scores: Vec<u8>) -> RatificationBallotPayload {
+        RatificationBallotPayload {
+            poll_id: poll_id(),
+            scores,
+        }
+    }
+
+    // Test 13: ballot length matches expected → Ok
+    #[test]
+    fn validate_ballot_length_matches_accepted() {
+        let b = ballot(vec![3, 0, 5, 1, 2]);
+        assert_eq!(validate_ratification_ballot(&b, 5), Ok(()));
+    }
+
+    // Test 14: ballot length mismatch rejected
+    #[test]
+    fn validate_ballot_length_mismatch_rejected() {
+        let b = ballot(vec![1, 2]);
+        assert_eq!(
+            validate_ratification_ballot(&b, 3),
+            Err(ValidateError::BallotLengthMismatch {
+                scores: 2,
+                expected: 3,
+            })
+        );
+    }
+
+    // Test 15: score above 5 rejected
+    #[test]
+    fn validate_ballot_score_above_5_rejected() {
+        let b = ballot(vec![3, 6, 1]);
+        assert_eq!(
+            validate_ratification_ballot(&b, 3),
+            Err(ValidateError::BallotScoreOutOfRange(6))
+        );
+    }
+
+    // Test 16: score = 5 accepted (upper boundary)
+    #[test]
+    fn validate_ballot_score_5_accepted() {
+        let b = ballot(vec![5, 5, 5]);
+        assert_eq!(validate_ratification_ballot(&b, 3), Ok(()));
+    }
+
+    // Test 17: score = 0 accepted (lower boundary)
+    #[test]
+    fn validate_ballot_score_0_accepted() {
+        let b = ballot(vec![0, 0, 0]);
+        assert_eq!(validate_ratification_ballot(&b, 3), Ok(()));
     }
 }
