@@ -354,6 +354,120 @@ impl Tier3PollState {
     }
 }
 
+// ── Drafting math ─────────────────────────────────────────────────────────────
+
+/// Maximum number of candidates that advance to ratification (including the
+/// guaranteed status_quo slot). Hard cap per design spec §9.
+pub const MAX_RATIFICATION_CANDIDATES: usize = 5;
+
+/// Deterministic synthetic status_quo candidate.
+///
+/// `event_hash = sha256(poll_id.0 || b"status_quo")`.
+///
+/// Inserted into the candidates list by `materialize()` at drafting open.
+/// The hash is stable across nodes because it depends only on the poll_id
+/// bytes, not on any event order.
+pub fn synthesize_status_quo(poll_id: &PollId) -> DraftCandidateState {
+    let mut hasher = Sha256::new();
+    hasher.update(poll_id.0);
+    hasher.update(b"status_quo");
+    DraftCandidateState {
+        event_hash: hasher.finalize().into(),
+        text: "<status quo>".into(),
+        proposer: None,
+        approvals: std::collections::HashSet::new(),
+    }
+}
+
+/// Top-N drafting advancers (status_quo always last) per design spec §9.
+///
+/// Threshold: `ceil(mini_public_size / 2)` = `(mini_public_size + 1) / 2`.
+/// Cap: `MAX_RATIFICATION_CANDIDATES = 5` (status_quo counts toward the cap,
+/// so at most 4 non-status-quo candidates can advance).
+/// Status quo always advances regardless of threshold.
+/// Non-status-quo candidates are filtered by threshold, sorted by
+/// `approval_count DESC`, ties by `candidate_event_hash lex ASC`.
+///
+/// # Panics
+///
+/// Panics if `status_quo_hash` is not found in `candidates`. The contract
+/// is that `materialize()` synthesizes status_quo before calling this.
+pub fn drafting_advancers(
+    candidates: &[DraftCandidateState],
+    mini_public_size: usize,
+    status_quo_hash: CandidateEventHash,
+) -> Vec<crate::community_voting_star::CandidateRef> {
+    use crate::community_voting_star::CandidateRef;
+
+    let threshold = mini_public_size.div_ceil(2); // ceil(N/2)
+
+    // Step 1: filter non-status-quo candidates by approval threshold.
+    let mut threshold_passers: Vec<&DraftCandidateState> = candidates
+        .iter()
+        .filter(|c| c.event_hash != status_quo_hash)
+        .filter(|c| c.approvals.len() >= threshold)
+        .collect();
+
+    // Step 2: sort by approval_count DESC, ties by event_hash ASC.
+    threshold_passers.sort_by(|a, b| {
+        b.approvals
+            .len()
+            .cmp(&a.approvals.len())
+            .then_with(|| a.event_hash.cmp(&b.event_hash))
+    });
+
+    // Step 3: take top (MAX_RATIFICATION_CANDIDATES - 1) — leave room for status_quo.
+    let mut advancers: Vec<CandidateRef> = threshold_passers
+        .into_iter()
+        .take(MAX_RATIFICATION_CANDIDATES - 1)
+        .map(|c| CandidateRef {
+            event_hash: c.event_hash,
+            approval_count: c.approvals.len() as u32,
+        })
+        .collect();
+
+    // Step 4: status_quo always advances, always last.
+    let status_quo = candidates
+        .iter()
+        .find(|c| c.event_hash == status_quo_hash)
+        .expect("materialize() guarantees status_quo synthesis at drafting open");
+    advancers.push(CandidateRef {
+        event_hash: status_quo.event_hash,
+        approval_count: status_quo.approvals.len() as u32,
+    });
+
+    advancers
+}
+
+/// Final ratification candidate ordering: `approval_count DESC`,
+/// ties by `candidate_event_hash lex ASC`.
+///
+/// Status quo has `approval_count = 0` (no approvals by design), so it
+/// naturally sorts last unless a real candidate also has zero approvals —
+/// in which case lex on `event_hash` breaks the tie deterministically.
+///
+/// The result is what `kd=rb RatificationBallot.scores` arrays index against.
+/// Call this function once at Stage 3 → Stage 4 transition and cache the result
+/// so all kd=rb events reference the same ordering.
+///
+/// Input `advancers` are the `CandidateRef`s that `drafting_advancers`
+/// returned (threshold filter + status_quo inclusion + cap already applied).
+pub fn ratification_candidates_ordering(
+    advancers: &[crate::community_voting_star::CandidateRef],
+    _status_quo_hash: CandidateEventHash,
+) -> Vec<crate::community_voting_star::CandidateRef> {
+    let mut ordered = advancers.to_vec();
+    // Sort by approval_count DESC, ties by event_hash ASC.
+    // Status quo's approval_count == 0 → naturally last unless other zero-approval
+    // candidates exist, in which case lex ASC tiebreaks.
+    ordered.sort_by(|a, b| {
+        b.approval_count
+            .cmp(&a.approval_count)
+            .then_with(|| a.event_hash.cmp(&b.event_hash))
+    });
+    ordered
+}
+
 // ── Tier 3 PollResult payload ─────────────────────────────────────────────────
 
 /// Payload for kd=rs PollResult when tier == Tier::Sortition.
@@ -598,13 +712,16 @@ mod tests {
         StarResult {
             winner: CandidateRef {
                 event_hash: [0xab; 32],
+                approval_count: 0,
             },
             finalists: vec![
                 CandidateRef {
                     event_hash: [0xab; 32],
+                    approval_count: 0,
                 },
                 CandidateRef {
                     event_hash: [0xcd; 32],
+                    approval_count: 0,
                 },
             ],
             total_scores: vec![30, 20],
@@ -995,5 +1112,249 @@ mod tests {
         poll.apply_event(&da_event(200, addr(2), unknown_hash))
             .expect("da for unknown candidate");
         assert!(poll.candidates.is_empty());
+    }
+
+    // ── Drafting math tests ───────────────────────────────────────────────────
+
+    // Helper: build a DraftCandidateState with a given hash and approval set.
+    fn make_candidate(hash_byte: u8, approvers: &[u8]) -> DraftCandidateState {
+        let mut approvals = std::collections::HashSet::new();
+        for &b in approvers {
+            approvals.insert(addr(b));
+        }
+        DraftCandidateState {
+            event_hash: [hash_byte; 32],
+            text: format!("proposal {hash_byte}"),
+            proposer: Some(addr(hash_byte)),
+            approvals,
+        }
+    }
+
+    // 1. synthesize_status_quo: same poll_id → same event_hash
+    #[test]
+    fn synthesize_status_quo_deterministic() {
+        let pid = poll_id();
+        let sq1 = synthesize_status_quo(&pid);
+        let sq2 = synthesize_status_quo(&pid);
+        assert_eq!(sq1.event_hash, sq2.event_hash);
+        assert_eq!(sq1.text, "<status quo>");
+        assert!(sq1.proposer.is_none());
+        assert!(sq1.approvals.is_empty());
+    }
+
+    // 2. synthesize_status_quo: different polls → different hashes
+    #[test]
+    fn synthesize_status_quo_different_polls_different_hashes() {
+        let pid1 = PollId([0x01; 32]);
+        let pid2 = PollId([0x02; 32]);
+        let sq1 = synthesize_status_quo(&pid1);
+        let sq2 = synthesize_status_quo(&pid2);
+        assert_ne!(sq1.event_hash, sq2.event_hash);
+    }
+
+    // 3. drafting_advancers: all below threshold → only status_quo returned
+    #[test]
+    fn drafting_advancers_below_threshold_returns_only_status_quo() {
+        let sq = synthesize_status_quo(&poll_id());
+        let sq_hash = sq.event_hash;
+        // mini_public_size=4, threshold=2; candidates have 1 approval each (below 2)
+        let candidates = vec![make_candidate(0x01, &[1]), make_candidate(0x02, &[2]), sq];
+        let result = drafting_advancers(&candidates, 4, sq_hash);
+        assert_eq!(result.len(), 1, "only status_quo should advance");
+        assert_eq!(result[0].event_hash, sq_hash);
+    }
+
+    // 4. drafting_advancers: candidates at/above threshold advance + status_quo
+    #[test]
+    fn drafting_advancers_above_threshold_returns_top_n_plus_status_quo() {
+        let sq = synthesize_status_quo(&poll_id());
+        let sq_hash = sq.event_hash;
+        // mini_public_size=4, threshold=2; candidate 0x01 has 3 approvals (above), 0x02 has 1 (below)
+        let candidates = vec![
+            make_candidate(0x01, &[1, 2, 3]),
+            make_candidate(0x02, &[2]),
+            sq,
+        ];
+        let result = drafting_advancers(&candidates, 4, sq_hash);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].event_hash, [0x01; 32]);
+        assert_eq!(result[1].event_hash, sq_hash, "status_quo must be last");
+    }
+
+    // 5. drafting_advancers: 10 candidates all above threshold → capped at 5 total
+    #[test]
+    fn drafting_advancers_caps_at_max_ratification_candidates_5() {
+        let sq = synthesize_status_quo(&poll_id());
+        let sq_hash = sq.event_hash;
+        // 10 regular candidates all with 3 approvals; threshold=2 (mini_public=4)
+        let mut candidates: Vec<DraftCandidateState> =
+            (1u8..=10).map(|b| make_candidate(b, &[1, 2, 3])).collect();
+        candidates.push(sq);
+
+        let result = drafting_advancers(&candidates, 4, sq_hash);
+        assert_eq!(
+            result.len(),
+            MAX_RATIFICATION_CANDIDATES,
+            "output must be capped at MAX_RATIFICATION_CANDIDATES=5"
+        );
+        // Last entry must be status_quo
+        assert_eq!(
+            result.last().unwrap().event_hash,
+            sq_hash,
+            "status_quo must be last"
+        );
+    }
+
+    // 6. drafting_advancers: status_quo always last
+    #[test]
+    fn drafting_advancers_status_quo_always_last() {
+        let sq = synthesize_status_quo(&poll_id());
+        let sq_hash = sq.event_hash;
+        let candidates = vec![
+            make_candidate(0x10, &[1, 2, 3, 4]),
+            make_candidate(0x20, &[1, 2, 3]),
+            sq,
+        ];
+        let result = drafting_advancers(&candidates, 4, sq_hash);
+        assert!(result.len() >= 2);
+        assert_eq!(
+            result.last().unwrap().event_hash,
+            sq_hash,
+            "status_quo must always be last"
+        );
+    }
+
+    // 7. drafting_advancers: sort by approval DESC, ties by hash ASC
+    #[test]
+    fn drafting_advancers_sort_by_approval_desc_then_hash_asc() {
+        let sq = synthesize_status_quo(&poll_id());
+        let sq_hash = sq.event_hash;
+        // 0x30: 3 approvals, 0x10: 3 approvals, 0x20: 2 approvals
+        // Tie between 0x10 and 0x30 at 3 approvals → hash ASC: 0x10 < 0x30
+        let candidates = vec![
+            make_candidate(0x30, &[1, 2, 3]),
+            make_candidate(0x10, &[1, 2, 3]),
+            make_candidate(0x20, &[1, 2]),
+            sq,
+        ];
+        // mini_public=4, threshold=2; all three pass
+        let result = drafting_advancers(&candidates, 4, sq_hash);
+        // Expected order: 0x10 (3 approvals, lower hash), 0x30 (3 approvals, higher hash),
+        // 0x20 (2 approvals), status_quo (last)
+        assert_eq!(result[0].event_hash, [0x10; 32]);
+        assert_eq!(result[1].event_hash, [0x30; 32]);
+        assert_eq!(result[2].event_hash, [0x20; 32]);
+        assert_eq!(result[3].event_hash, sq_hash);
+    }
+
+    // 8. drafting_advancers: ceil threshold for odd mini_public (N=5, threshold=3)
+    #[test]
+    fn drafting_advancers_ceil_threshold_for_odd_mini_public() {
+        let sq = synthesize_status_quo(&poll_id());
+        let sq_hash = sq.event_hash;
+        // N=5, threshold = ceil(5/2) = 3
+        // candidate with 2 approvals: below threshold
+        // candidate with 3 approvals: at threshold (passes)
+        let candidates = vec![
+            make_candidate(0x01, &[1, 2]),    // 2 approvals — below threshold=3
+            make_candidate(0x02, &[1, 2, 3]), // 3 approvals — at threshold=3
+            sq,
+        ];
+        let result = drafting_advancers(&candidates, 5, sq_hash);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].event_hash, [0x02; 32], "0x02 should advance");
+        assert_eq!(result[1].event_hash, sq_hash, "status_quo last");
+    }
+
+    // 9. drafting_advancers: ceil threshold for even mini_public (N=4, threshold=2)
+    #[test]
+    fn drafting_advancers_ceil_threshold_for_even_mini_public() {
+        let sq = synthesize_status_quo(&poll_id());
+        let sq_hash = sq.event_hash;
+        // N=4, threshold = ceil(4/2) = 2
+        // candidate with 1 approval: below threshold
+        // candidate with 2 approvals: at threshold (passes)
+        let candidates = vec![
+            make_candidate(0x01, &[1]),    // 1 approval — below threshold=2
+            make_candidate(0x02, &[1, 2]), // 2 approvals — at threshold=2
+            sq,
+        ];
+        let result = drafting_advancers(&candidates, 4, sq_hash);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].event_hash, [0x02; 32], "0x02 should advance");
+        assert_eq!(result[1].event_hash, sq_hash, "status_quo last");
+    }
+
+    // 10. ratification_candidates_ordering: deterministic (same input → same output)
+    #[test]
+    fn ratification_candidates_ordering_deterministic() {
+        let sq = synthesize_status_quo(&poll_id());
+        let sq_hash = sq.event_hash;
+        let candidates = vec![
+            make_candidate(0x10, &[1, 2, 3]),
+            make_candidate(0x20, &[1, 2]),
+            sq,
+        ];
+        let advancers = drafting_advancers(&candidates, 4, sq_hash);
+        let order1 = ratification_candidates_ordering(&advancers, sq_hash);
+        let order2 = ratification_candidates_ordering(&advancers, sq_hash);
+        assert_eq!(order1, order2, "ordering must be deterministic");
+    }
+
+    // 11. ratification_candidates_ordering: status_quo last unless tied at zero
+    #[test]
+    fn ratification_candidates_ordering_status_quo_always_last_unless_tied() {
+        let sq = synthesize_status_quo(&poll_id());
+        let sq_hash = sq.event_hash;
+        // Three candidates: 0x10 with 3 approvals, 0x20 with 2 approvals, status_quo (0 approvals)
+        // Expected ordering: 0x10 (3), 0x20 (2), status_quo (0)
+        let candidates = vec![
+            make_candidate(0x20, &[1, 2]),
+            make_candidate(0x10, &[1, 2, 3]),
+            sq,
+        ];
+        let advancers = drafting_advancers(&candidates, 4, sq_hash);
+        let ordered = ratification_candidates_ordering(&advancers, sq_hash);
+        assert_eq!(ordered[0].event_hash, [0x10; 32], "highest approvals first");
+        assert_eq!(ordered[1].event_hash, [0x20; 32]);
+        assert_eq!(
+            ordered.last().unwrap().event_hash,
+            sq_hash,
+            "status_quo last"
+        );
+    }
+
+    // 12. drafting_advancers: excludes below-threshold candidates
+    #[test]
+    fn drafting_advancers_excludes_below_threshold_candidates() {
+        let sq = synthesize_status_quo(&poll_id());
+        let sq_hash = sq.event_hash;
+        // N=6, threshold = ceil(6/2) = 3
+        // 0x01: 2 approvals (excluded), 0x02: 3 approvals (included), 0x03: 4 approvals (included)
+        let candidates = vec![
+            make_candidate(0x01, &[1, 2]),       // 2 — below
+            make_candidate(0x02, &[1, 2, 3]),    // 3 — at threshold
+            make_candidate(0x03, &[1, 2, 3, 4]), // 4 — above
+            sq,
+        ];
+        let result = drafting_advancers(&candidates, 6, sq_hash);
+        let hashes: Vec<u8> = result.iter().map(|c| c.event_hash[0]).collect();
+        assert!(
+            !hashes.contains(&0x01),
+            "below-threshold candidate must be excluded"
+        );
+        assert!(
+            hashes.contains(&0x02),
+            "at-threshold candidate must advance"
+        );
+        assert!(
+            hashes.contains(&0x03),
+            "above-threshold candidate must advance"
+        );
+        assert_eq!(
+            result.last().unwrap().event_hash,
+            sq_hash,
+            "status_quo last"
+        );
     }
 }

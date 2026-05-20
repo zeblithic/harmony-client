@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 /// `Serialize`/`Deserialize` are added in ZEB-309 Phase 4a-main so that
 /// `Tier3PollResultPayload` can encode the full `StarResult` in the kd=rs
 /// payload — required for SR1 verify (any node re-computes and compares).
+///
+/// `approval_count` is set by `drafting_advancers` (from `DraftCandidateState.approvals.len()`)
+/// and carried through `ratification_candidates_ordering` so the ordering sort can tiebreak
+/// deterministically without re-reading the full `DraftCandidateState` slice.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CandidateRef {
     #[serde(
@@ -19,6 +23,10 @@ pub struct CandidateRef {
         deserialize_with = "deserialize_bytes_from_bstr"
     )]
     pub event_hash: CandidateEventHash,
+    /// Approval count at the time this candidate was advanced to ratification.
+    /// Defaults to 0 for the status_quo candidate (no approvals by design).
+    #[serde(rename = "ac", default)]
+    pub approval_count: u32,
 }
 
 /// Output of the STAR tally computation.
@@ -170,10 +178,12 @@ pub mod test_helpers {
     use crate::community_voting_core::PollId;
 
     /// Build a `CandidateRef` from a single repeated byte (for readability in
-    /// tests).
+    /// tests). `approval_count` defaults to 0 (sufficient for all STAR tally tests
+    /// since tally_star doesn't use approval_count).
     pub fn candidate(byte: u8) -> CandidateRef {
         CandidateRef {
             event_hash: [byte; 32],
+            approval_count: 0,
         }
     }
 
