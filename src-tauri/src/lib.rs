@@ -22948,8 +22948,17 @@ async fn dfrost_request_vrf_beacon<R: tauri::Runtime>(
     };
 
     // 4. Snapshot the local FROST KeyPackage (materialised by Task 3's
-    //    round_num=3 path on DKG completion). Bail early if either the
-    //    committee isn't active or this node wasn't a DKG member.
+    //    round_num=3 path on DKG completion). Bail early if (a) the
+    //    committee isn't active, (b) this node wasn't a DKG member, or
+    //    (c) the caller-supplied `epoch` doesn't match
+    //    `committee_state.current_epoch` (R10 Cursor MEDIUM "VRF beacon
+    //    ignores committee epoch"). `derive_vrf_seed` and
+    //    `derive_ceremony_id` both mix `epoch` into their outputs to
+    //    bind a VRF beacon to the committee that authored it; without
+    //    this guard, a stale epoch from before a proactive refresh
+    //    could still drive a successful threshold sign on the rotated
+    //    committee. The binding is meaningless unless we verify the
+    //    caller's `epoch` agrees with the active committee here.
     let key_package = {
         let log = log_arc.lock().await;
         if !log.committee_state.active {
@@ -22957,6 +22966,13 @@ async fn dfrost_request_vrf_beacon<R: tauri::Runtime>(
                 "dfrost_request_vrf_beacon: no active committee — DKG must complete first"
                     .to_string(),
             );
+        }
+        if epoch != log.committee_state.current_epoch {
+            return Err(format!(
+                "dfrost_request_vrf_beacon: epoch {epoch} does not match active committee epoch \
+                 {}",
+                log.committee_state.current_epoch
+            ));
         }
         log.local_key_package.clone().ok_or(
             "dfrost_request_vrf_beacon: local_key_package missing — was this node a DKG member?",
