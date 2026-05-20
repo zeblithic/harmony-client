@@ -164,36 +164,68 @@ impl VotingLog {
         self.polls.contains_key(pid)
     }
 
-    /// Return the number of ratification candidates for a Tier 3 poll
-    /// once it has reached the Drafting stage (i.e., status_quo has been
-    /// synthesized into the candidate set). Used by
-    /// `voting_cast_ratification_ballot` for pre-flight ballot validation
-    /// against the canonical candidate ordering.
-    ///
-    /// Returns `None` if:
+    /// Return the count of ratification candidates for a Tier 3 poll
+    /// currently in `Stage::Ratification` (HLC-aware). Returns `None` if:
     /// - the poll does not exist,
-    /// - the poll is not Tier 3, or
-    /// - the poll has not yet reached Drafting/Ratification (status_quo
-    ///   not yet synthesized — `drafting_advancers` returns `None`).
+    /// - the poll is not Tier 3,
+    /// - the poll has no `last_hlc` (no events applied yet — definitely
+    ///   not in Ratification), or
+    /// - the poll is not in `Stage::Ratification` at `last_hlc`.
     ///
-    /// Caller is expected to additionally gate on `current_stage_at(&now)
-    /// == Stage::Ratification` if it needs strict Ratification-stage
-    /// pre-flight; the count itself is HLC-independent once
-    /// status_quo exists.
+    /// Used by `voting_cast_ratification_ballot` for pre-flight ballot
+    /// validation against the canonical candidate ordering.
+    ///
+    /// ## Why a local status_quo synthesis
+    ///
+    /// `synthesize_status_quo` is NEVER written into `t3.candidates` by
+    /// `apply` — status_quo is materialized only on a local clone at
+    /// orchestration time (see `verify_sr`, `verify_ratification_ballot`,
+    /// the engine-auto kd=rs trigger in
+    /// `community_voting_log_engine::maybe_trigger_engine_auto_orchestration`,
+    /// and the ratification-open Tauri-event branch in the post-apply
+    /// hook). If we called `drafting_advancers(&t3.candidates, ...)`
+    /// directly, it would return `None` for every production poll
+    /// because status_quo wouldn't be in the slice — and the IPC's
+    /// pre-flight would always reject valid ballots.
+    ///
+    /// This helper mirrors the engine-auto kd=rs pattern: clone
+    /// `t3.candidates`, push synthesized status_quo, then run
+    /// `drafting_advancers` + `ratification_candidates_ordering`. The
+    /// returned count includes status_quo.
     pub fn tier3_ratification_candidate_count(
         &self,
         pid: &crate::community_voting_core::PollId,
     ) -> Option<usize> {
         let state = self.polls.get(pid)?;
         let t3 = state.tier_state.as_tier3()?;
+
+        // Gate on Ratification stage using the latest applied event's HLC.
+        // If no events have been applied yet, the poll is at most in
+        // Stage::Sortition — definitely not Ratification.
+        let now = t3.last_hlc.as_ref()?;
+        if !matches!(
+            t3.current_stage_at(now),
+            crate::community_voting_tier3::Stage::Ratification
+        ) {
+            return None;
+        }
+
+        // Mirror the engine-auto kd=rs computation: synthesize status_quo
+        // locally and push onto a temp candidates slice so
+        // `drafting_advancers` returns Some.
         let sq = crate::community_voting_tier3::synthesize_status_quo(&t3.meta.poll_id);
+        let sq_hash = sq.event_hash;
+        let mut all_candidates = t3.candidates.clone();
+        all_candidates.push(sq);
         let primary_size = t3.meta.config.sortition_size as usize;
         let advancers = crate::community_voting_tier3::drafting_advancers(
-            &t3.candidates,
+            &all_candidates,
             primary_size,
-            sq.event_hash,
+            sq_hash,
         )?;
-        Some(advancers.len())
+        let ordering =
+            crate::community_voting_tier3::ratification_candidates_ordering(&advancers, sq_hash);
+        Some(ordering.len())
     }
 
     /// Apply a new event to the log. Caller has already done verify
@@ -2387,6 +2419,175 @@ mod tier3_dispatch_tests {
         assert_eq!(
             t3_1.eligible_electorate_snapshot, expected,
             "eligible_electorate_snapshot must be sorted OwnerAddr lex ASC"
+        );
+    }
+
+    // ── tier3_ratification_candidate_count regression test ──────────────────
+    //
+    // Pre-fix bug: the helper called `drafting_advancers(&t3.candidates, ...)`
+    // directly, which returns `None` because status_quo is never inserted into
+    // `t3.candidates` by `apply()` — it's only synthesized on a local clone at
+    // orchestration time. Net effect: `voting_cast_ratification_ballot` always
+    // failed its pre-flight in production.
+    //
+    // Fix: mirror the engine-auto kd=rs computation — clone t3.candidates,
+    // push synthesized status_quo, then derive advancers + ordering.
+    //
+    // This test drives a Tier 3 poll into Ratification with one above-threshold
+    // draft candidate and confirms the helper returns Some(2) (= 1 real
+    // candidate + status_quo) — NOT None, which is what it returned pre-fix.
+
+    #[test]
+    fn tier3_ratification_candidate_count_synthesizes_status_quo() {
+        use crate::community_voting_core::{
+            DraftApprovalPayload, DraftCandidatePayload, RatificationBallotPayload,
+            SortitionSelectionPayload,
+        };
+        use crate::community_voting_tier3::event_hash_of;
+
+        // Use the standard tier3_config() — sortition_size=20, dw=fw=rw=100s.
+        // Drafting threshold = ceil(20/2) = 10 approvals.
+        // Ratification reached at wall ≥ create_wall + (dw+fw)*1000 = 200_000ms.
+        let cfg = tier3_config();
+
+        let mut log = VotingLog::new();
+        let creator = addr(0xaa);
+
+        // PollCreate at t=1000 (tier3_create_event uses wall_ms=1000).
+        let create_ev = tier3_create_event(creator, &cfg);
+        let pid = log.apply(create_ev, &cid()).expect("tier3 create");
+
+        // Before any further events apply, no last_hlc → helper returns None.
+        assert_eq!(
+            log.tier3_ratification_candidate_count(&pid),
+            None,
+            "no events applied (last_hlc=None) must return None"
+        );
+
+        // kd=ss SortitionSelection — mini-public primary = [addr(1)..addr(20)].
+        let primary: Vec<_> = (1..=20u8).map(addr).collect();
+        let ss_payload = SortitionSelectionPayload {
+            poll_id: pid,
+            primary: primary.clone(),
+            backup: vec![],
+        };
+        log.apply(
+            tier3_event_with_payload(
+                PollEventKindCode::SortitionSelection,
+                2000,
+                addr(0xfe),
+                encode(&ss_payload),
+            ),
+            &cid(),
+        )
+        .expect("apply kd=ss");
+
+        // Still pre-Ratification (last_hlc=2000 → current_stage_at=Deliberation).
+        assert_eq!(
+            log.tier3_ratification_candidate_count(&pid),
+            None,
+            "Deliberation stage must return None"
+        );
+
+        // kd=dc DraftCandidate by addr(1) during Drafting window
+        // (wall ≥ 1000+100_000 = 101_000ms, wall < 1000+200_000 = 201_000ms).
+        let dc_payload = DraftCandidatePayload {
+            poll_id: pid,
+            text: "proposal A".into(),
+        };
+        let dc_ev = tier3_event_with_payload(
+            PollEventKindCode::DraftCandidate,
+            110_000,
+            addr(1),
+            encode(&dc_payload),
+        );
+        let candidate_hash = event_hash_of(&dc_ev);
+        log.apply(dc_ev, &cid()).expect("apply kd=dc");
+
+        // 9 additional approvers (addr(2)..addr(10)) — combined with the
+        // implicit self-approval from addr(1), the candidate reaches the
+        // threshold of 10.
+        for (i, approver_byte) in (2u8..=10).enumerate() {
+            let da_payload = DraftApprovalPayload {
+                poll_id: pid,
+                candidate_event_hash: candidate_hash,
+            };
+            log.apply(
+                tier3_event_with_payload(
+                    PollEventKindCode::DraftApproval,
+                    110_000 + 1 + i as u64,
+                    addr(approver_byte),
+                    encode(&da_payload),
+                ),
+                &cid(),
+            )
+            .unwrap_or_else(|e| panic!("apply kd=da for addr({approver_byte}): {e:?}"));
+        }
+
+        // Drafting stage — last_hlc still < 201_000.
+        assert_eq!(
+            log.tier3_ratification_candidate_count(&pid),
+            None,
+            "Drafting stage must return None"
+        );
+
+        // Push past the dw+fw threshold via a kd=rb RatificationBallot at
+        // wall=210_000 (≥ 201_000 → Ratification). apply_event does not
+        // validate ballot score length (verify does, but tests bypass verify),
+        // so any score vector works.
+        // Crucially: status_quo is NOT in t3.candidates — apply never writes
+        // it. This is the bug condition the helper must handle.
+        let rb_payload = RatificationBallotPayload {
+            poll_id: pid,
+            scores: vec![5, 0],
+        };
+        log.apply(
+            tier3_event_with_payload(
+                PollEventKindCode::RatificationBallot,
+                210_000,
+                addr(5),
+                encode(&rb_payload),
+            ),
+            &cid(),
+        )
+        .expect("apply kd=rb");
+
+        // Sanity: t3.candidates has exactly 1 entry (the draft). status_quo
+        // is NOT in the slice — the apply path never writes it.
+        let t3 = log.polls[&pid].tier_state.as_tier3().unwrap();
+        assert_eq!(
+            t3.candidates.len(),
+            1,
+            "status_quo is NOT in t3.candidates (apply path never writes it)"
+        );
+        assert_eq!(
+            t3.candidates[0].approvals.len(),
+            10,
+            "draft candidate must have 10 approvals (threshold for sortition_size=20)"
+        );
+        assert_eq!(
+            t3.last_hlc.as_ref().map(|h| h.wall_ms),
+            Some(210_000),
+            "last_hlc must reflect the kd=rb apply"
+        );
+
+        // The helper must now return Some(2) — 1 above-threshold draft +
+        // synthesized status_quo. Pre-fix this returned None because
+        // `drafting_advancers(&t3.candidates, ...)` couldn't find status_quo
+        // in the candidate slice.
+        assert_eq!(
+            log.tier3_ratification_candidate_count(&pid),
+            Some(2),
+            "Ratification stage with 1 above-threshold draft must return \
+             Some(2) (= 1 draft + status_quo). Pre-fix this was None."
+        );
+
+        // Unknown poll_id returns None.
+        let missing_pid = PollId([0xff; 32]);
+        assert_eq!(
+            log.tier3_ratification_candidate_count(&missing_pid),
+            None,
+            "Unknown poll_id must return None"
         );
     }
 }
