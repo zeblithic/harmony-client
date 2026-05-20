@@ -22291,100 +22291,89 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
             crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms)
                 .await;
 
-        // Snapshot the committee shape, validate preconditions, compute
-        // self's FROST identifier. All under the SAME lock as the
-        // already-submitted check so two concurrent IPC calls can't both
-        // pass the "not yet submitted" gate before either applies.
-        let (members, max_signers, threshold, self_id, r1_secret, r1_pkg_bytes) = {
-            let log = log_arc.lock().await;
-            let pending = log.committee_state.pending_dkg.as_ref().ok_or(
-                "dfrost_contribute_dkg_round: no pending DKG ceremony — \
-                     the initiator's dr rn=1 must apply locally first",
-            )?;
-            if pending.ceremony_id != ceremony_bytes {
-                return Err(format!(
-                    "dfrost_contribute_dkg_round: ceremony_id mismatch \
-                     (pending={}, requested={})",
-                    hex::encode(pending.ceremony_id),
-                    hex::encode(ceremony_bytes)
-                ));
-            }
-            let self_index = pending
-                .members
-                .iter()
-                .position(|a| *a == self_owner)
-                .ok_or(
+        // R7 (Cursor MEDIUM "Round one DKG race"): hold the log lock
+        // CONTINUOUSLY across gate → dkg_part1_local → build_signed →
+        // stash → apply. Releasing the lock between the
+        // `round1_packages.contains_key(self_owner)` gate and the apply
+        // let two concurrent IPC calls both pass the gate, both mint
+        // fresh round-1 material via `dkg_part1_local`, and race the
+        // apply — whichever applied second would overwrite
+        // `local_dkg_secret` with a fresh `sec_B` while the apply path's
+        // `or_insert` kept `pkg_A` in `round1_packages`, breaking the
+        // round-2 invariant (stashed secret must match broadcast pkg).
+        //
+        // The outbox lock is acquired in a nested inner block; the
+        // codebase's other dfrost IPCs all release the outbox before
+        // touching the log, so this is a no-deadlock log→outbox ordering.
+        let participants_after: usize = {
+            let mut log = log_arc.lock().await;
+            // ─── Snapshot + validate inside the lock ──
+            let (self_index, members, max_signers, threshold) = {
+                let pending = log.committee_state.pending_dkg.as_ref().ok_or(
+                    "dfrost_contribute_dkg_round: no pending DKG ceremony — \
+                         the initiator's dr rn=1 must apply locally first",
+                )?;
+                if pending.ceremony_id != ceremony_bytes {
+                    return Err(format!(
+                        "dfrost_contribute_dkg_round: ceremony_id mismatch \
+                         (pending={}, requested={})",
+                        hex::encode(pending.ceremony_id),
+                        hex::encode(ceremony_bytes)
+                    ));
+                }
+                let self_index = pending
+                    .members
+                    .iter()
+                    .position(|a| *a == self_owner)
+                    .ok_or(
                     "dfrost_contribute_dkg_round: self is not a committee member for this ceremony",
                 )?;
-            // Replay/double-submit gate. An already-applied own dr rn=1 has
-            // populated `round1_packages[self_owner]`; refusing a second
-            // call prevents a stale UI re-trigger from minting fresh round-1
-            // secret material that would silently replace the in-flight one
-            // (which would in turn break round_num=2 since the stashed
-            // `local_dkg_secret` would no longer match the broadcast
-            // round-1 package).
-            if pending.round1_packages.contains_key(&self_owner) {
-                return Err(
-                    "dfrost_contribute_dkg_round: round 1 already submitted by self".to_string(),
-                );
-            }
-            let members = pending.members.clone();
-            let max_signers = pending.max_signers;
-            let threshold = pending.threshold;
+                if pending.round1_packages.contains_key(&self_owner) {
+                    return Err(
+                        "dfrost_contribute_dkg_round: round 1 already submitted by self"
+                            .to_string(),
+                    );
+                }
+                (
+                    self_index,
+                    pending.members.clone(),
+                    pending.max_signers,
+                    pending.threshold,
+                )
+            };
             let self_id = crate::community_dfrost_crypto::identifier_for_index(self_index);
+            // `members` retained for documentation symmetry with the
+            // round-2/3 branches; silence the unused-binding lint.
+            let _ = &members;
 
-            // Run FROST DKG round 1 while holding the lock — the secret
-            // half stays on this node; the public package bytes ride
-            // inside the dr rn=1 payload. We don't strictly need the lock
-            // for `dkg_part1_local` itself, but doing it here lets us
-            // stash + apply under the same lock window the validation ran
-            // in, which we want for the apply step below.
-            let (sec, pkg) =
+            // ─── FROST DKG round 1 ──
+            let (r1_secret, r1_pkg_bytes) =
                 crate::community_dfrost_crypto::dkg_part1_local(self_id, max_signers, threshold)
                     .map_err(|e| format!("dfrost_contribute_dkg_round: dkg::part1: {e}"))?;
-            (members, max_signers, threshold, self_id, sec, pkg)
-        };
 
-        // max_signers / threshold / self_id are intentionally unused
-        // downstream of this point — they were derived for shape parity
-        // with `dfrost_initiate_dkg` step 4 and to make the dkg::part1
-        // arguments explicit. Silence the unused-binding warning without
-        // dropping the documentation value of the names.
-        let _ = (max_signers, threshold, self_id);
-        let _ = &members;
-
-        // Build the dr rn=1 payload + sign the envelope. Lock the outbox
-        // only as long as needed to access the signing key.
-        let (event, self_x25519_priv) = {
-            let outbox_g = dm_outbox.lock().await;
-            let signing_key = outbox_g.signing_key.as_ref();
+            // ─── Build + sign event (outbox lock nested inside log lock) ──
             let payload = crate::community_dfrost_types::DkgRoundPayload {
                 ceremony_id: ceremony_bytes,
                 round_num: 1,
                 round1_package: Some(r1_pkg_bytes),
                 recipient_ciphertexts: None,
             };
-            let ev = crate::community_dfrost_log::build_signed_dfrost_event(
-                signing_key,
-                self_owner,
-                crate::community_dfrost_types::DfrostEventKind::DkgRound,
-                &payload,
-                hlc,
-            )
-            .map_err(|e| format!("dfrost_contribute_dkg_round: build_signed: {e}"))?;
-            let x_priv: [u8; 32] = *crate::dm_signing::ed25519_priv_to_x25519(signing_key);
-            (ev, x_priv)
-        };
+            let (event, self_x25519_priv) = {
+                let outbox_g = dm_outbox.lock().await;
+                let signing_key = outbox_g.signing_key.as_ref();
+                let ev = crate::community_dfrost_log::build_signed_dfrost_event(
+                    signing_key,
+                    self_owner,
+                    crate::community_dfrost_types::DfrostEventKind::DkgRound,
+                    &payload,
+                    hlc,
+                )
+                .map_err(|e| format!("dfrost_contribute_dkg_round: build_signed: {e}"))?;
+                let x_priv: [u8; 32] = *crate::dm_signing::ed25519_priv_to_x25519(signing_key);
+                (ev, x_priv)
+            };
 
-        // Stash secret + apply under the same lock window. If apply
-        // succeeds the secret is in place for the round_num=2 path; if
-        // apply fails we DON'T want a stashed secret without a
-        // corresponding round-1 package in pending_dkg (which would mean
-        // a future round_num=2 call would use a secret that doesn't
-        // match any broadcast round-1 package), so we restore the prior
-        // value on apply failure.
-        let participants_after: usize = {
-            let mut log = log_arc.lock().await;
+            // ─── Stash secret + apply, rollback on apply failure ──
             let prior_secret = log.local_dkg_secret.take();
             log.local_dkg_secret = Some(r1_secret);
             if let Err(e) = log.apply_with_identity(event, &self_owner, &self_x25519_priv) {
