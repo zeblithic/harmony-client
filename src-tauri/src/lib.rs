@@ -2013,17 +2013,17 @@ async fn start_node(
                         let mint_sync_state_path = app_data_dir
                             .join("mint")
                             .join(crate::mint_sync_persist::MINT_SYNC_STATE_FILENAME);
-                        let initial_sync_state = crate::mint_sync_persist::load(
-                            &mint_sync_state_path,
-                        )
-                        .unwrap_or_else(|e| {
-                            tracing::warn!(
-                                target: "mint_sync",
-                                path = %mint_sync_state_path.display(),
-                                "load mint_sync_state failed: {e}; using default"
-                            );
-                            crate::mint_sync_types::MintSyncState::default()
-                        });
+                        // MAJOR 6: only fall back to Default when the file is
+                        // genuinely absent. Any other error (corrupt CBOR,
+                        // schema-too-new, I/O glitch) silently resetting the
+                        // replay tracker and deletion floor would be a
+                        // safety regression — both are correctness-critical state.
+                        // `mint_sync_persist::load` already returns Ok(default)
+                        // for NotFound and propagates all other errors, so we
+                        // propagate them here too.
+                        let initial_sync_state =
+                            crate::mint_sync_persist::load(&mint_sync_state_path)
+                                .map_err(|e| format!("load mint_sync_state failed: {e}"))?;
                         let mint_sync_state =
                             std::sync::Arc::new(tokio::sync::Mutex::new(initial_sync_state));
                         let (mint_out_tx, mint_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);

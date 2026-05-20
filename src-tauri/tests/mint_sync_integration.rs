@@ -47,13 +47,37 @@ async fn setup() -> Harness {
     }
 }
 
+/// Wait until the content store has at least `min_count` blobs, with a
+/// bounded poll to avoid flaky fixed-sleep timeouts on slow CI (MAJOR 9).
+async fn wait_for_cs_count(cs: &Arc<InMemoryStub>, min_count: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if cs.debug_all_cids().await.len() >= min_count {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for content store to reach {min_count} blob(s); \
+                 got {} after 5s",
+                cs.debug_all_cids().await.len()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// Drive engine_a → publish, then deliver to engine_b.
 async fn sync_a_to_b(h: &Harness) {
+    let before_count = h.cs.debug_all_cids().await.len();
     h.engine_a.flush_now().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Bounded poll instead of fixed sleep (MAJOR 9: avoids flaky CI failures).
+    wait_for_cs_count(&h.cs, before_count + 1).await;
     let cids = h.cs.debug_all_cids().await;
     for cid in cids {
-        let _ = h.engine_b.handle_incoming_envelope_for_test(cid).await;
+        h.engine_b
+            .handle_incoming_envelope_for_test(cid)
+            .await
+            .unwrap_or_else(|e| panic!("envelope {cid:?} failed on engine_b: {e}"));
     }
 }
 
@@ -272,11 +296,15 @@ async fn concurrent_writes_to_distinct_rows_both_land() {
     // A → B
     sync_a_to_b(&h).await;
     // B → A: publish from B and apply on A.
+    let before_b = h.cs.debug_all_cids().await.len();
     h.engine_b.flush_now().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_cs_count(&h.cs, before_b + 1).await;
     let cids = h.cs.debug_all_cids().await;
     for cid in cids {
-        let _ = h.engine_a.handle_incoming_envelope_for_test(cid).await;
+        h.engine_a
+            .handle_incoming_envelope_for_test(cid)
+            .await
+            .unwrap_or_else(|e| panic!("envelope {cid:?} failed on engine_a: {e}"));
     }
 
     // Both DBs should have both rows.

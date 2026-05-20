@@ -1010,12 +1010,16 @@ pub async fn mint_delete_account(
     app: tauri::AppHandle,
     state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
 ) -> Result<(), String> {
-    // Extract the sync_state handle from the engine — required; we do NOT
-    // fall back to a temporary floor when the engine is absent (see above).
-    let sync_state_handle = {
+    // Extract the sync_state handle + persist path from the engine — required;
+    // we do NOT fall back to a temporary floor when the engine is absent (see
+    // the doc-comment above the command).
+    let (sync_state_handle, sync_state_path_opt) = {
         let node = state.lock().expect("NodeState poisoned");
         match node.mint_sync.as_ref() {
-            Some(e) => e.sync_state_handle(),
+            Some(e) => (
+                e.sync_state_handle(),
+                e.sync_state_path().map(|p| p.to_path_buf()),
+            ),
             None => {
                 return Err(
                     "mint sync engine not yet initialized — cannot delete account safely \
@@ -1035,7 +1039,22 @@ pub async fn mint_delete_account(
             reassign_to.as_deref(),
             &mut st.account_deletion_floor,
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        // Persist the updated deletion floor so a restart doesn't lose it
+        // (CRITICAL 2: without this, a peer's stale snapshot could resurrect
+        // the deleted account on next sync after restart).
+        if let Some(path) = sync_state_path_opt {
+            let st_snap = st.clone();
+            if let Err(e) = crate::mint_sync_persist::save(&path, &st_snap) {
+                // Log a warning but don't fail the delete — the in-memory
+                // state is still correct and the delete has already committed.
+                tracing::warn!(
+                    target: "mint_sync",
+                    "persist sync_state after account deletion failed: {e}"
+                );
+            }
+        }
+        Ok::<(), String>(())
     })
     .await
     .map_err(|e| format!("join error: {e}"))??;

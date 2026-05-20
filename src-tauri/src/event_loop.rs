@@ -636,25 +636,41 @@ pub async fn run<R: Runtime>(
                 });
 
                 // Inbound: Zenoh subscriber → MintSyncEngine subscriber_rx.
+                // On transient recv_async errors, re-declare the subscriber
+                // with exponential backoff (MAJOR 8). The only terminal
+                // condition is `closing` becoming true (node shutdown) or
+                // `inbound_tx.send` failing (engine dropped its receiver).
                 match session.declare_subscriber(&key_expr).await {
                     Ok(sub) => {
                         let inbound_tx = handles.inbound_tx;
                         let closing_sub = Arc::clone(&closing);
                         let app_late = app.clone();
                         let topic_late = topic.clone();
+                        let session_sub = session.clone();
+                        let key_expr_sub = key_expr.clone();
                         tokio::spawn(async move {
-                            loop {
-                                match sub.recv_async().await {
-                                    Ok(sample) => {
-                                        let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
-                                        if inbound_tx.send(bytes).await.is_err() {
-                                            break;
+                            let mut current_sub = sub;
+                            let mut backoff_ms: u64 = 100;
+                            'outer: loop {
+                                loop {
+                                    match current_sub.recv_async().await {
+                                        Ok(sample) => {
+                                            backoff_ms = 100; // reset on success
+                                            let bytes: Vec<u8> =
+                                                sample.payload().to_bytes().to_vec();
+                                            if inbound_tx.send(bytes).await.is_err() {
+                                                // Engine dropped its receiver — clean shutdown.
+                                                break 'outer;
+                                            }
                                         }
-                                    }
-                                    Err(_) => {
-                                        if !closing_sub.load(Ordering::SeqCst) {
+                                        Err(_) => {
+                                            if closing_sub.load(Ordering::SeqCst) {
+                                                break 'outer;
+                                            }
                                             tracing::warn!(
-                                                "mint-root subscriber closed unexpectedly"
+                                                backoff_ms,
+                                                "mint-root subscriber closed unexpectedly; \
+                                                 will re-declare after backoff"
                                             );
                                             let _ = app_late.emit(
                                                 "mint-root-sync-degraded",
@@ -663,8 +679,30 @@ pub async fn run<R: Runtime>(
                                                     "topic": &topic_late,
                                                 }),
                                             );
+                                            break; // break inner, retry outer
                                         }
-                                        break;
+                                    }
+                                }
+                                if closing_sub.load(Ordering::SeqCst) {
+                                    break 'outer;
+                                }
+                                // Exponential backoff before re-declaring.
+                                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                                backoff_ms = (backoff_ms * 2).min(30_000);
+                                match session_sub.declare_subscriber(&key_expr_sub).await {
+                                    Ok(new_sub) => {
+                                        tracing::info!(
+                                            "mint-root subscriber re-declared successfully"
+                                        );
+                                        current_sub = new_sub;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            backoff_ms,
+                                            "mint-root subscriber re-declare failed; retrying"
+                                        );
+                                        // Don't reset backoff — keep backing off.
                                     }
                                 }
                             }
