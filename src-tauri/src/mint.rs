@@ -178,9 +178,11 @@ pub fn get_default_currency(conn: &Connection) -> Result<Option<String>, MintErr
 /// `MintError::Validation` on failure.
 pub fn set_default_currency(conn: &Connection, currency: &str) -> Result<(), MintError> {
     validate_currency(currency)?;
+    let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
-        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-        params![DEFAULT_CURRENCY_KEY, currency],
+        "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        rusqlite::params![DEFAULT_CURRENCY_KEY, currency, now],
     )?;
     Ok(())
 }
@@ -225,16 +227,16 @@ pub struct Account {
 pub fn create_account(conn: &Connection, name: &str) -> Result<Account, MintError> {
     let trimmed_name = validate_account_name(name)?;
     let id = uuid::Uuid::new_v4().to_string();
-    let created_at = chrono::Utc::now().to_rfc3339();
+    let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
-        "INSERT INTO accounts (id, name, created_at) VALUES (?, ?, ?)",
-        params![id, trimmed_name, created_at],
+        "INSERT INTO accounts (id, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
+        rusqlite::params![id, trimmed_name, now],
     )
     .map_err(map_account_name_constraint)?;
     Ok(Account {
         id,
         name: trimmed_name,
-        created_at,
+        created_at: now,
         transaction_count: 0,
     })
 }
@@ -245,7 +247,7 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>, MintError> {
     let mut stmt = conn.prepare(
         "SELECT a.id, a.name, a.created_at, COUNT(t.id) AS tx_count
          FROM accounts a
-         LEFT JOIN transactions t ON t.account_id = a.id
+         LEFT JOIN transactions t ON t.account_id = a.id AND t.deleted_at IS NULL
          GROUP BY a.id, a.name, a.created_at
          ORDER BY a.name COLLATE NOCASE",
     )?;
@@ -269,10 +271,11 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>, MintError> {
 /// taken by another account.
 pub fn rename_account(conn: &Connection, id: &str, new_name: &str) -> Result<Account, MintError> {
     let trimmed_name = validate_account_name(new_name)?;
+    let now = chrono::Utc::now().to_rfc3339();
     let affected = conn
         .execute(
-            "UPDATE accounts SET name = ? WHERE id = ?",
-            params![trimmed_name, id],
+            "UPDATE accounts SET name = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![trimmed_name, now, id],
         )
         .map_err(map_account_name_constraint)?;
     if affected == 0 {
@@ -332,7 +335,7 @@ pub fn delete_account(
 
     if reassign_to.is_none() {
         let count: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM transactions WHERE account_id = ?",
+            "SELECT COUNT(*) FROM transactions WHERE account_id = ? AND deleted_at IS NULL",
             params![id],
             |r| r.get(0),
         )?;
@@ -525,9 +528,13 @@ fn validate_metadata(s: &str) -> Result<(), MintError> {
 /// account_id, account_name (from JOIN), description, metadata,
 /// created_at, updated_at — matching the `Transaction` struct field
 /// order.
+/// Base SELECT + FROM + JOIN for all transaction reads. Always includes the
+/// soft-delete filter so no caller can accidentally surface tombstoned rows.
+/// Additional predicates must be appended with `AND` (not a second `WHERE`).
 const TRANSACTION_SELECT: &str = "SELECT t.id, t.transaction_date, t.amount, t.currency, \
     t.account_id, a.name, t.description, t.metadata, t.created_at, t.updated_at \
-    FROM transactions t JOIN accounts a ON a.id = t.account_id";
+    FROM transactions t JOIN accounts a ON a.id = t.account_id \
+    WHERE t.deleted_at IS NULL";
 
 fn map_transaction_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Transaction> {
     Ok(Transaction {
@@ -596,8 +603,9 @@ pub fn create_transaction(
 }
 
 /// Return the transaction with the given `id`, or `None` if no such row exists.
+/// Soft-deleted rows are excluded.
 pub fn get_transaction(conn: &Connection, id: &str) -> Result<Option<Transaction>, MintError> {
-    let sql = format!("{TRANSACTION_SELECT} WHERE t.id = ?");
+    let sql = format!("{TRANSACTION_SELECT} AND t.id = ?");
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query(params![id])?;
     if let Some(row) = rows.next()? {
@@ -634,13 +642,14 @@ pub fn list_transactions(
         params_vec.push(Box::new(a.clone()));
     }
 
-    let where_clause = if conditions.is_empty() {
+    // TRANSACTION_SELECT already contains `WHERE t.deleted_at IS NULL`.
+    // Additional conditions are appended with `AND`.
+    let extra = if conditions.is_empty() {
         String::new()
     } else {
-        format!("WHERE {}", conditions.join(" AND "))
+        format!("AND {}", conditions.join(" AND "))
     };
-    let sql =
-        format!("{TRANSACTION_SELECT} {where_clause} ORDER BY t.transaction_date DESC, t.id DESC");
+    let sql = format!("{TRANSACTION_SELECT} {extra} ORDER BY t.transaction_date DESC, t.id DESC");
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
@@ -720,10 +729,14 @@ pub fn update_transaction(
     sets.push("updated_at = ?");
     let now = chrono::Utc::now().to_rfc3339();
     params_vec.push(Box::new(now));
-    // WHERE id = ? — must come last.
+    // WHERE id = ? AND deleted_at IS NULL — must come last.
+    // Exclude tombstoned rows: a soft-deleted transaction is not updatable.
     params_vec.push(Box::new(id.to_string()));
 
-    let sql = format!("UPDATE transactions SET {} WHERE id = ?", sets.join(", "));
+    let sql = format!(
+        "UPDATE transactions SET {} WHERE id = ? AND deleted_at IS NULL",
+        sets.join(", ")
+    );
     let affected = conn.execute(
         &sql,
         rusqlite::params_from_iter(params_vec.iter().map(|b| b.as_ref())),
@@ -737,13 +750,35 @@ pub fn update_transaction(
         .ok_or_else(|| MintError::Other("transaction vanished between update and read".into()))
 }
 
-/// Delete a transaction by id.
+/// Soft-delete a transaction by id.
 ///
-/// Returns `MintError::NotFound` if no row was deleted.
+/// Sets `deleted_at` and bumps `updated_at` to the current UTC time.
+/// If the row is already tombstoned the call is a no-op (original
+/// `deleted_at` timestamp is preserved — idempotent).
+/// Returns `MintError::NotFound` if the row never existed.
 pub fn delete_transaction(conn: &Connection, id: &str) -> Result<(), MintError> {
-    let affected = conn.execute("DELETE FROM transactions WHERE id = ?", params![id])?;
-    if affected == 0 {
-        return Err(MintError::NotFound("transaction not found".into()));
+    let now = chrono::Utc::now().to_rfc3339();
+    let rows = conn.execute(
+        "UPDATE transactions SET deleted_at = ?1, updated_at = ?2 WHERE id = ?3 AND deleted_at IS NULL",
+        rusqlite::params![now, now, id],
+    )?;
+    if rows == 0 {
+        // Either the row doesn't exist or it's already tombstoned; both are OK
+        // from the caller's perspective. Distinguish so we can return NotFound
+        // for the "never existed" case (matches v1 hard-delete semantics for
+        // missing rows).
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transactions WHERE id = ?",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if exists == 0 {
+            return Err(MintError::NotFound(format!("transaction {id}")));
+        }
+        // Already tombstoned: no-op success — preserves the original
+        // deleted_at timestamp.
     }
     Ok(())
 }
@@ -814,7 +849,8 @@ pub fn export_csv(
         let sql = "SELECT t.transaction_date, a.name, t.amount, t.currency, \
             t.description, COALESCE(t.metadata, '') \
             FROM transactions t JOIN accounts a ON a.id = t.account_id \
-            WHERE (?1 IS NULL OR t.transaction_date >= ?1) \
+            WHERE t.deleted_at IS NULL \
+              AND (?1 IS NULL OR t.transaction_date >= ?1) \
               AND (?2 IS NULL OR t.transaction_date <= ?2) \
               AND (?3 IS NULL OR t.account_id = ?3) \
             ORDER BY t.transaction_date ASC, t.id ASC";
@@ -862,7 +898,7 @@ fn get_account_by_id(conn: &Connection, id: &str) -> Result<Option<Account>, Min
     let mut stmt = conn.prepare(
         "SELECT a.id, a.name, a.created_at, COUNT(t.id)
          FROM accounts a
-         LEFT JOIN transactions t ON t.account_id = a.id
+         LEFT JOIN transactions t ON t.account_id = a.id AND t.deleted_at IS NULL
          WHERE a.id = ?
          GROUP BY a.id, a.name, a.created_at",
     )?;

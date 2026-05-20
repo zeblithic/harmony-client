@@ -521,3 +521,124 @@ fn export_csv_respects_account_filter() {
         "unfiltered export should yield all 5 rows"
     );
 }
+
+// ── Soft-delete + updated_at bump tests (Task 2) ──────────────────────────────
+
+#[test]
+fn soft_delete_transaction_filters_from_reads() {
+    let conn = fresh_in_memory_db();
+    let acct = create_account(&conn, "Chase").unwrap();
+    let tx = create_transaction(
+        &conn,
+        NewTransaction {
+            transaction_date: "2026-05-01".into(),
+            amount: "-12.34".into(),
+            currency: "USD".into(),
+            account_id: acct.id.clone(),
+            description: "Coffee".into(),
+            metadata: None,
+        },
+    )
+    .unwrap();
+    delete_transaction(&conn, &tx.id).unwrap();
+    let listed = list_transactions(&conn, &ListFilter::default()).unwrap();
+    assert_eq!(listed.len(), 0, "soft-deleted row must not appear in list");
+    let fetched = get_transaction(&conn, &tx.id).unwrap();
+    assert!(
+        fetched.is_none(),
+        "soft-deleted row must not be returned by get"
+    );
+    let deleted_at: Option<String> = conn
+        .query_row(
+            "SELECT deleted_at FROM transactions WHERE id = ?",
+            [&tx.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(deleted_at.is_some(), "deleted_at should be populated");
+}
+
+#[test]
+fn soft_delete_is_idempotent() {
+    let conn = fresh_in_memory_db();
+    let acct = create_account(&conn, "Chase").unwrap();
+    let tx = create_transaction(
+        &conn,
+        NewTransaction {
+            transaction_date: "2026-05-01".into(),
+            amount: "1".into(),
+            currency: "USD".into(),
+            account_id: acct.id.clone(),
+            description: "x".into(),
+            metadata: None,
+        },
+    )
+    .unwrap();
+    delete_transaction(&conn, &tx.id).unwrap();
+    let first_deleted_at: String = conn
+        .query_row(
+            "SELECT deleted_at FROM transactions WHERE id = ?",
+            [&tx.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    delete_transaction(&conn, &tx.id).unwrap();
+    let second_deleted_at: String = conn
+        .query_row(
+            "SELECT deleted_at FROM transactions WHERE id = ?",
+            [&tx.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        first_deleted_at, second_deleted_at,
+        "second delete must not overwrite the original tombstone timestamp"
+    );
+}
+
+#[test]
+fn account_rename_bumps_updated_at() {
+    let conn = fresh_in_memory_db();
+    let acct = create_account(&conn, "Chase").unwrap();
+    let before: String = conn
+        .query_row(
+            "SELECT updated_at FROM accounts WHERE id = ?",
+            [&acct.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    rename_account(&conn, &acct.id, "Chase Checking").unwrap();
+    let after: String = conn
+        .query_row(
+            "SELECT updated_at FROM accounts WHERE id = ?",
+            [&acct.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(after > before, "rename must bump updated_at");
+}
+
+#[test]
+fn set_default_currency_bumps_updated_at() {
+    let conn = fresh_in_memory_db();
+    set_default_currency(&conn, "USD").unwrap();
+    let before: String = conn
+        .query_row(
+            "SELECT updated_at FROM settings WHERE key = ?",
+            ["default_currency"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    set_default_currency(&conn, "JPY").unwrap();
+    let after: String = conn
+        .query_row(
+            "SELECT updated_at FROM settings WHERE key = ?",
+            ["default_currency"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(after > before, "set_default_currency must bump updated_at");
+}
