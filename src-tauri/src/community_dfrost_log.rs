@@ -218,6 +218,22 @@ pub struct PendingSignSession {
     pub message_hash: [u8; 32],
     /// Per-actor (commitments_bytes, share_bytes) contributions.
     pub contributions: BTreeMap<OwnerAddr, (Vec<u8>, Vec<u8>)>,
+    /// Local node's secret FROST signing nonces (CBOR-encoded
+    /// `frost::round1::SigningNonces`). Populated by
+    /// `dfrost_request_vrf_beacon` (which calls `frost::round1::commit`
+    /// to produce both the public commitments + the secret nonces);
+    /// consumed by `dfrost_contribute_threshold_sign` (which feeds them
+    /// into `frost::round2::sign`).
+    ///
+    /// ZEB-305 security: `#[serde(skip, default)]` — these are the
+    /// local node's secret nonces. Persisting them to disk would leak
+    /// signing inputs across restarts. Same security justification as
+    /// `PendingDkg::round2_packages`. Restart recovery for in-flight
+    /// threshold-sign ceremonies requires re-requesting (re-running
+    /// `dfrost_request_vrf_beacon`); we MUST NOT silently snapshot
+    /// secret nonces onto the disk substrate.
+    #[serde(skip, default)]
+    pub local_nonces: Option<Vec<u8>>,
 }
 
 /// Which pending-ceremony slot a `dk` event resolves to. R1 fix: refresh
@@ -525,8 +541,28 @@ impl DfrostLog {
     /// Verify-side guarantees (signature + actor-is-member) are upstream;
     /// here we accumulate `(commitment_bytes, share_bytes)` per actor in
     /// `pending_sign[ceremony_id].contributions`, creating the session on
-    /// first contribution. Re-contributions from the same actor are
-    /// silently ignored (HLC LWW dedupes upstream).
+    /// first contribution.
+    ///
+    /// Upsert semantics — the IPC pair
+    /// `dfrost_request_vrf_beacon` → `dfrost_contribute_threshold_sign`
+    /// emits TWO `ts` events per actor on the local node:
+    ///   1. round-1: empty `share_bytes`, populated `commitment_bytes`
+    ///   2. round-2: filled `share_bytes`, SAME `commitment_bytes`
+    ///
+    /// A naive `or_insert` would keep the first and silently drop the
+    /// second — losing the signature share. We therefore upsert:
+    ///   * no existing contribution → insert.
+    ///   * existing empty-share + new filled share + matching commitment
+    ///     → update the share_bytes (the canonical fill-in path).
+    ///   * existing filled share + new filled share → `InvariantViolation`
+    ///     (FROST signature-share reuse attempt is security-critical;
+    ///     allowing this would let a malicious peer swap shares mid-ceremony
+    ///     after the first share committed the aggregator to one transcript).
+    ///   * new empty share when an entry already exists → idempotent no-op
+    ///     (peer re-broadcast of the round-1 ts; HLC LWW dedupes upstream
+    ///     but a single-process / late-arrival path may still hand it here).
+    ///   * existing entry with different `commitment_bytes` → `InvariantViolation`
+    ///     (peer attempted to swap commitments after the first round-1 ts).
     fn apply_threshold_sign(&mut self, event: &SignedCommitteeEvent) -> Result<(), ApplyError> {
         use crate::community_dfrost_types::ThresholdSignPayload;
 
@@ -545,6 +581,7 @@ impl DfrostLog {
             .or_insert_with(|| PendingSignSession {
                 message_hash: payload.message_hash,
                 contributions: BTreeMap::new(),
+                local_nonces: None,
             });
         // First-write-wins on message_hash — if a later `ts` claims a
         // different message for the same ceremony, that's an invariant
@@ -553,10 +590,55 @@ impl DfrostLog {
         if session.message_hash != payload.message_hash {
             return Err(ApplyError::InvariantViolation);
         }
-        session
-            .contributions
-            .entry(event.actor)
-            .or_insert((payload.commitment_bytes, payload.share_bytes));
+
+        match session.contributions.get(&event.actor) {
+            None => {
+                // First contribution from this actor — insert as-is.
+                session
+                    .contributions
+                    .insert(event.actor, (payload.commitment_bytes, payload.share_bytes));
+            }
+            Some((existing_commit, existing_share)) => {
+                // Commitment must match across both round-1 (empty share)
+                // and round-2 (filled share) ts events from the same actor.
+                // A peer that swaps commitment_bytes mid-ceremony is
+                // malformed.
+                if existing_commit != &payload.commitment_bytes {
+                    return Err(ApplyError::InvariantViolation);
+                }
+                match (existing_share.is_empty(), payload.share_bytes.is_empty()) {
+                    (true, false) => {
+                        // Canonical empty → filled upsert: round-2 ts
+                        // arriving after round-1. Update share_bytes
+                        // in place; commitment is already equal.
+                        session
+                            .contributions
+                            .insert(event.actor, (payload.commitment_bytes, payload.share_bytes));
+                    }
+                    (false, false) => {
+                        // Existing filled share + new filled share.
+                        // Idempotent if byte-identical (peer re-broadcast
+                        // of the round-2 ts after HLC LWW failed to
+                        // dedupe upstream); otherwise a signature-share
+                        // reuse attempt that we MUST reject — accepting a
+                        // second distinct share would let a malicious
+                        // peer fork the transcript after the aggregator
+                        // committed to the first.
+                        if existing_share != &payload.share_bytes {
+                            return Err(ApplyError::InvariantViolation);
+                        }
+                        // byte-identical → no-op
+                    }
+                    (true, true) | (false, true) => {
+                        // Either the round-1 ts re-arrived (true, true) or
+                        // the round-2 ts re-arrived and is now followed
+                        // by a stale round-1 (false, true). Both are
+                        // idempotent no-ops; never downgrade a filled
+                        // share back to empty.
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -834,6 +916,45 @@ impl DfrostLog {
     }
 }
 
+/// Build a fully-signed `SignedCommitteeEvent` for a D-FROST event, ready
+/// to broadcast / apply locally. Mirrors `community_voting_core::
+/// build_signed_poll_create_tier1` — encodes the kind-specific payload
+/// via ciborium, builds the envelope with a placeholder signature,
+/// computes `signing_bytes()`, signs with the supplied Ed25519 key, and
+/// returns the completed event.
+///
+/// The envelope `tag` is hardcoded to `'d'` (D-FROST) and `committee_tier`
+/// to `0`, matching the wire-format invariants enforced by
+/// `DfrostLog::apply` (which rejects any other tag / non-zero tier as
+/// `ApplyError::UnexpectedEnvelope`).
+pub fn build_signed_dfrost_event<P: serde::Serialize>(
+    keypair: &ed25519_dalek::SigningKey,
+    actor: crate::owner_state_types::OwnerAddr,
+    kind: crate::community_dfrost_types::DfrostEventKind,
+    payload: &P,
+    hlc: crate::owner_state_types::Hlc,
+) -> Result<crate::community_dfrost_types::SignedCommitteeEvent, String> {
+    use ed25519_dalek::Signer;
+    let mut payload_bytes = Vec::new();
+    ciborium::ser::into_writer(payload, &mut payload_bytes)
+        .map_err(|e| format!("encode payload: {e}"))?;
+    let mut ev = crate::community_dfrost_types::SignedCommitteeEvent {
+        tag: 'd',
+        version: 1,
+        committee_tier: 0,
+        kind,
+        hlc,
+        actor,
+        payload: payload_bytes,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev
+        .signing_bytes()
+        .map_err(|e| format!("signing_bytes: {e}"))?;
+    ev.sig = keypair.sign(&sb).to_bytes().to_vec();
+    Ok(ev)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1105,6 +1226,297 @@ mod tests {
         assert_eq!(sh, &vec![0x03u8, 0x04]);
     }
 
+    /// R1 (round-1 bot-review CRITICAL): `apply_threshold_sign` must
+    /// UPSERT the share when the share-bearing round-2 `ts` arrives after
+    /// the empty-share round-1 `ts` from the same actor. Previously the
+    /// `or_insert` pattern dropped the second event silently, losing the
+    /// signature share and breaking the threshold ceremony.
+    #[test]
+    fn ts_round2_filled_share_upserts_over_round1_empty_share() {
+        use crate::community_dfrost_types::{
+            DfrostEventKind, SignedCommitteeEvent, ThresholdSignPayload,
+        };
+        use crate::owner_state_types::Hlc;
+
+        let alice = OwnerAddr([0x01; 16]);
+        let ceremony_id = [0xcc; 32];
+        let msg_hash = [0xde; 32];
+
+        let mut log = DfrostLog::new();
+        log.committee_state.active = true;
+        log.committee_state.members = vec![alice];
+
+        // Round 1: empty share + populated commitment.
+        let p1 = ThresholdSignPayload {
+            ceremony_id,
+            message_hash: msg_hash,
+            commitment_bytes: vec![0xaa, 0xbb],
+            share_bytes: Vec::new(),
+        };
+        let mut pd1 = Vec::new();
+        ciborium::into_writer(&p1, &mut pd1).unwrap();
+        log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::ThresholdSign,
+            hlc: Hlc {
+                wall_ms: 4000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: alice,
+            payload: pd1,
+            sig: vec![0u8; 64],
+        })
+        .expect("apply round-1 ts");
+
+        // Round 2: SAME commitment, populated share.
+        let p2 = ThresholdSignPayload {
+            ceremony_id,
+            message_hash: msg_hash,
+            commitment_bytes: vec![0xaa, 0xbb],
+            share_bytes: vec![0x11, 0x22, 0x33],
+        };
+        let mut pd2 = Vec::new();
+        ciborium::into_writer(&p2, &mut pd2).unwrap();
+        log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::ThresholdSign,
+            hlc: Hlc {
+                wall_ms: 5000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: alice,
+            payload: pd2,
+            sig: vec![0u8; 64],
+        })
+        .expect("apply round-2 ts (upsert)");
+
+        let session = log.committee_state.pending_sign.get(&ceremony_id).unwrap();
+        let (cm, sh) = session.contributions.get(&alice).unwrap();
+        assert_eq!(
+            cm,
+            &vec![0xaau8, 0xbb],
+            "commitment preserved across upsert"
+        );
+        assert_eq!(
+            sh,
+            &vec![0x11u8, 0x22, 0x33],
+            "share_bytes filled by round-2 upsert"
+        );
+    }
+
+    /// R1 CRITICAL: two distinct filled shares from the same actor must
+    /// be rejected — FROST signature-share reuse is security-critical and
+    /// allowing a swap would let a malicious peer fork the transcript
+    /// after the aggregator committed to the first share.
+    #[test]
+    fn ts_second_filled_share_with_different_bytes_rejected() {
+        use crate::community_dfrost_types::{
+            DfrostEventKind, SignedCommitteeEvent, ThresholdSignPayload,
+        };
+        use crate::owner_state_types::Hlc;
+
+        let alice = OwnerAddr([0x01; 16]);
+        let ceremony_id = [0xcc; 32];
+        let msg_hash = [0xde; 32];
+
+        let mut log = DfrostLog::new();
+        log.committee_state.active = true;
+        log.committee_state.members = vec![alice];
+
+        for (wall, share) in [(4000u64, vec![0x11u8, 0x22]), (5000, vec![0x99, 0xaa])]
+            .iter()
+            .cloned()
+        {
+            let p = ThresholdSignPayload {
+                ceremony_id,
+                message_hash: msg_hash,
+                commitment_bytes: vec![0xaa, 0xbb],
+                share_bytes: share,
+            };
+            let mut pd = Vec::new();
+            ciborium::into_writer(&p, &mut pd).unwrap();
+            let r = log.apply(SignedCommitteeEvent {
+                tag: 'd',
+                version: 1,
+                committee_tier: 0,
+                kind: DfrostEventKind::ThresholdSign,
+                hlc: Hlc {
+                    wall_ms: wall,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                actor: alice,
+                payload: pd,
+                sig: vec![0u8; 64],
+            });
+            if wall == 4000 {
+                r.expect("first filled-share ts accepted");
+            } else {
+                assert_eq!(
+                    r,
+                    Err(ApplyError::InvariantViolation),
+                    "second distinct filled share must be rejected"
+                );
+            }
+        }
+    }
+
+    /// R1 CRITICAL: a `ts` event whose `commitment_bytes` differ from
+    /// the actor's existing contribution must be rejected — a peer that
+    /// swaps commitments mid-ceremony is malformed and accepting it
+    /// would silently invalidate the SigningPackage built from peer
+    /// commitments.
+    #[test]
+    fn ts_with_mismatched_commitment_bytes_rejected() {
+        use crate::community_dfrost_types::{
+            DfrostEventKind, SignedCommitteeEvent, ThresholdSignPayload,
+        };
+        use crate::owner_state_types::Hlc;
+
+        let alice = OwnerAddr([0x01; 16]);
+        let ceremony_id = [0xcc; 32];
+        let msg_hash = [0xde; 32];
+
+        let mut log = DfrostLog::new();
+        log.committee_state.active = true;
+        log.committee_state.members = vec![alice];
+
+        // Round 1 ts.
+        let p1 = ThresholdSignPayload {
+            ceremony_id,
+            message_hash: msg_hash,
+            commitment_bytes: vec![0xaa, 0xbb],
+            share_bytes: Vec::new(),
+        };
+        let mut pd1 = Vec::new();
+        ciborium::into_writer(&p1, &mut pd1).unwrap();
+        log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::ThresholdSign,
+            hlc: Hlc {
+                wall_ms: 4000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: alice,
+            payload: pd1,
+            sig: vec![0u8; 64],
+        })
+        .expect("apply round-1 ts");
+
+        // Round 2 with DIFFERENT commitment_bytes.
+        let p2 = ThresholdSignPayload {
+            ceremony_id,
+            message_hash: msg_hash,
+            commitment_bytes: vec![0xcc, 0xdd],
+            share_bytes: vec![0x11, 0x22],
+        };
+        let mut pd2 = Vec::new();
+        ciborium::into_writer(&p2, &mut pd2).unwrap();
+        let r = log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::ThresholdSign,
+            hlc: Hlc {
+                wall_ms: 5000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: alice,
+            payload: pd2,
+            sig: vec![0u8; 64],
+        });
+        assert_eq!(r, Err(ApplyError::InvariantViolation));
+    }
+
+    /// R1: an empty-share `ts` event arriving AFTER a filled-share `ts`
+    /// is an idempotent no-op — must never downgrade the actor's
+    /// recorded share back to empty (which would silently break
+    /// aggregation).
+    #[test]
+    fn ts_late_empty_share_does_not_downgrade_existing_filled_share() {
+        use crate::community_dfrost_types::{
+            DfrostEventKind, SignedCommitteeEvent, ThresholdSignPayload,
+        };
+        use crate::owner_state_types::Hlc;
+
+        let alice = OwnerAddr([0x01; 16]);
+        let ceremony_id = [0xcc; 32];
+        let msg_hash = [0xde; 32];
+
+        let mut log = DfrostLog::new();
+        log.committee_state.active = true;
+        log.committee_state.members = vec![alice];
+
+        // Round 2 lands first (e.g., HLC LWW ordering quirk).
+        let p_filled = ThresholdSignPayload {
+            ceremony_id,
+            message_hash: msg_hash,
+            commitment_bytes: vec![0xaa, 0xbb],
+            share_bytes: vec![0x11, 0x22, 0x33],
+        };
+        let mut pd_f = Vec::new();
+        ciborium::into_writer(&p_filled, &mut pd_f).unwrap();
+        log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::ThresholdSign,
+            hlc: Hlc {
+                wall_ms: 4000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: alice,
+            payload: pd_f,
+            sig: vec![0u8; 64],
+        })
+        .expect("filled-share ts accepted");
+
+        // Late-arriving empty-share ts (peer rebroadcast / log replay).
+        let p_empty = ThresholdSignPayload {
+            ceremony_id,
+            message_hash: msg_hash,
+            commitment_bytes: vec![0xaa, 0xbb],
+            share_bytes: Vec::new(),
+        };
+        let mut pd_e = Vec::new();
+        ciborium::into_writer(&p_empty, &mut pd_e).unwrap();
+        log.apply(SignedCommitteeEvent {
+            tag: 'd',
+            version: 1,
+            committee_tier: 0,
+            kind: DfrostEventKind::ThresholdSign,
+            hlc: Hlc {
+                wall_ms: 5000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            actor: alice,
+            payload: pd_e,
+            sig: vec![0u8; 64],
+        })
+        .expect("late empty-share ts is idempotent no-op");
+
+        // Share MUST still be the filled one — never downgraded.
+        let session = log.committee_state.pending_sign.get(&ceremony_id).unwrap();
+        let (_, sh) = session.contributions.get(&alice).unwrap();
+        assert_eq!(
+            sh,
+            &vec![0x11u8, 0x22, 0x33],
+            "late empty-share ts must not downgrade filled share"
+        );
+    }
+
     #[test]
     fn vb_with_wrong_vrf_output_rejected() {
         use crate::community_dfrost_types::{
@@ -1126,6 +1538,7 @@ mod tests {
             PendingSignSession {
                 message_hash: msg_hash,
                 contributions: BTreeMap::new(),
+                local_nonces: None,
             },
         );
 
@@ -1426,6 +1839,7 @@ mod tests {
             PendingSignSession {
                 message_hash: msg_hash,
                 contributions: BTreeMap::new(),
+                local_nonces: None,
             },
         );
 
@@ -1828,6 +2242,7 @@ mod tests {
             PendingSignSession {
                 message_hash: agreed_msg,
                 contributions: BTreeMap::new(),
+                local_nonces: None,
             },
         );
 
@@ -1911,5 +2326,88 @@ mod tests {
             sig: vec![0u8; 64],
         });
         assert_eq!(result, Err(ApplyError::InvariantViolation));
+    }
+
+    #[test]
+    fn pending_sign_session_local_nonces_serde_skipped() {
+        // local_nonces holds the local node's secret FROST signing nonces
+        // between dfrost_request_vrf_beacon and dfrost_contribute_threshold_sign.
+        // It MUST be marked #[serde(skip)] — persisting decrypted secret nonce
+        // material across restarts leaks signing inputs (same security
+        // posture as PendingDkg::round2_packages).
+        let session = PendingSignSession {
+            local_nonces: Some(vec![0xAA; 64]),
+            message_hash: [0xBB; 32],
+            ..Default::default()
+        };
+
+        // CBOR-encode → decode; local_nonces MUST round-trip as None.
+        let mut buf = Vec::new();
+        ciborium::into_writer(&session, &mut buf).expect("encode");
+        let decoded: PendingSignSession = ciborium::from_reader(&buf[..]).expect("decode");
+        assert_eq!(
+            decoded.local_nonces, None,
+            "local_nonces must be skipped during serialization (security)"
+        );
+        assert_eq!(decoded.message_hash, [0xBB; 32], "public fields preserved");
+    }
+
+    #[test]
+    fn build_signed_dfrost_event_round_trips_and_signs() {
+        use crate::community_dfrost_types::{DfrostEventKind, DkgRoundPayload};
+        use crate::owner_state_types::Hlc;
+        use ed25519_dalek::{SigningKey, Verifier};
+        use rand::rngs::OsRng;
+
+        let mut csprng = OsRng;
+        let keypair = SigningKey::generate(&mut csprng);
+        let actor = OwnerAddr([0xab; 16]);
+        let payload = DkgRoundPayload {
+            ceremony_id: [0x42u8; 32],
+            round_num: 1,
+            round1_package: Some(vec![0xde, 0xad, 0xbe, 0xef]),
+            recipient_ciphertexts: None,
+        };
+        let hlc = Hlc {
+            wall_ms: 1234,
+            logical: 0,
+            device_id: "t".into(),
+        };
+
+        let ev = build_signed_dfrost_event(
+            &keypair,
+            actor,
+            DfrostEventKind::DkgRound,
+            &payload,
+            hlc.clone(),
+        )
+        .expect("build signed event");
+
+        // Envelope shape: tag='d', committee_tier=0, kind/actor/hlc passthrough.
+        assert_eq!(ev.tag, 'd');
+        assert_eq!(ev.version, 1);
+        assert_eq!(ev.committee_tier, 0);
+        assert_eq!(ev.kind, DfrostEventKind::DkgRound);
+        assert_eq!(ev.actor, actor);
+        assert_eq!(ev.hlc, hlc);
+
+        // sig is non-zero (not the placeholder) AND is a valid Ed25519
+        // signature over signing_bytes() under the supplied keypair.
+        assert!(
+            ev.sig.iter().any(|b| *b != 0),
+            "sig must be the real Ed25519 signature, not the placeholder"
+        );
+        let sb = ev.signing_bytes().expect("signing bytes");
+        let sig_bytes: [u8; 64] = ev.sig.clone().try_into().expect("sig len");
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+        keypair
+            .verifying_key()
+            .verify(&sb, &sig)
+            .expect("sig verifies under signer's pubkey");
+
+        // Payload round-trips through ciborium.
+        let decoded: DkgRoundPayload =
+            ciborium::de::from_reader(&ev.payload[..]).expect("decode payload");
+        assert_eq!(decoded, payload);
     }
 }
