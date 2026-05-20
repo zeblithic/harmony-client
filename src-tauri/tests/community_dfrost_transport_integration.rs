@@ -522,6 +522,7 @@ async fn dkg_two_engine_peer_driven_via_transport_bridge_converges() {
         self_addr: alice_addr,
         self_x25519_priv: alice_x_priv,
         identity_resolver: alice_resolver,
+        registry_weak: None,
     })
     .await;
 
@@ -534,6 +535,7 @@ async fn dkg_two_engine_peer_driven_via_transport_bridge_converges() {
         self_addr: bob_addr,
         self_x25519_priv: bob_x_priv,
         identity_resolver: bob_resolver,
+        registry_weak: None,
     })
     .await;
 

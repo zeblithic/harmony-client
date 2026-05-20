@@ -38,6 +38,10 @@ pub struct PollId(
     pub [u8; 32],
 );
 
+/// SHA-256 hash of a `DraftCandidate` event's signing bytes, used by
+/// `DraftApprovalPayload` to reference the candidate being approved.
+pub type CandidateEventHash = [u8; 32];
+
 /// The three voting tiers. Wire-encoded as u8 (`tr` field of envelope).
 /// See spec §1 + §3.
 ///
@@ -93,6 +97,293 @@ pub enum Lifecycle {
     Closed,
     Finalized,
     Archived,
+}
+
+// ---------- Tier 3 payload structs (ZEB-309 Phase 4a-main) ----------
+
+/// Payload for `kd=ss` SortitionSelection: announces the selected mini-public
+/// (primary members + backup pool) for a Tier 3 poll.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SortitionSelectionPayload {
+    #[serde(rename = "pi")]
+    pub poll_id: PollId,
+    #[serde(rename = "pr")]
+    pub primary: Vec<OwnerAddr>,
+    #[serde(rename = "bk")]
+    pub backup: Vec<OwnerAddr>,
+}
+
+/// Payload for `kd=ds` DeliberationStatement: a mini-public member's text
+/// contribution during the deliberation stage (≤280 chars).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliberationStatementPayload {
+    #[serde(rename = "pi")]
+    pub poll_id: PollId,
+    #[serde(rename = "tx")]
+    pub text: String,
+}
+
+/// Payload for `kd=md` MiniPublicDecline: a selected member declining
+/// participation. Optional reason code ≤2 chars; omitted when `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MiniPublicDeclinePayload {
+    #[serde(rename = "pi")]
+    pub poll_id: PollId,
+    #[serde(rename = "rs", skip_serializing_if = "Option::is_none", default)]
+    pub reason: Option<String>,
+}
+
+/// Payload for `kd=dc` DraftCandidate: a mini-public member submitting a
+/// draft proposal text (≤512 chars). Implicit self-approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftCandidatePayload {
+    #[serde(rename = "pi")]
+    pub poll_id: PollId,
+    #[serde(rename = "tx")]
+    pub text: String,
+}
+
+/// Payload for `kd=da` DraftApproval: a mini-public member approving a
+/// peer's draft, referenced by the signing-bytes hash of the DraftCandidate
+/// event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftApprovalPayload {
+    #[serde(rename = "pi")]
+    pub poll_id: PollId,
+    #[serde(
+        rename = "ch",
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub candidate_event_hash: CandidateEventHash,
+}
+
+/// Payload for `kd=sf` SortitionFailed: the proposer declares sortition
+/// failed (all backup slots exhausted).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SortitionFailedPayload {
+    #[serde(rename = "pi")]
+    pub poll_id: PollId,
+}
+
+/// Payload for `kd=rb` RatificationBallot: full-electorate STAR scores,
+/// one byte per ratification candidate (0..=5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RatificationBallotPayload {
+    #[serde(rename = "pi")]
+    pub poll_id: PollId,
+    #[serde(rename = "sc", with = "serde_bytes")]
+    pub scores: Vec<u8>,
+}
+
+/// Payload for `kd=cr` PollCreate when `tier == Tier::Sortition`.
+/// Contains the full Tier 3 poll configuration.
+///
+/// `privacy_mode` values: `"pu"` (public, Phase 4a-main only);
+/// `"se"` and `"rf"` are reserved for Phase 6/7 and must not be
+/// produced or accepted in Phase 4a-main apply logic.
+///
+/// `retry_of` is `Some(prev_poll_id)` when this poll is a retry of a
+/// failed sortition attempt; omitted on first-try polls
+/// (`skip_serializing_if = "Option::is_none"`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tier3PollConfigPayload {
+    #[serde(rename = "pt")]
+    pub proposal_text: String,
+    #[serde(rename = "ss")]
+    pub sortition_size: u16,
+    #[serde(rename = "dw")]
+    pub deliberation_window_seconds: u32,
+    #[serde(rename = "fw")]
+    pub drafting_window_seconds: u32,
+    #[serde(rename = "rw")]
+    pub ratification_window_seconds: u32,
+    #[serde(rename = "pm")]
+    pub privacy_mode: String,
+    #[serde(rename = "im")]
+    pub incentive_mode: String,
+    #[serde(rename = "el")]
+    pub eligibility: Eligibility,
+    #[serde(rename = "ro", skip_serializing_if = "Option::is_none", default)]
+    pub retry_of: Option<PollId>,
+}
+
+#[cfg(test)]
+mod tier3_payload_tests {
+    use super::*;
+
+    #[test]
+    fn sortition_selection_round_trip() {
+        let payload = SortitionSelectionPayload {
+            poll_id: PollId([0x01; 32]),
+            primary: vec![OwnerAddr([0xaa; 16]), OwnerAddr([0xbb; 16])],
+            backup: vec![OwnerAddr([0xcc; 16])],
+        };
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&payload, &mut encoded).expect("encode");
+        let decoded: SortitionSelectionPayload =
+            ciborium::from_reader(&encoded[..]).expect("decode");
+        assert_eq!(payload, decoded);
+    }
+
+    #[test]
+    fn deliberation_statement_round_trip() {
+        let payload = DeliberationStatementPayload {
+            poll_id: PollId([0x02; 32]),
+            text: "We should consider option A carefully.".into(),
+        };
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&payload, &mut encoded).expect("encode");
+        let decoded: DeliberationStatementPayload =
+            ciborium::from_reader(&encoded[..]).expect("decode");
+        assert_eq!(payload, decoded);
+    }
+
+    #[test]
+    fn mini_public_decline_with_reason_round_trip() {
+        let payload = MiniPublicDeclinePayload {
+            poll_id: PollId([0x03; 32]),
+            reason: Some("b1".into()),
+        };
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&payload, &mut encoded).expect("encode");
+        let decoded: MiniPublicDeclinePayload =
+            ciborium::from_reader(&encoded[..]).expect("decode");
+        assert_eq!(payload, decoded);
+    }
+
+    #[test]
+    fn mini_public_decline_no_reason_omits_rs_field() {
+        let payload = MiniPublicDeclinePayload {
+            poll_id: PollId([0x03; 32]),
+            reason: None,
+        };
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&payload, &mut encoded).expect("encode");
+        let value: ciborium::Value = ciborium::from_reader(&encoded[..]).expect("decode as value");
+        let map = value.as_map().expect("map");
+        assert!(
+            !map.iter()
+                .any(|(k, _): &(ciborium::Value, ciborium::Value)| k.as_text() == Some("rs")),
+            "rs field must be omitted when reason is None"
+        );
+        let decoded: MiniPublicDeclinePayload =
+            ciborium::from_reader(&encoded[..]).expect("round-trip decode");
+        assert_eq!(payload, decoded);
+    }
+
+    #[test]
+    fn draft_candidate_round_trip() {
+        let payload = DraftCandidatePayload {
+            poll_id: PollId([0x04; 32]),
+            text: "This is a draft proposal.".into(),
+        };
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&payload, &mut encoded).expect("encode");
+        let decoded: DraftCandidatePayload = ciborium::from_reader(&encoded[..]).expect("decode");
+        assert_eq!(payload, decoded);
+    }
+
+    #[test]
+    fn draft_approval_round_trip() {
+        let payload = DraftApprovalPayload {
+            poll_id: PollId([0x05; 32]),
+            candidate_event_hash: [0xde; 32],
+        };
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&payload, &mut encoded).expect("encode");
+        let decoded: DraftApprovalPayload = ciborium::from_reader(&encoded[..]).expect("decode");
+        assert_eq!(payload, decoded);
+    }
+
+    #[test]
+    fn sortition_failed_round_trip() {
+        let payload = SortitionFailedPayload {
+            poll_id: PollId([0x06; 32]),
+        };
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&payload, &mut encoded).expect("encode");
+        let decoded: SortitionFailedPayload = ciborium::from_reader(&encoded[..]).expect("decode");
+        assert_eq!(payload, decoded);
+    }
+
+    #[test]
+    fn ratification_ballot_round_trip() {
+        let payload = RatificationBallotPayload {
+            poll_id: PollId([0x07; 32]),
+            scores: vec![5, 3, 1, 0, 4],
+        };
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&payload, &mut encoded).expect("encode");
+        let decoded: RatificationBallotPayload =
+            ciborium::from_reader(&encoded[..]).expect("decode");
+        assert_eq!(payload, decoded);
+    }
+
+    #[test]
+    fn tier3_poll_config_round_trip_no_retry() {
+        let payload = Tier3PollConfigPayload {
+            proposal_text: "Shall we adopt the new governance structure?".into(),
+            sortition_size: 15,
+            deliberation_window_seconds: 604_800,
+            drafting_window_seconds: 259_200,
+            ratification_window_seconds: 259_200,
+            privacy_mode: "pu".into(),
+            incentive_mode: "a".into(),
+            eligibility: Eligibility {
+                min_power: 1,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            retry_of: None,
+        };
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&payload, &mut encoded).expect("encode");
+        // Verify `ro` is omitted when retry_of is None.
+        let value: ciborium::Value = ciborium::from_reader(&encoded[..]).expect("decode as value");
+        let map = value.as_map().expect("map");
+        assert!(
+            !map.iter()
+                .any(|(k, _): &(ciborium::Value, ciborium::Value)| k.as_text() == Some("ro")),
+            "ro field must be omitted when retry_of is None"
+        );
+        let decoded: Tier3PollConfigPayload =
+            ciborium::from_reader(&encoded[..]).expect("round-trip decode");
+        assert_eq!(payload, decoded);
+    }
+
+    #[test]
+    fn tier3_poll_config_round_trip_with_retry() {
+        let prev_poll = PollId([0xf0; 32]);
+        let payload = Tier3PollConfigPayload {
+            proposal_text: "Retry: shall we adopt the new governance structure?".into(),
+            sortition_size: 15,
+            deliberation_window_seconds: 604_800,
+            drafting_window_seconds: 259_200,
+            ratification_window_seconds: 259_200,
+            privacy_mode: "pu".into(),
+            incentive_mode: "b".into(),
+            eligibility: Eligibility {
+                min_power: 1,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            retry_of: Some(prev_poll),
+        };
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&payload, &mut encoded).expect("encode");
+        // Verify `ro` is present when retry_of is Some.
+        let value: ciborium::Value = ciborium::from_reader(&encoded[..]).expect("decode as value");
+        let map = value.as_map().expect("map");
+        assert!(
+            map.iter()
+                .any(|(k, _): &(ciborium::Value, ciborium::Value)| k.as_text() == Some("ro")),
+            "ro field must be present when retry_of is Some"
+        );
+        let decoded: Tier3PollConfigPayload =
+            ciborium::from_reader(&encoded[..]).expect("round-trip decode");
+        assert_eq!(payload, decoded);
+    }
 }
 
 #[cfg(test)]
@@ -175,6 +466,21 @@ pub enum PollEventKindCode {
     Delegate,
     #[serde(rename = "ud")]
     Undelegate,
+    // Tier 3 (Sortition) kinds — added Phase 4a-main (ZEB-309).
+    #[serde(rename = "ss")]
+    SortitionSelection,
+    #[serde(rename = "ds")]
+    DeliberationStatement,
+    #[serde(rename = "md")]
+    MiniPublicDecline,
+    #[serde(rename = "dc")]
+    DraftCandidate,
+    #[serde(rename = "da")]
+    DraftApproval,
+    #[serde(rename = "sf")]
+    SortitionFailed,
+    #[serde(rename = "rb")]
+    RatificationBallot,
 }
 
 /// The wire envelope for every voting event. Spec §3.
@@ -338,11 +644,48 @@ mod envelope_tests {
             PollEventKindCode::Signal,
             PollEventKindCode::Delegate,
             PollEventKindCode::Undelegate,
+            // Tier 3 (Sortition) variants added Phase 4a-main (ZEB-309).
+            // Cluster 7 fix (CodeRabbit major, R1 bot review): cover all 7
+            // new variants so wire-string renames surface immediately.
+            PollEventKindCode::SortitionSelection,
+            PollEventKindCode::DeliberationStatement,
+            PollEventKindCode::MiniPublicDecline,
+            PollEventKindCode::DraftCandidate,
+            PollEventKindCode::DraftApproval,
+            PollEventKindCode::SortitionFailed,
+            PollEventKindCode::RatificationBallot,
         ] {
             let mut encoded = Vec::new();
             ciborium::into_writer(kind, &mut encoded).expect("encode");
             let decoded: PollEventKindCode = ciborium::from_reader(&encoded[..]).expect("decode");
             assert_eq!(*kind, decoded);
+        }
+    }
+
+    /// Pin Tier 3 wire codes so a future enum rename can't silently change them.
+    /// Cluster 7 fix (CodeRabbit major, R1 bot review): matches the existing
+    /// Tier 2 wire-string pin test pattern.
+    #[test]
+    fn tier3_kind_codes_have_expected_wire_strings() {
+        let cases = [
+            (PollEventKindCode::SortitionSelection, "ss"),
+            (PollEventKindCode::DeliberationStatement, "ds"),
+            (PollEventKindCode::MiniPublicDecline, "md"),
+            (PollEventKindCode::DraftCandidate, "dc"),
+            (PollEventKindCode::DraftApproval, "da"),
+            (PollEventKindCode::SortitionFailed, "sf"),
+            (PollEventKindCode::RatificationBallot, "rb"),
+        ];
+        for (kind, expected) in cases {
+            let mut encoded = Vec::new();
+            ciborium::into_writer(&kind, &mut encoded).expect("encode");
+            let value: ciborium::Value =
+                ciborium::from_reader(&encoded[..]).expect("decode as value");
+            assert_eq!(
+                value.as_text(),
+                Some(expected),
+                "wire code for {kind:?} must be {expected:?}"
+            );
         }
     }
 

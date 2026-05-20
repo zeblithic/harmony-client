@@ -1,0 +1,2518 @@
+//! ZEB-309 Phase 4a-main: multi-engine integration tests for Tier 3
+//! sortition + STAR ratification + drafting. Builds on the ZEB-307
+//! two-engine bidirectional-mpsc bridge pattern from
+//! community_dfrost_transport_integration.rs.
+//!
+//! ## Layout
+//!
+//! - `fixture_identity` — deterministic Ed25519 keys + OwnerAddrs that bind
+//!   through the address_hash verify gate.
+//! - `StaticIdentityResolver` — minimal IdentityResolver for tests.
+//! - `setup_two_voting_engine_bridge` — creates two VotingLogEngine instances
+//!   wired with bidirectional mpsc bridges (same shape as dfrost transport test).
+//! - `wait_for` — polling helper that avoids tokio::time::sleep flakiness.
+//! - Event builders: `build_tier3_poll_create_event`, `build_decline_event`,
+//!   `build_draft_candidate_event`, `build_draft_approval_event`,
+//!   `build_ratification_ballot_event`, `build_sortition_failed_event`.
+//! - Smoke tests: bridge starts/shuts down cleanly; Tier 1 ballot exchange
+//!   works through the bridge (sanity check before Tier 3 behavior tests in
+//!   Tasks 13-16).
+//!
+//! ## Why no DKG setup here
+//!
+//! A full DfrostLog DKG flow is heavy and already tested in ZEB-301/303/307.
+//! Task 12's scope is fixture infrastructure. DfrostLog integration (beacon
+//! path) is deferred to Task 13 which sets up a pre-computed kd=vb state.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use harmony_app::community_membership::ChannelId;
+use harmony_app::community_state_sync::IdentityResolver;
+use harmony_app::community_voting_approval::Tier1PollConfig;
+use harmony_app::community_voting_core::{
+    build_signed_poll_create_tier1, derive_poll_id, CandidateEventHash, DraftApprovalPayload,
+    DraftCandidatePayload, Eligibility, MemberAttrs, MembershipSnapshot, MiniPublicDeclinePayload,
+    PollEventKindCode, RatificationBallotPayload, SignedVotingEvent, SortitionFailedPayload,
+    SortitionSelectionPayload, Tier, Tier3PollConfigPayload,
+};
+use harmony_app::community_voting_log::{ApplyError, VotingLog};
+use harmony_app::community_voting_log_engine::{VotingLogEngine, VotingLogEngineParams};
+use harmony_app::community_voting_sortition::fisher_yates_select;
+use harmony_app::community_voting_star::tally_star;
+use harmony_app::community_voting_tier3::{
+    drafting_advancers, ratification_candidates_ordering, synthesize_status_quo, verify_sd,
+    verify_sf, Stage, Tier3PollResultPayload, VerifyError,
+};
+use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+use tokio::sync::{mpsc, Mutex};
+
+// ─── Identity-resolver helper ──────────────────────────────────────────────────
+
+/// Minimal `IdentityResolver` backed by a `HashMap`. Mirrors `StaticResolver`
+/// in `community_dfrost_transport_integration.rs`. Tests that exercise the
+/// VotingLogEngine inbound path need a resolver if the verify gate is ever
+/// wired; for now it is present for completeness.
+#[allow(dead_code)]
+struct StaticIdentityResolver(HashMap<OwnerAddr, [u8; 64]>);
+
+#[async_trait::async_trait]
+impl IdentityResolver for StaticIdentityResolver {
+    async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+        self.0.get(addr).copied()
+    }
+}
+
+// ─── Test identity ─────────────────────────────────────────────────────────────
+
+/// A convenience bundle returned by `fixture_identity`.
+pub struct TestIdentity {
+    pub owner: OwnerAddr,
+    pub signing_key: ed25519_dalek::SigningKey,
+    #[allow(dead_code)]
+    pub verifying_key: ed25519_dalek::VerifyingKey,
+    /// Raw 64-byte identity composite (X25519 || Ed25519). Needed to
+    /// populate `StaticIdentityResolver` so the address_hash binding passes
+    /// through the dfrost engine's `verify_signed_committee_event` gate.
+    pub pub_64: [u8; 64],
+}
+
+/// Build a `TestIdentity` from a single-byte seed. The returned `owner`'s
+/// `address_hash` field is derived from the public key bytes — the same
+/// binding enforced by `verify_signed_committee_event` in the dfrost engine.
+///
+/// Mirrors `fixture_identity` in `community_dfrost_transport_integration.rs`.
+pub fn fixture_identity(seed: u8) -> TestIdentity {
+    let priv_id = harmony_identity::PrivateIdentity::from_seed(&[seed; 32]);
+    let owner = OwnerAddr(priv_id.identity.address_hash);
+    let pub_64 = priv_id.identity.to_public_bytes();
+    let private_bytes = priv_id.to_private_bytes();
+    let mut ed_secret = [0u8; 32];
+    ed_secret.copy_from_slice(&private_bytes[32..64]);
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&ed_secret);
+    let verifying_key = signing_key.verifying_key();
+    TestIdentity {
+        owner,
+        signing_key,
+        verifying_key,
+        pub_64,
+    }
+}
+
+// ─── HLC helpers ──────────────────────────────────────────────────────────────
+
+fn hlc_at(wall_ms: u64, device_id: &str) -> Hlc {
+    Hlc {
+        wall_ms,
+        logical: 0,
+        device_id: device_id.into(),
+    }
+}
+
+// ─── Two-engine bridge ─────────────────────────────────────────────────────────
+
+/// Handles for both sides of a two-VotingLogEngine bridge. Drop to shut
+/// everything down cleanly.
+pub struct TwoVotingEngines {
+    pub engine_a: Arc<VotingLogEngine<tauri::test::MockRuntime>>,
+    pub engine_b: Arc<VotingLogEngine<tauri::test::MockRuntime>>,
+    pub log_a: Arc<Mutex<VotingLog>>,
+    pub log_b: Arc<Mutex<VotingLog>>,
+}
+
+/// Wire two `VotingLogEngine` instances with bidirectional mpsc channels,
+/// mirroring the two-engine bridge in `community_dfrost_transport_integration.rs`.
+///
+/// Spawns two forwarder tasks that relay published bytes from engine A's
+/// outbound channel into engine B's inbound channel and vice versa. When
+/// either engine is dropped its publisher sender closes, the forwarder
+/// receives `None`, and exits cleanly.
+pub async fn setup_two_voting_engine_bridge(community_id: SpaceId) -> TwoVotingEngines {
+    // Channel pairs: each engine gets its own pub_tx/sub_rx.
+    // The forwarder tasks relay: a_pub_rx → b_sub_tx and b_pub_rx → a_sub_tx.
+    let (a_pub_tx, mut a_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (b_pub_tx, mut b_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (a_sub_tx, a_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (b_sub_tx, b_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+
+    // Forwarder: A → B
+    let b_sub_tx_clone = b_sub_tx.clone();
+    tokio::spawn(async move {
+        while let Some(packet) = a_pub_rx.recv().await {
+            if b_sub_tx_clone.send(packet).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Forwarder: B → A
+    let a_sub_tx_clone = a_sub_tx.clone();
+    tokio::spawn(async move {
+        while let Some(packet) = b_pub_rx.recv().await {
+            if a_sub_tx_clone.send(packet).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let log_a = Arc::new(Mutex::new(VotingLog::new()));
+    let log_b = Arc::new(Mutex::new(VotingLog::new()));
+
+    let engine_a = VotingLogEngine::start(VotingLogEngineParams {
+        community_id,
+        voting_log: Arc::clone(&log_a),
+        publisher_tx: a_pub_tx,
+        subscriber_rx: a_sub_rx,
+    })
+    .await;
+
+    let engine_b = VotingLogEngine::start(VotingLogEngineParams {
+        community_id,
+        voting_log: Arc::clone(&log_b),
+        publisher_tx: b_pub_tx,
+        subscriber_rx: b_sub_rx,
+    })
+    .await;
+
+    TwoVotingEngines {
+        engine_a,
+        engine_b,
+        log_a,
+        log_b,
+    }
+}
+
+// ─── Polling helper ────────────────────────────────────────────────────────────
+
+/// Poll `predicate()` every `poll_interval_ms` until it returns `Some(T)`
+/// or `timeout_ms` elapses. Returns `None` on timeout.
+///
+/// This is the ZEB-307 R3 pattern: avoids a fixed `tokio::time::sleep`
+/// that would make tests flaky under heavy load.
+pub async fn wait_for<F, T>(timeout_ms: u64, poll_interval_ms: u64, mut predicate: F) -> Option<T>
+where
+    F: FnMut() -> Option<T>,
+{
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_millis(timeout_ms) {
+        if let Some(v) = predicate() {
+            return Some(v);
+        }
+        tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
+    }
+    None
+}
+
+/// Convenience wrapper: poll log_a + log_b until `predicate(log)` is true
+/// on the target log. Times out after 5 000 ms.
+pub async fn wait_for_log<F>(
+    label: &str,
+    log: &Arc<Mutex<VotingLog>>,
+    predicate: F,
+) -> Result<(), String>
+where
+    F: Fn(&VotingLog) -> bool,
+{
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        {
+            let guard = log.lock().await;
+            if predicate(&guard) {
+                return Ok(());
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("wait_for_log({label}) timed out after 5s"));
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+// ─── Event builders ────────────────────────────────────────────────────────────
+
+/// Default valid Tier 3 poll config (sortition_size 20 satisfies the [20,300]
+/// validation range; windows satisfy the ≥60s floor).
+pub fn default_tier3_config() -> Tier3PollConfigPayload {
+    Tier3PollConfigPayload {
+        proposal_text: "Should the community adopt proposal X?".into(),
+        sortition_size: 20,
+        deliberation_window_seconds: 3600,
+        drafting_window_seconds: 3600,
+        ratification_window_seconds: 3600,
+        privacy_mode: "pu".into(),
+        incentive_mode: "a".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+    }
+}
+
+/// Build a signed Tier 3 PollCreate (kd=cr, tier=Sortition) event.
+pub fn build_tier3_poll_create_event(
+    proposer: &TestIdentity,
+    config: &Tier3PollConfigPayload,
+    hlc: Hlc,
+) -> SignedVotingEvent {
+    use ed25519_dalek::Signer;
+    let mut payload = Vec::new();
+    ciborium::into_writer(config, &mut payload).expect("encode Tier3PollConfigPayload");
+    let mut ev = SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier: Tier::Sortition,
+        kind: PollEventKindCode::PollCreate,
+        hlc,
+        actor: proposer.owner,
+        payload,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev.signing_bytes().expect("signing_bytes for tier3 create");
+    ev.sig = proposer.signing_key.sign(&sb).to_bytes().to_vec();
+    ev
+}
+
+/// Build a signed kd=md MiniPublicDecline event.
+pub fn build_decline_event(
+    actor: &TestIdentity,
+    poll_id: harmony_app::community_voting_core::PollId,
+    hlc: Hlc,
+) -> SignedVotingEvent {
+    use ed25519_dalek::Signer;
+    let payload_struct = MiniPublicDeclinePayload {
+        poll_id,
+        reason: None,
+    };
+    let mut payload = Vec::new();
+    ciborium::into_writer(&payload_struct, &mut payload).expect("encode MiniPublicDeclinePayload");
+    let mut ev = SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier: Tier::Sortition,
+        kind: PollEventKindCode::MiniPublicDecline,
+        hlc,
+        actor: actor.owner,
+        payload,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev.signing_bytes().expect("signing_bytes for decline");
+    ev.sig = actor.signing_key.sign(&sb).to_bytes().to_vec();
+    ev
+}
+
+/// Build a signed kd=dc DraftCandidate event.
+pub fn build_draft_candidate_event(
+    actor: &TestIdentity,
+    poll_id: harmony_app::community_voting_core::PollId,
+    text: &str,
+    hlc: Hlc,
+) -> SignedVotingEvent {
+    use ed25519_dalek::Signer;
+    let payload_struct = DraftCandidatePayload {
+        poll_id,
+        text: text.into(),
+    };
+    let mut payload = Vec::new();
+    ciborium::into_writer(&payload_struct, &mut payload).expect("encode DraftCandidatePayload");
+    let mut ev = SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier: Tier::Sortition,
+        kind: PollEventKindCode::DraftCandidate,
+        hlc,
+        actor: actor.owner,
+        payload,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev
+        .signing_bytes()
+        .expect("signing_bytes for draft candidate");
+    ev.sig = actor.signing_key.sign(&sb).to_bytes().to_vec();
+    ev
+}
+
+/// Build a signed kd=da DraftApproval event.
+pub fn build_draft_approval_event(
+    actor: &TestIdentity,
+    poll_id: harmony_app::community_voting_core::PollId,
+    candidate_event_hash: CandidateEventHash,
+    hlc: Hlc,
+) -> SignedVotingEvent {
+    use ed25519_dalek::Signer;
+    let payload_struct = DraftApprovalPayload {
+        poll_id,
+        candidate_event_hash,
+    };
+    let mut payload = Vec::new();
+    ciborium::into_writer(&payload_struct, &mut payload).expect("encode DraftApprovalPayload");
+    let mut ev = SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier: Tier::Sortition,
+        kind: PollEventKindCode::DraftApproval,
+        hlc,
+        actor: actor.owner,
+        payload,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev
+        .signing_bytes()
+        .expect("signing_bytes for draft approval");
+    ev.sig = actor.signing_key.sign(&sb).to_bytes().to_vec();
+    ev
+}
+
+/// Build a signed kd=rb RatificationBallot event.
+/// `scores` is one byte per ratification candidate (0..=5).
+pub fn build_ratification_ballot_event(
+    actor: &TestIdentity,
+    poll_id: harmony_app::community_voting_core::PollId,
+    scores: Vec<u8>,
+    hlc: Hlc,
+) -> SignedVotingEvent {
+    use ed25519_dalek::Signer;
+    let payload_struct = RatificationBallotPayload { poll_id, scores };
+    let mut payload = Vec::new();
+    ciborium::into_writer(&payload_struct, &mut payload).expect("encode RatificationBallotPayload");
+    let mut ev = SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier: Tier::Sortition,
+        kind: PollEventKindCode::RatificationBallot,
+        hlc,
+        actor: actor.owner,
+        payload,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev
+        .signing_bytes()
+        .expect("signing_bytes for ratification ballot");
+    ev.sig = actor.signing_key.sign(&sb).to_bytes().to_vec();
+    ev
+}
+
+/// Build a signed kd=sf SortitionFailed event.
+pub fn build_sortition_failed_event(
+    proposer: &TestIdentity,
+    poll_id: harmony_app::community_voting_core::PollId,
+    hlc: Hlc,
+) -> SignedVotingEvent {
+    use ed25519_dalek::Signer;
+    let payload_struct = SortitionFailedPayload { poll_id };
+    let mut payload = Vec::new();
+    ciborium::into_writer(&payload_struct, &mut payload).expect("encode SortitionFailedPayload");
+    let mut ev = SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier: Tier::Sortition,
+        kind: PollEventKindCode::SortitionFailed,
+        hlc,
+        actor: proposer.owner,
+        payload,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev
+        .signing_bytes()
+        .expect("signing_bytes for sortition failed");
+    ev.sig = proposer.signing_key.sign(&sb).to_bytes().to_vec();
+    ev
+}
+
+/// Build a signed kd=ss SortitionSelection event (engine-generated shape:
+/// zero-sig actor is `OwnerAddr([0; 16])`). Used in tests that inject a
+/// pre-computed sortition result without a real DKG/beacon.
+pub fn build_sortition_selection_event(
+    poll_id: harmony_app::community_voting_core::PollId,
+    primary: Vec<OwnerAddr>,
+    backup: Vec<OwnerAddr>,
+    hlc: Hlc,
+) -> SignedVotingEvent {
+    let payload_struct = SortitionSelectionPayload {
+        poll_id,
+        primary,
+        backup,
+    };
+    let mut payload = Vec::new();
+    ciborium::into_writer(&payload_struct, &mut payload).expect("encode SortitionSelectionPayload");
+    // Engine-generated events use zero actor + zero sig (Task 19 wires real signing).
+    // Per community_voting_log_engine.rs::publish_sortition_selection comments,
+    // this is accepted for Phase 4a-main test fixtures.
+    SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier: Tier::Sortition,
+        kind: PollEventKindCode::SortitionSelection,
+        hlc,
+        actor: OwnerAddr([0u8; 16]),
+        payload,
+        sig: vec![0u8; 64],
+    }
+}
+
+/// Build a signed kd=cl PollClose event (Tier 3).
+pub fn build_poll_close_event(
+    actor: &TestIdentity,
+    poll_id: harmony_app::community_voting_core::PollId,
+    hlc: Hlc,
+) -> SignedVotingEvent {
+    use ed25519_dalek::Signer;
+    // PollClose for Tier 3 carries a minimal payload with just the poll_id reference.
+    // The payload is a CBOR map with key "pi" → poll_id bytes.
+    #[derive(serde::Serialize)]
+    struct PollClosePayload {
+        #[serde(rename = "pi")]
+        pi: harmony_app::community_voting_core::PollId,
+    }
+    let payload_struct = PollClosePayload { pi: poll_id };
+    let mut payload = Vec::new();
+    ciborium::into_writer(&payload_struct, &mut payload).expect("encode PollClosePayload");
+    let mut ev = SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier: Tier::Sortition,
+        kind: PollEventKindCode::PollClose,
+        hlc,
+        actor: actor.owner,
+        payload,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev.signing_bytes().expect("signing_bytes for poll close");
+    ev.sig = actor.signing_key.sign(&sb).to_bytes().to_vec();
+    ev
+}
+
+/// Build a signed kd=rs PollResult event (Tier 3).
+pub fn build_poll_result_event(
+    actor: &TestIdentity,
+    poll_id: harmony_app::community_voting_core::PollId,
+    result: harmony_app::community_voting_star::StarResult,
+    hlc: Hlc,
+) -> SignedVotingEvent {
+    use ed25519_dalek::Signer;
+    let payload_struct = Tier3PollResultPayload { poll_id, result };
+    let mut payload = Vec::new();
+    ciborium::into_writer(&payload_struct, &mut payload).expect("encode Tier3PollResultPayload");
+    let mut ev = SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier: Tier::Sortition,
+        kind: PollEventKindCode::PollResult,
+        hlc,
+        actor: actor.owner,
+        payload,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev.signing_bytes().expect("signing_bytes for poll result");
+    ev.sig = actor.signing_key.sign(&sb).to_bytes().to_vec();
+    ev
+}
+
+// ─── SMOKE TESTS ───────────────────────────────────────────────────────────────
+
+/// Verify that `setup_two_voting_engine_bridge` constructs + tears down
+/// without panics. This is a fixture meta-test — if this fails, all
+/// subsequent Task 13-16 tests are invalid.
+#[tokio::test]
+async fn smoke_two_engine_bridge_tier3_starts_and_shuts_down() {
+    let community_id = SpaceId([0xaa; 16]);
+    let engines = setup_two_voting_engine_bridge(community_id).await;
+    // Drop explicitly so forwarder tasks see channel closure and exit.
+    drop(engines);
+    // No assertion — just no panic.
+}
+
+/// Sanity check: an existing Tier 1 PollCreate published via engine_a
+/// crosses the bridge and is applied by engine_b. Confirms the bridge is
+/// functional before Tier 3 tests build on it.
+///
+/// Note: VotingLogEngine inbound path is gated behind
+/// `cfg(any(test, feature = "test-fixtures"))` in production, so this
+/// only runs with `--features test-fixtures` (which the test harness
+/// always passes — see CLAUDE.md).
+#[tokio::test]
+async fn smoke_tier3_bridge_tier1_event_crosses_to_peer() {
+    let community_id = SpaceId([0xbb; 16]);
+    let engines = setup_two_voting_engine_bridge(community_id).await;
+
+    let alice = fixture_identity(0xA1);
+
+    let tier1_cfg = Tier1PollConfig {
+        options: vec!["Yes".into(), "No".into()],
+        window_seconds: 3600,
+        quorum: None,
+        threshold_percent: None,
+        multi_winner: None,
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        channel_id: ChannelId([0x11; 16]),
+    };
+    let hlc = hlc_at(1_000, "alice-dev");
+    let event = build_signed_poll_create_tier1(&alice.signing_key, alice.owner, &tier1_cfg, hlc)
+        .expect("build_signed_poll_create_tier1");
+
+    engines
+        .engine_a
+        .publish_event(event)
+        .await
+        .expect("engine_a publish Tier1 PollCreate");
+
+    // Engine A should have applied it locally.
+    {
+        let log = engines.log_a.lock().await;
+        assert_eq!(
+            log.polls.len(),
+            1,
+            "engine_a must have exactly one poll after publish"
+        );
+    }
+
+    // Engine B must receive + apply via the bridge.
+    wait_for_log("engine_b sees tier1 poll", &engines.log_b, |log| {
+        log.polls.len() == 1
+    })
+    .await
+    .expect("engine_b must apply the Tier1 PollCreate from engine_a");
+
+    drop(engines);
+}
+
+/// Multi-engine 4-stage E2E happy path for Tier 3.
+///
+/// Design spec §12 AC #7: two voting engines must converge bit-identically on
+/// sortition_result, drafting advancers, ratification candidate ordering, and
+/// StarResult after driving the full PollCreate → kd=ss → Drafting → Ratification
+/// → Close → Result lifecycle.
+///
+/// ## Beacon injection
+///
+/// Rather than running a real DKG ceremony, we inject a kd=ss SortitionSelection
+/// event directly (zero-sig engine-generated shape) after computing the sortition
+/// deterministically with a fixed VRF output `[0xAB; 32]`. This simulates exactly
+/// what `VotingLogEngine::on_dfrost_beacon` would publish after receiving a matching
+/// VRF beacon from DfrostLog.
+///
+/// ## HLC advancement
+///
+/// Windows are 60s (minimum valid). Events are assigned explicit HLC wall_ms values
+/// that skip past each window boundary so we never wait real clock time.
+///
+/// ## sortition_size
+///
+/// Minimum valid per `validate_tier3_poll_config` is 20. We create 50 fixture
+/// identities as the electorate (20 primary + 20 backup = 40 slots, 50 total).
+#[tokio::test]
+async fn tier3_full_lifecycle_4_stage_convergence() {
+    const SORTITION_SIZE: u16 = 20;
+    const N_IDENTITIES: usize = 50;
+    const COMMUNITY_ID: SpaceId = SpaceId([0xE2; 16]);
+
+    // ── Step 1: build electorate ──────────────────────────────────────────────
+
+    let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
+
+    // All identity owner addresses — used as the electorate snapshot at PollCreate.
+    let electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
+
+    // ── Step 2: set up two-engine bridge ──────────────────────────────────────
+
+    let engines = setup_two_voting_engine_bridge(COMMUNITY_ID).await;
+
+    // ── Step 3: PollCreate (proposer = identities[0]) ─────────────────────────
+
+    let t0: u64 = 1_000_000; // base wall_ms
+    let proposer = &identities[0];
+
+    let config = Tier3PollConfigPayload {
+        proposal_text: "E2E lifecycle test proposal".into(),
+        sortition_size: SORTITION_SIZE,
+        deliberation_window_seconds: 60,
+        drafting_window_seconds: 60,
+        ratification_window_seconds: 60,
+        privacy_mode: "pu".into(),
+        incentive_mode: "d".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+    };
+
+    let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
+
+    // Compute poll_id and poll_create_event_hash from the create event.
+    let create_signing_bytes = create_event
+        .signing_bytes()
+        .expect("create event signing_bytes");
+    let poll_id = derive_poll_id(&COMMUNITY_ID, &create_signing_bytes);
+    let _poll_create_event_hash: [u8; 32] = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(&create_signing_bytes).into()
+    };
+
+    // Apply PollCreate via engine_a with the full electorate snapshot.
+    let snapshot = MembershipSnapshot {
+        members: electorate
+            .iter()
+            .map(|addr| {
+                (
+                    *addr,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )
+            })
+            .collect(),
+    };
+    {
+        let mut log = engines.log_a.lock().await;
+        log.apply_with_snapshot(create_event.clone(), &COMMUNITY_ID, Some(snapshot))
+            .expect("engine_a: PollCreate apply");
+    }
+    // Also feed to engine_b via the bridge by publishing via engine_a.
+    // But since we applied directly to log_a, we need to broadcast manually.
+    // Use the engine_a's publish_event path but that would double-apply to log_a.
+    // Instead: encode and send directly to engine_b's inbound via the bridge.
+    //
+    // Actually: re-apply directly to log_b with the same snapshot.
+    let snapshot_b = MembershipSnapshot {
+        members: electorate
+            .iter()
+            .map(|addr| {
+                (
+                    *addr,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )
+            })
+            .collect(),
+    };
+    {
+        let mut log = engines.log_b.lock().await;
+        log.apply_with_snapshot(create_event, &COMMUNITY_ID, Some(snapshot_b))
+            .expect("engine_b: PollCreate apply");
+    }
+
+    // Verify both logs have the poll in Sortition stage.
+    {
+        let log_a = engines.log_a.lock().await;
+        let t3 = log_a
+            .polls
+            .get(&poll_id)
+            .expect("poll in log_a")
+            .tier_state
+            .as_tier3()
+            .expect("tier3 state in log_a");
+        assert_eq!(
+            t3.stage,
+            Stage::Sortition,
+            "log_a: should start in Sortition"
+        );
+        assert!(t3.sortition_result.is_none(), "log_a: no sortition yet");
+        assert_eq!(
+            t3.eligible_electorate_snapshot.len(),
+            N_IDENTITIES,
+            "log_a: full electorate snapshotted"
+        );
+    }
+    {
+        let log_b = engines.log_b.lock().await;
+        let t3 = log_b
+            .polls
+            .get(&poll_id)
+            .expect("poll in log_b")
+            .tier_state
+            .as_tier3()
+            .expect("tier3 state in log_b");
+        assert_eq!(
+            t3.stage,
+            Stage::Sortition,
+            "log_b: should start in Sortition"
+        );
+    }
+
+    // ── Step 4: inject kd=ss via engine_a (beacon simulation) ────────────────
+    //
+    // Fixed VRF output. Mirrors exactly what VotingLogEngine::on_dfrost_beacon
+    // would publish after receiving a matching VRfBeaconPayload with
+    // vrf_output = [0xAB; 32].
+    let vrf_output: [u8; 32] = [0xAB; 32];
+    let sortition_result = fisher_yates_select(
+        &vrf_output,
+        &electorate,
+        SORTITION_SIZE as usize,
+        SORTITION_SIZE as usize,
+    );
+
+    let ss_event = build_sortition_selection_event(
+        poll_id,
+        sortition_result.primary.clone(),
+        sortition_result.backup.clone(),
+        hlc_at(t0 + 1, "engine"),
+    );
+
+    // Publish via engine_a — applies to log_a and broadcasts to engine_b via bridge.
+    engines
+        .engine_a
+        .publish_event(ss_event)
+        .await
+        .expect("engine_a: publish kd=ss");
+
+    // Wait for engine_b to apply the kd=ss (via bridge forwarder).
+    wait_for_log("engine_b: sortition_result set", &engines.log_b, |log| {
+        log.polls
+            .get(&poll_id)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .map(|t3| t3.sortition_result.is_some())
+            .unwrap_or(false)
+    })
+    .await
+    .expect("engine_b: kd=ss must arrive via bridge within 5s");
+
+    // Assert: both engines have identical sortition_result.
+    let primary_a = {
+        let log = engines.log_a.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        t3.sortition_result
+            .clone()
+            .expect("log_a: sortition_result Some")
+    };
+    let primary_b = {
+        let log = engines.log_b.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        t3.sortition_result
+            .clone()
+            .expect("log_b: sortition_result Some")
+    };
+    assert_eq!(
+        primary_a, primary_b,
+        "CONVERGENCE: both engines must have identical sortition_result"
+    );
+    assert_eq!(primary_a.primary.len(), SORTITION_SIZE as usize);
+    assert_eq!(primary_a.backup.len(), SORTITION_SIZE as usize);
+
+    // ── Step 5: Drafting stage — mini-public publishes kd=dc + kd=da ─────────
+    //
+    // Advance HLC past deliberation_window (60s = 60_000ms).
+    // Drafting opens at t0 + dw_ms.
+    let t_drafting = t0 + 60_001; // past deliberation window
+
+    // The actual mini-public is the primary set (no declines in this test).
+    // Find which TestIdentity objects correspond to primary OwnerAddrs.
+    let primary_set: std::collections::HashSet<OwnerAddr> =
+        primary_a.primary.iter().copied().collect();
+    let mini_public_ids: Vec<&TestIdentity> = identities
+        .iter()
+        .filter(|id| primary_set.contains(&id.owner))
+        .collect();
+    assert_eq!(
+        mini_public_ids.len(),
+        SORTITION_SIZE as usize,
+        "must find all primary members in identity list"
+    );
+
+    // Build 3 draft candidates from the first 3 mini-public members.
+    let dc_texts = ["Option A", "Option B", "Option C"];
+    let mut dc_events: Vec<SignedVotingEvent> = Vec::new();
+    for (i, text) in dc_texts.iter().enumerate() {
+        let actor = mini_public_ids[i];
+        let dc_ev = build_draft_candidate_event(
+            actor,
+            poll_id,
+            text,
+            hlc_at(t_drafting + i as u64 * 10, &format!("member-{i}-dev")),
+        );
+        engines
+            .engine_a
+            .publish_event(dc_ev.clone())
+            .await
+            .expect("engine_a: publish kd=dc");
+        dc_events.push(dc_ev);
+    }
+
+    // Compute candidate_event_hash for each kd=dc event.
+    let candidate_hashes: Vec<CandidateEventHash> = dc_events
+        .iter()
+        .map(|ev| {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(ev.signing_bytes().expect("dc signing bytes")).into()
+        })
+        .collect();
+
+    // All mini-public members approve each candidate (threshold = ceil(20/2) = 10).
+    // We need at least 10 approvals per candidate to advance to ratification.
+    // The proposer already has self-approval (1 approval each). Add 9 more per candidate.
+    // Use mini_public_ids[1..10] for candidate 0, mini_public_ids[0]+[2..10] for candidate 1, etc.
+    //
+    // Simple approach: all 20 mini-public members approve all 3 candidates.
+    for (c_idx, &candidate_hash) in candidate_hashes.iter().enumerate() {
+        for (m_idx, actor) in mini_public_ids.iter().enumerate() {
+            // Skip if this actor is the dc proposer (they already have self-approval,
+            // but adding again is idempotent — HashSet.insert is safe).
+            let da_ev = build_draft_approval_event(
+                actor,
+                poll_id,
+                candidate_hash,
+                hlc_at(
+                    t_drafting + 100 + (c_idx * 100 + m_idx) as u64,
+                    &format!("member-{m_idx}-dev"),
+                ),
+            );
+            engines
+                .engine_a
+                .publish_event(da_ev)
+                .await
+                .expect("engine_a: publish kd=da");
+        }
+    }
+
+    // Wait for engine_b to receive all drafting events.
+    let expected_events_after_drafting = 1 // kd=cr
+        + 1 // kd=ss
+        + dc_texts.len() // kd=dc ×3
+        + mini_public_ids.len() * dc_texts.len(); // kd=da ×(20*3=60)
+    wait_for_log(
+        "engine_b: all drafting events applied",
+        &engines.log_b,
+        |log| log.events.len() >= expected_events_after_drafting,
+    )
+    .await
+    .expect("engine_b: must receive all drafting events within 5s");
+
+    // ── Step 6: Ratification stage — full electorate casts kd=rb ──────────────
+    //
+    // Advance past drafting_window: t0 + dw + fw = t0 + 120_001ms.
+    let t_ratification = t0 + 120_001;
+
+    // Compute the ratification candidate ordering (same as both engines will see).
+    let sq = synthesize_status_quo(&poll_id);
+    let sq_hash = sq.event_hash;
+    let mini_public_size = SORTITION_SIZE as usize; // 20 (no declines)
+    let advancers = {
+        // We need the candidates from log_a to compute advancers.
+        let log = engines.log_a.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        // Build a candidates slice that includes status_quo (synthesized, not in state yet).
+        let mut all_candidates = t3.candidates.clone();
+        all_candidates.push(sq.clone());
+        drafting_advancers(&all_candidates, mini_public_size, sq_hash)
+            .expect("status_quo is in all_candidates")
+    };
+    assert_eq!(
+        advancers.len(),
+        4, // 3 real + 1 status_quo (all 3 pass threshold of 10 since all 20 approved them)
+        "all 3 candidates + status_quo should advance"
+    );
+    let ordered_candidates = ratification_candidates_ordering(&advancers, sq_hash);
+    let n_candidates = ordered_candidates.len();
+
+    // All 50 electorate members cast ballots with simple scores.
+    // Scores are indexed by position in ordered_candidates. Give candidate 0 the
+    // highest score so it wins the STAR tally.
+    let mut ballots: Vec<RatificationBallotPayload> = Vec::new();
+    for (e_idx, actor) in identities.iter().enumerate() {
+        // Score pattern: [5, 3, 2, 1] with slight variation for voter index.
+        // Ensures a clear winner at position 0 without all ties.
+        let scores: Vec<u8> = (0..n_candidates as u8)
+            .map(|i| if i == 0 { 5 } else { 4u8.saturating_sub(i) })
+            .collect();
+        let rb_ev = build_ratification_ballot_event(
+            actor,
+            poll_id,
+            scores.clone(),
+            hlc_at(
+                t_ratification + e_idx as u64 * 2,
+                &format!("voter-{e_idx}-dev"),
+            ),
+        );
+        ballots.push(RatificationBallotPayload { poll_id, scores });
+        engines
+            .engine_a
+            .publish_event(rb_ev)
+            .await
+            .expect("engine_a: publish kd=rb");
+    }
+
+    // Wait for engine_b to see all ballots.
+    let expected_events_after_ratification = expected_events_after_drafting + N_IDENTITIES;
+    wait_for_log(
+        "engine_b: all ratification ballots applied",
+        &engines.log_b,
+        |log| log.events.len() >= expected_events_after_ratification,
+    )
+    .await
+    .expect("engine_b: must receive all kd=rb events within 5s");
+
+    // ── Step 7: Close + Result ────────────────────────────────────────────────
+    //
+    // Advance past ratification_window: t0 + dw + fw + rw = t0 + 180_001ms.
+    let t_close = t0 + 180_001;
+
+    let close_ev = build_poll_close_event(proposer, poll_id, hlc_at(t_close, "proposer-dev"));
+    engines
+        .engine_a
+        .publish_event(close_ev)
+        .await
+        .expect("engine_a: publish kd=cl");
+
+    // Compute the STAR result deterministically (same computation as SR1 verify).
+    let star_result = tally_star(&ordered_candidates, &ballots);
+
+    let result_ev = build_poll_result_event(
+        proposer,
+        poll_id,
+        star_result.clone(),
+        hlc_at(t_close + 1, "proposer-dev"),
+    );
+    engines
+        .engine_a
+        .publish_event(result_ev)
+        .await
+        .expect("engine_a: publish kd=rs");
+
+    // Wait for engine_b to see Close + Result.
+    let expected_final_events = expected_events_after_ratification + 2;
+    wait_for_log(
+        "engine_b: PollClose + PollResult applied",
+        &engines.log_b,
+        |log| log.events.len() >= expected_final_events,
+    )
+    .await
+    .expect("engine_b: must receive kd=cl + kd=rs within 5s");
+
+    // ── Step 8: Assert full convergence ──────────────────────────────────────
+
+    // Give any async tasks a moment to settle.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let (t3_a, t3_b) = {
+        let log_a = engines.log_a.lock().await;
+        let log_b = engines.log_b.lock().await;
+        let t3_a = log_a.polls[&poll_id]
+            .tier_state
+            .as_tier3()
+            .expect("log_a tier3")
+            .clone();
+        let t3_b = log_b.polls[&poll_id]
+            .tier_state
+            .as_tier3()
+            .expect("log_b tier3")
+            .clone();
+        (t3_a, t3_b)
+    };
+
+    // Both engines must be in Finalized stage.
+    assert_eq!(
+        t3_a.stage,
+        Stage::Finalized,
+        "engine_a: stage must be Finalized"
+    );
+    assert_eq!(
+        t3_b.stage,
+        Stage::Finalized,
+        "engine_b: stage must be Finalized"
+    );
+
+    // Convergence: sortition_result identical.
+    assert_eq!(
+        t3_a.sortition_result, t3_b.sortition_result,
+        "CONVERGENCE: sortition_result must be identical"
+    );
+
+    // Convergence: candidates set identical (count + hashes).
+    assert_eq!(
+        t3_a.candidates.len(),
+        t3_b.candidates.len(),
+        "CONVERGENCE: candidate count must be identical"
+    );
+    // Compare candidate event_hashes (order is insertion-order, same on both since events arrive in order).
+    let hashes_a: Vec<_> = t3_a.candidates.iter().map(|c| c.event_hash).collect();
+    let hashes_b: Vec<_> = t3_b.candidates.iter().map(|c| c.event_hash).collect();
+    assert_eq!(
+        hashes_a, hashes_b,
+        "CONVERGENCE: candidate hashes must be identical"
+    );
+
+    // Convergence: ratification ballot count.
+    assert_eq!(
+        t3_a.ratification_ballots.len(),
+        N_IDENTITIES,
+        "engine_a: all {N_IDENTITIES} ballots applied"
+    );
+    assert_eq!(
+        t3_b.ratification_ballots.len(),
+        N_IDENTITIES,
+        "engine_b: all {N_IDENTITIES} ballots applied"
+    );
+
+    // Convergence: StarResult identical.
+    assert_eq!(
+        t3_a.result, t3_b.result,
+        "CONVERGENCE: StarResult must be identical on both engines"
+    );
+
+    // StarResult must match what we computed locally.
+    let result_a = t3_a.result.as_ref().expect("engine_a: result Some");
+    assert_eq!(
+        result_a, &star_result,
+        "engine_a: StarResult must match local tally_star computation"
+    );
+
+    // The winner should be the first ordered candidate (highest score = 5 × 50 voters).
+    assert_eq!(
+        result_a.winner.event_hash, ordered_candidates[0].event_hash,
+        "STAR winner must be the highest-scored candidate"
+    );
+
+    // Log event count convergence.
+    {
+        let log_a = engines.log_a.lock().await;
+        let log_b = engines.log_b.lock().await;
+        assert_eq!(
+            log_a.events.len(),
+            log_b.events.len(),
+            "CONVERGENCE: both logs must have identical event count"
+        );
+    }
+
+    drop(engines);
+}
+/// Multi-engine decline + backup promotion test.
+///
+/// Design spec §3 (decline flow) + §6 (materialize on kd=md auto-promotes backup)
+/// + §10 (failure modes / rejection path).
+///
+/// ## Scenario
+///
+/// 1. Two engines + 50 fixture identities + sortition_size=20.
+/// 2. kd=cr + kd=ss injected (same pattern as Task 13).
+/// 3. 3 primary members publish kd=md decline events.
+/// 4. Both engines converge: declines.len()==3, current_mini_public = primary[remaining] + backup[0..3].
+/// 5. A promoted backup member publishes kd=dc → SD1 verify accepts.
+/// 6. A non-mini-public, non-backup identity tries kd=dc → SD1 verify rejects NotInMiniPublic.
+/// 7. A kd=md from a non-primary member → SD1 verify rejects NotInMiniPublic.
+#[tokio::test]
+async fn tier3_decline_triggers_backup_promotion_across_engines() {
+    const SORTITION_SIZE: u16 = 20;
+    const N_IDENTITIES: usize = 50;
+    const COMMUNITY_ID: SpaceId = SpaceId([0xD3; 16]);
+
+    // ── Step 1: electorate ────────────────────────────────────────────────────
+
+    let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
+    let electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
+
+    // ── Step 2: two-engine bridge ─────────────────────────────────────────────
+
+    let engines = setup_two_voting_engine_bridge(COMMUNITY_ID).await;
+
+    // ── Step 3: PollCreate ─────────────────────────────────────────────────────
+
+    let t0: u64 = 2_000_000;
+    let proposer = &identities[0];
+
+    let config = Tier3PollConfigPayload {
+        proposal_text: "Decline + backup promotion test proposal".into(),
+        sortition_size: SORTITION_SIZE,
+        deliberation_window_seconds: 60,
+        drafting_window_seconds: 60,
+        ratification_window_seconds: 60,
+        privacy_mode: "pu".into(),
+        incentive_mode: "d".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+    };
+
+    let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
+
+    let create_signing_bytes = create_event
+        .signing_bytes()
+        .expect("create event signing_bytes");
+    let poll_id = derive_poll_id(&COMMUNITY_ID, &create_signing_bytes);
+
+    let snapshot = MembershipSnapshot {
+        members: electorate
+            .iter()
+            .map(|addr| {
+                (
+                    *addr,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )
+            })
+            .collect(),
+    };
+
+    // Apply PollCreate to both logs directly (same pattern as Task 13 happy path).
+    {
+        let mut log = engines.log_a.lock().await;
+        log.apply_with_snapshot(create_event.clone(), &COMMUNITY_ID, Some(snapshot.clone()))
+            .expect("engine_a: PollCreate apply");
+    }
+    {
+        let mut log = engines.log_b.lock().await;
+        log.apply_with_snapshot(create_event, &COMMUNITY_ID, Some(snapshot))
+            .expect("engine_b: PollCreate apply");
+    }
+
+    // ── Step 4: inject kd=ss (deterministic VRF output [0xCD; 32]) ───────────
+
+    let vrf_output: [u8; 32] = [0xCD; 32];
+    let sortition_result = fisher_yates_select(
+        &vrf_output,
+        &electorate,
+        SORTITION_SIZE as usize,
+        SORTITION_SIZE as usize,
+    );
+
+    let ss_event = build_sortition_selection_event(
+        poll_id,
+        sortition_result.primary.clone(),
+        sortition_result.backup.clone(),
+        hlc_at(t0 + 1, "engine"),
+    );
+
+    engines
+        .engine_a
+        .publish_event(ss_event)
+        .await
+        .expect("engine_a: publish kd=ss");
+
+    // Wait for engine_b to see the kd=ss via bridge.
+    wait_for_log("engine_b: sortition_result set", &engines.log_b, |log| {
+        log.polls
+            .get(&poll_id)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .map(|t3| t3.sortition_result.is_some())
+            .unwrap_or(false)
+    })
+    .await
+    .expect("engine_b: kd=ss must arrive via bridge within 5s");
+
+    // Confirm primary + backup sizes.
+    {
+        let log = engines.log_a.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        let sr = t3.sortition_result.as_ref().unwrap();
+        assert_eq!(sr.primary.len(), SORTITION_SIZE as usize);
+        assert_eq!(sr.backup.len(), SORTITION_SIZE as usize);
+    }
+
+    // ── Step 5: 3 primary members decline ────────────────────────────────────
+    //
+    // We need actual primary members (from fisher_yates_select output).
+    // Resolve their TestIdentity objects.
+    let primary_owners: Vec<OwnerAddr> = sortition_result.primary.clone();
+    let primary_ids: Vec<&TestIdentity> = primary_owners
+        .iter()
+        .map(|owner| {
+            identities
+                .iter()
+                .find(|id| id.owner == *owner)
+                .expect("primary member must be in identities list")
+        })
+        .collect();
+
+    // Have primary_ids[0..3] decline (HLC within deliberation window).
+    let t_decline_base = t0 + 100;
+    for (i, decliner) in primary_ids[0..3].iter().enumerate() {
+        let decline_ev = build_decline_event(
+            decliner,
+            poll_id,
+            hlc_at(t_decline_base + i as u64 * 10, &format!("primary-{i}-dev")),
+        );
+        engines
+            .engine_a
+            .publish_event(decline_ev)
+            .await
+            .expect("engine_a: publish kd=md decline");
+    }
+
+    // Wait for engine_b to receive all 3 decline events.
+    wait_for_log("engine_b: 3 declines applied", &engines.log_b, |log| {
+        log.polls
+            .get(&poll_id)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .map(|t3| t3.declines.len() >= 3)
+            .unwrap_or(false)
+    })
+    .await
+    .expect("engine_b: must receive 3 decline events within 5s");
+
+    // Give async tasks a moment to settle.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // ── Step 6: assert convergence on BOTH engines ────────────────────────────
+
+    let t_after_declines = hlc_at(t_decline_base + 200, "observer");
+
+    let (t3_a, t3_b) = {
+        let log_a = engines.log_a.lock().await;
+        let log_b = engines.log_b.lock().await;
+        let t3_a = log_a.polls[&poll_id]
+            .tier_state
+            .as_tier3()
+            .expect("engine_a tier3")
+            .clone();
+        let t3_b = log_b.polls[&poll_id]
+            .tier_state
+            .as_tier3()
+            .expect("engine_b tier3")
+            .clone();
+        (t3_a, t3_b)
+    };
+
+    // Both engines: declines.len() == 3.
+    assert_eq!(t3_a.declines.len(), 3, "engine_a: must have 3 declines");
+    assert_eq!(t3_b.declines.len(), 3, "engine_b: must have 3 declines");
+
+    // Both engines: current_mini_public at t_after_declines has same size (still 20).
+    let mp_a = t3_a.current_mini_public(&t_after_declines);
+    let mp_b = t3_b.current_mini_public(&t_after_declines);
+    assert_eq!(
+        mp_a.len(),
+        SORTITION_SIZE as usize,
+        "engine_a: mini-public still has 20 members (3 removed + 3 promoted)"
+    );
+    assert_eq!(
+        mp_b.len(),
+        SORTITION_SIZE as usize,
+        "engine_b: mini-public still has 20 members (3 removed + 3 promoted)"
+    );
+    assert_eq!(
+        mp_a, mp_b,
+        "CONVERGENCE: current_mini_public must be identical on both engines"
+    );
+
+    // The 3 decliners must NOT be in the current mini-public.
+    for decliner_id in &primary_ids[0..3] {
+        assert!(
+            !mp_a.contains(&decliner_id.owner),
+            "decliner {:?} must not be in current_mini_public",
+            decliner_id.owner
+        );
+    }
+
+    // The first 3 backup members MUST now be in the current mini-public.
+    let backup_owners: Vec<OwnerAddr> = sortition_result.backup.clone();
+    for (i, backup_owner) in backup_owners[0..3].iter().enumerate() {
+        assert!(
+            mp_a.contains(backup_owner),
+            "backup[{i}] ({backup_owner:?}) must be promoted into current_mini_public"
+        );
+    }
+
+    // The remaining primary members (non-decliners) must still be in the set.
+    for remaining_id in &primary_ids[3..] {
+        assert!(
+            mp_a.contains(&remaining_id.owner),
+            "non-declining primary {:?} must remain in current_mini_public",
+            remaining_id.owner
+        );
+    }
+
+    // ── Step 7: promoted backup publishes kd=dc → SD1 verify ACCEPTS ─────────
+
+    // Find the TestIdentity for backup[0].
+    let promoted_backup_id = identities
+        .iter()
+        .find(|id| id.owner == backup_owners[0])
+        .expect("backup[0] must be in identities list");
+
+    let t_drafting = t0 + 60_001; // past deliberation window
+
+    let dc_event_promoted = build_draft_candidate_event(
+        promoted_backup_id,
+        poll_id,
+        "Draft from promoted backup member",
+        hlc_at(t_drafting, "promoted-backup-dev"),
+    );
+
+    // SD1 verify on engine_a's state — promoted backup IS in current_mini_public.
+    {
+        let log = engines.log_a.lock().await;
+        let poll_state = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        let verify_result = verify_sd(&dc_event_promoted, poll_state);
+        assert_eq!(
+            verify_result,
+            Ok(()),
+            "SD1 verify must ACCEPT kd=dc from promoted backup member"
+        );
+    }
+
+    // ── Step 8: non-mini-public identity tries kd=dc → SD1 verify REJECTS ────
+    //
+    // We need an identity that is genuinely outside both the primary and backup
+    // pools. With 50 identities and sortition_size=20, fisher_yates_select picks
+    // 40 total (20 primary + 20 backup), leaving 10 outside. We scan to find one.
+    let outsider_id = identities
+        .iter()
+        .find(|id| !primary_owners.contains(&id.owner) && !backup_owners.contains(&id.owner))
+        .expect("at least one identity is outside both primary and backup pools");
+
+    // Confirm outsider is not in current_mini_public.
+    assert!(
+        !mp_a.contains(&outsider_id.owner),
+        "outsider must not be in current_mini_public"
+    );
+
+    let dc_event_outsider = build_draft_candidate_event(
+        outsider_id,
+        poll_id,
+        "Draft from outsider — should be rejected",
+        hlc_at(t_drafting + 10, "outsider-dev"),
+    );
+
+    {
+        let log = engines.log_a.lock().await;
+        let poll_state = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        let verify_result = verify_sd(&dc_event_outsider, poll_state);
+        assert_eq!(
+            verify_result,
+            Err(VerifyError::NotInMiniPublic(outsider_id.owner)),
+            "SD1 verify must REJECT kd=dc from non-mini-public outsider"
+        );
+    }
+
+    // ── Step 9: kd=md from non-primary member → SD1 verify REJECTS ──────────
+    //
+    // The non-primary outsider tries to publish a decline event.
+    // SD1 verify checks current_mini_public at event.hlc, and the outsider
+    // was never in primary, so they are not in the mini-public set.
+    let decline_event_outsider = build_decline_event(
+        outsider_id,
+        poll_id,
+        hlc_at(t_decline_base + 300, "outsider-dev"),
+    );
+
+    {
+        let log = engines.log_a.lock().await;
+        let poll_state = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        let verify_result = verify_sd(&decline_event_outsider, poll_state);
+        assert_eq!(
+            verify_result,
+            Err(VerifyError::NotInMiniPublic(outsider_id.owner)),
+            "SD1 verify must REJECT kd=md from non-primary member"
+        );
+    }
+
+    drop(engines);
+}
+
+/// Multi-engine mass-decline + SortitionFailed + retry chain test.
+///
+/// Design spec §3 (Failed = terminal state) + §6 (kd=sf apply rules + retry_of) +
+/// §10 (failure modes + retry chain).
+///
+/// ## Scenario
+///
+/// 1. Two engines + 50 fixture identities + sortition_size=20 + proposer = identities[49].
+/// 2. kd=cr + kd=ss injected (proposer is identities[49], outside primary/backup pools).
+/// 3. ALL 20 primary + ALL 20 backup members (40 total) publish kd=md decline events.
+/// 4. Both engines converge: declines.len()==40, decline_count_at==40.
+/// 5. SF1 verify accepts: decline_count(40) >= total_pool_size(40).
+/// 6. Proposer publishes kd=sf; both engines transition to Stage::Failed.
+/// 7. Subsequent events for the failed poll are rejected (PollInFailedState).
+/// 8. Proposer publishes new kd=cr with retry_of=Some(prev_poll_id) → accepted.
+/// 9. Negative: retry_of=Some(nonexistent) → RetryOfPollNotFound.
+/// 10. Negative: retry_of=Some(retry_poll_id) (non-Failed) → RetryOfPollNotFailed.
+#[tokio::test]
+async fn tier3_mass_decline_sortition_failed_with_retry_chain() {
+    const SORTITION_SIZE: u16 = 20;
+    const N_IDENTITIES: usize = 50;
+    const COMMUNITY_ID: SpaceId = SpaceId([0xEF; 16]);
+
+    // ── Step 1: electorate ────────────────────────────────────────────────────
+    //
+    // Proposer = identities[49] (outside the primary/backup pool selection since
+    // Fisher-Yates picks 40 from [0..49] — identities[49] is in the pool but may
+    // still be selected. Use a deterministic VRF seed and verify post-hoc, or
+    // simply include identities[49] in the electorate but verify it's not in the
+    // primary/backup pools. Cleanest: exclude identities[49] from the electorate
+    // that fisher_yates_select operates on; include them in the snapshot for
+    // eligibility, but use only identities[0..49] for the sortition electorate.)
+    //
+    // Simplest correct approach: proposer = identities[49]. The electorate passed
+    // to fisher_yates_select uses all 50 identities. We verify post-hoc that
+    // identities[49] is not in primary or backup (if it is, we adjust; but with
+    // seed [0xEF; 32] and 50 identities selecting 40, there's a 10/50 = 20% chance
+    // it IS selected. To guarantee it, we exclude it from the Fisher-Yates pool by
+    // passing only identities[0..49] to fisher_yates_select while still including
+    // all 50 in the PollCreate snapshot).
+
+    let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
+
+    // Proposer is identities[49] — separate from the sortition pool.
+    let proposer = &identities[49];
+
+    // Electorate for PollCreate snapshot: all 50 members.
+    let full_electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
+
+    // Sortition pool: only identities[0..49] (49 members), so proposer is never selected.
+    let sortition_pool: Vec<OwnerAddr> = identities[..49].iter().map(|id| id.owner).collect();
+
+    // ── Step 2: two-engine bridge ─────────────────────────────────────────────
+
+    let engines = setup_two_voting_engine_bridge(COMMUNITY_ID).await;
+
+    // ── Step 3: PollCreate (proposer = identities[49]) ────────────────────────
+
+    let t0: u64 = 3_000_000;
+
+    let config = Tier3PollConfigPayload {
+        proposal_text: "Mass-decline failure + retry chain test".into(),
+        sortition_size: SORTITION_SIZE,
+        deliberation_window_seconds: 3600,
+        drafting_window_seconds: 3600,
+        ratification_window_seconds: 3600,
+        privacy_mode: "pu".into(),
+        incentive_mode: "a".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+    };
+
+    let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
+
+    let create_signing_bytes = create_event
+        .signing_bytes()
+        .expect("create event signing_bytes");
+    let poll_id = derive_poll_id(&COMMUNITY_ID, &create_signing_bytes);
+
+    let snapshot = MembershipSnapshot {
+        members: full_electorate
+            .iter()
+            .map(|addr| {
+                (
+                    *addr,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )
+            })
+            .collect(),
+    };
+
+    // Apply PollCreate directly to both logs with the full snapshot.
+    {
+        let mut log = engines.log_a.lock().await;
+        log.apply_with_snapshot(create_event.clone(), &COMMUNITY_ID, Some(snapshot.clone()))
+            .expect("engine_a: PollCreate apply");
+    }
+    {
+        let mut log = engines.log_b.lock().await;
+        log.apply_with_snapshot(create_event, &COMMUNITY_ID, Some(snapshot))
+            .expect("engine_b: PollCreate apply");
+    }
+
+    // Verify both logs: poll in Sortition stage, proposer = identities[49].
+    {
+        let log = engines.log_a.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        assert_eq!(t3.stage, Stage::Sortition, "engine_a: starts in Sortition");
+        assert_eq!(
+            t3.meta.proposer, proposer.owner,
+            "engine_a: proposer = identities[49]"
+        );
+        assert_eq!(
+            t3.eligible_electorate_snapshot.len(),
+            N_IDENTITIES,
+            "engine_a: full electorate snapshotted"
+        );
+    }
+
+    // ── Step 4: inject kd=ss (VRF seed [0xEF; 32], sortition from pool[0..49]) ─
+
+    let vrf_output: [u8; 32] = [0xEF; 32];
+    let sortition_result = fisher_yates_select(
+        &vrf_output,
+        &sortition_pool,
+        SORTITION_SIZE as usize,
+        SORTITION_SIZE as usize,
+    );
+
+    // Sanity: proposer must NOT be in primary or backup (by construction).
+    assert!(
+        !sortition_result.primary.contains(&proposer.owner),
+        "proposer must not be in primary pool"
+    );
+    assert!(
+        !sortition_result.backup.contains(&proposer.owner),
+        "proposer must not be in backup pool"
+    );
+
+    let ss_event = build_sortition_selection_event(
+        poll_id,
+        sortition_result.primary.clone(),
+        sortition_result.backup.clone(),
+        hlc_at(t0 + 1, "engine"),
+    );
+
+    engines
+        .engine_a
+        .publish_event(ss_event)
+        .await
+        .expect("engine_a: publish kd=ss");
+
+    // Wait for engine_b to receive kd=ss via bridge.
+    wait_for_log("engine_b: sortition_result set", &engines.log_b, |log| {
+        log.polls
+            .get(&poll_id)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .map(|t3| t3.sortition_result.is_some())
+            .unwrap_or(false)
+    })
+    .await
+    .expect("engine_b: kd=ss must arrive via bridge within 5s");
+
+    // Confirm 20 primary + 20 backup.
+    {
+        let log = engines.log_a.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        let sr = t3.sortition_result.as_ref().unwrap();
+        assert_eq!(sr.primary.len(), SORTITION_SIZE as usize);
+        assert_eq!(sr.backup.len(), SORTITION_SIZE as usize);
+    }
+
+    // ── Step 5: ALL 40 primary + backup members publish kd=md declines ────────
+
+    let primary_owners: Vec<OwnerAddr> = sortition_result.primary.clone();
+    let backup_owners: Vec<OwnerAddr> = sortition_result.backup.clone();
+
+    // Resolve TestIdentity for each primary member.
+    let primary_ids: Vec<&TestIdentity> = primary_owners
+        .iter()
+        .map(|owner| {
+            identities
+                .iter()
+                .find(|id| id.owner == *owner)
+                .expect("primary member must be in identities list")
+        })
+        .collect();
+
+    // Resolve TestIdentity for each backup member.
+    let backup_ids: Vec<&TestIdentity> = backup_owners
+        .iter()
+        .map(|owner| {
+            identities
+                .iter()
+                .find(|id| id.owner == *owner)
+                .expect("backup member must be in identities list")
+        })
+        .collect();
+
+    let t_decline_base = t0 + 100;
+
+    // All 20 primary members decline.
+    for (i, decliner) in primary_ids.iter().enumerate() {
+        let decline_ev = build_decline_event(
+            decliner,
+            poll_id,
+            hlc_at(t_decline_base + i as u64 * 10, &format!("primary-{i}-dev")),
+        );
+        engines
+            .engine_a
+            .publish_event(decline_ev)
+            .await
+            .expect("engine_a: publish primary kd=md decline");
+    }
+
+    // All 20 backup members decline (HLC continues ascending, per-actor).
+    let backup_decline_base = t_decline_base + (SORTITION_SIZE as u64) * 10 + 10;
+    for (i, decliner) in backup_ids.iter().enumerate() {
+        let decline_ev = build_decline_event(
+            decliner,
+            poll_id,
+            hlc_at(
+                backup_decline_base + i as u64 * 10,
+                &format!("backup-{i}-dev"),
+            ),
+        );
+        engines
+            .engine_a
+            .publish_event(decline_ev)
+            .await
+            .expect("engine_a: publish backup kd=md decline");
+    }
+
+    // Wait for engine_b to receive all 40 decline events via bridge.
+    wait_for_log("engine_b: 40 declines applied", &engines.log_b, |log| {
+        log.polls
+            .get(&poll_id)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .map(|t3| t3.declines.len() >= 40)
+            .unwrap_or(false)
+    })
+    .await
+    .expect("engine_b: must receive all 40 decline events within 5s");
+
+    // Give async tasks a moment to settle.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // ── Step 6: assert convergence on both engines: declines.len()==40 ────────
+
+    let t_after_all_declines = hlc_at(
+        backup_decline_base + (SORTITION_SIZE as u64) * 10 + 1,
+        "observer",
+    );
+
+    let (t3_a, t3_b) = {
+        let log_a = engines.log_a.lock().await;
+        let log_b = engines.log_b.lock().await;
+        let t3_a = log_a.polls[&poll_id]
+            .tier_state
+            .as_tier3()
+            .expect("engine_a tier3")
+            .clone();
+        let t3_b = log_b.polls[&poll_id]
+            .tier_state
+            .as_tier3()
+            .expect("engine_b tier3")
+            .clone();
+        (t3_a, t3_b)
+    };
+
+    // Both engines: 40 total declines (20 primary + 20 backup).
+    assert_eq!(t3_a.declines.len(), 40, "engine_a: must have 40 declines");
+    assert_eq!(t3_b.declines.len(), 40, "engine_b: must have 40 declines");
+
+    // decline_count_at returns 40 for both engines.
+    let count_a = t3_a.decline_count_at(&t_after_all_declines);
+    let count_b = t3_b.decline_count_at(&t_after_all_declines);
+    assert_eq!(count_a, 40, "engine_a: decline_count_at must be 40");
+    assert_eq!(count_b, 40, "engine_b: decline_count_at must be 40");
+
+    // ── Step 7: SF1 verify accepts (decline_count ≥ backup_pool_size) ─────────
+
+    let t_sf = backup_decline_base + (SORTITION_SIZE as u64) * 10 + 100;
+    let sf_event = build_sortition_failed_event(proposer, poll_id, hlc_at(t_sf, "proposer-dev"));
+
+    // verify_sf must accept: proposer is correct, decline_count(40) >= total_pool_size(40).
+    {
+        let log = engines.log_a.lock().await;
+        let poll_state = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        let verify_result = verify_sf(&sf_event, poll_state);
+        assert_eq!(
+            verify_result,
+            Ok(()),
+            "SF1 verify must ACCEPT: decline_count=40 >= total_pool_size(primary=20+backup=20)=40"
+        );
+    }
+
+    // ── Step 8: proposer publishes kd=sf; both engines transition to Failed ───
+
+    engines
+        .engine_a
+        .publish_event(sf_event)
+        .await
+        .expect("engine_a: publish kd=sf SortitionFailed");
+
+    // Wait for engine_b to apply kd=sf → Stage::Failed.
+    wait_for_log("engine_b: stage == Failed", &engines.log_b, |log| {
+        log.polls
+            .get(&poll_id)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .map(|t3| t3.stage == Stage::Failed)
+            .unwrap_or(false)
+    })
+    .await
+    .expect("engine_b: stage must transition to Failed within 5s");
+
+    // Give engine_a a moment to settle (it applied synchronously, but confirm).
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // Assert both engines are in Failed stage.
+    {
+        let log_a = engines.log_a.lock().await;
+        let log_b = engines.log_b.lock().await;
+        let t3_a = log_a.polls[&poll_id].tier_state.as_tier3().unwrap();
+        let t3_b = log_b.polls[&poll_id].tier_state.as_tier3().unwrap();
+        assert_eq!(
+            t3_a.stage,
+            Stage::Failed,
+            "engine_a: stage must be Failed after kd=sf"
+        );
+        assert_eq!(
+            t3_b.stage,
+            Stage::Failed,
+            "engine_b: stage must be Failed after kd=sf"
+        );
+    }
+
+    // ── Step 9: subsequent events on the failed poll are rejected ─────────────
+    //
+    // Try publishing another kd=md from a primary member. Tier3PollState::apply_event
+    // returns PollInFailedState; VotingLog maps that to ApplyError::IllegalTransition.
+    let extra_decline_ev =
+        build_decline_event(primary_ids[0], poll_id, hlc_at(t_sf + 10, "primary-0-dev"));
+
+    // Apply directly to log_a to check the rejection (without going through engine
+    // since publish_event would propagate the error up as a string).
+    {
+        let mut log = engines.log_a.lock().await;
+        let err = log
+            .apply_with_snapshot(extra_decline_ev, &COMMUNITY_ID, None)
+            .expect_err("extra kd=md after Failed must be rejected");
+        assert_eq!(
+            err,
+            ApplyError::IllegalTransition,
+            "extra kd=md after Failed must return IllegalTransition (PollInFailedState mapped)"
+        );
+    }
+
+    // ── Step 10: retry chain — new kd=cr with retry_of=Some(prev_poll_id) ─────
+
+    let t_retry = t_sf + 1000;
+
+    let retry_config = Tier3PollConfigPayload {
+        proposal_text: "Retry of mass-decline poll".into(),
+        sortition_size: SORTITION_SIZE,
+        deliberation_window_seconds: 3600,
+        drafting_window_seconds: 3600,
+        ratification_window_seconds: 3600,
+        privacy_mode: "pu".into(),
+        incentive_mode: "a".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: Some(poll_id),
+    };
+
+    let retry_create_event =
+        build_tier3_poll_create_event(proposer, &retry_config, hlc_at(t_retry, "proposer-dev"));
+
+    let retry_signing_bytes = retry_create_event
+        .signing_bytes()
+        .expect("retry create event signing_bytes");
+    let retry_poll_id = derive_poll_id(&COMMUNITY_ID, &retry_signing_bytes);
+
+    let retry_snapshot = MembershipSnapshot {
+        members: full_electorate
+            .iter()
+            .map(|addr| {
+                (
+                    *addr,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )
+            })
+            .collect(),
+    };
+
+    // Apply retry kd=cr to both logs: must be accepted (predecessor is in Failed).
+    {
+        let mut log = engines.log_a.lock().await;
+        log.apply_with_snapshot(
+            retry_create_event.clone(),
+            &COMMUNITY_ID,
+            Some(retry_snapshot.clone()),
+        )
+        .expect("engine_a: retry kd=cr must be accepted (predecessor is Failed)");
+    }
+    {
+        let mut log = engines.log_b.lock().await;
+        log.apply_with_snapshot(retry_create_event, &COMMUNITY_ID, Some(retry_snapshot))
+            .expect("engine_b: retry kd=cr must be accepted (predecessor is Failed)");
+    }
+
+    // Both engines must have the new poll in their state.
+    {
+        let log_a = engines.log_a.lock().await;
+        let log_b = engines.log_b.lock().await;
+        assert!(
+            log_a.polls.contains_key(&retry_poll_id),
+            "engine_a: retry poll must be present"
+        );
+        assert!(
+            log_b.polls.contains_key(&retry_poll_id),
+            "engine_b: retry poll must be present"
+        );
+        // New poll starts in Sortition stage.
+        let retry_t3_a = log_a.polls[&retry_poll_id].tier_state.as_tier3().unwrap();
+        let retry_t3_b = log_b.polls[&retry_poll_id].tier_state.as_tier3().unwrap();
+        assert_eq!(
+            retry_t3_a.stage,
+            Stage::Sortition,
+            "engine_a: retry poll must start in Sortition"
+        );
+        assert_eq!(
+            retry_t3_b.stage,
+            Stage::Sortition,
+            "engine_b: retry poll must start in Sortition"
+        );
+        // New poll has a fresh poll_create_event_hash (different beacon seed).
+        assert_ne!(
+            retry_t3_a.meta.poll_create_event_hash, t3_a.meta.poll_create_event_hash,
+            "retry poll must have a different poll_create_event_hash (fresh beacon seed)"
+        );
+    }
+
+    // ── Step 11: negative — retry_of pointing to nonexistent poll → rejected ──
+
+    let phantom_poll_id = harmony_app::community_voting_core::PollId([0xFF; 32]);
+    let bad_retry_config_nonexistent = Tier3PollConfigPayload {
+        proposal_text: "Bad retry — nonexistent predecessor".into(),
+        sortition_size: SORTITION_SIZE,
+        deliberation_window_seconds: 3600,
+        drafting_window_seconds: 3600,
+        ratification_window_seconds: 3600,
+        privacy_mode: "pu".into(),
+        incentive_mode: "a".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: Some(phantom_poll_id),
+    };
+
+    let bad_nonexistent_event = build_tier3_poll_create_event(
+        proposer,
+        &bad_retry_config_nonexistent,
+        hlc_at(t_retry + 10, "proposer-dev"),
+    );
+
+    {
+        let mut log = engines.log_a.lock().await;
+        let err = log
+            .apply_with_snapshot(bad_nonexistent_event, &COMMUNITY_ID, None)
+            .expect_err("retry_of nonexistent poll must be rejected");
+        assert_eq!(
+            err,
+            ApplyError::RetryOfPollNotFound,
+            "retry_of nonexistent must return RetryOfPollNotFound"
+        );
+    }
+
+    // ── Step 12: negative — retry_of pointing to non-Failed poll → rejected ───
+    //
+    // The retry poll (retry_poll_id) is in Stage::Sortition, not Failed.
+    // A kd=cr with retry_of=Some(retry_poll_id) must be rejected.
+
+    let bad_retry_config_nonfailed = Tier3PollConfigPayload {
+        proposal_text: "Bad retry — predecessor is not Failed".into(),
+        sortition_size: SORTITION_SIZE,
+        deliberation_window_seconds: 3600,
+        drafting_window_seconds: 3600,
+        ratification_window_seconds: 3600,
+        privacy_mode: "pu".into(),
+        incentive_mode: "a".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: Some(retry_poll_id),
+    };
+
+    let bad_nonfailed_event = build_tier3_poll_create_event(
+        proposer,
+        &bad_retry_config_nonfailed,
+        hlc_at(t_retry + 20, "proposer-dev"),
+    );
+
+    {
+        let mut log = engines.log_a.lock().await;
+        let err = log
+            .apply_with_snapshot(bad_nonfailed_event, &COMMUNITY_ID, None)
+            .expect_err("retry_of non-Failed poll must be rejected");
+        assert_eq!(
+            err,
+            ApplyError::RetryOfPollNotFailed,
+            "retry_of non-Failed must return RetryOfPollNotFailed"
+        );
+    }
+
+    drop(engines);
+}
+
+#[tokio::test]
+async fn smoke_tier3_event_builders_encode_without_panic() {
+    let alice = fixture_identity(0xA2);
+    let bob = fixture_identity(0xB2);
+
+    let config = default_tier3_config();
+    let poll_id = harmony_app::community_voting_core::PollId([0x42; 32]);
+
+    // PollCreate
+    let create_ev = build_tier3_poll_create_event(&alice, &config, hlc_at(1_000, "alice-dev"));
+    assert_eq!(create_ev.tier, Tier::Sortition);
+    assert_eq!(create_ev.kind, PollEventKindCode::PollCreate);
+    assert_eq!(create_ev.actor, alice.owner);
+
+    // MiniPublicDecline
+    let decline_ev = build_decline_event(&bob, poll_id, hlc_at(2_000, "bob-dev"));
+    assert_eq!(decline_ev.kind, PollEventKindCode::MiniPublicDecline);
+
+    // DraftCandidate
+    let draft_ev = build_draft_candidate_event(
+        &bob,
+        poll_id,
+        "Proposal text here",
+        hlc_at(3_000, "bob-dev"),
+    );
+    assert_eq!(draft_ev.kind, PollEventKindCode::DraftCandidate);
+
+    // Derive candidate_event_hash from draft event signing bytes (SHA-256).
+    let draft_signing_bytes = draft_ev.signing_bytes().expect("draft signing bytes");
+    let candidate_event_hash: [u8; 32] = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(&draft_signing_bytes).into()
+    };
+
+    // DraftApproval
+    let approval_ev = build_draft_approval_event(
+        &alice,
+        poll_id,
+        candidate_event_hash,
+        hlc_at(4_000, "alice-dev"),
+    );
+    assert_eq!(approval_ev.kind, PollEventKindCode::DraftApproval);
+
+    // RatificationBallot
+    let ballot_ev =
+        build_ratification_ballot_event(&alice, poll_id, vec![5, 3, 1], hlc_at(5_000, "alice-dev"));
+    assert_eq!(ballot_ev.kind, PollEventKindCode::RatificationBallot);
+
+    // SortitionFailed
+    let failed_ev = build_sortition_failed_event(&alice, poll_id, hlc_at(6_000, "alice-dev"));
+    assert_eq!(failed_ev.kind, PollEventKindCode::SortitionFailed);
+
+    // SortitionSelection (engine-generated, zero actor)
+    let primary: Vec<OwnerAddr> = (0..20u8).map(|i| OwnerAddr([i; 16])).collect();
+    let backup: Vec<OwnerAddr> = (20..40u8).map(|i| OwnerAddr([i; 16])).collect();
+    let ss_ev = build_sortition_selection_event(poll_id, primary, backup, hlc_at(7_000, "engine"));
+    assert_eq!(ss_ev.kind, PollEventKindCode::SortitionSelection);
+    assert_eq!(ss_ev.actor, OwnerAddr([0u8; 16]));
+
+    // Verify all events encode without panic (CBOR round-trip).
+    for ev in &[
+        &create_ev,
+        &decline_ev,
+        &draft_ev,
+        &approval_ev,
+        &ballot_ev,
+        &failed_ev,
+        &ss_ev,
+    ] {
+        let mut buf = Vec::new();
+        ciborium::into_writer(ev, &mut buf).expect("CBOR encode must not panic");
+        let decoded: SignedVotingEvent =
+            ciborium::from_reader(&buf[..]).expect("CBOR decode must round-trip");
+        assert_eq!(decoded.kind, ev.kind, "round-trip kind must match");
+        assert_eq!(decoded.tier, ev.tier, "round-trip tier must match");
+    }
+}
+
+/// Cross-engine kd=ss convergence: idempotent apply under Phase 4a-main zero-sig constraint.
+///
+/// Design spec §3 (HLC LWW for racing publishes) + §5 (SS1: bit-identical content) +
+/// §10 (cross-engine convergence). Acceptance criterion #7.
+///
+/// ## Phase 4a-main zero-sig constraint
+///
+/// Both engines publish kd=ss with `actor = OwnerAddr([0; 16])` (zero-sig, engine-generated
+/// shape — Task 19 will wire real signing). Because the zero actor is shared, we cannot
+/// demonstrate strict per-actor HLC LWW (that requires distinct actors). Instead, we
+/// demonstrate the convergence property that matters for acceptance: two engines that each
+/// independently compute the same Fisher-Yates result (same VRF + same electorate) and
+/// publish it at different HLCs both end with bit-identical `sortition_result` on both
+/// sides after cross-engine bridge propagation.
+///
+/// ## Race scenario
+///
+/// The "race" is: engine_a publishes kd=ss at HLC 5000; engine_b independently publishes
+/// kd=ss at HLC 5001. Both events are identical in content (same primary + backup arrays)
+/// but differ in HLC. The materialize layer accepts both (5001 > 5000 is monotonic);
+/// the second overwrite is a no-op because content is identical. Both engines converge.
+///
+/// ## What this proves
+///
+/// Even without strict HLC LWW gate (deferred to Task 19 real signing), the invariant
+/// "all nodes converge on the same sortition_result for a given VRF output + electorate"
+/// is proven by this test. This is the load-bearing convergence property per spec §5 SS1.
+///
+/// A second sub-test (`tier3_cross_engine_kd_ss_hlc_tied_resolves_by_device_id_lex`)
+/// tests the tie-breaking path: same wall_ms+logical, different device_id. The lex-smaller
+/// device_id event arrives first in the log; both engines see both events and converge.
+#[tokio::test]
+async fn tier3_kd_ss_idempotent_apply_cross_engine_convergence() {
+    const SORTITION_SIZE: u16 = 20;
+    const N_IDENTITIES: usize = 50;
+    const COMMUNITY_ID: SpaceId = SpaceId([0xC4; 16]);
+
+    // ── Step 1: build electorate ──────────────────────────────────────────────
+
+    let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
+    let electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
+
+    // ── Step 2: two-engine bridge ─────────────────────────────────────────────
+
+    let engines = setup_two_voting_engine_bridge(COMMUNITY_ID).await;
+
+    // ── Step 3: PollCreate (proposer = identities[0]) ─────────────────────────
+
+    let t0: u64 = 4_000_000;
+    let proposer = &identities[0];
+
+    let config = Tier3PollConfigPayload {
+        proposal_text: "Cross-engine kd=ss convergence test".into(),
+        sortition_size: SORTITION_SIZE,
+        deliberation_window_seconds: 60,
+        drafting_window_seconds: 60,
+        ratification_window_seconds: 60,
+        privacy_mode: "pu".into(),
+        incentive_mode: "a".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+    };
+
+    let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
+
+    let create_signing_bytes = create_event
+        .signing_bytes()
+        .expect("create event signing_bytes");
+    let poll_id = derive_poll_id(&COMMUNITY_ID, &create_signing_bytes);
+
+    // Apply PollCreate directly to both logs with the full snapshot.
+    let snapshot = MembershipSnapshot {
+        members: electorate
+            .iter()
+            .map(|addr| {
+                (
+                    *addr,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )
+            })
+            .collect(),
+    };
+    {
+        let mut log = engines.log_a.lock().await;
+        log.apply_with_snapshot(create_event.clone(), &COMMUNITY_ID, Some(snapshot.clone()))
+            .expect("engine_a: PollCreate apply");
+    }
+    {
+        let mut log = engines.log_b.lock().await;
+        log.apply_with_snapshot(create_event, &COMMUNITY_ID, Some(snapshot))
+            .expect("engine_b: PollCreate apply");
+    }
+
+    // Confirm both logs start in Sortition with no sortition_result.
+    {
+        let log = engines.log_a.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        assert_eq!(t3.stage, Stage::Sortition, "engine_a: starts in Sortition");
+        assert!(t3.sortition_result.is_none(), "engine_a: no sortition yet");
+    }
+    {
+        let log = engines.log_b.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        assert_eq!(t3.stage, Stage::Sortition, "engine_b: starts in Sortition");
+        assert!(t3.sortition_result.is_none(), "engine_b: no sortition yet");
+    }
+
+    // ── Step 4: both engines independently compute the same sortition result ───
+    //
+    // Fixed VRF output [0xC4; 32]. Both engines use the same VRF output + electorate
+    // → fisher_yates_select produces bit-identical primary + backup arrays.
+    let vrf_output: [u8; 32] = [0xC4; 32];
+    let sortition_result = fisher_yates_select(
+        &vrf_output,
+        &electorate,
+        SORTITION_SIZE as usize,
+        SORTITION_SIZE as usize,
+    );
+
+    // ── Step 5: race — engine_a publishes kd=ss at HLC 5000, engine_b at HLC 5001 ──
+    //
+    // Both events carry the same primary + backup arrays (bit-identical content).
+    // HLCs differ: 5000 vs 5001, device_id: "engine-a" vs "engine-b".
+    //
+    // Phase 4a-main zero-sig constraint: both use actor=OwnerAddr([0;16]).
+    // The materialize layer's HLC monotonicity check is per-poll (not per-actor);
+    // 5001 > 5000 is monotonic, so both events are accepted in arrival order.
+    // The second overwrite is a no-op (same content). Both engines converge.
+    // HLC wall_ms must exceed t0 (4_000_000) for HLC monotonicity to pass after PollCreate.
+    // Race: engine_a at t0+1, engine_b at t0+2 (lex order: a < b for same wall_ms+1 would
+    // also work, but distinct wall_ms is cleaner — no ambiguity).
+    let ss_event_a = build_sortition_selection_event(
+        poll_id,
+        sortition_result.primary.clone(),
+        sortition_result.backup.clone(),
+        hlc_at(t0 + 1, "engine-a"),
+    );
+
+    let ss_event_b = build_sortition_selection_event(
+        poll_id,
+        sortition_result.primary.clone(),
+        sortition_result.backup.clone(),
+        hlc_at(t0 + 2, "engine-b"),
+    );
+
+    // engine_a publishes its kd=ss (HLC t0+1) — propagates to engine_b via bridge.
+    engines
+        .engine_a
+        .publish_event(ss_event_a)
+        .await
+        .expect("engine_a: publish kd=ss at HLC t0+1");
+
+    // Wait for engine_b to receive engine_a's kd=ss.
+    wait_for_log("engine_b: sees engine_a kd=ss", &engines.log_b, |log| {
+        log.polls
+            .get(&poll_id)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .map(|t3| t3.sortition_result.is_some())
+            .unwrap_or(false)
+    })
+    .await
+    .expect("engine_b: engine_a's kd=ss must arrive via bridge within 5s");
+
+    // engine_b publishes its own kd=ss (HLC t0+2) — propagates to engine_a via bridge.
+    // Content is identical; t0+2 > t0+1 is monotonic → materialize accepts it.
+    engines
+        .engine_b
+        .publish_event(ss_event_b)
+        .await
+        .expect("engine_b: publish kd=ss at HLC t0+2");
+
+    // Wait for engine_a to receive engine_b's kd=ss (a second apply of identical content).
+    // We need event count on both sides to reach ≥ 2 (kd=cr + kd=ss from A + kd=ss from B).
+    // The bridge relays both directions. After engine_b publishes, engine_a gets it back.
+    // Note: engine_a already applied its own kd=ss; the bridge delivers engine_b's kd=ss
+    // to engine_a. Both logs should have 3 events total (cr + ss_a + ss_b).
+    wait_for_log(
+        "engine_a: receives engine_b's kd=ss (3 total events)",
+        &engines.log_a,
+        |log| log.events.len() >= 3,
+    )
+    .await
+    .expect("engine_a: must receive engine_b's kd=ss within 5s");
+
+    wait_for_log(
+        "engine_b: has both kd=ss events (3 total events)",
+        &engines.log_b,
+        |log| log.events.len() >= 3,
+    )
+    .await
+    .expect("engine_b: must have 3 events (cr + ss_a + ss_b) within 5s");
+
+    // Give async tasks a moment to settle.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // ── Step 6: assert cross-engine convergence — sortition_result identical ───
+
+    let sr_a = {
+        let log = engines.log_a.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        t3.sortition_result
+            .clone()
+            .expect("engine_a: sortition_result must be Some")
+    };
+
+    let sr_b = {
+        let log = engines.log_b.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        t3.sortition_result
+            .clone()
+            .expect("engine_b: sortition_result must be Some")
+    };
+
+    // CONVERGENCE: both engines must have identical sortition_result.
+    assert_eq!(
+        sr_a, sr_b,
+        "CONVERGENCE: both engines must have identical sortition_result after cross-engine kd=ss race"
+    );
+
+    // Content must match the locally computed Fisher-Yates result.
+    assert_eq!(
+        sr_a.primary, sortition_result.primary,
+        "engine_a: sortition_result.primary must be bit-identical to fisher_yates_select output"
+    );
+    assert_eq!(
+        sr_a.backup, sortition_result.backup,
+        "engine_a: sortition_result.backup must be bit-identical to fisher_yates_select output"
+    );
+    assert_eq!(sr_a.primary.len(), SORTITION_SIZE as usize);
+    assert_eq!(sr_a.backup.len(), SORTITION_SIZE as usize);
+
+    // Both engines have sortition_result set → current_stage_at a future HLC is Deliberation.
+    // Note: `stage` field on Tier3PollState is NOT eagerly updated on kd=ss apply; the
+    // materialize layer uses current_stage_at for HLC-watermark-driven transitions.
+    // We probe current_stage_at(t0 + 10ms) which is within the deliberation window.
+    {
+        let log_a = engines.log_a.lock().await;
+        let log_b = engines.log_b.lock().await;
+        let t3_a = log_a.polls[&poll_id].tier_state.as_tier3().unwrap();
+        let t3_b = log_b.polls[&poll_id].tier_state.as_tier3().unwrap();
+        let probe_hlc = hlc_at(t0 + 10, "probe");
+        assert_eq!(
+            t3_a.current_stage_at(&probe_hlc),
+            Stage::Deliberation,
+            "engine_a: current_stage_at must be Deliberation after kd=ss (sortition_result set)"
+        );
+        assert_eq!(
+            t3_b.current_stage_at(&probe_hlc),
+            Stage::Deliberation,
+            "engine_b: current_stage_at must be Deliberation after kd=ss (sortition_result set)"
+        );
+        assert_eq!(
+            t3_a.current_stage_at(&probe_hlc),
+            t3_b.current_stage_at(&probe_hlc),
+            "CONVERGENCE: both engines in same logical stage"
+        );
+    }
+
+    drop(engines);
+}
+
+/// Cross-engine kd=ss HLC tie-breaking by device_id lex order.
+///
+/// When two kd=ss events have equal wall_ms + logical but different device_ids,
+/// the lex-smaller device_id sorts first in `(wall_ms, logical, device_id)` order.
+/// The materialize HLC monotonicity gate uses this lex order. The event with the
+/// lex-smaller device_id arrives at wall_ms=5000,"engine-a"; the event with device_id
+/// "engine-z" arrives at wall_ms=5000,"engine-z" which is lex-larger → monotonic (a < z).
+/// Both events are accepted; second overwrite is no-op (same content). Both engines converge.
+///
+/// This confirms the tie-breaking rule from design spec §3 (HLC lex order) works correctly
+/// across engines even when wall_ms + logical are identical.
+#[tokio::test]
+async fn tier3_cross_engine_kd_ss_hlc_tied_resolves_by_device_id_lex() {
+    const SORTITION_SIZE: u16 = 20;
+    const N_IDENTITIES: usize = 50;
+    const COMMUNITY_ID: SpaceId = SpaceId([0xC5; 16]);
+
+    // ── Step 1: electorate + two-engine bridge ────────────────────────────────
+
+    let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
+    let electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
+    let engines = setup_two_voting_engine_bridge(COMMUNITY_ID).await;
+
+    // ── Step 2: PollCreate ─────────────────────────────────────────────────────
+
+    let t0: u64 = 5_000_000;
+    let proposer = &identities[0];
+
+    let config = Tier3PollConfigPayload {
+        proposal_text: "HLC tie-breaking by device_id lex".into(),
+        sortition_size: SORTITION_SIZE,
+        deliberation_window_seconds: 60,
+        drafting_window_seconds: 60,
+        ratification_window_seconds: 60,
+        privacy_mode: "pu".into(),
+        incentive_mode: "a".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+    };
+
+    let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
+    let create_signing_bytes = create_event
+        .signing_bytes()
+        .expect("create event signing_bytes");
+    let poll_id = derive_poll_id(&COMMUNITY_ID, &create_signing_bytes);
+
+    let snapshot = MembershipSnapshot {
+        members: electorate
+            .iter()
+            .map(|addr| {
+                (
+                    *addr,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )
+            })
+            .collect(),
+    };
+    {
+        let mut log = engines.log_a.lock().await;
+        log.apply_with_snapshot(create_event.clone(), &COMMUNITY_ID, Some(snapshot.clone()))
+            .expect("engine_a: PollCreate apply");
+    }
+    {
+        let mut log = engines.log_b.lock().await;
+        log.apply_with_snapshot(create_event, &COMMUNITY_ID, Some(snapshot))
+            .expect("engine_b: PollCreate apply");
+    }
+
+    // ── Step 3: compute sortition (same VRF + electorate → identical content) ──
+
+    let vrf_output: [u8; 32] = [0xC5; 32];
+    let sortition_result = fisher_yates_select(
+        &vrf_output,
+        &electorate,
+        SORTITION_SIZE as usize,
+        SORTITION_SIZE as usize,
+    );
+
+    // ── Step 4: tied HLC — same wall_ms + logical, different device_id ─────────
+    //
+    // "engine-a" < "engine-z" lexicographically. The materialize HLC monotonicity
+    // gate uses (wall_ms, logical, device_id) lex order. "engine-a" event sorts first;
+    // "engine-z" event (lex-larger) arrives second — monotonically valid ("a" < "z").
+    // Both accepted; second overwrite is no-op (same content). Both engines converge.
+    //
+    // Both events use wall_ms = t0+1 (above PollCreate HLC for monotonicity).
+    // As long as ss_event_a is applied before ss_event_z on each engine, the order is valid.
+    // Both events share wall_ms = t0+1 (above PollCreate's t0 for HLC monotonicity)
+    // but differ in device_id. "engine-a" < "engine-z" lexicographically.
+    let ss_event_a = build_sortition_selection_event(
+        poll_id,
+        sortition_result.primary.clone(),
+        sortition_result.backup.clone(),
+        // device_id "engine-a" → lex-smaller → arrives first.
+        Hlc {
+            wall_ms: t0 + 1,
+            logical: 0,
+            device_id: "engine-a".into(),
+        },
+    );
+
+    let ss_event_z = build_sortition_selection_event(
+        poll_id,
+        sortition_result.primary.clone(),
+        sortition_result.backup.clone(),
+        // device_id "engine-z" → lex-larger → arrives second (monotonic: "engine-a" < "engine-z").
+        Hlc {
+            wall_ms: t0 + 1,
+            logical: 0,
+            device_id: "engine-z".into(),
+        },
+    );
+
+    // Publish lex-smaller event first via engine_a → bridge → engine_b.
+    engines
+        .engine_a
+        .publish_event(ss_event_a)
+        .await
+        .expect("engine_a: publish kd=ss (device_id=engine-a)");
+
+    // Wait for engine_b to receive it.
+    wait_for_log("engine_b: sees engine-a kd=ss", &engines.log_b, |log| {
+        log.polls
+            .get(&poll_id)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .map(|t3| t3.sortition_result.is_some())
+            .unwrap_or(false)
+    })
+    .await
+    .expect("engine_b: kd=ss from engine-a must arrive within 5s");
+
+    // Publish lex-larger event via engine_b → bridge → engine_a.
+    // "engine-z" > "engine-a" → lex order is monotonically increasing → accepted.
+    engines
+        .engine_b
+        .publish_event(ss_event_z)
+        .await
+        .expect("engine_b: publish kd=ss (device_id=engine-z)");
+
+    // Wait for both engines to have 3 events (cr + ss_a + ss_z).
+    wait_for_log(
+        "engine_a: receives engine_b's kd=ss (3 events)",
+        &engines.log_a,
+        |log| log.events.len() >= 3,
+    )
+    .await
+    .expect("engine_a: must receive engine_b's kd=ss within 5s");
+
+    wait_for_log("engine_b: has all 3 events", &engines.log_b, |log| {
+        log.events.len() >= 3
+    })
+    .await
+    .expect("engine_b: must have 3 events within 5s");
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // ── Step 5: assert convergence ────────────────────────────────────────────
+
+    let sr_a = {
+        let log = engines.log_a.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        t3.sortition_result
+            .clone()
+            .expect("engine_a: sortition_result Some")
+    };
+
+    let sr_b = {
+        let log = engines.log_b.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        t3.sortition_result
+            .clone()
+            .expect("engine_b: sortition_result Some")
+    };
+
+    assert_eq!(
+        sr_a, sr_b,
+        "CONVERGENCE: both engines must have identical sortition_result after HLC-tied kd=ss race"
+    );
+    assert_eq!(
+        sr_a.primary, sortition_result.primary,
+        "sortition_result.primary must be bit-identical to fisher_yates_select output"
+    );
+    assert_eq!(
+        sr_a.backup, sortition_result.backup,
+        "sortition_result.backup must be bit-identical to fisher_yates_select output"
+    );
+
+    // Confirm both engines compute the same logical stage at a probe HLC.
+    // `stage` field is not eagerly updated; use current_stage_at for watermark-driven stages.
+    {
+        let log_a = engines.log_a.lock().await;
+        let log_b = engines.log_b.lock().await;
+        let t3_a = log_a.polls[&poll_id].tier_state.as_tier3().unwrap();
+        let t3_b = log_b.polls[&poll_id].tier_state.as_tier3().unwrap();
+        let probe_hlc = hlc_at(t0 + 10, "probe");
+        assert_eq!(
+            t3_a.current_stage_at(&probe_hlc),
+            Stage::Deliberation,
+            "engine_a: current_stage_at must be Deliberation (sortition_result set)"
+        );
+        assert_eq!(
+            t3_b.current_stage_at(&probe_hlc),
+            Stage::Deliberation,
+            "engine_b: current_stage_at must be Deliberation (sortition_result set)"
+        );
+        assert_eq!(
+            t3_a.current_stage_at(&probe_hlc),
+            t3_b.current_stage_at(&probe_hlc),
+            "CONVERGENCE: both engines in same logical stage"
+        );
+    }
+
+    drop(engines);
+}

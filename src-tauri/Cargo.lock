@@ -2146,6 +2146,7 @@ dependencies = [
  "ml-dsa",
  "ml-kem",
  "rand 0.8.5",
+ "rand_chacha 0.3.1",
  "rusqlite",
  "rust_decimal",
  "secrecy 0.10.3",
