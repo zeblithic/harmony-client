@@ -1425,7 +1425,7 @@ async fn tier3_decline_triggers_backup_promotion_across_engines() {
 /// 2. kd=cr + kd=ss injected (proposer is identities[49], outside primary/backup pools).
 /// 3. ALL 20 primary + ALL 20 backup members (40 total) publish kd=md decline events.
 /// 4. Both engines converge: declines.len()==40, decline_count_at==40.
-/// 5. SF1 verify accepts: decline_count(40) >= backup_pool_size(20).
+/// 5. SF1 verify accepts: decline_count(40) >= total_pool_size(40).
 /// 6. Proposer publishes kd=sf; both engines transition to Stage::Failed.
 /// 7. Subsequent events for the failed poll are rejected (PollInFailedState).
 /// 8. Proposer publishes new kd=cr with retry_of=Some(prev_poll_id) → accepted.
@@ -1706,7 +1706,7 @@ async fn tier3_mass_decline_sortition_failed_with_retry_chain() {
     let t_sf = backup_decline_base + (SORTITION_SIZE as u64) * 10 + 100;
     let sf_event = build_sortition_failed_event(proposer, poll_id, hlc_at(t_sf, "proposer-dev"));
 
-    // verify_sf must accept: proposer is correct, decline_count(40) ≥ backup_size(20).
+    // verify_sf must accept: proposer is correct, decline_count(40) >= total_pool_size(40).
     {
         let log = engines.log_a.lock().await;
         let poll_state = log.polls[&poll_id].tier_state.as_tier3().unwrap();
@@ -1714,7 +1714,7 @@ async fn tier3_mass_decline_sortition_failed_with_retry_chain() {
         assert_eq!(
             verify_result,
             Ok(()),
-            "SF1 verify must ACCEPT: decline_count=40 >= backup_pool_size=20"
+            "SF1 verify must ACCEPT: decline_count=40 >= total_pool_size(primary=20+backup=20)=40"
         );
     }
 

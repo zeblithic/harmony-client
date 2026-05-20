@@ -644,10 +644,16 @@ pub fn verify_sf(
         return Err(VerifyError::SfActorNotProposer(event.actor));
     }
 
-    // 2. Backup pool must be exhausted: decline_count ≥ backup_pool_size.
-    //    backup_pool_size == sortition_size by design (primary_size == backup_size).
+    // 2. Backup pool must be exhausted: decline_count ≥ primary_size + backup_size.
+    //    Total pool = primary + backup = 2 × sortition_size by design.
+    //    Read the actual pool lengths from sortition_result if available (covers
+    //    any future asymmetric sizes); fall back to 2 × sortition_size from meta.
     let declined = poll_state.decline_count_at(&event.hlc);
-    let capacity = poll_state.meta.config.sortition_size as usize;
+    let capacity = poll_state
+        .sortition_result
+        .as_ref()
+        .map(|sr| sr.primary.len() + sr.backup.len())
+        .unwrap_or(2 * poll_state.meta.config.sortition_size as usize);
     if declined < capacity {
         return Err(VerifyError::BackupPoolNotExhausted { declined, capacity });
     }
@@ -2265,12 +2271,15 @@ mod tests {
     // 10. verify_sf_proposer_with_exhausted_pool_accepted
     #[test]
     fn verify_sf_proposer_with_exhausted_pool_accepted() {
-        // sortition_size=2, 2 declines → pool exhausted
-        let poll = poll_with_declines(2, 2);
+        // sortition_size=2: primary=2, backup=2 → total capacity=4.
+        // All 4 (2 primary + 2 backup) decline → pool fully exhausted → accepted.
+        let poll = poll_with_split_declines(2, 2, 2);
         let payload = SortitionFailedPayload { poll_id: poll_id() };
+        // wall_ms=10000 ensures all backup declines (HLCs ~140-150) are included in
+        // decline_count_at's filter (decline_count_at filters by ≤ event.hlc).
         let ev = make_event_with_payload(
             PollEventKindCode::SortitionFailed,
-            100,
+            10000,
             addr(0xff), // proposer = addr(0xff) from meta_at
             encode(&payload),
         );
@@ -2297,8 +2306,9 @@ mod tests {
     // 12. verify_sf_pool_not_exhausted_rejected_BackupPoolNotExhausted
     #[test]
     fn verify_sf_pool_not_exhausted_rejected_backup_pool_not_exhausted() {
-        // sortition_size=3 but only 1 decline → pool not exhausted (need 3)
-        let poll = poll_with_declines(1, 3);
+        // sortition_size=3: primary=3, backup=3 → total capacity=6.
+        // Only 1 decline → pool not exhausted (need 6).
+        let poll = poll_with_split_declines(3, 1, 0);
         let payload = SortitionFailedPayload { poll_id: poll_id() };
         let ev = make_event_with_payload(
             PollEventKindCode::SortitionFailed,
@@ -2310,8 +2320,104 @@ mod tests {
             verify_sf(&ev, &poll),
             Err(VerifyError::BackupPoolNotExhausted {
                 declined: 1,
-                capacity: 3
+                capacity: 6
             })
+        );
+    }
+
+    // 13a. Cluster J regression: verify_sf with sortition_size=20
+    //      - 20 declines (primary only) → still rejected (10 backup remain)
+    //      - 30 declines → still rejected (10 non-declined remain)
+    //      - 40 declines (full pool) → accepted
+    //
+    // Uses a dedicated helper that can inject backup declines as well.
+    /// Build a poll with `n_primary_declines` primary declines and `n_backup_declines`
+    /// backup declines. Both pools have `sortition_size` members.
+    fn poll_with_split_declines(
+        sortition_size: usize,
+        n_primary_declines: usize,
+        n_backup_declines: usize,
+    ) -> Tier3PollState {
+        assert!(n_primary_declines <= sortition_size);
+        assert!(n_backup_declines <= sortition_size);
+        let total = (sortition_size * 2 + 5) as u8;
+        let primary: Vec<OwnerAddr> = (0..sortition_size as u8).map(addr).collect();
+        let backup: Vec<OwnerAddr> = (100..100 + sortition_size as u8).map(addr).collect();
+        let mut meta = meta_at(0);
+        meta.config.sortition_size = sortition_size as u16;
+        let mut poll = Tier3PollState::new_from_create(meta, electorate(total));
+        let ev = ss_event(10, primary.clone(), backup.clone());
+        poll.apply_event(&ev).expect("ss");
+        for (i, actor) in primary.into_iter().take(n_primary_declines).enumerate() {
+            poll.apply_event(&md_event(20 + i as u64 * 10, actor))
+                .expect("primary md");
+        }
+        let base = 20 + (n_primary_declines as u64) * 10 + 100;
+        for (i, actor) in backup.into_iter().take(n_backup_declines).enumerate() {
+            poll.apply_event(&md_event(base + i as u64 * 10, actor))
+                .expect("backup md");
+        }
+        poll
+    }
+
+    #[test]
+    fn verify_sf_20_of_40_declines_rejected_j_regression() {
+        // sortition_size=20: primary=20, backup=20 → total capacity=40.
+        // 20 declines → not exhausted (20 < 40).
+        let poll = poll_with_split_declines(20, 20, 0);
+        let payload = SortitionFailedPayload { poll_id: poll_id() };
+        let ev = make_event_with_payload(
+            PollEventKindCode::SortitionFailed,
+            5000,
+            addr(0xff),
+            encode(&payload),
+        );
+        assert_eq!(
+            verify_sf(&ev, &poll),
+            Err(VerifyError::BackupPoolNotExhausted {
+                declined: 20,
+                capacity: 40
+            }),
+            "20 declines out of 40 must be rejected"
+        );
+    }
+
+    #[test]
+    fn verify_sf_30_of_40_declines_rejected_j_regression() {
+        // sortition_size=20: 30 declines (20 primary + 10 backup) → still 10 available.
+        let poll = poll_with_split_declines(20, 20, 10);
+        let payload = SortitionFailedPayload { poll_id: poll_id() };
+        let ev = make_event_with_payload(
+            PollEventKindCode::SortitionFailed,
+            5000,
+            addr(0xff),
+            encode(&payload),
+        );
+        assert_eq!(
+            verify_sf(&ev, &poll),
+            Err(VerifyError::BackupPoolNotExhausted {
+                declined: 30,
+                capacity: 40
+            }),
+            "30 declines out of 40 must be rejected"
+        );
+    }
+
+    #[test]
+    fn verify_sf_40_of_40_declines_accepted_j_regression() {
+        // sortition_size=20: all 40 declined → pool fully exhausted → accepted.
+        let poll = poll_with_split_declines(20, 20, 20);
+        let payload = SortitionFailedPayload { poll_id: poll_id() };
+        let ev = make_event_with_payload(
+            PollEventKindCode::SortitionFailed,
+            5000,
+            addr(0xff),
+            encode(&payload),
+        );
+        assert_eq!(
+            verify_sf(&ev, &poll),
+            Ok(()),
+            "40 declines out of 40 must be accepted"
         );
     }
 
