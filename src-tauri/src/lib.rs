@@ -2133,23 +2133,66 @@ async fn start_node(
                         // We can't call `mint_db_handle` here because that
                         // function takes a `tauri::State` wrapper; instead
                         // mirror its logic directly.
+                        //
+                        // Failure path: same degradation policy as the
+                        // mint_sync_persist::load above — log at error level
+                        // and break out of 'mint_init so the rest of the node
+                        // starts normally. A corrupt or unreadable ledger.db
+                        // should not block bringing the app online.
                         let mint_db_for_engine = {
                             // Fast path: already cached.
-                            let cached = {
-                                let node = state.lock().map_err(|e| format!("lock: {e}"))?;
-                                node.mint_db.clone()
+                            let cached = match state.lock() {
+                                Ok(node) => node.mint_db.clone(),
+                                Err(e) => {
+                                    tracing::error!(
+                                        target: "mint_sync",
+                                        error = %e,
+                                        "NodeState lock failed while reading mint_db cache — mint sync disabled"
+                                    );
+                                    break 'mint_init;
+                                }
                             };
                             if let Some(arc) = cached {
                                 arc
                             } else {
                                 let mint_dir = app_data_dir.join("mint");
-                                std::fs::create_dir_all(&mint_dir)
-                                    .map_err(|e| format!("create_dir mint: {e}"))?;
+                                if let Err(e) = std::fs::create_dir_all(&mint_dir) {
+                                    tracing::error!(
+                                        target: "mint_sync",
+                                        path = %mint_dir.display(),
+                                        error = %e,
+                                        "failed to create mint directory — mint sync disabled \
+                                         for this session, but other features will start normally"
+                                    );
+                                    break 'mint_init;
+                                }
                                 let db_path = mint_dir.join("ledger.db");
-                                let conn = crate::mint::open_database(&db_path)
-                                    .map_err(|e| e.to_string())?;
+                                let conn = match crate::mint::open_database(&db_path) {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        tracing::error!(
+                                            target: "mint_sync",
+                                            path = %db_path.display(),
+                                            error = %e,
+                                            "failed to open ledger.db — mint sync disabled for \
+                                             this session, but other features will start normally. \
+                                             Delete or repair the file to re-enable mint sync."
+                                        );
+                                        break 'mint_init;
+                                    }
+                                };
                                 let arc = std::sync::Arc::new(std::sync::Mutex::new(conn));
-                                let mut node = state.lock().map_err(|e| format!("lock: {e}"))?;
+                                let mut node = match state.lock() {
+                                    Ok(n) => n,
+                                    Err(e) => {
+                                        tracing::error!(
+                                            target: "mint_sync",
+                                            error = %e,
+                                            "NodeState lock failed while installing mint_db — mint sync disabled"
+                                        );
+                                        break 'mint_init;
+                                    }
+                                };
                                 if let Some(existing) = node.mint_db.as_ref() {
                                     existing.clone()
                                 } else {
