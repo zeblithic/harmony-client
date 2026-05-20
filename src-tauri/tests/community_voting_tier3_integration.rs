@@ -2025,3 +2025,493 @@ async fn smoke_tier3_event_builders_encode_without_panic() {
         assert_eq!(decoded.tier, ev.tier, "round-trip tier must match");
     }
 }
+
+/// Cross-engine kd=ss convergence: idempotent apply under Phase 4a-main zero-sig constraint.
+///
+/// Design spec §3 (HLC LWW for racing publishes) + §5 (SS1: bit-identical content) +
+/// §10 (cross-engine convergence). Acceptance criterion #7.
+///
+/// ## Phase 4a-main zero-sig constraint
+///
+/// Both engines publish kd=ss with `actor = OwnerAddr([0; 16])` (zero-sig, engine-generated
+/// shape — Task 19 will wire real signing). Because the zero actor is shared, we cannot
+/// demonstrate strict per-actor HLC LWW (that requires distinct actors). Instead, we
+/// demonstrate the convergence property that matters for acceptance: two engines that each
+/// independently compute the same Fisher-Yates result (same VRF + same electorate) and
+/// publish it at different HLCs both end with bit-identical `sortition_result` on both
+/// sides after cross-engine bridge propagation.
+///
+/// ## Race scenario
+///
+/// The "race" is: engine_a publishes kd=ss at HLC 5000; engine_b independently publishes
+/// kd=ss at HLC 5001. Both events are identical in content (same primary + backup arrays)
+/// but differ in HLC. The materialize layer accepts both (5001 > 5000 is monotonic);
+/// the second overwrite is a no-op because content is identical. Both engines converge.
+///
+/// ## What this proves
+///
+/// Even without strict HLC LWW gate (deferred to Task 19 real signing), the invariant
+/// "all nodes converge on the same sortition_result for a given VRF output + electorate"
+/// is proven by this test. This is the load-bearing convergence property per spec §5 SS1.
+///
+/// A second sub-test (`tier3_cross_engine_kd_ss_hlc_tied_resolves_by_device_id_lex`)
+/// tests the tie-breaking path: same wall_ms+logical, different device_id. The lex-smaller
+/// device_id event arrives first in the log; both engines see both events and converge.
+#[tokio::test]
+async fn tier3_kd_ss_idempotent_apply_cross_engine_convergence() {
+    const SORTITION_SIZE: u16 = 20;
+    const N_IDENTITIES: usize = 50;
+    const COMMUNITY_ID: SpaceId = SpaceId([0xC4; 16]);
+
+    // ── Step 1: build electorate ──────────────────────────────────────────────
+
+    let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
+    let electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
+
+    // ── Step 2: two-engine bridge ─────────────────────────────────────────────
+
+    let engines = setup_two_voting_engine_bridge(COMMUNITY_ID).await;
+
+    // ── Step 3: PollCreate (proposer = identities[0]) ─────────────────────────
+
+    let t0: u64 = 4_000_000;
+    let proposer = &identities[0];
+
+    let config = Tier3PollConfigPayload {
+        proposal_text: "Cross-engine kd=ss convergence test".into(),
+        sortition_size: SORTITION_SIZE,
+        deliberation_window_seconds: 60,
+        drafting_window_seconds: 60,
+        ratification_window_seconds: 60,
+        privacy_mode: "pu".into(),
+        incentive_mode: "a".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+    };
+
+    let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
+
+    let create_signing_bytes = create_event
+        .signing_bytes()
+        .expect("create event signing_bytes");
+    let poll_id = derive_poll_id(&COMMUNITY_ID, &create_signing_bytes);
+
+    // Apply PollCreate directly to both logs with the full snapshot.
+    let snapshot = MembershipSnapshot {
+        members: electorate
+            .iter()
+            .map(|addr| {
+                (
+                    *addr,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )
+            })
+            .collect(),
+    };
+    {
+        let mut log = engines.log_a.lock().await;
+        log.apply_with_snapshot(create_event.clone(), &COMMUNITY_ID, Some(snapshot.clone()))
+            .expect("engine_a: PollCreate apply");
+    }
+    {
+        let mut log = engines.log_b.lock().await;
+        log.apply_with_snapshot(create_event, &COMMUNITY_ID, Some(snapshot))
+            .expect("engine_b: PollCreate apply");
+    }
+
+    // Confirm both logs start in Sortition with no sortition_result.
+    {
+        let log = engines.log_a.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        assert_eq!(t3.stage, Stage::Sortition, "engine_a: starts in Sortition");
+        assert!(t3.sortition_result.is_none(), "engine_a: no sortition yet");
+    }
+    {
+        let log = engines.log_b.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        assert_eq!(t3.stage, Stage::Sortition, "engine_b: starts in Sortition");
+        assert!(t3.sortition_result.is_none(), "engine_b: no sortition yet");
+    }
+
+    // ── Step 4: both engines independently compute the same sortition result ───
+    //
+    // Fixed VRF output [0xC4; 32]. Both engines use the same VRF output + electorate
+    // → fisher_yates_select produces bit-identical primary + backup arrays.
+    let vrf_output: [u8; 32] = [0xC4; 32];
+    let sortition_result = fisher_yates_select(
+        &vrf_output,
+        &electorate,
+        SORTITION_SIZE as usize,
+        SORTITION_SIZE as usize,
+    );
+
+    // ── Step 5: race — engine_a publishes kd=ss at HLC 5000, engine_b at HLC 5001 ──
+    //
+    // Both events carry the same primary + backup arrays (bit-identical content).
+    // HLCs differ: 5000 vs 5001, device_id: "engine-a" vs "engine-b".
+    //
+    // Phase 4a-main zero-sig constraint: both use actor=OwnerAddr([0;16]).
+    // The materialize layer's HLC monotonicity check is per-poll (not per-actor);
+    // 5001 > 5000 is monotonic, so both events are accepted in arrival order.
+    // The second overwrite is a no-op (same content). Both engines converge.
+    // HLC wall_ms must exceed t0 (4_000_000) for HLC monotonicity to pass after PollCreate.
+    // Race: engine_a at t0+1, engine_b at t0+2 (lex order: a < b for same wall_ms+1 would
+    // also work, but distinct wall_ms is cleaner — no ambiguity).
+    let ss_event_a = build_sortition_selection_event(
+        poll_id,
+        sortition_result.primary.clone(),
+        sortition_result.backup.clone(),
+        hlc_at(t0 + 1, "engine-a"),
+    );
+
+    let ss_event_b = build_sortition_selection_event(
+        poll_id,
+        sortition_result.primary.clone(),
+        sortition_result.backup.clone(),
+        hlc_at(t0 + 2, "engine-b"),
+    );
+
+    // engine_a publishes its kd=ss (HLC t0+1) — propagates to engine_b via bridge.
+    engines
+        .engine_a
+        .publish_event(ss_event_a)
+        .await
+        .expect("engine_a: publish kd=ss at HLC t0+1");
+
+    // Wait for engine_b to receive engine_a's kd=ss.
+    wait_for_log("engine_b: sees engine_a kd=ss", &engines.log_b, |log| {
+        log.polls
+            .get(&poll_id)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .map(|t3| t3.sortition_result.is_some())
+            .unwrap_or(false)
+    })
+    .await
+    .expect("engine_b: engine_a's kd=ss must arrive via bridge within 5s");
+
+    // engine_b publishes its own kd=ss (HLC t0+2) — propagates to engine_a via bridge.
+    // Content is identical; t0+2 > t0+1 is monotonic → materialize accepts it.
+    engines
+        .engine_b
+        .publish_event(ss_event_b)
+        .await
+        .expect("engine_b: publish kd=ss at HLC t0+2");
+
+    // Wait for engine_a to receive engine_b's kd=ss (a second apply of identical content).
+    // We need event count on both sides to reach ≥ 2 (kd=cr + kd=ss from A + kd=ss from B).
+    // The bridge relays both directions. After engine_b publishes, engine_a gets it back.
+    // Note: engine_a already applied its own kd=ss; the bridge delivers engine_b's kd=ss
+    // to engine_a. Both logs should have 3 events total (cr + ss_a + ss_b).
+    wait_for_log(
+        "engine_a: receives engine_b's kd=ss (3 total events)",
+        &engines.log_a,
+        |log| log.events.len() >= 3,
+    )
+    .await
+    .expect("engine_a: must receive engine_b's kd=ss within 5s");
+
+    wait_for_log(
+        "engine_b: has both kd=ss events (3 total events)",
+        &engines.log_b,
+        |log| log.events.len() >= 3,
+    )
+    .await
+    .expect("engine_b: must have 3 events (cr + ss_a + ss_b) within 5s");
+
+    // Give async tasks a moment to settle.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // ── Step 6: assert cross-engine convergence — sortition_result identical ───
+
+    let sr_a = {
+        let log = engines.log_a.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        t3.sortition_result
+            .clone()
+            .expect("engine_a: sortition_result must be Some")
+    };
+
+    let sr_b = {
+        let log = engines.log_b.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        t3.sortition_result
+            .clone()
+            .expect("engine_b: sortition_result must be Some")
+    };
+
+    // CONVERGENCE: both engines must have identical sortition_result.
+    assert_eq!(
+        sr_a, sr_b,
+        "CONVERGENCE: both engines must have identical sortition_result after cross-engine kd=ss race"
+    );
+
+    // Content must match the locally computed Fisher-Yates result.
+    assert_eq!(
+        sr_a.primary, sortition_result.primary,
+        "engine_a: sortition_result.primary must be bit-identical to fisher_yates_select output"
+    );
+    assert_eq!(
+        sr_a.backup, sortition_result.backup,
+        "engine_a: sortition_result.backup must be bit-identical to fisher_yates_select output"
+    );
+    assert_eq!(sr_a.primary.len(), SORTITION_SIZE as usize);
+    assert_eq!(sr_a.backup.len(), SORTITION_SIZE as usize);
+
+    // Both engines have sortition_result set → current_stage_at a future HLC is Deliberation.
+    // Note: `stage` field on Tier3PollState is NOT eagerly updated on kd=ss apply; the
+    // materialize layer uses current_stage_at for HLC-watermark-driven transitions.
+    // We probe current_stage_at(t0 + 10ms) which is within the deliberation window.
+    {
+        let log_a = engines.log_a.lock().await;
+        let log_b = engines.log_b.lock().await;
+        let t3_a = log_a.polls[&poll_id].tier_state.as_tier3().unwrap();
+        let t3_b = log_b.polls[&poll_id].tier_state.as_tier3().unwrap();
+        let probe_hlc = hlc_at(t0 + 10, "probe");
+        assert_eq!(
+            t3_a.current_stage_at(&probe_hlc),
+            Stage::Deliberation,
+            "engine_a: current_stage_at must be Deliberation after kd=ss (sortition_result set)"
+        );
+        assert_eq!(
+            t3_b.current_stage_at(&probe_hlc),
+            Stage::Deliberation,
+            "engine_b: current_stage_at must be Deliberation after kd=ss (sortition_result set)"
+        );
+        assert_eq!(
+            t3_a.current_stage_at(&probe_hlc),
+            t3_b.current_stage_at(&probe_hlc),
+            "CONVERGENCE: both engines in same logical stage"
+        );
+    }
+
+    drop(engines);
+}
+
+/// Cross-engine kd=ss HLC tie-breaking by device_id lex order.
+///
+/// When two kd=ss events have equal wall_ms + logical but different device_ids,
+/// the lex-smaller device_id sorts first in `(wall_ms, logical, device_id)` order.
+/// The materialize HLC monotonicity gate uses this lex order. The event with the
+/// lex-smaller device_id arrives at wall_ms=5000,"engine-a"; the event with device_id
+/// "engine-z" arrives at wall_ms=5000,"engine-z" which is lex-larger → monotonic (a < z).
+/// Both events are accepted; second overwrite is no-op (same content). Both engines converge.
+///
+/// This confirms the tie-breaking rule from design spec §3 (HLC lex order) works correctly
+/// across engines even when wall_ms + logical are identical.
+#[tokio::test]
+async fn tier3_cross_engine_kd_ss_hlc_tied_resolves_by_device_id_lex() {
+    const SORTITION_SIZE: u16 = 20;
+    const N_IDENTITIES: usize = 50;
+    const COMMUNITY_ID: SpaceId = SpaceId([0xC5; 16]);
+
+    // ── Step 1: electorate + two-engine bridge ────────────────────────────────
+
+    let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
+    let electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
+    let engines = setup_two_voting_engine_bridge(COMMUNITY_ID).await;
+
+    // ── Step 2: PollCreate ─────────────────────────────────────────────────────
+
+    let t0: u64 = 5_000_000;
+    let proposer = &identities[0];
+
+    let config = Tier3PollConfigPayload {
+        proposal_text: "HLC tie-breaking by device_id lex".into(),
+        sortition_size: SORTITION_SIZE,
+        deliberation_window_seconds: 60,
+        drafting_window_seconds: 60,
+        ratification_window_seconds: 60,
+        privacy_mode: "pu".into(),
+        incentive_mode: "a".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+    };
+
+    let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
+    let create_signing_bytes = create_event
+        .signing_bytes()
+        .expect("create event signing_bytes");
+    let poll_id = derive_poll_id(&COMMUNITY_ID, &create_signing_bytes);
+
+    let snapshot = MembershipSnapshot {
+        members: electorate
+            .iter()
+            .map(|addr| {
+                (
+                    *addr,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )
+            })
+            .collect(),
+    };
+    {
+        let mut log = engines.log_a.lock().await;
+        log.apply_with_snapshot(create_event.clone(), &COMMUNITY_ID, Some(snapshot.clone()))
+            .expect("engine_a: PollCreate apply");
+    }
+    {
+        let mut log = engines.log_b.lock().await;
+        log.apply_with_snapshot(create_event, &COMMUNITY_ID, Some(snapshot))
+            .expect("engine_b: PollCreate apply");
+    }
+
+    // ── Step 3: compute sortition (same VRF + electorate → identical content) ──
+
+    let vrf_output: [u8; 32] = [0xC5; 32];
+    let sortition_result = fisher_yates_select(
+        &vrf_output,
+        &electorate,
+        SORTITION_SIZE as usize,
+        SORTITION_SIZE as usize,
+    );
+
+    // ── Step 4: tied HLC — same wall_ms + logical, different device_id ─────────
+    //
+    // "engine-a" < "engine-z" lexicographically. The materialize HLC monotonicity
+    // gate uses (wall_ms, logical, device_id) lex order. "engine-a" event sorts first;
+    // "engine-z" event (lex-larger) arrives second — monotonically valid ("a" < "z").
+    // Both accepted; second overwrite is no-op (same content). Both engines converge.
+    //
+    // Both events use wall_ms = t0+1 (above PollCreate HLC for monotonicity).
+    // As long as ss_event_a is applied before ss_event_z on each engine, the order is valid.
+    // Both events share wall_ms = t0+1 (above PollCreate's t0 for HLC monotonicity)
+    // but differ in device_id. "engine-a" < "engine-z" lexicographically.
+    let ss_event_a = build_sortition_selection_event(
+        poll_id,
+        sortition_result.primary.clone(),
+        sortition_result.backup.clone(),
+        // device_id "engine-a" → lex-smaller → arrives first.
+        Hlc {
+            wall_ms: t0 + 1,
+            logical: 0,
+            device_id: "engine-a".into(),
+        },
+    );
+
+    let ss_event_z = build_sortition_selection_event(
+        poll_id,
+        sortition_result.primary.clone(),
+        sortition_result.backup.clone(),
+        // device_id "engine-z" → lex-larger → arrives second (monotonic: "engine-a" < "engine-z").
+        Hlc {
+            wall_ms: t0 + 1,
+            logical: 0,
+            device_id: "engine-z".into(),
+        },
+    );
+
+    // Publish lex-smaller event first via engine_a → bridge → engine_b.
+    engines
+        .engine_a
+        .publish_event(ss_event_a)
+        .await
+        .expect("engine_a: publish kd=ss (device_id=engine-a)");
+
+    // Wait for engine_b to receive it.
+    wait_for_log("engine_b: sees engine-a kd=ss", &engines.log_b, |log| {
+        log.polls
+            .get(&poll_id)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .map(|t3| t3.sortition_result.is_some())
+            .unwrap_or(false)
+    })
+    .await
+    .expect("engine_b: kd=ss from engine-a must arrive within 5s");
+
+    // Publish lex-larger event via engine_b → bridge → engine_a.
+    // "engine-z" > "engine-a" → lex order is monotonically increasing → accepted.
+    engines
+        .engine_b
+        .publish_event(ss_event_z)
+        .await
+        .expect("engine_b: publish kd=ss (device_id=engine-z)");
+
+    // Wait for both engines to have 3 events (cr + ss_a + ss_z).
+    wait_for_log(
+        "engine_a: receives engine_b's kd=ss (3 events)",
+        &engines.log_a,
+        |log| log.events.len() >= 3,
+    )
+    .await
+    .expect("engine_a: must receive engine_b's kd=ss within 5s");
+
+    wait_for_log("engine_b: has all 3 events", &engines.log_b, |log| {
+        log.events.len() >= 3
+    })
+    .await
+    .expect("engine_b: must have 3 events within 5s");
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // ── Step 5: assert convergence ────────────────────────────────────────────
+
+    let sr_a = {
+        let log = engines.log_a.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        t3.sortition_result
+            .clone()
+            .expect("engine_a: sortition_result Some")
+    };
+
+    let sr_b = {
+        let log = engines.log_b.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        t3.sortition_result
+            .clone()
+            .expect("engine_b: sortition_result Some")
+    };
+
+    assert_eq!(
+        sr_a, sr_b,
+        "CONVERGENCE: both engines must have identical sortition_result after HLC-tied kd=ss race"
+    );
+    assert_eq!(
+        sr_a.primary, sortition_result.primary,
+        "sortition_result.primary must be bit-identical to fisher_yates_select output"
+    );
+    assert_eq!(
+        sr_a.backup, sortition_result.backup,
+        "sortition_result.backup must be bit-identical to fisher_yates_select output"
+    );
+
+    // Confirm both engines compute the same logical stage at a probe HLC.
+    // `stage` field is not eagerly updated; use current_stage_at for watermark-driven stages.
+    {
+        let log_a = engines.log_a.lock().await;
+        let log_b = engines.log_b.lock().await;
+        let t3_a = log_a.polls[&poll_id].tier_state.as_tier3().unwrap();
+        let t3_b = log_b.polls[&poll_id].tier_state.as_tier3().unwrap();
+        let probe_hlc = hlc_at(t0 + 10, "probe");
+        assert_eq!(
+            t3_a.current_stage_at(&probe_hlc),
+            Stage::Deliberation,
+            "engine_a: current_stage_at must be Deliberation (sortition_result set)"
+        );
+        assert_eq!(
+            t3_b.current_stage_at(&probe_hlc),
+            Stage::Deliberation,
+            "engine_b: current_stage_at must be Deliberation (sortition_result set)"
+        );
+        assert_eq!(
+            t3_a.current_stage_at(&probe_hlc),
+            t3_b.current_stage_at(&probe_hlc),
+            "CONVERGENCE: both engines in same logical stage"
+        );
+    }
+
+    drop(engines);
+}
