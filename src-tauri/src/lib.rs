@@ -21479,11 +21479,22 @@ async fn voting_resolve_community_for_poll(
     voting_logs: &VotingLogsMap,
     pid: &crate::community_voting_core::PollId,
 ) -> Result<crate::owner_state_types::SpaceId, String> {
-    let map = voting_logs.lock().await;
-    for (sid, log_arc) in map.iter() {
+    // Snapshot (SpaceId, Arc<Mutex<VotingLog>>) pairs while holding the
+    // outer map lock briefly, then DROP that lock before awaiting any
+    // per-log inner locks. Previously we held the outer map lock for the
+    // entire iteration; one busy community would block every other IPC
+    // needing the map.
+    let entries: Vec<(
+        crate::owner_state_types::SpaceId,
+        std::sync::Arc<tokio::sync::Mutex<crate::community_voting_log::VotingLog>>,
+    )> = {
+        let map = voting_logs.lock().await;
+        map.iter().map(|(sid, log)| (*sid, log.clone())).collect()
+    };
+    for (sid, log_arc) in entries {
         let log = log_arc.lock().await;
         if log.has_poll(pid) {
-            return Ok(*sid);
+            return Ok(sid);
         }
     }
     Err(format!(
