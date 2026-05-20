@@ -207,6 +207,7 @@ fn upsert_setting_lww(tx: &rusqlite::Transaction, r: &SettingRow) -> Result<(), 
 }
 
 pub const DEFAULT_DEBOUNCE_MS: u64 = 250;
+pub const DEFAULT_BOOT_FLUSH_DELAY_MS: u64 = 500;
 
 /// Shared state needed by both the internal task and the test-only subscriber
 /// path. Cloned at construction so `handle_incoming_envelope_for_test` can
@@ -235,6 +236,30 @@ impl std::future::Future for MintSyncEngineHandle {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         std::pin::Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+impl MintSyncEngine {
+    /// Test constructor that schedules a one-shot boot-hook flush.
+    /// The "real" `new` (Task 11) will use this same boot-hook pattern with
+    /// `DEFAULT_BOOT_FLUSH_DELAY_MS`. Splitting it out lets the Task 7/8/9
+    /// tests use `new_for_test` without the boot-hook firing on them.
+    pub async fn new_for_test_with_boot_delay(
+        mint_db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+        content_store: Arc<dyn crate::content_store::ContentStore>,
+        sync_state: Arc<TokioMutex<MintSyncState>>,
+        boot_delay: std::time::Duration,
+    ) -> (Self, MintSyncEngineHandle) {
+        let (engine, handle) = Self::new_for_test(mint_db, content_store, sync_state).await;
+        let flush_tx = engine.flush_now.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(boot_delay).await;
+            // Send-error is benign: engine was shut down before the boot
+            // hook fired, which is the expected outcome of a short-lived
+            // test that exits before 500ms elapses.
+            let _ = flush_tx.send(()).await;
+        });
+        (engine, handle)
     }
 }
 
@@ -836,5 +861,60 @@ mod tests {
             )
             .unwrap();
         assert!(deleted_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn boot_hook_publishes_when_non_empty() {
+        let mut conn = fresh_db();
+        seed_account(&mut conn, "a1", "Chase", "2026-05-01T00:00:00Z");
+        let conn = Arc::new(std::sync::Mutex::new(conn));
+        // Dual-arc pattern: concrete stub for debug_count, erased for the engine.
+        let cs_stub = Arc::new(crate::content_store::InMemoryStub::default());
+        let cs: Arc<dyn crate::content_store::ContentStore> = cs_stub.clone();
+        let sync_state = Arc::new(TokioMutex::new(MintSyncState::default()));
+
+        let (engine, handle) = MintSyncEngine::new_for_test_with_boot_delay(
+            conn,
+            cs,
+            sync_state,
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            cs_stub.debug_count().await,
+            1,
+            "boot-hook should have published"
+        );
+
+        engine.shutdown().await.unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn boot_hook_skips_when_empty() {
+        let conn = Arc::new(std::sync::Mutex::new(fresh_db()));
+        let cs_stub = Arc::new(crate::content_store::InMemoryStub::default());
+        let cs: Arc<dyn crate::content_store::ContentStore> = cs_stub.clone();
+        let sync_state = Arc::new(TokioMutex::new(MintSyncState::default()));
+
+        let (engine, handle) = MintSyncEngine::new_for_test_with_boot_delay(
+            conn,
+            cs,
+            sync_state,
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            cs_stub.debug_count().await,
+            0,
+            "boot-hook on empty db should no-op"
+        );
+
+        engine.shutdown().await.unwrap();
+        handle.await.unwrap();
     }
 }
