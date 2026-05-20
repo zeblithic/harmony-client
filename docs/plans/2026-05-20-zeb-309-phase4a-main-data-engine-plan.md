@@ -6,7 +6,7 @@
 
 **Architecture:** Three new files at `src-tauri/src/`: `community_voting_sortition.rs` (Fisher-Yates + VRF seeding, pure), `community_voting_star.rs` (score-then-runoff + tiebreaker cascade, pure), `community_voting_tier3.rs` (4-stage state machine + drafting + engine glue). Edits to `community_voting_core.rs` (new event kinds + Tier 3 PollConfig.ro field), `community_voting_log_engine.rs` (Arc<DfrostLogRegistry> handle + beacon callback), `lib.rs` (start_node/shutdown wiring). Two new integration test files. Wire-format fixtures pinned via the ZEB-250 regen-on-first-run pattern.
 
-**Tech Stack:** Rust 1.83 stable; `ciborium` (CBOR); `serde` + `serde_repr`; `sha2`; `rand_chacha` (deterministic RNG seeded from VRF output); `frost-ristretto255` 2.x (already vendored); `tokio` for engine; integration tests use mpsc channels for in-process bidirectional engine bridges (per ZEB-307 pattern).
+**Tech Stack:** Rust 1.88 stable; `ciborium` (CBOR); `serde` + `serde_repr`; `sha2`; `rand_chacha` (deterministic RNG seeded from VRF output); `frost-ristretto255` 2.x (already vendored); `tokio` for engine; integration tests use mpsc channels for in-process bidirectional engine bridges (per ZEB-307 pattern).
 
 **Reference spec:** `docs/specs/2026-05-20-zeb-309-phase4a-main-design.md` (HEAD~0 on this branch). Implementers MUST read it before starting any task.
 
@@ -21,8 +21,7 @@ Every task except Task 0 ends in a commit. Each task must leave the tree green f
 ```bash
 cd src-tauri && cargo fmt --all -- --check
 cd src-tauri && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
-cd src-tauri && cargo nextest run --locked -p harmony-app --features test-fixtures
-# (Note: -p harmony-app scopes per-task. Full --workspace --all-targets sweep deferred to Task 17.)
+cd src-tauri && cargo nextest run --locked --workspace --all-targets --features test-fixtures
 ```
 
 Frontend gates (`npx tsc --noEmit`, `npx vitest run`) are unaffected by ZEB-309 (backend-only) — verify in Task 17 only.
@@ -450,6 +449,7 @@ grep -E '^rand|^rand_chacha' src-tauri/Cargo.toml
 ```
 
 If missing, add to `[dependencies]`:
+
 ```toml
 rand = "0.8"
 rand_chacha = "0.3"

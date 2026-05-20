@@ -1,4 +1,4 @@
-# ZEB-293 Phase 4a-main Design: Sortition + STAR Ratification (Public Ballots)
+# ZEB-309 Phase 4a-main Design: Sortition + STAR Ratification (Public Ballots)
 
 **Status:** Brainstormed 2026-05-20; refines [ZEB-289 umbrella spec](2026-05-16-zeb-289-voting-polling-design.md) §6.
 **Tickets:** [ZEB-309](https://linear.app/zeblith/issue/ZEB-309) (this PR — data + engine), [ZEB-310](https://linear.app/zeblith/issue/ZEB-310) (IPCs + events), [ZEB-311](https://linear.app/zeblith/issue/ZEB-311) (UI).
