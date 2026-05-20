@@ -1278,8 +1278,7 @@ mod tests {
             captured_at: "2026-05-19T12:00:00Z".into(),
         };
 
-        let floor_to_merge =
-            apply_remote_snapshot(&mut local, &remote, &HashMap::new()).unwrap();
+        let floor_to_merge = apply_remote_snapshot(&mut local, &remote, &HashMap::new()).unwrap();
 
         // Account must be gone.
         let acct_exists: Option<String> = local

@@ -377,11 +377,7 @@ async fn floor_propagation_deletes_account_on_peer() {
     {
         let conn = h.conn_b.lock().unwrap();
         let acct: Option<String> = conn
-            .query_row(
-                "SELECT id FROM accounts WHERE id = 'a1'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT id FROM accounts WHERE id = 'a1'", [], |r| r.get(0))
             .optional()
             .unwrap();
         assert!(
