@@ -26,6 +26,7 @@ pub mod community_voting_conviction;
 pub mod community_voting_core;
 pub mod community_voting_log;
 pub mod community_voting_log_engine;
+pub mod community_voting_sortition;
 pub mod community_voting_tick;
 pub mod content_index;
 pub mod content_store;
