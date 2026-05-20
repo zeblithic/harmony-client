@@ -23741,20 +23741,20 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
     };
 
     // 6. Snapshot active committee state + sanity-check refresh
-    //    preconditions: (a) committee must be active, (b) no refresh in
+    //    preconditions: (a) committee must be active, (b) no DKG in
     //    flight, (c) proposed member set must equal the active set
     //    (refresh preserves membership), (d) threshold must match.
+    //    The "is a refresh already in flight?" gate is deferred until
+    //    after we compute the (deterministic) ceremony_id so we can
+    //    distinguish "same ceremony, different proposer" (a legitimate
+    //    peer contribution per R9) from "different refresh in flight"
+    //    (a protocol bug).
     let proposed_epoch = {
         let log = log_arc.lock().await;
         if !log.committee_state.active {
             return Err(
                 "dfrost_propose_refresh: no active committee — DKG must complete before refresh"
                     .to_string(),
-            );
-        }
-        if log.committee_state.pending_refresh.is_some() {
-            return Err(
-                "dfrost_propose_refresh: refresh already in flight for this committee".to_string(),
             );
         }
         if log.committee_state.pending_dkg.is_some() {
@@ -23799,27 +23799,74 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
         crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
 
     // 8. Derive ceremony_id = blake3(sorted_members || proposed_epoch_le ||
-    //    threshold_le || b"refresh-v1" || hlc.wall_ms_le ||
-    //    hlc.logical_le || space_id). The "refresh-v1" domain separator +
-    //    proposed_epoch scopes refresh ceremony_ids out of the DKG
-    //    derivation; hlc.logical + space_id close the same wall_ms /
-    //    cross-space collision windows as on the DKG side.
+    //    threshold_le || b"refresh-v1" || space_id). DETERMINISTIC by
+    //    design — every committee member computes the same ceremony_id
+    //    from inputs they all observe (active committee shape, agreed
+    //    next epoch, scoped to this community). This is what lets peer
+    //    members independently call `dfrost_propose_refresh` and
+    //    converge on one shared ceremony (R9 Cursor HIGH
+    //    "Refresh blocks second member").
     //
-    //    R1 (round-1 bot-review MAJOR): hlc.logical + space_id added
-    //    here in lockstep with `dfrost_initiate_dkg` so the two
-    //    namespaces stay symmetrically scoped.
-    let mut hasher_input: Vec<u8> =
-        Vec::with_capacity(member_addrs.len() * 16 + 8 + 2 + 10 + 8 + 4 + 16);
+    //    HLC is INTENTIONALLY excluded from the ceremony_id input: with
+    //    HLC each proposer's IPC would mint a distinct id and peers
+    //    couldn't share one ceremony. HLC still appears in the rf rn=1
+    //    EVENT envelope (signed by the actor) — it's just not load-
+    //    bearing for ceremony scoping any more.
+    //
+    //    Each (members, threshold, proposed_epoch, space_id) tuple
+    //    uniquely identifies one refresh ceremony at most. `proposed_epoch`
+    //    is `current_epoch + 1`, so within a given committee epoch there's
+    //    exactly one possible refresh ceremony_id — and refresh
+    //    COMPLETION (a `dk` for the rotated committee) clears
+    //    `pending_refresh` and advances `current_epoch` before any next
+    //    refresh can derive a new id.
+    let mut hasher_input: Vec<u8> = Vec::with_capacity(member_addrs.len() * 16 + 8 + 2 + 10 + 16);
     for a in &member_addrs {
         hasher_input.extend_from_slice(&a.0);
     }
     hasher_input.extend_from_slice(&proposed_epoch.to_le_bytes());
     hasher_input.extend_from_slice(&threshold.to_le_bytes());
     hasher_input.extend_from_slice(b"refresh-v1");
-    hasher_input.extend_from_slice(&hlc.wall_ms.to_le_bytes());
-    hasher_input.extend_from_slice(&hlc.logical.to_le_bytes());
     hasher_input.extend_from_slice(&space_id.0);
     let ceremony_id: [u8; 32] = blake3::hash(&hasher_input).into();
+
+    // 8b. Per-actor in-flight gate (R9): if a refresh is already in
+    //     flight for THIS ceremony, this call is a peer contribution —
+    //     allow it through unless self has already submitted rn=1. A
+    //     pending_refresh with a different ceremony_id signals a
+    //     protocol bug (different members / threshold / proposed_epoch
+    //     than this call computed) and we surface it explicitly rather
+    //     than silently apply.
+    //
+    //     The per-actor "have I already submitted?" signal is
+    //     `pending_refresh.round2_packages.contains_key(&self_owner)`:
+    //     `apply_with_identity` for ProactiveRefresh rn=1 stores the
+    //     decrypted sealed-to-self ciphertext at
+    //     `round2_packages[event.actor]`. For self's own rf rn=1,
+    //     `event.actor == self_owner`, so this map entry is the
+    //     definitive "self contributed" marker on this node.
+    {
+        let log = log_arc.lock().await;
+        if let Some(pr) = &log.committee_state.pending_refresh {
+            if pr.ceremony_id != ceremony_id {
+                return Err(format!(
+                    "dfrost_propose_refresh: a different refresh ceremony is in flight \
+                     (pending={}, requested={}). Refresh derivations are deterministic per \
+                     (members, threshold, proposed_epoch, space_id); a mismatch indicates a \
+                     protocol bug — abort the in-flight ceremony before retrying.",
+                    hex::encode(pr.ceremony_id),
+                    hex::encode(ceremony_id),
+                ));
+            }
+            if pr.round2_packages.contains_key(&self_owner) {
+                return Err(
+                    "dfrost_propose_refresh: self has already submitted rn=1 for this refresh \
+                     ceremony"
+                        .to_string(),
+                );
+            }
+        }
+    }
 
     // 9. Run DKG round-1 to mint a fresh round-1 secret + public round-1
     //    package bytes. In the current implementation the package bytes

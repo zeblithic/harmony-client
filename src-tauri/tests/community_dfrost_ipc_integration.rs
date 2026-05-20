@@ -1541,30 +1541,28 @@ async fn threshold_sign_ipc_round_trip_vrf_beacon_two_engine() {
 /// `dfrost_propose_refresh` step 8:
 ///
 /// `blake3(sorted_members || proposed_epoch_le || threshold_le ||
-///   b"refresh-v1" || hlc.wall_ms_le || hlc.logical_le || space_id)`.
+///   b"refresh-v1" || space_id)`.
 ///
-/// The `b"refresh-v1"` domain separator + `proposed_epoch` ensures no
-/// collision with `dfrost_initiate_dkg`'s ceremony-id tag space.
-/// `hlc.logical` + `space_id` close the same wall_ms / cross-space
-/// collision windows as on the DKG side (R1 round-1 bot-review MAJOR).
+/// R9 (Cursor "Refresh blocks second member"): DETERMINISTIC across
+/// committee members. HLC is intentionally EXCLUDED — every member
+/// derives the same ceremony_id from inputs they all observe (active
+/// committee shape, next epoch, this community's space_id), which lets
+/// peer members independently call `dfrost_propose_refresh` and
+/// converge on one shared ceremony. `(members, threshold,
+/// proposed_epoch, space_id)` uniquely identifies one refresh ceremony.
 fn derive_refresh_ceremony_id(
     members: &[OwnerAddr],
     proposed_epoch: u64,
     threshold: u16,
-    hlc_wall_ms: u64,
-    hlc_logical: u32,
     space_id: &SpaceId,
 ) -> [u8; 32] {
-    let mut hasher_input: Vec<u8> =
-        Vec::with_capacity(members.len() * 16 + 8 + 2 + 10 + 8 + 4 + 16);
+    let mut hasher_input: Vec<u8> = Vec::with_capacity(members.len() * 16 + 8 + 2 + 10 + 16);
     for a in members {
         hasher_input.extend_from_slice(&a.0);
     }
     hasher_input.extend_from_slice(&proposed_epoch.to_le_bytes());
     hasher_input.extend_from_slice(&threshold.to_le_bytes());
     hasher_input.extend_from_slice(b"refresh-v1");
-    hasher_input.extend_from_slice(&hlc_wall_ms.to_le_bytes());
-    hasher_input.extend_from_slice(&hlc_logical.to_le_bytes());
     hasher_input.extend_from_slice(&space_id.0);
     blake3::hash(&hasher_input).into()
 }
@@ -1725,25 +1723,21 @@ async fn refresh_ipc_round_trip_two_engine_preserves_joint_vk() {
     let alice_x_priv = alice_x25519_priv();
     let bob_x_priv = bob_x25519_priv();
 
-    // ── Step 1: derive a SHARED refresh_ceremony_id ───────────────────────
+    // ── Step 1: derive the deterministic refresh_ceremony_id ──────────────
     //
-    // The IPC derives ceremony_id from each proposer's `hlc.wall_ms`. In a
-    // single-process test path we need both nodes' rf rn=1 events to share
-    // ceremony_id so `apply_proactive_refresh`'s match-or-reject check
-    // succeeds when Bob's rf arrives on Alice's engine (and vice versa).
-    // We pin Alice's hlc.wall_ms as the canonical value; Bob's rf rn=1 is
-    // built with the same ceremony_id (mirrors Task 8's DKG pattern where
-    // both nodes reuse the initiator's ceremony_id).
+    // R9 (Cursor "Refresh blocks second member"): the IPC derives
+    // ceremony_id WITHOUT hlc — it's a function only of (members,
+    // threshold, proposed_epoch, space_id), all of which every
+    // committee member observes identically once the active committee
+    // is established. Each member's `dfrost_propose_refresh` call
+    // computes the same id, which is what lets peer members
+    // independently invoke the IPC and converge on one shared ceremony
+    // (rather than the pre-R9 design where each proposer's HLC minted
+    // a distinct id and only the first proposer's call landed).
     let alice_propose_hlc = hlc_at(7_000, "alice");
     let proposed_epoch = epoch_before + 1;
-    let refresh_ceremony_id = derive_refresh_ceremony_id(
-        &members,
-        proposed_epoch,
-        threshold,
-        alice_propose_hlc.wall_ms,
-        alice_propose_hlc.logical,
-        &TEST_SPACE_ID,
-    );
+    let refresh_ceremony_id =
+        derive_refresh_ceremony_id(&members, proposed_epoch, threshold, &TEST_SPACE_ID);
 
     // ── Step 2: Alice proposes refresh ────────────────────────────────────
     let rf1_alice = propose_refresh_local(
@@ -1769,13 +1763,16 @@ async fn refresh_ipc_round_trip_two_engine_preserves_joint_vk() {
 
     // ── Step 3: Bob proposes refresh with the SAME ceremony_id ────────────
     //
-    // From Bob's POV the IPC would reject re-proposal once pending_refresh
-    // is already set. In the IPC-mandated event-construction path we
-    // mirror Task 8's DKG round-1 pattern: skip the pre-condition check
-    // (the IPC's step 6 guards) and replicate steps 9-12 directly with
-    // the shared ceremony_id. This keeps the event-construction shape
-    // identical to the IPC's wire output even though the IPC's guard logic
-    // would prevent a second propose on a single node.
+    // R9: Bob's `dfrost_propose_refresh` call would now WORK end-to-end
+    // through the IPC — the deterministic derivation produces the same
+    // ceremony_id Alice already seeded into `pending_refresh`, and the
+    // per-actor gate (`round2_packages.contains_key(&BOB)`) sees that
+    // Bob hasn't submitted yet. We still replicate steps 9-12 directly
+    // here for test hermeticity (the helper avoids the IPC's
+    // community_registry / outbox plumbing); the resulting event-
+    // construction shape is identical to the IPC's wire output, and
+    // the apply path Alice/Bob exercise below is exactly the path Bob's
+    // IPC call would take.
     let bob_propose_hlc = hlc_at(7_100, "bob");
     let (bob_r1_secret, bob_r1_pkg_bytes) =
         dkg_part1_local(id_bob, max_signers, threshold).expect("bob dkg_part1 for refresh");
