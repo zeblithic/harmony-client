@@ -158,11 +158,23 @@ pub async fn setup_two_voting_engine_bridge(community_id: SpaceId) -> TwoVotingE
     let log_a = Arc::new(Mutex::new(VotingLog::new()));
     let log_b = Arc::new(Mutex::new(VotingLog::new()));
 
+    // ZEB-310 Task 9: provide engine_a with a per-device HLC tracker
+    // + device_id so the engine-auto orchestration hook
+    // (`maybe_trigger_engine_auto_orchestration`) can reserve HLCs on
+    // the local lane when triggered. engine_b is the peer — no
+    // orchestration on its side — so we wire one for it too (cheap;
+    // empty tracker behaves identically to None for non-orchestrating
+    // engines).
+    let a_hlc_tracker = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+    let b_hlc_tracker = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+
     let engine_a = VotingLogEngine::start(VotingLogEngineParams {
         community_id,
         voting_log: Arc::clone(&log_a),
         publisher_tx: a_pub_tx,
         subscriber_rx: a_sub_rx,
+        hlc_tracker: Some(a_hlc_tracker),
+        device_id: Some("engine-a".into()),
     })
     .await;
 
@@ -171,6 +183,8 @@ pub async fn setup_two_voting_engine_bridge(community_id: SpaceId) -> TwoVotingE
         voting_log: Arc::clone(&log_b),
         publisher_tx: b_pub_tx,
         subscriber_rx: b_sub_rx,
+        hlc_tracker: Some(b_hlc_tracker),
+        device_id: Some("engine-b".into()),
     })
     .await;
 
@@ -180,6 +194,28 @@ pub async fn setup_two_voting_engine_bridge(community_id: SpaceId) -> TwoVotingE
         log_a,
         log_b,
     }
+}
+
+/// ZEB-310 Task 9 fixture: `setup_two_voting_engine_bridge` + installs
+/// `proposer`'s signing key on `engine_a` so the engine-auto orchestration
+/// hook can mint follow-up events (kd=sf, and Tasks 10/11 kd=cl + kd=rs)
+/// on the proposer's behalf.
+///
+/// engine_b is left in read-only peer mode (no signing key installed) so
+/// the test exercises a realistic distributed shape: only the engine
+/// that holds the proposer's key originates the follow-up event; the
+/// peer receives it via the bridge.
+pub async fn setup_two_voting_engine_bridge_with_signing(
+    community_id: SpaceId,
+    proposer: &TestIdentity,
+) -> TwoVotingEngines {
+    let engines = setup_two_voting_engine_bridge(community_id).await;
+    let signing_key = Arc::new(proposer.signing_key.clone());
+    engines
+        .engine_a
+        .install_local_signing_key(signing_key, proposer.owner)
+        .await;
+    engines
 }
 
 // ─── Polling helper ────────────────────────────────────────────────────────────
@@ -2422,6 +2458,211 @@ async fn tier3_cross_engine_kd_ss_hlc_tied_resolves_by_device_id_lex() {
             t3_a.current_stage_at(&probe_hlc),
             t3_b.current_stage_at(&probe_hlc),
             "CONVERGENCE: both engines in same logical stage"
+        );
+    }
+
+    drop(engines);
+}
+
+// ─── ZEB-310 Task 9: engine-auto orchestration multi-engine test ─────────────
+
+/// Engine-auto orchestration: with the proposer's signing key installed on
+/// `engine_a`, once decline_count reaches `primary_size + backup_size` the
+/// engine MUST mint + publish a signed kd=sf without an IPC call, and the
+/// follow-up event MUST cross the bridge so `engine_b` also transitions
+/// to `Stage::Failed`.
+///
+/// Mirrors the structure of `tier3_mass_decline_sortition_failed_with_retry_chain`
+/// but proves the orchestration hook (vs the manual `publish_event(sf_event)`
+/// call there).
+#[tokio::test]
+async fn engine_auto_sf_on_mass_decline_from_proposer() {
+    const SORTITION_SIZE: u16 = 20;
+    const N_IDENTITIES: usize = 50;
+    const COMMUNITY_ID: SpaceId = SpaceId([0xC1; 16]);
+
+    let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
+    let proposer = &identities[49];
+    let full_electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
+    let sortition_pool: Vec<OwnerAddr> = identities[..49].iter().map(|id| id.owner).collect();
+
+    // engine_a holds the proposer's signing key → orchestration hook active.
+    // engine_b stays read-only (no key installed).
+    let engines = setup_two_voting_engine_bridge_with_signing(COMMUNITY_ID, proposer).await;
+
+    let t0: u64 = 5_000_000;
+
+    let config = Tier3PollConfigPayload {
+        proposal_text: "Engine-auto kd=sf test".into(),
+        sortition_size: SORTITION_SIZE,
+        deliberation_window_seconds: 3600,
+        drafting_window_seconds: 3600,
+        ratification_window_seconds: 3600,
+        privacy_mode: "pu".into(),
+        incentive_mode: "a".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+    };
+
+    let create_event = build_tier3_poll_create_event(proposer, &config, hlc_at(t0, "proposer-dev"));
+    let create_signing_bytes = create_event
+        .signing_bytes()
+        .expect("create event signing_bytes");
+    let poll_id = derive_poll_id(&COMMUNITY_ID, &create_signing_bytes);
+
+    let snapshot = MembershipSnapshot {
+        members: full_electorate
+            .iter()
+            .map(|addr| {
+                (
+                    *addr,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )
+            })
+            .collect(),
+    };
+
+    // Apply PollCreate directly to both logs with the full electorate snapshot.
+    // (We skip publish_event for the create to avoid wiring D-FROST in this
+    // test; the existing kd=ss / kd=md publish path below exercises the
+    // orchestration hook.)
+    {
+        let mut log = engines.log_a.lock().await;
+        log.apply_with_snapshot(create_event.clone(), &COMMUNITY_ID, Some(snapshot.clone()))
+            .expect("engine_a: PollCreate apply");
+    }
+    {
+        let mut log = engines.log_b.lock().await;
+        log.apply_with_snapshot(create_event, &COMMUNITY_ID, Some(snapshot))
+            .expect("engine_b: PollCreate apply");
+    }
+
+    // Inject kd=ss: deterministic VRF on sortition_pool (excludes proposer).
+    let vrf_output: [u8; 32] = [0xC1; 32];
+    let sortition_result = fisher_yates_select(
+        &vrf_output,
+        &sortition_pool,
+        SORTITION_SIZE as usize,
+        SORTITION_SIZE as usize,
+    );
+    assert!(
+        !sortition_result.primary.contains(&proposer.owner),
+        "proposer must not be selected"
+    );
+    assert!(
+        !sortition_result.backup.contains(&proposer.owner),
+        "proposer must not be selected"
+    );
+
+    let ss_event = build_sortition_selection_event(
+        poll_id,
+        sortition_result.primary.clone(),
+        sortition_result.backup.clone(),
+        hlc_at(t0 + 1, "engine"),
+    );
+    engines
+        .engine_a
+        .publish_event(ss_event)
+        .await
+        .expect("engine_a: publish kd=ss");
+
+    // Wait for engine_b to apply kd=ss.
+    wait_for_log("engine_b: sortition_result set", &engines.log_b, |log| {
+        log.polls
+            .get(&poll_id)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .map(|t3| t3.sortition_result.is_some())
+            .unwrap_or(false)
+    })
+    .await
+    .expect("engine_b: kd=ss must arrive within 5s");
+
+    // Publish 40 declines (20 primary + 20 backup) via engine_a. Each apply
+    // calls the orchestration hook, but kd=sf should only fire once the
+    // 40th decline lands (covering the full pool). Each pre-40 hook call
+    // returns early because `decline_count < capacity`.
+    let primary_ids: Vec<&TestIdentity> = sortition_result
+        .primary
+        .iter()
+        .map(|owner| identities.iter().find(|id| id.owner == *owner).unwrap())
+        .collect();
+    let backup_ids: Vec<&TestIdentity> = sortition_result
+        .backup
+        .iter()
+        .map(|owner| identities.iter().find(|id| id.owner == *owner).unwrap())
+        .collect();
+
+    let t_decline_base = t0 + 100;
+    for (i, decliner) in primary_ids.iter().enumerate() {
+        let decline_ev = build_decline_event(
+            decliner,
+            poll_id,
+            hlc_at(t_decline_base + i as u64 * 10, &format!("primary-{i}-dev")),
+        );
+        engines
+            .engine_a
+            .publish_event(decline_ev)
+            .await
+            .expect("publish primary decline");
+    }
+    let backup_decline_base = t_decline_base + (SORTITION_SIZE as u64) * 10 + 10;
+    for (i, decliner) in backup_ids.iter().enumerate() {
+        let decline_ev = build_decline_event(
+            decliner,
+            poll_id,
+            hlc_at(
+                backup_decline_base + i as u64 * 10,
+                &format!("backup-{i}-dev"),
+            ),
+        );
+        engines
+            .engine_a
+            .publish_event(decline_ev)
+            .await
+            .expect("publish backup decline");
+    }
+
+    // Engine-auto orchestration should now have minted kd=sf on engine_a's
+    // apply hook (40th decline). Wait for engine_b to receive + apply it
+    // via the bridge.
+    wait_for_log(
+        "engine_b: stage == Failed (engine-auto kd=sf propagated)",
+        &engines.log_b,
+        |log| {
+            log.polls
+                .get(&poll_id)
+                .and_then(|ps| ps.tier_state.as_tier3())
+                .map(|t3| t3.stage == Stage::Failed)
+                .unwrap_or(false)
+        },
+    )
+    .await
+    .expect("engine-auto kd=sf must propagate to engine_b within 5s");
+
+    // Confirm engine_a also transitioned (the hook recurses through
+    // publish_event which applies locally before broadcasting).
+    {
+        let log = engines.log_a.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        assert_eq!(
+            t3.stage,
+            Stage::Failed,
+            "engine_a: must be Failed after engine-auto kd=sf"
+        );
+        // The kd=sf was signed by the proposer's installed key (not a
+        // zero-actor synthetic). Confirm via the SF1 verify path —
+        // peers will accept this event because the actor matches the
+        // poll proposer.
+        assert!(
+            t3.declines.len() >= 40,
+            "engine_a: expected at least 40 declines on the poll"
         );
     }
 

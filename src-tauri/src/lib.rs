@@ -22138,6 +22138,15 @@ async fn ensure_voting_engine_for(
             voting_log: log_arc,
             publisher_tx,
             subscriber_rx,
+            // ZEB-310 Task 9: engine-auto orchestration is dormant in
+            // Phase 4a-main production wiring — the IPC layer applies
+            // directly to the local VotingLog rather than going through
+            // `engine.publish_event`. Tasks 19.x will plumb the real
+            // `hlc_tracker` + `device_id` from NodeState here and
+            // install the signing key via `install_local_signing_key`
+            // once IPC mints route through the engine.
+            hlc_tracker: None,
+            device_id: None,
         },
     )
     .await;
