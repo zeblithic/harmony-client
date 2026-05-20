@@ -490,10 +490,10 @@ pub struct NodeState {
     /// construct registries directly against `tauri::test::MockRuntime`
     /// without going through `NodeState`.
     ///
-    /// `#[allow(dead_code)]` is load-bearing only until ZEB-307 Task 8 wires
-    /// the field; Task 8 reads it from IPC handlers and the allow can be
-    /// dropped at that point.
-    #[allow(dead_code)]
+    /// Task 8 reads this field from the 5 D-FROST IPC handlers post-apply
+    /// to broadcast the locally-applied event over Zenoh (best-effort).
+    /// `None` in test contexts that bypass `start_node`; broadcast call-
+    /// sites in the IPC handlers no-op in that case.
     dfrost_log_registry:
         Option<std::sync::Arc<crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>>>,
     /// ZEB-218 Sub-D Phase 1: aggregated library-directory state. `Some`
@@ -22022,7 +22022,10 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
 
     // 3. Extract NodeState handles, drop the std::Mutex guard immediately
     //    so subsequent async lock acquisitions can't deadlock on it.
-    let (hlc_tracker, device_id, self_owner, dm_outbox, dfrost_logs) = {
+    //    `dfrost_log_registry` is `None` in tests that bypass `start_node`;
+    //    the broadcast call-site at the end of this function is a no-op in
+    //    that case so the IPC integration tests still pass.
+    let (hlc_tracker, device_id, self_owner, dm_outbox, dfrost_logs, dfrost_log_registry) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("dfrost_initiate_dkg: NodeState poisoned: {e}"))?;
@@ -22039,6 +22042,7 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
                 .clone()
                 .ok_or("dfrost_initiate_dkg: dm_outbox missing — no owner identity?")?,
             std::sync::Arc::clone(&g.dfrost_logs),
+            g.dfrost_log_registry.clone(),
         )
     };
 
@@ -22193,7 +22197,9 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
         // directly — using apply_with_identity here keeps a single
         // local-node apply call-site so future rn=2 IPCs can mirror it
         // verbatim.
-        if let Err(e) = log.apply_with_identity(event, &self_owner, &self_x25519_priv) {
+        // R/T8: clone the event so the original binding survives `apply_with_identity`
+        // (which consumes the event) and is available for the post-lock broadcast below.
+        if let Err(e) = log.apply_with_identity(event.clone(), &self_owner, &self_x25519_priv) {
             // R5-1: restore pre-mutation state so the next initiate
             // attempt can proceed. Without this, the phantom pending_dkg
             // from the failed attempt would trip the "already in flight"
@@ -22201,6 +22207,24 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
             log.committee_state.pending_dkg = prior_pending_dkg;
             log.local_dkg_secret = prior_local_dkg_secret;
             return Err(format!("dfrost_initiate_dkg: apply: {e:?}"));
+        }
+    }
+
+    // T8: broadcast the dr rn=1 event over Zenoh (best-effort; local apply
+    // already succeeded above). Lock ordering: this runs OUTSIDE the log
+    // lock scope closed above (R8 + R10 from PR #143). Broadcast failure
+    // logs + continues so a transient transport hiccup never reverses the
+    // local-apply success. Skipped entirely if `dfrost_log_registry` is
+    // `None` (test contexts that bypass `start_node`).
+    if let Some(registry) = dfrost_log_registry.as_ref() {
+        if let Some(engine) = registry.get(space_id).await {
+            if let Err(e) = engine.publish_event(event).await {
+                tracing::warn!(
+                    space_id = ?space_id,
+                    error = %e,
+                    "dfrost_initiate_dkg: broadcast failed (local apply succeeded)",
+                );
+            }
         }
     }
 
@@ -22312,7 +22336,10 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
     //    the same lock, so deferring the registry pull until after the
     //    round-1 branch doesn't change locking semantics — it just narrows
     //    the precondition for the round-1 IPC.
-    let (hlc_tracker, device_id, self_owner, dm_outbox, dfrost_logs) = {
+    // T8: also pull `dfrost_log_registry` here (Option, None in test
+    // contexts that bypass `start_node`). Broadcast call-sites below skip
+    // if it's None so the IPC integration tests remain pass-through.
+    let (hlc_tracker, device_id, self_owner, dm_outbox, dfrost_logs, dfrost_log_registry) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("dfrost_contribute_dkg_round: NodeState poisoned: {e}"))?;
@@ -22329,6 +22356,7 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
                 .clone()
                 .ok_or("dfrost_contribute_dkg_round: dm_outbox missing — no owner identity?")?,
             std::sync::Arc::clone(&g.dfrost_logs),
+            g.dfrost_log_registry.clone(),
         )
     };
 
@@ -22394,7 +22422,15 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
             std::sync::Arc::clone(&outbox_g.signing_key)
         };
 
-        let participants_after: usize = {
+        // T8: return BOTH the post-apply participants count AND a clone of
+        // the applied event so the post-lock broadcast block has access to
+        // the signed event. `apply_with_identity` consumes its event arg,
+        // so we clone it at the apply call and keep the original for
+        // broadcast.
+        let (participants_after, event_for_broadcast): (
+            usize,
+            crate::community_dfrost_types::SignedCommitteeEvent,
+        ) = {
             let mut log = log_arc.lock().await;
             // ─── Snapshot + validate inside the lock ──
             let (self_index, members, max_signers, threshold) = {
@@ -22461,18 +22497,38 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
                 *crate::dm_signing::ed25519_priv_to_x25519(signing_key_arc.as_ref());
 
             // ─── Stash secret + apply, rollback on apply failure ──
+            // T8: clone the event for apply so the original remains
+            // available for the post-lock broadcast block.
             let prior_secret = log.local_dkg_secret.take();
             log.local_dkg_secret = Some(r1_secret);
-            if let Err(e) = log.apply_with_identity(event, &self_owner, &self_x25519_priv) {
+            if let Err(e) = log.apply_with_identity(event.clone(), &self_owner, &self_x25519_priv) {
                 log.local_dkg_secret = prior_secret;
                 return Err(format!("dfrost_contribute_dkg_round: apply: {e:?}"));
             }
-            log.committee_state
+            let count = log
+                .committee_state
                 .pending_dkg
                 .as_ref()
                 .map(|p| p.round1_packages.len())
-                .unwrap_or(0)
+                .unwrap_or(0);
+            (count, event)
         };
+
+        // T8: broadcast the dr rn=1 peer event (best-effort; local apply
+        // already succeeded). Lock ordering: this runs AFTER the log lock
+        // released above (the `{ let mut log = ... }` block ended).
+        if let Some(registry) = dfrost_log_registry.as_ref() {
+            if let Some(engine) = registry.get(space_id).await {
+                if let Err(e) = engine.publish_event(event_for_broadcast).await {
+                    tracing::warn!(
+                        space_id = ?space_id,
+                        error = %e,
+                        "dfrost_contribute_dkg_round (rn=1): broadcast failed \
+                         (local apply succeeded)",
+                    );
+                }
+            }
+        }
 
         let evt_payload = DfrostDkgProgressPayload {
             ceremony_id: hex::encode(ceremony_bytes),
@@ -22874,6 +22930,9 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
     //    stash atomically (R6 Cursor MEDIUM). For round 3, no
     //    `local_dkg_secret2` mutation happens here — the field is only
     //    cloned upstream — so failure simply propagates.
+    //
+    // T8: clone the event for apply so the original remains available for
+    // the post-lock broadcast block below.
     {
         let mut log = log_arc.lock().await;
         let prior_secret2 = if r2_secret_to_stash.is_some() {
@@ -22883,11 +22942,30 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
         } else {
             None
         };
-        if let Err(e) = log.apply_with_identity(event_to_apply, &self_owner, &self_x25519_priv) {
+        if let Err(e) =
+            log.apply_with_identity(event_to_apply.clone(), &self_owner, &self_x25519_priv)
+        {
             if let Some(prior) = prior_secret2 {
                 log.local_dkg_secret2 = prior;
             }
             return Err(format!("dfrost_contribute_dkg_round: apply: {e:?}"));
+        }
+    }
+
+    // T8: broadcast the dr rn=2 OR dk rn=3 event (best-effort; local apply
+    // already succeeded). Lock ordering: this runs OUTSIDE the log lock
+    // scope above (R8 + R10 from PR #143). Failure here logs + continues.
+    if let Some(registry) = dfrost_log_registry.as_ref() {
+        if let Some(engine) = registry.get(space_id).await {
+            if let Err(e) = engine.publish_event(event_to_apply).await {
+                tracing::warn!(
+                    space_id = ?space_id,
+                    round_num = round_num,
+                    error = %e,
+                    "dfrost_contribute_dkg_round (rn=2/3): broadcast failed \
+                     (local apply succeeded)",
+                );
+            }
         }
     }
 
@@ -22994,7 +23072,8 @@ async fn dfrost_request_vrf_beacon<R: tauri::Runtime>(
     //    self's X25519 private key because `apply_with_identity` requires
     //    it as a parameter — for `ts` the impl falls through to `apply()`
     //    without ever touching the decrypt path.
-    let (hlc_tracker, device_id, self_owner, dm_outbox, dfrost_logs) = {
+    // T8: also pull `dfrost_log_registry` (Option, None in test contexts).
+    let (hlc_tracker, device_id, self_owner, dm_outbox, dfrost_logs, dfrost_log_registry) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("dfrost_request_vrf_beacon: NodeState poisoned: {e}"))?;
@@ -23011,6 +23090,7 @@ async fn dfrost_request_vrf_beacon<R: tauri::Runtime>(
                 .clone()
                 .ok_or("dfrost_request_vrf_beacon: dm_outbox missing — no owner identity?")?,
             std::sync::Arc::clone(&g.dfrost_logs),
+            g.dfrost_log_registry.clone(),
         )
     };
 
@@ -23152,9 +23232,12 @@ async fn dfrost_request_vrf_beacon<R: tauri::Runtime>(
     //    materialised PendingSignSession. Apply must succeed first
     //    because apply_threshold_sign is what creates the pending_sign
     //    entry on the first `ts` contribution.
+    //
+    // T8: clone the event for apply so the original remains available
+    // for the post-lock broadcast block below.
     {
         let mut log = log_arc.lock().await;
-        log.apply_with_identity(event, &self_owner, &self_x25519_priv)
+        log.apply_with_identity(event.clone(), &self_owner, &self_x25519_priv)
             .map_err(|e| format!("dfrost_request_vrf_beacon: apply: {e:?}"))?;
 
         let pending = log
@@ -23163,6 +23246,22 @@ async fn dfrost_request_vrf_beacon<R: tauri::Runtime>(
             .get_mut(&ceremony_id)
             .ok_or("dfrost_request_vrf_beacon: apply succeeded but pending_sign entry missing")?;
         pending.local_nonces = Some(nonces_cbor);
+    }
+
+    // T8: broadcast the ts commitment event (best-effort; local apply
+    // already succeeded and local_nonces have been stashed). Lock
+    // ordering: this runs OUTSIDE the log lock scope above. R10 epoch
+    // validation already happened pre-apply — broadcast does NOT move it.
+    if let Some(registry) = dfrost_log_registry.as_ref() {
+        if let Some(engine) = registry.get(space_id).await {
+            if let Err(e) = engine.publish_event(event).await {
+                tracing::warn!(
+                    space_id = ?space_id,
+                    error = %e,
+                    "dfrost_request_vrf_beacon: broadcast failed (local apply succeeded)",
+                );
+            }
+        }
     }
 
     Ok(hex::encode(ceremony_id))
@@ -23228,8 +23327,9 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
                 .to_string()
         })?;
 
-    // 2. Snapshot NodeState handles.
-    let (hlc_tracker, device_id, self_owner, dm_outbox, dfrost_logs) = {
+    // 2. Snapshot NodeState handles. T8: also pull `dfrost_log_registry`
+    //    (Option, None in test contexts that bypass `start_node`).
+    let (hlc_tracker, device_id, self_owner, dm_outbox, dfrost_logs, dfrost_log_registry) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("dfrost_contribute_threshold_sign: NodeState poisoned: {e}"))?;
@@ -23247,6 +23347,7 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
                 "dfrost_contribute_threshold_sign: dm_outbox missing — no owner identity?",
             )?,
             std::sync::Arc::clone(&g.dfrost_logs),
+            g.dfrost_log_registry.clone(),
         )
     };
 
@@ -23495,9 +23596,11 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
         (ev, x_priv)
     };
 
+    // T8: clone the event for apply so the original remains available for
+    // the post-lock broadcast block below.
     {
         let mut log = log_arc.lock().await;
-        log.apply_with_identity(event, &self_owner, &self_x25519_priv)
+        log.apply_with_identity(event.clone(), &self_owner, &self_x25519_priv)
             .map_err(|e| {
                 // R2-3: if apply fails after `round2::sign` already
                 // consumed the nonces, the ceremony state is inconsistent
@@ -23511,6 +23614,23 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
                      ceremony state inconsistent — restart via dfrost_request_vrf_beacon: {e:?}"
                 )
             })?;
+    }
+
+    // T8: broadcast the ts share-bearing event (best-effort; local apply
+    // already succeeded). Lock ordering: this runs OUTSIDE the log lock
+    // scope above. Failure here logs + continues so the aggregation path
+    // below still proceeds locally.
+    if let Some(registry) = dfrost_log_registry.as_ref() {
+        if let Some(engine) = registry.get(space_id).await {
+            if let Err(e) = engine.publish_event(event).await {
+                tracing::warn!(
+                    space_id = ?space_id,
+                    error = %e,
+                    "dfrost_contribute_threshold_sign (ts share): broadcast failed \
+                     (local apply succeeded)",
+                );
+            }
+        }
     }
 
     // 7. Post-apply: do ALL members of the canonical signing set have
@@ -23654,9 +23774,11 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
         .map_err(|e| format!("dfrost_contribute_threshold_sign: build_signed vb: {e}"))?
     };
 
+    // T8: clone the event for apply so the original remains available for
+    // the post-lock broadcast block below.
     {
         let mut log = log_arc.lock().await;
-        log.apply_with_identity(vb_event, &self_owner, &self_x25519_priv)
+        log.apply_with_identity(vb_event.clone(), &self_owner, &self_x25519_priv)
             .map_err(|e| {
                 // R2-3: aggregate succeeded but the `vb` apply failed —
                 // the threshold signature was computed correctly but the
@@ -23667,6 +23789,23 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
                      ceremony state inconsistent — restart via dfrost_request_vrf_beacon: {e:?}"
                 )
             })?;
+    }
+
+    // T8: broadcast the vb aggregate event (best-effort; local apply
+    // already succeeded). Lock ordering: this runs OUTSIDE the log lock
+    // scope above. Failure here logs + continues so the beacon-ready UI
+    // event below still emits.
+    if let Some(registry) = dfrost_log_registry.as_ref() {
+        if let Some(engine) = registry.get(space_id).await {
+            if let Err(e) = engine.publish_event(vb_event).await {
+                tracing::warn!(
+                    space_id = ?space_id,
+                    error = %e,
+                    "dfrost_contribute_threshold_sign (vb aggregate): broadcast failed \
+                     (local apply succeeded)",
+                );
+            }
+        }
     }
 
     let evt = DfrostBeaconReadyPayload {
@@ -23791,7 +23930,16 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
     //    OwnerAddr → identity_pub_64 → X25519 pubkey lookup used to seal
     //    each per-recipient share package (same path
     //    `dfrost_contribute_dkg_round` rn=2 uses).
-    let (hlc_tracker, device_id, self_owner, dm_outbox, dfrost_logs, community_registry) = {
+    // T8: also pull `dfrost_log_registry` (Option, None in test contexts).
+    let (
+        hlc_tracker,
+        device_id,
+        self_owner,
+        dm_outbox,
+        dfrost_logs,
+        community_registry,
+        dfrost_log_registry,
+    ) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("dfrost_propose_refresh: NodeState poisoned: {e}"))?;
@@ -23811,6 +23959,7 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
             g.community_registry
                 .clone()
                 .ok_or("dfrost_propose_refresh: community_registry missing — node not running?")?,
+            g.dfrost_log_registry.clone(),
         )
     };
 
@@ -24062,15 +24211,33 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
     //     concurrent DKG / refresh attempt. The `pending_refresh` field
     //     is NOT pre-mutated here (apply auto-initialises it), so no
     //     snapshot is needed for that field.
+    // T8: clone the event for apply so the original remains available for
+    // the post-lock broadcast block below.
     {
         let mut log = log_arc.lock().await;
         let prior_local_dkg_secret = log.local_dkg_secret.clone();
         log.local_dkg_secret = Some(r1_secret);
-        if let Err(e) = log.apply_with_identity(event, &self_owner, &self_x25519_priv) {
+        if let Err(e) = log.apply_with_identity(event.clone(), &self_owner, &self_x25519_priv) {
             // R5-1: restore prior secret so retry isn't fighting a stale
             // stash from this failed attempt.
             log.local_dkg_secret = prior_local_dkg_secret;
             return Err(format!("dfrost_propose_refresh: apply: {e:?}"));
+        }
+    }
+
+    // T8: broadcast the rf rn=1 event (best-effort; local apply already
+    // succeeded). Lock ordering: this runs OUTSIDE the log lock scope
+    // above (R8 + R10 from PR #143). R9 per-actor idempotency gate
+    // happens INSIDE the log lock pre-apply — broadcast does NOT move it.
+    if let Some(registry) = dfrost_log_registry.as_ref() {
+        if let Some(engine) = registry.get(space_id).await {
+            if let Err(e) = engine.publish_event(event).await {
+                tracing::warn!(
+                    space_id = ?space_id,
+                    error = %e,
+                    "dfrost_propose_refresh: broadcast failed (local apply succeeded)",
+                );
+            }
         }
     }
 
