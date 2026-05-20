@@ -499,6 +499,13 @@ pub struct NodeState {
     /// sites in the IPC handlers no-op in that case.
     dfrost_log_registry:
         Option<std::sync::Arc<crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>>>,
+    /// ZEB-309 Phase 4a-main Task 11: injected closure for triggering VRF
+    /// beacon ceremonies. Constructed in `start_node` and stored here so
+    /// `ensure_voting_engine_for` can call `install_dfrost_handle` on each
+    /// lazily-created `VotingLogEngine` without threading the closure through
+    /// every IPC call-site. `None` until `start_node` wires it; cleared in
+    /// `stop_inner` alongside the dfrost and voting engine cleanup.
+    beacon_requester: Option<crate::community_voting_log_engine::BeaconRequester>,
     /// ZEB-218 Sub-D Phase 1: aggregated library-directory state. `Some`
     /// while the node is running; the matching `request_rx` is consumed
     /// by an event-loop task that declares per-library Zenoh
@@ -681,6 +688,10 @@ impl Default for NodeState {
             // wires it (Task 8). IPC handlers will reject with
             // "dfrost_log_registry missing — node not running" while None.
             dfrost_log_registry: None,
+            // ZEB-309 Task 11: beacon_requester stays None until start_node
+            // builds and installs it. VotingLogEngines created before then
+            // (direct unit tests) have no requester and skip beacon fire.
+            beacon_requester: None,
             // ZEB-218 Sub-D Phase 1: directory stays None until
             // start_node wires it.
             library_directory: None,
@@ -985,6 +996,12 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         // can run on an ephemeral runtime (the std `MutexGuard` is
         // `!Send`). Mirrors `channel_log_registry`'s take pattern.
         dfrost_log_registry_for_shutdown = guard.dfrost_log_registry.take();
+        // ZEB-309 Task 11: clear the beacon_requester before voting engines
+        // are dropped (below) so no in-flight beacon spawn can race with
+        // teardown. Dropping the Arc here reduces the refcount; any spawned
+        // beacon futures that already cloned the requester will run to
+        // completion or be abandoned when the tokio runtime tears down.
+        let _ = guard.beacon_requester.take();
         // ZEB-291 Phase 2 Task 20: abort the voting tick task. Done
         // under the lock so a racing start_node can't re-spawn a new
         // tick that we'd then orphan. Engines clear in the same scope.
@@ -1584,6 +1601,10 @@ async fn start_node(
         // identity's D-FROST registry into the outer-scope binding;
         // shutdown runs below outside the std `MutexGuard`.
         old_dfrost_log_registry = guard.dfrost_log_registry.take();
+        // ZEB-309 Task 11: drop the prior identity's beacon_requester so
+        // the new identity gets a fresh closure (captures the same AppHandle
+        // but the new start_node call constructs a brand-new one for clarity).
+        let _ = guard.beacon_requester.take();
         // ZEB-218 Sub-D Phase 1: drop the previous identity's library
         // directory handle. The matching event_loop consumer task
         // observes the request_tx close on next recv and exits.
@@ -1877,6 +1898,35 @@ async fn start_node(
         > = std::sync::Arc::new(crate::community_dfrost_log_engine::DfrostLogRegistry::<
             tauri::Wry,
         >::new());
+
+        // ZEB-309 Phase 4a-main Task 11: build the BeaconRequester closure that
+        // voting engines use to trigger VRF beacon ceremonies when a Tier 3
+        // PollCreate is applied. The closure captures the AppHandle (which is
+        // Clone + Send + Sync + 'static) and calls app.state::<Mutex<NodeState>>()
+        // inside the async body to reach dfrost_request_vrf_beacon_inner without
+        // holding a raw &NodeState reference across an await.
+        //
+        // BeaconRequester signature (from community_voting_log_engine.rs):
+        //   Arc<dyn Fn(SpaceId, [u8;32], u64) -> BoxFuture<'static, Result<String,String>>
+        //       + Send + Sync + 'static>
+        //
+        // Return value: Ok(ceremony_id_string) or Err(reason). The voting engine
+        // ignores the ceremony_id (fires-and-forgets the beacon request), but the
+        // signature must match BeaconRequester exactly.
+        let beacon_requester_for_state: crate::community_voting_log_engine::BeaconRequester = {
+            let app_for_beacon = app.clone();
+            std::sync::Arc::new(
+                move |space_id: crate::owner_state_types::SpaceId, seed: [u8; 32], epoch: u64| {
+                    let app = app_for_beacon.clone();
+                    Box::pin(async move {
+                        use tauri::Manager as _;
+                        let state = app.state::<Mutex<NodeState>>();
+                        crate::dfrost_request_vrf_beacon_inner(&state, space_id, seed, epoch).await
+                    })
+                        as futures::future::BoxFuture<'static, Result<String, String>>
+                },
+            )
+        };
 
         // ── ZEB-281 Sub-D Phase 4: profile-broadcast publisher + cache + request channel ──
         //
@@ -3372,6 +3422,13 @@ async fn start_node(
                         // `registry.get(space_id)` returning None is expected
                         // and the IPC broadcast sites already log + skip.
                         guard.dfrost_log_registry = Some(dfrost_log_registry_arc.clone());
+                        // ZEB-309 Phase 4a-main Task 11: stash the beacon_requester
+                        // closure so `ensure_voting_engine_for` can call
+                        // `install_dfrost_handle` on each lazily-created
+                        // VotingLogEngine. Cleared in stop_inner alongside the
+                        // dfrost registry so late beacon arrivals cannot race
+                        // with shutdown.
+                        guard.beacon_requester = Some(beacon_requester_for_state.clone());
                         // ZEB-218 Sub-D Phase 1: stash the library_directory Arc
                         // so future IPC handlers (Task 4) can reach `request_tx`
                         // to add / remove libraries. The matching rx was moved
@@ -20941,6 +20998,13 @@ type VotingLogEnginesMap = std::sync::Arc<
 /// Lazy-register a `VotingLogEngine` for `community_id` if none exists,
 /// sharing the per-community `Arc<Mutex<VotingLog>>` from `voting_logs`.
 ///
+/// ZEB-309 Phase 4a-main Task 11: `dfrost_log_registry` and `beacon_requester`
+/// are optional; when both are `Some`, `install_dfrost_handle` is called on
+/// any newly-created engine so Tier 3 PollCreate events trigger VRF beacon
+/// requests and arriving beacons trigger kd=ss publication. Pre-existing
+/// engines (already in the map) are NOT re-wired — they were wired at their
+/// creation time.
+///
 /// TODO ZEB-291 Task 19.1: the engine's `publisher_tx` currently drops on
 /// the floor and `subscriber_rx` is never fed — wire the existing Zenoh
 /// adapter (`harmony/community/{id}/voting`) so cross-peer Tier 2 sync
@@ -20952,6 +21016,10 @@ async fn ensure_voting_engine_for(
     voting_logs: &VotingLogsMap,
     voting_log_engines: &VotingLogEnginesMap,
     community_id: crate::owner_state_types::SpaceId,
+    dfrost_log_registry: Option<
+        std::sync::Arc<crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>>,
+    >,
+    beacon_requester: Option<crate::community_voting_log_engine::BeaconRequester>,
 ) -> Result<(), String> {
     // Fast-path read under the std::Mutex (no awaits).
     {
@@ -21004,6 +21072,17 @@ async fn ensure_voting_engine_for(
         },
     )
     .await;
+
+    // ZEB-309 Phase 4a-main Task 11: wire DfrostLog handle so the engine
+    // can trigger VRF beacon requests on Tier 3 PollCreate and publish
+    // kd=ss on beacon arrival. Called before inserting into the map so the
+    // engine is fully wired before any concurrent caller can reach it.
+    if let (Some(registry), Some(requester)) = (dfrost_log_registry, beacon_requester) {
+        crate::community_voting_log_engine::VotingLogEngine::install_dfrost_handle(
+            &engine, registry, requester,
+        )
+        .await;
+    }
 
     let mut g = voting_log_engines
         .lock()
@@ -21291,6 +21370,8 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
         crdt_state,
         voting_logs,
         voting_log_engines,
+        dfrost_log_registry_for_engine,
+        beacon_requester_for_engine,
     ) = {
         let g = state_lock
             .lock()
@@ -21310,6 +21391,9 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
                 .ok_or("crdt_state missing — node not running?")?,
             std::sync::Arc::clone(&g.voting_logs),
             std::sync::Arc::clone(&g.voting_log_engines),
+            // ZEB-309 Task 11: pass dfrost handles so new engines get wired.
+            g.dfrost_log_registry.clone(),
+            g.beacon_requester.clone(),
         )
     };
 
@@ -21320,7 +21404,14 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
         .map_err(|e| format!("voting_create_tier2_proposal: creator not eligible: {e:?}"))?;
 
     // ── 5. Lazy-register the engine for this community ────────────────
-    ensure_voting_engine_for(&voting_logs, &voting_log_engines, space_id).await?;
+    ensure_voting_engine_for(
+        &voting_logs,
+        &voting_log_engines,
+        space_id,
+        dfrost_log_registry_for_engine,
+        beacon_requester_for_engine,
+    )
+    .await?;
 
     // ── 6. Reserve HLC + sign PollCreate ──────────────────────────────
     let wall_now_ms = std::time::SystemTime::now()
@@ -21536,6 +21627,8 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
         crdt_state,
         voting_logs,
         voting_log_engines,
+        dfrost_log_registry_for_engine,
+        beacon_requester_for_engine,
     ) = {
         let g = state_lock
             .lock()
@@ -21555,6 +21648,9 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
                 .ok_or("crdt_state missing — node not running?")?,
             std::sync::Arc::clone(&g.voting_logs),
             std::sync::Arc::clone(&g.voting_log_engines),
+            // ZEB-309 Task 11: pass dfrost handles so new engines get wired.
+            g.dfrost_log_registry.clone(),
+            g.beacon_requester.clone(),
         )
     };
 
@@ -21570,7 +21666,14 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
     }
 
     // Lazy-register the engine so the per-community log exists.
-    ensure_voting_engine_for(&voting_logs, &voting_log_engines, space_id).await?;
+    ensure_voting_engine_for(
+        &voting_logs,
+        &voting_log_engines,
+        space_id,
+        dfrost_log_registry_for_engine,
+        beacon_requester_for_engine,
+    )
+    .await?;
 
     let wall_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -21625,7 +21728,16 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
         .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
     let space_id = crate::owner_state_types::SpaceId(cid_bytes);
 
-    let (hlc_tracker, device_id, self_owner, dm_outbox, voting_logs, voting_log_engines) = {
+    let (
+        hlc_tracker,
+        device_id,
+        self_owner,
+        dm_outbox,
+        voting_logs,
+        voting_log_engines,
+        dfrost_log_registry_for_engine,
+        beacon_requester_for_engine,
+    ) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -21638,10 +21750,20 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
                 .ok_or("dm_outbox missing — no owner identity?")?,
             std::sync::Arc::clone(&g.voting_logs),
             std::sync::Arc::clone(&g.voting_log_engines),
+            // ZEB-309 Task 11: pass dfrost handles so new engines get wired.
+            g.dfrost_log_registry.clone(),
+            g.beacon_requester.clone(),
         )
     };
 
-    ensure_voting_engine_for(&voting_logs, &voting_log_engines, space_id).await?;
+    ensure_voting_engine_for(
+        &voting_logs,
+        &voting_log_engines,
+        space_id,
+        dfrost_log_registry_for_engine,
+        beacon_requester_for_engine,
+    )
+    .await?;
 
     let wall_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -27853,6 +27975,7 @@ mod start_node_race_tests {
             community_adapter_request_tx: None,
             channel_log_registry: None,
             dfrost_log_registry: None,
+            beacon_requester: None,
             library_directory: None,
             profile_broadcast_publisher: None,
             profile_broadcast_cache: None,
