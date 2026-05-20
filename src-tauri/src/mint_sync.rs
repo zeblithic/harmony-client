@@ -582,15 +582,21 @@ async fn internal_task(
 async fn publish_root_now(
     mint_db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
     content_store: &Arc<dyn crate::content_store::ContentStore>,
-    _sync_state: &Arc<TokioMutex<MintSyncState>>,
+    sync_state: &Arc<TokioMutex<MintSyncState>>,
 ) -> Result<(), MintSyncError> {
     let mint_db = mint_db.clone();
-    let snap = tokio::task::spawn_blocking(move || {
+    let mut snap = tokio::task::spawn_blocking(move || {
         let mut conn = mint_db.lock().expect("mint_db lock poisoned");
         snapshot_current_db(&mut conn)
     })
     .await
     .map_err(|e| MintSyncError::Other(format!("spawn_blocking: {e}")))??;
+
+    // Attach deletion floor so peers can learn about hard-deleted accounts.
+    {
+        let st = sync_state.lock().await;
+        snap.account_deletion_floor = st.account_deletion_floor.clone();
+    }
 
     if snap.accounts.is_empty() && snap.transactions.is_empty() && snap.settings.is_empty() {
         tracing::debug!(
@@ -784,12 +790,18 @@ async fn publish_root_now_zenoh(
 ) -> Result<(), MintSyncError> {
     // 1. Snapshot the DB.
     let mint_db_c = mint_db.clone();
-    let snap = tokio::task::spawn_blocking(move || {
+    let mut snap = tokio::task::spawn_blocking(move || {
         let mut conn = mint_db_c.lock().expect("mint_db lock poisoned");
         snapshot_current_db(&mut conn)
     })
     .await
     .map_err(|e| MintSyncError::Other(format!("spawn_blocking: {e}")))??;
+
+    // Attach deletion floor so peers can learn about hard-deleted accounts.
+    {
+        let st = sync_state.lock().await;
+        snap.account_deletion_floor = st.account_deletion_floor.clone();
+    }
 
     if snap.accounts.is_empty() && snap.transactions.is_empty() && snap.settings.is_empty() {
         tracing::debug!(
