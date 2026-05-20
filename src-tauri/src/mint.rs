@@ -1053,9 +1053,7 @@ mod tests {
 
     /// Open a fresh in-memory database with migrations applied.
     fn fresh_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        apply_migrations(&conn).unwrap();
-        conn
+        super::open_in_memory().expect("open_in_memory")
     }
 
     #[test]
@@ -1076,8 +1074,10 @@ mod tests {
 
     #[test]
     fn migration_is_idempotent() {
-        let conn = Connection::open_in_memory().unwrap();
-        apply_migrations(&conn).unwrap();
+        // fresh_db() (via super::open_in_memory()) applies migrations once
+        // and enables the FK pragma. Call apply_migrations a second time to
+        // verify idempotency.
+        let conn = fresh_db();
         // Second call must not error.
         apply_migrations(&conn).unwrap();
         // Idempotency means more than "no error" — the seed row must not duplicate.

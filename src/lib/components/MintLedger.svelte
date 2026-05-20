@@ -50,12 +50,12 @@
       // the "table mysteriously empty after delete" UX trap.
       if (filterAccountId && !accs.some((a) => a.id === filterAccountId)) {
         filterAccountId = '';
-        // We've changed a filter — but DON'T recurse into load() here,
-        // because the current load() result (with the now-invalid filter)
-        // returned 0 transactions. Just clear `transactions` and let the
-        // user's next interaction (or the next onChanged via account
-        // manager) drive a clean reload.
-        transactions = [];
+        // The current load() ran with a stale filter — reissue with the
+        // cleared filter so the table updates immediately. The recursive
+        // call increments loadEpoch, so this load()'s subsequent state
+        // writes (and the finally block's loading=false) are skipped via
+        // the epoch guards already in place.
+        void load();
         return;
       }
     } catch (e) {
