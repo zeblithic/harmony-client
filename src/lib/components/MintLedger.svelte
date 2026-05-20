@@ -22,7 +22,13 @@
   let filterDateTo = $state<string>('');
   let filterAccountId = $state<string>('');
 
+  // Plain let (not $state) — epoch is an instance counter, not a reactive
+  // value. Reads and writes are synchronous so no reactivity needed.
+  let loadEpoch = 0;
+
   async function load() {
+    loadEpoch++;
+    const myEpoch = loadEpoch;
     loading = true;
     loadError = null;
     try {
@@ -35,13 +41,19 @@
         service.listAccounts(),
         service.getDefaultCurrency(),
       ]);
+      // Stale result guard — only the most recent load() writes to state.
+      if (myEpoch !== loadEpoch) return;
       transactions = txs;
       accounts = accs;
       defaultCurrency = def ?? 'USD';
     } catch (e) {
+      if (myEpoch !== loadEpoch) return;
       loadError = e instanceof Error ? e.message : String(e);
     } finally {
-      loading = false;
+      // Only the most-recent load clears the loading flag — prevents
+      // a stale completion from prematurely flipping off a spinner that
+      // a newer load is still waiting on.
+      if (myEpoch === loadEpoch) loading = false;
     }
   }
 

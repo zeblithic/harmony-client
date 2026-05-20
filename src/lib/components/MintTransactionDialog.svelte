@@ -18,7 +18,18 @@
     onSaved: () => void;
   } = $props();
 
-  let date = $state(new Date().toISOString().slice(0, 10));
+  // Returns today's date as YYYY-MM-DD in the user's local timezone.
+  // new Date().toISOString() returns UTC, which gives US Pacific users
+  // tomorrow's date after 5pm local — wrong for a transaction date picker.
+  function todayLocal(): string {
+    const d = new Date();
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
+
+  let date = $state(todayLocal());
   let amount = $state('');
   let currency = $state(defaultCurrency);
   let accountId = $state(accounts[0]?.id ?? '');
@@ -48,7 +59,7 @@
       // component is mounted (currently impossible because the dialog
       // unmounts via {#if showAddEdit} in MintLedger, but kept robust
       // against future refactors that might keep the dialog mounted).
-      date = new Date().toISOString().slice(0, 10);
+      date = todayLocal();
       amount = '';
       currency = defaultCurrency;
       accountId = accounts[0]?.id ?? '';
