@@ -943,6 +943,14 @@ where
     ciborium::from_reader(bytes).map_err(|e| e.to_string())
 }
 
+/// SHA-256 of `signing_bytes` for the event. Public wrapper around
+/// `sha256_of_signing_bytes` exposed for the IPC layer (Tasks 4-8) so
+/// callers can return the event_hash hex for chaining (DraftApproval
+/// references DraftCandidate hashes; PollClose references statement hashes).
+pub fn event_hash_of(event: &SignedVotingEvent) -> [u8; 32] {
+    sha256_of_signing_bytes(event)
+}
+
 /// Compute SHA-256 of the signing bytes of a SignedVotingEvent.
 /// Used to derive event_hash for kd=dc DraftCandidate and kd=cl PollClose.
 fn sha256_of_signing_bytes(ev: &SignedVotingEvent) -> [u8; 32] {

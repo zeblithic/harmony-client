@@ -157,6 +157,13 @@ impl VotingLog {
         Self::default()
     }
 
+    /// Returns true if any poll with this PollId is currently tracked.
+    /// Used by `voting_resolve_community_for_poll` (lib.rs) to locate
+    /// the owning SpaceId for an IPC that only knows the poll_id.
+    pub fn has_poll(&self, pid: &crate::community_voting_core::PollId) -> bool {
+        self.polls.contains_key(pid)
+    }
+
     /// Apply a new event to the log. Caller has already done verify
     /// (V1-V6, kind-specific) — this function only handles materialize
     /// (lifecycle transition + tier-specific apply).
