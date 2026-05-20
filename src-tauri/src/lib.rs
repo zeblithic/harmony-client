@@ -21863,6 +21863,17 @@ async fn voting_cast_ratification_ballot<R: tauri::Runtime>(
 
     let space_id = voting_resolve_community_for_poll(&voting_logs, &pid).await?;
 
+    // Reserve "now" BEFORE the pre-flight: the stage gate in the helper
+    // must use the HLC we're about to use for the new ballot, not
+    // t3.last_hlc (which can lag the ratification window if no events
+    // have been applied since deliberation closed).
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+
     // Pre-flight: look up current ratification candidate count from the
     // owning community's voting log, then re-use the canonical
     // `validate_ratification_ballot` validator. Returns None when the poll
@@ -21879,7 +21890,7 @@ async fn voting_cast_ratification_ballot<R: tauri::Runtime>(
         };
         let log = log_arc.lock().await;
         let candidate_count = log
-            .tier3_ratification_candidate_count(&pid)
+            .tier3_ratification_candidate_count(&pid, &hlc)
             .ok_or_else(|| {
                 "voting_cast_ratification_ballot: poll not in Ratification stage or not Tier 3"
                     .to_string()
@@ -21894,13 +21905,6 @@ async fn voting_cast_ratification_ballot<R: tauri::Runtime>(
         )
         .map_err(|e| format!("voting_cast_ratification_ballot: invalid ballot: {e:?}"))?;
     }
-
-    let wall_now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    let hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
 
     let event = {
         let outbox_g = dm_outbox.lock().await;

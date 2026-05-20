@@ -192,17 +192,26 @@ impl VotingLog {
     /// `t3.candidates`, push synthesized status_quo, then run
     /// `drafting_advancers` + `ratification_candidates_ordering`. The
     /// returned count includes status_quo.
+    ///
+    /// `now` is the HLC the caller intends to use as "now" — typically the
+    /// HLC just reserved for the new ratification ballot. Gating on
+    /// `t3.last_hlc` here would be incorrect: that is the HLC of the last
+    /// applied event on this poll, which may pre-date the ratification
+    /// window if no events have been applied since deliberation closed.
     pub fn tier3_ratification_candidate_count(
         &self,
         pid: &crate::community_voting_core::PollId,
+        now: &crate::owner_state_types::Hlc,
     ) -> Option<usize> {
         let state = self.polls.get(pid)?;
         let t3 = state.tier_state.as_tier3()?;
 
-        // Gate on Ratification stage using the latest applied event's HLC.
-        // If no events have been applied yet, the poll is at most in
-        // Stage::Sortition — definitely not Ratification.
-        let now = t3.last_hlc.as_ref()?;
+        // Gate on Ratification stage using the caller-provided "now"
+        // (typically the HLC reserved for the new ballot). Using
+        // t3.last_hlc would be wrong — that's the HLC of the latest
+        // applied event on this poll, which can lag the ratification
+        // window when no events have been applied since deliberation
+        // closed.
         if !matches!(
             t3.current_stage_at(now),
             crate::community_voting_tier3::Stage::Ratification
@@ -2457,11 +2466,23 @@ mod tier3_dispatch_tests {
         let create_ev = tier3_create_event(creator, &cfg);
         let pid = log.apply(create_ev, &cid()).expect("tier3 create");
 
-        // Before any further events apply, no last_hlc → helper returns None.
+        // "now" well past the deadline (create + dw + fw = 201_000ms;
+        // ratification window closes at 301_000ms). Use a wall_ms inside
+        // Ratification for the success-case assertions; for stage-gate
+        // negative cases, use a `now` inside the corresponding stage.
+        let now_ratification = hlc(250_000);
+        let now_sortition = hlc(1_500);
+        let now_deliberation = hlc(50_000);
+        let now_drafting = hlc(150_000);
+
+        // Before any further events apply, the helper still returns None
+        // because we haven't reached Ratification stage at `now_sortition`.
+        // Pre-fix this relied on `last_hlc.as_ref()?` short-circuiting; now
+        // it relies on `current_stage_at(now_sortition) != Ratification`.
         assert_eq!(
-            log.tier3_ratification_candidate_count(&pid),
+            log.tier3_ratification_candidate_count(&pid, &now_sortition),
             None,
-            "no events applied (last_hlc=None) must return None"
+            "now in Sortition stage must return None"
         );
 
         // kd=ss SortitionSelection — mini-public primary = [addr(1)..addr(20)].
@@ -2482,9 +2503,10 @@ mod tier3_dispatch_tests {
         )
         .expect("apply kd=ss");
 
-        // Still pre-Ratification (last_hlc=2000 → current_stage_at=Deliberation).
+        // Still pre-Ratification at `now_deliberation` (wall=50_000 is
+        // inside the deliberation window).
         assert_eq!(
-            log.tier3_ratification_candidate_count(&pid),
+            log.tier3_ratification_candidate_count(&pid, &now_deliberation),
             None,
             "Deliberation stage must return None"
         );
@@ -2524,9 +2546,10 @@ mod tier3_dispatch_tests {
             .unwrap_or_else(|e| panic!("apply kd=da for addr({approver_byte}): {e:?}"));
         }
 
-        // Drafting stage — last_hlc still < 201_000.
+        // Drafting stage at `now_drafting` (wall=150_000 is between
+        // dw (101_000) and dw+fw (201_000) → Drafting).
         assert_eq!(
-            log.tier3_ratification_candidate_count(&pid),
+            log.tier3_ratification_candidate_count(&pid, &now_drafting),
             None,
             "Drafting stage must return None"
         );
@@ -2576,16 +2599,26 @@ mod tier3_dispatch_tests {
         // `drafting_advancers(&t3.candidates, ...)` couldn't find status_quo
         // in the candidate slice.
         assert_eq!(
-            log.tier3_ratification_candidate_count(&pid),
+            log.tier3_ratification_candidate_count(&pid, &now_ratification),
             Some(2),
             "Ratification stage with 1 above-threshold draft must return \
              Some(2) (= 1 draft + status_quo). Pre-fix this was None."
         );
 
+        // The new caller-provided `now` is load-bearing: gating on
+        // `t3.last_hlc` (= 210_000, Ratification) would also have worked
+        // here, but for a poll where no events were applied after
+        // deliberation closed, `last_hlc` would be earlier than the
+        // ratification window and gating on it would incorrectly reject
+        // valid ballots. This `now_ratification` is well past the
+        // deadline (250_000 > 201_000) and represents the HLC the caller
+        // would have just reserved for the new ballot.
+        assert!(now_ratification.wall_ms > 201_000);
+
         // Unknown poll_id returns None.
         let missing_pid = PollId([0xff; 32]);
         assert_eq!(
-            log.tier3_ratification_candidate_count(&missing_pid),
+            log.tier3_ratification_candidate_count(&missing_pid, &now_ratification),
             None,
             "Unknown poll_id must return None"
         );
