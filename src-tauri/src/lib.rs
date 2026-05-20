@@ -21258,6 +21258,218 @@ async fn voting_get_poll(
     Err(format!("voting_get_poll: poll {} not found", poll_id))
 }
 
+// ─── ZEB-310 Phase 4a-main Task 3 — Tier 3 (Sortition + STAR) IPCs ─────────
+
+/// Tauri IPC: create a Tier 3 (Sortition + STAR) governance poll. Returns the
+/// new `PollId` as a hex string (32 bytes → 64 chars).
+///
+/// Pre-flight ordering mirrors `voting_create_tier1_poll`: validate config →
+/// build snapshot → check eligibility (so we don't sign a proposal we can't
+/// participate in) → mint signed event → apply locally → emit
+/// `voting-tier3-poll-created` → chat-fanout a poll-kind chat message into the
+/// host channel so the chat feed can render a `<PollMessage>` card inline.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn voting_create_tier3_proposal<R: tauri::Runtime>(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    app: tauri::AppHandle<R>,
+    community_id: String,
+    channel_id: String,
+    proposal_text: String,
+    sortition_size: u16,
+    deliberation_window_seconds: u32,
+    drafting_window_seconds: u32,
+    ratification_window_seconds: u32,
+    incentive_mode: String,
+    min_power: u8,
+    min_vouching_depth: Option<u8>,
+    retry_of: Option<String>,
+) -> Result<String, String> {
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("voting_create_tier3_proposal: invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "voting_create_tier3_proposal: community_id must be 16 bytes (32 hex chars)".to_string()
+        })?;
+    let space_id = crate::owner_state_types::SpaceId(cid_bytes);
+
+    let chid_bytes: [u8; 16] = hex::decode(&channel_id)
+        .map_err(|e| format!("voting_create_tier3_proposal: invalid channel_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "voting_create_tier3_proposal: channel_id must be 16 bytes (32 hex chars)".to_string()
+        })?;
+    let channel = crate::community_membership::ChannelId(chid_bytes);
+
+    let retry_of_pid: Option<crate::community_voting_core::PollId> = match retry_of {
+        None => None,
+        Some(hex_str) => {
+            let bytes: [u8; 32] = hex::decode(&hex_str)
+                .map_err(|e| format!("voting_create_tier3_proposal: invalid retry_of hex: {e}"))?
+                .as_slice()
+                .try_into()
+                .map_err(|_| {
+                    "voting_create_tier3_proposal: retry_of must be 32 bytes (64 hex chars)"
+                        .to_string()
+                })?;
+            Some(crate::community_voting_core::PollId(bytes))
+        }
+    };
+
+    // Note: `Tier3PollConfigPayload` has no `channel_id` field — the host
+    // channel is carried by the chat-fanout body, not by the on-the-wire
+    // voting payload. `privacy_mode` is hardcoded to "pu" (public) in
+    // Phase 4a-main; "se"/"rf" are reserved for Phase 6/7.
+    let cfg = crate::community_voting_core::Tier3PollConfigPayload {
+        proposal_text,
+        sortition_size,
+        deliberation_window_seconds,
+        drafting_window_seconds,
+        ratification_window_seconds,
+        privacy_mode: "pu".into(),
+        incentive_mode,
+        eligibility: crate::community_voting_core::Eligibility {
+            min_power,
+            min_vouching_depth,
+            sortition_size: Some(sortition_size),
+        },
+        retry_of: retry_of_pid,
+    };
+    crate::community_voting_tier3::validate_tier3_poll_config(&cfg)
+        .map_err(|e| format!("voting_create_tier3_proposal: invalid config: {e:?}"))?;
+
+    let (
+        hlc_tracker,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        crdt_state,
+        voting_logs,
+        channel_log_registry,
+    ) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or("dm_self_owner missing")?,
+            g.community_registry
+                .clone()
+                .ok_or("community_registry missing — node not running?")?,
+            g.dm_outbox
+                .clone()
+                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
+            std::sync::Arc::clone(&g.voting_logs),
+            g.channel_log_registry.clone(),
+        )
+    };
+
+    // Build snapshot + check eligibility BEFORE signing. If we're not
+    // eligible to participate in our own proposal, the UI should surface that
+    // instead of producing an unusable poll.
+    let snapshot =
+        voting_build_snapshot_for_community(crdt_state, community_registry, space_id).await?;
+    crate::community_voting_core::check_eligibility(&snapshot, &self_owner, &cfg.eligibility)
+        .map_err(|e| format!("voting_create_tier3_proposal: creator not eligible: {e:?}"))?;
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+
+    let event = {
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        crate::community_voting_core::build_signed_poll_create_tier3(
+            signing_key,
+            self_owner,
+            &cfg,
+            hlc,
+        )
+        .map_err(|e| format!("voting_create_tier3_proposal: build_signed: {e:?}"))?
+    };
+
+    let poll_id = {
+        let log_arc = {
+            let mut map = voting_logs.lock().await;
+            map.entry(space_id)
+                .or_insert_with(|| {
+                    std::sync::Arc::new(tokio::sync::Mutex::new(
+                        crate::community_voting_log::VotingLog::new(),
+                    ))
+                })
+                .clone()
+        };
+        let mut log = log_arc.lock().await;
+        log.apply_with_snapshot(event, &space_id, Some(snapshot))
+            .map_err(|e| format!("voting_create_tier3_proposal: apply: {e:?}"))?
+    };
+
+    let poll_id_hex = hex::encode(poll_id.0);
+    let payload = VotingTier3PollCreatedPayload {
+        poll_id: poll_id_hex.clone(),
+        channel_id: hex::encode(channel.0),
+        community_id: hex::encode(space_id.0),
+        proposer: hex::encode(self_owner.0),
+        sortition_size,
+        deliberation_window_seconds,
+        drafting_window_seconds,
+        ratification_window_seconds,
+    };
+    if let Err(e) = app.emit("voting-tier3-poll-created", &payload) {
+        // Non-fatal: poll is already in the log; emit is just a UI hint.
+        tracing::warn!(error = %e, "voting-tier3-poll-created emit failed");
+    }
+
+    // Chat-fanout: post a poll-kind chat message into the host channel so the
+    // chat feed can render a `<PollMessage>` card inline at the point in
+    // conversation where the Tier 3 proposal was created. Mirrors the Tier 1
+    // chat-fanout: POLL_BODY_MAGIC byte + 64-char ASCII hex poll_id. Failures
+    // here are non-fatal — the poll is already in the voting log and the
+    // event has fired.
+    if let Some(registry) = channel_log_registry {
+        match registry.engine(&space_id, &channel).await {
+            Some(engine) => {
+                let mut body =
+                    Vec::with_capacity(crate::community_channel_log_engine::POLL_BODY_LEN);
+                body.push(crate::community_channel_log_engine::POLL_BODY_MAGIC);
+                body.extend_from_slice(poll_id_hex.as_bytes());
+                if let Err(e) = engine.publish(body, None).await {
+                    tracing::warn!(
+                        error = %e,
+                        community_id = %hex::encode(space_id.0),
+                        channel_id = %hex::encode(channel.0),
+                        poll_id = %poll_id_hex,
+                        "voting_create_tier3_proposal: poll-kind chat fanout failed (non-fatal)"
+                    );
+                }
+            }
+            None => {
+                tracing::debug!(
+                    community_id = %hex::encode(space_id.0),
+                    channel_id = %hex::encode(channel.0),
+                    "voting_create_tier3_proposal: no channel engine; skipping chat fanout"
+                );
+            }
+        }
+    } else {
+        tracing::debug!(
+            "voting_create_tier3_proposal: channel_log_registry absent; skipping chat fanout"
+        );
+    }
+
+    Ok(poll_id_hex)
+}
+
 // ─── ZEB-291 Phase 2 Task 18 — Tier 2 (Conviction) IPCs ────────────────────
 
 /// Serialize / deserialize `i128` as a decimal JSON string. Required for
@@ -25158,6 +25370,8 @@ pub fn run() {
             voting_cast_tier1_ballot,
             voting_list_active_polls,
             voting_get_poll,
+            // ZEB-310 Phase 4a-main Task 3: Tier 3 (Sortition + STAR) voting IPCs.
+            voting_create_tier3_proposal,
             // ZEB-291 Phase 2 Task 18: Tier 2 (Conviction) voting IPCs.
             voting_create_tier2_proposal,
             voting_signal_tier2,
@@ -25219,6 +25433,8 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         voting_cast_tier1_ballot,
         voting_list_active_polls,
         voting_get_poll,
+        // ZEB-310 Phase 4a-main Task 3: Tier 3 (Sortition + STAR) voting IPCs.
+        voting_create_tier3_proposal,
         // ZEB-291 Phase 2 Task 18: Tier 2 (Conviction) voting IPCs.
         voting_create_tier2_proposal,
         voting_signal_tier2,
