@@ -358,3 +358,104 @@ export interface VotingDelegateSignaledOnYourBehalfPayload {
   delegate: string;
   support: boolean;
 }
+
+// ─── ZEB-310 Phase 4a-main — Tier 3 (Sortition + STAR) frontend types ─
+// Args + event payloads + DTOs for the 6 Tier 3 IPC commands declared in
+// src-tauri/src/lib.rs and the 5 Tier 3 events emitted from the engine
+// post-apply hook (see ZEB-310 Task 12). All event payload structs carry
+// `#[serde(rename_all = "camelCase")]` on the Rust side, so the wire
+// keys are camelCase as written here. Hex string IDs are used in this
+// surface (not `number[]`) because Tier 3 payloads are built ad-hoc via
+// serde_json with the Rust hex helpers — same convention as Tier 2.
+
+/** Args for `createTier3Proposal`. Mirrors the Rust IPC signature 1:1
+ *  (`voting_create_tier3_proposal` in src-tauri/src/lib.rs). */
+export interface CreateTier3ProposalArgs {
+  communityId: string;
+  channelId: string;
+  proposalText: string;
+  sortitionSize: number;
+  deliberationWindowSeconds: number;
+  draftingWindowSeconds: number;
+  ratificationWindowSeconds: number;
+  /** Incentive mode 2-char tag: 'se' (sortition-equal), 'ab' (approval-
+   *  bonus), 'co' (community), 'dp' (decision-power). */
+  incentiveMode: 'se' | 'ab' | 'co' | 'dp';
+  minPower: number;
+  minVouchingDepth?: number;
+  /** Optional prior PollId hex when this proposal retries a failed Tier 3. */
+  retryOf?: string;
+}
+
+/** Payload for `voting-tier3-poll-created` event. */
+export interface VotingTier3PollCreatedPayload {
+  pollId: string;
+  channelId: string;
+  communityId: string;
+  /** 32-char hex `OwnerAddr` of the proposer. */
+  proposer: string;
+  sortitionSize: number;
+  deliberationWindowSeconds: number;
+  draftingWindowSeconds: number;
+  ratificationWindowSeconds: number;
+}
+
+/** Payload for `voting-tier3-sortition-complete` event. Lists the
+ *  selected mini-public (primary) and the backup pool (secondary). */
+export interface VotingTier3SortitionCompletePayload {
+  pollId: string;
+  communityId: string;
+  /** 32-char hex `OwnerAddr` strings — selected mini-public members. */
+  primary: string[];
+  /** 32-char hex `OwnerAddr` strings — backup pool members. */
+  backup: string[];
+}
+
+/** Payload for `voting-tier3-drafting-open` event. */
+export interface VotingTier3DraftingOpenPayload {
+  pollId: string;
+  communityId: string;
+}
+
+/** One draft candidate in the ratification ordering. Embedded in
+ *  `VotingTier3RatificationOpenPayload.candidateOrdering`. */
+export interface CandidateRef {
+  /** 64-char hex of the 32-byte event hash of the kd=dc candidate event. */
+  eventHash: string;
+  text: string;
+  approvalCount: number;
+}
+
+/** Payload for `voting-tier3-ratification-open` event. Carries the
+ *  canonical candidate ordering (ratifiers score by index into this
+ *  list, so order MUST be deterministic across peers). */
+export interface VotingTier3RatificationOpenPayload {
+  pollId: string;
+  communityId: string;
+  candidateOrdering: CandidateRef[];
+}
+
+/** Per-candidate score summary in `VotingTier3FinalizedPayload`. */
+export interface CandidateScore {
+  /** 64-char hex of the 32-byte event hash of the kd=dc candidate event. */
+  eventHash: string;
+  /** Sum of all STAR scores (0..=5) cast for this candidate across all
+   *  ratification ballots. */
+  totalScore: number;
+  /** Number of runoff ballots this candidate received (STAR runoff
+   *  phase between the two top scorers). */
+  runoffVotes: number;
+}
+
+/** Payload for `voting-tier3-finalized` event. */
+export interface VotingTier3FinalizedPayload {
+  pollId: string;
+  communityId: string;
+  /** 64-char hex of the winning candidate's kd=dc event hash. */
+  winnerEventHash: string;
+  winnerText: string;
+  /** Runner-up event hash when present (STAR always identifies a
+   *  runoff opponent unless there's only one candidate). */
+  runnerUpEventHash?: string;
+  scoresSummary: CandidateScore[];
+}
