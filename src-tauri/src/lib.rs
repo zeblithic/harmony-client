@@ -24110,26 +24110,16 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
             })?;
     }
 
-    // Cluster 5 fix (CodeAnt incomplete-implementation MAJOR, R1 bot review):
-    // dispatch beacon callbacks for the AGGREGATING node. The inbound path
-    // (`process_inbound`) dispatches callbacks after applying a peer's VrfBeacon
-    // event, but the aggregating node applied the beacon locally via
-    // `apply_with_identity` above, bypassing `process_inbound`. Without this
-    // dispatch, the VotingLogEngine on the aggregating node never receives the
-    // beacon notification → never publishes kd=ss → Tier 3 polls stall.
+    // T8: broadcast the vb aggregate event BEFORE dispatching local beacon
+    // callbacks (Cluster F fix, R2 bot review — vb→ss ordering race).
     //
-    // Dispatch AFTER the log lock is released (above) so beacon callbacks
-    // can safely re-acquire locks without deadlocking.
-    if let Some(registry) = dfrost_log_registry.as_ref() {
-        registry
-            .dispatch_beacon_callbacks(&vb_payload, &space_id)
-            .await;
-    }
-
-    // T8: broadcast the vb aggregate event (best-effort; local apply
-    // already succeeded). Lock ordering: this runs OUTSIDE the log lock
-    // scope above. Failure here logs + continues so the beacon-ready UI
-    // event below still emits.
+    // Ordering rationale: `dispatch_beacon_callbacks` triggers VotingLogEngine
+    // to publish kd=ss referencing this vb beacon. Peers must receive kd=vb
+    // before kd=ss so they can verify the sortition; if we dispatch callbacks
+    // first the aggregating node publishes kd=ss before peers have the beacon.
+    //
+    // Broadcast is best-effort (local apply already succeeded). Lock ordering:
+    // this runs OUTSIDE the log lock scope above.
     match dfrost_log_registry.as_ref() {
         Some(registry) => match registry.get(space_id).await {
             Some(engine) => {
@@ -24157,6 +24147,23 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
                  dfrost_log_registry is None — broadcast skipped (test context?)",
             );
         }
+    }
+
+    // Cluster 5 fix (CodeAnt incomplete-implementation MAJOR, R1 bot review):
+    // dispatch beacon callbacks for the AGGREGATING node. The inbound path
+    // (`process_inbound`) dispatches callbacks after applying a peer's VrfBeacon
+    // event, but the aggregating node applied the beacon locally via
+    // `apply_with_identity` above, bypassing `process_inbound`. Without this
+    // dispatch, the VotingLogEngine on the aggregating node never receives the
+    // beacon notification → never publishes kd=ss → Tier 3 polls stall.
+    //
+    // Dispatch AFTER the T8 broadcast (above) so peers receive kd=vb before
+    // the aggregating node publishes kd=ss via beacon callbacks. Also dispatches
+    // AFTER the log lock is released so callbacks can safely re-acquire locks.
+    if let Some(registry) = dfrost_log_registry.as_ref() {
+        registry
+            .dispatch_beacon_callbacks(&vb_payload, &space_id)
+            .await;
     }
 
     let evt = DfrostBeaconReadyPayload {

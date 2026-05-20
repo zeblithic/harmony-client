@@ -1599,6 +1599,102 @@ mod tests {
         );
     }
 
+    /// Cluster F regression (R2 bot review — vb→ss ordering race):
+    /// `publish_event` (T8 broadcast) MUST be called and its tracker record
+    /// committed BEFORE `dispatch_beacon_callbacks` fires any callbacks.
+    ///
+    /// If the order is reversed, beacon callbacks (which trigger kd=ss
+    /// publish) fire before peers receive kd=vb — peers see kd=ss
+    /// referencing a beacon they haven't applied yet and reject it.
+    ///
+    /// Observable: after calling `publish_event`, a packet is enqueued on
+    /// `pub_rx`. In the callback we `try_recv()` — a packet present means
+    /// T8 already ran; absent means the order was reversed.
+    #[tokio::test]
+    async fn t8_broadcast_happens_before_beacon_callbacks() {
+        use crate::community_dfrost_types::VrfBeaconPayload;
+        use crate::owner_state_types::SpaceId;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::sync::mpsc;
+
+        let community_id = SpaceId([0xF6; 16]);
+
+        // Build a minimal engine so `publish_event` is callable.
+        let (pub_tx, pub_rx) = mpsc::channel::<Vec<u8>>(8);
+        let pub_rx_shared = Arc::new(tokio::sync::Mutex::new(pub_rx));
+        let (_sub_tx, sub_rx) = mpsc::channel::<Vec<u8>>(8);
+        let log = Arc::new(tokio::sync::Mutex::new(
+            crate::community_dfrost_log::DfrostLog::new(),
+        ));
+        let resolver: Arc<dyn IdentityResolver + Send + Sync> =
+            Arc::new(StaticResolver(HashMap::new()));
+        let app = tauri::test::mock_app();
+
+        let reg = Arc::new(DfrostLogRegistry::<tauri::test::MockRuntime>::new());
+        DfrostLogRegistry::register(
+            &reg,
+            DfrostLogEngineParams {
+                community_id,
+                dfrost_log: log,
+                publisher_tx: pub_tx,
+                subscriber_rx: sub_rx,
+                app_handle: app.handle().clone(),
+                self_addr: OwnerAddr([0u8; 16]),
+                self_x25519_priv: [0u8; 32],
+                identity_resolver: resolver,
+                registry_weak: None,
+            },
+        )
+        .await;
+
+        let engine = reg
+            .get(community_id)
+            .await
+            .expect("engine registered");
+
+        // Build a minimal VrfBeacon event — payload bytes don't need to be
+        // valid CBOR for this test; publish_event only CBOR-encodes the
+        // outer `SignedCommitteeEvent` envelope, not the payload field.
+        let vb_event = test_event(OwnerAddr([0xF6; 16]), 1_000, 0);
+        let vb_payload = VrfBeaconPayload {
+            ceremony_id: [0u8; 32],
+            message_hash: [0u8; 32],
+            signature: vec![0u8; 64],
+            vrf_output: [0u8; 32],
+        };
+
+        // Assertion flag: the callback must see a broadcast packet on
+        // `pub_rx` — proving T8 ran before the callback fired.
+        let broadcast_seen_in_callback = Arc::new(AtomicBool::new(false));
+        let flag_clone = Arc::clone(&broadcast_seen_in_callback);
+        let pub_rx_clone = Arc::clone(&pub_rx_shared);
+
+        reg.subscribe_beacons(move |_payload, _cid| {
+            // Non-blocking peek: if the packet is already queued, T8 ran first.
+            let mut rx = pub_rx_clone.try_lock().expect("pub_rx not contended in callback");
+            flag_clone.store(rx.try_recv().is_ok(), Ordering::SeqCst);
+        })
+        .await;
+
+        // ── The ordering under test ──────────────────────────────────────────
+        // T8 broadcast FIRST (enqueues packet on pub_rx).
+        engine
+            .publish_event(vb_event)
+            .await
+            .expect("publish_event succeeds");
+
+        // Callbacks SECOND — the closure should now see the packet already queued.
+        reg.dispatch_beacon_callbacks(&vb_payload, &community_id)
+            .await;
+
+        assert!(
+            broadcast_seen_in_callback.load(Ordering::SeqCst),
+            "Cluster F regression: publish_event (T8 broadcast) must complete \
+             before dispatch_beacon_callbacks fires. If this fails, the ordering \
+             in dfrost_contribute_threshold_sign has regressed."
+        );
+    }
+
     /// DfrostBeaconOracle returns None when no engine is registered for the community.
     #[tokio::test]
     async fn dfrost_beacon_oracle_returns_none_when_no_engine_registered() {
