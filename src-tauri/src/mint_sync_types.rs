@@ -12,6 +12,8 @@ pub struct MintSnapshot {
     pub accounts: Vec<AccountRow>,
     pub transactions: Vec<TransactionRow>,
     pub settings: Vec<SettingRow>,
+    /// ISO 8601 snapshot timestamp. Debugging/observability only — NOT used in
+    /// merge logic. Per-row LWW uses each row's own `updated_at`.
     pub captured_at: String,
 }
 
@@ -130,7 +132,7 @@ mod tests {
         let mut bytes = Vec::new();
         into_writer(&row, &mut bytes).unwrap();
         let decoded: TransactionRow = from_reader(&bytes[..]).unwrap();
-        assert_eq!(row.deleted_at, decoded.deleted_at);
+        assert_eq!(row, decoded);
     }
 
     #[test]
