@@ -180,7 +180,7 @@ fn export_csv_round_trips_via_csv_reader() {
     let tmpdir = tempfile::tempdir().unwrap();
     let csv_path = tmpdir.path().join("export.csv");
 
-    let summary = export_csv(&conn, &csv_path, None, None).unwrap();
+    let summary = export_csv(&conn, &csv_path, None, None, None).unwrap();
     assert_eq!(summary.rows_written, 50, "should have written 50 data rows");
     assert!(summary.byte_size > 0, "file should be non-empty");
 
@@ -229,7 +229,7 @@ fn export_csv_escapes_special_characters() {
     let tmpdir = tempfile::tempdir().unwrap();
     let csv_path = tmpdir.path().join("escape_test.csv");
 
-    let summary = export_csv(&conn, &csv_path, None, None).unwrap();
+    let summary = export_csv(&conn, &csv_path, None, None, None).unwrap();
     assert_eq!(summary.rows_written, 1);
 
     // Re-read and verify the special characters round-trip byte-exactly.
@@ -273,7 +273,14 @@ fn export_csv_respects_date_filter() {
     let csv_path = tmpdir.path().join("date_filter.csv");
 
     // Export only 2026-05-15 through 2026-05-17 (inclusive).
-    let summary = export_csv(&conn, &csv_path, Some("2026-05-15"), Some("2026-05-17")).unwrap();
+    let summary = export_csv(
+        &conn,
+        &csv_path,
+        Some("2026-05-15"),
+        Some("2026-05-17"),
+        None,
+    )
+    .unwrap();
     assert_eq!(
         summary.rows_written, 3,
         "date filter should include exactly 3 rows (May 15, 16, 17)"
@@ -300,7 +307,7 @@ fn export_csv_empty_ledger() {
     let tmpdir = tempfile::tempdir().unwrap();
     let csv_path = tmpdir.path().join("empty.csv");
 
-    let summary = export_csv(&conn, &csv_path, None, None).unwrap();
+    let summary = export_csv(&conn, &csv_path, None, None, None).unwrap();
     assert_eq!(summary.rows_written, 0, "no data rows expected");
     assert!(
         summary.byte_size > 0,
@@ -352,7 +359,7 @@ fn export_csv_no_partial_file_on_unwritable_path() {
     // sibling remains in the parent directory after a successful export.
     let tmpdir = tempfile::tempdir().unwrap();
     let out = tmpdir.path().join("nested").join("export.csv");
-    let summary = export_csv(&conn, &out, None, None).unwrap();
+    let summary = export_csv(&conn, &out, None, None, None).unwrap();
     assert_eq!(summary.rows_written, 1);
     assert!(out.exists());
 
@@ -368,5 +375,69 @@ fn export_csv_no_partial_file_on_unwritable_path() {
         leftover.is_empty(),
         "stray tempfile left behind: {:?}",
         leftover.iter().map(|e| e.path()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn export_csv_respects_account_filter() {
+    let conn = fresh_in_memory_db();
+
+    // Create two accounts.
+    let acc_a = create_account(&conn, "Account A").unwrap();
+    let acc_b = create_account(&conn, "Account B").unwrap();
+
+    // Create 3 transactions on account A and 2 on account B.
+    for i in 1u32..=3 {
+        create_transaction(
+            &conn,
+            NewTransaction {
+                transaction_date: format!("2026-05-{i:02}"),
+                amount: format!("-{i}.00"),
+                currency: "USD".into(),
+                account_id: acc_a.id.clone(),
+                description: format!("A tx {i}"),
+                metadata: None,
+            },
+        )
+        .unwrap();
+    }
+    for i in 4u32..=5 {
+        create_transaction(
+            &conn,
+            NewTransaction {
+                transaction_date: format!("2026-05-{i:02}"),
+                amount: format!("-{i}.00"),
+                currency: "USD".into(),
+                account_id: acc_b.id.clone(),
+                description: format!("B tx {i}"),
+                metadata: None,
+            },
+        )
+        .unwrap();
+    }
+
+    let tmpdir = tempfile::tempdir().unwrap();
+
+    // Export filtered to account A only — expect exactly 3 rows.
+    let path_a = tmpdir.path().join("account_a.csv");
+    let summary_a = export_csv(&conn, &path_a, None, None, Some(&acc_a.id)).unwrap();
+    assert_eq!(
+        summary_a.rows_written, 3,
+        "account A filter should yield 3 rows"
+    );
+
+    let mut reader_a = csv::Reader::from_path(&path_a).unwrap();
+    let rows_a: Vec<_> = reader_a.records().collect::<Result<_, _>>().unwrap();
+    assert_eq!(rows_a.len(), 3);
+    for r in &rows_a {
+        assert_eq!(&r[1], "Account A", "all rows must belong to Account A");
+    }
+
+    // Export with no account filter — expect all 5 rows.
+    let path_all = tmpdir.path().join("all.csv");
+    let summary_all = export_csv(&conn, &path_all, None, None, None).unwrap();
+    assert_eq!(
+        summary_all.rows_written, 5,
+        "unfiltered export should yield all 5 rows"
     );
 }

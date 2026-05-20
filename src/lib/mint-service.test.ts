@@ -164,6 +164,7 @@ describe('MintService', () => {
         outputPath: '/tmp/o.csv',
         dateFrom: null,
         dateTo: null,
+        accountId: null,
       });
     });
 
@@ -176,6 +177,20 @@ describe('MintService', () => {
         outputPath: '/tmp/o.csv',
         dateFrom: '2026-05-01',
         dateTo: '2026-05-31',
+        accountId: null,
+      });
+    });
+
+    it('exportCsv passes accountId when provided', async () => {
+      const { adapter: a } = createMockAdapter();
+      (a.invoke as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ rowsWritten: 0, outputPath: '/tmp/x.csv', byteSize: 50 });
+      const svc = new MintService(a);
+      await svc.exportCsv('/tmp/x.csv', { accountId: 'acc-7' });
+      expect(a.invoke).toHaveBeenCalledWith('mint_export_csv', {
+        outputPath: '/tmp/x.csv',
+        dateFrom: null,
+        dateTo: null,
+        accountId: 'acc-7',
       });
     });
   });

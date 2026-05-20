@@ -71,12 +71,13 @@ export class MintService {
 
   async exportCsv(
     outputPath: string,
-    filter: { dateFrom?: string; dateTo?: string } = {}
+    filter: { dateFrom?: string; dateTo?: string; accountId?: string } = {}
   ): Promise<ExportSummary> {
     return (await this.adapter.invoke('mint_export_csv', {
       outputPath,
       dateFrom: filter.dateFrom ?? null,
       dateTo: filter.dateTo ?? null,
+      accountId: filter.accountId ?? null,
     })) as ExportSummary;
   }
 }
