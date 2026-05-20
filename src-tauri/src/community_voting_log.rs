@@ -455,6 +455,18 @@ impl VotingLog {
                 // must exist and be in Stage::Failed. Predecessor may be in this
                 // log (local) or will be wired in Task 12 (peer-received path).
                 // For Phase 4a-main we validate against the local log only.
+                //
+                // TODO(ZEB-309 Phase 4b): out-of-order arrival — if the retry
+                // event arrives before its predecessor (e.g. gossip reorder), the
+                // apply currently returns `RetryOfPollNotFound` and the event is
+                // permanently lost. The correct fix is a pending-retries map:
+                //   `pending_retries: HashMap<PollId, Vec<VotingEvent>>` keyed by
+                //   `retry_of` predecessor id. When a poll reaches Stage::Failed,
+                //   drain any pending retries for it and re-apply in HLC order.
+                // Phase 4a conservative stance: Phase 4a topology is single-node
+                // (no peer gossip yet); the predecessor always lands first via the
+                // initiating node. Peer-received ordering becomes relevant when
+                // Task 12 (peer-received path) is wired in Phase 4b.
                 if let Some(prev_id) = cfg.retry_of {
                     let prev_state = self
                         .polls
@@ -1941,7 +1953,63 @@ mod tier3_dispatch_tests {
         );
     }
 
-    // ── Test 12: Cluster 3 regression — eligibility filter in electorate snapshot ──
+    // ── Test 12 (Cluster G): retry_of out-of-order arrival — known limitation ──
+    //
+    // Verifies the current behaviour (RetryOfPollNotFound) and pins it so
+    // any future implementation of the pending-retries map (see TODO in
+    // apply) knows exactly what to change.
+
+    #[test]
+    fn dispatch_retry_of_out_of_order_arrival_returns_not_found() {
+        // Both the predecessor poll and the retry poll are built upfront.
+        // We apply the RETRY before the PREDECESSOR to simulate an out-of-order
+        // gossip delivery. The current Phase 4a implementation returns
+        // RetryOfPollNotFound because the predecessor is not yet in the log.
+        //
+        // TODO(ZEB-309 Phase 4b): when the pending-retries map is added, this
+        // test should be updated: the retry must pend until the predecessor
+        // arrives as Stage::Failed, then apply cleanly.
+        let mut log = VotingLog::new();
+        let creator = addr(0xaa);
+        let c = cid();
+
+        // Build the predecessor poll (not yet applied to the log).
+        let pred_cfg = tier3_config();
+        let pred_ev = tier3_create_event(creator, &pred_cfg);
+        // Derive the predecessor poll_id using the same derivation apply uses:
+        // sha256(community_id || signing_bytes).
+        let pred_signing = pred_ev
+            .signing_bytes()
+            .expect("signing_bytes for pred_ev");
+        let pred_poll_id =
+            crate::community_voting_core::derive_poll_id(&c, &pred_signing);
+
+        // Build the retry poll referencing the not-yet-applied predecessor.
+        let mut retry_cfg = tier3_config();
+        retry_cfg.retry_of = Some(pred_poll_id);
+        let retry_ev = SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::PollCreate,
+            hlc: hlc(2000),
+            actor: creator,
+            payload: encode(&retry_cfg),
+            sig: vec![0u8; 64],
+        };
+
+        // Apply retry FIRST — predecessor not yet in log → RetryOfPollNotFound.
+        let err = log
+            .apply(retry_ev, &c)
+            .expect_err("retry before predecessor must fail");
+        assert_eq!(
+            err,
+            ApplyError::RetryOfPollNotFound,
+            "out-of-order retry must return RetryOfPollNotFound (Phase 4a limitation)"
+        );
+    }
+
+    // ── Test 13: Cluster 3 regression — eligibility filter in electorate snapshot ──
 
     #[test]
     fn dispatch_tier3_electorate_snapshot_filters_ineligible_members() {
