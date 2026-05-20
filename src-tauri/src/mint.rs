@@ -80,7 +80,7 @@ pub fn open_in_memory() -> Result<Connection, MintError> {
 /// can be called on every app start without error.  The `accounts` table
 /// includes a `UNIQUE(name)` constraint; we are pre-launch so all test
 /// databases are in-memory and no on-disk migration is required.
-pub(crate) fn apply_migrations(conn: &Connection) -> Result<(), MintError> {
+pub fn apply_migrations(conn: &Connection) -> Result<(), MintError> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS accounts (
@@ -114,6 +114,50 @@ pub(crate) fn apply_migrations(conn: &Connection) -> Result<(), MintError> {
         "INSERT OR IGNORE INTO settings (key, value) VALUES (?, 'USD')",
         params![DEFAULT_CURRENCY_KEY],
     )?;
+
+    // --- Schema v2 (Phase 2 sync) ---
+    //
+    // `let _ = conn.execute("ALTER TABLE ...")` swallows the "column already
+    // exists" error that SQLite fires on every run after the first. This is
+    // the idempotency idiom for ADD COLUMN — do NOT replace `let _ =` with
+    // `?`. The subsequent CREATE INDEX IF NOT EXISTS and UPDATE statements are
+    // safe to chain with `?` because they are inherently idempotent.
+
+    // transactions.deleted_at — tombstone column for soft-delete.
+    let _ = conn.execute(
+        "ALTER TABLE transactions ADD COLUMN deleted_at TEXT NULL",
+        [],
+    );
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tx_deleted_at ON transactions(deleted_at)",
+        [],
+    )?;
+
+    // accounts.updated_at — backfilled from created_at for legacy rows.
+    let _ = conn.execute(
+        "ALTER TABLE accounts ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    conn.execute(
+        "UPDATE accounts SET updated_at = created_at WHERE updated_at = ''",
+        [],
+    )?;
+
+    // settings.updated_at — backfilled to epoch for legacy rows.
+    // Use epoch (1970-01-01T00:00:00Z) rather than wall-clock now() so that
+    // any explicit user change (which always carries chrono::Utc::now()) wins
+    // unconditionally in LWW merge. Per-device wall-clock backfill was causing
+    // a peer whose migration ran later (T_B > T_A) to silently revert another
+    // peer's earlier intentional edit (T_A) on next sync.
+    let _ = conn.execute(
+        "ALTER TABLE settings ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    conn.execute(
+        "UPDATE settings SET updated_at = '1970-01-01T00:00:00Z' WHERE updated_at = ''",
+        [],
+    )?;
+
     Ok(())
 }
 
@@ -138,9 +182,11 @@ pub fn get_default_currency(conn: &Connection) -> Result<Option<String>, MintErr
 /// `MintError::Validation` on failure.
 pub fn set_default_currency(conn: &Connection, currency: &str) -> Result<(), MintError> {
     validate_currency(currency)?;
+    let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
-        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-        params![DEFAULT_CURRENCY_KEY, currency],
+        "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        rusqlite::params![DEFAULT_CURRENCY_KEY, currency, now],
     )?;
     Ok(())
 }
@@ -185,16 +231,16 @@ pub struct Account {
 pub fn create_account(conn: &Connection, name: &str) -> Result<Account, MintError> {
     let trimmed_name = validate_account_name(name)?;
     let id = uuid::Uuid::new_v4().to_string();
-    let created_at = chrono::Utc::now().to_rfc3339();
+    let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
-        "INSERT INTO accounts (id, name, created_at) VALUES (?, ?, ?)",
-        params![id, trimmed_name, created_at],
+        "INSERT INTO accounts (id, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
+        rusqlite::params![id, trimmed_name, now],
     )
     .map_err(map_account_name_constraint)?;
     Ok(Account {
         id,
         name: trimmed_name,
-        created_at,
+        created_at: now,
         transaction_count: 0,
     })
 }
@@ -205,7 +251,7 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>, MintError> {
     let mut stmt = conn.prepare(
         "SELECT a.id, a.name, a.created_at, COUNT(t.id) AS tx_count
          FROM accounts a
-         LEFT JOIN transactions t ON t.account_id = a.id
+         LEFT JOIN transactions t ON t.account_id = a.id AND t.deleted_at IS NULL
          GROUP BY a.id, a.name, a.created_at
          ORDER BY a.name COLLATE NOCASE",
     )?;
@@ -229,10 +275,11 @@ pub fn list_accounts(conn: &Connection) -> Result<Vec<Account>, MintError> {
 /// taken by another account.
 pub fn rename_account(conn: &Connection, id: &str, new_name: &str) -> Result<Account, MintError> {
     let trimmed_name = validate_account_name(new_name)?;
+    let now = chrono::Utc::now().to_rfc3339();
     let affected = conn
         .execute(
-            "UPDATE accounts SET name = ? WHERE id = ?",
-            params![trimmed_name, id],
+            "UPDATE accounts SET name = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![trimmed_name, now, id],
         )
         .map_err(map_account_name_constraint)?;
     if affected == 0 {
@@ -259,6 +306,13 @@ pub fn delete_account(
     // `unchecked_transaction` is correct here: `conn` is a `&Connection`
     // already obtained from the `Mutex<Connection>` guard, so we know we
     // are the sole user of this connection.
+    //
+    // NOTE: the caller (mint_delete_account IPC handler) is responsible for
+    // inserting the deletion-floor entry and persisting it to disk BEFORE
+    // calling this function. This ordering ensures that a crash between floor
+    // persist and SQLite commit leaves a "phantom" floor entry (minor
+    // inconvenience) rather than a committed SQLite delete with no floor entry
+    // (zombie resurrection risk).
     let tx = conn.unchecked_transaction()?;
 
     // ── Validate first, before any mutation ───────────────────────────────────
@@ -292,7 +346,7 @@ pub fn delete_account(
 
     if reassign_to.is_none() {
         let count: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM transactions WHERE account_id = ?",
+            "SELECT COUNT(*) FROM transactions WHERE account_id = ? AND deleted_at IS NULL",
             params![id],
             |r| r.get(0),
         )?;
@@ -315,6 +369,7 @@ pub fn delete_account(
     tx.execute("DELETE FROM accounts WHERE id = ?", params![id])?;
 
     tx.commit()?;
+
     Ok(())
 }
 
@@ -485,9 +540,13 @@ fn validate_metadata(s: &str) -> Result<(), MintError> {
 /// account_id, account_name (from JOIN), description, metadata,
 /// created_at, updated_at — matching the `Transaction` struct field
 /// order.
+/// Base SELECT + FROM + JOIN for all transaction reads. Always includes the
+/// soft-delete filter so no caller can accidentally surface tombstoned rows.
+/// Additional predicates must be appended with `AND` (not a second `WHERE`).
 const TRANSACTION_SELECT: &str = "SELECT t.id, t.transaction_date, t.amount, t.currency, \
     t.account_id, a.name, t.description, t.metadata, t.created_at, t.updated_at \
-    FROM transactions t JOIN accounts a ON a.id = t.account_id";
+    FROM transactions t JOIN accounts a ON a.id = t.account_id \
+    WHERE t.deleted_at IS NULL";
 
 fn map_transaction_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Transaction> {
     Ok(Transaction {
@@ -556,8 +615,9 @@ pub fn create_transaction(
 }
 
 /// Return the transaction with the given `id`, or `None` if no such row exists.
+/// Soft-deleted rows are excluded.
 pub fn get_transaction(conn: &Connection, id: &str) -> Result<Option<Transaction>, MintError> {
-    let sql = format!("{TRANSACTION_SELECT} WHERE t.id = ?");
+    let sql = format!("{TRANSACTION_SELECT} AND t.id = ?");
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query(params![id])?;
     if let Some(row) = rows.next()? {
@@ -594,13 +654,14 @@ pub fn list_transactions(
         params_vec.push(Box::new(a.clone()));
     }
 
-    let where_clause = if conditions.is_empty() {
+    // TRANSACTION_SELECT already contains `WHERE t.deleted_at IS NULL`.
+    // Additional conditions are appended with `AND`.
+    let extra = if conditions.is_empty() {
         String::new()
     } else {
-        format!("WHERE {}", conditions.join(" AND "))
+        format!("AND {}", conditions.join(" AND "))
     };
-    let sql =
-        format!("{TRANSACTION_SELECT} {where_clause} ORDER BY t.transaction_date DESC, t.id DESC");
+    let sql = format!("{TRANSACTION_SELECT} {extra} ORDER BY t.transaction_date DESC, t.id DESC");
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
@@ -680,10 +741,14 @@ pub fn update_transaction(
     sets.push("updated_at = ?");
     let now = chrono::Utc::now().to_rfc3339();
     params_vec.push(Box::new(now));
-    // WHERE id = ? — must come last.
+    // WHERE id = ? AND deleted_at IS NULL — must come last.
+    // Exclude tombstoned rows: a soft-deleted transaction is not updatable.
     params_vec.push(Box::new(id.to_string()));
 
-    let sql = format!("UPDATE transactions SET {} WHERE id = ?", sets.join(", "));
+    let sql = format!(
+        "UPDATE transactions SET {} WHERE id = ? AND deleted_at IS NULL",
+        sets.join(", ")
+    );
     let affected = conn.execute(
         &sql,
         rusqlite::params_from_iter(params_vec.iter().map(|b| b.as_ref())),
@@ -697,13 +762,34 @@ pub fn update_transaction(
         .ok_or_else(|| MintError::Other("transaction vanished between update and read".into()))
 }
 
-/// Delete a transaction by id.
+/// Soft-delete a transaction by id.
 ///
-/// Returns `MintError::NotFound` if no row was deleted.
+/// Sets `deleted_at` and bumps `updated_at` to the current UTC time.
+/// If the row is already tombstoned the call is a no-op (original
+/// `deleted_at` timestamp is preserved — idempotent).
+/// Returns `MintError::NotFound` if the row never existed.
 pub fn delete_transaction(conn: &Connection, id: &str) -> Result<(), MintError> {
-    let affected = conn.execute("DELETE FROM transactions WHERE id = ?", params![id])?;
-    if affected == 0 {
-        return Err(MintError::NotFound("transaction not found".into()));
+    let now = chrono::Utc::now().to_rfc3339();
+    let rows = conn.execute(
+        "UPDATE transactions SET deleted_at = ?1, updated_at = ?2 WHERE id = ?3 AND deleted_at IS NULL",
+        rusqlite::params![now, now, id],
+    )?;
+    if rows == 0 {
+        // Either the row doesn't exist or it's already tombstoned; both are OK
+        // from the caller's perspective. Distinguish so we can return NotFound
+        // for the "never existed" case (matches v1 hard-delete semantics for
+        // missing rows).
+        // No TOCTOU concern in practice: Mint is single-writer and UUIDs are not reused.
+        let exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM transactions WHERE id = ?",
+            [id],
+            |r| r.get(0),
+        )?;
+        if exists == 0 {
+            return Err(MintError::NotFound(format!("transaction {id}")));
+        }
+        // Already tombstoned: no-op success — preserves the original
+        // deleted_at timestamp.
     }
     Ok(())
 }
@@ -774,7 +860,8 @@ pub fn export_csv(
         let sql = "SELECT t.transaction_date, a.name, t.amount, t.currency, \
             t.description, COALESCE(t.metadata, '') \
             FROM transactions t JOIN accounts a ON a.id = t.account_id \
-            WHERE (?1 IS NULL OR t.transaction_date >= ?1) \
+            WHERE t.deleted_at IS NULL \
+              AND (?1 IS NULL OR t.transaction_date >= ?1) \
               AND (?2 IS NULL OR t.transaction_date <= ?2) \
               AND (?3 IS NULL OR t.account_id = ?3) \
             ORDER BY t.transaction_date ASC, t.id ASC";
@@ -822,7 +909,7 @@ fn get_account_by_id(conn: &Connection, id: &str) -> Result<Option<Account>, Min
     let mut stmt = conn.prepare(
         "SELECT a.id, a.name, a.created_at, COUNT(t.id)
          FROM accounts a
-         LEFT JOIN transactions t ON t.account_id = a.id
+         LEFT JOIN transactions t ON t.account_id = a.id AND t.deleted_at IS NULL
          WHERE a.id = ?
          GROUP BY a.id, a.name, a.created_at",
     )?;
@@ -842,6 +929,16 @@ fn get_account_by_id(conn: &Connection, id: &str) -> Result<Option<Account>, Min
 // ── Tauri command layer ──────────────────────────────────────────────────────
 //
 // All commands wrap their sync rusqlite work in tokio::task::spawn_blocking
+
+/// Extract the mint sync engine handle (if running) and call `notify_dirty()`.
+/// Non-blocking — the debounce window coalesces rapid mutation bursts.
+fn notify_mint_dirty(state: &tauri::State<'_, std::sync::Mutex<crate::NodeState>>) {
+    if let Ok(guard) = state.lock() {
+        if let Some(engine) = guard.mint_sync.as_ref() {
+            engine.notify_dirty();
+        }
+    }
+}
 // so the tokio executor never blocks on file I/O. The `std::sync::Mutex` on
 // the connection is correct (not tokio::sync::Mutex) because the lock is
 // only held inside the spawn_blocking closure, never across an .await.
@@ -873,12 +970,14 @@ pub async fn mint_create_account(
     state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
 ) -> Result<Account, String> {
     let conn = crate::mint_db_handle(&app, &state)?;
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         let conn = conn.lock().expect("mint_db lock poisoned");
         create_account(&conn, &name).map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("join error: {e}"))?
+    .map_err(|e| format!("join error: {e}"))??;
+    notify_mint_dirty(&state);
+    Ok(result)
 }
 
 #[tauri::command]
@@ -889,14 +988,26 @@ pub async fn mint_rename_account(
     state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
 ) -> Result<Account, String> {
     let conn = crate::mint_db_handle(&app, &state)?;
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         let conn = conn.lock().expect("mint_db lock poisoned");
         rename_account(&conn, &id, &name).map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("join error: {e}"))?
+    .map_err(|e| format!("join error: {e}"))??;
+    notify_mint_dirty(&state);
+    Ok(result)
 }
 
+/// Delete an account from the mint ledger.
+///
+/// **Constraint:** the mint sync engine must already be initialized (i.e.
+/// identity bootstrap must have completed) before this command is called.
+/// This is a deliberate safety requirement: the deletion floor entry must be
+/// persisted to disk before the SQLite delete is committed (crash-safety
+/// ordering). If the engine is absent there is no durable floor path, so we
+/// refuse the delete rather than risk zombie resurrection. Returning an error
+/// here lets the UI surface the constraint clearly and retry once identity
+/// bootstrap has finished (typically < 500 ms after node start).
 #[tauri::command]
 pub async fn mint_delete_account(
     id: String,
@@ -904,13 +1015,72 @@ pub async fn mint_delete_account(
     app: tauri::AppHandle,
     state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
 ) -> Result<(), String> {
+    // Extract the sync_state handle + persist path from the engine — required;
+    // we do NOT fall back to a temporary floor when the engine is absent (see
+    // the doc-comment above the command).
+    let (sync_state_handle, sync_state_path_opt) = {
+        let node = state.lock().expect("NodeState poisoned");
+        match node.mint_sync.as_ref() {
+            Some(e) => (
+                e.sync_state_handle(),
+                e.sync_state_path().map(|p| p.to_path_buf()),
+            ),
+            None => {
+                return Err(
+                    "mint sync engine not yet initialized — cannot delete account safely \
+                     (deletion floor would be lost). Retry after identity bootstrap completes."
+                        .to_string(),
+                );
+            }
+        }
+    };
     let conn = crate::mint_db_handle(&app, &state)?;
     tokio::task::spawn_blocking(move || {
         let conn = conn.lock().expect("mint_db lock poisoned");
-        delete_account(&conn, &id, reassign_to.as_deref()).map_err(|e| e.to_string())
+        let mut st = sync_state_handle.blocking_lock();
+
+        // ── Ordering matters for crash-safety ─────────────────────────────────
+        // 1. Insert floor entry in memory.
+        // 2. Persist floor to disk.
+        // 3. Commit SQLite delete.
+        //
+        // A crash between steps 2 and 3 leaves a "phantom" floor entry for an
+        // account that's still present locally. That's minor: the account
+        // remains usable and a subsequent delete attempt will succeed normally.
+        //
+        // The previous order (SQLite commit FIRST, then floor insert) had the
+        // opposite risk: a crash left the SQLite delete committed but the floor
+        // empty — on next sync, a peer that still held the account would replay
+        // it (zombie resurrection). This ordering eliminates that risk entirely.
+        let now = chrono::Utc::now().to_rfc3339();
+        st.account_deletion_floor.insert(id.clone(), now);
+
+        if let Some(ref path) = sync_state_path_opt {
+            let st_snap = st.clone();
+            if let Err(e) = crate::mint_sync_persist::save(path, &st_snap) {
+                // Floor persist failed. Abort — do NOT proceed with the SQLite
+                // delete, because if we did and then crashed, the floor entry
+                // would vanish on restart (the in-memory insert is not durable
+                // without the persist). Rolling back the in-memory insert and
+                // returning an error is the safe choice: the account is still
+                // present, and the user can retry.
+                st.account_deletion_floor.remove(&id);
+                return Err(format!(
+                    "persist sync_state before account deletion failed: {e} — \
+                     delete aborted to prevent zombie resurrection risk"
+                ));
+            }
+        }
+
+        // Floor is now durable. Proceed with the SQLite delete.
+        delete_account(&conn, &id, reassign_to.as_deref()).map_err(|e| e.to_string())?;
+
+        Ok::<(), String>(())
     })
     .await
-    .map_err(|e| format!("join error: {e}"))?
+    .map_err(|e| format!("join error: {e}"))??;
+    notify_mint_dirty(&state);
+    Ok(())
 }
 
 #[tauri::command]
@@ -957,12 +1127,14 @@ pub async fn mint_create_transaction(
     state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
 ) -> Result<Transaction, String> {
     let conn = crate::mint_db_handle(&app, &state)?;
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         let conn = conn.lock().expect("mint_db lock poisoned");
         create_transaction(&conn, payload).map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("join error: {e}"))?
+    .map_err(|e| format!("join error: {e}"))??;
+    notify_mint_dirty(&state);
+    Ok(result)
 }
 
 #[tauri::command]
@@ -973,12 +1145,14 @@ pub async fn mint_update_transaction(
     state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
 ) -> Result<Transaction, String> {
     let conn = crate::mint_db_handle(&app, &state)?;
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         let conn = conn.lock().expect("mint_db lock poisoned");
         update_transaction(&conn, &id, payload).map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("join error: {e}"))?
+    .map_err(|e| format!("join error: {e}"))??;
+    notify_mint_dirty(&state);
+    Ok(result)
 }
 
 #[tauri::command]
@@ -993,7 +1167,9 @@ pub async fn mint_delete_transaction(
         delete_transaction(&conn, &id).map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("join error: {e}"))?
+    .map_err(|e| format!("join error: {e}"))??;
+    notify_mint_dirty(&state);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1022,7 +1198,9 @@ pub async fn mint_set_default_currency(
         set_default_currency(&conn, &currency).map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("join error: {e}"))?
+    .map_err(|e| format!("join error: {e}"))??;
+    notify_mint_dirty(&state);
+    Ok(())
 }
 
 #[tauri::command]

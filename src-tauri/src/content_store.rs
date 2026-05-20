@@ -150,6 +150,17 @@ impl ContentStore for RuntimeContentStore {
     }
 }
 
+#[cfg(any(test, feature = "test-fixtures"))]
+impl InMemoryStub {
+    pub async fn debug_count(&self) -> usize {
+        self.inner.lock().unwrap().len()
+    }
+
+    pub async fn debug_all_cids(&self) -> Vec<crate::owner_state_types::ContentId> {
+        self.inner.lock().unwrap().keys().copied().collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

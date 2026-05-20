@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import type { TauriAdapter } from '../zenoh-service';
   import { MintService } from '../mint-service';
   import type { Transaction, Account } from '../mint-types';
@@ -72,6 +73,15 @@
 
   onMount(() => {
     void load();
+    let unlisten: UnlistenFn | undefined;
+    void (async () => {
+      unlisten = await listen('mint-changed', () => {
+        void load();
+      });
+    })();
+    return () => {
+      if (unlisten) unlisten();
+    };
   });
 
   async function exportCsv() {

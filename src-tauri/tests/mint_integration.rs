@@ -210,8 +210,12 @@ fn export_csv_escapes_special_characters() {
 
     // Description with literal comma, double-quotes, and embedded newline.
     let description = "Lunch, \"deluxe\" combo\nwith soup";
-    // Metadata with an embedded newline in a JSON string value.
-    let metadata = "{\"note\":\"line\nbreak\"}";
+    // Metadata uses the JSON `\n` escape (two characters: backslash + n)
+    // rather than a raw newline byte — RFC 8259 forbids raw control chars
+    // inside JSON string values, and our validator rejects them. RFC 4180
+    // CSV escaping has no special treatment for backslash-n, so the field
+    // still round-trips byte-exactly.
+    let metadata = "{\"note\":\"line\\nbreak\"}";
 
     create_transaction(
         &conn,
@@ -379,6 +383,86 @@ fn export_csv_no_partial_file_on_unwritable_path() {
 }
 
 #[test]
+fn migration_v2_adds_columns_and_backfills() {
+    let db_path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+    // First open: open_database internally calls apply_migrations (v1 + v2
+    // both land). The explicit apply_migrations call here is redundant with
+    // what open_database already did; it documents that calling it a second
+    // time in the same session is safe (same-process idempotency).
+    //
+    // The INSERT statements use only the v1 column set intentionally: they
+    // simulate rows that were written before the v2 backfill UPDATE ran (i.e.
+    // rows that will have updated_at = '' until the next migration pass).
+    {
+        let conn = harmony_app::mint::open_database(&db_path).unwrap();
+        harmony_app::mint::apply_migrations(&conn).unwrap();
+        // Insert rows that intentionally omit the v2 columns (updated_at),
+        // simulating pre-v2 row state to verify the backfill UPDATEs fire.
+        conn.execute(
+            "INSERT INTO accounts (id, name, created_at) VALUES (?, ?, ?)",
+            rusqlite::params!["acct-1", "Chase", "2026-05-01T00:00:00Z"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            rusqlite::params!["default_currency", "USD"],
+        )
+        .unwrap();
+    }
+    // Second open: close and reopen the DB, then migrate again. This verifies
+    // that the backfill UPDATEs in apply_migrations correctly handle rows that
+    // were inserted with updated_at = '' (the DEFAULT for pre-v2 rows).
+    let conn = harmony_app::mint::open_database(&db_path).unwrap();
+    harmony_app::mint::apply_migrations(&conn).unwrap();
+
+    // accounts now has updated_at, backfilled from created_at.
+    let updated_at: String = conn
+        .query_row(
+            "SELECT updated_at FROM accounts WHERE id = ?",
+            ["acct-1"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(updated_at, "2026-05-01T00:00:00Z");
+
+    // settings now has updated_at, backfilled to epoch so any explicit user
+    // change (with a real timestamp) always wins in LWW merge.
+    let setting_updated: String = conn
+        .query_row(
+            "SELECT updated_at FROM settings WHERE key = ?",
+            ["default_currency"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        setting_updated, "1970-01-01T00:00:00Z",
+        "v2 migration must backfill settings.updated_at to epoch, not wall-clock now()"
+    );
+
+    // transactions has the deleted_at column (NULL by default).
+    conn.execute(
+        "INSERT INTO transactions (id, transaction_date, amount, currency, account_id, description, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        rusqlite::params![
+            "tx-1", "2026-05-01", "-12.34", "USD", "acct-1", "Coffee",
+            "2026-05-01T00:00:00Z", "2026-05-01T00:00:00Z"
+        ],
+    )
+    .unwrap();
+    let deleted_at: Option<String> = conn
+        .query_row(
+            "SELECT deleted_at FROM transactions WHERE id = ?",
+            ["tx-1"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(deleted_at, None);
+
+    // Idempotency: a third migration is a no-op.
+    harmony_app::mint::apply_migrations(&conn).unwrap();
+}
+
+#[test]
 fn export_csv_respects_account_filter() {
     let conn = fresh_in_memory_db();
 
@@ -440,4 +524,201 @@ fn export_csv_respects_account_filter() {
         summary_all.rows_written, 5,
         "unfiltered export should yield all 5 rows"
     );
+}
+
+// ── Soft-delete + updated_at bump tests (Task 2) ──────────────────────────────
+
+#[test]
+fn soft_delete_transaction_filters_from_reads() {
+    let conn = fresh_in_memory_db();
+    let acct = create_account(&conn, "Chase").unwrap();
+    let tx = create_transaction(
+        &conn,
+        NewTransaction {
+            transaction_date: "2026-05-01".into(),
+            amount: "-12.34".into(),
+            currency: "USD".into(),
+            account_id: acct.id.clone(),
+            description: "Coffee".into(),
+            metadata: None,
+        },
+    )
+    .unwrap();
+    delete_transaction(&conn, &tx.id).unwrap();
+    let listed = list_transactions(&conn, &ListFilter::default()).unwrap();
+    assert_eq!(listed.len(), 0, "soft-deleted row must not appear in list");
+    let fetched = get_transaction(&conn, &tx.id).unwrap();
+    assert!(
+        fetched.is_none(),
+        "soft-deleted row must not be returned by get"
+    );
+    let deleted_at: Option<String> = conn
+        .query_row(
+            "SELECT deleted_at FROM transactions WHERE id = ?",
+            [&tx.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(deleted_at.is_some(), "deleted_at should be populated");
+}
+
+#[test]
+fn soft_delete_is_idempotent() {
+    let conn = fresh_in_memory_db();
+    let acct = create_account(&conn, "Chase").unwrap();
+    let tx = create_transaction(
+        &conn,
+        NewTransaction {
+            transaction_date: "2026-05-01".into(),
+            amount: "1".into(),
+            currency: "USD".into(),
+            account_id: acct.id.clone(),
+            description: "x".into(),
+            metadata: None,
+        },
+    )
+    .unwrap();
+    delete_transaction(&conn, &tx.id).unwrap();
+    let first_deleted_at: String = conn
+        .query_row(
+            "SELECT deleted_at FROM transactions WHERE id = ?",
+            [&tx.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    delete_transaction(&conn, &tx.id).unwrap();
+    let second_deleted_at: String = conn
+        .query_row(
+            "SELECT deleted_at FROM transactions WHERE id = ?",
+            [&tx.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        first_deleted_at, second_deleted_at,
+        "second delete must not overwrite the original tombstone timestamp"
+    );
+}
+
+#[test]
+fn account_rename_bumps_updated_at() {
+    let conn = fresh_in_memory_db();
+    let acct = create_account(&conn, "Chase").unwrap();
+    let before: String = conn
+        .query_row(
+            "SELECT updated_at FROM accounts WHERE id = ?",
+            [&acct.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    rename_account(&conn, &acct.id, "Chase Checking").unwrap();
+    let after: String = conn
+        .query_row(
+            "SELECT updated_at FROM accounts WHERE id = ?",
+            [&acct.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(after > before, "rename must bump updated_at");
+}
+
+#[test]
+fn set_default_currency_bumps_updated_at() {
+    let conn = fresh_in_memory_db();
+    set_default_currency(&conn, "USD").unwrap();
+    let before: String = conn
+        .query_row(
+            "SELECT updated_at FROM settings WHERE key = ?",
+            ["default_currency"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    set_default_currency(&conn, "JPY").unwrap();
+    let after: String = conn
+        .query_row(
+            "SELECT updated_at FROM settings WHERE key = ?",
+            ["default_currency"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(after > before, "set_default_currency must bump updated_at");
+}
+
+#[test]
+fn update_transaction_on_tombstoned_row_returns_not_found() {
+    let conn = fresh_in_memory_db();
+    let acct = create_account(&conn, "Chase").unwrap();
+    let tx = create_transaction(
+        &conn,
+        NewTransaction {
+            transaction_date: "2026-05-01".into(),
+            amount: "1".into(),
+            currency: "USD".into(),
+            account_id: acct.id.clone(),
+            description: "x".into(),
+            metadata: None,
+        },
+    )
+    .unwrap();
+    delete_transaction(&conn, &tx.id).unwrap();
+    let result = update_transaction(
+        &conn,
+        &tx.id,
+        UpdateTransaction {
+            transaction_date: None,
+            amount: Some("999".into()),
+            currency: None,
+            account_id: None,
+            description: None,
+            metadata: None,
+        },
+    );
+    assert!(
+        matches!(result, Err(MintError::NotFound(_))),
+        "updating a tombstoned row must return NotFound, got: {result:?}"
+    );
+}
+
+#[test]
+fn export_csv_excludes_tombstoned_transactions() {
+    let conn = fresh_in_memory_db();
+    let acct = create_account(&conn, "Chase").unwrap();
+    let live = create_transaction(
+        &conn,
+        NewTransaction {
+            transaction_date: "2026-05-01".into(),
+            amount: "1".into(),
+            currency: "USD".into(),
+            account_id: acct.id.clone(),
+            description: "live".into(),
+            metadata: None,
+        },
+    )
+    .unwrap();
+    let tombstone = create_transaction(
+        &conn,
+        NewTransaction {
+            transaction_date: "2026-05-02".into(),
+            amount: "2".into(),
+            currency: "USD".into(),
+            account_id: acct.id.clone(),
+            description: "soon-to-be-tombstoned".into(),
+            metadata: None,
+        },
+    )
+    .unwrap();
+    delete_transaction(&conn, &tombstone.id).unwrap();
+
+    let tmpdir = tempfile::tempdir().unwrap();
+    let csv_path = tmpdir.path().join("export.csv");
+    let summary = export_csv(&conn, &csv_path, None, None, None).unwrap();
+
+    assert_eq!(
+        summary.rows_written, 1,
+        "export_csv should exclude tombstoned rows"
+    );
+    let _ = live; // suppress unused warning if any
 }
