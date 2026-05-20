@@ -6,8 +6,8 @@ use crate::community_voting_core::{
     MiniPublicDeclinePayload, PollEventKindCode, PollId, RatificationBallotPayload,
     SignedVotingEvent, SortitionFailedPayload, SortitionSelectionPayload, Tier3PollConfigPayload,
 };
-use crate::community_voting_sortition::SortitionResult;
-use crate::community_voting_star::StarResult;
+use crate::community_voting_sortition::{derive_beacon_seed, fisher_yates_select, SortitionResult};
+use crate::community_voting_star::{tally_star, StarResult};
 use crate::owner_state_types::{Hlc, OwnerAddr};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -54,6 +54,15 @@ pub struct Tier3PollMeta {
     pub proposer: OwnerAddr,
     pub poll_create_hlc: Hlc,
     pub config: Tier3PollConfigPayload,
+    /// SHA-256 of the signing bytes of the kd=cr PollCreate event.
+    /// Used by verify_ss to derive the beacon seed deterministically.
+    /// Populated by the caller (Task 8 dispatch) at apply-create time.
+    pub poll_create_event_hash: [u8; 32],
+    /// Community epoch at PollCreate time, used to derive the beacon seed
+    /// via `derive_beacon_seed(poll_create_event_hash, community_epoch)`.
+    /// Populated by the caller (Task 8 dispatch) at apply-create time;
+    /// Task 10 wires the real epoch from DfrostLogRegistry.
+    pub community_epoch: u32,
 }
 
 /// Full state of an in-progress or terminal Tier 3 poll.
@@ -196,6 +205,9 @@ pub enum ApplyError {
 impl Tier3PollState {
     /// Create a fresh Tier3PollState from a parsed Tier 3 PollCreate event meta
     /// and the electorate snapshot taken at PollCreate.hlc.
+    ///
+    /// `poll_create_event_hash`: SHA-256 of the signing bytes of the kd=cr event.
+    /// `community_epoch`: epoch value for beacon seed derivation (Task 10 wires real value).
     ///
     /// Starts in Stage::Sortition — awaiting kd=ss.
     pub fn new_from_create(
@@ -449,6 +461,244 @@ impl Tier3PollState {
     }
 }
 
+// ── BeaconOracle trait ────────────────────────────────────────────────────────
+
+/// Trait for looking up VRF beacon output by `(community_id, seed)`.
+///
+/// SS1 verify reconstructs sortition deterministically from VRF output, so
+/// `verify_ss` must query the local DfrostLog state. This trait decouples
+/// Task 7 verify logic from the actual `DfrostLogRegistry` wiring (Task 10).
+///
+/// Implementations:
+/// - Production (Task 10): `Arc<DfrostLogRegistry>` looks up the committee's
+///   `kd=vb` event in the local dfrost log.
+/// - Tests (this task): `MockBeaconOracle` returns canned outputs.
+///
+/// `community_id` is the community space-id (not the poll). `seed` is the
+/// seed value derived from `PollCreate.event_hash + community_epoch`.
+#[async_trait::async_trait]
+pub trait BeaconOracle: Send + Sync {
+    async fn vrf_output_for(
+        &self,
+        community_id: &crate::owner_state_types::SpaceId,
+        seed: &[u8; 32],
+    ) -> Option<[u8; 32]>;
+}
+
+// ── VerifyError ───────────────────────────────────────────────────────────────
+
+/// Errors returned by the `verify_*` functions in this module.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum VerifyError {
+    #[error("sortition selection mismatch: recomputed differs from claimed")]
+    SortitionMismatch,
+    #[error("VRF beacon not yet available for this poll")]
+    BeaconNotYetAvailable,
+    #[error("actor {0:?} not in current mini-public set")]
+    NotInMiniPublic(crate::owner_state_types::OwnerAddr),
+    #[error("actor {0:?} not in eligible electorate")]
+    NotInEligibleElectorate(crate::owner_state_types::OwnerAddr),
+    #[error("SortitionFailed: actor {0:?} is not the proposer")]
+    SfActorNotProposer(crate::owner_state_types::OwnerAddr),
+    #[error(
+        "SortitionFailed: backup pool not yet exhausted (declines {declined}, backup {capacity})"
+    )]
+    BackupPoolNotExhausted { declined: usize, capacity: usize },
+    #[error("PollResult tally mismatch: recomputed differs from claimed")]
+    TallyMismatch,
+    #[error("payload decode failed: {0}")]
+    PayloadDecode(String),
+    #[error("ballot validation failed: {0}")]
+    BallotInvalid(#[from] ValidateError),
+    #[error("ratification stage not active at event.hlc")]
+    NotInRatificationStage,
+    #[error("DraftApproval references unknown candidate")]
+    UnknownCandidate,
+    #[error("poll lifecycle not Closed at HLC (PollResult R1)")]
+    NotInClosedStage,
+}
+
+// ── Verify functions ──────────────────────────────────────────────────────────
+
+/// SS1 verify: `SortitionSelection` recomputes deterministically from VRF beacon.
+///
+/// Per spec §5: the claimed `primary` + `backup` arrays must be bit-identical to
+/// `fisher_yates_select(vrf_output, electorate_snapshot, sortition_size, sortition_size)`.
+///
+/// The beacon seed is derived from `meta.poll_create_event_hash` and `meta.community_epoch`
+/// via `derive_beacon_seed`. The VRF output is fetched from the `BeaconOracle`; if the
+/// beacon isn't present yet, returns `BeaconNotYetAvailable`.
+pub async fn verify_ss(
+    event: &SignedVotingEvent,
+    poll_state: &Tier3PollState,
+    beacon_oracle: &dyn BeaconOracle,
+    community_id: &crate::owner_state_types::SpaceId,
+) -> Result<(), VerifyError> {
+    // 1. Decode SortitionSelectionPayload from event.payload.
+    let payload: SortitionSelectionPayload =
+        decode_payload(&event.payload).map_err(VerifyError::PayloadDecode)?;
+
+    // 2. Derive beacon seed from poll_create_event_hash + community_epoch.
+    let seed = derive_beacon_seed(
+        &poll_state.meta.poll_create_event_hash,
+        poll_state.meta.community_epoch,
+    );
+
+    // 3. Look up VRF output.
+    let vrf_output = beacon_oracle
+        .vrf_output_for(community_id, &seed)
+        .await
+        .ok_or(VerifyError::BeaconNotYetAvailable)?;
+
+    // 4. Deterministically recompute sortition.
+    let primary_size = poll_state.meta.config.sortition_size as usize;
+    let backup_size = primary_size;
+    let recomputed = fisher_yates_select(
+        &vrf_output,
+        &poll_state.eligible_electorate_snapshot,
+        primary_size,
+        backup_size,
+    );
+
+    // 5. Compare bit-identical.
+    if recomputed.primary != payload.primary || recomputed.backup != payload.backup {
+        return Err(VerifyError::SortitionMismatch);
+    }
+
+    Ok(())
+}
+
+/// SD1 verify: `event.actor` must be in the current mini-public set at `event.hlc`.
+///
+/// Applies to `kd=ds`, `kd=dc`, `kd=da`, `kd=md`.
+pub fn verify_sd(
+    event: &SignedVotingEvent,
+    poll_state: &Tier3PollState,
+) -> Result<(), VerifyError> {
+    let mini_public = poll_state.current_mini_public(&event.hlc);
+    if !mini_public.contains(&event.actor) {
+        return Err(VerifyError::NotInMiniPublic(event.actor));
+    }
+    Ok(())
+}
+
+/// DA additional verify: the referenced candidate must exist in `poll_state.candidates`.
+///
+/// Call this in addition to `verify_sd` when processing `kd=da` DraftApproval events.
+pub fn verify_da_candidate_exists(
+    event: &SignedVotingEvent,
+    poll_state: &Tier3PollState,
+) -> Result<(), VerifyError> {
+    let payload: DraftApprovalPayload =
+        decode_payload(&event.payload).map_err(VerifyError::PayloadDecode)?;
+    let exists = poll_state
+        .candidates
+        .iter()
+        .any(|c| c.event_hash == payload.candidate_event_hash);
+    if !exists {
+        return Err(VerifyError::UnknownCandidate);
+    }
+    Ok(())
+}
+
+/// SF1 verify: `SortitionFailed` must be proposer-signed AND the backup pool must be
+/// fully exhausted at `event.hlc` (i.e., `decline_count ≥ backup_pool_size`).
+pub fn verify_sf(
+    event: &SignedVotingEvent,
+    poll_state: &Tier3PollState,
+) -> Result<(), VerifyError> {
+    // 1. Actor must be the poll proposer.
+    if event.actor != poll_state.meta.proposer {
+        return Err(VerifyError::SfActorNotProposer(event.actor));
+    }
+
+    // 2. Backup pool must be exhausted: decline_count ≥ backup_pool_size.
+    //    backup_pool_size == sortition_size by design (primary_size == backup_size).
+    let declined = poll_state.decline_count_at(&event.hlc);
+    let capacity = poll_state.meta.config.sortition_size as usize;
+    if declined < capacity {
+        return Err(VerifyError::BackupPoolNotExhausted { declined, capacity });
+    }
+
+    Ok(())
+}
+
+/// SR1 verify: `PollResult` tally must be bit-identical to deterministic re-compute.
+///
+/// R1 prerequisite: `poll_state.close_event_hash` must be `Some` (kd=cl already applied).
+/// R2: re-run `tally_star` over `poll_state.ratification_ballots` and compare.
+pub fn verify_sr(
+    event: &SignedVotingEvent,
+    poll_state: &Tier3PollState,
+) -> Result<(), VerifyError> {
+    // R1: PollClose must have been applied.
+    if poll_state.close_event_hash.is_none() {
+        return Err(VerifyError::NotInClosedStage);
+    }
+
+    // Decode the claimed result from the payload.
+    let payload: Tier3PollResultPayload =
+        decode_payload(&event.payload).map_err(VerifyError::PayloadDecode)?;
+
+    // Recompute: derive ratification candidates ordering from state, then tally.
+    let sq = synthesize_status_quo(&poll_state.meta.poll_id);
+    let sq_hash = sq.event_hash;
+
+    // Build candidate list from state (same as the ordered list used at ratification open).
+    // For SR1, we re-derive the ordered candidate set from the stored candidates.
+    let primary_size = poll_state.meta.config.sortition_size as usize;
+    let advancers = drafting_advancers(&poll_state.candidates, primary_size, sq_hash);
+    let ordered_candidates = ratification_candidates_ordering(&advancers, sq_hash);
+
+    let recomputed = tally_star(&ordered_candidates, &poll_state.ratification_ballots);
+
+    if recomputed != payload.result {
+        return Err(VerifyError::TallyMismatch);
+    }
+
+    Ok(())
+}
+
+/// B1-B5 verify for `kd=rb` RatificationBallot (Tier 3 extension of Tier 1 B1-B5).
+///
+/// - B2: poll must be in `Stage::Ratification` at `event.hlc`.
+/// - B3: `event.actor` must be in `eligible_electorate_snapshot` (full electorate, NOT mini-public).
+/// - B4: `validate_ratification_ballot` — score length and range.
+/// - B5: `privacy_mode == "pu"` (enforced at PollCreate via validate_tier3_poll_config,
+///   but checked defensively here).
+pub fn verify_ratification_ballot(
+    event: &SignedVotingEvent,
+    poll_state: &Tier3PollState,
+) -> Result<(), VerifyError> {
+    // B2: must be in Ratification stage at event.hlc.
+    if poll_state.current_stage_at(&event.hlc) != Stage::Ratification {
+        return Err(VerifyError::NotInRatificationStage);
+    }
+
+    // B3: actor must be in the full eligible electorate (NOT just mini-public).
+    if !poll_state
+        .eligible_electorate_snapshot
+        .contains(&event.actor)
+    {
+        return Err(VerifyError::NotInEligibleElectorate(event.actor));
+    }
+
+    // B4: validate ballot payload (score length + range).
+    let payload: RatificationBallotPayload =
+        decode_payload(&event.payload).map_err(VerifyError::PayloadDecode)?;
+
+    // Compute the ratification candidate count from state.
+    let sq = synthesize_status_quo(&poll_state.meta.poll_id);
+    let sq_hash = sq.event_hash;
+    let primary_size = poll_state.meta.config.sortition_size as usize;
+    let advancers = drafting_advancers(&poll_state.candidates, primary_size, sq_hash);
+    let expected_candidate_count = advancers.len();
+
+    validate_ratification_ballot(&payload, expected_candidate_count)?;
+
+    Ok(())
+}
+
 // ── Drafting math ─────────────────────────────────────────────────────────────
 
 /// Maximum number of candidates that advance to ratification (including the
@@ -658,6 +908,8 @@ mod tests {
             proposer: addr(0xff),
             poll_create_hlc: hlc(wall_ms),
             config: default_config(),
+            poll_create_event_hash: [0xaa; 32],
+            community_epoch: 1,
         }
     }
 
@@ -1660,5 +1912,591 @@ mod tests {
     fn validate_ballot_score_0_accepted() {
         let b = ballot(vec![0, 0, 0]);
         assert_eq!(validate_ratification_ballot(&b, 3), Ok(()));
+    }
+
+    // ── MockBeaconOracle + verify_ss tests ────────────────────────────────────
+
+    use crate::community_voting_sortition::derive_beacon_seed;
+    use crate::owner_state_types::SpaceId;
+
+    struct MockBeaconOracle {
+        // Maps (community_id bytes, seed) → vrf_output
+        outputs: Vec<([u8; 16], [u8; 32], [u8; 32])>,
+    }
+
+    impl MockBeaconOracle {
+        fn new() -> Self {
+            MockBeaconOracle {
+                outputs: Vec::new(),
+            }
+        }
+
+        fn with(mut self, community_id: [u8; 16], seed: [u8; 32], vrf: [u8; 32]) -> Self {
+            self.outputs.push((community_id, seed, vrf));
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BeaconOracle for MockBeaconOracle {
+        async fn vrf_output_for(
+            &self,
+            community_id: &SpaceId,
+            seed: &[u8; 32],
+        ) -> Option<[u8; 32]> {
+            self.outputs
+                .iter()
+                .find(|(cid, s, _)| cid == &community_id.0 && s == seed)
+                .map(|(_, _, vrf)| *vrf)
+        }
+    }
+
+    fn community_id() -> SpaceId {
+        SpaceId([0x01; 16])
+    }
+
+    /// Build a poll state with `sortition_size` members in the electorate
+    /// so fisher_yates_select can draw primary_size + backup_size from it.
+    fn poll_state_with_electorate(create_wall_ms: u64, electorate_size: u8) -> Tier3PollState {
+        let mut meta = meta_at(create_wall_ms);
+        meta.config.sortition_size = 2; // primary=2, backup=2 → need ≥4 members
+        Tier3PollState::new_from_create(meta, electorate(electorate_size))
+    }
+
+    /// Compute the seed a poll with the default meta_at hash + epoch=1 would produce.
+    fn default_seed() -> [u8; 32] {
+        derive_beacon_seed(&[0xaa; 32], 1)
+    }
+
+    /// Use fisher_yates_select to compute the correct SortitionSelectionPayload for a poll.
+    fn correct_ss_payload(poll: &Tier3PollState, vrf: &[u8; 32]) -> SortitionSelectionPayload {
+        use crate::community_voting_sortition::fisher_yates_select;
+        let size = poll.meta.config.sortition_size as usize;
+        let sr = fisher_yates_select(vrf, &poll.eligible_electorate_snapshot, size, size);
+        SortitionSelectionPayload {
+            poll_id: poll.meta.poll_id,
+            primary: sr.primary,
+            backup: sr.backup,
+        }
+    }
+
+    // 1. verify_ss_happy_path_recompute_matches
+    #[tokio::test]
+    async fn verify_ss_happy_path_recompute_matches() {
+        let poll = poll_state_with_electorate(0, 10);
+        let vrf = [0x55u8; 32];
+        let seed = default_seed();
+        let oracle = MockBeaconOracle::new().with([0x01; 16], seed, vrf);
+        let payload = correct_ss_payload(&poll, &vrf);
+        let ev = make_event_with_payload(
+            PollEventKindCode::SortitionSelection,
+            100,
+            addr(0xfe),
+            encode(&payload),
+        );
+        let result = verify_ss(&ev, &poll, &oracle, &community_id()).await;
+        assert_eq!(result, Ok(()));
+    }
+
+    // 2. verify_ss_mismatched_primary_rejected_SortitionMismatch
+    #[tokio::test]
+    async fn verify_ss_mismatched_primary_rejected_sortition_mismatch() {
+        let poll = poll_state_with_electorate(0, 10);
+        let vrf = [0x55u8; 32];
+        let seed = default_seed();
+        let oracle = MockBeaconOracle::new().with([0x01; 16], seed, vrf);
+        let mut payload = correct_ss_payload(&poll, &vrf);
+        payload.primary[0] = addr(0xde); // corrupt primary
+        let ev = make_event_with_payload(
+            PollEventKindCode::SortitionSelection,
+            100,
+            addr(0xfe),
+            encode(&payload),
+        );
+        let result = verify_ss(&ev, &poll, &oracle, &community_id()).await;
+        assert_eq!(result, Err(VerifyError::SortitionMismatch));
+    }
+
+    // 3. verify_ss_mismatched_backup_rejected_SortitionMismatch
+    #[tokio::test]
+    async fn verify_ss_mismatched_backup_rejected_sortition_mismatch() {
+        let poll = poll_state_with_electorate(0, 10);
+        let vrf = [0x55u8; 32];
+        let seed = default_seed();
+        let oracle = MockBeaconOracle::new().with([0x01; 16], seed, vrf);
+        let mut payload = correct_ss_payload(&poll, &vrf);
+        payload.backup[0] = addr(0xde); // corrupt backup
+        let ev = make_event_with_payload(
+            PollEventKindCode::SortitionSelection,
+            100,
+            addr(0xfe),
+            encode(&payload),
+        );
+        let result = verify_ss(&ev, &poll, &oracle, &community_id()).await;
+        assert_eq!(result, Err(VerifyError::SortitionMismatch));
+    }
+
+    // 4. verify_ss_missing_beacon_rejected_BeaconNotYetAvailable
+    #[tokio::test]
+    async fn verify_ss_missing_beacon_rejected_beacon_not_yet_available() {
+        let poll = poll_state_with_electorate(0, 10);
+        let oracle = MockBeaconOracle::new(); // empty — no outputs registered
+        let payload = SortitionSelectionPayload {
+            poll_id: poll_id(),
+            primary: vec![],
+            backup: vec![],
+        };
+        let ev = make_event_with_payload(
+            PollEventKindCode::SortitionSelection,
+            100,
+            addr(0xfe),
+            encode(&payload),
+        );
+        let result = verify_ss(&ev, &poll, &oracle, &community_id()).await;
+        assert_eq!(result, Err(VerifyError::BeaconNotYetAvailable));
+    }
+
+    // 5. verify_ss_decode_failure_rejected_PayloadDecode
+    #[tokio::test]
+    async fn verify_ss_decode_failure_rejected_payload_decode() {
+        let poll = poll_state_with_electorate(0, 10);
+        let seed = default_seed();
+        let oracle = MockBeaconOracle::new().with([0x01; 16], seed, [0x55; 32]);
+        let ev = make_event_with_payload(
+            PollEventKindCode::SortitionSelection,
+            100,
+            addr(0xfe),
+            vec![0xff, 0xfe], // garbage CBOR
+        );
+        let result = verify_ss(&ev, &poll, &oracle, &community_id()).await;
+        assert!(matches!(result, Err(VerifyError::PayloadDecode(_))));
+    }
+
+    // ── verify_sd tests ───────────────────────────────────────────────────────
+
+    /// Build a poll state already past sortition, in Deliberation, with a known primary + backup.
+    fn poll_with_sortition(
+        create_wall_ms: u64,
+        primary: Vec<OwnerAddr>,
+        backup: Vec<OwnerAddr>,
+    ) -> Tier3PollState {
+        let electorate_size = (primary.len() + backup.len() + 5) as u8; // padding
+        let mut meta = meta_at(create_wall_ms);
+        meta.config.sortition_size = primary.len() as u16;
+        let mut poll = Tier3PollState::new_from_create(meta, electorate(electorate_size));
+        let ev = ss_event(create_wall_ms + 10, primary, backup);
+        poll.apply_event(&ev).expect("apply ss in fixture");
+        poll
+    }
+
+    // 6. verify_sd_actor_in_primary_accepted
+    #[test]
+    fn verify_sd_actor_in_primary_accepted() {
+        let poll = poll_with_sortition(0, vec![addr(1), addr(2), addr(3)], vec![addr(10)]);
+        let ev = make_event(PollEventKindCode::DeliberationStatement, 50, addr(1));
+        assert_eq!(verify_sd(&ev, &poll), Ok(()));
+    }
+
+    // 7. verify_sd_actor_in_promoted_backup_accepted (primary member declined → backup promoted)
+    #[test]
+    fn verify_sd_actor_in_promoted_backup_accepted() {
+        let mut poll =
+            poll_with_sortition(0, vec![addr(1), addr(2), addr(3)], vec![addr(10), addr(11)]);
+        // addr(1) declines → addr(10) is promoted as backup[0]
+        poll.apply_event(&md_event(60, addr(1))).expect("md");
+        let ev = make_event(PollEventKindCode::DeliberationStatement, 80, addr(10));
+        assert_eq!(verify_sd(&ev, &poll), Ok(()));
+    }
+
+    // 8. verify_sd_actor_not_in_set_rejected_NotInMiniPublic
+    #[test]
+    fn verify_sd_actor_not_in_set_rejected_not_in_mini_public() {
+        let poll = poll_with_sortition(0, vec![addr(1), addr(2)], vec![addr(10)]);
+        let ev = make_event(PollEventKindCode::DeliberationStatement, 50, addr(99));
+        assert_eq!(
+            verify_sd(&ev, &poll),
+            Err(VerifyError::NotInMiniPublic(addr(99)))
+        );
+    }
+
+    // 9. verify_sd_actor_declined_no_longer_in_set_rejected
+    #[test]
+    fn verify_sd_actor_declined_no_longer_in_set_rejected() {
+        let mut poll = poll_with_sortition(0, vec![addr(1), addr(2), addr(3)], vec![addr(10)]);
+        // addr(1) declines at wall_ms=60
+        poll.apply_event(&md_event(60, addr(1))).expect("md");
+        // Now at wall_ms=80, addr(1) tries to act — should be rejected (no longer in mini-public)
+        let ev = make_event(PollEventKindCode::DeliberationStatement, 80, addr(1));
+        assert_eq!(
+            verify_sd(&ev, &poll),
+            Err(VerifyError::NotInMiniPublic(addr(1)))
+        );
+    }
+
+    // ── verify_sf tests ───────────────────────────────────────────────────────
+
+    /// Build a poll with `n_declines` pre-recorded declines. sortition_size=n_backup_capacity.
+    fn poll_with_declines(n_declines: usize, backup_capacity: usize) -> Tier3PollState {
+        let total = (n_declines + backup_capacity + 5) as u8;
+        let primary: Vec<OwnerAddr> = (0..n_declines as u8).map(addr).collect();
+        let backup: Vec<OwnerAddr> = (100..100 + backup_capacity as u8).map(addr).collect();
+        let mut meta = meta_at(0);
+        meta.config.sortition_size = backup_capacity as u16;
+        let mut poll = Tier3PollState::new_from_create(meta, electorate(total));
+        let ev = ss_event(10, primary.clone(), backup);
+        poll.apply_event(&ev).expect("ss");
+        for (i, actor) in primary.into_iter().enumerate() {
+            poll.apply_event(&md_event(20 + i as u64 * 10, actor))
+                .expect("md");
+        }
+        poll
+    }
+
+    // 10. verify_sf_proposer_with_exhausted_pool_accepted
+    #[test]
+    fn verify_sf_proposer_with_exhausted_pool_accepted() {
+        // sortition_size=2, 2 declines → pool exhausted
+        let poll = poll_with_declines(2, 2);
+        let payload = SortitionFailedPayload { poll_id: poll_id() };
+        let ev = make_event_with_payload(
+            PollEventKindCode::SortitionFailed,
+            100,
+            addr(0xff), // proposer = addr(0xff) from meta_at
+            encode(&payload),
+        );
+        assert_eq!(verify_sf(&ev, &poll), Ok(()));
+    }
+
+    // 11. verify_sf_non_proposer_rejected_SfActorNotProposer
+    #[test]
+    fn verify_sf_non_proposer_rejected_sf_actor_not_proposer() {
+        let poll = poll_with_declines(3, 2);
+        let payload = SortitionFailedPayload { poll_id: poll_id() };
+        let ev = make_event_with_payload(
+            PollEventKindCode::SortitionFailed,
+            100,
+            addr(0x01), // NOT the proposer (which is addr(0xff))
+            encode(&payload),
+        );
+        assert_eq!(
+            verify_sf(&ev, &poll),
+            Err(VerifyError::SfActorNotProposer(addr(0x01)))
+        );
+    }
+
+    // 12. verify_sf_pool_not_exhausted_rejected_BackupPoolNotExhausted
+    #[test]
+    fn verify_sf_pool_not_exhausted_rejected_backup_pool_not_exhausted() {
+        // sortition_size=3 but only 1 decline → pool not exhausted (need 3)
+        let poll = poll_with_declines(1, 3);
+        let payload = SortitionFailedPayload { poll_id: poll_id() };
+        let ev = make_event_with_payload(
+            PollEventKindCode::SortitionFailed,
+            100,
+            addr(0xff), // proposer
+            encode(&payload),
+        );
+        assert_eq!(
+            verify_sf(&ev, &poll),
+            Err(VerifyError::BackupPoolNotExhausted {
+                declined: 1,
+                capacity: 3
+            })
+        );
+    }
+
+    // ── verify_sr tests ───────────────────────────────────────────────────────
+
+    /// Build a poll state in Ratification with some ballots and a kd=cl close applied.
+    ///
+    /// Uses sortition_size=3 (matching primary=[addr(1),2,3]) so threshold=ceil(3/2)=2
+    /// and a candidate with 2 approvals passes. Simulates materialize() synthesizing
+    /// status_quo into candidates at drafting open.
+    fn poll_at_closed_with_ballots(ballots: &[(u64, OwnerAddr, Vec<u8>)]) -> Tier3PollState {
+        let mut meta = meta_at(0);
+        meta.config.sortition_size = 3; // threshold = ceil(3/2)=2; dw=10s, fw=10s
+        let mut poll = Tier3PollState::new_from_create(meta, electorate(20));
+        // Apply sortition
+        poll.apply_event(&ss_event(10, vec![addr(1), addr(2), addr(3)], vec![]))
+            .expect("ss");
+        // Add a candidate with enough approvals (threshold = ceil(3/2) = 2)
+        let dc = dc_event(200, addr(1), "proposal A");
+        poll.apply_event(&dc).expect("dc");
+        let candidate_hash = sha256_of_signing_bytes(&dc);
+        poll.apply_event(&da_event(300, addr(2), candidate_hash))
+            .expect("da");
+        // Simulate materialize() synthesizing status_quo at drafting open.
+        let sq = synthesize_status_quo(&poll.meta.poll_id);
+        poll.candidates.push(sq);
+        // Apply ballots (at ratification time, wall_ms ≥ 20000)
+        for (wall_ms, actor, scores) in ballots {
+            poll.apply_event(&rb_event(*wall_ms, *actor, scores.clone()))
+                .expect("rb");
+        }
+        // Apply kd=cl PollClose
+        let cl_ev = make_event(PollEventKindCode::PollClose, 40000, addr(0xff));
+        poll.apply_event(&cl_ev).expect("cl");
+        poll
+    }
+
+    // 13. verify_sr_happy_path_matching_tally_accepted
+    #[test]
+    fn verify_sr_happy_path_matching_tally_accepted() {
+        let poll = poll_at_closed_with_ballots(&[(25000, addr(5), vec![5, 3])]);
+        // Recompute expected result manually to build the correct payload.
+        let sq = synthesize_status_quo(&poll.meta.poll_id);
+        let sq_hash = sq.event_hash;
+        let primary_size = poll.meta.config.sortition_size as usize;
+        let advancers = drafting_advancers(&poll.candidates, primary_size, sq_hash);
+        let ordered = ratification_candidates_ordering(&advancers, sq_hash);
+        let expected_result = tally_star(&ordered, &poll.ratification_ballots);
+        let payload = Tier3PollResultPayload {
+            poll_id: poll_id(),
+            result: expected_result,
+        };
+        let ev = make_event_with_payload(
+            PollEventKindCode::PollResult,
+            41000,
+            addr(0xfe),
+            encode(&payload),
+        );
+        assert_eq!(verify_sr(&ev, &poll), Ok(()));
+    }
+
+    // 14. verify_sr_no_kd_cl_applied_rejected_NotInClosedStage
+    #[test]
+    fn verify_sr_no_kd_cl_applied_rejected_not_in_closed_stage() {
+        // A poll without kd=cl applied
+        let mut poll = new_poll(0);
+        poll.apply_event(&ss_event(10, vec![addr(1)], vec![]))
+            .expect("ss");
+        let payload = Tier3PollResultPayload {
+            poll_id: poll_id(),
+            result: star_result(),
+        };
+        let ev = make_event_with_payload(
+            PollEventKindCode::PollResult,
+            500,
+            addr(0xfe),
+            encode(&payload),
+        );
+        assert_eq!(verify_sr(&ev, &poll), Err(VerifyError::NotInClosedStage));
+    }
+
+    // 15. verify_sr_tally_mismatch_rejected_TallyMismatch
+    #[test]
+    fn verify_sr_tally_mismatch_rejected_tally_mismatch() {
+        let poll = poll_at_closed_with_ballots(&[(25000, addr(5), vec![5, 3])]);
+        // Construct a deliberately wrong result
+        let wrong_result = StarResult {
+            winner: crate::community_voting_star::CandidateRef {
+                event_hash: [0x00; 32],
+                approval_count: 0,
+            },
+            finalists: vec![],
+            total_scores: vec![0, 0],
+            runoff_votes: vec![0],
+        };
+        let payload = Tier3PollResultPayload {
+            poll_id: poll_id(),
+            result: wrong_result,
+        };
+        let ev = make_event_with_payload(
+            PollEventKindCode::PollResult,
+            41000,
+            addr(0xfe),
+            encode(&payload),
+        );
+        assert_eq!(verify_sr(&ev, &poll), Err(VerifyError::TallyMismatch));
+    }
+
+    // ── verify_ratification_ballot tests ─────────────────────────────────────
+
+    /// Build a poll that is in Stage::Ratification with status_quo + 1 real candidate.
+    /// electorate = addr(0..19), mini_public primary = [addr(1), addr(2), addr(3)],
+    /// sortition_size=3 (so threshold = ceil(3/2) = 2 and 2 approvals suffice).
+    ///
+    /// Simulates materialize() by synthesizing status_quo into candidates at drafting open.
+    fn poll_in_ratification() -> Tier3PollState {
+        // Use sortition_size=3 so threshold = ceil(3/2)=2 matches the actual primary size.
+        let mut meta = meta_at(0);
+        meta.config.sortition_size = 3; // dw=10s, fw=10s; threshold = ceil(3/2)=2
+        let mut poll = Tier3PollState::new_from_create(meta, electorate(20));
+        // primary = [addr(1), addr(2), addr(3)], backup = [] so no backup needed
+        poll.apply_event(&ss_event(10, vec![addr(1), addr(2), addr(3)], vec![]))
+            .expect("ss");
+        // Add 1 candidate with 2 approvals (threshold = ceil(3/2)=2 → passes)
+        let dc = dc_event(200, addr(1), "proposal A");
+        poll.apply_event(&dc).expect("dc");
+        let candidate_hash = sha256_of_signing_bytes(&dc);
+        poll.apply_event(&da_event(300, addr(2), candidate_hash))
+            .expect("da");
+        // Simulate materialize() synthesizing status_quo at drafting open.
+        let sq = synthesize_status_quo(&poll.meta.poll_id);
+        poll.candidates.push(sq);
+        poll
+    }
+
+    // 16. verify_rb_actor_in_full_electorate_accepted
+    #[test]
+    fn verify_rb_actor_in_full_electorate_accepted() {
+        let poll = poll_in_ratification();
+        // The electorate is addr(0..19); any of them can cast a ratification ballot.
+        // wall_ms = 25000 > 20000 → Ratification stage
+        // Candidate count = 2 (1 real + status_quo)
+        let rb_payload = RatificationBallotPayload {
+            poll_id: poll_id(),
+            scores: vec![3, 1], // 2 candidates: real + status_quo
+        };
+        let ev = make_event_with_payload(
+            PollEventKindCode::RatificationBallot,
+            25000,
+            addr(7), // in electorate (electorate(20) covers addr(0)..addr(19))
+            encode(&rb_payload),
+        );
+        assert_eq!(verify_ratification_ballot(&ev, &poll), Ok(()));
+    }
+
+    // 17. verify_rb_actor_not_in_electorate_rejected
+    #[test]
+    fn verify_rb_actor_not_in_electorate_rejected() {
+        let poll = poll_in_ratification();
+        let rb_payload = RatificationBallotPayload {
+            poll_id: poll_id(),
+            scores: vec![3, 1],
+        };
+        let ev = make_event_with_payload(
+            PollEventKindCode::RatificationBallot,
+            25000,
+            addr(200), // NOT in electorate (electorate is addr(0)..addr(19))
+            encode(&rb_payload),
+        );
+        assert_eq!(
+            verify_ratification_ballot(&ev, &poll),
+            Err(VerifyError::NotInEligibleElectorate(addr(200)))
+        );
+    }
+
+    // 18. verify_rb_wrong_stage_rejected_NotInRatificationStage
+    #[test]
+    fn verify_rb_wrong_stage_rejected_not_in_ratification_stage() {
+        let poll = poll_in_ratification();
+        let rb_payload = RatificationBallotPayload {
+            poll_id: poll_id(),
+            scores: vec![3, 1],
+        };
+        // wall_ms = 5000 → still in Deliberation stage (dw not elapsed yet)
+        let ev = make_event_with_payload(
+            PollEventKindCode::RatificationBallot,
+            5000,
+            addr(7),
+            encode(&rb_payload),
+        );
+        assert_eq!(
+            verify_ratification_ballot(&ev, &poll),
+            Err(VerifyError::NotInRatificationStage)
+        );
+    }
+
+    // 19. verify_rb_score_above_5_rejected_via_BallotInvalid
+    #[test]
+    fn verify_rb_score_above_5_rejected_via_ballot_invalid() {
+        let poll = poll_in_ratification();
+        let rb_payload = RatificationBallotPayload {
+            poll_id: poll_id(),
+            scores: vec![6, 1], // score 6 > 5 → BallotScoreOutOfRange
+        };
+        let ev = make_event_with_payload(
+            PollEventKindCode::RatificationBallot,
+            25000,
+            addr(7),
+            encode(&rb_payload),
+        );
+        let result = verify_ratification_ballot(&ev, &poll);
+        assert!(
+            matches!(
+                result,
+                Err(VerifyError::BallotInvalid(
+                    ValidateError::BallotScoreOutOfRange(6)
+                ))
+            ),
+            "expected BallotInvalid(BallotScoreOutOfRange(6)), got {result:?}"
+        );
+    }
+
+    // 20. verify_rb_wrong_length_rejected_via_BallotInvalid
+    #[test]
+    fn verify_rb_wrong_length_rejected_via_ballot_invalid() {
+        let poll = poll_in_ratification();
+        // Expected 2 candidates (1 real + status_quo); provide 3 scores → mismatch
+        let rb_payload = RatificationBallotPayload {
+            poll_id: poll_id(),
+            scores: vec![3, 1, 5],
+        };
+        let ev = make_event_with_payload(
+            PollEventKindCode::RatificationBallot,
+            25000,
+            addr(7),
+            encode(&rb_payload),
+        );
+        let result = verify_ratification_ballot(&ev, &poll);
+        assert!(
+            matches!(
+                result,
+                Err(VerifyError::BallotInvalid(
+                    ValidateError::BallotLengthMismatch {
+                        scores: 3,
+                        expected: 2
+                    }
+                ))
+            ),
+            "expected BallotLengthMismatch, got {result:?}"
+        );
+    }
+
+    // ── verify_da tests ───────────────────────────────────────────────────────
+
+    // 21. verify_da_known_candidate_accepted
+    #[test]
+    fn verify_da_known_candidate_accepted() {
+        let mut poll = new_poll(0);
+        poll.apply_event(&ss_event(10, vec![addr(1), addr(2)], vec![]))
+            .expect("ss");
+        let dc = dc_event(200, addr(1), "my proposal");
+        poll.apply_event(&dc).expect("dc");
+        let candidate_hash = sha256_of_signing_bytes(&dc);
+
+        let payload = DraftApprovalPayload {
+            poll_id: poll_id(),
+            candidate_event_hash: candidate_hash,
+        };
+        let ev = make_event_with_payload(
+            PollEventKindCode::DraftApproval,
+            300,
+            addr(2),
+            encode(&payload),
+        );
+        assert_eq!(verify_da_candidate_exists(&ev, &poll), Ok(()));
+    }
+
+    // 22. verify_da_unknown_candidate_rejected_UnknownCandidate
+    #[test]
+    fn verify_da_unknown_candidate_rejected_unknown_candidate() {
+        let poll = new_poll(0);
+        // No candidates registered yet
+        let payload = DraftApprovalPayload {
+            poll_id: poll_id(),
+            candidate_event_hash: [0xde; 32], // unknown
+        };
+        let ev = make_event_with_payload(
+            PollEventKindCode::DraftApproval,
+            300,
+            addr(2),
+            encode(&payload),
+        );
+        assert_eq!(
+            verify_da_candidate_exists(&ev, &poll),
+            Err(VerifyError::UnknownCandidate)
+        );
     }
 }
