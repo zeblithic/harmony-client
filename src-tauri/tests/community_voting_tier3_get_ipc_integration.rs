@@ -18,14 +18,19 @@ use std::sync::{Arc, Mutex as StdMutex};
 use harmony_app::community_membership::ChannelId;
 use harmony_app::community_voting_approval::Tier1PollConfig;
 use harmony_app::community_voting_core::{
-    build_signed_poll_create_tier1, build_signed_poll_create_tier3,
+    build_signed_draft_candidate, build_signed_poll_close_tier3, build_signed_poll_create_tier1,
+    build_signed_poll_create_tier3, build_signed_poll_result_tier3,
     build_signed_sortition_selection, derive_poll_id, Eligibility, MemberAttrs, MembershipSnapshot,
     Tier3PollConfigPayload,
 };
 use harmony_app::community_voting_log::VotingLog;
 use harmony_app::community_voting_sortition::fisher_yates_select;
+use harmony_app::community_voting_star::{CandidateRef, StarResult};
+use harmony_app::community_voting_tier3::event_hash_of;
 use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
-use harmony_app::{voting_get_tier3_poll_impl, NodeState, Tier3MyRole, Tier3StageTag};
+use harmony_app::{
+    voting_get_tier3_poll_impl, voting_list_tier3_polls_impl, NodeState, Tier3MyRole, Tier3StageTag,
+};
 use tokio::sync::Mutex;
 
 // ─── Fixture identity helper ──────────────────────────────────────────────────
@@ -204,12 +209,227 @@ impl Tier3TestHarness {
         }
     }
 
+    /// NodeState with two Tier 3 polls in Sortition stage at different HLCs.
+    /// The poll created later has a higher `poll_create_hlc_ms`.
+    async fn with_two_polls_in_sortition_stage_at_different_hlcs() -> Self {
+        let community_id = SpaceId([0xA4; 16]);
+        let proposer = fixture_identity(4);
+
+        // Poll A: created at HLC 1_000_000.
+        let config_a = tier3_config();
+        let hlc_a = hlc_at(1_000_000);
+        let event_a =
+            build_signed_poll_create_tier3(&proposer.signing_key, proposer.owner, &config_a, hlc_a)
+                .expect("build_signed_poll_create_tier3 A");
+        let signing_bytes_a = event_a.signing_bytes().expect("signing_bytes A");
+        let poll_id_a = derive_poll_id(&community_id, &signing_bytes_a);
+
+        // Poll B: same proposer, slightly different hlc so signing_bytes differ → distinct PollId.
+        let hlc_b = hlc_at(2_000_000);
+        let event_b =
+            build_signed_poll_create_tier3(&proposer.signing_key, proposer.owner, &config_a, hlc_b)
+                .expect("build_signed_poll_create_tier3 B");
+
+        let snapshot = single_member_snapshot(proposer.owner);
+        let mut log = VotingLog::new();
+        log.apply_with_snapshot(event_a, &community_id, Some(snapshot.clone()))
+            .expect("apply poll A");
+        log.apply_with_snapshot(event_b, &community_id, Some(snapshot))
+            .expect("apply poll B");
+
+        let state = build_node_state_with_log(community_id, log, None).await;
+        Tier3TestHarness {
+            state,
+            poll_id_hex: hex::encode(poll_id_a.0),
+            community_id_hex: hex::encode(community_id.0),
+        }
+    }
+
+    /// NodeState with one Tier 3 poll and one Tier 1 poll in the same community.
+    async fn with_one_tier3_and_one_tier1_in_same_community() -> Self {
+        let community_id = SpaceId([0xA5; 16]);
+        let proposer = fixture_identity(5);
+
+        // Tier 3 poll.
+        let config = tier3_config();
+        let hlc_t3 = hlc_at(1_000_000);
+        let event_t3 =
+            build_signed_poll_create_tier3(&proposer.signing_key, proposer.owner, &config, hlc_t3)
+                .expect("build tier3 poll");
+        let signing_bytes_t3 = event_t3.signing_bytes().expect("signing_bytes t3");
+        let poll_id_t3 = derive_poll_id(&community_id, &signing_bytes_t3);
+
+        // Tier 1 poll.
+        let tier1_cfg = Tier1PollConfig {
+            options: vec!["Yes".into(), "No".into()],
+            window_seconds: 3600,
+            quorum: None,
+            threshold_percent: None,
+            multi_winner: None,
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            channel_id: ChannelId([0x22; 16]),
+        };
+        let hlc_t1 = hlc_at(2_000_000);
+        let event_t1 = build_signed_poll_create_tier1(
+            &proposer.signing_key,
+            proposer.owner,
+            &tier1_cfg,
+            hlc_t1,
+        )
+        .expect("build tier1 poll");
+
+        let snapshot = single_member_snapshot(proposer.owner);
+        let mut log = VotingLog::new();
+        log.apply_with_snapshot(event_t3, &community_id, Some(snapshot.clone()))
+            .expect("apply tier3");
+        log.apply_with_snapshot(event_t1, &community_id, Some(snapshot))
+            .expect("apply tier1");
+
+        let state = build_node_state_with_log(community_id, log, None).await;
+        Tier3TestHarness {
+            state,
+            poll_id_hex: hex::encode(poll_id_t3.0),
+            community_id_hex: hex::encode(community_id.0),
+        }
+    }
+
+    /// NodeState with a Tier 3 poll that has reached Stage::Finalized.
+    ///
+    /// Uses sortition_size=1 so threshold = ceil(1/2) = 1 (one approval
+    /// satisfies the drafting threshold). Sequence:
+    ///   kd=cr → kd=ss (1 primary) → kd=dc (self-approval = 1 ≥ threshold)
+    ///   → kd=cl (poll close) → kd=rs (poll result, winner = dc candidate)
+    ///
+    /// The `winner_text` in the summary will be the draft candidate's text.
+    /// Status quo is NOT synthesized into t3.candidates here (no engine
+    /// orchestration), so the winner must be the real kd=dc candidate to
+    /// get a non-None `winner_text`.
+    async fn with_finalized_tier3_poll() -> Self {
+        let community_id = SpaceId([0xA6; 16]);
+        let proposer = fixture_identity(6);
+
+        // Use sortition_size=1 so threshold = ceil(1/2) = 1.
+        let config = Tier3PollConfigPayload {
+            proposal_text: "Finalized proposal text".into(),
+            sortition_size: 1,
+            deliberation_window_seconds: 1,
+            drafting_window_seconds: 1,
+            ratification_window_seconds: 1,
+            privacy_mode: "pu".into(),
+            incentive_mode: "d".into(),
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            retry_of: None,
+        };
+        let hlc_create = hlc_at(1_000_000);
+        let event_create = build_signed_poll_create_tier3(
+            &proposer.signing_key,
+            proposer.owner,
+            &config,
+            hlc_create,
+        )
+        .expect("build tier3 poll");
+        let signing_bytes = event_create.signing_bytes().expect("signing_bytes");
+        let poll_id = derive_poll_id(&community_id, &signing_bytes);
+
+        let snapshot = single_member_snapshot(proposer.owner);
+        let mut log = VotingLog::new();
+        log.apply_with_snapshot(event_create, &community_id, Some(snapshot))
+            .expect("apply kd=cr");
+
+        // kd=ss: 1 primary (proposer), 0 backup.
+        let ss_event = build_signed_sortition_selection(
+            &proposer.signing_key,
+            proposer.owner,
+            poll_id,
+            vec![proposer.owner],
+            vec![],
+            hlc_at(1_000_001),
+        )
+        .expect("build kd=ss");
+        log.apply_with_snapshot(ss_event, &community_id, None)
+            .expect("apply kd=ss");
+
+        // kd=dc: draft candidate from proposer (self-approval = 1, hits threshold=1).
+        let dc_event = build_signed_draft_candidate(
+            &proposer.signing_key,
+            proposer.owner,
+            poll_id,
+            "Winner proposal text".into(),
+            hlc_at(1_000_002),
+        )
+        .expect("build kd=dc");
+        let dc_hash: [u8; 32] = event_hash_of(&dc_event);
+        log.apply_with_snapshot(dc_event, &community_id, None)
+            .expect("apply kd=dc");
+
+        // kd=cl: poll close (proposer signs).
+        let cl_event = build_signed_poll_close_tier3(
+            &proposer.signing_key,
+            proposer.owner,
+            poll_id,
+            hlc_at(1_000_003),
+        )
+        .expect("build kd=cl");
+        log.apply_with_snapshot(cl_event, &community_id, None)
+            .expect("apply kd=cl");
+
+        // kd=rs: poll result. Construct StarResult with dc_hash as winner.
+        // apply_event does NOT verify tally (verify_sr is an upstream gate);
+        // we only need winner.event_hash to match a real t3.candidates entry
+        // so that winner_text resolves to "Winner proposal text".
+        let star_result = StarResult {
+            winner: CandidateRef {
+                event_hash: dc_hash,
+                approval_count: 1,
+            },
+            finalists: vec![CandidateRef {
+                event_hash: dc_hash,
+                approval_count: 1,
+            }],
+            total_scores: vec![0],
+            runoff_votes: vec![1],
+        };
+        let rs_event = build_signed_poll_result_tier3(
+            &proposer.signing_key,
+            proposer.owner,
+            poll_id,
+            star_result,
+            hlc_at(1_000_004),
+        )
+        .expect("build kd=rs");
+        log.apply_with_snapshot(rs_event, &community_id, None)
+            .expect("apply kd=rs");
+
+        let state = build_node_state_with_log(community_id, log, None).await;
+        Tier3TestHarness {
+            state,
+            poll_id_hex: hex::encode(poll_id.0),
+            community_id_hex: hex::encode(community_id.0),
+        }
+    }
+
     /// Call `voting_get_tier3_poll_impl` — the decoupled inner implementation.
     async fn get_tier3_poll(
         &self,
         poll_id_hex: &str,
     ) -> Result<harmony_app::Tier3PollExport, String> {
         voting_get_tier3_poll_impl(&self.state, poll_id_hex.to_string()).await
+    }
+
+    /// Call `voting_list_tier3_polls_impl` — the decoupled inner implementation.
+    async fn list_tier3_polls(
+        &self,
+        community_id_hex: &str,
+    ) -> Result<Vec<harmony_app::Tier3PollSummary>, String> {
+        voting_list_tier3_polls_impl(&self.state, community_id_hex.to_string()).await
     }
 }
 
@@ -308,5 +528,61 @@ async fn get_tier3_poll_returns_error_on_tier_mismatch() {
     assert!(
         err.contains("not tier3") || err.contains("not Tier3"),
         "expected tier mismatch error, got: {err}"
+    );
+}
+
+// ─── list_tier3_polls tests ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn list_tier3_polls_returns_polls_ordered_newest_first() {
+    let h = Tier3TestHarness::with_two_polls_in_sortition_stage_at_different_hlcs().await;
+    let summaries = h.list_tier3_polls(&h.community_id_hex).await.expect("ok");
+    assert_eq!(summaries.len(), 2, "expected 2 Tier 3 polls");
+    assert!(
+        summaries[0].poll_create_hlc_ms >= summaries[1].poll_create_hlc_ms,
+        "polls must be ordered newest first: [{}, {}]",
+        summaries[0].poll_create_hlc_ms,
+        summaries[1].poll_create_hlc_ms,
+    );
+}
+
+#[tokio::test]
+async fn list_tier3_polls_excludes_tier1_and_tier2_polls() {
+    let h = Tier3TestHarness::with_one_tier3_and_one_tier1_in_same_community().await;
+    let summaries = h.list_tier3_polls(&h.community_id_hex).await.expect("ok");
+    assert_eq!(
+        summaries.len(),
+        1,
+        "list must exclude the Tier 1 poll; got {summaries:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_tier3_polls_includes_finalized_with_winner_text() {
+    let h = Tier3TestHarness::with_finalized_tier3_poll().await;
+    let summaries = h.list_tier3_polls(&h.community_id_hex).await.expect("ok");
+    assert_eq!(summaries.len(), 1, "expected exactly 1 finalized poll");
+    assert_eq!(
+        summaries[0].stage,
+        Tier3StageTag::Finalized,
+        "stage must be Finalized"
+    );
+    assert!(
+        summaries[0].winner_text.is_some(),
+        "winner_text must be set for a Finalized poll; got {:?}",
+        summaries[0].winner_text
+    );
+}
+
+#[tokio::test]
+async fn list_tier3_polls_returns_empty_for_unknown_community() {
+    let h = Tier3TestHarness::empty().await;
+    let summaries = h
+        .list_tier3_polls(&"00".repeat(16))
+        .await
+        .expect("ok — unknown community returns empty vec, not error");
+    assert!(
+        summaries.is_empty(),
+        "unknown community must return empty vec"
     );
 }

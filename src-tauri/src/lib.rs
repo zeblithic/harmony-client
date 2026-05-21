@@ -24236,6 +24236,88 @@ fn build_tier3_export(
     })
 }
 
+/// ZEB-311: Tauri IPC — list every Tier 3 poll for a community, ordered
+/// by `poll_create_hlc_ms` descending (newest first). Includes all
+/// lifecycle stages; Finalized polls carry a cached `winner_text` so
+/// the panel can render "Charter §3 amended" without an extra fetch.
+///
+/// Returns an empty vec for unknown `community_id` (no error).
+///
+/// Errors:
+/// - "invalid community_id hex" — hex decode failure
+#[tauri::command(rename_all = "snake_case")]
+async fn voting_list_tier3_polls(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    community_id: String,
+) -> Result<Vec<Tier3PollSummary>, String> {
+    voting_list_tier3_polls_impl(state_lock.inner(), community_id).await
+}
+
+/// ZEB-311: Decoupled implementation of `voting_list_tier3_polls` for integration testing.
+/// Integration tests drive this directly with a raw `&Mutex<NodeState>` rather than
+/// a `tauri::State<'_, ...>` (which is not directly constructible outside Tauri's app setup).
+#[cfg(any(test, feature = "test-fixtures"))]
+pub async fn voting_list_tier3_polls_impl(
+    state_lock: &Mutex<NodeState>,
+    community_id: String,
+) -> Result<Vec<Tier3PollSummary>, String> {
+    voting_list_tier3_polls_raw(state_lock, community_id).await
+}
+
+async fn voting_list_tier3_polls_raw(
+    state_lock: &Mutex<NodeState>,
+    community_id: String,
+) -> Result<Vec<Tier3PollSummary>, String> {
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(cid_bytes);
+
+    let voting_logs = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        std::sync::Arc::clone(&g.voting_logs)
+    };
+
+    let log_arc = {
+        let map = voting_logs.lock().await;
+        match map.get(&space_id) {
+            Some(arc) => arc.clone(),
+            None => return Ok(Vec::new()),
+        }
+    };
+    let g = log_arc.lock().await;
+
+    let mut summaries: Vec<Tier3PollSummary> = g
+        .polls
+        .values()
+        .filter_map(|state| {
+            let t3 = state.tier_state.as_tier3()?;
+            let winner_text = t3.result.as_ref().and_then(|r| {
+                t3.candidates
+                    .iter()
+                    .find(|c| c.event_hash == r.winner.event_hash)
+                    .map(|c| c.text.clone())
+            });
+            Some(Tier3PollSummary {
+                poll_id: hex::encode(state.meta.poll_id.0),
+                community_id: hex::encode(state.meta.community_id.0),
+                proposal_text: t3.meta.config.proposal_text.clone(),
+                proposer: hex::encode(t3.meta.proposer.0),
+                stage: t3.stage.into(),
+                poll_create_hlc_ms: t3.meta.poll_create_hlc.wall_ms as i128,
+                sortition_size: t3.meta.config.sortition_size,
+                winner_text,
+            })
+        })
+        .collect();
+    summaries.sort_by_key(|s| std::cmp::Reverse(s.poll_create_hlc_ms));
+    Ok(summaries)
+}
+
 /// Tauri IPC: convenience wrapper for "contesting" a near-finalize
 /// Tier 2 proposal by issuing an Unsignal event from the caller's
 /// identity. If the caller previously signaled support, this withdraws
@@ -27015,6 +27097,7 @@ pub fn run() {
             voting_contest_tier2_finalization,
             // ZEB-311: Tier 3 pull-style read IPCs.
             voting_get_tier3_poll,
+            voting_list_tier3_polls,
             // ZEB-292 Phase 3: delegation UI read IPCs.
             voting_get_my_delegate,
             voting_list_delegations,
@@ -27087,6 +27170,7 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         voting_contest_tier2_finalization,
         // ZEB-311: Tier 3 pull-style read IPCs.
         voting_get_tier3_poll,
+        voting_list_tier3_polls,
         // ZEB-292 Phase 3: delegation UI read IPCs.
         voting_get_my_delegate,
         voting_list_delegations,
