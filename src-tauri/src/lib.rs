@@ -23983,7 +23983,10 @@ async fn voting_get_tier3_poll(
     state_lock: tauri::State<'_, Mutex<NodeState>>,
     poll_id: String,
 ) -> Result<Tier3PollExport, String> {
-    voting_get_tier3_poll_impl(state_lock.inner(), poll_id).await
+    // Call `_raw` directly. The `_impl` shim below is cfg-gated for tests
+    // only — calling it here would break production builds without
+    // `--features test-fixtures`.
+    voting_get_tier3_poll_raw(state_lock.inner(), poll_id).await
 }
 
 /// ZEB-311: Decoupled implementation of `voting_get_tier3_poll` for integration testing.
@@ -24263,7 +24266,10 @@ async fn voting_list_tier3_polls(
     state_lock: tauri::State<'_, Mutex<NodeState>>,
     community_id: String,
 ) -> Result<Vec<Tier3PollSummary>, String> {
-    voting_list_tier3_polls_impl(state_lock.inner(), community_id).await
+    // Call `_raw` directly. The `_impl` shim below is cfg-gated for tests
+    // only — calling it here would break production builds without
+    // `--features test-fixtures`.
+    voting_list_tier3_polls_raw(state_lock.inner(), community_id).await
 }
 
 /// ZEB-311: Decoupled implementation of `voting_list_tier3_polls` for integration testing.
