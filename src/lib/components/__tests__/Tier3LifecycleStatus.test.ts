@@ -1,7 +1,7 @@
 import { render } from '@testing-library/svelte';
 import { describe, it, expect } from 'vitest';
 import Tier3LifecycleStatus from '../Tier3LifecycleStatus.svelte';
-import type { Tier3PollSummary } from '$lib/types/voting';
+import type { Tier3PollSummary } from '../../types/voting';
 
 const baseSummary: Tier3PollSummary = {
   pollId: 'aa'.repeat(32),
