@@ -48,6 +48,39 @@ pub struct DraftCandidateState {
     pub approvals: HashSet<OwnerAddr>,
 }
 
+/// A mini-public member's contribution during the deliberation stage,
+/// stored after `kd=ds` apply. Immutable per spec §2 — no edit/retract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliberationStatement {
+    pub event_hash: [u8; 32],
+    pub author: OwnerAddr,
+    pub text: String,
+    pub created_at_hlc: Hlc,
+}
+
+/// A single (voter, statement) vote entry. LWW-resolved on apply by
+/// `(last_update_hlc, last_update_event_hash)` lex comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliberationVoteEntry {
+    pub voter: OwnerAddr,
+    pub statement_event_hash: [u8; 32],
+    pub vote: crate::community_voting_core::BridgingVoteCode,
+    pub last_update_hlc: Hlc,
+    pub last_update_event_hash: [u8; 32],
+}
+
+/// Tier 3 deliberation projection state. Materialized from `kd=ds` and
+/// `kd=dv` events; consumed by the bridging algorithm + IPC read paths.
+///
+/// BTreeMap (not HashMap) for deterministic iteration — bridging-detection
+/// determinism (spec §4.7 point 2) depends on this.
+#[derive(Debug, Clone, Default)]
+pub struct DeliberationState {
+    pub statements: std::collections::BTreeMap<[u8; 32], DeliberationStatement>,
+    pub votes: std::collections::BTreeMap<(OwnerAddr, [u8; 32]), DeliberationVoteEntry>,
+    pub statements_per_author: std::collections::BTreeMap<OwnerAddr, u8>,
+}
+
 /// Immutable metadata derived from the kd=cr PollCreate event.
 #[derive(Debug, Clone)]
 pub struct Tier3PollMeta {
@@ -87,6 +120,9 @@ pub struct Tier3PollState {
     pub close_event_hash: Option<[u8; 32]>,
     /// Set by kd=rs PollResult event (StarResult decoded from payload).
     pub result: Option<StarResult>,
+    /// Phase 5 (Tier 3b) deliberation projection. Populated by `kd=ds`
+    /// and `kd=dv` apply paths. Default empty until Task 3/4 wire apply.
+    pub deliberation: DeliberationState,
     /// HLC of the most recent event applied (None before any event).
     pub last_hlc: Option<Hlc>,
 }
@@ -242,6 +278,7 @@ impl Tier3PollState {
             ratification_ballots: Vec::new(),
             close_event_hash: None,
             result: None,
+            deliberation: DeliberationState::default(),
             last_hlc: None,
         }
     }
@@ -1603,6 +1640,18 @@ mod tests {
     fn current_mini_public_empty_before_sortition() {
         let poll = new_poll(0);
         assert!(poll.current_mini_public(&hlc(100)).is_empty());
+    }
+
+    // ── Task 2: new Tier3PollState has empty deliberation projection ──────────
+
+    #[test]
+    fn new_tier3_poll_state_has_empty_deliberation() {
+        let meta = meta_at(0);
+        let poll =
+            Tier3PollState::new_from_create(meta, vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])]);
+        assert!(poll.deliberation.statements.is_empty());
+        assert!(poll.deliberation.votes.is_empty());
+        assert!(poll.deliberation.statements_per_author.is_empty());
     }
 
     // ── Additional: da for unknown candidate is silently ignored ──────────────
