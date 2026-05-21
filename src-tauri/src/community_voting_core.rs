@@ -1389,10 +1389,12 @@ pub fn build_signed_ratification_ballot(
 
 /// Build a fully-signed `kd=ss` SortitionSelection event (Tier 3).
 ///
-/// ZEB-298+ZEB-312 PR 1: the engine currently emits zero-sig kd=ss events
-/// (Task 19 will wire real signing). This builder is exposed so integration
-/// tests can create properly-signed kd=ss events for the cross-engine bridge
-/// path, enabling end-to-end verification without the old feature-gate bypass.
+/// Exposed so integration tests can create properly-signed kd=ss events
+/// for the cross-engine bridge path, enabling end-to-end verification
+/// of inbound apply through real signatures. Engine-auto-emitted kd=ss
+/// in PR 1 is dormant (Tier 3 IPCs still apply directly to VotingLog);
+/// PR 2 will route IPCs through `engine.publish_event` so engine-auto
+/// kd=ss mints with the local signing key.
 pub fn build_signed_sortition_selection(
     keypair: &ed25519_dalek::SigningKey,
     actor: OwnerAddr,

@@ -1463,16 +1463,16 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             }
         }
 
-        // Verify-then-apply. Resolvers must be installed; None means the
-        // engine is not production-wired and inbound events are rejected.
-        let mem_resolver = membership_resolver.ok_or_else(|| {
-            "process_inbound: membership_resolver not installed (engine wiring incomplete)"
-                .to_string()
-        })?;
-        let id_resolver = identity_resolver.ok_or_else(|| {
-            "process_inbound: identity_resolver not installed (engine wiring incomplete)"
-                .to_string()
-        })?;
+        // ZEB-298+ZEB-312 PR 1: when resolvers are absent (engine not fully
+        // production-wired — e.g. identity_resolver is deferred to PR 2),
+        // silently drop inbound events. This avoids flooding logs with
+        // "resolver not installed" warns on every peer event arriving over
+        // Zenoh. Inbound activates once PR 2 wires the production
+        // OwnerDeviceCacheResolver adapter.
+        let (Some(id_resolver), Some(mem_resolver)) = (identity_resolver, membership_resolver)
+        else {
+            return Ok(());
+        };
 
         let snapshot = mem_resolver
             .snapshot_at(community_id, &event.hlc)
@@ -1482,6 +1482,73 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         crate::community_voting_core::verify_voting_event(&event, &snapshot, id_resolver.as_ref())
             .await
             .map_err(|e| format!("verify: {e}"))?;
+
+        // ZEB-298+ZEB-312 PR 1 Fix (Qodo finding): Tier 2 eligibility check.
+        // verify_voting_event does V6 (membership) + signature only — it
+        // intentionally skips eligibility. For Tier 2 Signal/PollCreate
+        // inbound, peers must also satisfy the proposal's eligibility predicate
+        // before applying, or they could influence threshold math via
+        // ineligible signals.
+        if event.tier == crate::community_voting_core::Tier::Conviction {
+            match event.kind {
+                crate::community_voting_core::PollEventKindCode::Signal => {
+                    // Decode SignalPayload to get proposal_id.
+                    let signal: crate::community_voting_conviction::SignalPayload =
+                        ciborium::de::from_reader(&event.payload[..])
+                            .map_err(|e| format!("decode signal payload: {e}"))?;
+
+                    // Fetch the proposal's eligibility predicate.
+                    let log_g = voting_log.lock().await;
+                    let eligibility = match log_g.polls.get(&signal.proposal_id) {
+                        Some(ps) => match &ps.tier_state {
+                            crate::community_voting_log::TierState::Tier2(t2) => {
+                                t2.config.eligibility
+                            }
+                            _ => {
+                                // Mismatch: Tier 2 Signal but the proposal exists in
+                                // a non-Tier-2 slot. Reject.
+                                return Err(format!(
+                                    "Tier 2 Signal for non-Tier-2 poll {}",
+                                    hex::encode(signal.proposal_id.0)
+                                ));
+                            }
+                        },
+                        None => {
+                            return Err(format!(
+                                "Tier 2 Signal for unknown poll {}",
+                                hex::encode(signal.proposal_id.0)
+                            ));
+                        }
+                    };
+                    drop(log_g);
+
+                    crate::community_voting_core::check_eligibility(
+                        &snapshot,
+                        &event.actor,
+                        &eligibility,
+                    )
+                    .map_err(|e| format!("Tier 2 Signal: actor not eligible: {e:?}"))?;
+                }
+                crate::community_voting_core::PollEventKindCode::PollCreate => {
+                    // For Tier 2 PollCreate, the proposal's eligibility predicate
+                    // is in the payload itself (Tier2PollConfig.eligibility) — the
+                    // creator must satisfy their own predicate.
+                    let cfg: crate::community_voting_conviction::Tier2PollConfig =
+                        ciborium::de::from_reader(&event.payload[..])
+                            .map_err(|e| format!("decode tier2 poll config: {e}"))?;
+                    crate::community_voting_core::check_eligibility(
+                        &snapshot,
+                        &event.actor,
+                        &cfg.eligibility,
+                    )
+                    .map_err(|e| format!("Tier 2 PollCreate: creator not eligible: {e:?}"))?;
+                }
+                // Delegate/Undelegate are community-wide graph mutations — they
+                // don't have a proposal-specific eligibility check. The membership
+                // check in verify_voting_event is sufficient.
+                _ => {}
+            }
+        }
 
         // Apply with the verified snapshot.
         {

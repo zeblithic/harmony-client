@@ -3748,6 +3748,23 @@ pub fn spawn_voting_log_zenoh_adapter(
                     res = sub.recv_async() => {
                         match res {
                             Ok(sample) => {
+                                // Size cap: voting events are small CBOR envelopes
+                                // (typically <2 KiB). Cap inbound payloads to prevent
+                                // peer-controlled allocation attacks before we even
+                                // decode for verification.
+                                let payload_len = sample.payload().len();
+                                const MAX_VOTING_PAYLOAD_BYTES: usize = 64 * 1024;
+                                if payload_len > MAX_VOTING_PAYLOAD_BYTES {
+                                    if !closing_sub.load(Ordering::SeqCst) {
+                                        tracing::warn!(
+                                            topic = %topic_sub,
+                                            len = payload_len,
+                                            max = MAX_VOTING_PAYLOAD_BYTES,
+                                            "voting payload exceeds size cap; dropping"
+                                        );
+                                    }
+                                    continue;
+                                }
                                 let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
                                 if subscriber_tx.send(bytes).await.is_err() {
                                     break;
