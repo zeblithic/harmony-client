@@ -121,7 +121,7 @@ fn hlc_at(wall_ms: u64, device_id: &str) -> Hlc {
 /// for the canonical implementation; this is a local duplicate required because
 /// each integration test file is its own Cargo crate.
 pub struct BridgeTestResolvers {
-    identity: std::sync::RwLock<HashMap<OwnerAddr, ed25519_dalek::VerifyingKey>>,
+    identity: std::sync::RwLock<HashMap<OwnerAddr, [u8; 64]>>,
     snapshot: std::sync::RwLock<MembershipSnapshot>,
 }
 
@@ -136,10 +136,7 @@ impl BridgeTestResolvers {
     }
 
     fn add_identity(&self, id: &TestIdentity) {
-        self.identity
-            .write()
-            .unwrap()
-            .insert(id.owner, id.signing_key.verifying_key());
+        self.identity.write().unwrap().insert(id.owner, id.pub_64);
         self.snapshot.write().unwrap().members.insert(
             id.owner,
             MemberAttrs {
@@ -152,7 +149,7 @@ impl BridgeTestResolvers {
 
 #[async_trait::async_trait]
 impl VotingIdentityResolver for BridgeTestResolvers {
-    async fn verifying_key_for(&self, owner: &OwnerAddr) -> Option<ed25519_dalek::VerifyingKey> {
+    async fn resolve(&self, owner: &OwnerAddr) -> Option<[u8; 64]> {
         self.identity.read().unwrap().get(owner).copied()
     }
 }

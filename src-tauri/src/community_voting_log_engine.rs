@@ -1669,20 +1669,31 @@ mod tests {
     // ── Test resolvers ─────────────────────────────────────────────────────
 
     /// Fixed resolver pair for unit tests: holds a HashMap of OwnerAddr →
-    /// VerifyingKey for identity resolution and a fixed MembershipSnapshot.
+    /// 64-byte composite identity (X25519 || Ed25519) and a fixed MembershipSnapshot.
     struct FixedTestResolvers {
-        identity: HashMap<OwnerAddr, ed25519_dalek::VerifyingKey>,
+        identity: HashMap<OwnerAddr, [u8; 64]>,
         snapshot: MembershipSnapshot,
     }
 
     #[async_trait::async_trait]
     impl VotingIdentityResolver for FixedTestResolvers {
-        async fn verifying_key_for(
-            &self,
-            owner: &OwnerAddr,
-        ) -> Option<ed25519_dalek::VerifyingKey> {
+        async fn resolve(&self, owner: &OwnerAddr) -> Option<[u8; 64]> {
             self.identity.get(owner).copied()
         }
+    }
+
+    /// Build a `(SigningKey, OwnerAddr, [u8; 64])` triple from a single-byte seed.
+    /// The returned `owner`'s `address_hash` is derived from the public key bytes —
+    /// the same binding enforced by `verify_voting_event`'s defense-in-depth check.
+    fn fixture_identity_engine(seed: u8) -> (ed25519_dalek::SigningKey, OwnerAddr, [u8; 64]) {
+        let priv_id = harmony_identity::PrivateIdentity::from_seed(&[seed; 32]);
+        let owner = OwnerAddr(priv_id.identity.address_hash);
+        let pub_64 = priv_id.identity.to_public_bytes();
+        let private_bytes = priv_id.to_private_bytes();
+        let mut ed_secret = [0u8; 32];
+        ed_secret.copy_from_slice(&private_bytes[32..64]);
+        let signing = ed25519_dalek::SigningKey::from_bytes(&ed_secret);
+        (signing, owner, pub_64)
     }
 
     #[async_trait::async_trait]
@@ -1893,14 +1904,11 @@ mod tests {
         // unconditional. We build a real Ed25519 keypair so the signature
         // checks out.
         use crate::community_voting_core::build_signed_poll_create_tier1;
-        use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
 
         let voting_log = Arc::new(Mutex::new(VotingLog::new()));
         let community_id = SpaceId([0x77; 16]);
 
-        let keypair = SigningKey::generate(&mut OsRng);
-        let peer_actor = OwnerAddr([0xbb; 16]);
+        let (keypair, peer_actor, peer_pub64) = fixture_identity_engine(0xbb);
 
         let cfg = good_tier1_config();
         let peer_event = build_signed_poll_create_tier1(
@@ -1917,7 +1925,7 @@ mod tests {
 
         // Build fixed resolvers so the engine can verify the inbound event.
         let resolvers = Arc::new(FixedTestResolvers {
-            identity: HashMap::from([(peer_actor, keypair.verifying_key())]),
+            identity: HashMap::from([(peer_actor, peer_pub64)]),
             snapshot: MembershipSnapshot {
                 members: HashMap::from([(
                     peer_actor,

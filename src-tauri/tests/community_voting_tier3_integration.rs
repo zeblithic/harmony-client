@@ -74,7 +74,7 @@ impl IdentityResolver for StaticIdentityResolver {
 /// engines are started (the resolver Arc is shared with both engines at
 /// setup time; tests add identities incrementally as test actors are created).
 pub struct BridgeTestResolvers {
-    identity: std::sync::RwLock<HashMap<OwnerAddr, ed25519_dalek::VerifyingKey>>,
+    identity: std::sync::RwLock<HashMap<OwnerAddr, [u8; 64]>>,
     snapshot: std::sync::RwLock<MembershipSnapshot>,
 }
 
@@ -90,10 +90,7 @@ impl BridgeTestResolvers {
 
     /// Register an identity and add it to the membership snapshot.
     pub fn add_identity(&self, id: &TestIdentity) {
-        self.identity
-            .write()
-            .unwrap()
-            .insert(id.owner, id.signing_key.verifying_key());
+        self.identity.write().unwrap().insert(id.owner, id.pub_64);
         self.snapshot.write().unwrap().members.insert(
             id.owner,
             MemberAttrs {
@@ -106,7 +103,7 @@ impl BridgeTestResolvers {
 
 #[async_trait::async_trait]
 impl VotingIdentityResolver for BridgeTestResolvers {
-    async fn verifying_key_for(&self, owner: &OwnerAddr) -> Option<ed25519_dalek::VerifyingKey> {
+    async fn resolve(&self, owner: &OwnerAddr) -> Option<[u8; 64]> {
         self.identity.read().unwrap().get(owner).copied()
     }
 }

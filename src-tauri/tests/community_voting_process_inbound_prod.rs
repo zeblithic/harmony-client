@@ -11,8 +11,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use tokio::sync::Mutex;
 
 use harmony_app::community_membership::ChannelId;
@@ -30,14 +28,28 @@ use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 
 // ── Fixed resolver pair for this test ────────────────────────────────────────
 
+/// Build a `(SigningKey, OwnerAddr, [u8; 64])` triple from a single-byte seed.
+/// The returned `owner`'s `address_hash` is derived from the public key bytes —
+/// the same binding enforced by `verify_voting_event`'s defense-in-depth check.
+fn fixture_identity(seed: u8) -> (ed25519_dalek::SigningKey, OwnerAddr, [u8; 64]) {
+    let priv_id = harmony_identity::PrivateIdentity::from_seed(&[seed; 32]);
+    let owner = OwnerAddr(priv_id.identity.address_hash);
+    let pub_64 = priv_id.identity.to_public_bytes();
+    let private_bytes = priv_id.to_private_bytes();
+    let mut ed_secret = [0u8; 32];
+    ed_secret.copy_from_slice(&private_bytes[32..64]);
+    let signing = ed25519_dalek::SigningKey::from_bytes(&ed_secret);
+    (signing, owner, pub_64)
+}
+
 struct FixedResolvers {
-    identity: HashMap<OwnerAddr, ed25519_dalek::VerifyingKey>,
+    identity: HashMap<OwnerAddr, [u8; 64]>,
     snapshot: MembershipSnapshot,
 }
 
 #[async_trait]
 impl VotingIdentityResolver for FixedResolvers {
-    async fn verifying_key_for(&self, owner: &OwnerAddr) -> Option<ed25519_dalek::VerifyingKey> {
+    async fn resolve(&self, owner: &OwnerAddr) -> Option<[u8; 64]> {
         self.identity.get(owner).copied()
     }
 }
@@ -57,9 +69,8 @@ impl MembershipSnapshotResolver for FixedResolvers {
 
 #[tokio::test]
 async fn process_inbound_peer_apply_succeeds_in_production_build() {
-    // Build a peer PollCreate event signed by `keypair` for `actor`.
-    let keypair = SigningKey::generate(&mut OsRng);
-    let actor = OwnerAddr([0xaa; 16]);
+    // Build a peer PollCreate event signed by a fixture identity.
+    let (keypair, actor, pub_64) = fixture_identity(0xaa);
     let community_id = SpaceId([0xcc; 16]);
     let channel_id = ChannelId([0xbb; 16]);
 
@@ -96,7 +107,7 @@ async fn process_inbound_peer_apply_succeeds_in_production_build() {
         },
     );
     let resolvers = Arc::new(FixedResolvers {
-        identity: HashMap::from([(actor, keypair.verifying_key())]),
+        identity: HashMap::from([(actor, pub_64)]),
         snapshot: MembershipSnapshot { members },
     });
 
@@ -145,12 +156,10 @@ async fn process_inbound_tier2_signal_from_ineligible_actor_is_rejected() {
     let community_id = SpaceId([0xcc; 16]);
 
     // Creator: power=5 — satisfies eligibility.min_power=5
-    let creator_keypair = SigningKey::generate(&mut OsRng);
-    let creator = OwnerAddr([0xaa; 16]);
+    let (creator_keypair, creator, creator_pub64) = fixture_identity(0xaa);
 
     // Signaler: power=0 — below min_power=5
-    let signaler_keypair = SigningKey::generate(&mut OsRng);
-    let signaler = OwnerAddr([0xbb; 16]);
+    let (signaler_keypair, signaler, signaler_pub64) = fixture_identity(0xbb);
 
     // Tier 2 config with min_power=5
     let cfg = Tier2PollConfig {
@@ -215,10 +224,7 @@ async fn process_inbound_tier2_signal_from_ineligible_actor_is_rejected() {
         },
     );
     let resolvers = Arc::new(FixedResolvers {
-        identity: HashMap::from([
-            (creator, creator_keypair.verifying_key()),
-            (signaler, signaler_keypair.verifying_key()),
-        ]),
+        identity: HashMap::from([(creator, creator_pub64), (signaler, signaler_pub64)]),
         snapshot: MembershipSnapshot { members },
     });
 
