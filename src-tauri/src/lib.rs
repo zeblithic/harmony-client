@@ -22219,12 +22219,8 @@ async fn ensure_voting_engine_for(
     >,
     beacon_requester: Option<crate::community_voting_log_engine::BeaconRequester>,
 ) -> Result<(), String> {
-    // Fast-path read under the std::Mutex (no awaits).
-    // TODO ZEB-314: this releases the lock before sending the adapter
-    // request, creating a TOCTOU window where two concurrent first-time
-    // callers can briefly spawn duplicate Zenoh adapters (the loser drops
-    // its adapter halves within milliseconds — bounded, self-cleaning,
-    // not a correctness bug).
+    // Fast-path read under the std::Mutex (no awaits). Saves the
+    // engine-construction cost when the engine already exists.
     {
         let g = voting_log_engines
             .lock()
@@ -22254,20 +22250,11 @@ async fn ensure_voting_engine_for(
         std::sync::Arc<dyn crate::community_voting_core::VotingIdentityResolver>,
     > = None;
 
-    // Build the engine's mpsc halves; their "other halves" go to the
-    // Zenoh adapter via VotingLogAdapterRequest.
+    // Build the engine's mpsc halves; the "other halves" are bundled into
+    // the VotingLogAdapterRequest below and sent to the event loop only
+    // if we win the engine map race.
     let (publisher_tx, publisher_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     let (subscriber_tx, subscriber_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-
-    let req = crate::event_loop::VotingLogAdapterRequest {
-        id_hex: hex::encode(community_id.0),
-        publisher_rx,
-        subscriber_tx,
-    };
-    voting_log_adapter_request_tx
-        .send(req)
-        .await
-        .map_err(|e| format!("voting_log_adapter_request_tx send failed: {e}"))?;
 
     let engine = crate::community_voting_log_engine::VotingLogEngine::start(
         crate::community_voting_log_engine::VotingLogEngineParams {
@@ -22294,16 +22281,13 @@ async fn ensure_voting_engine_for(
 
     // ZEB-298+ZEB-312 PR 1: install the local signing key so the engine
     // can mint and sign events via engine-auto orchestration paths.
-    // Called before inserting into the map so the engine is fully wired
-    // before any concurrent caller can reach it.
     engine
         .install_local_signing_key(local_signing_key, local_owner)
         .await;
 
     // ZEB-309 Phase 4a-main Task 11: wire DfrostLog handle so the engine
     // can trigger VRF beacon requests on Tier 3 PollCreate and publish
-    // kd=ss on beacon arrival. Called before inserting into the map so the
-    // engine is fully wired before any concurrent caller can reach it.
+    // kd=ss on beacon arrival.
     if let (Some(registry), Some(requester)) = (dfrost_log_registry, beacon_requester) {
         crate::community_voting_log_engine::VotingLogEngine::install_dfrost_handle(
             &engine, registry, requester,
@@ -22311,14 +22295,46 @@ async fn ensure_voting_engine_for(
         .await;
     }
 
-    let mut g = voting_log_engines
-        .lock()
-        .map_err(|e| format!("voting_log_engines poisoned: {e}"))?;
-    // Race: another caller may have raced us to insert. The "winner" is
-    // whichever Arc landed first; we drop ours by overwrite-only-if-
-    // -empty semantics. Use entry().or_insert_with for atomic
-    // insert-if-absent.
-    g.entry(community_id).or_insert(engine);
+    // Build the adapter request now but do NOT send yet — we only send if
+    // we win the engine map insertion below. This closes the TOCTOU window
+    // where two concurrent first-time callers could each send an adapter
+    // request and spawn duplicate Zenoh subscribers on the same topic.
+    let req = crate::event_loop::VotingLogAdapterRequest {
+        id_hex: hex::encode(community_id.0),
+        publisher_rx,
+        subscriber_tx,
+    };
+
+    // Atomic check-and-insert under the std::Mutex. The FIRST caller to
+    // reach this lock for a given community wins and proceeds to spawn
+    // the Zenoh adapter; losers drop their locally-built engine + adapter
+    // halves here without ever spawning a duplicate subscriber.
+    let won_insertion = {
+        let mut g = voting_log_engines
+            .lock()
+            .map_err(|e| format!("voting_log_engines poisoned: {e}"))?;
+        if let std::collections::hash_map::Entry::Vacant(e) = g.entry(community_id) {
+            e.insert(engine);
+            true
+        } else {
+            false
+        }
+    };
+    if !won_insertion {
+        // Lost the race: the locally-built engine + req drop here. The
+        // engine's spawned task observes its publisher_rx peer dropping
+        // (when req drops) and exits cleanly on next poll.
+        return Ok(());
+    }
+
+    // Won the race: spawn the Zenoh adapter on the topic. On send failure
+    // (event loop is shutting down), the engine remains in the map but
+    // without Zenoh wiring — only reachable during app shutdown, after
+    // which no further IPC will exercise it.
+    voting_log_adapter_request_tx
+        .send(req)
+        .await
+        .map_err(|e| format!("voting_log_adapter_request_tx send failed: {e}"))?;
     Ok(())
 }
 
