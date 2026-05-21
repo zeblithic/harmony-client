@@ -1387,8 +1387,6 @@ pub fn build_signed_ratification_ballot(
     Ok(ev)
 }
 
-/// Build a fully-signed `kd=sf` SortitionFailed event. Only the proposer
-/// should sign (enforced at the verify layer via SF1).
 /// Build a fully-signed `kd=ss` SortitionSelection event (Tier 3).
 ///
 /// ZEB-298+ZEB-312 PR 1: the engine currently emits zero-sig kd=ss events

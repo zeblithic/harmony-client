@@ -208,6 +208,18 @@ pub struct VotingLogEngine<R: tauri::Runtime> {
     /// Wrapped in `RwLock<Option<...>>` so the install is one-shot
     /// from outside and reads are non-blocking on the common path.
     local_signing: RwLock<Option<(Arc<ed25519_dalek::SigningKey>, OwnerAddr)>>,
+    /// ZEB-298+ZEB-312 PR 1: production wiring — identity resolver for
+    /// Ed25519 signature verification on inbound voting events. `None`
+    /// means the engine is not production-wired and inbound events are
+    /// rejected.
+    #[allow(dead_code)]
+    pub(crate) identity_resolver:
+        Option<std::sync::Arc<dyn crate::community_voting_core::VotingIdentityResolver>>,
+    /// ZEB-298+ZEB-312 PR 1: production wiring — membership snapshot
+    /// resolver for inbound voting events. `None` ⇒ rejected.
+    #[allow(dead_code)]
+    pub(crate) membership_resolver:
+        Option<std::sync::Arc<dyn crate::community_voting_log::MembershipSnapshotResolver>>,
     /// ZEB-307 PhantomData<fn() -> R>: makes VotingLogEngine<R> unconditionally
     /// Send + Sync even when R = tauri::Wry (which is !Send because its
     /// EventLoop holds Rc<>). The engine only owns R through this marker,
@@ -231,8 +243,10 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         let tracker_for_loop = Arc::clone(&tracker);
         let community_id = params.community_id;
         let mut rx = params.subscriber_rx;
-        let identity_resolver_for_loop = params.identity_resolver.clone();
-        let membership_resolver_for_loop = params.membership_resolver.clone();
+        let identity_resolver = params.identity_resolver.clone();
+        let membership_resolver = params.membership_resolver.clone();
+        let identity_resolver_for_loop = identity_resolver.clone();
+        let membership_resolver_for_loop = membership_resolver.clone();
         let receive_handle = tokio::spawn(async move {
             while let Some(packet) = rx.recv().await {
                 if let Err(e) = Self::process_inbound(
@@ -266,6 +280,8 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             device_id: params.device_id,
             app_handle: params.app_handle,
             local_signing: RwLock::new(None),
+            identity_resolver,
+            membership_resolver,
             _phantom: PhantomData,
         })
     }
