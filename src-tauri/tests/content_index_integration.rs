@@ -158,6 +158,14 @@ async fn ingest_list_pin_burn_roundtrip() {
                         >(1);
                         rx
                     },
+                    {
+                        // ZEB-298+ZEB-312 PR 1: voting-log adapter request channel;
+                        // not exercised in this test, tx dropped immediately.
+                        let (_tx, rx) = tokio::sync::mpsc::channel::<
+                            harmony_app::event_loop::VotingLogAdapterRequest,
+                        >(1);
+                        rx
+                    },
                     None, // ZEB-262 Phase 4 Task 9: community_registry not exercised in this test
                     {
                         // ZEB-270 Phase 3 Task 4.5: channel-log adapter
@@ -431,6 +439,14 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
                         // dropped immediately so the select arm idles.
                         let (_tx, rx) = tokio::sync::mpsc::channel::<
                             harmony_app::event_loop::CommunityAdapterRequest,
+                        >(1);
+                        rx
+                    },
+                    {
+                        // ZEB-298+ZEB-312 PR 1: voting-log adapter request channel;
+                        // not exercised in this test, tx dropped immediately.
+                        let (_tx, rx) = tokio::sync::mpsc::channel::<
+                            harmony_app::event_loop::VotingLogAdapterRequest,
                         >(1);
                         rx
                     },
@@ -812,6 +828,14 @@ async fn fetch_complete_arm_pins_root_in_intent() {
                         >(1);
                         rx
                     },
+                    {
+                        // ZEB-298+ZEB-312 PR 1: voting-log adapter request channel;
+                        // not exercised in this test, tx dropped immediately.
+                        let (_tx, rx) = tokio::sync::mpsc::channel::<
+                            harmony_app::event_loop::VotingLogAdapterRequest,
+                        >(1);
+                        rx
+                    },
                     None, // ZEB-262 Phase 4 Task 9: community_registry not exercised in this test
                     {
                         // ZEB-270 Phase 3 Task 4.5: channel-log adapter
@@ -1048,6 +1072,14 @@ async fn unpin_folder_leaves_independently_pinned_leaf_in_cache() {
                     {
                         let (_tx, rx) = tokio::sync::mpsc::channel::<
                             harmony_app::event_loop::CommunityAdapterRequest,
+                        >(1);
+                        rx
+                    },
+                    {
+                        // ZEB-298+ZEB-312 PR 1: voting-log adapter request channel;
+                        // not exercised in this test, tx dropped immediately.
+                        let (_tx, rx) = tokio::sync::mpsc::channel::<
+                            harmony_app::event_loop::VotingLogAdapterRequest,
                         >(1);
                         rx
                     },
@@ -1346,6 +1378,14 @@ async fn rapid_pin_unpin_toggling_keeps_sidecar_and_runtime_consistent() {
                     {
                         let (_tx, rx) = tokio::sync::mpsc::channel::<
                             harmony_app::event_loop::CommunityAdapterRequest,
+                        >(1);
+                        rx
+                    },
+                    {
+                        // ZEB-298+ZEB-312 PR 1: voting-log adapter request channel;
+                        // not exercised in this test, tx dropped immediately.
+                        let (_tx, rx) = tokio::sync::mpsc::channel::<
+                            harmony_app::event_loop::VotingLogAdapterRequest,
                         >(1);
                         rx
                     },

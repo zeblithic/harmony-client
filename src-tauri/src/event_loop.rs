@@ -84,6 +84,19 @@ pub struct CommunityAdapterRequest {
     pub subscriber_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
 
+/// ZEB-298+ZEB-312 PR 1: per-community voting-log adapter request.
+/// Same shape as `CommunityAdapterRequest` (state-root v1) — voting
+/// is per-community + pub/sub-only (no queryable, no backfill in PR 1).
+pub struct VotingLogAdapterRequest {
+    /// Hex-encoded community SpaceId — used to form
+    /// `harmony/community/{id_hex}/voting`.
+    pub id_hex: String,
+    /// Engine outbound → Zenoh `put`.
+    pub publisher_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    /// Zenoh subscriber → engine inbound.
+    pub subscriber_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
 /// ZEB-270 Phase 3 Task 4.5: per-channel adapter request handed from
 /// `ChannelLogRegistry::spawn` (lib.rs / runtime IPC) into the event
 /// loop's Zenoh-session scope.
@@ -348,6 +361,13 @@ pub async fn run<R: Runtime>(
     // adapter spawn is fire-and-forget so two requests on the same
     // tick fan out concurrently rather than serializing.
     mut community_adapter_request_rx: mpsc::Receiver<CommunityAdapterRequest>,
+    // ZEB-298+ZEB-312 PR 1: on-demand voting-log adapter request receiver.
+    // `ensure_voting_engine_for` sends a `VotingLogAdapterRequest` here;
+    // the select! arm below drains it and calls
+    // `spawn_voting_log_zenoh_adapter` against the live session. Bounded
+    // capacity 32 — same as `community_adapter_request_rx` (voting
+    // engine creation is always user-triggered via IPC, low burst rate).
+    mut voting_log_adapter_request_rx: mpsc::Receiver<VotingLogAdapterRequest>,
     // ZEB-262 Phase 4 Task 9: community sync registry. Threaded into
     // `handle_runtime_action_or_dispatch` so the new
     // `inbound_packet::try_dispatch_community` discriminant pre-fork
@@ -2031,6 +2051,21 @@ pub async fn run<R: Runtime>(
                 );
             }
 
+            // ── ZEB-298+ZEB-312 PR 1: voting-log adapter bridge ──────
+            // Drained whenever ensure_voting_engine_for enqueues an
+            // adapter request. Spawns the per-community Zenoh adapter
+            // against the live session_arc. Same closing-flag plumbing
+            // as the state-root arm.
+            Some(req) = voting_log_adapter_request_rx.recv() => {
+                spawn_voting_log_zenoh_adapter(
+                    Arc::clone(&session_arc),
+                    req.id_hex,
+                    req.publisher_rx,
+                    req.subscriber_tx,
+                    Arc::clone(&closing),
+                );
+            }
+
             // ── ZEB-270 Phase 3 Task 4.5: channel-log adapter bridge ──
             // Drained whenever `ChannelLogRegistry::spawn` enqueues an
             // adapter request. Spawns the per-channel Zenoh adapter
@@ -3559,6 +3594,171 @@ pub fn spawn_community_state_zenoh_adapter(
                                         topic = %topic_sub,
                                         error = %e,
                                         "community state-root subscriber closed unexpectedly"
+                                    );
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    _ = subscriber_tx.closed() => {
+                        // Engine dropped subscriber_rx — nothing to
+                        // forward to anymore. Silent exit; engine
+                        // owns the shutdown trace if relevant.
+                        break;
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        if closing_sub.load(Ordering::SeqCst) { break; }
+                    }
+                }
+            }
+        });
+
+        let _ = pub_handle.await;
+        let _ = sub_handle.await;
+    })
+}
+
+/// ZEB-298+ZEB-312 PR 1: per-community Zenoh adapter for the VotingLog
+/// data plane. Structurally identical to
+/// `spawn_community_state_zenoh_adapter` — pub/sub only (no queryable,
+/// no backfill in PR 1). Topic: `harmony/community/{id_hex}/voting`.
+///
+/// The function is fire-and-forget: `event_loop::run`'s select! arm
+/// calls it and drops the `JoinHandle`. The spawned task exits when
+/// `closing` is set, when the engine drops its publisher_tx, or when
+/// Zenoh closes the subscriber. Engine teardown is driven by the
+/// `VotingLogEnginesMap` lock in stop_inner (same as state-root v1).
+pub fn spawn_voting_log_zenoh_adapter(
+    session: Arc<zenoh::Session>,
+    community_id_hex: String,
+    mut publisher_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    subscriber_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    closing: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    let topic = format!("harmony/community/{}/voting", community_id_hex);
+
+    tokio::spawn(async move {
+        let key_expr = match zenoh::key_expr::KeyExpr::try_from(topic.clone()) {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    %topic,
+                    "community voting-log key_expr invalid; adapter skipped"
+                );
+                // publisher_rx and subscriber_tx drop on this arm's exit;
+                // engine's transport sees both channels close and falls
+                // into degraded mode.
+                return;
+            }
+        };
+
+        // Outbound: drain engine's publisher_rx → Zenoh put.
+        let session_pub = Arc::clone(&session);
+        let key_pub = key_expr.clone();
+        let topic_pub = topic.clone();
+        let closing_pub = Arc::clone(&closing);
+        let pub_handle = tokio::spawn(async move {
+            // Bounded-time shutdown: poll `closing` every second so a
+            // node-stop event terminates the publisher within ~1s even
+            // if no bytes are flowing on `publisher_rx`. Without this,
+            // the outer JoinHandle this fn returns could only resolve
+            // when the engine drops its publisher_tx — fine under the
+            // documented teardown order (registry.shutdown_all first),
+            // but easy for a future caller to misuse.
+            loop {
+                tokio::select! {
+                    // Data-flow arm first: when both arms are ready
+                    // (i.e., a byte is queued AND the 1s timer fires)
+                    // the actual publish wins. With the previous arm
+                    // order the biased eval would always pick the
+                    // closing-check, delaying every collision-case
+                    // publish by one loop iteration.
+                    biased;
+                    maybe = publisher_rx.recv() => {
+                        let Some(bytes) = maybe else { break; };
+                        if let Err(e) = session_pub.put(&key_pub, bytes).await {
+                            if !closing_pub.load(Ordering::SeqCst) {
+                                tracing::warn!(
+                                    topic = %topic_pub,
+                                    error = %e,
+                                    "community voting-log publish failed"
+                                );
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        if closing_pub.load(Ordering::SeqCst) { break; }
+                    }
+                }
+            }
+        });
+
+        // Inbound: Zenoh subscriber → engine's subscriber_tx.
+        let session_sub = session;
+        let key_sub = key_expr;
+        let topic_sub = topic;
+        let closing_sub = Arc::clone(&closing);
+        let sub_handle = tokio::spawn(async move {
+            let sub = match session_sub.declare_subscriber(&key_sub).await {
+                Ok(s) => s,
+                Err(e) => {
+                    if !closing_sub.load(Ordering::SeqCst) {
+                        tracing::error!(
+                            topic = %topic_sub,
+                            error = %e,
+                            "failed to declare community voting-log subscriber"
+                        );
+                    }
+                    // subscriber_tx drops on this arm's exit; engine's
+                    // subscriber_rx hits None and latches inbound_closed,
+                    // continuing in publish-only mode.
+                    return;
+                }
+            };
+            // Three ways the loop ends:
+            //   1. `subscriber_tx.send` fails — engine cleanly shut down
+            //      (registry tore the engine down). Stay silent so a
+            //      routine community-leave / shutdown doesn't log.
+            //   2. `sub.recv_async` returns Err — Zenoh session/subscriber
+            //      died. Warn (gated on !closing) and exit; the engine's
+            //      own subscriber_channel_closed degraded report covers
+            //      surface-level visibility.
+            //   3. `closing` flag flips — bounded-time shutdown, mirrors
+            //      the publisher arm above.
+            //   4. `subscriber_tx.closed()` resolves — the engine
+            //      dropped its subscriber_rx (e.g., registry.stop_engine
+            //      tore down a community while no inbound was flowing).
+            //      Without this arm the loop stays blocked on
+            //      `sub.recv_async` until the next sample arrives,
+            //      leaving the JoinHandle unresolved indefinitely.
+            loop {
+                tokio::select! {
+                    // Data-flow arm first (see publisher loop above
+                    // for rationale). If `subscriber_tx.closed()`
+                    // resolves on the same poll as an inbound sample,
+                    // delivering the sample is harmless: the
+                    // subsequent `subscriber_tx.send` returns Err and
+                    // breaks the loop on the next iteration. Putting
+                    // `closed()` first instead would silently discard
+                    // that sample — contradicting the documented
+                    // intent and masking edge-case message loss
+                    // during teardown.
+                    biased;
+                    res = sub.recv_async() => {
+                        match res {
+                            Ok(sample) => {
+                                let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
+                                if subscriber_tx.send(bytes).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                if !closing_sub.load(Ordering::SeqCst) {
+                                    tracing::warn!(
+                                        topic = %topic_sub,
+                                        error = %e,
+                                        "community voting-log subscriber closed unexpectedly"
                                     );
                                 }
                                 break;
