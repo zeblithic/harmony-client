@@ -480,6 +480,14 @@ pub struct NodeState {
     /// `None` until start_node wires it; cleared in stop_inner.
     voting_log_adapter_request_tx:
         Option<tokio::sync::mpsc::Sender<crate::event_loop::VotingLogAdapterRequest>>,
+    /// ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle captured at
+    /// `start_node` so IPC handlers (which are generic over
+    /// `R: tauri::Runtime` and can't downcast `AppHandle<R>` to
+    /// `AppHandle<Wry>`) can hand the voting engine a concrete
+    /// `AppHandle<Wry>` for Tier 3 lifecycle event emission. Mirrors
+    /// the existing typed-Wry pattern on `voting_log_engines`.
+    /// `None` until `start_node` wires it; cleared in `stop_inner`.
+    app_handle_wry: Option<tauri::AppHandle<tauri::Wry>>,
     /// ZEB-270 Phase 3 Task 4C: per-(community, channel) ChannelLog
     /// engine registry. `None` until `start_node` constructs it
     /// (post-event-loop-ready, so the registry can hold the live
@@ -698,6 +706,9 @@ impl Default for NodeState {
             community_adapter_request_tx: None,
             // ZEB-298+ZEB-312 PR 1: cleared until start_node wires it.
             voting_log_adapter_request_tx: None,
+            // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle captured
+            // at start_node for Tier 3 lifecycle emit.
+            app_handle_wry: None,
             // ZEB-270 Task 4C: registry stays None until start_node
             // wires it (see follow-up Task 4C deferred work).
             channel_log_registry: None,
@@ -1011,6 +1022,9 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         // channel was unused so a restart's fresh Sender doesn't
         // collide with a leaked one.
         let _ = guard.voting_log_adapter_request_tx.take();
+        // ZEB-298+ZEB-312 PR 2 Task 2: drop the typed Wry AppHandle so
+        // a subsequent start_node captures a fresh one for the new run.
+        let _ = guard.app_handle_wry.take();
         // ZEB-270 Phase 3 Task 4C: take the registry handle so we
         // can run `shutdown_all` against it below outside the std
         // `MutexGuard` scope (the `block_on` would panic on the
@@ -1655,6 +1669,9 @@ async fn start_node(
         // request sender so it doesn't outlive the previous event loop.
         // A fresh channel pair is constructed below.
         let _ = guard.voting_log_adapter_request_tx.take();
+        // ZEB-298+ZEB-312 PR 2 Task 2: clear the prior typed Wry
+        // AppHandle so the restart captures a fresh one.
+        let _ = guard.app_handle_wry.take();
         // ZEB-270 Phase 3 Task 4.5: take the prior channel-log
         // registry into the outer-scope binding. Awaited outside the
         // guard scope (the std `MutexGuard` is `!Send`) — mirrors
@@ -3655,6 +3672,12 @@ async fn start_node(
                         // loop. The matching rx was moved into event_loop::run
                         // above.
                         guard.voting_log_adapter_request_tx = Some(voting_log_adapter_request_tx);
+                        // ZEB-298+ZEB-312 PR 2 Task 2: capture the typed Wry
+                        // AppHandle so IPC handlers (generic over R) can hand
+                        // the voting engine a concrete `AppHandle<Wry>` for
+                        // Tier 3 lifecycle event emission. `app` here is
+                        // `tauri::AppHandle` (= `AppHandle<Wry>` by default).
+                        guard.app_handle_wry = Some(app.clone());
                         // ZEB-270 Phase 3 Task 4.5: store the channel-log
                         // registry handle so stop_inner can flip every
                         // per-channel `closing` flag and run final flushes
@@ -21179,6 +21202,48 @@ async fn voting_list_active_polls(
         .collect())
 }
 
+/// ZEB-298 Task 6: Tauri IPC to set a community's per-user
+/// `notify_on_delegate_signal` policy flag. Mutates `VotingLog.policy`
+/// directly (no signed event — the policy is local UX preference, not
+/// consensus-relevant). Lazy-creates the VotingLog for the community
+/// if it doesn't exist yet, mirroring the IPC fast-path used elsewhere.
+#[tauri::command(rename_all = "snake_case")]
+async fn voting_set_notify_on_delegate_signal(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    community_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(cid_bytes);
+
+    let voting_logs = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        std::sync::Arc::clone(&g.voting_logs)
+    };
+
+    let log_arc = {
+        let mut map = voting_logs.lock().await;
+        map.entry(space_id)
+            .or_insert_with(|| {
+                std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::community_voting_log::VotingLog::new(),
+                ))
+            })
+            .clone()
+    };
+    let mut log_g = log_arc.lock().await;
+    let mut policy = log_g.policy().clone();
+    policy.notify_on_delegate_signal = enabled;
+    log_g.set_policy(policy);
+    Ok(())
+}
+
 /// Tauri IPC: get full state for a single poll by id. Includes meta,
 /// tally projection, and the caller's own latest ballot indices (so
 /// the UI can pre-fill the ballot picker without a second IPC).
@@ -21382,6 +21447,12 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
         crdt_state,
         voting_logs,
         channel_log_registry,
+        voting_log_engines,
+        dfrost_log_registry_for_engine,
+        beacon_requester_for_engine,
+        voting_log_adapter_request_tx,
+        self_identity_pub_64,
+        app_handle_wry,
     ) = {
         let g = state_lock
             .lock()
@@ -21401,16 +21472,71 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
                 .ok_or("crdt_state missing — node not running?")?,
             std::sync::Arc::clone(&g.voting_logs),
             g.channel_log_registry.clone(),
+            std::sync::Arc::clone(&g.voting_log_engines),
+            // ZEB-309 Task 11: pass dfrost handles so new engines get wired.
+            g.dfrost_log_registry.clone(),
+            g.beacon_requester.clone(),
+            // ZEB-298+ZEB-312 PR 1: sender for voting-log adapter requests.
+            g.voting_log_adapter_request_tx
+                .clone()
+                .ok_or("voting_log_adapter_request_tx missing — node not running?")?,
+            // ZEB-298+ZEB-312 PR 2 Task 1: needed to construct the
+            // production OwnerDeviceCacheResolver for the voting engine.
+            g.dm_identity_pub_64
+                .ok_or("dm_identity_pub_64 missing — node not running?")?,
+            // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle for the
+            // voting engine's Tier 3 lifecycle emit path. Captured at
+            // start_node so generic IPC handlers can pass a concrete
+            // AppHandle<Wry> without downcasting from AppHandle<R>.
+            g.app_handle_wry
+                .clone()
+                .ok_or("app_handle_wry missing — node not running?")?,
         )
     };
 
     // Build snapshot + check eligibility BEFORE signing. If we're not
     // eligible to participate in our own proposal, the UI should surface that
     // instead of producing an unusable poll.
-    let snapshot =
-        voting_build_snapshot_for_community(crdt_state, community_registry, space_id).await?;
+    let snapshot = voting_build_snapshot_for_community(
+        crdt_state.clone(),
+        community_registry.clone(),
+        space_id,
+    )
+    .await?;
     crate::community_voting_core::check_eligibility(&snapshot, &self_owner, &cfg.eligibility)
         .map_err(|e| format!("voting_create_tier3_proposal: creator not eligible: {e:?}"))?;
+
+    // ZEB-298+ZEB-312 PR 2 Task 7: lazy-register the engine for this community
+    // so engine-auto orchestration (kd=ss/sf/cl/rs auto-mint hooks) fires from
+    // real user actions. ensure_voting_engine_for is idempotent — fast-path
+    // returns Ok if the engine is already initialized.
+    let local_signing_key_for_engine = {
+        let outbox_g = dm_outbox.lock().await;
+        std::sync::Arc::clone(&outbox_g.signing_key)
+    };
+    let membership_resolver_for_engine: std::sync::Arc<
+        dyn crate::community_voting_log::MembershipSnapshotResolver,
+    > = std::sync::Arc::new(NodeStateMembershipResolver {
+        community_registry: community_registry.clone(),
+        crdt_state: crdt_state.clone(),
+    });
+    ensure_voting_engine_for(
+        &voting_logs,
+        &voting_log_engines,
+        space_id,
+        voting_log_adapter_request_tx,
+        hlc_tracker.clone(),
+        device_id.clone(),
+        local_signing_key_for_engine,
+        self_owner,
+        membership_resolver_for_engine,
+        crdt_state.clone(),
+        self_identity_pub_64,
+        app_handle_wry,
+        dfrost_log_registry_for_engine,
+        beacon_requester_for_engine,
+    )
+    .await?;
 
     let wall_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -21431,21 +21557,29 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
         .map_err(|e| format!("voting_create_tier3_proposal: build_signed: {e:?}"))?
     };
 
-    let poll_id = {
-        let log_arc = {
-            let mut map = voting_logs.lock().await;
-            map.entry(space_id)
-                .or_insert_with(|| {
-                    std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::community_voting_log::VotingLog::new(),
-                    ))
-                })
-                .clone()
-        };
-        let mut log = log_arc.lock().await;
-        log.apply_with_snapshot(event, &space_id, Some(snapshot))
-            .map_err(|e| format!("voting_create_tier3_proposal: apply: {e:?}"))?
+    // ZEB-298+ZEB-312 PR 2 Task 7: publish through the engine instead of
+    // applying directly so engine-auto orchestration (Tier 3 PollCreate →
+    // VRF beacon request → kd=ss auto-mint) is exercised in production.
+    // Tier 3 PollCreate passes Some(snapshot) so the engine threads the
+    // already-built electorate through to apply_with_snapshot. Compute the
+    // PollId BEFORE publish so the post-publish UI emit can reference it
+    // without re-reading from the log.
+    let signing_bytes = event
+        .signing_bytes()
+        .map_err(|e| format!("voting_create_tier3_proposal: signing_bytes: {e:?}"))?;
+    let poll_id = crate::community_voting_core::derive_poll_id(&space_id, &signing_bytes);
+    let engine_arc = {
+        let g = voting_log_engines
+            .lock()
+            .map_err(|e| format!("voting_log_engines poisoned: {e}"))?;
+        g.get(&space_id).cloned().ok_or_else(|| {
+            "voting_create_tier3_proposal: engine missing after ensure".to_string()
+        })?
     };
+    engine_arc
+        .publish_event(event, Some(snapshot))
+        .await
+        .map_err(|e| format!("voting_create_tier3_proposal: publish: {e}"))?;
 
     let poll_id_hex = hex::encode(poll_id.0);
     let payload = VotingTier3PollCreatedPayload {
@@ -21563,7 +21697,21 @@ async fn voting_submit_deliberation_statement<R: tauri::Runtime>(
         ));
     }
 
-    let (hlc_tracker, device_id, self_owner, dm_outbox, voting_logs) = {
+    let (
+        hlc_tracker,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        crdt_state,
+        voting_logs,
+        voting_log_engines,
+        dfrost_log_registry_for_engine,
+        beacon_requester_for_engine,
+        voting_log_adapter_request_tx,
+        self_identity_pub_64,
+        app_handle_wry,
+    ) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -21572,15 +21720,61 @@ async fn voting_submit_deliberation_statement<R: tauri::Runtime>(
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner
                 .ok_or("dm_self_owner missing — no owner identity?")?,
+            g.community_registry
+                .clone()
+                .ok_or("community_registry missing — node not running?")?,
             g.dm_outbox
                 .clone()
                 .ok_or("dm_outbox missing — no owner identity?")?,
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
             std::sync::Arc::clone(&g.voting_logs),
+            std::sync::Arc::clone(&g.voting_log_engines),
+            g.dfrost_log_registry.clone(),
+            g.beacon_requester.clone(),
+            g.voting_log_adapter_request_tx
+                .clone()
+                .ok_or("voting_log_adapter_request_tx missing — node not running?")?,
+            g.dm_identity_pub_64
+                .ok_or("dm_identity_pub_64 missing — node not running?")?,
+            g.app_handle_wry
+                .clone()
+                .ok_or("app_handle_wry missing — node not running?")?,
         )
     };
 
     // Resolve space_id from the poll_id by scanning open polls.
     let space_id = voting_resolve_community_for_poll(&voting_logs, &pid).await?;
+
+    // ZEB-298+ZEB-312 PR 2 Task 7: lazy-register the engine for this community.
+    let local_signing_key_for_engine = {
+        let outbox_g = dm_outbox.lock().await;
+        std::sync::Arc::clone(&outbox_g.signing_key)
+    };
+    let membership_resolver_for_engine: std::sync::Arc<
+        dyn crate::community_voting_log::MembershipSnapshotResolver,
+    > = std::sync::Arc::new(NodeStateMembershipResolver {
+        community_registry,
+        crdt_state: crdt_state.clone(),
+    });
+    ensure_voting_engine_for(
+        &voting_logs,
+        &voting_log_engines,
+        space_id,
+        voting_log_adapter_request_tx,
+        hlc_tracker.clone(),
+        device_id.clone(),
+        local_signing_key_for_engine,
+        self_owner,
+        membership_resolver_for_engine,
+        crdt_state,
+        self_identity_pub_64,
+        app_handle_wry,
+        dfrost_log_registry_for_engine,
+        beacon_requester_for_engine,
+    )
+    .await?;
 
     let wall_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -21604,19 +21798,21 @@ async fn voting_submit_deliberation_statement<R: tauri::Runtime>(
 
     let event_hash = hex::encode(crate::community_voting_tier3::event_hash_of(&event));
 
-    let log_arc = {
-        let mut map = voting_logs.lock().await;
-        map.entry(space_id)
-            .or_insert_with(|| {
-                std::sync::Arc::new(tokio::sync::Mutex::new(
-                    crate::community_voting_log::VotingLog::new(),
-                ))
-            })
-            .clone()
+    // ZEB-298+ZEB-312 PR 2 Task 7: publish through the engine so kd=cl
+    // auto-mint (close deliberation when statement-cap or window hits) can
+    // observe this Statement and fire.
+    let engine_arc = {
+        let g = voting_log_engines
+            .lock()
+            .map_err(|e| format!("voting_log_engines poisoned: {e}"))?;
+        g.get(&space_id).cloned().ok_or_else(|| {
+            "voting_submit_deliberation_statement: engine missing after ensure".to_string()
+        })?
     };
-    let mut log = log_arc.lock().await;
-    log.apply_with_snapshot(event, &space_id, None)
-        .map_err(|e| format!("voting_submit_deliberation_statement: apply: {e:?}"))?;
+    engine_arc
+        .publish_event(event, None)
+        .await
+        .map_err(|e| format!("voting_submit_deliberation_statement: publish: {e}"))?;
     Ok(event_hash)
 }
 
@@ -21651,7 +21847,21 @@ async fn voting_propose_draft_candidate<R: tauri::Runtime>(
         ));
     }
 
-    let (hlc_tracker, device_id, self_owner, dm_outbox, voting_logs) = {
+    let (
+        hlc_tracker,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        crdt_state,
+        voting_logs,
+        voting_log_engines,
+        dfrost_log_registry_for_engine,
+        beacon_requester_for_engine,
+        voting_log_adapter_request_tx,
+        self_identity_pub_64,
+        app_handle_wry,
+    ) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -21660,14 +21870,60 @@ async fn voting_propose_draft_candidate<R: tauri::Runtime>(
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner
                 .ok_or("dm_self_owner missing — no owner identity?")?,
+            g.community_registry
+                .clone()
+                .ok_or("community_registry missing — node not running?")?,
             g.dm_outbox
                 .clone()
                 .ok_or("dm_outbox missing — no owner identity?")?,
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
             std::sync::Arc::clone(&g.voting_logs),
+            std::sync::Arc::clone(&g.voting_log_engines),
+            g.dfrost_log_registry.clone(),
+            g.beacon_requester.clone(),
+            g.voting_log_adapter_request_tx
+                .clone()
+                .ok_or("voting_log_adapter_request_tx missing — node not running?")?,
+            g.dm_identity_pub_64
+                .ok_or("dm_identity_pub_64 missing — node not running?")?,
+            g.app_handle_wry
+                .clone()
+                .ok_or("app_handle_wry missing — node not running?")?,
         )
     };
 
     let space_id = voting_resolve_community_for_poll(&voting_logs, &pid).await?;
+
+    // ZEB-298+ZEB-312 PR 2 Task 7: lazy-register the engine for this community.
+    let local_signing_key_for_engine = {
+        let outbox_g = dm_outbox.lock().await;
+        std::sync::Arc::clone(&outbox_g.signing_key)
+    };
+    let membership_resolver_for_engine: std::sync::Arc<
+        dyn crate::community_voting_log::MembershipSnapshotResolver,
+    > = std::sync::Arc::new(NodeStateMembershipResolver {
+        community_registry,
+        crdt_state: crdt_state.clone(),
+    });
+    ensure_voting_engine_for(
+        &voting_logs,
+        &voting_log_engines,
+        space_id,
+        voting_log_adapter_request_tx,
+        hlc_tracker.clone(),
+        device_id.clone(),
+        local_signing_key_for_engine,
+        self_owner,
+        membership_resolver_for_engine,
+        crdt_state,
+        self_identity_pub_64,
+        app_handle_wry,
+        dfrost_log_registry_for_engine,
+        beacon_requester_for_engine,
+    )
+    .await?;
 
     let wall_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -21691,19 +21947,19 @@ async fn voting_propose_draft_candidate<R: tauri::Runtime>(
 
     let event_hash = hex::encode(crate::community_voting_tier3::event_hash_of(&event));
 
-    let log_arc = {
-        let mut map = voting_logs.lock().await;
-        map.entry(space_id)
-            .or_insert_with(|| {
-                std::sync::Arc::new(tokio::sync::Mutex::new(
-                    crate::community_voting_log::VotingLog::new(),
-                ))
-            })
-            .clone()
+    // ZEB-298+ZEB-312 PR 2 Task 7: publish through the engine.
+    let engine_arc = {
+        let g = voting_log_engines
+            .lock()
+            .map_err(|e| format!("voting_log_engines poisoned: {e}"))?;
+        g.get(&space_id).cloned().ok_or_else(|| {
+            "voting_propose_draft_candidate: engine missing after ensure".to_string()
+        })?
     };
-    let mut log = log_arc.lock().await;
-    log.apply_with_snapshot(event, &space_id, None)
-        .map_err(|e| format!("voting_propose_draft_candidate: apply: {e:?}"))?;
+    engine_arc
+        .publish_event(event, None)
+        .await
+        .map_err(|e| format!("voting_propose_draft_candidate: publish: {e}"))?;
     Ok(event_hash)
 }
 
@@ -21738,7 +21994,21 @@ async fn voting_approve_draft_candidate<R: tauri::Runtime>(
                 .to_string()
         })?;
 
-    let (hlc_tracker, device_id, self_owner, dm_outbox, voting_logs) = {
+    let (
+        hlc_tracker,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        crdt_state,
+        voting_logs,
+        voting_log_engines,
+        dfrost_log_registry_for_engine,
+        beacon_requester_for_engine,
+        voting_log_adapter_request_tx,
+        self_identity_pub_64,
+        app_handle_wry,
+    ) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -21747,10 +22017,27 @@ async fn voting_approve_draft_candidate<R: tauri::Runtime>(
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner
                 .ok_or("dm_self_owner missing — no owner identity?")?,
+            g.community_registry
+                .clone()
+                .ok_or("community_registry missing — node not running?")?,
             g.dm_outbox
                 .clone()
                 .ok_or("dm_outbox missing — no owner identity?")?,
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
             std::sync::Arc::clone(&g.voting_logs),
+            std::sync::Arc::clone(&g.voting_log_engines),
+            g.dfrost_log_registry.clone(),
+            g.beacon_requester.clone(),
+            g.voting_log_adapter_request_tx
+                .clone()
+                .ok_or("voting_log_adapter_request_tx missing — node not running?")?,
+            g.dm_identity_pub_64
+                .ok_or("dm_identity_pub_64 missing — node not running?")?,
+            g.app_handle_wry
+                .clone()
+                .ok_or("app_handle_wry missing — node not running?")?,
         )
     };
 
@@ -21798,6 +22085,35 @@ async fn voting_approve_draft_candidate<R: tauri::Runtime>(
     let hlc =
         crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
 
+    // ZEB-298+ZEB-312 PR 2 Task 7: lazy-register the engine for this community.
+    let local_signing_key_for_engine = {
+        let outbox_g = dm_outbox.lock().await;
+        std::sync::Arc::clone(&outbox_g.signing_key)
+    };
+    let membership_resolver_for_engine: std::sync::Arc<
+        dyn crate::community_voting_log::MembershipSnapshotResolver,
+    > = std::sync::Arc::new(NodeStateMembershipResolver {
+        community_registry,
+        crdt_state: crdt_state.clone(),
+    });
+    ensure_voting_engine_for(
+        &voting_logs,
+        &voting_log_engines,
+        space_id,
+        voting_log_adapter_request_tx,
+        hlc_tracker.clone(),
+        device_id.clone(),
+        local_signing_key_for_engine,
+        self_owner,
+        membership_resolver_for_engine,
+        crdt_state,
+        self_identity_pub_64,
+        app_handle_wry,
+        dfrost_log_registry_for_engine,
+        beacon_requester_for_engine,
+    )
+    .await?;
+
     let event = {
         let outbox_g = dm_outbox.lock().await;
         let signing_key = outbox_g.signing_key.as_ref();
@@ -21811,19 +22127,19 @@ async fn voting_approve_draft_candidate<R: tauri::Runtime>(
         .map_err(|e| format!("voting_approve_draft_candidate: build_signed: {e:?}"))?
     };
 
-    let log_arc = {
-        let mut map = voting_logs.lock().await;
-        map.entry(space_id)
-            .or_insert_with(|| {
-                std::sync::Arc::new(tokio::sync::Mutex::new(
-                    crate::community_voting_log::VotingLog::new(),
-                ))
-            })
-            .clone()
+    // ZEB-298+ZEB-312 PR 2 Task 7: publish through the engine.
+    let engine_arc = {
+        let g = voting_log_engines
+            .lock()
+            .map_err(|e| format!("voting_log_engines poisoned: {e}"))?;
+        g.get(&space_id).cloned().ok_or_else(|| {
+            "voting_approve_draft_candidate: engine missing after ensure".to_string()
+        })?
     };
-    let mut log = log_arc.lock().await;
-    log.apply_with_snapshot(event, &space_id, None)
-        .map_err(|e| format!("voting_approve_draft_candidate: apply: {e:?}"))?;
+    engine_arc
+        .publish_event(event, None)
+        .await
+        .map_err(|e| format!("voting_approve_draft_candidate: publish: {e}"))?;
     Ok(())
 }
 
@@ -21850,7 +22166,21 @@ async fn voting_decline_sortition<R: tauri::Runtime>(
     crate::community_voting_tier3::validate_decline_reason(&reason)
         .map_err(|e| format!("voting_decline_sortition: invalid reason: {e:?}"))?;
 
-    let (hlc_tracker, device_id, self_owner, dm_outbox, voting_logs) = {
+    let (
+        hlc_tracker,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        crdt_state,
+        voting_logs,
+        voting_log_engines,
+        dfrost_log_registry_for_engine,
+        beacon_requester_for_engine,
+        voting_log_adapter_request_tx,
+        self_identity_pub_64,
+        app_handle_wry,
+    ) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -21859,14 +22189,60 @@ async fn voting_decline_sortition<R: tauri::Runtime>(
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner
                 .ok_or("dm_self_owner missing — no owner identity?")?,
+            g.community_registry
+                .clone()
+                .ok_or("community_registry missing — node not running?")?,
             g.dm_outbox
                 .clone()
                 .ok_or("dm_outbox missing — no owner identity?")?,
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
             std::sync::Arc::clone(&g.voting_logs),
+            std::sync::Arc::clone(&g.voting_log_engines),
+            g.dfrost_log_registry.clone(),
+            g.beacon_requester.clone(),
+            g.voting_log_adapter_request_tx
+                .clone()
+                .ok_or("voting_log_adapter_request_tx missing — node not running?")?,
+            g.dm_identity_pub_64
+                .ok_or("dm_identity_pub_64 missing — node not running?")?,
+            g.app_handle_wry
+                .clone()
+                .ok_or("app_handle_wry missing — node not running?")?,
         )
     };
 
     let space_id = voting_resolve_community_for_poll(&voting_logs, &pid).await?;
+
+    // ZEB-298+ZEB-312 PR 2 Task 7: lazy-register the engine for this community.
+    let local_signing_key_for_engine = {
+        let outbox_g = dm_outbox.lock().await;
+        std::sync::Arc::clone(&outbox_g.signing_key)
+    };
+    let membership_resolver_for_engine: std::sync::Arc<
+        dyn crate::community_voting_log::MembershipSnapshotResolver,
+    > = std::sync::Arc::new(NodeStateMembershipResolver {
+        community_registry,
+        crdt_state: crdt_state.clone(),
+    });
+    ensure_voting_engine_for(
+        &voting_logs,
+        &voting_log_engines,
+        space_id,
+        voting_log_adapter_request_tx,
+        hlc_tracker.clone(),
+        device_id.clone(),
+        local_signing_key_for_engine,
+        self_owner,
+        membership_resolver_for_engine,
+        crdt_state,
+        self_identity_pub_64,
+        app_handle_wry,
+        dfrost_log_registry_for_engine,
+        beacon_requester_for_engine,
+    )
+    .await?;
 
     let wall_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -21888,19 +22264,21 @@ async fn voting_decline_sortition<R: tauri::Runtime>(
         .map_err(|e| format!("voting_decline_sortition: build_signed: {e:?}"))?
     };
 
-    let log_arc = {
-        let mut map = voting_logs.lock().await;
-        map.entry(space_id)
-            .or_insert_with(|| {
-                std::sync::Arc::new(tokio::sync::Mutex::new(
-                    crate::community_voting_log::VotingLog::new(),
-                ))
-            })
-            .clone()
+    // ZEB-298+ZEB-312 PR 2 Task 7: publish through the engine so kd=sf
+    // (sortition-fallback) auto-mint can observe declines and mint a
+    // replacement seat.
+    let engine_arc = {
+        let g = voting_log_engines
+            .lock()
+            .map_err(|e| format!("voting_log_engines poisoned: {e}"))?;
+        g.get(&space_id)
+            .cloned()
+            .ok_or_else(|| "voting_decline_sortition: engine missing after ensure".to_string())?
     };
-    let mut log = log_arc.lock().await;
-    log.apply_with_snapshot(event, &space_id, None)
-        .map_err(|e| format!("voting_decline_sortition: apply: {e:?}"))?;
+    engine_arc
+        .publish_event(event, None)
+        .await
+        .map_err(|e| format!("voting_decline_sortition: publish: {e}"))?;
     Ok(())
 }
 
@@ -21924,7 +22302,21 @@ async fn voting_cast_ratification_ballot<R: tauri::Runtime>(
         })?;
     let pid = crate::community_voting_core::PollId(pid_bytes);
 
-    let (hlc_tracker, device_id, self_owner, dm_outbox, voting_logs) = {
+    let (
+        hlc_tracker,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        crdt_state,
+        voting_logs,
+        voting_log_engines,
+        dfrost_log_registry_for_engine,
+        beacon_requester_for_engine,
+        voting_log_adapter_request_tx,
+        self_identity_pub_64,
+        app_handle_wry,
+    ) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -21933,14 +22325,60 @@ async fn voting_cast_ratification_ballot<R: tauri::Runtime>(
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner
                 .ok_or("dm_self_owner missing — no owner identity?")?,
+            g.community_registry
+                .clone()
+                .ok_or("community_registry missing — node not running?")?,
             g.dm_outbox
                 .clone()
                 .ok_or("dm_outbox missing — no owner identity?")?,
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
             std::sync::Arc::clone(&g.voting_logs),
+            std::sync::Arc::clone(&g.voting_log_engines),
+            g.dfrost_log_registry.clone(),
+            g.beacon_requester.clone(),
+            g.voting_log_adapter_request_tx
+                .clone()
+                .ok_or("voting_log_adapter_request_tx missing — node not running?")?,
+            g.dm_identity_pub_64
+                .ok_or("dm_identity_pub_64 missing — node not running?")?,
+            g.app_handle_wry
+                .clone()
+                .ok_or("app_handle_wry missing — node not running?")?,
         )
     };
 
     let space_id = voting_resolve_community_for_poll(&voting_logs, &pid).await?;
+
+    // ZEB-298+ZEB-312 PR 2 Task 7: lazy-register the engine for this community.
+    let local_signing_key_for_engine = {
+        let outbox_g = dm_outbox.lock().await;
+        std::sync::Arc::clone(&outbox_g.signing_key)
+    };
+    let membership_resolver_for_engine: std::sync::Arc<
+        dyn crate::community_voting_log::MembershipSnapshotResolver,
+    > = std::sync::Arc::new(NodeStateMembershipResolver {
+        community_registry,
+        crdt_state: crdt_state.clone(),
+    });
+    ensure_voting_engine_for(
+        &voting_logs,
+        &voting_log_engines,
+        space_id,
+        voting_log_adapter_request_tx,
+        hlc_tracker.clone(),
+        device_id.clone(),
+        local_signing_key_for_engine,
+        self_owner,
+        membership_resolver_for_engine,
+        crdt_state,
+        self_identity_pub_64,
+        app_handle_wry,
+        dfrost_log_registry_for_engine,
+        beacon_requester_for_engine,
+    )
+    .await?;
 
     // Reserve "now" BEFORE the pre-flight: the stage gate in the helper
     // must use the HLC we're about to use for the new ballot, not
@@ -21998,19 +22436,21 @@ async fn voting_cast_ratification_ballot<R: tauri::Runtime>(
         .map_err(|e| format!("voting_cast_ratification_ballot: build_signed: {e:?}"))?
     };
 
-    let log_arc = {
-        let mut map = voting_logs.lock().await;
-        map.entry(space_id)
-            .or_insert_with(|| {
-                std::sync::Arc::new(tokio::sync::Mutex::new(
-                    crate::community_voting_log::VotingLog::new(),
-                ))
-            })
-            .clone()
+    // ZEB-298+ZEB-312 PR 2 Task 7: publish through the engine so kd=rs
+    // (ratification-summary) auto-mint can observe ballots and finalize
+    // the poll once quorum + window conditions are met.
+    let engine_arc = {
+        let g = voting_log_engines
+            .lock()
+            .map_err(|e| format!("voting_log_engines poisoned: {e}"))?;
+        g.get(&space_id).cloned().ok_or_else(|| {
+            "voting_cast_ratification_ballot: engine missing after ensure".to_string()
+        })?
     };
-    let mut log = log_arc.lock().await;
-    log.apply_with_snapshot(event, &space_id, None)
-        .map_err(|e| format!("voting_cast_ratification_ballot: apply: {e:?}"))?;
+    engine_arc
+        .publish_event(event, None)
+        .await
+        .map_err(|e| format!("voting_cast_ratification_ballot: publish: {e}"))?;
     Ok(())
 }
 
@@ -22206,13 +22646,22 @@ async fn ensure_voting_engine_for(
         tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
     >,
     device_id: String,
-    // Note: app_handle deliberately omitted — see TODO in fn body. Tier 3
-    // lifecycle events deferred to PR 2; Tier 2-only scope is unaffected.
     local_signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
     local_owner: crate::owner_state_types::OwnerAddr,
     membership_resolver: std::sync::Arc<
         dyn crate::community_voting_log::MembershipSnapshotResolver,
     >,
+    // ZEB-298+ZEB-312 PR 2 Task 1: identity resolver production wiring.
+    // The OwnerDeviceCacheResolver implements both IdentityResolver
+    // (channel-log) and VotingIdentityResolver — same lookup, same
+    // semantics — so the voting engine can reuse the existing cache.
+    crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    self_identity_pub_64: [u8; 64],
+    // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle for Tier 3
+    // lifecycle emit. IPCs read this from `NodeState.app_handle_wry`
+    // (captured at start_node) so the generic `AppHandle<R>` from the
+    // IPC's own param doesn't need an unsafe downcast.
+    app_handle: tauri::AppHandle<tauri::Wry>,
     // Existing trailing params:
     dfrost_log_registry: Option<
         std::sync::Arc<crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>>,
@@ -22241,14 +22690,22 @@ async fn ensure_voting_engine_for(
             .clone()
     };
 
-    // TODO ZEB-298+ZEB-312 PR 2 follow-up: wire production identity_resolver
-    // from OwnerDeviceCacheResolver (or a thin Ed25519-extracting adapter).
-    // PR 1 leaves identity_resolver: None — inbound events return a clear
-    // error until the production wiring lands; outbound publishing is fully
-    // functional.
+    // ZEB-298+ZEB-312 PR 2 Task 1: production identity resolver. Both
+    // the channel-log IdentityResolver and the voting VotingIdentityResolver
+    // map OwnerAddr → 64-byte composite (X25519_pub || Ed25519_pub); the
+    // OwnerDeviceCacheResolver implements both by delegating to a single
+    // owner_device_cache lookup. Inbound Tier 1 BallotCast + Tier 2 Signal
+    // events from peers can now verify and apply (the PR 1 None placeholder
+    // would have rejected them with IdentityNotResolvable).
     let identity_resolver: Option<
         std::sync::Arc<dyn crate::community_voting_core::VotingIdentityResolver>,
-    > = None;
+    > = Some(std::sync::Arc::new(
+        crate::community_state_sync::OwnerDeviceCacheResolver::new(
+            crdt_state.clone(),
+            local_owner,
+            self_identity_pub_64,
+        ),
+    ));
 
     // Build the engine's mpsc halves; the "other halves" are bundled into
     // the VotingLogAdapterRequest below and sent to the event loop only
@@ -22264,15 +22721,11 @@ async fn ensure_voting_engine_for(
             subscriber_rx,
             hlc_tracker: Some(hlc_tracker),
             device_id: Some(device_id),
-            // TODO ZEB-298+ZEB-312 PR 2 follow-up: wire app_handle so
-            // Tier 3 lifecycle events (sortition-complete / drafting-open /
-            // ratification-open / finalized) fire to the UI. Deferred
-            // because the IPC handlers are generic over R: tauri::Runtime
-            // but VotingLogEnginesMap is typed for tauri::Wry — threading
-            // AppHandle<Wry> through generic IPC handlers requires either
-            // a type-erased handle or a dedicated wrapper. Tier 2-only
-            // scope in PR 1 is unaffected.
-            app_handle: None,
+            // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle for Tier 3
+            // lifecycle emit. IPCs read this from NodeState.app_handle_wry
+            // (captured at start_node, so the generic AppHandle<R> from
+            // the IPC's own param doesn't need an unsafe downcast).
+            app_handle: Some(app_handle.clone()),
             identity_resolver,
             membership_resolver: Some(membership_resolver),
         },
@@ -22616,6 +23069,8 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
         dfrost_log_registry_for_engine,
         beacon_requester_for_engine,
         voting_log_adapter_request_tx,
+        self_identity_pub_64,
+        app_handle_wry,
     ) = {
         let g = state_lock
             .lock()
@@ -22642,6 +23097,17 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
             g.voting_log_adapter_request_tx
                 .clone()
                 .ok_or("voting_log_adapter_request_tx missing — node not running?")?,
+            // ZEB-298+ZEB-312 PR 2 Task 1: needed to construct the
+            // production OwnerDeviceCacheResolver for the voting engine.
+            g.dm_identity_pub_64
+                .ok_or("dm_identity_pub_64 missing — node not running?")?,
+            // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle for the
+            // voting engine's Tier 3 lifecycle emit path. Captured at
+            // start_node so generic IPC handlers can pass a concrete
+            // AppHandle<Wry> without downcasting from AppHandle<R>.
+            g.app_handle_wry
+                .clone()
+                .ok_or("app_handle_wry missing — node not running?")?,
         )
     };
 
@@ -22678,6 +23144,9 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
         local_signing_key_for_engine,
         self_owner,
         membership_resolver_for_engine,
+        crdt_state.clone(),
+        self_identity_pub_64,
+        app_handle_wry,
         dfrost_log_registry_for_engine,
         beacon_requester_for_engine,
     )
@@ -22900,6 +23369,8 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
         dfrost_log_registry_for_engine,
         beacon_requester_for_engine,
         voting_log_adapter_request_tx,
+        self_identity_pub_64,
+        app_handle_wry,
     ) = {
         let g = state_lock
             .lock()
@@ -22926,6 +23397,17 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
             g.voting_log_adapter_request_tx
                 .clone()
                 .ok_or("voting_log_adapter_request_tx missing — node not running?")?,
+            // ZEB-298+ZEB-312 PR 2 Task 1: needed to construct the
+            // production OwnerDeviceCacheResolver for the voting engine.
+            g.dm_identity_pub_64
+                .ok_or("dm_identity_pub_64 missing — node not running?")?,
+            // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle for the
+            // voting engine's Tier 3 lifecycle emit path. Captured at
+            // start_node so generic IPC handlers can pass a concrete
+            // AppHandle<Wry> without downcasting from AppHandle<R>.
+            g.app_handle_wry
+                .clone()
+                .ok_or("app_handle_wry missing — node not running?")?,
         )
     };
 
@@ -22966,6 +23448,9 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
         local_signing_key_for_engine,
         self_owner,
         membership_resolver_for_engine,
+        crdt_state.clone(),
+        self_identity_pub_64,
+        app_handle_wry,
         dfrost_log_registry_for_engine,
         beacon_requester_for_engine,
     )
@@ -23036,6 +23521,8 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
         voting_log_adapter_request_tx,
         community_registry,
         crdt_state,
+        self_identity_pub_64,
+        app_handle_wry,
     ) = {
         let g = state_lock
             .lock()
@@ -23063,6 +23550,17 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
             g.crdt_state
                 .clone()
                 .ok_or("crdt_state missing — node not running?")?,
+            // ZEB-298+ZEB-312 PR 2 Task 1: needed to construct the
+            // production OwnerDeviceCacheResolver for the voting engine.
+            g.dm_identity_pub_64
+                .ok_or("dm_identity_pub_64 missing — node not running?")?,
+            // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle for the
+            // voting engine's Tier 3 lifecycle emit path. Captured at
+            // start_node so generic IPC handlers can pass a concrete
+            // AppHandle<Wry> without downcasting from AppHandle<R>.
+            g.app_handle_wry
+                .clone()
+                .ok_or("app_handle_wry missing — node not running?")?,
         )
     };
 
@@ -23075,7 +23573,7 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
         dyn crate::community_voting_log::MembershipSnapshotResolver,
     > = std::sync::Arc::new(NodeStateMembershipResolver {
         community_registry,
-        crdt_state,
+        crdt_state: crdt_state.clone(),
     });
     ensure_voting_engine_for(
         &voting_logs,
@@ -23087,6 +23585,9 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
         local_signing_key_for_engine,
         self_owner,
         membership_resolver_for_engine,
+        crdt_state,
+        self_identity_pub_64,
+        app_handle_wry,
         dfrost_log_registry_for_engine,
         beacon_requester_for_engine,
     )
@@ -26089,6 +26590,8 @@ pub fn run() {
             voting_cast_tier1_ballot,
             voting_list_active_polls,
             voting_get_poll,
+            // ZEB-298 Task 6: community-scoped policy IPC.
+            voting_set_notify_on_delegate_signal,
             // ZEB-310 Phase 4a-main Task 3: Tier 3 (Sortition + STAR) voting IPCs.
             voting_create_tier3_proposal,
             voting_submit_deliberation_statement,
@@ -26157,6 +26660,8 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         voting_cast_tier1_ballot,
         voting_list_active_polls,
         voting_get_poll,
+        // ZEB-298 Task 6: community-scoped policy IPC.
+        voting_set_notify_on_delegate_signal,
         // ZEB-310 Phase 4a-main Task 3: Tier 3 (Sortition + STAR) voting IPCs.
         voting_create_tier3_proposal,
         voting_submit_deliberation_statement,
@@ -29338,6 +29843,7 @@ mod start_node_race_tests {
             dm_identity_pub_64: None,
             community_adapter_request_tx: None,
             voting_log_adapter_request_tx: None,
+            app_handle_wry: None,
             channel_log_registry: None,
             dfrost_log_registry: None,
             beacon_requester: None,

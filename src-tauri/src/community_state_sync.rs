@@ -4687,6 +4687,21 @@ impl IdentityResolver for OwnerDeviceCacheResolver {
     }
 }
 
+/// ZEB-298+ZEB-312 PR 2 Task 1: production wiring for the voting engine's
+/// identity resolver. The voting engine's `VotingIdentityResolver` trait
+/// has the same `OwnerAddr → Option<[u8; 64]>` shape as channel-log's
+/// `IdentityResolver`, so this impl delegates to the existing lookup —
+/// no separate cache or different semantics. The 64-byte composite is
+/// `X25519_pub || Ed25519_pub`, which `verify_voting_event` feeds to
+/// `harmony_identity::Identity::from_public_bytes` for signature
+/// verification + actor-address-binding check.
+#[async_trait::async_trait]
+impl crate::community_voting_core::VotingIdentityResolver for OwnerDeviceCacheResolver {
+    async fn resolve(&self, owner: &OwnerAddr) -> Option<[u8; 64]> {
+        <Self as IdentityResolver>::resolve(self, owner).await
+    }
+}
+
 // ── ZEB-270 Phase 3 Task 4.5: production adapters for the channel-log
 //    verify chain ────────────────────────────────────────────────────────
 

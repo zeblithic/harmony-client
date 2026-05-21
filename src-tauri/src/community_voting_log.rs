@@ -66,6 +66,10 @@ pub struct VotingLog {
     /// resolves concurrent updates. Empty for communities with no Tier 2
     /// activity yet.
     pub delegation_graph: DelegationGraph,
+    /// ZEB-298: community-scoped voting policy. Mutated via IPC (not
+    /// via signed event). Default = all-fields-false so existing
+    /// communities preserve pre-policy behavior.
+    policy: crate::community_voting_conviction::CommunityVotingPolicy,
 }
 
 /// Materialized state for a single poll.
@@ -182,6 +186,17 @@ pub enum ApplyError {
 impl VotingLog {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn policy(&self) -> &crate::community_voting_conviction::CommunityVotingPolicy {
+        &self.policy
+    }
+
+    pub fn set_policy(
+        &mut self,
+        policy: crate::community_voting_conviction::CommunityVotingPolicy,
+    ) {
+        self.policy = policy;
     }
 
     /// Returns true if any poll with this PollId is currently tracked.
@@ -743,7 +758,13 @@ impl VotingLog {
 
 /// Decode a `{ "pi": <PollId> }` map from `pd` bytes. Used by all
 /// non-PollCreate events to identify which poll they belong to.
-fn decode_poll_id_ref(pd: &[u8]) -> Option<PollId> {
+///
+/// `pub(crate)` so the engine's `previous_stage_for_emit` snapshot path
+/// (in both `publish_event` and `process_inbound_dispatch`) can resolve
+/// the affected poll using the same logic as `apply_with_snapshot` —
+/// signing-bytes-derivation only matches for `PollCreate` and gives the
+/// wrong PollId for every other Tier 3 event kind (Qodo R1).
+pub(crate) fn decode_poll_id_ref(pd: &[u8]) -> Option<PollId> {
     #[derive(serde::Deserialize)]
     struct Ref {
         #[serde(rename = "pi")]

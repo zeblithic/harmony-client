@@ -125,6 +125,35 @@ pub struct Tier2PollConfig {
     pub eligibility: Eligibility,
 }
 
+/// ZEB-298: community-scoped voting policy. Settings that apply across
+/// all polls in a community (Tier 1 + Tier 3 currently have no
+/// community-scoped settings; this struct grows organically as more
+/// policy fields are needed). Mutated via IPC (Task 6), not via signed
+/// event — policy is local UX preference, not consensus-relevant.
+///
+/// All fields default to `false` so existing communities that don't
+/// have a policy stored (or have an older serialized policy missing
+/// new fields) preserve their pre-policy behavior.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CommunityVotingPolicy {
+    /// ZEB-298: when `true`, the engine emits
+    /// `voting-delegate-signaled-on-your-behalf` on inbound kd=signal
+    /// (Tier 2 Signal) when the signaler is the local user's current
+    /// delegate in this community. Opt-in so existing communities
+    /// don't suddenly notify.
+    ///
+    /// `skip_serializing_if = "<not>"` makes a `false` value omit
+    /// the key on the wire so a default-valued policy encodes as the
+    /// empty CBOR map (`0xA0`). Combined with `#[serde(default)]` on
+    /// deserialize, this preserves the upgrade-in-place property:
+    /// communities storing an older shape (or no shape yet) decode to
+    /// today's `Default` and would re-encode to the same empty map.
+    /// `wire_format_community_voting_policy_fixtures.rs` byte-pins
+    /// this invariant.
+    #[serde(default, rename = "nd", skip_serializing_if = "::std::ops::Not::not")]
+    pub notify_on_delegate_signal: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Tier 2 event payloads (Signal / Delegate / Undelegate)
 // ---------------------------------------------------------------------------
