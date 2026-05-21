@@ -341,7 +341,7 @@
       {:else if selectedDetail.stage === 'de' || selectedDetail.stage === 'dr' || selectedDetail.stage === 'ra' || selectedDetail.stage === 'fi'}
         <SortitionRevealView detail={selectedDetail} {myAddr} />
         {#if selectedDetail.myRole === 'mini_public' && (selectedDetail.stage === 'de' || selectedDetail.stage === 'dr')}
-          <MiniPublicParticipationToggle detail={selectedDetail} {adapter} onDecline={refetchSelected} />
+          <MiniPublicParticipationToggle detail={selectedDetail} {adapter} {myAddr} onDecline={refetchSelected} />
         {/if}
         {#if selectedDetail.stage === 'dr'}
           <DraftingPanel detail={selectedDetail} {adapter} {myAddr} onChange={refetchSelected} />
