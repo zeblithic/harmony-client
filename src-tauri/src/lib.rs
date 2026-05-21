@@ -22761,6 +22761,30 @@ pub struct RatificationCandidateExport {
     pub text: String,
 }
 
+/// ZEB-294: one deliberation statement with aggregate vote counts, as
+/// exposed to the frontend. Ordered by BTreeMap iteration (statement_event_hash
+/// ascending) in the parent `Tier3PollExport.deliberation_statements` vec.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliberationStatementExport {
+    pub statement_event_hash: String, // 64-char hex
+    pub author: String,               // 32-char hex (OwnerAddr is 16 bytes)
+    pub text: String,
+    pub created_at_hlc_ms: i128,
+    pub agree_count: u16,
+    pub disagree_count: u16,
+    pub pass_count: u16,
+}
+
+/// ZEB-294: caller's vote on a single deliberation statement, as exposed
+/// to the frontend. Entry exists only for statements the caller has voted on.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MyDeliberationVoteExport {
+    pub statement_event_hash: String,
+    pub vote: String, // "agree" | "disagree" | "pass"
+}
+
 /// ZEB-311: full state for a single Tier 3 poll, projected from
 /// `Tier3PollState` plus caller-derived `my_*` fields.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -22796,6 +22820,14 @@ pub struct Tier3PollExport {
     /// `ratification_candidates` order). `None` if never cast or
     /// stage hasn't reached Ratification.
     pub my_ratification_scores: Option<Vec<u8>>,
+    /// ZEB-294: deliberation statements with aggregate vote counts. Ordered by
+    /// BTreeMap iteration (sorted by statement_event_hash ascending).
+    pub deliberation_statements: Vec<DeliberationStatementExport>,
+    /// ZEB-294: caller's accepted-statement count (for composer 5-cap UX).
+    pub my_deliberation_statement_count: u8,
+    /// ZEB-294: caller's per-statement votes; entry exists only for statements
+    /// the caller has voted on.
+    pub my_deliberation_votes: Vec<MyDeliberationVoteExport>,
     /// 64-char hex of the winning candidate's kd=dc event hash;
     /// `None` until stage = Finalized.
     pub winner_event_hash: Option<String>,
@@ -24432,6 +24464,53 @@ fn build_tier3_export(
             .map(|f| hex::encode(f.event_hash))
     });
 
+    // ZEB-294: aggregate vote counts per statement AND capture the caller's own votes.
+    // One pass over deliberation.votes builds both structures simultaneously.
+    let mut agg_per_stmt: std::collections::BTreeMap<[u8; 32], (u16, u16, u16)> =
+        std::collections::BTreeMap::new();
+    let mut my_votes_vec: Vec<MyDeliberationVoteExport> = Vec::new();
+    for ((voter, stmt_hash), entry) in t3.deliberation.votes.iter() {
+        let agg = agg_per_stmt.entry(*stmt_hash).or_insert((0, 0, 0));
+        match entry.vote {
+            crate::community_voting_core::BridgingVoteCode::Agree => agg.0 += 1,
+            crate::community_voting_core::BridgingVoteCode::Disagree => agg.1 += 1,
+            crate::community_voting_core::BridgingVoteCode::Pass => agg.2 += 1,
+        }
+        if let Some(self_owner) = self_owner_opt {
+            if voter == &self_owner {
+                my_votes_vec.push(MyDeliberationVoteExport {
+                    statement_event_hash: hex::encode(stmt_hash),
+                    vote: entry.vote.as_wire_str().to_string(),
+                });
+            }
+        }
+    }
+
+    let deliberation_statements: Vec<DeliberationStatementExport> = t3
+        .deliberation
+        .statements
+        .values()
+        .map(|s| {
+            let (a, d, p) = agg_per_stmt
+                .get(&s.event_hash)
+                .copied()
+                .unwrap_or((0, 0, 0));
+            DeliberationStatementExport {
+                statement_event_hash: hex::encode(s.event_hash),
+                author: hex::encode(s.author.0),
+                text: s.text.clone(),
+                created_at_hlc_ms: s.created_at_hlc.wall_ms as i128,
+                agree_count: a,
+                disagree_count: d,
+                pass_count: p,
+            }
+        })
+        .collect();
+
+    let my_deliberation_statement_count = self_owner_opt
+        .and_then(|owner| t3.deliberation.statements_per_author.get(&owner).copied())
+        .unwrap_or(0);
+
     Ok(Tier3PollExport {
         poll_id: hex::encode(state.meta.poll_id.0),
         community_id: hex::encode(state.meta.community_id.0),
@@ -24452,6 +24531,9 @@ fn build_tier3_export(
         my_role,
         my_drafting_approvals,
         my_ratification_scores,
+        deliberation_statements,
+        my_deliberation_statement_count,
+        my_deliberation_votes: my_votes_vec,
         winner_event_hash,
         runner_up_event_hash,
     })
@@ -24574,6 +24656,26 @@ async fn voting_list_tier3_polls_raw(
 #[tauri::command]
 async fn voting_list_bridging_statements(
     state_lock: tauri::State<'_, Mutex<NodeState>>,
+    poll_id: String,
+    top_n: u16,
+) -> Result<Vec<BridgingScoreExport>, String> {
+    voting_list_bridging_statements_raw(state_lock.inner(), poll_id, top_n).await
+}
+
+/// ZEB-294: Decoupled implementation of `voting_list_bridging_statements` for integration
+/// testing. Integration tests drive this directly with a raw `&Mutex<NodeState>` rather than
+/// a `tauri::State<'_, ...>` (which is not directly constructible outside Tauri's app setup).
+#[cfg(any(test, feature = "test-fixtures"))]
+pub async fn voting_list_bridging_statements_impl(
+    state_lock: &Mutex<NodeState>,
+    poll_id: String,
+    top_n: u16,
+) -> Result<Vec<BridgingScoreExport>, String> {
+    voting_list_bridging_statements_raw(state_lock, poll_id, top_n).await
+}
+
+async fn voting_list_bridging_statements_raw(
+    state_lock: &Mutex<NodeState>,
     poll_id: String,
     top_n: u16,
 ) -> Result<Vec<BridgingScoreExport>, String> {

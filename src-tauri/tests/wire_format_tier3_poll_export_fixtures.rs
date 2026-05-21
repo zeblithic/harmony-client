@@ -5,7 +5,10 @@
 //! match the spec. Any field rename or default change must be deliberate and
 //! reflected in this fixture.
 
-use harmony_app::{Tier3MyRole, Tier3PollExport, Tier3PollSummary, Tier3StageTag};
+use harmony_app::{
+    DeliberationStatementExport, MyDeliberationVoteExport, Tier3MyRole, Tier3PollExport,
+    Tier3PollSummary, Tier3StageTag,
+};
 
 /// Decode a CBOR buffer as a map of `String -> Value` and return the
 /// sorted set of top-level keys. We use this to assert exact serde
@@ -50,6 +53,20 @@ fn tier3_poll_export_round_trips_through_cbor() {
         my_role: Tier3MyRole::MiniPublic,
         my_drafting_approvals: vec![],
         my_ratification_scores: None,
+        deliberation_statements: vec![DeliberationStatementExport {
+            statement_event_hash: "ab".repeat(32),
+            author: "cd".repeat(16),
+            text: "Test statement".to_string(),
+            created_at_hlc_ms: 1_700_000_100_000,
+            agree_count: 3,
+            disagree_count: 1,
+            pass_count: 0,
+        }],
+        my_deliberation_statement_count: 1,
+        my_deliberation_votes: vec![MyDeliberationVoteExport {
+            statement_event_hash: "ab".repeat(32),
+            vote: "agree".to_string(),
+        }],
         winner_event_hash: None,
         runner_up_event_hash: None,
     };
@@ -67,11 +84,14 @@ fn tier3_poll_export_round_trips_through_cbor() {
         "backupPool",
         "communityId",
         "declined",
+        "deliberationStatements",
         "deliberationWindowSeconds",
         "draftCandidates",
         "draftingWindowSeconds",
         "incentiveMode",
         "miniPublic",
+        "myDeliberationStatementCount",
+        "myDeliberationVotes",
         "myDraftingApprovals",
         "myRatificationScores",
         "myRole",
