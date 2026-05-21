@@ -13,9 +13,10 @@
 //! the wire format changed.
 
 use harmony_app::community_voting_core::{
-    DeliberationStatementPayload, DraftApprovalPayload, DraftCandidatePayload, Eligibility,
-    MiniPublicDeclinePayload, PollClosePayload, PollId, RatificationBallotPayload,
-    SortitionFailedPayload, SortitionSelectionPayload, Tier3PollConfigPayload,
+    BridgingVoteCode, DeliberationStatementPayload, DeliberationVotePayload, DraftApprovalPayload,
+    DraftCandidatePayload, Eligibility, MiniPublicDeclinePayload, PollClosePayload, PollId,
+    RatificationBallotPayload, SortitionFailedPayload, SortitionSelectionPayload,
+    Tier3PollConfigPayload,
 };
 use harmony_app::community_voting_star::{CandidateRef, StarResult};
 use harmony_app::community_voting_tier3::Tier3PollResultPayload;
@@ -279,4 +280,29 @@ fn fixture_tier3_poll_result() {
     let mut bytes = Vec::new();
     ciborium::ser::into_writer(&pd, &mut bytes).expect("encode");
     assert_two_char_keys(&bytes, &["pi", "rs"]);
+}
+
+/// ZEB-294: canonical CBOR bytes for `DeliberationVotePayload` (kd=dv).
+///
+/// Pins the Agree variant (vote=0). Disagree (1) and Pass (2) share the
+/// same payload shape — only the "vt" field value differs — so one
+/// representative fixture is sufficient for wire-format regression
+/// detection.
+///
+/// To regenerate:
+///     REGENERATE_VOTING_TIER3_FIXTURES=1 cargo nextest run \
+///         --locked -p harmony-app --features test-fixtures \
+///         -E 'test(fixture_tier3_deliberation_vote)'
+#[test]
+fn fixture_tier3_deliberation_vote() {
+    let pd = DeliberationVotePayload {
+        poll_id: PollId([0x42; 32]),
+        statement_event_hash: [0x7c; 32],
+        vote: BridgingVoteCode::Agree.as_u8(),
+    };
+    round_trip_or_regen("deliberation_vote.cbor", &pd);
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(&pd, &mut bytes).expect("encode");
+    // Keys: "pi" (poll_id), "sh" (statement_event_hash), "vt" (vote).
+    assert_two_char_keys(&bytes, &["pi", "sh", "vt"]);
 }
