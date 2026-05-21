@@ -511,7 +511,7 @@ async fn ipc_tier3_full_lifecycle_two_engines() {
     );
     engines
         .engine_a
-        .publish_event(ss_event)
+        .publish_event(ss_event, None)
         .await
         .expect("engine_a: publish kd=ss");
 
@@ -538,7 +538,7 @@ async fn ipc_tier3_full_lifecycle_two_engines() {
         build_decline_event(primary_ids[0], poll_id, hlc_at(t0 + 100, "primary-0-dev"));
     engines
         .engine_a
-        .publish_event(decline_ev)
+        .publish_event(decline_ev, None)
         .await
         .expect("engine_a: publish kd=md");
 
@@ -569,12 +569,12 @@ async fn ipc_tier3_full_lifecycle_two_engines() {
     );
     engines
         .engine_a
-        .publish_event(dc_ev_1.clone())
+        .publish_event(dc_ev_1.clone(), None)
         .await
         .expect("engine_a: publish kd=dc 1");
     engines
         .engine_a
-        .publish_event(dc_ev_2.clone())
+        .publish_event(dc_ev_2.clone(), None)
         .await
         .expect("engine_a: publish kd=dc 2");
 
@@ -603,7 +603,7 @@ async fn ipc_tier3_full_lifecycle_two_engines() {
             );
             engines
                 .engine_a
-                .publish_event(da_ev)
+                .publish_event(da_ev, None)
                 .await
                 .expect("engine_a: publish kd=da for candidate 1");
             t_approval += 5;
@@ -619,7 +619,7 @@ async fn ipc_tier3_full_lifecycle_two_engines() {
             );
             engines
                 .engine_a
-                .publish_event(da_ev)
+                .publish_event(da_ev, None)
                 .await
                 .expect("engine_a: publish kd=da for candidate 2");
             t_approval += 5;
@@ -682,7 +682,7 @@ async fn ipc_tier3_full_lifecycle_two_engines() {
             build_ratification_ballot_event(voter, poll_id, scores, hlc_at(t_ballot, "voter-dev"));
         engines
             .engine_a
-            .publish_event(rb_ev)
+            .publish_event(rb_ev, None)
             .await
             .expect("engine_a: publish kd=rb");
         t_ballot += 10;
@@ -708,7 +708,7 @@ async fn ipc_tier3_full_lifecycle_two_engines() {
     );
     engines
         .engine_a
-        .publish_event(trigger_rb)
+        .publish_event(trigger_rb, None)
         .await
         .expect("engine_a: publish trigger kd=rb");
 
@@ -861,7 +861,7 @@ async fn ipc_tier3_engine_auto_kd_sf_on_mass_decline() {
     );
     engines
         .engine_a
-        .publish_event(ss_event)
+        .publish_event(ss_event, None)
         .await
         .expect("engine_a: publish kd=ss");
 
@@ -896,7 +896,7 @@ async fn ipc_tier3_engine_auto_kd_sf_on_mass_decline() {
         );
         engines
             .engine_a
-            .publish_event(decline_ev)
+            .publish_event(decline_ev, None)
             .await
             .expect("publish primary decline");
     }
@@ -909,7 +909,7 @@ async fn ipc_tier3_engine_auto_kd_sf_on_mass_decline() {
         );
         engines
             .engine_a
-            .publish_event(decline_ev)
+            .publish_event(decline_ev, None)
             .await
             .expect("publish backup decline");
     }
@@ -1047,7 +1047,7 @@ async fn ipc_tier3_engine_auto_kd_cl_kd_rs_race_tolerant() {
     // therefore apply kd=ss, and BOTH fire their orchestration hook.
     engines
         .engine_a
-        .publish_event(ss_event)
+        .publish_event(ss_event, None)
         .await
         .expect("engine_a: publish kd=ss");
 
@@ -1204,7 +1204,7 @@ async fn ipc_tier3_retry_of_via_ipc() {
     );
     engines
         .engine_a
-        .publish_event(ss_a)
+        .publish_event(ss_a, None)
         .await
         .expect("engine_a: publish kd=ss for poll A");
 
@@ -1242,7 +1242,7 @@ async fn ipc_tier3_retry_of_via_ipc() {
         );
         engines
             .engine_a
-            .publish_event(decline_ev)
+            .publish_event(decline_ev, None)
             .await
             .expect("engine_a: publish primary decline (poll A)");
     }
@@ -1255,7 +1255,7 @@ async fn ipc_tier3_retry_of_via_ipc() {
         );
         engines
             .engine_a
-            .publish_event(decline_ev)
+            .publish_event(decline_ev, None)
             .await
             .expect("engine_a: publish backup decline (poll A)");
     }

@@ -677,7 +677,7 @@ async fn smoke_tier3_bridge_tier1_event_crosses_to_peer() {
 
     engines
         .engine_a
-        .publish_event(event)
+        .publish_event(event, None)
         .await
         .expect("engine_a publish Tier1 PollCreate");
 
@@ -888,7 +888,7 @@ async fn tier3_full_lifecycle_4_stage_convergence() {
     // Publish via engine_a — applies to log_a and broadcasts to engine_b via bridge.
     engines
         .engine_a
-        .publish_event(ss_event)
+        .publish_event(ss_event, None)
         .await
         .expect("engine_a: publish kd=ss");
 
@@ -958,7 +958,7 @@ async fn tier3_full_lifecycle_4_stage_convergence() {
         );
         engines
             .engine_a
-            .publish_event(dc_ev.clone())
+            .publish_event(dc_ev.clone(), None)
             .await
             .expect("engine_a: publish kd=dc");
         dc_events.push(dc_ev);
@@ -994,7 +994,7 @@ async fn tier3_full_lifecycle_4_stage_convergence() {
             );
             engines
                 .engine_a
-                .publish_event(da_ev)
+                .publish_event(da_ev, None)
                 .await
                 .expect("engine_a: publish kd=da");
         }
@@ -1062,7 +1062,7 @@ async fn tier3_full_lifecycle_4_stage_convergence() {
         ballots.push(RatificationBallotPayload { poll_id, scores });
         engines
             .engine_a
-            .publish_event(rb_ev)
+            .publish_event(rb_ev, None)
             .await
             .expect("engine_a: publish kd=rb");
     }
@@ -1085,7 +1085,7 @@ async fn tier3_full_lifecycle_4_stage_convergence() {
     let close_ev = build_poll_close_event(proposer, poll_id, hlc_at(t_close, "proposer-dev"));
     engines
         .engine_a
-        .publish_event(close_ev)
+        .publish_event(close_ev, None)
         .await
         .expect("engine_a: publish kd=cl");
 
@@ -1100,7 +1100,7 @@ async fn tier3_full_lifecycle_4_stage_convergence() {
     );
     engines
         .engine_a
-        .publish_event(result_ev)
+        .publish_event(result_ev, None)
         .await
         .expect("engine_a: publish kd=rs");
 
@@ -1318,7 +1318,7 @@ async fn tier3_decline_triggers_backup_promotion_across_engines() {
 
     engines
         .engine_a
-        .publish_event(ss_event)
+        .publish_event(ss_event, None)
         .await
         .expect("engine_a: publish kd=ss");
 
@@ -1367,7 +1367,7 @@ async fn tier3_decline_triggers_backup_promotion_across_engines() {
         );
         engines
             .engine_a
-            .publish_event(decline_ev)
+            .publish_event(decline_ev, None)
             .await
             .expect("engine_a: publish kd=md decline");
     }
@@ -1702,7 +1702,7 @@ async fn tier3_mass_decline_sortition_failed_with_retry_chain() {
 
     engines
         .engine_a
-        .publish_event(ss_event)
+        .publish_event(ss_event, None)
         .await
         .expect("engine_a: publish kd=ss");
 
@@ -1764,7 +1764,7 @@ async fn tier3_mass_decline_sortition_failed_with_retry_chain() {
         );
         engines
             .engine_a
-            .publish_event(decline_ev)
+            .publish_event(decline_ev, None)
             .await
             .expect("engine_a: publish primary kd=md decline");
     }
@@ -1782,7 +1782,7 @@ async fn tier3_mass_decline_sortition_failed_with_retry_chain() {
         );
         engines
             .engine_a
-            .publish_event(decline_ev)
+            .publish_event(decline_ev, None)
             .await
             .expect("engine_a: publish backup kd=md decline");
     }
@@ -1855,7 +1855,7 @@ async fn tier3_mass_decline_sortition_failed_with_retry_chain() {
 
     engines
         .engine_a
-        .publish_event(sf_event)
+        .publish_event(sf_event, None)
         .await
         .expect("engine_a: publish kd=sf SortitionFailed");
 
@@ -2321,7 +2321,7 @@ async fn tier3_kd_ss_idempotent_apply_cross_engine_convergence() {
     // engine_a publishes its kd=ss (HLC t0+1) — propagates to engine_b via bridge.
     engines
         .engine_a
-        .publish_event(ss_event_a)
+        .publish_event(ss_event_a, None)
         .await
         .expect("engine_a: publish kd=ss at HLC t0+1");
 
@@ -2340,7 +2340,7 @@ async fn tier3_kd_ss_idempotent_apply_cross_engine_convergence() {
     // Content is identical; t0+2 > t0+1 is monotonic → materialize accepts it.
     engines
         .engine_b
-        .publish_event(ss_event_b)
+        .publish_event(ss_event_b, None)
         .await
         .expect("engine_b: publish kd=ss at HLC t0+2");
 
@@ -2562,7 +2562,7 @@ async fn tier3_cross_engine_kd_ss_hlc_tied_resolves_by_device_id_lex() {
     // Publish lex-smaller event first via engine_a → bridge → engine_b.
     engines
         .engine_a
-        .publish_event(ss_event_a)
+        .publish_event(ss_event_a, None)
         .await
         .expect("engine_a: publish kd=ss (device_id=engine-a)");
 
@@ -2581,7 +2581,7 @@ async fn tier3_cross_engine_kd_ss_hlc_tied_resolves_by_device_id_lex() {
     // "engine-z" > "engine-a" → lex order is monotonically increasing → accepted.
     engines
         .engine_b
-        .publish_event(ss_event_z)
+        .publish_event(ss_event_z, None)
         .await
         .expect("engine_b: publish kd=ss (device_id=engine-z)");
 
@@ -2770,7 +2770,7 @@ async fn engine_auto_sf_on_mass_decline_from_proposer() {
     );
     engines
         .engine_a
-        .publish_event(ss_event)
+        .publish_event(ss_event, None)
         .await
         .expect("engine_a: publish kd=ss");
 
@@ -2809,7 +2809,7 @@ async fn engine_auto_sf_on_mass_decline_from_proposer() {
         );
         engines
             .engine_a
-            .publish_event(decline_ev)
+            .publish_event(decline_ev, None)
             .await
             .expect("publish primary decline");
     }
@@ -2825,7 +2825,7 @@ async fn engine_auto_sf_on_mass_decline_from_proposer() {
         );
         engines
             .engine_a
-            .publish_event(decline_ev)
+            .publish_event(decline_ev, None)
             .await
             .expect("publish backup decline");
     }
@@ -2992,7 +2992,7 @@ async fn engine_auto_cl_when_ratification_window_expires() {
     );
     engines
         .engine_a
-        .publish_event(ss_event)
+        .publish_event(ss_event, None)
         .await
         .expect("engine_a: publish kd=ss");
 
@@ -3126,7 +3126,7 @@ async fn engine_auto_rs_after_cl_with_bit_identical_tally() {
     );
     engines
         .engine_a
-        .publish_event(ss_event)
+        .publish_event(ss_event, None)
         .await
         .expect("engine_a: publish kd=ss");
 
@@ -3338,7 +3338,7 @@ async fn engine_auto_tier3_tauri_events_fire_at_expected_lifecycle_points() {
     );
     engines
         .engine_a
-        .publish_event(ss_event)
+        .publish_event(ss_event, None)
         .await
         .expect("engine_a: publish kd=ss");
 

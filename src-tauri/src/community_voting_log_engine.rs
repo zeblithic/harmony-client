@@ -553,7 +553,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             sig: vec![0u8; 64], // Task 19: wire real signature
         };
 
-        if let Err(e) = self.publish_event(ss_event).await {
+        if let Err(e) = self.publish_event(ss_event, None).await {
             tracing::warn!(
                 community_id = ?self.community_id,
                 ?poll_id,
@@ -751,7 +751,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
 
             // (4) Publish recursively. `Box::pin` breaks the async-fn
             // return-type cycle (publish_event → orchestration → publish_event).
-            if let Err(e) = Box::pin(self.publish_event(sf_ev)).await {
+            if let Err(e) = Box::pin(self.publish_event(sf_ev, None)).await {
                 tracing::warn!(
                     error = %e,
                     poll_id = %hex::encode(pid.0),
@@ -864,7 +864,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                     return;
                 }
             };
-            if let Err(e) = Box::pin(self.publish_event(cl_ev)).await {
+            if let Err(e) = Box::pin(self.publish_event(cl_ev, None)).await {
                 // L1 / replay-dedup rejection on race loss is expected.
                 tracing::debug!(
                     error = %e,
@@ -963,7 +963,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                     return;
                 }
             };
-            if let Err(e) = Box::pin(self.publish_event(rs_ev)).await {
+            if let Err(e) = Box::pin(self.publish_event(rs_ev, None)).await {
                 // PollInFinalizedState (race loser) is expected.
                 tracing::debug!(
                     error = %e,
@@ -992,7 +992,15 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
     ///
     /// Note: the caller is responsible for verify (V1-V6 + kind-specific)
     /// before invoking this. Phase 2's IPC layer always does that.
-    pub async fn publish_event(self: &Arc<Self>, event: SignedVotingEvent) -> Result<(), String> {
+    pub async fn publish_event(
+        self: &Arc<Self>,
+        event: SignedVotingEvent,
+        // ZEB-298+ZEB-312 PR 2 Task 3: optional membership snapshot used
+        // only for Tier 3 PollCreate, which freezes the electorate at
+        // creation time. For all other event kinds the snapshot is None
+        // (the apply path reads the poll's frozen snapshot from state).
+        snapshot: Option<crate::community_voting_core::MembershipSnapshot>,
+    ) -> Result<(), String> {
         // (1) Encode first so we don't mutate any state on a malformed event.
         let mut packet = Vec::new();
         ciborium::into_writer(&event, &mut packet).map_err(|e| format!("encode: {e}"))?;
@@ -1089,7 +1097,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         let applied_poll_id: PollId = {
             let mut log = self.voting_log.lock().await;
             let pid = log
-                .apply_with_snapshot(event.clone(), &self.community_id, None)
+                .apply_with_snapshot(event.clone(), &self.community_id, snapshot.clone())
                 .map_err(|e| format!("apply: {e:?}"))?;
 
             // Store the pre-read epoch on the newly-created Tier 3 poll.
@@ -2003,7 +2011,7 @@ mod tests {
         let event = poll_create_event(actor, "dev-a", 1_000);
 
         engine
-            .publish_event(event.clone())
+            .publish_event(event.clone(), None)
             .await
             .expect("publish_event");
 
@@ -2663,7 +2671,7 @@ mod tests {
         let (create_event, _electorate) =
             tier3_poll_create_event(actor, "dev-d", 4_000, sortition_size);
         engine
-            .publish_event(create_event)
+            .publish_event(create_event, None)
             .await
             .expect("publish tier3 create");
 
@@ -2922,7 +2930,7 @@ mod tests {
         let (create_ev, _electorate) =
             tier3_poll_create_event(actor, "dev-e", 1_000, sortition_size);
 
-        let result = engine.publish_event(create_ev).await;
+        let result = engine.publish_event(create_ev, None).await;
         assert!(
             result.is_err(),
             "publish_event must fail when D-FROST registry is not installed"
