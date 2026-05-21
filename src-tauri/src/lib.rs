@@ -21827,9 +21827,14 @@ async fn voting_submit_deliberation_statement<R: tauri::Runtime>(
 /// Tauri IPC: cast a deliberation vote (kd=dv) on a mini-public statement.
 ///
 /// `vote` must be one of the wire strings "agree" | "disagree" | "pass"
-/// (matches `BridgingVoteCode::from_wire_str`). Returns `Ok(())` on success;
-/// errors if the poll is not in Deliberation stage, the target statement
-/// does not exist, or the vote code is invalid.
+/// (matches `BridgingVoteCode::from_wire_str`). The IPC validates wire-level
+/// inputs (hex lengths, vote string) and publishes the event; eligibility
+/// rules (Deliberation stage, target statement exists, caller in current
+/// mini-public, not self-voting) are enforced by `Tier3PollState::apply_event`
+/// per spec §2.3 and silently drop invalid events at apply time. Returns
+/// `Ok(())` if publish succeeds (matches the existing pattern of other Tier 3
+/// voting IPCs). Frontend callers should observe projection state via
+/// `voting_get_tier3_poll` to confirm the vote landed.
 #[tauri::command]
 async fn voting_cast_deliberation_vote<R: tauri::Runtime>(
     state_lock: tauri::State<'_, Mutex<NodeState>>,

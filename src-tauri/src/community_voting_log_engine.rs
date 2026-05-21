@@ -1473,10 +1473,11 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         }
 
         // 5. ZEB-294: deliberation-statement-created (kd=ds applied).
-        // Decode the payload to extract poll_id, text, and derive event_hash.
-        // Fire unconditionally on kind-match — a dropped (re-applied) event
-        // causes one extra IPC refresh on the frontend (cheap false positive);
-        // a missed emit would be a false negative (much worse).
+        // Decode the payload, then re-acquire the voting_log lock to confirm
+        // the statement actually landed in the projection. Apply rules
+        // (stage / mini-public / spam-cap / length) silently drop invalid
+        // events; emitting only on real acceptance avoids unnecessary UI
+        // refresh churn on dropped traffic.
         if applied_event.kind == PollEventKindCode::DeliberationStatement {
             if let Ok(ds_payload) = ciborium::de::from_reader::<
                 crate::community_voting_core::DeliberationStatementPayload,
@@ -1484,26 +1485,39 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             >(&applied_event.payload[..])
             {
                 let event_hash = crate::community_voting_tier3::event_hash_of(applied_event);
-                let payload = serde_json::json!({
-                    "pollId": hex::encode(ds_payload.poll_id.0),
-                    "statementEventHash": hex::encode(event_hash),
-                    "author": hex::encode(applied_event.actor.0),
-                    "text": ds_payload.text,
-                    "createdAtHlcMs": applied_event.hlc.wall_ms,
-                });
-                if let Err(e) =
-                    app_handle.emit("voting-tier3-deliberation-statement-created", &payload)
-                {
-                    tracing::warn!(
-                        error = %e,
-                        poll_id = %pid_hex,
-                        "voting-tier3-deliberation-statement-created emit failed (non-fatal)"
-                    );
+                let accepted: bool = {
+                    let log = self.voting_log.lock().await;
+                    log.polls
+                        .get(pid)
+                        .and_then(|ps| ps.tier_state.as_tier3())
+                        .is_some_and(|t3| t3.deliberation.statements.contains_key(&event_hash))
+                };
+                if accepted {
+                    let payload = serde_json::json!({
+                        "pollId": hex::encode(ds_payload.poll_id.0),
+                        "statementEventHash": hex::encode(event_hash),
+                        "author": hex::encode(applied_event.actor.0),
+                        "text": ds_payload.text,
+                        "createdAtHlcMs": applied_event.hlc.wall_ms,
+                    });
+                    if let Err(e) =
+                        app_handle.emit("voting-tier3-deliberation-statement-created", &payload)
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            poll_id = %pid_hex,
+                            "voting-tier3-deliberation-statement-created emit failed (non-fatal)"
+                        );
+                    }
                 }
             }
         }
 
         // 6. ZEB-294: deliberation-vote-cast (kd=dv applied).
+        // Only emit when the event actually landed (or refreshed) a vote entry —
+        // i.e. the projection's entry for (voter, statement_event_hash) points
+        // at this event's hash. LWW-rejected duplicates and apply-time drops
+        // would leave a different (or absent) entry.
         if applied_event.kind == PollEventKindCode::DeliberationVote {
             if let Ok(dv_payload) = ciborium::de::from_reader::<
                 crate::community_voting_core::DeliberationVotePayload,
@@ -1513,19 +1527,35 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                 if let Some(vote_code) =
                     crate::community_voting_core::BridgingVoteCode::from_u8(dv_payload.vote)
                 {
-                    let payload = serde_json::json!({
-                        "pollId": hex::encode(dv_payload.poll_id.0),
-                        "statementEventHash": hex::encode(dv_payload.statement_event_hash),
-                        "voter": hex::encode(applied_event.actor.0),
-                        "vote": vote_code.as_wire_str(),
-                    });
-                    if let Err(e) = app_handle.emit("voting-tier3-deliberation-vote-cast", &payload)
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            poll_id = %pid_hex,
-                            "voting-tier3-deliberation-vote-cast emit failed (non-fatal)"
-                        );
+                    let event_hash = crate::community_voting_tier3::event_hash_of(applied_event);
+                    let accepted: bool = {
+                        let log = self.voting_log.lock().await;
+                        log.polls
+                            .get(pid)
+                            .and_then(|ps| ps.tier_state.as_tier3())
+                            .and_then(|t3| {
+                                t3.deliberation
+                                    .votes
+                                    .get(&(applied_event.actor, dv_payload.statement_event_hash))
+                            })
+                            .is_some_and(|entry| entry.last_update_event_hash == event_hash)
+                    };
+                    if accepted {
+                        let payload = serde_json::json!({
+                            "pollId": hex::encode(dv_payload.poll_id.0),
+                            "statementEventHash": hex::encode(dv_payload.statement_event_hash),
+                            "voter": hex::encode(applied_event.actor.0),
+                            "vote": vote_code.as_wire_str(),
+                        });
+                        if let Err(e) =
+                            app_handle.emit("voting-tier3-deliberation-vote-cast", &payload)
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                poll_id = %pid_hex,
+                                "voting-tier3-deliberation-vote-cast emit failed (non-fatal)"
+                            );
+                        }
                     }
                 }
             }

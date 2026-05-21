@@ -182,6 +182,12 @@ pub struct DeliberationVotePayload {
         deserialize_with = "deserialize_bytes_from_bstr"
     )]
     pub statement_event_hash: [u8; 32],
+    // Wire-tolerant by spec §2.3: vt is stored as u8 (not a validated enum)
+    // so malformed peer events deserialize successfully and are silently
+    // dropped at apply time via `BridgingVoteCode::from_u8(...).is_none()`.
+    // Adding a validating deserializer here would convert silent drops into
+    // `ApplyError::PayloadDecode`, conflicting with the CRDT-tolerant drop
+    // semantics the apply layer relies on.
     #[serde(rename = "vt")]
     pub vote: u8,
 }
