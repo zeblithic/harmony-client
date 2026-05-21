@@ -24031,10 +24031,7 @@ async fn voting_get_tier3_poll_raw(
             return build_tier3_export(state, self_owner_opt);
         }
     }
-    Err(format!(
-        "voting_get_tier3_poll: poll {} not found",
-        poll_id
-    ))
+    Err(format!("voting_get_tier3_poll: poll {} not found", poll_id))
 }
 
 /// ZEB-311: Pure projection: `PollState` (must be Tier 3) → `Tier3PollExport`.
@@ -24169,25 +24166,18 @@ fn build_tier3_export(
                 .unwrap_or(t3.meta.config.sortition_size as usize);
             // Build a candidates slice that includes the synthesized status_quo if present.
             let all_candidates: Vec<&crate::community_voting_tier3::DraftCandidateState> =
-                std::iter::once(&sq)
-                    .chain(t3.candidates.iter())
-                    .collect();
+                std::iter::once(&sq).chain(t3.candidates.iter()).collect();
             // Use the candidates slice that might or might not include status_quo already.
             // drafting_advancers returns None if sq_hash not found in the slice.
             // We pass `all_candidates` so sq is always found.
             match crate::community_voting_tier3::drafting_advancers(
-                &all_candidates
-                    .iter()
-                    .copied()
-                    .cloned()
-                    .collect::<Vec<_>>(),
+                &all_candidates.iter().copied().cloned().collect::<Vec<_>>(),
                 mini_public_size,
                 sq_hash,
             ) {
                 Some(advancers) => {
                     let ordered = crate::community_voting_tier3::ratification_candidates_ordering(
-                        &advancers,
-                        sq_hash,
+                        &advancers, sq_hash,
                     );
                     ordered
                         .iter()
@@ -24213,10 +24203,7 @@ fn build_tier3_export(
             }
         };
 
-    let winner_event_hash = t3
-        .result
-        .as_ref()
-        .map(|r| hex::encode(r.winner.event_hash));
+    let winner_event_hash = t3.result.as_ref().map(|r| hex::encode(r.winner.event_hash));
     let runner_up_event_hash = t3.result.as_ref().and_then(|r| {
         r.finalists
             .iter()

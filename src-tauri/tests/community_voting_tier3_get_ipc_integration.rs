@@ -15,13 +15,13 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 
+use harmony_app::community_membership::ChannelId;
+use harmony_app::community_voting_approval::Tier1PollConfig;
 use harmony_app::community_voting_core::{
     build_signed_poll_create_tier1, build_signed_poll_create_tier3,
     build_signed_sortition_selection, derive_poll_id, Eligibility, MemberAttrs, MembershipSnapshot,
     Tier3PollConfigPayload,
 };
-use harmony_app::community_voting_approval::Tier1PollConfig;
-use harmony_app::community_membership::ChannelId;
 use harmony_app::community_voting_log::VotingLog;
 use harmony_app::community_voting_sortition::fisher_yates_select;
 use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
@@ -134,8 +134,7 @@ impl Tier3TestHarness {
             .expect("apply tier3 poll create");
 
         // self_id is NOT the proposer AND kd=ss not applied → role = Observer.
-        let state =
-            build_node_state_with_log(community_id, log, Some(self_id.owner)).await;
+        let state = build_node_state_with_log(community_id, log, Some(self_id.owner)).await;
         Tier3TestHarness {
             state,
             poll_id_hex: hex::encode(poll_id.0),
@@ -151,9 +150,8 @@ impl Tier3TestHarness {
         // self_id will be included in the pool; fisher_yates_select needs
         // primary_size + backup_size = 40 distinct members. We use 50 total.
         let self_id = fixture_identity(10);
-        let other_pool: Vec<OwnerAddr> = (0u8..49)
-            .map(|i| fixture_identity(20 + i).owner)
-            .collect();
+        let other_pool: Vec<OwnerAddr> =
+            (0u8..49).map(|i| fixture_identity(20 + i).owner).collect();
 
         let config = tier3_config();
         let hlc = hlc_at(2_000_000);
@@ -198,8 +196,7 @@ impl Tier3TestHarness {
             "self_id must be in primary or backup for this harness to be useful"
         );
 
-        let state =
-            build_node_state_with_log(community_id, log, Some(self_id.owner)).await;
+        let state = build_node_state_with_log(community_id, log, Some(self_id.owner)).await;
         Tier3TestHarness {
             state,
             poll_id_hex: hex::encode(poll_id.0),
@@ -212,11 +209,7 @@ impl Tier3TestHarness {
         &self,
         poll_id_hex: &str,
     ) -> Result<harmony_app::Tier3PollExport, String> {
-        let inner = self.state.lock().unwrap();
-        // We need to call through the Mutex<NodeState>. Reconstruct via a fresh Arc.
-        // voting_get_tier3_poll_impl takes &Mutex<NodeState>.
-        drop(inner);
-        voting_get_tier3_poll_impl(&*self.state, poll_id_hex.to_string()).await
+        voting_get_tier3_poll_impl(&self.state, poll_id_hex.to_string()).await
     }
 }
 
@@ -295,7 +288,10 @@ async fn get_tier3_poll_returns_drafting_stage_with_mini_public_role_when_self_s
         "self should be MiniPublic or Backup after kd=ss (self was placed in the sortition pool), got {:?}",
         export.my_role
     );
-    assert!(!export.mini_public.is_empty(), "mini_public must be set after kd=ss");
+    assert!(
+        !export.mini_public.is_empty(),
+        "mini_public must be set after kd=ss"
+    );
 }
 
 #[tokio::test]
