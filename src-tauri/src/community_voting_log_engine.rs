@@ -1574,23 +1574,37 @@ async fn inbound_eligibility_check(
                     .map_err(|e| format!("Tier 1 PollCreate: creator not eligible: {e:?}"))?;
                 }
                 crate::community_voting_core::PollEventKindCode::BallotCast => {
-                    // Tier 1 BallotCast: fetch the poll's eligibility from the
-                    // stored Tier1PollConfig — mirrors voting_cast_tier1_ballot's
-                    // check_eligibility call.
+                    // Tier 1 BallotCast: use the poll's FROZEN tier1_snapshot
+                    // (captured at PollCreate apply-time) for the eligibility
+                    // check, mirroring voting_cast_tier1_ballot's local-IPC
+                    // discipline. Using the fresh at-HEAD snapshot here would
+                    // diverge from local (which uses the frozen one), causing
+                    // peer/local apply mismatch during membership churn — a
+                    // member who voted while eligible would be retroactively
+                    // rejected on peer apply if they later lost eligibility.
                     let ballot: crate::community_voting_approval::Tier1Ballot =
                         ciborium::de::from_reader(&event.payload[..])
                             .map_err(|e| format!("decode Tier1Ballot: {e}"))?;
                     let log_g = voting_log.lock().await;
-                    let eligibility = match log_g.polls.get(&ballot.poll_id) {
-                        Some(ps) => match &ps.tier1_cfg {
-                            Some(cfg) => cfg.eligibility,
-                            None => {
-                                return Err(format!(
+                    let (eligibility, frozen_snapshot) = match log_g.polls.get(&ballot.poll_id) {
+                        Some(ps) => {
+                            let cfg = ps.tier1_cfg.as_ref().ok_or_else(|| {
+                                format!(
                                     "Tier 1 BallotCast: poll {} missing tier1_cfg",
                                     hex::encode(ballot.poll_id.0)
-                                ));
-                            }
-                        },
+                                )
+                            })?;
+                            let snap = ps.tier1_snapshot.clone().ok_or_else(|| {
+                                format!(
+                                    "Tier 1 BallotCast: poll {} missing tier1_snapshot \
+                                     (peer-received poll without frozen snapshot — \
+                                     ZEB-298+ZEB-312 PR 2 will fill this via the inbound \
+                                     apply path materializing the snapshot)",
+                                    hex::encode(ballot.poll_id.0)
+                                )
+                            })?;
+                            (cfg.eligibility, snap)
+                        }
                         None => {
                             return Err(format!(
                                 "Tier 1 BallotCast for unknown poll {}",
@@ -1600,7 +1614,7 @@ async fn inbound_eligibility_check(
                     };
                     drop(log_g);
                     crate::community_voting_core::check_eligibility(
-                        snapshot,
+                        &frozen_snapshot,
                         &event.actor,
                         &eligibility,
                     )
