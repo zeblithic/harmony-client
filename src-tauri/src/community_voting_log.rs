@@ -66,6 +66,10 @@ pub struct VotingLog {
     /// resolves concurrent updates. Empty for communities with no Tier 2
     /// activity yet.
     pub delegation_graph: DelegationGraph,
+    /// ZEB-298: community-scoped voting policy. Mutated via IPC (not
+    /// via signed event). Default = all-fields-false so existing
+    /// communities preserve pre-policy behavior.
+    policy: crate::community_voting_conviction::CommunityVotingPolicy,
 }
 
 /// Materialized state for a single poll.
@@ -182,6 +186,17 @@ pub enum ApplyError {
 impl VotingLog {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn policy(&self) -> &crate::community_voting_conviction::CommunityVotingPolicy {
+        &self.policy
+    }
+
+    pub fn set_policy(
+        &mut self,
+        policy: crate::community_voting_conviction::CommunityVotingPolicy,
+    ) {
+        self.policy = policy;
     }
 
     /// Returns true if any poll with this PollId is currently tracked.
