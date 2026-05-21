@@ -22213,6 +22213,12 @@ async fn ensure_voting_engine_for(
     membership_resolver: std::sync::Arc<
         dyn crate::community_voting_log::MembershipSnapshotResolver,
     >,
+    // ZEB-298+ZEB-312 PR 2 Task 1: identity resolver production wiring.
+    // The OwnerDeviceCacheResolver implements both IdentityResolver
+    // (channel-log) and VotingIdentityResolver — same lookup, same
+    // semantics — so the voting engine can reuse the existing cache.
+    crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    self_identity_pub_64: [u8; 64],
     // Existing trailing params:
     dfrost_log_registry: Option<
         std::sync::Arc<crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>>,
@@ -22241,14 +22247,22 @@ async fn ensure_voting_engine_for(
             .clone()
     };
 
-    // TODO ZEB-298+ZEB-312 PR 2 follow-up: wire production identity_resolver
-    // from OwnerDeviceCacheResolver (or a thin Ed25519-extracting adapter).
-    // PR 1 leaves identity_resolver: None — inbound events return a clear
-    // error until the production wiring lands; outbound publishing is fully
-    // functional.
+    // ZEB-298+ZEB-312 PR 2 Task 1: production identity resolver. Both
+    // the channel-log IdentityResolver and the voting VotingIdentityResolver
+    // map OwnerAddr → 64-byte composite (X25519_pub || Ed25519_pub); the
+    // OwnerDeviceCacheResolver implements both by delegating to a single
+    // owner_device_cache lookup. Inbound Tier 1 BallotCast + Tier 2 Signal
+    // events from peers can now verify and apply (the PR 1 None placeholder
+    // would have rejected them with IdentityNotResolvable).
     let identity_resolver: Option<
         std::sync::Arc<dyn crate::community_voting_core::VotingIdentityResolver>,
-    > = None;
+    > = Some(std::sync::Arc::new(
+        crate::community_state_sync::OwnerDeviceCacheResolver::new(
+            crdt_state.clone(),
+            local_owner,
+            self_identity_pub_64,
+        ),
+    ));
 
     // Build the engine's mpsc halves; the "other halves" are bundled into
     // the VotingLogAdapterRequest below and sent to the event loop only
@@ -22616,6 +22630,7 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
         dfrost_log_registry_for_engine,
         beacon_requester_for_engine,
         voting_log_adapter_request_tx,
+        self_identity_pub_64,
     ) = {
         let g = state_lock
             .lock()
@@ -22642,6 +22657,10 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
             g.voting_log_adapter_request_tx
                 .clone()
                 .ok_or("voting_log_adapter_request_tx missing — node not running?")?,
+            // ZEB-298+ZEB-312 PR 2 Task 1: needed to construct the
+            // production OwnerDeviceCacheResolver for the voting engine.
+            g.dm_identity_pub_64
+                .ok_or("dm_identity_pub_64 missing — node not running?")?,
         )
     };
 
@@ -22678,6 +22697,8 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
         local_signing_key_for_engine,
         self_owner,
         membership_resolver_for_engine,
+        crdt_state.clone(),
+        self_identity_pub_64,
         dfrost_log_registry_for_engine,
         beacon_requester_for_engine,
     )
@@ -22900,6 +22921,7 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
         dfrost_log_registry_for_engine,
         beacon_requester_for_engine,
         voting_log_adapter_request_tx,
+        self_identity_pub_64,
     ) = {
         let g = state_lock
             .lock()
@@ -22926,6 +22948,10 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
             g.voting_log_adapter_request_tx
                 .clone()
                 .ok_or("voting_log_adapter_request_tx missing — node not running?")?,
+            // ZEB-298+ZEB-312 PR 2 Task 1: needed to construct the
+            // production OwnerDeviceCacheResolver for the voting engine.
+            g.dm_identity_pub_64
+                .ok_or("dm_identity_pub_64 missing — node not running?")?,
         )
     };
 
@@ -22966,6 +22992,8 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
         local_signing_key_for_engine,
         self_owner,
         membership_resolver_for_engine,
+        crdt_state.clone(),
+        self_identity_pub_64,
         dfrost_log_registry_for_engine,
         beacon_requester_for_engine,
     )
@@ -23036,6 +23064,7 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
         voting_log_adapter_request_tx,
         community_registry,
         crdt_state,
+        self_identity_pub_64,
     ) = {
         let g = state_lock
             .lock()
@@ -23063,6 +23092,10 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
             g.crdt_state
                 .clone()
                 .ok_or("crdt_state missing — node not running?")?,
+            // ZEB-298+ZEB-312 PR 2 Task 1: needed to construct the
+            // production OwnerDeviceCacheResolver for the voting engine.
+            g.dm_identity_pub_64
+                .ok_or("dm_identity_pub_64 missing — node not running?")?,
         )
     };
 
@@ -23075,7 +23108,7 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
         dyn crate::community_voting_log::MembershipSnapshotResolver,
     > = std::sync::Arc::new(NodeStateMembershipResolver {
         community_registry,
-        crdt_state,
+        crdt_state: crdt_state.clone(),
     });
     ensure_voting_engine_for(
         &voting_logs,
@@ -23087,6 +23120,8 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
         local_signing_key_for_engine,
         self_owner,
         membership_resolver_for_engine,
+        crdt_state,
+        self_identity_pub_64,
         dfrost_log_registry_for_engine,
         beacon_requester_for_engine,
     )
