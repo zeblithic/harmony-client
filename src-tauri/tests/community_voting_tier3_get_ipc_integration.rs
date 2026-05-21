@@ -700,6 +700,45 @@ async fn get_tier3_poll_returns_drafting_stage_with_mini_public_role_when_self_s
 }
 
 #[tokio::test]
+async fn get_tier3_poll_projects_deliberation_stage_after_kd_ss_within_dw_window() {
+    // Regression for the R10 high-severity Cursor finding: t3.stage is only
+    // persisted for terminal states (Sortition / Failed / Finalized). The
+    // intermediate stages (Deliberation / Drafting / Ratification) are
+    // time-derived via current_stage_at(&t3.last_hlc). build_tier3_export
+    // previously projected t3.stage directly, which meant the UI saw
+    // "Sortition" for the entire post-kd=ss window — observers got the wrong
+    // panels and the wrong roles.
+    //
+    // Harness sets: create at HLC 2_000_000, kd=ss applied at 2_000_001,
+    // dw = 3600s = 3_600_000 ms. stage_2_threshold = 5_600_000.
+    // last_hlc = 2_000_001 < 5_600_000 → Deliberation.
+    let h = Tier3TestHarness::with_poll_in_drafting_stage_and_self_in_mini_public().await;
+    let export = h.get_tier3_poll(&h.poll_id_hex).await.expect("ok");
+    assert_eq!(
+        export.stage,
+        Tier3StageTag::Deliberation,
+        "post-kd=ss within dw should project Deliberation, not the persisted t3.stage (still Sortition)"
+    );
+}
+
+#[tokio::test]
+async fn list_tier3_polls_projects_deliberation_stage_after_kd_ss_within_dw_window() {
+    // Mirror of the get_tier3_poll regression: list_tier3_polls had the same
+    // t3.stage leak. Verify the summary projection uses current_stage_at too.
+    let h = Tier3TestHarness::with_poll_in_drafting_stage_and_self_in_mini_public().await;
+    let summaries = h.list_tier3_polls(&h.community_id_hex).await.expect("ok");
+    let summary = summaries
+        .iter()
+        .find(|s| s.poll_id == h.poll_id_hex)
+        .expect("poll should appear in list");
+    assert_eq!(
+        summary.stage,
+        Tier3StageTag::Deliberation,
+        "list summary stage should mirror get_tier3_poll stage (both via current_stage_at)"
+    );
+}
+
+#[tokio::test]
 async fn get_tier3_poll_returns_error_on_unknown_poll() {
     let h = Tier3TestHarness::empty().await;
     let err = h.get_tier3_poll(&"00".repeat(32)).await.unwrap_err();

@@ -24064,6 +24064,18 @@ fn build_tier3_export(
     // `subscribeTier3*` — so the export always tracks the latest
     // applied HLC. If sortition hasn't happened or no events have
     // applied, the effective set is empty and no actor can be in it.
+    //
+    // Stage projection uses the same watermark: `t3.stage` is only
+    // persisted for terminal states (Sortition / Failed / Finalized).
+    // The intermediate stages (Deliberation / Drafting / Ratification)
+    // are time-derived from the create HLC + window config — pulling
+    // them via `current_stage_at(&now)` is the only way the UI can know
+    // which stage the poll is in.
+    let effective_stage = t3
+        .last_hlc
+        .as_ref()
+        .map(|now| t3.current_stage_at(now))
+        .unwrap_or(t3.stage);
     let effective_mp: std::collections::HashSet<crate::owner_state_types::OwnerAddr> =
         match (t3.last_hlc.as_ref(), t3.sortition_result.as_ref()) {
             (Some(now), Some(_)) => t3.current_mini_public(now),
@@ -24232,7 +24244,7 @@ fn build_tier3_export(
         community_id: hex::encode(state.meta.community_id.0),
         proposal_text: t3.meta.config.proposal_text.clone(),
         proposer: hex::encode(t3.meta.proposer.0),
-        stage: t3.stage.into(),
+        stage: effective_stage.into(),
         poll_create_hlc_ms: t3.meta.poll_create_hlc.wall_ms as i128,
         sortition_size: t3.meta.config.sortition_size,
         deliberation_window_seconds: t3.meta.config.deliberation_window_seconds,
@@ -24331,12 +24343,23 @@ async fn voting_list_tier3_polls_raw(
                         .unwrap_or_default()
                 }
             });
+            // `t3.stage` only stores terminal states (Sortition / Failed /
+            // Finalized). Intermediate stages (Deliberation / Drafting /
+            // Ratification) are time-derived — must be computed via
+            // current_stage_at(&t3.last_hlc) so the list reflects the actual
+            // active stage, not the static stored value. Same projection as
+            // build_tier3_export.
+            let effective_stage = t3
+                .last_hlc
+                .as_ref()
+                .map(|now| t3.current_stage_at(now))
+                .unwrap_or(t3.stage);
             Some(Tier3PollSummary {
                 poll_id: hex::encode(state.meta.poll_id.0),
                 community_id: hex::encode(state.meta.community_id.0),
                 proposal_text: t3.meta.config.proposal_text.clone(),
                 proposer: hex::encode(t3.meta.proposer.0),
-                stage: t3.stage.into(),
+                stage: effective_stage.into(),
                 poll_create_hlc_ms: t3.meta.poll_create_hlc.wall_ms as i128,
                 sortition_size: t3.meta.config.sortition_size,
                 winner_text,

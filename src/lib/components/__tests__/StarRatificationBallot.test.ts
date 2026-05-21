@@ -80,4 +80,33 @@ describe('StarRatificationBallot', () => {
     expect(sliders[0].value).toBe('3');
     expect(sliders[1].value).toBe('5');
   });
+
+  it('keeps slider + number input in sync when one is changed via setScore', async () => {
+    // Regression: setScore previously wrote `scores[index] = clamped` in
+    // place. In Svelte 5 $state arrays this should reactively update both
+    // paired inputs, but reassigning the array is the load-bearing pattern
+    // that guarantees re-render across Svelte 5 minor versions.
+    const adapter = new VotingAdapter();
+    const { getAllByRole, container } = render(StarRatificationBallot, {
+      props: { detail, adapter, onCast: () => {} },
+    });
+    const sliders = getAllByRole('slider') as HTMLInputElement[];
+    const numberInputs = container.querySelectorAll('input[type="number"]') as NodeListOf<HTMLInputElement>;
+
+    // Change the FIRST slider to 4 → number input for index 0 must follow.
+    await fireEvent.input(sliders[0], { target: { value: '4' } });
+    expect(sliders[0].value).toBe('4');
+    expect(numberInputs[0].value).toBe('4');
+    // The second pair must remain at 0.
+    expect(sliders[1].value).toBe('0');
+    expect(numberInputs[1].value).toBe('0');
+
+    // Now change the SECOND number input to 2 → slider for index 1 must follow.
+    await fireEvent.input(numberInputs[1], { target: { value: '2' } });
+    expect(numberInputs[1].value).toBe('2');
+    expect(sliders[1].value).toBe('2');
+    // First pair unchanged.
+    expect(sliders[0].value).toBe('4');
+    expect(numberInputs[0].value).toBe('4');
+  });
 });

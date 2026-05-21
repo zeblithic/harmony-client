@@ -72,7 +72,14 @@
 
   function setScore(index: number, value: number) {
     const clamped = Math.max(0, Math.min(5, Math.round(value)));
-    scores[index] = clamped;
+    // Reassign the array (not in-place index write) so the paired
+    // slider + number input both react. Svelte 5 $state arrays are
+    // proxied and per-index writes generally do reactively fire, but
+    // doing a full reassignment is the load-bearing pattern that
+    // guarantees both `value={scores[i]}` bindings re-render across
+    // any Svelte 5 minor version. n ≤ 5 (ZEB-309 candidate cap), so
+    // the O(n) cost is negligible.
+    scores = scores.map((s, i) => (i === index ? clamped : s));
   }
 
   async function confirmCast() {
