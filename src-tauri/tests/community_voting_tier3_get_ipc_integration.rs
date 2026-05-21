@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 use harmony_app::community_membership::ChannelId;
 use harmony_app::community_voting_approval::Tier1PollConfig;
 use harmony_app::community_voting_core::{
-    build_signed_draft_candidate, build_signed_poll_close_tier3, build_signed_poll_create_tier1,
-    build_signed_poll_create_tier3, build_signed_poll_result_tier3,
+    build_signed_draft_approval, build_signed_draft_candidate, build_signed_poll_close_tier3,
+    build_signed_poll_create_tier1, build_signed_poll_create_tier3, build_signed_poll_result_tier3,
     build_signed_sortition_selection, derive_poll_id, Eligibility, MemberAttrs, MembershipSnapshot,
     Tier3PollConfigPayload,
 };
@@ -299,26 +299,29 @@ impl Tier3TestHarness {
 
     /// NodeState with a Tier 3 poll that has reached Stage::Finalized.
     ///
-    /// Uses sortition_size=1 so threshold = ceil(1/2) = 1 (one approval
-    /// satisfies the drafting threshold). Sequence:
-    ///   kd=cr → kd=ss (1 primary) → kd=dc (self-approval = 1 ≥ threshold)
-    ///   → kd=cl (poll close) → kd=rs (poll result, winner = dc candidate)
+    /// Uses the minimum valid config (sortition_size=20, window=60s each).
+    /// With sortition_size=20, threshold = ceil(20/2) = 10 approvals.
+    /// Sequence:
+    ///   kd=cr → kd=ss (20 primary) → kd=dc by primary[0] (self-approval=1)
+    ///   → kd=da by primary[1..9] (9 more → 10 total, hits threshold)
+    ///   → kd=cl → kd=rs (poll result, winner = dc candidate)
     ///
-    /// The `winner_text` in the summary will be the draft candidate's text.
-    /// Status quo is NOT synthesized into t3.candidates here (no engine
-    /// orchestration), so the winner must be the real kd=dc candidate to
-    /// get a non-None `winner_text`.
+    /// apply_event does NOT verify tally (verify_sr is an upstream gate);
+    /// we construct a StarResult whose winner.event_hash matches the real
+    /// kd=dc candidate so that winner_text resolves to "Winner proposal text".
     async fn with_finalized_tier3_poll() -> Self {
+        const SORTITION_SIZE: u16 = 20;
         let community_id = SpaceId([0xA6; 16]);
         let proposer = fixture_identity(6);
+        // primary[0..20] are identities 30..49; proposer (seed=6) is outside.
+        let primary: Vec<_> = (30u8..50).map(fixture_identity).collect();
 
-        // Use sortition_size=1 so threshold = ceil(1/2) = 1.
         let config = Tier3PollConfigPayload {
             proposal_text: "Finalized proposal text".into(),
-            sortition_size: 1,
-            deliberation_window_seconds: 1,
-            drafting_window_seconds: 1,
-            ratification_window_seconds: 1,
+            sortition_size: SORTITION_SIZE,
+            deliberation_window_seconds: 60, // minimum valid
+            drafting_window_seconds: 60,
+            ratification_window_seconds: 60,
             privacy_mode: "pu".into(),
             incentive_mode: "d".into(),
             eligibility: Eligibility {
@@ -344,12 +347,13 @@ impl Tier3TestHarness {
         log.apply_with_snapshot(event_create, &community_id, Some(snapshot))
             .expect("apply kd=cr");
 
-        // kd=ss: 1 primary (proposer), 0 backup.
+        // kd=ss: 20 primary (primary identities), 0 backup.
+        let primary_owners: Vec<OwnerAddr> = primary.iter().map(|id| id.owner).collect();
         let ss_event = build_signed_sortition_selection(
             &proposer.signing_key,
             proposer.owner,
             poll_id,
-            vec![proposer.owner],
+            primary_owners,
             vec![],
             hlc_at(1_000_001),
         )
@@ -357,10 +361,11 @@ impl Tier3TestHarness {
         log.apply_with_snapshot(ss_event, &community_id, None)
             .expect("apply kd=ss");
 
-        // kd=dc: draft candidate from proposer (self-approval = 1, hits threshold=1).
+        // kd=dc: draft candidate from primary[0]; gets implicit self-approval (count=1).
+        let dc_actor = &primary[0];
         let dc_event = build_signed_draft_candidate(
-            &proposer.signing_key,
-            proposer.owner,
+            &dc_actor.signing_key,
+            dc_actor.owner,
             poll_id,
             "Winner proposal text".into(),
             hlc_at(1_000_002),
@@ -370,12 +375,27 @@ impl Tier3TestHarness {
         log.apply_with_snapshot(dc_event, &community_id, None)
             .expect("apply kd=dc");
 
-        // kd=cl: poll close (proposer signs).
+        // kd=da: 9 more approvals from primary[1..10] → total 10, hits threshold=ceil(20/2)=10.
+        // apply_event for kd=da is a HashSet insert — no threshold validation at materialize layer.
+        for (i, approver) in primary[1..10].iter().enumerate() {
+            let da_event = build_signed_draft_approval(
+                &approver.signing_key,
+                approver.owner,
+                poll_id,
+                dc_hash,
+                hlc_at(1_000_003 + i as u64),
+            )
+            .expect("build kd=da");
+            log.apply_with_snapshot(da_event, &community_id, None)
+                .expect("apply kd=da");
+        }
+
+        // kd=cl: poll close.
         let cl_event = build_signed_poll_close_tier3(
             &proposer.signing_key,
             proposer.owner,
             poll_id,
-            hlc_at(1_000_003),
+            hlc_at(1_001_000),
         )
         .expect("build kd=cl");
         log.apply_with_snapshot(cl_event, &community_id, None)
@@ -388,11 +408,11 @@ impl Tier3TestHarness {
         let star_result = StarResult {
             winner: CandidateRef {
                 event_hash: dc_hash,
-                approval_count: 1,
+                approval_count: 10,
             },
             finalists: vec![CandidateRef {
                 event_hash: dc_hash,
-                approval_count: 1,
+                approval_count: 10,
             }],
             total_scores: vec![0],
             runoff_votes: vec![1],
@@ -402,7 +422,7 @@ impl Tier3TestHarness {
             proposer.owner,
             poll_id,
             star_result,
-            hlc_at(1_000_004),
+            hlc_at(1_001_001),
         )
         .expect("build kd=rs");
         log.apply_with_snapshot(rs_event, &community_id, None)
