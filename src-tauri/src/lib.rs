@@ -480,6 +480,14 @@ pub struct NodeState {
     /// `None` until start_node wires it; cleared in stop_inner.
     voting_log_adapter_request_tx:
         Option<tokio::sync::mpsc::Sender<crate::event_loop::VotingLogAdapterRequest>>,
+    /// ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle captured at
+    /// `start_node` so IPC handlers (which are generic over
+    /// `R: tauri::Runtime` and can't downcast `AppHandle<R>` to
+    /// `AppHandle<Wry>`) can hand the voting engine a concrete
+    /// `AppHandle<Wry>` for Tier 3 lifecycle event emission. Mirrors
+    /// the existing typed-Wry pattern on `voting_log_engines`.
+    /// `None` until `start_node` wires it; cleared in `stop_inner`.
+    app_handle_wry: Option<tauri::AppHandle<tauri::Wry>>,
     /// ZEB-270 Phase 3 Task 4C: per-(community, channel) ChannelLog
     /// engine registry. `None` until `start_node` constructs it
     /// (post-event-loop-ready, so the registry can hold the live
@@ -698,6 +706,9 @@ impl Default for NodeState {
             community_adapter_request_tx: None,
             // ZEB-298+ZEB-312 PR 1: cleared until start_node wires it.
             voting_log_adapter_request_tx: None,
+            // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle captured
+            // at start_node for Tier 3 lifecycle emit.
+            app_handle_wry: None,
             // ZEB-270 Task 4C: registry stays None until start_node
             // wires it (see follow-up Task 4C deferred work).
             channel_log_registry: None,
@@ -1011,6 +1022,9 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         // channel was unused so a restart's fresh Sender doesn't
         // collide with a leaked one.
         let _ = guard.voting_log_adapter_request_tx.take();
+        // ZEB-298+ZEB-312 PR 2 Task 2: drop the typed Wry AppHandle so
+        // a subsequent start_node captures a fresh one for the new run.
+        let _ = guard.app_handle_wry.take();
         // ZEB-270 Phase 3 Task 4C: take the registry handle so we
         // can run `shutdown_all` against it below outside the std
         // `MutexGuard` scope (the `block_on` would panic on the
@@ -1655,6 +1669,9 @@ async fn start_node(
         // request sender so it doesn't outlive the previous event loop.
         // A fresh channel pair is constructed below.
         let _ = guard.voting_log_adapter_request_tx.take();
+        // ZEB-298+ZEB-312 PR 2 Task 2: clear the prior typed Wry
+        // AppHandle so the restart captures a fresh one.
+        let _ = guard.app_handle_wry.take();
         // ZEB-270 Phase 3 Task 4.5: take the prior channel-log
         // registry into the outer-scope binding. Awaited outside the
         // guard scope (the std `MutexGuard` is `!Send`) — mirrors
@@ -3655,6 +3672,12 @@ async fn start_node(
                         // loop. The matching rx was moved into event_loop::run
                         // above.
                         guard.voting_log_adapter_request_tx = Some(voting_log_adapter_request_tx);
+                        // ZEB-298+ZEB-312 PR 2 Task 2: capture the typed Wry
+                        // AppHandle so IPC handlers (generic over R) can hand
+                        // the voting engine a concrete `AppHandle<Wry>` for
+                        // Tier 3 lifecycle event emission. `app` here is
+                        // `tauri::AppHandle` (= `AppHandle<Wry>` by default).
+                        guard.app_handle_wry = Some(app.clone());
                         // ZEB-270 Phase 3 Task 4.5: store the channel-log
                         // registry handle so stop_inner can flip every
                         // per-channel `closing` flag and run final flushes
@@ -22206,8 +22229,6 @@ async fn ensure_voting_engine_for(
         tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
     >,
     device_id: String,
-    // Note: app_handle deliberately omitted — see TODO in fn body. Tier 3
-    // lifecycle events deferred to PR 2; Tier 2-only scope is unaffected.
     local_signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
     local_owner: crate::owner_state_types::OwnerAddr,
     membership_resolver: std::sync::Arc<
@@ -22219,6 +22240,11 @@ async fn ensure_voting_engine_for(
     // semantics — so the voting engine can reuse the existing cache.
     crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     self_identity_pub_64: [u8; 64],
+    // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle for Tier 3
+    // lifecycle emit. IPCs read this from `NodeState.app_handle_wry`
+    // (captured at start_node) so the generic `AppHandle<R>` from the
+    // IPC's own param doesn't need an unsafe downcast.
+    app_handle: tauri::AppHandle<tauri::Wry>,
     // Existing trailing params:
     dfrost_log_registry: Option<
         std::sync::Arc<crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>>,
@@ -22278,15 +22304,11 @@ async fn ensure_voting_engine_for(
             subscriber_rx,
             hlc_tracker: Some(hlc_tracker),
             device_id: Some(device_id),
-            // TODO ZEB-298+ZEB-312 PR 2 follow-up: wire app_handle so
-            // Tier 3 lifecycle events (sortition-complete / drafting-open /
-            // ratification-open / finalized) fire to the UI. Deferred
-            // because the IPC handlers are generic over R: tauri::Runtime
-            // but VotingLogEnginesMap is typed for tauri::Wry — threading
-            // AppHandle<Wry> through generic IPC handlers requires either
-            // a type-erased handle or a dedicated wrapper. Tier 2-only
-            // scope in PR 1 is unaffected.
-            app_handle: None,
+            // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle for Tier 3
+            // lifecycle emit. IPCs read this from NodeState.app_handle_wry
+            // (captured at start_node, so the generic AppHandle<R> from
+            // the IPC's own param doesn't need an unsafe downcast).
+            app_handle: Some(app_handle.clone()),
             identity_resolver,
             membership_resolver: Some(membership_resolver),
         },
@@ -22631,6 +22653,7 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
         beacon_requester_for_engine,
         voting_log_adapter_request_tx,
         self_identity_pub_64,
+        app_handle_wry,
     ) = {
         let g = state_lock
             .lock()
@@ -22661,6 +22684,13 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
             // production OwnerDeviceCacheResolver for the voting engine.
             g.dm_identity_pub_64
                 .ok_or("dm_identity_pub_64 missing — node not running?")?,
+            // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle for the
+            // voting engine's Tier 3 lifecycle emit path. Captured at
+            // start_node so generic IPC handlers can pass a concrete
+            // AppHandle<Wry> without downcasting from AppHandle<R>.
+            g.app_handle_wry
+                .clone()
+                .ok_or("app_handle_wry missing — node not running?")?,
         )
     };
 
@@ -22699,6 +22729,7 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
         membership_resolver_for_engine,
         crdt_state.clone(),
         self_identity_pub_64,
+        app_handle_wry,
         dfrost_log_registry_for_engine,
         beacon_requester_for_engine,
     )
@@ -22922,6 +22953,7 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
         beacon_requester_for_engine,
         voting_log_adapter_request_tx,
         self_identity_pub_64,
+        app_handle_wry,
     ) = {
         let g = state_lock
             .lock()
@@ -22952,6 +22984,13 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
             // production OwnerDeviceCacheResolver for the voting engine.
             g.dm_identity_pub_64
                 .ok_or("dm_identity_pub_64 missing — node not running?")?,
+            // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle for the
+            // voting engine's Tier 3 lifecycle emit path. Captured at
+            // start_node so generic IPC handlers can pass a concrete
+            // AppHandle<Wry> without downcasting from AppHandle<R>.
+            g.app_handle_wry
+                .clone()
+                .ok_or("app_handle_wry missing — node not running?")?,
         )
     };
 
@@ -22994,6 +23033,7 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
         membership_resolver_for_engine,
         crdt_state.clone(),
         self_identity_pub_64,
+        app_handle_wry,
         dfrost_log_registry_for_engine,
         beacon_requester_for_engine,
     )
@@ -23065,6 +23105,7 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
         community_registry,
         crdt_state,
         self_identity_pub_64,
+        app_handle_wry,
     ) = {
         let g = state_lock
             .lock()
@@ -23096,6 +23137,13 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
             // production OwnerDeviceCacheResolver for the voting engine.
             g.dm_identity_pub_64
                 .ok_or("dm_identity_pub_64 missing — node not running?")?,
+            // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle for the
+            // voting engine's Tier 3 lifecycle emit path. Captured at
+            // start_node so generic IPC handlers can pass a concrete
+            // AppHandle<Wry> without downcasting from AppHandle<R>.
+            g.app_handle_wry
+                .clone()
+                .ok_or("app_handle_wry missing — node not running?")?,
         )
     };
 
@@ -23122,6 +23170,7 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
         membership_resolver_for_engine,
         crdt_state,
         self_identity_pub_64,
+        app_handle_wry,
         dfrost_log_registry_for_engine,
         beacon_requester_for_engine,
     )
@@ -29373,6 +29422,7 @@ mod start_node_race_tests {
             dm_identity_pub_64: None,
             community_adapter_request_tx: None,
             voting_log_adapter_request_tx: None,
+            app_handle_wry: None,
             channel_log_registry: None,
             dfrost_log_registry: None,
             beacon_requester: None,
