@@ -378,9 +378,9 @@ export interface CreateTier3ProposalArgs {
   deliberationWindowSeconds: number;
   draftingWindowSeconds: number;
   ratificationWindowSeconds: number;
-  /** Incentive mode 2-char tag: 'se' (sortition-equal), 'ab' (approval-
-   *  bonus), 'co' (community), 'dp' (decision-power). */
-  incentiveMode: 'se' | 'ab' | 'co' | 'dp';
+  /** 1-char `incentive_mode` tag accepted by the backend
+   *  `validate_tier3_poll_config`: 'a' | 'b' | 'c' | 'd'. */
+  incentiveMode: 'a' | 'b' | 'c' | 'd';
   minPower: number;
   minVouchingDepth?: number;
   /** Optional prior PollId hex when this proposal retries a failed Tier 3. */
@@ -501,8 +501,8 @@ export interface Tier3PollExport {
   deliberationWindowSeconds: number;
   draftingWindowSeconds: number;
   ratificationWindowSeconds: number;
-  /** 1-char incentive_mode tag from validate_tier3_poll_config: 'a' | 'b' | 'c' | 'd'. */
-  incentiveMode: string;
+  /** 1-char `incentive_mode` tag from `validate_tier3_poll_config`. */
+  incentiveMode: 'a' | 'b' | 'c' | 'd';
   miniPublic: string[];
   backupPool: string[];
   /** Tuples of (ownerHex, hlcMs). */

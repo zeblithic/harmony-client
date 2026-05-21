@@ -55,7 +55,7 @@ describe('VotingAdapter Tier 3 IPC wrappers', () => {
       deliberationWindowSeconds: 600,
       draftingWindowSeconds: 600,
       ratificationWindowSeconds: 600,
-      incentiveMode: 'dp',
+      incentiveMode: 'd',
       minPower: 0,
     });
     expect(pid).toBe('aa'.repeat(32));
@@ -64,7 +64,7 @@ describe('VotingAdapter Tier 3 IPC wrappers', () => {
       expect.objectContaining({
         communityId: 'bb'.repeat(16),
         sortitionSize: 20,
-        incentiveMode: 'dp',
+        incentiveMode: 'd',
       }),
     );
   });

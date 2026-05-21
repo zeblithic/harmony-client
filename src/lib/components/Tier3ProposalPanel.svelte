@@ -51,8 +51,12 @@
   let deliberationWindowSeconds = $state(1_209_600); // 14d
   let draftingWindowSeconds = $state(604_800);       // 7d
   let ratificationWindowSeconds = $state(1_209_600); // 14d
-  let incentiveMode = $state<'se' | 'ab' | 'co' | 'dp'>('dp');
+  // The backend `validate_tier3_poll_config` accepts only the 1-char tags
+  // 'a' | 'b' | 'c' | 'd' (see community_voting_tier3.rs). Labels are
+  // descriptive UI strings; the wire value MUST be the single char.
+  let incentiveMode = $state<'a' | 'b' | 'c' | 'd'>('d');
   let confirmingCreate = $state(false);
+  let creating = $state(false);
   let createError = $state<string | null>(null);
 
   // List + selection state
@@ -61,6 +65,7 @@
   let selectedPollId = $state<string | null>(null);
   let selectedDetail = $state<Tier3PollExport | null>(null);
   let detailError = $state<string | null>(null);
+  let detailRequestSeq = $state(0);
 
   let unsubscribers: Array<() => void> = [];
 
@@ -74,10 +79,17 @@
   }
 
   async function loadDetail(pollId: string) {
+    // Rapid clicks or event-driven refetches can race: an older
+    // response can overwrite a fresher selection. Track a sequence
+    // number and a pollId snapshot; commit only when both still match.
+    const req = ++detailRequestSeq;
     try {
-      selectedDetail = await adapter.getTier3Poll(pollId);
+      const next = await adapter.getTier3Poll(pollId);
+      if (req !== detailRequestSeq || selectedPollId !== pollId) return;
+      selectedDetail = next;
       detailError = null;
     } catch (e) {
+      if (req !== detailRequestSeq || selectedPollId !== pollId) return;
       detailError = e instanceof Error ? e.message : String(e);
     }
   }
@@ -92,6 +104,8 @@
   }
 
   async function submitCreate() {
+    if (creating) return;
+    creating = true;
     try {
       await adapter.createTier3Proposal({
         communityId,
@@ -111,6 +125,8 @@
     } catch (e) {
       createError = e instanceof Error ? e.message : String(e);
       confirmingCreate = false;
+    } finally {
+      creating = false;
     }
   }
 
@@ -273,10 +289,10 @@
     <label>
       <span>Incentive mode</span>
       <select bind:value={incentiveMode}>
-        <option value="se">se — SortitionEqual</option>
-        <option value="ab">ab — ApprovalBonus</option>
-        <option value="co">co — Community</option>
-        <option value="dp">dp — DecisionPower (default)</option>
+        <option value="a">a — SortitionEqual</option>
+        <option value="b">b — ApprovalBonus</option>
+        <option value="c">c — Community</option>
+        <option value="d">d — DecisionPower (default)</option>
       </select>
     </label>
 
@@ -293,8 +309,10 @@
         "{proposalText.slice(0, 120)}{proposalText.length > 120 ? '…' : ''}"
       </p>
       <div class="confirm-actions">
-        <button type="button" onclick={() => (confirmingCreate = false)}>Cancel</button>
-        <button type="button" onclick={submitCreate}>Confirm</button>
+        <button type="button" onclick={() => (confirmingCreate = false)} disabled={creating}>Cancel</button>
+        <button type="button" onclick={submitCreate} disabled={creating}>
+          {creating ? 'Creating…' : 'Confirm'}
+        </button>
       </div>
     </div>
   {/if}

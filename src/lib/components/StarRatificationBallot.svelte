@@ -20,20 +20,23 @@
     onCast: () => void;
   } = $props();
 
-  // Initial scores: seeded by the $effect below to avoid Svelte's
-  // `state_referenced_locally` warning (direct prop reads in $state()
-  // initialisers only capture the first-render value, masking later prop
-  // swaps). The $effect runs on first render and whenever detail changes.
   let scores = $state<number[]>([]);
   let confirming = $state(false);
   let casting = $state(false);
   let castError = $state<string | null>(null);
   let castSuccess = $state(false);
+  // Reseed scores only when the active poll changes, not on every detail
+  // refetch. Tier3ProposalPanel refetches the selected poll on each
+  // Tier 3 event; without this guard, in-progress slider edits get
+  // clobbered to all-zeros when the server snapshot has no
+  // myRatificationScores yet.
+  let lastSeededPollId: string | null = null;
 
-  // Seed/sync scores from the server snapshot whenever detail changes
-  // (including first render). Prefills from myRatificationScores when
-  // present; otherwise initialises all-zero sized to the candidate count.
   $effect(() => {
+    if (detail.pollId === lastSeededPollId) return;
+    lastSeededPollId = detail.pollId;
+    castSuccess = false;
+    castError = null;
     if (detail.myRatificationScores) {
       scores = [...detail.myRatificationScores];
     } else {
@@ -49,6 +52,7 @@
   async function confirmCast() {
     confirming = false;
     casting = true;
+    castSuccess = false;
     castError = null;
     try {
       await adapter.castRatificationBallot(detail.pollId, scores);

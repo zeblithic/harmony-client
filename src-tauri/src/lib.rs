@@ -24133,72 +24133,59 @@ fn build_tier3_export(
         })
         .collect();
 
-    // ratification_candidates: during Finalized, use t3.result.finalists (authoritative).
-    // During Ratification (or any earlier stage), derive from t3.candidates via
-    // drafting_advancers + synthesize_status_quo, which matches the ordering that
-    // kd=rb ballot scores index against.
+    // ratification_candidates: during Finalized, use `t3.result.finalists`
+    // (authoritative). During Ratification (or any earlier stage), derive
+    // from `t3.candidates` the same way `verify_ratification_ballot` and
+    // `tier3_ratification_candidate_count` do — synthesize status_quo,
+    // push onto a local clone, then run drafting_advancers +
+    // ratification_candidates_ordering. We size by the configured
+    // `sortition_size`, matching the verifier (which uses
+    // `meta.config.sortition_size`, NOT `sortition_result.primary.len()`).
+    //
+    // Note: `synthesize_status_quo` is NEVER written into `t3.candidates`
+    // by `apply` (see community_voting_log.rs:222), so for ANY finalist
+    // or candidate hash equal to `sq_hash` we must source the text from
+    // the synthesized struct, not `t3.candidates`.
+    let sq = crate::community_voting_tier3::synthesize_status_quo(&state.meta.poll_id);
+    let sq_hash = sq.event_hash;
+    let candidate_text_for = |hash: crate::community_voting_core::CandidateEventHash| -> String {
+        if hash == sq_hash {
+            return sq.text.clone();
+        }
+        t3.candidates
+            .iter()
+            .find(|c| c.event_hash == hash)
+            .map(|c| c.text.clone())
+            .unwrap_or_default()
+    };
     let ratification_candidates: Vec<RatificationCandidateExport> =
         if let Some(result) = t3.result.as_ref() {
-            // Finalized: use the settled finalists list directly.
             result
                 .finalists
                 .iter()
                 .map(|f| RatificationCandidateExport {
                     event_hash: hex::encode(f.event_hash),
-                    text: t3
-                        .candidates
-                        .iter()
-                        .find(|c| c.event_hash == f.event_hash)
-                        .map(|c| c.text.clone())
-                        .unwrap_or_default(),
+                    text: candidate_text_for(f.event_hash),
                 })
                 .collect()
         } else {
-            // Ratification stage (or earlier): derive the candidate ordering
-            // the same way verify_ratification_ballot does — synthesize status_quo,
-            // run drafting_advancers, then ratification_candidates_ordering.
-            let sq = crate::community_voting_tier3::synthesize_status_quo(&state.meta.poll_id);
-            let sq_hash = sq.event_hash;
-            let mini_public_size = t3
-                .sortition_result
-                .as_ref()
-                .map(|r| r.primary.len())
-                .unwrap_or(t3.meta.config.sortition_size as usize);
-            // Build a candidates slice that includes the synthesized status_quo if present.
-            let all_candidates: Vec<&crate::community_voting_tier3::DraftCandidateState> =
-                std::iter::once(&sq).chain(t3.candidates.iter()).collect();
-            // Use the candidates slice that might or might not include status_quo already.
-            // drafting_advancers returns None if sq_hash not found in the slice.
-            // We pass `all_candidates` so sq is always found.
+            let mut all_candidates = t3.candidates.clone();
+            all_candidates.push(sq.clone());
+            let primary_size = t3.meta.config.sortition_size as usize;
             match crate::community_voting_tier3::drafting_advancers(
-                &all_candidates.iter().copied().cloned().collect::<Vec<_>>(),
-                mini_public_size,
+                &all_candidates,
+                primary_size,
                 sq_hash,
             ) {
-                Some(advancers) => {
-                    let ordered = crate::community_voting_tier3::ratification_candidates_ordering(
-                        &advancers, sq_hash,
-                    );
-                    ordered
-                        .iter()
-                        .map(|cr| {
-                            // Find matching candidate text, checking both real candidates and sq.
-                            let text = if cr.event_hash == sq_hash {
-                                sq.text.clone()
-                            } else {
-                                t3.candidates
-                                    .iter()
-                                    .find(|c| c.event_hash == cr.event_hash)
-                                    .map(|c| c.text.clone())
-                                    .unwrap_or_default()
-                            };
-                            RatificationCandidateExport {
-                                event_hash: hex::encode(cr.event_hash),
-                                text,
-                            }
-                        })
-                        .collect()
-                }
+                Some(advancers) => crate::community_voting_tier3::ratification_candidates_ordering(
+                    &advancers, sq_hash,
+                )
+                .into_iter()
+                .map(|cr| RatificationCandidateExport {
+                    event_hash: hex::encode(cr.event_hash),
+                    text: candidate_text_for(cr.event_hash),
+                })
+                .collect(),
                 None => Vec::new(),
             }
         };
@@ -24296,11 +24283,21 @@ async fn voting_list_tier3_polls_raw(
         .values()
         .filter_map(|state| {
             let t3 = state.tier_state.as_tier3()?;
-            let winner_text = t3.result.as_ref().and_then(|r| {
-                t3.candidates
-                    .iter()
-                    .find(|c| c.event_hash == r.winner.event_hash)
-                    .map(|c| c.text.clone())
+            // status_quo is NEVER stored in `t3.candidates` (apply() skips it),
+            // so when it wins the runoff we'd otherwise return None and the
+            // UI would render a blank winner label. Synthesize sq locally and
+            // fall back to its text when the winner hash matches sq_hash.
+            let winner_text = t3.result.as_ref().map(|r| {
+                let sq = crate::community_voting_tier3::synthesize_status_quo(&state.meta.poll_id);
+                if r.winner.event_hash == sq.event_hash {
+                    sq.text
+                } else {
+                    t3.candidates
+                        .iter()
+                        .find(|c| c.event_hash == r.winner.event_hash)
+                        .map(|c| c.text.clone())
+                        .unwrap_or_default()
+                }
             });
             Some(Tier3PollSummary {
                 poll_id: hex::encode(state.meta.poll_id.0),

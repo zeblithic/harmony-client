@@ -7,6 +7,27 @@
 
 use harmony_app::{Tier3MyRole, Tier3PollExport, Tier3PollSummary, Tier3StageTag};
 
+/// Decode a CBOR buffer as a map of `String -> Value` and return the
+/// sorted set of top-level keys. We use this to assert exact serde
+/// rename output, which guards against accidental snake_case drift that
+/// would silently break the camelCase TS DTOs on the frontend side.
+fn cbor_top_level_keys(buf: &[u8]) -> Vec<String> {
+    let v: ciborium::value::Value = ciborium::from_reader(buf).expect("decode as Value");
+    let map = match v {
+        ciborium::value::Value::Map(m) => m,
+        other => panic!("expected CBOR map at root, got {other:?}"),
+    };
+    let mut keys: Vec<String> = map
+        .into_iter()
+        .map(|(k, _)| match k {
+            ciborium::value::Value::Text(s) => s,
+            other => panic!("expected text key, got {other:?}"),
+        })
+        .collect();
+    keys.sort();
+    keys
+}
+
 #[test]
 fn tier3_poll_export_round_trips_through_cbor() {
     let export = Tier3PollExport {
@@ -38,6 +59,39 @@ fn tier3_poll_export_round_trips_through_cbor() {
     assert_eq!(decoded.poll_id, export.poll_id);
     assert_eq!(decoded.stage, Tier3StageTag::Drafting);
     assert_eq!(decoded.my_role, Tier3MyRole::MiniPublic);
+
+    // Pin the exact camelCase keys the frontend expects. Adding a field
+    // requires updating this list; renaming a field via serde will fail
+    // this assertion before it can silently break the UI.
+    let expected: Vec<&str> = vec![
+        "backupPool",
+        "communityId",
+        "declined",
+        "deliberationWindowSeconds",
+        "draftCandidates",
+        "draftingWindowSeconds",
+        "incentiveMode",
+        "miniPublic",
+        "myDraftingApprovals",
+        "myRatificationScores",
+        "myRole",
+        "pollCreateHlcMs",
+        "pollId",
+        "proposalText",
+        "proposer",
+        "ratificationCandidates",
+        "ratificationWindowSeconds",
+        "runnerUpEventHash",
+        "sortitionSize",
+        "stage",
+        "winnerEventHash",
+    ];
+    let actual = cbor_top_level_keys(&buf);
+    assert_eq!(
+        actual,
+        expected.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        "Tier3PollExport CBOR key drift — update TS Tier3PollExport in lockstep",
+    );
 }
 
 #[test]
@@ -57,6 +111,23 @@ fn tier3_poll_summary_round_trips_through_cbor() {
     let decoded: Tier3PollSummary = ciborium::from_reader(&buf[..]).expect("decode");
     assert_eq!(decoded.stage, Tier3StageTag::Ratification);
     assert_eq!(decoded.winner_text, None);
+
+    let expected: Vec<&str> = vec![
+        "communityId",
+        "pollCreateHlcMs",
+        "pollId",
+        "proposalText",
+        "proposer",
+        "sortitionSize",
+        "stage",
+        "winnerText",
+    ];
+    let actual = cbor_top_level_keys(&buf);
+    assert_eq!(
+        actual,
+        expected.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        "Tier3PollSummary CBOR key drift — update TS Tier3PollSummary in lockstep",
+    );
 }
 
 #[test]
