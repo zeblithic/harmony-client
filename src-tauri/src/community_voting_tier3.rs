@@ -649,6 +649,27 @@ impl Tier3PollState {
         set
     }
 
+    /// Build the (statements, votes, mini_public) tuple that the bridging
+    /// algorithm consumes. Computed once per bridging IPC call so the
+    /// authoritative-set snapshot is fixed for the entire computation
+    /// (spec §4.7 determinism guarantee 4).
+    #[allow(clippy::type_complexity)]
+    pub fn bridging_inputs(
+        &self,
+        eval_hlc: &Hlc,
+    ) -> (
+        &std::collections::BTreeMap<[u8; 32], DeliberationStatement>,
+        &std::collections::BTreeMap<(OwnerAddr, [u8; 32]), DeliberationVoteEntry>,
+        std::collections::HashSet<OwnerAddr>,
+    ) {
+        let mini_public = self.current_mini_public(eval_hlc);
+        (
+            &self.deliberation.statements,
+            &self.deliberation.votes,
+            mini_public,
+        )
+    }
+
     /// Count of UNIQUE actors who declined at or before `now`.
     ///
     /// Cluster 4 fix (Qodo bug #3, R1 bot review): counts unique decliners
