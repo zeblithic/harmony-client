@@ -1163,6 +1163,16 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             )
             .await;
         }
+
+        // (6) ZEB-298 Task 5: emit `voting-delegate-signaled-on-your-behalf`
+        // when the just-applied event is a Tier 2 Signal whose signaler is
+        // the local user's current delegate and the community policy opts
+        // in. Mirror the call site of `maybe_emit_tier3_lifecycle_events`
+        // (post-apply, post-broadcast); Task 8 will also wire this hook
+        // from `process_inbound` so peer replicas notify identically.
+        self.maybe_emit_delegate_on_behalf(&event, &applied_poll_id)
+            .await;
+
         Ok(())
     }
 
@@ -1445,6 +1455,127 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                     );
                 }
             }
+        }
+    }
+
+    /// ZEB-298 Task 5: emit `voting-delegate-signaled-on-your-behalf` when
+    /// the just-applied event is a Tier 2 Signal whose signaler is the
+    /// local user's current delegate in this community and the community
+    /// policy opts in. Fired from `publish_event` (this PR) and from
+    /// `process_inbound` (ZEB-298 Task 8) so the local replica notifies
+    /// identically regardless of whether the Signal arrived via outbound
+    /// IPC or peer-inbound.
+    ///
+    /// Conjunctive guards (ALL must hold to emit):
+    /// 1. `self.app_handle` is `Some(_)` — tests/lightweight harnesses pass
+    ///    `None` and stay silent.
+    /// 2. Event is a Tier 2 Signal (`Tier::Conviction` + `kd=Signal`).
+    /// 3. Community policy `notify_on_delegate_signal == true`.
+    /// 4. The local user's current delegate in this community equals
+    ///    `event.actor` — by construction this implies (a) the local user
+    ///    has a live `delegation_graph` edge in this community, i.e. is a
+    ///    "registered" Tier 2 voter, and (b) the signaler is that
+    ///    delegate. (The task spec lists these as two conditions; the
+    ///    `delegate_of(local) == Some(actor)` test collapses them
+    ///    cleanly — VotingLog stores no separate community-membership
+    ///    accessor today, so the delegation edge is the operational
+    ///    proxy.)
+    ///
+    /// All emit failures are non-fatal — logged at WARN and ignored. The
+    /// local log + broadcast already succeeded; failing to notify the UI
+    /// is a degraded path, not a state divergence.
+    async fn maybe_emit_delegate_on_behalf(&self, event: &SignedVotingEvent, poll_id: &PollId) {
+        // Guard 1: app_handle wired.
+        let Some(app) = self.app_handle.as_ref() else {
+            return;
+        };
+
+        // Guard 2: Tier 2 Signal only. Cheapest gate — runs before any
+        // lock acquire so non-Tier-2 traffic pays zero overhead.
+        if !matches!(
+            (event.tier, event.kind),
+            (Tier::Conviction, PollEventKindCode::Signal)
+        ) {
+            return;
+        }
+
+        // Local user comes from `local_signing` (set by IPC at startup
+        // and by tests via the equivalent helper). Read-only peer mode
+        // (no installed key) cannot have a "local delegate".
+        let local_owner = {
+            let r = self.local_signing.read().await;
+            match r.as_ref() {
+                Some((_, owner)) => *owner,
+                None => return,
+            }
+        };
+
+        // Read policy + delegate edge under one VotingLog lock acquire.
+        // Drop the lock before the emit (Tauri emit may serialize JSON
+        // and dispatch synchronously; holding the lock through that is
+        // unnecessary and risks contention with concurrent applies).
+        let (notify_enabled, current_delegate) = {
+            let log = self.voting_log.lock().await;
+            let notify = log.policy().notify_on_delegate_signal;
+            let delegate = log.delegation_graph.delegate_of(local_owner);
+            (notify, delegate)
+        };
+
+        // Guard 3: policy opted in.
+        if !notify_enabled {
+            return;
+        }
+
+        // Guards 4 (+ membership-by-proxy): local user has a current
+        // delegate AND that delegate is the signaler.
+        let Some(delegate) = current_delegate else {
+            return;
+        };
+        if event.actor != delegate {
+            return;
+        }
+
+        // Decode the Tier 2 Signal payload to read `support`.
+        // Decode failure is non-fatal: the apply already succeeded, so
+        // the payload is well-formed at the apply layer — a decode error
+        // here would indicate a serialization drift bug we want surfaced
+        // in logs but not propagated.
+        let support = match ciborium::de::from_reader::<
+            crate::community_voting_conviction::SignalPayload,
+            _,
+        >(&event.payload[..])
+        {
+            Ok(p) => p.support,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "voting-delegate-signaled-on-your-behalf: signal payload decode failed"
+                );
+                return;
+            }
+        };
+
+        // Camel-case payload per harmony-client IPC convention.
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Payload {
+            community_id: String,
+            proposal_id: String,
+            delegate: String,
+            support: bool,
+        }
+        let payload = Payload {
+            community_id: hex::encode(self.community_id.0),
+            proposal_id: hex::encode(poll_id.0),
+            delegate: hex::encode(event.actor.0),
+            support,
+        };
+        if let Err(e) = app.emit("voting-delegate-signaled-on-your-behalf", &payload) {
+            tracing::warn!(
+                error = %e,
+                community_id = %hex::encode(self.community_id.0),
+                "voting-delegate-signaled-on-your-behalf emit failed (non-fatal)"
+            );
         }
     }
 
@@ -3175,6 +3306,328 @@ mod tests {
             log.events.len(),
             1,
             "only PollCreate must be in the log; ballot must not have been applied"
+        );
+    }
+
+    // ── ZEB-298 Task 5: maybe_emit_delegate_on_behalf ──────────────────────
+    //
+    // The hook is exercised end-to-end via `publish_event` so the tests
+    // also lock in the call-site wiring in `publish_event` (parallel to
+    // `maybe_emit_tier3_lifecycle_events`). Tier 2 Signal must apply to
+    // an existing Tier 2 poll, so each test seeds the log with a
+    // PollCreate that mints the poll, registers the local user's
+    // delegation edge (delegator = local, delegate = signaler), and sets
+    // the policy.
+
+    /// Shared fixture: build a `VotingLogEngine` wired to a mock Tauri
+    /// app_handle, with a pre-seeded Tier 2 poll, a delegation edge from
+    /// `local_owner` → `delegate_owner`, and the supplied policy.
+    /// Returns the running engine, the `PollId` of the seeded poll, and
+    /// the mock app handle (so callers can attach a listener).
+    /// Guard struct returned by `delegate_on_behalf_fixture` so the
+    /// adapter-side channel halves (`publisher_rx` + `subscriber_tx`)
+    /// stay alive for the duration of the test. Dropping them would
+    /// close the engine's `publisher_tx`, making subsequent
+    /// `publish_event` calls fail with `"voting publisher_tx closed"`.
+    struct DelegateOnBehalfFixture {
+        engine: Arc<VotingLogEngine<tauri::test::MockRuntime>>,
+        pid: PollId,
+        app_handle: tauri::AppHandle<tauri::test::MockRuntime>,
+        // Kept alive; reads aren't asserted by these tests.
+        _publisher_rx: mpsc::Receiver<Vec<u8>>,
+        _subscriber_tx: mpsc::Sender<Vec<u8>>,
+    }
+
+    async fn delegate_on_behalf_fixture(
+        local_owner: OwnerAddr,
+        delegate_owner: OwnerAddr,
+        notify_policy: bool,
+    ) -> DelegateOnBehalfFixture {
+        use crate::community_voting_conviction::{
+            AutoExecAction, CommunityVotingPolicy, Tier2PollConfig, Q32,
+        };
+
+        let community_id = SpaceId([0xE2; 16]);
+        let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+
+        // Seed the Tier 2 poll, delegation edge, and policy. Doing this
+        // before engine.start avoids any race with the inbound loop.
+        let pid: PollId = {
+            let mut log = voting_log.lock().await;
+
+            // Tier 2 PollCreate.
+            let cfg = Tier2PollConfig {
+                proposal_text: "promote".into(),
+                half_life_seconds: 86_400,
+                threshold_min_q32: Q32,
+                threshold_max_q32: 100 * Q32,
+                beta: 2,
+                delegation_allowed: true,
+                auto_exec: AutoExecAction::None,
+                eligibility: Eligibility {
+                    min_power: 0,
+                    min_vouching_depth: None,
+                    sortition_size: None,
+                },
+            };
+            let mut payload = Vec::new();
+            ciborium::into_writer(&cfg, &mut payload).expect("encode tier2 cfg");
+            let create_event = SignedVotingEvent {
+                tag: 'p',
+                version: 1,
+                tier: Tier::Conviction,
+                kind: PollEventKindCode::PollCreate,
+                hlc: Hlc {
+                    wall_ms: 1_000,
+                    logical: 0,
+                    device_id: "dev-create".into(),
+                },
+                actor: delegate_owner,
+                payload,
+                sig: vec![0u8; 64],
+            };
+
+            // Snapshot includes both the local user and the delegate so
+            // Tier 2 PollCreate's `total_supply` is non-zero. The exact
+            // membership shape doesn't affect emit semantics — only the
+            // delegation edge + policy + actor-is-delegate gate do.
+            let mut members = HashMap::new();
+            for owner in [local_owner, delegate_owner] {
+                members.insert(
+                    owner,
+                    MemberAttrs {
+                        power: 10,
+                        vouching_depth: 0,
+                    },
+                );
+            }
+            let pid = log
+                .apply_with_snapshot(
+                    create_event,
+                    &community_id,
+                    Some(MembershipSnapshot { members }),
+                )
+                .expect("apply tier2 create");
+
+            // Delegation edge: local_owner → delegate_owner.
+            log.delegation_graph
+                .apply_delegate(local_owner, delegate_owner, (500, 0))
+                .expect("apply_delegate edge");
+
+            // Community policy.
+            log.set_policy(CommunityVotingPolicy {
+                notify_on_delegate_signal: notify_policy,
+            });
+
+            pid
+        };
+
+        let (publisher_tx, publisher_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (subscriber_tx, subscriber_rx) = mpsc::channel::<Vec<u8>>(8);
+
+        let app = tauri::test::mock_app();
+        let app_handle = app.handle().clone();
+
+        let engine = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+            community_id,
+            voting_log: Arc::clone(&voting_log),
+            publisher_tx,
+            subscriber_rx,
+            hlc_tracker: None,
+            device_id: None,
+            app_handle: Some(app_handle.clone()),
+            identity_resolver: None,
+            membership_resolver: None,
+        })
+        .await;
+
+        // Install the local owner so `maybe_emit_delegate_on_behalf` can
+        // read it from `local_signing`. Signing key value is irrelevant —
+        // the hook only reads the owner.
+        let signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
+        engine
+            .install_local_signing_key(signing_key, local_owner)
+            .await;
+
+        DelegateOnBehalfFixture {
+            engine,
+            pid,
+            app_handle,
+            _publisher_rx: publisher_rx,
+            _subscriber_tx: subscriber_tx,
+        }
+    }
+
+    /// Build a Tier 2 Signal event by `signaler` against `pid`. Skips
+    /// signing — the publish path does not verify locally-minted events.
+    fn signal_event_for_emit(
+        signaler: OwnerAddr,
+        pid: PollId,
+        support: bool,
+        wall_ms: u64,
+    ) -> SignedVotingEvent {
+        let payload_obj = crate::community_voting_conviction::SignalPayload {
+            proposal_id: pid,
+            support,
+        };
+        let mut payload = Vec::new();
+        ciborium::into_writer(&payload_obj, &mut payload).expect("encode signal");
+        SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Conviction,
+            kind: PollEventKindCode::Signal,
+            hlc: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "dev-signal".into(),
+            },
+            actor: signaler,
+            payload,
+            sig: vec![0u8; 64],
+        }
+    }
+
+    /// Drain captured emits (if any) by waiting up to `timeout` and
+    /// returning the collected JSON payload strings. Drives the Tauri
+    /// event loop via `tokio::task::yield_now` so the listener has a
+    /// chance to fire before the assertion.
+    async fn wait_for_emits(
+        captured: Arc<std::sync::Mutex<Vec<String>>>,
+        min_count: usize,
+        timeout: Duration,
+    ) -> Vec<String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            {
+                let v = captured.lock().expect("captured lock");
+                if v.len() >= min_count {
+                    return v.clone();
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let v = captured.lock().expect("captured lock");
+                return v.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn maybe_emit_delegate_on_behalf_fires_when_all_conditions_hold() {
+        use tauri::Listener;
+
+        let local_owner = OwnerAddr([0x11; 16]);
+        let delegate_owner = OwnerAddr([0x22; 16]);
+        let fix = delegate_on_behalf_fixture(local_owner, delegate_owner, true).await;
+
+        let captured: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_listener = Arc::clone(&captured);
+        fix.app_handle
+            .listen("voting-delegate-signaled-on-your-behalf", move |evt| {
+                captured_for_listener
+                    .lock()
+                    .expect("captured lock")
+                    .push(evt.payload().to_string());
+            });
+
+        // Delegate signals on local's behalf.
+        let signal = signal_event_for_emit(delegate_owner, fix.pid, true, 2_000);
+        fix.engine
+            .publish_event(signal, None)
+            .await
+            .expect("publish_event signal");
+
+        let payloads = wait_for_emits(Arc::clone(&captured), 1, Duration::from_secs(1)).await;
+        assert_eq!(
+            payloads.len(),
+            1,
+            "exactly one voting-delegate-signaled-on-your-behalf emit expected; got {payloads:?}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payloads[0]).expect("payload is JSON");
+        assert_eq!(
+            parsed["proposalId"].as_str(),
+            Some(hex::encode(fix.pid.0).as_str())
+        );
+        assert_eq!(
+            parsed["delegate"].as_str(),
+            Some(hex::encode(delegate_owner.0).as_str())
+        );
+        assert_eq!(parsed["support"].as_bool(), Some(true));
+        assert!(
+            parsed["communityId"].is_string(),
+            "communityId field present and a string"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_emit_delegate_on_behalf_silent_when_policy_disabled() {
+        use tauri::Listener;
+
+        let local_owner = OwnerAddr([0x11; 16]);
+        let delegate_owner = OwnerAddr([0x22; 16]);
+        // Same fixture but with policy.notify_on_delegate_signal = false.
+        let fix = delegate_on_behalf_fixture(local_owner, delegate_owner, false).await;
+
+        let captured: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_listener = Arc::clone(&captured);
+        fix.app_handle
+            .listen("voting-delegate-signaled-on-your-behalf", move |evt| {
+                captured_for_listener
+                    .lock()
+                    .expect("captured lock")
+                    .push(evt.payload().to_string());
+            });
+
+        let signal = signal_event_for_emit(delegate_owner, fix.pid, true, 2_000);
+        fix.engine
+            .publish_event(signal, None)
+            .await
+            .expect("publish_event signal");
+
+        // Wait long enough that a delayed emit would land.
+        let payloads = wait_for_emits(Arc::clone(&captured), 1, Duration::from_millis(200)).await;
+        assert!(
+            payloads.is_empty(),
+            "policy.notify_on_delegate_signal=false must suppress the emit; got {payloads:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_emit_delegate_on_behalf_silent_when_signaler_not_local_delegate() {
+        use tauri::Listener;
+
+        let local_owner = OwnerAddr([0x11; 16]);
+        let delegate_owner = OwnerAddr([0x22; 16]);
+        let other_signaler = OwnerAddr([0x33; 16]);
+        // Policy enabled + delegation edge installed, but the actual
+        // signaler is a different OwnerAddr.
+        let fix = delegate_on_behalf_fixture(local_owner, delegate_owner, true).await;
+
+        let captured: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_listener = Arc::clone(&captured);
+        fix.app_handle
+            .listen("voting-delegate-signaled-on-your-behalf", move |evt| {
+                captured_for_listener
+                    .lock()
+                    .expect("captured lock")
+                    .push(evt.payload().to_string());
+            });
+
+        let signal = signal_event_for_emit(other_signaler, fix.pid, true, 2_000);
+        fix.engine
+            .publish_event(signal, None)
+            .await
+            .expect("publish_event signal");
+
+        let payloads = wait_for_emits(Arc::clone(&captured), 1, Duration::from_millis(200)).await;
+        assert!(
+            payloads.is_empty(),
+            "signaler != local's delegate must suppress the emit; got {payloads:?}"
         );
     }
 }
