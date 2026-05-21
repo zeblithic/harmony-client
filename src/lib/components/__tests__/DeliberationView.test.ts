@@ -68,18 +68,55 @@ describe('DeliberationView', () => {
     expect(adapter.listBridgingStatements).toHaveBeenLastCalledWith('aa'.repeat(32), 10);
   });
 
-  it('refreshes bridging when subscribeTier3DeliberationVoteCast fires', async () => {
-    let voteHandler: (() => void) | null = null;
+  it('refreshes bridging when subscribeTier3DeliberationVoteCast fires for the active poll', async () => {
+    type VoteHandler = Parameters<VotingAdapter['subscribeTier3DeliberationVoteCast']>[0];
+    let voteHandler: VoteHandler | null = null;
     const adapter = createAdapterMock();
     vi.spyOn(adapter, 'subscribeTier3DeliberationVoteCast').mockImplementation((h) => {
-      voteHandler = h as () => void;
+      voteHandler = h;
+      return () => {};
+    });
+    const pollId = 'aa'.repeat(32);
+    render(DeliberationView, {
+      props: {
+        detail: createDetail({ pollId }),
+        adapter,
+        myAddr: '33'.repeat(32),
+        onChange: () => {},
+      },
+    });
+    await waitFor(() => expect(adapter.listBridgingStatements).toHaveBeenCalledTimes(1));
+    voteHandler!({
+      pollId,
+      statementEventHash: '99'.repeat(32),
+      voter: '44'.repeat(32),
+      vote: 'agree',
+    });
+    await waitFor(() => expect(adapter.listBridgingStatements).toHaveBeenCalledTimes(2));
+  });
+
+  it('ignores subscribeTier3DeliberationVoteCast for unrelated polls', async () => {
+    type VoteHandler = Parameters<VotingAdapter['subscribeTier3DeliberationVoteCast']>[0];
+    let voteHandler: VoteHandler | null = null;
+    const adapter = createAdapterMock();
+    vi.spyOn(adapter, 'subscribeTier3DeliberationVoteCast').mockImplementation((h) => {
+      voteHandler = h;
       return () => {};
     });
     render(DeliberationView, {
       props: { detail: createDetail(), adapter, myAddr: '33'.repeat(32), onChange: () => {} },
     });
     await waitFor(() => expect(adapter.listBridgingStatements).toHaveBeenCalledTimes(1));
-    voteHandler!();
-    await waitFor(() => expect(adapter.listBridgingStatements).toHaveBeenCalledTimes(2));
+    // Fire an event for a completely different poll. The pollId guard must
+    // drop it without triggering a bridging refresh.
+    voteHandler!({
+      pollId: 'bb'.repeat(32),
+      statementEventHash: '99'.repeat(32),
+      voter: '44'.repeat(32),
+      vote: 'agree',
+    });
+    // Give Svelte a microtask to settle; the call count must remain 1.
+    await new Promise((r) => setTimeout(r, 10));
+    expect(adapter.listBridgingStatements).toHaveBeenCalledTimes(1);
   });
 });

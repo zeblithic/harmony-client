@@ -54,16 +54,23 @@
     bridgingScores = [];
     bridgingError = null;
     untrack(() => loadBridging());
+    // Capture the active pollId snapshot for guarding event handlers.
+    // The subscription is re-armed in $effect whenever detail.pollId changes,
+    // but events for unrelated polls would otherwise fire onChange/loadBridging
+    // and churn the IPC layer.
+    const activePollId = detail.pollId;
     unsubscribers.push(
-      adapter.subscribeTier3DeliberationStatementCreated(() => {
+      adapter.subscribeTier3DeliberationStatementCreated((p) => {
+        if (p.pollId !== activePollId) return;
         onChange();
-        loadBridging();
+        void loadBridging();
       }),
     );
     unsubscribers.push(
-      adapter.subscribeTier3DeliberationVoteCast(() => {
+      adapter.subscribeTier3DeliberationVoteCast((p) => {
+        if (p.pollId !== activePollId) return;
         onChange();
-        loadBridging();
+        void loadBridging();
       }),
     );
     return () => {

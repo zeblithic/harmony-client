@@ -47,7 +47,7 @@ Pattern sources verified to exist:
 
 ## 1. Architecture overview
 
-```
+```text
 ┌──────────────────────────────────────────────────────────────────────┐
 │  community_voting_core.rs                                            │
 │    • DeliberationStatementPayload (EXISTS — Phase 4)                 │
@@ -209,7 +209,7 @@ For each `m ∈ mini_public`, build `V_m: BTreeMap<StatementEventHash, i8>`:
 
 For each pair `(m1, m2)` with `m1 < m2` lex order:
 
-```
+```text
 joint_support = count of statements s where V_m1[s] ≠ 0 AND V_m2[s] ≠ 0
 disagree_count = count where V_m1[s] ≠ V_m2[s] AND both ≠ 0
 d_q32(m1, m2) = ((disagree_count as u64) << 32) / max(1u64, joint_support as u64)
@@ -219,7 +219,7 @@ Result is a Q32 fixed-point fraction in `[0, 2^32]`. Pure integer arithmetic —
 
 ### 4.4 Per-statement bridging score
 
-```
+```text
 For each statement s in statements (iter in BTreeMap order):
     supporters(s) = { m ∈ mini_public : V_m[s] == +1 }
     if |supporters(s)| < 2:
@@ -331,7 +331,7 @@ Adapter calls in `DeliberationView.svelte` use the seq + key snapshot pattern (p
 
 ### 6.1 Component tree
 
-```
+```text
 src/lib/components/
   DeliberationView.svelte            (NEW — two-column container)
     ├── StatementComposer.svelte     (NEW — left-top, mini-public only)

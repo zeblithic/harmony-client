@@ -378,6 +378,36 @@ async fn two_engines_converge_on_identical_bridging_output() {
     // supporter means diversity_q32 = 0 and bridging_score_q64 = 0.
     //
     // The deterministic sort places B first (DESC by score).
+    // Assert the publicly contracted ordering — (bridging_score_q64 DESC,
+    // statement_event_hash ASC) — directly on both projections. Without this,
+    // a regression that flips both projections to the same wrong order would
+    // still pass the per-hash content checks below.
+    for scores in [&scores_a, &scores_b] {
+        for pair in scores.windows(2) {
+            let lhs = &pair[0];
+            let rhs = &pair[1];
+            assert!(
+                lhs.bridging_score_q64 > rhs.bridging_score_q64
+                    || (lhs.bridging_score_q64 == rhs.bridging_score_q64
+                        && lhs.statement_event_hash <= rhs.statement_event_hash),
+                "bridging output must be sorted (score DESC, hash ASC); \
+                 violated at lhs=(score={}, hash={:?}) rhs=(score={}, hash={:?})",
+                lhs.bridging_score_q64,
+                lhs.statement_event_hash,
+                rhs.bridging_score_q64,
+                rhs.statement_event_hash,
+            );
+        }
+    }
+    // Specifically: B has a non-zero score, A has zero, so B must come first.
+    assert_eq!(
+        scores_a[0].statement_event_hash, hash_b,
+        "statement B (higher score) must sort first"
+    );
+    assert_eq!(
+        scores_a[1].statement_event_hash, hash_a,
+        "statement A (zero score) must sort after B"
+    );
     let stmt_b_score = scores_a
         .iter()
         .find(|s| s.statement_event_hash == hash_b)

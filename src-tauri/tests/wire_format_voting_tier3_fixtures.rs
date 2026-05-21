@@ -291,7 +291,7 @@ fn fixture_tier3_poll_result() {
 ///
 /// To regenerate:
 ///     REGENERATE_VOTING_TIER3_FIXTURES=1 cargo nextest run \
-///         --locked -p harmony-app --features test-fixtures \
+///         --locked --all-targets -p harmony-app --features test-fixtures \
 ///         -E 'test(fixture_tier3_deliberation_vote)'
 #[test]
 fn fixture_tier3_deliberation_vote() {
