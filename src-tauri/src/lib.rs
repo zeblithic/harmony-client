@@ -22150,8 +22150,10 @@ type VotingLogEnginesMap = std::sync::Arc<
 /// Production `MembershipSnapshotResolver` that reads from the live
 /// `NodeState` handles (`community_registry` + `crdt_state`). Wraps
 /// `voting_build_snapshot_for_community`. The HLC parameter is currently
-/// unused — the underlying helper returns an at-HEAD snapshot. Plumb
-/// through historical HLC resolution when a consumer needs it.
+/// unused — the underlying helper returns an at-HEAD snapshot.
+///
+/// TODO ZEB-315: plumb historical-HLC resolution so events from
+/// recently-removed members aren't rejected during membership churn.
 pub struct NodeStateMembershipResolver {
     pub community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
     pub crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
@@ -22162,7 +22164,7 @@ impl crate::community_voting_log::MembershipSnapshotResolver for NodeStateMember
     async fn snapshot_at(
         &self,
         community_id: crate::owner_state_types::SpaceId,
-        _hlc: &crate::owner_state_types::Hlc,
+        _hlc: &crate::owner_state_types::Hlc, // TODO ZEB-315: use this for historical resolution
     ) -> Result<
         crate::community_voting_core::MembershipSnapshot,
         crate::community_voting_log::SnapshotResolverError,
@@ -22218,6 +22220,11 @@ async fn ensure_voting_engine_for(
     beacon_requester: Option<crate::community_voting_log_engine::BeaconRequester>,
 ) -> Result<(), String> {
     // Fast-path read under the std::Mutex (no awaits).
+    // TODO ZEB-314: this releases the lock before sending the adapter
+    // request, creating a TOCTOU window where two concurrent first-time
+    // callers can briefly spawn duplicate Zenoh adapters (the loser drops
+    // its adapter halves within milliseconds — bounded, self-cleaning,
+    // not a correctness bug).
     {
         let g = voting_log_engines
             .lock()

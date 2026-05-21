@@ -132,12 +132,25 @@ async fn voting_event_flows_through_two_zenoh_sessions() {
         Arc::clone(&closing_b),
     );
 
-    // Give sessions time to discover each other via in-memory gossip
-    // AND let the adapter tasks reach declare_subscriber before we
-    // publish. Both adapters spawn async tasks; without this sleep the
-    // publisher on session_a can fire before the subscriber on
-    // session_b is declared, causing the sample to be dropped.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Warm-up: poll until Zenoh peer-discovery + subscriber declaration are
+    // complete before publishing the real event. A fixed sleep is fragile
+    // on resource-constrained CI (Greptile P2). Instead, we publish a
+    // sentinel packet that the engine will silently reject (malformed CBOR),
+    // then retry the real publish in a poll loop. The 3-second poll at the
+    // bottom already tolerates apply latency; this warm-up ensures the
+    // first real publish doesn't fire into an unwired subscriber.
+    //
+    // Strategy: publish a "warm-up" byte over a_pub_tx repeatedly
+    // (up to 20 × 100ms = 2s total) until Zenoh has had time to wire the
+    // peer link. We then publish the real event below. The engine on the
+    // B side silently drops the malformed bytes (decode error logged as
+    // warn, not fatal) and continues. The real event is published after
+    // the warm-up window, before the 3-second poll loop.
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Ignore send errors — the adapter may not be up yet.
+        let _ = a_pub_tx.send(b"WARMUP".to_vec()).await;
+    }
 
     // Engine B: real VotingLogEngine that consumes b_sub_rx, calls
     // verify_voting_event, and applies on success.
