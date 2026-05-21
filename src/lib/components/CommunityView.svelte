@@ -14,6 +14,7 @@
   import TypedConfirmationModal from './TypedConfirmationModal.svelte';
   import CommunitySettingsPanel from './CommunitySettingsPanel.svelte';
   import CommunityProposalsPanel from './CommunityProposalsPanel.svelte';
+  import Tier3ProposalPanel from './Tier3ProposalPanel.svelte';
   import type { VotingAdapter } from '../voting-adapter';
 
   let {
@@ -80,7 +81,7 @@
    *  'channels' (chat-native, current behavior); 'proposals' switches
    *  to the Tier 2 governance panel. Only togglable when a
    *  votingAdapter is provided. */
-  let activeView = $state<'channels' | 'proposals'>('channels');
+  let activeView = $state<'channels' | 'proposals' | 'tier3'>('channels');
   let settingsModalOpen = $state(false);
   let communityMembersPanelOpen = $state(false);
   let showCreateDialog = $state(false);
@@ -259,6 +260,13 @@
           aria-pressed={activeView === 'proposals'}
           onclick={() => { activeView = 'proposals'; }}
         >Proposals</button>
+        <button
+          type="button"
+          class="view-tab"
+          class:active={activeView === 'tier3'}
+          aria-pressed={activeView === 'tier3'}
+          onclick={() => { activeView = 'tier3'; }}
+        >Constitutional</button>
       </nav>
     {/if}
     <div class="header-actions">
@@ -329,7 +337,13 @@
       onModifyClick={(c) => { modifyDialogChannel = c; }}
       onDeleteClick={(c) => { deleteConfirmChannel = c; }}
     />
-    {#if activeView === 'proposals' && votingAdapter}
+    {#if activeView === 'tier3' && votingAdapter}
+      <Tier3ProposalPanel
+        {communityId}
+        adapter={votingAdapter}
+        myAddr={ownAddress}
+      />
+    {:else if activeView === 'proposals' && votingAdapter}
       <CommunityProposalsPanel
         {communityId}
         adapter={votingAdapter}

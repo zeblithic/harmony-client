@@ -4,6 +4,7 @@ import CommunityView from '../CommunityView.svelte';
 import { CommunityService } from '../../community-service';
 import { ChannelMessageService } from '../../channel-message-service';
 import { NavService } from '../../nav-service';
+import { VotingAdapter } from '../../voting-adapter';
 import type { TauriAdapter } from '../../zenoh-service';
 import type { CommunityMember } from '../../types';
 
@@ -219,5 +220,32 @@ describe('CommunityView', () => {
       expect(container.querySelector('.channel-item.active .channel-name')?.textContent?.trim()).toBe('announcements');
     });
     expect(communityService.getSelectedChannel('aa'.repeat(16))).toBe(announcements.channelId);
+  });
+
+  it('Constitutional tab mounts Tier3ProposalPanel when votingAdapter is provided', async () => {
+    const votingAdapter = new VotingAdapter();
+    votingAdapter.listTier3Polls = vi.fn().mockResolvedValue([]);
+    // Stub out all subscribe methods so onMount doesn't error on an unconnected adapter.
+    const noopUnsub = () => {};
+    votingAdapter.subscribeTier3PollCreated = vi.fn().mockReturnValue(noopUnsub);
+    votingAdapter.subscribeTier3SortitionComplete = vi.fn().mockReturnValue(noopUnsub);
+    votingAdapter.subscribeTier3DraftingOpen = vi.fn().mockReturnValue(noopUnsub);
+    votingAdapter.subscribeTier3RatificationOpen = vi.fn().mockReturnValue(noopUnsub);
+    votingAdapter.subscribeTier3Finalized = vi.fn().mockReturnValue(noopUnsub);
+
+    const { container, getByText } = await setup(undefined, { votingAdapter });
+
+    // Wait for the view tabs to appear.
+    await waitFor(() => {
+      expect(getByText('Constitutional')).toBeTruthy();
+    });
+
+    // Click the Constitutional tab.
+    await fireEvent.click(getByText('Constitutional'));
+
+    // Tier3ProposalPanel renders a <section class="tier3-panel"> as its root.
+    await waitFor(() => {
+      expect(container.querySelector('.tier3-panel')).toBeTruthy();
+    });
   });
 });
