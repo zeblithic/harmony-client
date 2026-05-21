@@ -1774,12 +1774,22 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         // on event.tier + event.kind + beacon_requester presence.
         self.maybe_trigger_beacon_for_tier3_create(&event).await;
 
-        // (2 + 3) Tier 3-only orchestration + lifecycle emit. Cheap
-        // tier gate avoids touching local_signing / app_handle for
-        // non-Tier-3 traffic.
+        // (2) Tier 3 lifecycle emit. Cheap tier gate avoids touching
+        // app_handle for non-Tier-3 traffic.
+        //
+        // NOTE: `maybe_trigger_engine_auto_orchestration` is deliberately
+        // NOT called from the inbound path. When two engines both hold
+        // the local_signing key, having both auto-mint kd=cl / kd=rs from
+        // their independent post-apply hooks creates a real-time HLC race
+        // (each engine's `reserve_next_local_hlc` uses real `wall_now_ms`,
+        // so the two mints get distinct device_id-tagged HLCs and LWW
+        // picks differently per run). A proper fix needs a deterministic
+        // HLC for engine-auto mints (e.g. derived from the triggering
+        // event's HLC) so peer replicas mint bit-identical events. Filed
+        // as a follow-up; peer replicas still converge in the common case
+        // because the originating node's kd=cl / kd=rs flow through
+        // Zenoh and apply via `apply_with_snapshot`'s LWW gate.
         if event.tier == Tier::Sortition {
-            self.maybe_trigger_engine_auto_orchestration(&applied_poll_id)
-                .await;
             self.maybe_emit_tier3_lifecycle_events(
                 &applied_poll_id,
                 &event,
