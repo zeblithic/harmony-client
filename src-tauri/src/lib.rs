@@ -22234,6 +22234,10 @@ async fn ensure_voting_engine_for(
             // (sortition-complete / drafting-open / ratification-open /
             // finalized) fire to the UI.
             app_handle: None,
+            // ZEB-298+ZEB-312 PR 1 Task 4 will plumb real resolvers here
+            // once the NodeState wiring is complete.
+            identity_resolver: None,
+            membership_resolver: None,
         },
     )
     .await;

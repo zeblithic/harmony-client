@@ -144,6 +144,18 @@ pub struct VotingLogEngineParams<R: tauri::Runtime = tauri::Wry> {
     /// disables emission — used by tests / lightweight harnesses that don't
     /// drive the UI.
     pub app_handle: Option<AppHandle<R>>,
+    /// ZEB-298+ZEB-312 PR 1: production wiring — resolves identity for
+    /// Ed25519 signature verification on inbound voting events. `None`
+    /// means inbound events are rejected (engine not production-wired).
+    pub identity_resolver:
+        Option<std::sync::Arc<dyn crate::community_voting_core::VotingIdentityResolver>>,
+    /// ZEB-298+ZEB-312 PR 1: production wiring — resolves per-community
+    /// membership snapshot at an HLC for inbound voting events.
+    /// Non-PollCreate events use a fresh snapshot too (pragmatic
+    /// uniformity over case-splitting). `None` means inbound events are
+    /// rejected.
+    pub membership_resolver:
+        Option<std::sync::Arc<dyn crate::community_voting_log::MembershipSnapshotResolver>>,
     // No backfill_req_tx in Phase 2 — sparse event volume, deferred.
 }
 
@@ -219,11 +231,19 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         let tracker_for_loop = Arc::clone(&tracker);
         let community_id = params.community_id;
         let mut rx = params.subscriber_rx;
+        let identity_resolver_for_loop = params.identity_resolver.clone();
+        let membership_resolver_for_loop = params.membership_resolver.clone();
         let receive_handle = tokio::spawn(async move {
             while let Some(packet) = rx.recv().await {
-                if let Err(e) =
-                    Self::process_inbound(community_id, &log_for_loop, &tracker_for_loop, &packet)
-                        .await
+                if let Err(e) = Self::process_inbound(
+                    community_id,
+                    &log_for_loop,
+                    &tracker_for_loop,
+                    identity_resolver_for_loop.as_ref(),
+                    membership_resolver_for_loop.as_ref(),
+                    &packet,
+                )
+                .await
                 {
                     tracing::warn!(
                         community_id = ?community_id,
@@ -1392,16 +1412,26 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         }
     }
 
-    /// Inbound packet processing: decode, dedup, apply, record.
+    /// Inbound packet processing: decode, dedup, verify, apply, record.
     ///
     /// Called from the receive loop spawned by `start`. Errors here are
-    /// logged and dropped (peer sent garbage or we hit a transient apply
-    /// failure); we never propagate up to the receive loop or kill the
-    /// engine.
-    async fn process_inbound(
+    /// logged and dropped (peer sent garbage, failed signature check, or
+    /// we hit a transient apply failure); we never propagate up to the
+    /// receive loop or kill the engine.
+    ///
+    /// ZEB-298+ZEB-312 PR 1: verify-then-apply path. The snapshot is
+    /// resolved uniformly for every event kind (pragmatic uniformity
+    /// over case-splitting PollCreate-fresh vs others-cached): freshness
+    /// cost is small, and the uniform shape avoids snapshot-shape
+    /// divergence between tier1_snapshot and tier3 eligible_electorate.
+    pub(crate) async fn process_inbound(
         community_id: SpaceId,
         voting_log: &Arc<Mutex<VotingLog>>,
         tracker: &Arc<Mutex<VotingReplayTracker>>,
+        identity_resolver: Option<&Arc<dyn crate::community_voting_core::VotingIdentityResolver>>,
+        membership_resolver: Option<
+            &Arc<dyn crate::community_voting_log::MembershipSnapshotResolver>,
+        >,
         packet: &[u8],
     ) -> Result<(), String> {
         // Decode.
@@ -1417,35 +1447,30 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             }
         }
 
-        // Hard verify gate. Apply-time invariants in
-        // `VotingLog::apply_with_snapshot` (lifecycle transitions,
-        // payload decode, graph cycle checks) cannot detect a forged
-        // Ed25519 signature, so unverified peer packets must NOT mutate
-        // state. The envelope carries only the 16-byte `OwnerAddr` hash
-        // — not the Ed25519 pubkey — so signature verification needs
-        // the per-community membership snapshot (pubkey → OwnerAddr
-        // mapping) that the apply layer otherwise consults for
-        // eligibility. The Zenoh adapter (ZEB-291 Task 19.1
-        // follow-up) is the natural place to do this lookup; until it
-        // lands, this receive loop is dead code in production. CR R3
-        // Major: refuse to apply any inbound packet from this surface
-        // until the verify gate is wired. Tests that exercised the
-        // receive loop with synthetic packets are now feature-gated
-        // behind `cfg(any(test, feature = "test-fixtures"))` so the
-        // production binary cannot accept forged peer events.
-        #[cfg(not(any(test, feature = "test-fixtures")))]
-        {
-            return Err(
-                "inbound voting events are refused until ZEB-291 Task 19.1 wires \
-                 verify_event with the per-community membership snapshot"
-                    .into(),
-            );
-        }
+        // Verify-then-apply. Resolvers must be installed; None means the
+        // engine is not production-wired and inbound events are rejected.
+        let mem_resolver = membership_resolver.ok_or_else(|| {
+            "process_inbound: membership_resolver not installed (engine wiring incomplete)"
+                .to_string()
+        })?;
+        let id_resolver = identity_resolver.ok_or_else(|| {
+            "process_inbound: identity_resolver not installed (engine wiring incomplete)"
+                .to_string()
+        })?;
 
-        // Apply.
+        let snapshot = mem_resolver
+            .snapshot_at(community_id, &event.hlc)
+            .await
+            .map_err(|e| format!("snapshot resolve: {e}"))?;
+
+        crate::community_voting_core::verify_voting_event(&event, &snapshot, id_resolver.as_ref())
+            .await
+            .map_err(|e| format!("verify: {e}"))?;
+
+        // Apply with the verified snapshot.
         {
             let mut log = voting_log.lock().await;
-            log.apply_with_snapshot(event.clone(), &community_id, None)
+            log.apply_with_snapshot(event.clone(), &community_id, Some(snapshot))
                 .map_err(|e| format!("apply: {e:?}"))?;
         }
 
@@ -1460,6 +1485,33 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
 
         Ok(())
     }
+}
+
+// ── process_inbound_for_test seam ───────────────────────────────────────────
+
+/// ZEB-298+ZEB-312 PR 1 test seam: invoke `process_inbound` directly from
+/// integration tests (which compile against the public API). Gated by
+/// neither `cfg(test)` nor `feature = "test-fixtures"` — the production
+/// build also exposes this, since it is the load-bearing assertion that
+/// the feature-gate is gone.
+#[doc(hidden)]
+pub async fn process_inbound_for_test(
+    community_id: crate::owner_state_types::SpaceId,
+    voting_log: &Arc<Mutex<VotingLog>>,
+    tracker: &Arc<Mutex<VotingReplayTracker>>,
+    identity_resolver: Option<&Arc<dyn crate::community_voting_core::VotingIdentityResolver>>,
+    membership_resolver: Option<&Arc<dyn crate::community_voting_log::MembershipSnapshotResolver>>,
+    packet: &[u8],
+) -> Result<(), String> {
+    VotingLogEngine::<tauri::Wry>::process_inbound(
+        community_id,
+        voting_log,
+        tracker,
+        identity_resolver,
+        membership_resolver,
+        packet,
+    )
+    .await
 }
 
 // ── Registry ────────────────────────────────────────────────────────────────
@@ -1523,9 +1575,43 @@ impl<R: tauri::Runtime> VotingLogRegistry<R> {
 mod tests {
     use super::*;
     use crate::community_voting_approval::Tier1PollConfig;
-    use crate::community_voting_core::{Eligibility, PollEventKindCode, SignedVotingEvent, Tier};
+    use crate::community_voting_core::{
+        Eligibility, MemberAttrs, MembershipSnapshot, PollEventKindCode, SignedVotingEvent, Tier,
+        VotingIdentityResolver,
+    };
+    use crate::community_voting_log::{MembershipSnapshotResolver, SnapshotResolverError};
     use crate::owner_state_types::Hlc;
     use std::time::Duration;
+
+    // ── Test resolvers ─────────────────────────────────────────────────────
+
+    /// Fixed resolver pair for unit tests: holds a HashMap of OwnerAddr →
+    /// VerifyingKey for identity resolution and a fixed MembershipSnapshot.
+    struct FixedTestResolvers {
+        identity: HashMap<OwnerAddr, ed25519_dalek::VerifyingKey>,
+        snapshot: MembershipSnapshot,
+    }
+
+    #[async_trait::async_trait]
+    impl VotingIdentityResolver for FixedTestResolvers {
+        async fn verifying_key_for(
+            &self,
+            owner: &OwnerAddr,
+        ) -> Option<ed25519_dalek::VerifyingKey> {
+            self.identity.get(owner).copied()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MembershipSnapshotResolver for FixedTestResolvers {
+        async fn snapshot_at(
+            &self,
+            _community_id: SpaceId,
+            _hlc: &Hlc,
+        ) -> Result<MembershipSnapshot, SnapshotResolverError> {
+            Ok(self.snapshot.clone())
+        }
+    }
 
     // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -1666,6 +1752,8 @@ mod tests {
             hlc_tracker: None,
             device_id: None,
             app_handle: None,
+            identity_resolver: None,
+            membership_resolver: None,
         })
         .await;
 
@@ -1714,10 +1802,51 @@ mod tests {
 
     #[tokio::test]
     async fn engine_inbound_apply() {
-        // Push a packet onto subscriber_rx without going through publish_event;
-        // the receive loop must decode + apply it to the log.
+        // Push a properly signed packet onto subscriber_rx without going
+        // through publish_event; the receive loop must verify + apply it.
+        //
+        // ZEB-298+ZEB-312 PR 1: now requires resolvers to be wired because
+        // the #[cfg(not(test))] gate is gone and verify-then-apply is
+        // unconditional. We build a real Ed25519 keypair so the signature
+        // checks out.
+        use crate::community_voting_core::build_signed_poll_create_tier1;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
         let voting_log = Arc::new(Mutex::new(VotingLog::new()));
         let community_id = SpaceId([0x77; 16]);
+
+        let keypair = SigningKey::generate(&mut OsRng);
+        let peer_actor = OwnerAddr([0xbb; 16]);
+
+        let cfg = good_tier1_config();
+        let peer_event = build_signed_poll_create_tier1(
+            &keypair,
+            peer_actor,
+            &cfg,
+            Hlc {
+                wall_ms: 5_000,
+                logical: 0,
+                device_id: "dev-peer".into(),
+            },
+        )
+        .expect("build peer event");
+
+        // Build fixed resolvers so the engine can verify the inbound event.
+        let resolvers = Arc::new(FixedTestResolvers {
+            identity: HashMap::from([(peer_actor, keypair.verifying_key())]),
+            snapshot: MembershipSnapshot {
+                members: HashMap::from([(
+                    peer_actor,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 1,
+                    },
+                )]),
+            },
+        });
+        let id_resolver: Arc<dyn VotingIdentityResolver> = resolvers.clone();
+        let mem_resolver: Arc<dyn MembershipSnapshotResolver> = resolvers.clone();
 
         let (publisher_tx, _publisher_rx) = mpsc::channel::<Vec<u8>>(8);
         let (subscriber_tx, subscriber_rx) = mpsc::channel::<Vec<u8>>(8);
@@ -1730,15 +1859,12 @@ mod tests {
             hlc_tracker: None,
             device_id: None,
             app_handle: None,
+            identity_resolver: Some(id_resolver),
+            membership_resolver: Some(mem_resolver),
         })
         .await;
 
-        // Peer-minted event: actor + device different from anything
-        // recorded locally so the dedup gate is open.
-        let peer_actor = OwnerAddr([0xbb; 16]);
-        let peer_event = poll_create_event(peer_actor, "dev-peer", 5_000);
         let packet = encode_event(&peer_event);
-
         subscriber_tx
             .send(packet)
             .await
@@ -1787,6 +1913,8 @@ mod tests {
                 hlc_tracker: None,
                 device_id: None,
                 app_handle: None,
+                identity_resolver: None,
+                membership_resolver: None,
             })
             .await;
 
@@ -1801,6 +1929,8 @@ mod tests {
                 hlc_tracker: None,
                 device_id: None,
                 app_handle: None,
+                identity_resolver: None,
+                membership_resolver: None,
             })
             .await;
 
@@ -1923,6 +2053,8 @@ mod tests {
             hlc_tracker: None,
             device_id: None,
             app_handle: None,
+            identity_resolver: None,
+            membership_resolver: None,
         })
         .await;
 
@@ -2020,6 +2152,8 @@ mod tests {
             hlc_tracker: None,
             device_id: None,
             app_handle: None,
+            identity_resolver: None,
+            membership_resolver: None,
         })
         .await;
 
@@ -2105,6 +2239,8 @@ mod tests {
             hlc_tracker: None,
             device_id: None,
             app_handle: None,
+            identity_resolver: None,
+            membership_resolver: None,
         })
         .await;
 
@@ -2233,6 +2369,8 @@ mod tests {
             hlc_tracker: None,
             device_id: None,
             app_handle: None,
+            identity_resolver: None,
+            membership_resolver: None,
         })
         .await;
 
@@ -2329,6 +2467,8 @@ mod tests {
             hlc_tracker: None,
             device_id: None,
             app_handle: None,
+            identity_resolver: None,
+            membership_resolver: None,
         })
         .await;
 
@@ -2434,6 +2574,8 @@ mod tests {
             hlc_tracker: None,
             device_id: None,
             app_handle: None,
+            identity_resolver: None,
+            membership_resolver: None,
         })
         .await;
 
@@ -2532,6 +2674,8 @@ mod tests {
             hlc_tracker: None,
             device_id: None,
             app_handle: None,
+            identity_resolver: None,
+            membership_resolver: None,
         })
         .await;
         // Do NOT call install_dfrost_handle — dfrost_registry is None.

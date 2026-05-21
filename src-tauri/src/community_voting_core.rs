@@ -1389,6 +1389,44 @@ pub fn build_signed_ratification_ballot(
 
 /// Build a fully-signed `kd=sf` SortitionFailed event. Only the proposer
 /// should sign (enforced at the verify layer via SF1).
+/// Build a fully-signed `kd=ss` SortitionSelection event (Tier 3).
+///
+/// ZEB-298+ZEB-312 PR 1: the engine currently emits zero-sig kd=ss events
+/// (Task 19 will wire real signing). This builder is exposed so integration
+/// tests can create properly-signed kd=ss events for the cross-engine bridge
+/// path, enabling end-to-end verification without the old feature-gate bypass.
+pub fn build_signed_sortition_selection(
+    keypair: &ed25519_dalek::SigningKey,
+    actor: OwnerAddr,
+    poll_id: PollId,
+    primary: Vec<OwnerAddr>,
+    backup: Vec<OwnerAddr>,
+    hlc: Hlc,
+) -> Result<SignedVotingEvent, BuildError> {
+    use ed25519_dalek::Signer;
+    let payload_struct = SortitionSelectionPayload {
+        poll_id,
+        primary,
+        backup,
+    };
+    let mut payload = Vec::new();
+    ciborium::ser::into_writer(&payload_struct, &mut payload)
+        .map_err(|_| BuildError::EncodePayload)?;
+    let mut ev = SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier: Tier::Sortition,
+        kind: PollEventKindCode::SortitionSelection,
+        hlc,
+        actor,
+        payload,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev.signing_bytes().map_err(|_| BuildError::SigningBytes)?;
+    ev.sig = keypair.sign(&sb).to_bytes().to_vec();
+    Ok(ev)
+}
+
 pub fn build_signed_sortition_failed(
     keypair: &ed25519_dalek::SigningKey,
     actor: OwnerAddr,

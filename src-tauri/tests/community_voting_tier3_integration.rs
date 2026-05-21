@@ -31,12 +31,15 @@ use std::time::Duration;
 use harmony_app::community_membership::ChannelId;
 use harmony_app::community_state_sync::IdentityResolver;
 use harmony_app::community_voting_approval::Tier1PollConfig;
+use harmony_app::community_voting_core::VotingIdentityResolver;
 use harmony_app::community_voting_core::{
     build_signed_poll_create_tier1, derive_poll_id, CandidateEventHash, Eligibility, MemberAttrs,
-    MembershipSnapshot, PollEventKindCode, RatificationBallotPayload, SignedVotingEvent,
-    SortitionSelectionPayload, Tier, Tier3PollConfigPayload,
+    MembershipSnapshot, PollEventKindCode, RatificationBallotPayload, SignedVotingEvent, Tier,
+    Tier3PollConfigPayload,
 };
-use harmony_app::community_voting_log::{ApplyError, VotingLog};
+use harmony_app::community_voting_log::{
+    ApplyError, MembershipSnapshotResolver, SnapshotResolverError, VotingLog,
+};
 use harmony_app::community_voting_log_engine::{VotingLogEngine, VotingLogEngineParams};
 use harmony_app::community_voting_sortition::fisher_yates_select;
 use harmony_app::community_voting_star::tally_star;
@@ -61,6 +64,61 @@ struct StaticIdentityResolver(HashMap<OwnerAddr, [u8; 64]>);
 impl IdentityResolver for StaticIdentityResolver {
     async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
         self.0.get(addr).copied()
+    }
+}
+
+// ─── VotingIdentityResolver + MembershipSnapshotResolver for bridge tests ────────
+
+/// Mutable bridge-test resolvers: identity map + membership snapshot both
+/// guarded by a `std::sync::RwLock` so they can be populated AFTER the
+/// engines are started (the resolver Arc is shared with both engines at
+/// setup time; tests add identities incrementally as test actors are created).
+pub struct BridgeTestResolvers {
+    identity: std::sync::RwLock<HashMap<OwnerAddr, ed25519_dalek::VerifyingKey>>,
+    snapshot: std::sync::RwLock<MembershipSnapshot>,
+}
+
+impl BridgeTestResolvers {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            identity: std::sync::RwLock::new(HashMap::new()),
+            snapshot: std::sync::RwLock::new(MembershipSnapshot {
+                members: HashMap::new(),
+            }),
+        })
+    }
+
+    /// Register an identity and add it to the membership snapshot.
+    pub fn add_identity(&self, id: &TestIdentity) {
+        self.identity
+            .write()
+            .unwrap()
+            .insert(id.owner, id.signing_key.verifying_key());
+        self.snapshot.write().unwrap().members.insert(
+            id.owner,
+            MemberAttrs {
+                power: 1,
+                vouching_depth: 1,
+            },
+        );
+    }
+}
+
+#[async_trait::async_trait]
+impl VotingIdentityResolver for BridgeTestResolvers {
+    async fn verifying_key_for(&self, owner: &OwnerAddr) -> Option<ed25519_dalek::VerifyingKey> {
+        self.identity.read().unwrap().get(owner).copied()
+    }
+}
+
+#[async_trait::async_trait]
+impl MembershipSnapshotResolver for BridgeTestResolvers {
+    async fn snapshot_at(
+        &self,
+        _community_id: harmony_app::owner_state_types::SpaceId,
+        _hlc: &harmony_app::owner_state_types::Hlc,
+    ) -> Result<MembershipSnapshot, SnapshotResolverError> {
+        Ok(self.snapshot.read().unwrap().clone())
     }
 }
 
@@ -119,6 +177,10 @@ pub struct TwoVotingEngines {
     pub engine_b: Arc<VotingLogEngine<tauri::test::MockRuntime>>,
     pub log_a: Arc<Mutex<VotingLog>>,
     pub log_b: Arc<Mutex<VotingLog>>,
+    /// Shared mutable resolvers for both engines' inbound paths.
+    /// Tests call `resolvers.add_identity(&id)` for each actor that
+    /// will publish events crossing the bridge.
+    pub resolvers: Arc<BridgeTestResolvers>,
 }
 
 /// Wire two `VotingLogEngine` instances with bidirectional mpsc channels,
@@ -128,6 +190,11 @@ pub struct TwoVotingEngines {
 /// outbound channel into engine B's inbound channel and vice versa. When
 /// either engine is dropped its publisher sender closes, the forwarder
 /// receives `None`, and exits cleanly.
+///
+/// `resolvers`: optional identity + membership resolvers for both engines'
+/// inbound paths. `None` means inbound events are rejected (resolvers not
+/// installed) — safe for tests that don't test bridge convergence on
+/// inbound events.
 pub async fn setup_two_voting_engine_bridge(community_id: SpaceId) -> TwoVotingEngines {
     // Channel pairs: each engine gets its own pub_tx/sub_rx.
     // The forwarder tasks relay: a_pub_rx → b_sub_tx and b_pub_rx → a_sub_tx.
@@ -169,6 +236,20 @@ pub async fn setup_two_voting_engine_bridge(community_id: SpaceId) -> TwoVotingE
     let a_hlc_tracker = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
     let b_hlc_tracker = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
 
+    // ZEB-298+ZEB-312 PR 1: shared mutable resolver for bridge tests.
+    // Tests must call `engines.resolvers.add_identity(&id)` for each
+    // actor that publishes events crossing the bridge, before those events
+    // are sent.
+    let resolvers = BridgeTestResolvers::new();
+    let id_resolver_a: Arc<dyn VotingIdentityResolver> =
+        Arc::clone(&resolvers) as Arc<dyn VotingIdentityResolver>;
+    let mem_resolver_a: Arc<dyn MembershipSnapshotResolver> =
+        Arc::clone(&resolvers) as Arc<dyn MembershipSnapshotResolver>;
+    let id_resolver_b: Arc<dyn VotingIdentityResolver> =
+        Arc::clone(&resolvers) as Arc<dyn VotingIdentityResolver>;
+    let mem_resolver_b: Arc<dyn MembershipSnapshotResolver> =
+        Arc::clone(&resolvers) as Arc<dyn MembershipSnapshotResolver>;
+
     let engine_a = VotingLogEngine::start(VotingLogEngineParams {
         community_id,
         voting_log: Arc::clone(&log_a),
@@ -177,6 +258,8 @@ pub async fn setup_two_voting_engine_bridge(community_id: SpaceId) -> TwoVotingE
         hlc_tracker: Some(a_hlc_tracker),
         device_id: Some("engine-a".into()),
         app_handle: None,
+        identity_resolver: Some(id_resolver_a),
+        membership_resolver: Some(mem_resolver_a),
     })
     .await;
 
@@ -188,6 +271,8 @@ pub async fn setup_two_voting_engine_bridge(community_id: SpaceId) -> TwoVotingE
         hlc_tracker: Some(b_hlc_tracker),
         device_id: Some("engine-b".into()),
         app_handle: None,
+        identity_resolver: Some(id_resolver_b),
+        membership_resolver: Some(mem_resolver_b),
     })
     .await;
 
@@ -196,6 +281,7 @@ pub async fn setup_two_voting_engine_bridge(community_id: SpaceId) -> TwoVotingE
         engine_b,
         log_a,
         log_b,
+        resolvers,
     }
 }
 
@@ -213,6 +299,8 @@ pub async fn setup_two_voting_engine_bridge_with_signing(
     proposer: &TestIdentity,
 ) -> TwoVotingEngines {
     let engines = setup_two_voting_engine_bridge(community_id).await;
+    // Register the proposer so their events can be verified on the inbound path.
+    engines.resolvers.add_identity(proposer);
     let signing_key = Arc::new(proposer.signing_key.clone());
     engines
         .engine_a
@@ -264,6 +352,18 @@ pub async fn setup_two_voting_engine_bridge_with_signing_and_app(
     let a_hlc_tracker = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
     let b_hlc_tracker = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
 
+    // ZEB-298+ZEB-312 PR 1: shared mutable resolver for bridge tests.
+    let resolvers = BridgeTestResolvers::new();
+    resolvers.add_identity(proposer);
+    let id_resolver_a: Arc<dyn VotingIdentityResolver> =
+        Arc::clone(&resolvers) as Arc<dyn VotingIdentityResolver>;
+    let mem_resolver_a: Arc<dyn MembershipSnapshotResolver> =
+        Arc::clone(&resolvers) as Arc<dyn MembershipSnapshotResolver>;
+    let id_resolver_b: Arc<dyn VotingIdentityResolver> =
+        Arc::clone(&resolvers) as Arc<dyn VotingIdentityResolver>;
+    let mem_resolver_b: Arc<dyn MembershipSnapshotResolver> =
+        Arc::clone(&resolvers) as Arc<dyn MembershipSnapshotResolver>;
+
     let engine_a = VotingLogEngine::start(VotingLogEngineParams {
         community_id,
         voting_log: Arc::clone(&log_a),
@@ -272,6 +372,8 @@ pub async fn setup_two_voting_engine_bridge_with_signing_and_app(
         hlc_tracker: Some(a_hlc_tracker),
         device_id: Some("engine-a".into()),
         app_handle: Some(app_handle),
+        identity_resolver: Some(id_resolver_a),
+        membership_resolver: Some(mem_resolver_a),
     })
     .await;
 
@@ -283,6 +385,8 @@ pub async fn setup_two_voting_engine_bridge_with_signing_and_app(
         hlc_tracker: Some(b_hlc_tracker),
         device_id: Some("engine-b".into()),
         app_handle: None,
+        identity_resolver: Some(id_resolver_b),
+        membership_resolver: Some(mem_resolver_b),
     })
     .await;
 
@@ -296,6 +400,7 @@ pub async fn setup_two_voting_engine_bridge_with_signing_and_app(
         engine_b,
         log_a,
         log_b,
+        resolvers,
     }
 }
 
@@ -473,37 +578,25 @@ pub fn build_sortition_failed_event(
 /// zero-sig actor is `OwnerAddr([0; 16])`). Used in tests that inject a
 /// pre-computed sortition result without a real DKG/beacon.
 ///
-/// NOTE: this helper is intentionally retained in the integration test
-/// file (no core counterpart) because the engine-generated shape uses a
-/// zero actor + zero sig, which has no signing-key analogue. Task 19
-/// will wire real signing and at that point the function will move into
-/// the engine-side surface.
+/// ZEB-298+ZEB-312 PR 1: now signs the event with `actor`'s key so it
+/// passes `verify_voting_event` on the receiving engine. The actor must be
+/// in the bridge resolvers' snapshot + identity map.
 pub fn build_sortition_selection_event(
+    actor: &TestIdentity,
     poll_id: harmony_app::community_voting_core::PollId,
     primary: Vec<OwnerAddr>,
     backup: Vec<OwnerAddr>,
     hlc: Hlc,
 ) -> SignedVotingEvent {
-    let payload_struct = SortitionSelectionPayload {
+    harmony_app::community_voting_core::build_signed_sortition_selection(
+        &actor.signing_key,
+        actor.owner,
         poll_id,
         primary,
         backup,
-    };
-    let mut payload = Vec::new();
-    ciborium::into_writer(&payload_struct, &mut payload).expect("encode SortitionSelectionPayload");
-    // Engine-generated events use zero actor + zero sig (Task 19 wires real signing).
-    // Per community_voting_log_engine.rs::publish_sortition_selection comments,
-    // this is accepted for Phase 4a-main test fixtures.
-    SignedVotingEvent {
-        tag: 'p',
-        version: 1,
-        tier: Tier::Sortition,
-        kind: PollEventKindCode::SortitionSelection,
         hlc,
-        actor: OwnerAddr([0u8; 16]),
-        payload,
-        sig: vec![0u8; 64],
-    }
+    )
+    .expect("build_signed_sortition_selection")
 }
 
 /// Build a signed kd=cl PollClose event (Tier 3).
@@ -556,16 +649,17 @@ async fn smoke_two_engine_bridge_tier3_starts_and_shuts_down() {
 /// crosses the bridge and is applied by engine_b. Confirms the bridge is
 /// functional before Tier 3 tests build on it.
 ///
-/// Note: VotingLogEngine inbound path is gated behind
-/// `cfg(any(test, feature = "test-fixtures"))` in production, so this
-/// only runs with `--features test-fixtures` (which the test harness
-/// always passes — see CLAUDE.md).
+/// ZEB-298+ZEB-312 PR 1: the production gate is removed; the inbound path
+/// now verifies signatures. This test uses `BridgeTestResolvers` with alice
+/// registered so the inbound PollCreate passes verification on engine_b.
 #[tokio::test]
 async fn smoke_tier3_bridge_tier1_event_crosses_to_peer() {
     let community_id = SpaceId([0xbb; 16]);
     let engines = setup_two_voting_engine_bridge(community_id).await;
 
     let alice = fixture_identity(0xA1);
+    // Register alice so her PollCreate passes inbound verification on engine_b.
+    engines.resolvers.add_identity(&alice);
 
     let tier1_cfg = Tier1PollConfig {
         options: vec!["Yes".into(), "No".into()],
@@ -650,6 +744,11 @@ async fn tier3_full_lifecycle_4_stage_convergence() {
     // ── Step 2: set up two-engine bridge ──────────────────────────────────────
 
     let engines = setup_two_voting_engine_bridge(COMMUNITY_ID).await;
+    // Register all identities so any of them can have their events verified
+    // on the inbound path (ZEB-298+ZEB-312 PR 1: verify-then-apply).
+    for id in &identities {
+        engines.resolvers.add_identity(id);
+    }
 
     // ── Step 3: PollCreate (proposer = identities[0]) ─────────────────────────
 
@@ -782,6 +881,7 @@ async fn tier3_full_lifecycle_4_stage_convergence() {
     );
 
     let ss_event = build_sortition_selection_event(
+        proposer,
         poll_id,
         sortition_result.primary.clone(),
         sortition_result.backup.clone(),
@@ -1142,6 +1242,9 @@ async fn tier3_decline_triggers_backup_promotion_across_engines() {
     // ── Step 2: two-engine bridge ─────────────────────────────────────────────
 
     let engines = setup_two_voting_engine_bridge(COMMUNITY_ID).await;
+    for id in &identities {
+        engines.resolvers.add_identity(id);
+    }
 
     // ── Step 3: PollCreate ─────────────────────────────────────────────────────
 
@@ -1209,6 +1312,7 @@ async fn tier3_decline_triggers_backup_promotion_across_engines() {
     );
 
     let ss_event = build_sortition_selection_event(
+        proposer,
         poll_id,
         sortition_result.primary.clone(),
         sortition_result.backup.clone(),
@@ -1497,6 +1601,9 @@ async fn tier3_mass_decline_sortition_failed_with_retry_chain() {
     // ── Step 2: two-engine bridge ─────────────────────────────────────────────
 
     let engines = setup_two_voting_engine_bridge(COMMUNITY_ID).await;
+    for id in &identities {
+        engines.resolvers.add_identity(id);
+    }
 
     // ── Step 3: PollCreate (proposer = identities[49]) ────────────────────────
 
@@ -1589,6 +1696,7 @@ async fn tier3_mass_decline_sortition_failed_with_retry_chain() {
     );
 
     let ss_event = build_sortition_selection_event(
+        proposer,
         poll_id,
         sortition_result.primary.clone(),
         sortition_result.backup.clone(),
@@ -2029,12 +2137,13 @@ async fn smoke_tier3_event_builders_encode_without_panic() {
     let failed_ev = build_sortition_failed_event(&alice, poll_id, hlc_at(6_000, "alice-dev"));
     assert_eq!(failed_ev.kind, PollEventKindCode::SortitionFailed);
 
-    // SortitionSelection (engine-generated, zero actor)
+    // SortitionSelection (signed by alice as the proposer/orchestrator actor)
     let primary: Vec<OwnerAddr> = (0..20u8).map(|i| OwnerAddr([i; 16])).collect();
     let backup: Vec<OwnerAddr> = (20..40u8).map(|i| OwnerAddr([i; 16])).collect();
-    let ss_ev = build_sortition_selection_event(poll_id, primary, backup, hlc_at(7_000, "engine"));
+    let ss_ev =
+        build_sortition_selection_event(&alice, poll_id, primary, backup, hlc_at(7_000, "engine"));
     assert_eq!(ss_ev.kind, PollEventKindCode::SortitionSelection);
-    assert_eq!(ss_ev.actor, OwnerAddr([0u8; 16]));
+    assert_eq!(ss_ev.actor, alice.owner);
 
     // Verify all events encode without panic (CBOR round-trip).
     for ev in &[
@@ -2100,6 +2209,9 @@ async fn tier3_kd_ss_idempotent_apply_cross_engine_convergence() {
     // ── Step 2: two-engine bridge ─────────────────────────────────────────────
 
     let engines = setup_two_voting_engine_bridge(COMMUNITY_ID).await;
+    for id in &identities {
+        engines.resolvers.add_identity(id);
+    }
 
     // ── Step 3: PollCreate (proposer = identities[0]) ─────────────────────────
 
@@ -2194,6 +2306,7 @@ async fn tier3_kd_ss_idempotent_apply_cross_engine_convergence() {
     // Race: engine_a at t0+1, engine_b at t0+2 (lex order: a < b for same wall_ms+1 would
     // also work, but distinct wall_ms is cleaner — no ambiguity).
     let ss_event_a = build_sortition_selection_event(
+        proposer,
         poll_id,
         sortition_result.primary.clone(),
         sortition_result.backup.clone(),
@@ -2201,6 +2314,7 @@ async fn tier3_kd_ss_idempotent_apply_cross_engine_convergence() {
     );
 
     let ss_event_b = build_sortition_selection_event(
+        proposer,
         poll_id,
         sortition_result.primary.clone(),
         sortition_result.backup.clone(),
@@ -2345,6 +2459,9 @@ async fn tier3_cross_engine_kd_ss_hlc_tied_resolves_by_device_id_lex() {
     let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
     let electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
     let engines = setup_two_voting_engine_bridge(COMMUNITY_ID).await;
+    for id in &identities {
+        engines.resolvers.add_identity(id);
+    }
 
     // ── Step 2: PollCreate ─────────────────────────────────────────────────────
 
@@ -2420,6 +2537,7 @@ async fn tier3_cross_engine_kd_ss_hlc_tied_resolves_by_device_id_lex() {
     // Both events share wall_ms = t0+1 (above PollCreate's t0 for HLC monotonicity)
     // but differ in device_id. "engine-a" < "engine-z" lexicographically.
     let ss_event_a = build_sortition_selection_event(
+        proposer,
         poll_id,
         sortition_result.primary.clone(),
         sortition_result.backup.clone(),
@@ -2432,6 +2550,7 @@ async fn tier3_cross_engine_kd_ss_hlc_tied_resolves_by_device_id_lex() {
     );
 
     let ss_event_z = build_sortition_selection_event(
+        proposer,
         poll_id,
         sortition_result.primary.clone(),
         sortition_result.backup.clone(),
@@ -2570,6 +2689,9 @@ async fn engine_auto_sf_on_mass_decline_from_proposer() {
     // engine_a holds the proposer's signing key → orchestration hook active.
     // engine_b stays read-only (no key installed).
     let engines = setup_two_voting_engine_bridge_with_signing(COMMUNITY_ID, proposer).await;
+    for id in &identities {
+        engines.resolvers.add_identity(id);
+    }
 
     let t0: u64 = 5_000_000;
 
@@ -2643,6 +2765,7 @@ async fn engine_auto_sf_on_mass_decline_from_proposer() {
     );
 
     let ss_event = build_sortition_selection_event(
+        proposer,
         poll_id,
         sortition_result.primary.clone(),
         sortition_result.backup.clone(),
@@ -2783,6 +2906,9 @@ async fn engine_auto_cl_when_ratification_window_expires() {
 
     // engine_a holds the proposer's signing key → orchestration hook active.
     let engines = setup_two_voting_engine_bridge_with_signing(COMMUNITY_ID, proposer).await;
+    for id in &identities {
+        engines.resolvers.add_identity(id);
+    }
 
     // Synthetic t0 — the kd=cl trigger is HLC-driven (uses
     // `t3.last_hlc.wall_ms`, NOT wall-clock — see hook comments in
@@ -2861,6 +2987,7 @@ async fn engine_auto_cl_when_ratification_window_expires() {
     );
     let ss_hlc_wall = t0 + 500_000;
     let ss_event = build_sortition_selection_event(
+        proposer,
         poll_id,
         sortition_result.primary.clone(),
         sortition_result.backup.clone(),
@@ -2931,6 +3058,9 @@ async fn engine_auto_rs_after_cl_with_bit_identical_tally() {
     let sortition_pool: Vec<OwnerAddr> = identities[..49].iter().map(|id| id.owner).collect();
 
     let engines = setup_two_voting_engine_bridge_with_signing(COMMUNITY_ID, proposer).await;
+    for id in &identities {
+        engines.resolvers.add_identity(id);
+    }
 
     let t0: u64 = 6_000_000;
 
@@ -2991,6 +3121,7 @@ async fn engine_auto_rs_after_cl_with_bit_identical_tally() {
     );
     let ss_hlc_wall = t0 + 500_000;
     let ss_event = build_sortition_selection_event(
+        proposer,
         poll_id,
         sortition_result.primary.clone(),
         sortition_result.backup.clone(),
@@ -3132,6 +3263,9 @@ async fn engine_auto_tier3_tauri_events_fire_at_expected_lifecycle_points() {
         app_handle.clone(),
     )
     .await;
+    for id in &identities {
+        engines.resolvers.add_identity(id);
+    }
 
     let t0: u64 = 6_000_000;
     let config = Tier3PollConfigPayload {
@@ -3199,6 +3333,7 @@ async fn engine_auto_tier3_tauri_events_fire_at_expected_lifecycle_points() {
     );
     let ss_hlc_wall = t0 + 500_000;
     let ss_event = build_sortition_selection_event(
+        proposer,
         poll_id,
         sortition_result.primary.clone(),
         sortition_result.backup.clone(),
