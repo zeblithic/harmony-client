@@ -177,7 +177,13 @@ pub struct VotingLogEngine<R: tauri::Runtime> {
     /// Held only so the receive task isn't aborted by handle-drop while
     /// the engine is alive. The task exits naturally when `subscriber_rx`
     /// closes (adapter dropped the matching `Sender`).
-    _receive_handle: tokio::task::JoinHandle<()>,
+    ///
+    /// ZEB-298 Task 8: wrapped in `Mutex<Option<...>>` so we can build
+    /// the `Arc<Self>` first and then spawn the receive loop with
+    /// `Arc::clone(&engine)`, giving the loop `self`-method access for
+    /// the post-apply hooks (`maybe_trigger_engine_auto_orchestration`
+    /// et al). Slotted in after spawn completes.
+    _receive_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Optional DfrostLogRegistry for BeaconOracle (verify_ss) + subscribe_beacons.
     /// Populated by `install_dfrost_handle`. None until wired by Task 19.
     /// Mutex<Option<...>> for interior mutability (set once, read many).
@@ -251,41 +257,22 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             );
         }
 
-        // Spawn the inbound loop. It takes ownership of subscriber_rx
-        // and exits cleanly when the adapter drops its matching Sender.
-        let log_for_loop = Arc::clone(&params.voting_log);
-        let tracker_for_loop = Arc::clone(&tracker);
+        // ZEB-298 Task 8: build the `Arc<Self>` BEFORE spawning the
+        // receive loop so we can hand `Arc::clone(&engine)` to the loop.
+        // This gives the inbound path `self`-method access (needed by the
+        // four post-apply hooks fired by `process_inbound_dispatch`:
+        // beacon, engine-auto orchestration, Tier 3 lifecycle emit, and
+        // delegate-on-behalf emit). The `_receive_handle` slot stays
+        // empty until the spawn completes; storing the handle later
+        // closes the lifecycle loop.
         let community_id = params.community_id;
         let mut rx = params.subscriber_rx;
-        let identity_resolver_for_loop = params.identity_resolver.clone();
-        let membership_resolver_for_loop = params.membership_resolver.clone();
-        let receive_handle = tokio::spawn(async move {
-            while let Some(packet) = rx.recv().await {
-                if let Err(e) = Self::process_inbound(
-                    community_id,
-                    &log_for_loop,
-                    &tracker_for_loop,
-                    identity_resolver_for_loop.as_ref(),
-                    membership_resolver_for_loop.as_ref(),
-                    &packet,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        community_id = ?community_id,
-                        err = ?e,
-                        "voting engine inbound process failed"
-                    );
-                }
-            }
-        });
-
-        Arc::new(Self {
+        let engine = Arc::new(Self {
             community_id,
             voting_log: Arc::clone(&params.voting_log),
-            tracker,
+            tracker: Arc::clone(&tracker),
             publisher_tx: params.publisher_tx,
-            _receive_handle: receive_handle,
+            _receive_handle: Mutex::new(None),
             dfrost_registry: Mutex::new(None),
             beacon_requester: Mutex::new(None),
             hlc_tracker: params.hlc_tracker,
@@ -295,7 +282,31 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             identity_resolver: params.identity_resolver,
             membership_resolver: params.membership_resolver,
             _phantom: PhantomData,
-        })
+        });
+
+        // Spawn the inbound loop. It takes ownership of subscriber_rx
+        // and exits cleanly when the adapter drops its matching Sender.
+        // The loop holds an `Arc::clone` of the engine so each packet
+        // is dispatched through `self.process_inbound_dispatch(&packet)`
+        // which fans out to the post-apply hooks after a successful
+        // apply.
+        let receive_handle = {
+            let me = Arc::clone(&engine);
+            tokio::spawn(async move {
+                while let Some(packet) = rx.recv().await {
+                    if let Err(e) = me.process_inbound_dispatch(&packet).await {
+                        tracing::warn!(
+                            community_id = ?community_id,
+                            err = ?e,
+                            "voting engine inbound process failed"
+                        );
+                    }
+                }
+            })
+        };
+        *engine._receive_handle.lock().await = Some(receive_handle);
+
+        engine
     }
 
     /// ZEB-310 Task 9: install (or replace) the local signing key + owner
@@ -1600,7 +1611,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             &Arc<dyn crate::community_voting_log::MembershipSnapshotResolver>,
         >,
         packet: &[u8],
-    ) -> Result<(), String> {
+    ) -> Result<Option<(SignedVotingEvent, PollId)>, String> {
         // Decode.
         let event: SignedVotingEvent =
             ciborium::from_reader(packet).map_err(|e| format!("decode: {e}"))?;
@@ -1610,7 +1621,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             let tracker = tracker.lock().await;
             if tracker.contains(&event) {
                 // Self-loopback or peer redelivery; drop silently.
-                return Ok(());
+                return Ok(None);
             }
         }
 
@@ -1626,7 +1637,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                 community_id = ?community_id,
                 "process_inbound: dropping event — resolvers not wired"
             );
-            return Ok(());
+            return Ok(None);
         };
 
         let snapshot = mem_resolver
@@ -1646,11 +1657,11 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         inbound_eligibility_check(&event, &snapshot, voting_log).await?;
 
         // Apply with the verified snapshot.
-        {
+        let applied_poll_id: PollId = {
             let mut log = voting_log.lock().await;
             log.apply_with_snapshot(event.clone(), &community_id, Some(snapshot))
-                .map_err(|e| format!("apply: {e:?}"))?;
-        }
+                .map_err(|e| format!("apply: {e:?}"))?
+        };
 
         // Record AFTER successful apply on the inbound path: if apply
         // failed (illegal transition, etc.) we don't want to suppress a
@@ -1660,6 +1671,128 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             let mut tracker = tracker.lock().await;
             tracker.record(&event);
         }
+
+        Ok(Some((event, applied_poll_id)))
+    }
+
+    /// ZEB-298 Task 8: inbound dispatch wrapper. Invoked from the receive
+    /// loop with `Arc::clone(&engine)` so the four post-apply hooks have
+    /// `self`-method access.
+    ///
+    /// Mirrors `publish_event`'s post-apply hook fan-out so peer replicas
+    /// reach an identical post-state to the originating node:
+    /// 1. `maybe_trigger_beacon_for_tier3_create` — D-FROST VRF beacon
+    ///    request on Tier 3 PollCreate
+    /// 2. `maybe_trigger_engine_auto_orchestration` — auto-mint
+    ///    kd=sf/cl/rs follow-ups (gated on Tier 3)
+    /// 3. `maybe_emit_tier3_lifecycle_events` — Tauri lifecycle events
+    ///    for Deliberation→Drafting, Drafting→Ratification, kd=ss /
+    ///    kd=rs (gated on Tier 3 + AppHandle)
+    /// 4. `maybe_emit_delegate_on_behalf` — ZEB-298 Tier 2 Signal
+    ///    notification when the inbound signaler is the local user's
+    ///    delegate
+    ///
+    /// Lock ordering: capture `previous_stage` BEFORE delegating to
+    /// `Self::process_inbound` (which acquires the log lock for the
+    /// apply step). After the static call returns the log lock is
+    /// released; the four hooks each re-acquire it briefly as needed,
+    /// avoiding the deadlock that would otherwise occur if we tried to
+    /// fire them while holding it.
+    ///
+    /// Returns `Ok(())` whether the event applied or was dropped (dedup
+    /// / resolvers-not-wired / verify failure / apply rejection). The
+    /// receive-loop callsite logs `Err` at warn but does not propagate.
+    async fn process_inbound_dispatch(self: &Arc<Self>, packet: &[u8]) -> Result<(), String> {
+        // Cheap pre-decode of the event header to compute the
+        // pre-apply previous_stage snapshot for Tier 3 lifecycle emit
+        // (mirrors `publish_event`'s `previous_stage_for_emit`
+        // derivation). Failure here is non-fatal — `process_inbound`
+        // will hit the same decode error and report it to the caller;
+        // we just degrade gracefully to "no previous stage snapshot".
+        let previous_stage_for_emit: Option<crate::community_voting_tier3::Stage> = if self
+            .app_handle
+            .is_some()
+        {
+            match ciborium::from_reader::<SignedVotingEvent, _>(packet) {
+                Ok(pre_event) => {
+                    if pre_event.tier == Tier::Sortition
+                        && pre_event.kind != PollEventKindCode::PollCreate
+                    {
+                        let pid_opt: Option<PollId> = pre_event.signing_bytes().ok().map(|sb| {
+                            crate::community_voting_core::derive_poll_id(&self.community_id, &sb)
+                        });
+                        match pid_opt {
+                            Some(pid) => {
+                                let now = self.current_hlc_estimate().await;
+                                let log = self.voting_log.lock().await;
+                                log.polls
+                                    .get(&pid)
+                                    .and_then(|ps| ps.tier_state.as_tier3())
+                                    .map(|t3| t3.current_stage_at(&now))
+                            }
+                            None => None,
+                        }
+                    } else {
+                        None
+                    }
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        // Delegate the decode + dedup + verify + eligibility + apply
+        // pipeline to the static `process_inbound`. Returns the
+        // applied `(event, pid)` on success, `None` on dedup-drop /
+        // resolvers-not-wired (silent), or `Err` on verify / apply
+        // failures.
+        let applied = Self::process_inbound(
+            self.community_id,
+            &self.voting_log,
+            &self.tracker,
+            self.identity_resolver.as_ref(),
+            self.membership_resolver.as_ref(),
+            packet,
+        )
+        .await?;
+
+        let Some((event, applied_poll_id)) = applied else {
+            // Dropped silently (dedup or resolvers absent); no hooks.
+            return Ok(());
+        };
+
+        // ── Post-apply hooks: same order + same guards as publish_event ──
+        //
+        // The log lock is released by this point (the apply scope inside
+        // `process_inbound` ended). Each hook re-acquires the lock
+        // briefly as needed and drops it before any external side
+        // effect (Tauri emit, beacon spawn) — so no hook deadlocks with
+        // a sibling, even though several touch the log.
+
+        // (1) D-FROST beacon for Tier 3 PollCreate. Internally gated
+        // on event.tier + event.kind + beacon_requester presence.
+        self.maybe_trigger_beacon_for_tier3_create(&event).await;
+
+        // (2 + 3) Tier 3-only orchestration + lifecycle emit. Cheap
+        // tier gate avoids touching local_signing / app_handle for
+        // non-Tier-3 traffic.
+        if event.tier == Tier::Sortition {
+            self.maybe_trigger_engine_auto_orchestration(&applied_poll_id)
+                .await;
+            self.maybe_emit_tier3_lifecycle_events(
+                &applied_poll_id,
+                &event,
+                previous_stage_for_emit,
+            )
+            .await;
+        }
+
+        // (4) ZEB-298 Tier 2 delegate-on-behalf notify. Internally
+        // gated on (Tier::Conviction, Signal) + policy + delegate
+        // edge; non-matching traffic short-circuits cheaply.
+        self.maybe_emit_delegate_on_behalf(&event, &applied_poll_id)
+            .await;
 
         Ok(())
     }
@@ -1873,6 +2006,12 @@ pub async fn process_inbound_for_test(
     membership_resolver: Option<&Arc<dyn crate::community_voting_log::MembershipSnapshotResolver>>,
     packet: &[u8],
 ) -> Result<(), String> {
+    // ZEB-298 Task 8: the static `process_inbound` now returns
+    // `Result<Option<(SignedVotingEvent, PollId)>, String>` so the
+    // dispatch wrapper can fire post-apply hooks. The shim collapses
+    // the Some/None distinction back to `Result<(), String>` so
+    // existing integration tests which assert `is_ok()` / `is_err()`
+    // / `unwrap_err()` continue to work without change.
     VotingLogEngine::<tauri::Wry>::process_inbound(
         community_id,
         voting_log,
@@ -1882,6 +2021,7 @@ pub async fn process_inbound_for_test(
         packet,
     )
     .await
+    .map(|_| ())
 }
 
 // ── Registry ────────────────────────────────────────────────────────────────
@@ -3629,5 +3769,221 @@ mod tests {
             payloads.is_empty(),
             "signaler != local's delegate must suppress the emit; got {payloads:?}"
         );
+    }
+
+    // ── ZEB-298 Task 8: process_inbound post-apply hook fan-out ────────────
+    //
+    // The four hooks fired from `publish_event` must ALSO fire from the
+    // inbound (peer-Zenoh-receive) path so peer replicas reach an
+    // identical post-state to the originating node. The previous tests
+    // cover the `publish_event` callsite of `maybe_emit_delegate_on_behalf`;
+    // this one mirrors the assertion but exercises the
+    // `process_inbound_dispatch` callsite end-to-end by pushing a real
+    // signed Signal event onto the engine's subscriber channel and
+    // confirming the Tauri emit fires.
+
+    /// Tier 2 Signal arriving via the inbound (peer-Zenoh) path must
+    /// fire `voting-delegate-signaled-on-your-behalf` when the
+    /// signaler is the local user's delegate and policy opts in —
+    /// proving that `process_inbound_dispatch` invokes the same
+    /// `maybe_emit_delegate_on_behalf` hook that `publish_event` does.
+    #[tokio::test]
+    async fn process_inbound_tier2_signal_fires_delegate_on_behalf() {
+        use crate::community_voting_conviction::{
+            AutoExecAction, CommunityVotingPolicy, Tier2PollConfig, Q32,
+        };
+        use tauri::Listener;
+
+        let community_id = SpaceId([0xE3; 16]);
+
+        // Real keypairs so verify_voting_event passes: `local_owner` is
+        // who we install on the engine; `delegate_owner` is the actor
+        // that signs both the seed PollCreate and the inbound Signal.
+        let (_local_key, local_owner, local_pub64) = fixture_identity_engine(0xE1);
+        let (delegate_key, delegate_owner, delegate_pub64) = fixture_identity_engine(0xE2);
+
+        // Tier 2 config — eligibility is permissive (min_power = 0) so
+        // the inbound Signal isn't rejected by the per-tier eligibility
+        // gate. `notify_on_delegate_signal` matters only after apply.
+        let cfg = Tier2PollConfig {
+            proposal_text: "promote".into(),
+            half_life_seconds: 86_400,
+            threshold_min_q32: Q32,
+            threshold_max_q32: 100 * Q32,
+            beta: 2,
+            delegation_allowed: true,
+            auto_exec: AutoExecAction::None,
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+        };
+
+        // Snapshot covers both the local user and the delegate so
+        // PollCreate's total_supply is non-zero and the Signal's
+        // eligibility check sees the delegate as a member.
+        let mut members = HashMap::new();
+        for owner in [local_owner, delegate_owner] {
+            members.insert(
+                owner,
+                MemberAttrs {
+                    power: 10,
+                    vouching_depth: 0,
+                },
+            );
+        }
+        let snapshot = MembershipSnapshot { members };
+
+        // Pre-seed the log: PollCreate (signed by the delegate so it's
+        // valid in case we ever route it through inbound), delegation
+        // edge (local → delegate), and policy enabled.
+        let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+        let pid: PollId = {
+            let mut log = voting_log.lock().await;
+
+            let mut create_payload = Vec::new();
+            ciborium::into_writer(&cfg, &mut create_payload).expect("encode cfg");
+            let create_event = SignedVotingEvent {
+                tag: 'p',
+                version: 1,
+                tier: Tier::Conviction,
+                kind: PollEventKindCode::PollCreate,
+                hlc: Hlc {
+                    wall_ms: 1_000,
+                    logical: 0,
+                    device_id: "dev-create".into(),
+                },
+                actor: delegate_owner,
+                payload: create_payload,
+                sig: vec![0u8; 64], // local pre-seed bypasses verify
+            };
+            let pid = log
+                .apply_with_snapshot(create_event, &community_id, Some(snapshot.clone()))
+                .expect("apply tier2 create");
+
+            // Delegation edge: local_owner → delegate_owner.
+            log.delegation_graph
+                .apply_delegate(local_owner, delegate_owner, (500, 0))
+                .expect("apply_delegate edge");
+
+            // Community policy enables the notify hook.
+            log.set_policy(CommunityVotingPolicy {
+                notify_on_delegate_signal: true,
+            });
+
+            pid
+        };
+
+        // Production resolvers so process_inbound's verify + apply
+        // path activates (otherwise it short-circuits to Ok(None)).
+        let resolvers = Arc::new(FixedTestResolvers {
+            identity: HashMap::from([(local_owner, local_pub64), (delegate_owner, delegate_pub64)]),
+            snapshot,
+        });
+        let id_resolver: Arc<dyn crate::community_voting_core::VotingIdentityResolver> =
+            resolvers.clone();
+        let mem_resolver: Arc<dyn crate::community_voting_log::MembershipSnapshotResolver> =
+            resolvers;
+
+        let (publisher_tx, _publisher_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (subscriber_tx, subscriber_rx) = mpsc::channel::<Vec<u8>>(8);
+
+        let app = tauri::test::mock_app();
+        let app_handle = app.handle().clone();
+
+        let engine = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+            community_id,
+            voting_log: Arc::clone(&voting_log),
+            publisher_tx,
+            subscriber_rx,
+            hlc_tracker: None,
+            device_id: None,
+            app_handle: Some(app_handle.clone()),
+            identity_resolver: Some(id_resolver),
+            membership_resolver: Some(mem_resolver),
+        })
+        .await;
+
+        // Install local_owner so maybe_emit_delegate_on_behalf can
+        // read it. Signing-key bytes are irrelevant — the hook only
+        // reads the owner.
+        let local_signing = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]));
+        engine
+            .install_local_signing_key(local_signing, local_owner)
+            .await;
+
+        // Listener for the emit under test.
+        let captured: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_listener = Arc::clone(&captured);
+        app_handle.listen("voting-delegate-signaled-on-your-behalf", move |evt| {
+            captured_for_listener
+                .lock()
+                .expect("captured lock")
+                .push(evt.payload().to_string());
+        });
+
+        // Build a real, delegate-signed Tier 2 Signal event and push
+        // it onto the subscriber channel — the engine's receive loop
+        // dispatches via `process_inbound_dispatch`, which invokes
+        // `maybe_emit_delegate_on_behalf` on successful apply.
+        let signal_event = {
+            use ed25519_dalek::Signer;
+            let payload_struct = crate::community_voting_conviction::SignalPayload {
+                proposal_id: pid,
+                support: true,
+            };
+            let mut payload = Vec::new();
+            ciborium::into_writer(&payload_struct, &mut payload).expect("encode signal");
+            let mut ev = SignedVotingEvent {
+                tag: 'p',
+                version: 1,
+                tier: Tier::Conviction,
+                kind: PollEventKindCode::Signal,
+                hlc: Hlc {
+                    wall_ms: 2_000,
+                    logical: 0,
+                    device_id: "dev-signal".into(),
+                },
+                actor: delegate_owner,
+                payload,
+                sig: vec![0u8; 64],
+            };
+            let sb = ev.signing_bytes().expect("signing_bytes");
+            ev.sig = delegate_key.sign(&sb).to_bytes().to_vec();
+            ev
+        };
+        let mut packet = Vec::new();
+        ciborium::into_writer(&signal_event, &mut packet).expect("encode signal packet");
+
+        subscriber_tx
+            .send(packet)
+            .await
+            .expect("send signal packet to subscriber channel");
+
+        let payloads = wait_for_emits(Arc::clone(&captured), 1, Duration::from_secs(2)).await;
+        assert_eq!(
+            payloads.len(),
+            1,
+            "process_inbound must fire voting-delegate-signaled-on-your-behalf exactly once; \
+             got {payloads:?}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payloads[0]).expect("payload is JSON");
+        assert_eq!(
+            parsed["proposalId"].as_str(),
+            Some(hex::encode(pid.0).as_str())
+        );
+        assert_eq!(
+            parsed["delegate"].as_str(),
+            Some(hex::encode(delegate_owner.0).as_str())
+        );
+        assert_eq!(parsed["support"].as_bool(), Some(true));
+
+        // Keep the engine + subscriber_tx alive until end-of-scope so
+        // the receive loop doesn't exit before the emit lands.
+        drop(engine);
+        drop(subscriber_tx);
     }
 }
