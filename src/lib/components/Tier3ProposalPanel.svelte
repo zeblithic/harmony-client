@@ -22,7 +22,7 @@
    * Per ZEB-287 R4: every $props field destructured below.
    * Per Tauri error-extraction memory: e instanceof Error ? e.message : String(e).
    */
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy } from 'svelte';
   import type {
     Tier3PollExport,
     Tier3PollSummary,
@@ -151,7 +151,29 @@
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }
 
-  onMount(() => {
+  // Reload list + tear-down/re-arm subscriptions when communityId changes.
+  // Using $effect (not onMount) so the panel reacts to parent re-binding
+  // the prop — e.g. user switching between communities in the same view.
+  // Subscriber handlers themselves are not community-scoped (they fire on
+  // any tier3 event); they call loadSummaries() which always reads the
+  // current `communityId` via the IPC. Resetting selection on switch
+  // avoids rendering the previous community's detail while the new
+  // community's list is in-flight.
+  $effect(() => {
+    // Track communityId as a reactive dep. Reads must be synchronous;
+    // the dep wouldn't register if we only read it inside the async
+    // loadSummaries() body.
+    void communityId;
+
+    for (const u of unsubscribers) u();
+    unsubscribers = [];
+
+    summaries = [];
+    selectedPollId = null;
+    selectedDetail = null;
+    detailError = null;
+    listError = null;
+
     loadSummaries();
     unsubscribers.push(adapter.subscribeTier3PollCreated(() => loadSummaries()));
     unsubscribers.push(
@@ -178,6 +200,23 @@
         refetchSelected();
       }),
     );
+  });
+
+  // Polling fallback for peer-driven mid-stage mutations: declines,
+  // draft candidates, and draft-approval signals don't emit Tauri events
+  // the panel subscribes to (only the 5 stage-transition events do). An
+  // observer with an expanded poll would otherwise see stale rosters
+  // and approval counts until a stage transition fires or they themselves
+  // mutate. 5s is a pragmatic balance — ZEB-319 tracks adding granular
+  // post-apply events that will replace this polling.
+  $effect(() => {
+    if (!selectedPollId) return;
+    const id = selectedPollId;
+    const interval = setInterval(() => {
+      loadDetail(id);
+      loadSummaries();
+    }, 5_000);
+    return () => clearInterval(interval);
   });
 
   onDestroy(() => {
