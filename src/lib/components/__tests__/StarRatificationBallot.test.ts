@@ -1,0 +1,66 @@
+import { render, fireEvent, waitFor } from '@testing-library/svelte';
+import { describe, it, expect, vi } from 'vitest';
+import StarRatificationBallot from '../StarRatificationBallot.svelte';
+import { VotingAdapter } from '../../voting-adapter';
+import type { Tier3PollExport } from '../../types/voting';
+
+const detail: Tier3PollExport = {
+  pollId: 'aa'.repeat(32),
+  communityId: '11'.repeat(16),
+  proposalText: 'Amend §3',
+  proposer: 'pp'.repeat(32),
+  stage: 'ra',
+  pollCreateHlcMs: 1_700_000_000_000,
+  sortitionSize: 100,
+  deliberationWindowSeconds: 1_209_600,
+  draftingWindowSeconds: 604_800,
+  ratificationWindowSeconds: 1_209_600,
+  incentiveMode: 'd',
+  miniPublic: ['mm'.repeat(32)],
+  backupPool: [],
+  declined: [],
+  draftCandidates: [],
+  ratificationCandidates: [
+    { eventHash: 'aa'.repeat(32), text: 'Candidate A' },
+    { eventHash: 'bb'.repeat(32), text: 'Candidate B' },
+  ],
+  myRole: 'observer',
+  myDraftingApprovals: [],
+  myRatificationScores: null,
+  winnerEventHash: null,
+  runnerUpEventHash: null,
+};
+
+describe('StarRatificationBallot', () => {
+  it('renders one slider per ratification candidate', () => {
+    const adapter = new VotingAdapter();
+    const { getAllByRole } = render(StarRatificationBallot, {
+      props: { detail, adapter, onCast: () => {} },
+    });
+    const sliders = getAllByRole('slider');
+    expect(sliders).toHaveLength(2);
+  });
+
+  it('cast button opens confirm modal before invoking', async () => {
+    const adapter = new VotingAdapter();
+    vi.spyOn(adapter, 'castRatificationBallot').mockResolvedValue();
+    const { getByText, findByText } = render(StarRatificationBallot, {
+      props: { detail, adapter, onCast: () => {} },
+    });
+    await fireEvent.click(getByText(/Cast ballot/i));
+    expect(await findByText(/Confirm ratification ballot/i)).toBeTruthy();
+    expect(adapter.castRatificationBallot).not.toHaveBeenCalled();
+    await fireEvent.click(await findByText(/^Confirm$/i));
+    await waitFor(() => expect(adapter.castRatificationBallot).toHaveBeenCalledWith(detail.pollId, [0, 0]));
+  });
+
+  it('prefills sliders with myRatificationScores when present', () => {
+    const adapter = new VotingAdapter();
+    const { getAllByRole } = render(StarRatificationBallot, {
+      props: { detail: { ...detail, myRatificationScores: [3, 5] }, adapter, onCast: () => {} },
+    });
+    const sliders = getAllByRole('slider') as HTMLInputElement[];
+    expect(sliders[0].value).toBe('3');
+    expect(sliders[1].value).toBe('5');
+  });
+});
