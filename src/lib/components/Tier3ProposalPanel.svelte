@@ -360,31 +360,65 @@
     </ul>
   {/if}
 
-  {#if selectedDetail}
+  {#if selectedPollId}
     <section class="detail-pane">
-      <h4>{selectedDetail.proposalText}</h4>
-      <p class="stage-label">{tier3StageLabel(selectedDetail.stage)}</p>
       {#if detailError}
         <p class="error">{detailError}</p>
-      {/if}
+      {:else if !selectedDetail}
+        <p class="empty">Loading proposal details…</p>
+      {:else}
+        <h4>{selectedDetail.proposalText}</h4>
+        <p class="stage-label">{tier3StageLabel(selectedDetail.stage)}</p>
 
-      {#if selectedDetail.stage === 'so'}
-        <p>Awaiting sortition draw. The D-FROST committee must produce the VRF beacon before the mini-public is selected.</p>
-      {:else if selectedDetail.stage === 'de' || selectedDetail.stage === 'dr' || selectedDetail.stage === 'ra' || selectedDetail.stage === 'fi'}
-        <SortitionRevealView detail={selectedDetail} {myAddr} />
-        {#if selectedDetail.myRole === 'mini_public' && (selectedDetail.stage === 'de' || selectedDetail.stage === 'dr')}
-          <MiniPublicParticipationToggle detail={selectedDetail} {adapter} {myAddr} onDecline={refetchSelected} />
+        {#if selectedDetail.stage === 'so'}
+          <p>Awaiting sortition draw. The D-FROST committee must produce the VRF beacon before the mini-public is selected.</p>
+        {:else if selectedDetail.stage === 'de' || selectedDetail.stage === 'dr' || selectedDetail.stage === 'ra' || selectedDetail.stage === 'fi'}
+          <SortitionRevealView detail={selectedDetail} {myAddr} />
+          {#if selectedDetail.myRole === 'mini_public' && (selectedDetail.stage === 'de' || selectedDetail.stage === 'dr')}
+            <MiniPublicParticipationToggle detail={selectedDetail} {adapter} {myAddr} onDecline={refetchSelected} />
+          {/if}
+          {#if selectedDetail.stage === 'dr'}
+            <DraftingPanel detail={selectedDetail} {adapter} {myAddr} onChange={refetchSelected} />
+          {/if}
+          {#if selectedDetail.stage === 'ra'}
+            <StarRatificationBallot detail={selectedDetail} {adapter} onCast={refetchSelected} />
+          {:else if selectedDetail.stage === 'fi'}
+            <!-- Finalized view: ratificationCandidates pivots from the
+                 drafting-derived ordering to result.finalists, so the
+                 caller's `myRatificationScores` (indexed against the OLD
+                 ordering at cast time) cannot be safely re-paired here.
+                 Show the read-only outcome instead of mounting the ballot. -->
+            {@const winner = selectedDetail.ratificationCandidates.find(
+              (c) => c.eventHash === selectedDetail.winnerEventHash,
+            )}
+            {@const runnerUp = selectedDetail.runnerUpEventHash
+              ? selectedDetail.ratificationCandidates.find(
+                  (c) => c.eventHash === selectedDetail.runnerUpEventHash,
+                )
+              : null}
+            <section class="finalized-result">
+              <h5>Outcome</h5>
+              {#if winner}
+                <p class="winner-line"><span class="badge winner">Winner</span> {winner.text}</p>
+              {/if}
+              {#if runnerUp}
+                <p class="runner-up-line"><span class="badge runner-up">Runner-up</span> {runnerUp.text}</p>
+              {/if}
+              <details class="finalists">
+                <summary>All finalists ({selectedDetail.ratificationCandidates.length})</summary>
+                <ol>
+                  {#each selectedDetail.ratificationCandidates as c (c.eventHash)}
+                    <li>{c.text}</li>
+                  {/each}
+                </ol>
+              </details>
+            </section>
+          {/if}
+        {:else if selectedDetail.stage === 'fa'}
+          <p class="failed-detail">
+            Sortition failed — the backup pool was exhausted before the mini-public could be assembled.
+          </p>
         {/if}
-        {#if selectedDetail.stage === 'dr'}
-          <DraftingPanel detail={selectedDetail} {adapter} {myAddr} onChange={refetchSelected} />
-        {/if}
-        {#if selectedDetail.stage === 'ra' || selectedDetail.stage === 'fi'}
-          <StarRatificationBallot detail={selectedDetail} {adapter} onCast={refetchSelected} />
-        {/if}
-      {:else if selectedDetail.stage === 'fa'}
-        <p class="failed-detail">
-          Sortition failed — the backup pool was exhausted before the mini-public could be assembled.
-        </p>
       {/if}
     </section>
   {/if}
@@ -484,4 +518,18 @@
   .error { color: #d93838; }
   .empty { color: #8a8c95; }
   .failed-detail { color: #d93838; }
+  .finalized-result { margin-top: 1rem; }
+  .winner-line, .runner-up-line { margin: 0.4rem 0; }
+  .badge {
+    display: inline-block;
+    font-size: 0.7rem;
+    padding: 0.1rem 0.4rem;
+    border-radius: 3px;
+    margin-right: 0.4rem;
+    font-weight: 500;
+  }
+  .badge.winner { background: var(--success-bg, rgba(74, 217, 122, 0.15)); color: var(--success, #4ad97a); }
+  .badge.runner-up { background: rgba(74, 158, 255, 0.15); color: var(--accent, #4a9eff); }
+  .finalists { margin-top: 0.5rem; color: #8a8c95; font-size: 0.85rem; }
+  .finalists ol { margin: 0.25rem 0; padding-left: 1.25rem; }
 </style>
