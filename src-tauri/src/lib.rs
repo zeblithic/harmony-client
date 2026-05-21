@@ -24066,12 +24066,17 @@ fn build_tier3_export(
         .as_ref()
         .map(|s| s == &t3.meta.proposer)
         .unwrap_or(false);
-    let my_role = if self_is_proposer {
-        Tier3MyRole::Proposer
-    } else if self_in_primary {
+    // Priority order: function-bearing roles before informational ones.
+    // The proposer can also be drawn into the mini-public (sortition is
+    // random across the full electorate). Reporting Proposer first would
+    // hide the decline/drafting/ratification UI gated on MiniPublic.
+    // Mini-public > Backup > Proposer > Observer.
+    let my_role = if self_in_primary {
         Tier3MyRole::MiniPublic
     } else if self_in_backup {
         Tier3MyRole::Backup
+    } else if self_is_proposer {
+        Tier3MyRole::Proposer
     } else {
         Tier3MyRole::Observer
     };

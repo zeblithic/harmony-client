@@ -436,6 +436,171 @@ impl Tier3TestHarness {
         }
     }
 
+    /// R2 follow-up: Finalized harness with TWO finalists so the export's
+    /// `runner_up_event_hash` derivation path (find first finalist whose
+    /// hash differs from `winner`) is exercised end-to-end. Without this,
+    /// a regression that returns the winner as its own runner-up would
+    /// go undetected.
+    async fn with_finalized_tier3_poll_two_finalists() -> Self {
+        const SORTITION_SIZE: u16 = 20;
+        let community_id = SpaceId([0xC4; 16]);
+        let proposer = fixture_identity(7);
+        let primary: Vec<_> = (50u8..70).map(fixture_identity).collect();
+
+        let config = Tier3PollConfigPayload {
+            proposal_text: "Two-finalist proposal text".into(),
+            sortition_size: SORTITION_SIZE,
+            deliberation_window_seconds: 60,
+            drafting_window_seconds: 60,
+            ratification_window_seconds: 60,
+            privacy_mode: "pu".into(),
+            incentive_mode: "d".into(),
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            retry_of: None,
+        };
+        let hlc_create = hlc_at(2_000_000);
+        let event_create = build_signed_poll_create_tier3(
+            &proposer.signing_key,
+            proposer.owner,
+            &config,
+            hlc_create,
+        )
+        .expect("build tier3 poll");
+        let signing_bytes = event_create.signing_bytes().expect("signing_bytes");
+        let poll_id = derive_poll_id(&community_id, &signing_bytes);
+
+        let snapshot = single_member_snapshot(proposer.owner);
+        let mut log = VotingLog::new();
+        log.apply_with_snapshot(event_create, &community_id, Some(snapshot))
+            .expect("apply kd=cr");
+
+        let primary_owners: Vec<OwnerAddr> = primary.iter().map(|id| id.owner).collect();
+        let ss_event = build_signed_sortition_selection(
+            &proposer.signing_key,
+            proposer.owner,
+            poll_id,
+            primary_owners,
+            vec![],
+            hlc_at(2_000_001),
+        )
+        .expect("build kd=ss");
+        log.apply_with_snapshot(ss_event, &community_id, None)
+            .expect("apply kd=ss");
+
+        // Two kd=dc draft candidates, each authored by a distinct primary
+        // member so their event_hashes differ. Implicit self-approval gives
+        // each candidate count=1; we boost both above the threshold=10 with
+        // kd=da from primaries[2..11].
+        let dc_a_actor = &primary[0];
+        let dc_a_event = build_signed_draft_candidate(
+            &dc_a_actor.signing_key,
+            dc_a_actor.owner,
+            poll_id,
+            "Winner candidate text".into(),
+            hlc_at(2_000_002),
+        )
+        .expect("build kd=dc A");
+        let dc_a_hash: [u8; 32] = event_hash_of(&dc_a_event);
+        log.apply_with_snapshot(dc_a_event, &community_id, None)
+            .expect("apply kd=dc A");
+
+        let dc_b_actor = &primary[1];
+        let dc_b_event = build_signed_draft_candidate(
+            &dc_b_actor.signing_key,
+            dc_b_actor.owner,
+            poll_id,
+            "Runner-up candidate text".into(),
+            hlc_at(2_000_003),
+        )
+        .expect("build kd=dc B");
+        let dc_b_hash: [u8; 32] = event_hash_of(&dc_b_event);
+        log.apply_with_snapshot(dc_b_event, &community_id, None)
+            .expect("apply kd=dc B");
+        assert_ne!(
+            dc_a_hash, dc_b_hash,
+            "harness invariant: two distinct candidates must have distinct hashes"
+        );
+
+        // 9 approvals each from primaries [2..11] for A and [11..20] for B
+        // (clear of A's slot). Materialize is a HashSet insert; threshold
+        // validation lives at verify, which we bypass here.
+        for (i, approver) in primary[2..11].iter().enumerate() {
+            let da_event = build_signed_draft_approval(
+                &approver.signing_key,
+                approver.owner,
+                poll_id,
+                dc_a_hash,
+                hlc_at(2_000_004 + i as u64),
+            )
+            .expect("build kd=da A");
+            log.apply_with_snapshot(da_event, &community_id, None)
+                .expect("apply kd=da A");
+        }
+        for (i, approver) in primary[11..20].iter().enumerate() {
+            let da_event = build_signed_draft_approval(
+                &approver.signing_key,
+                approver.owner,
+                poll_id,
+                dc_b_hash,
+                hlc_at(2_000_020 + i as u64),
+            )
+            .expect("build kd=da B");
+            log.apply_with_snapshot(da_event, &community_id, None)
+                .expect("apply kd=da B");
+        }
+
+        let cl_event = build_signed_poll_close_tier3(
+            &proposer.signing_key,
+            proposer.owner,
+            poll_id,
+            hlc_at(2_001_000),
+        )
+        .expect("build kd=cl");
+        log.apply_with_snapshot(cl_event, &community_id, None)
+            .expect("apply kd=cl");
+
+        // kd=rs: winner = A, runner-up = B. Both finalists present.
+        let star_result = StarResult {
+            winner: CandidateRef {
+                event_hash: dc_a_hash,
+                approval_count: 10,
+            },
+            finalists: vec![
+                CandidateRef {
+                    event_hash: dc_a_hash,
+                    approval_count: 10,
+                },
+                CandidateRef {
+                    event_hash: dc_b_hash,
+                    approval_count: 10,
+                },
+            ],
+            total_scores: vec![50, 30],
+            runoff_votes: vec![12, 8],
+        };
+        let rs_event = build_signed_poll_result_tier3(
+            &proposer.signing_key,
+            proposer.owner,
+            poll_id,
+            star_result,
+            hlc_at(2_001_001),
+        )
+        .expect("build kd=rs");
+        log.apply_with_snapshot(rs_event, &community_id, None)
+            .expect("apply kd=rs");
+
+        let state = build_node_state_with_log(community_id, log, None).await;
+        Tier3TestHarness {
+            state,
+            poll_id_hex: hex::encode(poll_id.0),
+            community_id_hex: hex::encode(community_id.0),
+        }
+    }
+
     /// Call `voting_get_tier3_poll_impl` — the decoupled inner implementation.
     async fn get_tier3_poll(
         &self,
@@ -592,6 +757,41 @@ async fn list_tier3_polls_includes_finalized_with_winner_text() {
         "winner_text must be set for a Finalized poll; got {:?}",
         summaries[0].winner_text
     );
+}
+
+#[tokio::test]
+async fn get_tier3_poll_two_finalist_finalized_exposes_runner_up() {
+    // R2 follow-up to Greptile: the single-finalist `with_finalized_tier3_poll`
+    // never exercises the `runner_up_event_hash` derivation. This harness
+    // builds a 2-finalist StarResult so the export must report runner_up.
+    let h = Tier3TestHarness::with_finalized_tier3_poll_two_finalists().await;
+    let export = h.get_tier3_poll(&h.poll_id_hex).await.expect("ok");
+    assert_eq!(export.stage, Tier3StageTag::Finalized);
+    let winner = export
+        .winner_event_hash
+        .as_ref()
+        .expect("winner_event_hash must be set");
+    let runner_up = export
+        .runner_up_event_hash
+        .as_ref()
+        .expect("runner_up_event_hash must be set when finalists.len() >= 2");
+    assert_ne!(
+        winner, runner_up,
+        "runner_up must differ from winner: winner={winner}, runner_up={runner_up}"
+    );
+    // ratification_candidates exposes both finalists with their text.
+    assert_eq!(
+        export.ratification_candidates.len(),
+        2,
+        "finalists projection must include both candidates"
+    );
+    let texts: Vec<&str> = export
+        .ratification_candidates
+        .iter()
+        .map(|c| c.text.as_str())
+        .collect();
+    assert!(texts.contains(&"Winner candidate text"));
+    assert!(texts.contains(&"Runner-up candidate text"));
 }
 
 #[tokio::test]

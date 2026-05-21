@@ -96,6 +96,13 @@
 
   function select(pollId: string) {
     selectedPollId = pollId;
+    // Drop the prior poll's detail immediately so the pane doesn't
+    // render stale text/stage/child-panels while the new fetch
+    // resolves. (Background event-driven refetches via refetchSelected
+    // call loadDetail without going through select(), so they don't
+    // null out the detail.)
+    selectedDetail = null;
+    detailError = null;
     loadDetail(pollId);
   }
 
@@ -116,7 +123,12 @@
         draftingWindowSeconds,
         ratificationWindowSeconds,
         incentiveMode,
-        minPower: 1,
+        // Eligibility floor for proposing. Default 0 so 0-power members
+        // can author constitutional proposals — Tier 3 is the
+        // egalitarian deliberation tier; gating proposal authorship on
+        // power is a configuration choice the proposer makes
+        // explicitly, not the platform's default.
+        minPower: 0,
       });
       proposalText = '';
       confirmingCreate = false;
@@ -304,15 +316,17 @@
 
   {#if confirmingCreate}
     <div class="confirm-modal" role="dialog" aria-modal="true" aria-label="Confirm new Tier 3 proposal">
-      <p>Confirm new Tier 3 proposal</p>
-      <p class="confirm-summary">
-        "{proposalText.slice(0, 120)}{proposalText.length > 120 ? '…' : ''}"
-      </p>
-      <div class="confirm-actions">
-        <button type="button" onclick={() => (confirmingCreate = false)} disabled={creating}>Cancel</button>
-        <button type="button" onclick={submitCreate} disabled={creating}>
-          {creating ? 'Creating…' : 'Confirm'}
-        </button>
+      <div class="confirm-card">
+        <p>Confirm new Tier 3 proposal</p>
+        <p class="confirm-summary">
+          "{proposalText.slice(0, 120)}{proposalText.length > 120 ? '…' : ''}"
+        </p>
+        <div class="confirm-actions">
+          <button type="button" onclick={() => (confirmingCreate = false)} disabled={creating}>Cancel</button>
+          <button type="button" onclick={submitCreate} disabled={creating}>
+            {creating ? 'Creating…' : 'Confirm'}
+          </button>
+        </div>
       </div>
     </div>
   {/if}
@@ -419,13 +433,16 @@
     place-items: center;
     z-index: 100;
   }
-  .confirm-modal > * {
+  .confirm-card {
     background: var(--panel-bg, #1a1c24);
-    padding: 1rem 1.5rem;
+    padding: 1.25rem 1.5rem;
     border-radius: 8px;
-    margin: 0.25rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    max-width: 480px;
   }
-  .confirm-actions { display: flex; gap: 0.5rem; }
+  .confirm-actions { display: flex; gap: 0.5rem; justify-content: flex-end; }
   .confirm-actions button:last-child {
     background: var(--accent, #4a9eff);
     color: #fff;

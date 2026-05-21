@@ -57,6 +57,15 @@
 
   {#if detail.declined.length > 0}
     <h5>Declined ({detail.declined.length})</h5>
+    <ul class="roster">
+      {#each detail.declined as [owner, hlcMs] (owner)}
+        <li class="declined" class:self={owner === myAddr}>
+          <code>{shortAddr(owner)}</code>
+          {#if owner === myAddr}<span class="tag">you</span>{/if}
+          <span class="tag" title={`declined at HLC wall_ms ${hlcMs}`}>declined</span>
+        </li>
+      {/each}
+    </ul>
   {/if}
 </section>
 

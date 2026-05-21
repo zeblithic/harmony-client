@@ -25,23 +25,37 @@
   let casting = $state(false);
   let castError = $state<string | null>(null);
   let castSuccess = $state(false);
-  // Reseed scores only when the active poll changes, not on every detail
-  // refetch. Tier3ProposalPanel refetches the selected poll on each
-  // Tier 3 event; without this guard, in-progress slider edits get
-  // clobbered to all-zeros when the server snapshot has no
-  // myRatificationScores yet.
-  let lastSeededPollId: string | null = null;
+  // Track which (poll, server-cast-state) we last seeded from. Reseed when:
+  //   - the active poll changes (different pollId), OR
+  //   - the same poll's myRatificationScores transitions null→array, OR
+  //   - the same poll's myRatificationScores array contents change.
+  // We MUST NOT reseed merely because `detail` changes — Tier3ProposalPanel
+  // refetches the selected poll on each Tier 3 event, and reseeding from
+  // a server snapshot that still has `myRatificationScores: null` (because
+  // the user hasn't cast yet) would clobber in-progress slider edits.
+  // Stringifying the scores array gives a stable identity for "same vs
+  // different cast state" — typed arrays are short (≤5 candidates per
+  // ZEB-309 cap), so the cost is negligible.
+  let lastSeededKey: string | null = null;
+  function seedKey(d: Tier3PollExport): string {
+    return `${d.pollId}|${d.myRatificationScores ? JSON.stringify(d.myRatificationScores) : 'null'}`;
+  }
 
   $effect(() => {
-    if (detail.pollId === lastSeededPollId) return;
-    lastSeededPollId = detail.pollId;
+    const key = seedKey(detail);
+    if (key === lastSeededKey) return;
+    const isPollSwap = lastSeededKey === null
+      || !lastSeededKey.startsWith(`${detail.pollId}|`);
+    lastSeededKey = key;
     castSuccess = false;
     castError = null;
     if (detail.myRatificationScores) {
       scores = [...detail.myRatificationScores];
-    } else {
+    } else if (isPollSwap) {
+      // Fresh poll, no prior cast — start at zeros.
       scores = new Array(detail.ratificationCandidates.length).fill(0);
     }
+    // Else: same poll, no server-side cast yet — keep in-progress edits.
   });
 
   function setScore(index: number, value: number) {
@@ -110,16 +124,18 @@
 
 {#if confirming}
   <div class="confirm-modal" role="dialog" aria-modal="true" aria-label="Confirm ratification ballot">
-    <p>Confirm ratification ballot</p>
-    <ul class="ballot-summary">
-      {#each detail.ratificationCandidates as c, i}
-        <li><strong>{scores[i]}</strong> — {c.text}</li>
-      {/each}
-    </ul>
-    <p class="caveat">You can re-cast later if the ratification window is still open.</p>
-    <div class="confirm-actions">
-      <button type="button" onclick={() => (confirming = false)}>Cancel</button>
-      <button type="button" onclick={confirmCast}>Confirm</button>
+    <div class="confirm-card">
+      <p>Confirm ratification ballot</p>
+      <ul class="ballot-summary">
+        {#each detail.ratificationCandidates as c, i}
+          <li><strong>{scores[i]}</strong> — {c.text}</li>
+        {/each}
+      </ul>
+      <p class="caveat">You can re-cast later if the ratification window is still open.</p>
+      <div class="confirm-actions">
+        <button type="button" onclick={() => (confirming = false)}>Cancel</button>
+        <button type="button" onclick={confirmCast}>Confirm</button>
+      </div>
     </div>
   </div>
 {/if}
@@ -166,16 +182,19 @@
     place-items: center;
     z-index: 100;
   }
-  .confirm-modal > * {
+  .confirm-card {
     background: var(--panel-bg, #1a1c24);
-    padding: 1rem 1.5rem;
+    padding: 1.25rem 1.5rem;
     border-radius: 8px;
-    margin: 0.25rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    max-width: 480px;
   }
-  .ballot-summary { list-style: none; padding: 0; }
+  .ballot-summary { list-style: none; padding: 0; margin: 0; }
   .ballot-summary li { padding: 0.1rem 0; }
   .caveat { color: #8a8c95; font-size: 0.8rem; }
-  .confirm-actions { display: flex; gap: 0.5rem; }
+  .confirm-actions { display: flex; gap: 0.5rem; justify-content: flex-end; }
   .confirm-actions button:last-child {
     background: var(--accent, #4a9eff);
     color: #fff;
