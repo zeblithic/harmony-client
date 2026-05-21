@@ -397,11 +397,86 @@ impl Tier3PollState {
                 }
             }
 
-            // kd=dv DeliberationVote: Phase 5 — payload parse only; full materialize in Task 4.
+            // kd=dv DeliberationVote: LWW upsert keyed by (voter, statement_event_hash).
+            // Apply-time rules per spec §2.3 (silent drop on failure; falls through to
+            // post-match last_hlc update).
             PollEventKindCode::DeliberationVote => {
-                let _payload: DeliberationVotePayload =
+                let payload: DeliberationVotePayload =
                     decode_payload(&ev.payload).map_err(ApplyError::PayloadDecode)?;
-                // No-op: Task 4 wires DeliberationState insertion.
+                let event_hash = sha256_of_signing_bytes(ev);
+
+                let stage_ok = self.current_stage_at(&ev.hlc) == Stage::Deliberation;
+                let mp_ok = stage_ok && self.current_mini_public(&ev.hlc).contains(&ev.actor);
+                let target_ok = mp_ok
+                    && self
+                        .deliberation
+                        .statements
+                        .contains_key(&payload.statement_event_hash);
+                let vote_code =
+                    crate::community_voting_core::BridgingVoteCode::from_u8(payload.vote);
+
+                if !stage_ok {
+                    tracing::debug!(
+                        poll_id = %hex::encode(self.meta.poll_id.0),
+                        actor = %hex::encode(ev.actor.0),
+                        "kd=dv drop: not in Deliberation stage"
+                    );
+                } else if !mp_ok {
+                    tracing::debug!(
+                        poll_id = %hex::encode(self.meta.poll_id.0),
+                        actor = %hex::encode(ev.actor.0),
+                        "kd=dv drop: actor not in current mini-public"
+                    );
+                } else if !target_ok {
+                    tracing::debug!(
+                        poll_id = %hex::encode(self.meta.poll_id.0),
+                        actor = %hex::encode(ev.actor.0),
+                        statement = %hex::encode(payload.statement_event_hash),
+                        "kd=dv drop: target statement not in projection"
+                    );
+                } else if vote_code.is_none() {
+                    tracing::debug!(
+                        poll_id = %hex::encode(self.meta.poll_id.0),
+                        actor = %hex::encode(ev.actor.0),
+                        vote_byte = payload.vote,
+                        "kd=dv drop: vote byte out of range"
+                    );
+                } else {
+                    let vote_code = vote_code.unwrap();
+                    // LWW: insert only if (ev.hlc, event_hash) > existing entry's (hlc, hash).
+                    let key = (ev.actor, payload.statement_event_hash);
+                    let should_insert = match self.deliberation.votes.get(&key) {
+                        None => true,
+                        Some(existing) => {
+                            let incoming = (
+                                ev.hlc.wall_ms,
+                                ev.hlc.logical,
+                                ev.hlc.device_id.as_str(),
+                                event_hash,
+                            );
+                            let current = (
+                                existing.last_update_hlc.wall_ms,
+                                existing.last_update_hlc.logical,
+                                existing.last_update_hlc.device_id.as_str(),
+                                existing.last_update_event_hash,
+                            );
+                            incoming > current
+                        }
+                    };
+                    if should_insert {
+                        self.deliberation.votes.insert(
+                            key,
+                            DeliberationVoteEntry {
+                                voter: ev.actor,
+                                statement_event_hash: payload.statement_event_hash,
+                                vote: vote_code,
+                                last_update_hlc: ev.hlc.clone(),
+                                last_update_event_hash: event_hash,
+                            },
+                        );
+                    }
+                    // Else: stale event (incoming HLC/hash ≤ current entry); silent drop.
+                }
             }
 
             // kd=dc DraftCandidate: append new candidate with implicit self-approval.
@@ -3188,6 +3263,179 @@ mod tests {
         assert!(
             poll.deliberation.statements.is_empty(),
             "event outside deliberation window must be silently dropped"
+        );
+    }
+
+    // ── Task 4: kd=dv apply_event tests ──────────────────────────────────────
+
+    /// Build a kd=dv event with a specific vote byte (raw u8, so we can test invalid values).
+    fn dv_event_raw(
+        wall_ms: u64,
+        actor: OwnerAddr,
+        statement_hash: [u8; 32],
+        vote_byte: u8,
+    ) -> SignedVotingEvent {
+        let payload = DeliberationVotePayload {
+            poll_id: poll_id(),
+            statement_event_hash: statement_hash,
+            vote: vote_byte,
+        };
+        make_event_with_payload(
+            PollEventKindCode::DeliberationVote,
+            wall_ms,
+            actor,
+            encode(&payload),
+        )
+    }
+
+    /// Build a kd=dv event with a valid BridgingVoteCode.
+    fn dv_event(
+        wall_ms: u64,
+        actor: OwnerAddr,
+        statement_hash: [u8; 32],
+        vote: crate::community_voting_core::BridgingVoteCode,
+    ) -> SignedVotingEvent {
+        dv_event_raw(wall_ms, actor, statement_hash, vote.as_u8())
+    }
+
+    // Task 4 — Test 1: happy path — mini-public member votes agree on existing statement.
+    #[test]
+    fn apply_dv_accepts_valid_vote_from_mini_public() {
+        use crate::community_voting_core::BridgingVoteCode;
+
+        let mut poll = build_poll_in_deliberation_stage();
+        // addr(1) posts a statement.
+        let ds_ev = ds_event_with_text(100, addr(1), "Statement from addr(1)");
+        poll.apply_event(&ds_ev).expect("ds apply");
+        let stmt_hash = sha256_of_signing_bytes(&ds_ev);
+
+        // addr(2) votes agree on that statement.
+        let dv_ev = dv_event(200, addr(2), stmt_hash, BridgingVoteCode::Agree);
+        poll.apply_event(&dv_ev).expect("dv apply");
+
+        let key = (addr(2), stmt_hash);
+        let entry = poll
+            .deliberation
+            .votes
+            .get(&key)
+            .expect("vote entry must exist");
+        assert_eq!(entry.vote, BridgingVoteCode::Agree, "vote must be Agree");
+        assert_eq!(entry.voter, addr(2));
+        assert_eq!(entry.statement_event_hash, stmt_hash);
+    }
+
+    // Task 4 — Test 2: drops vote referencing a non-existent statement.
+    #[test]
+    fn apply_dv_drops_non_existent_statement_reference() {
+        use crate::community_voting_core::BridgingVoteCode;
+
+        let mut poll = build_poll_in_deliberation_stage();
+        let fake_hash = [0x99u8; 32];
+        let dv_ev = dv_event(100, addr(1), fake_hash, BridgingVoteCode::Agree);
+        poll.apply_event(&dv_ev)
+            .expect("apply returns Ok (silent drop)");
+        assert!(
+            poll.deliberation.votes.is_empty(),
+            "vote targeting non-existent statement must be silently dropped"
+        );
+    }
+
+    // Task 4 — Test 3: drops vote from actor not in mini-public.
+    #[test]
+    fn apply_dv_drops_non_mini_public_voter() {
+        use crate::community_voting_core::BridgingVoteCode;
+
+        let mut poll = build_poll_in_deliberation_stage();
+        // addr(1) posts a statement.
+        let ds_ev = ds_event_with_text(100, addr(1), "Some statement");
+        poll.apply_event(&ds_ev).expect("ds apply");
+        let stmt_hash = sha256_of_signing_bytes(&ds_ev);
+
+        // addr(99) is not in primary or backup.
+        let dv_ev = dv_event(200, addr(99), stmt_hash, BridgingVoteCode::Agree);
+        poll.apply_event(&dv_ev)
+            .expect("apply returns Ok (silent drop)");
+        assert!(
+            poll.deliberation.votes.is_empty(),
+            "vote from non-mini-public actor must be silently dropped"
+        );
+    }
+
+    // Task 4 — Test 4: LWW — later HLC wins (revote replaces earlier vote).
+    #[test]
+    fn apply_dv_revote_lww_later_hlc_wins() {
+        use crate::community_voting_core::BridgingVoteCode;
+
+        let mut poll = build_poll_in_deliberation_stage();
+        let ds_ev = ds_event_with_text(100, addr(1), "A statement");
+        poll.apply_event(&ds_ev).expect("ds");
+        let stmt_hash = sha256_of_signing_bytes(&ds_ev);
+
+        // First vote: agree at hlc=200.
+        let v1 = dv_event(200, addr(2), stmt_hash, BridgingVoteCode::Agree);
+        poll.apply_event(&v1).expect("v1");
+
+        // Second vote: disagree at hlc=300 (later). LWW: disagree wins.
+        let v2 = dv_event(300, addr(2), stmt_hash, BridgingVoteCode::Disagree);
+        poll.apply_event(&v2).expect("v2");
+
+        let entry = poll
+            .deliberation
+            .votes
+            .get(&(addr(2), stmt_hash))
+            .expect("entry must exist");
+        assert_eq!(
+            entry.vote,
+            BridgingVoteCode::Disagree,
+            "later vote must win"
+        );
+    }
+
+    // Task 4 — Test 5: LWW — earlier HLC dropped (monotonic check may reject first).
+    #[test]
+    fn apply_dv_revote_lww_earlier_hlc_dropped() {
+        use crate::community_voting_core::BridgingVoteCode;
+
+        let mut poll = build_poll_in_deliberation_stage();
+        let ds_ev = ds_event_with_text(100, addr(1), "A statement");
+        poll.apply_event(&ds_ev).expect("ds");
+        let stmt_hash = sha256_of_signing_bytes(&ds_ev);
+
+        // First vote: disagree at hlc=200 (later HLC applied first).
+        let v1 = dv_event(200, addr(2), stmt_hash, BridgingVoteCode::Disagree);
+        poll.apply_event(&v1).expect("v1");
+
+        // Second attempt: agree at hlc=100 (earlier). apply_event's monotonic HLC check
+        // rejects this with HlcNotMonotonic — the existing Disagree entry stays either way.
+        let _ = poll.apply_event(&dv_event(100, addr(2), stmt_hash, BridgingVoteCode::Agree));
+
+        let entry = poll
+            .deliberation
+            .votes
+            .get(&(addr(2), stmt_hash))
+            .expect("entry must still exist");
+        assert_eq!(
+            entry.vote,
+            BridgingVoteCode::Disagree,
+            "earlier vote must not overwrite later vote"
+        );
+    }
+
+    // Task 4 — Test 6: drops vote with invalid vote byte (3).
+    #[test]
+    fn apply_dv_drops_vote_byte_3() {
+        let mut poll = build_poll_in_deliberation_stage();
+        let ds_ev = ds_event_with_text(100, addr(1), "A statement");
+        poll.apply_event(&ds_ev).expect("ds");
+        let stmt_hash = sha256_of_signing_bytes(&ds_ev);
+
+        // Build vote with raw byte=3 (out of range).
+        let dv_ev = dv_event_raw(200, addr(2), stmt_hash, 3);
+        poll.apply_event(&dv_ev)
+            .expect("apply returns Ok (silent drop)");
+        assert!(
+            poll.deliberation.votes.is_empty(),
+            "vote byte=3 (out of range) must be silently dropped"
         );
     }
 }
