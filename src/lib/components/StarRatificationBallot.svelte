@@ -7,6 +7,7 @@
    * Per ZEB-287 R4: every $props field destructured below.
    * Per Tauri error-extraction memory.
    */
+  import { untrack } from 'svelte';
   import type { Tier3PollExport } from '../types/voting';
   import type { VotingAdapter } from '../voting-adapter';
 
@@ -20,11 +21,6 @@
     onCast: () => void;
   } = $props();
 
-  let scores = $state<number[]>([]);
-  let confirming = $state(false);
-  let casting = $state(false);
-  let castError = $state<string | null>(null);
-  let castSuccess = $state(false);
   // Track which (poll, server-cast-state) we last seeded from. Reseed when:
   //   - the active poll changes (different pollId), OR
   //   - the same poll's myRatificationScores transitions null→array, OR
@@ -36,16 +32,32 @@
   // Stringifying the scores array gives a stable identity for "same vs
   // different cast state" — typed arrays are short (≤5 candidates per
   // ZEB-309 cap), so the cost is negligible.
-  let lastSeededKey: string | null = null;
   function seedKey(d: Tier3PollExport): string {
     return `${d.pollId}|${d.myRatificationScores ? JSON.stringify(d.myRatificationScores) : 'null'}`;
   }
+  function initialScores(d: Tier3PollExport): number[] {
+    return d.myRatificationScores
+      ? [...d.myRatificationScores]
+      : new Array(d.ratificationCandidates.length).fill(0);
+  }
+
+  // Seed synchronously at component construction so the first render paints
+  // the correct slider/number values. Initializing `scores = []` and then
+  // populating from a $effect would let the first paint show browser-default
+  // slider midpoints + empty number inputs before snapping on the effect's
+  // first run. `untrack` documents that the snapshot is intentional — the
+  // $effect below handles all subsequent updates to `detail`.
+  let scores = $state<number[]>(untrack(() => initialScores(detail)));
+  let confirming = $state(false);
+  let casting = $state(false);
+  let castError = $state<string | null>(null);
+  let castSuccess = $state(false);
+  let lastSeededKey: string | null = untrack(() => seedKey(detail));
 
   $effect(() => {
     const key = seedKey(detail);
     if (key === lastSeededKey) return;
-    const isPollSwap = lastSeededKey === null
-      || !lastSeededKey.startsWith(`${detail.pollId}|`);
+    const isPollSwap = !lastSeededKey.startsWith(`${detail.pollId}|`);
     lastSeededKey = key;
     castSuccess = false;
     castError = null;

@@ -41,6 +41,23 @@ describe('StarRatificationBallot', () => {
     expect(sliders).toHaveLength(2);
   });
 
+  it('seeds slider + number inputs to 0 synchronously on first render', () => {
+    // Regression: scores were previously initialized as `[]` and populated by
+    // $effect, leaving scores[i] === undefined during the first paint. Now
+    // seeded synchronously via $state initializer.
+    const adapter = new VotingAdapter();
+    const { getAllByRole, container } = render(StarRatificationBallot, {
+      props: { detail, adapter, onCast: () => {} },
+    });
+    const sliders = getAllByRole('slider') as HTMLInputElement[];
+    expect(sliders[0].value).toBe('0');
+    expect(sliders[1].value).toBe('0');
+    const numberInputs = container.querySelectorAll('input[type="number"]') as NodeListOf<HTMLInputElement>;
+    expect(numberInputs).toHaveLength(2);
+    expect(numberInputs[0].value).toBe('0');
+    expect(numberInputs[1].value).toBe('0');
+  });
+
   it('cast button opens confirm modal before invoking', async () => {
     const adapter = new VotingAdapter();
     vi.spyOn(adapter, 'castRatificationBallot').mockResolvedValue();
