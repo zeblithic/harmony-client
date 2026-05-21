@@ -25,11 +25,15 @@
 import type { TauriAdapter } from './zenoh-service';
 import type {
   AutoExecAction,
+  BridgingScoreExport,
   CreateTier3ProposalArgs,
+  DeliberationVoteCode,
   DelegationEdgeExport,
   PollMeta,
   PollStateExport,
   Tier2ProposalExport,
+  Tier3DeliberationStatementCreatedPayload,
+  Tier3DeliberationVoteCastPayload,
   VotingBallotCastPayload,
   VotingDelegateSignaledOnYourBehalfPayload,
   VotingDelegationChangedPayload,
@@ -122,6 +126,14 @@ export class VotingAdapter {
     (p: VotingTier3RatificationOpenPayload) => void
   > = [];
   private tier3FinalizedSubs: Array<(p: VotingTier3FinalizedPayload) => void> = [];
+
+  // ZEB-294 — Tier 3 deliberation event subscribers.
+  private tier3DeliberationStatementCreatedSubs: Array<
+    (p: Tier3DeliberationStatementCreatedPayload) => void
+  > = [];
+  private tier3DeliberationVoteCastSubs: Array<
+    (p: Tier3DeliberationVoteCastPayload) => void
+  > = [];
 
   subscribePollCreated(handler: (p: VotingPollCreatedPayload) => void): () => void {
     this.pollCreatedSubs.push(handler);
@@ -256,6 +268,27 @@ export class VotingAdapter {
     return () => {
       const i = this.tier3FinalizedSubs.indexOf(handler);
       if (i >= 0) this.tier3FinalizedSubs.splice(i, 1);
+    };
+  }
+
+  // ─── ZEB-294 — Tier 3 deliberation event subscribers ────────────────
+  subscribeTier3DeliberationStatementCreated(
+    handler: (p: Tier3DeliberationStatementCreatedPayload) => void,
+  ): () => void {
+    this.tier3DeliberationStatementCreatedSubs.push(handler);
+    return () => {
+      const i = this.tier3DeliberationStatementCreatedSubs.indexOf(handler);
+      if (i >= 0) this.tier3DeliberationStatementCreatedSubs.splice(i, 1);
+    };
+  }
+
+  subscribeTier3DeliberationVoteCast(
+    handler: (p: Tier3DeliberationVoteCastPayload) => void,
+  ): () => void {
+    this.tier3DeliberationVoteCastSubs.push(handler);
+    return () => {
+      const i = this.tier3DeliberationVoteCastSubs.indexOf(handler);
+      if (i >= 0) this.tier3DeliberationVoteCastSubs.splice(i, 1);
     };
   }
 
@@ -423,6 +456,25 @@ export class VotingAdapter {
           },
         );
         stagedUnlisteners.push(unlistenTier3Finalized);
+
+        // ZEB-294 — Tier 3 deliberation events.
+        const unlistenTier3DeliberationStatementCreated = await adapter.listen(
+          'voting-tier3-deliberation-statement-created',
+          (event) => {
+            const payload = event.payload as Tier3DeliberationStatementCreatedPayload;
+            for (const sub of [...this.tier3DeliberationStatementCreatedSubs]) sub(payload);
+          },
+        );
+        stagedUnlisteners.push(unlistenTier3DeliberationStatementCreated);
+
+        const unlistenTier3DeliberationVoteCast = await adapter.listen(
+          'voting-tier3-deliberation-vote-cast',
+          (event) => {
+            const payload = event.payload as Tier3DeliberationVoteCastPayload;
+            for (const sub of [...this.tier3DeliberationVoteCastSubs]) sub(payload);
+          },
+        );
+        stagedUnlisteners.push(unlistenTier3DeliberationVoteCast);
 
         this.adapter = adapter;
         this.unlisteners.push(...stagedUnlisteners);
@@ -600,6 +652,33 @@ export class VotingAdapter {
    *  scaffold — emits valid events but no clustering yet. Returns event_hash hex. */
   async submitDeliberationStatement(pollId: string, text: string): Promise<string> {
     return this.invoke<string>('voting_submit_deliberation_statement', { pollId, text });
+  }
+
+  /** Cast a deliberation vote (kd=dv) on a statement. `vote` is one of
+   *  'agree' | 'disagree' | 'pass'. Mini-public only (backend enforces). */
+  async castDeliberationVote(
+    pollId: string,
+    statementEventHash: string,
+    vote: DeliberationVoteCode,
+  ): Promise<void> {
+    await this.invoke<void>('voting_cast_deliberation_vote', {
+      pollId,
+      statementEventHash,
+      vote,
+    });
+  }
+
+  /** List up to `topN` deliberation statements for a poll, sorted by
+   *  bridging score DESC. Returns the full `BridgingScoreExport` rows
+   *  including diversity and bridging-score fixed-point strings. */
+  async listBridgingStatements(
+    pollId: string,
+    topN: number = 10,
+  ): Promise<BridgingScoreExport[]> {
+    return this.invoke<BridgingScoreExport[]>('voting_list_bridging_statements', {
+      pollId,
+      topN,
+    });
   }
 
   /** Propose a draft candidate (kd=dc). Returns candidate_event_hash hex

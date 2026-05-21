@@ -460,6 +460,73 @@ export interface VotingTier3FinalizedPayload {
   scoresSummary: CandidateScore[];
 }
 
+// ─── ZEB-294 — Tier 3 deliberation types ────────────────────────────────
+// Mirror the Rust `DeliberationStatementExport`, `MyDeliberationVoteExport`,
+// and `BridgingScoreExport` DTOs. All fields arrive camelCased (Rust serde
+// `rename_all = "camelCase"`).
+
+/** Wire vote code for kd=dv DeliberationVote events. */
+export type DeliberationVoteCode = 'agree' | 'disagree' | 'pass';
+
+/** ZEB-294: one deliberation statement with aggregate vote counts.
+ *  Mirrors Rust `DeliberationStatementExport`. */
+export interface DeliberationStatementExport {
+  /** 64-char hex SHA-256 of the signing bytes of the kd=ds event. */
+  statementEventHash: string;
+  /** 32-char hex (OwnerAddr is 16 bytes). */
+  author: string;
+  text: string;
+  createdAtHlcMs: number;
+  agreeCount: number;
+  disagreeCount: number;
+  passCount: number;
+}
+
+/** ZEB-294: caller's vote on a single deliberation statement.
+ *  Mirrors Rust `MyDeliberationVoteExport`. */
+export interface MyDeliberationVoteExport {
+  statementEventHash: string;
+  vote: DeliberationVoteCode;
+}
+
+/** ZEB-294: bridging-score row for a deliberation statement.
+ *  Mirrors Rust `BridgingScoreExport`. Returned by
+ *  `adapter.listBridgingStatements(pollId, topN)`. */
+export interface BridgingScoreExport {
+  /** 64-char hex SHA-256 of the signing bytes of the kd=ds event. */
+  statementEventHash: string;
+  statementText: string;
+  /** 32-char hex (OwnerAddr is 16 bytes). */
+  author: string;
+  agreeCount: number;
+  disagreeCount: number;
+  passCount: number;
+  /** Q32 fixed-point u64 as decimal string. Frontend renders as 0..1 float
+   *  for the heat bar — never used for sort. */
+  diversityQ32: string;
+  /** Q64 fixed-point u64 as decimal string. Sort key. */
+  bridgingScoreQ64: string;
+}
+
+/** Tauri event payload for `voting-tier3-deliberation-statement-created`.
+ *  Fired post-apply for every accepted kd=ds event. */
+export interface Tier3DeliberationStatementCreatedPayload {
+  pollId: string;
+  statementEventHash: string;
+  author: string;
+  text: string;
+  createdAtHlcMs: number;
+}
+
+/** Tauri event payload for `voting-tier3-deliberation-vote-cast`.
+ *  Fired post-apply for every accepted kd=dv event. */
+export interface Tier3DeliberationVoteCastPayload {
+  pollId: string;
+  statementEventHash: string;
+  voter: string;
+  vote: DeliberationVoteCode;
+}
+
 // ─── ZEB-311 Phase 4a-main — Tier 3 pull-IPC types ─────────────────────
 // Mirror the Rust Tier3PollExport + Tier3PollSummary DTOs produced by
 // `voting_get_tier3_poll` and `voting_list_tier3_polls`. All fields
@@ -512,6 +579,14 @@ export interface Tier3PollExport {
   myRole: Tier3MyRole;
   myDraftingApprovals: string[];
   myRatificationScores: number[] | null;
+  /** ZEB-294: deliberation statements with aggregate vote counts.
+   *  Ordered by statementEventHash ascending (BTreeMap iteration order). */
+  deliberationStatements: DeliberationStatementExport[];
+  /** ZEB-294: caller's accepted-statement count (for composer 5-cap UX). */
+  myDeliberationStatementCount: number;
+  /** ZEB-294: caller's per-statement votes; entry exists only for
+   *  statements the caller has voted on. */
+  myDeliberationVotes: MyDeliberationVoteExport[];
   winnerEventHash: string | null;
   runnerUpEventHash: string | null;
 }
