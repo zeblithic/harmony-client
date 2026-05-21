@@ -219,6 +219,14 @@ fn spawn_event_loop(
                         >(1);
                         rx
                     },
+                    {
+                        // ZEB-298+ZEB-312 PR 1: voting-log adapter request channel;
+                        // not exercised in this test, tx dropped immediately.
+                        let (_tx, rx) = tokio::sync::mpsc::channel::<
+                            harmony_app::event_loop::VotingLogAdapterRequest,
+                        >(1);
+                        rx
+                    },
                     None, // ZEB-262 Phase 4 Task 9: community_registry not exercised in this test
                     {
                         let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<

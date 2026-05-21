@@ -473,6 +473,13 @@ pub struct NodeState {
     /// loop's channel.
     community_adapter_request_tx:
         Option<tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>>,
+    /// ZEB-298+ZEB-312 PR 1: per-community voting-log adapter request
+    /// channel. `ensure_voting_engine_for` sends a `VotingLogAdapterRequest`
+    /// here; event_loop::run drains it and calls
+    /// `spawn_voting_log_zenoh_adapter` against the live session.
+    /// `None` until start_node wires it; cleared in stop_inner.
+    voting_log_adapter_request_tx:
+        Option<tokio::sync::mpsc::Sender<crate::event_loop::VotingLogAdapterRequest>>,
     /// ZEB-270 Phase 3 Task 4C: per-(community, channel) ChannelLog
     /// engine registry. `None` until `start_node` constructs it
     /// (post-event-loop-ready, so the registry can hold the live
@@ -689,6 +696,8 @@ impl Default for NodeState {
             unicast_send_tx: None,
             dm_identity_pub_64: None,
             community_adapter_request_tx: None,
+            // ZEB-298+ZEB-312 PR 1: cleared until start_node wires it.
+            voting_log_adapter_request_tx: None,
             // ZEB-270 Task 4C: registry stays None until start_node
             // wires it (see follow-up Task 4C deferred work).
             channel_log_registry: None,
@@ -996,6 +1005,12 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         // create_community calls in this lifetime) so a restart's
         // fresh `Sender` doesn't collide with a leaked one.
         let _ = guard.community_adapter_request_tx.take();
+        // ZEB-298+ZEB-312 PR 1: drop the voting-log adapter-request
+        // sender. The event_loop's matching receiver gets None on next
+        // recv(); the select arm exits cleanly. Cleared even when the
+        // channel was unused so a restart's fresh Sender doesn't
+        // collide with a leaked one.
+        let _ = guard.voting_log_adapter_request_tx.take();
         // ZEB-270 Phase 3 Task 4C: take the registry handle so we
         // can run `shutdown_all` against it below outside the std
         // `MutexGuard` scope (the `block_on` would panic on the
@@ -1636,6 +1651,10 @@ async fn start_node(
         // loop. The new event loop is constructed below with a fresh
         // channel pair.
         let _ = guard.community_adapter_request_tx.take();
+        // ZEB-298+ZEB-312 PR 1: clear the previous voting-log adapter-
+        // request sender so it doesn't outlive the previous event loop.
+        // A fresh channel pair is constructed below.
+        let _ = guard.voting_log_adapter_request_tx.take();
         // ZEB-270 Phase 3 Task 4.5: take the prior channel-log
         // registry into the outer-scope binding. Awaited outside the
         // guard scope (the std `MutexGuard` is `!Send`) — mirrors
@@ -3413,6 +3432,13 @@ async fn start_node(
                 // IPC side rather than blocking under contention.
                 let (community_adapter_request_tx, community_adapter_request_rx) =
                     tokio::sync::mpsc::channel::<crate::event_loop::CommunityAdapterRequest>(32);
+                // ZEB-298+ZEB-312 PR 1: on-demand voting-log adapter request channel.
+                // `ensure_voting_engine_for` sends requests here; the event_loop
+                // select! arm drains and calls `spawn_voting_log_zenoh_adapter`.
+                // Capacity 32 mirrors the community state-root channel — voting
+                // engine creation is always user-triggered via IPC, low burst rate.
+                let (voting_log_adapter_request_tx, voting_log_adapter_request_rx) =
+                    tokio::sync::mpsc::channel::<crate::event_loop::VotingLogAdapterRequest>(32);
                 // ZEB-262 Phase 4 Task 9: clone the community_registry handle
                 // for event_loop::run BEFORE the closure capture below moves
                 // `community_registry_arc` (the post-spawn `guard.community_registry`
@@ -3528,6 +3554,7 @@ async fn start_node(
                                 unicast_send_tx_for_loop,
                                 community_adapter_requests_for_loop,
                                 community_adapter_request_rx,
+                                voting_log_adapter_request_rx,
                                 community_registry_for_loop,
                                 channel_log_adapter_request_rx_for_loop,
                                 library_directory_for_loop,
@@ -3622,6 +3649,12 @@ async fn start_node(
                         // `CommunityAdapterRequest`s into the event loop. The
                         // matching rx was moved into event_loop::run above.
                         guard.community_adapter_request_tx = Some(community_adapter_request_tx);
+                        // ZEB-298+ZEB-312 PR 1: store the voting-log adapter-
+                        // request sender so `ensure_voting_engine_for` can
+                        // dispatch `VotingLogAdapterRequest`s into the event
+                        // loop. The matching rx was moved into event_loop::run
+                        // above.
+                        guard.voting_log_adapter_request_tx = Some(voting_log_adapter_request_tx);
                         // ZEB-270 Phase 3 Task 4.5: store the channel-log
                         // registry handle so stop_inner can flip every
                         // per-channel `closing` flag and run final flushes
@@ -22114,8 +22147,45 @@ type VotingLogEnginesMap = std::sync::Arc<
     >,
 >;
 
+/// Production `MembershipSnapshotResolver` that reads from the live
+/// `NodeState` handles (`community_registry` + `crdt_state`). Wraps
+/// `voting_build_snapshot_for_community`. The HLC parameter is currently
+/// unused — the underlying helper returns an at-HEAD snapshot.
+///
+/// TODO ZEB-315: plumb historical-HLC resolution so events from
+/// recently-removed members aren't rejected during membership churn.
+pub struct NodeStateMembershipResolver {
+    pub community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
+    pub crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+}
+
+#[async_trait::async_trait]
+impl crate::community_voting_log::MembershipSnapshotResolver for NodeStateMembershipResolver {
+    async fn snapshot_at(
+        &self,
+        community_id: crate::owner_state_types::SpaceId,
+        _hlc: &crate::owner_state_types::Hlc, // TODO ZEB-315: use this for historical resolution
+    ) -> Result<
+        crate::community_voting_core::MembershipSnapshot,
+        crate::community_voting_log::SnapshotResolverError,
+    > {
+        voting_build_snapshot_for_community(
+            self.crdt_state.clone(),
+            self.community_registry.clone(),
+            community_id,
+        )
+        .await
+        .map_err(crate::community_voting_log::SnapshotResolverError::BackendError)
+    }
+}
+
 /// Lazy-register a `VotingLogEngine` for `community_id` if none exists,
 /// sharing the per-community `Arc<Mutex<VotingLog>>` from `voting_logs`.
+///
+/// ZEB-298+ZEB-312 PR 1: the engine is now production-active — its mpsc
+/// halves are bridged to Zenoh via `VotingLogAdapterRequest` so cross-peer
+/// Tier 2 sync lights up. The signing key is installed via
+/// `install_local_signing_key` so engine-auto orchestration can mint events.
 ///
 /// ZEB-309 Phase 4a-main Task 11: `dfrost_log_registry` and `beacon_requester`
 /// are optional; when both are `Some`, `install_dfrost_handle` is called on
@@ -22123,24 +22193,34 @@ type VotingLogEnginesMap = std::sync::Arc<
 /// requests and arriving beacons trigger kd=ss publication. Pre-existing
 /// engines (already in the map) are NOT re-wired — they were wired at their
 /// creation time.
-///
-/// TODO ZEB-291 Task 19.1: the engine's `publisher_tx` currently drops on
-/// the floor and `subscriber_rx` is never fed — wire the existing Zenoh
-/// adapter (`harmony/community/{id}/voting`) so cross-peer Tier 2 sync
-/// lights up. Phase 2 ships single-node-correct: every Tier 2 IPC applies
-/// directly to the local `VotingLog` (which the engine ALSO holds), so
-/// local UX works; remote peers only see local-mint events once the
-/// adapter is wired.
+#[allow(clippy::too_many_arguments)]
 async fn ensure_voting_engine_for(
     voting_logs: &VotingLogsMap,
     voting_log_engines: &VotingLogEnginesMap,
     community_id: crate::owner_state_types::SpaceId,
+    // ZEB-298+ZEB-312 PR 1 new params:
+    voting_log_adapter_request_tx: tokio::sync::mpsc::Sender<
+        crate::event_loop::VotingLogAdapterRequest,
+    >,
+    hlc_tracker: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+    >,
+    device_id: String,
+    // Note: app_handle deliberately omitted — see TODO in fn body. Tier 3
+    // lifecycle events deferred to PR 2; Tier 2-only scope is unaffected.
+    local_signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    local_owner: crate::owner_state_types::OwnerAddr,
+    membership_resolver: std::sync::Arc<
+        dyn crate::community_voting_log::MembershipSnapshotResolver,
+    >,
+    // Existing trailing params:
     dfrost_log_registry: Option<
         std::sync::Arc<crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>>,
     >,
     beacon_requester: Option<crate::community_voting_log_engine::BeaconRequester>,
 ) -> Result<(), String> {
-    // Fast-path read under the std::Mutex (no awaits).
+    // Fast-path read under the std::Mutex (no awaits). Saves the
+    // engine-construction cost when the engine already exists.
     {
         let g = voting_log_engines
             .lock()
@@ -22160,27 +22240,21 @@ async fn ensure_voting_engine_for(
             })
             .clone()
     };
-    // Build stub mpsc pairs: publisher_tx drops on the floor (its
-    // receiver is held inside an immediately-spawned drain task that
-    // exits when the sender is dropped, NEVER while the engine lives);
-    // subscriber_rx is fed by nothing (its matching Sender is created
-    // here and immediately dropped, so the engine's inbound loop sees
-    // the channel as closed and exits without doing any work). Bot
-    // halves get replaced once Task 19.1 wires the real Zenoh adapter.
-    let (publisher_tx, publisher_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
-    // Drain the stub publisher so try_send doesn't pile up infinitely
-    // — without this drain, the channel fills and publishes start
-    // logging "publisher_tx full or closed" warnings. The drain task
-    // exits cleanly when the engine drops its sender (i.e. when the
-    // registry drops the Arc).
-    tokio::spawn(async move {
-        let mut rx = publisher_rx;
-        while rx.recv().await.is_some() {
-            // Drop on the floor. TODO Task 19.1: forward to Zenoh adapter.
-        }
-    });
-    let (sub_tx_unused, subscriber_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
-    drop(sub_tx_unused);
+
+    // TODO ZEB-298+ZEB-312 PR 2 follow-up: wire production identity_resolver
+    // from OwnerDeviceCacheResolver (or a thin Ed25519-extracting adapter).
+    // PR 1 leaves identity_resolver: None — inbound events return a clear
+    // error until the production wiring lands; outbound publishing is fully
+    // functional.
+    let identity_resolver: Option<
+        std::sync::Arc<dyn crate::community_voting_core::VotingIdentityResolver>,
+    > = None;
+
+    // Build the engine's mpsc halves; the "other halves" are bundled into
+    // the VotingLogAdapterRequest below and sent to the event loop only
+    // if we win the engine map race.
+    let (publisher_tx, publisher_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let (subscriber_tx, subscriber_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
 
     let engine = crate::community_voting_log_engine::VotingLogEngine::start(
         crate::community_voting_log_engine::VotingLogEngineParams {
@@ -22188,30 +22262,32 @@ async fn ensure_voting_engine_for(
             voting_log: log_arc,
             publisher_tx,
             subscriber_rx,
-            // ZEB-310 Task 9: engine-auto orchestration is dormant in
-            // Phase 4a-main production wiring — the IPC layer applies
-            // directly to the local VotingLog rather than going through
-            // `engine.publish_event`. Tasks 19.x will plumb the real
-            // `hlc_tracker` + `device_id` from NodeState here and
-            // install the signing key via `install_local_signing_key`
-            // once IPC mints route through the engine.
-            hlc_tracker: None,
-            device_id: None,
-            // ZEB-310 Task 12: engine-auto Tier 3 lifecycle events are
-            // dormant in this wiring too. Once the IPC layer routes Tier 3
-            // mints through `engine.publish_event`, plumb `app_handle`
-            // here so the four post-apply lifecycle events
-            // (sortition-complete / drafting-open / ratification-open /
-            // finalized) fire to the UI.
+            hlc_tracker: Some(hlc_tracker),
+            device_id: Some(device_id),
+            // TODO ZEB-298+ZEB-312 PR 2 follow-up: wire app_handle so
+            // Tier 3 lifecycle events (sortition-complete / drafting-open /
+            // ratification-open / finalized) fire to the UI. Deferred
+            // because the IPC handlers are generic over R: tauri::Runtime
+            // but VotingLogEnginesMap is typed for tauri::Wry — threading
+            // AppHandle<Wry> through generic IPC handlers requires either
+            // a type-erased handle or a dedicated wrapper. Tier 2-only
+            // scope in PR 1 is unaffected.
             app_handle: None,
+            identity_resolver,
+            membership_resolver: Some(membership_resolver),
         },
     )
     .await;
 
+    // ZEB-298+ZEB-312 PR 1: install the local signing key so the engine
+    // can mint and sign events via engine-auto orchestration paths.
+    engine
+        .install_local_signing_key(local_signing_key, local_owner)
+        .await;
+
     // ZEB-309 Phase 4a-main Task 11: wire DfrostLog handle so the engine
     // can trigger VRF beacon requests on Tier 3 PollCreate and publish
-    // kd=ss on beacon arrival. Called before inserting into the map so the
-    // engine is fully wired before any concurrent caller can reach it.
+    // kd=ss on beacon arrival.
     if let (Some(registry), Some(requester)) = (dfrost_log_registry, beacon_requester) {
         crate::community_voting_log_engine::VotingLogEngine::install_dfrost_handle(
             &engine, registry, requester,
@@ -22219,14 +22295,46 @@ async fn ensure_voting_engine_for(
         .await;
     }
 
-    let mut g = voting_log_engines
-        .lock()
-        .map_err(|e| format!("voting_log_engines poisoned: {e}"))?;
-    // Race: another caller may have raced us to insert. The "winner" is
-    // whichever Arc landed first; we drop ours by overwrite-only-if-
-    // -empty semantics. Use entry().or_insert_with for atomic
-    // insert-if-absent.
-    g.entry(community_id).or_insert(engine);
+    // Build the adapter request now but do NOT send yet — we only send if
+    // we win the engine map insertion below. This closes the TOCTOU window
+    // where two concurrent first-time callers could each send an adapter
+    // request and spawn duplicate Zenoh subscribers on the same topic.
+    let req = crate::event_loop::VotingLogAdapterRequest {
+        id_hex: hex::encode(community_id.0),
+        publisher_rx,
+        subscriber_tx,
+    };
+
+    // Atomic check-and-insert under the std::Mutex. The FIRST caller to
+    // reach this lock for a given community wins and proceeds to spawn
+    // the Zenoh adapter; losers drop their locally-built engine + adapter
+    // halves here without ever spawning a duplicate subscriber.
+    let won_insertion = {
+        let mut g = voting_log_engines
+            .lock()
+            .map_err(|e| format!("voting_log_engines poisoned: {e}"))?;
+        if let std::collections::hash_map::Entry::Vacant(e) = g.entry(community_id) {
+            e.insert(engine);
+            true
+        } else {
+            false
+        }
+    };
+    if !won_insertion {
+        // Lost the race: the locally-built engine + req drop here. The
+        // engine's spawned task observes its publisher_rx peer dropping
+        // (when req drops) and exits cleanly on next poll.
+        return Ok(());
+    }
+
+    // Won the race: spawn the Zenoh adapter on the topic. On send failure
+    // (event loop is shutting down), the engine remains in the map but
+    // without Zenoh wiring — only reachable during app shutdown, after
+    // which no further IPC will exercise it.
+    voting_log_adapter_request_tx
+        .send(req)
+        .await
+        .map_err(|e| format!("voting_log_adapter_request_tx send failed: {e}"))?;
     Ok(())
 }
 
@@ -22507,6 +22615,7 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
         voting_log_engines,
         dfrost_log_registry_for_engine,
         beacon_requester_for_engine,
+        voting_log_adapter_request_tx,
     ) = {
         let g = state_lock
             .lock()
@@ -22529,20 +22638,46 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
             // ZEB-309 Task 11: pass dfrost handles so new engines get wired.
             g.dfrost_log_registry.clone(),
             g.beacon_requester.clone(),
+            // ZEB-298+ZEB-312 PR 1: sender for voting-log adapter requests.
+            g.voting_log_adapter_request_tx
+                .clone()
+                .ok_or("voting_log_adapter_request_tx missing — node not running?")?,
         )
     };
 
     // ── 4. Build snapshot + verify creator eligibility ────────────────
-    let snapshot =
-        voting_build_snapshot_for_community(crdt_state, community_registry, space_id).await?;
+    let snapshot = voting_build_snapshot_for_community(
+        crdt_state.clone(),
+        community_registry.clone(),
+        space_id,
+    )
+    .await?;
     crate::community_voting_core::check_eligibility(&snapshot, &self_owner, &cfg.eligibility)
         .map_err(|e| format!("voting_create_tier2_proposal: creator not eligible: {e:?}"))?;
 
     // ── 5. Lazy-register the engine for this community ────────────────
+    // ZEB-298+ZEB-312 PR 1: extract signing key and build membership
+    // resolver before calling ensure_voting_engine_for.
+    let local_signing_key_for_engine = {
+        let outbox_g = dm_outbox.lock().await;
+        std::sync::Arc::clone(&outbox_g.signing_key)
+    };
+    let membership_resolver_for_engine: std::sync::Arc<
+        dyn crate::community_voting_log::MembershipSnapshotResolver,
+    > = std::sync::Arc::new(NodeStateMembershipResolver {
+        community_registry: community_registry.clone(),
+        crdt_state: crdt_state.clone(),
+    });
     ensure_voting_engine_for(
         &voting_logs,
         &voting_log_engines,
         space_id,
+        voting_log_adapter_request_tx,
+        hlc_tracker.clone(),
+        device_id.clone(),
+        local_signing_key_for_engine,
+        self_owner,
+        membership_resolver_for_engine,
         dfrost_log_registry_for_engine,
         beacon_requester_for_engine,
     )
@@ -22764,6 +22899,7 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
         voting_log_engines,
         dfrost_log_registry_for_engine,
         beacon_requester_for_engine,
+        voting_log_adapter_request_tx,
     ) = {
         let g = state_lock
             .lock()
@@ -22786,13 +22922,21 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
             // ZEB-309 Task 11: pass dfrost handles so new engines get wired.
             g.dfrost_log_registry.clone(),
             g.beacon_requester.clone(),
+            // ZEB-298+ZEB-312 PR 1: sender for voting-log adapter requests.
+            g.voting_log_adapter_request_tx
+                .clone()
+                .ok_or("voting_log_adapter_request_tx missing — node not running?")?,
         )
     };
 
     // Membership check: both caller AND delegate must currently be in
     // the community. Both surfaces use 16-byte OwnerAddr keys.
-    let snapshot =
-        voting_build_snapshot_for_community(crdt_state, community_registry, space_id).await?;
+    let snapshot = voting_build_snapshot_for_community(
+        crdt_state.clone(),
+        community_registry.clone(),
+        space_id,
+    )
+    .await?;
     if !snapshot.members.contains_key(&self_owner) {
         return Err("voting_delegate_tier2: caller is not a current community member".into());
     }
@@ -22801,10 +22945,27 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
     }
 
     // Lazy-register the engine so the per-community log exists.
+    // ZEB-298+ZEB-312 PR 1: build signing key + membership resolver for new params.
+    let local_signing_key_for_engine = {
+        let outbox_g = dm_outbox.lock().await;
+        std::sync::Arc::clone(&outbox_g.signing_key)
+    };
+    let membership_resolver_for_engine: std::sync::Arc<
+        dyn crate::community_voting_log::MembershipSnapshotResolver,
+    > = std::sync::Arc::new(NodeStateMembershipResolver {
+        community_registry: community_registry.clone(),
+        crdt_state: crdt_state.clone(),
+    });
     ensure_voting_engine_for(
         &voting_logs,
         &voting_log_engines,
         space_id,
+        voting_log_adapter_request_tx,
+        hlc_tracker.clone(),
+        device_id.clone(),
+        local_signing_key_for_engine,
+        self_owner,
+        membership_resolver_for_engine,
         dfrost_log_registry_for_engine,
         beacon_requester_for_engine,
     )
@@ -22872,6 +23033,9 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
         voting_log_engines,
         dfrost_log_registry_for_engine,
         beacon_requester_for_engine,
+        voting_log_adapter_request_tx,
+        community_registry,
+        crdt_state,
     ) = {
         let g = state_lock
             .lock()
@@ -22888,13 +23052,41 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
             // ZEB-309 Task 11: pass dfrost handles so new engines get wired.
             g.dfrost_log_registry.clone(),
             g.beacon_requester.clone(),
+            // ZEB-298+ZEB-312 PR 1: sender for voting-log adapter requests.
+            g.voting_log_adapter_request_tx
+                .clone()
+                .ok_or("voting_log_adapter_request_tx missing — node not running?")?,
+            // ZEB-298+ZEB-312 PR 1: needed to build NodeStateMembershipResolver.
+            g.community_registry
+                .clone()
+                .ok_or("community_registry missing — node not running?")?,
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
         )
     };
 
+    // ZEB-298+ZEB-312 PR 1: build signing key + membership resolver for new params.
+    let local_signing_key_for_engine = {
+        let outbox_g = dm_outbox.lock().await;
+        std::sync::Arc::clone(&outbox_g.signing_key)
+    };
+    let membership_resolver_for_engine: std::sync::Arc<
+        dyn crate::community_voting_log::MembershipSnapshotResolver,
+    > = std::sync::Arc::new(NodeStateMembershipResolver {
+        community_registry,
+        crdt_state,
+    });
     ensure_voting_engine_for(
         &voting_logs,
         &voting_log_engines,
         space_id,
+        voting_log_adapter_request_tx,
+        hlc_tracker.clone(),
+        device_id.clone(),
+        local_signing_key_for_engine,
+        self_owner,
+        membership_resolver_for_engine,
         dfrost_log_registry_for_engine,
         beacon_requester_for_engine,
     )
@@ -29145,6 +29337,7 @@ mod start_node_race_tests {
             dm_send_stopping: None,
             dm_identity_pub_64: None,
             community_adapter_request_tx: None,
+            voting_log_adapter_request_tx: None,
             channel_log_registry: None,
             dfrost_log_registry: None,
             beacon_requester: None,
