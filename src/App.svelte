@@ -26,6 +26,9 @@
   import RedeemInviteDialog from './lib/components/RedeemInviteDialog.svelte';
   import CommunityView from './lib/components/CommunityView.svelte';
   import LibraryDirectoryBrowser from './lib/components/LibraryDirectoryBrowser.svelte';
+  import ToastHost from './lib/components/ToastHost.svelte';
+  import { VotingAdapter } from './lib/voting-adapter';
+  import { setupDelegateOnBehalfToast } from './lib/voting-toast-wiring';
   import { LibraryDirectoryService } from './lib/library-directory-service';
   import { ProfileBroadcastService } from './lib/profile-broadcast-service';
   import type { TauriAdapter } from './lib/zenoh-service';
@@ -246,6 +249,13 @@
   // adapter wires up. The CommunitySettingsPanel toggle and the
   // ProfilePopover memberships section both route through this instance.
   let profileBroadcastService = $state<ProfileBroadcastService | null>(null);
+  // ZEB-298 PR 2 Task 10 — singleton VotingAdapter shared by the
+  // delegate-on-behalf toast wiring and any voting-UI components that
+  // accept the `votingAdapter` prop (CommunityView et al.). Constructed
+  // up-front so module-scope wiring code can reference the same
+  // instance regardless of Tauri-init ordering; `connectAdapter` runs
+  // exactly once below, after the TauriAdapter is established.
+  const votingAdapter = new VotingAdapter();
   // Local mirror of per-community shared_in_profile state. The backend
   // is the source of truth; we hydrate this Map at startup via
   // `profileBroadcastService.listSharedSet()` (see ZEB-281 Sub-D Phase 4
@@ -601,6 +611,23 @@
       tauriAdapter = adapter;
       libraryDirectoryService = new LibraryDirectoryService(adapter);
       profileBroadcastService = new ProfileBroadcastService(adapter);
+
+      // ZEB-298 PR 2 Task 10 — wire the voting adapter so the
+      // delegate-on-behalf Tauri event can fire toast notifications.
+      // connectAdapter resolves once all voting-event listeners are
+      // registered; only after that do we attach the toast handler so
+      // we never miss an in-flight event during boot. Failure is
+      // logged at warn level (matching other tryConnect callers below)
+      // — toast notifications are non-critical UX; rest of the app
+      // boots regardless.
+      void votingAdapter
+        .connectAdapter(adapter)
+        .then(() => {
+          setupDelegateOnBehalfToast(votingAdapter);
+        })
+        .catch((err) => {
+          console.warn('[harmony-client] votingAdapter connect failed:', err);
+        });
 
       // Per-service connect wrapper: logs failures with the adapter name but
       // doesn't cascade — a broken MessageService shouldn't kill VineService.
@@ -1235,6 +1262,14 @@
 
 <svelte:window bind:innerWidth />
 
+<!--
+  ZEB-298 PR 2 Task 10 — ToastHost mounts unconditionally at the top of
+  the template so toast notifications (e.g., delegate-on-behalf events)
+  appear regardless of which view is active. The host is `position:
+  fixed` so it floats above whatever Layout renders.
+-->
+<ToastHost />
+
 <BackupStalenessWarning onExportRequested={handleExportRequested} />
 
 <Layout {collapsed} {showSettings} mode={appMode} mailSelected={selectedMailCid !== null}>
@@ -1289,6 +1324,7 @@
         {channelMessageService}
         {trustService}
         {navService}
+        {votingAdapter}
         onForkSuccess={(forkSpaceId) => {
           // ZEB-285: navigate to the newly created fork community and
           // refresh its member roster (matching create/join/redeem flows).
