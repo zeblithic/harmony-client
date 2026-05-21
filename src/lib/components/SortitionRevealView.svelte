@@ -20,14 +20,19 @@
     return hex.length > 16 ? `${hex.slice(0, 8)}…${hex.slice(-4)}` : hex;
   }
 
-  let amInPrimary = $derived(detail.miniPublic.includes(myAddr));
-  let amInBackup = $derived(detail.backupPool.includes(myAddr));
+  // Banner state is driven by `detail.myRole`, which the backend projects
+  // from the *effective* mini-public (current_mini_public after declines +
+  // backup promotion). Deriving from the static `miniPublic` / `backupPool`
+  // rosters would misclassify promoted backups (role=mini_public, still in
+  // static backupPool) and declined primaries (role=observer, still in
+  // static miniPublic). The roster lists below stay tied to the static
+  // sortition draw — they're a historical record, not active state.
   let declinedSet = $derived(new Set(detail.declined.map(([owner]) => owner)));
 </script>
 
-{#if amInPrimary}
+{#if detail.myRole === 'mini_public'}
   <p class="selected-banner">🎯 You were selected for the mini-public!</p>
-{:else if amInBackup}
+{:else if detail.myRole === 'backup'}
   <p class="backup-banner">You're in the backup pool — you'll be promoted if a primary member declines.</p>
 {/if}
 

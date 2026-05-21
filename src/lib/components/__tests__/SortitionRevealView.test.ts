@@ -36,11 +36,53 @@ describe('SortitionRevealView', () => {
     expect(getByText(/Backup pool \(1\)/)).toBeTruthy();
   });
 
-  it('highlights "You were selected!" when self in primary', () => {
+  it('shows "You were selected" banner when myRole=mini_public', () => {
     const { getByText } = render(SortitionRevealView, {
       props: { detail: { ...baseDetail, myRole: 'mini_public' }, myAddr: 'aa'.repeat(32) },
     });
     expect(getByText(/You were selected/i)).toBeTruthy();
+  });
+
+  it('shows "backup pool" banner when myRole=backup', () => {
+    const { getByText } = render(SortitionRevealView, {
+      props: { detail: { ...baseDetail, myRole: 'backup' }, myAddr: 'cc'.repeat(32) },
+    });
+    // Match banner copy specifically, not the "Backup pool (N)" roster heading.
+    expect(getByText(/in the backup pool/i)).toBeTruthy();
+  });
+
+  it('shows no banner when myRole=observer (declined primary case)', () => {
+    // Self is in static miniPublic but declined → backend projects myRole=observer.
+    // Banner must NOT use the static roster as source of truth.
+    const { queryByText } = render(SortitionRevealView, {
+      props: {
+        detail: {
+          ...baseDetail,
+          myRole: 'observer',
+          declined: [['aa'.repeat(32), 1_700_000_500_000]],
+        },
+        myAddr: 'aa'.repeat(32),
+      },
+    });
+    expect(queryByText(/You were selected/i)).toBeNull();
+    expect(queryByText(/in the backup pool/i)).toBeNull();
+  });
+
+  it('shows "You were selected" banner for promoted backup (in static backupPool, myRole=mini_public)', () => {
+    // Self is in static backupPool but a primary declined and self was promoted →
+    // backend projects myRole=mini_public. Banner must trust myRole, not static roster.
+    const { getByText, queryByText } = render(SortitionRevealView, {
+      props: {
+        detail: {
+          ...baseDetail,
+          myRole: 'mini_public',
+          declined: [['bb'.repeat(32), 1_700_000_500_000]],
+        },
+        myAddr: 'cc'.repeat(32),
+      },
+    });
+    expect(getByText(/You were selected/i)).toBeTruthy();
+    expect(queryByText(/in the backup pool/i)).toBeNull();
   });
 
   it('shows declined members when present', () => {
