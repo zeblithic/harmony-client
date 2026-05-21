@@ -663,6 +663,14 @@ impl NodeState {
     pub fn is_running(&self) -> bool {
         self.thread.is_some()
     }
+
+    /// ZEB-311: test-only helper to set dm_self_owner for integration tests
+    /// that exercise IPC paths requiring a caller identity. Only available
+    /// under the `test-fixtures` feature (never compiled into production).
+    #[cfg(feature = "test-fixtures")]
+    pub fn set_test_self_owner(&mut self, owner: crate::owner_state_types::OwnerAddr) {
+        self.dm_self_owner = Some(owner);
+    }
 }
 
 impl Default for NodeState {
@@ -23960,6 +23968,287 @@ async fn voting_get_tier2_proposal(
     ))
 }
 
+/// ZEB-311: Tauri IPC — get the full state of a single Tier 3 poll by id.
+///
+/// Returns a `Tier3PollExport` projecting `Tier3PollState` into a
+/// camelCased frontend shape. `my_*` fields are resolved from the
+/// caller's `dm_self_owner` (None if unavailable → `my_role = Observer`).
+///
+/// Errors:
+/// - "invalid poll_id hex" — hex decode failure
+/// - "voting_get_tier3_poll: poll {id} not found" — no PollState matches
+/// - "voting_get_tier3_poll: poll {id} is tier {t:?}, not Tier3" — tier mismatch
+#[tauri::command(rename_all = "snake_case")]
+async fn voting_get_tier3_poll(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    poll_id: String,
+) -> Result<Tier3PollExport, String> {
+    voting_get_tier3_poll_impl(state_lock.inner(), poll_id).await
+}
+
+/// ZEB-311: Decoupled implementation of `voting_get_tier3_poll` for integration testing.
+/// Integration tests drive this directly with a raw `&Mutex<NodeState>` rather than
+/// a `tauri::State<'_, ...>` (which is not directly constructible outside Tauri's app setup).
+#[cfg(any(test, feature = "test-fixtures"))]
+pub async fn voting_get_tier3_poll_impl(
+    state_lock: &Mutex<NodeState>,
+    poll_id: String,
+) -> Result<Tier3PollExport, String> {
+    voting_get_tier3_poll_raw(state_lock, poll_id).await
+}
+
+async fn voting_get_tier3_poll_raw(
+    state_lock: &Mutex<NodeState>,
+    poll_id: String,
+) -> Result<Tier3PollExport, String> {
+    let pid_bytes: [u8; 32] = hex::decode(&poll_id)
+        .map_err(|e| format!("invalid poll_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "poll_id must be 32 bytes (64 hex chars)".to_string())?;
+    let pid = crate::community_voting_core::PollId(pid_bytes);
+
+    let (self_owner_opt, voting_logs) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (g.dm_self_owner, std::sync::Arc::clone(&g.voting_logs))
+    };
+
+    let log_arcs: Vec<_> = {
+        let map = voting_logs.lock().await;
+        map.values().cloned().collect()
+    };
+    for log_arc in log_arcs.iter() {
+        let g = log_arc.lock().await;
+        if let Some(state) = g.polls.get(&pid) {
+            if state.meta.tier != crate::community_voting_core::Tier::Sortition {
+                return Err(format!(
+                    "voting_get_tier3_poll: poll {} is tier {:?}, not Tier3",
+                    poll_id, state.meta.tier
+                ));
+            }
+            return build_tier3_export(state, self_owner_opt);
+        }
+    }
+    Err(format!(
+        "voting_get_tier3_poll: poll {} not found",
+        poll_id
+    ))
+}
+
+/// ZEB-311: Pure projection: `PollState` (must be Tier 3) → `Tier3PollExport`.
+fn build_tier3_export(
+    state: &crate::community_voting_log::PollState,
+    self_owner_opt: Option<crate::owner_state_types::OwnerAddr>,
+) -> Result<Tier3PollExport, String> {
+    let t3 = state
+        .tier_state
+        .as_tier3()
+        .ok_or("build_tier3_export: poll is not Tier 3")?;
+
+    let self_in_primary = self_owner_opt
+        .as_ref()
+        .map(|s| {
+            t3.sortition_result
+                .as_ref()
+                .map(|r| r.primary.contains(s))
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    let self_in_backup = self_owner_opt
+        .as_ref()
+        .map(|s| {
+            t3.sortition_result
+                .as_ref()
+                .map(|r| r.backup.contains(s))
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    let self_is_proposer = self_owner_opt
+        .as_ref()
+        .map(|s| s == &t3.meta.proposer)
+        .unwrap_or(false);
+    let my_role = if self_is_proposer {
+        Tier3MyRole::Proposer
+    } else if self_in_primary {
+        Tier3MyRole::MiniPublic
+    } else if self_in_backup {
+        Tier3MyRole::Backup
+    } else {
+        Tier3MyRole::Observer
+    };
+
+    let my_drafting_approvals: Vec<String> = self_owner_opt
+        .map(|s| {
+            t3.candidates
+                .iter()
+                .filter(|c| c.approvals.contains(&s))
+                .map(|c| hex::encode(c.event_hash))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Ratification scores: the voter is on SignedVotingEvent.actor, not on
+    // the RatificationBallotPayload itself (which only carries poll_id + scores).
+    // Walk state.events in reverse to find the most recent kd=rb event from self.
+    let my_ratification_scores: Option<Vec<u8>> = self_owner_opt.and_then(|s| {
+        state
+            .events
+            .iter()
+            .rev()
+            .find(|ev| {
+                ev.kind == crate::community_voting_core::PollEventKindCode::RatificationBallot
+                    && ev.actor == s
+            })
+            .and_then(|ev| {
+                let payload: Result<crate::community_voting_core::RatificationBallotPayload, _> =
+                    ciborium::from_reader(&ev.payload[..]);
+                payload.ok().map(|p| p.scores)
+            })
+    });
+
+    let mini_public = t3
+        .sortition_result
+        .as_ref()
+        .map(|r| r.primary.iter().map(|o| hex::encode(o.0)).collect())
+        .unwrap_or_default();
+    let backup_pool = t3
+        .sortition_result
+        .as_ref()
+        .map(|r| r.backup.iter().map(|o| hex::encode(o.0)).collect())
+        .unwrap_or_default();
+
+    let declined = t3
+        .declines
+        .iter()
+        .map(|(o, h)| (hex::encode(o.0), h.wall_ms as i128))
+        .collect();
+
+    let draft_candidates = t3
+        .candidates
+        .iter()
+        .map(|c| DraftCandidateExport {
+            event_hash: hex::encode(c.event_hash),
+            text: c.text.clone(),
+            proposer: c.proposer.as_ref().map(|p| hex::encode(p.0)),
+            approval_count: c.approvals.len() as u32,
+        })
+        .collect();
+
+    // ratification_candidates: during Finalized, use t3.result.finalists (authoritative).
+    // During Ratification (or any earlier stage), derive from t3.candidates via
+    // drafting_advancers + synthesize_status_quo, which matches the ordering that
+    // kd=rb ballot scores index against.
+    let ratification_candidates: Vec<RatificationCandidateExport> =
+        if let Some(result) = t3.result.as_ref() {
+            // Finalized: use the settled finalists list directly.
+            result
+                .finalists
+                .iter()
+                .map(|f| RatificationCandidateExport {
+                    event_hash: hex::encode(f.event_hash),
+                    text: t3
+                        .candidates
+                        .iter()
+                        .find(|c| c.event_hash == f.event_hash)
+                        .map(|c| c.text.clone())
+                        .unwrap_or_default(),
+                })
+                .collect()
+        } else {
+            // Ratification stage (or earlier): derive the candidate ordering
+            // the same way verify_ratification_ballot does — synthesize status_quo,
+            // run drafting_advancers, then ratification_candidates_ordering.
+            let sq = crate::community_voting_tier3::synthesize_status_quo(&state.meta.poll_id);
+            let sq_hash = sq.event_hash;
+            let mini_public_size = t3
+                .sortition_result
+                .as_ref()
+                .map(|r| r.primary.len())
+                .unwrap_or(t3.meta.config.sortition_size as usize);
+            // Build a candidates slice that includes the synthesized status_quo if present.
+            let all_candidates: Vec<&crate::community_voting_tier3::DraftCandidateState> =
+                std::iter::once(&sq)
+                    .chain(t3.candidates.iter())
+                    .collect();
+            // Use the candidates slice that might or might not include status_quo already.
+            // drafting_advancers returns None if sq_hash not found in the slice.
+            // We pass `all_candidates` so sq is always found.
+            match crate::community_voting_tier3::drafting_advancers(
+                &all_candidates
+                    .iter()
+                    .copied()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                mini_public_size,
+                sq_hash,
+            ) {
+                Some(advancers) => {
+                    let ordered = crate::community_voting_tier3::ratification_candidates_ordering(
+                        &advancers,
+                        sq_hash,
+                    );
+                    ordered
+                        .iter()
+                        .map(|cr| {
+                            // Find matching candidate text, checking both real candidates and sq.
+                            let text = if cr.event_hash == sq_hash {
+                                sq.text.clone()
+                            } else {
+                                t3.candidates
+                                    .iter()
+                                    .find(|c| c.event_hash == cr.event_hash)
+                                    .map(|c| c.text.clone())
+                                    .unwrap_or_default()
+                            };
+                            RatificationCandidateExport {
+                                event_hash: hex::encode(cr.event_hash),
+                                text,
+                            }
+                        })
+                        .collect()
+                }
+                None => Vec::new(),
+            }
+        };
+
+    let winner_event_hash = t3
+        .result
+        .as_ref()
+        .map(|r| hex::encode(r.winner.event_hash));
+    let runner_up_event_hash = t3.result.as_ref().and_then(|r| {
+        r.finalists
+            .iter()
+            .find(|f| f.event_hash != r.winner.event_hash)
+            .map(|f| hex::encode(f.event_hash))
+    });
+
+    Ok(Tier3PollExport {
+        poll_id: hex::encode(state.meta.poll_id.0),
+        community_id: hex::encode(state.meta.community_id.0),
+        proposal_text: t3.meta.config.proposal_text.clone(),
+        proposer: hex::encode(t3.meta.proposer.0),
+        stage: t3.stage.into(),
+        poll_create_hlc_ms: t3.meta.poll_create_hlc.wall_ms as i128,
+        sortition_size: t3.meta.config.sortition_size,
+        deliberation_window_seconds: t3.meta.config.deliberation_window_seconds,
+        drafting_window_seconds: t3.meta.config.drafting_window_seconds,
+        ratification_window_seconds: t3.meta.config.ratification_window_seconds,
+        incentive_mode: t3.meta.config.incentive_mode.clone(),
+        mini_public,
+        backup_pool,
+        declined,
+        draft_candidates,
+        ratification_candidates,
+        my_role,
+        my_drafting_approvals,
+        my_ratification_scores,
+        winner_event_hash,
+        runner_up_event_hash,
+    })
+}
+
 /// Tauri IPC: convenience wrapper for "contesting" a near-finalize
 /// Tier 2 proposal by issuing an Unsignal event from the caller's
 /// identity. If the caller previously signaled support, this withdraws
@@ -26737,6 +27026,8 @@ pub fn run() {
             voting_list_tier2_proposals,
             voting_get_tier2_proposal,
             voting_contest_tier2_finalization,
+            // ZEB-311: Tier 3 pull-style read IPCs.
+            voting_get_tier3_poll,
             // ZEB-292 Phase 3: delegation UI read IPCs.
             voting_get_my_delegate,
             voting_list_delegations,
@@ -26807,6 +27098,8 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         voting_list_tier2_proposals,
         voting_get_tier2_proposal,
         voting_contest_tier2_finalization,
+        // ZEB-311: Tier 3 pull-style read IPCs.
+        voting_get_tier3_poll,
         // ZEB-292 Phase 3: delegation UI read IPCs.
         voting_get_my_delegate,
         voting_list_delegations,
