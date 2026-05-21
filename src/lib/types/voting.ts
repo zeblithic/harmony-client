@@ -459,3 +459,83 @@ export interface VotingTier3FinalizedPayload {
   runnerUpEventHash?: string;
   scoresSummary: CandidateScore[];
 }
+
+// ─── ZEB-311 Phase 4a-main — Tier 3 pull-IPC types ─────────────────────
+// Mirror the Rust Tier3PollExport + Tier3PollSummary DTOs produced by
+// `voting_get_tier3_poll` and `voting_list_tier3_polls`. All fields
+// arrive camelCased (Rust serde `rename_all = "camelCase"`).
+
+/** ZEB-311 — Tier 3 stage tag. Wire-encoded as 2-char strings. */
+export type Tier3Stage = 'so' | 'de' | 'dr' | 'ra' | 'fi' | 'fa';
+
+/** ZEB-311 — caller's role for a Tier 3 poll. snake_case on the wire. */
+export type Tier3MyRole = 'proposer' | 'mini_public' | 'backup' | 'observer';
+
+/** ZEB-311 — one draft candidate visible to the frontend. */
+export interface DraftCandidateExport {
+  /** 64-char hex of the SHA-256 of the kd=dc event's signing bytes. */
+  eventHash: string;
+  text: string;
+  /** 64-char hex OwnerAddr; null for the synthetic status_quo. */
+  proposer: string | null;
+  approvalCount: number;
+}
+
+/** ZEB-311 — one ratification candidate. */
+export interface RatificationCandidateExport {
+  eventHash: string;
+  text: string;
+}
+
+/** ZEB-311 — full Tier 3 poll state for the UI. Returned by
+ *  `adapter.getTier3Poll(pollId)`. */
+export interface Tier3PollExport {
+  pollId: string;
+  communityId: string;
+  proposalText: string;
+  proposer: string;
+  stage: Tier3Stage;
+  /** HLC wall_ms projection. */
+  pollCreateHlcMs: number;
+  sortitionSize: number;
+  deliberationWindowSeconds: number;
+  draftingWindowSeconds: number;
+  ratificationWindowSeconds: number;
+  /** 1-char incentive_mode tag from validate_tier3_poll_config: 'a' | 'b' | 'c' | 'd'. */
+  incentiveMode: string;
+  miniPublic: string[];
+  backupPool: string[];
+  /** Tuples of (ownerHex, hlcMs). */
+  declined: [string, number][];
+  draftCandidates: DraftCandidateExport[];
+  ratificationCandidates: RatificationCandidateExport[];
+  myRole: Tier3MyRole;
+  myDraftingApprovals: string[];
+  myRatificationScores: number[] | null;
+  winnerEventHash: string | null;
+  runnerUpEventHash: string | null;
+}
+
+/** ZEB-311 — list-row shape. Lightweight; no candidate details. */
+export interface Tier3PollSummary {
+  pollId: string;
+  communityId: string;
+  proposalText: string;
+  proposer: string;
+  stage: Tier3Stage;
+  pollCreateHlcMs: number;
+  sortitionSize: number;
+  winnerText: string | null;
+}
+
+/** Stage label for UI display. */
+export function tier3StageLabel(s: Tier3Stage): string {
+  switch (s) {
+    case 'so': return 'Sortition';
+    case 'de': return 'Deliberation';
+    case 'dr': return 'Drafting';
+    case 'ra': return 'Ratification';
+    case 'fi': return 'Finalized';
+    case 'fa': return 'Failed';
+  }
+}

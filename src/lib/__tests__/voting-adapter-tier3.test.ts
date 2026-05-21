@@ -230,3 +230,25 @@ describe('VotingAdapter Tier 3 event subscribers', () => {
     expect(seen[0]?.winnerText).toBe('Winner!');
   });
 });
+
+describe('VotingAdapter.getTier3Poll', () => {
+  it('invokes voting_get_tier3_poll with the camelCased pollId', async () => {
+    const { adapter, invoke } = makeMockAdapter();
+    const a = new VotingAdapter();
+    await a.connectAdapter(adapter);
+    invoke.mockResolvedValueOnce({ pollId: 'aa', stage: 'so' });
+    await a.getTier3Poll('aa');
+    expect(invoke).toHaveBeenCalledWith('voting_get_tier3_poll', { pollId: 'aa' });
+  });
+});
+
+describe('VotingAdapter.listTier3Polls', () => {
+  it('invokes voting_list_tier3_polls with the camelCased communityId', async () => {
+    const { adapter, invoke } = makeMockAdapter();
+    const a = new VotingAdapter();
+    await a.connectAdapter(adapter);
+    invoke.mockResolvedValueOnce([]);
+    await a.listTier3Polls('11');
+    expect(invoke).toHaveBeenCalledWith('voting_list_tier3_polls', { communityId: '11' });
+  });
+});

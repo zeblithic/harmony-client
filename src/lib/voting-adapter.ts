@@ -45,6 +45,8 @@ import type {
   VotingTier3PollCreatedPayload,
   VotingTier3RatificationOpenPayload,
   VotingTier3SortitionCompletePayload,
+  Tier3PollExport,
+  Tier3PollSummary,
 } from './types/voting';
 
 /** Args for `createTier1Poll`. Mirrors the Rust IPC signature 1:1. */
@@ -622,6 +624,19 @@ export class VotingAdapter {
    *  ratification candidate in `candidateOrdering` (0..=5). */
   async castRatificationBallot(pollId: string, scores: number[]): Promise<void> {
     await this.invoke<void>('voting_cast_ratification_ballot', { pollId, scores });
+  }
+
+  /** ZEB-311: Fetch the full state of a single Tier 3 poll by id.
+   *  Returns a `Tier3PollExport` including caller-derived my_role / my_*
+   *  fields. Errors propagate to the caller. */
+  async getTier3Poll(pollId: string): Promise<Tier3PollExport> {
+    return this.invoke<Tier3PollExport>('voting_get_tier3_poll', { pollId });
+  }
+
+  /** ZEB-311: List all Tier 3 polls in a community, ordered by
+   *  PollCreate.hlc descending. Finalized polls are included. */
+  async listTier3Polls(communityId: string): Promise<Tier3PollSummary[]> {
+    return this.invoke<Tier3PollSummary[]>('voting_list_tier3_polls', { communityId });
   }
 
   private async invoke<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
