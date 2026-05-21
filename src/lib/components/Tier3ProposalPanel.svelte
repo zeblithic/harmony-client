@@ -34,6 +34,7 @@
   import MiniPublicParticipationToggle from './MiniPublicParticipationToggle.svelte';
   import DraftingPanel from './DraftingPanel.svelte';
   import StarRatificationBallot from './StarRatificationBallot.svelte';
+  import DeliberationView from './DeliberationView.svelte';
 
   let {
     communityId,
@@ -432,6 +433,9 @@
           <p>Awaiting sortition draw. The D-FROST committee must produce the VRF beacon before the mini-public is selected.</p>
         {:else if selectedDetail.stage === 'de' || selectedDetail.stage === 'dr' || selectedDetail.stage === 'ra' || selectedDetail.stage === 'fi'}
           <SortitionRevealView detail={selectedDetail} {myAddr} />
+          {#if selectedDetail.stage === 'de'}
+            <DeliberationView detail={selectedDetail} {adapter} {myAddr} onChange={refetchSelected} />
+          {/if}
           {#if selectedDetail.myRole === 'mini_public' && (selectedDetail.stage === 'de' || selectedDetail.stage === 'dr')}
             <MiniPublicParticipationToggle detail={selectedDetail} {adapter} {myAddr} onDecline={refetchSelected} />
           {/if}

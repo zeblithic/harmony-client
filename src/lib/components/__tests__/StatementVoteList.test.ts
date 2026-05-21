@@ -1,0 +1,97 @@
+import { render, fireEvent, waitFor } from '@testing-library/svelte';
+import { describe, it, expect, vi } from 'vitest';
+import StatementVoteList from '../StatementVoteList.svelte';
+import { VotingAdapter } from '../../voting-adapter';
+import type { Tier3PollExport, DeliberationStatementExport } from '../../types/voting';
+
+const stmt: DeliberationStatementExport = {
+  statementEventHash: 'aa'.repeat(32),
+  author: '33'.repeat(32),
+  text: 'A bridging idea',
+  createdAtHlcMs: 1_700_000_010_000,
+  agreeCount: 0,
+  disagreeCount: 0,
+  passCount: 0,
+};
+
+const baseDetail: Tier3PollExport = {
+  pollId: 'bb'.repeat(32),
+  communityId: '11'.repeat(16),
+  proposalText: 'Test',
+  proposer: '22'.repeat(32),
+  stage: 'de',
+  pollCreateHlcMs: 1_700_000_000_000,
+  sortitionSize: 100,
+  deliberationWindowSeconds: 1_209_600,
+  draftingWindowSeconds: 604_800,
+  ratificationWindowSeconds: 1_209_600,
+  incentiveMode: 'd',
+  miniPublic: ['33'.repeat(32)],
+  backupPool: [],
+  declined: [],
+  draftCandidates: [],
+  ratificationCandidates: [],
+  myRole: 'mini_public',
+  myDraftingApprovals: [],
+  myRatificationScores: null,
+  deliberationStatements: [stmt],
+  myDeliberationStatementCount: 0,
+  myDeliberationVotes: [],
+  winnerEventHash: null,
+  runnerUpEventHash: null,
+};
+
+describe('StatementVoteList', () => {
+  it('renders tri-button for mini-public', () => {
+    const adapter = new VotingAdapter();
+    const { getByText } = render(StatementVoteList, {
+      props: { detail: baseDetail, adapter, myAddr: '33'.repeat(32), onChange: () => {} },
+    });
+    expect(getByText(/👍 Agree/)).toBeTruthy();
+    expect(getByText(/👎 Disagree/)).toBeTruthy();
+    expect(getByText(/⊘ Pass/)).toBeTruthy();
+  });
+
+  it('renders read-only chips for observer', () => {
+    const adapter = new VotingAdapter();
+    const { queryByText, getByText } = render(StatementVoteList, {
+      props: {
+        detail: { ...baseDetail, myRole: 'observer' },
+        adapter, myAddr: 'zz'.repeat(32), onChange: () => {},
+      },
+    });
+    expect(queryByText(/👍 Agree/)).toBeNull();
+    expect(getByText(/👍 0/)).toBeTruthy();
+  });
+
+  it('casts vote via adapter when tri-button clicked', async () => {
+    const adapter = new VotingAdapter();
+    vi.spyOn(adapter, 'castDeliberationVote').mockResolvedValue();
+    const { getByText } = render(StatementVoteList, {
+      props: { detail: baseDetail, adapter, myAddr: '33'.repeat(32), onChange: () => {} },
+    });
+    await fireEvent.click(getByText(/👍 Agree/));
+    await waitFor(() =>
+      expect(adapter.castDeliberationVote).toHaveBeenCalledWith(
+        'bb'.repeat(32), 'aa'.repeat(32), 'agree',
+      ),
+    );
+  });
+
+  it('filter "Unvoted by me" hides statements I have voted on', async () => {
+    const adapter = new VotingAdapter();
+    const { queryByText } = render(StatementVoteList, {
+      props: {
+        detail: {
+          ...baseDetail,
+          myDeliberationVotes: [{ statementEventHash: stmt.statementEventHash, vote: 'agree' }],
+        },
+        adapter,
+        myAddr: '33'.repeat(32),
+        onChange: () => {},
+      },
+    });
+    // Statement is voted-on, filter is default-on for mini-public → hidden.
+    expect(queryByText('A bridging idea')).toBeNull();
+  });
+});
