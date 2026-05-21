@@ -96,6 +96,70 @@ describe('Tier3ProposalPanel', () => {
     expect(unsubscribe).toHaveBeenCalledTimes(1);
   });
 
+  it('drops stale listTier3Polls response when communityId switches mid-flight', async () => {
+    // Race: communityId switches while the first listTier3Polls is still
+    // in flight. The second IPC for the new community must "win" even if
+    // the older one resolves last. Without the seq guard, the stale
+    // resolution would overwrite `summaries` with the previous
+    // community's polls.
+    const adapter = new VotingAdapter();
+    let resolveA!: (v: Tier3PollSummary[]) => void;
+    let resolveB!: (v: Tier3PollSummary[]) => void;
+    const aPromise = new Promise<Tier3PollSummary[]>((r) => {
+      resolveA = r;
+    });
+    const bPromise = new Promise<Tier3PollSummary[]>((r) => {
+      resolveB = r;
+    });
+    let callIdx = 0;
+    vi.spyOn(adapter, 'listTier3Polls').mockImplementation(async () => {
+      callIdx += 1;
+      return callIdx === 1 ? aPromise : bPromise;
+    });
+    vi.spyOn(adapter, 'subscribeTier3PollCreated').mockReturnValue(() => {});
+    vi.spyOn(adapter, 'subscribeTier3SortitionComplete').mockReturnValue(() => {});
+    vi.spyOn(adapter, 'subscribeTier3DraftingOpen').mockReturnValue(() => {});
+    vi.spyOn(adapter, 'subscribeTier3RatificationOpen').mockReturnValue(() => {});
+    vi.spyOn(adapter, 'subscribeTier3Finalized').mockReturnValue(() => {});
+
+    const aSummary: Tier3PollSummary = {
+      pollId: 'aa'.repeat(32),
+      communityId: 'aa'.repeat(16),
+      proposalText: 'Community A proposal',
+      proposer: '22'.repeat(32),
+      stage: 'dr',
+      pollCreateHlcMs: 1_700_000_000_000,
+      sortitionSize: 100,
+      winnerText: null,
+    };
+    const bSummary: Tier3PollSummary = {
+      pollId: 'bb'.repeat(32),
+      communityId: 'bb'.repeat(16),
+      proposalText: 'Community B proposal',
+      proposer: '22'.repeat(32),
+      stage: 'dr',
+      pollCreateHlcMs: 1_700_000_000_000,
+      sortitionSize: 100,
+      winnerText: null,
+    };
+
+    const { rerender, queryByText, findByText } = render(Tier3ProposalPanel, {
+      props: { communityId: 'aa'.repeat(16), adapter, myAddr: '22'.repeat(32) },
+    });
+    // Switch to community B while A's listTier3Polls is still pending.
+    await rerender({ communityId: 'bb'.repeat(16), adapter, myAddr: '22'.repeat(32) });
+    await waitFor(() => expect(adapter.listTier3Polls).toHaveBeenCalledTimes(2));
+
+    // Resolve B's IPC first (the newer call), then A's (the stale call).
+    resolveB([bSummary]);
+    await findByText('Community B proposal');
+    resolveA([aSummary]);
+    // Flush microtasks so any stale write would have landed by now.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(queryByText('Community A proposal')).toBeNull();
+    expect(queryByText('Community B proposal')).toBeTruthy();
+  });
+
   it('polls selectedDetail every 5s while a poll is expanded', async () => {
     vi.useFakeTimers();
     try {

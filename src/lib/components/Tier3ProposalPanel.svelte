@@ -65,15 +65,34 @@
   let selectedPollId = $state<string | null>(null);
   let selectedDetail = $state<Tier3PollExport | null>(null);
   let detailError = $state<string | null>(null);
-  let detailRequestSeq = $state(0);
+  // Internal sequence numbers for in-flight-response race protection.
+  // NOT $state — these are written inside $effect bodies (the
+  // community-reactivity effect and the polling effect), and a $state
+  // here would make ++seq read+write the same tracked dep, triggering
+  // an effect_update_depth_exceeded loop. They aren't rendered in
+  // templates so reactivity isn't required.
+  let detailRequestSeq = 0;
+  let summariesRequestSeq = 0;
 
   let unsubscribers: Array<() => void> = [];
 
   async function loadSummaries() {
+    // Race protection mirroring loadDetail: a community switch or 5s
+    // polling fire can leave two listTier3Polls calls in-flight; an
+    // older response finishing last would overwrite `summaries` with
+    // the previous community's polls. `req` guards against same-cid
+    // overwrites; `cid !== communityId` guards against the user
+    // switching communities between request dispatch and response
+    // arrival.
+    const req = ++summariesRequestSeq;
+    const cid = communityId;
     try {
-      summaries = await adapter.listTier3Polls(communityId);
+      const next = await adapter.listTier3Polls(cid);
+      if (req !== summariesRequestSeq || cid !== communityId) return;
+      summaries = next;
       listError = null;
     } catch (e) {
+      if (req !== summariesRequestSeq || cid !== communityId) return;
       listError = e instanceof Error ? e.message : String(e);
     }
   }
