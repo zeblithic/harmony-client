@@ -18,10 +18,10 @@ use std::sync::{Arc, Mutex as StdMutex};
 use harmony_app::community_membership::ChannelId;
 use harmony_app::community_voting_approval::Tier1PollConfig;
 use harmony_app::community_voting_core::{
-    build_signed_draft_approval, build_signed_draft_candidate, build_signed_poll_close_tier3,
-    build_signed_poll_create_tier1, build_signed_poll_create_tier3, build_signed_poll_result_tier3,
-    build_signed_sortition_selection, derive_poll_id, Eligibility, MemberAttrs, MembershipSnapshot,
-    Tier3PollConfigPayload,
+    build_signed_draft_approval, build_signed_draft_candidate, build_signed_mini_public_decline,
+    build_signed_poll_close_tier3, build_signed_poll_create_tier1, build_signed_poll_create_tier3,
+    build_signed_poll_result_tier3, build_signed_sortition_selection, derive_poll_id, Eligibility,
+    MemberAttrs, MembershipSnapshot, Tier3PollConfigPayload,
 };
 use harmony_app::community_voting_log::VotingLog;
 use harmony_app::community_voting_sortition::fisher_yates_select;
@@ -805,4 +805,164 @@ async fn list_tier3_polls_returns_empty_for_unknown_community() {
         summaries.is_empty(),
         "unknown community must return empty vec"
     );
+}
+
+// ─── R4 role-projection tests: effective mini-public after declines ────────
+//
+// Cursor Bugbot (R3 finding, high severity): `my_role` must reflect the
+// EFFECTIVE mini-public after declines + backup promotion, not the static
+// `sortition_result.primary/backup` slices. `verify_sd` authorizes drafting
+// and decline only for the active set; the export's `my_role` must agree.
+//
+// Scenario: 5-member primary + 5-member backup. primary[0] declines. The
+// effective mini-public becomes primary[1..5] ∪ {backup[0]} (backup[0]
+// promoted in to refill primary[0]'s slot per the cascade walk in
+// Tier3PollState::current_mini_public).
+//
+// Expected roles after the decline:
+//   primary[0] (declined primary) → Observer (lost drafting rights)
+//   primary[1] (active primary)   → MiniPublic
+//   backup[0]  (promoted backup)  → MiniPublic (gained drafting rights)
+//   backup[1]  (waiting backup)   → Backup
+//   proposer (NOT in primary/backup) → Proposer
+
+/// Build a log with kd=cr, kd=ss (5 primary + 5 backup), and one kd=md
+/// (decline) by primary[0]. Returns (community_id, poll_id, ordered
+/// primary owners, ordered backup owners, proposer identity).
+async fn build_decline_promotion_log() -> (
+    SpaceId,
+    harmony_app::community_voting_core::PollId,
+    Vec<OwnerAddr>,
+    Vec<OwnerAddr>,
+    TestIdentity,
+    VotingLog,
+) {
+    let community_id = SpaceId([0xD1; 16]);
+    let proposer = fixture_identity(80);
+    // primary[0..5] are identities 81..86; backup[0..5] are identities 86..91.
+    let primary_ids: Vec<TestIdentity> = (81u8..86).map(fixture_identity).collect();
+    let backup_ids: Vec<TestIdentity> = (86u8..91).map(fixture_identity).collect();
+    let primary: Vec<OwnerAddr> = primary_ids.iter().map(|i| i.owner).collect();
+    let backup: Vec<OwnerAddr> = backup_ids.iter().map(|i| i.owner).collect();
+
+    // Config: sortition_size=5 fails validation (min 20), so use 20 — but
+    // we only put 5 in `primary` to match. `current_mini_public` uses
+    // `sr.primary.len()` as the target size, not config.sortition_size, so
+    // a deliberate small-primary harness for role testing is fine.
+    let cfg = Tier3PollConfigPayload {
+        proposal_text: "Decline-promotion role test".into(),
+        sortition_size: 20, // satisfies validate; sr.primary.len() drives semantics
+        deliberation_window_seconds: 60,
+        drafting_window_seconds: 60,
+        ratification_window_seconds: 60,
+        privacy_mode: "pu".into(),
+        incentive_mode: "d".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+    };
+    let hlc_create = hlc_at(3_000_000);
+    let cr_event =
+        build_signed_poll_create_tier3(&proposer.signing_key, proposer.owner, &cfg, hlc_create)
+            .expect("build kd=cr");
+    let signing_bytes = cr_event.signing_bytes().expect("signing_bytes");
+    let poll_id = derive_poll_id(&community_id, &signing_bytes);
+
+    let snapshot = single_member_snapshot(proposer.owner);
+    let mut log = VotingLog::new();
+    log.apply_with_snapshot(cr_event, &community_id, Some(snapshot))
+        .expect("apply kd=cr");
+
+    let ss_event = build_signed_sortition_selection(
+        &proposer.signing_key,
+        proposer.owner,
+        poll_id,
+        primary.clone(),
+        backup.clone(),
+        hlc_at(3_000_001),
+    )
+    .expect("build kd=ss");
+    log.apply_with_snapshot(ss_event, &community_id, None)
+        .expect("apply kd=ss");
+
+    // primary[0] declines — backup[0] should be promoted by current_mini_public.
+    let md_event = build_signed_mini_public_decline(
+        &primary_ids[0].signing_key,
+        primary_ids[0].owner,
+        poll_id,
+        None,
+        hlc_at(3_000_002),
+    )
+    .expect("build kd=md");
+    log.apply_with_snapshot(md_event, &community_id, None)
+        .expect("apply kd=md");
+
+    (community_id, poll_id, primary, backup, proposer, log)
+}
+
+async fn role_for_self(
+    community_id: SpaceId,
+    log: VotingLog,
+    poll_id_hex: &str,
+    self_addr: OwnerAddr,
+) -> Tier3MyRole {
+    let state = build_node_state_with_log(community_id, log, Some(self_addr)).await;
+    voting_get_tier3_poll_impl(&state, poll_id_hex.to_string())
+        .await
+        .expect("get_tier3_poll ok")
+        .my_role
+}
+
+#[tokio::test]
+async fn role_declined_primary_projects_as_observer_not_mini_public() {
+    let (cid, pid, primary, _backup, _proposer, log) = build_decline_promotion_log().await;
+    let pid_hex = hex::encode(pid.0);
+    let role = role_for_self(cid, log, &pid_hex, primary[0]).await;
+    assert_eq!(
+        role,
+        Tier3MyRole::Observer,
+        "declined primary must NOT keep MiniPublic role — verify_sd would reject their drafting actions"
+    );
+}
+
+#[tokio::test]
+async fn role_promoted_backup_projects_as_mini_public_not_backup() {
+    let (cid, pid, _primary, backup, _proposer, log) = build_decline_promotion_log().await;
+    let pid_hex = hex::encode(pid.0);
+    let role = role_for_self(cid, log, &pid_hex, backup[0]).await;
+    assert_eq!(
+        role,
+        Tier3MyRole::MiniPublic,
+        "promoted backup (refilling a declined primary slot) must see MiniPublic role"
+    );
+}
+
+#[tokio::test]
+async fn role_active_primary_remains_mini_public_after_other_decline() {
+    let (cid, pid, primary, _backup, _proposer, log) = build_decline_promotion_log().await;
+    let pid_hex = hex::encode(pid.0);
+    let role = role_for_self(cid, log, &pid_hex, primary[1]).await;
+    assert_eq!(role, Tier3MyRole::MiniPublic);
+}
+
+#[tokio::test]
+async fn role_waiting_backup_remains_backup_after_partial_promotion() {
+    let (cid, pid, _primary, backup, _proposer, log) = build_decline_promotion_log().await;
+    let pid_hex = hex::encode(pid.0);
+    // backup[1] is still waiting (backup[0] was promoted to fill the
+    // single primary[0] vacancy; backup[1] is next in line if another
+    // primary declines).
+    let role = role_for_self(cid, log, &pid_hex, backup[1]).await;
+    assert_eq!(role, Tier3MyRole::Backup);
+}
+
+#[tokio::test]
+async fn role_proposer_not_in_sortition_pool_remains_proposer() {
+    let (cid, pid, _primary, _backup, proposer, log) = build_decline_promotion_log().await;
+    let pid_hex = hex::encode(pid.0);
+    let role = role_for_self(cid, log, &pid_hex, proposer.owner).await;
+    assert_eq!(role, Tier3MyRole::Proposer);
 }

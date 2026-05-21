@@ -24044,16 +24044,33 @@ fn build_tier3_export(
         .as_tier3()
         .ok_or("build_tier3_export: poll is not Tier 3")?;
 
-    let self_in_primary = self_owner_opt
+    // my_role must reflect the EFFECTIVE mini-public at the poll's
+    // current watermark, not the static `sortition_result.primary`
+    // slice. `verify_sd` (sortition-decline) and `verify_sr` (kd=rb
+    // ratification ballot — see `verify_ratification_ballot` upstream
+    // sourcing `current_mini_public`) authorize drafting / decline /
+    // ratification only for members of the active set after declines
+    // and backup promotion cascade. Reporting `mini_public` for a
+    // declined primary surfaces drafting UI the backend will reject;
+    // reporting `backup` for a promoted-and-active backup hides the
+    // drafting UI they actually have rights to.
+    //
+    // Watermark = `t3.last_hlc`. Future state-change events (decline,
+    // promotion, kd=dr / kd=ra transitions) re-fire the matching Tier 3
+    // Tauri event, and `Tier3ProposalPanel` refetches via
+    // `subscribeTier3*` — so the export always tracks the latest
+    // applied HLC. If sortition hasn't happened or no events have
+    // applied, the effective set is empty and no actor can be in it.
+    let effective_mp: std::collections::HashSet<crate::owner_state_types::OwnerAddr> =
+        match (t3.last_hlc.as_ref(), t3.sortition_result.as_ref()) {
+            (Some(now), Some(_)) => t3.current_mini_public(now),
+            _ => std::collections::HashSet::new(),
+        };
+    let self_in_effective_mp = self_owner_opt
         .as_ref()
-        .map(|s| {
-            t3.sortition_result
-                .as_ref()
-                .map(|r| r.primary.contains(s))
-                .unwrap_or(false)
-        })
+        .map(|s| effective_mp.contains(s))
         .unwrap_or(false);
-    let self_in_backup = self_owner_opt
+    let self_in_static_backup = self_owner_opt
         .as_ref()
         .map(|s| {
             t3.sortition_result
@@ -24062,18 +24079,22 @@ fn build_tier3_export(
                 .unwrap_or(false)
         })
         .unwrap_or(false);
+    let self_declined = self_owner_opt
+        .as_ref()
+        .map(|s| t3.declines.iter().any(|(owner, _)| owner == s))
+        .unwrap_or(false);
     let self_is_proposer = self_owner_opt
         .as_ref()
         .map(|s| s == &t3.meta.proposer)
         .unwrap_or(false);
-    // Priority order: function-bearing roles before informational ones.
-    // The proposer can also be drawn into the mini-public (sortition is
-    // random across the full electorate). Reporting Proposer first would
-    // hide the decline/drafting/ratification UI gated on MiniPublic.
-    // Mini-public > Backup > Proposer > Observer.
-    let my_role = if self_in_primary {
+    // Priority order:
+    //   MiniPublic (currently active — has drafting + decline + ratification rights)
+    //   Backup    (in static backup pool, NOT yet promoted, NOT declined — waiting)
+    //   Proposer  (informational; no per-poll actions beyond create)
+    //   Observer  (everyone else — including declined primaries + declined backups)
+    let my_role = if self_in_effective_mp {
         Tier3MyRole::MiniPublic
-    } else if self_in_backup {
+    } else if self_in_static_backup && !self_declined {
         Tier3MyRole::Backup
     } else if self_is_proposer {
         Tier3MyRole::Proposer
