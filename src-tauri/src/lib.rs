@@ -21202,6 +21202,48 @@ async fn voting_list_active_polls(
         .collect())
 }
 
+/// ZEB-298 Task 6: Tauri IPC to set a community's per-user
+/// `notify_on_delegate_signal` policy flag. Mutates `VotingLog.policy`
+/// directly (no signed event — the policy is local UX preference, not
+/// consensus-relevant). Lazy-creates the VotingLog for the community
+/// if it doesn't exist yet, mirroring the IPC fast-path used elsewhere.
+#[tauri::command(rename_all = "snake_case")]
+async fn voting_set_notify_on_delegate_signal(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    community_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let cid_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(cid_bytes);
+
+    let voting_logs = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        std::sync::Arc::clone(&g.voting_logs)
+    };
+
+    let log_arc = {
+        let mut map = voting_logs.lock().await;
+        map.entry(space_id)
+            .or_insert_with(|| {
+                std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::community_voting_log::VotingLog::new(),
+                ))
+            })
+            .clone()
+    };
+    let mut log_g = log_arc.lock().await;
+    let mut policy = log_g.policy().clone();
+    policy.notify_on_delegate_signal = enabled;
+    log_g.set_policy(policy);
+    Ok(())
+}
+
 /// Tauri IPC: get full state for a single poll by id. Includes meta,
 /// tally projection, and the caller's own latest ballot indices (so
 /// the UI can pre-fill the ballot picker without a second IPC).
@@ -26173,6 +26215,8 @@ pub fn run() {
             voting_cast_tier1_ballot,
             voting_list_active_polls,
             voting_get_poll,
+            // ZEB-298 Task 6: community-scoped policy IPC.
+            voting_set_notify_on_delegate_signal,
             // ZEB-310 Phase 4a-main Task 3: Tier 3 (Sortition + STAR) voting IPCs.
             voting_create_tier3_proposal,
             voting_submit_deliberation_statement,
@@ -26241,6 +26285,8 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         voting_cast_tier1_ballot,
         voting_list_active_polls,
         voting_get_poll,
+        // ZEB-298 Task 6: community-scoped policy IPC.
+        voting_set_notify_on_delegate_signal,
         // ZEB-310 Phase 4a-main Task 3: Tier 3 (Sortition + STAR) voting IPCs.
         voting_create_tier3_proposal,
         voting_submit_deliberation_statement,
