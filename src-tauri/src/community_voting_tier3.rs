@@ -2,9 +2,10 @@
 //! See docs/specs/2026-05-20-zeb-309-phase4a-main-design.md §3 + §6 + §9.
 
 use crate::community_voting_core::{
-    CandidateEventHash, DeliberationStatementPayload, DraftApprovalPayload, DraftCandidatePayload,
-    MiniPublicDeclinePayload, PollEventKindCode, PollId, RatificationBallotPayload,
-    SignedVotingEvent, SortitionFailedPayload, SortitionSelectionPayload, Tier3PollConfigPayload,
+    CandidateEventHash, DeliberationStatementPayload, DeliberationVotePayload,
+    DraftApprovalPayload, DraftCandidatePayload, MiniPublicDeclinePayload, PollEventKindCode,
+    PollId, RatificationBallotPayload, SignedVotingEvent, SortitionFailedPayload,
+    SortitionSelectionPayload, Tier3PollConfigPayload,
 };
 use crate::community_voting_sortition::{derive_beacon_seed, fisher_yates_select, SortitionResult};
 use crate::community_voting_star::{tally_star, StarResult};
@@ -303,6 +304,13 @@ impl Tier3PollState {
                 let _payload: DeliberationStatementPayload =
                     decode_payload(&ev.payload).map_err(ApplyError::PayloadDecode)?;
                 // No-op: Phase 5 will cluster statements. Accepted so multi-engine convergence holds.
+            }
+
+            // kd=dv DeliberationVote: Phase 5 — payload parse only; full materialize in Task 4.
+            PollEventKindCode::DeliberationVote => {
+                let _payload: DeliberationVotePayload =
+                    decode_payload(&ev.payload).map_err(ApplyError::PayloadDecode)?;
+                // No-op: Task 4 wires DeliberationState insertion.
             }
 
             // kd=dc DraftCandidate: append new candidate with implicit self-approval.
