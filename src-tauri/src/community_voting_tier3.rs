@@ -334,13 +334,67 @@ impl Tier3PollState {
                 self.declines.push((ev.actor, ev.hlc.clone()));
             }
 
-            // kd=ds DeliberationStatement: Phase 4a-main scaffold — accept event
-            // (SD1 verify deferred); no state mutation beyond last_hlc update.
+            // kd=ds DeliberationStatement: materialize per spec §2.3 apply rules.
+            // Apply-time rules (silent drop on failure; falls through to post-match last_hlc update).
             PollEventKindCode::DeliberationStatement => {
-                // Validate payload parses (don't silently accept corrupt payloads).
-                let _payload: DeliberationStatementPayload =
+                let payload: DeliberationStatementPayload =
                     decode_payload(&ev.payload).map_err(ApplyError::PayloadDecode)?;
-                // No-op: Phase 5 will cluster statements. Accepted so multi-engine convergence holds.
+                let event_hash = sha256_of_signing_bytes(ev);
+
+                // Rule 1: stage must be Deliberation at ev.hlc.
+                if self.current_stage_at(&ev.hlc) != Stage::Deliberation {
+                    tracing::debug!(
+                        poll_id = %hex::encode(self.meta.poll_id.0),
+                        actor = %hex::encode(ev.actor.0),
+                        "kd=ds drop: not in Deliberation stage"
+                    );
+                // Rule 2: actor must be in the current mini-public at ev.hlc.
+                } else if !self.current_mini_public(&ev.hlc).contains(&ev.actor) {
+                    tracing::debug!(
+                        poll_id = %hex::encode(self.meta.poll_id.0),
+                        actor = %hex::encode(ev.actor.0),
+                        "kd=ds drop: actor not in current mini-public"
+                    );
+                // Rule 3: text must be 1..=280 chars (non-empty after trim).
+                } else if payload.text.chars().count() > 280 || payload.text.trim().is_empty() {
+                    tracing::debug!(
+                        poll_id = %hex::encode(self.meta.poll_id.0),
+                        actor = %hex::encode(ev.actor.0),
+                        "kd=ds drop: text length out of range or whitespace-only"
+                    );
+                } else {
+                    // Rule 4: per-actor spam cap — at most 5 statements per poll.
+                    let prior_count = self
+                        .deliberation
+                        .statements_per_author
+                        .get(&ev.actor)
+                        .copied()
+                        .unwrap_or(0);
+                    if prior_count >= 5 {
+                        tracing::debug!(
+                            poll_id = %hex::encode(self.meta.poll_id.0),
+                            actor = %hex::encode(ev.actor.0),
+                            prior_count,
+                            "kd=ds drop: per-actor 5-statement spam cap reached"
+                        );
+                    } else {
+                        // Accept: insert into deliberation projection.
+                        self.deliberation.statements.insert(
+                            event_hash,
+                            DeliberationStatement {
+                                event_hash,
+                                author: ev.actor,
+                                text: payload.text,
+                                created_at_hlc: ev.hlc.clone(),
+                            },
+                        );
+                        *self
+                            .deliberation
+                            .statements_per_author
+                            .entry(ev.actor)
+                            .or_insert(0) += 1;
+                    }
+                }
             }
 
             // kd=dv DeliberationVote: Phase 5 — payload parse only; full materialize in Task 4.
@@ -3010,6 +3064,130 @@ mod tests {
             *epoch_seen,
             Some(expected_epoch),
             "verify_ss must pass poll's stored epoch to BeaconOracle::vrf_output_for"
+        );
+    }
+
+    // ── Task 3: kd=ds apply_event tests ──────────────────────────────────────
+
+    /// Build a poll in Deliberation stage with primary=[addr(1), addr(2), addr(3)]
+    /// and backup=[addr(10), addr(11)].  Poll created at wall_ms=0, dw=10000ms.
+    /// Sortition event applied at wall_ms=50.  Any event HLC in 51..9999 is
+    /// within the Deliberation window.
+    fn build_poll_in_deliberation_stage() -> Tier3PollState {
+        let mut poll = new_poll(0);
+        poll.apply_event(&ss_event(
+            50,
+            vec![addr(1), addr(2), addr(3)],
+            vec![addr(10), addr(11)],
+        ))
+        .expect("ss");
+        poll
+    }
+
+    /// Build a kd=ds event with a custom text string.
+    fn ds_event_with_text(wall_ms: u64, actor: OwnerAddr, text: &str) -> SignedVotingEvent {
+        let payload = DeliberationStatementPayload {
+            poll_id: poll_id(),
+            text: text.into(),
+        };
+        make_event_with_payload(
+            PollEventKindCode::DeliberationStatement,
+            wall_ms,
+            actor,
+            encode(&payload),
+        )
+    }
+
+    // Task 3 — Test 1: happy path accepts mini-public member in deliberation window.
+    #[test]
+    fn apply_ds_accepts_mini_public_member_in_window() {
+        let mut poll = build_poll_in_deliberation_stage();
+        let author = addr(1); // primary member
+        let ev = ds_event_with_text(100, author, "Hello world");
+        poll.apply_event(&ev).expect("apply");
+        assert_eq!(poll.deliberation.statements.len(), 1);
+        assert_eq!(
+            poll.deliberation.statements_per_author[&author], 1,
+            "statements_per_author must be incremented"
+        );
+    }
+
+    // Task 3 — Test 2: drops event from actor not in mini-public.
+    #[test]
+    fn apply_ds_drops_non_mini_public_actor() {
+        let mut poll = build_poll_in_deliberation_stage();
+        // addr(99) is not in primary or backup.
+        let ev = ds_event_with_text(100, addr(99), "Hello from outsider");
+        poll.apply_event(&ev)
+            .expect("apply returns Ok (silent drop)");
+        assert!(
+            poll.deliberation.statements.is_empty(),
+            "non-mini-public actor must be silently dropped"
+        );
+    }
+
+    // Task 3 — Test 3: drops event with text longer than 280 chars.
+    #[test]
+    fn apply_ds_drops_281_char_text() {
+        let mut poll = build_poll_in_deliberation_stage();
+        let long_text = "x".repeat(281);
+        let ev = ds_event_with_text(100, addr(1), &long_text);
+        poll.apply_event(&ev)
+            .expect("apply returns Ok (silent drop)");
+        assert!(
+            poll.deliberation.statements.is_empty(),
+            "281-char text must be silently dropped"
+        );
+    }
+
+    // Task 3 — Test 4: drops event whose text is whitespace-only.
+    #[test]
+    fn apply_ds_drops_whitespace_only_text() {
+        let mut poll = build_poll_in_deliberation_stage();
+        let ev = ds_event_with_text(100, addr(1), "   \t\n  ");
+        poll.apply_event(&ev)
+            .expect("apply returns Ok (silent drop)");
+        assert!(
+            poll.deliberation.statements.is_empty(),
+            "whitespace-only text must be silently dropped"
+        );
+    }
+
+    // Task 3 — Test 5: enforces per-actor 5-statement spam cap.
+    #[test]
+    fn apply_ds_enforces_5_statement_spam_cap() {
+        let mut poll = build_poll_in_deliberation_stage();
+        let author = addr(2); // primary member
+
+        // Apply 6 statements with distinct text + monotonically increasing HLCs.
+        for i in 0u64..6 {
+            let text = format!("Statement number {i}");
+            let ev = ds_event_with_text(100 + i, author, &text);
+            poll.apply_event(&ev).expect("apply returns Ok");
+        }
+
+        assert_eq!(
+            poll.deliberation.statements.len(),
+            5,
+            "only 5 statements must be accepted (spam cap)"
+        );
+        assert_eq!(
+            poll.deliberation.statements_per_author[&author], 5,
+            "statements_per_author must cap at 5"
+        );
+    }
+
+    // Task 3 — Test 6: drops event with HLC outside the deliberation window.
+    #[test]
+    fn apply_ds_drops_event_outside_deliberation_window() {
+        let mut poll = build_poll_in_deliberation_stage();
+        // dw=10s → deliberation ends at wall_ms=10000.  wall_ms=15000 is in Drafting.
+        let ev = ds_event_with_text(15_000, addr(1), "Too late");
+        poll.apply_event(&ev)
+            .expect("apply returns Ok (silent drop)");
+        assert!(
+            poll.deliberation.statements.is_empty(),
+            "event outside deliberation window must be silently dropped"
         );
     }
 }
