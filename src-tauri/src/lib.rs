@@ -22526,6 +22526,136 @@ pub struct Tier2ProposalExport {
     pub threshold_reached_at_ms: Option<i128>,
 }
 
+/// ZEB-311: 2-char tag for Tier 3 poll stage. Serializes as a short
+/// string so the JS-side switch matches the wire bytes without an
+/// indirection (mirrors `kd` 2-char codes used elsewhere in the
+/// voting layer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Tier3StageTag {
+    #[serde(rename = "so")]
+    Sortition,
+    #[serde(rename = "de")]
+    Deliberation,
+    #[serde(rename = "dr")]
+    Drafting,
+    #[serde(rename = "ra")]
+    Ratification,
+    #[serde(rename = "fi")]
+    Finalized,
+    #[serde(rename = "fa")]
+    Failed,
+}
+
+impl From<crate::community_voting_tier3::Stage> for Tier3StageTag {
+    fn from(s: crate::community_voting_tier3::Stage) -> Self {
+        use crate::community_voting_tier3::Stage;
+        match s {
+            Stage::Sortition => Tier3StageTag::Sortition,
+            Stage::Deliberation => Tier3StageTag::Deliberation,
+            Stage::Drafting => Tier3StageTag::Drafting,
+            Stage::Ratification => Tier3StageTag::Ratification,
+            Stage::Finalized => Tier3StageTag::Finalized,
+            Stage::Failed => Tier3StageTag::Failed,
+        }
+    }
+}
+
+/// ZEB-311: caller's role for a specific Tier 3 poll. Determines which
+/// UI affordances are available — mini-public members get the
+/// drafting + decline buttons; the proposer gets the retry affordance
+/// on Failed; observers get read-only views of every stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tier3MyRole {
+    Proposer,
+    MiniPublic,
+    Backup,
+    Observer,
+}
+
+/// ZEB-311: one draft candidate as exposed to the frontend.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftCandidateExport {
+    /// 64-char hex of the SHA-256 of the kd=dc event's signing bytes.
+    pub event_hash: String,
+    pub text: String,
+    /// 64-char hex of the proposer's OwnerAddr; `None` for the
+    /// synthetic status_quo candidate.
+    pub proposer: Option<String>,
+    pub approval_count: u32,
+}
+
+/// ZEB-311: one ratification candidate (subset of `DraftCandidateExport`
+/// with no proposer/approval bookkeeping; ratification cares only about
+/// candidate identity + presentation text).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RatificationCandidateExport {
+    pub event_hash: String,
+    pub text: String,
+}
+
+/// ZEB-311: full state for a single Tier 3 poll, projected from
+/// `Tier3PollState` plus caller-derived `my_*` fields.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Tier3PollExport {
+    pub poll_id: String,      // 64-char hex
+    pub community_id: String, // 32-char hex
+    pub proposal_text: String,
+    pub proposer: String, // 64-char hex
+    pub stage: Tier3StageTag,
+    /// HLC of PollCreate in ms since UNIX_EPOCH (whatever the HLC's
+    /// wall-clock projection resolves to).
+    pub poll_create_hlc_ms: i128,
+    pub sortition_size: u16,
+    pub deliberation_window_seconds: u32,
+    pub drafting_window_seconds: u32,
+    pub ratification_window_seconds: u32,
+    /// Single-character tag ("a" | "b" | "c" | "d") matching
+    /// the validated config field.
+    pub incentive_mode: String,
+    /// 64-char hex `OwnerAddr` strings of the primary mini-public.
+    /// Empty before kd=ss applies.
+    pub mini_public: Vec<String>,
+    pub backup_pool: Vec<String>,
+    /// (owner_hex, hlc_ms) pairs for each kd=md decline.
+    pub declined: Vec<(String, i128)>,
+    pub draft_candidates: Vec<DraftCandidateExport>,
+    pub ratification_candidates: Vec<RatificationCandidateExport>,
+    pub my_role: Tier3MyRole,
+    /// Event hashes of draft candidates the caller has approved.
+    pub my_drafting_approvals: Vec<String>,
+    /// Caller's most recent ratification ballot scores (indexed by
+    /// `ratification_candidates` order). `None` if never cast or
+    /// stage hasn't reached Ratification.
+    pub my_ratification_scores: Option<Vec<u8>>,
+    /// 64-char hex of the winning candidate's kd=dc event hash;
+    /// `None` until stage = Finalized.
+    pub winner_event_hash: Option<String>,
+    pub runner_up_event_hash: Option<String>,
+}
+
+/// ZEB-311: lightweight per-row shape returned by
+/// `voting_list_tier3_polls`. Doesn't include drafting candidates or
+/// ratification scores — the panel pulls those via `get_tier3_poll`
+/// when the user expands a row.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Tier3PollSummary {
+    pub poll_id: String,
+    pub community_id: String,
+    pub proposal_text: String,
+    pub proposer: String,
+    pub stage: Tier3StageTag,
+    pub poll_create_hlc_ms: i128,
+    pub sortition_size: u16,
+    /// Set once stage = Finalized; lets the panel show "Charter §3
+    /// amended" without an extra fetch.
+    pub winner_text: Option<String>,
+}
+
 /// Pure helper: project a `PollState` (which must be Tier 2) into the
 /// frontend DTO. Computes `total_conviction` + `threshold_conviction` at
 /// `now_ms`; the caller's signal is resolved from the per-voter map.
