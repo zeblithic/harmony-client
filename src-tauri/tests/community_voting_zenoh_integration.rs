@@ -1,0 +1,200 @@
+//! ZEB-298+ZEB-312 PR 1: end-to-end test of voting outbound→inbound
+//! through TWO real `zenoh::Session` instances (not the mpsc test
+//! bridge). Verifies that a peer-delivered voting event arrives via
+//! the Zenoh subscriber, passes through `verify_voting_event` on the
+//! receiving engine, and applies to its `VotingLog`.
+//!
+//! Why this test exists: the mpsc-bridged tests prove the engine's
+//! pub/sub channels work, but they cannot verify the Zenoh transport
+//! layer itself (key_expr parsing, session.put, declare_subscriber,
+//! recv_async). This is the missing end-to-end coverage that proves
+//! voting events actually cross the wire.
+
+#![cfg(feature = "test-fixtures")]
+
+use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use ed25519_dalek::SigningKey;
+use rand::rngs::OsRng;
+use tokio::sync::Mutex;
+
+use harmony_app::community_membership::ChannelId;
+use harmony_app::community_voting_approval::Tier1PollConfig;
+use harmony_app::community_voting_core::{
+    build_signed_poll_create_tier1, derive_poll_id, Eligibility, MemberAttrs, MembershipSnapshot,
+    VotingIdentityResolver,
+};
+use harmony_app::community_voting_log::{
+    MembershipSnapshotResolver, SnapshotResolverError, VotingLog,
+};
+use harmony_app::community_voting_log_engine::{VotingLogEngine, VotingLogEngineParams};
+use harmony_app::event_loop::spawn_voting_log_zenoh_adapter;
+use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+
+/// Test resolvers that satisfy both VotingIdentityResolver and
+/// MembershipSnapshotResolver from a single Arc — same pattern used in
+/// the production-build process_inbound test.
+struct FixedResolvers {
+    identity: HashMap<OwnerAddr, ed25519_dalek::VerifyingKey>,
+    snapshot: MembershipSnapshot,
+}
+
+#[async_trait]
+impl VotingIdentityResolver for FixedResolvers {
+    async fn verifying_key_for(&self, owner: &OwnerAddr) -> Option<ed25519_dalek::VerifyingKey> {
+        self.identity.get(owner).copied()
+    }
+}
+
+#[async_trait]
+impl MembershipSnapshotResolver for FixedResolvers {
+    async fn snapshot_at(
+        &self,
+        _community_id: SpaceId,
+        _hlc: &Hlc,
+    ) -> Result<MembershipSnapshot, SnapshotResolverError> {
+        Ok(self.snapshot.clone())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voting_event_flows_through_two_zenoh_sessions() {
+    // Open two default-config peer sessions — they discover each other
+    // via in-memory gossip.
+    let cfg = zenoh::Config::default();
+    let session_a = Arc::new(zenoh::open(cfg.clone()).await.expect("session A open"));
+    let session_b = Arc::new(zenoh::open(cfg).await.expect("session B open"));
+
+    let community_id = SpaceId([0xab; 16]);
+    let community_id_hex = hex::encode(community_id.0);
+
+    // Build the peer event.
+    let keypair = SigningKey::generate(&mut OsRng);
+    let actor = OwnerAddr([0xcd; 16]);
+
+    let resolvers = Arc::new(FixedResolvers {
+        identity: HashMap::from([(actor, keypair.verifying_key())]),
+        snapshot: MembershipSnapshot {
+            members: HashMap::from([(
+                actor,
+                MemberAttrs {
+                    power: 1,
+                    vouching_depth: 1,
+                },
+            )]),
+        },
+    });
+    let id_resolver: Arc<dyn VotingIdentityResolver> = resolvers.clone();
+    let mem_resolver: Arc<dyn MembershipSnapshotResolver> = resolvers.clone();
+
+    // ── Engine A side (publisher only) ──────────────────────────────────
+    // We only need session A to publish to the topic via the production
+    // adapter. Engine A doesn't hold a real engine — we just drive
+    // a_pub_tx from the test body.
+    let closing_a = Arc::new(AtomicBool::new(false));
+    let (a_pub_tx, a_pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    // Engine A doesn't need to receive inbound; give it a dummy subscriber_tx.
+    let (a_sub_tx_unused, _a_sub_rx_unused) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    let _adapter_a_handle = spawn_voting_log_zenoh_adapter(
+        Arc::clone(&session_a),
+        community_id_hex.clone(),
+        a_pub_rx,
+        a_sub_tx_unused,
+        Arc::clone(&closing_a),
+    );
+
+    // ── Engine B side (subscriber + engine) ─────────────────────────────
+    // The adapter on session_b subscribes to the topic and forwards
+    // received packets → b_sub_tx → engine B's inbound receive loop,
+    // which calls verify_voting_event then applies on success.
+    let closing_b = Arc::new(AtomicBool::new(false));
+    let (b_pub_tx, b_pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    let (b_sub_tx, b_sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    let _adapter_b_handle = spawn_voting_log_zenoh_adapter(
+        Arc::clone(&session_b),
+        community_id_hex.clone(),
+        b_pub_rx,
+        b_sub_tx,
+        Arc::clone(&closing_b),
+    );
+
+    // Give sessions time to discover each other via in-memory gossip
+    // AND let the adapter tasks reach declare_subscriber before we
+    // publish. Both adapters spawn async tasks; without this sleep the
+    // publisher on session_a can fire before the subscriber on
+    // session_b is declared, causing the sample to be dropped.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Engine B: real VotingLogEngine that consumes b_sub_rx, calls
+    // verify_voting_event, and applies on success.
+    let log_b = Arc::new(Mutex::new(VotingLog::default()));
+    let _engine_b = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+        community_id,
+        voting_log: Arc::clone(&log_b),
+        publisher_tx: b_pub_tx,
+        subscriber_rx: b_sub_rx,
+        hlc_tracker: None,
+        device_id: None,
+        app_handle: None,
+        identity_resolver: Some(id_resolver),
+        membership_resolver: Some(mem_resolver),
+    })
+    .await;
+
+    // ── Mint a Tier 1 PollCreate event and push it via engine A ─────────
+    let cfg_poll = Tier1PollConfig {
+        options: vec!["a".into(), "b".into()],
+        window_seconds: 600,
+        quorum: None,
+        threshold_percent: None,
+        multi_winner: None,
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        channel_id: ChannelId([0xef; 16]),
+    };
+    let event_hlc = Hlc {
+        wall_ms: 1_700_000_000_000,
+        logical: 0,
+        device_id: "peer-a".into(),
+    };
+    let event = build_signed_poll_create_tier1(&keypair, actor, &cfg_poll, event_hlc)
+        .expect("build poll create");
+
+    let mut packet = Vec::new();
+    ciborium::ser::into_writer(&event, &mut packet).expect("encode");
+
+    // Push packet through engine A's outbound channel → adapter A →
+    // session_a.put → in-memory peer link → session_b subscriber →
+    // adapter B → b_sub_rx → engine B's inbound loop → verify+apply.
+    a_pub_tx.send(packet).await.expect("push to a_pub_tx");
+
+    // ── Wait for engine B to apply the event (poll up to 3 seconds) ─────
+    let sb = event.signing_bytes().expect("signing_bytes");
+    let pid = derive_poll_id(&community_id, &sb);
+
+    let mut applied = false;
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let log = log_b.lock().await;
+        if log.has_poll(&pid) {
+            applied = true;
+            break;
+        }
+    }
+
+    assert!(
+        applied,
+        "engine B must apply the peer event via Zenoh within 3s"
+    );
+
+    // ── Clean shutdown ───────────────────────────────────────────────────
+    closing_a.store(true, std::sync::atomic::Ordering::SeqCst);
+    closing_b.store(true, std::sync::atomic::Ordering::SeqCst);
+    drop(_engine_b);
+}
