@@ -256,6 +256,12 @@
   // instance regardless of Tauri-init ordering; `connectAdapter` runs
   // exactly once below, after the TauriAdapter is established.
   const votingAdapter = new VotingAdapter();
+  // Captured unsubscribe handle from setupDelegateOnBehalfToast. Stored
+  // so any future re-init / remount path can tear down the prior toast
+  // subscription before registering a new one (preventing duplicate
+  // toasts on a single delegate signal). Today connectAdapter runs once
+  // at boot; this is future-proofing per CodeRabbit R1.
+  let toastUnsubscribe: (() => void) | null = null;
   // Local mirror of per-community shared_in_profile state. The backend
   // is the source of truth; we hydrate this Map at startup via
   // `profileBroadcastService.listSharedSet()` (see ZEB-281 Sub-D Phase 4
@@ -623,7 +629,11 @@
       void votingAdapter
         .connectAdapter(adapter)
         .then(() => {
-          setupDelegateOnBehalfToast(votingAdapter);
+          // Tear down any prior toast subscription before registering a new
+          // one — prevents duplicate toasts if connectAdapter is ever called
+          // twice (e.g. a future reconnect path).
+          toastUnsubscribe?.();
+          toastUnsubscribe = setupDelegateOnBehalfToast(votingAdapter);
         })
         .catch((err) => {
           console.warn('[harmony-client] votingAdapter connect failed:', err);

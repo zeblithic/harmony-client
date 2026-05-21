@@ -5,7 +5,10 @@
   let { toast }: { toast: Toast } = $props();
 </script>
 
-<div class="toast" role="status" aria-live="polite" transition:fly={{ y: 20, duration: 200 }}>
+<!-- ZEB-298 R1: live-region semantics live on the parent ToastHost
+     (which sets aria-live="polite" on the container). Adding them
+     per-toast would cause assistive tech to announce each toast twice. -->
+<div class="toast" transition:fly={{ y: 20, duration: 200 }}>
   <span class="message">{toast.message}</span>
   <button
     type="button"

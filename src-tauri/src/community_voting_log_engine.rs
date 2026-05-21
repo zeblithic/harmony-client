@@ -1083,10 +1083,14 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                 && event.tier == Tier::Sortition
                 && event.kind != PollEventKindCode::PollCreate
             {
-                // Derive pid from signing bytes (cheap; same derivation as apply).
-                let pid_opt: Option<PollId> = event.signing_bytes().ok().map(|sb| {
-                    crate::community_voting_core::derive_poll_id(&self.community_id, &sb)
-                });
+                // Non-PollCreate Tier 3 events reference the affected poll
+                // via the `{ "pi": ... }` map in the payload — `derive_poll_id`
+                // from signing_bytes is correct ONLY for PollCreate. Using
+                // it for kd=md/dc/da/rb/cl/rs/sf yields a different (wrong)
+                // PollId that misses log.polls, suppressing lifecycle
+                // emits (Qodo R1 finding).
+                let pid_opt: Option<PollId> =
+                    crate::community_voting_log::decode_poll_id_ref(&event.payload);
                 match pid_opt {
                     Some(pid) => {
                         let now = self.current_hlc_estimate().await;
@@ -1709,38 +1713,40 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         // derivation). Failure here is non-fatal — `process_inbound`
         // will hit the same decode error and report it to the caller;
         // we just degrade gracefully to "no previous stage snapshot".
-        let previous_stage_for_emit: Option<crate::community_voting_tier3::Stage> = if self
-            .app_handle
-            .is_some()
-        {
-            match ciborium::from_reader::<SignedVotingEvent, _>(packet) {
-                Ok(pre_event) => {
-                    if pre_event.tier == Tier::Sortition
-                        && pre_event.kind != PollEventKindCode::PollCreate
-                    {
-                        let pid_opt: Option<PollId> = pre_event.signing_bytes().ok().map(|sb| {
-                            crate::community_voting_core::derive_poll_id(&self.community_id, &sb)
-                        });
-                        match pid_opt {
-                            Some(pid) => {
-                                let now = self.current_hlc_estimate().await;
-                                let log = self.voting_log.lock().await;
-                                log.polls
-                                    .get(&pid)
-                                    .and_then(|ps| ps.tier_state.as_tier3())
-                                    .map(|t3| t3.current_stage_at(&now))
+        let previous_stage_for_emit: Option<crate::community_voting_tier3::Stage> =
+            if self.app_handle.is_some() {
+                match ciborium::from_reader::<SignedVotingEvent, _>(packet) {
+                    Ok(pre_event) => {
+                        if pre_event.tier == Tier::Sortition
+                            && pre_event.kind != PollEventKindCode::PollCreate
+                        {
+                            // Non-PollCreate Tier 3 events: PollId lives in the
+                            // payload's `{ "pi": ... }` map, NOT in signing_bytes
+                            // (Qodo R1 — signing-bytes derivation is only correct
+                            // for PollCreate; using it elsewhere misses log.polls
+                            // and suppresses lifecycle emits).
+                            let pid_opt: Option<PollId> =
+                                crate::community_voting_log::decode_poll_id_ref(&pre_event.payload);
+                            match pid_opt {
+                                Some(pid) => {
+                                    let now = self.current_hlc_estimate().await;
+                                    let log = self.voting_log.lock().await;
+                                    log.polls
+                                        .get(&pid)
+                                        .and_then(|ps| ps.tier_state.as_tier3())
+                                        .map(|t3| t3.current_stage_at(&now))
+                                }
+                                None => None,
                             }
-                            None => None,
+                        } else {
+                            None
                         }
-                    } else {
-                        None
                     }
+                    Err(_) => None,
                 }
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         // Delegate the decode + dedup + verify + eligibility + apply
         // pipeline to the static `process_inbound`. Returns the
