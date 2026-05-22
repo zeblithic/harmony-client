@@ -100,9 +100,75 @@ pub struct Tier3PollMeta {
     pub community_epoch: u64,
 }
 
+// ── ZEB-295 Phase 6: ballot-secret committee oracle + tally state ────────────
+
+/// Public-side view of the committee at a single DKG epoch, exposed by a
+/// `CommitteeOracle`. Carries everything the tier3 apply path needs to
+/// verify a `kd=ts` payload — the joint verifying key (= ElGamal Y), per-
+/// member verifying shares (= DLEQ basis points Y_i), and the threshold.
+#[derive(Debug, Clone)]
+pub struct CommitteePublicState {
+    pub epoch: u32,
+    pub joint_verifying_key: [u8; 32],
+    pub verifying_shares: std::collections::BTreeMap<OwnerAddr, [u8; 32]>,
+    pub threshold: u16,
+}
+
+/// Read-side handle into the per-community DKG history. The Tier 3 apply
+/// path consults this to verify `kd=ts` payloads against the committee
+/// that was active at the poll's PollCreate epoch (or — for cross-epoch
+/// shares — the matching `epoch` in the payload).
+///
+/// `Send + Sync` because `Tier3PollState` is stored inside per-community
+/// engines that the IPC layer hands out behind locks; the oracle must be
+/// safe to share across those locks.
+pub trait CommitteeOracle: Send + Sync + std::fmt::Debug {
+    fn committee_at_epoch(&self, epoch: u32) -> Option<CommitteePublicState>;
+    fn latest_epoch(&self) -> Option<u32>;
+}
+
+/// Trivial oracle that knows about no committees — used as the default
+/// before Task 10 wires the real `DfrostLogRegistry`-backed implementation.
+/// All Tier 3c apply paths that consult the oracle MUST tolerate `None`
+/// returns (silent drop with no state mutation, matching the existing
+/// Phase 4a "silent drop for missing prerequisites" convention).
+#[derive(Debug, Default)]
+pub struct NullCommitteeOracle;
+
+impl CommitteeOracle for NullCommitteeOracle {
+    fn committee_at_epoch(&self, _epoch: u32) -> Option<CommitteePublicState> {
+        None
+    }
+    fn latest_epoch(&self) -> Option<u32> {
+        None
+    }
+}
+
+/// Ballot-secret tally projection. `tally_shares` is LWW-upserted by
+/// `(actor, committee_epoch)` — each committee member contributes at most
+/// one share-set per epoch; later-HLC re-submissions overwrite. Value is
+/// the full `entries` Vec from that member's `TallySharePayload` (one
+/// entry per ciphertext being decrypted: scores + indicators across all
+/// candidates × ballots).
+#[derive(Debug, Clone, Default)]
+pub struct SecretTallyState {
+    pub tally_shares: std::collections::BTreeMap<
+        (OwnerAddr, u32),
+        Vec<crate::community_voting_core::TallyShareEntry>,
+    >,
+    /// Populated once enough shares are collected to Lagrange-combine and
+    /// BSGS-decode every ciphertext. Mirrors the pu-mode `result` field
+    /// shape so the IPC read path can render either uniformly.
+    pub decrypted_result: Option<crate::community_voting_star::StarResult>,
+}
+
 /// Full state of an in-progress or terminal Tier 3 poll.
 /// Built by applying kd=* events in (hlc, event_hash) lex order.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-rolled because `Arc<dyn CommitteeOracle>` does derive
+/// Debug (the trait carries `+ Debug`) but we prefer to print a short
+/// `<oracle>` placeholder rather than risk dumping committee internals.
+#[derive(Clone)]
 pub struct Tier3PollState {
     pub meta: Tier3PollMeta,
     pub stage: Stage,
@@ -136,6 +202,43 @@ pub struct Tier3PollState {
     /// target-missing kd=dv) would silently bypass the guard and never be
     /// re-materialized, causing replica divergence (Qodo PR #154 finding).
     pub last_received_hlc: Option<Hlc>,
+    /// ZEB-295 Phase 6: ballot-secret tally projection. Populated by
+    /// `kd=ts` apply (Task 7) and the decrypted-result derivation
+    /// (Task 8). Empty in pu-mode polls.
+    pub secret_tally: SecretTallyState,
+    /// ZEB-295 Phase 6: read-side handle into the per-community committee
+    /// history, used at `kd=ts` apply to verify DLEQ proofs against the
+    /// correct epoch's verifying shares. Defaults to `NullCommitteeOracle`
+    /// (returns `None` for every query); Task 10 wires the real registry-
+    /// backed implementation.
+    pub committee_oracle: std::sync::Arc<dyn CommitteeOracle>,
+}
+
+// Hand-rolled Debug because `Arc<dyn CommitteeOracle>` is awkward to format
+// and the oracle internals aren't useful in poll-state dumps. Every other
+// field passes through unchanged.
+impl std::fmt::Debug for Tier3PollState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tier3PollState")
+            .field("meta", &self.meta)
+            .field("stage", &self.stage)
+            .field(
+                "eligible_electorate_snapshot",
+                &self.eligible_electorate_snapshot,
+            )
+            .field("sortition_result", &self.sortition_result)
+            .field("declines", &self.declines)
+            .field("candidates", &self.candidates)
+            .field("ratification_ballots", &self.ratification_ballots)
+            .field("close_event_hash", &self.close_event_hash)
+            .field("result", &self.result)
+            .field("deliberation", &self.deliberation)
+            .field("last_hlc", &self.last_hlc)
+            .field("last_received_hlc", &self.last_received_hlc)
+            .field("secret_tally", &self.secret_tally)
+            .field("committee_oracle", &"<oracle>")
+            .finish()
+    }
 }
 
 // ── Validate error type ───────────────────────────────────────────────────────
@@ -300,7 +403,17 @@ impl Tier3PollState {
             deliberation: DeliberationState::default(),
             last_hlc: None,
             last_received_hlc: None,
+            secret_tally: SecretTallyState::default(),
+            committee_oracle: std::sync::Arc::new(NullCommitteeOracle),
         }
+    }
+
+    /// ZEB-295 Phase 6: install a committee oracle. Used by the engine
+    /// setup path (Task 10) to bind the per-community
+    /// `DfrostLogRegistry` view; tests can install a fixture oracle
+    /// to short-circuit DKG ceremony setup.
+    pub fn install_committee_oracle(&mut self, oracle: std::sync::Arc<dyn CommitteeOracle>) {
+        self.committee_oracle = oracle;
     }
 
     /// Apply a single event to this state, mutating it in place.
@@ -1895,6 +2008,23 @@ mod tests {
         assert!(poll.deliberation.statements.is_empty());
         assert!(poll.deliberation.votes.is_empty());
         assert!(poll.deliberation.statements_per_author.is_empty());
+    }
+
+    // ── ZEB-295 Task 6: secret tally projection + committee oracle ─────────
+
+    #[test]
+    fn tier3_poll_state_initializes_with_empty_secret_tally() {
+        let meta = meta_at(0);
+        let state = Tier3PollState::new_from_create(meta, vec![]);
+        assert!(state.secret_tally.tally_shares.is_empty());
+        assert!(state.secret_tally.decrypted_result.is_none());
+    }
+
+    #[test]
+    fn null_committee_oracle_returns_none() {
+        let oracle = NullCommitteeOracle;
+        assert!(oracle.committee_at_epoch(7).is_none());
+        assert!(oracle.latest_epoch().is_none());
     }
 
     // ── Additional: da for unknown candidate is silently ignored ──────────────
