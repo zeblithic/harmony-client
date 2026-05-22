@@ -138,8 +138,10 @@ After the kd=dv branch (currently ends ~line 2158) and before the closing `}` of
 // 7. ZEB-319: mini-public-decline (kd=md applied). Mirror the kd=ds
 // acceptance check: emit only when the decline actually landed in
 // t3.declines (apply rules drop invalid declines silently).
+//
+// Note: t3.declines is Vec<(OwnerAddr, Hlc)>, so use tuple indexing
+// d.0/d.1 — not named struct access.
 if applied_event.kind == PollEventKindCode::MiniPublicDecline {
-    let event_hash = crate::community_voting_tier3::event_hash_of(applied_event);
     let accepted: bool = {
         let log = self.voting_log.lock().await;
         log.polls
@@ -148,7 +150,7 @@ if applied_event.kind == PollEventKindCode::MiniPublicDecline {
             .is_some_and(|t3| {
                 t3.declines
                     .iter()
-                    .any(|d| d.actor == applied_event.actor && d.hlc == applied_event.hlc)
+                    .any(|d| d.0 == applied_event.actor && d.1 == applied_event.hlc)
             })
     };
     if accepted {
@@ -162,7 +164,6 @@ if applied_event.kind == PollEventKindCode::MiniPublicDecline {
             tracing::warn!(
                 error = %e,
                 poll_id = %pid_hex,
-                event_hash = %hex::encode(event_hash),
                 "voting-tier3-mini-public-decline emit failed (non-fatal)"
             );
         }
@@ -243,13 +244,16 @@ The emit branch sits after the kd=dc branch:
 ```rust
 // 9. ZEB-319: draft-approval (kd=da applied). Acceptance check:
 // the actor is in the targeted candidate's approvals set.
+//
+// Note: DraftApprovalPayload field is `candidate_event_hash`, not
+// `target_event_hash` — verify via grep before writing.
 if applied_event.kind == PollEventKindCode::DraftApproval {
     if let Ok(da_payload) = ciborium::de::from_reader::<
         crate::community_voting_core::DraftApprovalPayload,
         _,
     >(&applied_event.payload[..])
     {
-        let target_hash = da_payload.target_event_hash;
+        let target_hash = da_payload.candidate_event_hash;
         let accepted: bool = {
             let log = self.voting_log.lock().await;
             log.polls
@@ -283,7 +287,7 @@ if applied_event.kind == PollEventKindCode::DraftApproval {
 ```
 
 **Field name verification:**
-- Verify `DraftApprovalPayload` has a `.target_event_hash` field via `grep -A5 "struct DraftApprovalPayload" src-tauri/src/community_voting_core.rs`. Adjust if named differently.
+- Verify `DraftApprovalPayload` has a `.candidate_event_hash` field via `grep -A5 "struct DraftApprovalPayload" src-tauri/src/community_voting_core.rs`. Adjust if named differently.
 - Verify `DraftCandidateState` has an `.approvals` field that contains `OwnerAddr` values (check existing usage at line 705: `// kd=da DraftApproval: add actor to the named candidate's approvals (idempotent).`).
 
 - [ ] **Step 7: Run full backend gates**
