@@ -319,8 +319,19 @@ pub struct TallySharePayload {
     #[serde(rename = "pi")]
     pub poll_id: PollId,
     /// CHURP rotation generation. Shares from different epochs cannot be mixed.
+    ///
+    /// `u64` to match `DfrostLogEngine::current_epoch` (the DKG-side source of
+    /// truth) and `Tier3PollMeta::community_epoch`. The earlier `u32` shape
+    /// was a cross-module type-contract drift (CodeAnt PR #155 critical):
+    /// if the CHURP rotation counter ever exceeds `u32::MAX` (4 billion
+    /// rotations) the tally-share envelope's epoch silently truncates and
+    /// no longer matches the dfrost log's epoch, so the apply path drops
+    /// every kd=ts. Even below that horizon, the encoded-as-u32 wire byte
+    /// length differs from the encoded-as-u64 length, so a future widening
+    /// would break compatibility with already-shipped envelopes — fixing
+    /// this NOW, before Phase 6 ships, is the only race-free option.
     #[serde(rename = "ce")]
-    pub committee_epoch: u32,
+    pub committee_epoch: u64,
     /// `n + C(n,2)` entries: candidate score-sum entries first, then indicator-sum
     /// entries in unordered-pair lexicographic order. Vec (not fixed array) because
     /// `n` is per-poll and only known at apply time.

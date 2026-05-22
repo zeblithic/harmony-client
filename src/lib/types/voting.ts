@@ -629,7 +629,15 @@ export interface Tier3PollSummary {
 
 /** ZEB-295: emitted on every accepted kd=ts so the frontend can update
  *  incremental committee-share-count progress on the awaiting-tally
- *  ratification view. */
+ *  ratification view.
+ *
+ *  `epoch` is widened to `u64` on the Rust side (CodeAnt PR #155 critical
+ *  fix for the u32/u64 epoch mismatch). JavaScript can lossless-represent
+ *  integers up to 2^53−1; CHURP rotations are not expected to cross that
+ *  for any deployed community, so `number` remains the safe shape. If we
+ *  ever need exact-u64, Tauri's serde JSON encoder handles `number ↔ u64`
+ *  for values ≤ Number.MAX_SAFE_INTEGER; values above would need a string
+ *  encoding migration. */
 export interface Tier3TallyShareAppliedPayload {
   communityId: string;
   pollId: string;

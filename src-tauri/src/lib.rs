@@ -21522,6 +21522,40 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
     crate::community_voting_core::check_eligibility(&snapshot, &self_owner, &cfg.eligibility)
         .map_err(|e| format!("voting_create_tier3_proposal: creator not eligible: {e:?}"))?;
 
+    // ZEB-295 Phase 6: hard gate on se-mode polls — refuse to create a
+    // ballot-secret poll unless the community has an active D-FROST
+    // committee. Without this, the freshly-applied PollCreate would
+    // bind to `NullCommitteeOracle` (Findings #2 + Cursor PR #155 #1):
+    //   - `maybe_install_committee_oracle_for_poll` is called exactly
+    //     once at apply time and returns early if no DKG has completed.
+    //   - Subsequent applies do NOT retry the install (would be a more
+    //     invasive change), so the poll stays bound to the null oracle
+    //     forever — every kd=rb's NIZK verify against the joint Y silently
+    //     fails (no oracle = no Y), every kd=ts verify fails (no Y_i),
+    //     and the poll permanently stalls in Ratification.
+    //
+    // Fail-fast here matches the existing pattern in
+    // `voting_cast_ratification_ballot`, which already errors out when
+    // no committee key is resolvable — surfacing the same precondition
+    // at PollCreate time instead of letting the proposer build a poll
+    // that no one (including themselves) can vote in.
+    if cfg.privacy_mode == "se" {
+        let dfrost_engine_opt = if let Some(reg) = dfrost_log_registry_for_engine.as_ref() {
+            reg.get(space_id).await
+        } else {
+            None
+        };
+        let has_active_committee = match dfrost_engine_opt {
+            Some(engine) => engine.latest_committee_epoch().await.is_some(),
+            None => false,
+        };
+        if !has_active_committee {
+            return Err("se-mode polls require an active community committee; \
+                 complete DKG ceremony first"
+                .to_string());
+        }
+    }
+
     // ZEB-298+ZEB-312 PR 2 Task 7: lazy-register the engine for this community
     // so engine-auto orchestration (kd=ss/sf/cl/rs auto-mint hooks) fires from
     // real user actions. ensure_voting_engine_for is idempotent — fast-path

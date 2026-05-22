@@ -105,11 +105,11 @@ struct MockCommitteeOracle {
     joint_verifying_key: [u8; 32],
     verifying_shares: BTreeMap<OwnerAddr, [u8; 32]>,
     threshold: u16,
-    latest: u32,
+    latest: u64,
 }
 
 impl CommitteeOracle for MockCommitteeOracle {
-    fn committee_at_epoch(&self, epoch: u32) -> Option<CommitteePublicState> {
+    fn committee_at_epoch(&self, epoch: u64) -> Option<CommitteePublicState> {
         Some(CommitteePublicState {
             epoch,
             joint_verifying_key: self.joint_verifying_key,
@@ -117,7 +117,7 @@ impl CommitteeOracle for MockCommitteeOracle {
             threshold: self.threshold,
         })
     }
-    fn latest_epoch(&self) -> Option<u32> {
+    fn latest_epoch(&self) -> Option<u64> {
         Some(self.latest)
     }
 }
@@ -125,7 +125,7 @@ impl CommitteeOracle for MockCommitteeOracle {
 fn oracle_for(
     committee: &MockCommittee,
     threshold: u16,
-    latest: u32,
+    latest: u64,
 ) -> std::sync::Arc<MockCommitteeOracle> {
     let mut verifying_shares = BTreeMap::new();
     for (i, addr) in committee.member_addrs.iter().enumerate() {
@@ -271,7 +271,7 @@ fn build_real_ts_payload(
     state: &Tier3PollState,
     committee: &MockCommittee,
     member_idx: usize,
-    committee_epoch: u32,
+    committee_epoch: u64,
 ) -> TallySharePayload {
     let n = state.candidates.len() + 1;
     let aggregates =

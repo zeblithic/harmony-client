@@ -397,7 +397,7 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
     /// or if the requested epoch does not match the current epoch.
     pub async fn committee_snapshot_at_epoch(
         &self,
-        epoch: u32,
+        epoch: u64,
     ) -> Option<(
         [u8; 32],
         std::collections::BTreeMap<OwnerAddr, [u8; 32]>,
@@ -412,8 +412,7 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
         // accept the query only when `epoch` matches `current_epoch`.
         // Multi-epoch historical lookup is a follow-up (see spec §5.3 —
         // CHURP rotation event log integration).
-        let current_epoch_u32 = u32::try_from(cs.current_epoch).ok()?;
-        if epoch != current_epoch_u32 {
+        if epoch != cs.current_epoch {
             return None;
         }
         let vk = cs.joint_verifying_key?;
@@ -422,12 +421,16 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
 
     /// ZEB-295 Phase 6 Task 8: return the latest CHURP epoch from the
     /// dfrost log. `None` if no DKG has completed yet.
-    pub async fn latest_committee_epoch(&self) -> Option<u32> {
+    ///
+    /// `u64` to match `committee_state.current_epoch` directly (CodeAnt
+    /// PR #155 critical: the earlier `u32` truncation silently broke the
+    /// epoch contract once CHURP rotations exceeded `u32::MAX`).
+    pub async fn latest_committee_epoch(&self) -> Option<u64> {
         let log = self.dfrost_log.lock().await;
         if !log.committee_state.active {
             return None;
         }
-        u32::try_from(log.committee_state.current_epoch).ok()
+        Some(log.committee_state.current_epoch)
     }
 
     /// ZEB-295 Phase 6 Task 8: clone this engine's local FROST

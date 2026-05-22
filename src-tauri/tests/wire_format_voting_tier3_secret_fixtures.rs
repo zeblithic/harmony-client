@@ -120,7 +120,7 @@ fn build_rb_se(n: usize) -> RatificationBallotPayload {
 
 /// Build a deterministic TallySharePayload at the given `n` and CHURP epoch.
 /// Entry count is `n + C(n,2)` per spec.
-fn build_ts(n: usize, epoch: u32) -> TallySharePayload {
+fn build_ts(n: usize, epoch: u64) -> TallySharePayload {
     let pair_count = n * (n - 1) / 2;
     let total = n + pair_count;
     TallySharePayload {

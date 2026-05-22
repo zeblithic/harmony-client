@@ -108,7 +108,7 @@ pub struct Tier3PollMeta {
 /// member verifying shares (= DLEQ basis points Y_i), and the threshold.
 #[derive(Debug, Clone)]
 pub struct CommitteePublicState {
-    pub epoch: u32,
+    pub epoch: u64,
     pub joint_verifying_key: [u8; 32],
     pub verifying_shares: std::collections::BTreeMap<OwnerAddr, [u8; 32]>,
     pub threshold: u16,
@@ -123,8 +123,8 @@ pub struct CommitteePublicState {
 /// engines that the IPC layer hands out behind locks; the oracle must be
 /// safe to share across those locks.
 pub trait CommitteeOracle: Send + Sync + std::fmt::Debug {
-    fn committee_at_epoch(&self, epoch: u32) -> Option<CommitteePublicState>;
-    fn latest_epoch(&self) -> Option<u32>;
+    fn committee_at_epoch(&self, epoch: u64) -> Option<CommitteePublicState>;
+    fn latest_epoch(&self) -> Option<u64>;
 }
 
 /// Trivial oracle that knows about no committees — used as the default
@@ -136,10 +136,10 @@ pub trait CommitteeOracle: Send + Sync + std::fmt::Debug {
 pub struct NullCommitteeOracle;
 
 impl CommitteeOracle for NullCommitteeOracle {
-    fn committee_at_epoch(&self, _epoch: u32) -> Option<CommitteePublicState> {
+    fn committee_at_epoch(&self, _epoch: u64) -> Option<CommitteePublicState> {
         None
     }
-    fn latest_epoch(&self) -> Option<u32> {
+    fn latest_epoch(&self) -> Option<u64> {
         None
     }
 }
@@ -173,7 +173,7 @@ pub struct TallyShareRecord {
 /// updated aggregates and have the new submission win.
 #[derive(Debug, Clone, Default)]
 pub struct SecretTallyState {
-    pub tally_shares: std::collections::BTreeMap<(OwnerAddr, u32), TallyShareRecord>,
+    pub tally_shares: std::collections::BTreeMap<(OwnerAddr, u64), TallyShareRecord>,
     /// Populated once enough shares are collected to Lagrange-combine and
     /// BSGS-decode every ciphertext. Mirrors the pu-mode `result` field
     /// shape so the IPC read path can render either uniformly.
@@ -1549,7 +1549,7 @@ pub fn recover_secret_tally(
     // (OwnerAddr, epoch) → TallyShareRecord; we want
     // epoch → [(addr, &entries)…] for Lagrange combination below.
     let mut by_epoch: BTreeMap<
-        u32,
+        u64,
         Vec<(
             OwnerAddr,
             &Vec<crate::community_voting_core::TallyShareEntry>,
@@ -4670,11 +4670,11 @@ mod tests {
         #[derive(Debug)]
         pub struct MockCommitteeOracle {
             pub state: MockOracleState,
-            pub latest: u32,
+            pub latest: u64,
         }
 
         impl super::super::CommitteeOracle for MockCommitteeOracle {
-            fn committee_at_epoch(&self, epoch: u32) -> Option<super::super::CommitteePublicState> {
+            fn committee_at_epoch(&self, epoch: u64) -> Option<super::super::CommitteePublicState> {
                 Some(super::super::CommitteePublicState {
                     epoch,
                     joint_verifying_key: self.state.joint_verifying_key,
@@ -4682,7 +4682,7 @@ mod tests {
                     threshold: self.state.threshold,
                 })
             }
-            fn latest_epoch(&self) -> Option<u32> {
+            fn latest_epoch(&self) -> Option<u64> {
                 Some(self.latest)
             }
         }
@@ -4771,7 +4771,7 @@ mod tests {
             state: &super::super::Tier3PollState,
             committee: &MockCommittee,
             member_idx: usize,
-            committee_epoch: u32,
+            committee_epoch: u64,
         ) -> crate::community_voting_core::TallySharePayload {
             use crate::community_voting_tier3_crypto::{
                 compress_point, decompress_point, partial_decrypt_share,
