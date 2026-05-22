@@ -497,8 +497,8 @@ mod tests {
     #[test]
     fn dleq_honest_proves_and_verifies() {
         let x_i = rs();
-        let y_i = &G * &x_i;
-        let c1_agg = &G * &rs();
+        let y_i = G * x_i;
+        let c1_agg = G * rs();
         let d_i = c1_agg * x_i;
         let proof = dleq_prove(&G, &y_i, &c1_agg, &d_i, &x_i);
         assert!(dleq_verify(&G, &y_i, &c1_agg, &d_i, &proof));
@@ -507,10 +507,10 @@ mod tests {
     #[test]
     fn dleq_tampered_share_fails() {
         let x_i = rs();
-        let y_i = &G * &x_i;
-        let c1_agg = &G * &rs();
+        let y_i = G * x_i;
+        let c1_agg = G * rs();
         let d_i = c1_agg * x_i;
-        let bad_d = d_i + &G;
+        let bad_d = d_i + G;
         let proof = dleq_prove(&G, &y_i, &c1_agg, &d_i, &x_i);
         assert!(!dleq_verify(&G, &y_i, &c1_agg, &bad_d, &proof));
     }
@@ -518,9 +518,9 @@ mod tests {
     #[test]
     fn dleq_tampered_y_fails() {
         let x_i = rs();
-        let y_i = &G * &x_i;
-        let bad_y = y_i + &G;
-        let c1_agg = &G * &rs();
+        let y_i = G * x_i;
+        let bad_y = y_i + G;
+        let c1_agg = G * rs();
         let d_i = c1_agg * x_i;
         let proof = dleq_prove(&G, &y_i, &c1_agg, &d_i, &x_i);
         assert!(!dleq_verify(&G, &bad_y, &c1_agg, &d_i, &proof));
@@ -531,7 +531,7 @@ mod tests {
     #[test]
     fn range5_proves_for_each_m_in_0_to_5() {
         let x = rs();
-        let y_point = &G * &x;
+        let y_point = G * x;
         for m in 0u64..=5 {
             let r = rs();
             let (c1, c2) = encrypt(Scalar::from(m), y_point, r);
@@ -546,11 +546,11 @@ mod tests {
     #[test]
     fn range5_rejects_out_of_range_m() {
         let x = rs();
-        let y_point = &G * &x;
+        let y_point = G * x;
         let r = rs();
         let m_bad = Scalar::from(6u64);
-        let c1 = &G * &r;
-        let c2 = (&G * &m_bad) + y_point * r;
+        let c1 = G * r;
+        let c2 = (G * m_bad) + y_point * r;
         // Caller tries to prove m=5 for a ciphertext that actually encrypts 6.
         let bad_proof = range5_prove(&y_point, &c1, &c2, 5, r);
         assert!(!range5_verify(&y_point, &c1, &c2, &bad_proof));
@@ -561,7 +561,7 @@ mod tests {
     #[test]
     fn consistency_passes_for_every_score_pair() {
         let x = rs();
-        let y_point = &G * &x;
+        let y_point = G * x;
         for score_a in 0u64..=5 {
             for score_b in 0u64..=5 {
                 let r_a = rs();
@@ -594,7 +594,7 @@ mod tests {
     #[test]
     fn consistency_rejects_mismatched_indicator() {
         let x = rs();
-        let y_point = &G * &x;
+        let y_point = G * x;
         let r_a = rs();
         let r_b = rs();
         let r_i = rs();
@@ -622,7 +622,7 @@ mod tests {
     #[test]
     fn ballot_bundle_round_trip_n5() {
         let x = rs();
-        let y_point = &G * &x;
+        let y_point = G * x;
         let scores = [5u64, 4, 3, 2, 1];
         let r_scores: Vec<Scalar> = (0..5).map(|_| rs()).collect();
         let (bundle, ciphertexts_scores, ciphertexts_indicators) =
@@ -638,7 +638,7 @@ mod tests {
     #[test]
     fn ballot_bundle_rejects_tampered_indicator() {
         let x = rs();
-        let y_point = &G * &x;
+        let y_point = G * x;
         let scores = [5u64, 0, 0];
         let r_scores: Vec<Scalar> = (0..3).map(|_| rs()).collect();
         let (mut bundle, ciphertexts_scores, ciphertexts_indicators) =

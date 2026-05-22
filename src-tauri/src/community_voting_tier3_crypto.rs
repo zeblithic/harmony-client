@@ -163,7 +163,7 @@ mod tests {
         // (x_secret, {id -> x_i}, Y = G * x).
         let coeffs: Vec<Scalar> = (0..t).map(|_| rand_scalar()).collect();
         let x = coeffs[0];
-        let y_point = &G * &x;
+        let y_point = G * x;
         let mut shares = BTreeMap::new();
         for i in 1..=n as u16 {
             let id = Scalar::from(i as u64);
@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn elgamal_encrypt_decrypt_known_message_round_trip() {
         let x = rand_scalar();
-        let y_point = &G * &x;
+        let y_point = G * x;
         let m = Scalar::from(3u64);
         let (c1, c2) = encrypt(m, y_point, rand_scalar());
         // Plaintext recovery shortcut for the single-key (non-threshold) case:
@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn elgamal_homomorphic_add_aggregates_messages() {
         let x = rand_scalar();
-        let y_point = &G * &x;
+        let y_point = G * x;
         let (a1, a2) = encrypt(Scalar::from(2u64), y_point, rand_scalar());
         let (b1, b2) = encrypt(Scalar::from(5u64), y_point, rand_scalar());
         let sum1 = a1 + b1;
@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn bsgs_rejects_out_of_bound() {
-        let p = &G * &Scalar::from(100u64);
+        let p = G * Scalar::from(100u64);
         assert_eq!(
             bsgs(&p, 50),
             None,
@@ -260,7 +260,7 @@ mod tests {
         let m = Scalar::from(1u64);
         let (c1_agg, c2_agg) = encrypt(m, y_point, rand_scalar());
         // Tamper: bump c2 by an unrelated point.
-        let bad_c2 = c2_agg + (&G * &Scalar::from(999u64));
+        let bad_c2 = c2_agg + (G * Scalar::from(999u64));
         let mut partial: BTreeMap<u16, RistrettoPoint> = BTreeMap::new();
         for id in [1u16, 2] {
             partial.insert(id, partial_decrypt_share(&c1_agg, &shares[&id]));
