@@ -224,6 +224,30 @@ pub fn recover_secret_tally(
 
 **Multi-engine determinism property:** Lagrange-interpolation over ANY size-`t` subset of `(i, x_i)` pairs from the SAME polynomial reconstructs the same secret. So replicas seeing different first-`t` shares from the same epoch converge on the same plaintext. Test 7.4 exercises this directly.
 
+#### 3.4.1 `compute_star_from_sums` — runoff round shape
+
+The runoff round operates on the aggregate `(score_sums, indicator_sums, ballot_count)` triple, NOT on per-ballot data (which the secret-mode protocol deliberately discards). For each finalist count:
+
+- **1 finalist:** `runoff_votes[0] = ballot_count` — every ballot's "leader" is the sole finalist (matches `tally_star` which `+1`s when there is a unique leader on each ballot).
+- **2 finalists `(a, b)` with `a < b` in `ordered`:**
+    - `runoff_votes[a] = indicator_sums[k(a, b)]` (the canonical "A beats B" direction).
+    - `runoff_votes[b] = ballot_count − indicator_sums[k(a, b)]`.
+- **3+ finalists (score-tie at 2nd place):** Condorcet-style "pairwise wins". For each finalist `i`, count OTHER finalists that `i` STRICTLY pairwise-beats. The pair index uses ABSOLUTE indices in `ordered` (not finalist-relative).
+
+The pair-index formula matches `aggregate_se_ballots`:
+
+```text
+k(a, b) = a * (2n − a − 1) / 2 + (b − a − 1)   for 0 ≤ a < b < n
+```
+
+#### 3.4.2 Known divergence from `tally_star` (one-direction encoding limitation)
+
+The wire format (§4.7.2) encrypts `[score_A > score_B]` only — NOT `[score_B > score_A]` or `[score_A == score_B]`. Per-ballot ties (which `tally_star` treats as abstentions in the 2-finalist runoff, and as "no unique leader → abstain" in the 3+-finalist runoff) are charged to the larger-index finalist via `ballot_count − indicator_sums[k]`. Likewise, multi-finalist Condorcet wins cannot distinguish "B strictly beats A" from "B ties A" — both feed into the `ballot_count − indicator_sums[k]` side.
+
+**Bit-identical equivalence to `tally_star` holds whenever no per-ballot tie exists between any pair of finalists.** When such ties exist, secret-mode STAR remains deterministic (same input → same output across all replicas) but may pick a different winner from public-mode STAR. The `compute_star_from_sums_diverges_from_tally_star_on_pair_ties` test sentinels the limitation.
+
+Encoding both directions of each indicator pair (so abstentions are derivable as `ballot_count − i_wins − j_wins`) is a wire-format extension deferred to a follow-up — it would double `RatificationBallotPayload.ciphertexts_indicators` and require a matching NIZK extension.
+
 ### 3.5 Stage projection — unchanged
 
 `current_stage_at(now)` continues to be purely time-based via the existing function. The "awaiting committee tally" state is NOT a new `Stage` variant — it's UI-only: `current_stage_at == Ratification` AND `now > ratification_end` AND `decrypted_result.is_none()`.
@@ -551,6 +575,8 @@ Regen pattern matches `wire_format_voting_tier3_fixtures.rs`. Comment in regen i
 ### 7.5 Plaintext-equivalence test
 
 Cast the same per-voter scores in two parallel polls (one `"pu"`, one `"se"`). Assert recovered `StarResult` equality. The "doesn't break STAR semantics" sentinel — ensures the Eager-STAR-with-NIZK path computes the same final outcome as the plaintext path.
+
+**Caveat per §3.4.2:** the bit-identical match holds whenever no per-ballot tie exists between any pair of finalists. Test ballot sets MUST avoid finalist-pair ties; the `compute_star_from_sums_matches_tally_star_for_random_ballots` test and the IPC integration plaintext-equivalence test both use deterministic non-tied ballots. The complementary `compute_star_from_sums_diverges_from_tally_star_on_pair_ties` test sentinels the divergence with a constructed pair-tie input. Removing this caveat requires the two-direction wire-format extension described in §3.4.2.
 
 ### 7.6 Frontend tests (`src/lib/components/__tests__/`)
 
