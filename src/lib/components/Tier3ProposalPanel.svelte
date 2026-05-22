@@ -264,23 +264,30 @@
         if (selectedPollId && p.pollId === selectedPollId) refetchSelected();
       }),
     );
-  });
-
-  // Polling fallback for peer-driven mid-stage mutations: declines,
-  // draft candidates, and draft-approval signals don't emit Tauri events
-  // the panel subscribes to (only the 5 stage-transition events do). An
-  // observer with an expanded poll would otherwise see stale rosters
-  // and approval counts until a stage transition fires or they themselves
-  // mutate. 5s is a pragmatic balance — ZEB-319 tracks adding granular
-  // post-apply events that will replace this polling.
-  $effect(() => {
-    if (!selectedPollId) return;
-    const id = selectedPollId;
-    const interval = setInterval(() => {
-      loadDetail(id);
-      loadSummaries();
-    }, 5_000);
-    return () => clearInterval(interval);
+    // ZEB-319: refetch on mid-stage mutations (replaces the 5s
+    // polling fallback). Filter by (communityId, pollId) to avoid
+    // needless refetches in multi-community / multi-poll panels.
+    unsubscribers.push(
+      adapter.subscribeTier3MiniPublicDecline((p) => {
+        if (p.communityId !== communityId) return;
+        if (selectedPollId && p.pollId === selectedPollId) refetchSelected();
+        // Declines change the mini-public size shown in the summary
+        // list (backup promotions), so refetch summaries too.
+        loadSummaries();
+      }),
+    );
+    unsubscribers.push(
+      adapter.subscribeTier3DraftCandidate((p) => {
+        if (p.communityId !== communityId) return;
+        if (selectedPollId && p.pollId === selectedPollId) refetchSelected();
+      }),
+    );
+    unsubscribers.push(
+      adapter.subscribeTier3DraftApproval((p) => {
+        if (p.communityId !== communityId) return;
+        if (selectedPollId && p.pollId === selectedPollId) refetchSelected();
+      }),
+    );
   });
 
   onDestroy(() => {
