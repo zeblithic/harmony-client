@@ -2,18 +2,73 @@ import { render, fireEvent, waitFor } from '@testing-library/svelte';
 import { describe, it, expect, vi } from 'vitest';
 import Tier3ProposalPanel from '../Tier3ProposalPanel.svelte';
 import { VotingAdapter } from '../../voting-adapter';
-import type { Tier3PollSummary } from '../../types/voting';
+import type { Tier3PollSummary, Tier3PollExport } from '../../types/voting';
+
+const TEST_COMMUNITY_ID = '11'.repeat(16);
+const TEST_POLL_ID = 'aa'.repeat(32);
+const TEST_MY_ADDR = '22'.repeat(32);
+
+function makeExportFixture(): Tier3PollExport {
+  return {
+    pollId: TEST_POLL_ID,
+    communityId: TEST_COMMUNITY_ID,
+    proposalText: 'Existing proposal',
+    proposer: TEST_MY_ADDR,
+    stage: 'dr',
+    pollCreateHlcMs: 1_700_000_000_000,
+    sortitionSize: 100,
+    deliberationWindowSeconds: 86400,
+    draftingWindowSeconds: 86400,
+    ratificationWindowSeconds: 86400,
+    incentiveMode: 'a',
+    miniPublic: [],
+    backupPool: [],
+    declined: [],
+    draftCandidates: [],
+    ratificationCandidates: [],
+    myRole: 'observer',
+    myDraftingApprovals: [],
+    myRatificationScores: null,
+    deliberationStatements: [],
+    myDeliberationStatementCount: 0,
+    myDeliberationVotes: [],
+    winnerEventHash: null,
+    runnerUpEventHash: null,
+    privacyMode: 'pu',
+    encryptedTallyShareCount: 0,
+    encryptedTallyThreshold: 0,
+    encryptedTallyCommitteeSize: 0,
+  };
+}
+
+function makeSummaryFixture(): Tier3PollSummary {
+  return {
+    pollId: TEST_POLL_ID,
+    communityId: TEST_COMMUNITY_ID,
+    proposalText: 'Existing proposal',
+    proposer: TEST_MY_ADDR,
+    stage: 'dr',
+    pollCreateHlcMs: 1_700_000_000_000,
+    sortitionSize: 100,
+    winnerText: null,
+    privacyMode: 'pu',
+  };
+}
 
 function createAdapterMock(summaries: Tier3PollSummary[] = []) {
   const adapter = new VotingAdapter();
   vi.spyOn(adapter, 'listTier3Polls').mockResolvedValue(summaries);
   vi.spyOn(adapter, 'createTier3Proposal').mockResolvedValue('pollid'.padEnd(64, '0'));
+  vi.spyOn(adapter, 'getTier3Poll').mockResolvedValue(makeExportFixture());
   vi.spyOn(adapter, 'subscribeTier3PollCreated').mockReturnValue(() => {});
   vi.spyOn(adapter, 'subscribeTier3SortitionComplete').mockReturnValue(() => {});
   vi.spyOn(adapter, 'subscribeTier3DraftingOpen').mockReturnValue(() => {});
   vi.spyOn(adapter, 'subscribeTier3RatificationOpen').mockReturnValue(() => {});
   vi.spyOn(adapter, 'subscribeTier3Finalized').mockReturnValue(() => {});
   vi.spyOn(adapter, 'subscribeTier3TallyShareApplied').mockReturnValue(() => {});
+  vi.spyOn(adapter, 'subscribeTier3MiniPublicDecline').mockReturnValue(() => {});
+  vi.spyOn(adapter, 'subscribeTier3DraftCandidate').mockReturnValue(() => {});
+  vi.spyOn(adapter, 'subscribeTier3DraftApproval').mockReturnValue(() => {});
   return adapter;
 }
 
@@ -118,12 +173,16 @@ describe('Tier3ProposalPanel', () => {
       callIdx += 1;
       return callIdx === 1 ? aPromise : bPromise;
     });
+    vi.spyOn(adapter, 'getTier3Poll').mockResolvedValue(makeExportFixture());
     vi.spyOn(adapter, 'subscribeTier3PollCreated').mockReturnValue(() => {});
     vi.spyOn(adapter, 'subscribeTier3SortitionComplete').mockReturnValue(() => {});
     vi.spyOn(adapter, 'subscribeTier3DraftingOpen').mockReturnValue(() => {});
     vi.spyOn(adapter, 'subscribeTier3RatificationOpen').mockReturnValue(() => {});
     vi.spyOn(adapter, 'subscribeTier3Finalized').mockReturnValue(() => {});
     vi.spyOn(adapter, 'subscribeTier3TallyShareApplied').mockReturnValue(() => {});
+    vi.spyOn(adapter, 'subscribeTier3MiniPublicDecline').mockReturnValue(() => {});
+    vi.spyOn(adapter, 'subscribeTier3DraftCandidate').mockReturnValue(() => {});
+    vi.spyOn(adapter, 'subscribeTier3DraftApproval').mockReturnValue(() => {});
 
     const aSummary: Tier3PollSummary = {
       pollId: 'aa'.repeat(32),
@@ -163,6 +222,139 @@ describe('Tier3ProposalPanel', () => {
     await new Promise((r) => setTimeout(r, 0));
     expect(queryByText('Community A proposal')).toBeNull();
     expect(queryByText('Community B proposal')).toBeTruthy();
+  });
+
+  // ── ZEB-319: event-driven refetch tests ──────────────────────────────────
+
+  it('refetches detail + summaries on voting-tier3-mini-public-decline matching selected community + poll', async () => {
+    let declineHandler: ((p: { pollId: string; communityId: string; decliner: string; declineHlcMs: number }) => void) | null = null;
+    const adapter = createAdapterMock([makeSummaryFixture()]);
+    vi.spyOn(adapter, 'subscribeTier3MiniPublicDecline').mockImplementation((h) => {
+      declineHandler = h as typeof declineHandler;
+      return () => {};
+    });
+
+    const { findByText } = render(Tier3ProposalPanel, {
+      props: { communityId: TEST_COMMUNITY_ID, adapter, myAddr: TEST_MY_ADDR },
+    });
+
+    // Select the poll so selectedPollId is set.
+    await fireEvent.click(await findByText('Existing proposal'));
+    await waitFor(() => expect(adapter.getTier3Poll).toHaveBeenCalledTimes(1));
+    expect(declineHandler).not.toBeNull();
+
+    vi.mocked(adapter.getTier3Poll).mockClear();
+    vi.mocked(adapter.listTier3Polls).mockClear();
+
+    declineHandler!({
+      communityId: TEST_COMMUNITY_ID,
+      pollId: TEST_POLL_ID,
+      decliner: 'cc'.repeat(32),
+      declineHlcMs: 1_234_567_890,
+    });
+
+    await waitFor(() => expect(adapter.getTier3Poll).toHaveBeenCalledTimes(1));
+    expect(adapter.getTier3Poll).toHaveBeenCalledWith(TEST_POLL_ID);
+    expect(adapter.listTier3Polls).toHaveBeenCalled();
+  });
+
+  it('ignores voting-tier3-mini-public-decline with mismatched communityId', async () => {
+    let declineHandler: ((p: { pollId: string; communityId: string; decliner: string; declineHlcMs: number }) => void) | null = null;
+    const adapter = createAdapterMock([makeSummaryFixture()]);
+    vi.spyOn(adapter, 'subscribeTier3MiniPublicDecline').mockImplementation((h) => {
+      declineHandler = h as typeof declineHandler;
+      return () => {};
+    });
+
+    const { findByText } = render(Tier3ProposalPanel, {
+      props: { communityId: TEST_COMMUNITY_ID, adapter, myAddr: TEST_MY_ADDR },
+    });
+
+    await fireEvent.click(await findByText('Existing proposal'));
+    await waitFor(() => expect(adapter.getTier3Poll).toHaveBeenCalledTimes(1));
+    expect(declineHandler).not.toBeNull();
+
+    vi.mocked(adapter.getTier3Poll).mockClear();
+    vi.mocked(adapter.listTier3Polls).mockClear();
+
+    // Fire with a different communityId — panel should ignore it entirely.
+    declineHandler!({
+      communityId: 'ff'.repeat(16),
+      pollId: TEST_POLL_ID,
+      decliner: 'cc'.repeat(32),
+      declineHlcMs: 1_234_567_890,
+    });
+
+    // Allow a tick for any async effects to settle.
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(adapter.getTier3Poll).not.toHaveBeenCalled();
+    expect(adapter.listTier3Polls).not.toHaveBeenCalled();
+  });
+
+  it('refetches detail on voting-tier3-draft-candidate matching selected community + poll', async () => {
+    let candidateHandler: ((p: { pollId: string; communityId: string; proposer: string; eventHash: string; candidateText: string }) => void) | null = null;
+    const adapter = createAdapterMock([makeSummaryFixture()]);
+    vi.spyOn(adapter, 'subscribeTier3DraftCandidate').mockImplementation((h) => {
+      candidateHandler = h as typeof candidateHandler;
+      return () => {};
+    });
+
+    const { findByText } = render(Tier3ProposalPanel, {
+      props: { communityId: TEST_COMMUNITY_ID, adapter, myAddr: TEST_MY_ADDR },
+    });
+
+    await fireEvent.click(await findByText('Existing proposal'));
+    await waitFor(() => expect(adapter.getTier3Poll).toHaveBeenCalledTimes(1));
+    expect(candidateHandler).not.toBeNull();
+
+    vi.mocked(adapter.getTier3Poll).mockClear();
+    vi.mocked(adapter.listTier3Polls).mockClear();
+
+    candidateHandler!({
+      communityId: TEST_COMMUNITY_ID,
+      pollId: TEST_POLL_ID,
+      proposer: TEST_MY_ADDR,
+      eventHash: 'dd'.repeat(32),
+      candidateText: 'Draft text',
+    });
+
+    await waitFor(() => expect(adapter.getTier3Poll).toHaveBeenCalledTimes(1));
+    expect(adapter.getTier3Poll).toHaveBeenCalledWith(TEST_POLL_ID);
+    // Draft-candidate does NOT trigger loadSummaries — only refetchSelected.
+    expect(adapter.listTier3Polls).not.toHaveBeenCalled();
+  });
+
+  it('refetches detail on voting-tier3-draft-approval matching selected community + poll', async () => {
+    let approvalHandler: ((p: { pollId: string; communityId: string; approver: string; targetEventHash: string }) => void) | null = null;
+    const adapter = createAdapterMock([makeSummaryFixture()]);
+    vi.spyOn(adapter, 'subscribeTier3DraftApproval').mockImplementation((h) => {
+      approvalHandler = h as typeof approvalHandler;
+      return () => {};
+    });
+
+    const { findByText } = render(Tier3ProposalPanel, {
+      props: { communityId: TEST_COMMUNITY_ID, adapter, myAddr: TEST_MY_ADDR },
+    });
+
+    await fireEvent.click(await findByText('Existing proposal'));
+    await waitFor(() => expect(adapter.getTier3Poll).toHaveBeenCalledTimes(1));
+    expect(approvalHandler).not.toBeNull();
+
+    vi.mocked(adapter.getTier3Poll).mockClear();
+    vi.mocked(adapter.listTier3Polls).mockClear();
+
+    approvalHandler!({
+      communityId: TEST_COMMUNITY_ID,
+      pollId: TEST_POLL_ID,
+      approver: TEST_MY_ADDR,
+      targetEventHash: 'ee'.repeat(32),
+    });
+
+    await waitFor(() => expect(adapter.getTier3Poll).toHaveBeenCalledTimes(1));
+    expect(adapter.getTier3Poll).toHaveBeenCalledWith(TEST_POLL_ID);
+    // Draft-approval does NOT trigger loadSummaries — only refetchSelected.
+    expect(adapter.listTier3Polls).not.toHaveBeenCalled();
   });
 
 });
