@@ -211,8 +211,8 @@ pub fn tally_star(
 /// - **1 finalist:** `runoff_votes[0] = ballot_count` (mirrors tally_star's
 ///   `+1` per ballot when there's a single leader).
 /// - **2 finalists `(a, b)` with `a < b` in `ordered`:**
-///     `runoff_votes[a] = indicator_sums[k(a,b)]` and
-///     `runoff_votes[b] = ballot_count - indicator_sums[k(a,b)]`.
+///   `runoff_votes[a] = indicator_sums[k(a,b)]` and
+///   `runoff_votes[b] = ballot_count - indicator_sums[k(a,b)]`.
 /// - **3+ finalists:** Condorcet-style "pairwise wins" count. For each
 ///   finalist `i`, `runoff_votes[i]` = number of OTHER finalists that
 ///   finalist `i` strictly pairwise-beats. This matches the ordering
@@ -327,14 +327,12 @@ pub fn compute_star_from_sums(
         // ABSOLUTE indices in `ordered` (NOT finalist-relative indices) —
         // `aggregate_se_ballots` and `recover_secret_tally` populate
         // `indicator_sums` over all `n*(n-1)/2` candidate pairs.
-        for fi_i in 0..finalist_indices.len() {
-            let i_abs = finalist_indices[fi_i];
+        for (fi_i, &i_abs) in finalist_indices.iter().enumerate() {
             let mut wins: u32 = 0;
-            for fi_j in 0..finalist_indices.len() {
+            for (fi_j, &j_abs) in finalist_indices.iter().enumerate() {
                 if fi_i == fi_j {
                     continue;
                 }
-                let j_abs = finalist_indices[fi_j];
                 // pair_index requires lo < hi over absolute indices.
                 let (lo, hi) = if i_abs < j_abs {
                     (i_abs, j_abs)
