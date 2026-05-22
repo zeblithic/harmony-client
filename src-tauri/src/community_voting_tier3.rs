@@ -3520,70 +3520,58 @@ mod tests {
     // per-author spam counter must NOT bump on replay, otherwise rehydrating
     // a log with duplicate events would falsely advance toward the 5-cap
     // and block legitimate later statements.
+    //
+    // The HLC monotonic guard (apply_event step 2) rejects strictly-less
+    // HLCs but accepts equal HLCs, so applying the exact same
+    // SignedVotingEvent twice exercises both the BTreeMap idempotency and
+    // the apply_event counter-skip guard end-to-end.
     #[test]
     fn apply_ds_replay_is_idempotent_for_spam_cap() {
         let mut poll = build_poll_in_deliberation_stage();
         let author = addr(1);
         let ev = ds_event_with_text(100, author, "Same statement");
 
-        // Apply the exact same event twice.
+        // First apply: counter must bump to 1.
         poll.apply_event(&ev).expect("first apply");
-        // Build a near-clone with a slightly later HLC so apply_event's
-        // monotonic guard accepts the second pass; we still hash the same
-        // payload bytes — but build_event re-derives the hash from signing
-        // bytes which include the HLC, so we instead apply by cloning the
-        // SignedVotingEvent at the same HLC. The engine layer permits this
-        // because the monotonic check compares `>` not `>=`... Actually,
-        // testing replay properly: we apply the same event payload+author
-        // twice. The HLC monotonic guard is the safeguard against true
-        // duplicates in production; this test exercises only the per-author
-        // counter logic when an insert *would* be a no-op.
-        //
-        // To test the counter-skip directly, force the second apply to use
-        // the same event_hash by reapplying the same SignedVotingEvent. The
-        // monotonic-HLC guard inside apply_event accepts equal HLCs only on
-        // identical (actor, hlc) — we bypass that ambiguity by lowering to
-        // the direct map-insert idempotency observation:
-
-        let event_hash = sha256_of_signing_bytes(&ev);
-        let prior_count = poll.deliberation.statements_per_author[&author];
-        assert_eq!(prior_count, 1, "first apply must increment counter to 1");
-        // Manually re-insert (simulating an idempotent map-insert path).
-        let replay_was_new = poll
-            .deliberation
-            .statements
-            .insert(
-                event_hash,
-                DeliberationStatement {
-                    event_hash,
-                    author,
-                    text: "Same statement".into(),
-                    created_at_hlc: ev.hlc.clone(),
-                },
-            )
-            .is_none();
-        assert!(
-            !replay_was_new,
-            "re-inserting the same event_hash must return Some (existing entry)"
+        assert_eq!(
+            poll.deliberation.statements_per_author[&author], 1,
+            "first apply must increment counter to 1"
+        );
+        assert_eq!(
+            poll.deliberation.statements.len(),
+            1,
+            "first apply must insert exactly one statement"
         );
 
-        // The fix in apply_event guards `statements_per_author += 1` on
-        // `is_none()`. Verify that the counter stays at 1 after distinct
-        // events, then 5-cap behavior remains correct.
+        // Replay the exact same SignedVotingEvent. Equal HLCs pass the
+        // monotonic guard; the BTreeMap insert returns the existing entry
+        // (no-op); the counter MUST NOT bump.
+        poll.apply_event(&ev).expect("replay apply");
+        assert_eq!(
+            poll.deliberation.statements_per_author[&author], 1,
+            "replay must NOT bump the per-author counter"
+        );
+        assert_eq!(
+            poll.deliberation.statements.len(),
+            1,
+            "replay must NOT add a new statement entry"
+        );
+
+        // After the replay, four more distinct statements should fit under
+        // the 5-cap, and a sixth distinct one is rejected.
         for i in 1u64..=4 {
             let next = ds_event_with_text(100 + i, author, &format!("Statement {i}"));
             poll.apply_event(&next).expect("apply");
         }
         assert_eq!(
             poll.deliberation.statements_per_author[&author], 5,
-            "exactly 5 distinct statements must be counted"
+            "exactly 5 distinct statements must be counted after replay"
         );
-        // A 6th distinct statement is rejected by the spam cap.
         let sixth = ds_event_with_text(200, author, "Sixth");
         poll.apply_event(&sixth).expect("apply");
         assert_eq!(
             poll.deliberation.statements_per_author[&author], 5,
-            "6th statement must be dropped (cap reached)"
+            "6th distinct statement must be dropped (cap reached)"
         );
     }
 }

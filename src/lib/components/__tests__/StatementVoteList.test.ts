@@ -41,11 +41,16 @@ const baseDetail: Tier3PollExport = {
   runnerUpEventHash: null,
 };
 
+// myAddr is intentionally different from `stmt.author` so the tri-button
+// renders by default. Self-vote suppression is covered by a dedicated test
+// below.
+const otherAddr = '44'.repeat(32);
+
 describe('StatementVoteList', () => {
-  it('renders tri-button for mini-public', () => {
+  it('renders tri-button for mini-public (statement from another member)', () => {
     const adapter = new VotingAdapter();
     const { getByText } = render(StatementVoteList, {
-      props: { detail: baseDetail, adapter, myAddr: '33'.repeat(32), onChange: () => {} },
+      props: { detail: baseDetail, adapter, myAddr: otherAddr, onChange: () => {} },
     });
     expect(getByText(/👍 Agree/)).toBeTruthy();
     expect(getByText(/👎 Disagree/)).toBeTruthy();
@@ -68,7 +73,7 @@ describe('StatementVoteList', () => {
     const adapter = new VotingAdapter();
     vi.spyOn(adapter, 'castDeliberationVote').mockResolvedValue();
     const { getByText } = render(StatementVoteList, {
-      props: { detail: baseDetail, adapter, myAddr: '33'.repeat(32), onChange: () => {} },
+      props: { detail: baseDetail, adapter, myAddr: otherAddr, onChange: () => {} },
     });
     await fireEvent.click(getByText(/👍 Agree/));
     await waitFor(() =>
@@ -87,11 +92,24 @@ describe('StatementVoteList', () => {
           myDeliberationVotes: [{ statementEventHash: stmt.statementEventHash, vote: 'agree' }],
         },
         adapter,
-        myAddr: '33'.repeat(32),
+        myAddr: otherAddr,
         onChange: () => {},
       },
     });
     // Statement is voted-on, filter is default-on for mini-public → hidden.
     expect(queryByText('A bridging idea')).toBeNull();
+  });
+
+  it('hides tri-button on own statement and shows "yours" chip', () => {
+    const adapter = new VotingAdapter();
+    // myAddr === stmt.author → self-vote case (Greptile bot-pass 2 P2).
+    const { queryByText, getByText } = render(StatementVoteList, {
+      props: { detail: baseDetail, adapter, myAddr: stmt.author, onChange: () => {} },
+    });
+    // Tri-button must be suppressed (backend silently drops self-votes).
+    expect(queryByText(/👍 Agree/)).toBeNull();
+    // Read-only chips and a "yours" indicator must still render.
+    expect(getByText(/👍 0/)).toBeTruthy();
+    expect(getByText(/yours/i)).toBeTruthy();
   });
 });

@@ -31,11 +31,18 @@
   // Plain `let` — increments inside $effect would trip effect_update_depth_exceeded if tracked.
   let bridgingRequestSeq = 0;
 
+  // Bridging surface size: a 150-member mini-public with the 5-statement
+  // spam cap admits up to 750 statements per poll. Top-10 was too narrow
+  // for that scale (Greptile bot-pass 2 nit). Top-20 keeps the panel
+  // scannable while surfacing a meaningfully broader slice; revisit if
+  // larger mini-publics or longer deliberations become common.
+  const BRIDGING_TOP_N = 20;
+
   async function loadBridging() {
     const seq = ++bridgingRequestSeq;
     const pollIdSnapshot = detail.pollId;
     try {
-      const next = await adapter.listBridgingStatements(pollIdSnapshot, 10);
+      const next = await adapter.listBridgingStatements(pollIdSnapshot, BRIDGING_TOP_N);
       if (seq !== bridgingRequestSeq || pollIdSnapshot !== detail.pollId) return;
       bridgingScores = next;
       bridgingError = null;

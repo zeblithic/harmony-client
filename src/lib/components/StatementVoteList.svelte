@@ -68,9 +68,12 @@
     return myVoteMap.get(s.statementEventHash);
   }
 
-  // Suppress unused variable warning — myAddr is passed for future use
-  // (e.g., highlighting your own statements).
-  void myAddr;
+  /** True when `s` was authored by the current viewer; the apply layer
+   * silently drops self-votes (spec §2.3), so we hide the tri-button to
+   * avoid presenting controls that are silently no-ops on click. */
+  function isOwnStatement(s: DeliberationStatementExport): boolean {
+    return s.author === myAddr;
+  }
 </script>
 
 <section class="vote-list">
@@ -97,7 +100,7 @@
       <li class="row">
         <div class="text">{s.text}</div>
         <div class="meta">by {authorShort(s.author)}</div>
-        {#if isWritable}
+        {#if isWritable && !isOwnStatement(s)}
           <div class="tri-button">
             <button
               type="button"
@@ -123,6 +126,9 @@
             <span class="chip agree">👍 {s.agreeCount}</span>
             <span class="chip disagree">👎 {s.disagreeCount}</span>
             <span class="chip pass">⊘ {s.passCount}</span>
+            {#if isOwnStatement(s)}
+              <span class="chip own" title="You authored this statement">yours</span>
+            {/if}
           </div>
         {/if}
       </li>
@@ -150,6 +156,7 @@
   .chip { padding: 0.1rem 0.4rem; background: #2a2c34; border-radius: 2px; color: #8a8c95; }
   .chip.agree { color: #4ad97a; }
   .chip.disagree { color: #d93838; }
+  .chip.own { color: #d6d6d6; background: #3a3c44; }
   .empty { color: #8a8c95; font-style: italic; }
   .error { color: #d93838; }
 </style>

@@ -22,10 +22,14 @@
   let submitting = $state(false);
   let submitError = $state<string | null>(null);
 
-  let charsRemaining = $derived(280 - text.length);
+  // Count Unicode scalar values (matches Rust `chars().count()` at apply time),
+  // not UTF-16 code units (`text.length`). `[...text]` iterates code points so
+  // emoji and other supplementary-plane characters count as 1 instead of 2.
+  let charCount = $derived([...text].length);
+  let charsRemaining = $derived(280 - charCount);
   let canSubmit = $derived(
     text.trim().length > 0
-      && text.length <= 280
+      && charCount <= 280
       && detail.stage === 'de'
       && detail.myDeliberationStatementCount < 5
       && !submitting,
@@ -54,10 +58,10 @@
     <p class="cap-warning">You've used all 5 statement slots for this poll.</p>
   {:else}
     <textarea
-      maxlength="280"
       placeholder="Up to 280 characters. Statements are immutable once submitted."
       bind:value={text}
       disabled={submitting}
+      aria-invalid={charCount > 280}
     ></textarea>
     <div class="footer">
       <span class="char-count">{charsRemaining} chars left</span>

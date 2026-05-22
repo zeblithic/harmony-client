@@ -78,4 +78,21 @@ describe('StatementComposer', () => {
     await fireEvent.input(getByPlaceholderText(/Up to 280 characters/i), { target: { value: '   \t  ' } });
     expect((getByText(/^Submit$/).closest('button') as HTMLButtonElement).disabled).toBe(true);
   });
+
+  it('counts Unicode scalar values (not UTF-16 code units) for charsRemaining', async () => {
+    // Cursor Bugbot pass-2 fix: emoji and other supplementary-plane chars
+    // must count as 1 to match Rust `chars().count()`. A string of 200
+    // 🙂 characters is 400 UTF-16 code units but only 200 Unicode scalars,
+    // which is well under the 280 limit; charsRemaining must reflect that.
+    const adapter = new VotingAdapter();
+    const { getByPlaceholderText, getByText } = render(StatementComposer, {
+      props: { detail: baseDetail, adapter, onChange: () => {} },
+    });
+    const emoji200 = '🙂'.repeat(200);
+    await fireEvent.input(getByPlaceholderText(/Up to 280 characters/i), { target: { value: emoji200 } });
+    // 280 - 200 = 80 remaining. If the old `text.length` logic were still
+    // in play, this would read `-120 chars left` and disable Submit.
+    expect(getByText(/80 chars left/)).toBeTruthy();
+    expect((getByText(/^Submit$/).closest('button') as HTMLButtonElement).disabled).toBe(false);
+  });
 });

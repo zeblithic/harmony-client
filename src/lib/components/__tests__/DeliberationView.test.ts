@@ -65,7 +65,7 @@ describe('DeliberationView', () => {
       props: { detail: createDetail(), adapter, myAddr: '33'.repeat(32), onChange: () => {} },
     });
     await waitFor(() => expect(adapter.listBridgingStatements).toHaveBeenCalledTimes(1));
-    expect(adapter.listBridgingStatements).toHaveBeenLastCalledWith('aa'.repeat(32), 10);
+    expect(adapter.listBridgingStatements).toHaveBeenLastCalledWith('aa'.repeat(32), 20);
   });
 
   it('refreshes bridging when subscribeTier3DeliberationVoteCast fires for the active poll', async () => {
