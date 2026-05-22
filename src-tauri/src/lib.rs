@@ -24693,23 +24693,26 @@ fn build_tier3_export(
     // size n. In pu-mode (or when no committee is active), all three are 0 —
     // the frontend gates rendering on privacy_mode != "pu".
     let privacy_mode = t3.meta.config.privacy_mode.clone();
+    // CodeRabbit PR #155: capture `latest_epoch()` once rather than calling
+    // it twice (once to fetch the committee, again to filter `tally_shares`).
+    // The oracle's `latest_epoch` is cheap, but the read-twice pattern
+    // invited a subtle inconsistency if the oracle ever became mutable
+    // (e.g. an interleaved CHURP rotation between the two calls).
     let (encrypted_tally_share_count, encrypted_tally_threshold, encrypted_tally_committee_size) =
         if privacy_mode == "se" {
-            match t3
-                .committee_oracle
-                .latest_epoch()
-                .and_then(|e| t3.committee_oracle.committee_at_epoch(e))
-            {
-                Some(cs) => {
-                    let latest = t3.committee_oracle.latest_epoch();
-                    let count = t3
-                        .secret_tally
-                        .tally_shares
-                        .iter()
-                        .filter(|((_, ep), _)| Some(*ep) == latest)
-                        .count() as u32;
-                    (count, cs.threshold, cs.verifying_shares.len() as u16)
-                }
+            match t3.committee_oracle.latest_epoch() {
+                Some(epoch) => match t3.committee_oracle.committee_at_epoch(epoch) {
+                    Some(cs) => {
+                        let count = t3
+                            .secret_tally
+                            .tally_shares
+                            .iter()
+                            .filter(|((_, ep), _)| *ep == epoch)
+                            .count() as u32;
+                        (count, cs.threshold, cs.verifying_shares.len() as u16)
+                    }
+                    None => (0, 0, 0),
+                },
                 None => (0, 0, 0),
             }
         } else {

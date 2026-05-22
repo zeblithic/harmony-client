@@ -3,9 +3,14 @@
 //!
 //! ## What this suite proves
 //!
-//! 1. Two independent `Tier3PollState` projections, fed the same ratification
-//!    ballots + tally shares in deliberately-different arrival orders, recover
-//!    **bit-identical** `StarResult` (`two_engines_recover_bit_identical_tally_from_same_log`).
+//! 1. Two independent `Tier3PollState` projections, fed byte-identical
+//!    HLC-monotonic event sequences (the discipline `Tier3PollState::apply_event`
+//!    enforces on any caller), recover **bit-identical** `StarResult`
+//!    (`two_engines_recover_bit_identical_tally_from_same_log`). This proves
+//!    `apply_event` + `recover_secret_tally` is a pure function of
+//!    (initial-state, sequence) — no hidden global ordering, RNG, or
+//!    nondeterministic permutation inside the apply path leaks into the
+//!    recovered tally.
 //!
 //! 2. **Lagrange invariance**: combining different size-`threshold` subsets of
 //!    valid shares yields the same plaintext (`lagrange_invariance_subset_a_eq_subset_b`).
@@ -332,22 +337,32 @@ fn ordered_candidates_for(state: &Tier3PollState) -> Vec<CandidateRef> {
         .collect()
 }
 
-// ─── Test 1: two engines, same events, different arrival orders ─────────────
+// ─── Test 1: two engines, same byte-identical HLC-monotonic event log ───────
 
-/// Build two independent `Tier3PollState` projections, apply the same set of
-/// ratification ballots + tally shares in deliberately-different arrival
-/// orders, and assert that both projections recover **bit-identical**
-/// `StarResult`. Same-process variant (matches the pattern in
-/// `community_voting_tier3_deliberation_multi_engine_integration.rs`).
+/// Build two independent `Tier3PollState` projections, feed both the same
+/// byte-identical HLC-monotonic event sequence, and assert that both recover
+/// **bit-identical** `StarResult`. Same-process variant (matches the pattern
+/// in `community_voting_tier3_deliberation_multi_engine_integration.rs`).
 ///
-/// The "different arrival orders" matters: `Tier3PollState::apply_event`
-/// enforces strict HLC monotonicity (Qodo PR #154 finding), so the test uses
-/// HLC-staggered events but applies them to engine A in [b1, b2, b3, t1, t2]
-/// order vs engine B in [b1, b3, b2, t2, t1] permuted only where HLC allows.
-/// Since strict-monotonic dispatch forces both engines to consume the same
-/// HLC-sorted sequence, the assertion proves the apply path is a pure
-/// function of (poll_state, sequence) — no nondeterministic ordering
-/// inside apply_event leaks into the recovered tally.
+/// Why feed identical sequences (not permuted ones)? `Tier3PollState::apply_event`
+/// enforces strict HLC monotonicity (Qodo PR #154 finding): a truly-permuted
+/// order with HLC-staggered events would be rejected at the apply boundary,
+/// not folded in. The HLC-monotonic dispatch discipline IS the convergence
+/// mechanism — every replica sorts incoming events into HLC order before
+/// apply, so by the time `apply_event` sees them they are already byte-identical
+/// across replicas. This test exercises the apply-path-is-pure-function
+/// invariant downstream of that discipline: given the same byte-identical
+/// input sequence, `apply_event` + `recover_secret_tally` is deterministic.
+/// A nondeterministic permutation inside `apply_event` itself (e.g. a
+/// HashMap iteration leaking into `ratification_ballots` ordering or into
+/// `recover_secret_tally`'s aggregate construction) would manifest as a
+/// diff in score_sums or runoff_votes between engine A and engine B. The
+/// bitwise-identical assertion is the canary.
+//
+// CodeAnt + CodeRabbit PR #155: the previous docstring claimed
+// "deliberately-different arrival orders" but the implementation feeds
+// byte-identical sequences. Docstring updated to match what the test
+// actually proves; semantics unchanged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_engines_recover_bit_identical_tally_from_same_log() {
     let committee = fake_committee(2, 3);

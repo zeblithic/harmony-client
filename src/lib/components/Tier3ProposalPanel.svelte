@@ -171,18 +171,24 @@
     }
   }
 
-  // ZEB-295 Phase 6 Task 11: derive whether the ratification window has
-  // closed for a given poll. Used by the awaiting-tally se-mode branch
-  // to render the committee-share progress banner instead of the active
-  // ratification ballot once Date.now() is past the window's end.
-  function pastRatificationEnd(d: Tier3PollExport): boolean {
-    const endMs =
-      d.pollCreateHlcMs +
-      (d.deliberationWindowSeconds +
-        d.draftingWindowSeconds +
-        d.ratificationWindowSeconds) *
-        1000;
-    return Date.now() >= endMs;
+  // ZEB-295 Phase 6 Task 11: derive whether to render the awaiting-tally
+  // committee-progress banner instead of the active ratification ballot.
+  //
+  // CodeRabbit PR #155: we previously gated on `Date.now() >= endMs` using
+  // a client-clock-derived window end. A device with a fast clock would
+  // hide the ballot UI before the backend considers ratification closed.
+  // Switch to a backend-derived signal: once any committee member has
+  // published a kd=ts share, the engine considers ratification closed from
+  // its perspective (shares are only emitted post-window). If no shares
+  // have arrived yet, keep the ballot UI up — worst case the backend
+  // rejects a too-late cast with a clear error, which is strictly better
+  // than hiding controls early on clock skew. Re-render the banner once
+  // a winner has been finalized is also out (caller's render branch
+  // guards on `!d.winnerEventHash`).
+  function shouldShowAwaitingTally(d: Tier3PollExport): boolean {
+    return d.privacyMode === 'se'
+        && !d.winnerEventHash
+        && d.encryptedTallyShareCount > 0;
   }
 
   function retryFailed(failed: Tier3PollSummary) {
@@ -247,9 +253,15 @@
     // share is applied so the awaiting-tally banner's k-of-n counter
     // updates incrementally. The list view doesn't depend on share
     // counts, so we only refetch the detail — not the summary list.
+    //
+    // CodeRabbit PR #155: the event fires for every accepted kd=ts across
+    // every community + poll the engine sees. Filter to (this community,
+    // currently-selected poll) so a tally share in a different community
+    // doesn't trigger a needless detail refetch on this panel.
     unsubscribers.push(
-      adapter.subscribeTier3TallyShareApplied(() => {
-        refetchSelected();
+      adapter.subscribeTier3TallyShareApplied((p) => {
+        if (p.communityId !== communityId) return;
+        if (selectedPollId && p.pollId === selectedPollId) refetchSelected();
       }),
     );
   });
@@ -493,7 +505,7 @@
             <DraftingPanel detail={selectedDetail} {adapter} {myAddr} onChange={refetchSelected} />
           {/if}
           {#if selectedDetail.stage === 'ra'}
-            {#if selectedDetail.privacyMode === 'se' && pastRatificationEnd(selectedDetail) && !selectedDetail.winnerEventHash}
+            {#if shouldShowAwaitingTally(selectedDetail)}
               <p class="awaiting-tally">
                 🔒 Ballots closed. Awaiting committee tally —
                 {selectedDetail.encryptedTallyShareCount} / {selectedDetail.encryptedTallyThreshold}

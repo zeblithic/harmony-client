@@ -20,7 +20,7 @@
 //! intentional wire-format change:
 //!
 //!     REGENERATE_VOTING_TIER3_SECRET_FIXTURES=1 cargo nextest run \
-//!         --locked -p harmony-app --features test-fixtures \
+//!         --locked -p harmony-app --all-targets --features test-fixtures \
 //!         --test wire_format_voting_tier3_secret_fixtures
 //!
 //! Then commit the new `.cbor` files in `tests/fixtures/voting_tier3_secret/`.

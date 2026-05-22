@@ -109,15 +109,14 @@ describe('StarRatificationBallot — se-mode rendering', () => {
 });
 
 describe('Tier3ProposalPanel — awaiting-tally state', () => {
-  it('shows committee progress banner when ballots closed but no winner yet', async () => {
-    // Configure timestamps so Date.now() is past the ratification window
-    // end. pollCreateHlcMs + (delib + draft + ratif) seconds * 1000.
-    // Use a pollCreateHlcMs of (now - 1 year) to guarantee post-end.
-    const now = Date.now();
-    const longPastStart = now - 365 * 86_400 * 1000;
+  it('shows committee progress banner when at least one tally share has arrived', async () => {
+    // CodeRabbit PR #155: gating switched from client-clock `Date.now() >=
+    // pollCreateHlcMs + window_seconds*1000` (skew-vulnerable) to
+    // backend-derived `encryptedTallyShareCount > 0`. A committee member
+    // publishing a kd=ts share is itself proof the engine considers
+    // ratification closed — no client clock required.
     const detail = seBaseExport({
       stage: 'ra',
-      pollCreateHlcMs: longPastStart,
       winnerEventHash: null,
       encryptedTallyShareCount: 1,
       encryptedTallyThreshold: 2,
@@ -129,7 +128,7 @@ describe('Tier3ProposalPanel — awaiting-tally state', () => {
       proposalText: detail.proposalText,
       proposer: detail.proposer,
       stage: 'ra',
-      pollCreateHlcMs: longPastStart,
+      pollCreateHlcMs: detail.pollCreateHlcMs,
       sortitionSize: detail.sortitionSize,
       winnerText: null,
       privacyMode: 'se',
@@ -149,6 +148,48 @@ describe('Tier3ProposalPanel — awaiting-tally state', () => {
       await findByText(/1 \/ 2[\s\S]*of 3 committee members/i),
     ).toBeTruthy();
     expect(getByText(/Awaiting committee tally/i)).toBeTruthy();
+  });
+
+  it('does NOT show awaiting-tally banner when zero shares have arrived (clock-skew safe)', async () => {
+    // CodeRabbit PR #155 regression test: even if the device clock is
+    // ahead and the client thinks the window has closed, no shares ⇒ keep
+    // the ballot UI up. The ballot component itself is rendered by the
+    // `:else` branch — assert that the awaiting-tally copy is absent.
+    const detail = seBaseExport({
+      stage: 'ra',
+      winnerEventHash: null,
+      // Backend hasn't seen any committee shares yet — no clock-derived
+      // signal can override this. Note pollCreateHlcMs is in the deep
+      // past (1.7e12 ms ≈ 2023) so `Date.now() >= windowEnd` would have
+      // returned true under the old gating; the new gating ignores it.
+      encryptedTallyShareCount: 0,
+      encryptedTallyThreshold: 2,
+      encryptedTallyCommitteeSize: 3,
+    });
+    const summary: Tier3PollSummary = {
+      pollId: detail.pollId,
+      communityId: detail.communityId,
+      proposalText: detail.proposalText,
+      proposer: detail.proposer,
+      stage: 'ra',
+      pollCreateHlcMs: detail.pollCreateHlcMs,
+      sortitionSize: detail.sortitionSize,
+      winnerText: null,
+      privacyMode: 'se',
+    };
+    const adapter = createPanelAdapterMock([summary], detail);
+    const { findByText, queryByText } = render(Tier3ProposalPanel, {
+      props: { communityId: detail.communityId, adapter, myAddr: 'zz'.repeat(32) },
+    });
+    const row = await findByText(detail.proposalText);
+    row.click();
+    await new Promise((r) => setTimeout(r, 0));
+    // Wait for the detail pane to finish rendering, then assert the
+    // banner is NOT present. We don't try to assert the ballot IS
+    // present (that's StarRatificationBallot's test surface); we just
+    // check the awaiting-tally copy is absent.
+    await findByText(detail.proposalText, { selector: 'h4' });
+    expect(queryByText(/Awaiting committee tally/i)).toBeNull();
   });
 });
 
