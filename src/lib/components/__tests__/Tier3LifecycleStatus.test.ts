@@ -12,6 +12,7 @@ const baseSummary: Tier3PollSummary = {
   pollCreateHlcMs: 1_700_000_000_000,
   sortitionSize: 100,
   winnerText: null,
+  privacyMode: 'pu',
 };
 
 describe('Tier3LifecycleStatus', () => {

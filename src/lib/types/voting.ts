@@ -385,6 +385,10 @@ export interface CreateTier3ProposalArgs {
   minVouchingDepth?: number;
   /** Optional prior PollId hex when this proposal retries a failed Tier 3. */
   retryOf?: string;
+  /** ZEB-295 Phase 6 Task 9: optional privacy_mode tag. The Rust IPC
+   *  accepts `Option<String>` and defaults to "pu" when omitted. Domain
+   *  here is restricted to the two end-user choices; 'rf' is reserved. */
+  privacyMode?: 'pu' | 'se';
 }
 
 /** Payload for `voting-tier3-poll-created` event. */
@@ -589,6 +593,22 @@ export interface Tier3PollExport {
   myDeliberationVotes: MyDeliberationVoteExport[];
   winnerEventHash: string | null;
   runnerUpEventHash: string | null;
+  /** ZEB-295: privacy mode for ratification ballots.
+   *   - 'pu' = Public (default): ballots are visible per-voter.
+   *   - 'se' = Ballot-secret: ballots are encrypted, tally revealed by
+   *     threshold committee decryption after the ratification window.
+   *   - 'rf' = Reserved future tag (Rust side accepts the string but no
+   *     production code path yet uses it). */
+  privacyMode: 'pu' | 'se' | 'rf';
+  /** ZEB-295 (se-mode only): committee members who have published shares
+   *  at the latest epoch. Always 0 in pu-mode polls. */
+  encryptedTallyShareCount: number;
+  /** ZEB-295 (se-mode only): threshold t at the latest committee epoch.
+   *  Always 0 in pu-mode polls or when no committee is yet active. */
+  encryptedTallyThreshold: number;
+  /** ZEB-295 (se-mode only): committee size n at the latest committee
+   *  epoch. Always 0 in pu-mode polls or when no committee is yet active. */
+  encryptedTallyCommitteeSize: number;
 }
 
 /** ZEB-311 — list-row shape. Lightweight; no candidate details. */
@@ -601,6 +621,21 @@ export interface Tier3PollSummary {
   pollCreateHlcMs: number;
   sortitionSize: number;
   winnerText: string | null;
+  /** ZEB-295: privacy mode tag — lets the list view render the 🔒 chip
+   *  without a full poll-detail fetch. Same three-tag domain as
+   *  `Tier3PollExport.privacyMode`. */
+  privacyMode: 'pu' | 'se' | 'rf';
+}
+
+/** ZEB-295: emitted on every accepted kd=ts so the frontend can update
+ *  incremental committee-share-count progress on the awaiting-tally
+ *  ratification view. */
+export interface Tier3TallyShareAppliedPayload {
+  communityId: string;
+  pollId: string;
+  epoch: number;
+  shareCount: number;
+  threshold: number;
 }
 
 /** Stage label for UI display. */

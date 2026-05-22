@@ -135,6 +135,7 @@ fn tier3_poll_summary_round_trips_through_cbor() {
         poll_create_hlc_ms: 1_700_000_000_000,
         sortition_size: 100,
         winner_text: None,
+        privacy_mode: "pu".to_string(),
     };
     let mut buf = Vec::new();
     ciborium::into_writer(&summary, &mut buf).expect("encode");
@@ -146,6 +147,7 @@ fn tier3_poll_summary_round_trips_through_cbor() {
         "communityId",
         "pollCreateHlcMs",
         "pollId",
+        "privacyMode",
         "proposalText",
         "proposer",
         "sortitionSize",

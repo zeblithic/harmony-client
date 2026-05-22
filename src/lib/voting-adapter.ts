@@ -34,6 +34,7 @@ import type {
   Tier2ProposalExport,
   Tier3DeliberationStatementCreatedPayload,
   Tier3DeliberationVoteCastPayload,
+  Tier3TallyShareAppliedPayload,
   VotingBallotCastPayload,
   VotingDelegateSignaledOnYourBehalfPayload,
   VotingDelegationChangedPayload,
@@ -133,6 +134,13 @@ export class VotingAdapter {
   > = [];
   private tier3DeliberationVoteCastSubs: Array<
     (p: Tier3DeliberationVoteCastPayload) => void
+  > = [];
+
+  // ZEB-295 Phase 6 — Tier 3 tally-share-applied subscriber. Emitted on
+  // every accepted kd=ts (se-mode poll) so the awaiting-tally banner can
+  // update its k-of-n committee-share progress incrementally.
+  private tier3TallyShareAppliedSubs: Array<
+    (p: Tier3TallyShareAppliedPayload) => void
   > = [];
 
   subscribePollCreated(handler: (p: VotingPollCreatedPayload) => void): () => void {
@@ -289,6 +297,17 @@ export class VotingAdapter {
     return () => {
       const i = this.tier3DeliberationVoteCastSubs.indexOf(handler);
       if (i >= 0) this.tier3DeliberationVoteCastSubs.splice(i, 1);
+    };
+  }
+
+  // ─── ZEB-295 Phase 6 — Tier 3 tally-share-applied subscriber ────────
+  subscribeTier3TallyShareApplied(
+    handler: (p: Tier3TallyShareAppliedPayload) => void,
+  ): () => void {
+    this.tier3TallyShareAppliedSubs.push(handler);
+    return () => {
+      const i = this.tier3TallyShareAppliedSubs.indexOf(handler);
+      if (i >= 0) this.tier3TallyShareAppliedSubs.splice(i, 1);
     };
   }
 
@@ -476,6 +495,16 @@ export class VotingAdapter {
         );
         stagedUnlisteners.push(unlistenTier3DeliberationVoteCast);
 
+        // ZEB-295 Phase 6 — incremental committee-share-count progress.
+        const unlistenTier3TallyShareApplied = await adapter.listen(
+          'voting-tier3-tally-share-applied',
+          (event) => {
+            const payload = event.payload as Tier3TallyShareAppliedPayload;
+            for (const sub of [...this.tier3TallyShareAppliedSubs]) sub(payload);
+          },
+        );
+        stagedUnlisteners.push(unlistenTier3TallyShareApplied);
+
         this.adapter = adapter;
         this.unlisteners.push(...stagedUnlisteners);
       } catch (e) {
@@ -645,6 +674,10 @@ export class VotingAdapter {
       minPower: args.minPower,
       minVouchingDepth: args.minVouchingDepth,
       retryOf: args.retryOf,
+      // ZEB-295 Phase 6 Task 11: optional privacy_mode passthrough.
+      // Rust IPC accepts Option<String>; undefined here serializes to
+      // null and the backend substitutes the "pu" default.
+      privacyMode: args.privacyMode,
     });
   }
 

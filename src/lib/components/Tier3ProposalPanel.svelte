@@ -56,6 +56,12 @@
   // 'a' | 'b' | 'c' | 'd' (see community_voting_tier3.rs). Labels are
   // descriptive UI strings; the wire value MUST be the single char.
   let incentiveMode = $state<'a' | 'b' | 'c' | 'd'>('d');
+  // ZEB-295 Phase 6 Task 11: privacy mode for ratification ballots.
+  //   'pu' (default) = public — per-voter ballots are visible.
+  //   'se' = ballot-secret — ballots encrypted, tally revealed only after
+  //          D-FROST committee threshold decryption.
+  // 'rf' is reserved on the wire but never user-selectable here.
+  let privacyMode = $state<'pu' | 'se'>('pu');
   let confirmingCreate = $state(false);
   let creating = $state(false);
   let createError = $state<string | null>(null);
@@ -149,6 +155,9 @@
         // power is a configuration choice the proposer makes
         // explicitly, not the platform's default.
         minPower: 0,
+        // ZEB-295 Phase 6 Task 11: privacy_mode passthrough. Omitted (pu)
+        // lets the Rust IPC substitute the default.
+        privacyMode,
       });
       proposalText = '';
       confirmingCreate = false;
@@ -160,6 +169,20 @@
     } finally {
       creating = false;
     }
+  }
+
+  // ZEB-295 Phase 6 Task 11: derive whether the ratification window has
+  // closed for a given poll. Used by the awaiting-tally se-mode branch
+  // to render the committee-share progress banner instead of the active
+  // ratification ballot once Date.now() is past the window's end.
+  function pastRatificationEnd(d: Tier3PollExport): boolean {
+    const endMs =
+      d.pollCreateHlcMs +
+      (d.deliberationWindowSeconds +
+        d.draftingWindowSeconds +
+        d.ratificationWindowSeconds) *
+        1000;
+    return Date.now() >= endMs;
   }
 
   function retryFailed(failed: Tier3PollSummary) {
@@ -217,6 +240,15 @@
     unsubscribers.push(
       adapter.subscribeTier3Finalized(() => {
         loadSummaries();
+        refetchSelected();
+      }),
+    );
+    // ZEB-295 Phase 6 Task 11: refetch the selected poll when a kd=ts
+    // share is applied so the awaiting-tally banner's k-of-n counter
+    // updates incrementally. The list view doesn't depend on share
+    // counts, so we only refetch the detail — not the summary list.
+    unsubscribers.push(
+      adapter.subscribeTier3TallyShareApplied(() => {
         refetchSelected();
       }),
     );
@@ -367,6 +399,21 @@
       </select>
     </label>
 
+    <label>
+      <span>Privacy mode</span>
+      <select id="privacy-mode" bind:value={privacyMode}>
+        <option value="pu">Public — all ballots visible</option>
+        <option value="se">Ballot-secret — only the aggregate tally is revealed</option>
+      </select>
+    </label>
+    {#if privacyMode === 'se'}
+      <p class="help-text">
+        🔒 Encrypted ballots; only the aggregate tally is decrypted after the
+        ratification window closes. Requires the community's D-FROST committee
+        to perform threshold decryption.
+      </p>
+    {/if}
+
     <button type="submit" disabled={!proposalText.trim()}>Create proposal</button>
     {#if createError}
       <p class="error">{createError}</p>
@@ -407,6 +454,9 @@
             class:selected={selectedPollId === s.pollId}
           >
             <span class="proposal-text">{s.proposalText}</span>
+            {#if s.privacyMode === 'se'}
+              <span class="privacy-chip" aria-label="ballot-secret poll" title="Ballot-secret">🔒</span>
+            {/if}
             <Tier3LifecycleStatus summary={s} />
           </button>
           {#if s.stage === 'fa' && s.proposer === myAddr}
@@ -443,7 +493,15 @@
             <DraftingPanel detail={selectedDetail} {adapter} {myAddr} onChange={refetchSelected} />
           {/if}
           {#if selectedDetail.stage === 'ra'}
-            <StarRatificationBallot detail={selectedDetail} {adapter} onCast={refetchSelected} />
+            {#if selectedDetail.privacyMode === 'se' && pastRatificationEnd(selectedDetail) && !selectedDetail.winnerEventHash}
+              <p class="awaiting-tally">
+                🔒 Ballots closed. Awaiting committee tally —
+                {selectedDetail.encryptedTallyShareCount} / {selectedDetail.encryptedTallyThreshold}
+                of {selectedDetail.encryptedTallyCommitteeSize} committee members have published shares.
+              </p>
+            {:else}
+              <StarRatificationBallot detail={selectedDetail} {adapter} onCast={refetchSelected} />
+            {/if}
           {:else if selectedDetail.stage === 'fi'}
             <!-- Finalized view: ratificationCandidates pivots from the
                  drafting-derived ordering to result.finalists, so the
@@ -580,6 +638,31 @@
   .error { color: #d93838; }
   .empty { color: #8a8c95; }
   .failed-detail { color: #d93838; }
+  /* ZEB-295 Phase 6 Task 11: ballot-secret affordances. Lock-icon chip
+     on the list row, help text under the create-form privacy toggle,
+     and the awaiting-tally banner on the ratification detail pane. */
+  .privacy-chip {
+    font-size: 0.85rem;
+    padding: 0.05rem 0.35rem;
+    border-radius: 3px;
+    background: rgba(170, 130, 255, 0.12);
+    color: #b29bff;
+  }
+  .help-text {
+    color: #8a8c95;
+    font-size: 0.8rem;
+    margin: -0.4rem 0 0;
+    line-height: 1.4;
+  }
+  .awaiting-tally {
+    margin: 0.75rem 0;
+    padding: 0.6rem 0.8rem;
+    background: rgba(170, 130, 255, 0.08);
+    border-left: 3px solid #b29bff;
+    border-radius: 3px;
+    color: #ddd;
+    font-size: 0.9rem;
+  }
   .finalized-result { margin-top: 1rem; }
   .winner-line, .runner-up-line { margin: 0.4rem 0; }
   .badge {

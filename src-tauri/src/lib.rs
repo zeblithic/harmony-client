@@ -22989,6 +22989,10 @@ pub struct Tier3PollSummary {
     /// Set once stage = Finalized; lets the panel show "Charter §3
     /// amended" without an extra fetch.
     pub winner_text: Option<String>,
+    /// ZEB-295 Phase 6 Task 11: privacy mode tag carried from the poll's
+    /// config ("pu" | "se" | "rf"). Lets the list view render the 🔒
+    /// privacy chip without doing a full `voting_get_tier3_poll` fetch.
+    pub privacy_mode: String,
 }
 
 /// ZEB-294: camelCase wire DTO for a bridging-statement score row.
@@ -24812,6 +24816,7 @@ async fn voting_list_tier3_polls_raw(
                 poll_create_hlc_ms: t3.meta.poll_create_hlc.wall_ms as i128,
                 sortition_size: t3.meta.config.sortition_size,
                 winner_text,
+                privacy_mode: t3.meta.config.privacy_mode.clone(),
             })
         })
         .collect();
