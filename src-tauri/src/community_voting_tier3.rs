@@ -733,8 +733,11 @@ impl Tier3PollState {
                                 .as_ref()
                                 .is_some_and(|v| v.len() == pair_count)
                             && payload.proof.as_ref().is_some_and(|p| {
-                                p.range_proofs.len() == 384 * n
-                                    && p.consistency_proofs.len() == 768 * pair_count
+                                p.range_proofs.len()
+                                == crate::community_voting_tier3_nizk::Range5Proof::SIZE * n
+                                && p.consistency_proofs.len()
+                                    == crate::community_voting_tier3_nizk::ConsistencyProof::SIZE
+                                        * pair_count
                             })
                     }
                     _ => false,
@@ -4629,11 +4632,7 @@ mod tests {
             scores: &[u64],
         ) -> super::super::RatificationBallotPayload {
             use crate::community_voting_tier3_nizk::prove_ballot_bundle_with_outputs;
-            let r_scores: Vec<Scalar> = (0..scores.len())
-                .map(|_| Scalar::random(&mut OsRng))
-                .collect();
-            let (bundle, cs, ci) =
-                prove_ballot_bundle_with_outputs(&committee.joint_y, scores, &r_scores);
+            let (bundle, cs, ci) = prove_ballot_bundle_with_outputs(&committee.joint_y, scores);
             super::super::RatificationBallotPayload {
                 poll_id: super::poll_id(),
                 scores: None,
@@ -4781,7 +4780,7 @@ mod tests {
             ]),
             ciphertexts_indicators: Some(vec![]),
             proof: Some(crate::community_voting_core::BallotNIZKProof {
-                range_proofs: vec![0u8; 384 * n],
+                range_proofs: vec![0u8; crate::community_voting_tier3_nizk::Range5Proof::SIZE * n],
                 consistency_proofs: vec![],
             }),
         };

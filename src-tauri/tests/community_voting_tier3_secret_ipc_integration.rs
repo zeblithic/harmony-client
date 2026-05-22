@@ -44,7 +44,9 @@ use harmony_app::community_voting_tier3::{
 use harmony_app::community_voting_tier3_crypto::{
     compress_point, decompress_point, partial_decrypt_share,
 };
-use harmony_app::community_voting_tier3_nizk::{dleq_prove, prove_ballot_bundle_with_outputs};
+use harmony_app::community_voting_tier3_nizk::{
+    dleq_prove, prove_ballot_bundle_with_outputs_with_nonces,
+};
 use harmony_app::owner_state_types::{Hlc, OwnerAddr};
 
 // ─── Shared fixture helpers (duplicated from ts_apply_helpers) ───────────────
@@ -264,7 +266,8 @@ fn build_real_se_ballot(committee: &MockCommittee, scores: &[u64]) -> Ratificati
     let r_scores: Vec<Scalar> = (0..scores.len())
         .map(|_| Scalar::random(&mut OsRng))
         .collect();
-    let (bundle, cs, ci) = prove_ballot_bundle_with_outputs(&committee.joint_y, scores, &r_scores);
+    let (bundle, cs, ci) =
+        prove_ballot_bundle_with_outputs_with_nonces(&committee.joint_y, scores, &r_scores);
     RatificationBallotPayload {
         poll_id: poll_id(),
         scores: None,

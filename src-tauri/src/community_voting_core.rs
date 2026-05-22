@@ -668,8 +668,12 @@ mod tier3_payload_tests {
                 3
             ]),
             proof: Some(BallotNIZKProof {
-                range_proofs: vec![0xEE; 384 * 3],
-                consistency_proofs: vec![0xFF; 768 * 3],
+                range_proofs: vec![0xEE; crate::community_voting_tier3_nizk::Range5Proof::SIZE * 3],
+                consistency_proofs: vec![
+                    0xFF;
+                    crate::community_voting_tier3_nizk::ConsistencyProof::SIZE
+                        * 3
+                ],
             }),
         };
         let mut buf = Vec::new();

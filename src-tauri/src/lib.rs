@@ -22678,21 +22678,18 @@ async fn voting_cast_ratification_ballot<R: tauri::Runtime>(
                 "voting_cast_ratification_ballot: joint_verifying_key failed to \
                      decompress — committee state corrupt?",
             )?;
-            // 3. Sample per-score randomness and generate the NIZK bundle.
-            //    `prove_ballot_bundle_with_outputs` returns the ciphertexts
-            //    derived during proof construction; randomness is bound by
-            //    construction, so we don't need to re-encrypt outside the
-            //    prover.
-            use curve25519_dalek::scalar::Scalar;
-            use frost_ristretto255::rand_core::OsRng;
-            let n = scores.len();
-            let r_scores: Vec<Scalar> = (0..n).map(|_| Scalar::random(&mut OsRng)).collect();
+            // 3. Generate the NIZK bundle. `prove_ballot_bundle_with_outputs`
+            //    samples ALL encryption randomness internally and returns the
+            //    ciphertexts derived during proof construction; randomness is
+            //    bound by construction, so we don't need to re-encrypt outside
+            //    the prover. Production MUST use this no-nonce API — the
+            //    deterministic-nonce variant is test-fixtures-gated to avoid
+            //    catastrophic nonce reuse.
             let scores_u64: Vec<u64> = scores.iter().map(|&s| s as u64).collect();
             let (bundle, ciphertexts_scores, ciphertexts_indicators) =
                 crate::community_voting_tier3_nizk::prove_ballot_bundle_with_outputs(
                     &y_point,
                     &scores_u64,
-                    &r_scores,
                 );
             crate::community_voting_core::RatificationBallotPayload {
                 poll_id: pid,

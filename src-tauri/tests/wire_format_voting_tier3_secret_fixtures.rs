@@ -33,6 +33,7 @@ use harmony_app::community_voting_core::{
     BallotNIZKProof, EncCiphertext, PollId, RatificationBallotPayload, TallyShareEntry,
     TallySharePayload,
 };
+use harmony_app::community_voting_tier3_nizk::{ConsistencyProof, Range5Proof};
 use std::path::PathBuf;
 
 const FIXTURE_DIR: &str = "tests/fixtures/voting_tier3_secret";
@@ -102,7 +103,7 @@ fn ts_entry(share_byte: u8, proof_byte: u8) -> TallyShareEntry {
 /// Build a deterministic se-mode RatificationBallotPayload at the given `n`.
 /// Ciphertext byte fields are fixed (`0xAA`/`0xBB` for scores, `0xCC`/`0xDD`
 /// for indicators); range/consistency proof blobs are `0xEE`/`0xFF` runs of
-/// the contractual length (384·n and 768·C(n,2)).
+/// the contractual length (Range5Proof::SIZE·n and ConsistencyProof::SIZE·C(n,2)).
 fn build_rb_se(n: usize) -> RatificationBallotPayload {
     let pair_count = n * (n - 1) / 2;
     RatificationBallotPayload {
@@ -111,8 +112,8 @@ fn build_rb_se(n: usize) -> RatificationBallotPayload {
         ciphertexts_scores: Some((0..n).map(|_| enc_ct(0xAA, 0xBB)).collect()),
         ciphertexts_indicators: Some((0..pair_count).map(|_| enc_ct(0xCC, 0xDD)).collect()),
         proof: Some(BallotNIZKProof {
-            range_proofs: vec![0xEE; 384 * n],
-            consistency_proofs: vec![0xFF; 768 * pair_count],
+            range_proofs: vec![0xEE; Range5Proof::SIZE * n],
+            consistency_proofs: vec![0xFF; ConsistencyProof::SIZE * pair_count],
         }),
     }
 }
@@ -131,8 +132,8 @@ fn build_ts(n: usize, epoch: u32) -> TallySharePayload {
 
 // ─── Test 1: kd=rb (se-mode) at n=3 ──────────────────────────────────────────
 
-/// n=3 → cs.len()=3, in.len()=3 (C(3,2)), range_proofs=384·3=1152,
-/// consistency_proofs=768·3=2304. Total encoded payload ≈ 3968 bytes.
+/// n=3 → cs.len()=3, in.len()=3 (C(3,2)),
+/// range_proofs = Range5Proof::SIZE·3, consistency_proofs = ConsistencyProof::SIZE·3.
 #[test]
 fn fixture_rb_se_n3_round_trip_and_byte_pin() {
     let payload = build_rb_se(3);
@@ -141,8 +142,8 @@ fn fixture_rb_se_n3_round_trip_and_byte_pin() {
 
 #[test]
 fn fixture_rb_se_n5_round_trip_and_byte_pin() {
-    // n=5 → cs.len()=5, in.len()=10 (C(5,2)), range_proofs=384·5=1920,
-    // consistency_proofs=768·10=7680. Total encoded payload ≈ 10,787 bytes.
+    // n=5 → cs.len()=5, in.len()=10 (C(5,2)),
+    // range_proofs = Range5Proof::SIZE·5, consistency_proofs = ConsistencyProof::SIZE·10.
     // n=5 is the spec's documented max-supported candidate count.
     let payload = build_rb_se(5);
     round_trip_or_regen("rb_se_n5.cbor", &payload);
