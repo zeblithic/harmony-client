@@ -21698,10 +21698,14 @@ async fn voting_submit_deliberation_statement<R: tauri::Runtime>(
         })?;
     let pid = crate::community_voting_core::PollId(pid_bytes);
 
-    if text.is_empty() || text.len() > 512 {
+    // Spec §2.3: text is 1..=280 Unicode scalar values (matches Rust
+    // `chars().count()` at apply time). Using byte length (`text.len()`)
+    // would falsely reject CJK at ~170 chars and silently accept 281..=512
+    // ASCII chars that the apply layer then drops — user-visible no-op.
+    let char_count = text.chars().count();
+    if char_count == 0 || char_count > 280 {
         return Err(format!(
-            "voting_submit_deliberation_statement: text length {} out of range (1..=512)",
-            text.len()
+            "voting_submit_deliberation_statement: text length {char_count} chars out of range (1..=280)"
         ));
     }
 
