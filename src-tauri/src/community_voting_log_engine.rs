@@ -1816,7 +1816,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                             .secret_tally
                             .tally_shares
                             .iter()
-                            .filter(|((_addr, e), _entries)| *e == ep)
+                            .filter(|((_addr, e), _record)| *e == ep)
                             .count();
                         let threshold = t3
                             .committee_oracle

@@ -144,18 +144,36 @@ impl CommitteeOracle for NullCommitteeOracle {
     }
 }
 
+/// Single LWW-stamped tally-share submission held as the value of
+/// `SecretTallyState::tally_shares`. Tagged with the submitting event's
+/// `(hlc, event_hash)` so the apply path can compare against an incoming
+/// re-submission from the same `(actor, committee_epoch)` key and
+/// overwrite when the incoming pair is strictly greater (Cursor PR #155
+/// #3 + Qodo PR #155 #4 LWW fix).
+///
+/// `entries` mirrors the original `TallySharePayload.entries` Vec: one
+/// `TallyShareEntry` per ciphertext aggregate (score-sum slots first,
+/// then indicator-pair slots in canonical order).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TallyShareRecord {
+    pub entries: Vec<crate::community_voting_core::TallyShareEntry>,
+    pub last_update_hlc: Hlc,
+    pub last_update_event_hash: [u8; 32],
+}
+
 /// Ballot-secret tally projection. `tally_shares` is LWW-upserted by
-/// `(actor, committee_epoch)` — each committee member contributes at most
-/// one share-set per epoch; later-HLC re-submissions overwrite. Value is
-/// the full `entries` Vec from that member's `TallySharePayload` (one
-/// entry per ciphertext being decrypted: scores + indicators across all
-/// candidates × ballots).
+/// `(actor, committee_epoch)` keyed on `(hlc.wall_ms, hlc.logical,
+/// hlc.device_id, event_hash)` lex order. Later submissions from the same
+/// committee member at the same epoch overwrite earlier ones — required
+/// per Qodo PR #155 #4 because kd=ts DLEQ verification is performed
+/// against aggregates computed from the poll's CURRENT accepted ballots,
+/// and a late-arriving valid ballot (lower HLC than already-applied
+/// shares) changes those aggregates and invalidates earlier shares for
+/// decryption; the committee member must be able to resubmit with the
+/// updated aggregates and have the new submission win.
 #[derive(Debug, Clone, Default)]
 pub struct SecretTallyState {
-    pub tally_shares: std::collections::BTreeMap<
-        (OwnerAddr, u32),
-        Vec<crate::community_voting_core::TallyShareEntry>,
-    >,
+    pub tally_shares: std::collections::BTreeMap<(OwnerAddr, u32), TallyShareRecord>,
     /// Populated once enough shares are collected to Lagrange-combine and
     /// BSGS-decode every ciphertext. Mirrors the pu-mode `result` field
     /// shape so the IPC read path can render either uniformly.
@@ -943,17 +961,56 @@ impl Tier3PollState {
                                         "kd=ts drop: T2 DLEQ verify failed (or aggregate decode failed)"
                                     );
                                 } else {
-                                    use std::collections::btree_map::Entry;
+                                    // Cursor PR #155 #3 + Qodo PR #155 #4:
+                                    // true LWW upsert on (actor, committee_epoch).
+                                    // Compare incoming (hlc, event_hash) against the
+                                    // existing record's; overwrite only when strictly
+                                    // greater. Stale arrivals are silent-dropped
+                                    // (advance_last_hlc=false so the projection
+                                    // watermark does not advance, ZEB-320).
+                                    //
+                                    // First-wins was incorrect because kd=ts DLEQ
+                                    // proofs verify against the homomorphic aggregate
+                                    // of all currently-accepted ballots; if a valid
+                                    // ballot with an earlier HLC arrives after some
+                                    // shares were applied, the aggregate changes and
+                                    // those earlier shares no longer decrypt the new
+                                    // aggregate, so the committee member must resubmit
+                                    // and the resubmission must win.
+                                    let event_hash = sha256_of_signing_bytes(ev);
                                     let key = (ev.actor, payload.committee_epoch);
-                                    match self.secret_tally.tally_shares.entry(key) {
-                                        Entry::Vacant(v) => {
-                                            v.insert(payload.entries.clone());
-                                        }
-                                        Entry::Occupied(_) => {
-                                            // LWW idempotent on (actor, epoch) — first valid wins;
-                                            // subsequent same-key shares accepted silently as no-op
-                                            // (watermark advances because the event was authenticated).
-                                        }
+                                    let should_insert =
+                                        match self.secret_tally.tally_shares.get(&key) {
+                                            None => true,
+                                            Some(existing) => {
+                                                let incoming = (
+                                                    ev.hlc.wall_ms,
+                                                    ev.hlc.logical,
+                                                    ev.hlc.device_id.as_str(),
+                                                    event_hash,
+                                                );
+                                                let current = (
+                                                    existing.last_update_hlc.wall_ms,
+                                                    existing.last_update_hlc.logical,
+                                                    existing.last_update_hlc.device_id.as_str(),
+                                                    existing.last_update_event_hash,
+                                                );
+                                                incoming > current
+                                            }
+                                        };
+                                    if should_insert {
+                                        self.secret_tally.tally_shares.insert(
+                                            key,
+                                            TallyShareRecord {
+                                                entries: payload.entries.clone(),
+                                                last_update_hlc: ev.hlc.clone(),
+                                                last_update_event_hash: event_hash,
+                                            },
+                                        );
+                                    } else {
+                                        // Stale LWW: incoming (hlc, event_hash) ≤
+                                        // existing; silent-drop watermark hold.
+                                        advance_last_hlc = false;
                                     }
                                 }
                             }
@@ -1489,7 +1546,8 @@ pub fn recover_secret_tally(
     let pair_count = n * (n - 1) / 2;
 
     // Group received tally_shares by epoch. tally_shares is keyed by
-    // (OwnerAddr, epoch) → entries vec; we want epoch → [(addr, entries)…].
+    // (OwnerAddr, epoch) → TallyShareRecord; we want
+    // epoch → [(addr, &entries)…] for Lagrange combination below.
     let mut by_epoch: BTreeMap<
         u32,
         Vec<(
@@ -1497,8 +1555,11 @@ pub fn recover_secret_tally(
             &Vec<crate::community_voting_core::TallyShareEntry>,
         )>,
     > = BTreeMap::new();
-    for ((addr, epoch), entries) in &poll.secret_tally.tally_shares {
-        by_epoch.entry(*epoch).or_default().push((*addr, entries));
+    for ((addr, epoch), record) in &poll.secret_tally.tally_shares {
+        by_epoch
+            .entry(*epoch)
+            .or_default()
+            .push((*addr, &record.entries));
     }
 
     // LWW-dedup of ratification ballots by actor — last (HLC, event_hash)
@@ -5152,8 +5213,101 @@ mod tests {
         );
     }
 
+    // Cursor PR #155 #3 + Qodo PR #155 #4: kd=ts is LWW per
+    // (actor, committee_epoch), keyed on (hlc.wall_ms, hlc.logical,
+    // hlc.device_id, event_hash) lex order. Two follow-on tests cover the
+    // "later wins" and "byte-identical replay is no-op" cases; a third
+    // covers the same-HLC-different-event-hash lex tiebreak.
+    //
+    // The earlier-HLC-second case (an old share arriving after a newer one)
+    // is intercepted by the apply_event monotonic-HLC guard *in single-
+    // replica flow*, so the LWW lex comparison is exercised through
+    // `incoming == existing` (replay) and same-HLC-different-hash branches
+    // here. Cross-replica convergence is exercised by integration tests
+    // that drive events through `apply_event` in canonical (hlc, hash) order.
     #[test]
-    fn kd_ts_lww_replays_dedup_by_actor_epoch() {
+    fn kd_ts_lww_later_hlc_with_different_entries_overwrites() {
+        let (mut state, committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        // Two ballots, then re-prove two share payloads against the same
+        // current aggregate. Each `build_real_tally_share_payload` call
+        // freshly samples DLEQ randomness, so entries differ between calls
+        // even though the underlying aggregate is identical. The test goal
+        // is to confirm that a later-HLC kd=ts overwrites an earlier-HLC one
+        // for the same (actor, epoch), regardless of payload differences.
+        let ballot_a = ts_apply_helpers::build_real_se_ballot_payload(&committee, &[5, 3, 1]);
+        let rb_a = ts_apply_helpers::rb_event_at_with_actor(
+            RATIFICATION_OPEN_MS,
+            committee.member_addrs[0],
+            &ballot_a,
+        );
+        state.apply_event(&rb_a).expect("rb apply A");
+        let ballot_b = ts_apply_helpers::build_real_se_ballot_payload(&committee, &[1, 2, 3]);
+        let rb_b = ts_apply_helpers::rb_event_at_with_actor(
+            RATIFICATION_OPEN_MS + 1,
+            committee.member_addrs[1],
+            &ballot_b,
+        );
+        state.apply_event(&rb_b).expect("rb apply B");
+
+        let payload_first =
+            ts_apply_helpers::build_real_tally_share_payload(&state, &committee, 0, 0);
+        let payload_second =
+            ts_apply_helpers::build_real_tally_share_payload(&state, &committee, 0, 0);
+        // Fresh DLEQ randomness → different entries; both are valid against
+        // the same aggregate (verified by the apply path's T2 DLEQ check).
+        assert_ne!(
+            payload_first.entries, payload_second.entries,
+            "test precondition: two re-proves at the same aggregate differ",
+        );
+
+        let ev_first = ts_apply_helpers::ts_event_at_with_actor(
+            RATIFICATION_END_MS,
+            committee.member_addrs[0],
+            &payload_first,
+        );
+        state.apply_event(&ev_first).expect("apply first");
+        let after_first = state
+            .secret_tally
+            .tally_shares
+            .get(&(committee.member_addrs[0], 0))
+            .expect("share first applied")
+            .clone();
+
+        let ev_second = ts_apply_helpers::ts_event_at_with_actor(
+            RATIFICATION_END_MS + 1,
+            committee.member_addrs[0],
+            &payload_second,
+        );
+        state.apply_event(&ev_second).expect("apply second");
+        let after_second = state
+            .secret_tally
+            .tally_shares
+            .get(&(committee.member_addrs[0], 0))
+            .expect("share second applied")
+            .clone();
+
+        assert_eq!(
+            state.secret_tally.tally_shares.len(),
+            1,
+            "(actor, epoch) LWW: still a single record",
+        );
+        assert_eq!(
+            after_second.entries, payload_second.entries,
+            "later-HLC submission with different entries must overwrite (LWW)",
+        );
+        assert_ne!(
+            after_second.entries, after_first.entries,
+            "record was overwritten, not retained",
+        );
+        assert!(
+            after_second.last_update_hlc.wall_ms > after_first.last_update_hlc.wall_ms,
+            "record carries the newer event's HLC",
+        );
+    }
+
+    #[test]
+    fn kd_ts_lww_byte_identical_replay_is_noop() {
         let (mut state, committee) =
             ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
         let ballot = ts_apply_helpers::build_real_se_ballot_payload(&committee, &[5, 3, 1]);
@@ -5162,35 +5316,119 @@ mod tests {
             committee.member_addrs[0],
             &ballot,
         );
-        state.apply_event(&rb_ev).expect("rb ok");
+        state.apply_event(&rb_ev).expect("rb apply");
         let payload = ts_apply_helpers::build_real_tally_share_payload(&state, &committee, 0, 0);
-        // First arrival (valid).
-        let ev_a = ts_apply_helpers::ts_event_at_with_actor(
+        let ev = ts_apply_helpers::ts_event_at_with_actor(
             RATIFICATION_END_MS,
             committee.member_addrs[0],
             &payload,
         );
-        state.apply_event(&ev_a).expect("apply A");
-        let first_entries =
-            state.secret_tally.tally_shares[&(committee.member_addrs[0], 0)].clone();
-        // Second arrival (same payload — DLEQ proofs use fresh randomness so
-        // this is a *re-prove* with same actor/epoch — but here payload is
-        // cloned, so it's a true byte-identical replay).
-        let ev_b = ts_apply_helpers::ts_event_at_with_actor(
-            RATIFICATION_END_MS + 1,
-            committee.member_addrs[0],
-            &payload,
-        );
-        state.apply_event(&ev_b).expect("apply B");
+        state.apply_event(&ev).expect("apply 1");
+        let record_after_first = state
+            .secret_tally
+            .tally_shares
+            .get(&(committee.member_addrs[0], 0))
+            .expect("share applied")
+            .clone();
+        let last_hlc_after_first = state.last_hlc.clone();
+
+        // True byte-identical replay: same event passed through apply_event
+        // again. The monotonic-HLC guard uses strict `<`, so equal HLCs
+        // pass; the LWW comparison then reports `incoming == existing`
+        // (not strictly greater) → silent stale-drop.
+        state.apply_event(&ev).expect("apply 2");
         assert_eq!(
             state.secret_tally.tally_shares.len(),
             1,
-            "(actor, epoch) LWW dedup: only one entry"
+            "LWW: still a single record",
+        );
+        let record_after_second = state
+            .secret_tally
+            .tally_shares
+            .get(&(committee.member_addrs[0], 0))
+            .expect("share still present")
+            .clone();
+        assert_eq!(
+            record_after_first, record_after_second,
+            "byte-identical replay must not change the record (LWW idempotent)",
         );
         assert_eq!(
-            state.secret_tally.tally_shares[&(committee.member_addrs[0], 0)],
-            first_entries,
-            "first-arrival wins (idempotent)"
+            state.last_hlc, last_hlc_after_first,
+            "stale LWW drop must not advance last_hlc watermark (ZEB-320)",
+        );
+    }
+
+    #[test]
+    fn kd_ts_lww_same_hlc_event_hash_tiebreak_is_deterministic() {
+        // Same HLC, two events with different payloads → different event_hash.
+        // The monotonic guard uses strict `<` so equal HLCs pass; the LWW
+        // comparison falls through to the event_hash tiebreak. We construct
+        // both events, sort them by event_hash to know which is "later",
+        // apply the "earlier" one first, then the "later" one — assert the
+        // later one wins.
+        let (mut state, committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        let ballot = ts_apply_helpers::build_real_se_ballot_payload(&committee, &[5, 3, 1]);
+        let rb_ev = ts_apply_helpers::rb_event_at_with_actor(
+            RATIFICATION_OPEN_MS,
+            committee.member_addrs[0],
+            &ballot,
+        );
+        state.apply_event(&rb_ev).expect("rb apply");
+
+        // Two payloads with different DLEQ-proof randomness — same aggregate,
+        // but the proofs use fresh `OsRng` so entries differ between calls.
+        let payload_a = ts_apply_helpers::build_real_tally_share_payload(&state, &committee, 0, 0);
+        let payload_b = ts_apply_helpers::build_real_tally_share_payload(&state, &committee, 0, 0);
+        assert_ne!(
+            payload_a.entries, payload_b.entries,
+            "test precondition: two distinct re-proves at the same aggregate",
+        );
+
+        let ev_a = ts_apply_helpers::ts_event_at_with_actor(
+            RATIFICATION_END_MS,
+            committee.member_addrs[0],
+            &payload_a,
+        );
+        let ev_b = ts_apply_helpers::ts_event_at_with_actor(
+            RATIFICATION_END_MS,
+            committee.member_addrs[0],
+            &payload_b,
+        );
+        let hash_a = event_hash_of(&ev_a);
+        let hash_b = event_hash_of(&ev_b);
+        // Order events so we apply the lower-hash one first, then the
+        // higher-hash one; LWW lex order says the higher hash wins.
+        let (lower, higher, higher_entries) = if hash_a < hash_b {
+            (&ev_a, &ev_b, &payload_b.entries)
+        } else {
+            (&ev_b, &ev_a, &payload_a.entries)
+        };
+        state.apply_event(lower).expect("apply lower");
+        let last_hlc_after_lower = state.last_hlc.clone();
+        state.apply_event(higher).expect("apply higher");
+
+        assert_eq!(
+            state.secret_tally.tally_shares.len(),
+            1,
+            "still a single record",
+        );
+        let record = &state.secret_tally.tally_shares[&(committee.member_addrs[0], 0)];
+        assert_eq!(
+            &record.entries, higher_entries,
+            "higher event_hash must win the same-HLC lex tiebreak",
+        );
+        // Both events accepted → watermark advances on each (equal HLC,
+        // but `advance_last_hlc=true` for the second). last_hlc stays at
+        // ev's HLC.
+        assert_eq!(
+            state.last_hlc.as_ref().map(|h| h.wall_ms),
+            Some(RATIFICATION_END_MS),
+        );
+        // Sanity: last_hlc_after_lower was already RATIFICATION_END_MS.
+        assert_eq!(
+            last_hlc_after_lower.as_ref().map(|h| h.wall_ms),
+            Some(RATIFICATION_END_MS),
         );
     }
 
