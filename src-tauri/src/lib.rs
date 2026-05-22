@@ -22719,12 +22719,24 @@ async fn voting_cast_ratification_ballot<R: tauri::Runtime>(
             //    the prover. Production MUST use this no-nonce API — the
             //    deterministic-nonce variant is test-fixtures-gated to avoid
             //    catastrophic nonce reuse.
+            //
+            //    Wrapped in `spawn_blocking` because n=5 candidates triggers
+            //    O(n + n²) Ristretto scalar-mults + sigma-protocol generation
+            //    (≈100-500 ms wall-clock) that would otherwise starve the
+            //    Tokio runtime worker thread under concurrent IPC load
+            //    (CodeAnt Performance finding).
             let scores_u64: Vec<u64> = scores.iter().map(|&s| s as u64).collect();
+            let y_point_for_blocking = y_point;
             let (bundle, ciphertexts_scores, ciphertexts_indicators) =
-                crate::community_voting_tier3_nizk::prove_ballot_bundle_with_outputs(
-                    &y_point,
-                    &scores_u64,
-                );
+                tokio::task::spawn_blocking(move || {
+                    crate::community_voting_tier3_nizk::prove_ballot_bundle_with_outputs(
+                        &y_point_for_blocking,
+                        &scores_u64,
+                    )
+                })
+                .await
+                .map_err(|e| format!("voting_cast_ratification_ballot: NIZK task join: {e}"))?
+                .map_err(|e| format!("voting_cast_ratification_ballot: invalid ballot: {e}"))?;
             crate::community_voting_core::RatificationBallotPayload {
                 poll_id: pid,
                 scores: None,

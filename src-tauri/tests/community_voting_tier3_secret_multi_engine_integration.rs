@@ -60,7 +60,7 @@ use harmony_app::community_voting_tier3_crypto::{
     bsgs, combine_shares, compress_point, decompress_point, encrypt, partial_decrypt_share,
 };
 use harmony_app::community_voting_tier3_nizk::{
-    dleq_prove, prove_ballot_bundle_with_outputs_with_nonces,
+    dleq_prove, prove_ballot_bundle_with_outputs_with_score_nonces,
 };
 use harmony_app::owner_state_types::{Hlc, OwnerAddr};
 
@@ -259,7 +259,7 @@ fn build_real_se_ballot(committee: &MockCommittee, scores: &[u64]) -> Ratificati
         .map(|_| Scalar::random(&mut OsRng))
         .collect();
     let (bundle, cs, ci) =
-        prove_ballot_bundle_with_outputs_with_nonces(&committee.joint_y, scores, &r_scores);
+        prove_ballot_bundle_with_outputs_with_score_nonces(&committee.joint_y, scores, &r_scores);
     RatificationBallotPayload {
         poll_id: poll_id(),
         scores: None,

@@ -695,9 +695,21 @@ pub fn consistency_verify(
 
 // ── Ballot bundle (n score range proofs + C(n,2) consistency proofs) ────
 
+#[derive(Debug)]
 pub struct BallotBundleProof {
     pub range_proofs: Vec<u8>,       // Range5Proof::SIZE * n
     pub consistency_proofs: Vec<u8>, // ConsistencyProof::SIZE * C(n,2)
+}
+
+/// Reasons `prove_ballot_bundle_with_outputs` may reject the input.
+/// Distinct error variants so the IPC layer can render a user-friendly
+/// message without sniffing strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum BallotBundleBuildError {
+    #[error("ballot must contain at least one score")]
+    Empty,
+    #[error("ballot scores must be in 0..=5")]
+    ScoreOutOfRange,
 }
 
 /// Generate a per-ballot NIZK bundle AND return the score + indicator
@@ -709,27 +721,52 @@ pub struct BallotBundleProof {
 /// Production callers must NEVER pass deterministic randomness (would
 /// catastrophically reuse nonces). The deterministic-nonce variant is
 /// gated behind `#[cfg(any(test, feature = "test-fixtures"))]`; see
-/// `prove_ballot_bundle_with_outputs_with_nonces`.
+/// `prove_ballot_bundle_with_outputs_with_score_nonces`.
+///
+/// Validates `scores` is non-empty and all values are ≤ 5 before
+/// generating randomness; out-of-range input returns
+/// `BallotBundleBuildError` instead of reaching the prover's debug
+/// assertion (which would otherwise panic in release builds via the
+/// downstream `assert!`).
 pub fn prove_ballot_bundle_with_outputs(
     y_point: &RistrettoPoint,
     scores: &[u64],
-) -> (
-    BallotBundleProof,
-    Vec<crate::community_voting_core::EncCiphertext>,
-    Vec<crate::community_voting_core::EncCiphertext>,
-) {
+) -> Result<
+    (
+        BallotBundleProof,
+        Vec<crate::community_voting_core::EncCiphertext>,
+        Vec<crate::community_voting_core::EncCiphertext>,
+    ),
+    BallotBundleBuildError,
+> {
+    if scores.is_empty() {
+        return Err(BallotBundleBuildError::Empty);
+    }
+    if scores.iter().any(|&s| s > 5) {
+        return Err(BallotBundleBuildError::ScoreOutOfRange);
+    }
     let n = scores.len();
     let r_scores: Vec<Scalar> = (0..n)
         .map(|_| Scalar::random(&mut frost_ristretto255::rand_core::OsRng))
         .collect();
-    prove_ballot_bundle_with_outputs_internal(y_point, scores, &r_scores)
+    Ok(prove_ballot_bundle_with_outputs_internal(
+        y_point, scores, &r_scores,
+    ))
 }
 
 /// **Test/test-fixture-only.** Same as `prove_ballot_bundle_with_outputs`
 /// but caller supplies the per-score encryption randomness — needed for
 /// deterministic wire-format pinning. Production code must NEVER call this.
+///
+/// **Determinism scope:** ONLY the per-score encryption randomness
+/// (`r_scores`) is fixed. Indicator-ciphertext nonces AND CDS simulator
+/// scalars inside each sigma-protocol branch are still sampled internally
+/// — so for fixed (y_point, scores, r_scores) the output `(bundle, cs, ci)`
+/// is NOT byte-identical across runs. Fixture-pinning tests that need
+/// byte-stable proof blobs use synthetic blobs (`vec![0xEE; ...]`) rather
+/// than calling this helper.
 #[cfg(any(test, feature = "test-fixtures"))]
-pub fn prove_ballot_bundle_with_outputs_with_nonces(
+pub fn prove_ballot_bundle_with_outputs_with_score_nonces(
     y_point: &RistrettoPoint,
     scores: &[u64],
     r_scores: &[Scalar],
@@ -1225,7 +1262,7 @@ mod tests {
         let y_point = G * x;
         let scores = [5u64, 4, 3, 2, 1];
         let (bundle, ciphertexts_scores, ciphertexts_indicators) =
-            prove_ballot_bundle_with_outputs(&y_point, &scores);
+            prove_ballot_bundle_with_outputs(&y_point, &scores).expect("valid scores");
         assert!(verify_ballot_bundle(
             &y_point,
             &ciphertexts_scores,
@@ -1240,7 +1277,7 @@ mod tests {
         let y_point = G * x;
         let scores = [5u64, 0, 0];
         let (mut bundle, ciphertexts_scores, ciphertexts_indicators) =
-            prove_ballot_bundle_with_outputs(&y_point, &scores);
+            prove_ballot_bundle_with_outputs(&y_point, &scores).expect("valid scores");
         bundle.consistency_proofs[0] ^= 0x01; // bit-flip one byte
         assert!(!verify_ballot_bundle(
             &y_point,
@@ -1250,23 +1287,38 @@ mod tests {
         ));
     }
 
-    /// Deterministic-nonce variant must produce reproducible output.
-    /// This is the variant the wire-format pinning tests need to remain
-    /// regen-stable across runs.
     #[test]
-    fn ballot_bundle_with_nonces_is_deterministic_for_fixed_inputs() {
-        // Note: the consistency proofs internally sample fresh randomness
-        // for the indicator ciphertexts AND for CDS simulator scalars, so
-        // the proof bytes are NOT deterministic even with fixed r_scores.
-        // What IS deterministic with fixed r_scores: the score ciphertexts.
+    fn ballot_bundle_rejects_empty_scores() {
+        let x = rs();
+        let y_point = G * x;
+        let err = prove_ballot_bundle_with_outputs(&y_point, &[]).expect_err("empty");
+        assert_eq!(err, BallotBundleBuildError::Empty);
+    }
+
+    #[test]
+    fn ballot_bundle_rejects_out_of_range_score() {
+        let x = rs();
+        let y_point = G * x;
+        let err = prove_ballot_bundle_with_outputs(&y_point, &[5, 6, 0]).expect_err("score=6");
+        assert_eq!(err, BallotBundleBuildError::ScoreOutOfRange);
+    }
+
+    /// Deterministic-nonce variant's score-randomness scope.
+    /// `_with_score_nonces` ONLY freezes the per-score encryption randomness.
+    /// Indicator-ciphertext nonces + CDS simulator scalars are still sampled
+    /// internally, so for fixed inputs only the score ciphertexts are
+    /// byte-stable. Fixture tests that need byte-stable proof blobs use
+    /// synthetic blobs (`vec![0xEE; ...]`) instead of this helper.
+    #[test]
+    fn ballot_bundle_with_score_nonces_freezes_score_ciphertexts_only() {
         let x = rs();
         let y_point = G * x;
         let scores = [4u64, 1, 2];
         let r_scores: Vec<Scalar> = (0..3).map(|_| rs()).collect();
         let (_bundle_a, cs_a, _ci_a) =
-            prove_ballot_bundle_with_outputs_with_nonces(&y_point, &scores, &r_scores);
+            prove_ballot_bundle_with_outputs_with_score_nonces(&y_point, &scores, &r_scores);
         let (_bundle_b, cs_b, _ci_b) =
-            prove_ballot_bundle_with_outputs_with_nonces(&y_point, &scores, &r_scores);
+            prove_ballot_bundle_with_outputs_with_score_nonces(&y_point, &scores, &r_scores);
         assert_eq!(
             cs_a, cs_b,
             "score ciphertexts are deterministic in r_scores"

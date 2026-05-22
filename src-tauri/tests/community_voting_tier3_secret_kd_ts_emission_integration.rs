@@ -315,7 +315,8 @@ async fn engine_orchestration_emits_kd_ts_after_kd_cl_se_mode() {
     let joint_y_point = joint_verifying_key_to_point(pkp.verifying_key());
     let mut ratification_ballots: Vec<RatificationBallotPayload> = Vec::new();
     for _ in 0..3 {
-        let (bundle, cs, ci) = prove_ballot_bundle_with_outputs(&joint_y_point, &[5u64, 1, 0]);
+        let (bundle, cs, ci) = prove_ballot_bundle_with_outputs(&joint_y_point, &[5u64, 1, 0])
+            .expect("test scores are well-formed");
         ratification_ballots.push(RatificationBallotPayload {
             poll_id,
             scores: None,

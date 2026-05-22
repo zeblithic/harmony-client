@@ -4749,7 +4749,8 @@ mod tests {
             scores: &[u64],
         ) -> super::super::RatificationBallotPayload {
             use crate::community_voting_tier3_nizk::prove_ballot_bundle_with_outputs;
-            let (bundle, cs, ci) = prove_ballot_bundle_with_outputs(&committee.joint_y, scores);
+            let (bundle, cs, ci) = prove_ballot_bundle_with_outputs(&committee.joint_y, scores)
+                .expect("test scores are well-formed");
             super::super::RatificationBallotPayload {
                 poll_id: super::poll_id(),
                 scores: None,
