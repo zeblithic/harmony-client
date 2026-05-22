@@ -4950,9 +4950,29 @@ mod tests {
         let snapshot = MembershipSnapshot {
             members: electorate
                 .iter()
-                .map(|o| (*o, MemberAttrs { power: 1, vouching_depth: 0 }))
-                .chain(std::iter::once((actor_owner, MemberAttrs { power: 1, vouching_depth: 0 })))
-                .chain(std::iter::once((proposer_owner, MemberAttrs { power: 1, vouching_depth: 0 })))
+                .map(|o| {
+                    (
+                        *o,
+                        MemberAttrs {
+                            power: 1,
+                            vouching_depth: 0,
+                        },
+                    )
+                })
+                .chain(std::iter::once((
+                    actor_owner,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )))
+                .chain(std::iter::once((
+                    proposer_owner,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )))
                 .collect(),
         };
 
@@ -5022,11 +5042,7 @@ mod tests {
     }
 
     /// Build a signed kd=md MiniPublicDecline event for tests.
-    fn build_md_event(
-        actor_seed: u8,
-        pid: PollId,
-        wall_ms: u64,
-    ) -> SignedVotingEvent {
+    fn build_md_event(actor_seed: u8, pid: PollId, wall_ms: u64) -> SignedVotingEvent {
         use ed25519_dalek::Signer;
         let priv_id = harmony_identity::PrivateIdentity::from_seed(&[actor_seed; 32]);
         let owner = OwnerAddr(priv_id.identity.address_hash);
@@ -5066,11 +5082,10 @@ mod tests {
     /// declineHlcMs }.
     #[tokio::test]
     async fn emits_voting_tier3_mini_public_decline_payload_shape() {
-        use tauri::Listener;
         use std::time::Duration;
+        use tauri::Listener;
 
-        let (engine, pid, app_handle, _pub_rx, _sub_tx) =
-            tier3_past_sortition_fixture().await;
+        let (engine, pid, app_handle, _pub_rx, _sub_tx) = tier3_past_sortition_fixture().await;
 
         // Capture emits.
         let captured: Arc<std::sync::Mutex<Vec<String>>> =
@@ -5134,12 +5149,11 @@ mod tests {
     /// eventHash, candidateText }.
     #[tokio::test]
     async fn emits_voting_tier3_draft_candidate_payload_shape() {
-        use tauri::Listener;
-        use std::time::Duration;
         use ed25519_dalek::Signer;
+        use std::time::Duration;
+        use tauri::Listener;
 
-        let (engine, pid, app_handle, _pub_rx, _sub_tx) =
-            tier3_past_sortition_fixture().await;
+        let (engine, pid, app_handle, _pub_rx, _sub_tx) = tier3_past_sortition_fixture().await;
 
         // Capture emits.
         let captured: Arc<std::sync::Mutex<Vec<String>>> =
@@ -5236,12 +5250,11 @@ mod tests {
     /// targetEventHash }.
     #[tokio::test]
     async fn emits_voting_tier3_draft_approval_payload_shape() {
-        use tauri::Listener;
-        use std::time::Duration;
         use ed25519_dalek::Signer;
+        use std::time::Duration;
+        use tauri::Listener;
 
-        let (engine, pid, app_handle, _pub_rx, _sub_tx) =
-            tier3_past_sortition_fixture().await;
+        let (engine, pid, app_handle, _pub_rx, _sub_tx) = tier3_past_sortition_fixture().await;
 
         // Capture emits.
         let captured_dc: Arc<std::sync::Mutex<Vec<String>>> =
