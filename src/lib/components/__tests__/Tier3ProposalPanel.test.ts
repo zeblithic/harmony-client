@@ -255,7 +255,9 @@ describe('Tier3ProposalPanel', () => {
 
     await waitFor(() => expect(adapter.getTier3Poll).toHaveBeenCalledTimes(1));
     expect(adapter.getTier3Poll).toHaveBeenCalledWith(TEST_POLL_ID);
-    expect(adapter.listTier3Polls).toHaveBeenCalled();
+    // Summary DTO does not include decline / roster fields, so loadSummaries
+    // must NOT be triggered by a decline event.
+    expect(adapter.listTier3Polls).not.toHaveBeenCalled();
   });
 
   it('ignores voting-tier3-mini-public-decline with mismatched communityId', async () => {
@@ -355,6 +357,37 @@ describe('Tier3ProposalPanel', () => {
     expect(adapter.getTier3Poll).toHaveBeenCalledWith(TEST_POLL_ID);
     // Draft-approval does NOT trigger loadSummaries — only refetchSelected.
     expect(adapter.listTier3Polls).not.toHaveBeenCalled();
+  });
+
+  it('does not schedule a polling interval after mount', async () => {
+    const adapter = createAdapterMock([makeSummaryFixture()]);
+
+    // Mount with real timers so the async Svelte $effect / mount lifecycle
+    // settles cleanly before we take over the clock.
+    render(Tier3ProposalPanel, {
+      props: { communityId: TEST_COMMUNITY_ID, adapter, myAddr: TEST_MY_ADDR },
+    });
+
+    // Let mount complete: listTier3Polls is called once on mount.
+    await waitFor(() => expect(adapter.listTier3Polls).toHaveBeenCalledTimes(1));
+
+    // Switch to fake timers AFTER mount so Svelte internals aren't disrupted.
+    vi.useFakeTimers();
+    try {
+      // Clear call counts to focus on post-mount activity only.
+      vi.mocked(adapter.getTier3Poll).mockClear();
+      vi.mocked(adapter.listTier3Polls).mockClear();
+
+      // Advance 10 seconds — without polling, no extra refetches should fire.
+      vi.advanceTimersByTime(10_000);
+      // Allow microtasks to flush after the timer advance.
+      await Promise.resolve();
+
+      expect(adapter.getTier3Poll).not.toHaveBeenCalled();
+      expect(adapter.listTier3Polls).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
 });

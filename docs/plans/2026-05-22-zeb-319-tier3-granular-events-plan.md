@@ -22,10 +22,11 @@ All implementer subagents MUST:
 - 5 backend gates per task:
   1. `cd src-tauri && cargo fmt --all -- --check`
   2. `cd src-tauri && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`
-  3. `cd src-tauri && cargo nextest run --locked --workspace --all-targets --features test-fixtures` (10-minute wall-clock kill switch)
+  3. `cd src-tauri && cargo check --locked --all-targets --features test-fixtures` — MSRV gate — declared toolchain via `rust-toolchain.toml`. Should be fast (incremental check, no codegen).
+  4. `cd src-tauri && cargo nextest run --locked --workspace --all-targets --features test-fixtures` (10-minute wall-clock kill switch)
 - 2 frontend gates per task touching `src/`:
-  4. `npx tsc --noEmit` (from repo root)
-  5. `npx vitest run` (from repo root)
+  5. `npx tsc --noEmit` (from repo root)
+  6. `npx vitest run` (from repo root)
 - **Commit BEFORE running the gates** so a 10-min wall-clock timeout doesn't lose work. The DONE_WITH_CONCERNS escape hatch is for "gate timed out, but commit is in place and observable concerns are X, Y, Z."
 - Use `set -o pipefail` or `${PIPESTATUS[0]}` whenever piping cargo output through `tail`/`grep` — pipe exit codes lie.
 - No worktrees — `git checkout` in the main repo only. The branch is already created.

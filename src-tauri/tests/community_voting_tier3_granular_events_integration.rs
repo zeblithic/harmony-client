@@ -675,11 +675,14 @@ async fn voting_tier3_draft_approval_emits_on_originator_and_peer() {
         Arc::new(std::sync::Mutex::new(Vec::new()));
     let captured_a_da: Arc<std::sync::Mutex<Vec<String>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured_b_dc: Arc<std::sync::Mutex<Vec<String>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
     let captured_b_da: Arc<std::sync::Mutex<Vec<String>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
 
     let captured_a_dc_clone = Arc::clone(&captured_a_dc);
     let captured_a_da_clone = Arc::clone(&captured_a_da);
+    let captured_b_dc_clone = Arc::clone(&captured_b_dc);
     let captured_b_da_clone = Arc::clone(&captured_b_da);
 
     app_handle_a.listen("voting-tier3-draft-candidate", move |evt| {
@@ -692,6 +695,12 @@ async fn voting_tier3_draft_approval_emits_on_originator_and_peer() {
         captured_a_da_clone
             .lock()
             .expect("captured_a_da lock")
+            .push(evt.payload().to_string());
+    });
+    app_handle_b.listen("voting-tier3-draft-candidate", move |evt| {
+        captured_b_dc_clone
+            .lock()
+            .expect("captured_b_dc lock")
             .push(evt.payload().to_string());
     });
     app_handle_b.listen("voting-tier3-draft-approval", move |evt| {
@@ -733,8 +742,15 @@ async fn voting_tier3_draft_approval_emits_on_originator_and_peer() {
         .await
         .expect("forward kd=dc packet to Engine B");
 
-    // Give Engine B a moment to process the kd=dc inbound.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait deterministically for Engine B to emit voting-tier3-draft-candidate,
+    // which implies the candidate is in its projection before kd=da arrives.
+    // Replacing the previous 100ms wall-clock sleep which was flaky on slow machines.
+    let payloads_b_dc = wait_for_emits(Arc::clone(&captured_b_dc), 1, Duration::from_secs(2)).await;
+    assert_eq!(
+        payloads_b_dc.len(),
+        1,
+        "Engine B must process kd=dc before kd=da is published; got {payloads_b_dc:?}"
+    );
 
     // Step 2: Engine A publishes kd=da referencing the candidate.
     let da_event = build_signed_draft_approval(

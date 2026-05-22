@@ -271,9 +271,9 @@
       adapter.subscribeTier3MiniPublicDecline((p) => {
         if (p.communityId !== communityId) return;
         if (selectedPollId && p.pollId === selectedPollId) refetchSelected();
-        // Declines change the mini-public size shown in the summary
-        // list (backup promotions), so refetch summaries too.
-        loadSummaries();
+        // Summary DTO does not include decline / roster fields
+        // (see voting_list_tier3_polls_raw in lib.rs), so no summaries
+        // reload is needed — declines only affect detail.
       }),
     );
     unsubscribers.push(
