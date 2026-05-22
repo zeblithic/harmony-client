@@ -221,19 +221,37 @@ fn build_ss_event(wall_ms: u64, primary: Vec<OwnerAddr>) -> SignedVotingEvent {
 /// aggregate count); explicit candidates = `n_total - 1` (status_quo
 /// accounts for the missing one). After this, applying further events at
 /// `wall_ms >= RATIFICATION_OPEN_MS` lands in the Ratification stage.
+/// Build an approval set of size ≥ `min_approvals`. The integration-test
+/// config uses sortition_size=20 → drafting threshold ceil(20/2)=10, more
+/// than the 3-member committee can supply, so we synthesize fake approver
+/// addresses (drafting_advancers only checks set cardinality, not identity).
+fn synthetic_approvals(min_approvals: usize) -> std::collections::HashSet<OwnerAddr> {
+    (0..min_approvals as u8)
+        .map(|i| OwnerAddr([0xA0 | i; 16]))
+        .collect()
+}
+
 fn arrange_se_poll_in_ratification(n_total: usize) -> (Tier3PollState, MockCommittee) {
     assert!(n_total >= 1, "n must be ≥ 1 (status_quo counts)");
     let committee = fake_committee_2_of_3();
     let electorate: Vec<OwnerAddr> = committee.member_addrs.to_vec();
-    let mut state = Tier3PollState::new_from_create(meta_with(se_config(), 0), electorate);
+    let cfg = se_config();
+    let threshold = (cfg.sortition_size as usize).div_ceil(2);
+    let mut state = Tier3PollState::new_from_create(meta_with(cfg, 0), electorate);
     state.install_committee_oracle(oracle_for(&committee, 0));
-    // Synthetic candidates so n_total = candidates.len() + 1.
+    // Synthetic candidates so n_total = ratification ordering length post-fix.
+    // Apply-time n derivation (Qodo PR #155 #2 fix) consults
+    // `ratification_candidates_ordering(drafting_advancers(...))`, which
+    // filters non-status-quo candidates that lack ceil(sortition_size/2)
+    // approvals. Give every synthetic candidate a full threshold-sized
+    // approval set so all advance.
+    let approvals = synthetic_approvals(threshold);
     for i in 0..(n_total - 1) {
         state.candidates.push(DraftCandidateState {
             event_hash: [0xC0 | (i as u8); 32],
             text: format!("candidate {i}"),
             proposer: Some(committee.member_addrs[0]),
-            approvals: std::collections::HashSet::new(),
+            approvals: approvals.clone(),
         });
     }
     // Apply a kd=ss at wall_ms=10 so the stage-projection has a
@@ -246,13 +264,17 @@ fn arrange_se_poll_in_ratification(n_total: usize) -> (Tier3PollState, MockCommi
 fn arrange_pu_poll_in_ratification(n_total: usize) -> Tier3PollState {
     assert!(n_total >= 1);
     let electorate: Vec<OwnerAddr> = (0..3u8).map(|i| OwnerAddr([0x10 + i; 16])).collect();
-    let mut state = Tier3PollState::new_from_create(meta_with(pu_config(), 0), electorate.clone());
+    let cfg = pu_config();
+    let threshold = (cfg.sortition_size as usize).div_ceil(2);
+    let mut state = Tier3PollState::new_from_create(meta_with(cfg, 0), electorate.clone());
+    // Same canonical-n fix as the se helper above.
+    let approvals = synthetic_approvals(threshold);
     for i in 0..(n_total - 1) {
         state.candidates.push(DraftCandidateState {
             event_hash: [0xC0 | (i as u8); 32],
             text: format!("candidate {i}"),
             proposer: Some(electorate[0]),
-            approvals: std::collections::HashSet::new(),
+            approvals: approvals.clone(),
         });
     }
     let ss = build_ss_event(10, electorate.clone());

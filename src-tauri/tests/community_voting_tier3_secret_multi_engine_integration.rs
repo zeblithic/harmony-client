@@ -223,15 +223,25 @@ fn build_ss_event(wall_ms: u64, primary: Vec<OwnerAddr>) -> SignedVotingEvent {
 /// (n_total - 1 synthetic + 1 implicit status_quo) in Ratification stage.
 fn build_se_poll_state(n_total: usize, committee: &MockCommittee) -> Tier3PollState {
     let electorate: Vec<OwnerAddr> = committee.member_addrs.to_vec();
-    let mut state =
-        Tier3PollState::new_from_create(meta_with(config_with_privacy("se"), 0), electorate);
+    let cfg = config_with_privacy("se");
+    let threshold = (cfg.sortition_size as usize).div_ceil(2);
+    let mut state = Tier3PollState::new_from_create(meta_with(cfg, 0), electorate);
     state.install_committee_oracle(oracle_for(committee, 2, 0));
+    // Apply-time n derivation (Qodo PR #155 #2 fix) uses
+    // `ratification_candidates_ordering(drafting_advancers(...))` which
+    // filters non-status-quo candidates lacking ceil(sortition_size/2)
+    // approvals. Give every synthetic candidate enough fake approvers to
+    // pass; addresses don't need to be in the electorate — drafting
+    // advances on set cardinality alone.
+    let approvals: std::collections::HashSet<OwnerAddr> = (0..threshold as u8)
+        .map(|i| OwnerAddr([0xA0 | i; 16]))
+        .collect();
     for i in 0..(n_total - 1) {
         state.candidates.push(DraftCandidateState {
             event_hash: [0xC0 | (i as u8); 32],
             text: format!("candidate {i}"),
             proposer: Some(committee.member_addrs[0]),
-            approvals: std::collections::HashSet::new(),
+            approvals: approvals.clone(),
         });
     }
     let ss = build_ss_event(10, committee.member_addrs.clone());

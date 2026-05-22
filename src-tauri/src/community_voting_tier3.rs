@@ -709,11 +709,38 @@ impl Tier3PollState {
                 let payload: RatificationBallotPayload =
                     decode_payload(&ev.payload).map_err(ApplyError::PayloadDecode)?;
                 let mode = self.meta.config.privacy_mode.as_str();
-                // n includes the synthesized status_quo slot (spec §6 Phase 4).
-                // self.candidates is the kd=dc-derived list; status_quo is
-                // materialized at Drafting-open, not at apply-time, so we add 1
-                // to reflect the eventual ratification candidate count.
-                let n = self.candidates.len() + 1;
+                // Qodo PR #155 #2 (ZEB-295 Phase 6): derive `n` from the
+                // canonical ratification-candidate ordering — the same
+                // computation the IPC path (`tier3_ratification_candidate_count`)
+                // and engine-auto kd=rs path use. Using `self.candidates.len() + 1`
+                // is incorrect when only a subset of kd=dc candidates pass the
+                // approval threshold + primary_size cap, because then
+                // `ratification_candidates_ordering.len() < self.candidates.len() + 1`
+                // and se-mode ballots minted by the IPC at the correct length
+                // would be silently dropped here on shape mismatch.
+                //
+                // If `drafting_advancers` returns None, we're pre-Drafting
+                // (status_quo not yet synthesized); silent-drop per spec §3.2.
+                let sq = synthesize_status_quo(&self.meta.poll_id);
+                let sq_hash = sq.event_hash;
+                let mut all_candidates = self.candidates.clone();
+                all_candidates.push(sq);
+                let primary_size = self.meta.config.sortition_size as usize;
+                let n = match drafting_advancers(&all_candidates, primary_size, sq_hash) {
+                    Some(advancers) => ratification_candidates_ordering(&advancers, sq_hash).len(),
+                    None => {
+                        advance_last_hlc = false;
+                        tracing::debug!(
+                            poll_id = %hex::encode(self.meta.poll_id.0),
+                            actor = %hex::encode(ev.actor.0),
+                            "kd=rb drop: pre-Drafting stage (status_quo not synthesized)"
+                        );
+                        // Skip downstream shape/NIZK checks; flow into the
+                        // unified tail. Use a no-op block to keep the
+                        // `if !b5_ok …` branches reachable but inert.
+                        0
+                    }
+                };
                 let pair_count = n * (n - 1) / 2;
                 let b5_ok = match mode {
                     "pu" => {
@@ -822,7 +849,28 @@ impl Tier3PollState {
                             "kd=ts drop: too early (ratification window not closed)"
                         );
                     } else {
-                        let n = self.candidates.len() + 1;
+                        // Qodo PR #155 #2: derive `n` from the canonical
+                        // ratification ordering, matching the IPC + engine-auto
+                        // kd=rs paths. See the analogous comment in the
+                        // RatificationBallot arm.
+                        let sq = synthesize_status_quo(&self.meta.poll_id);
+                        let sq_hash = sq.event_hash;
+                        let mut all_candidates = self.candidates.clone();
+                        all_candidates.push(sq);
+                        let primary_size = self.meta.config.sortition_size as usize;
+                        let n = match drafting_advancers(&all_candidates, primary_size, sq_hash) {
+                            Some(advancers) => {
+                                ratification_candidates_ordering(&advancers, sq_hash).len()
+                            }
+                            None => {
+                                advance_last_hlc = false;
+                                tracing::debug!(
+                                    poll_id = %hex::encode(self.meta.poll_id.0),
+                                    "kd=ts drop: pre-Drafting (status_quo not synthesized)"
+                                );
+                                0
+                            }
+                        };
                         let expected = n + n * (n - 1) / 2;
                         if payload.entries.len() != expected {
                             advance_last_hlc = false;
@@ -4606,7 +4654,15 @@ mod tests {
                 state: oracle_state,
                 latest: 0,
             }));
-            // Append `n_total - 1` synthetic candidates so n = candidates.len() + 1.
+            // Append `n_total - 1` synthetic candidates so the post-fix
+            // ratification ordering (drafting_advancers → ratification_candidates_ordering)
+            // has length n_total. Each candidate needs ≥ ceil(sortition_size/2)
+            // approvals to pass the drafting threshold; the default config's
+            // sortition_size=5 → threshold=3, exactly matching the 3 committee
+            // members. We approve every synthetic candidate by every committee
+            // member so all advance (deterministic test setup).
+            let all_approvals: std::collections::HashSet<crate::owner_state_types::OwnerAddr> =
+                committee.member_addrs.iter().copied().collect();
             for i in 0..(n_total - 1) {
                 state
                     .candidates
@@ -4614,7 +4670,7 @@ mod tests {
                         event_hash: [0xC0 | (i as u8); 32],
                         text: format!("candidate {i}"),
                         proposer: Some(committee.member_addrs[0]),
-                        approvals: std::collections::HashSet::new(),
+                        approvals: all_approvals.clone(),
                     });
             }
             // Apply a kd=ss at wall_ms=10 so the stage projection has a
@@ -4660,7 +4716,20 @@ mod tests {
                 compress_point, decompress_point, partial_decrypt_share,
             };
             use crate::community_voting_tier3_nizk::dleq_prove;
-            let n = state.candidates.len() + 1;
+            // Derive n from the canonical ratification ordering, matching the
+            // apply path's n derivation (Qodo PR #155 #2 fix). Using
+            // `state.candidates.len() + 1` is only correct when every kd=dc
+            // candidate passes threshold + cap, which the new
+            // n-derivation regression tests deliberately violate.
+            let sq = super::super::synthesize_status_quo(&state.meta.poll_id);
+            let sq_hash = sq.event_hash;
+            let mut all_candidates = state.candidates.clone();
+            all_candidates.push(sq);
+            let primary_size = state.meta.config.sortition_size as usize;
+            let advancers =
+                super::super::drafting_advancers(&all_candidates, primary_size, sq_hash)
+                    .expect("ratification ordering reachable");
+            let n = super::super::ratification_candidates_ordering(&advancers, sq_hash).len();
             let aggregates = super::super::aggregate_se_ballots(&state.ratification_ballots, n)
                 .expect("aggregates");
             let frost_id = (member_idx + 1) as u16;
@@ -4844,6 +4913,110 @@ mod tests {
             state.last_hlc.as_ref().map(|h| h.wall_ms),
             Some(RATIFICATION_OPEN_MS),
             "accept must advance last_hlc"
+        );
+    }
+
+    // Qodo PR #155 #2: regression for apply-time n derivation. Build a poll
+    // where `self.candidates.len() + 1` (the old buggy n) differs from the
+    // canonical ratification-ordering length. Asserts a se-mode ballot built
+    // for the canonical n is accepted — under the buggy code it would have
+    // been silently dropped by the b5 shape check.
+    #[test]
+    fn kd_rb_se_mode_n_derived_from_ratification_ordering_not_candidate_count() {
+        // Helper provisions 2 synthetic candidates with full committee approvals
+        // (post-fix helper). After the fix to the apply path, n = ordering length;
+        // we extend `state.candidates` with sub-threshold candidates that bring
+        // `self.candidates.len() + 1` to 6 while the canonical ordering remains 3
+        // (2 passing + status_quo). The IPC path sizes ballots at the canonical
+        // ordering length, so under the buggy `n = candidates.len() + 1` the
+        // ballot would be silently dropped by the b5 shape gate.
+        let (mut state, committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        // Push 3 extra candidates with ZERO approvals → they fail the
+        // drafting threshold (ceil(sortition_size=5 / 2) = 3) and are
+        // filtered out by `drafting_advancers`. After these pushes:
+        //   - self.candidates.len() = 5
+        //   - self.candidates.len() + 1 = 6  (old buggy n)
+        //   - ratification ordering length = 2 (passing) + 1 (status_quo) = 3
+        //     (the correct n).
+        for i in 0..3u8 {
+            state
+                .candidates
+                .push(crate::community_voting_tier3::DraftCandidateState {
+                    event_hash: [0xD0 | i; 32],
+                    text: format!("sub-threshold {i}"),
+                    proposer: Some(committee.member_addrs[0]),
+                    approvals: std::collections::HashSet::new(),
+                });
+        }
+        assert_eq!(state.candidates.len(), 5, "test setup precondition");
+
+        // Build a real se-mode ballot for n=3 (3 scores → 3 score-aggregates,
+        // 3 indicator-pair aggregates).
+        let payload = ts_apply_helpers::build_real_se_ballot_payload(&committee, &[5, 3, 1]);
+        let ev = ts_apply_helpers::rb_event_at_with_actor(
+            RATIFICATION_OPEN_MS,
+            state.eligible_electorate_snapshot[0],
+            &payload,
+        );
+        state.apply_event(&ev).expect("apply ok");
+        assert_eq!(
+            state.ratification_ballots.len(),
+            1,
+            "se-mode ballot sized for ratification ordering n=3 must be accepted; \
+             under the buggy n = candidates.len()+1 = 6, the b5 shape check would have dropped it",
+        );
+        assert_eq!(
+            state.last_hlc.as_ref().map(|h| h.wall_ms),
+            Some(RATIFICATION_OPEN_MS),
+            "accept must advance last_hlc",
+        );
+    }
+
+    // Qodo PR #155 #2: same bug surface for the kd=ts shape check.
+    // A kd=ts payload sized to the canonical ratification ordering n must be
+    // accepted; the buggy path used `self.candidates.len() + 1` and would
+    // reject any payload sized for a smaller n.
+    #[test]
+    fn kd_ts_n_derived_from_ratification_ordering_not_candidate_count() {
+        let (mut state, committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        // Same trick as above: extend `state.candidates` with sub-threshold
+        // entries so `self.candidates.len() + 1 = 6 ≠ 3 = ordering length`.
+        for i in 0..3u8 {
+            state
+                .candidates
+                .push(crate::community_voting_tier3::DraftCandidateState {
+                    event_hash: [0xD0 | i; 32],
+                    text: format!("sub-threshold {i}"),
+                    proposer: Some(committee.member_addrs[0]),
+                    approvals: std::collections::HashSet::new(),
+                });
+        }
+        // Submit a valid ballot first so `aggregate_se_ballots` has input;
+        // built for n=3 (the correct ordering length).
+        let ballot = ts_apply_helpers::build_real_se_ballot_payload(&committee, &[5, 3, 1]);
+        let rb_ev = ts_apply_helpers::rb_event_at_with_actor(
+            RATIFICATION_OPEN_MS,
+            committee.member_addrs[0],
+            &ballot,
+        );
+        state.apply_event(&rb_ev).expect("rb apply");
+        // Build a kd=ts payload for n=3 (per the helper, which reads
+        // `aggregate_se_ballots(..., n=3)` internally — see helper for
+        // n derivation).
+        let payload = ts_apply_helpers::build_real_tally_share_payload(&state, &committee, 0, 0);
+        let ev = ts_apply_helpers::ts_event_at_with_actor(
+            RATIFICATION_END_MS,
+            committee.member_addrs[0],
+            &payload,
+        );
+        state.apply_event(&ev).expect("apply ok");
+        assert_eq!(
+            state.secret_tally.tally_shares.len(),
+            1,
+            "kd=ts payload sized for ratification ordering n=3 must be accepted; \
+             under the buggy n = candidates.len()+1 = 6 the shape check would have dropped it",
         );
     }
 
