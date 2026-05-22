@@ -221,15 +221,22 @@ pub fn validate_ratification_ballot(
     pd: &RatificationBallotPayload,
     expected_candidate_count: usize,
 ) -> Result<(), ValidateError> {
-    if pd.scores.len() != expected_candidate_count {
+    // ZEB-295 Phase 6: `scores` is now Option<Vec<u8>> on the wire-format
+    // type (Some in "pu" mode, None in "se" mode). This validator is only
+    // called from the pu-mode IPC path, so we treat None as a length-0 ballot
+    // for the mismatch error path. The se-mode path bypasses this validator.
+    let scores_len = pd.scores.as_ref().map(|s| s.len()).unwrap_or(0);
+    if scores_len != expected_candidate_count {
         return Err(ValidateError::BallotLengthMismatch {
-            scores: pd.scores.len(),
+            scores: scores_len,
             expected: expected_candidate_count,
         });
     }
-    for &s in &pd.scores {
-        if s > 5 {
-            return Err(ValidateError::BallotScoreOutOfRange(s));
+    if let Some(scores) = pd.scores.as_ref() {
+        for &s in scores {
+            if s > 5 {
+                return Err(ValidateError::BallotScoreOutOfRange(s));
+            }
         }
     }
     Ok(())
@@ -583,6 +590,23 @@ impl Tier3PollState {
                 let payload: RatificationBallotPayload =
                     decode_payload(&ev.payload).map_err(ApplyError::PayloadDecode)?;
                 self.ratification_ballots.push(payload);
+            }
+
+            // kd=ts TallyShare (ZEB-295 Phase 6): committee member's partial
+            // decryption share + DLEQ proof. Task 1 (wire format) only — apply
+            // behavior is wired in Task 7 (secret-tally state). Silent drop
+            // here keeps the projection unchanged; last_hlc must NOT advance
+            // (ZEB-320) so a future re-apply pass after Task 7 lands can
+            // process the same event.
+            PollEventKindCode::TallyShare => {
+                let _payload: crate::community_voting_core::TallySharePayload =
+                    decode_payload(&ev.payload).map_err(ApplyError::PayloadDecode)?;
+                advance_last_hlc = false;
+                tracing::debug!(
+                    poll_id = %hex::encode(self.meta.poll_id.0),
+                    actor = %hex::encode(ev.actor.0),
+                    "kd=ts drop: TallyShare apply not yet implemented (ZEB-295 Task 7)"
+                );
             }
 
             // kd=cl PollClose: record close_event_hash.
@@ -1442,7 +1466,10 @@ mod tests {
     fn rb_event(wall_ms: u64, actor: OwnerAddr, scores: Vec<u8>) -> SignedVotingEvent {
         let payload = RatificationBallotPayload {
             poll_id: poll_id(),
-            scores,
+            scores: Some(scores),
+            ciphertexts_scores: None,
+            ciphertexts_indicators: None,
+            proof: None,
         };
         make_event_with_payload(
             PollEventKindCode::RatificationBallot,
@@ -1782,8 +1809,8 @@ mod tests {
         poll.apply_event(&rb_event(300, addr(2), vec![0, 5, 2]))
             .expect("rb2");
         assert_eq!(poll.ratification_ballots.len(), 2);
-        assert_eq!(poll.ratification_ballots[0].scores, vec![3, 1, 5]);
-        assert_eq!(poll.ratification_ballots[1].scores, vec![0, 5, 2]);
+        assert_eq!(poll.ratification_ballots[0].scores, Some(vec![3, 1, 5]));
+        assert_eq!(poll.ratification_ballots[1].scores, Some(vec![0, 5, 2]));
     }
 
     // ── Test 17: apply kd=ds is scaffold no-op (accepts event) ───────────────
@@ -2298,7 +2325,10 @@ mod tests {
     fn ballot(scores: Vec<u8>) -> RatificationBallotPayload {
         RatificationBallotPayload {
             poll_id: poll_id(),
-            scores,
+            scores: Some(scores),
+            ciphertexts_scores: None,
+            ciphertexts_indicators: None,
+            proof: None,
         }
     }
 
@@ -2880,7 +2910,10 @@ mod tests {
         // Candidate count = 2 (1 real + status_quo)
         let rb_payload = RatificationBallotPayload {
             poll_id: poll_id(),
-            scores: vec![3, 1], // 2 candidates: real + status_quo
+            scores: Some(vec![3, 1]), // 2 candidates: real + status_quo
+            ciphertexts_scores: None,
+            ciphertexts_indicators: None,
+            proof: None,
         };
         let ev = make_event_with_payload(
             PollEventKindCode::RatificationBallot,
@@ -2897,7 +2930,10 @@ mod tests {
         let poll = poll_in_ratification();
         let rb_payload = RatificationBallotPayload {
             poll_id: poll_id(),
-            scores: vec![3, 1],
+            scores: Some(vec![3, 1]),
+            ciphertexts_scores: None,
+            ciphertexts_indicators: None,
+            proof: None,
         };
         let ev = make_event_with_payload(
             PollEventKindCode::RatificationBallot,
@@ -2917,7 +2953,10 @@ mod tests {
         let poll = poll_in_ratification();
         let rb_payload = RatificationBallotPayload {
             poll_id: poll_id(),
-            scores: vec![3, 1],
+            scores: Some(vec![3, 1]),
+            ciphertexts_scores: None,
+            ciphertexts_indicators: None,
+            proof: None,
         };
         // wall_ms = 5000 → still in Deliberation stage (dw not elapsed yet)
         let ev = make_event_with_payload(
@@ -2938,7 +2977,10 @@ mod tests {
         let poll = poll_in_ratification();
         let rb_payload = RatificationBallotPayload {
             poll_id: poll_id(),
-            scores: vec![6, 1], // score 6 > 5 → BallotScoreOutOfRange
+            scores: Some(vec![6, 1]), // score 6 > 5 → BallotScoreOutOfRange
+            ciphertexts_scores: None,
+            ciphertexts_indicators: None,
+            proof: None,
         };
         let ev = make_event_with_payload(
             PollEventKindCode::RatificationBallot,
@@ -2965,7 +3007,10 @@ mod tests {
         // Expected 2 candidates (1 real + status_quo); provide 3 scores → mismatch
         let rb_payload = RatificationBallotPayload {
             poll_id: poll_id(),
-            scores: vec![3, 1, 5],
+            scores: Some(vec![3, 1, 5]),
+            ciphertexts_scores: None,
+            ciphertexts_indicators: None,
+            proof: None,
         };
         let ev = make_event_with_payload(
             PollEventKindCode::RatificationBallot,
@@ -3086,7 +3131,10 @@ mod tests {
 
         let rb_payload = RatificationBallotPayload {
             poll_id: poll_id(),
-            scores: vec![3, 1], // 2 scores — but no status_quo yet
+            scores: Some(vec![3, 1]), // 2 scores — but no status_quo yet
+            ciphertexts_scores: None,
+            ciphertexts_indicators: None,
+            proof: None,
         };
         let ev = make_event_with_payload(
             PollEventKindCode::RatificationBallot,

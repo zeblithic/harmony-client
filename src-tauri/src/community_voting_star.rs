@@ -91,7 +91,15 @@ pub fn tally_star(
     // to `u64` accumulator before deploying.
     let mut total_scores = vec![0u32; n];
     for ballot in ballots {
-        for (i, &score) in ballot.scores.iter().enumerate().take(n) {
+        // ZEB-295 Phase 6: `scores` is Option<Vec<u8>>. tally_star is the
+        // pu-mode tally path; se-mode ballots are tallied via the homomorphic
+        // aggregation path and never reach here. None ⇒ treat as no scores
+        // (defensive; the B4 caller filters to pu-mode ballots).
+        let scores = match ballot.scores.as_ref() {
+            Some(s) => s,
+            None => continue,
+        };
+        for (i, &score) in scores.iter().enumerate().take(n) {
             total_scores[i] += u32::from(score);
         }
     }
@@ -117,10 +125,15 @@ pub fn tally_star(
     // --- Runoff round ---
     let mut runoff_votes = vec![0u32; finalist_indices.len()];
     for ballot in ballots {
+        // ZEB-295 Phase 6: skip se-mode ballots (None scores) in pu-mode tally.
+        let scores = match ballot.scores.as_ref() {
+            Some(s) => s,
+            None => continue,
+        };
         // Collect each finalist's score from this ballot.
         let finalist_scores: Vec<u8> = finalist_indices
             .iter()
-            .map(|&ci| ballot.scores.get(ci).copied().unwrap_or(0))
+            .map(|&ci| scores.get(ci).copied().unwrap_or(0))
             .collect();
 
         let max_score = finalist_scores.iter().copied().max().unwrap_or(0);
@@ -196,7 +209,10 @@ pub mod test_helpers {
     pub fn ballot(scores: &[u8]) -> RatificationBallotPayload {
         RatificationBallotPayload {
             poll_id: PollId([0u8; 32]),
-            scores: scores.to_vec(),
+            scores: Some(scores.to_vec()),
+            ciphertexts_scores: None,
+            ciphertexts_indicators: None,
+            proof: None,
         }
     }
 }

@@ -235,14 +235,124 @@ pub struct SortitionFailedPayload {
     pub poll_id: PollId,
 }
 
-/// Payload for `kd=rb` RatificationBallot: full-electorate STAR scores,
-/// one byte per ratification candidate (0..=5).
+/// Payload for `kd=rb` RatificationBallot. Overloaded for both privacy
+/// modes per ZEB-295 spec §2.1. Mode is determined at apply time from
+/// the poll's `privacy_mode` field, NOT from the payload itself.
+/// Same-length-keys invariant: all top-level CBOR keys are 2 chars.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RatificationBallotPayload {
     #[serde(rename = "pi")]
     pub poll_id: PollId,
-    #[serde(rename = "sc", with = "serde_bytes")]
-    pub scores: Vec<u8>,
+    /// `"pu"`-mode: raw scores 0..=5 per candidate. None in `"se"` mode.
+    #[serde(
+        rename = "sc",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "scores_opt_serde"
+    )]
+    pub scores: Option<Vec<u8>>,
+    /// `"se"`-mode: one ElGamal ciphertext per candidate; len == n.
+    #[serde(rename = "cs", default, skip_serializing_if = "Option::is_none")]
+    pub ciphertexts_scores: Option<Vec<EncCiphertext>>,
+    /// `"se"`-mode: one ElGamal ciphertext per unordered candidate pair
+    /// (smaller-index-wins canonical orientation); len == n*(n-1)/2.
+    #[serde(rename = "in", default, skip_serializing_if = "Option::is_none")]
+    pub ciphertexts_indicators: Option<Vec<EncCiphertext>>,
+    /// `"se"`-mode: per-ballot NIZK bundle (range proofs + consistency proofs).
+    #[serde(rename = "pf", default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<BallotNIZKProof>,
+}
+
+/// Tiny module so the `with = "..."` attribute on `scores` keeps the
+/// `serde_bytes` Vec<u8> encoding for Some(...) but elides None entirely.
+mod scores_opt_serde {
+    use serde::{Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(b) => serde_bytes::serialize(b.as_slice(), s),
+            None => unreachable!("skip_serializing_if elides None before reaching here"),
+        }
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        let b: Vec<u8> = serde_bytes::deserialize(d)?;
+        Ok(Some(b))
+    }
+}
+
+/// ElGamal ciphertext in Ristretto255. Compressed-point encoding per spec §2.3.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncCiphertext {
+    #[serde(rename = "c1", with = "serde_bytes_32")]
+    pub c1: [u8; 32],
+    #[serde(rename = "c2", with = "serde_bytes_32")]
+    pub c2: [u8; 32],
+}
+
+/// Per-ballot NIZK bundle. Concatenated sigma-protocol bytes per spec §4.7.
+/// Sizes are deterministic in n (number of candidates).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BallotNIZKProof {
+    /// `n` range proofs over {0..5}, 384 B each; total len = 384*n.
+    #[serde(rename = "rp", with = "serde_bytes")]
+    pub range_proofs: Vec<u8>,
+    /// `C(n,2)` consistency proofs, 768 B each; total len = 768*C(n,2).
+    #[serde(rename = "ip", with = "serde_bytes")]
+    pub consistency_proofs: Vec<u8>,
+}
+
+/// Single committee member's per-aggregate decryption share + DLEQ proof.
+/// Spec §2.2.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TallyShareEntry {
+    /// Partial decryption share `d_i = c1_agg * x_i` (compressed Ristretto).
+    #[serde(rename = "sh", with = "serde_bytes_32")]
+    pub share: [u8; 32],
+    /// Chaum-Pedersen DLEQ proof bytes — `(challenge: [u8;32], response: [u8;32])`.
+    #[serde(rename = "dp", with = "serde_bytes_64")]
+    pub dleq_proof: [u8; 64],
+}
+
+/// Payload for `kd=ts` TallyShare. Spec §2.2.
+/// Same-length-keys invariant: pi/ce/ts are all 2 chars.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TallySharePayload {
+    #[serde(rename = "pi")]
+    pub poll_id: PollId,
+    /// CHURP rotation generation. Shares from different epochs cannot be mixed.
+    #[serde(rename = "ce")]
+    pub committee_epoch: u32,
+    /// `n + C(n,2)` entries: candidate score-sum entries first, then indicator-sum
+    /// entries in unordered-pair lexicographic order. Vec (not fixed array) because
+    /// `n` is per-poll and only known at apply time.
+    #[serde(rename = "ts")]
+    pub entries: Vec<TallyShareEntry>,
+}
+
+// Fixed-length byte-array helpers used by EncCiphertext / TallyShareEntry.
+mod serde_bytes_32 {
+    use serde::{Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(b: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+        serde_bytes::serialize(b.as_slice(), s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+        let v: Vec<u8> = serde_bytes::deserialize(d)?;
+        v.as_slice()
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("expected 32 bytes"))
+    }
+}
+
+mod serde_bytes_64 {
+    use serde::{Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(b: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
+        serde_bytes::serialize(b.as_slice(), s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
+        let v: Vec<u8> = serde_bytes::deserialize(d)?;
+        v.as_slice()
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("expected 64 bytes"))
+    }
 }
 
 /// Payload for `kd=cl` PollClose events (Tier 3). Wire format is a CBOR
@@ -444,7 +554,10 @@ mod tier3_payload_tests {
     fn ratification_ballot_round_trip() {
         let payload = RatificationBallotPayload {
             poll_id: PollId([0x07; 32]),
-            scores: vec![5, 3, 1, 0, 4],
+            scores: Some(vec![5, 3, 1, 0, 4]),
+            ciphertexts_scores: None,
+            ciphertexts_indicators: None,
+            proof: None,
         };
         let mut encoded = Vec::new();
         ciborium::into_writer(&payload, &mut encoded).expect("encode");
@@ -516,6 +629,149 @@ mod tier3_payload_tests {
         let decoded: Tier3PollConfigPayload =
             ciborium::from_reader(&encoded[..]).expect("round-trip decode");
         assert_eq!(payload, decoded);
+    }
+
+    // ── ZEB-295 Phase 6 (Tier 3c ballot-secret) wire-format tests ───────────
+
+    #[test]
+    fn ratification_ballot_payload_pu_mode_round_trips() {
+        let payload = RatificationBallotPayload {
+            poll_id: PollId([0x11; 32]),
+            scores: Some(vec![5, 3, 1, 0, 4]),
+            ciphertexts_scores: None,
+            ciphertexts_indicators: None,
+            proof: None,
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&payload, &mut buf).expect("encode");
+        let decoded: RatificationBallotPayload = ciborium::from_reader(&buf[..]).expect("decode");
+        assert_eq!(payload, decoded);
+    }
+
+    #[test]
+    fn ratification_ballot_payload_se_mode_round_trips() {
+        let payload = RatificationBallotPayload {
+            poll_id: PollId([0x22; 32]),
+            scores: None,
+            ciphertexts_scores: Some(vec![
+                EncCiphertext {
+                    c1: [0xAA; 32],
+                    c2: [0xBB; 32]
+                };
+                3
+            ]),
+            ciphertexts_indicators: Some(vec![
+                EncCiphertext {
+                    c1: [0xCC; 32],
+                    c2: [0xDD; 32]
+                };
+                3
+            ]),
+            proof: Some(BallotNIZKProof {
+                range_proofs: vec![0xEE; 384 * 3],
+                consistency_proofs: vec![0xFF; 768 * 3],
+            }),
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&payload, &mut buf).expect("encode");
+        let decoded: RatificationBallotPayload = ciborium::from_reader(&buf[..]).expect("decode");
+        assert_eq!(payload, decoded);
+    }
+
+    #[test]
+    fn ratification_ballot_payload_pu_mode_omits_se_keys() {
+        // skip_serializing_if on Option-fields must elide them from the wire.
+        let payload = RatificationBallotPayload {
+            poll_id: PollId([0; 32]),
+            scores: Some(vec![5]),
+            ciphertexts_scores: None,
+            ciphertexts_indicators: None,
+            proof: None,
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&payload, &mut buf).expect("encode");
+        let value: ciborium::Value = ciborium::from_reader(&buf[..]).expect("decode value");
+        let map = value.as_map().expect("map");
+        assert_eq!(map.len(), 2, "pu-mode payload must have exactly {{pi, sc}}");
+    }
+
+    #[test]
+    fn ratification_ballot_payload_se_mode_omits_sc_key() {
+        let payload = RatificationBallotPayload {
+            poll_id: PollId([0; 32]),
+            scores: None,
+            ciphertexts_scores: Some(vec![EncCiphertext {
+                c1: [0; 32],
+                c2: [0; 32],
+            }]),
+            ciphertexts_indicators: Some(vec![EncCiphertext {
+                c1: [0; 32],
+                c2: [0; 32],
+            }]),
+            proof: Some(BallotNIZKProof {
+                range_proofs: vec![0; 384],
+                consistency_proofs: vec![0; 768],
+            }),
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&payload, &mut buf).expect("encode");
+        let value: ciborium::Value = ciborium::from_reader(&buf[..]).expect("decode value");
+        let map = value.as_map().expect("map");
+        assert_eq!(
+            map.len(),
+            4,
+            "se-mode payload must have exactly {{pi, cs, in, pf}}"
+        );
+        let keys: std::collections::BTreeSet<&str> = map
+            .iter()
+            .map(|(k, _): &(ciborium::Value, ciborium::Value)| k.as_text().expect("text key"))
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from(["pi", "cs", "in", "pf"])
+        );
+    }
+
+    #[test]
+    fn tally_share_payload_round_trips() {
+        let payload = TallySharePayload {
+            poll_id: PollId([0x33; 32]),
+            committee_epoch: 7,
+            entries: vec![
+                TallyShareEntry {
+                    share: [0xA1; 32],
+                    dleq_proof: [0xB2; 64],
+                },
+                TallyShareEntry {
+                    share: [0xC3; 32],
+                    dleq_proof: [0xD4; 64],
+                },
+            ],
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&payload, &mut buf).expect("encode");
+        let decoded: TallySharePayload = ciborium::from_reader(&buf[..]).expect("decode");
+        assert_eq!(payload, decoded);
+    }
+
+    #[test]
+    fn tally_share_payload_top_keys_are_two_char() {
+        let payload = TallySharePayload {
+            poll_id: PollId([0; 32]),
+            committee_epoch: 0,
+            entries: vec![],
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&payload, &mut buf).expect("encode");
+        let value: ciborium::Value = ciborium::from_reader(&buf[..]).expect("decode value");
+        for (k, _) in value.as_map().expect("map").iter() {
+            let s = k.as_text().expect("text key");
+            assert_eq!(
+                s.len(),
+                2,
+                "TallySharePayload key {s:?} violates 2-char invariant"
+            );
+        }
     }
 }
 
@@ -618,6 +874,11 @@ pub enum PollEventKindCode {
     SortitionFailed,
     #[serde(rename = "rb")]
     RatificationBallot,
+    // Tier 3c (ballot-secret) kind — added Phase 6 (ZEB-295). Committee
+    // member's partial decryption share + DLEQ proof; one per aggregate
+    // ciphertext after the ratification window closes.
+    #[serde(rename = "ts")]
+    TallyShare,
 }
 
 /// The wire envelope for every voting event. Spec §3.
@@ -792,6 +1053,8 @@ mod envelope_tests {
             PollEventKindCode::DraftApproval,
             PollEventKindCode::SortitionFailed,
             PollEventKindCode::RatificationBallot,
+            // Phase 6 (ZEB-295): ballot-secret tally share.
+            PollEventKindCode::TallyShare,
         ] {
             let mut encoded = Vec::new();
             ciborium::into_writer(kind, &mut encoded).expect("encode");
@@ -814,6 +1077,8 @@ mod envelope_tests {
             (PollEventKindCode::DraftApproval, "da"),
             (PollEventKindCode::SortitionFailed, "sf"),
             (PollEventKindCode::RatificationBallot, "rb"),
+            // Phase 6 (ZEB-295): ballot-secret tally share.
+            (PollEventKindCode::TallyShare, "ts"),
         ];
         for (kind, expected) in cases {
             let mut encoded = Vec::new();
@@ -1566,7 +1831,13 @@ pub fn build_signed_ratification_ballot(
     hlc: Hlc,
 ) -> Result<SignedVotingEvent, BuildError> {
     use ed25519_dalek::Signer;
-    let payload_struct = RatificationBallotPayload { poll_id, scores };
+    let payload_struct = RatificationBallotPayload {
+        poll_id,
+        scores: Some(scores),
+        ciphertexts_scores: None,
+        ciphertexts_indicators: None,
+        proof: None,
+    };
     let mut payload = Vec::new();
     ciborium::ser::into_writer(&payload_struct, &mut payload)
         .map_err(|_| BuildError::EncodePayload)?;

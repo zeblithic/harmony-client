@@ -22588,7 +22588,10 @@ async fn voting_cast_ratification_ballot<R: tauri::Runtime>(
             })?;
         let preflight_payload = crate::community_voting_core::RatificationBallotPayload {
             poll_id: pid,
-            scores: scores.clone(),
+            scores: Some(scores.clone()),
+            ciphertexts_scores: None,
+            ciphertexts_indicators: None,
+            proof: None,
         };
         crate::community_voting_tier3::validate_ratification_ballot(
             &preflight_payload,
@@ -24376,7 +24379,9 @@ fn build_tier3_export(
             .and_then(|ev| {
                 let payload: Result<crate::community_voting_core::RatificationBallotPayload, _> =
                     ciborium::from_reader(&ev.payload[..]);
-                payload.ok().map(|p| p.scores)
+                // ZEB-295 Phase 6: payload.scores is Option<Vec<u8>> (None in
+                // se-mode). Flatten Result→Option→Option<Vec<u8>>.
+                payload.ok().and_then(|p| p.scores)
             })
     });
 
