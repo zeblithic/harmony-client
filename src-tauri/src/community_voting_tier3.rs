@@ -123,8 +123,19 @@ pub struct Tier3PollState {
     /// Phase 5 (Tier 3b) deliberation projection. Populated by `kd=ds`
     /// and `kd=dv` apply paths. Default empty until Task 3/4 wire apply.
     pub deliberation: DeliberationState,
-    /// HLC of the most recent event applied (None before any event).
+    /// HLC of the most recent **accepted** event (None before any accept).
+    /// Used as the `now` watermark by `current_stage_at` and `current_mini_public`
+    /// via `build_tier3_export`. Drop paths must NOT advance this (ZEB-320).
     pub last_hlc: Option<Hlc>,
+    /// HLC of the most recent **dispatched** event, accepted *or* silently
+    /// dropped. Used for the monotonic-HLC guard at the top of `apply_event`
+    /// so out-of-order peer delivery is still surfaced as `HlcNotMonotonic`
+    /// even when the previous event was dropped — without this, a dropped
+    /// event followed by an earlier-HLC event that would change drop decisions
+    /// (e.g., the kd=ds whose existence is the prerequisite for a previously
+    /// target-missing kd=dv) would silently bypass the guard and never be
+    /// re-materialized, causing replica divergence (Qodo PR #154 finding).
+    pub last_received_hlc: Option<Hlc>,
 }
 
 // ── Validate error type ───────────────────────────────────────────────────────
@@ -280,6 +291,7 @@ impl Tier3PollState {
             result: None,
             deliberation: DeliberationState::default(),
             last_hlc: None,
+            last_received_hlc: None,
         }
     }
 
@@ -300,7 +312,10 @@ impl Tier3PollState {
 
         // 2. Monotonic HLC check (defensive — upstream should enforce, but we
         //    surface HlcNotMonotonic if the caller sends out-of-order events).
-        if let Some(ref last) = self.last_hlc {
+        //    Reads `last_received_hlc` (advances on every dispatch, accept or
+        //    drop) rather than `last_hlc` (advances on accepts only) so the
+        //    guard still catches out-of-order delivery after a dropped event.
+        if let Some(ref last) = self.last_received_hlc {
             let incoming = &ev.hlc;
             let last_tuple = (last.wall_ms, last.logical, last.device_id.as_str());
             let inc_tuple = (
@@ -312,6 +327,14 @@ impl Tier3PollState {
                 return Err(ApplyError::HlcNotMonotonic);
             }
         }
+
+        // ZEB-320: silent-drop paths must NOT advance the projection watermark
+        // `last_hlc` (read by `current_stage_at` and `current_mini_public` via
+        // `build_tier3_export`); advancing it on filtered/invalid peer events
+        // would let an adversary push the projected stage forward without any
+        // accepted state change. Each drop branch below sets this to false.
+        // `last_received_hlc` always advances at the tail regardless.
+        let mut advance_last_hlc = true;
 
         // 3. Dispatch on event kind.
         match ev.kind {
@@ -343,6 +366,7 @@ impl Tier3PollState {
 
                 // Rule 1: stage must be Deliberation at ev.hlc.
                 if self.current_stage_at(&ev.hlc) != Stage::Deliberation {
+                    advance_last_hlc = false;
                     tracing::debug!(
                         poll_id = %hex::encode(self.meta.poll_id.0),
                         actor = %hex::encode(ev.actor.0),
@@ -350,6 +374,7 @@ impl Tier3PollState {
                     );
                 // Rule 2: actor must be in the current mini-public at ev.hlc.
                 } else if !self.current_mini_public(&ev.hlc).contains(&ev.actor) {
+                    advance_last_hlc = false;
                     tracing::debug!(
                         poll_id = %hex::encode(self.meta.poll_id.0),
                         actor = %hex::encode(ev.actor.0),
@@ -357,6 +382,7 @@ impl Tier3PollState {
                     );
                 // Rule 3: text must be 1..=280 chars (non-empty after trim).
                 } else if payload.text.chars().count() > 280 || payload.text.trim().is_empty() {
+                    advance_last_hlc = false;
                     tracing::debug!(
                         poll_id = %hex::encode(self.meta.poll_id.0),
                         actor = %hex::encode(ev.actor.0),
@@ -371,6 +397,7 @@ impl Tier3PollState {
                         .copied()
                         .unwrap_or(0);
                     if prior_count >= 5 {
+                        advance_last_hlc = false;
                         tracing::debug!(
                             poll_id = %hex::encode(self.meta.poll_id.0),
                             actor = %hex::encode(ev.actor.0),
@@ -430,18 +457,21 @@ impl Tier3PollState {
                     crate::community_voting_core::BridgingVoteCode::from_u8(payload.vote);
 
                 if !stage_ok {
+                    advance_last_hlc = false;
                     tracing::debug!(
                         poll_id = %hex::encode(self.meta.poll_id.0),
                         actor = %hex::encode(ev.actor.0),
                         "kd=dv drop: not in Deliberation stage"
                     );
                 } else if !mp_ok {
+                    advance_last_hlc = false;
                     tracing::debug!(
                         poll_id = %hex::encode(self.meta.poll_id.0),
                         actor = %hex::encode(ev.actor.0),
                         "kd=dv drop: actor not in current mini-public"
                     );
                 } else if target.is_none() {
+                    advance_last_hlc = false;
                     tracing::debug!(
                         poll_id = %hex::encode(self.meta.poll_id.0),
                         actor = %hex::encode(ev.actor.0),
@@ -451,6 +481,7 @@ impl Tier3PollState {
                 } else if self_vote {
                     // Spec §2.3: deliberation votes are for *another* member's statement;
                     // self-votes would distort statement totals and bridging scores.
+                    advance_last_hlc = false;
                     tracing::debug!(
                         poll_id = %hex::encode(self.meta.poll_id.0),
                         actor = %hex::encode(ev.actor.0),
@@ -489,9 +520,13 @@ impl Tier3PollState {
                                 last_update_event_hash: event_hash,
                             },
                         );
+                    } else {
+                        // Stale LWW: incoming (hlc, event_hash) ≤ existing entry's;
+                        // silent drop, watermark must not advance (ZEB-320).
+                        advance_last_hlc = false;
                     }
-                    // Else: stale event (incoming HLC/hash ≤ current entry); silent drop.
                 } else {
+                    advance_last_hlc = false;
                     tracing::debug!(
                         poll_id = %hex::encode(self.meta.poll_id.0),
                         actor = %hex::encode(ev.actor.0),
@@ -526,18 +561,21 @@ impl Tier3PollState {
                     .find(|c| c.event_hash == payload.candidate_event_hash)
                 {
                     candidate.approvals.insert(ev.actor); // HashSet = idempotent
+                } else {
+                    // Candidate not found: silent drop (candidate may arrive out of
+                    // order in cross-node scenarios; Task 6 verify will enforce
+                    // ordering). Watermark must not advance (ZEB-320).
+                    advance_last_hlc = false;
                 }
-                // If candidate not found: silently ignore (candidate may arrive out of order
-                // in future cross-node scenarios; Task 6 verify will enforce ordering constraints).
             }
 
-            // kd=sf SortitionFailed: terminal failure state.
+            // kd=sf SortitionFailed: terminal failure state. Falls through
+            // to the unified tail (advance_last_hlc stays true → both
+            // watermarks update; equivalent to the prior explicit set+return).
             PollEventKindCode::SortitionFailed => {
                 let _payload: SortitionFailedPayload =
                     decode_payload(&ev.payload).map_err(ApplyError::PayloadDecode)?;
                 self.stage = Stage::Failed;
-                self.last_hlc = Some(ev.hlc.clone());
-                return Ok(());
             }
 
             // kd=rb RatificationBallot: append to ratification_ballots.
@@ -553,14 +591,13 @@ impl Tier3PollState {
                 self.close_event_hash = Some(hash);
             }
 
-            // kd=rs PollResult (Tier 3): decode StarResult from payload; transition to Finalized.
+            // kd=rs PollResult (Tier 3): decode StarResult from payload;
+            // transition to Finalized. Falls through to the unified tail.
             PollEventKindCode::PollResult => {
                 let payload: Tier3PollResultPayload =
                     decode_payload(&ev.payload).map_err(ApplyError::PayloadDecode)?;
                 self.result = Some(payload.result);
                 self.stage = Stage::Finalized;
-                self.last_hlc = Some(ev.hlc.clone());
-                return Ok(());
             }
 
             // Tier 1 / Tier 2 only kinds — not valid for Tier 3 state machine.
@@ -575,7 +612,13 @@ impl Tier3PollState {
             }
         }
 
-        self.last_hlc = Some(ev.hlc.clone());
+        // last_received_hlc always advances on Ok return — including silent
+        // drops — so the monotonic guard keeps catching out-of-order delivery
+        // after a drop. last_hlc only advances on accepts (ZEB-320).
+        self.last_received_hlc = Some(ev.hlc.clone());
+        if advance_last_hlc {
+            self.last_hlc = Some(ev.hlc.clone());
+        }
         Ok(())
     }
 
@@ -3573,6 +3616,227 @@ mod tests {
             poll.deliberation.statements_per_author[&author], 5,
             "6th distinct statement must be dropped (cap reached)"
         );
+    }
+
+    // ── ZEB-320: drop paths must not advance the materialize watermark ──────
+    //
+    // `last_hlc` feeds `current_stage_at` and `current_mini_public` via
+    // `build_tier3_export`. Advancing it on silent-dropped events would let
+    // peer-originated invalid events push the projected stage forward without
+    // any accepted state change. Each test below applies a baseline-accepting
+    // event, then an event the apply layer silently drops, and asserts the
+    // watermark stayed at the baseline.
+
+    #[test]
+    fn dropped_ds_past_deliberation_window_does_not_advance_last_hlc() {
+        let mut poll = build_poll_in_deliberation_stage();
+        // Baseline: build_poll_in_deliberation_stage applies ss at wall_ms=50.
+        assert_eq!(poll.last_hlc.as_ref().unwrap().wall_ms, 50);
+
+        // dw_ms = 10_000 (default test config); at wall_ms = 15_000 the
+        // projected stage is Drafting, so the kd=ds Rule 1 check drops it.
+        let drop_ev = ds_event_with_text(15_000, addr(1), "Late statement");
+        poll.apply_event(&drop_ev).expect("ok (silent drop)");
+
+        assert_eq!(
+            poll.last_hlc.as_ref().unwrap().wall_ms,
+            50,
+            "dropped kd=ds must not advance last_hlc past the baseline"
+        );
+        // Visible consequence: stage projection at the watermark stays in
+        // Deliberation. With the buggy unconditional advance, last_hlc would
+        // be 15_000 and current_stage_at would erroneously report Drafting.
+        assert_eq!(
+            poll.current_stage_at(poll.last_hlc.as_ref().unwrap()),
+            Stage::Deliberation,
+            "stage watermark must stay in Deliberation after dropped event"
+        );
+        assert!(
+            poll.deliberation.statements.is_empty(),
+            "no statement should have been materialized"
+        );
+    }
+
+    #[test]
+    fn dropped_dv_self_vote_does_not_advance_last_hlc() {
+        use crate::community_voting_core::BridgingVoteCode;
+
+        let mut poll = build_poll_in_deliberation_stage();
+        let author = addr(1);
+        let ds_ev = ds_event_with_text(100, author, "Statement");
+        poll.apply_event(&ds_ev).expect("ds apply");
+        let stmt_hash = sha256_of_signing_bytes(&ds_ev);
+        // Baseline after accepted kd=ds: last_hlc.wall_ms = 100.
+        assert_eq!(poll.last_hlc.as_ref().unwrap().wall_ms, 100);
+
+        // Self-vote on own statement is silently dropped by apply_event.
+        let drop_ev = dv_event(500, author, stmt_hash, BridgingVoteCode::Agree);
+        poll.apply_event(&drop_ev).expect("ok (silent drop)");
+
+        assert_eq!(
+            poll.last_hlc.as_ref().unwrap().wall_ms,
+            100,
+            "self-vote drop must not advance last_hlc"
+        );
+        assert!(
+            poll.deliberation.votes.is_empty(),
+            "no vote should have been materialized"
+        );
+    }
+
+    #[test]
+    fn dropped_dv_unknown_target_does_not_advance_last_hlc() {
+        use crate::community_voting_core::BridgingVoteCode;
+
+        let mut poll = build_poll_in_deliberation_stage();
+        let ds_ev = ds_event_with_text(100, addr(1), "Statement");
+        poll.apply_event(&ds_ev).expect("ds apply");
+        // Baseline after accepted kd=ds: last_hlc.wall_ms = 100.
+        assert_eq!(poll.last_hlc.as_ref().unwrap().wall_ms, 100);
+
+        // Reference a statement_event_hash that doesn't exist in the projection.
+        let phantom_hash: [u8; 32] = [0x77; 32];
+        let drop_ev = dv_event(500, addr(2), phantom_hash, BridgingVoteCode::Agree);
+        poll.apply_event(&drop_ev).expect("ok (silent drop)");
+
+        assert_eq!(
+            poll.last_hlc.as_ref().unwrap().wall_ms,
+            100,
+            "unknown-target dv drop must not advance last_hlc"
+        );
+        assert!(
+            poll.deliberation.votes.is_empty(),
+            "no vote should have been materialized"
+        );
+    }
+
+    #[test]
+    fn dropped_da_unknown_candidate_does_not_advance_last_hlc() {
+        let mut poll = build_poll_in_deliberation_stage();
+        // Baseline after ss: last_hlc.wall_ms = 50. No candidates exist yet.
+        assert_eq!(poll.last_hlc.as_ref().unwrap().wall_ms, 50);
+        assert!(poll.candidates.is_empty());
+
+        // Approve a phantom candidate — silent drop via candidates lookup miss.
+        let phantom_hash: [u8; 32] = [0x88; 32];
+        let drop_ev = da_event(500, addr(1), phantom_hash);
+        poll.apply_event(&drop_ev).expect("ok (silent drop)");
+
+        assert_eq!(
+            poll.last_hlc.as_ref().unwrap().wall_ms,
+            50,
+            "unknown-candidate da drop must not advance last_hlc"
+        );
+    }
+
+    // Qodo PR #154 bot-pass-1 finding: with Option A alone, `last_hlc` was
+    // doing two jobs (projection watermark + monotonic-HLC guard), and
+    // not advancing it on drops weakened the guard. An earlier-HLC event
+    // arriving after a dropped later-HLC event would silently bypass the
+    // guard and never be re-materialized when its prerequisites later
+    // arrived (e.g., a kd=dv whose target ds had not yet been delivered).
+    //
+    // Option B splits the watermarks: `last_received_hlc` advances on every
+    // dispatched event (accept or drop) so the guard still surfaces
+    // HlcNotMonotonic on out-of-order delivery; `last_hlc` only advances on
+    // accepts so the projection is unaffected by silent drops.
+    #[test]
+    fn guard_still_rejects_earlier_hlc_after_dropped_event() {
+        let mut poll = build_poll_in_deliberation_stage();
+        // Baseline: last_hlc = 50 (ss accepted).
+        assert_eq!(poll.last_hlc.as_ref().unwrap().wall_ms, 50);
+
+        // Drop a ds at wall=15000 (past deliberation window → Rule 1 drop).
+        let drop_ev = ds_event_with_text(15_000, addr(1), "Late");
+        poll.apply_event(&drop_ev).expect("ok (silent drop)");
+        assert_eq!(
+            poll.last_hlc.as_ref().unwrap().wall_ms,
+            50,
+            "drop did not advance projection watermark"
+        );
+        // But last_received_hlc DID advance — the guard sees the late event.
+        assert_eq!(
+            poll.last_received_hlc.as_ref().unwrap().wall_ms,
+            15_000,
+            "drop advanced received watermark (guard)"
+        );
+
+        // Now deliver an honest earlier event. Without the dual watermark,
+        // it would slip past `last_hlc=50` and silently apply, leaving the
+        // dropped event un-replayed and the replica divergent.
+        let earlier_ev = ds_event_with_text(100, addr(1), "Earlier");
+        let err = poll
+            .apply_event(&earlier_ev)
+            .expect_err("guard must reject earlier-HLC delivery");
+        assert!(matches!(err, ApplyError::HlcNotMonotonic));
+    }
+
+    // CodeRabbit PR #154 bot-pass-1 nitpick: cover the remaining gated drop
+    // branches with explicit watermark assertions (kd=ds spam-cap; kd=dv
+    // stage-mismatch / mp-not-member / invalid-vote-byte). LWW-stale is
+    // unreachable in single-device single-thread tests because the HLC
+    // guard catches strictly-earlier delivery first; the implementation
+    // still gates it (see the `else { advance_last_hlc = false; }` branch
+    // in the LWW match).
+    #[test]
+    fn remaining_drop_branches_do_not_advance_last_hlc() {
+        use crate::community_voting_core::BridgingVoteCode;
+
+        let mut poll = build_poll_in_deliberation_stage();
+
+        // Set up: author1 fills the 5-statement spam cap; author2 posts one
+        // statement so dv has a valid target to point at.
+        let author1 = addr(1);
+        let author2 = addr(2);
+        for i in 0..5 {
+            let ev = ds_event_with_text(100 + i, author1, &format!("Stmt {i}"));
+            poll.apply_event(&ev).expect("apply");
+        }
+        let target_ev = ds_event_with_text(200, author2, "Target statement");
+        poll.apply_event(&target_ev).expect("apply target");
+        let target_hash = sha256_of_signing_bytes(&target_ev);
+
+        // Snapshot the projection watermark after the last accept.
+        let baseline = poll.last_hlc.clone().expect("baseline last_hlc");
+        assert_eq!(baseline.wall_ms, 200);
+
+        // Each case: an event the apply layer silently drops. HLCs are
+        // strictly increasing across cases to satisfy the monotonic guard
+        // (which now reads last_received_hlc, not last_hlc).
+        let dv_other = addr(3); // mini-public member who hasn't voted yet
+        let drop_cases: Vec<(SignedVotingEvent, &str)> = vec![
+            (
+                ds_event_with_text(300, author1, "Sixth"),
+                "kd=ds spam-cap (6th statement)",
+            ),
+            (
+                dv_event_raw(400, dv_other, target_hash, 99),
+                "kd=dv invalid vote byte",
+            ),
+            (
+                dv_event(500, addr(99), target_hash, BridgingVoteCode::Agree),
+                "kd=dv actor not in mini-public",
+            ),
+            (
+                dv_event(15_000, dv_other, target_hash, BridgingVoteCode::Agree),
+                "kd=dv past deliberation window (stage mismatch)",
+            ),
+        ];
+
+        for (ev, label) in drop_cases {
+            poll.apply_event(&ev).unwrap_or_else(|e| {
+                panic!("apply must return Ok (silent drop) for {label}: {e:?}")
+            });
+            assert_eq!(
+                poll.last_hlc.as_ref().unwrap(),
+                &baseline,
+                "{label}: last_hlc must remain at baseline ({baseline:?})"
+            );
+        }
+
+        // Sanity: 5 from author1 + 1 from author2; no votes accepted.
+        assert_eq!(poll.deliberation.statements.len(), 6);
+        assert!(poll.deliberation.votes.is_empty());
     }
 }
 
