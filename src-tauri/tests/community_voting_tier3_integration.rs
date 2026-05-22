@@ -1059,7 +1059,13 @@ async fn tier3_full_lifecycle_4_stage_convergence() {
                 &format!("voter-{e_idx}-dev"),
             ),
         );
-        ballots.push(RatificationBallotPayload { poll_id, scores });
+        ballots.push(RatificationBallotPayload {
+            poll_id,
+            scores: Some(scores),
+            ciphertexts_scores: None,
+            ciphertexts_indicators: None,
+            proof: None,
+        });
         engines
             .engine_a
             .publish_event(rb_ev, None)

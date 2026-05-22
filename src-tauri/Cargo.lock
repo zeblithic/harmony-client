@@ -2143,6 +2143,7 @@ dependencies = [
  "hmac",
  "keccak 0.2.0-rc.2",
  "keyring",
+ "merlin",
  "ml-dsa",
  "ml-kem",
  "rand 0.8.5",
@@ -3295,6 +3296,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "merlin"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58c38e2799fc0978b65dfff8023ec7843e2330bb462f19198840b34b6582397d"
+dependencies = [
+ "byteorder",
+ "keccak 0.1.6",
+ "rand_core 0.6.4",
+ "zeroize",
 ]
 
 [[package]]

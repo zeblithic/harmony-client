@@ -30,6 +30,8 @@ pub mod community_voting_sortition;
 pub mod community_voting_star;
 pub mod community_voting_tick;
 pub mod community_voting_tier3;
+pub mod community_voting_tier3_crypto;
+pub mod community_voting_tier3_nizk;
 pub mod content_index;
 pub mod content_store;
 pub mod dm_crypto;
@@ -21390,6 +21392,11 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
     min_power: u8,
     min_vouching_depth: Option<u8>,
     retry_of: Option<String>,
+    // ZEB-295 Phase 6 Task 9: optional privacy_mode (defaults to "pu" for
+    // backward compatibility — Phase 4a-main behavior). Accepts "pu" (public)
+    // or "se" (ballot-secret); "rf" reserved for Phase 7. Validation runs
+    // through validate_tier3_poll_config which already accepts both modes.
+    privacy_mode: Option<String>,
 ) -> Result<String, String> {
     let cid_bytes: [u8; 16] = hex::decode(&community_id)
         .map_err(|e| format!("voting_create_tier3_proposal: invalid community_id hex: {e}"))?
@@ -21426,15 +21433,16 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
 
     // Note: `Tier3PollConfigPayload` has no `channel_id` field — the host
     // channel is carried by the chat-fanout body, not by the on-the-wire
-    // voting payload. `privacy_mode` is hardcoded to "pu" (public) in
-    // Phase 4a-main; "se"/"rf" are reserved for Phase 6/7.
+    // voting payload. ZEB-295 Phase 6 Task 9: `privacy_mode` is now plumbed
+    // through the IPC (defaults to "pu" if unset). `validate_tier3_poll_config`
+    // accepts "pu"/"se"; "rf" is rejected (reserved for Phase 7).
     let cfg = crate::community_voting_core::Tier3PollConfigPayload {
         proposal_text,
         sortition_size,
         deliberation_window_seconds,
         drafting_window_seconds,
         ratification_window_seconds,
-        privacy_mode: "pu".into(),
+        privacy_mode: privacy_mode.unwrap_or_else(|| "pu".into()),
         incentive_mode,
         eligibility: crate::community_voting_core::Eligibility {
             min_power,
@@ -21513,6 +21521,40 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
     .await?;
     crate::community_voting_core::check_eligibility(&snapshot, &self_owner, &cfg.eligibility)
         .map_err(|e| format!("voting_create_tier3_proposal: creator not eligible: {e:?}"))?;
+
+    // ZEB-295 Phase 6: hard gate on se-mode polls — refuse to create a
+    // ballot-secret poll unless the community has an active D-FROST
+    // committee. Without this, the freshly-applied PollCreate would
+    // bind to `NullCommitteeOracle` (Findings #2 + Cursor PR #155 #1):
+    //   - `maybe_install_committee_oracle_for_poll` is called exactly
+    //     once at apply time and returns early if no DKG has completed.
+    //   - Subsequent applies do NOT retry the install (would be a more
+    //     invasive change), so the poll stays bound to the null oracle
+    //     forever — every kd=rb's NIZK verify against the joint Y silently
+    //     fails (no oracle = no Y), every kd=ts verify fails (no Y_i),
+    //     and the poll permanently stalls in Ratification.
+    //
+    // Fail-fast here matches the existing pattern in
+    // `voting_cast_ratification_ballot`, which already errors out when
+    // no committee key is resolvable — surfacing the same precondition
+    // at PollCreate time instead of letting the proposer build a poll
+    // that no one (including themselves) can vote in.
+    if cfg.privacy_mode == "se" {
+        let dfrost_engine_opt = if let Some(reg) = dfrost_log_registry_for_engine.as_ref() {
+            reg.get(space_id).await
+        } else {
+            None
+        };
+        let has_active_committee = match dfrost_engine_opt {
+            Some(engine) => engine.latest_committee_epoch().await.is_some(),
+            None => false,
+        };
+        if !has_active_committee {
+            return Err("se-mode polls require an active community committee; \
+                 complete DKG ceremony first"
+                .to_string());
+        }
+    }
 
     // ZEB-298+ZEB-312 PR 2 Task 7: lazy-register the engine for this community
     // so engine-auto orchestration (kd=ss/sf/cl/rs auto-mint hooks) fires from
@@ -22549,7 +22591,7 @@ async fn voting_cast_ratification_ballot<R: tauri::Runtime>(
         crdt_state,
         self_identity_pub_64,
         app_handle_wry,
-        dfrost_log_registry_for_engine,
+        dfrost_log_registry_for_engine.clone(),
         beacon_requester_for_engine,
     )
     .await?;
@@ -22565,11 +22607,14 @@ async fn voting_cast_ratification_ballot<R: tauri::Runtime>(
     let hlc =
         crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
 
-    // Pre-flight: look up current ratification candidate count from the
-    // owning community's voting log, then re-use the canonical
-    // `validate_ratification_ballot` validator. Returns None when the poll
-    // is not Tier 3 or has not yet reached Drafting/Ratification.
-    {
+    // Pre-flight: look up current ratification candidate count AND the poll's
+    // privacy_mode from the owning community's voting log. The pu-mode path
+    // re-uses `validate_ratification_ballot`; the se-mode path bypasses it
+    // (the validator expects `scores: Some(_)`, which is None on se-mode wire
+    // payloads) and instead validates length implicitly via the NIZK builder.
+    // ZEB-295 Phase 6 Task 9: fold privacy_mode lookup into the same lock
+    // scope as candidate_count so we hit the log exactly once.
+    let (candidate_count, privacy_mode) = {
         let log_arc = {
             let map = voting_logs.lock().await;
             map.get(&space_id).cloned().ok_or_else(|| {
@@ -22580,31 +22625,143 @@ async fn voting_cast_ratification_ballot<R: tauri::Runtime>(
             })?
         };
         let log = log_arc.lock().await;
-        let candidate_count = log
+        let cc = log
             .tier3_ratification_candidate_count(&pid, &hlc)
             .ok_or_else(|| {
                 "voting_cast_ratification_ballot: poll not in Ratification stage or not Tier 3"
                     .to_string()
             })?;
-        let preflight_payload = crate::community_voting_core::RatificationBallotPayload {
-            poll_id: pid,
-            scores: scores.clone(),
-        };
-        crate::community_voting_tier3::validate_ratification_ballot(
-            &preflight_payload,
-            candidate_count,
-        )
-        .map_err(|e| format!("voting_cast_ratification_ballot: invalid ballot: {e:?}"))?;
-    }
+        let pm = log
+            .polls
+            .get(&pid)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .map(|t3| t3.meta.config.privacy_mode.clone())
+            .ok_or_else(|| {
+                "voting_cast_ratification_ballot: poll not found or not Tier 3 when reading \
+                 privacy_mode"
+                    .to_string()
+            })?;
+        (cc, pm)
+    };
+
+    // Build the wire payload. pu-mode: re-validate via the canonical
+    // validator (size + score range). se-mode: encrypt every score to the
+    // committee's joint key Y, generate the per-ballot NIZK bundle, assemble
+    // the payload. Both modes go through the same envelope-signer below.
+    let payload_struct = match privacy_mode.as_str() {
+        "pu" => {
+            let pu_payload = crate::community_voting_core::RatificationBallotPayload {
+                poll_id: pid,
+                scores: Some(scores.clone()),
+                ciphertexts_scores: None,
+                ciphertexts_indicators: None,
+                proof: None,
+            };
+            crate::community_voting_tier3::validate_ratification_ballot(
+                &pu_payload,
+                candidate_count,
+            )
+            .map_err(|e| format!("voting_cast_ratification_ballot: invalid ballot: {e:?}"))?;
+            pu_payload
+        }
+        "se" => {
+            // ZEB-295 Phase 6 Task 9: ballot-secret path.
+            // 1. Pre-flight ballot length against the candidate set (the
+            //    NIZK builder asserts internally, but a friendly error here
+            //    surfaces the mismatch BEFORE we spend ~100–500ms on proof
+            //    generation).
+            if scores.len() != candidate_count {
+                return Err(format!(
+                    "voting_cast_ratification_ballot: scores length {} != candidate count {}",
+                    scores.len(),
+                    candidate_count
+                ));
+            }
+            for &s in &scores {
+                if s > 5 {
+                    return Err(format!(
+                        "voting_cast_ratification_ballot: score {s} > 5 (range 0..=5)"
+                    ));
+                }
+            }
+            // 2. Look up the community's D-FROST joint verifying key Y for
+            //    the latest CHURP epoch via the dfrost_log_registry. Without
+            //    an active committee, an se-mode ballot is uncastable —
+            //    surface a clear error rather than silently fall back to
+            //    pu-mode (which would catastrophically reveal the scores).
+            let registry = dfrost_log_registry_for_engine.as_ref().ok_or(
+                "voting_cast_ratification_ballot: dfrost_log_registry missing — \
+                 cannot resolve committee key for se-mode ballot",
+            )?;
+            let engine = registry.get(space_id).await.ok_or(
+                "voting_cast_ratification_ballot: community has no committee key \
+                 for se-mode ballot",
+            )?;
+            let latest_epoch = engine.latest_committee_epoch().await.ok_or(
+                "voting_cast_ratification_ballot: community has no committee key \
+                 for se-mode ballot",
+            )?;
+            let (y_bytes, _verifying_shares, _threshold) = engine
+                .committee_snapshot_at_epoch(latest_epoch)
+                .await
+                .ok_or(
+                    "voting_cast_ratification_ballot: community has no committee key \
+                     for se-mode ballot",
+                )?;
+            let y_point = crate::community_voting_tier3_crypto::decompress_point(&y_bytes).ok_or(
+                "voting_cast_ratification_ballot: joint_verifying_key failed to \
+                     decompress — committee state corrupt?",
+            )?;
+            // 3. Generate the NIZK bundle. `prove_ballot_bundle_with_outputs`
+            //    samples ALL encryption randomness internally and returns the
+            //    ciphertexts derived during proof construction; randomness is
+            //    bound by construction, so we don't need to re-encrypt outside
+            //    the prover. Production MUST use this no-nonce API — the
+            //    deterministic-nonce variant is test-fixtures-gated to avoid
+            //    catastrophic nonce reuse.
+            //
+            //    Wrapped in `spawn_blocking` because n=5 candidates triggers
+            //    O(n + n²) Ristretto scalar-mults + sigma-protocol generation
+            //    (≈100-500 ms wall-clock) that would otherwise starve the
+            //    Tokio runtime worker thread under concurrent IPC load
+            //    (CodeAnt Performance finding).
+            let scores_u64: Vec<u64> = scores.iter().map(|&s| s as u64).collect();
+            let y_point_for_blocking = y_point;
+            let (bundle, ciphertexts_scores, ciphertexts_indicators) =
+                tokio::task::spawn_blocking(move || {
+                    crate::community_voting_tier3_nizk::prove_ballot_bundle_with_outputs(
+                        &y_point_for_blocking,
+                        &scores_u64,
+                    )
+                })
+                .await
+                .map_err(|e| format!("voting_cast_ratification_ballot: NIZK task join: {e}"))?
+                .map_err(|e| format!("voting_cast_ratification_ballot: invalid ballot: {e}"))?;
+            crate::community_voting_core::RatificationBallotPayload {
+                poll_id: pid,
+                scores: None,
+                ciphertexts_scores: Some(ciphertexts_scores),
+                ciphertexts_indicators: Some(ciphertexts_indicators),
+                proof: Some(crate::community_voting_core::BallotNIZKProof {
+                    range_proofs: bundle.range_proofs,
+                    consistency_proofs: bundle.consistency_proofs,
+                }),
+            }
+        }
+        other => {
+            return Err(format!(
+                "voting_cast_ratification_ballot: unsupported privacy_mode {other:?}"
+            ));
+        }
+    };
 
     let event = {
         let outbox_g = dm_outbox.lock().await;
         let signing_key = outbox_g.signing_key.as_ref();
-        crate::community_voting_core::build_signed_ratification_ballot(
+        crate::community_voting_core::build_signed_ratification_ballot_payload(
             signing_key,
             self_owner,
-            pid,
-            scores,
+            payload_struct,
             hlc,
         )
         .map_err(|e| format!("voting_cast_ratification_ballot: build_signed: {e:?}"))?
@@ -22841,6 +22998,21 @@ pub struct Tier3PollExport {
     /// `None` until stage = Finalized.
     pub winner_event_hash: Option<String>,
     pub runner_up_event_hash: Option<String>,
+    /// ZEB-295 Phase 6 Task 9 / spec §6.6: privacy mode tag carried from
+    /// the poll's config ("pu" | "se" | "rf"). Frontend uses this to
+    /// render the ballot-secret chip + branch the cast flow.
+    pub privacy_mode: String,
+    /// ZEB-295 Phase 6 Task 9 / spec §6.6: count of kd=ts tally-share events
+    /// applied for the latest committee epoch. Always 0 in pu-mode polls.
+    pub encrypted_tally_share_count: u32,
+    /// ZEB-295 Phase 6 Task 9 / spec §6.6: FROST threshold `t` for the
+    /// latest committee epoch. Always 0 in pu-mode polls or when no
+    /// committee is yet active.
+    pub encrypted_tally_threshold: u16,
+    /// ZEB-295 Phase 6 Task 9 / spec §6.6: committee size `n` for the
+    /// latest committee epoch. Always 0 in pu-mode polls or when no
+    /// committee is yet active.
+    pub encrypted_tally_committee_size: u16,
 }
 
 /// ZEB-311: lightweight per-row shape returned by
@@ -22860,6 +23032,10 @@ pub struct Tier3PollSummary {
     /// Set once stage = Finalized; lets the panel show "Charter §3
     /// amended" without an extra fetch.
     pub winner_text: Option<String>,
+    /// ZEB-295 Phase 6 Task 11: privacy mode tag carried from the poll's
+    /// config ("pu" | "se" | "rf"). Lets the list view render the 🔒
+    /// privacy chip without doing a full `voting_get_tier3_poll` fetch.
+    pub privacy_mode: String,
 }
 
 /// ZEB-294: camelCase wire DTO for a bridging-statement score row.
@@ -24376,7 +24552,9 @@ fn build_tier3_export(
             .and_then(|ev| {
                 let payload: Result<crate::community_voting_core::RatificationBallotPayload, _> =
                     ciborium::from_reader(&ev.payload[..]);
-                payload.ok().map(|p| p.scores)
+                // ZEB-295 Phase 6: payload.scores is Option<Vec<u8>> (None in
+                // se-mode). Flatten Result→Option→Option<Vec<u8>>.
+                payload.ok().and_then(|p| p.scores)
             })
     });
 
@@ -24520,6 +24698,39 @@ fn build_tier3_export(
         .and_then(|owner| t3.deliberation.statements_per_author.get(&owner).copied())
         .unwrap_or(0);
 
+    // ZEB-295 Phase 6 Task 9 / spec §6.6: project ballot-secret status fields.
+    // In se-mode, surface (a) how many committee members have published their
+    // kd=ts share for the latest epoch (the "k/t of n" progress indicator
+    // RatificationView renders), (b) the threshold t, and (c) the committee
+    // size n. In pu-mode (or when no committee is active), all three are 0 —
+    // the frontend gates rendering on privacy_mode != "pu".
+    let privacy_mode = t3.meta.config.privacy_mode.clone();
+    // CodeRabbit PR #155: capture `latest_epoch()` once rather than calling
+    // it twice (once to fetch the committee, again to filter `tally_shares`).
+    // The oracle's `latest_epoch` is cheap, but the read-twice pattern
+    // invited a subtle inconsistency if the oracle ever became mutable
+    // (e.g. an interleaved CHURP rotation between the two calls).
+    let (encrypted_tally_share_count, encrypted_tally_threshold, encrypted_tally_committee_size) =
+        if privacy_mode == "se" {
+            match t3.committee_oracle.latest_epoch() {
+                Some(epoch) => match t3.committee_oracle.committee_at_epoch(epoch) {
+                    Some(cs) => {
+                        let count = t3
+                            .secret_tally
+                            .tally_shares
+                            .iter()
+                            .filter(|((_, ep), _)| *ep == epoch)
+                            .count() as u32;
+                        (count, cs.threshold, cs.verifying_shares.len() as u16)
+                    }
+                    None => (0, 0, 0),
+                },
+                None => (0, 0, 0),
+            }
+        } else {
+            (0, 0, 0)
+        };
+
     Ok(Tier3PollExport {
         poll_id: hex::encode(state.meta.poll_id.0),
         community_id: hex::encode(state.meta.community_id.0),
@@ -24545,6 +24756,10 @@ fn build_tier3_export(
         my_deliberation_votes: my_votes_vec,
         winner_event_hash,
         runner_up_event_hash,
+        privacy_mode,
+        encrypted_tally_share_count,
+        encrypted_tally_threshold,
+        encrypted_tally_committee_size,
     })
 }
 
@@ -24647,6 +24862,7 @@ async fn voting_list_tier3_polls_raw(
                 poll_create_hlc_ms: t3.meta.poll_create_hlc.wall_ms as i128,
                 sortition_size: t3.meta.config.sortition_size,
                 winner_text,
+                privacy_mode: t3.meta.config.privacy_mode.clone(),
             })
         })
         .collect();

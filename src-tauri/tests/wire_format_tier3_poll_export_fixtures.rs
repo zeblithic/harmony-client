@@ -69,6 +69,11 @@ fn tier3_poll_export_round_trips_through_cbor() {
         }],
         winner_event_hash: None,
         runner_up_event_hash: None,
+        // ZEB-295 Phase 6 Task 9 / spec §6.6: ballot-secret status fields.
+        privacy_mode: "pu".to_string(),
+        encrypted_tally_share_count: 0,
+        encrypted_tally_threshold: 0,
+        encrypted_tally_committee_size: 0,
     };
     let mut buf = Vec::new();
     ciborium::into_writer(&export, &mut buf).expect("encode");
@@ -88,6 +93,10 @@ fn tier3_poll_export_round_trips_through_cbor() {
         "deliberationWindowSeconds",
         "draftCandidates",
         "draftingWindowSeconds",
+        // ZEB-295 Phase 6 Task 9 / spec §6.6: ballot-secret status fields.
+        "encryptedTallyCommitteeSize",
+        "encryptedTallyShareCount",
+        "encryptedTallyThreshold",
         "incentiveMode",
         "miniPublic",
         "myDeliberationStatementCount",
@@ -97,6 +106,7 @@ fn tier3_poll_export_round_trips_through_cbor() {
         "myRole",
         "pollCreateHlcMs",
         "pollId",
+        "privacyMode",
         "proposalText",
         "proposer",
         "ratificationCandidates",
@@ -125,6 +135,7 @@ fn tier3_poll_summary_round_trips_through_cbor() {
         poll_create_hlc_ms: 1_700_000_000_000,
         sortition_size: 100,
         winner_text: None,
+        privacy_mode: "pu".to_string(),
     };
     let mut buf = Vec::new();
     ciborium::into_writer(&summary, &mut buf).expect("encode");
@@ -136,6 +147,7 @@ fn tier3_poll_summary_round_trips_through_cbor() {
         "communityId",
         "pollCreateHlcMs",
         "pollId",
+        "privacyMode",
         "proposalText",
         "proposer",
         "sortitionSize",

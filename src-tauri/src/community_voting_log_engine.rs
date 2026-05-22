@@ -40,7 +40,81 @@ use tauri::{AppHandle, Emitter};
 use crate::community_dfrost_log_engine::DfrostLogRegistry;
 use crate::community_voting_core::{PollEventKindCode, PollId, SignedVotingEvent, Tier};
 use crate::community_voting_log::VotingLog;
+use crate::community_voting_tier3::{CommitteeOracle, CommitteePublicState};
 use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+
+// ── ZEB-295 Phase 6 Task 8: production CommitteeOracle ──────────────────────
+
+/// Production `CommitteeOracle` backed by a snapshot of the per-community
+/// `DfrostLog` committee state at oracle-install time.
+///
+/// Phase 6 v1 caching rationale: the `CommitteeOracle` trait is sync (no
+/// `async fn` — the apply path is sync), but the underlying dfrost log
+/// lives behind a `tokio::sync::Mutex`. Rather than blocking the async
+/// runtime via `blocking_lock` at every oracle query, we snapshot the
+/// committee state once at install time (typically PollCreate apply,
+/// after DKG has finalised) and serve queries from the cache. This is
+/// correct as long as the committee doesn't rotate mid-poll — CHURP
+/// rotation handling (multi-epoch snapshot tracking) is a v2 concern
+/// per spec §5.2/§5.3. The current dfrost wiring stores only the
+/// latest committee state in `committee_state` anyway, so multi-epoch
+/// recovery is constrained to the snapshot epoch in Phase 6.
+///
+/// `None` returns (committee not yet active, requested epoch doesn't
+/// match snapshot) flow through to the existing "silent drop on
+/// missing prerequisite" convention in the apply path.
+#[derive(Debug, Clone)]
+pub struct DfrostLogCommitteeOracle {
+    /// CHURP epoch this snapshot represents.
+    pub epoch: u64,
+    /// Joint verifying key Y = G · x (compressed Ristretto, 32 bytes).
+    pub joint_verifying_key: [u8; 32],
+    /// Per-member verifying shares Y_i = G · x_i.
+    pub verifying_shares: BTreeMap<OwnerAddr, [u8; 32]>,
+    /// FROST `min_signers` (= ElGamal threshold `t`).
+    pub threshold: u16,
+}
+
+impl DfrostLogCommitteeOracle {
+    /// Construct a fresh oracle by snapshotting the current committee state
+    /// from a per-community `DfrostLogEngine`. Returns `None` if no DKG has
+    /// completed yet (committee inactive).
+    pub async fn from_dfrost_engine<R: tauri::Runtime>(
+        engine: &crate::community_dfrost_log_engine::DfrostLogEngine<R>,
+    ) -> Option<Self> {
+        let epoch = engine.latest_committee_epoch().await?;
+        let (joint_verifying_key, verifying_shares, threshold) =
+            engine.committee_snapshot_at_epoch(epoch).await?;
+        Some(Self {
+            epoch,
+            joint_verifying_key,
+            verifying_shares,
+            threshold,
+        })
+    }
+}
+
+impl CommitteeOracle for DfrostLogCommitteeOracle {
+    fn committee_at_epoch(&self, epoch: u64) -> Option<CommitteePublicState> {
+        // Phase 6 v1: snapshot stores ONE epoch. Queries for other epochs
+        // return None — the recover_secret_tally path falls through to the
+        // next epoch, eventually returning None overall if the requested
+        // epoch isn't the snapshot epoch. See spec §5.3 multi-epoch
+        // recovery (deferred to v2 with CHURP rotation event log).
+        if epoch != self.epoch {
+            return None;
+        }
+        Some(CommitteePublicState {
+            epoch,
+            joint_verifying_key: self.joint_verifying_key,
+            verifying_shares: self.verifying_shares.clone(),
+            threshold: self.threshold,
+        })
+    }
+    fn latest_epoch(&self) -> Option<u64> {
+        Some(self.epoch)
+    }
+}
 
 // ── BeaconRequester type alias ───────────────────────────────────────────────
 
@@ -916,7 +990,13 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                 Some(t) => t,
                 None => return,
             };
-            if t3.close_event_hash.is_none() || t3.result.is_some() {
+            // ZEB-295 Phase 6: this branch handles pu-mode only. se-mode polls
+            // route through `maybe_emit_tier3_result_secret` below, which
+            // gates on tally-share threshold rather than just close_event_hash.
+            if t3.meta.config.privacy_mode != "pu"
+                || t3.close_event_hash.is_none()
+                || t3.result.is_some()
+            {
                 None
             } else {
                 // Build candidate ordering. Same pattern as verify_sr.
@@ -981,6 +1061,453 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                     poll_id = %hex::encode(pid.0),
                     "engine-auto kd=rs publish rejected (race loser?)"
                 );
+            }
+        }
+
+        // ── ZEB-295 Phase 6 Task 8: kd=ts TallyShare orchestration ──────
+        //
+        // Fires when (privacy_mode == "se", kd=cl applied, we're a committee
+        // member at the latest epoch, we haven't yet emitted for this
+        // (actor, epoch)). Builds the per-aggregate partial decryption
+        // shares + DLEQ proofs against the homomorphic ballot aggregate
+        // and publishes the signed envelope so peers can collect ≥t
+        // shares and Lagrange-combine the STAR plaintext.
+        self.maybe_emit_tally_share(pid, &signing_key, self_owner)
+            .await;
+
+        // ── ZEB-295 Phase 6 Task 8: kd=rs (secret-mode) orchestration ───
+        //
+        // CodeRabbit PR #155 major: a node that is NOT in the committee
+        // never publishes kd=ts itself, so the outbound-only invocation
+        // (existing behavior) means peers can collect ≥t shares from
+        // other nodes' kd=ts but never finalize the poll on their own
+        // log. The inbound dispatch path also calls
+        // `try_finalize_secret_tally` (see `process_inbound_dispatch`)
+        // so any node that crosses the share threshold finalizes
+        // independently — Lagrange invariance + canonical share-subset
+        // selection guarantees bit-identical kd=rs envelopes across
+        // replicas, so the LWW gate in apply cleanly resolves the race.
+        self.try_finalize_secret_tally(pid, &signing_key, self_owner)
+            .await;
+    }
+
+    /// ZEB-295 Phase 6 Task 8: emit a kd=ts TallyShare event after
+    /// ratification close if this engine is a committee member at the
+    /// latest epoch and hasn't yet emitted.
+    ///
+    /// Steps (after all gates pass):
+    /// 1. Snapshot poll-state under lock (close + privacy_mode +
+    ///    aggregate-input ballots + epoch + committee snapshot).
+    /// 2. Resolve the local FROST `KeyPackage` from the per-community
+    ///    `DfrostLogEngine` and derive the ElGamal decryption scalar
+    ///    `x_i = signing_share_as_scalar(kp)`.
+    /// 3. For each of the `n + C(n,2)` ballot aggregates: compute the
+    ///    partial decryption share `d_i = c1_agg · x_i` and a
+    ///    Chaum-Pedersen DLEQ proof `(G ↦ Y_i, c1_agg ↦ d_i)` so peers
+    ///    can verify the share against the committee oracle without
+    ///    learning `x_i`.
+    /// 4. Wrap into `TallySharePayload` and publish via the recursive
+    ///    `publish_event` path (mirrors all other engine-auto mints).
+    ///
+    /// Silent-bail on any missing prerequisite (no committee, no DKG
+    /// key locally, aggregate decode fail). Re-runs cheaply on every
+    /// apply via the already-emitted guard — late-arriving prerequisites
+    /// (e.g. CHURP epoch refresh) get picked up on the next apply tick.
+    /// Test seam: invoke `maybe_emit_tally_share` directly from
+    /// integration tests + unit tests under `mod tests` below. The
+    /// production hook is fired from `maybe_trigger_engine_auto_orchestration`
+    /// which is itself only invoked through `publish_event` — driving
+    /// the full publish path in a test would require seeding both a
+    /// valid prior log and a kd=cl event that passes all apply gates.
+    /// This thin pub wrapper preserves the private orchestration hook
+    /// while letting tests assert the emission in isolation.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub async fn test_invoke_maybe_emit_tally_share(
+        self: &Arc<Self>,
+        pid: &PollId,
+        signing_key: &Arc<ed25519_dalek::SigningKey>,
+        self_owner: OwnerAddr,
+    ) {
+        self.maybe_emit_tally_share(pid, signing_key, self_owner)
+            .await;
+    }
+
+    async fn maybe_emit_tally_share(
+        self: &Arc<Self>,
+        pid: &PollId,
+        signing_key: &Arc<ed25519_dalek::SigningKey>,
+        self_owner: OwnerAddr,
+    ) {
+        use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
+
+        // (1) Quick mode + state gates, plus snapshot of all apply-state
+        // we need to compute shares. Drop the lock BEFORE the async
+        // crypto work + dfrost engine acquire.
+        //
+        // Cursor PR #155 review-round-3 (F23): the previous
+        // `tally_shares.contains_key(&(self_owner, latest_epoch))` early-
+        // bail was wrong — it prevented re-emission when the homomorphic
+        // aggregate changed (late-arriving ballots reorder by LWW, which
+        // changes `c1_agg`, which invalidates the DLEQ proofs in our
+        // previously-published share). C2's LWW upsert in apply means a
+        // newer-HLC kd=ts from us OVERWRITES the stale one; so the
+        // correct gate is "does our stored share still match what we'd
+        // compute against the current aggregate?" We carry the stored
+        // entry through the snapshot for post-key-fetch comparison.
+        struct Snapshot {
+            n: usize,
+            aggregates: Vec<crate::community_voting_core::EncCiphertext>,
+            committee_epoch: u64,
+            y_i_compressed: [u8; 32],
+            stored_first_share: Option<[u8; 32]>,
+        }
+        let snapshot: Option<Snapshot> = {
+            let log = self.voting_log.lock().await;
+            let state = match log.polls.get(pid) {
+                Some(s) => s,
+                None => return,
+            };
+            let t3 = match state.tier_state.as_tier3() {
+                Some(t) => t,
+                None => return,
+            };
+            if t3.meta.config.privacy_mode != "se" || t3.close_event_hash.is_none() {
+                return;
+            }
+            let latest_epoch = match t3.committee_oracle.latest_epoch() {
+                Some(e) => e,
+                None => return,
+            };
+            // Committee membership + own verifying share.
+            let cs = match t3.committee_oracle.committee_at_epoch(latest_epoch) {
+                Some(c) => c,
+                None => return,
+            };
+            let y_i_compressed = match cs.verifying_shares.get(&self_owner) {
+                Some(b) => *b,
+                None => return, // not on committee
+            };
+            // Capture the first share-entry we previously published at
+            // this (actor, epoch), if any — used post-key-fetch to detect
+            // unchanged-aggregate idempotency and skip the publish.
+            let stored_first_share = t3
+                .secret_tally
+                .tally_shares
+                .get(&(self_owner, latest_epoch))
+                .and_then(|rec| rec.entries.first().map(|e| e.share));
+            // Derive n via the canonical ratification ordering, matching
+            // the apply path's n derivation (C2 fix). Pre-Drafting state
+            // is silently skipped — kd=ts can only meaningfully emit
+            // after kd=cl has been applied, which requires Ratification.
+            let sq = crate::community_voting_tier3::synthesize_status_quo(&t3.meta.poll_id);
+            let sq_hash = sq.event_hash;
+            let mut all_candidates = t3.candidates.clone();
+            all_candidates.push(sq);
+            let primary_size = t3.meta.config.sortition_size as usize;
+            let advancers = match crate::community_voting_tier3::drafting_advancers(
+                &all_candidates,
+                primary_size,
+                sq_hash,
+            ) {
+                Some(a) => a,
+                None => return,
+            };
+            let n = crate::community_voting_tier3::ratification_candidates_ordering(
+                &advancers, sq_hash,
+            )
+            .len();
+            if n == 0 {
+                return;
+            }
+            let aggregates = match crate::community_voting_tier3::aggregate_se_ballots(
+                &t3.ratification_ballots,
+                n,
+            ) {
+                Some(a) => a,
+                None => {
+                    // No accepted ballots — nothing to decrypt. Future
+                    // emit will fire if any ballot lands later (the
+                    // apply path resets emit-eligibility on stale-LWW
+                    // overwrites; for "no ballots at all" the share
+                    // would decrypt to all zeros, but we skip rather
+                    // than publish an empty-electorate kd=ts).
+                    return;
+                }
+            };
+            Some(Snapshot {
+                n,
+                aggregates,
+                committee_epoch: latest_epoch,
+                y_i_compressed,
+                stored_first_share,
+            })
+        };
+        let snap = match snapshot {
+            Some(s) => s,
+            None => return,
+        };
+
+        // (2) Acquire the local FROST KeyPackage from the per-community
+        // dfrost engine. If unwired or no local key (non-committee
+        // member, or DKG didn't finalize locally yet), silent-bail —
+        // future applies will retry the gates above.
+        let kp = {
+            let dr = self.dfrost_registry.lock().await;
+            let engine_opt = match dr.as_ref() {
+                Some(reg) => reg.get(self.community_id).await,
+                None => None,
+            };
+            match engine_opt {
+                Some(engine) => engine.local_key_package().await,
+                None => None,
+            }
+        };
+        let kp = match kp {
+            Some(k) => k,
+            None => {
+                tracing::debug!(
+                    poll_id = %hex::encode(pid.0),
+                    "engine-auto kd=ts: no local FROST KeyPackage — bail"
+                );
+                return;
+            }
+        };
+        let x_i = crate::community_dfrost_crypto::signing_share_as_scalar(&kp);
+
+        // (2.5) Aggregate-change idempotency check. If we have a stored
+        // share at this (actor, epoch) AND its first entry matches what
+        // we'd compute for the current aggregate's c1_agg[0], then the
+        // homomorphic aggregate hasn't changed since our last emit — no
+        // need to re-publish. If they differ, late-arriving ballots have
+        // shifted the aggregate; we re-emit so the LWW upsert in apply
+        // replaces our stale share with a freshly-bound one (CodeRabbit
+        // F23 fix).
+        if let Some(stored) = snap.stored_first_share {
+            let c1_agg_0 = match crate::community_voting_tier3_crypto::decompress_point(
+                &snap.aggregates[0].c1,
+            ) {
+                Some(p) => p,
+                None => return,
+            };
+            let expected_first =
+                crate::community_voting_tier3_crypto::partial_decrypt_share(&c1_agg_0, &x_i);
+            let expected_compressed =
+                crate::community_voting_tier3_crypto::compress_point(&expected_first);
+            if expected_compressed == stored {
+                tracing::debug!(
+                    poll_id = %hex::encode(pid.0),
+                    "engine-auto kd=ts: aggregate unchanged since last emit — skipping"
+                );
+                return;
+            }
+        }
+
+        // (3) Decompress own verifying share Y_i once for DLEQ proofs.
+        let y_i = match crate::community_voting_tier3_crypto::decompress_point(&snap.y_i_compressed)
+        {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    poll_id = %hex::encode(pid.0),
+                    "engine-auto kd=ts: Y_i failed to decompress — committee snapshot corrupt?"
+                );
+                return;
+            }
+        };
+        let g = RISTRETTO_BASEPOINT_POINT;
+
+        // (4) Compute one TallyShareEntry per aggregate.
+        let mut entries: Vec<crate::community_voting_core::TallyShareEntry> =
+            Vec::with_capacity(snap.aggregates.len());
+        for agg in &snap.aggregates {
+            let c1_agg = match crate::community_voting_tier3_crypto::decompress_point(&agg.c1) {
+                Some(p) => p,
+                None => {
+                    tracing::warn!(
+                        poll_id = %hex::encode(pid.0),
+                        "engine-auto kd=ts: c1_agg failed to decompress — bail"
+                    );
+                    return;
+                }
+            };
+            let d_i = crate::community_voting_tier3_crypto::partial_decrypt_share(&c1_agg, &x_i);
+            let proof =
+                crate::community_voting_tier3_nizk::dleq_prove(&g, &y_i, &c1_agg, &d_i, &x_i);
+            entries.push(crate::community_voting_core::TallyShareEntry {
+                share: crate::community_voting_tier3_crypto::compress_point(&d_i),
+                dleq_proof: proof.to_bytes(),
+            });
+        }
+        debug_assert_eq!(entries.len(), snap.n + snap.n * (snap.n - 1) / 2);
+
+        // (5) Build the signed envelope and publish.
+        let hlc = self.reserve_next_local_hlc().await;
+        let payload = crate::community_voting_core::TallySharePayload {
+            poll_id: *pid,
+            committee_epoch: snap.committee_epoch,
+            entries,
+        };
+        let ts_ev = match crate::community_voting_core::build_signed_tally_share(
+            signing_key,
+            self_owner,
+            payload,
+            hlc,
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    poll_id = %hex::encode(pid.0),
+                    "engine-auto kd=ts build_signed_tally_share failed"
+                );
+                return;
+            }
+        };
+        if let Err(e) = Box::pin(self.publish_event(ts_ev, None)).await {
+            // Race-loss (replay-tracker dedup) is expected when two
+            // engines on the same node share signing material. Log at
+            // debug to avoid alarm-fatigue.
+            tracing::debug!(
+                error = %e,
+                poll_id = %hex::encode(pid.0),
+                "engine-auto kd=ts publish rejected (race loser?)"
+            );
+        }
+    }
+
+    /// ZEB-295 Phase 6 Task 8: finalize a se-mode poll by minting kd=rs
+    /// once enough kd=ts have accumulated.
+    ///
+    /// CodeRabbit PR #155 major: this method is the single source of
+    /// truth for the kd=rs (se-mode) emit, called from BOTH the outbound
+    /// orchestration cascade (`maybe_trigger_engine_auto_orchestration`)
+    /// and the inbound dispatch hook (`process_inbound_dispatch`). The
+    /// inbound path is load-bearing because a node that is NOT in the
+    /// committee never publishes kd=ts itself, so its outbound cascade
+    /// never executes; without the inbound invocation, a non-committee
+    /// node would observe ≥t kd=ts events from peers but never finalize
+    /// its own log → permanent divergence.
+    ///
+    /// Determinism: `recover_secret_tally` deterministically picks a
+    /// canonical size-`threshold` subset of (i, x_i) shares (Lagrange
+    /// invariance) so all replicas that cross the threshold reconstruct
+    /// bit-identical kd=rs envelopes — late arrivals are silently
+    /// rejected by the apply-time terminal-state gate.
+    async fn try_finalize_secret_tally(
+        self: &Arc<Self>,
+        pid: &PollId,
+        signing_key: &Arc<ed25519_dalek::SigningKey>,
+        self_owner: OwnerAddr,
+    ) {
+        // (1) Snapshot under lock, compute result, drop lock before
+        // recursive publish_event.
+        let trigger_result: Option<crate::community_voting_star::StarResult> = {
+            let log = self.voting_log.lock().await;
+            let state = match log.polls.get(pid) {
+                Some(s) => s,
+                None => return,
+            };
+            let t3 = match state.tier_state.as_tier3() {
+                Some(t) => t,
+                None => return,
+            };
+            if t3.meta.config.privacy_mode != "se" || t3.result.is_some() {
+                None
+            } else {
+                // Build candidate ordering (mirror kd=rs pu-mode path).
+                let sq = crate::community_voting_tier3::synthesize_status_quo(&t3.meta.poll_id);
+                let sq_hash = sq.event_hash;
+                let mut all_candidates = t3.candidates.clone();
+                all_candidates.push(sq);
+                let primary_size = t3.meta.config.sortition_size as usize;
+                let advancers = match crate::community_voting_tier3::drafting_advancers(
+                    &all_candidates,
+                    primary_size,
+                    sq_hash,
+                ) {
+                    Some(a) => a,
+                    None => {
+                        // Pre-Drafting stage — can't happen given the
+                        // close-event invariant in the kd=ts apply path
+                        // (kd=ts only stored once Ratification is past).
+                        return;
+                    }
+                };
+                let ordered = crate::community_voting_tier3::ratification_candidates_ordering(
+                    &advancers, sq_hash,
+                );
+                crate::community_voting_tier3::recover_secret_tally(t3, &ordered)
+            }
+        };
+
+        if let Some(result) = trigger_result {
+            let hlc = self.reserve_next_local_hlc().await;
+            let rs_ev = match crate::community_voting_core::build_signed_poll_result_tier3(
+                signing_key,
+                self_owner,
+                *pid,
+                result,
+                hlc,
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        poll_id = %hex::encode(pid.0),
+                        "engine-auto kd=rs (secret) build_signed_poll_result_tier3 failed"
+                    );
+                    return;
+                }
+            };
+            if let Err(e) = Box::pin(self.publish_event(rs_ev, None)).await {
+                tracing::debug!(
+                    error = %e,
+                    poll_id = %hex::encode(pid.0),
+                    "engine-auto kd=rs (secret) publish rejected (race loser?)"
+                );
+            }
+        }
+    }
+
+    /// ZEB-295 Phase 6 Task 8: install a `DfrostLogCommitteeOracle`
+    /// snapshot on the freshly-applied Tier 3 poll. Best-effort — if
+    /// the dfrost registry is unwired or no DKG has completed yet, the
+    /// poll keeps its default `NullCommitteeOracle` and any se-mode
+    /// kd=ts apply silently drops until a real committee exists.
+    async fn maybe_install_committee_oracle_for_poll(self: &Arc<Self>, pid: &PollId) {
+        // Acquire the dfrost engine; bail if registry/engine unwired.
+        let dfrost_engine = {
+            let dr = self.dfrost_registry.lock().await;
+            match dr.as_ref() {
+                Some(reg) => reg.get(self.community_id).await,
+                None => None,
+            }
+        };
+        let engine = match dfrost_engine {
+            Some(e) => e,
+            None => {
+                tracing::debug!(
+                    poll_id = %hex::encode(pid.0),
+                    "engine-auto: dfrost engine unwired; skipping CommitteeOracle install"
+                );
+                return;
+            }
+        };
+        let oracle = match DfrostLogCommitteeOracle::from_dfrost_engine(engine.as_ref()).await {
+            Some(o) => o,
+            None => {
+                tracing::debug!(
+                    poll_id = %hex::encode(pid.0),
+                    "engine-auto: no DKG completed yet; skipping CommitteeOracle install"
+                );
+                return;
+            }
+        };
+        // Re-acquire the voting_log lock briefly to mutate t3.committee_oracle.
+        let mut log = self.voting_log.lock().await;
+        if let Some(ps) = log.polls.get_mut(pid) {
+            if let Some(t3) = ps.tier_state.as_tier3_mut() {
+                t3.install_committee_oracle(Arc::new(oracle));
             }
         }
     }
@@ -1129,6 +1656,18 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         // request uses it via the poll's meta (not a fresh dfrost query).
         // Fire-and-forget; errors are logged inside maybe_trigger_beacon_for_tier3_create.
         self.maybe_trigger_beacon_for_tier3_create(&event).await;
+
+        // (3b) ZEB-295 Phase 6: install production CommitteeOracle on the
+        // freshly-created Tier 3 poll. Snapshot once from the dfrost log;
+        // future queries serve from the cache (CHURP rotation handling
+        // deferred to v2 per spec §5.2). Failure to install (no DKG yet,
+        // registry not wired) is non-fatal — the poll keeps its default
+        // NullCommitteeOracle, and any se-mode kd=ts apply will silently
+        // drop until a real committee is available.
+        if event.tier == Tier::Sortition && event.kind == PollEventKindCode::PollCreate {
+            self.maybe_install_committee_oracle_for_poll(&applied_poll_id)
+                .await;
+        }
 
         // (4) Broadcast. `send().await` waits for adapter capacity rather
         // than dropping on a full channel — Phase 2 has no backfill, so
@@ -1467,6 +2006,63 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                         error = %e,
                         poll_id = %pid_hex,
                         "voting-tier3-finalized emit failed (non-fatal)"
+                    );
+                }
+            }
+        }
+
+        // ZEB-295 Phase 6 Task 8: emit voting-tier3-tally-share-applied
+        // on every accepted kd=ts so the frontend can render incremental
+        // committee-share-count progress in the awaiting-tally se-mode
+        // state. Snapshot share_count + threshold at the latest epoch
+        // from the post-apply state.
+        if applied_event.kind == PollEventKindCode::TallyShare {
+            // Decode the applied payload's epoch (we need it for the DTO
+            // even though we count shares at the *latest* epoch on the
+            // poll — for the simple case they match).
+            let epoch_from_payload: Option<u64> = ciborium::de::from_reader::<
+                crate::community_voting_core::TallySharePayload,
+                _,
+            >(&applied_event.payload[..])
+            .ok()
+            .map(|p| p.committee_epoch);
+
+            // Compute share_count + threshold under a brief re-acquire.
+            let counts: Option<(u64, usize, u16)> = {
+                let log = self.voting_log.lock().await;
+                log.polls
+                    .get(pid)
+                    .and_then(|ps| ps.tier_state.as_tier3())
+                    .and_then(|t3| {
+                        let ep =
+                            epoch_from_payload.or_else(|| t3.committee_oracle.latest_epoch())?;
+                        let share_count = t3
+                            .secret_tally
+                            .tally_shares
+                            .iter()
+                            .filter(|((_addr, e), _record)| *e == ep)
+                            .count();
+                        let threshold = t3
+                            .committee_oracle
+                            .committee_at_epoch(ep)
+                            .map(|cs| cs.threshold)
+                            .unwrap_or(0);
+                        Some((ep, share_count, threshold))
+                    })
+            };
+            if let Some((epoch, share_count, threshold)) = counts {
+                let payload = serde_json::json!({
+                    "communityId": community_id_hex,
+                    "pollId": pid_hex,
+                    "epoch": epoch,
+                    "shareCount": share_count,
+                    "threshold": threshold,
+                });
+                if let Err(e) = app_handle.emit("voting-tier3-tally-share-applied", &payload) {
+                    tracing::warn!(
+                        error = %e,
+                        poll_id = %pid_hex,
+                        "voting-tier3-tally-share-applied emit failed (non-fatal)"
                     );
                 }
             }
@@ -1869,6 +2465,15 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         // on event.tier + event.kind + beacon_requester presence.
         self.maybe_trigger_beacon_for_tier3_create(&event).await;
 
+        // (1a) ZEB-295 Phase 6: install production CommitteeOracle on a
+        // freshly-applied inbound Tier 3 PollCreate. Mirrors the outbound
+        // install in `publish_event` so peer-received polls see the same
+        // committee snapshot.
+        if event.tier == Tier::Sortition && event.kind == PollEventKindCode::PollCreate {
+            self.maybe_install_committee_oracle_for_poll(&applied_poll_id)
+                .await;
+        }
+
         // (2) Tier 3 lifecycle emit. Cheap tier gate avoids touching
         // app_handle for non-Tier-3 traffic.
         //
@@ -1891,6 +2496,67 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                 previous_stage_for_emit,
             )
             .await;
+        }
+
+        // (3) CodeRabbit PR #155 major: inbound kd=ts must drive kd=rs
+        // finalization for nodes that are NOT in the committee. Such
+        // nodes never publish kd=ts themselves, so the outbound
+        // orchestration cascade (which runs only on
+        // `publish_event`-driven mints) never fires for them. Without
+        // this hook, a non-committee node would receive ≥t kd=ts events
+        // from peers, hold all the inputs `recover_secret_tally` needs,
+        // and never finalize its own log → permanent divergence with
+        // peers that DID finalize.
+        //
+        // Scope: ONLY `try_finalize_secret_tally` runs here (NOT the
+        // full orchestration cascade). The full cascade includes
+        // outbound kd=cl / kd=sf / pu-mode kd=rs minting, which was
+        // intentionally excluded from inbound dispatch (see note above)
+        // because cross-engine HLC races there cause divergence. The
+        // se-mode kd=rs path is safe to run from both sides because:
+        //   1. Lagrange invariance + canonical share-subset selection
+        //      guarantees bit-identical kd=rs envelopes across replicas
+        //      that cross threshold, so the apply LWW gate cleanly
+        //      resolves any race.
+        //   2. Race-losers are silently rejected by the apply-time
+        //      `PollInFinalizedState` gate (the kd=rs apply path
+        //      transitions to `Stage::Finalized`).
+        //
+        // Gated on (Tier::Sortition + kind ∈ {TallyShare, PollClose}) to
+        // skip the lock-acquire on every non-Tier3 inbound event. The
+        // method itself silently returns if `local_signing` is unset,
+        // privacy_mode is not "se", or `result.is_some()`, so the
+        // operation is cheap on irrelevant polls even within the gate.
+        if event.tier == Tier::Sortition
+            && matches!(
+                event.kind,
+                PollEventKindCode::TallyShare | PollEventKindCode::PollClose
+            )
+        {
+            let local_signing_opt = {
+                let r = self.local_signing.read().await;
+                r.as_ref().map(|(k, o)| (k.clone(), *o))
+            };
+            // Skip silently if we lack signing material (read-only peer)
+            // or have no HLC tracker installed for engine-auto mints.
+            if let Some((signing_key, self_owner)) = local_signing_opt {
+                if self.hlc_tracker.is_some() && self.device_id.is_some() {
+                    // CodeRabbit PR #155 review-round-3 (F24): a committee
+                    // member that learns of kd=cl via PEER inbound (rather
+                    // than initiating it locally) never executes the
+                    // outbound orchestration cascade, so without minting
+                    // here it would never publish its kd=ts. With
+                    // threshold > 1, secret-mode polls stall indefinitely.
+                    // Mint our share first, then attempt finalize — the
+                    // emit's apply-time replay path will trigger
+                    // finalize again via the normal inbound dispatch on
+                    // the just-published event.
+                    self.maybe_emit_tally_share(&applied_poll_id, &signing_key, self_owner)
+                        .await;
+                    self.try_finalize_secret_tally(&applied_poll_id, &signing_key, self_owner)
+                        .await;
+                }
+            }
         }
 
         // (4) ZEB-298 Tier 2 delegate-on-behalf notify. Internally
@@ -3662,6 +4328,7 @@ mod tests {
             // Community policy.
             log.set_policy(CommunityVotingPolicy {
                 notify_on_delegate_signal: notify_policy,
+                tier3_privacy_mode_default: "pu".into(),
             });
 
             pid
@@ -3975,6 +4642,7 @@ mod tests {
             // Community policy enables the notify hook.
             log.set_policy(CommunityVotingPolicy {
                 notify_on_delegate_signal: true,
+                tier3_privacy_mode_default: "pu".into(),
             });
 
             pid

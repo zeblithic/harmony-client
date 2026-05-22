@@ -29,6 +29,10 @@ const baseDetail: Tier3PollExport = {
   myDeliberationVotes: [],
   winnerEventHash: null,
   runnerUpEventHash: null,
+  privacyMode: 'pu',
+  encryptedTallyShareCount: 0,
+  encryptedTallyThreshold: 0,
+  encryptedTallyCommitteeSize: 0,
 };
 
 describe('StatementComposer', () => {

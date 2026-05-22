@@ -310,6 +310,7 @@ async fn tier2_signal_via_zenoh_fires_delegate_on_behalf_on_peer_engine() {
         // should reach an identical policy state).
         guard.set_policy(CommunityVotingPolicy {
             notify_on_delegate_signal: true,
+            tier3_privacy_mode_default: "pu".into(),
         });
     }
 

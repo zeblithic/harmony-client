@@ -100,9 +100,93 @@ pub struct Tier3PollMeta {
     pub community_epoch: u64,
 }
 
+// ── ZEB-295 Phase 6: ballot-secret committee oracle + tally state ────────────
+
+/// Public-side view of the committee at a single DKG epoch, exposed by a
+/// `CommitteeOracle`. Carries everything the tier3 apply path needs to
+/// verify a `kd=ts` payload — the joint verifying key (= ElGamal Y), per-
+/// member verifying shares (= DLEQ basis points Y_i), and the threshold.
+#[derive(Debug, Clone)]
+pub struct CommitteePublicState {
+    pub epoch: u64,
+    pub joint_verifying_key: [u8; 32],
+    pub verifying_shares: std::collections::BTreeMap<OwnerAddr, [u8; 32]>,
+    pub threshold: u16,
+}
+
+/// Read-side handle into the per-community DKG history. The Tier 3 apply
+/// path consults this to verify `kd=ts` payloads against the committee
+/// that was active at the poll's PollCreate epoch (or — for cross-epoch
+/// shares — the matching `epoch` in the payload).
+///
+/// `Send + Sync` because `Tier3PollState` is stored inside per-community
+/// engines that the IPC layer hands out behind locks; the oracle must be
+/// safe to share across those locks.
+pub trait CommitteeOracle: Send + Sync + std::fmt::Debug {
+    fn committee_at_epoch(&self, epoch: u64) -> Option<CommitteePublicState>;
+    fn latest_epoch(&self) -> Option<u64>;
+}
+
+/// Trivial oracle that knows about no committees — used as the default
+/// before Task 10 wires the real `DfrostLogRegistry`-backed implementation.
+/// All Tier 3c apply paths that consult the oracle MUST tolerate `None`
+/// returns (silent drop with no state mutation, matching the existing
+/// Phase 4a "silent drop for missing prerequisites" convention).
+#[derive(Debug, Default)]
+pub struct NullCommitteeOracle;
+
+impl CommitteeOracle for NullCommitteeOracle {
+    fn committee_at_epoch(&self, _epoch: u64) -> Option<CommitteePublicState> {
+        None
+    }
+    fn latest_epoch(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// Single LWW-stamped tally-share submission held as the value of
+/// `SecretTallyState::tally_shares`. Tagged with the submitting event's
+/// `(hlc, event_hash)` so the apply path can compare against an incoming
+/// re-submission from the same `(actor, committee_epoch)` key and
+/// overwrite when the incoming pair is strictly greater (Cursor PR #155
+/// #3 + Qodo PR #155 #4 LWW fix).
+///
+/// `entries` mirrors the original `TallySharePayload.entries` Vec: one
+/// `TallyShareEntry` per ciphertext aggregate (score-sum slots first,
+/// then indicator-pair slots in canonical order).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TallyShareRecord {
+    pub entries: Vec<crate::community_voting_core::TallyShareEntry>,
+    pub last_update_hlc: Hlc,
+    pub last_update_event_hash: [u8; 32],
+}
+
+/// Ballot-secret tally projection. `tally_shares` is LWW-upserted by
+/// `(actor, committee_epoch)` keyed on `(hlc.wall_ms, hlc.logical,
+/// hlc.device_id, event_hash)` lex order. Later submissions from the same
+/// committee member at the same epoch overwrite earlier ones — required
+/// per Qodo PR #155 #4 because kd=ts DLEQ verification is performed
+/// against aggregates computed from the poll's CURRENT accepted ballots,
+/// and a late-arriving valid ballot (lower HLC than already-applied
+/// shares) changes those aggregates and invalidates earlier shares for
+/// decryption; the committee member must be able to resubmit with the
+/// updated aggregates and have the new submission win.
+#[derive(Debug, Clone, Default)]
+pub struct SecretTallyState {
+    pub tally_shares: std::collections::BTreeMap<(OwnerAddr, u64), TallyShareRecord>,
+    /// Populated once enough shares are collected to Lagrange-combine and
+    /// BSGS-decode every ciphertext. Mirrors the pu-mode `result` field
+    /// shape so the IPC read path can render either uniformly.
+    pub decrypted_result: Option<crate::community_voting_star::StarResult>,
+}
+
 /// Full state of an in-progress or terminal Tier 3 poll.
 /// Built by applying kd=* events in (hlc, event_hash) lex order.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-rolled because `Arc<dyn CommitteeOracle>` does derive
+/// Debug (the trait carries `+ Debug`) but we prefer to print a short
+/// `<oracle>` placeholder rather than risk dumping committee internals.
+#[derive(Clone)]
 pub struct Tier3PollState {
     pub meta: Tier3PollMeta,
     pub stage: Stage,
@@ -136,6 +220,43 @@ pub struct Tier3PollState {
     /// target-missing kd=dv) would silently bypass the guard and never be
     /// re-materialized, causing replica divergence (Qodo PR #154 finding).
     pub last_received_hlc: Option<Hlc>,
+    /// ZEB-295 Phase 6: ballot-secret tally projection. Populated by
+    /// `kd=ts` apply (Task 7) and the decrypted-result derivation
+    /// (Task 8). Empty in pu-mode polls.
+    pub secret_tally: SecretTallyState,
+    /// ZEB-295 Phase 6: read-side handle into the per-community committee
+    /// history, used at `kd=ts` apply to verify DLEQ proofs against the
+    /// correct epoch's verifying shares. Defaults to `NullCommitteeOracle`
+    /// (returns `None` for every query); Task 10 wires the real registry-
+    /// backed implementation.
+    pub committee_oracle: std::sync::Arc<dyn CommitteeOracle>,
+}
+
+// Hand-rolled Debug because `Arc<dyn CommitteeOracle>` is awkward to format
+// and the oracle internals aren't useful in poll-state dumps. Every other
+// field passes through unchanged.
+impl std::fmt::Debug for Tier3PollState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tier3PollState")
+            .field("meta", &self.meta)
+            .field("stage", &self.stage)
+            .field(
+                "eligible_electorate_snapshot",
+                &self.eligible_electorate_snapshot,
+            )
+            .field("sortition_result", &self.sortition_result)
+            .field("declines", &self.declines)
+            .field("candidates", &self.candidates)
+            .field("ratification_ballots", &self.ratification_ballots)
+            .field("close_event_hash", &self.close_event_hash)
+            .field("result", &self.result)
+            .field("deliberation", &self.deliberation)
+            .field("last_hlc", &self.last_hlc)
+            .field("last_received_hlc", &self.last_received_hlc)
+            .field("secret_tally", &self.secret_tally)
+            .field("committee_oracle", &"<oracle>")
+            .finish()
+    }
 }
 
 // ── Validate error type ───────────────────────────────────────────────────────
@@ -154,7 +275,7 @@ pub enum ValidateError {
     DraftingWindowTooSmall(u32),
     #[error("ratification_window_seconds {0} below floor 60")]
     RatificationWindowTooSmall(u32),
-    #[error("unknown privacy_mode {0:?}; Phase 4a-main only accepts \"pu\"")]
+    #[error("unknown privacy_mode {0:?}; accepts \"pu\" or \"se\" (\"rf\" reserved for Phase 7)")]
     UnknownPrivacyMode(String),
     #[error("unknown incentive_mode {0:?}; must be one of a/b/c/d")]
     UnknownIncentiveMode(String),
@@ -200,8 +321,9 @@ pub fn validate_tier3_poll_config(pd: &Tier3PollConfigPayload) -> Result<(), Val
             pd.ratification_window_seconds,
         ));
     }
-    if pd.privacy_mode != "pu" {
-        // "se" reserved for Phase 6; "rf" reserved for Phase 7.
+    if !["pu", "se"].contains(&pd.privacy_mode.as_str()) {
+        // ZEB-295 Phase 6: "se" (ballot-secret threshold-ElGamal) is now
+        // accepted; "rf" (receipt-free) remains reserved for Phase 7.
         return Err(ValidateError::UnknownPrivacyMode(pd.privacy_mode.clone()));
     }
     if !["a", "b", "c", "d"].contains(&pd.incentive_mode.as_str()) {
@@ -221,15 +343,22 @@ pub fn validate_ratification_ballot(
     pd: &RatificationBallotPayload,
     expected_candidate_count: usize,
 ) -> Result<(), ValidateError> {
-    if pd.scores.len() != expected_candidate_count {
+    // ZEB-295 Phase 6: `scores` is now Option<Vec<u8>> on the wire-format
+    // type (Some in "pu" mode, None in "se" mode). This validator is only
+    // called from the pu-mode IPC path, so we treat None as a length-0 ballot
+    // for the mismatch error path. The se-mode path bypasses this validator.
+    let scores_len = pd.scores.as_ref().map(|s| s.len()).unwrap_or(0);
+    if scores_len != expected_candidate_count {
         return Err(ValidateError::BallotLengthMismatch {
-            scores: pd.scores.len(),
+            scores: scores_len,
             expected: expected_candidate_count,
         });
     }
-    for &s in &pd.scores {
-        if s > 5 {
-            return Err(ValidateError::BallotScoreOutOfRange(s));
+    if let Some(scores) = pd.scores.as_ref() {
+        for &s in scores {
+            if s > 5 {
+                return Err(ValidateError::BallotScoreOutOfRange(s));
+            }
         }
     }
     Ok(())
@@ -292,7 +421,17 @@ impl Tier3PollState {
             deliberation: DeliberationState::default(),
             last_hlc: None,
             last_received_hlc: None,
+            secret_tally: SecretTallyState::default(),
+            committee_oracle: std::sync::Arc::new(NullCommitteeOracle),
         }
+    }
+
+    /// ZEB-295 Phase 6: install a committee oracle. Used by the engine
+    /// setup path (Task 10) to bind the per-community
+    /// `DfrostLogRegistry` view; tests can install a fixture oracle
+    /// to short-circuit DKG ceremony setup.
+    pub fn install_committee_oracle(&mut self, oracle: std::sync::Arc<dyn CommitteeOracle>) {
+        self.committee_oracle = oracle;
     }
 
     /// Apply a single event to this state, mutating it in place.
@@ -578,11 +717,306 @@ impl Tier3PollState {
                 self.stage = Stage::Failed;
             }
 
-            // kd=rb RatificationBallot: append to ratification_ballots.
+            // kd=rb RatificationBallot. Phase 4: append the pu-mode ballot.
+            // Phase 6 (ZEB-295): B5 = encoding-matches-privacy-mode +
+            // ciphertext-shape + NIZK verify (se-mode only). Failure on any
+            // sub-check → silent-drop per spec §3.2; advance_last_hlc = false
+            // so the projection watermark does not advance for filtered events
+            // (ZEB-320).
             PollEventKindCode::RatificationBallot => {
                 let payload: RatificationBallotPayload =
                     decode_payload(&ev.payload).map_err(ApplyError::PayloadDecode)?;
-                self.ratification_ballots.push(payload);
+                let mode = self.meta.config.privacy_mode.as_str();
+                // Qodo PR #155 #2 (ZEB-295 Phase 6): derive `n` from the
+                // canonical ratification-candidate ordering — the same
+                // computation the IPC path (`tier3_ratification_candidate_count`)
+                // and engine-auto kd=rs path use. Using `self.candidates.len() + 1`
+                // is incorrect when only a subset of kd=dc candidates pass the
+                // approval threshold + primary_size cap, because then
+                // `ratification_candidates_ordering.len() < self.candidates.len() + 1`
+                // and se-mode ballots minted by the IPC at the correct length
+                // would be silently dropped here on shape mismatch.
+                //
+                // If `drafting_advancers` returns None, we're pre-Drafting
+                // (status_quo not yet synthesized); silent-drop per spec §3.2.
+                let sq = synthesize_status_quo(&self.meta.poll_id);
+                let sq_hash = sq.event_hash;
+                let mut all_candidates = self.candidates.clone();
+                all_candidates.push(sq);
+                let primary_size = self.meta.config.sortition_size as usize;
+                let n = match drafting_advancers(&all_candidates, primary_size, sq_hash) {
+                    Some(advancers) => ratification_candidates_ordering(&advancers, sq_hash).len(),
+                    None => {
+                        advance_last_hlc = false;
+                        tracing::debug!(
+                            poll_id = %hex::encode(self.meta.poll_id.0),
+                            actor = %hex::encode(ev.actor.0),
+                            "kd=rb drop: pre-Drafting stage (status_quo not synthesized)"
+                        );
+                        // Skip downstream shape/NIZK checks; flow into the
+                        // unified tail. Use a no-op block to keep the
+                        // `if !b5_ok …` branches reachable but inert.
+                        0
+                    }
+                };
+                let pair_count = n * (n - 1) / 2;
+                let b5_ok = match mode {
+                    "pu" => {
+                        payload.scores.is_some()
+                            && payload.ciphertexts_scores.is_none()
+                            && payload.ciphertexts_indicators.is_none()
+                            && payload.proof.is_none()
+                    }
+                    "se" => {
+                        payload.scores.is_none()
+                            && payload
+                                .ciphertexts_scores
+                                .as_ref()
+                                .is_some_and(|v| v.len() == n)
+                            && payload
+                                .ciphertexts_indicators
+                                .as_ref()
+                                .is_some_and(|v| v.len() == pair_count)
+                            && payload.proof.as_ref().is_some_and(|p| {
+                                p.range_proofs.len()
+                                == crate::community_voting_tier3_nizk::Range5Proof::SIZE * n
+                                && p.consistency_proofs.len()
+                                    == crate::community_voting_tier3_nizk::ConsistencyProof::SIZE
+                                        * pair_count
+                            })
+                    }
+                    _ => false,
+                };
+                if !b5_ok {
+                    advance_last_hlc = false;
+                    tracing::debug!(
+                        poll_id = %hex::encode(self.meta.poll_id.0),
+                        actor = %hex::encode(ev.actor.0),
+                        mode,
+                        "kd=rb drop: B5 encoding-matches-privacy-mode/shape failed"
+                    );
+                } else if mode == "se" {
+                    // NIZK verify against committee Y at latest known epoch.
+                    let nizk_ok = match self
+                        .committee_oracle
+                        .latest_epoch()
+                        .and_then(|e| self.committee_oracle.committee_at_epoch(e))
+                    {
+                        Some(cs) => match crate::community_voting_tier3_crypto::decompress_point(
+                            &cs.joint_verifying_key,
+                        ) {
+                            Some(y_point) => {
+                                let proof_ref = payload.proof.as_ref().unwrap();
+                                let proof_struct =
+                                    crate::community_voting_tier3_nizk::BallotBundleProof {
+                                        range_proofs: proof_ref.range_proofs.clone(),
+                                        consistency_proofs: proof_ref.consistency_proofs.clone(),
+                                    };
+                                crate::community_voting_tier3_nizk::verify_ballot_bundle(
+                                    &y_point,
+                                    payload.ciphertexts_scores.as_ref().unwrap(),
+                                    payload.ciphertexts_indicators.as_ref().unwrap(),
+                                    &proof_struct,
+                                )
+                            }
+                            None => false,
+                        },
+                        None => false,
+                    };
+                    if !nizk_ok {
+                        advance_last_hlc = false;
+                        tracing::debug!(
+                            poll_id = %hex::encode(self.meta.poll_id.0),
+                            actor = %hex::encode(ev.actor.0),
+                            "kd=rb se-mode drop: NIZK verify failed"
+                        );
+                    } else {
+                        self.ratification_ballots.push(payload);
+                    }
+                } else {
+                    self.ratification_ballots.push(payload);
+                }
+            }
+
+            // kd=ts TallyShare (ZEB-295 Phase 6, spec §3.3): committee member's
+            // partial decryption share + DLEQ proof. Silent-drop per sub-check
+            // on failure; advance_last_hlc=false on every drop branch so the
+            // projection watermark does not advance (ZEB-320).
+            PollEventKindCode::TallyShare => {
+                let payload: crate::community_voting_core::TallySharePayload =
+                    decode_payload(&ev.payload).map_err(ApplyError::PayloadDecode)?;
+
+                if self.meta.config.privacy_mode != "se" {
+                    advance_last_hlc = false;
+                    tracing::debug!(
+                        poll_id = %hex::encode(self.meta.poll_id.0),
+                        "kd=ts drop: poll is not se-mode"
+                    );
+                } else {
+                    let ratification_end_ms = self.meta.poll_create_hlc.wall_ms
+                        + (self.meta.config.deliberation_window_seconds as u64
+                            + self.meta.config.drafting_window_seconds as u64
+                            + self.meta.config.ratification_window_seconds as u64)
+                            * 1000;
+                    if ev.hlc.wall_ms < ratification_end_ms {
+                        advance_last_hlc = false;
+                        tracing::debug!(
+                            poll_id = %hex::encode(self.meta.poll_id.0),
+                            wall_ms = ev.hlc.wall_ms,
+                            ratification_end_ms,
+                            "kd=ts drop: too early (ratification window not closed)"
+                        );
+                    } else {
+                        // Qodo PR #155 #2: derive `n` from the canonical
+                        // ratification ordering, matching the IPC + engine-auto
+                        // kd=rs paths. See the analogous comment in the
+                        // RatificationBallot arm.
+                        let sq = synthesize_status_quo(&self.meta.poll_id);
+                        let sq_hash = sq.event_hash;
+                        let mut all_candidates = self.candidates.clone();
+                        all_candidates.push(sq);
+                        let primary_size = self.meta.config.sortition_size as usize;
+                        let n = match drafting_advancers(&all_candidates, primary_size, sq_hash) {
+                            Some(advancers) => {
+                                ratification_candidates_ordering(&advancers, sq_hash).len()
+                            }
+                            None => {
+                                advance_last_hlc = false;
+                                tracing::debug!(
+                                    poll_id = %hex::encode(self.meta.poll_id.0),
+                                    "kd=ts drop: pre-Drafting (status_quo not synthesized)"
+                                );
+                                0
+                            }
+                        };
+                        let expected = n + n * (n - 1) / 2;
+                        if payload.entries.len() != expected {
+                            advance_last_hlc = false;
+                            tracing::debug!(
+                                poll_id = %hex::encode(self.meta.poll_id.0),
+                                expected,
+                                actual = payload.entries.len(),
+                                "kd=ts drop: shape mismatch"
+                            );
+                        } else {
+                            let oracle_state = self
+                                .committee_oracle
+                                .committee_at_epoch(payload.committee_epoch);
+                            let t1_ok = oracle_state
+                                .as_ref()
+                                .is_some_and(|cs| cs.verifying_shares.contains_key(&ev.actor));
+                            if !t1_ok {
+                                advance_last_hlc = false;
+                                tracing::debug!(
+                                    poll_id = %hex::encode(self.meta.poll_id.0),
+                                    actor = %hex::encode(ev.actor.0),
+                                    epoch = payload.committee_epoch,
+                                    "kd=ts drop: T1 actor not in committee at epoch"
+                                );
+                            } else {
+                                // T2: per-entry DLEQ verify against (G, Y_i,
+                                // c1_agg[idx], share). c1_agg comes from the
+                                // homomorphic aggregate of accepted ballots.
+                                let cs = oracle_state.unwrap();
+                                let y_i_opt =
+                                    crate::community_voting_tier3_crypto::decompress_point(
+                                        &cs.verifying_shares[&ev.actor],
+                                    );
+                                let aggregates =
+                                    aggregate_se_ballots(&self.ratification_ballots, n);
+                                let all_dleq_ok = match (y_i_opt, aggregates) {
+                                    (Some(y_i), Some(aggregates)) => {
+                                        let g_point =
+                                            curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
+                                        let mut ok = true;
+                                        for (idx, entry) in payload.entries.iter().enumerate() {
+                                            let c1_agg = match crate::community_voting_tier3_crypto::decompress_point(&aggregates[idx].c1) {
+                                                Some(p) => p,
+                                                None => { ok = false; break; }
+                                            };
+                                            let d_i = match crate::community_voting_tier3_crypto::decompress_point(&entry.share) {
+                                                Some(p) => p,
+                                                None => { ok = false; break; }
+                                            };
+                                            let proof = match crate::community_voting_tier3_nizk::DleqProof::from_bytes(&entry.dleq_proof) {
+                                                Some(p) => p,
+                                                None => { ok = false; break; }
+                                            };
+                                            if !crate::community_voting_tier3_nizk::dleq_verify(
+                                                &g_point, &y_i, &c1_agg, &d_i, &proof,
+                                            ) {
+                                                ok = false;
+                                                break;
+                                            }
+                                        }
+                                        ok
+                                    }
+                                    _ => false,
+                                };
+                                if !all_dleq_ok {
+                                    advance_last_hlc = false;
+                                    tracing::debug!(
+                                        poll_id = %hex::encode(self.meta.poll_id.0),
+                                        actor = %hex::encode(ev.actor.0),
+                                        "kd=ts drop: T2 DLEQ verify failed (or aggregate decode failed)"
+                                    );
+                                } else {
+                                    // Cursor PR #155 #3 + Qodo PR #155 #4:
+                                    // true LWW upsert on (actor, committee_epoch).
+                                    // Compare incoming (hlc, event_hash) against the
+                                    // existing record's; overwrite only when strictly
+                                    // greater. Stale arrivals are silent-dropped
+                                    // (advance_last_hlc=false so the projection
+                                    // watermark does not advance, ZEB-320).
+                                    //
+                                    // First-wins was incorrect because kd=ts DLEQ
+                                    // proofs verify against the homomorphic aggregate
+                                    // of all currently-accepted ballots; if a valid
+                                    // ballot with an earlier HLC arrives after some
+                                    // shares were applied, the aggregate changes and
+                                    // those earlier shares no longer decrypt the new
+                                    // aggregate, so the committee member must resubmit
+                                    // and the resubmission must win.
+                                    let event_hash = sha256_of_signing_bytes(ev);
+                                    let key = (ev.actor, payload.committee_epoch);
+                                    let should_insert =
+                                        match self.secret_tally.tally_shares.get(&key) {
+                                            None => true,
+                                            Some(existing) => {
+                                                let incoming = (
+                                                    ev.hlc.wall_ms,
+                                                    ev.hlc.logical,
+                                                    ev.hlc.device_id.as_str(),
+                                                    event_hash,
+                                                );
+                                                let current = (
+                                                    existing.last_update_hlc.wall_ms,
+                                                    existing.last_update_hlc.logical,
+                                                    existing.last_update_hlc.device_id.as_str(),
+                                                    existing.last_update_event_hash,
+                                                );
+                                                incoming > current
+                                            }
+                                        };
+                                    if should_insert {
+                                        self.secret_tally.tally_shares.insert(
+                                            key,
+                                            TallyShareRecord {
+                                                entries: payload.entries.clone(),
+                                                last_update_hlc: ev.hlc.clone(),
+                                                last_update_event_hash: event_hash,
+                                            },
+                                        );
+                                    } else {
+                                        // Stale LWW: incoming (hlc, event_hash) ≤
+                                        // existing; silent-drop watermark hold.
+                                        advance_last_hlc = false;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // kd=cl PollClose: record close_event_hash.
@@ -1025,6 +1459,278 @@ pub fn verify_ratification_ballot(
 /// guaranteed status_quo slot). Hard cap per design spec §9.
 pub const MAX_RATIFICATION_CANDIDATES: usize = 5;
 
+/// Homomorphic aggregate of accepted se-mode ballots. Returns a
+/// `Vec<EncCiphertext>` of length `n + C(n,2)` — `n` score-sum aggregates
+/// first, then `C(n,2)` indicator-sum aggregates in unordered-pair
+/// lexicographic order. Pure point-addition over decompressed Ristretto
+/// points; spec §3.4 step 4.
+///
+/// Returns `None` if `ballots.is_empty()`, if any ballot has the wrong
+/// ciphertext shape, or if any compressed point fails to decode.
+///
+/// Per-actor LWW dedup is the caller's responsibility — for Task 7
+/// apply-time verification, `self.ratification_ballots` is the accept-stream
+/// (each kd=rb event is filtered through B5 + NIZK verify before being
+/// appended), so all entries are valid; spec §3.4 step 4 cross-references
+/// the engine's `recover_secret_tally` for the production lww_dedup step.
+pub fn aggregate_se_ballots(
+    ballots: &[crate::community_voting_core::RatificationBallotPayload],
+    n: usize,
+) -> Option<Vec<crate::community_voting_core::EncCiphertext>> {
+    use crate::community_voting_tier3_crypto::{compress_point, decompress_point};
+    use curve25519_dalek::ristretto::RistrettoPoint;
+    if ballots.is_empty() {
+        return None;
+    }
+    let pair_count = n * (n - 1) / 2;
+    let mut sums_score: Vec<(RistrettoPoint, RistrettoPoint)> =
+        vec![(RistrettoPoint::default(), RistrettoPoint::default()); n];
+    let mut sums_ind: Vec<(RistrettoPoint, RistrettoPoint)> =
+        vec![(RistrettoPoint::default(), RistrettoPoint::default()); pair_count];
+    for b in ballots {
+        let cs = b.ciphertexts_scores.as_ref()?;
+        let ci = b.ciphertexts_indicators.as_ref()?;
+        if cs.len() != n || ci.len() != pair_count {
+            return None;
+        }
+        for (i, ec) in cs.iter().enumerate() {
+            sums_score[i].0 += decompress_point(&ec.c1)?;
+            sums_score[i].1 += decompress_point(&ec.c2)?;
+        }
+        for (i, ec) in ci.iter().enumerate() {
+            sums_ind[i].0 += decompress_point(&ec.c1)?;
+            sums_ind[i].1 += decompress_point(&ec.c2)?;
+        }
+    }
+    let mut out = Vec::with_capacity(n + pair_count);
+    for (c1, c2) in sums_score {
+        out.push(crate::community_voting_core::EncCiphertext {
+            c1: compress_point(&c1),
+            c2: compress_point(&c2),
+        });
+    }
+    for (c1, c2) in sums_ind {
+        out.push(crate::community_voting_core::EncCiphertext {
+            c1: compress_point(&c1),
+            c2: compress_point(&c2),
+        });
+    }
+    Some(out)
+}
+
+/// ZEB-295 Phase 6: recover the aggregate STAR result from accumulated
+/// `kd=ts` tally shares. Returns `None` if no epoch yet has ≥ threshold
+/// valid shares whose Lagrange-combine + BSGS decode cleanly. Spec §3.4
+/// + §5.3.
+///
+/// Iterates epochs in descending order (latest first); falls through to
+/// earlier epochs on insufficient-quorum / decryption-failure. Multi-
+/// engine deterministic: any size-`threshold` subset of `(i, x_i)` pairs
+/// from the SAME polynomial reconstructs the same secret (Lagrange
+/// invariance), so all replicas converge on the same plaintext result.
+///
+/// `ordered_candidates`: the deterministic ratification ordering produced
+/// by `ratification_candidates_ordering`. Length = `n` (score-sum
+/// aggregate count).
+pub fn recover_secret_tally(
+    poll: &Tier3PollState,
+    ordered_candidates: &[crate::community_voting_star::CandidateRef],
+) -> Option<crate::community_voting_star::StarResult> {
+    use crate::community_voting_tier3_crypto::{bsgs, combine_shares, decompress_point};
+    use std::collections::BTreeMap;
+
+    let n = ordered_candidates.len();
+    if n == 0 {
+        return None;
+    }
+    let pair_count = n * (n - 1) / 2;
+
+    // Group received tally_shares by epoch. tally_shares is keyed by
+    // (OwnerAddr, epoch) → TallyShareRecord; we want
+    // epoch → [(addr, &entries)…] for Lagrange combination below.
+    let mut by_epoch: BTreeMap<
+        u64,
+        Vec<(
+            OwnerAddr,
+            &Vec<crate::community_voting_core::TallyShareEntry>,
+        )>,
+    > = BTreeMap::new();
+    for ((addr, epoch), record) in &poll.secret_tally.tally_shares {
+        by_epoch
+            .entry(*epoch)
+            .or_default()
+            .push((*addr, &record.entries));
+    }
+
+    // LWW-dedup of ratification ballots by actor — last (HLC, event_hash)
+    // wins. For Phase 6 v1 we treat each accepted payload as already
+    // canonical (the apply path enforces 1-per-eligible-electorate via
+    // verify rule + monotonic-HLC discipline). See §3.1 — LWW dedup at
+    // tally time is a tally-side concern; for the current apply layer
+    // this is a no-op.
+    let lww_ballots = lww_dedup_se_ballots(&poll.ratification_ballots);
+    let ballot_count = lww_ballots.len() as u64;
+
+    // Try epochs newest-first. Fall through on failure.
+    for (epoch, shares) in by_epoch.iter().rev() {
+        let cs = match poll.committee_oracle.committee_at_epoch(*epoch) {
+            Some(s) => s,
+            None => continue,
+        };
+        if shares.len() < cs.threshold as usize {
+            continue;
+        }
+
+        let aggregates = match aggregate_se_ballots(&lww_ballots, n) {
+            Some(a) => a,
+            None => continue,
+        };
+        if aggregates.len() != n + pair_count {
+            continue;
+        }
+
+        // Build the OwnerAddr → 1-indexed FROST identifier map. The
+        // committee oracle's verifying_shares BTreeMap is sorted by
+        // OwnerAddr lex ASC (BTreeMap natural order); identifiers are
+        // 1-indexed in that sorted order — same derivation as
+        // `community_dfrost_crypto::identifier_for_index` over the
+        // committee's sorted member list.
+        let addr_to_id: BTreeMap<OwnerAddr, u16> = cs
+            .verifying_shares
+            .keys()
+            .copied()
+            .enumerate()
+            .map(|(i, addr)| (addr, (i + 1) as u16))
+            .collect();
+
+        // Lagrange-combine + BSGS-decode every aggregate. Any per-
+        // aggregate failure falls through to the next-older epoch.
+        let mut score_sums: Vec<u64> = Vec::with_capacity(n);
+        let mut ind_sums: Vec<u64> = Vec::with_capacity(pair_count);
+        let electorate_size = poll.eligible_electorate_snapshot.len() as u64;
+        let mut decryption_ok = true;
+
+        // Take the first `threshold` shares (sorted by OwnerAddr ASC since
+        // BTreeMap iteration order is canonical). All replicas pick the
+        // same subset given the same shares; even if subsets differ
+        // across replicas, Lagrange invariance guarantees the same
+        // plaintext (see spec §3.4 multi-engine determinism note).
+        let selected: Vec<(
+            OwnerAddr,
+            &Vec<crate::community_voting_core::TallyShareEntry>,
+        )> = {
+            let mut s: Vec<_> = shares.iter().map(|(a, e)| (*a, *e)).collect();
+            s.sort_by_key(|(a, _)| *a);
+            s.truncate(cs.threshold as usize);
+            s
+        };
+
+        for idx in 0..(n + pair_count) {
+            let c1_agg = match decompress_point(&aggregates[idx].c1) {
+                Some(p) => p,
+                None => {
+                    decryption_ok = false;
+                    break;
+                }
+            };
+            let c2_agg = match decompress_point(&aggregates[idx].c2) {
+                Some(p) => p,
+                None => {
+                    decryption_ok = false;
+                    break;
+                }
+            };
+
+            // Build the partial-share map for this aggregate, keyed by
+            // FROST identifier.
+            let mut partial: BTreeMap<u16, curve25519_dalek::ristretto::RistrettoPoint> =
+                BTreeMap::new();
+            let mut ok = true;
+            for (addr, entries) in &selected {
+                let id = match addr_to_id.get(addr) {
+                    Some(i) => *i,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                };
+                // Shape gate: each member's entries vec must match
+                // n + pair_count.
+                if entries.len() != n + pair_count {
+                    ok = false;
+                    break;
+                }
+                let share_pt = match decompress_point(&entries[idx].share) {
+                    Some(p) => p,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                };
+                partial.insert(id, share_pt);
+            }
+            if !ok {
+                decryption_ok = false;
+                break;
+            }
+
+            let d_agg = match combine_shares(&c1_agg, &partial) {
+                Some(d) => d,
+                None => {
+                    decryption_ok = false;
+                    break;
+                }
+            };
+            let m_point = c2_agg - d_agg;
+
+            // Bounds per spec §4.6: score-sum bound = electorate × 5,
+            // indicator-sum bound = electorate.
+            let bound = if idx < n {
+                electorate_size.saturating_mul(5)
+            } else {
+                electorate_size
+            };
+            let m = match bsgs(&m_point, bound) {
+                Some(m) => m,
+                None => {
+                    decryption_ok = false;
+                    break;
+                }
+            };
+            if idx < n {
+                score_sums.push(m);
+            } else {
+                ind_sums.push(m);
+            }
+        }
+
+        if !decryption_ok {
+            continue;
+        }
+
+        return Some(crate::community_voting_star::compute_star_from_sums(
+            ordered_candidates,
+            score_sums,
+            ind_sums,
+            ballot_count,
+        ));
+    }
+    None
+}
+
+/// LWW-dedup helper for se-mode ratification ballots. Phase 6 v1 ships a
+/// pass-through: the apply path already enforces 1-per-actor via
+/// `current_mini_public` membership + monotonic-HLC discipline. A real
+/// dedup would walk `ratification_ballots` newest-first by HLC and keep
+/// the latest entry per actor — but the current Vec preserves arrival
+/// order with no actor tag (the actor is on the SignedVotingEvent, not
+/// the payload). v1 treats accepted payloads as canonical.
+fn lww_dedup_se_ballots(
+    ballots: &[crate::community_voting_core::RatificationBallotPayload],
+) -> Vec<crate::community_voting_core::RatificationBallotPayload> {
+    ballots.to_vec()
+}
+
 /// Deterministic synthetic status_quo candidate.
 ///
 /// `event_hash = sha256(poll_id.0 || b"status_quo")`.
@@ -1442,7 +2148,10 @@ mod tests {
     fn rb_event(wall_ms: u64, actor: OwnerAddr, scores: Vec<u8>) -> SignedVotingEvent {
         let payload = RatificationBallotPayload {
             poll_id: poll_id(),
-            scores,
+            scores: Some(scores),
+            ciphertexts_scores: None,
+            ciphertexts_indicators: None,
+            proof: None,
         };
         make_event_with_payload(
             PollEventKindCode::RatificationBallot,
@@ -1782,8 +2491,8 @@ mod tests {
         poll.apply_event(&rb_event(300, addr(2), vec![0, 5, 2]))
             .expect("rb2");
         assert_eq!(poll.ratification_ballots.len(), 2);
-        assert_eq!(poll.ratification_ballots[0].scores, vec![3, 1, 5]);
-        assert_eq!(poll.ratification_ballots[1].scores, vec![0, 5, 2]);
+        assert_eq!(poll.ratification_ballots[0].scores, Some(vec![3, 1, 5]));
+        assert_eq!(poll.ratification_ballots[1].scores, Some(vec![0, 5, 2]));
     }
 
     // ── Test 17: apply kd=ds is scaffold no-op (accepts event) ───────────────
@@ -1867,6 +2576,23 @@ mod tests {
         assert!(poll.deliberation.statements.is_empty());
         assert!(poll.deliberation.votes.is_empty());
         assert!(poll.deliberation.statements_per_author.is_empty());
+    }
+
+    // ── ZEB-295 Task 6: secret tally projection + committee oracle ─────────
+
+    #[test]
+    fn tier3_poll_state_initializes_with_empty_secret_tally() {
+        let meta = meta_at(0);
+        let state = Tier3PollState::new_from_create(meta, vec![]);
+        assert!(state.secret_tally.tally_shares.is_empty());
+        assert!(state.secret_tally.decrypted_result.is_none());
+    }
+
+    #[test]
+    fn null_committee_oracle_returns_none() {
+        let oracle = NullCommitteeOracle;
+        assert!(oracle.committee_at_epoch(7).is_none());
+        assert!(oracle.latest_epoch().is_none());
     }
 
     // ── Additional: da for unknown candidate is silently ignored ──────────────
@@ -2238,15 +2964,12 @@ mod tests {
         );
     }
 
-    // Test 8: privacy_mode "se" rejected (Phase 6 forward-compat)
+    // Test 8: privacy_mode "se" accepted (ZEB-295 Phase 6)
     #[test]
-    fn validate_config_privacy_mode_se_rejected_with_unknown_privacy_mode() {
+    fn validate_config_privacy_mode_se_accepted() {
         let mut c = valid_config();
         c.privacy_mode = "se".into();
-        assert_eq!(
-            validate_tier3_poll_config(&c),
-            Err(ValidateError::UnknownPrivacyMode("se".into()))
-        );
+        assert_eq!(validate_tier3_poll_config(&c), Ok(()));
     }
 
     // Test 9: privacy_mode "rf" rejected (Phase 7 forward-compat)
@@ -2298,7 +3021,10 @@ mod tests {
     fn ballot(scores: Vec<u8>) -> RatificationBallotPayload {
         RatificationBallotPayload {
             poll_id: poll_id(),
-            scores,
+            scores: Some(scores),
+            ciphertexts_scores: None,
+            ciphertexts_indicators: None,
+            proof: None,
         }
     }
 
@@ -2880,7 +3606,10 @@ mod tests {
         // Candidate count = 2 (1 real + status_quo)
         let rb_payload = RatificationBallotPayload {
             poll_id: poll_id(),
-            scores: vec![3, 1], // 2 candidates: real + status_quo
+            scores: Some(vec![3, 1]), // 2 candidates: real + status_quo
+            ciphertexts_scores: None,
+            ciphertexts_indicators: None,
+            proof: None,
         };
         let ev = make_event_with_payload(
             PollEventKindCode::RatificationBallot,
@@ -2897,7 +3626,10 @@ mod tests {
         let poll = poll_in_ratification();
         let rb_payload = RatificationBallotPayload {
             poll_id: poll_id(),
-            scores: vec![3, 1],
+            scores: Some(vec![3, 1]),
+            ciphertexts_scores: None,
+            ciphertexts_indicators: None,
+            proof: None,
         };
         let ev = make_event_with_payload(
             PollEventKindCode::RatificationBallot,
@@ -2917,7 +3649,10 @@ mod tests {
         let poll = poll_in_ratification();
         let rb_payload = RatificationBallotPayload {
             poll_id: poll_id(),
-            scores: vec![3, 1],
+            scores: Some(vec![3, 1]),
+            ciphertexts_scores: None,
+            ciphertexts_indicators: None,
+            proof: None,
         };
         // wall_ms = 5000 → still in Deliberation stage (dw not elapsed yet)
         let ev = make_event_with_payload(
@@ -2938,7 +3673,10 @@ mod tests {
         let poll = poll_in_ratification();
         let rb_payload = RatificationBallotPayload {
             poll_id: poll_id(),
-            scores: vec![6, 1], // score 6 > 5 → BallotScoreOutOfRange
+            scores: Some(vec![6, 1]), // score 6 > 5 → BallotScoreOutOfRange
+            ciphertexts_scores: None,
+            ciphertexts_indicators: None,
+            proof: None,
         };
         let ev = make_event_with_payload(
             PollEventKindCode::RatificationBallot,
@@ -2965,7 +3703,10 @@ mod tests {
         // Expected 2 candidates (1 real + status_quo); provide 3 scores → mismatch
         let rb_payload = RatificationBallotPayload {
             poll_id: poll_id(),
-            scores: vec![3, 1, 5],
+            scores: Some(vec![3, 1, 5]),
+            ciphertexts_scores: None,
+            ciphertexts_indicators: None,
+            proof: None,
         };
         let ev = make_event_with_payload(
             PollEventKindCode::RatificationBallot,
@@ -3086,7 +3827,10 @@ mod tests {
 
         let rb_payload = RatificationBallotPayload {
             poll_id: poll_id(),
-            scores: vec![3, 1], // 2 scores — but no status_quo yet
+            scores: Some(vec![3, 1]), // 2 scores — but no status_quo yet
+            ciphertexts_scores: None,
+            ciphertexts_indicators: None,
+            proof: None,
         };
         let ev = make_event_with_payload(
             PollEventKindCode::RatificationBallot,
@@ -3837,6 +4581,982 @@ mod tests {
         // Sanity: 5 from author1 + 1 from author2; no votes accepted.
         assert_eq!(poll.deliberation.statements.len(), 6);
         assert!(poll.deliberation.votes.is_empty());
+    }
+
+    // ── ZEB-295 Task 7: kd=rb se-mode + kd=ts apply tests ─────────────────────
+    //
+    // These tests cover the 10 silent-drop/accept branches per spec §3.2 (B5)
+    // and §3.3 (T1/T2). Helpers below construct a real 2-of-3 ElGamal committee
+    // + a MockCommitteeOracle so we can exercise NIZK + DLEQ proof verification
+    // end-to-end.
+    mod ts_apply_helpers {
+        use curve25519_dalek::{
+            constants::RISTRETTO_BASEPOINT_POINT, ristretto::RistrettoPoint, scalar::Scalar,
+        };
+        use frost_ristretto255::rand_core::OsRng;
+        use std::collections::BTreeMap;
+
+        /// A 2-of-3 ElGamal committee built by sampling a random polynomial of
+        /// degree 1: f(0) = x (joint secret), f(i+1) = x_i (per-member share).
+        /// Joint Y = G·x; per-member Y_i = G·x_i.
+        pub struct MockCommittee {
+            #[allow(dead_code)]
+            pub secret: Scalar,
+            pub joint_y: RistrettoPoint,
+            pub member_addrs: Vec<crate::owner_state_types::OwnerAddr>,
+            /// FROST identifier (1-based) → secret share scalar.
+            pub shares: BTreeMap<u16, Scalar>,
+            /// FROST identifier (1-based) → verifying share point Y_i = G·x_i.
+            pub verifying_shares: BTreeMap<u16, RistrettoPoint>,
+        }
+
+        pub fn fake_committee_2_of_3() -> MockCommittee {
+            let coeffs: Vec<Scalar> = (0..2).map(|_| Scalar::random(&mut OsRng)).collect();
+            let secret = coeffs[0];
+            let joint_y = RISTRETTO_BASEPOINT_POINT * secret;
+            let mut shares = BTreeMap::new();
+            let mut verifying_shares = BTreeMap::new();
+            for i in 1u16..=3u16 {
+                let id = Scalar::from(i as u64);
+                let mut acc = Scalar::ZERO;
+                let mut id_pow = Scalar::ONE;
+                for c in &coeffs {
+                    acc += c * id_pow;
+                    id_pow *= id;
+                }
+                shares.insert(i, acc);
+                verifying_shares.insert(i, RISTRETTO_BASEPOINT_POINT * acc);
+            }
+            // Deterministic per-member OwnerAddrs (0x10, 0x11, 0x12).
+            let member_addrs = vec![
+                crate::owner_state_types::OwnerAddr([0x10; 16]),
+                crate::owner_state_types::OwnerAddr([0x11; 16]),
+                crate::owner_state_types::OwnerAddr([0x12; 16]),
+            ];
+            MockCommittee {
+                secret,
+                joint_y,
+                member_addrs,
+                shares,
+                verifying_shares,
+            }
+        }
+
+        /// Snapshot of a MockCommittee suitable for CommitteeOracle queries.
+        /// Cloned once per oracle install — the oracle returns identical state
+        /// for every epoch query.
+        #[derive(Debug, Clone)]
+        pub struct MockOracleState {
+            pub joint_verifying_key: [u8; 32],
+            pub verifying_shares: BTreeMap<crate::owner_state_types::OwnerAddr, [u8; 32]>,
+            pub threshold: u16,
+        }
+
+        pub fn snapshot_of(c: &MockCommittee) -> MockOracleState {
+            use crate::community_voting_tier3_crypto::compress_point;
+            let joint_verifying_key = compress_point(&c.joint_y);
+            let mut verifying_shares = BTreeMap::new();
+            for (i, addr) in c.member_addrs.iter().enumerate() {
+                let id = (i + 1) as u16;
+                verifying_shares.insert(*addr, compress_point(&c.verifying_shares[&id]));
+            }
+            MockOracleState {
+                joint_verifying_key,
+                verifying_shares,
+                threshold: 2,
+            }
+        }
+
+        #[derive(Debug)]
+        pub struct MockCommitteeOracle {
+            pub state: MockOracleState,
+            pub latest: u64,
+        }
+
+        impl super::super::CommitteeOracle for MockCommitteeOracle {
+            fn committee_at_epoch(&self, epoch: u64) -> Option<super::super::CommitteePublicState> {
+                Some(super::super::CommitteePublicState {
+                    epoch,
+                    joint_verifying_key: self.state.joint_verifying_key,
+                    verifying_shares: self.state.verifying_shares.clone(),
+                    threshold: self.state.threshold,
+                })
+            }
+            fn latest_epoch(&self) -> Option<u64> {
+                Some(self.latest)
+            }
+        }
+
+        /// Construct a se-mode Tier3PollState in (effective) Ratification
+        /// stage with a real 2-of-3 committee installed.
+        ///
+        /// `n_total` is the spec's `n` (score-aggregate count): explicit
+        /// candidates = `n_total - 1` (status_quo accounts for the missing
+        /// one). e.g. n_total=3 → 2 explicit kd=dc candidates are appended.
+        ///
+        /// The poll is created at wall_ms=0 with the default 10s/10s/10s
+        /// window config. After this helper, `last_hlc` is past the
+        /// drafting threshold (20s) — `current_stage_at(now=20000+)` returns
+        /// `Ratification`.
+        pub fn arrange_se_poll_in_ratification_stage_with_real_committee(
+            n_total: usize,
+        ) -> (super::super::Tier3PollState, MockCommittee) {
+            assert!(n_total >= 1, "n must be >= 1 (status_quo counts)");
+            let committee = fake_committee_2_of_3();
+            // Use a se-mode meta; default windows are 10s/10s/10s.
+            let mut meta = super::meta_at(0);
+            meta.config.privacy_mode = "se".into();
+            let electorate: Vec<crate::owner_state_types::OwnerAddr> =
+                committee.member_addrs.to_vec();
+            let mut state = super::super::Tier3PollState::new_from_create(meta, electorate);
+            // Install oracle.
+            let oracle_state = snapshot_of(&committee);
+            state.install_committee_oracle(std::sync::Arc::new(MockCommitteeOracle {
+                state: oracle_state,
+                latest: 0,
+            }));
+            // Append `n_total - 1` synthetic candidates so the post-fix
+            // ratification ordering (drafting_advancers → ratification_candidates_ordering)
+            // has length n_total. Each candidate needs ≥ ceil(sortition_size/2)
+            // approvals to pass the drafting threshold; the default config's
+            // sortition_size=5 → threshold=3, exactly matching the 3 committee
+            // members. We approve every synthetic candidate by every committee
+            // member so all advance (deterministic test setup).
+            let all_approvals: std::collections::HashSet<crate::owner_state_types::OwnerAddr> =
+                committee.member_addrs.iter().copied().collect();
+            for i in 0..(n_total - 1) {
+                state
+                    .candidates
+                    .push(crate::community_voting_tier3::DraftCandidateState {
+                        event_hash: [0xC0 | (i as u8); 32],
+                        text: format!("candidate {i}"),
+                        proposer: Some(committee.member_addrs[0]),
+                        approvals: all_approvals.clone(),
+                    });
+            }
+            // Apply a kd=ss at wall_ms=10 so the stage projection has a
+            // sortition_result (current_stage_at requires it to leave
+            // Sortition). last_hlc=10 after this.
+            let ss_ev = super::ss_event(10, committee.member_addrs.clone(), Vec::new());
+            state.apply_event(&ss_ev).expect("ss apply");
+            (state, committee)
+        }
+
+        /// Build a real se-mode RatificationBallotPayload via the bundled
+        /// NIZK prover. `scores.len()` must equal n.
+        pub fn build_real_se_ballot_payload(
+            committee: &MockCommittee,
+            scores: &[u64],
+        ) -> super::super::RatificationBallotPayload {
+            use crate::community_voting_tier3_nizk::prove_ballot_bundle_with_outputs;
+            let (bundle, cs, ci) = prove_ballot_bundle_with_outputs(&committee.joint_y, scores)
+                .expect("test scores are well-formed");
+            super::super::RatificationBallotPayload {
+                poll_id: super::poll_id(),
+                scores: None,
+                ciphertexts_scores: Some(cs),
+                ciphertexts_indicators: Some(ci),
+                proof: Some(crate::community_voting_core::BallotNIZKProof {
+                    range_proofs: bundle.range_proofs,
+                    consistency_proofs: bundle.consistency_proofs,
+                }),
+            }
+        }
+
+        /// Compute a real kd=ts payload for member at index `member_idx` (0-based).
+        /// Aggregates the accepted ballots from `state.ratification_ballots`,
+        /// produces per-entry DLEQ proofs against the member's share x_i.
+        ///
+        /// `committee_epoch` is the epoch this share is being published for.
+        pub fn build_real_tally_share_payload(
+            state: &super::super::Tier3PollState,
+            committee: &MockCommittee,
+            member_idx: usize,
+            committee_epoch: u64,
+        ) -> crate::community_voting_core::TallySharePayload {
+            use crate::community_voting_tier3_crypto::{
+                compress_point, decompress_point, partial_decrypt_share,
+            };
+            use crate::community_voting_tier3_nizk::dleq_prove;
+            // Derive n from the canonical ratification ordering, matching the
+            // apply path's n derivation (Qodo PR #155 #2 fix). Using
+            // `state.candidates.len() + 1` is only correct when every kd=dc
+            // candidate passes threshold + cap, which the new
+            // n-derivation regression tests deliberately violate.
+            let sq = super::super::synthesize_status_quo(&state.meta.poll_id);
+            let sq_hash = sq.event_hash;
+            let mut all_candidates = state.candidates.clone();
+            all_candidates.push(sq);
+            let primary_size = state.meta.config.sortition_size as usize;
+            let advancers =
+                super::super::drafting_advancers(&all_candidates, primary_size, sq_hash)
+                    .expect("ratification ordering reachable");
+            let n = super::super::ratification_candidates_ordering(&advancers, sq_hash).len();
+            let aggregates = super::super::aggregate_se_ballots(&state.ratification_ballots, n)
+                .expect("aggregates");
+            let frost_id = (member_idx + 1) as u16;
+            let x_i = committee.shares[&frost_id];
+            let y_i = committee.verifying_shares[&frost_id];
+            let g = RISTRETTO_BASEPOINT_POINT;
+            let entries: Vec<crate::community_voting_core::TallyShareEntry> = aggregates
+                .iter()
+                .map(|agg| {
+                    let c1_agg = decompress_point(&agg.c1).expect("c1");
+                    let share_pt = partial_decrypt_share(&c1_agg, &x_i);
+                    let proof = dleq_prove(&g, &y_i, &c1_agg, &share_pt, &x_i);
+                    crate::community_voting_core::TallyShareEntry {
+                        share: compress_point(&share_pt),
+                        dleq_proof: proof.to_bytes(),
+                    }
+                })
+                .collect();
+            crate::community_voting_core::TallySharePayload {
+                poll_id: super::poll_id(),
+                committee_epoch,
+                entries,
+            }
+        }
+
+        /// Encode a payload into a SignedVotingEvent at a custom wall_ms +
+        /// actor (used by kd=ts tests where actor identity drives T1).
+        pub fn rb_event_at_with_actor<T: serde::Serialize>(
+            wall_ms: u64,
+            actor: crate::owner_state_types::OwnerAddr,
+            payload: &T,
+        ) -> crate::community_voting_core::SignedVotingEvent {
+            super::make_event_with_payload(
+                super::super::PollEventKindCode::RatificationBallot,
+                wall_ms,
+                actor,
+                super::encode(payload),
+            )
+        }
+
+        pub fn ts_event_at_with_actor<T: serde::Serialize>(
+            wall_ms: u64,
+            actor: crate::owner_state_types::OwnerAddr,
+            payload: &T,
+        ) -> crate::community_voting_core::SignedVotingEvent {
+            super::make_event_with_payload(
+                super::super::PollEventKindCode::TallyShare,
+                wall_ms,
+                actor,
+                super::encode(payload),
+            )
+        }
+    }
+
+    // The default config has dw=10/fw=10/rw=10 (seconds), so ratification
+    // window opens at wall_ms=20_000 and closes at wall_ms=30_000.
+    const RATIFICATION_OPEN_MS: u64 = 20_000;
+    const RATIFICATION_END_MS: u64 = 30_000;
+
+    // ── B5: encoding-matches-privacy-mode ────────────────────────────────────
+
+    #[test]
+    fn kd_rb_b5_pu_mode_payload_in_se_mode_poll_silent_drops() {
+        // se-mode poll; sending pu-mode payload (scores Some, others None).
+        let (mut state, _committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        let pu_payload = RatificationBallotPayload {
+            poll_id: poll_id(),
+            scores: Some(vec![5, 3, 1]),
+            ciphertexts_scores: None,
+            ciphertexts_indicators: None,
+            proof: None,
+        };
+        let prev_last_hlc = state.last_hlc.clone();
+        let ev = ts_apply_helpers::rb_event_at_with_actor(
+            RATIFICATION_OPEN_MS,
+            state.eligible_electorate_snapshot[0],
+            &pu_payload,
+        );
+        state.apply_event(&ev).expect("apply ok");
+        assert_eq!(
+            state.ratification_ballots.len(),
+            0,
+            "se-mode poll must reject pu-mode payload"
+        );
+        assert_eq!(
+            state.last_hlc, prev_last_hlc,
+            "drop must not advance last_hlc (ZEB-320)"
+        );
+        assert_eq!(
+            state.last_received_hlc.as_ref().map(|h| h.wall_ms),
+            Some(RATIFICATION_OPEN_MS),
+            "last_received_hlc must advance on every dispatch"
+        );
+    }
+
+    #[test]
+    fn kd_rb_b5_se_mode_payload_in_pu_mode_poll_silent_drops() {
+        // pu-mode poll; sending se-mode payload.
+        let mut state = Tier3PollState::new_from_create(meta_at(0), electorate(20));
+        // Apply ss to leave Sortition.
+        state
+            .apply_event(&ss_event(10, vec![addr(1)], vec![]))
+            .expect("ss apply");
+        let n = state.candidates.len() + 1; // 1
+        let _pair_count = n * (n - 1) / 2;
+        // Construct a se-mode shape correctly for the n=1 case.
+        let se_payload = RatificationBallotPayload {
+            poll_id: poll_id(),
+            scores: None,
+            ciphertexts_scores: Some(vec![
+                crate::community_voting_core::EncCiphertext {
+                    c1: [0u8; 32],
+                    c2: [0u8; 32],
+                };
+                n
+            ]),
+            ciphertexts_indicators: Some(vec![]),
+            proof: Some(crate::community_voting_core::BallotNIZKProof {
+                range_proofs: vec![0u8; crate::community_voting_tier3_nizk::Range5Proof::SIZE * n],
+                consistency_proofs: vec![],
+            }),
+        };
+        let prev_last_hlc = state.last_hlc.clone();
+        let ev =
+            ts_apply_helpers::rb_event_at_with_actor(RATIFICATION_OPEN_MS, addr(1), &se_payload);
+        state.apply_event(&ev).expect("apply ok");
+        assert_eq!(state.ratification_ballots.len(), 0);
+        assert_eq!(state.last_hlc, prev_last_hlc);
+    }
+
+    #[test]
+    fn kd_rb_se_mode_wrong_ciphertext_shape_silent_drops() {
+        let (mut state, committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        let mut payload = ts_apply_helpers::build_real_se_ballot_payload(&committee, &[5, 3, 1]);
+        // Wrong shape: pop one indicator → ci.len() = pair_count - 1.
+        payload.ciphertexts_indicators.as_mut().unwrap().pop();
+        let prev_last_hlc = state.last_hlc.clone();
+        let ev = ts_apply_helpers::rb_event_at_with_actor(
+            RATIFICATION_OPEN_MS,
+            state.eligible_electorate_snapshot[0],
+            &payload,
+        );
+        state.apply_event(&ev).expect("apply ok");
+        assert_eq!(state.ratification_ballots.len(), 0);
+        assert_eq!(state.last_hlc, prev_last_hlc);
+    }
+
+    #[test]
+    fn kd_rb_se_mode_invalid_nizk_silent_drops() {
+        let (mut state, committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        let mut payload = ts_apply_helpers::build_real_se_ballot_payload(&committee, &[5, 3, 1]);
+        // Bit-flip one byte of the range proof bundle.
+        payload.proof.as_mut().unwrap().range_proofs[0] ^= 0x01;
+        let prev_last_hlc = state.last_hlc.clone();
+        let ev = ts_apply_helpers::rb_event_at_with_actor(
+            RATIFICATION_OPEN_MS,
+            state.eligible_electorate_snapshot[0],
+            &payload,
+        );
+        state.apply_event(&ev).expect("apply ok");
+        assert_eq!(state.ratification_ballots.len(), 0);
+        assert_eq!(state.last_hlc, prev_last_hlc);
+    }
+
+    #[test]
+    fn kd_rb_se_mode_valid_ballot_accepted() {
+        let (mut state, committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        let payload = ts_apply_helpers::build_real_se_ballot_payload(&committee, &[5, 3, 1]);
+        let ev = ts_apply_helpers::rb_event_at_with_actor(
+            RATIFICATION_OPEN_MS,
+            state.eligible_electorate_snapshot[0],
+            &payload,
+        );
+        state.apply_event(&ev).expect("apply ok");
+        assert_eq!(state.ratification_ballots.len(), 1, "valid ballot accepted");
+        assert_eq!(
+            state.last_hlc.as_ref().map(|h| h.wall_ms),
+            Some(RATIFICATION_OPEN_MS),
+            "accept must advance last_hlc"
+        );
+    }
+
+    // Qodo PR #155 #2: regression for apply-time n derivation. Build a poll
+    // where `self.candidates.len() + 1` (the old buggy n) differs from the
+    // canonical ratification-ordering length. Asserts a se-mode ballot built
+    // for the canonical n is accepted — under the buggy code it would have
+    // been silently dropped by the b5 shape check.
+    #[test]
+    fn kd_rb_se_mode_n_derived_from_ratification_ordering_not_candidate_count() {
+        // Helper provisions 2 synthetic candidates with full committee approvals
+        // (post-fix helper). After the fix to the apply path, n = ordering length;
+        // we extend `state.candidates` with sub-threshold candidates that bring
+        // `self.candidates.len() + 1` to 6 while the canonical ordering remains 3
+        // (2 passing + status_quo). The IPC path sizes ballots at the canonical
+        // ordering length, so under the buggy `n = candidates.len() + 1` the
+        // ballot would be silently dropped by the b5 shape gate.
+        let (mut state, committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        // Push 3 extra candidates with ZERO approvals → they fail the
+        // drafting threshold (ceil(sortition_size=5 / 2) = 3) and are
+        // filtered out by `drafting_advancers`. After these pushes:
+        //   - self.candidates.len() = 5
+        //   - self.candidates.len() + 1 = 6  (old buggy n)
+        //   - ratification ordering length = 2 (passing) + 1 (status_quo) = 3
+        //     (the correct n).
+        for i in 0..3u8 {
+            state
+                .candidates
+                .push(crate::community_voting_tier3::DraftCandidateState {
+                    event_hash: [0xD0 | i; 32],
+                    text: format!("sub-threshold {i}"),
+                    proposer: Some(committee.member_addrs[0]),
+                    approvals: std::collections::HashSet::new(),
+                });
+        }
+        assert_eq!(state.candidates.len(), 5, "test setup precondition");
+
+        // Build a real se-mode ballot for n=3 (3 scores → 3 score-aggregates,
+        // 3 indicator-pair aggregates).
+        let payload = ts_apply_helpers::build_real_se_ballot_payload(&committee, &[5, 3, 1]);
+        let ev = ts_apply_helpers::rb_event_at_with_actor(
+            RATIFICATION_OPEN_MS,
+            state.eligible_electorate_snapshot[0],
+            &payload,
+        );
+        state.apply_event(&ev).expect("apply ok");
+        assert_eq!(
+            state.ratification_ballots.len(),
+            1,
+            "se-mode ballot sized for ratification ordering n=3 must be accepted; \
+             under the buggy n = candidates.len()+1 = 6, the b5 shape check would have dropped it",
+        );
+        assert_eq!(
+            state.last_hlc.as_ref().map(|h| h.wall_ms),
+            Some(RATIFICATION_OPEN_MS),
+            "accept must advance last_hlc",
+        );
+    }
+
+    // Qodo PR #155 #2: same bug surface for the kd=ts shape check.
+    // A kd=ts payload sized to the canonical ratification ordering n must be
+    // accepted; the buggy path used `self.candidates.len() + 1` and would
+    // reject any payload sized for a smaller n.
+    #[test]
+    fn kd_ts_n_derived_from_ratification_ordering_not_candidate_count() {
+        let (mut state, committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        // Same trick as above: extend `state.candidates` with sub-threshold
+        // entries so `self.candidates.len() + 1 = 6 ≠ 3 = ordering length`.
+        for i in 0..3u8 {
+            state
+                .candidates
+                .push(crate::community_voting_tier3::DraftCandidateState {
+                    event_hash: [0xD0 | i; 32],
+                    text: format!("sub-threshold {i}"),
+                    proposer: Some(committee.member_addrs[0]),
+                    approvals: std::collections::HashSet::new(),
+                });
+        }
+        // Submit a valid ballot first so `aggregate_se_ballots` has input;
+        // built for n=3 (the correct ordering length).
+        let ballot = ts_apply_helpers::build_real_se_ballot_payload(&committee, &[5, 3, 1]);
+        let rb_ev = ts_apply_helpers::rb_event_at_with_actor(
+            RATIFICATION_OPEN_MS,
+            committee.member_addrs[0],
+            &ballot,
+        );
+        state.apply_event(&rb_ev).expect("rb apply");
+        // Build a kd=ts payload for n=3 (per the helper, which reads
+        // `aggregate_se_ballots(..., n=3)` internally — see helper for
+        // n derivation).
+        let payload = ts_apply_helpers::build_real_tally_share_payload(&state, &committee, 0, 0);
+        let ev = ts_apply_helpers::ts_event_at_with_actor(
+            RATIFICATION_END_MS,
+            committee.member_addrs[0],
+            &payload,
+        );
+        state.apply_event(&ev).expect("apply ok");
+        assert_eq!(
+            state.secret_tally.tally_shares.len(),
+            1,
+            "kd=ts payload sized for ratification ordering n=3 must be accepted; \
+             under the buggy n = candidates.len()+1 = 6 the shape check would have dropped it",
+        );
+    }
+
+    // ── kd=ts: T1 / T2 / timing / mode ───────────────────────────────────────
+
+    #[test]
+    fn kd_ts_t1_non_committee_actor_silent_drops() {
+        let (mut state, committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        // Submit at least one valid ballot so aggregates exist for the kd=ts
+        // shape check to reach T1 (otherwise an empty-ballots path would
+        // confound the test). The aggregates are not needed for the T1 check
+        // itself — T1 only consults the oracle's verifying_shares map.
+        let ballot = ts_apply_helpers::build_real_se_ballot_payload(&committee, &[5, 3, 1]);
+        let rb_ev = ts_apply_helpers::rb_event_at_with_actor(
+            RATIFICATION_OPEN_MS,
+            committee.member_addrs[0],
+            &ballot,
+        );
+        state.apply_event(&rb_ev).expect("rb ok");
+        // Actor 0xFF is not in the committee.
+        let bogus_actor = OwnerAddr([0xFF; 16]);
+        let n = state.candidates.len() + 1;
+        let payload = crate::community_voting_core::TallySharePayload {
+            poll_id: poll_id(),
+            committee_epoch: 0,
+            entries: vec![
+                crate::community_voting_core::TallyShareEntry {
+                    share: [0; 32],
+                    dleq_proof: [0; 64],
+                };
+                n + n * (n - 1) / 2
+            ],
+        };
+        let prev_last_hlc = state.last_hlc.clone();
+        let ev =
+            ts_apply_helpers::ts_event_at_with_actor(RATIFICATION_END_MS, bogus_actor, &payload);
+        state.apply_event(&ev).expect("apply ok");
+        assert!(state.secret_tally.tally_shares.is_empty());
+        assert_eq!(state.last_hlc, prev_last_hlc);
+    }
+
+    #[test]
+    fn kd_ts_t2_invalid_dleq_silent_drops() {
+        let (mut state, committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        let ballot = ts_apply_helpers::build_real_se_ballot_payload(&committee, &[5, 3, 1]);
+        let rb_ev = ts_apply_helpers::rb_event_at_with_actor(
+            RATIFICATION_OPEN_MS,
+            committee.member_addrs[0],
+            &ballot,
+        );
+        state.apply_event(&rb_ev).expect("rb ok");
+        let mut payload =
+            ts_apply_helpers::build_real_tally_share_payload(&state, &committee, 0, 0);
+        // Bit-flip one byte of the first entry's DLEQ proof.
+        payload.entries[0].dleq_proof[0] ^= 0x01;
+        let prev_last_hlc = state.last_hlc.clone();
+        let ev = ts_apply_helpers::ts_event_at_with_actor(
+            RATIFICATION_END_MS,
+            committee.member_addrs[0],
+            &payload,
+        );
+        state.apply_event(&ev).expect("apply ok");
+        assert!(state.secret_tally.tally_shares.is_empty());
+        assert_eq!(state.last_hlc, prev_last_hlc);
+    }
+
+    #[test]
+    fn kd_ts_too_early_silent_drops() {
+        let (mut state, committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        let ballot = ts_apply_helpers::build_real_se_ballot_payload(&committee, &[5, 3, 1]);
+        let rb_ev = ts_apply_helpers::rb_event_at_with_actor(
+            RATIFICATION_OPEN_MS,
+            committee.member_addrs[0],
+            &ballot,
+        );
+        state.apply_event(&rb_ev).expect("rb ok");
+        let payload = ts_apply_helpers::build_real_tally_share_payload(&state, &committee, 0, 0);
+        // wall_ms < ratification_end_ms (which is 30_000).
+        let prev_last_hlc = state.last_hlc.clone();
+        let ev = ts_apply_helpers::ts_event_at_with_actor(
+            RATIFICATION_END_MS - 1,
+            committee.member_addrs[0],
+            &payload,
+        );
+        state.apply_event(&ev).expect("apply ok");
+        assert!(state.secret_tally.tally_shares.is_empty());
+        assert_eq!(state.last_hlc, prev_last_hlc);
+    }
+
+    #[test]
+    fn kd_ts_in_pu_mode_poll_silent_drops() {
+        let mut state = Tier3PollState::new_from_create(meta_at(0), electorate(20));
+        state
+            .apply_event(&ss_event(10, vec![addr(1)], vec![]))
+            .expect("ss apply");
+        let payload = crate::community_voting_core::TallySharePayload {
+            poll_id: poll_id(),
+            committee_epoch: 0,
+            entries: vec![],
+        };
+        let prev_last_hlc = state.last_hlc.clone();
+        let ev = ts_apply_helpers::ts_event_at_with_actor(RATIFICATION_END_MS, addr(1), &payload);
+        state.apply_event(&ev).expect("apply ok");
+        assert!(state.secret_tally.tally_shares.is_empty());
+        assert_eq!(state.last_hlc, prev_last_hlc);
+    }
+
+    #[test]
+    fn kd_ts_valid_share_accepted() {
+        let (mut state, committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        let ballot = ts_apply_helpers::build_real_se_ballot_payload(&committee, &[5, 3, 1]);
+        let rb_ev = ts_apply_helpers::rb_event_at_with_actor(
+            RATIFICATION_OPEN_MS,
+            committee.member_addrs[0],
+            &ballot,
+        );
+        state.apply_event(&rb_ev).expect("rb ok");
+        let payload = ts_apply_helpers::build_real_tally_share_payload(&state, &committee, 0, 0);
+        let ev = ts_apply_helpers::ts_event_at_with_actor(
+            RATIFICATION_END_MS,
+            committee.member_addrs[0],
+            &payload,
+        );
+        state.apply_event(&ev).expect("apply ok");
+        assert_eq!(
+            state.secret_tally.tally_shares.len(),
+            1,
+            "valid (T1+T2+timing+shape) share accepted"
+        );
+    }
+
+    // Cursor PR #155 #3 + Qodo PR #155 #4: kd=ts is LWW per
+    // (actor, committee_epoch), keyed on (hlc.wall_ms, hlc.logical,
+    // hlc.device_id, event_hash) lex order. Two follow-on tests cover the
+    // "later wins" and "byte-identical replay is no-op" cases; a third
+    // covers the same-HLC-different-event-hash lex tiebreak.
+    //
+    // The earlier-HLC-second case (an old share arriving after a newer one)
+    // is intercepted by the apply_event monotonic-HLC guard *in single-
+    // replica flow*, so the LWW lex comparison is exercised through
+    // `incoming == existing` (replay) and same-HLC-different-hash branches
+    // here. Cross-replica convergence is exercised by integration tests
+    // that drive events through `apply_event` in canonical (hlc, hash) order.
+    #[test]
+    fn kd_ts_lww_later_hlc_with_different_entries_overwrites() {
+        let (mut state, committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        // Two ballots, then re-prove two share payloads against the same
+        // current aggregate. Each `build_real_tally_share_payload` call
+        // freshly samples DLEQ randomness, so entries differ between calls
+        // even though the underlying aggregate is identical. The test goal
+        // is to confirm that a later-HLC kd=ts overwrites an earlier-HLC one
+        // for the same (actor, epoch), regardless of payload differences.
+        let ballot_a = ts_apply_helpers::build_real_se_ballot_payload(&committee, &[5, 3, 1]);
+        let rb_a = ts_apply_helpers::rb_event_at_with_actor(
+            RATIFICATION_OPEN_MS,
+            committee.member_addrs[0],
+            &ballot_a,
+        );
+        state.apply_event(&rb_a).expect("rb apply A");
+        let ballot_b = ts_apply_helpers::build_real_se_ballot_payload(&committee, &[1, 2, 3]);
+        let rb_b = ts_apply_helpers::rb_event_at_with_actor(
+            RATIFICATION_OPEN_MS + 1,
+            committee.member_addrs[1],
+            &ballot_b,
+        );
+        state.apply_event(&rb_b).expect("rb apply B");
+
+        let payload_first =
+            ts_apply_helpers::build_real_tally_share_payload(&state, &committee, 0, 0);
+        let payload_second =
+            ts_apply_helpers::build_real_tally_share_payload(&state, &committee, 0, 0);
+        // Fresh DLEQ randomness → different entries; both are valid against
+        // the same aggregate (verified by the apply path's T2 DLEQ check).
+        assert_ne!(
+            payload_first.entries, payload_second.entries,
+            "test precondition: two re-proves at the same aggregate differ",
+        );
+
+        let ev_first = ts_apply_helpers::ts_event_at_with_actor(
+            RATIFICATION_END_MS,
+            committee.member_addrs[0],
+            &payload_first,
+        );
+        state.apply_event(&ev_first).expect("apply first");
+        let after_first = state
+            .secret_tally
+            .tally_shares
+            .get(&(committee.member_addrs[0], 0))
+            .expect("share first applied")
+            .clone();
+
+        let ev_second = ts_apply_helpers::ts_event_at_with_actor(
+            RATIFICATION_END_MS + 1,
+            committee.member_addrs[0],
+            &payload_second,
+        );
+        state.apply_event(&ev_second).expect("apply second");
+        let after_second = state
+            .secret_tally
+            .tally_shares
+            .get(&(committee.member_addrs[0], 0))
+            .expect("share second applied")
+            .clone();
+
+        assert_eq!(
+            state.secret_tally.tally_shares.len(),
+            1,
+            "(actor, epoch) LWW: still a single record",
+        );
+        assert_eq!(
+            after_second.entries, payload_second.entries,
+            "later-HLC submission with different entries must overwrite (LWW)",
+        );
+        assert_ne!(
+            after_second.entries, after_first.entries,
+            "record was overwritten, not retained",
+        );
+        assert!(
+            after_second.last_update_hlc.wall_ms > after_first.last_update_hlc.wall_ms,
+            "record carries the newer event's HLC",
+        );
+    }
+
+    #[test]
+    fn kd_ts_lww_byte_identical_replay_is_noop() {
+        let (mut state, committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        let ballot = ts_apply_helpers::build_real_se_ballot_payload(&committee, &[5, 3, 1]);
+        let rb_ev = ts_apply_helpers::rb_event_at_with_actor(
+            RATIFICATION_OPEN_MS,
+            committee.member_addrs[0],
+            &ballot,
+        );
+        state.apply_event(&rb_ev).expect("rb apply");
+        let payload = ts_apply_helpers::build_real_tally_share_payload(&state, &committee, 0, 0);
+        let ev = ts_apply_helpers::ts_event_at_with_actor(
+            RATIFICATION_END_MS,
+            committee.member_addrs[0],
+            &payload,
+        );
+        state.apply_event(&ev).expect("apply 1");
+        let record_after_first = state
+            .secret_tally
+            .tally_shares
+            .get(&(committee.member_addrs[0], 0))
+            .expect("share applied")
+            .clone();
+        let last_hlc_after_first = state.last_hlc.clone();
+
+        // True byte-identical replay: same event passed through apply_event
+        // again. The monotonic-HLC guard uses strict `<`, so equal HLCs
+        // pass; the LWW comparison then reports `incoming == existing`
+        // (not strictly greater) → silent stale-drop.
+        state.apply_event(&ev).expect("apply 2");
+        assert_eq!(
+            state.secret_tally.tally_shares.len(),
+            1,
+            "LWW: still a single record",
+        );
+        let record_after_second = state
+            .secret_tally
+            .tally_shares
+            .get(&(committee.member_addrs[0], 0))
+            .expect("share still present")
+            .clone();
+        assert_eq!(
+            record_after_first, record_after_second,
+            "byte-identical replay must not change the record (LWW idempotent)",
+        );
+        assert_eq!(
+            state.last_hlc, last_hlc_after_first,
+            "stale LWW drop must not advance last_hlc watermark (ZEB-320)",
+        );
+    }
+
+    #[test]
+    fn kd_ts_lww_same_hlc_event_hash_tiebreak_is_deterministic() {
+        // Same HLC, two events with different payloads → different event_hash.
+        // The monotonic guard uses strict `<` so equal HLCs pass; the LWW
+        // comparison falls through to the event_hash tiebreak. We construct
+        // both events, sort them by event_hash to know which is "later",
+        // apply the "earlier" one first, then the "later" one — assert the
+        // later one wins.
+        let (mut state, committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        let ballot = ts_apply_helpers::build_real_se_ballot_payload(&committee, &[5, 3, 1]);
+        let rb_ev = ts_apply_helpers::rb_event_at_with_actor(
+            RATIFICATION_OPEN_MS,
+            committee.member_addrs[0],
+            &ballot,
+        );
+        state.apply_event(&rb_ev).expect("rb apply");
+
+        // Two payloads with different DLEQ-proof randomness — same aggregate,
+        // but the proofs use fresh `OsRng` so entries differ between calls.
+        let payload_a = ts_apply_helpers::build_real_tally_share_payload(&state, &committee, 0, 0);
+        let payload_b = ts_apply_helpers::build_real_tally_share_payload(&state, &committee, 0, 0);
+        assert_ne!(
+            payload_a.entries, payload_b.entries,
+            "test precondition: two distinct re-proves at the same aggregate",
+        );
+
+        let ev_a = ts_apply_helpers::ts_event_at_with_actor(
+            RATIFICATION_END_MS,
+            committee.member_addrs[0],
+            &payload_a,
+        );
+        let ev_b = ts_apply_helpers::ts_event_at_with_actor(
+            RATIFICATION_END_MS,
+            committee.member_addrs[0],
+            &payload_b,
+        );
+        let hash_a = event_hash_of(&ev_a);
+        let hash_b = event_hash_of(&ev_b);
+        // Order events so we apply the lower-hash one first, then the
+        // higher-hash one; LWW lex order says the higher hash wins.
+        let (lower, higher, higher_entries) = if hash_a < hash_b {
+            (&ev_a, &ev_b, &payload_b.entries)
+        } else {
+            (&ev_b, &ev_a, &payload_a.entries)
+        };
+        state.apply_event(lower).expect("apply lower");
+        let last_hlc_after_lower = state.last_hlc.clone();
+        state.apply_event(higher).expect("apply higher");
+
+        assert_eq!(
+            state.secret_tally.tally_shares.len(),
+            1,
+            "still a single record",
+        );
+        let record = &state.secret_tally.tally_shares[&(committee.member_addrs[0], 0)];
+        assert_eq!(
+            &record.entries, higher_entries,
+            "higher event_hash must win the same-HLC lex tiebreak",
+        );
+        // Both events accepted → watermark advances on each (equal HLC,
+        // but `advance_last_hlc=true` for the second). last_hlc stays at
+        // ev's HLC.
+        assert_eq!(
+            state.last_hlc.as_ref().map(|h| h.wall_ms),
+            Some(RATIFICATION_END_MS),
+        );
+        // Sanity: last_hlc_after_lower was already RATIFICATION_END_MS.
+        assert_eq!(
+            last_hlc_after_lower.as_ref().map(|h| h.wall_ms),
+            Some(RATIFICATION_END_MS),
+        );
+    }
+
+    // ── ZEB-295 Phase 6 Task 8: recover_secret_tally end-to-end ──────────
+
+    #[test]
+    fn recover_secret_tally_no_shares_returns_none() {
+        let (state, _committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        let ordered = vec![
+            crate::community_voting_star::CandidateRef {
+                event_hash: [0xC0; 32],
+                approval_count: 0,
+            },
+            crate::community_voting_star::CandidateRef {
+                event_hash: [0xC1; 32],
+                approval_count: 0,
+            },
+            crate::community_voting_star::CandidateRef {
+                event_hash: [0xC2; 32],
+                approval_count: 0,
+            },
+        ];
+        assert!(super::recover_secret_tally(&state, &ordered).is_none());
+    }
+
+    #[test]
+    fn recover_secret_tally_below_threshold_returns_none() {
+        let (mut state, committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        // One ballot.
+        let ballot = ts_apply_helpers::build_real_se_ballot_payload(&committee, &[5, 3, 1]);
+        let rb_ev = ts_apply_helpers::rb_event_at_with_actor(
+            RATIFICATION_OPEN_MS,
+            committee.member_addrs[0],
+            &ballot,
+        );
+        state.apply_event(&rb_ev).expect("rb ok");
+        // One share (committee threshold = 2).
+        let payload = ts_apply_helpers::build_real_tally_share_payload(&state, &committee, 0, 0);
+        let ev = ts_apply_helpers::ts_event_at_with_actor(
+            RATIFICATION_END_MS,
+            committee.member_addrs[0],
+            &payload,
+        );
+        state.apply_event(&ev).expect("ts apply");
+        let ordered = vec![
+            crate::community_voting_star::CandidateRef {
+                event_hash: [0xC0; 32],
+                approval_count: 0,
+            },
+            crate::community_voting_star::CandidateRef {
+                event_hash: [0xC1; 32],
+                approval_count: 0,
+            },
+            crate::community_voting_star::CandidateRef {
+                event_hash: [0xC2; 32],
+                approval_count: 0,
+            },
+        ];
+        assert!(
+            super::recover_secret_tally(&state, &ordered).is_none(),
+            "1 share with threshold=2 must not recover"
+        );
+    }
+
+    #[test]
+    fn recover_secret_tally_threshold_shares_recover_plaintext() {
+        let (mut state, committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        // Cast 3 ballots so the runoff has clear winner-decisive indicators.
+        // n=3 (2 explicit candidates + status_quo); pair_count = 3.
+        // Scores indexed by candidate position [c0, c1, c2 = status_quo].
+        // Ballots:
+        //   voter0 [5, 1, 0]: c0 dominates
+        //   voter1 [5, 2, 0]: c0 dominates
+        //   voter2 [5, 3, 0]: c0 dominates
+        // score_sums = [15, 6, 0]
+        // c0 wins with absolute dominance. No per-ballot ties.
+        let ballots = [[5u64, 1, 0], [5, 2, 0], [5, 3, 0]];
+        for (i, scores) in ballots.iter().enumerate() {
+            let payload = ts_apply_helpers::build_real_se_ballot_payload(&committee, scores);
+            let ev = ts_apply_helpers::rb_event_at_with_actor(
+                RATIFICATION_OPEN_MS + i as u64,
+                committee.member_addrs[i],
+                &payload,
+            );
+            state.apply_event(&ev).expect("rb apply");
+        }
+        // Two valid shares (threshold = 2-of-3).
+        for member_idx in [0, 1] {
+            let ts_payload =
+                ts_apply_helpers::build_real_tally_share_payload(&state, &committee, member_idx, 0);
+            let ev = ts_apply_helpers::ts_event_at_with_actor(
+                RATIFICATION_END_MS + member_idx as u64,
+                committee.member_addrs[member_idx],
+                &ts_payload,
+            );
+            state.apply_event(&ev).expect("ts apply");
+        }
+        assert_eq!(state.secret_tally.tally_shares.len(), 2);
+
+        // Build ordered candidates matching state.candidates order. The
+        // helper appends synthetic candidates with event_hashes
+        // 0xC0..=0xC1 then status_quo would be added by ratification
+        // path; here we use the same hashes as build_real_*.
+        let ordered: Vec<crate::community_voting_star::CandidateRef> = state
+            .candidates
+            .iter()
+            .map(|c| crate::community_voting_star::CandidateRef {
+                event_hash: c.event_hash,
+                approval_count: 0,
+            })
+            .chain(std::iter::once(
+                crate::community_voting_star::CandidateRef {
+                    event_hash: synthesize_status_quo(&state.meta.poll_id).event_hash,
+                    approval_count: 0,
+                },
+            ))
+            .collect();
+        let result = super::recover_secret_tally(&state, &ordered).expect("must recover");
+
+        // c0 score_sum = 15, c1 score_sum = 6, c2 score_sum = 0.
+        assert_eq!(result.total_scores, vec![15, 6, 0]);
+        // Finalists: c0 (15) and c1 (6) — c2 (0) excluded.
+        assert_eq!(result.finalists.len(), 2);
+        assert_eq!(result.winner.event_hash, ordered[0].event_hash);
     }
 }
 

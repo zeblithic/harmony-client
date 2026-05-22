@@ -158,6 +158,63 @@ pub fn verify_schnorr_signature(
     vk.verify(msg, &sig).map_err(|e| format!("verify: {e}"))
 }
 
+// ── ZEB-295 Phase 6: FROST→ElGamal primitive bridges ─────────────────────────
+//
+// The threshold-ElGamal scheme used for ballot-secret ratification (spec §1)
+// reuses the FROST committee's key material directly:
+//   - joint verifying key Y = G·x       → ElGamal encryption key
+//   - per-member verifying share Y_i    → DLEQ verifier basis at T2 apply
+//   - per-member signing share x_i      → ElGamal decryption secret share
+//
+// FROST exposes these as wrapper types (`SigningShare`, `VerifyingShare`,
+// `VerifyingKey`); the threshold-ElGamal helpers operate on raw
+// `curve25519_dalek` types. These three thin converters bridge the gap
+// without re-deriving any secret material — the FROST `SigningShare` IS the
+// per-member decryption share (no separate ceremony needed).
+
+/// Expose this committee member's signing share `x_i` as a curve25519-dalek
+/// Scalar — the same Scalar that the FROST library internally holds.
+/// Used as the threshold-ElGamal decryption secret share. Spec §1
+/// "FROST `signing_share` IS the per-member ElGamal decryption secret share x_i".
+pub fn signing_share_as_scalar(kp: &KeyPackage) -> curve25519_dalek::scalar::Scalar {
+    // `SigningShare::serialize` is infallible for Ristretto255 and returns
+    // a 32-byte canonical Scalar encoding. Copy into a fixed array and
+    // round-trip through `Scalar::from_canonical_bytes` — the unwrap is
+    // safe because FROST never produces a non-canonical share.
+    let bytes = kp.signing_share().serialize();
+    debug_assert_eq!(bytes.len(), 32, "Ristretto SigningShare is 32 bytes");
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Option::from(curve25519_dalek::scalar::Scalar::from_canonical_bytes(arr))
+        .expect("FROST SigningShare must be a canonical Ristretto scalar")
+}
+
+/// Expose a single committee member's verifying share `Y_i = G·x_i` as a
+/// curve25519-dalek RistrettoPoint. Used by T2 (DLEQ verify) at apply time.
+pub fn verifying_share_to_point(
+    vs: &VerifyingShare,
+) -> curve25519_dalek::ristretto::RistrettoPoint {
+    use curve25519_dalek::ristretto::CompressedRistretto;
+    let bytes = verifying_share_to_bytes(vs);
+    CompressedRistretto::from_slice(&bytes)
+        .expect("32 bytes")
+        .decompress()
+        .expect("FROST VerifyingShare must be a valid Ristretto point")
+}
+
+/// Expose the joint committee verifying key `Y = G·x` as a RistrettoPoint —
+/// the ElGamal encryption key voters target. Spec §1.
+pub fn joint_verifying_key_to_point(
+    vk: &VerifyingKey,
+) -> curve25519_dalek::ristretto::RistrettoPoint {
+    use curve25519_dalek::ristretto::CompressedRistretto;
+    let bytes = verifying_key_to_bytes(vk);
+    CompressedRistretto::from_slice(&bytes)
+        .expect("32 bytes")
+        .decompress()
+        .expect("FROST VerifyingKey must be a valid Ristretto point")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +262,114 @@ mod tests {
         assert_eq!(r2_map.len(), 2);
         assert!(r2_map.contains_key(&id2));
         assert!(r2_map.contains_key(&id3));
+    }
+
+    // ── ZEB-295 Phase 6: FROST→ElGamal bridge round-trips ────────────────
+
+    /// Helper: run a complete 2-of-3 FROST DKG and return each participant's
+    /// `(KeyPackage, PublicKeyPackage)`. Mirrors the boilerplate from
+    /// `dkg_part2_produces_one_package_per_other_participant` but carries
+    /// the ceremony all the way through part3.
+    fn run_3_party_dkg_2_of_3() -> Vec<(Identifier, KeyPackage, PublicKeyPackage)> {
+        let ids: Vec<Identifier> = (0..3).map(identifier_for_index).collect();
+
+        // ── Round 1: every participant runs part1 locally and broadcasts the
+        //    round-1 package to every other participant.
+        let mut r1_secrets: BTreeMap<Identifier, dkg::round1::SecretPackage> = BTreeMap::new();
+        let mut r1_pkgs: BTreeMap<Identifier, Vec<u8>> = BTreeMap::new();
+        for id in &ids {
+            let (sec, pkg) = dkg_part1_local(*id, 3, 2).expect("part1");
+            r1_secrets.insert(*id, sec);
+            r1_pkgs.insert(*id, pkg);
+        }
+
+        // ── Round 2: every participant runs part2 against the round-1 packages
+        //    received from the OTHERS, producing pairwise round-2 packages.
+        //    `r2_outbound[sender][recipient]` is the encoded round-2 package
+        //    that `sender` sends privately to `recipient`.
+        let mut r2_secrets: BTreeMap<Identifier, dkg::round2::SecretPackage> = BTreeMap::new();
+        let mut r2_outbound: BTreeMap<Identifier, BTreeMap<Identifier, Vec<u8>>> = BTreeMap::new();
+        for id in &ids {
+            // Move the round-1 secret out (consumed by part2).
+            let sec = r1_secrets
+                .remove(id)
+                .expect("each participant has a round-1 secret");
+            // Round-1 packages received from the OTHERS.
+            let received_r1: BTreeMap<Identifier, Vec<u8>> = r1_pkgs
+                .iter()
+                .filter(|(other, _)| *other != id)
+                .map(|(other, bytes)| (*other, bytes.clone()))
+                .collect();
+            let (r2_sec, r2_out) = dkg_part2_local(sec, &received_r1).expect("part2");
+            r2_secrets.insert(*id, r2_sec);
+            r2_outbound.insert(*id, r2_out);
+        }
+
+        // ── Round 3: each participant gathers the round-2 packages addressed
+        //    to it (one from each of the other 2 senders) and finalizes.
+        let mut out: Vec<(Identifier, KeyPackage, PublicKeyPackage)> = Vec::new();
+        for id in &ids {
+            // Round-1 packages received from the OTHERS (same as in round 2).
+            let received_r1: BTreeMap<Identifier, Vec<u8>> = r1_pkgs
+                .iter()
+                .filter(|(other, _)| *other != id)
+                .map(|(other, bytes)| (*other, bytes.clone()))
+                .collect();
+            // Round-2 packages addressed TO this participant by each OTHER sender.
+            let mut received_r2: BTreeMap<Identifier, Vec<u8>> = BTreeMap::new();
+            for (sender, out_map) in &r2_outbound {
+                if sender == id {
+                    continue;
+                }
+                let bytes = out_map
+                    .get(id)
+                    .cloned()
+                    .expect("every other sender produced a round-2 package for me");
+                received_r2.insert(*sender, bytes);
+            }
+            let r2_sec = r2_secrets
+                .get(id)
+                .expect("each participant has a round-2 secret");
+            let (kp, pkp) = dkg_part3_local(r2_sec, &received_r1, &received_r2).expect("part3");
+            out.push((*id, kp, pkp));
+        }
+        out
+    }
+
+    #[test]
+    fn joint_verifying_key_round_trip_with_elgamal_point() {
+        // Run a 2-of-3 DKG, extract the joint VK from the PublicKeyPackage,
+        // convert to a RistrettoPoint, recompress, and compare against the
+        // canonical `verifying_key_to_bytes` encoding. The conversion must
+        // be byte-exact — any drift would silently desync the ElGamal voter
+        // encryption key from the FROST joint VK.
+        let parties = run_3_party_dkg_2_of_3();
+        let (_id, _kp, pkp) = &parties[0];
+        let vk = pkp.verifying_key();
+        let point = joint_verifying_key_to_point(vk);
+        let canonical_bytes = verifying_key_to_bytes(vk);
+        let point_bytes = point.compress().to_bytes();
+        assert_eq!(
+            point_bytes, canonical_bytes,
+            "joint_verifying_key_to_point must round-trip with verifying_key_to_bytes"
+        );
+    }
+
+    #[test]
+    fn signing_share_as_scalar_round_trips_through_verifying_share() {
+        // After DKG: G * signing_share_as_scalar(kp) == verifying_share_to_point(kp.verifying_share()).
+        // i.e. our exposed Scalar matches the FROST library's exposed VerifyingShare.
+        use curve25519_dalek::constants::RISTRETTO_BASEPOINT_TABLE;
+        let parties = run_3_party_dkg_2_of_3();
+        for (id, kp, _pkp) in &parties {
+            let x_i = signing_share_as_scalar(kp);
+            let y_i_via_basepoint = RISTRETTO_BASEPOINT_TABLE * &x_i;
+            let y_i_from_frost = verifying_share_to_point(kp.verifying_share());
+            assert_eq!(
+                y_i_via_basepoint.compress().to_bytes(),
+                y_i_from_frost.compress().to_bytes(),
+                "G * x_i must equal Y_i for participant {id:?}",
+            );
+        }
     }
 }

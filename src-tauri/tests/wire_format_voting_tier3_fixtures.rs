@@ -234,7 +234,10 @@ fn fixture_sortition_failed() {
 fn fixture_ratification_ballot() {
     let pd = RatificationBallotPayload {
         poll_id: PollId([0x42; 32]),
-        scores: vec![5, 3, 4, 0, 2],
+        scores: Some(vec![5, 3, 4, 0, 2]),
+        ciphertexts_scores: None,
+        ciphertexts_indicators: None,
+        proof: None,
     };
     round_trip_or_regen("ratification_ballot.cbor", &pd);
     let mut bytes = Vec::new();

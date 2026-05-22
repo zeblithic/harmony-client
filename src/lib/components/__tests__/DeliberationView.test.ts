@@ -30,6 +30,10 @@ function createDetail(overrides: Partial<Tier3PollExport> = {}): Tier3PollExport
     myDeliberationVotes: [],
     winnerEventHash: null,
     runnerUpEventHash: null,
+    privacyMode: 'pu',
+    encryptedTallyShareCount: 0,
+    encryptedTallyThreshold: 0,
+    encryptedTallyCommitteeSize: 0,
     ...overrides,
   };
 }

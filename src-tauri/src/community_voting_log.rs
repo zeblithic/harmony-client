@@ -2610,7 +2610,10 @@ mod tier3_dispatch_tests {
         // it. This is the bug condition the helper must handle.
         let rb_payload = RatificationBallotPayload {
             poll_id: pid,
-            scores: vec![5, 0],
+            scores: Some(vec![5, 0]),
+            ciphertexts_scores: None,
+            ciphertexts_indicators: None,
+            proof: None,
         };
         log.apply(
             tier3_event_with_payload(

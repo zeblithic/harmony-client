@@ -13,6 +13,7 @@ function createAdapterMock(summaries: Tier3PollSummary[] = []) {
   vi.spyOn(adapter, 'subscribeTier3DraftingOpen').mockReturnValue(() => {});
   vi.spyOn(adapter, 'subscribeTier3RatificationOpen').mockReturnValue(() => {});
   vi.spyOn(adapter, 'subscribeTier3Finalized').mockReturnValue(() => {});
+  vi.spyOn(adapter, 'subscribeTier3TallyShareApplied').mockReturnValue(() => {});
   return adapter;
 }
 
@@ -28,6 +29,7 @@ describe('Tier3ProposalPanel', () => {
         pollCreateHlcMs: 1_700_000_000_000,
         sortitionSize: 100,
         winnerText: null,
+        privacyMode: 'pu',
       },
     ]);
     const { findByText } = render(Tier3ProposalPanel, {
@@ -121,6 +123,7 @@ describe('Tier3ProposalPanel', () => {
     vi.spyOn(adapter, 'subscribeTier3DraftingOpen').mockReturnValue(() => {});
     vi.spyOn(adapter, 'subscribeTier3RatificationOpen').mockReturnValue(() => {});
     vi.spyOn(adapter, 'subscribeTier3Finalized').mockReturnValue(() => {});
+    vi.spyOn(adapter, 'subscribeTier3TallyShareApplied').mockReturnValue(() => {});
 
     const aSummary: Tier3PollSummary = {
       pollId: 'aa'.repeat(32),
@@ -131,6 +134,7 @@ describe('Tier3ProposalPanel', () => {
       pollCreateHlcMs: 1_700_000_000_000,
       sortitionSize: 100,
       winnerText: null,
+      privacyMode: 'pu',
     };
     const bSummary: Tier3PollSummary = {
       pollId: 'bb'.repeat(32),
@@ -141,6 +145,7 @@ describe('Tier3ProposalPanel', () => {
       pollCreateHlcMs: 1_700_000_000_000,
       sortitionSize: 100,
       winnerText: null,
+      privacyMode: 'pu',
     };
 
     const { rerender, queryByText, findByText } = render(Tier3ProposalPanel, {
@@ -173,6 +178,7 @@ describe('Tier3ProposalPanel', () => {
           pollCreateHlcMs: 1_700_000_000_000,
           sortitionSize: 100,
           winnerText: null,
+          privacyMode: 'pu',
         },
       ]);
       vi.spyOn(adapter, 'getTier3Poll').mockResolvedValue({
@@ -200,6 +206,10 @@ describe('Tier3ProposalPanel', () => {
         myDeliberationVotes: [],
         winnerEventHash: null,
         runnerUpEventHash: null,
+        privacyMode: 'pu',
+        encryptedTallyShareCount: 0,
+        encryptedTallyThreshold: 0,
+        encryptedTallyCommitteeSize: 0,
       });
 
       const { findByText } = render(Tier3ProposalPanel, {

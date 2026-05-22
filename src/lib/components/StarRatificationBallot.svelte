@@ -103,6 +103,13 @@
   <h5>STAR ratification ballot</h5>
   <p class="instructions">Score each candidate 0-5. Top two advance to runoff; the candidate scored higher on more ballots wins.</p>
 
+  {#if detail.privacyMode === 'se'}
+    <p class="encryption-banner">
+      🔒 Your ballot will be encrypted to the community committee. The tally
+      is revealed only after the ratification window closes.
+    </p>
+  {/if}
+
   <ol class="candidate-list">
     {#each detail.ratificationCandidates as c, i (c.eventHash)}
       <li class="candidate">
@@ -135,7 +142,11 @@
       <span class="success">✓ Ballot submitted</span>
     {/if}
     <button type="button" onclick={() => (confirming = true)} disabled={casting || detail.stage !== 'ra'}>
-      {casting ? 'Casting…' : detail.myRatificationScores ? 'Re-cast ballot' : 'Cast ballot'}
+      {#if casting}
+        {detail.privacyMode === 'se' ? 'Encrypting…' : 'Casting…'}
+      {:else}
+        {detail.myRatificationScores ? 'Re-cast ballot' : 'Cast ballot'}
+      {/if}
     </button>
   </div>
   {#if castError}<p class="error">{castError}</p>{/if}
@@ -162,6 +173,19 @@
 <style>
   .ratification-ballot { margin-top: 1rem; }
   .instructions { color: #8a8c95; font-size: 0.85rem; }
+  /* ZEB-295 Phase 6 Task 11: ballot-secret affordance — lock-icon banner
+     above the per-candidate sliders so the voter knows the ballot will
+     be encrypted before submitting. */
+  .encryption-banner {
+    margin: 0.5rem 0 0.75rem;
+    padding: 0.6rem 0.8rem;
+    background: rgba(170, 130, 255, 0.08);
+    border-left: 3px solid #b29bff;
+    border-radius: 3px;
+    color: #ddd;
+    font-size: 0.9rem;
+    line-height: 1.4;
+  }
   .candidate-list { list-style: decimal; padding-left: 1.25rem; }
   .candidate {
     display: grid;
