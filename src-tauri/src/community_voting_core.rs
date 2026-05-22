@@ -1822,7 +1822,10 @@ pub fn build_signed_draft_approval(
     Ok(ev)
 }
 
-/// Build a fully-signed `kd=rb` RatificationBallot event.
+/// Build a fully-signed `kd=rb` RatificationBallot event in pu-mode
+/// (raw scores 0..=5). Delegates to `build_signed_ratification_ballot_payload`
+/// with the pu-mode payload pre-built so existing callers don't need to know
+/// about the new se-mode variant.
 pub fn build_signed_ratification_ballot(
     keypair: &ed25519_dalek::SigningKey,
     actor: OwnerAddr,
@@ -1830,7 +1833,6 @@ pub fn build_signed_ratification_ballot(
     scores: Vec<u8>,
     hlc: Hlc,
 ) -> Result<SignedVotingEvent, BuildError> {
-    use ed25519_dalek::Signer;
     let payload_struct = RatificationBallotPayload {
         poll_id,
         scores: Some(scores),
@@ -1838,6 +1840,21 @@ pub fn build_signed_ratification_ballot(
         ciphertexts_indicators: None,
         proof: None,
     };
+    build_signed_ratification_ballot_payload(keypair, actor, payload_struct, hlc)
+}
+
+/// ZEB-295 Phase 6 Task 9: build a fully-signed `kd=rb` RatificationBallot
+/// event from a pre-built `RatificationBallotPayload`. Mirrors the pattern
+/// used by `build_signed_tally_share` — the se-mode IPC path constructs the
+/// payload (encrypt + NIZK) and then hands it to this helper for envelope
+/// assembly + signing.
+pub fn build_signed_ratification_ballot_payload(
+    keypair: &ed25519_dalek::SigningKey,
+    actor: OwnerAddr,
+    payload_struct: RatificationBallotPayload,
+    hlc: Hlc,
+) -> Result<SignedVotingEvent, BuildError> {
+    use ed25519_dalek::Signer;
     let mut payload = Vec::new();
     ciborium::ser::into_writer(&payload_struct, &mut payload)
         .map_err(|_| BuildError::EncodePayload)?;
