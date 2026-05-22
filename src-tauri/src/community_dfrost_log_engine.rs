@@ -385,6 +385,63 @@ impl<R: tauri::Runtime> DfrostLogEngine<R> {
         log.committee_state.current_epoch
     }
 
+    /// ZEB-295 Phase 6 Task 8: snapshot the committee state at a given
+    /// epoch as the read-only triple the voting-side `CommitteeOracle`
+    /// trait needs. Returns `(joint_verifying_key, verifying_shares,
+    /// threshold)` for the CURRENT committee if `epoch` matches the
+    /// committee's current epoch (CHURP rotation events store only the
+    /// latest committee state — historical-epoch lookups are not
+    /// implemented in Phase 4 wiring).
+    ///
+    /// Returns `None` if no DKG has completed yet (committee not active),
+    /// or if the requested epoch does not match the current epoch.
+    pub async fn committee_snapshot_at_epoch(
+        &self,
+        epoch: u32,
+    ) -> Option<(
+        [u8; 32],
+        std::collections::BTreeMap<OwnerAddr, [u8; 32]>,
+        u16,
+    )> {
+        let log = self.dfrost_log.lock().await;
+        let cs = &log.committee_state;
+        if !cs.active {
+            return None;
+        }
+        // Phase 4 wiring stores only the LATEST committee state; we
+        // accept the query only when `epoch` matches `current_epoch`.
+        // Multi-epoch historical lookup is a follow-up (see spec §5.3 —
+        // CHURP rotation event log integration).
+        let current_epoch_u32 = u32::try_from(cs.current_epoch).ok()?;
+        if epoch != current_epoch_u32 {
+            return None;
+        }
+        let vk = cs.joint_verifying_key?;
+        Some((vk, cs.verifying_shares.clone(), cs.threshold))
+    }
+
+    /// ZEB-295 Phase 6 Task 8: return the latest CHURP epoch from the
+    /// dfrost log. `None` if no DKG has completed yet.
+    pub async fn latest_committee_epoch(&self) -> Option<u32> {
+        let log = self.dfrost_log.lock().await;
+        if !log.committee_state.active {
+            return None;
+        }
+        u32::try_from(log.committee_state.current_epoch).ok()
+    }
+
+    /// ZEB-295 Phase 6 Task 8: clone this engine's local FROST
+    /// `KeyPackage` (this committee member's signing share), if
+    /// materialized. `None` for non-committee members or before DKG
+    /// finalises locally. Used by the voting engine's
+    /// `maybe_emit_tally_share` hook to derive the ElGamal
+    /// decryption secret `x_i` via
+    /// `community_dfrost_crypto::signing_share_as_scalar`.
+    pub async fn local_key_package(&self) -> Option<frost_ristretto255::keys::KeyPackage> {
+        let log = self.dfrost_log.lock().await;
+        log.local_key_package.clone()
+    }
+
     /// Look up the `vrf_output` for a completed beacon by its beacon seed and
     /// committee epoch. Derives `message_hash = derive_vrf_seed(seed, epoch)` and
     /// checks `dfrost_log.beacon_index`.

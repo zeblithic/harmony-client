@@ -1410,6 +1410,215 @@ pub fn aggregate_se_ballots(
     Some(out)
 }
 
+/// ZEB-295 Phase 6: recover the aggregate STAR result from accumulated
+/// `kd=ts` tally shares. Returns `None` if no epoch yet has ≥ threshold
+/// valid shares whose Lagrange-combine + BSGS decode cleanly. Spec §3.4
+/// + §5.3.
+///
+/// Iterates epochs in descending order (latest first); falls through to
+/// earlier epochs on insufficient-quorum / decryption-failure. Multi-
+/// engine deterministic: any size-`threshold` subset of `(i, x_i)` pairs
+/// from the SAME polynomial reconstructs the same secret (Lagrange
+/// invariance), so all replicas converge on the same plaintext result.
+///
+/// `ordered_candidates`: the deterministic ratification ordering produced
+/// by `ratification_candidates_ordering`. Length = `n` (score-sum
+/// aggregate count).
+pub fn recover_secret_tally(
+    poll: &Tier3PollState,
+    ordered_candidates: &[crate::community_voting_star::CandidateRef],
+) -> Option<crate::community_voting_star::StarResult> {
+    use crate::community_voting_tier3_crypto::{bsgs, combine_shares, decompress_point};
+    use std::collections::BTreeMap;
+
+    let n = ordered_candidates.len();
+    if n == 0 {
+        return None;
+    }
+    let pair_count = n * (n - 1) / 2;
+
+    // Group received tally_shares by epoch. tally_shares is keyed by
+    // (OwnerAddr, epoch) → entries vec; we want epoch → [(addr, entries)…].
+    let mut by_epoch: BTreeMap<
+        u32,
+        Vec<(
+            OwnerAddr,
+            &Vec<crate::community_voting_core::TallyShareEntry>,
+        )>,
+    > = BTreeMap::new();
+    for ((addr, epoch), entries) in &poll.secret_tally.tally_shares {
+        by_epoch.entry(*epoch).or_default().push((*addr, entries));
+    }
+
+    // LWW-dedup of ratification ballots by actor — last (HLC, event_hash)
+    // wins. For Phase 6 v1 we treat each accepted payload as already
+    // canonical (the apply path enforces 1-per-eligible-electorate via
+    // verify rule + monotonic-HLC discipline). See §3.1 — LWW dedup at
+    // tally time is a tally-side concern; for the current apply layer
+    // this is a no-op.
+    let lww_ballots = lww_dedup_se_ballots(&poll.ratification_ballots);
+    let ballot_count = lww_ballots.len() as u64;
+
+    // Try epochs newest-first. Fall through on failure.
+    for (epoch, shares) in by_epoch.iter().rev() {
+        let cs = match poll.committee_oracle.committee_at_epoch(*epoch) {
+            Some(s) => s,
+            None => continue,
+        };
+        if shares.len() < cs.threshold as usize {
+            continue;
+        }
+
+        let aggregates = match aggregate_se_ballots(&lww_ballots, n) {
+            Some(a) => a,
+            None => continue,
+        };
+        if aggregates.len() != n + pair_count {
+            continue;
+        }
+
+        // Build the OwnerAddr → 1-indexed FROST identifier map. The
+        // committee oracle's verifying_shares BTreeMap is sorted by
+        // OwnerAddr lex ASC (BTreeMap natural order); identifiers are
+        // 1-indexed in that sorted order — same derivation as
+        // `community_dfrost_crypto::identifier_for_index` over the
+        // committee's sorted member list.
+        let addr_to_id: BTreeMap<OwnerAddr, u16> = cs
+            .verifying_shares
+            .keys()
+            .copied()
+            .enumerate()
+            .map(|(i, addr)| (addr, (i + 1) as u16))
+            .collect();
+
+        // Lagrange-combine + BSGS-decode every aggregate. Any per-
+        // aggregate failure falls through to the next-older epoch.
+        let mut score_sums: Vec<u64> = Vec::with_capacity(n);
+        let mut ind_sums: Vec<u64> = Vec::with_capacity(pair_count);
+        let electorate_size = poll.eligible_electorate_snapshot.len() as u64;
+        let mut decryption_ok = true;
+
+        // Take the first `threshold` shares (sorted by OwnerAddr ASC since
+        // BTreeMap iteration order is canonical). All replicas pick the
+        // same subset given the same shares; even if subsets differ
+        // across replicas, Lagrange invariance guarantees the same
+        // plaintext (see spec §3.4 multi-engine determinism note).
+        let selected: Vec<(
+            OwnerAddr,
+            &Vec<crate::community_voting_core::TallyShareEntry>,
+        )> = {
+            let mut s: Vec<_> = shares.iter().map(|(a, e)| (*a, *e)).collect();
+            s.sort_by_key(|(a, _)| *a);
+            s.truncate(cs.threshold as usize);
+            s
+        };
+
+        for idx in 0..(n + pair_count) {
+            let c1_agg = match decompress_point(&aggregates[idx].c1) {
+                Some(p) => p,
+                None => {
+                    decryption_ok = false;
+                    break;
+                }
+            };
+            let c2_agg = match decompress_point(&aggregates[idx].c2) {
+                Some(p) => p,
+                None => {
+                    decryption_ok = false;
+                    break;
+                }
+            };
+
+            // Build the partial-share map for this aggregate, keyed by
+            // FROST identifier.
+            let mut partial: BTreeMap<u16, curve25519_dalek::ristretto::RistrettoPoint> =
+                BTreeMap::new();
+            let mut ok = true;
+            for (addr, entries) in &selected {
+                let id = match addr_to_id.get(addr) {
+                    Some(i) => *i,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                };
+                // Shape gate: each member's entries vec must match
+                // n + pair_count.
+                if entries.len() != n + pair_count {
+                    ok = false;
+                    break;
+                }
+                let share_pt = match decompress_point(&entries[idx].share) {
+                    Some(p) => p,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                };
+                partial.insert(id, share_pt);
+            }
+            if !ok {
+                decryption_ok = false;
+                break;
+            }
+
+            let d_agg = match combine_shares(&c1_agg, &partial) {
+                Some(d) => d,
+                None => {
+                    decryption_ok = false;
+                    break;
+                }
+            };
+            let m_point = c2_agg - d_agg;
+
+            // Bounds per spec §4.6: score-sum bound = electorate × 5,
+            // indicator-sum bound = electorate.
+            let bound = if idx < n {
+                electorate_size.saturating_mul(5)
+            } else {
+                electorate_size
+            };
+            let m = match bsgs(&m_point, bound) {
+                Some(m) => m,
+                None => {
+                    decryption_ok = false;
+                    break;
+                }
+            };
+            if idx < n {
+                score_sums.push(m);
+            } else {
+                ind_sums.push(m);
+            }
+        }
+
+        if !decryption_ok {
+            continue;
+        }
+
+        return Some(crate::community_voting_star::compute_star_from_sums(
+            ordered_candidates,
+            score_sums,
+            ind_sums,
+            ballot_count,
+        ));
+    }
+    None
+}
+
+/// LWW-dedup helper for se-mode ratification ballots. Phase 6 v1 ships a
+/// pass-through: the apply path already enforces 1-per-actor via
+/// `current_mini_public` membership + monotonic-HLC discipline. A real
+/// dedup would walk `ratification_ballots` newest-first by HLC and keep
+/// the latest entry per actor — but the current Vec preserves arrival
+/// order with no actor tag (the actor is on the SignedVotingEvent, not
+/// the payload). v1 treats accepted payloads as canonical.
+fn lww_dedup_se_ballots(
+    ballots: &[crate::community_voting_core::RatificationBallotPayload],
+) -> Vec<crate::community_voting_core::RatificationBallotPayload> {
+    ballots.to_vec()
+}
+
 /// Deterministic synthetic status_quo candidate.
 ///
 /// `event_hash = sha256(poll_id.0 || b"status_quo")`.
@@ -4811,6 +5020,132 @@ mod tests {
             first_entries,
             "first-arrival wins (idempotent)"
         );
+    }
+
+    // ── ZEB-295 Phase 6 Task 8: recover_secret_tally end-to-end ──────────
+
+    #[test]
+    fn recover_secret_tally_no_shares_returns_none() {
+        let (state, _committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        let ordered = vec![
+            crate::community_voting_star::CandidateRef {
+                event_hash: [0xC0; 32],
+                approval_count: 0,
+            },
+            crate::community_voting_star::CandidateRef {
+                event_hash: [0xC1; 32],
+                approval_count: 0,
+            },
+            crate::community_voting_star::CandidateRef {
+                event_hash: [0xC2; 32],
+                approval_count: 0,
+            },
+        ];
+        assert!(super::recover_secret_tally(&state, &ordered).is_none());
+    }
+
+    #[test]
+    fn recover_secret_tally_below_threshold_returns_none() {
+        let (mut state, committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        // One ballot.
+        let ballot = ts_apply_helpers::build_real_se_ballot_payload(&committee, &[5, 3, 1]);
+        let rb_ev = ts_apply_helpers::rb_event_at_with_actor(
+            RATIFICATION_OPEN_MS,
+            committee.member_addrs[0],
+            &ballot,
+        );
+        state.apply_event(&rb_ev).expect("rb ok");
+        // One share (committee threshold = 2).
+        let payload = ts_apply_helpers::build_real_tally_share_payload(&state, &committee, 0, 0);
+        let ev = ts_apply_helpers::ts_event_at_with_actor(
+            RATIFICATION_END_MS,
+            committee.member_addrs[0],
+            &payload,
+        );
+        state.apply_event(&ev).expect("ts apply");
+        let ordered = vec![
+            crate::community_voting_star::CandidateRef {
+                event_hash: [0xC0; 32],
+                approval_count: 0,
+            },
+            crate::community_voting_star::CandidateRef {
+                event_hash: [0xC1; 32],
+                approval_count: 0,
+            },
+            crate::community_voting_star::CandidateRef {
+                event_hash: [0xC2; 32],
+                approval_count: 0,
+            },
+        ];
+        assert!(
+            super::recover_secret_tally(&state, &ordered).is_none(),
+            "1 share with threshold=2 must not recover"
+        );
+    }
+
+    #[test]
+    fn recover_secret_tally_threshold_shares_recover_plaintext() {
+        let (mut state, committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        // Cast 3 ballots so the runoff has clear winner-decisive indicators.
+        // n=3 (2 explicit candidates + status_quo); pair_count = 3.
+        // Scores indexed by candidate position [c0, c1, c2 = status_quo].
+        // Ballots:
+        //   voter0 [5, 1, 0]: c0 dominates
+        //   voter1 [5, 2, 0]: c0 dominates
+        //   voter2 [5, 3, 0]: c0 dominates
+        // score_sums = [15, 6, 0]
+        // c0 wins with absolute dominance. No per-ballot ties.
+        let ballots = [[5u64, 1, 0], [5, 2, 0], [5, 3, 0]];
+        for (i, scores) in ballots.iter().enumerate() {
+            let payload = ts_apply_helpers::build_real_se_ballot_payload(&committee, scores);
+            let ev = ts_apply_helpers::rb_event_at_with_actor(
+                RATIFICATION_OPEN_MS + i as u64,
+                committee.member_addrs[i],
+                &payload,
+            );
+            state.apply_event(&ev).expect("rb apply");
+        }
+        // Two valid shares (threshold = 2-of-3).
+        for member_idx in [0, 1] {
+            let ts_payload =
+                ts_apply_helpers::build_real_tally_share_payload(&state, &committee, member_idx, 0);
+            let ev = ts_apply_helpers::ts_event_at_with_actor(
+                RATIFICATION_END_MS + member_idx as u64,
+                committee.member_addrs[member_idx],
+                &ts_payload,
+            );
+            state.apply_event(&ev).expect("ts apply");
+        }
+        assert_eq!(state.secret_tally.tally_shares.len(), 2);
+
+        // Build ordered candidates matching state.candidates order. The
+        // helper appends synthetic candidates with event_hashes
+        // 0xC0..=0xC1 then status_quo would be added by ratification
+        // path; here we use the same hashes as build_real_*.
+        let ordered: Vec<crate::community_voting_star::CandidateRef> = state
+            .candidates
+            .iter()
+            .map(|c| crate::community_voting_star::CandidateRef {
+                event_hash: c.event_hash,
+                approval_count: 0,
+            })
+            .chain(std::iter::once(
+                crate::community_voting_star::CandidateRef {
+                    event_hash: synthesize_status_quo(&state.meta.poll_id).event_hash,
+                    approval_count: 0,
+                },
+            ))
+            .collect();
+        let result = super::recover_secret_tally(&state, &ordered).expect("must recover");
+
+        // c0 score_sum = 15, c1 score_sum = 6, c2 score_sum = 0.
+        assert_eq!(result.total_scores, vec![15, 6, 0]);
+        // Finalists: c0 (15) and c1 (6) — c2 (0) excluded.
+        assert_eq!(result.finalists.len(), 2);
+        assert_eq!(result.winner.event_hash, ordered[0].event_hash);
     }
 }
 

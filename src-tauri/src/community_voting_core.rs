@@ -1977,6 +1977,36 @@ pub fn build_signed_poll_result_tier3(
     Ok(ev)
 }
 
+/// Build a fully-signed `kd=ts` TallyShare event (Tier 3, ZEB-295 Phase 6).
+///
+/// Used by the engine-auto `maybe_emit_tally_share` hook on committee
+/// members after ratification close. The payload bundles `n + C(n,2)`
+/// partial-decryption shares + DLEQ proofs against a single CHURP epoch.
+pub fn build_signed_tally_share(
+    keypair: &ed25519_dalek::SigningKey,
+    actor: OwnerAddr,
+    payload_struct: TallySharePayload,
+    hlc: Hlc,
+) -> Result<SignedVotingEvent, BuildError> {
+    use ed25519_dalek::Signer;
+    let mut payload = Vec::new();
+    ciborium::ser::into_writer(&payload_struct, &mut payload)
+        .map_err(|_| BuildError::EncodePayload)?;
+    let mut ev = SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier: Tier::Sortition,
+        kind: PollEventKindCode::TallyShare,
+        hlc,
+        actor,
+        payload,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev.signing_bytes().map_err(|_| BuildError::SigningBytes)?;
+    ev.sig = keypair.sign(&sb).to_bytes().to_vec();
+    Ok(ev)
+}
+
 /// Frontend-friendly subset of `PollState` for IPC return values.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PollStateExport {

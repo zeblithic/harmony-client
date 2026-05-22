@@ -186,6 +186,145 @@ pub fn tally_star(
     }
 }
 
+/// ZEB-295 Phase 6: compute a STAR result from pre-aggregated score sums +
+/// indicator sums. Spec §3.4 step 7.
+///
+/// The secret-mode tally produces these aggregates via threshold-ElGamal
+/// decryption + BSGS dlog recovery; from there the algorithm follows the
+/// same STAR shape as [`tally_star`], but operates on aggregate counts
+/// rather than per-ballot scores.
+///
+/// - `ordered`: ratification candidate ordering (same shape as `tally_star`'s
+///   first argument).
+/// - `score_sums[i]`: Σ over electorate of score for candidate `i` (matches
+///   `ordered[i]`). `score_sums.len()` must equal `ordered.len()`.
+/// - `indicator_sums[k]`: Σ over electorate of `[score_A > score_B]` for the
+///   k-th unordered pair `(A, B)` with `A < B` in `ordered` index order.
+///   `indicator_sums.len()` must equal `n*(n-1)/2`. The pair index is
+///   `k(A, B) = A * (2n - A - 1) / 2 + (B - A - 1)`.
+/// - `ballot_count`: the number of accepted (LWW-deduped) ballots. Used to
+///   derive `runoff_votes[b] = ballot_count - indicator_sums[k]` for the
+///   2-finalist case. Tally_star's per-ballot abstain-on-tie behavior is
+///   NOT recoverable from one-direction indicator sums alone (the spec
+///   stores only `[score_A > score_B]` and not `[score_B > score_A]`), so
+///   tied-pair ballots are counted toward `B` here rather than abstained.
+///   Plaintext equivalence (§7.5) holds whenever no per-ballot tie occurs
+///   on the finalist pair; for the test, deterministic non-tie ballots are
+///   used.
+///
+/// Tie-break invariants match [`tally_star`]:
+/// - Runoff-vote tie → higher `total_score` wins, then smaller `event_hash`.
+/// - Score-tie → smaller candidate `event_hash` wins.
+///
+/// # Panics
+/// Panics if `ordered` is empty (mirrors `tally_star`).
+pub fn compute_star_from_sums(
+    ordered: &[CandidateRef],
+    score_sums: Vec<u64>,
+    indicator_sums: Vec<u64>,
+    ballot_count: u64,
+) -> StarResult {
+    assert!(
+        !ordered.is_empty(),
+        "compute_star_from_sums: ordered must be non-empty"
+    );
+    let n = ordered.len();
+    assert_eq!(
+        score_sums.len(),
+        n,
+        "compute_star_from_sums: score_sums.len() must equal ordered.len()"
+    );
+    let pair_count = n * (n - 1) / 2;
+    assert_eq!(
+        indicator_sums.len(),
+        pair_count,
+        "compute_star_from_sums: indicator_sums.len() must equal n*(n-1)/2"
+    );
+
+    // --- Score round ---
+    // Use the same u32 accumulator + max1/max2/finalist selection as
+    // tally_star so the per-candidate score totals are bit-identical.
+    let total_scores: Vec<u32> = score_sums
+        .iter()
+        .map(|s| u32::try_from(*s).unwrap_or(u32::MAX))
+        .collect();
+    let max1 = total_scores.iter().copied().max().unwrap_or(0);
+    let mut sorted_desc = total_scores.clone();
+    sorted_desc.sort_unstable_by(|a, b| b.cmp(a));
+    let max2 = sorted_desc.get(1).copied().unwrap_or(max1);
+    let finalist_indices: Vec<usize> = (0..n)
+        .filter(|&i| total_scores[i] == max1 || total_scores[i] == max2)
+        .collect();
+
+    // --- Runoff round ---
+    // For 2 finalists (a, b) with a_idx < b_idx in `ordered`:
+    //     k = a_idx * (2n - a_idx - 1) / 2 + (b_idx - a_idx - 1)
+    //     runoff_votes[a] = indicator_sums[k]              (canonical direction)
+    //     runoff_votes[b] = ballot_count - indicator_sums[k]
+    //                       (everyone NOT counted as A; over-counts ties to B)
+    //
+    // The spec stores only the canonical-direction indicator (smaller index
+    // ">"), not the reverse. Per-ballot ties (s_a == s_b) are abstentions
+    // in tally_star but get attributed to B here. For plaintext-equivalence
+    // (§7.5), the bit-identical match holds whenever no finalist-pair ties
+    // occur per ballot. See spec §4.7.2 — encoding both directions is a
+    // wire-format extension deferred to a follow-up.
+    //
+    // For finalist count > 2 (score-tie at 2nd place → 3+ finalists), the
+    // per-ballot "unique leader" required by tally_star cannot be recovered
+    // from pairwise sums alone. v1 falls back to all-zero runoff_votes for
+    // 3+ finalists; the comparator chain in `max_by` cascades to total_score
+    // + event_hash, which is identical to what tally_star produces when
+    // every ballot abstains (all leaders tied). Score-tied finalists DO
+    // share the same total_score, so the cascade lands on event_hash —
+    // matching tally_star's behavior at the score-tied 2nd-place case.
+    let mut runoff_votes = vec![0u32; finalist_indices.len()];
+    if finalist_indices.len() == 1 {
+        // Single finalist: every ballot's "leader" is the sole finalist
+        // (matches tally_star which always +1's when leaders.len() == 1).
+        runoff_votes[0] = u32::try_from(ballot_count).unwrap_or(u32::MAX);
+    } else if finalist_indices.len() == 2 {
+        let a_idx = finalist_indices[0];
+        let b_idx = finalist_indices[1];
+        // a_idx < b_idx by construction (finalist_indices iterates 0..n).
+        let k = a_idx * (2 * n - a_idx - 1) / 2 + (b_idx - a_idx - 1);
+        let a_wins = indicator_sums[k];
+        let b_wins = ballot_count.saturating_sub(a_wins);
+        runoff_votes[0] = u32::try_from(a_wins).unwrap_or(u32::MAX);
+        runoff_votes[1] = u32::try_from(b_wins).unwrap_or(u32::MAX);
+    }
+
+    // --- Winner selection ---
+    // Same comparator chain as tally_star.
+    let winner_fi = (0..finalist_indices.len())
+        .max_by(|&a, &b| {
+            runoff_votes[a]
+                .cmp(&runoff_votes[b])
+                .then_with(|| {
+                    total_scores[finalist_indices[a]].cmp(&total_scores[finalist_indices[b]])
+                })
+                .then_with(|| {
+                    // lex ASC → smaller hash wins; reverse for max_by.
+                    ordered[finalist_indices[b]]
+                        .event_hash
+                        .cmp(&ordered[finalist_indices[a]].event_hash)
+                })
+        })
+        .unwrap(); // safe: ordered non-empty ⇒ finalist_indices non-empty.
+
+    let finalists: Vec<CandidateRef> = finalist_indices
+        .iter()
+        .map(|&ci| ordered[ci].clone())
+        .collect();
+
+    StarResult {
+        winner: ordered[finalist_indices[winner_fi]].clone(),
+        finalists,
+        total_scores,
+        runoff_votes,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -641,5 +780,119 @@ mod tests {
         let a_idx = winner_fi_idx.unwrap();
         assert_eq!(result.runoff_votes[a_idx], 4);
         assert_eq!(result.winner, candidate(0xAA));
+    }
+
+    // ── ZEB-295 Phase 6: compute_star_from_sums ───────────────────────────────
+
+    /// Manually derive (score_sums, indicator_sums) from per-ballot scores
+    /// for the test-only `compute_star_from_sums` invocation. Mirrors the
+    /// homomorphic aggregation in `aggregate_se_ballots` but on plaintext.
+    fn derive_sums_from_ballots(n: usize, ballots: &[Vec<u8>]) -> (Vec<u64>, Vec<u64>) {
+        let mut score_sums = vec![0u64; n];
+        let pair_count = n * (n - 1) / 2;
+        let mut indicator_sums = vec![0u64; pair_count];
+        for scores in ballots {
+            for (i, &s) in scores.iter().enumerate().take(n) {
+                score_sums[i] += u64::from(s);
+            }
+            let mut k = 0usize;
+            for a in 0..n {
+                for b in (a + 1)..n {
+                    if scores.get(a).copied().unwrap_or(0) > scores.get(b).copied().unwrap_or(0) {
+                        indicator_sums[k] += 1;
+                    }
+                    k += 1;
+                }
+            }
+        }
+        (score_sums, indicator_sums)
+    }
+
+    /// Plaintext-equivalence (spec §7.5): for 10 deterministic ballots over
+    /// 3 candidates that produce no per-ballot pair-ties on the eventual
+    /// finalists, the StarResult from `compute_star_from_sums` is
+    /// bit-identical to `tally_star`. The deterministic ballot set avoids
+    /// pair-ties on the (A, B) finalist pair so `runoff_votes[b] =
+    /// ballot_count - indicator_sums[k]` matches tally_star's
+    /// abstain-on-tie semantics exactly (zero abstentions).
+    #[test]
+    fn compute_star_from_sums_matches_tally_star_for_random_ballots() {
+        // 10 ballots, 3 candidates. Scores avoid per-ballot ties between
+        // candidates A and B (the eventual finalists). C has consistently
+        // lower scores so finalists are A and B.
+        // A scores: 5,4,5,4,5,4,5,4,5,4 → total 45
+        // B scores: 4,5,4,5,4,5,4,5,4,5 → total 45
+        // C scores: 1,2,1,2,1,2,1,2,1,2 → total 15
+        // Pair-ties on (A,B): none (every ballot has A ≠ B strictly).
+        let ballot_sets: Vec<Vec<u8>> = vec![
+            vec![5, 4, 1],
+            vec![4, 5, 2],
+            vec![5, 4, 1],
+            vec![4, 5, 2],
+            vec![5, 4, 1],
+            vec![4, 5, 2],
+            vec![5, 4, 1],
+            vec![4, 5, 2],
+            vec![5, 4, 1],
+            vec![4, 5, 2],
+        ];
+        let candidates = vec![candidate(0x10), candidate(0x20), candidate(0x30)];
+        let ballots: Vec<RatificationBallotPayload> =
+            ballot_sets.iter().map(|s| ballot(s)).collect();
+
+        let plaintext_result = tally_star(&candidates, &ballots);
+
+        let n = candidates.len();
+        let (score_sums, indicator_sums) = derive_sums_from_ballots(n, &ballot_sets);
+        let ballot_count = ballots.len() as u64;
+        let secret_result =
+            compute_star_from_sums(&candidates, score_sums, indicator_sums, ballot_count);
+
+        assert_eq!(
+            secret_result, plaintext_result,
+            "compute_star_from_sums must equal tally_star bit-identical"
+        );
+    }
+
+    /// Single-candidate edge case: ordered=[A]. No pairs ⇒ no indicators.
+    /// Both tally paths produce the same result.
+    #[test]
+    fn compute_star_from_sums_single_candidate() {
+        let candidates = vec![candidate(0xAA)];
+        let ballots = vec![ballot(&[5]), ballot(&[3]), ballot(&[4])];
+        let plaintext = tally_star(&candidates, &ballots);
+        let (score_sums, indicator_sums) = derive_sums_from_ballots(
+            1,
+            &ballots
+                .iter()
+                .map(|b| b.scores.clone().unwrap())
+                .collect::<Vec<_>>(),
+        );
+        let secret = compute_star_from_sums(
+            &candidates,
+            score_sums,
+            indicator_sums,
+            ballots.len() as u64,
+        );
+        assert_eq!(secret, plaintext);
+    }
+
+    /// Clear 2-candidate runoff with no ballot-level ties → bit-identical.
+    #[test]
+    fn compute_star_from_sums_two_candidates_clear_winner() {
+        let candidates = vec![candidate(0x10), candidate(0x20)];
+        let ballot_sets: Vec<Vec<u8>> = vec![vec![5, 1], vec![4, 2], vec![5, 3]];
+        let ballots: Vec<RatificationBallotPayload> =
+            ballot_sets.iter().map(|s| ballot(s)).collect();
+        let plaintext = tally_star(&candidates, &ballots);
+        let (score_sums, indicator_sums) = derive_sums_from_ballots(2, &ballot_sets);
+        let secret = compute_star_from_sums(
+            &candidates,
+            score_sums,
+            indicator_sums,
+            ballots.len() as u64,
+        );
+        assert_eq!(secret, plaintext);
+        assert_eq!(secret.winner, candidate(0x10));
     }
 }

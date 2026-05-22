@@ -40,7 +40,81 @@ use tauri::{AppHandle, Emitter};
 use crate::community_dfrost_log_engine::DfrostLogRegistry;
 use crate::community_voting_core::{PollEventKindCode, PollId, SignedVotingEvent, Tier};
 use crate::community_voting_log::VotingLog;
+use crate::community_voting_tier3::{CommitteeOracle, CommitteePublicState};
 use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+
+// ── ZEB-295 Phase 6 Task 8: production CommitteeOracle ──────────────────────
+
+/// Production `CommitteeOracle` backed by a snapshot of the per-community
+/// `DfrostLog` committee state at oracle-install time.
+///
+/// Phase 6 v1 caching rationale: the `CommitteeOracle` trait is sync (no
+/// `async fn` — the apply path is sync), but the underlying dfrost log
+/// lives behind a `tokio::sync::Mutex`. Rather than blocking the async
+/// runtime via `blocking_lock` at every oracle query, we snapshot the
+/// committee state once at install time (typically PollCreate apply,
+/// after DKG has finalised) and serve queries from the cache. This is
+/// correct as long as the committee doesn't rotate mid-poll — CHURP
+/// rotation handling (multi-epoch snapshot tracking) is a v2 concern
+/// per spec §5.2/§5.3. The current dfrost wiring stores only the
+/// latest committee state in `committee_state` anyway, so multi-epoch
+/// recovery is constrained to the snapshot epoch in Phase 6.
+///
+/// `None` returns (committee not yet active, requested epoch doesn't
+/// match snapshot) flow through to the existing "silent drop on
+/// missing prerequisite" convention in the apply path.
+#[derive(Debug, Clone)]
+pub struct DfrostLogCommitteeOracle {
+    /// CHURP epoch this snapshot represents.
+    pub epoch: u32,
+    /// Joint verifying key Y = G · x (compressed Ristretto, 32 bytes).
+    pub joint_verifying_key: [u8; 32],
+    /// Per-member verifying shares Y_i = G · x_i.
+    pub verifying_shares: BTreeMap<OwnerAddr, [u8; 32]>,
+    /// FROST `min_signers` (= ElGamal threshold `t`).
+    pub threshold: u16,
+}
+
+impl DfrostLogCommitteeOracle {
+    /// Construct a fresh oracle by snapshotting the current committee state
+    /// from a per-community `DfrostLogEngine`. Returns `None` if no DKG has
+    /// completed yet (committee inactive).
+    pub async fn from_dfrost_engine<R: tauri::Runtime>(
+        engine: &crate::community_dfrost_log_engine::DfrostLogEngine<R>,
+    ) -> Option<Self> {
+        let epoch = engine.latest_committee_epoch().await?;
+        let (joint_verifying_key, verifying_shares, threshold) =
+            engine.committee_snapshot_at_epoch(epoch).await?;
+        Some(Self {
+            epoch,
+            joint_verifying_key,
+            verifying_shares,
+            threshold,
+        })
+    }
+}
+
+impl CommitteeOracle for DfrostLogCommitteeOracle {
+    fn committee_at_epoch(&self, epoch: u32) -> Option<CommitteePublicState> {
+        // Phase 6 v1: snapshot stores ONE epoch. Queries for other epochs
+        // return None — the recover_secret_tally path falls through to the
+        // next epoch, eventually returning None overall if the requested
+        // epoch isn't the snapshot epoch. See spec §5.3 multi-epoch
+        // recovery (deferred to v2 with CHURP rotation event log).
+        if epoch != self.epoch {
+            return None;
+        }
+        Some(CommitteePublicState {
+            epoch,
+            joint_verifying_key: self.joint_verifying_key,
+            verifying_shares: self.verifying_shares.clone(),
+            threshold: self.threshold,
+        })
+    }
+    fn latest_epoch(&self) -> Option<u32> {
+        Some(self.epoch)
+    }
+}
 
 // ── BeaconRequester type alias ───────────────────────────────────────────────
 
@@ -916,7 +990,13 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                 Some(t) => t,
                 None => return,
             };
-            if t3.close_event_hash.is_none() || t3.result.is_some() {
+            // ZEB-295 Phase 6: this branch handles pu-mode only. se-mode polls
+            // route through `maybe_emit_tier3_result_secret` below, which
+            // gates on tally-share threshold rather than just close_event_hash.
+            if t3.meta.config.privacy_mode != "pu"
+                || t3.close_event_hash.is_none()
+                || t3.result.is_some()
+            {
                 None
             } else {
                 // Build candidate ordering. Same pattern as verify_sr.
@@ -981,6 +1061,229 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                     poll_id = %hex::encode(pid.0),
                     "engine-auto kd=rs publish rejected (race loser?)"
                 );
+            }
+        }
+
+        // ── ZEB-295 Phase 6 Task 8: kd=ts TallyShare orchestration ──────
+        //
+        // Production-side stub. Fires when (privacy_mode == "se", kd=cl
+        // applied, we're a committee member at the latest epoch, we
+        // haven't yet emitted for this (actor, epoch)). The full
+        // production wiring needs:
+        //   1. Access to this engine's local FROST KeyPackage. The
+        //      voting engine doesn't hold a direct reference to the
+        //      dfrost engine's KeyPackage today — it goes through
+        //      `dfrost_registry.get(...)` + `local_key_package().await`.
+        //   2. Computing aggregates + per-aggregate partial shares +
+        //      DLEQ proofs (all crypto primitives already exist in
+        //      `community_voting_tier3_crypto` / `community_voting_tier3_nizk`).
+        //
+        // Phase 6 v1 ships this as a debug-log stub — Task 10's
+        // integration test will exercise `recover_secret_tally` directly
+        // without the engine path. Full kd=ts emission is filed for the
+        // Task 10 integration test or a follow-up PR once the test
+        // surface defines the exact API shape needed.
+        self.maybe_emit_tally_share(pid).await;
+
+        // ── ZEB-295 Phase 6 Task 8: kd=rs (secret-mode) orchestration ───
+        self.maybe_emit_tier3_result_secret(pid, &signing_key, self_owner)
+            .await;
+    }
+
+    /// ZEB-295 Phase 6 Task 8 (production-side, stubbed): emit a kd=ts
+    /// TallyShare event after ratification close if this engine is a
+    /// committee member at the latest epoch and hasn't yet emitted.
+    ///
+    /// **Phase 6 v1 status: minimal stub.** Full production wiring
+    /// requires plumbing the local FROST KeyPackage through to this
+    /// hook. The KeyPackage IS accessible via the dfrost registry
+    /// (`dfrost_registry.get(community_id).await?.local_key_package().await`),
+    /// but Task 10's integration test will drive the exact API shape;
+    /// we ship the gate skeleton + a debug-log placeholder here so
+    /// Task 10 can fill in the body without changing call sites.
+    ///
+    /// The corresponding `maybe_emit_tier3_result_secret` is fully
+    /// implemented below — it consumes apply-state-side data only
+    /// (tally_shares + committee oracle) with no engine-side keys
+    /// required.
+    async fn maybe_emit_tally_share(self: &Arc<Self>, pid: &PollId) {
+        // (1) Quick mode + state gates.
+        let (privacy_mode_se, close_done, latest_epoch_opt, already_emitted_or_not_committee) = {
+            let log = self.voting_log.lock().await;
+            let state = match log.polls.get(pid) {
+                Some(s) => s,
+                None => return,
+            };
+            let t3 = match state.tier_state.as_tier3() {
+                Some(t) => t,
+                None => return,
+            };
+            let mode_se = t3.meta.config.privacy_mode == "se";
+            let close = t3.close_event_hash.is_some();
+            let latest = t3.committee_oracle.latest_epoch();
+            // We can't read self_owner without local_signing — but the
+            // outer call site has already filtered on local_signing. Even
+            // so, defensively re-check before any keypair access.
+            let self_owner = {
+                let r = self.local_signing.read().await;
+                r.as_ref().map(|(_, o)| *o)
+            };
+            let already_or_no = match (latest, self_owner) {
+                (Some(ep), Some(owner)) => {
+                    // already emitted for (owner, ep)?
+                    let already = t3.secret_tally.tally_shares.contains_key(&(owner, ep));
+                    // not on the committee at latest epoch?
+                    let not_committee = match t3.committee_oracle.committee_at_epoch(ep) {
+                        Some(cs) => !cs.verifying_shares.contains_key(&owner),
+                        None => true,
+                    };
+                    already || not_committee
+                }
+                _ => true,
+            };
+            (mode_se, close, latest, already_or_no)
+        };
+        if !privacy_mode_se || !close_done || already_emitted_or_not_committee {
+            return;
+        }
+        let _ = latest_epoch_opt;
+
+        // (2) Stub: full kd=ts emission deferred to Task 10's integration
+        // test wiring. The crypto primitives + payload-building blocks
+        // all exist (community_voting_tier3_crypto::partial_decrypt_share,
+        // community_voting_tier3_nizk::dleq_prove, build_signed_tally_share);
+        // the missing piece is a clean accessor for this engine's local
+        // KeyPackage. Tracked as follow-up.
+        tracing::debug!(
+            poll_id = %hex::encode(pid.0),
+            "ZEB-295 Task 8 minimal: kd=ts emission deferred — full wiring requires Task 10 integration-test setup"
+        );
+    }
+
+    /// ZEB-295 Phase 6 Task 8: emit a kd=rs PollResult after se-mode
+    /// tally recovery succeeds. Fires when (privacy_mode == "se", no
+    /// kd=rs yet, recover_secret_tally returns Some(StarResult)).
+    ///
+    /// This hook consumes only apply-state-side data (poll's
+    /// tally_shares + committee oracle); no engine-side FROST key
+    /// material needed. Multi-engine deterministic: Lagrange invariance
+    /// plus canonical share-subset selection means every replica that
+    /// crosses threshold recovers the same StarResult bit-identically.
+    async fn maybe_emit_tier3_result_secret(
+        self: &Arc<Self>,
+        pid: &PollId,
+        signing_key: &Arc<ed25519_dalek::SigningKey>,
+        self_owner: OwnerAddr,
+    ) {
+        // (1) Snapshot under lock, compute result, drop lock before
+        // recursive publish_event.
+        let trigger_result: Option<crate::community_voting_star::StarResult> = {
+            let log = self.voting_log.lock().await;
+            let state = match log.polls.get(pid) {
+                Some(s) => s,
+                None => return,
+            };
+            let t3 = match state.tier_state.as_tier3() {
+                Some(t) => t,
+                None => return,
+            };
+            if t3.meta.config.privacy_mode != "se" || t3.result.is_some() {
+                None
+            } else {
+                // Build candidate ordering (mirror kd=rs pu-mode path).
+                let sq = crate::community_voting_tier3::synthesize_status_quo(&t3.meta.poll_id);
+                let sq_hash = sq.event_hash;
+                let mut all_candidates = t3.candidates.clone();
+                all_candidates.push(sq);
+                let primary_size = t3.meta.config.sortition_size as usize;
+                let advancers = match crate::community_voting_tier3::drafting_advancers(
+                    &all_candidates,
+                    primary_size,
+                    sq_hash,
+                ) {
+                    Some(a) => a,
+                    None => {
+                        // Pre-Drafting stage — can't happen given the
+                        // close-event invariant in the kd=ts apply path
+                        // (kd=ts only stored once Ratification is past).
+                        return;
+                    }
+                };
+                let ordered = crate::community_voting_tier3::ratification_candidates_ordering(
+                    &advancers, sq_hash,
+                );
+                crate::community_voting_tier3::recover_secret_tally(t3, &ordered)
+            }
+        };
+
+        if let Some(result) = trigger_result {
+            let hlc = self.reserve_next_local_hlc().await;
+            let rs_ev = match crate::community_voting_core::build_signed_poll_result_tier3(
+                signing_key,
+                self_owner,
+                *pid,
+                result,
+                hlc,
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        poll_id = %hex::encode(pid.0),
+                        "engine-auto kd=rs (secret) build_signed_poll_result_tier3 failed"
+                    );
+                    return;
+                }
+            };
+            if let Err(e) = Box::pin(self.publish_event(rs_ev, None)).await {
+                tracing::debug!(
+                    error = %e,
+                    poll_id = %hex::encode(pid.0),
+                    "engine-auto kd=rs (secret) publish rejected (race loser?)"
+                );
+            }
+        }
+    }
+
+    /// ZEB-295 Phase 6 Task 8: install a `DfrostLogCommitteeOracle`
+    /// snapshot on the freshly-applied Tier 3 poll. Best-effort — if
+    /// the dfrost registry is unwired or no DKG has completed yet, the
+    /// poll keeps its default `NullCommitteeOracle` and any se-mode
+    /// kd=ts apply silently drops until a real committee exists.
+    async fn maybe_install_committee_oracle_for_poll(self: &Arc<Self>, pid: &PollId) {
+        // Acquire the dfrost engine; bail if registry/engine unwired.
+        let dfrost_engine = {
+            let dr = self.dfrost_registry.lock().await;
+            match dr.as_ref() {
+                Some(reg) => reg.get(self.community_id).await,
+                None => None,
+            }
+        };
+        let engine = match dfrost_engine {
+            Some(e) => e,
+            None => {
+                tracing::debug!(
+                    poll_id = %hex::encode(pid.0),
+                    "engine-auto: dfrost engine unwired; skipping CommitteeOracle install"
+                );
+                return;
+            }
+        };
+        let oracle = match DfrostLogCommitteeOracle::from_dfrost_engine(engine.as_ref()).await {
+            Some(o) => o,
+            None => {
+                tracing::debug!(
+                    poll_id = %hex::encode(pid.0),
+                    "engine-auto: no DKG completed yet; skipping CommitteeOracle install"
+                );
+                return;
+            }
+        };
+        // Re-acquire the voting_log lock briefly to mutate t3.committee_oracle.
+        let mut log = self.voting_log.lock().await;
+        if let Some(ps) = log.polls.get_mut(pid) {
+            if let Some(t3) = ps.tier_state.as_tier3_mut() {
+                t3.install_committee_oracle(Arc::new(oracle));
             }
         }
     }
@@ -1129,6 +1432,18 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         // request uses it via the poll's meta (not a fresh dfrost query).
         // Fire-and-forget; errors are logged inside maybe_trigger_beacon_for_tier3_create.
         self.maybe_trigger_beacon_for_tier3_create(&event).await;
+
+        // (3b) ZEB-295 Phase 6: install production CommitteeOracle on the
+        // freshly-created Tier 3 poll. Snapshot once from the dfrost log;
+        // future queries serve from the cache (CHURP rotation handling
+        // deferred to v2 per spec §5.2). Failure to install (no DKG yet,
+        // registry not wired) is non-fatal — the poll keeps its default
+        // NullCommitteeOracle, and any se-mode kd=ts apply will silently
+        // drop until a real committee is available.
+        if event.tier == Tier::Sortition && event.kind == PollEventKindCode::PollCreate {
+            self.maybe_install_committee_oracle_for_poll(&applied_poll_id)
+                .await;
+        }
 
         // (4) Broadcast. `send().await` waits for adapter capacity rather
         // than dropping on a full channel — Phase 2 has no backfill, so
@@ -1467,6 +1782,63 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                         error = %e,
                         poll_id = %pid_hex,
                         "voting-tier3-finalized emit failed (non-fatal)"
+                    );
+                }
+            }
+        }
+
+        // ZEB-295 Phase 6 Task 8: emit voting-tier3-tally-share-applied
+        // on every accepted kd=ts so the frontend can render incremental
+        // committee-share-count progress in the awaiting-tally se-mode
+        // state. Snapshot share_count + threshold at the latest epoch
+        // from the post-apply state.
+        if applied_event.kind == PollEventKindCode::TallyShare {
+            // Decode the applied payload's epoch (we need it for the DTO
+            // even though we count shares at the *latest* epoch on the
+            // poll — for the simple case they match).
+            let epoch_from_payload: Option<u32> = ciborium::de::from_reader::<
+                crate::community_voting_core::TallySharePayload,
+                _,
+            >(&applied_event.payload[..])
+            .ok()
+            .map(|p| p.committee_epoch);
+
+            // Compute share_count + threshold under a brief re-acquire.
+            let counts: Option<(u32, usize, u16)> = {
+                let log = self.voting_log.lock().await;
+                log.polls
+                    .get(pid)
+                    .and_then(|ps| ps.tier_state.as_tier3())
+                    .and_then(|t3| {
+                        let ep =
+                            epoch_from_payload.or_else(|| t3.committee_oracle.latest_epoch())?;
+                        let share_count = t3
+                            .secret_tally
+                            .tally_shares
+                            .iter()
+                            .filter(|((_addr, e), _entries)| *e == ep)
+                            .count();
+                        let threshold = t3
+                            .committee_oracle
+                            .committee_at_epoch(ep)
+                            .map(|cs| cs.threshold)
+                            .unwrap_or(0);
+                        Some((ep, share_count, threshold))
+                    })
+            };
+            if let Some((epoch, share_count, threshold)) = counts {
+                let payload = serde_json::json!({
+                    "communityId": community_id_hex,
+                    "pollId": pid_hex,
+                    "epoch": epoch,
+                    "shareCount": share_count,
+                    "threshold": threshold,
+                });
+                if let Err(e) = app_handle.emit("voting-tier3-tally-share-applied", &payload) {
+                    tracing::warn!(
+                        error = %e,
+                        poll_id = %pid_hex,
+                        "voting-tier3-tally-share-applied emit failed (non-fatal)"
                     );
                 }
             }
@@ -1868,6 +2240,15 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         // (1) D-FROST beacon for Tier 3 PollCreate. Internally gated
         // on event.tier + event.kind + beacon_requester presence.
         self.maybe_trigger_beacon_for_tier3_create(&event).await;
+
+        // (1a) ZEB-295 Phase 6: install production CommitteeOracle on a
+        // freshly-applied inbound Tier 3 PollCreate. Mirrors the outbound
+        // install in `publish_event` so peer-received polls see the same
+        // committee snapshot.
+        if event.tier == Tier::Sortition && event.kind == PollEventKindCode::PollCreate {
+            self.maybe_install_committee_oracle_for_poll(&applied_poll_id)
+                .await;
+        }
 
         // (2) Tier 3 lifecycle emit. Cheap tier gate avoids touching
         // app_handle for non-Tier-3 traffic.
