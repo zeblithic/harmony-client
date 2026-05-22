@@ -1143,11 +1143,23 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         // (1) Quick mode + state gates, plus snapshot of all apply-state
         // we need to compute shares. Drop the lock BEFORE the async
         // crypto work + dfrost engine acquire.
+        //
+        // Cursor PR #155 review-round-3 (F23): the previous
+        // `tally_shares.contains_key(&(self_owner, latest_epoch))` early-
+        // bail was wrong — it prevented re-emission when the homomorphic
+        // aggregate changed (late-arriving ballots reorder by LWW, which
+        // changes `c1_agg`, which invalidates the DLEQ proofs in our
+        // previously-published share). C2's LWW upsert in apply means a
+        // newer-HLC kd=ts from us OVERWRITES the stale one; so the
+        // correct gate is "does our stored share still match what we'd
+        // compute against the current aggregate?" We carry the stored
+        // entry through the snapshot for post-key-fetch comparison.
         struct Snapshot {
             n: usize,
             aggregates: Vec<crate::community_voting_core::EncCiphertext>,
             committee_epoch: u64,
             y_i_compressed: [u8; 32],
+            stored_first_share: Option<[u8; 32]>,
         }
         let snapshot: Option<Snapshot> = {
             let log = self.voting_log.lock().await;
@@ -1166,14 +1178,6 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                 Some(e) => e,
                 None => return,
             };
-            // Already emitted at this epoch by us?
-            if t3
-                .secret_tally
-                .tally_shares
-                .contains_key(&(self_owner, latest_epoch))
-            {
-                return;
-            }
             // Committee membership + own verifying share.
             let cs = match t3.committee_oracle.committee_at_epoch(latest_epoch) {
                 Some(c) => c,
@@ -1183,6 +1187,14 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                 Some(b) => *b,
                 None => return, // not on committee
             };
+            // Capture the first share-entry we previously published at
+            // this (actor, epoch), if any — used post-key-fetch to detect
+            // unchanged-aggregate idempotency and skip the publish.
+            let stored_first_share = t3
+                .secret_tally
+                .tally_shares
+                .get(&(self_owner, latest_epoch))
+                .and_then(|rec| rec.entries.first().map(|e| e.share));
             // Derive n via the canonical ratification ordering, matching
             // the apply path's n derivation (C2 fix). Pre-Drafting state
             // is silently skipped — kd=ts can only meaningfully emit
@@ -1227,6 +1239,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                 aggregates,
                 committee_epoch: latest_epoch,
                 y_i_compressed,
+                stored_first_share,
             })
         };
         let snap = match snapshot {
@@ -1260,6 +1273,34 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             }
         };
         let x_i = crate::community_dfrost_crypto::signing_share_as_scalar(&kp);
+
+        // (2.5) Aggregate-change idempotency check. If we have a stored
+        // share at this (actor, epoch) AND its first entry matches what
+        // we'd compute for the current aggregate's c1_agg[0], then the
+        // homomorphic aggregate hasn't changed since our last emit — no
+        // need to re-publish. If they differ, late-arriving ballots have
+        // shifted the aggregate; we re-emit so the LWW upsert in apply
+        // replaces our stale share with a freshly-bound one (CodeRabbit
+        // F23 fix).
+        if let Some(stored) = snap.stored_first_share {
+            let c1_agg_0 = match crate::community_voting_tier3_crypto::decompress_point(
+                &snap.aggregates[0].c1,
+            ) {
+                Some(p) => p,
+                None => return,
+            };
+            let expected_first =
+                crate::community_voting_tier3_crypto::partial_decrypt_share(&c1_agg_0, &x_i);
+            let expected_compressed =
+                crate::community_voting_tier3_crypto::compress_point(&expected_first);
+            if expected_compressed == stored {
+                tracing::debug!(
+                    poll_id = %hex::encode(pid.0),
+                    "engine-auto kd=ts: aggregate unchanged since last emit — skipping"
+                );
+                return;
+            }
+        }
 
         // (3) Decompress own verifying share Y_i once for DLEQ proofs.
         let y_i = match crate::community_voting_tier3_crypto::decompress_point(&snap.y_i_compressed)
@@ -2500,6 +2541,18 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             // or have no HLC tracker installed for engine-auto mints.
             if let Some((signing_key, self_owner)) = local_signing_opt {
                 if self.hlc_tracker.is_some() && self.device_id.is_some() {
+                    // CodeRabbit PR #155 review-round-3 (F24): a committee
+                    // member that learns of kd=cl via PEER inbound (rather
+                    // than initiating it locally) never executes the
+                    // outbound orchestration cascade, so without minting
+                    // here it would never publish its kd=ts. With
+                    // threshold > 1, secret-mode polls stall indefinitely.
+                    // Mint our share first, then attempt finalize — the
+                    // emit's apply-time replay path will trigger
+                    // finalize again via the normal inbound dispatch on
+                    // the just-published event.
+                    self.maybe_emit_tally_share(&applied_poll_id, &signing_key, self_owner)
+                        .await;
                     self.try_finalize_secret_tally(&applied_poll_id, &signing_key, self_owner)
                         .await;
                 }
