@@ -19,7 +19,7 @@
 All implementer subagents MUST:
 
 - Run from project root unless instructed otherwise. **Cargo commands run from `src-tauri/`. Frontend commands run from repo root.**
-- 5 backend gates per task:
+- 4 backend gates per task:
   1. `cd src-tauri && cargo fmt --all -- --check`
   2. `cd src-tauri && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`
   3. `cd src-tauri && cargo check --locked --all-targets --features test-fixtures` — MSRV gate — declared toolchain via `rust-toolchain.toml`. Should be fast (incremental check, no codegen).

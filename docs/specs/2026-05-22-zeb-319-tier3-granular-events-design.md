@@ -254,7 +254,7 @@ Extend `src/lib/components/__tests__/Tier3ProposalPanel.test.ts`:
 
 ## 7. Hard rules (memory-locked)
 
-- 5 backend gates from `src-tauri/`: `cargo fmt --all -- --check` + `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings` + `cargo check --locked --all-targets --features test-fixtures` (MSRV gate — declared toolchain via `rust-toolchain.toml`; fast incremental check, no codegen) + `cargo nextest run --locked --workspace --all-targets --features test-fixtures` (10-min kill switch).
+- 4 backend gates from `src-tauri/`: `cargo fmt --all -- --check` + `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings` + `cargo check --locked --all-targets --features test-fixtures` (MSRV gate — declared toolchain via `rust-toolchain.toml`; fast incremental check, no codegen) + `cargo nextest run --locked --workspace --all-targets --features test-fixtures` (10-min kill switch).
 - 2 frontend gates from repo root via npx: `npx tsc --noEmit` + `npx vitest run`.
 - No worktrees — `git checkout -b` in main repo only (branch `zeb-319-tier3-granular-events` already created).
 - Pull-before-work satisfied: branch is off `origin/main` `9ab41f6`.
