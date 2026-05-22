@@ -25,6 +25,7 @@ fn default_policy_encodes_to_empty_cbor_map() {
 fn notify_on_delegate_signal_true_encodes_with_nd_key() {
     let p = CommunityVotingPolicy {
         notify_on_delegate_signal: true,
+        tier3_privacy_mode_default: "pu".into(),
     };
     let mut buf = Vec::new();
     ciborium::ser::into_writer(&p, &mut buf).expect("encode true");
@@ -33,6 +34,8 @@ fn notify_on_delegate_signal_true_encodes_with_nd_key() {
     //   0x62 = text string of 2 bytes
     //   'n' 'd' = the key
     //   0xF5 = bool(true)
+    // The tier3_privacy_mode_default="pu" default is elided by
+    // skip_serializing_if = "is_pu_default" — wire-format invariant.
     assert_eq!(buf, vec![0xA1, 0x62, b'n', b'd', 0xF5]);
 }
 
@@ -49,6 +52,7 @@ fn absent_field_decodes_as_default_false() {
 fn round_trip_preserves_field() {
     let p = CommunityVotingPolicy {
         notify_on_delegate_signal: true,
+        tier3_privacy_mode_default: "pu".into(),
     };
     let mut buf = Vec::new();
     ciborium::ser::into_writer(&p, &mut buf).expect("encode");

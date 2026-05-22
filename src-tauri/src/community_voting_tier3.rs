@@ -154,7 +154,7 @@ pub enum ValidateError {
     DraftingWindowTooSmall(u32),
     #[error("ratification_window_seconds {0} below floor 60")]
     RatificationWindowTooSmall(u32),
-    #[error("unknown privacy_mode {0:?}; Phase 4a-main only accepts \"pu\"")]
+    #[error("unknown privacy_mode {0:?}; accepts \"pu\" or \"se\" (\"rf\" reserved for Phase 7)")]
     UnknownPrivacyMode(String),
     #[error("unknown incentive_mode {0:?}; must be one of a/b/c/d")]
     UnknownIncentiveMode(String),
@@ -200,8 +200,9 @@ pub fn validate_tier3_poll_config(pd: &Tier3PollConfigPayload) -> Result<(), Val
             pd.ratification_window_seconds,
         ));
     }
-    if pd.privacy_mode != "pu" {
-        // "se" reserved for Phase 6; "rf" reserved for Phase 7.
+    if !["pu", "se"].contains(&pd.privacy_mode.as_str()) {
+        // ZEB-295 Phase 6: "se" (ballot-secret threshold-ElGamal) is now
+        // accepted; "rf" (receipt-free) remains reserved for Phase 7.
         return Err(ValidateError::UnknownPrivacyMode(pd.privacy_mode.clone()));
     }
     if !["a", "b", "c", "d"].contains(&pd.incentive_mode.as_str()) {
@@ -2265,15 +2266,12 @@ mod tests {
         );
     }
 
-    // Test 8: privacy_mode "se" rejected (Phase 6 forward-compat)
+    // Test 8: privacy_mode "se" accepted (ZEB-295 Phase 6)
     #[test]
-    fn validate_config_privacy_mode_se_rejected_with_unknown_privacy_mode() {
+    fn validate_config_privacy_mode_se_accepted() {
         let mut c = valid_config();
         c.privacy_mode = "se".into();
-        assert_eq!(
-            validate_tier3_poll_config(&c),
-            Err(ValidateError::UnknownPrivacyMode("se".into()))
-        );
+        assert_eq!(validate_tier3_poll_config(&c), Ok(()));
     }
 
     // Test 9: privacy_mode "rf" rejected (Phase 7 forward-compat)

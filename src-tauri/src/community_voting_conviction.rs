@@ -134,7 +134,7 @@ pub struct Tier2PollConfig {
 /// All fields default to `false` so existing communities that don't
 /// have a policy stored (or have an older serialized policy missing
 /// new fields) preserve their pre-policy behavior.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommunityVotingPolicy {
     /// ZEB-298: when `true`, the engine emits
     /// `voting-delegate-signaled-on-your-behalf` on inbound kd=signal
@@ -152,6 +152,42 @@ pub struct CommunityVotingPolicy {
     /// this invariant.
     #[serde(default, rename = "nd", skip_serializing_if = "::std::ops::Not::not")]
     pub notify_on_delegate_signal: bool,
+
+    /// ZEB-295 Phase 6: community-wide default for Tier 3 PollCreate
+    /// `privacy_mode` when the proposer does not explicitly set one in the
+    /// IPC payload. Accepts `"pu"` (public scores) or `"se"` (ballot-secret
+    /// threshold-ElGamal); `"rf"` is reserved for Phase 7. The per-poll
+    /// `Tier3PollConfigPayload.privacy_mode` always wins — this field is
+    /// only consulted when the proposer omits the override.
+    ///
+    /// Wire-format stability: `skip_serializing_if = "is_pu_default"` ensures
+    /// a policy whose only divergence from default is this `"pu"` value still
+    /// encodes as the empty CBOR map (`0xA0`), preserving the upgrade-in-
+    /// place property pinned by `wire_format_community_voting_policy_fixtures.rs`.
+    #[serde(
+        default = "default_tier3_privacy_mode",
+        rename = "t3",
+        skip_serializing_if = "is_pu_default"
+    )]
+    pub tier3_privacy_mode_default: String,
+}
+
+fn default_tier3_privacy_mode() -> String {
+    "pu".into()
+}
+
+#[allow(clippy::ptr_arg)] // serde's skip_serializing_if requires &String, not &str
+fn is_pu_default(s: &String) -> bool {
+    s == "pu"
+}
+
+impl Default for CommunityVotingPolicy {
+    fn default() -> Self {
+        Self {
+            notify_on_delegate_signal: false,
+            tier3_privacy_mode_default: default_tier3_privacy_mode(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -796,6 +832,18 @@ impl DelegationGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── ZEB-295 Phase 6: policy default for Tier 3 privacy_mode ──────────
+
+    /// `CommunityVotingPolicy::default()` must yield `"pu"` so existing
+    /// communities (which never set the field) stay on public-ballot
+    /// scores until the proposer opts in to ballot-secret per poll.
+    #[test]
+    fn community_voting_policy_default_tier3_privacy_mode_is_pu() {
+        let p = CommunityVotingPolicy::default();
+        assert_eq!(p.tier3_privacy_mode_default, "pu");
+        assert!(!p.notify_on_delegate_signal);
+    }
 
     /// Tolerance for "approximately equal" comparisons against f64 oracles,
     /// ≈ 6 fractional digits in Q32 units. The Taylor truncation + integer

@@ -3662,6 +3662,7 @@ mod tests {
             // Community policy.
             log.set_policy(CommunityVotingPolicy {
                 notify_on_delegate_signal: notify_policy,
+                tier3_privacy_mode_default: "pu".into(),
             });
 
             pid
@@ -3975,6 +3976,7 @@ mod tests {
             // Community policy enables the notify hook.
             log.set_policy(CommunityVotingPolicy {
                 notify_on_delegate_signal: true,
+                tier3_privacy_mode_default: "pu".into(),
             });
 
             pid
