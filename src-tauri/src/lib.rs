@@ -30,6 +30,7 @@ pub mod community_voting_sortition;
 pub mod community_voting_star;
 pub mod community_voting_tick;
 pub mod community_voting_tier3;
+pub mod community_voting_tier3_crypto;
 pub mod content_index;
 pub mod content_store;
 pub mod dm_crypto;
