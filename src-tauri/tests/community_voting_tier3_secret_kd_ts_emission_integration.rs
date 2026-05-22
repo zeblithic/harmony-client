@@ -251,6 +251,10 @@ async fn engine_orchestration_emits_kd_ts_after_kd_cl_se_mode() {
     let poll_id = PollId([0x77; 32]);
     let config = Tier3PollConfigPayload {
         proposal_text: "kd=ts emission smoke".into(),
+        // Drafting threshold = ceil(sortition_size / 2). Keep small so 3
+        // synthetic approvers per candidate (the test's full committee)
+        // exceeds the threshold and drafting_advancers returns both
+        // candidates → n=3 (2 candidates + status_quo).
         sortition_size: 20,
         deliberation_window_seconds: 10,
         drafting_window_seconds: 10,
@@ -290,18 +294,20 @@ async fn engine_orchestration_emits_kd_ts_after_kd_cl_se_mode() {
     };
     t3.install_committee_oracle(Arc::new(oracle));
 
-    // Add 2 synthetic candidates with full approvals so they pass the
-    // drafting threshold gate (matches the canonical
-    // `ratification_candidates_ordering` derivation used by both the
-    // apply path and the emission hook).
-    let all_approvals: std::collections::HashSet<OwnerAddr> =
-        member_addrs.iter().copied().collect();
+    // Add 2 synthetic candidates with ≥ ceil(sortition_size/2) = 10
+    // synthetic approvers each so drafting_advancers admits them and
+    // ratification_candidates_ordering returns n=3 (2 candidates +
+    // status_quo). The approver OwnerAddrs don't need to be in the
+    // electorate — drafting_advancers only counts set cardinality of
+    // `approvals` against the threshold.
+    let approvals: std::collections::HashSet<OwnerAddr> =
+        (0u8..10).map(|i| OwnerAddr([0xA0 | i; 16])).collect();
     for i in 0..2u8 {
         t3.candidates.push(DraftCandidateState {
             event_hash: [0xC0 | i; 32],
             text: format!("candidate {i}"),
             proposer: Some(self_owner),
-            approvals: all_approvals.clone(),
+            approvals: approvals.clone(),
         });
     }
     // Synthesize ratification ballots so `aggregate_se_ballots` returns
@@ -387,46 +393,11 @@ async fn engine_orchestration_emits_kd_ts_after_kd_cl_se_mode() {
     // n=3 (2 candidates + status_quo); n + C(n,2) = 3 + 3 = 6 entries.
     assert_eq!(payload.entries.len(), 6);
 
-    // (7) Apply the emitted kd=ts back to the state and confirm the
-    // T1/T2 verify gates accept it — round-trip soundness check that
-    // the emission is bit-exact with what the apply path expects.
-    let mut buf = Vec::new();
-    ciborium::into_writer(&payload, &mut buf).expect("encode");
-    let pre_share_count = {
-        let log = voting_log.lock().await;
-        let t3 = log
-            .polls
-            .get(&poll_id)
-            .and_then(|ps| ps.tier_state.as_tier3())
-            .expect("t3 present");
-        t3.secret_tally.tally_shares.len()
-    };
-    assert_eq!(pre_share_count, 0, "no shares before kd=ts apply");
-
-    let hlc = Hlc {
-        wall_ms: 30_001,
-        logical: 0,
-        device_id: device_id.clone(),
-    };
-    let ev = SignedVotingEvent {
-        tag: 'p',
-        version: 1,
-        tier: Tier::Sortition,
-        kind: PollEventKindCode::TallyShare,
-        hlc: hlc.clone(),
-        actor: self_owner,
-        payload: buf,
-        sig: vec![0u8; 64],
-    };
-    {
-        let mut log = voting_log.lock().await;
-        let t3 = log
-            .polls
-            .get_mut(&poll_id)
-            .and_then(|ps| ps.tier_state.as_tier3_mut())
-            .expect("t3 present");
-        t3.apply_event(&ev).expect("apply emitted kd=ts");
-    }
+    // (7) Soundness: the emitted kd=ts must round-trip through the
+    // apply path. `publish_event` already self-applies before broadcast
+    // (the self-loopback fix from ZEB-270), so by this point the kd=ts
+    // is in the projection — assert the state matches what the apply
+    // path would have produced from the broadcast.
     {
         let log = voting_log.lock().await;
         let t3 = log
@@ -437,7 +408,7 @@ async fn engine_orchestration_emits_kd_ts_after_kd_cl_se_mode() {
         assert_eq!(
             t3.secret_tally.tally_shares.len(),
             1,
-            "emitted kd=ts must round-trip through the apply path"
+            "engine-auto kd=ts must self-apply via publish_event"
         );
         let record = t3
             .secret_tally
@@ -445,6 +416,12 @@ async fn engine_orchestration_emits_kd_ts_after_kd_cl_se_mode() {
             .get(&(self_owner, 0u64))
             .expect("record at (owner, epoch=0)");
         assert_eq!(record.entries.len(), 6);
+        // Bit-exactness check: the projection's TallyShareEntry vec
+        // must equal the broadcast envelope's entries.
+        assert_eq!(
+            record.entries, payload.entries,
+            "self-applied entries must match broadcast envelope's entries"
+        );
     }
 
     // (8) Idempotence: invoking the hook again must NOT emit a second
