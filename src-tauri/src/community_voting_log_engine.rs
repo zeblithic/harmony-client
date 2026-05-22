@@ -2156,6 +2156,118 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                 }
             }
         }
+
+        // 7. ZEB-319: mini-public-decline (kd=md applied). Emit only when
+        // the decline actually landed in t3.declines (apply rules drop
+        // invalid declines silently — though kd=md currently has no
+        // stage guard, keeping the acceptance check future-proofs against
+        // apply-rule tightening).
+        if applied_event.kind == PollEventKindCode::MiniPublicDecline {
+            let accepted: bool = {
+                let log = self.voting_log.lock().await;
+                log.polls
+                    .get(pid)
+                    .and_then(|ps| ps.tier_state.as_tier3())
+                    .is_some_and(|t3| {
+                        t3.declines
+                            .iter()
+                            .any(|d| d.0 == applied_event.actor && d.1 == applied_event.hlc)
+                    })
+            };
+            if accepted {
+                let payload = serde_json::json!({
+                    "pollId": pid_hex,
+                    "communityId": community_id_hex,
+                    "decliner": hex::encode(applied_event.actor.0),
+                    "declineHlcMs": applied_event.hlc.wall_ms,
+                });
+                if let Err(e) = app_handle.emit("voting-tier3-mini-public-decline", &payload) {
+                    tracing::warn!(
+                        error = %e,
+                        poll_id = %pid_hex,
+                        "voting-tier3-mini-public-decline emit failed (non-fatal)"
+                    );
+                }
+            }
+        }
+
+        // 8. ZEB-319: draft-candidate (kd=dc applied). Emit only when the
+        // candidate actually landed in t3.candidates (apply is currently
+        // unconditional, but acceptance check future-proofs against
+        // stage-gating apply-rule additions).
+        if applied_event.kind == PollEventKindCode::DraftCandidate {
+            if let Ok(dc_payload) = ciborium::de::from_reader::<
+                crate::community_voting_core::DraftCandidatePayload,
+                _,
+            >(&applied_event.payload[..])
+            {
+                let event_hash = crate::community_voting_tier3::event_hash_of(applied_event);
+                let accepted: bool = {
+                    let log = self.voting_log.lock().await;
+                    log.polls
+                        .get(pid)
+                        .and_then(|ps| ps.tier_state.as_tier3())
+                        .is_some_and(|t3| t3.candidates.iter().any(|c| c.event_hash == event_hash))
+                };
+                if accepted {
+                    let payload = serde_json::json!({
+                        "pollId": pid_hex,
+                        "communityId": community_id_hex,
+                        "proposer": hex::encode(applied_event.actor.0),
+                        "eventHash": hex::encode(event_hash),
+                        "candidateText": dc_payload.text,
+                    });
+                    if let Err(e) = app_handle.emit("voting-tier3-draft-candidate", &payload) {
+                        tracing::warn!(
+                            error = %e,
+                            poll_id = %pid_hex,
+                            "voting-tier3-draft-candidate emit failed (non-fatal)"
+                        );
+                    }
+                }
+            }
+        }
+
+        // 9. ZEB-319: draft-approval (kd=da applied). Emit only when the
+        // approval actually landed — i.e. the referenced candidate exists
+        // and the actor is now in its approvals set. Silent-drop kd=da
+        // events (unknown candidate_event_hash) stay silent.
+        if applied_event.kind == PollEventKindCode::DraftApproval {
+            if let Ok(da_payload) = ciborium::de::from_reader::<
+                crate::community_voting_core::DraftApprovalPayload,
+                _,
+            >(&applied_event.payload[..])
+            {
+                let target_hash = da_payload.candidate_event_hash;
+                let accepted: bool = {
+                    let log = self.voting_log.lock().await;
+                    log.polls
+                        .get(pid)
+                        .and_then(|ps| ps.tier_state.as_tier3())
+                        .is_some_and(|t3| {
+                            t3.candidates
+                                .iter()
+                                .find(|c| c.event_hash == target_hash)
+                                .is_some_and(|c| c.approvals.contains(&applied_event.actor))
+                        })
+                };
+                if accepted {
+                    let payload = serde_json::json!({
+                        "pollId": pid_hex,
+                        "communityId": community_id_hex,
+                        "approver": hex::encode(applied_event.actor.0),
+                        "targetEventHash": hex::encode(target_hash),
+                    });
+                    if let Err(e) = app_handle.emit("voting-tier3-draft-approval", &payload) {
+                        tracing::warn!(
+                            error = %e,
+                            poll_id = %pid_hex,
+                            "voting-tier3-draft-approval emit failed (non-fatal)"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// ZEB-298 Task 5: emit `voting-delegate-signaled-on-your-behalf` when
@@ -4758,5 +4870,518 @@ mod tests {
         // the receive loop doesn't exit before the emit lands.
         drop(engine);
         drop(subscriber_tx);
+    }
+
+    // ── ZEB-319: Tier 3 kd=md/dc/da emit payload-shape tests ─────────────
+
+    /// Shared fixture: build a VotingLogEngine wired to a mock Tauri
+    /// app_handle, with a Tier 3 poll pre-seeded past sortition.
+    /// Returns (engine, pid, app_handle, _publisher_rx, _subscriber_tx).
+    async fn tier3_past_sortition_fixture() -> (
+        Arc<VotingLogEngine<tauri::test::MockRuntime>>,
+        PollId,
+        tauri::AppHandle<tauri::test::MockRuntime>,
+        mpsc::Receiver<Vec<u8>>,
+        mpsc::Sender<Vec<u8>>,
+    ) {
+        use crate::community_voting_core::{
+            Eligibility, MemberAttrs, MembershipSnapshot, Tier3PollConfigPayload,
+        };
+
+        let community_id = SpaceId([0xF3; 16]);
+
+        // Primary mini-public member (actor for kd=md/dc/da tests).
+        let (actor_key, actor_owner, _actor_pub64) = fixture_identity_engine(0xA1);
+        // Proposer who creates the poll + kd=ss.
+        let (_proposer_key, proposer_owner, _proposer_pub64) = fixture_identity_engine(0xA2);
+
+        let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+
+        // 1. Build + apply a Tier 3 PollCreate directly into the log.
+        let sortition_size: u16 = 20; // minimum valid per validate_tier3_poll_config
+        let config = Tier3PollConfigPayload {
+            proposal_text: "ZEB-319 emit test".into(),
+            sortition_size,
+            deliberation_window_seconds: 7200,
+            drafting_window_seconds: 7200,
+            ratification_window_seconds: 7200,
+            privacy_mode: "pu".into(),
+            incentive_mode: "a".into(),
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            retry_of: None,
+        };
+        let mut cfg_payload = Vec::new();
+        ciborium::into_writer(&config, &mut cfg_payload).expect("encode tier3 cfg");
+        let create_event = SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::PollCreate,
+            hlc: Hlc {
+                wall_ms: 1_000_000,
+                logical: 0,
+                device_id: "dev-cr".into(),
+            },
+            actor: proposer_owner,
+            payload: cfg_payload,
+            sig: vec![0u8; 64],
+        };
+
+        // Snapshot: need sortition_size * 2 eligible members.
+        let electorate: Vec<OwnerAddr> = (0..(sortition_size as usize * 2))
+            .map(|i| {
+                let mut a = [0u8; 16];
+                a[0] = (i & 0xFF) as u8;
+                a[1] = 0xF3;
+                OwnerAddr(a)
+            })
+            .collect();
+        // Make actor_owner one of the primary members (for mini-public).
+        let primary: Vec<OwnerAddr> = {
+            let mut p = vec![actor_owner];
+            p.extend(electorate.iter().take(sortition_size as usize - 1).copied());
+            p
+        };
+
+        let snapshot = MembershipSnapshot {
+            members: electorate
+                .iter()
+                .map(|o| {
+                    (
+                        *o,
+                        MemberAttrs {
+                            power: 1,
+                            vouching_depth: 0,
+                        },
+                    )
+                })
+                .chain(std::iter::once((
+                    actor_owner,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )))
+                .chain(std::iter::once((
+                    proposer_owner,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )))
+                .collect(),
+        };
+
+        let pid = {
+            let mut log = voting_log.lock().await;
+            log.apply_with_snapshot(create_event.clone(), &community_id, Some(snapshot))
+                .expect("apply tier3 PollCreate")
+        };
+
+        // 2. Apply a kd=ss SortitionSelection (actor_owner in primary).
+        let ss_payload_struct = crate::community_voting_core::SortitionSelectionPayload {
+            poll_id: pid,
+            primary: primary.clone(),
+            backup: vec![],
+        };
+        let mut ss_payload = Vec::new();
+        ciborium::into_writer(&ss_payload_struct, &mut ss_payload).expect("encode ss");
+        let ss_event = SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::SortitionSelection,
+            hlc: Hlc {
+                wall_ms: 1_000_001,
+                logical: 0,
+                device_id: "dev-ss".into(),
+            },
+            actor: proposer_owner,
+            payload: ss_payload,
+            sig: vec![0u8; 64],
+        };
+        {
+            let mut log = voting_log.lock().await;
+            log.apply_with_snapshot(ss_event, &community_id, None)
+                .expect("apply kd=ss");
+        }
+
+        // 3. Start engine with mock app_handle.
+        let (publisher_tx, publisher_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (subscriber_tx, subscriber_rx) = mpsc::channel::<Vec<u8>>(8);
+
+        let app = tauri::test::mock_app();
+        let app_handle = app.handle().clone();
+
+        let engine = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+            community_id,
+            voting_log: Arc::clone(&voting_log),
+            publisher_tx,
+            subscriber_rx,
+            hlc_tracker: None,
+            device_id: None,
+            app_handle: Some(app_handle.clone()),
+            identity_resolver: None,
+            membership_resolver: None,
+        })
+        .await;
+
+        // Return actor_key in a way that publish_event can sign events.
+        // We store it on the engine via install_local_signing_key so that
+        // engine-auto paths work; the actual test events are signed externally.
+        let signing_key = Arc::new(actor_key);
+        engine
+            .install_local_signing_key(Arc::clone(&signing_key), actor_owner)
+            .await;
+
+        (engine, pid, app_handle, publisher_rx, subscriber_tx)
+    }
+
+    /// Build a signed kd=md MiniPublicDecline event for tests.
+    fn build_md_event(actor_seed: u8, pid: PollId, wall_ms: u64) -> SignedVotingEvent {
+        use ed25519_dalek::Signer;
+        let priv_id = harmony_identity::PrivateIdentity::from_seed(&[actor_seed; 32]);
+        let owner = OwnerAddr(priv_id.identity.address_hash);
+        let private_bytes = priv_id.to_private_bytes();
+        let mut ed_secret = [0u8; 32];
+        ed_secret.copy_from_slice(&private_bytes[32..64]);
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&ed_secret);
+
+        let payload_struct = crate::community_voting_core::MiniPublicDeclinePayload {
+            poll_id: pid,
+            reason: None,
+        };
+        let mut payload = Vec::new();
+        ciborium::into_writer(&payload_struct, &mut payload).expect("encode md");
+        let mut ev = SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::MiniPublicDecline,
+            hlc: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "dev-md".into(),
+            },
+            actor: owner,
+            payload,
+            sig: vec![0u8; 64],
+        };
+        let sb = ev.signing_bytes().expect("signing_bytes");
+        ev.sig = signing_key.sign(&sb).to_bytes().to_vec();
+        ev
+    }
+
+    /// Asserts that `publish_event` of a kd=md MiniPublicDecline fires
+    /// exactly one `voting-tier3-mini-public-decline` Tauri event with
+    /// the expected payload shape: { pollId, communityId, decliner,
+    /// declineHlcMs }.
+    #[tokio::test]
+    async fn emits_voting_tier3_mini_public_decline_payload_shape() {
+        use std::time::Duration;
+        use tauri::Listener;
+
+        let (engine, pid, app_handle, _pub_rx, _sub_tx) = tier3_past_sortition_fixture().await;
+
+        // Capture emits.
+        let captured: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+        app_handle.listen("voting-tier3-mini-public-decline", move |evt| {
+            captured_clone
+                .lock()
+                .expect("captured lock")
+                .push(evt.payload().to_string());
+        });
+
+        // The fixture installs actor seed 0xA1 as local signing key.
+        // Build the kd=md event signed by that actor.
+        let md_event = build_md_event(0xA1, pid, 1_100_000);
+        let actor_owner = md_event.actor;
+        let wall_ms = md_event.hlc.wall_ms;
+
+        engine
+            .publish_event(md_event, None)
+            .await
+            .expect("publish kd=md");
+
+        let payloads = wait_for_emits(Arc::clone(&captured), 1, Duration::from_secs(2)).await;
+        assert_eq!(
+            payloads.len(),
+            1,
+            "exactly one voting-tier3-mini-public-decline expected; got {payloads:?}"
+        );
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payloads[0]).expect("payload is valid JSON");
+
+        // Assert all four expected keys are present with correct values.
+        assert!(parsed["pollId"].is_string(), "pollId present");
+        assert!(parsed["communityId"].is_string(), "communityId present");
+        assert_eq!(
+            parsed["decliner"].as_str(),
+            Some(hex::encode(actor_owner.0).as_str()),
+            "decliner == hex(actor.0)"
+        );
+        assert_eq!(
+            parsed["declineHlcMs"].as_u64(),
+            Some(wall_ms),
+            "declineHlcMs == md_event.hlc.wall_ms"
+        );
+
+        // Assert no extra keys beyond the four expected.
+        let obj = parsed.as_object().expect("payload is an object");
+        assert_eq!(
+            obj.len(),
+            4,
+            "payload must have exactly 4 keys (pollId, communityId, decliner, declineHlcMs); \
+             got {obj:?}"
+        );
+    }
+
+    /// Asserts that `publish_event` of a kd=dc DraftCandidate fires
+    /// exactly one `voting-tier3-draft-candidate` Tauri event with
+    /// the expected payload shape: { pollId, communityId, proposer,
+    /// eventHash, candidateText }.
+    #[tokio::test]
+    async fn emits_voting_tier3_draft_candidate_payload_shape() {
+        use ed25519_dalek::Signer;
+        use std::time::Duration;
+        use tauri::Listener;
+
+        let (engine, pid, app_handle, _pub_rx, _sub_tx) = tier3_past_sortition_fixture().await;
+
+        // Capture emits.
+        let captured: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+        app_handle.listen("voting-tier3-draft-candidate", move |evt| {
+            captured_clone
+                .lock()
+                .expect("captured lock")
+                .push(evt.payload().to_string());
+        });
+
+        // Build actor (seed 0xA1 = same actor installed in the fixture).
+        let priv_id = harmony_identity::PrivateIdentity::from_seed(&[0xA1u8; 32]);
+        let actor_owner = OwnerAddr(priv_id.identity.address_hash);
+        let private_bytes = priv_id.to_private_bytes();
+        let mut ed_secret = [0u8; 32];
+        ed_secret.copy_from_slice(&private_bytes[32..64]);
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&ed_secret);
+
+        let candidate_text = "Proposal text for ZEB-319 dc test".to_string();
+        let dc_payload_struct = crate::community_voting_core::DraftCandidatePayload {
+            poll_id: pid,
+            text: candidate_text.clone(),
+        };
+        let mut dc_payload_bytes = Vec::new();
+        ciborium::into_writer(&dc_payload_struct, &mut dc_payload_bytes).expect("encode dc");
+        let mut dc_event = SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::DraftCandidate,
+            hlc: Hlc {
+                wall_ms: 1_200_000,
+                logical: 0,
+                device_id: "dev-dc".into(),
+            },
+            actor: actor_owner,
+            payload: dc_payload_bytes,
+            sig: vec![0u8; 64],
+        };
+        let sb = dc_event.signing_bytes().expect("signing_bytes");
+        dc_event.sig = signing_key.sign(&sb).to_bytes().to_vec();
+
+        // Compute expected event_hash BEFORE publish_event moves the event.
+        let expected_event_hash = crate::community_voting_tier3::event_hash_of(&dc_event);
+
+        engine
+            .publish_event(dc_event, None)
+            .await
+            .expect("publish kd=dc");
+
+        let payloads = wait_for_emits(Arc::clone(&captured), 1, Duration::from_secs(2)).await;
+        assert_eq!(
+            payloads.len(),
+            1,
+            "exactly one voting-tier3-draft-candidate expected; got {payloads:?}"
+        );
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payloads[0]).expect("payload is valid JSON");
+
+        assert!(parsed["pollId"].is_string(), "pollId present");
+        assert!(parsed["communityId"].is_string(), "communityId present");
+        assert_eq!(
+            parsed["proposer"].as_str(),
+            Some(hex::encode(actor_owner.0).as_str()),
+            "proposer == hex(actor.0)"
+        );
+        assert_eq!(
+            parsed["eventHash"].as_str(),
+            Some(hex::encode(expected_event_hash).as_str()),
+            "eventHash == hex(sha256(signing_bytes(dc_event)))"
+        );
+        assert_eq!(
+            parsed["candidateText"].as_str(),
+            Some(candidate_text.as_str()),
+            "candidateText == DraftCandidatePayload.text"
+        );
+
+        // Assert no extra keys beyond the five expected.
+        let obj = parsed.as_object().expect("payload is an object");
+        assert_eq!(
+            obj.len(),
+            5,
+            "payload must have exactly 5 keys (pollId, communityId, proposer, eventHash, \
+             candidateText); got {obj:?}"
+        );
+    }
+
+    /// Asserts that `publish_event` of a kd=da DraftApproval fires
+    /// exactly one `voting-tier3-draft-approval` Tauri event with
+    /// the expected payload shape: { pollId, communityId, approver,
+    /// targetEventHash }.
+    #[tokio::test]
+    async fn emits_voting_tier3_draft_approval_payload_shape() {
+        use ed25519_dalek::Signer;
+        use std::time::Duration;
+        use tauri::Listener;
+
+        let (engine, pid, app_handle, _pub_rx, _sub_tx) = tier3_past_sortition_fixture().await;
+
+        // Capture emits.
+        let captured_dc: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_da: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_dc_clone = Arc::clone(&captured_dc);
+        let captured_da_clone = Arc::clone(&captured_da);
+        app_handle.listen("voting-tier3-draft-candidate", move |evt| {
+            captured_dc_clone
+                .lock()
+                .expect("captured_dc lock")
+                .push(evt.payload().to_string());
+        });
+        app_handle.listen("voting-tier3-draft-approval", move |evt| {
+            captured_da_clone
+                .lock()
+                .expect("captured_da lock")
+                .push(evt.payload().to_string());
+        });
+
+        // Build actor (seed 0xA1 = installed in fixture).
+        let priv_id = harmony_identity::PrivateIdentity::from_seed(&[0xA1u8; 32]);
+        let actor_owner = OwnerAddr(priv_id.identity.address_hash);
+        let private_bytes = priv_id.to_private_bytes();
+        let mut ed_secret = [0u8; 32];
+        ed_secret.copy_from_slice(&private_bytes[32..64]);
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&ed_secret);
+
+        // Step 1: publish a kd=dc so we have a candidate to approve.
+        let dc_payload_struct = crate::community_voting_core::DraftCandidatePayload {
+            poll_id: pid,
+            text: "Candidate for approval test".into(),
+        };
+        let mut dc_payload_bytes = Vec::new();
+        ciborium::into_writer(&dc_payload_struct, &mut dc_payload_bytes).expect("encode dc");
+        let mut dc_event = SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::DraftCandidate,
+            hlc: Hlc {
+                wall_ms: 1_200_000,
+                logical: 0,
+                device_id: "dev-dc-for-da".into(),
+            },
+            actor: actor_owner,
+            payload: dc_payload_bytes,
+            sig: vec![0u8; 64],
+        };
+        let sb = dc_event.signing_bytes().expect("signing_bytes dc");
+        dc_event.sig = signing_key.sign(&sb).to_bytes().to_vec();
+        let candidate_event_hash = crate::community_voting_tier3::event_hash_of(&dc_event);
+
+        engine
+            .publish_event(dc_event, None)
+            .await
+            .expect("publish kd=dc for da test");
+
+        // Wait for dc emit to land before publishing da.
+        wait_for_emits(Arc::clone(&captured_dc), 1, Duration::from_secs(2)).await;
+
+        // Step 2: publish a kd=da DraftApproval referencing the above candidate.
+        // Use a second actor (seed 0xA2 is the proposer in the fixture; use the
+        // fixture actor again but at a different HLC to simulate self-approval
+        // from another mini-public member — apply is idempotent for same actor).
+        let da_payload_struct = crate::community_voting_core::DraftApprovalPayload {
+            poll_id: pid,
+            candidate_event_hash,
+        };
+        let mut da_payload_bytes = Vec::new();
+        ciborium::into_writer(&da_payload_struct, &mut da_payload_bytes).expect("encode da");
+        // Use actor seed 0xA1's key (already in mini-public; self-approval
+        // already implicit via dc apply, so this is a no-op on the HashSet
+        // but the apply still routes and the emit should still fire).
+        let mut da_event = SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::DraftApproval,
+            hlc: Hlc {
+                wall_ms: 1_300_000,
+                logical: 0,
+                device_id: "dev-da".into(),
+            },
+            actor: actor_owner,
+            payload: da_payload_bytes,
+            sig: vec![0u8; 64],
+        };
+        let sb_da = da_event.signing_bytes().expect("signing_bytes da");
+        da_event.sig = signing_key.sign(&sb_da).to_bytes().to_vec();
+
+        engine
+            .publish_event(da_event, None)
+            .await
+            .expect("publish kd=da");
+
+        let payloads = wait_for_emits(Arc::clone(&captured_da), 1, Duration::from_secs(2)).await;
+        assert_eq!(
+            payloads.len(),
+            1,
+            "exactly one voting-tier3-draft-approval expected; got {payloads:?}"
+        );
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payloads[0]).expect("payload is valid JSON");
+
+        assert!(parsed["pollId"].is_string(), "pollId present");
+        assert!(parsed["communityId"].is_string(), "communityId present");
+        assert_eq!(
+            parsed["approver"].as_str(),
+            Some(hex::encode(actor_owner.0).as_str()),
+            "approver == hex(actor.0)"
+        );
+        assert_eq!(
+            parsed["targetEventHash"].as_str(),
+            Some(hex::encode(candidate_event_hash).as_str()),
+            "targetEventHash == hex(candidate_event_hash)"
+        );
+
+        // Assert no extra keys beyond the four expected.
+        let obj = parsed.as_object().expect("payload is an object");
+        assert_eq!(
+            obj.len(),
+            4,
+            "payload must have exactly 4 keys (pollId, communityId, approver, \
+             targetEventHash); got {obj:?}"
+        );
     }
 }

@@ -34,6 +34,9 @@ import type {
   Tier2ProposalExport,
   Tier3DeliberationStatementCreatedPayload,
   Tier3DeliberationVoteCastPayload,
+  Tier3DraftApprovalPayload,
+  Tier3DraftCandidatePayload,
+  Tier3MiniPublicDeclinePayload,
   Tier3TallyShareAppliedPayload,
   VotingBallotCastPayload,
   VotingDelegateSignaledOnYourBehalfPayload,
@@ -141,6 +144,17 @@ export class VotingAdapter {
   // update its k-of-n committee-share progress incrementally.
   private tier3TallyShareAppliedSubs: Array<
     (p: Tier3TallyShareAppliedPayload) => void
+  > = [];
+
+  // ZEB-319 — Tier 3 granular drafting-stage event subscribers.
+  private tier3MiniPublicDeclineSubs: Array<
+    (p: Tier3MiniPublicDeclinePayload) => void
+  > = [];
+  private tier3DraftCandidateSubs: Array<
+    (p: Tier3DraftCandidatePayload) => void
+  > = [];
+  private tier3DraftApprovalSubs: Array<
+    (p: Tier3DraftApprovalPayload) => void
   > = [];
 
   subscribePollCreated(handler: (p: VotingPollCreatedPayload) => void): () => void {
@@ -308,6 +322,42 @@ export class VotingAdapter {
     return () => {
       const i = this.tier3TallyShareAppliedSubs.indexOf(handler);
       if (i >= 0) this.tier3TallyShareAppliedSubs.splice(i, 1);
+    };
+  }
+
+  // ─── ZEB-319 — Tier 3 granular drafting-stage subscribers ────────────
+
+  /**
+   * ZEB-319: subscribe to mid-stage sortition-decline events.
+   * Returns an unlisten function that should be called on teardown.
+   */
+  subscribeTier3MiniPublicDecline(
+    handler: (p: Tier3MiniPublicDeclinePayload) => void,
+  ): () => void {
+    this.tier3MiniPublicDeclineSubs.push(handler);
+    return () => {
+      const i = this.tier3MiniPublicDeclineSubs.indexOf(handler);
+      if (i >= 0) this.tier3MiniPublicDeclineSubs.splice(i, 1);
+    };
+  }
+
+  subscribeTier3DraftCandidate(
+    handler: (p: Tier3DraftCandidatePayload) => void,
+  ): () => void {
+    this.tier3DraftCandidateSubs.push(handler);
+    return () => {
+      const i = this.tier3DraftCandidateSubs.indexOf(handler);
+      if (i >= 0) this.tier3DraftCandidateSubs.splice(i, 1);
+    };
+  }
+
+  subscribeTier3DraftApproval(
+    handler: (p: Tier3DraftApprovalPayload) => void,
+  ): () => void {
+    this.tier3DraftApprovalSubs.push(handler);
+    return () => {
+      const i = this.tier3DraftApprovalSubs.indexOf(handler);
+      if (i >= 0) this.tier3DraftApprovalSubs.splice(i, 1);
     };
   }
 
@@ -504,6 +554,34 @@ export class VotingAdapter {
           },
         );
         stagedUnlisteners.push(unlistenTier3TallyShareApplied);
+
+        // ZEB-319 — granular drafting-stage events.
+        const unlistenTier3MiniPublicDecline = await adapter.listen(
+          'voting-tier3-mini-public-decline',
+          (event) => {
+            const payload = event.payload as Tier3MiniPublicDeclinePayload;
+            for (const sub of [...this.tier3MiniPublicDeclineSubs]) sub(payload);
+          },
+        );
+        stagedUnlisteners.push(unlistenTier3MiniPublicDecline);
+
+        const unlistenTier3DraftCandidate = await adapter.listen(
+          'voting-tier3-draft-candidate',
+          (event) => {
+            const payload = event.payload as Tier3DraftCandidatePayload;
+            for (const sub of [...this.tier3DraftCandidateSubs]) sub(payload);
+          },
+        );
+        stagedUnlisteners.push(unlistenTier3DraftCandidate);
+
+        const unlistenTier3DraftApproval = await adapter.listen(
+          'voting-tier3-draft-approval',
+          (event) => {
+            const payload = event.payload as Tier3DraftApprovalPayload;
+            for (const sub of [...this.tier3DraftApprovalSubs]) sub(payload);
+          },
+        );
+        stagedUnlisteners.push(unlistenTier3DraftApproval);
 
         this.adapter = adapter;
         this.unlisteners.push(...stagedUnlisteners);

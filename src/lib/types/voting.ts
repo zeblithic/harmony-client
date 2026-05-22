@@ -646,6 +646,43 @@ export interface Tier3TallyShareAppliedPayload {
   threshold: number;
 }
 
+/**
+ * ZEB-319: payload of `voting-tier3-mini-public-decline` Tauri event.
+ * Emitted when a kd=md MiniPublicDecline event is successfully applied
+ * to a Tier 3 poll's projection (backup promotion may follow).
+ */
+export interface Tier3MiniPublicDeclinePayload {
+  pollId: string;
+  communityId: string;
+  decliner: string;
+  declineHlcMs: number;
+}
+
+/**
+ * ZEB-319: payload of `voting-tier3-draft-candidate` Tauri event.
+ * Emitted when a kd=dc DraftCandidate event is successfully applied
+ * to a Tier 3 poll's projection.
+ */
+export interface Tier3DraftCandidatePayload {
+  pollId: string;
+  communityId: string;
+  proposer: string;
+  eventHash: string;
+  candidateText: string;
+}
+
+/**
+ * ZEB-319: payload of `voting-tier3-draft-approval` Tauri event.
+ * Emitted when a kd=da DraftApproval event is successfully applied
+ * to a Tier 3 poll's projection.
+ */
+export interface Tier3DraftApprovalPayload {
+  pollId: string;
+  communityId: string;
+  approver: string;
+  targetEventHash: string;
+}
+
 /** Stage label for UI display. */
 export function tier3StageLabel(s: Tier3Stage): string {
   switch (s) {
