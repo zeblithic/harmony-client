@@ -21698,10 +21698,14 @@ async fn voting_submit_deliberation_statement<R: tauri::Runtime>(
         })?;
     let pid = crate::community_voting_core::PollId(pid_bytes);
 
-    if text.is_empty() || text.len() > 512 {
+    // Spec §2.3: text is 1..=280 Unicode scalar values (matches Rust
+    // `chars().count()` at apply time). Using byte length (`text.len()`)
+    // would falsely reject CJK at ~170 chars and silently accept 281..=512
+    // ASCII chars that the apply layer then drops — user-visible no-op.
+    let char_count = text.chars().count();
+    if char_count == 0 || char_count > 280 {
         return Err(format!(
-            "voting_submit_deliberation_statement: text length {} out of range (1..=512)",
-            text.len()
+            "voting_submit_deliberation_statement: text length {char_count} chars out of range (1..=280)"
         ));
     }
 
@@ -21822,6 +21826,168 @@ async fn voting_submit_deliberation_statement<R: tauri::Runtime>(
         .await
         .map_err(|e| format!("voting_submit_deliberation_statement: publish: {e}"))?;
     Ok(event_hash)
+}
+
+/// Tauri IPC: cast a deliberation vote (kd=dv) on a mini-public statement.
+///
+/// `vote` must be one of the wire strings "agree" | "disagree" | "pass"
+/// (matches `BridgingVoteCode::from_wire_str`). The IPC validates wire-level
+/// inputs (hex lengths, vote string) and publishes the event; eligibility
+/// rules (Deliberation stage, target statement exists, caller in current
+/// mini-public, not self-voting) are enforced by `Tier3PollState::apply_event`
+/// per spec §2.3 and silently drop invalid events at apply time. Returns
+/// `Ok(())` if publish succeeds (matches the existing pattern of other Tier 3
+/// voting IPCs). Frontend callers should observe projection state via
+/// `voting_get_tier3_poll` to confirm the vote landed.
+#[tauri::command]
+async fn voting_cast_deliberation_vote<R: tauri::Runtime>(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    _app: tauri::AppHandle<R>,
+    poll_id: String,
+    statement_event_hash: String,
+    vote: String,
+) -> Result<(), String> {
+    let pid_bytes: [u8; 32] = hex::decode(&poll_id)
+        .map_err(|e| format!("voting_cast_deliberation_vote: invalid poll_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "voting_cast_deliberation_vote: poll_id must be 32 bytes (64 hex chars)".to_string()
+        })?;
+    let pid = crate::community_voting_core::PollId(pid_bytes);
+
+    let stmt_hash_bytes: [u8; 32] = hex::decode(&statement_event_hash)
+        .map_err(|e| {
+            format!("voting_cast_deliberation_vote: invalid statement_event_hash hex: {e}")
+        })?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "voting_cast_deliberation_vote: statement_event_hash must be 32 bytes (64 hex chars)"
+                .to_string()
+        })?;
+
+    let vote_code = crate::community_voting_core::BridgingVoteCode::from_wire_str(&vote)
+        .ok_or_else(|| {
+            format!(
+                "voting_cast_deliberation_vote: invalid vote {:?}; expected agree|disagree|pass",
+                vote
+            )
+        })?;
+
+    let (
+        hlc_tracker,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        crdt_state,
+        voting_logs,
+        voting_log_engines,
+        dfrost_log_registry_for_engine,
+        beacon_requester_for_engine,
+        voting_log_adapter_request_tx,
+        self_identity_pub_64,
+        app_handle_wry,
+    ) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner
+                .ok_or("dm_self_owner missing — no owner identity?")?,
+            g.community_registry
+                .clone()
+                .ok_or("community_registry missing — node not running?")?,
+            g.dm_outbox
+                .clone()
+                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.crdt_state
+                .clone()
+                .ok_or("crdt_state missing — node not running?")?,
+            std::sync::Arc::clone(&g.voting_logs),
+            std::sync::Arc::clone(&g.voting_log_engines),
+            g.dfrost_log_registry.clone(),
+            g.beacon_requester.clone(),
+            g.voting_log_adapter_request_tx
+                .clone()
+                .ok_or("voting_log_adapter_request_tx missing — node not running?")?,
+            g.dm_identity_pub_64
+                .ok_or("dm_identity_pub_64 missing — node not running?")?,
+            g.app_handle_wry
+                .clone()
+                .ok_or("app_handle_wry missing — node not running?")?,
+        )
+    };
+
+    // Resolve space_id from the poll_id by scanning open polls.
+    let space_id = voting_resolve_community_for_poll(&voting_logs, &pid).await?;
+
+    // Lazy-register the engine for this community.
+    let local_signing_key_for_engine = {
+        let outbox_g = dm_outbox.lock().await;
+        std::sync::Arc::clone(&outbox_g.signing_key)
+    };
+    let membership_resolver_for_engine: std::sync::Arc<
+        dyn crate::community_voting_log::MembershipSnapshotResolver,
+    > = std::sync::Arc::new(NodeStateMembershipResolver {
+        community_registry,
+        crdt_state: crdt_state.clone(),
+    });
+    ensure_voting_engine_for(
+        &voting_logs,
+        &voting_log_engines,
+        space_id,
+        voting_log_adapter_request_tx,
+        hlc_tracker.clone(),
+        device_id.clone(),
+        local_signing_key_for_engine,
+        self_owner,
+        membership_resolver_for_engine,
+        crdt_state,
+        self_identity_pub_64,
+        app_handle_wry,
+        dfrost_log_registry_for_engine,
+        beacon_requester_for_engine,
+    )
+    .await?;
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+
+    let event = {
+        let outbox_g = dm_outbox.lock().await;
+        let signing_key = outbox_g.signing_key.as_ref();
+        crate::community_voting_core::build_signed_deliberation_vote(
+            signing_key,
+            self_owner,
+            pid,
+            stmt_hash_bytes,
+            vote_code,
+            hlc,
+        )
+        .map_err(|e| format!("voting_cast_deliberation_vote: build_signed: {e:?}"))?
+    };
+
+    let engine_arc = {
+        let g = voting_log_engines
+            .lock()
+            .map_err(|e| format!("voting_log_engines poisoned: {e}"))?;
+        g.get(&space_id).cloned().ok_or_else(|| {
+            "voting_cast_deliberation_vote: engine missing after ensure".to_string()
+        })?
+    };
+    engine_arc
+        .publish_event(event, None)
+        .await
+        .map_err(|e| format!("voting_cast_deliberation_vote: publish: {e}"))?;
+    Ok(())
 }
 
 /// Tauri IPC: propose a draft candidate (kd=dc) for a Tier 3 poll.
@@ -22604,6 +22770,30 @@ pub struct RatificationCandidateExport {
     pub text: String,
 }
 
+/// ZEB-294: one deliberation statement with aggregate vote counts, as
+/// exposed to the frontend. Ordered by BTreeMap iteration (statement_event_hash
+/// ascending) in the parent `Tier3PollExport.deliberation_statements` vec.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliberationStatementExport {
+    pub statement_event_hash: String, // 64-char hex
+    pub author: String,               // 32-char hex (OwnerAddr is 16 bytes)
+    pub text: String,
+    pub created_at_hlc_ms: i128,
+    pub agree_count: u16,
+    pub disagree_count: u16,
+    pub pass_count: u16,
+}
+
+/// ZEB-294: caller's vote on a single deliberation statement, as exposed
+/// to the frontend. Entry exists only for statements the caller has voted on.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MyDeliberationVoteExport {
+    pub statement_event_hash: String,
+    pub vote: String, // "agree" | "disagree" | "pass"
+}
+
 /// ZEB-311: full state for a single Tier 3 poll, projected from
 /// `Tier3PollState` plus caller-derived `my_*` fields.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -22639,6 +22829,14 @@ pub struct Tier3PollExport {
     /// `ratification_candidates` order). `None` if never cast or
     /// stage hasn't reached Ratification.
     pub my_ratification_scores: Option<Vec<u8>>,
+    /// ZEB-294: deliberation statements with aggregate vote counts. Ordered by
+    /// BTreeMap iteration (sorted by statement_event_hash ascending).
+    pub deliberation_statements: Vec<DeliberationStatementExport>,
+    /// ZEB-294: caller's accepted-statement count (for composer 5-cap UX).
+    pub my_deliberation_statement_count: u8,
+    /// ZEB-294: caller's per-statement votes; entry exists only for statements
+    /// the caller has voted on.
+    pub my_deliberation_votes: Vec<MyDeliberationVoteExport>,
     /// 64-char hex of the winning candidate's kd=dc event hash;
     /// `None` until stage = Finalized.
     pub winner_event_hash: Option<String>,
@@ -22662,6 +22860,42 @@ pub struct Tier3PollSummary {
     /// Set once stage = Finalized; lets the panel show "Charter §3
     /// amended" without an extra fetch.
     pub winner_text: Option<String>,
+}
+
+/// ZEB-294: camelCase wire DTO for a bridging-statement score row.
+/// u64 fixed-point values are serialized as decimal strings to survive
+/// JSON's f64 mantissa limit (2^53). Frontend converts to BigInt or
+/// Number based on need.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgingScoreExport {
+    /// SHA-256 of the signing bytes of the kd=ds event (64-char hex).
+    pub statement_event_hash: String,
+    pub statement_text: String,
+    /// 32-char hex (OwnerAddr is 16 bytes → 32 hex chars).
+    pub author: String,
+    pub agree_count: u16,
+    pub disagree_count: u16,
+    pub pass_count: u16,
+    /// Q32 fraction as decimal u64 string, range [0, 2^32].
+    pub diversity_q32: String,
+    /// Q64 score as decimal u64 string. Sort key (DESC).
+    pub bridging_score_q64: String,
+}
+
+impl From<crate::community_voting_sortition::bridging::BridgingScore> for BridgingScoreExport {
+    fn from(s: crate::community_voting_sortition::bridging::BridgingScore) -> Self {
+        Self {
+            statement_event_hash: hex::encode(s.statement_event_hash),
+            statement_text: s.statement_text,
+            author: hex::encode(s.author.0),
+            agree_count: s.agree_count,
+            disagree_count: s.disagree_count,
+            pass_count: s.pass_count,
+            diversity_q32: s.diversity_q32.to_string(),
+            bridging_score_q64: s.bridging_score_q64.to_string(),
+        }
+    }
 }
 
 /// Pure helper: project a `PollState` (which must be Tier 2) into the
@@ -24239,6 +24473,53 @@ fn build_tier3_export(
             .map(|f| hex::encode(f.event_hash))
     });
 
+    // ZEB-294: aggregate vote counts per statement AND capture the caller's own votes.
+    // One pass over deliberation.votes builds both structures simultaneously.
+    let mut agg_per_stmt: std::collections::BTreeMap<[u8; 32], (u16, u16, u16)> =
+        std::collections::BTreeMap::new();
+    let mut my_votes_vec: Vec<MyDeliberationVoteExport> = Vec::new();
+    for ((voter, stmt_hash), entry) in t3.deliberation.votes.iter() {
+        let agg = agg_per_stmt.entry(*stmt_hash).or_insert((0, 0, 0));
+        match entry.vote {
+            crate::community_voting_core::BridgingVoteCode::Agree => agg.0 += 1,
+            crate::community_voting_core::BridgingVoteCode::Disagree => agg.1 += 1,
+            crate::community_voting_core::BridgingVoteCode::Pass => agg.2 += 1,
+        }
+        if let Some(self_owner) = self_owner_opt {
+            if voter == &self_owner {
+                my_votes_vec.push(MyDeliberationVoteExport {
+                    statement_event_hash: hex::encode(stmt_hash),
+                    vote: entry.vote.as_wire_str().to_string(),
+                });
+            }
+        }
+    }
+
+    let deliberation_statements: Vec<DeliberationStatementExport> = t3
+        .deliberation
+        .statements
+        .values()
+        .map(|s| {
+            let (a, d, p) = agg_per_stmt
+                .get(&s.event_hash)
+                .copied()
+                .unwrap_or((0, 0, 0));
+            DeliberationStatementExport {
+                statement_event_hash: hex::encode(s.event_hash),
+                author: hex::encode(s.author.0),
+                text: s.text.clone(),
+                created_at_hlc_ms: s.created_at_hlc.wall_ms as i128,
+                agree_count: a,
+                disagree_count: d,
+                pass_count: p,
+            }
+        })
+        .collect();
+
+    let my_deliberation_statement_count = self_owner_opt
+        .and_then(|owner| t3.deliberation.statements_per_author.get(&owner).copied())
+        .unwrap_or(0);
+
     Ok(Tier3PollExport {
         poll_id: hex::encode(state.meta.poll_id.0),
         community_id: hex::encode(state.meta.community_id.0),
@@ -24259,6 +24540,9 @@ fn build_tier3_export(
         my_role,
         my_drafting_approvals,
         my_ratification_scores,
+        deliberation_statements,
+        my_deliberation_statement_count,
+        my_deliberation_votes: my_votes_vec,
         winner_event_hash,
         runner_up_event_hash,
     })
@@ -24368,6 +24652,126 @@ async fn voting_list_tier3_polls_raw(
         .collect();
     summaries.sort_by_key(|s| std::cmp::Reverse(s.poll_create_hlc_ms));
     Ok(summaries)
+}
+
+/// Tauri IPC: list bridging-ranked deliberation statements for a Tier 3 poll.
+///
+/// Returns up to `top_n` rows, sorted by `bridging_score_q64` DESC then
+/// `statement_event_hash` ASC (deterministic tiebreak). Allowed in stages
+/// Deliberation, Drafting, Ratification, and Finalized — rejects Sortition
+/// (no statements yet) and Failed (no meaningful output).
+///
+/// Read-only; does not require engine initialization.
+#[tauri::command]
+async fn voting_list_bridging_statements(
+    state_lock: tauri::State<'_, Mutex<NodeState>>,
+    poll_id: String,
+    top_n: u16,
+) -> Result<Vec<BridgingScoreExport>, String> {
+    voting_list_bridging_statements_raw(state_lock.inner(), poll_id, top_n).await
+}
+
+/// ZEB-294: Decoupled implementation of `voting_list_bridging_statements` for integration
+/// testing. Integration tests drive this directly with a raw `&Mutex<NodeState>` rather than
+/// a `tauri::State<'_, ...>` (which is not directly constructible outside Tauri's app setup).
+#[cfg(any(test, feature = "test-fixtures"))]
+pub async fn voting_list_bridging_statements_impl(
+    state_lock: &Mutex<NodeState>,
+    poll_id: String,
+    top_n: u16,
+) -> Result<Vec<BridgingScoreExport>, String> {
+    voting_list_bridging_statements_raw(state_lock, poll_id, top_n).await
+}
+
+async fn voting_list_bridging_statements_raw(
+    state_lock: &Mutex<NodeState>,
+    poll_id: String,
+    top_n: u16,
+) -> Result<Vec<BridgingScoreExport>, String> {
+    let pid_bytes: [u8; 32] = hex::decode(&poll_id)
+        .map_err(|e| format!("voting_list_bridging_statements: invalid poll_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            "voting_list_bridging_statements: poll_id must be 32 bytes (64 hex chars)".to_string()
+        })?;
+    let pid = crate::community_voting_core::PollId(pid_bytes);
+
+    let voting_logs = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        std::sync::Arc::clone(&g.voting_logs)
+    };
+
+    // Scan all loaded logs for the target poll.
+    let log_arcs: Vec<_> = {
+        let map = voting_logs.lock().await;
+        map.values().cloned().collect()
+    };
+    for log_arc in log_arcs.iter() {
+        let g = log_arc.lock().await;
+        if let Some(poll_state) = g.polls.get(&pid) {
+            let t3 = poll_state
+                .tier_state
+                .as_tier3()
+                .ok_or_else(|| format!("poll {poll_id} is not Tier 3"))?;
+
+            // Stage gate: use the effective stage from the last-applied HLC,
+            // matching the pattern in build_tier3_export / voting_list_tier3_polls.
+            let effective_stage = t3
+                .last_hlc
+                .as_ref()
+                .map(|now| t3.current_stage_at(now))
+                .unwrap_or(t3.stage);
+            match effective_stage {
+                crate::community_voting_tier3::Stage::Deliberation
+                | crate::community_voting_tier3::Stage::Drafting
+                | crate::community_voting_tier3::Stage::Ratification
+                | crate::community_voting_tier3::Stage::Finalized => {}
+                other => {
+                    return Err(format!(
+                        "voting_list_bridging_statements: poll {poll_id} in stage {other:?}; \
+                         bridging scores not available until Deliberation"
+                    ));
+                }
+            }
+
+            // Build inputs. `bridging_inputs` returns (&stmts, &votes, HashSet<OwnerAddr>).
+            // We clone statements + votes so we can drop the log lock before computing.
+            let eval_hlc = t3
+                .last_hlc
+                .clone()
+                .unwrap_or_else(|| t3.meta.poll_create_hlc.clone());
+            let (stmts_ref, votes_ref, mini_public) = t3.bridging_inputs(&eval_hlc);
+            let stmts = stmts_ref.clone();
+            let votes = votes_ref.clone();
+            drop(g); // release log lock before computing
+
+            let mut scores = crate::community_voting_sortition::bridging::compute_bridging_scores(
+                &stmts,
+                &votes,
+                &mini_public,
+            );
+
+            // Sort: bridging_score_q64 DESC, statement_event_hash ASC (tiebreak).
+            scores.sort_by(|a, b| {
+                b.bridging_score_q64
+                    .cmp(&a.bridging_score_q64)
+                    .then_with(|| a.statement_event_hash.cmp(&b.statement_event_hash))
+            });
+
+            let result: Vec<BridgingScoreExport> = scores
+                .into_iter()
+                .take(top_n as usize)
+                .map(BridgingScoreExport::from)
+                .collect();
+            return Ok(result);
+        }
+    }
+    Err(format!(
+        "voting_list_bridging_statements: poll {poll_id} not found"
+    ))
 }
 
 /// Tauri IPC: convenience wrapper for "contesting" a near-finalize
@@ -27135,6 +27539,7 @@ pub fn run() {
             // ZEB-310 Phase 4a-main Task 3: Tier 3 (Sortition + STAR) voting IPCs.
             voting_create_tier3_proposal,
             voting_submit_deliberation_statement,
+            voting_cast_deliberation_vote,
             voting_propose_draft_candidate,
             voting_approve_draft_candidate,
             voting_decline_sortition,
@@ -27150,6 +27555,8 @@ pub fn run() {
             // ZEB-311: Tier 3 pull-style read IPCs.
             voting_get_tier3_poll,
             voting_list_tier3_polls,
+            // ZEB-294: Deliberation bridging read IPC.
+            voting_list_bridging_statements,
             // ZEB-292 Phase 3: delegation UI read IPCs.
             voting_get_my_delegate,
             voting_list_delegations,
@@ -27208,6 +27615,7 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         // ZEB-310 Phase 4a-main Task 3: Tier 3 (Sortition + STAR) voting IPCs.
         voting_create_tier3_proposal,
         voting_submit_deliberation_statement,
+        voting_cast_deliberation_vote,
         voting_propose_draft_candidate,
         voting_approve_draft_candidate,
         voting_decline_sortition,
@@ -27223,6 +27631,8 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         // ZEB-311: Tier 3 pull-style read IPCs.
         voting_get_tier3_poll,
         voting_list_tier3_polls,
+        // ZEB-294: Deliberation bridging read IPC.
+        voting_list_bridging_statements,
         // ZEB-292 Phase 3: delegation UI read IPCs.
         voting_get_my_delegate,
         voting_list_delegations,

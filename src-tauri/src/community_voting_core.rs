@@ -123,6 +123,75 @@ pub struct DeliberationStatementPayload {
     pub text: String,
 }
 
+/// Vote type for `kd=dv` DeliberationVote events. Wire encoding is a single
+/// u8 (0=agree, 1=disagree, 2=pass) inside the payload; this enum is the
+/// type-safe Rust representation used throughout the engine + IPC layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum BridgingVoteCode {
+    Agree = 0,
+    Disagree = 1,
+    Pass = 2,
+}
+
+impl BridgingVoteCode {
+    pub fn from_u8(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Agree),
+            1 => Some(Self::Disagree),
+            2 => Some(Self::Pass),
+            _ => None,
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Agree => "agree",
+            Self::Disagree => "disagree",
+            Self::Pass => "pass",
+        }
+    }
+
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        match s {
+            "agree" => Some(Self::Agree),
+            "disagree" => Some(Self::Disagree),
+            "pass" => Some(Self::Pass),
+            _ => None,
+        }
+    }
+}
+
+/// Payload for `kd=dv` DeliberationVote: a mini-public member's vote
+/// (agree/disagree/pass) on another member's DeliberationStatement.
+/// `statement_event_hash` is the SHA-256 of the signing bytes of the
+/// referenced `kd=ds` event (32 bytes). `vote` is `BridgingVoteCode::as_u8`.
+///
+/// All field keys are 2 chars per spec §3 same-length-keys invariant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliberationVotePayload {
+    #[serde(rename = "pi")]
+    pub poll_id: PollId,
+    #[serde(
+        rename = "sh",
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
+    pub statement_event_hash: [u8; 32],
+    // Wire-tolerant by spec §2.3: vt is stored as u8 (not a validated enum)
+    // so malformed peer events deserialize successfully and are silently
+    // dropped at apply time via `BridgingVoteCode::from_u8(...).is_none()`.
+    // Adding a validating deserializer here would convert silent drops into
+    // `ApplyError::PayloadDecode`, conflicting with the CRDT-tolerant drop
+    // semantics the apply layer relies on.
+    #[serde(rename = "vt")]
+    pub vote: u8,
+}
+
 /// Payload for `kd=md` MiniPublicDecline: a selected member declining
 /// participation. Optional reason code ≤2 chars; omitted when `None`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,6 +315,61 @@ mod tier3_payload_tests {
         let decoded: DeliberationStatementPayload =
             ciborium::from_reader(&encoded[..]).expect("decode");
         assert_eq!(payload, decoded);
+    }
+
+    #[test]
+    fn deliberation_vote_payload_round_trip() {
+        let payload = DeliberationVotePayload {
+            poll_id: PollId([0xAB; 32]),
+            statement_event_hash: [0xCD; 32],
+            vote: BridgingVoteCode::Agree.as_u8(),
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&payload, &mut buf).expect("encode");
+        let decoded: DeliberationVotePayload = ciborium::de::from_reader(&buf[..]).expect("decode");
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn deliberation_vote_payload_all_three_vote_codes_round_trip() {
+        for code in [
+            BridgingVoteCode::Agree,
+            BridgingVoteCode::Disagree,
+            BridgingVoteCode::Pass,
+        ] {
+            let payload = DeliberationVotePayload {
+                poll_id: PollId([1; 32]),
+                statement_event_hash: [2; 32],
+                vote: code.as_u8(),
+            };
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&payload, &mut buf).expect("encode");
+            let decoded: DeliberationVotePayload =
+                ciborium::de::from_reader(&buf[..]).expect("decode");
+            assert_eq!(decoded.vote, code.as_u8());
+            assert_eq!(BridgingVoteCode::from_u8(decoded.vote), Some(code));
+        }
+    }
+
+    #[test]
+    fn bridging_vote_code_from_u8_rejects_out_of_range() {
+        assert_eq!(BridgingVoteCode::from_u8(3), None);
+        assert_eq!(BridgingVoteCode::from_u8(255), None);
+    }
+
+    #[test]
+    fn bridging_vote_code_wire_str_round_trip() {
+        for code in [
+            BridgingVoteCode::Agree,
+            BridgingVoteCode::Disagree,
+            BridgingVoteCode::Pass,
+        ] {
+            assert_eq!(
+                BridgingVoteCode::from_wire_str(code.as_wire_str()),
+                Some(code)
+            );
+        }
+        assert_eq!(BridgingVoteCode::from_wire_str("foo"), None);
     }
 
     #[test]
@@ -480,6 +604,10 @@ pub enum PollEventKindCode {
     SortitionSelection,
     #[serde(rename = "ds")]
     DeliberationStatement,
+    /// kd=dv DeliberationVote — mini-public member agrees/disagrees/passes
+    /// on another member's DeliberationStatement.
+    #[serde(rename = "dv")]
+    DeliberationVote,
     #[serde(rename = "md")]
     MiniPublicDecline,
     #[serde(rename = "dc")]
@@ -658,6 +786,7 @@ mod envelope_tests {
             // new variants so wire-string renames surface immediately.
             PollEventKindCode::SortitionSelection,
             PollEventKindCode::DeliberationStatement,
+            PollEventKindCode::DeliberationVote,
             PollEventKindCode::MiniPublicDecline,
             PollEventKindCode::DraftCandidate,
             PollEventKindCode::DraftApproval,
@@ -679,6 +808,7 @@ mod envelope_tests {
         let cases = [
             (PollEventKindCode::SortitionSelection, "ss"),
             (PollEventKindCode::DeliberationStatement, "ds"),
+            (PollEventKindCode::DeliberationVote, "dv"),
             (PollEventKindCode::MiniPublicDecline, "md"),
             (PollEventKindCode::DraftCandidate, "dc"),
             (PollEventKindCode::DraftApproval, "da"),
@@ -1307,6 +1437,39 @@ pub fn build_signed_deliberation_statement(
     Ok(ev)
 }
 
+/// Build a fully-signed `kd=dv` DeliberationVote event.
+pub fn build_signed_deliberation_vote(
+    keypair: &ed25519_dalek::SigningKey,
+    actor: OwnerAddr,
+    poll_id: PollId,
+    statement_event_hash: [u8; 32],
+    vote: BridgingVoteCode,
+    hlc: Hlc,
+) -> Result<SignedVotingEvent, BuildError> {
+    use ed25519_dalek::Signer;
+    let payload_struct = DeliberationVotePayload {
+        poll_id,
+        statement_event_hash,
+        vote: vote.as_u8(),
+    };
+    let mut payload = Vec::new();
+    ciborium::ser::into_writer(&payload_struct, &mut payload)
+        .map_err(|_| BuildError::EncodePayload)?;
+    let mut ev = SignedVotingEvent {
+        tag: 'p',
+        version: 1,
+        tier: Tier::Sortition,
+        kind: PollEventKindCode::DeliberationVote,
+        hlc,
+        actor,
+        payload,
+        sig: vec![0u8; 64],
+    };
+    let sb = ev.signing_bytes().map_err(|_| BuildError::SigningBytes)?;
+    ev.sig = keypair.sign(&sb).to_bytes().to_vec();
+    Ok(ev)
+}
+
 /// Build a fully-signed `kd=md` MiniPublicDecline event.
 pub fn build_signed_mini_public_decline(
     keypair: &ed25519_dalek::SigningKey,
@@ -1670,6 +1833,32 @@ mod build_tests {
             .expect("build");
         assert_eq!(ev.kind, PollEventKindCode::DeliberationStatement);
         verify_sig(&keypair, &ev);
+    }
+
+    #[test]
+    fn signed_deliberation_vote_round_trip() {
+        let keypair = SigningKey::generate(&mut OsRng);
+        let actor = OwnerAddr([0x55; 16]);
+        let pid = PollId([0x66; 32]);
+        let seh: [u8; 32] = [0x77; 32];
+        let hlc = Hlc {
+            wall_ms: 3,
+            logical: 0,
+            device_id: "d".into(),
+        };
+        let ev =
+            build_signed_deliberation_vote(&keypair, actor, pid, seh, BridgingVoteCode::Agree, hlc)
+                .expect("build");
+        assert_eq!(ev.kind, PollEventKindCode::DeliberationVote);
+        verify_sig(&keypair, &ev);
+        let decoded: DeliberationVotePayload =
+            ciborium::de::from_reader(&ev.payload[..]).expect("decode payload");
+        assert_eq!(decoded.poll_id, pid);
+        assert_eq!(decoded.statement_event_hash, seh);
+        assert_eq!(
+            BridgingVoteCode::from_u8(decoded.vote),
+            Some(BridgingVoteCode::Agree)
+        );
     }
 
     #[test]

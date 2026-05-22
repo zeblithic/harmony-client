@@ -29,6 +29,9 @@ const baseDetail: Tier3PollExport = {
   myRole: 'mini_public',
   myDraftingApprovals: [],
   myRatificationScores: null,
+  deliberationStatements: [],
+  myDeliberationStatementCount: 0,
+  myDeliberationVotes: [],
   winnerEventHash: null,
   runnerUpEventHash: null,
 };

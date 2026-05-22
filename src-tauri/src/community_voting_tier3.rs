@@ -2,9 +2,10 @@
 //! See docs/specs/2026-05-20-zeb-309-phase4a-main-design.md §3 + §6 + §9.
 
 use crate::community_voting_core::{
-    CandidateEventHash, DeliberationStatementPayload, DraftApprovalPayload, DraftCandidatePayload,
-    MiniPublicDeclinePayload, PollEventKindCode, PollId, RatificationBallotPayload,
-    SignedVotingEvent, SortitionFailedPayload, SortitionSelectionPayload, Tier3PollConfigPayload,
+    CandidateEventHash, DeliberationStatementPayload, DeliberationVotePayload,
+    DraftApprovalPayload, DraftCandidatePayload, MiniPublicDeclinePayload, PollEventKindCode,
+    PollId, RatificationBallotPayload, SignedVotingEvent, SortitionFailedPayload,
+    SortitionSelectionPayload, Tier3PollConfigPayload,
 };
 use crate::community_voting_sortition::{derive_beacon_seed, fisher_yates_select, SortitionResult};
 use crate::community_voting_star::{tally_star, StarResult};
@@ -47,6 +48,39 @@ pub struct DraftCandidateState {
     pub approvals: HashSet<OwnerAddr>,
 }
 
+/// A mini-public member's contribution during the deliberation stage,
+/// stored after `kd=ds` apply. Immutable per spec §2 — no edit/retract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliberationStatement {
+    pub event_hash: [u8; 32],
+    pub author: OwnerAddr,
+    pub text: String,
+    pub created_at_hlc: Hlc,
+}
+
+/// A single (voter, statement) vote entry. LWW-resolved on apply by
+/// `(last_update_hlc, last_update_event_hash)` lex comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliberationVoteEntry {
+    pub voter: OwnerAddr,
+    pub statement_event_hash: [u8; 32],
+    pub vote: crate::community_voting_core::BridgingVoteCode,
+    pub last_update_hlc: Hlc,
+    pub last_update_event_hash: [u8; 32],
+}
+
+/// Tier 3 deliberation projection state. Materialized from `kd=ds` and
+/// `kd=dv` events; consumed by the bridging algorithm + IPC read paths.
+///
+/// BTreeMap (not HashMap) for deterministic iteration — bridging-detection
+/// determinism (spec §4.7 point 2) depends on this.
+#[derive(Debug, Clone, Default)]
+pub struct DeliberationState {
+    pub statements: std::collections::BTreeMap<[u8; 32], DeliberationStatement>,
+    pub votes: std::collections::BTreeMap<(OwnerAddr, [u8; 32]), DeliberationVoteEntry>,
+    pub statements_per_author: std::collections::BTreeMap<OwnerAddr, u8>,
+}
+
 /// Immutable metadata derived from the kd=cr PollCreate event.
 #[derive(Debug, Clone)]
 pub struct Tier3PollMeta {
@@ -86,6 +120,9 @@ pub struct Tier3PollState {
     pub close_event_hash: Option<[u8; 32]>,
     /// Set by kd=rs PollResult event (StarResult decoded from payload).
     pub result: Option<StarResult>,
+    /// Phase 5 (Tier 3b) deliberation projection. Populated by `kd=ds`
+    /// and `kd=dv` apply paths. Default empty until Task 3/4 wire apply.
+    pub deliberation: DeliberationState,
     /// HLC of the most recent event applied (None before any event).
     pub last_hlc: Option<Hlc>,
 }
@@ -241,6 +278,7 @@ impl Tier3PollState {
             ratification_ballots: Vec::new(),
             close_event_hash: None,
             result: None,
+            deliberation: DeliberationState::default(),
             last_hlc: None,
         }
     }
@@ -296,13 +334,171 @@ impl Tier3PollState {
                 self.declines.push((ev.actor, ev.hlc.clone()));
             }
 
-            // kd=ds DeliberationStatement: Phase 4a-main scaffold — accept event
-            // (SD1 verify deferred); no state mutation beyond last_hlc update.
+            // kd=ds DeliberationStatement: materialize per spec §2.3 apply rules.
+            // Apply-time rules (silent drop on failure; falls through to post-match last_hlc update).
             PollEventKindCode::DeliberationStatement => {
-                // Validate payload parses (don't silently accept corrupt payloads).
-                let _payload: DeliberationStatementPayload =
+                let payload: DeliberationStatementPayload =
                     decode_payload(&ev.payload).map_err(ApplyError::PayloadDecode)?;
-                // No-op: Phase 5 will cluster statements. Accepted so multi-engine convergence holds.
+                let event_hash = sha256_of_signing_bytes(ev);
+
+                // Rule 1: stage must be Deliberation at ev.hlc.
+                if self.current_stage_at(&ev.hlc) != Stage::Deliberation {
+                    tracing::debug!(
+                        poll_id = %hex::encode(self.meta.poll_id.0),
+                        actor = %hex::encode(ev.actor.0),
+                        "kd=ds drop: not in Deliberation stage"
+                    );
+                // Rule 2: actor must be in the current mini-public at ev.hlc.
+                } else if !self.current_mini_public(&ev.hlc).contains(&ev.actor) {
+                    tracing::debug!(
+                        poll_id = %hex::encode(self.meta.poll_id.0),
+                        actor = %hex::encode(ev.actor.0),
+                        "kd=ds drop: actor not in current mini-public"
+                    );
+                // Rule 3: text must be 1..=280 chars (non-empty after trim).
+                } else if payload.text.chars().count() > 280 || payload.text.trim().is_empty() {
+                    tracing::debug!(
+                        poll_id = %hex::encode(self.meta.poll_id.0),
+                        actor = %hex::encode(ev.actor.0),
+                        "kd=ds drop: text length out of range or whitespace-only"
+                    );
+                } else {
+                    // Rule 4: per-actor spam cap — at most 5 statements per poll.
+                    let prior_count = self
+                        .deliberation
+                        .statements_per_author
+                        .get(&ev.actor)
+                        .copied()
+                        .unwrap_or(0);
+                    if prior_count >= 5 {
+                        tracing::debug!(
+                            poll_id = %hex::encode(self.meta.poll_id.0),
+                            actor = %hex::encode(ev.actor.0),
+                            prior_count,
+                            "kd=ds drop: per-actor 5-statement spam cap reached"
+                        );
+                    } else {
+                        // Accept: insert into deliberation projection. Statement events are
+                        // keyed by event_hash (sha256 of signing bytes), so replays of the
+                        // exact same event are idempotent on the map. Only bump the per-author
+                        // spam counter when the insert actually added a new statement —
+                        // otherwise repeated apply of the same event would falsely advance
+                        // the cap toward the 5-statement limit.
+                        let inserted = self
+                            .deliberation
+                            .statements
+                            .insert(
+                                event_hash,
+                                DeliberationStatement {
+                                    event_hash,
+                                    author: ev.actor,
+                                    text: payload.text,
+                                    created_at_hlc: ev.hlc.clone(),
+                                },
+                            )
+                            .is_none();
+                        if inserted {
+                            *self
+                                .deliberation
+                                .statements_per_author
+                                .entry(ev.actor)
+                                .or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+
+            // kd=dv DeliberationVote: LWW upsert keyed by (voter, statement_event_hash).
+            // Apply-time rules per spec §2.3 (silent drop on failure; falls through to
+            // post-match last_hlc update).
+            PollEventKindCode::DeliberationVote => {
+                let payload: DeliberationVotePayload =
+                    decode_payload(&ev.payload).map_err(ApplyError::PayloadDecode)?;
+                let event_hash = sha256_of_signing_bytes(ev);
+
+                let stage_ok = self.current_stage_at(&ev.hlc) == Stage::Deliberation;
+                let mp_ok = stage_ok && self.current_mini_public(&ev.hlc).contains(&ev.actor);
+                let target = if mp_ok {
+                    self.deliberation
+                        .statements
+                        .get(&payload.statement_event_hash)
+                } else {
+                    None
+                };
+                let self_vote = target.is_some_and(|s| s.author == ev.actor);
+                let vote_code =
+                    crate::community_voting_core::BridgingVoteCode::from_u8(payload.vote);
+
+                if !stage_ok {
+                    tracing::debug!(
+                        poll_id = %hex::encode(self.meta.poll_id.0),
+                        actor = %hex::encode(ev.actor.0),
+                        "kd=dv drop: not in Deliberation stage"
+                    );
+                } else if !mp_ok {
+                    tracing::debug!(
+                        poll_id = %hex::encode(self.meta.poll_id.0),
+                        actor = %hex::encode(ev.actor.0),
+                        "kd=dv drop: actor not in current mini-public"
+                    );
+                } else if target.is_none() {
+                    tracing::debug!(
+                        poll_id = %hex::encode(self.meta.poll_id.0),
+                        actor = %hex::encode(ev.actor.0),
+                        statement = %hex::encode(payload.statement_event_hash),
+                        "kd=dv drop: target statement not in projection"
+                    );
+                } else if self_vote {
+                    // Spec §2.3: deliberation votes are for *another* member's statement;
+                    // self-votes would distort statement totals and bridging scores.
+                    tracing::debug!(
+                        poll_id = %hex::encode(self.meta.poll_id.0),
+                        actor = %hex::encode(ev.actor.0),
+                        statement = %hex::encode(payload.statement_event_hash),
+                        "kd=dv drop: voter is author of target statement"
+                    );
+                } else if let Some(vote_code) = vote_code {
+                    // LWW: insert only if (ev.hlc, event_hash) > existing entry's (hlc, hash).
+                    let key = (ev.actor, payload.statement_event_hash);
+                    let should_insert = match self.deliberation.votes.get(&key) {
+                        None => true,
+                        Some(existing) => {
+                            let incoming = (
+                                ev.hlc.wall_ms,
+                                ev.hlc.logical,
+                                ev.hlc.device_id.as_str(),
+                                event_hash,
+                            );
+                            let current = (
+                                existing.last_update_hlc.wall_ms,
+                                existing.last_update_hlc.logical,
+                                existing.last_update_hlc.device_id.as_str(),
+                                existing.last_update_event_hash,
+                            );
+                            incoming > current
+                        }
+                    };
+                    if should_insert {
+                        self.deliberation.votes.insert(
+                            key,
+                            DeliberationVoteEntry {
+                                voter: ev.actor,
+                                statement_event_hash: payload.statement_event_hash,
+                                vote: vote_code,
+                                last_update_hlc: ev.hlc.clone(),
+                                last_update_event_hash: event_hash,
+                            },
+                        );
+                    }
+                    // Else: stale event (incoming HLC/hash ≤ current entry); silent drop.
+                } else {
+                    tracing::debug!(
+                        poll_id = %hex::encode(self.meta.poll_id.0),
+                        actor = %hex::encode(ev.actor.0),
+                        vote_byte = payload.vote,
+                        "kd=dv drop: vote byte out of range"
+                    );
+                }
             }
 
             // kd=dc DraftCandidate: append new candidate with implicit self-approval.
@@ -473,6 +669,27 @@ impl Tier3PollState {
         }
 
         set
+    }
+
+    /// Build the (statements, votes, mini_public) tuple that the bridging
+    /// algorithm consumes. Computed once per bridging IPC call so the
+    /// authoritative-set snapshot is fixed for the entire computation
+    /// (spec §4.7 determinism guarantee 4).
+    #[allow(clippy::type_complexity)]
+    pub fn bridging_inputs(
+        &self,
+        eval_hlc: &Hlc,
+    ) -> (
+        &std::collections::BTreeMap<[u8; 32], DeliberationStatement>,
+        &std::collections::BTreeMap<(OwnerAddr, [u8; 32]), DeliberationVoteEntry>,
+        std::collections::HashSet<OwnerAddr>,
+    ) {
+        let mini_public = self.current_mini_public(eval_hlc);
+        (
+            &self.deliberation.statements,
+            &self.deliberation.votes,
+            mini_public,
+        )
     }
 
     /// Count of UNIQUE actors who declined at or before `now`.
@@ -1595,6 +1812,18 @@ mod tests {
     fn current_mini_public_empty_before_sortition() {
         let poll = new_poll(0);
         assert!(poll.current_mini_public(&hlc(100)).is_empty());
+    }
+
+    // ── Task 2: new Tier3PollState has empty deliberation projection ──────────
+
+    #[test]
+    fn new_tier3_poll_state_has_empty_deliberation() {
+        let meta = meta_at(0);
+        let poll =
+            Tier3PollState::new_from_create(meta, vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])]);
+        assert!(poll.deliberation.statements.is_empty());
+        assert!(poll.deliberation.votes.is_empty());
+        assert!(poll.deliberation.statements_per_author.is_empty());
     }
 
     // ── Additional: da for unknown candidate is silently ignored ──────────────
@@ -2953,6 +3182,396 @@ mod tests {
             *epoch_seen,
             Some(expected_epoch),
             "verify_ss must pass poll's stored epoch to BeaconOracle::vrf_output_for"
+        );
+    }
+
+    // ── Task 3: kd=ds apply_event tests ──────────────────────────────────────
+
+    /// Build a poll in Deliberation stage with primary=[addr(1), addr(2), addr(3)]
+    /// and backup=[addr(10), addr(11)].  Poll created at wall_ms=0, dw=10000ms.
+    /// Sortition event applied at wall_ms=50.  Any event HLC in 51..9999 is
+    /// within the Deliberation window.
+    fn build_poll_in_deliberation_stage() -> Tier3PollState {
+        let mut poll = new_poll(0);
+        poll.apply_event(&ss_event(
+            50,
+            vec![addr(1), addr(2), addr(3)],
+            vec![addr(10), addr(11)],
+        ))
+        .expect("ss");
+        poll
+    }
+
+    /// Build a kd=ds event with a custom text string.
+    fn ds_event_with_text(wall_ms: u64, actor: OwnerAddr, text: &str) -> SignedVotingEvent {
+        let payload = DeliberationStatementPayload {
+            poll_id: poll_id(),
+            text: text.into(),
+        };
+        make_event_with_payload(
+            PollEventKindCode::DeliberationStatement,
+            wall_ms,
+            actor,
+            encode(&payload),
+        )
+    }
+
+    // Task 3 — Test 1: happy path accepts mini-public member in deliberation window.
+    #[test]
+    fn apply_ds_accepts_mini_public_member_in_window() {
+        let mut poll = build_poll_in_deliberation_stage();
+        let author = addr(1); // primary member
+        let ev = ds_event_with_text(100, author, "Hello world");
+        poll.apply_event(&ev).expect("apply");
+        assert_eq!(poll.deliberation.statements.len(), 1);
+        assert_eq!(
+            poll.deliberation.statements_per_author[&author], 1,
+            "statements_per_author must be incremented"
+        );
+    }
+
+    // Task 3 — Test 2: drops event from actor not in mini-public.
+    #[test]
+    fn apply_ds_drops_non_mini_public_actor() {
+        let mut poll = build_poll_in_deliberation_stage();
+        // addr(99) is not in primary or backup.
+        let ev = ds_event_with_text(100, addr(99), "Hello from outsider");
+        poll.apply_event(&ev)
+            .expect("apply returns Ok (silent drop)");
+        assert!(
+            poll.deliberation.statements.is_empty(),
+            "non-mini-public actor must be silently dropped"
+        );
+    }
+
+    // Task 3 — Test 3: drops event with text longer than 280 chars.
+    #[test]
+    fn apply_ds_drops_281_char_text() {
+        let mut poll = build_poll_in_deliberation_stage();
+        let long_text = "x".repeat(281);
+        let ev = ds_event_with_text(100, addr(1), &long_text);
+        poll.apply_event(&ev)
+            .expect("apply returns Ok (silent drop)");
+        assert!(
+            poll.deliberation.statements.is_empty(),
+            "281-char text must be silently dropped"
+        );
+    }
+
+    // Task 3 — Test 4: drops event whose text is whitespace-only.
+    #[test]
+    fn apply_ds_drops_whitespace_only_text() {
+        let mut poll = build_poll_in_deliberation_stage();
+        let ev = ds_event_with_text(100, addr(1), "   \t\n  ");
+        poll.apply_event(&ev)
+            .expect("apply returns Ok (silent drop)");
+        assert!(
+            poll.deliberation.statements.is_empty(),
+            "whitespace-only text must be silently dropped"
+        );
+    }
+
+    // Task 3 — Test 5: enforces per-actor 5-statement spam cap.
+    #[test]
+    fn apply_ds_enforces_5_statement_spam_cap() {
+        let mut poll = build_poll_in_deliberation_stage();
+        let author = addr(2); // primary member
+
+        // Apply 6 statements with distinct text + monotonically increasing HLCs.
+        for i in 0u64..6 {
+            let text = format!("Statement number {i}");
+            let ev = ds_event_with_text(100 + i, author, &text);
+            poll.apply_event(&ev).expect("apply returns Ok");
+        }
+
+        assert_eq!(
+            poll.deliberation.statements.len(),
+            5,
+            "only 5 statements must be accepted (spam cap)"
+        );
+        assert_eq!(
+            poll.deliberation.statements_per_author[&author], 5,
+            "statements_per_author must cap at 5"
+        );
+    }
+
+    // Task 3 — Test 6: drops event with HLC outside the deliberation window.
+    #[test]
+    fn apply_ds_drops_event_outside_deliberation_window() {
+        let mut poll = build_poll_in_deliberation_stage();
+        // dw=10s → deliberation ends at wall_ms=10000.  wall_ms=15000 is in Drafting.
+        let ev = ds_event_with_text(15_000, addr(1), "Too late");
+        poll.apply_event(&ev)
+            .expect("apply returns Ok (silent drop)");
+        assert!(
+            poll.deliberation.statements.is_empty(),
+            "event outside deliberation window must be silently dropped"
+        );
+    }
+
+    // ── Task 4: kd=dv apply_event tests ──────────────────────────────────────
+
+    /// Build a kd=dv event with a specific vote byte (raw u8, so we can test invalid values).
+    fn dv_event_raw(
+        wall_ms: u64,
+        actor: OwnerAddr,
+        statement_hash: [u8; 32],
+        vote_byte: u8,
+    ) -> SignedVotingEvent {
+        let payload = DeliberationVotePayload {
+            poll_id: poll_id(),
+            statement_event_hash: statement_hash,
+            vote: vote_byte,
+        };
+        make_event_with_payload(
+            PollEventKindCode::DeliberationVote,
+            wall_ms,
+            actor,
+            encode(&payload),
+        )
+    }
+
+    /// Build a kd=dv event with a valid BridgingVoteCode.
+    fn dv_event(
+        wall_ms: u64,
+        actor: OwnerAddr,
+        statement_hash: [u8; 32],
+        vote: crate::community_voting_core::BridgingVoteCode,
+    ) -> SignedVotingEvent {
+        dv_event_raw(wall_ms, actor, statement_hash, vote.as_u8())
+    }
+
+    // Task 4 — Test 1: happy path — mini-public member votes agree on existing statement.
+    #[test]
+    fn apply_dv_accepts_valid_vote_from_mini_public() {
+        use crate::community_voting_core::BridgingVoteCode;
+
+        let mut poll = build_poll_in_deliberation_stage();
+        // addr(1) posts a statement.
+        let ds_ev = ds_event_with_text(100, addr(1), "Statement from addr(1)");
+        poll.apply_event(&ds_ev).expect("ds apply");
+        let stmt_hash = sha256_of_signing_bytes(&ds_ev);
+
+        // addr(2) votes agree on that statement.
+        let dv_ev = dv_event(200, addr(2), stmt_hash, BridgingVoteCode::Agree);
+        poll.apply_event(&dv_ev).expect("dv apply");
+
+        let key = (addr(2), stmt_hash);
+        let entry = poll
+            .deliberation
+            .votes
+            .get(&key)
+            .expect("vote entry must exist");
+        assert_eq!(entry.vote, BridgingVoteCode::Agree, "vote must be Agree");
+        assert_eq!(entry.voter, addr(2));
+        assert_eq!(entry.statement_event_hash, stmt_hash);
+    }
+
+    // Task 4 — Test 2: drops vote referencing a non-existent statement.
+    #[test]
+    fn apply_dv_drops_non_existent_statement_reference() {
+        use crate::community_voting_core::BridgingVoteCode;
+
+        let mut poll = build_poll_in_deliberation_stage();
+        let fake_hash = [0x99u8; 32];
+        let dv_ev = dv_event(100, addr(1), fake_hash, BridgingVoteCode::Agree);
+        poll.apply_event(&dv_ev)
+            .expect("apply returns Ok (silent drop)");
+        assert!(
+            poll.deliberation.votes.is_empty(),
+            "vote targeting non-existent statement must be silently dropped"
+        );
+    }
+
+    // Task 4 — Test 3: drops vote from actor not in mini-public.
+    #[test]
+    fn apply_dv_drops_non_mini_public_voter() {
+        use crate::community_voting_core::BridgingVoteCode;
+
+        let mut poll = build_poll_in_deliberation_stage();
+        // addr(1) posts a statement.
+        let ds_ev = ds_event_with_text(100, addr(1), "Some statement");
+        poll.apply_event(&ds_ev).expect("ds apply");
+        let stmt_hash = sha256_of_signing_bytes(&ds_ev);
+
+        // addr(99) is not in primary or backup.
+        let dv_ev = dv_event(200, addr(99), stmt_hash, BridgingVoteCode::Agree);
+        poll.apply_event(&dv_ev)
+            .expect("apply returns Ok (silent drop)");
+        assert!(
+            poll.deliberation.votes.is_empty(),
+            "vote from non-mini-public actor must be silently dropped"
+        );
+    }
+
+    // Task 4 — Test 4: LWW — later HLC wins (revote replaces earlier vote).
+    #[test]
+    fn apply_dv_revote_lww_later_hlc_wins() {
+        use crate::community_voting_core::BridgingVoteCode;
+
+        let mut poll = build_poll_in_deliberation_stage();
+        let ds_ev = ds_event_with_text(100, addr(1), "A statement");
+        poll.apply_event(&ds_ev).expect("ds");
+        let stmt_hash = sha256_of_signing_bytes(&ds_ev);
+
+        // First vote: agree at hlc=200.
+        let v1 = dv_event(200, addr(2), stmt_hash, BridgingVoteCode::Agree);
+        poll.apply_event(&v1).expect("v1");
+
+        // Second vote: disagree at hlc=300 (later). LWW: disagree wins.
+        let v2 = dv_event(300, addr(2), stmt_hash, BridgingVoteCode::Disagree);
+        poll.apply_event(&v2).expect("v2");
+
+        let entry = poll
+            .deliberation
+            .votes
+            .get(&(addr(2), stmt_hash))
+            .expect("entry must exist");
+        assert_eq!(
+            entry.vote,
+            BridgingVoteCode::Disagree,
+            "later vote must win"
+        );
+    }
+
+    // Task 4 — Test 5: LWW — earlier HLC dropped (monotonic check may reject first).
+    #[test]
+    fn apply_dv_revote_lww_earlier_hlc_dropped() {
+        use crate::community_voting_core::BridgingVoteCode;
+
+        let mut poll = build_poll_in_deliberation_stage();
+        let ds_ev = ds_event_with_text(100, addr(1), "A statement");
+        poll.apply_event(&ds_ev).expect("ds");
+        let stmt_hash = sha256_of_signing_bytes(&ds_ev);
+
+        // First vote: disagree at hlc=200 (later HLC applied first).
+        let v1 = dv_event(200, addr(2), stmt_hash, BridgingVoteCode::Disagree);
+        poll.apply_event(&v1).expect("v1");
+
+        // Second attempt: agree at hlc=100 (earlier). apply_event's monotonic HLC check
+        // rejects this with HlcNotMonotonic — the existing Disagree entry stays either way.
+        let _ = poll.apply_event(&dv_event(100, addr(2), stmt_hash, BridgingVoteCode::Agree));
+
+        let entry = poll
+            .deliberation
+            .votes
+            .get(&(addr(2), stmt_hash))
+            .expect("entry must still exist");
+        assert_eq!(
+            entry.vote,
+            BridgingVoteCode::Disagree,
+            "earlier vote must not overwrite later vote"
+        );
+    }
+
+    // Task 4 — Test 6: drops vote with invalid vote byte (3).
+    #[test]
+    fn apply_dv_drops_vote_byte_3() {
+        let mut poll = build_poll_in_deliberation_stage();
+        let ds_ev = ds_event_with_text(100, addr(1), "A statement");
+        poll.apply_event(&ds_ev).expect("ds");
+        let stmt_hash = sha256_of_signing_bytes(&ds_ev);
+
+        // Build vote with raw byte=3 (out of range).
+        let dv_ev = dv_event_raw(200, addr(2), stmt_hash, 3);
+        poll.apply_event(&dv_ev)
+            .expect("apply returns Ok (silent drop)");
+        assert!(
+            poll.deliberation.votes.is_empty(),
+            "vote byte=3 (out of range) must be silently dropped"
+        );
+    }
+
+    // Bot-review #1 fix (CodeRabbit): the apply layer must reject self-votes
+    // because deliberation votes are for *another* member's statement (spec
+    // §2.3). Counting self-votes would distort statement totals and bridging
+    // scores.
+    #[test]
+    fn apply_dv_drops_self_vote_on_own_statement() {
+        use crate::community_voting_core::BridgingVoteCode;
+
+        let mut poll = build_poll_in_deliberation_stage();
+        let author = addr(1); // primary mini-public member
+        let ds_ev = ds_event_with_text(100, author, "My own statement");
+        poll.apply_event(&ds_ev).expect("ds apply");
+        let stmt_hash = sha256_of_signing_bytes(&ds_ev);
+
+        // Same actor tries to vote on their own statement.
+        let dv_ev = dv_event(200, author, stmt_hash, BridgingVoteCode::Agree);
+        poll.apply_event(&dv_ev)
+            .expect("apply returns Ok (silent drop)");
+
+        assert!(
+            poll.deliberation.votes.is_empty(),
+            "self-vote on own statement must be silently dropped"
+        );
+        // The other mini-public member can still vote on it normally.
+        let other_ev = dv_event(300, addr(2), stmt_hash, BridgingVoteCode::Agree);
+        poll.apply_event(&other_ev).expect("other apply");
+        assert_eq!(
+            poll.deliberation.votes.len(),
+            1,
+            "non-self votes on the same statement remain accepted"
+        );
+    }
+
+    // Bot-review #2 fix (CodeAnt): replaying the same kd=ds event must be
+    // idempotent — the BTreeMap insert is idempotent on event_hash, but the
+    // per-author spam counter must NOT bump on replay, otherwise rehydrating
+    // a log with duplicate events would falsely advance toward the 5-cap
+    // and block legitimate later statements.
+    //
+    // The HLC monotonic guard (apply_event step 2) rejects strictly-less
+    // HLCs but accepts equal HLCs, so applying the exact same
+    // SignedVotingEvent twice exercises both the BTreeMap idempotency and
+    // the apply_event counter-skip guard end-to-end.
+    #[test]
+    fn apply_ds_replay_is_idempotent_for_spam_cap() {
+        let mut poll = build_poll_in_deliberation_stage();
+        let author = addr(1);
+        let ev = ds_event_with_text(100, author, "Same statement");
+
+        // First apply: counter must bump to 1.
+        poll.apply_event(&ev).expect("first apply");
+        assert_eq!(
+            poll.deliberation.statements_per_author[&author], 1,
+            "first apply must increment counter to 1"
+        );
+        assert_eq!(
+            poll.deliberation.statements.len(),
+            1,
+            "first apply must insert exactly one statement"
+        );
+
+        // Replay the exact same SignedVotingEvent. Equal HLCs pass the
+        // monotonic guard; the BTreeMap insert returns the existing entry
+        // (no-op); the counter MUST NOT bump.
+        poll.apply_event(&ev).expect("replay apply");
+        assert_eq!(
+            poll.deliberation.statements_per_author[&author], 1,
+            "replay must NOT bump the per-author counter"
+        );
+        assert_eq!(
+            poll.deliberation.statements.len(),
+            1,
+            "replay must NOT add a new statement entry"
+        );
+
+        // After the replay, four more distinct statements should fit under
+        // the 5-cap, and a sixth distinct one is rejected.
+        for i in 1u64..=4 {
+            let next = ds_event_with_text(100 + i, author, &format!("Statement {i}"));
+            poll.apply_event(&next).expect("apply");
+        }
+        assert_eq!(
+            poll.deliberation.statements_per_author[&author], 5,
+            "exactly 5 distinct statements must be counted after replay"
+        );
+        let sixth = ds_event_with_text(200, author, "Sixth");
+        poll.apply_event(&sixth).expect("apply");
+        assert_eq!(
+            poll.deliberation.statements_per_author[&author], 5,
+            "6th distinct statement must be dropped (cap reached)"
         );
     }
 }
