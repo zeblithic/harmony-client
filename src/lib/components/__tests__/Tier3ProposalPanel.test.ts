@@ -226,7 +226,7 @@ describe('Tier3ProposalPanel', () => {
 
   // ── ZEB-319: event-driven refetch tests ──────────────────────────────────
 
-  it('refetches detail + summaries on voting-tier3-mini-public-decline matching selected community + poll', async () => {
+  it('refetches detail only (not summaries) on voting-tier3-mini-public-decline matching selected community + poll', async () => {
     let declineHandler: ((p: { pollId: string; communityId: string; decliner: string; declineHlcMs: number }) => void) | null = null;
     const adapter = createAdapterMock([makeSummaryFixture()]);
     vi.spyOn(adapter, 'subscribeTier3MiniPublicDecline').mockImplementation((h) => {
