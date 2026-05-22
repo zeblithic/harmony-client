@@ -197,10 +197,30 @@ async fn two_engine_fixture(
 
     let mut members: HashMap<OwnerAddr, MemberAttrs> = electorate
         .iter()
-        .map(|o| (*o, MemberAttrs { power: 1, vouching_depth: 0 }))
+        .map(|o| {
+            (
+                *o,
+                MemberAttrs {
+                    power: 1,
+                    vouching_depth: 0,
+                },
+            )
+        })
         .collect();
-    members.insert(actor_owner, MemberAttrs { power: 1, vouching_depth: 0 });
-    members.insert(proposer_owner, MemberAttrs { power: 1, vouching_depth: 0 });
+    members.insert(
+        actor_owner,
+        MemberAttrs {
+            power: 1,
+            vouching_depth: 0,
+        },
+    );
+    members.insert(
+        proposer_owner,
+        MemberAttrs {
+            power: 1,
+            vouching_depth: 0,
+        },
+    );
     let snapshot = MembershipSnapshot { members };
 
     // Build and apply PollCreate + SortitionSelection into a shared
@@ -333,8 +353,17 @@ async fn voting_tier3_mini_public_decline_emits_on_originator_and_peer() {
     use tauri::Listener;
 
     let community_id = SpaceId([0xD1; 16]);
-    let (engine_a, engine_b, app_handle_a, app_handle_b, mut pub_rx_a, sub_tx_b, poll_id, actor_owner, actor_key) =
-        two_engine_fixture(community_id, 0xA1, 0xA2).await;
+    let (
+        engine_a,
+        engine_b,
+        app_handle_a,
+        app_handle_b,
+        mut pub_rx_a,
+        sub_tx_b,
+        poll_id,
+        actor_owner,
+        actor_key,
+    ) = two_engine_fixture(community_id, 0xA1, 0xA2).await;
 
     // Install listeners on both engines' app handles.
     let captured_a: Arc<std::sync::Mutex<Vec<String>>> =
@@ -382,7 +411,10 @@ async fn voting_tier3_mini_public_decline_emits_on_originator_and_peer() {
     let parsed_a: serde_json::Value =
         serde_json::from_str(&payloads_a[0]).expect("Engine A payload is valid JSON");
     assert!(parsed_a["pollId"].is_string(), "A: pollId present");
-    assert!(parsed_a["communityId"].is_string(), "A: communityId present");
+    assert!(
+        parsed_a["communityId"].is_string(),
+        "A: communityId present"
+    );
     assert_eq!(
         parsed_a["decliner"].as_str(),
         Some(hex::encode(actor_owner.0).as_str()),
@@ -424,7 +456,10 @@ async fn voting_tier3_mini_public_decline_emits_on_originator_and_peer() {
     let parsed_b: serde_json::Value =
         serde_json::from_str(&payloads_b[0]).expect("Engine B payload is valid JSON");
     assert!(parsed_b["pollId"].is_string(), "B: pollId present");
-    assert!(parsed_b["communityId"].is_string(), "B: communityId present");
+    assert!(
+        parsed_b["communityId"].is_string(),
+        "B: communityId present"
+    );
     assert_eq!(
         parsed_b["decliner"].as_str(),
         Some(hex::encode(actor_owner.0).as_str()),
@@ -464,8 +499,17 @@ async fn voting_tier3_draft_candidate_emits_on_originator_and_peer() {
     use tauri::Listener;
 
     let community_id = SpaceId([0xD2; 16]);
-    let (engine_a, engine_b, app_handle_a, app_handle_b, mut pub_rx_a, sub_tx_b, poll_id, actor_owner, actor_key) =
-        two_engine_fixture(community_id, 0xB1, 0xB2).await;
+    let (
+        engine_a,
+        engine_b,
+        app_handle_a,
+        app_handle_b,
+        mut pub_rx_a,
+        sub_tx_b,
+        poll_id,
+        actor_owner,
+        actor_key,
+    ) = two_engine_fixture(community_id, 0xB1, 0xB2).await;
 
     let captured_a: Arc<std::sync::Mutex<Vec<String>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -515,7 +559,10 @@ async fn voting_tier3_draft_candidate_emits_on_originator_and_peer() {
     let parsed_a: serde_json::Value =
         serde_json::from_str(&payloads_a[0]).expect("Engine A payload is valid JSON");
     assert!(parsed_a["pollId"].is_string(), "A: pollId present");
-    assert!(parsed_a["communityId"].is_string(), "A: communityId present");
+    assert!(
+        parsed_a["communityId"].is_string(),
+        "A: communityId present"
+    );
     assert_eq!(
         parsed_a["proposer"].as_str(),
         Some(hex::encode(actor_owner.0).as_str()),
@@ -562,7 +609,10 @@ async fn voting_tier3_draft_candidate_emits_on_originator_and_peer() {
     let parsed_b: serde_json::Value =
         serde_json::from_str(&payloads_b[0]).expect("Engine B payload is valid JSON");
     assert!(parsed_b["pollId"].is_string(), "B: pollId present");
-    assert!(parsed_b["communityId"].is_string(), "B: communityId present");
+    assert!(
+        parsed_b["communityId"].is_string(),
+        "B: communityId present"
+    );
     assert_eq!(
         parsed_b["proposer"].as_str(),
         Some(hex::encode(actor_owner.0).as_str()),
@@ -607,8 +657,17 @@ async fn voting_tier3_draft_approval_emits_on_originator_and_peer() {
     use tauri::Listener;
 
     let community_id = SpaceId([0xD3; 16]);
-    let (engine_a, engine_b, app_handle_a, app_handle_b, mut pub_rx_a, sub_tx_b, poll_id, actor_owner, actor_key) =
-        two_engine_fixture(community_id, 0xC1, 0xC2).await;
+    let (
+        engine_a,
+        engine_b,
+        app_handle_a,
+        app_handle_b,
+        mut pub_rx_a,
+        sub_tx_b,
+        poll_id,
+        actor_owner,
+        actor_key,
+    ) = two_engine_fixture(community_id, 0xC1, 0xC2).await;
 
     // Listen for both kd=dc and kd=da on Engine A (need to drain kd=dc
     // from publisher_rx_a first before the kd=da packet arrives).
@@ -702,7 +761,10 @@ async fn voting_tier3_draft_approval_emits_on_originator_and_peer() {
     let parsed_a: serde_json::Value =
         serde_json::from_str(&payloads_a[0]).expect("Engine A kd=da payload is valid JSON");
     assert!(parsed_a["pollId"].is_string(), "A: pollId present");
-    assert!(parsed_a["communityId"].is_string(), "A: communityId present");
+    assert!(
+        parsed_a["communityId"].is_string(),
+        "A: communityId present"
+    );
     assert_eq!(
         parsed_a["approver"].as_str(),
         Some(hex::encode(actor_owner.0).as_str()),
@@ -743,7 +805,10 @@ async fn voting_tier3_draft_approval_emits_on_originator_and_peer() {
     let parsed_b: serde_json::Value =
         serde_json::from_str(&payloads_b[0]).expect("Engine B kd=da payload is valid JSON");
     assert!(parsed_b["pollId"].is_string(), "B: pollId present");
-    assert!(parsed_b["communityId"].is_string(), "B: communityId present");
+    assert!(
+        parsed_b["communityId"].is_string(),
+        "B: communityId present"
+    );
     assert_eq!(
         parsed_b["approver"].as_str(),
         Some(hex::encode(actor_owner.0).as_str()),
@@ -757,7 +822,10 @@ async fn voting_tier3_draft_approval_emits_on_originator_and_peer() {
 
     // Exactly-once: Engine A's kd=da count stays at 1.
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let final_a = captured_a_da.lock().expect("captured_a_da final lock").clone();
+    let final_a = captured_a_da
+        .lock()
+        .expect("captured_a_da final lock")
+        .clone();
     assert_eq!(
         final_a.len(),
         1,
