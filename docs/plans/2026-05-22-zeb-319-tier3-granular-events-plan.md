@@ -491,50 +491,68 @@ export interface Tier3DraftApprovalPayload {
 
 - [ ] **Step 2: Add the three subscriber methods in `src/lib/voting-adapter.ts`**
 
-Locate `subscribeTier3TallyShareApplied` (around line 304). Append three new methods following the same shape:
+The existing adapter pattern splits responsibility two ways:
+1. Per-event-kind: a `tier3*Subs: Array<(payload) => void>` field holds local handlers; a sync `subscribeTier3*(handler)` method pushes onto the array and returns a closure that splices the handler back out.
+2. One-time wiring: `connectAdapter(adapter)` invokes `adapter.listen('event-name', payload => for-each(subs, h => h(payload)))` and pushes the resulting unlisten function onto `stagedUnlisteners: Array<() => void>`.
+
+Locate `subscribeTier3TallyShareApplied` (around line 304) for the closest pattern. Append three new methods, three new `tier3*Subs` field declarations, and three new `adapter.listen(...)` blocks inside `connectAdapter`:
 
 ```typescript
-/**
- * ZEB-319: subscribe to mid-stage sortition-decline events.
- * @returns an UnlistenFn — call to remove the listener.
- */
-async subscribeTier3MiniPublicDecline(
+// In the class field section (near `tier3TallyShareAppliedSubs`):
+private tier3MiniPublicDeclineSubs: Array<
+  (payload: Tier3MiniPublicDeclinePayload) => void
+> = [];
+private tier3DraftCandidateSubs: Array<
+  (payload: Tier3DraftCandidatePayload) => void
+> = [];
+private tier3DraftApprovalSubs: Array<
+  (payload: Tier3DraftApprovalPayload) => void
+> = [];
+
+// In the subscribe-method section (near `subscribeTier3TallyShareApplied`):
+subscribeTier3MiniPublicDecline(
   handler: (payload: Tier3MiniPublicDeclinePayload) => void,
-): Promise<UnlistenFn> {
-  return listen<Tier3MiniPublicDeclinePayload>(
-    'voting-tier3-mini-public-decline',
-    (event) => handler(event.payload),
-  );
+): () => void {
+  this.tier3MiniPublicDeclineSubs.push(handler);
+  return () => {
+    const i = this.tier3MiniPublicDeclineSubs.indexOf(handler);
+    if (i >= 0) this.tier3MiniPublicDeclineSubs.splice(i, 1);
+  };
 }
 
-/**
- * ZEB-319: subscribe to mid-stage draft-candidate proposals.
- */
-async subscribeTier3DraftCandidate(
+subscribeTier3DraftCandidate(
   handler: (payload: Tier3DraftCandidatePayload) => void,
-): Promise<UnlistenFn> {
-  return listen<Tier3DraftCandidatePayload>(
-    'voting-tier3-draft-candidate',
-    (event) => handler(event.payload),
-  );
+): () => void {
+  this.tier3DraftCandidateSubs.push(handler);
+  return () => {
+    const i = this.tier3DraftCandidateSubs.indexOf(handler);
+    if (i >= 0) this.tier3DraftCandidateSubs.splice(i, 1);
+  };
 }
 
-/**
- * ZEB-319: subscribe to mid-stage draft-approval signals.
- */
-async subscribeTier3DraftApproval(
+subscribeTier3DraftApproval(
   handler: (payload: Tier3DraftApprovalPayload) => void,
-): Promise<UnlistenFn> {
-  return listen<Tier3DraftApprovalPayload>(
-    'voting-tier3-draft-approval',
-    (event) => handler(event.payload),
-  );
+): () => void {
+  this.tier3DraftApprovalSubs.push(handler);
+  return () => {
+    const i = this.tier3DraftApprovalSubs.indexOf(handler);
+    if (i >= 0) this.tier3DraftApprovalSubs.splice(i, 1);
+  };
 }
+
+// In connectAdapter(...) (near the existing voting-tier3-tally-share-applied wiring):
+const unlistenTier3MiniPublicDecline = await adapter.listen<
+  Tier3MiniPublicDeclinePayload
+>('voting-tier3-mini-public-decline', (payload) => {
+  for (const h of this.tier3MiniPublicDeclineSubs) h(payload);
+});
+stagedUnlisteners.push(unlistenTier3MiniPublicDecline);
+// ... repeat for voting-tier3-draft-candidate and voting-tier3-draft-approval.
 ```
 
-**Import + return-type verification (before writing):**
-- Verify the exact `listen` / `UnlistenFn` import shape used by `subscribeTier3TallyShareApplied` (Promise vs sync return, callback signature). Match it precisely.
-- If the existing method uses a non-async signature, match that style instead.
+**Pattern verification (before writing):**
+- Confirm `subscribeTier3TallyShareApplied` is sync, returns `() => void`, and pushes into `tier3TallyShareAppliedSubs`. If it doesn't, match whatever the actual existing pattern is.
+- Confirm `connectAdapter` collects `adapter.listen(...)` results into `stagedUnlisteners`. The new event names go in the same block as the existing tally-share wiring.
 
 - [ ] **Step 3: Run frontend gates**
 
