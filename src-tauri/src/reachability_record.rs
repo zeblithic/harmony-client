@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use crate::owner_state_crypto::{
     canonical_cbor_encode, sealed::CanonicalPayloadSealed, CanonicalPayload, CryptoError,
 };
+use crate::owner_state_types::{deserialize_bytes_from_bstr, serialize_bytes_as_bstr};
 
 /// Payload of a `MembershipEventKind::ReachabilityAnnounce` variant.
 /// All 5 field keys are 2 chars to satisfy the same-length-keys invariant
@@ -17,7 +18,11 @@ use crate::owner_state_crypto::{
 pub struct ReachabilityAnnouncePayload {
     /// Iroh NodeId (Ed25519 public key, 32 bytes). Distinct from
     /// harmony identity key — bound to it via `identity_signature`.
-    #[serde(rename = "nd", with = "serde_bytes_array_32")]
+    #[serde(
+        rename = "nd",
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
     pub iroh_node_id: [u8; 32],
 
     /// Home DERP relay URL (Phase 1: an n0-hosted relay).
@@ -36,50 +41,16 @@ pub struct ReachabilityAnnouncePayload {
     /// Inner Ed25519 signature by the device's HARMONY identity key
     /// over canonical CBOR of (nd, rl, da, ts, actor, hlc). Binds the
     /// Iroh NodeId to the harmony identity. 64 bytes.
-    #[serde(rename = "sg", with = "serde_bytes_array_64")]
+    #[serde(
+        rename = "sg",
+        serialize_with = "serialize_bytes_as_bstr",
+        deserialize_with = "deserialize_bytes_from_bstr"
+    )]
     pub identity_signature: [u8; 64],
 }
 
 impl CanonicalPayloadSealed for ReachabilityAnnouncePayload {}
 impl CanonicalPayload for ReachabilityAnnouncePayload {}
-
-// 32- and 64-byte fixed-length serde helpers — encode as CBOR bstr
-// (major type 2) rather than array-of-u8.
-mod serde_bytes_array_32 {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use serde_bytes::Bytes;
-
-    pub fn serialize<S: Serializer>(v: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
-        Bytes::new(v).serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
-        let v: serde_bytes::ByteBuf = serde_bytes::ByteBuf::deserialize(d)?;
-        let arr: [u8; 32] = v
-            .as_ref()
-            .try_into()
-            .map_err(|_| serde::de::Error::custom("expected 32-byte iroh_node_id"))?;
-        Ok(arr)
-    }
-}
-
-mod serde_bytes_array_64 {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use serde_bytes::Bytes;
-
-    pub fn serialize<S: Serializer>(v: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
-        Bytes::new(v).serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
-        let v: serde_bytes::ByteBuf = serde_bytes::ByteBuf::deserialize(d)?;
-        let arr: [u8; 64] = v
-            .as_ref()
-            .try_into()
-            .map_err(|_| serde::de::Error::custom("expected 64-byte identity_signature"))?;
-        Ok(arr)
-    }
-}
 
 /// Convenience: canonical-encode for hashing / signing.
 pub fn canonical_payload_bytes(p: &ReachabilityAnnouncePayload) -> Result<Vec<u8>, CryptoError> {
@@ -111,7 +82,7 @@ mod tests {
 
     #[test]
     fn payload_keys_are_2_chars() {
-        // Same-length-keys CBOR invariant — see community_membership.rs:325.
+        // Same-length-keys CBOR invariant — see EventPayload doc in community_membership.rs.
         let p = fixture_payload();
         let bytes = canonical_payload_bytes(&p).expect("encode");
         let val: ciborium::Value = ciborium::de::from_reader(&bytes[..]).expect("decode");
