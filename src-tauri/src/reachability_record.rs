@@ -168,6 +168,10 @@ pub fn verify_inner_signature(
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum InnerSigError {
+    /// Unreachable in practice — `ciborium::into_writer` against a
+    /// `Vec<u8>` writer is infallible (no IO failure mode). Kept as
+    /// defensive-coding hygiene for future refactors that might use a
+    /// real IO sink.
     #[error("inner reachability signature failed to encode")]
     Encode,
     #[error("inner reachability signature invalid")]
@@ -225,8 +229,12 @@ mod tests {
 
     #[test]
     fn inner_sig_roundtrip_with_real_identity() {
-        let identity = PrivateIdentity::generate(&mut rand::thread_rng());
-        let actor = OwnerAddr(identity.identity.address_hash);
+        // Deterministic seed matches the pattern used by
+        // zeb_321_reachability_verify_tests::make_identity — keeps tests
+        // reproducible across runs (no rand::thread_rng dependency).
+        let identity = PrivateIdentity::from_seed(&[0xAA; 32]);
+        let public = identity.public_identity();
+        let actor = OwnerAddr(public.address_hash);
         let hlc = fixture_hlc();
         let p = build_signed_payload(
             [0xAB; 32],
@@ -239,19 +247,14 @@ mod tests {
         )
         .expect("sign");
 
-        // PrivateIdentity::to_public_bytes() returns 64 bytes:
-        // X25519_pub (32) || Ed25519_pub (32).
-        let pub_bytes = identity.identity.to_public_bytes();
-        let ed_pub: [u8; 32] = pub_bytes[32..].try_into().unwrap();
-        let verifying = ed25519_dalek::VerifyingKey::from_bytes(&ed_pub).unwrap();
-
-        verify_inner_signature(&p, &actor, &hlc, &verifying).expect("verify");
+        verify_inner_signature(&p, &actor, &hlc, &public.verifying_key).expect("verify");
     }
 
     #[test]
     fn inner_sig_rejects_tampered_node_id() {
-        let identity = PrivateIdentity::generate(&mut rand::thread_rng());
-        let actor = OwnerAddr(identity.identity.address_hash);
+        let identity = PrivateIdentity::from_seed(&[0xAA; 32]);
+        let public = identity.public_identity();
+        let actor = OwnerAddr(public.address_hash);
         let hlc = fixture_hlc();
         let mut p = build_signed_payload(
             [0xAB; 32],
@@ -265,12 +268,8 @@ mod tests {
         .expect("sign");
         p.iroh_node_id[0] ^= 0xFF;
 
-        let pub_bytes = identity.identity.to_public_bytes();
-        let ed_pub: [u8; 32] = pub_bytes[32..].try_into().unwrap();
-        let verifying = ed25519_dalek::VerifyingKey::from_bytes(&ed_pub).unwrap();
-
         assert_eq!(
-            verify_inner_signature(&p, &actor, &hlc, &verifying),
+            verify_inner_signature(&p, &actor, &hlc, &public.verifying_key),
             Err(InnerSigError::Invalid)
         );
     }

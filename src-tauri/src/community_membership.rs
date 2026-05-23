@@ -2843,20 +2843,23 @@ pub fn verify_event(
             // function (uniform with every other variant; surfaces as
             // VerifyError::SignatureInvalid). No work here.
 
+            // Derive harmony Identity once for both RCH2 (Ed25519
+            // verifying key) and RCH3 (address_hash). Avoids re-running
+            // `Identity::from_public_bytes` twice in the same arm.
+            let derived_identity =
+                harmony_identity::Identity::from_public_bytes(ctx.actor_identity_pub)
+                    .map_err(|_| VerifyError::InvalidIdentityPub)?;
+
             // RCH2: inner identity signature must verify over canonical
             // CBOR of (nd, rl, da, ts, actor, hlc) using the actor's
-            // Ed25519 public component (the back half of the 64-byte
-            // identity_pub: X25519_pub || Ed25519_pub).
-            let ed_pub: [u8; 32] = ctx.actor_identity_pub[32..]
-                .try_into()
-                .map_err(|_| VerifyError::InvalidIdentityPub)?;
-            let verifying = ed25519_dalek::VerifyingKey::from_bytes(&ed_pub)
-                .map_err(|_| VerifyError::InvalidIdentityPub)?;
+            // Ed25519 verifying key (the back half of the 64-byte
+            // identity_pub: X25519_pub || Ed25519_pub, exposed by
+            // harmony_identity::Identity as `verifying_key`).
             crate::reachability_record::verify_inner_signature(
                 payload,
                 &event.actor,
                 &event.at,
-                &verifying,
+                &derived_identity.verifying_key,
             )
             .map_err(|e| match e {
                 crate::reachability_record::InnerSigError::Encode => {
@@ -2867,18 +2870,19 @@ pub fn verify_event(
                 }
             })?;
 
-            // RCH3: actor in envelope must equal the OwnerAddr derived
-            // from the identity that produced the inner sig. The outer
-            // `verify_signature()` already proves event.actor matches
-            // ctx.actor_identity_pub (via ActorPubkeyMismatch), and the
-            // inner verify above uses the same key — so this is
-            // defense-in-depth, not a new check. We re-derive the addr
-            // and compare to surface the dedicated RCH3 discriminant if
-            // any future refactor splits the outer-sig and inner-sig
-            // identity-pub sources.
-            let derived_identity =
-                harmony_identity::Identity::from_public_bytes(ctx.actor_identity_pub)
-                    .map_err(|_| VerifyError::InvalidIdentityPub)?;
+            // RCH3: actor in envelope must equal address derived from the
+            // inner-sig signer. This is the spec's dedicated RCH3 rule —
+            // kept as its own check + discriminant for telemetry
+            // traceability (so RCH3 violations surface distinctly in
+            // error metrics).
+            //
+            // In practice this is UNREACHABLE: verify_signature() at the
+            // top of verify_event already derives event.actor from
+            // ctx.actor_identity_pub and returns
+            // VerifyError::ActorPubkeyMismatch on mismatch. The inner
+            // sig (RCH2) above uses the same key source. If a future
+            // refactor ever splits the inner-sig key from the outer-sig
+            // key, this check becomes load-bearing.
             let derived_addr = OwnerAddr(derived_identity.address_hash);
             if derived_addr != event.actor {
                 return Err(VerifyError::ReachabilityActorMismatch);
@@ -2888,9 +2892,8 @@ pub fn verify_event(
             // Cast to i64 first to allow negative skew. u64 → i64 cast
             // is safe under realistic wall-clock values (i64::MAX ms ≈
             // year 292 277 026 596); we don't worry about overflow.
-            const SKEW_MS: i64 = 30 * 60 * 1000;
             let skew = (payload.announced_at_ms as i64) - (event.at.wall_ms as i64);
-            if skew.abs() > SKEW_MS {
+            if skew.abs() > REACHABILITY_TIMESTAMP_SKEW_MAX_MS {
                 return Err(VerifyError::ReachabilityTimestampSkew);
             }
 
@@ -3049,6 +3052,13 @@ pub const MATERIALIZE_PENDING_EXPIRY_MS: u64 = 30 * 86_400_000;
 /// Mirrors ZEB-254's PendingJoin 30-day expiry. Same constant value;
 /// kept as a separate const for clarity at the call site.
 pub const ADMIN_PROPOSAL_EXPIRY_MS: u64 = 30 * 86_400_000;
+
+/// ZEB-321 RCH4: maximum allowed skew (ms) between a
+/// ReachabilityAnnounce payload's `announced_at_ms` and the event's
+/// HLC `wall_ms`. ±30 minutes — generous enough to tolerate normal
+/// device clock drift; tight enough to reject obviously-tampered
+/// records (spec §5.5 silent-drop semantics).
+pub const REACHABILITY_TIMESTAMP_SKEW_MAX_MS: i64 = 30 * 60 * 1000;
 
 /// ZEB-250: apply an admin-proposal's effect to the running
 /// materialized state when the proposal has reached quorum within the
@@ -9338,10 +9348,12 @@ mod zeb_321_reachability_verify_tests {
         let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
         let prior = joined_prior(community_id, &admin_priv, admin_addr);
 
-        // announced_at_ms = wall_ms + 31 minutes (just outside the
-        // 30-min window).
-        let wall_ms = 1_000_000_000;
-        let announced_at_ms = wall_ms + 31 * 60 * 1000;
+        // announced_at_ms = wall_ms + (skew-max + 1 min), i.e. just
+        // outside the RCH4 ±30-min window. Referencing the const keeps
+        // this test in sync if the threshold is ever tuned.
+        let wall_ms: u64 = 1_000_000_000;
+        let announced_at_ms =
+            wall_ms + (REACHABILITY_TIMESTAMP_SKEW_MAX_MS as u64) + 60 * 1000;
         let event = make_reachability_event(
             community_id,
             &admin_priv,
