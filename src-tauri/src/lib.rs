@@ -63,6 +63,7 @@ pub mod pairing;
 pub mod pairing_commands;
 pub mod profile_broadcast;
 pub mod reachability_record;
+pub mod reachability_resolver;
 pub mod recovery_cli;
 pub mod recovery_policy;
 mod save_dialog;
