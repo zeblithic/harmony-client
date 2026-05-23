@@ -538,16 +538,15 @@ pub async fn run<R: Runtime>(
     // tasks live for the lifetime of the tokio runtime that hosts the
     // event loop, ending when their internal streams close (endpoint
     // shutdown for accept loop; runtime drop for publisher).
-    let _iroh_handles_keepalive = iroh_handles.map(|h| {
+    // `inspect` keeps `h` in the Option while letting us trigger the
+    // spawn side-effects; the returned Option is bound to a `_`-prefixed
+    // variable so the contained Arcs (endpoint + link manager +
+    // publisher) live for the rest of the event loop. Dropping them
+    // would race the spawned accept loop and publisher into observing
+    // their endpoint shutting down mid-flight.
+    let _iroh_handles_keepalive = iroh_handles.inspect(|h| {
         let _accept = h.link_manager.spawn_accept_loop();
         let _publisher = std::sync::Arc::clone(&h.publisher).spawn();
-        // Keep the Arcs alive for the duration of the event loop. Without
-        // this binding, dropping `h` at end of the closure would drop the
-        // endpoint + publisher Arcs immediately and the spawned tasks
-        // would observe `accept()` returning None / publisher pollers
-        // racing with shutdown. The `_` prefix opts the binding out of
-        // unused-warnings.
-        h
     });
 
     // ── Phase 3a: SyncEngine wire-up ────────────────────────────────────
