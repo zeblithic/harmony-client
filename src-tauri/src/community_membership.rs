@@ -293,6 +293,20 @@ pub enum MembershipEventKind {
         )]
         target_event_id: EventId,
     },
+
+    /// ZEB-321 Phase 1: device publishes its Iroh NodeId + DERP relay +
+    /// direct-address hints into the community-state CRDT so other
+    /// community members can reach it cross-WAN via Iroh.
+    ///
+    /// Variant tag "a" (1-char value, unused before this — keeps the
+    /// same-length-keys invariant intact). Inner field keys are 2-char
+    /// per the `ReachabilityAnnouncePayload` struct.
+    /// See `docs/specs/2026-05-22-zeb-321-cross-wan-connectivity-design.md` §5.
+    #[serde(rename = "a")]
+    ReachabilityAnnounce {
+        #[serde(rename = "pl")]
+        payload: crate::reachability_record::ReachabilityAnnouncePayload,
+    },
 }
 
 impl CanonicalPayloadSealed for MembershipEventKind {}
@@ -1998,6 +2012,11 @@ pub fn materialize_with_now(
                 // in seen_admin_proposals but not in proposals_index — shouldn't
                 // happen in a well-formed log; silently skip.
             }
+
+            MembershipEventKind::ReachabilityAnnounce { .. } => {
+                // ZEB-321: no membership-state effect; handled by
+                // ReachabilityResolver hook in event_loop.
+            }
         }
     }
 
@@ -2498,6 +2517,9 @@ pub fn verify_event(
             // mirror ZEB-254's JoinCountersign — out-of-order DAG-sync
             // delivery is normal. Pairing happens at materialize time.
         }
+        MembershipEventKind::ReachabilityAnnounce { .. } => {
+            // ZEB-321 Task 2 will add RCH1-RCH5 verify.
+        }
     }
 
     // 5. Per-kind power rules.
@@ -2770,6 +2792,10 @@ pub fn verify_event(
         MembershipEventKind::AdminCountersign { .. } => {
             // All AdminCountersign gates (AC1-AC3) are handled in the
             // joined-membership block above. No separate power rule needed.
+        }
+        MembershipEventKind::ReachabilityAnnounce { .. } => {
+            // ZEB-321 Task 2 will add RCH1-RCH5 verify (signer must be a
+            // Joined member; inner identity_signature must verify; etc).
         }
     }
 
@@ -5541,6 +5567,53 @@ mod tests {
         let encoded = crate::owner_state_crypto::canonical_cbor_encode(&status).expect("encode");
         let decoded: MemberStatus = ciborium::from_reader(&mut encoded.as_slice()).expect("decode");
         assert_eq!(status, decoded);
+    }
+
+    #[test]
+    fn reachability_announce_variant_cbor_roundtrip() {
+        use crate::reachability_record::ReachabilityAnnouncePayload;
+        let payload = ReachabilityAnnouncePayload {
+            iroh_node_id: [0xAB; 32],
+            home_relay_url: "https://derp.example/".into(),
+            direct_addresses: vec![],
+            announced_at_ms: 1_700_000_000_000,
+            identity_signature: [0xCD; 64],
+        };
+        let kind = MembershipEventKind::ReachabilityAnnounce {
+            payload: payload.clone(),
+        };
+        let bytes = crate::owner_state_crypto::canonical_cbor_encode(&kind).expect("encode");
+        let decoded: MembershipEventKind =
+            ciborium::de::from_reader(&bytes[..]).expect("decode");
+        assert_eq!(
+            decoded,
+            MembershipEventKind::ReachabilityAnnounce { payload }
+        );
+    }
+
+    #[test]
+    fn reachability_announce_outer_keys_invariant() {
+        use crate::reachability_record::ReachabilityAnnouncePayload;
+        let kind = MembershipEventKind::ReachabilityAnnounce {
+            payload: ReachabilityAnnouncePayload {
+                iroh_node_id: [0; 32],
+                home_relay_url: String::new(),
+                direct_addresses: vec![],
+                announced_at_ms: 0,
+                identity_signature: [0; 64],
+            },
+        };
+        let bytes = crate::owner_state_crypto::canonical_cbor_encode(&kind).expect("encode");
+        let val: ciborium::Value = ciborium::de::from_reader(&bytes[..]).expect("decode");
+        let map = val.as_map().expect("outer is map");
+        for (k, _) in map {
+            let s = k.as_text().expect("key is text");
+            assert_eq!(
+                s.chars().count(),
+                2,
+                "MembershipEventKind::ReachabilityAnnounce outer key {s:?} violates 2-char invariant"
+            );
+        }
     }
 }
 

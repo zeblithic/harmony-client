@@ -62,6 +62,7 @@ pub mod owner_state_types;
 pub mod pairing;
 pub mod pairing_commands;
 pub mod profile_broadcast;
+pub mod reachability_record;
 pub mod recovery_cli;
 pub mod recovery_policy;
 mod save_dialog;
@@ -19565,7 +19566,11 @@ pub fn delta_to_change(
         // ZEB-250: AdminProposal and AdminCountersign are governance events;
         // projection to MembershipChange is deferred to Task 8 (IPC wiring).
         | crate::community_membership::MembershipEventKind::AdminProposal { .. }
-        | crate::community_membership::MembershipEventKind::AdminCountersign { .. } => return None,
+        | crate::community_membership::MembershipEventKind::AdminCountersign { .. }
+        // ZEB-321: ReachabilityAnnounce is connectivity-state, not
+        // membership-state; no MembershipChange is projected. Handled
+        // by the ReachabilityResolver hook in event_loop.
+        | crate::community_membership::MembershipEventKind::ReachabilityAnnounce { .. } => return None,
     };
     Some((cid_hex, change))
 }
