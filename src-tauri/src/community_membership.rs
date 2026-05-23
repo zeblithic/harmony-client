@@ -744,6 +744,31 @@ pub enum VerifyError {
     /// rejected because admin_quorum > 1.
     /// Must route through AdminProposal + AdminCountersign quorum.
     KickRequiresQuorum,
+
+    // ── ZEB-321 RCH1-RCH5 ReachabilityAnnounce verify rules ──
+    //
+    // RCH1 (outer SignedMembershipEvent signature) is enforced by the
+    // existing `verify_signature()` call at the top of verify_event —
+    // reuses `VerifyError::SignatureInvalid`. No dedicated discriminant.
+    /// ZEB-321 RCH2: inner identity signature on a ReachabilityAnnounce
+    /// payload failed to verify. Binds the Iroh NodeId to the harmony
+    /// identity; rejecting prevents a malicious community member from
+    /// claiming someone else's NodeId.
+    ReachabilityInnerSigInvalid,
+
+    /// ZEB-321 RCH3: the actor field of a ReachabilityAnnounce envelope
+    /// does not match the OwnerAddr derived from the identity that
+    /// produced the inner signature.
+    ReachabilityActorMismatch,
+
+    /// ZEB-321 RCH4: the payload's `announced_at_ms` differs from the
+    /// event's HLC `wall_ms` by more than ±30 minutes. Sanity check —
+    /// rejects obviously-tampered records (the spec's "silent drop").
+    ReachabilityTimestampSkew,
+
+    /// ZEB-321 RCH5: the actor is not a current community member at
+    /// the event's HLC (read via membership projection).
+    ReachabilityActorNotMember,
 }
 
 impl std::fmt::Display for VerifyError {
@@ -893,6 +918,18 @@ impl std::fmt::Display for VerifyError {
             }
             VerifyError::SetPowerRequiresQuorum => write!(f, "ZEB-250: direct admin-affecting SetPower rejected (admin_quorum > 1 — use AdminProposal)"),
             VerifyError::KickRequiresQuorum => write!(f, "ZEB-250: direct Kick of an admin rejected (admin_quorum > 1 — use AdminProposal)"),
+            VerifyError::ReachabilityInnerSigInvalid => {
+                write!(f, "ZEB-321 RCH2 inner ReachabilityAnnounce signature invalid")
+            }
+            VerifyError::ReachabilityActorMismatch => {
+                write!(f, "ZEB-321 RCH3 ReachabilityAnnounce actor != inner-signer")
+            }
+            VerifyError::ReachabilityTimestampSkew => {
+                write!(f, "ZEB-321 RCH4 ReachabilityAnnounce timestamp skew > 30min")
+            }
+            VerifyError::ReachabilityActorNotMember => {
+                write!(f, "ZEB-321 RCH5 ReachabilityAnnounce actor is not a community member")
+            }
         }
     }
 }
@@ -2518,7 +2555,12 @@ pub fn verify_event(
             // delivery is normal. Pairing happens at materialize time.
         }
         MembershipEventKind::ReachabilityAnnounce { .. } => {
-            // ZEB-321 Task 2 will add RCH1-RCH5 verify.
+            // ZEB-321: membership status (RCH5) is enforced in the
+            // per-kind power-rules block below, alongside the inner-sig
+            // and timestamp-skew checks. No work here — reachability is
+            // a "any-joined-member, no power gate" kind (analogous to
+            // Fork) but we keep all RCH2-RCH5 enforcement contiguous in
+            // the per-kind block for readability.
         }
     }
 
@@ -2793,9 +2835,73 @@ pub fn verify_event(
             // All AdminCountersign gates (AC1-AC3) are handled in the
             // joined-membership block above. No separate power rule needed.
         }
-        MembershipEventKind::ReachabilityAnnounce { .. } => {
-            // ZEB-321 Task 2 will add RCH1-RCH5 verify (signer must be a
-            // Joined member; inner identity_signature must verify; etc).
+        MembershipEventKind::ReachabilityAnnounce { payload } => {
+            // ZEB-321 RCH1-RCH5 enforcement.
+            //
+            // RCH1: outer SignedMembershipEvent signature — already
+            // verified by `verify_signature()` at the top of this
+            // function (uniform with every other variant; surfaces as
+            // VerifyError::SignatureInvalid). No work here.
+
+            // RCH2: inner identity signature must verify over canonical
+            // CBOR of (nd, rl, da, ts, actor, hlc) using the actor's
+            // Ed25519 public component (the back half of the 64-byte
+            // identity_pub: X25519_pub || Ed25519_pub).
+            let ed_pub: [u8; 32] = ctx.actor_identity_pub[32..]
+                .try_into()
+                .map_err(|_| VerifyError::InvalidIdentityPub)?;
+            let verifying = ed25519_dalek::VerifyingKey::from_bytes(&ed_pub)
+                .map_err(|_| VerifyError::InvalidIdentityPub)?;
+            crate::reachability_record::verify_inner_signature(
+                payload,
+                &event.actor,
+                &event.at,
+                &verifying,
+            )
+            .map_err(|e| match e {
+                crate::reachability_record::InnerSigError::Encode => {
+                    VerifyError::EncodeError("inner reachability sig encode".to_string())
+                }
+                crate::reachability_record::InnerSigError::Invalid => {
+                    VerifyError::ReachabilityInnerSigInvalid
+                }
+            })?;
+
+            // RCH3: actor in envelope must equal the OwnerAddr derived
+            // from the identity that produced the inner sig. The outer
+            // `verify_signature()` already proves event.actor matches
+            // ctx.actor_identity_pub (via ActorPubkeyMismatch), and the
+            // inner verify above uses the same key — so this is
+            // defense-in-depth, not a new check. We re-derive the addr
+            // and compare to surface the dedicated RCH3 discriminant if
+            // any future refactor splits the outer-sig and inner-sig
+            // identity-pub sources.
+            let derived_identity =
+                harmony_identity::Identity::from_public_bytes(ctx.actor_identity_pub)
+                    .map_err(|_| VerifyError::InvalidIdentityPub)?;
+            let derived_addr = OwnerAddr(derived_identity.address_hash);
+            if derived_addr != event.actor {
+                return Err(VerifyError::ReachabilityActorMismatch);
+            }
+
+            // RCH4: announced_at_ms vs hlc.wall_ms within ±30 min.
+            // Cast to i64 first to allow negative skew. u64 → i64 cast
+            // is safe under realistic wall-clock values (i64::MAX ms ≈
+            // year 292 277 026 596); we don't worry about overflow.
+            const SKEW_MS: i64 = 30 * 60 * 1000;
+            let skew = (payload.announced_at_ms as i64) - (event.at.wall_ms as i64);
+            if skew.abs() > SKEW_MS {
+                return Err(VerifyError::ReachabilityTimestampSkew);
+            }
+
+            // RCH5: actor must be Joined at hlc. Same shape as Fork's
+            // membership check (any joined member, no power gate).
+            // Reuses prior_state.members — verify_event's caller has
+            // already projected state up to (but not including) this
+            // event per the function's contract.
+            if !is_joined_member(prior_state, &event.actor) {
+                return Err(VerifyError::ReachabilityActorNotMember);
+            }
         }
     }
 
@@ -9070,6 +9176,274 @@ mod zeb_250_admin_proposal_materialize_tests {
             m.power_levels.get(&target).copied().unwrap_or(0),
             100,
             "target must be promoted to 100 (effect applied exactly once)"
+        );
+    }
+}
+
+// ── ZEB-321 RCH1-RCH5 ReachabilityAnnounce verify_event tests ─────────────────
+
+#[cfg(test)]
+mod zeb_321_reachability_verify_tests {
+    use super::*;
+    use crate::reachability_record::{build_signed_payload, ReachabilityAnnouncePayload};
+
+    /// Build a test identity from a seed byte.
+    /// Returns (PrivateIdentity, identity_pub [u8; 64], OwnerAddr).
+    fn make_identity(seed_byte: u8) -> (harmony_identity::PrivateIdentity, [u8; 64], OwnerAddr) {
+        let seed = [seed_byte; 32];
+        let private = harmony_identity::PrivateIdentity::from_seed(&seed);
+        let public = private.public_identity();
+        let identity_pub = public.to_public_bytes();
+        let addr = OwnerAddr(public.address_hash);
+        (private, identity_pub, addr)
+    }
+
+    /// Helper: produce a `prior_state` where `actor` is currently
+    /// Joined. Uses materialize on a single Join event so power_levels
+    /// + members reflect the bootstrap-admin shape.
+    fn joined_prior(
+        community_id: SpaceId,
+        admin_priv: &harmony_identity::PrivateIdentity,
+        admin_addr: OwnerAddr,
+    ) -> MaterializedMembership {
+        let admin_join_payload = EventPayload {
+            id: [0x01; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        };
+        let admin_join = sign_event_with_identity(&admin_join_payload, admin_priv)
+            .expect("sign admin join");
+        materialize(std::slice::from_ref(&admin_join), admin_addr)
+    }
+
+    /// Build a signed ReachabilityAnnounce event using a real identity.
+    /// `announced_at_ms` and `wall_ms` are passed separately so tests
+    /// can exercise the timestamp-skew gate.
+    fn make_reachability_event(
+        community_id: SpaceId,
+        identity: &harmony_identity::PrivateIdentity,
+        actor: OwnerAddr,
+        announced_at_ms: u64,
+        wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        let hlc = Hlc {
+            wall_ms,
+            logical: 0,
+            device_id: "t".into(),
+        };
+        let payload = build_signed_payload(
+            [0xAB; 32],
+            "https://derp.example/".into(),
+            vec![],
+            announced_at_ms,
+            &actor,
+            &hlc,
+            identity,
+        )
+        .expect("build signed payload");
+        let payload = EventPayload {
+            id: [0x42; 16],
+            community_id,
+            kind: MembershipEventKind::ReachabilityAnnounce { payload },
+            actor,
+            at: hlc,
+        };
+        sign_event_with_identity(&payload, identity).expect("sign envelope")
+    }
+
+    /// Positive end-to-end: joined actor + valid inner sig + matching
+    /// timestamp → Ok(()).
+    /// (Doubles as the implicit RCH1 + RCH3 positive: outer sig + actor
+    ///  derivation both pass cleanly here.)
+    #[test]
+    fn verify_reachability_announce_accepts_valid() {
+        let community_id = SpaceId([0xc0; 16]);
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let prior = joined_prior(community_id, &admin_priv, admin_addr);
+
+        let event =
+            make_reachability_event(community_id, &admin_priv, admin_addr, 1_000_000, 1_000_000);
+
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: None,
+        };
+        verify_event(&event, &prior, &ctx).expect("valid ReachabilityAnnounce must verify");
+    }
+
+    /// RCH2 negative: tampering the inner identity_signature bytes
+    /// makes verify_event reject with ReachabilityInnerSigInvalid.
+    /// (RCH3 explicit test omitted — it's defense-in-depth provably
+    ///  equivalent given RCH2 + outer signature verification. RCH1
+    ///  explicit test omitted — covered by existing verify_signature
+    ///  tests for the outer SignedMembershipEvent shape.)
+    #[test]
+    fn verify_reachability_announce_rejects_inner_sig_tampering() {
+        let community_id = SpaceId([0xc0; 16]);
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let prior = joined_prior(community_id, &admin_priv, admin_addr);
+
+        let mut event =
+            make_reachability_event(community_id, &admin_priv, admin_addr, 1_000_000, 1_000_000);
+
+        // Flip a bit inside the inner identity_signature.
+        // We must re-sign the OUTER envelope after mutating the payload
+        // (else the outer verify_signature would reject with
+        // SignatureInvalid before we reach the RCH2 check).
+        if let MembershipEventKind::ReachabilityAnnounce { ref mut payload } = event.kind {
+            payload.identity_signature[0] ^= 0xFF;
+        } else {
+            panic!("expected ReachabilityAnnounce");
+        }
+        let resigned_payload = EventPayload {
+            id: event.id,
+            community_id: event.community_id,
+            kind: event.kind.clone(),
+            actor: event.actor,
+            at: event.at.clone(),
+        };
+        let resigned =
+            sign_event_with_identity(&resigned_payload, &admin_priv).expect("re-sign envelope");
+
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: None,
+        };
+        let result = verify_event(&resigned, &prior, &ctx);
+        assert!(
+            matches!(result, Err(VerifyError::ReachabilityInnerSigInvalid)),
+            "tampered inner sig must produce ReachabilityInnerSigInvalid; got {result:?}"
+        );
+    }
+
+    /// RCH4 negative: announced_at_ms outside ±30 min of hlc.wall_ms
+    /// (here: +31 min) is rejected with ReachabilityTimestampSkew.
+    #[test]
+    fn verify_reachability_announce_rejects_timestamp_skew() {
+        let community_id = SpaceId([0xc0; 16]);
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let prior = joined_prior(community_id, &admin_priv, admin_addr);
+
+        // announced_at_ms = wall_ms + 31 minutes (just outside the
+        // 30-min window).
+        let wall_ms = 1_000_000_000;
+        let announced_at_ms = wall_ms + 31 * 60 * 1000;
+        let event = make_reachability_event(
+            community_id,
+            &admin_priv,
+            admin_addr,
+            announced_at_ms,
+            wall_ms,
+        );
+
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: None,
+        };
+        let result = verify_event(&event, &prior, &ctx);
+        assert!(
+            matches!(result, Err(VerifyError::ReachabilityTimestampSkew)),
+            "out-of-skew announced_at_ms must produce ReachabilityTimestampSkew; got {result:?}"
+        );
+    }
+
+    /// RCH5 negative: actor is not currently Joined (never joined).
+    /// Must be rejected with ReachabilityActorNotMember.
+    ///
+    /// Note: a never-member's RCH5 check fires AFTER RCH2 (inner-sig
+    /// passes since the actor signs validly) and RCH4 (timestamp is
+    /// in-window). So this test exercises RCH5 in isolation by
+    /// ensuring the other gates pass first.
+    #[test]
+    fn verify_reachability_announce_rejects_non_member() {
+        let community_id = SpaceId([0xc0; 16]);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
+        // Bob exists as an identity but has never Joined the community.
+        let (bob_priv, bob_pub, bob_addr) = make_identity(0xbb);
+        let prior = joined_prior(community_id, &admin_priv, admin_addr);
+
+        let event =
+            make_reachability_event(community_id, &bob_priv, bob_addr, 1_000_000, 1_000_000);
+
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &bob_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: None,
+        };
+        let result = verify_event(&event, &prior, &ctx);
+        assert!(
+            matches!(result, Err(VerifyError::ReachabilityActorNotMember)),
+            "non-member's ReachabilityAnnounce must produce ReachabilityActorNotMember; got {result:?}"
+        );
+    }
+
+    /// Sanity: a fresh `ReachabilityAnnouncePayload` (the all-zeros
+    /// shape used in serialization round-trip tests) is NOT mistakenly
+    /// accepted by verify — its inner identity_signature is all zeros,
+    /// which fails verify_strict regardless of identity.
+    #[test]
+    fn verify_reachability_announce_rejects_all_zero_inner_sig() {
+        let community_id = SpaceId([0xc0; 16]);
+        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let prior = joined_prior(community_id, &admin_priv, admin_addr);
+
+        let hlc = Hlc {
+            wall_ms: 1_000_000,
+            logical: 0,
+            device_id: "t".into(),
+        };
+        let bad_payload = ReachabilityAnnouncePayload {
+            iroh_node_id: [0xAB; 32],
+            home_relay_url: "https://derp.example/".into(),
+            direct_addresses: vec![],
+            announced_at_ms: 1_000_000,
+            identity_signature: [0u8; 64],
+        };
+        let payload = EventPayload {
+            id: [0x99; 16],
+            community_id,
+            kind: MembershipEventKind::ReachabilityAnnounce {
+                payload: bad_payload,
+            },
+            actor: admin_addr,
+            at: hlc,
+        };
+        let event =
+            sign_event_with_identity(&payload, &admin_priv).expect("sign envelope");
+
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: false,
+            actor_identity_pub: &admin_pub,
+            countersigner_identity_pub: None,
+            admin_identity_pub: None,
+        };
+        let result = verify_event(&event, &prior, &ctx);
+        assert!(
+            matches!(result, Err(VerifyError::ReachabilityInnerSigInvalid)),
+            "all-zero inner sig must produce ReachabilityInnerSigInvalid; got {result:?}"
         );
     }
 }

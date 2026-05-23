@@ -8,7 +8,9 @@ use std::net::SocketAddr;
 use crate::owner_state_crypto::{
     canonical_cbor_encode, sealed::CanonicalPayloadSealed, CanonicalPayload, CryptoError,
 };
-use crate::owner_state_types::{deserialize_bytes_from_bstr, serialize_bytes_as_bstr};
+use crate::owner_state_types::{
+    deserialize_bytes_from_bstr, serialize_bytes_as_bstr, Hlc, OwnerAddr,
+};
 
 /// Payload of a `MembershipEventKind::ReachabilityAnnounce` variant.
 /// All 5 field keys are 2 chars to satisfy the same-length-keys invariant
@@ -57,9 +59,134 @@ pub fn canonical_payload_bytes(p: &ReachabilityAnnouncePayload) -> Result<Vec<u8
     canonical_cbor_encode(p)
 }
 
+/// Canonical byte string the inner identity signature covers:
+/// CBOR(canonical) of (nd, rl, da, ts, ac, hl). The actor + hlc are pulled
+/// from the surrounding membership envelope; they're NOT part of the
+/// payload struct itself but are bound into the signature so a replay
+/// attacker can't lift a `ReachabilityAnnouncePayload` from one envelope
+/// and re-attach it under a different actor or HLC.
+///
+/// All 6 field keys are 2 chars to satisfy the same-length-keys
+/// invariant at this nesting level. This sig-input map MUST be kept
+/// distinct from `ReachabilityAnnouncePayload`'s wire shape (which has
+/// only the 5 self-contained fields nd/rl/da/ts/sg); confusing them
+/// would let a peer replay the inner-sig bytes verbatim.
+///
+/// Encodes via raw `ciborium::into_writer` (not `canonical_cbor_encode`)
+/// because the input struct holds references — and `CanonicalPayload`'s
+/// sealed-trait API can't be impl'd for borrowed `&T`. The encoding
+/// shape is still deterministic given all field serde impls are.
+pub fn inner_signed_bytes(
+    iroh_node_id: &[u8; 32],
+    home_relay_url: &str,
+    direct_addresses: &[SocketAddr],
+    announced_at_ms: u64,
+    actor: &OwnerAddr,
+    hlc: &Hlc,
+) -> Result<Vec<u8>, CryptoError> {
+    #[derive(Serialize)]
+    struct InnerSigInput<'a> {
+        #[serde(rename = "nd", serialize_with = "serialize_bytes_as_bstr")]
+        nd: &'a [u8; 32],
+        #[serde(rename = "rl")]
+        rl: &'a str,
+        #[serde(rename = "da")]
+        da: &'a [SocketAddr],
+        #[serde(rename = "ts")]
+        ts: u64,
+        #[serde(rename = "ac")]
+        ac: &'a OwnerAddr,
+        #[serde(rename = "hl")]
+        hl: &'a Hlc,
+    }
+    let input = InnerSigInput {
+        nd: iroh_node_id,
+        rl: home_relay_url,
+        da: direct_addresses,
+        ts: announced_at_ms,
+        ac: actor,
+        hl: hlc,
+    };
+    let mut buf = Vec::new();
+    ciborium::into_writer(&input, &mut buf)
+        .map_err(|e| CryptoError::CborEncode(format!("{e}")))?;
+    Ok(buf)
+}
+
+/// Sign a fresh `ReachabilityAnnouncePayload` using the device's harmony
+/// identity signing key. Caller is responsible for ensuring `actor`
+/// matches the identity (`identity.identity.address_hash`).
+pub fn build_signed_payload(
+    iroh_node_id: [u8; 32],
+    home_relay_url: String,
+    direct_addresses: Vec<SocketAddr>,
+    announced_at_ms: u64,
+    actor: &OwnerAddr,
+    hlc: &Hlc,
+    identity: &harmony_identity::PrivateIdentity,
+) -> Result<ReachabilityAnnouncePayload, CryptoError> {
+    let inner = inner_signed_bytes(
+        &iroh_node_id,
+        &home_relay_url,
+        &direct_addresses,
+        announced_at_ms,
+        actor,
+        hlc,
+    )?;
+    let sig = identity.sign(&inner);
+    Ok(ReachabilityAnnouncePayload {
+        iroh_node_id,
+        home_relay_url,
+        direct_addresses,
+        announced_at_ms,
+        identity_signature: sig,
+    })
+}
+
+/// Verify the inner identity signature against the given Ed25519
+/// verifying key — the 32-byte Ed25519 half of the 64-byte
+/// `harmony_identity::Identity::to_public_bytes()`.
+pub fn verify_inner_signature(
+    p: &ReachabilityAnnouncePayload,
+    actor: &OwnerAddr,
+    hlc: &Hlc,
+    actor_ed25519_pub: &ed25519_dalek::VerifyingKey,
+) -> Result<(), InnerSigError> {
+    let bytes = inner_signed_bytes(
+        &p.iroh_node_id,
+        &p.home_relay_url,
+        &p.direct_addresses,
+        p.announced_at_ms,
+        actor,
+        hlc,
+    )
+    .map_err(|_| InnerSigError::Encode)?;
+    let sig = ed25519_dalek::Signature::from_bytes(&p.identity_signature);
+    actor_ed25519_pub
+        .verify_strict(&bytes, &sig)
+        .map_err(|_| InnerSigError::Invalid)
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum InnerSigError {
+    #[error("inner reachability signature failed to encode")]
+    Encode,
+    #[error("inner reachability signature invalid")]
+    Invalid,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harmony_identity::PrivateIdentity;
+
+    fn fixture_hlc() -> Hlc {
+        Hlc {
+            wall_ms: 1_700_000_000_000,
+            logical: 0,
+            device_id: "fix".into(),
+        }
+    }
 
     fn fixture_payload() -> ReachabilityAnnouncePayload {
         ReachabilityAnnouncePayload {
@@ -95,5 +222,57 @@ mod tests {
                 "ReachabilityAnnouncePayload key {s:?} violates 2-char invariant"
             );
         }
+    }
+
+    #[test]
+    fn inner_sig_roundtrip_with_real_identity() {
+        let identity = PrivateIdentity::generate(&mut rand::thread_rng());
+        let actor = OwnerAddr(identity.identity.address_hash);
+        let hlc = fixture_hlc();
+        let p = build_signed_payload(
+            [0xAB; 32],
+            "https://derp.example/".into(),
+            vec![],
+            1_700_000_000_000,
+            &actor,
+            &hlc,
+            &identity,
+        )
+        .expect("sign");
+
+        // PrivateIdentity::to_public_bytes() returns 64 bytes:
+        // X25519_pub (32) || Ed25519_pub (32).
+        let pub_bytes = identity.identity.to_public_bytes();
+        let ed_pub: [u8; 32] = pub_bytes[32..].try_into().unwrap();
+        let verifying = ed25519_dalek::VerifyingKey::from_bytes(&ed_pub).unwrap();
+
+        verify_inner_signature(&p, &actor, &hlc, &verifying).expect("verify");
+    }
+
+    #[test]
+    fn inner_sig_rejects_tampered_node_id() {
+        let identity = PrivateIdentity::generate(&mut rand::thread_rng());
+        let actor = OwnerAddr(identity.identity.address_hash);
+        let hlc = fixture_hlc();
+        let mut p = build_signed_payload(
+            [0xAB; 32],
+            "https://derp.example/".into(),
+            vec![],
+            1_700_000_000_000,
+            &actor,
+            &hlc,
+            &identity,
+        )
+        .expect("sign");
+        p.iroh_node_id[0] ^= 0xFF;
+
+        let pub_bytes = identity.identity.to_public_bytes();
+        let ed_pub: [u8; 32] = pub_bytes[32..].try_into().unwrap();
+        let verifying = ed25519_dalek::VerifyingKey::from_bytes(&ed_pub).unwrap();
+
+        assert_eq!(
+            verify_inner_signature(&p, &actor, &hlc, &verifying),
+            Err(InnerSigError::Invalid)
+        );
     }
 }
