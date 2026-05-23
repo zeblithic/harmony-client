@@ -9352,8 +9352,7 @@ mod zeb_321_reachability_verify_tests {
         // outside the RCH4 ±30-min window. Referencing the const keeps
         // this test in sync if the threshold is ever tuned.
         let wall_ms: u64 = 1_000_000_000;
-        let announced_at_ms =
-            wall_ms + (REACHABILITY_TIMESTAMP_SKEW_MAX_MS as u64) + 60 * 1000;
+        let announced_at_ms = wall_ms + (REACHABILITY_TIMESTAMP_SKEW_MAX_MS as u64) + 60 * 1000;
         let event = make_reachability_event(
             community_id,
             &admin_priv,
