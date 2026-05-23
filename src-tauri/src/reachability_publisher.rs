@@ -113,7 +113,9 @@ impl ReachabilityPublisher {
             let mut iface_stream = match if_watch::tokio::IfWatcher::new() {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::warn!("if-watch init failed: {e}; falling back to idle-only republish");
+                    tracing::warn!(
+                        "if-watch init failed: {e}; falling back to idle-only republish"
+                    );
                     self.idle_loop().await;
                     return;
                 }
@@ -231,9 +233,12 @@ mod tests {
     /// approaches its budget something is wrong with the select loop.
     #[tokio::test]
     async fn force_notify_triggers_publish() {
-        tokio::time::timeout(Duration::from_secs(15), force_notify_triggers_publish_inner())
-            .await
-            .expect("force_notify_triggers_publish must complete within 15s");
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            force_notify_triggers_publish_inner(),
+        )
+        .await
+        .expect("force_notify_triggers_publish must complete within 15s");
     }
 
     async fn force_notify_triggers_publish_inner() {
