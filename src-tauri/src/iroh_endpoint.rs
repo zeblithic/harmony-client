@@ -114,6 +114,19 @@ impl IrohEndpoint {
         self.inner.addr().ip_addrs().copied().collect()
     }
 
+    /// Local socket addresses the underlying iroh sockets are bound to.
+    ///
+    /// Unlike [`Self::direct_addresses`] (which routes through the
+    /// `addr()` snapshot that depends on the address-lookup service),
+    /// this returns the actual `bind()`-result sockets and is populated
+    /// immediately on bind — including for hermetic endpoints built
+    /// without the address-lookup service. Used by integration tests
+    /// (Task 10) that need to seed `ReachabilityAnnouncePayload::direct_addresses`
+    /// with reachable loopback sockets.
+    pub fn bound_sockets(&self) -> Vec<SocketAddr> {
+        self.inner.bound_sockets()
+    }
+
     /// Escape hatch for in-crate callers that need the full iroh API
     /// (e.g. the zenoh-over-iroh transport in later tasks, which calls
     /// `.connect()` / `.accept()` directly). Kept `pub(crate)` so the
