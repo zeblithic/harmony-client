@@ -292,12 +292,26 @@ enum ZenohEvent {
 /// Construction lives in `start_node` (rather than inside `event_loop::run`)
 /// so the per-community membership-delta consumer closure can capture the
 /// resolver and route freshly-inserted `ReachabilityAnnounce` events into
-/// it without a separate plumbing pass. The link manager + publisher are
-/// passed in pre-built so the event loop owns only the `spawn_*` calls.
+/// it without a separate plumbing pass. The link manager is passed in
+/// pre-built so the event loop owns only the `spawn_accept_loop` call.
+///
+/// ZEB-321 Phase 1 Task 9 update: the `ReachabilityPublisher` is NOT in
+/// this bundle. The publisher's real `publish_fn` closure needs to
+/// iterate joined communities + sign `ReachabilityAnnounce` events,
+/// which requires the `CommunitySyncRegistry` + `PrivateIdentity` — both
+/// constructed later in `start_node` than the iroh endpoint. lib.rs owns
+/// the publisher's `Arc` + `JoinHandle` so it can build them once
+/// registry + identity are ready (see start_node body in lib.rs). We
+/// chose this "defer publisher construction" (Option A) over a runtime
+/// `replace_publish_callback` swap (Option B) because it avoids interior
+/// mutability and keeps the publisher's identity stable across its
+/// entire lifetime — there's only ever one publisher per device session,
+/// and the few-line delay until registry/identity are ready costs
+/// nothing (the publisher's startup-publish would have hit a no-op
+/// callback otherwise).
 pub struct IrohRuntimeHandles {
     pub endpoint: std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>,
     pub link_manager: std::sync::Arc<crate::zenoh_iroh_transport::IrohZenohLinkManager>,
-    pub publisher: std::sync::Arc<crate::reachability_publisher::ReachabilityPublisher>,
 }
 
 /// Run the NodeRuntime event loop as a background task.
@@ -526,27 +540,21 @@ pub async fn run<R: Runtime>(
     // Channel from spawned Zenoh tasks → main select loop.
     let (zenoh_tx, mut zenoh_rx) = mpsc::channel::<ZenohEvent>(256);
 
-    // ── ZEB-321 Phase 1 Task 8: iroh-transport background tasks ──────────
+    // ── ZEB-321 Phase 1 Task 8 (Task 9 update): iroh-transport bg tasks ──
     // Spawn the link-manager accept loop (drives inbound iroh→zenoh links
-    // off the endpoint's `accept()`) and the publisher driver (re-emits
-    // this device's `ReachabilityAnnounce` on startup / network change /
-    // 60-min idle / force-republish). The endpoint, link manager, and
-    // publisher are constructed in `start_node` so the per-community
-    // delta-consumer closure can capture the resolver feed hook.
+    // off the endpoint's `accept()`). The publisher is spawned by lib.rs
+    // (NOT here) — see `IrohRuntimeHandles`' doc for why.
     //
-    // The returned join handles are intentionally dropped — both spawned
-    // tasks live for the lifetime of the tokio runtime that hosts the
-    // event loop, ending when their internal streams close (endpoint
-    // shutdown for accept loop; runtime drop for publisher).
+    // The returned join handle is intentionally dropped — the spawned
+    // accept loop lives for the lifetime of the tokio runtime that hosts
+    // the event loop, ending when the endpoint shuts down.
     // `inspect` keeps `h` in the Option while letting us trigger the
-    // spawn side-effects; the returned Option is bound to a `_`-prefixed
-    // variable so the contained Arcs (endpoint + link manager +
-    // publisher) live for the rest of the event loop. Dropping them
-    // would race the spawned accept loop and publisher into observing
-    // their endpoint shutting down mid-flight.
+    // spawn side-effect; the returned Option is bound to a `_`-prefixed
+    // variable so the contained Arcs (endpoint + link manager) live for
+    // the rest of the event loop. Dropping them would race the spawned
+    // accept loop into observing its endpoint shutting down mid-flight.
     let _iroh_handles_keepalive = iroh_handles.inspect(|h| {
         let _accept = h.link_manager.spawn_accept_loop();
-        let _publisher = std::sync::Arc::clone(&h.publisher).spawn();
     });
 
     // ── Phase 3a: SyncEngine wire-up ────────────────────────────────────

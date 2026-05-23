@@ -2118,15 +2118,24 @@ async fn start_node(
         //
         // Built unconditionally (not gated on owner identity) because the
         // keychain-resident `SecretKey` is per-device, not per-owner, and
-        // the link manager + publisher need to be live before any owner is
-        // loaded so post-pair startups don't miss the first publish window.
+        // the link manager needs to be live before any owner is loaded so
+        // post-pair startups don't miss inbound iroh-link traffic.
         //
         // The resolver is held here in the outer scope so the
         // per-community membership-delta consumer closure (constructed
         // inside the `if let Some(seed)` block below) can capture it and
         // feed accepted `ReachabilityAnnounce` events into it. The
-        // endpoint + publisher Arcs are stashed on NodeState post-spawn
-        // so Task 9's IPC handlers can reach them.
+        // endpoint Arc is stashed on NodeState post-spawn so Task 9's IPC
+        // handlers can reach it.
+        //
+        // ZEB-321 Phase 1 Task 9: the `ReachabilityPublisher` is NOT
+        // constructed here. Its real publish callback needs the
+        // `CommunitySyncRegistry` (built later in this fn, inside the
+        // `if let Some(seed)` block) plus a `PrivateIdentity`. We build +
+        // spawn the publisher there instead, after both are ready. When
+        // no identity is loaded (pre-pair) there are no joined
+        // communities to publish to, so skipping publisher spawn entirely
+        // in that case is correct.
         //
         // Wire failures (keychain unavailable, bind error) degrade
         // gracefully: log + skip the iroh subsystem, the rest of the node
@@ -2135,58 +2144,39 @@ async fn start_node(
         // sign-off arrives.
         let iroh_endpoint_arc: Option<std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>>;
         let reachability_resolver: crate::reachability_resolver::ReachabilityResolver;
-        let iroh_publisher_arc: Option<
-            std::sync::Arc<crate::reachability_publisher::ReachabilityPublisher>,
-        >;
         let iroh_handles_for_loop: Option<crate::event_loop::IrohRuntimeHandles>;
         {
             reachability_resolver = crate::reachability_resolver::ReachabilityResolver::new();
             match crate::iroh_endpoint::load_or_create_secret_key() {
-                Ok(secret) => match crate::iroh_endpoint::IrohEndpoint::new_with_secret(secret)
-                    .await
-                {
-                    Ok(ep) => {
-                        let ep_arc = std::sync::Arc::new(ep);
-                        let (new_link_tx, _new_link_rx) =
-                            flume::unbounded::<zenoh_link::LinkUnicast>();
-                        let link_mgr = std::sync::Arc::new(
-                            crate::zenoh_iroh_transport::IrohZenohLinkManager::new(
-                                std::sync::Arc::clone(&ep_arc),
-                                reachability_resolver.clone(),
-                                new_link_tx,
-                            ),
-                        );
-                        // Publisher callback is a no-op stub; Task 9's
-                        // `connectivity_force_republish` IPC + per-community
-                        // signed-event emission will replace it via a
-                        // closure that signs + broadcasts a
-                        // ReachabilityAnnounce into each joined community.
-                        let publisher = std::sync::Arc::new(
-                            crate::reachability_publisher::ReachabilityPublisher::new(
-                                std::sync::Arc::clone(&ep_arc),
-                                std::sync::Arc::new(|| {
-                                    Box::pin(async {}) as futures::future::BoxFuture<'static, ()>
-                                }),
-                            ),
-                        );
-                        iroh_endpoint_arc = Some(std::sync::Arc::clone(&ep_arc));
-                        iroh_publisher_arc = Some(std::sync::Arc::clone(&publisher));
-                        iroh_handles_for_loop = Some(crate::event_loop::IrohRuntimeHandles {
-                            endpoint: ep_arc,
-                            link_manager: link_mgr,
-                            publisher,
-                        });
+                Ok(secret) => {
+                    match crate::iroh_endpoint::IrohEndpoint::new_with_secret(secret).await {
+                        Ok(ep) => {
+                            let ep_arc = std::sync::Arc::new(ep);
+                            let (new_link_tx, _new_link_rx) =
+                                flume::unbounded::<zenoh_link::LinkUnicast>();
+                            let link_mgr = std::sync::Arc::new(
+                                crate::zenoh_iroh_transport::IrohZenohLinkManager::new(
+                                    std::sync::Arc::clone(&ep_arc),
+                                    reachability_resolver.clone(),
+                                    new_link_tx,
+                                ),
+                            );
+                            iroh_endpoint_arc = Some(std::sync::Arc::clone(&ep_arc));
+                            iroh_handles_for_loop = Some(crate::event_loop::IrohRuntimeHandles {
+                                endpoint: ep_arc,
+                                link_manager: link_mgr,
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "iroh endpoint bind failed; ZEB-321 transport disabled this session",
+                            );
+                            iroh_endpoint_arc = None;
+                            iroh_handles_for_loop = None;
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "iroh endpoint bind failed; ZEB-321 transport disabled this session",
-                        );
-                        iroh_endpoint_arc = None;
-                        iroh_publisher_arc = None;
-                        iroh_handles_for_loop = None;
-                    }
-                },
+                }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
@@ -2194,11 +2184,21 @@ async fn start_node(
                          ZEB-321 transport disabled this session",
                     );
                     iroh_endpoint_arc = None;
-                    iroh_publisher_arc = None;
                     iroh_handles_for_loop = None;
                 }
             }
         }
+        // ZEB-321 Phase 1 Task 9: publisher Arc, populated in the
+        // identity-loaded block below once `community_registry_arc` +
+        // `private_identity_arc` are both available. Stays `None` when
+        // iroh bind failed OR no owner identity is loaded — the latter
+        // case skips publish spawning entirely (no joined communities to
+        // publish into). NodeState.iroh_publisher_force is set from this
+        // Arc's `force_handle()` post-spawn; when None, the
+        // `connectivity_force_republish` IPC no-ops cleanly.
+        let mut iroh_publisher_arc: Option<
+            std::sync::Arc<crate::reachability_publisher::ReachabilityPublisher>,
+        > = None;
 
         let sync_engine_arc: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>> =
             if let Some(ref loaded) = owner_loaded {
@@ -3380,7 +3380,200 @@ async fn start_node(
                         }
                     }
 
-                    community_registry_arc = Some(registry);
+                    community_registry_arc = Some(std::sync::Arc::clone(&registry));
+
+                    // ── ZEB-321 Phase 1 Task 9: real ReachabilityAnnounce publisher ──
+                    //
+                    // Construct the publisher here (NOT in the iroh boot
+                    // block above) so its `publish_fn` callback can
+                    // capture the freshly-built `CommunitySyncRegistry`
+                    // alongside `private_identity_arc`, `self_owner`,
+                    // `hlc_tracker`, and `device_id`. The callback path:
+                    //
+                    //   1. Snapshot iroh node_id + home_relay + direct
+                    //      addresses ONCE per publish invocation (memory
+                    //      rule feedback_metadata_before_irreversible_write —
+                    //      re-reading per community would let different
+                    //      communities disagree on what address we're at).
+                    //   2. Iterate joined communities via
+                    //      `registry.known_ids()`.
+                    //   3. For each, reserve an HLC, build the inner
+                    //      identity-signed `ReachabilityAnnouncePayload`,
+                    //      wrap in `MembershipEventKind::ReachabilityAnnounce`,
+                    //      sign the outer envelope with the harmony
+                    //      identity, and insert via
+                    //      `engine.insert_local_event`.
+                    //   4. Per-community failures log + continue — the
+                    //      publisher loop is long-running, one broken
+                    //      community CRDT must not abort all publishing.
+                    //
+                    // Skipped entirely when iroh bind failed (no
+                    // endpoint to snapshot). When NO communities are
+                    // joined, the loop body is a no-op (still cheap —
+                    // happens on startup + idle-60min + force).
+                    if let Some(ep_arc_for_publisher) = iroh_endpoint_arc.as_ref() {
+                        let ep_for_cb = std::sync::Arc::clone(ep_arc_for_publisher);
+                        let registry_for_cb = std::sync::Arc::clone(&registry);
+                        let identity_for_cb = std::sync::Arc::clone(&private_identity_arc);
+                        let self_owner_for_cb = self_owner;
+                        let hlc_tracker_for_cb = std::sync::Arc::clone(&tracker);
+                        let device_id_for_cb = device_id.clone();
+                        let publish_fn: crate::reachability_publisher::PublishFn =
+                            std::sync::Arc::new(move || {
+                                // Per-invocation clones — the closure is
+                                // `Fn`, not `FnOnce`, so we can't move
+                                // the captures into the BoxFuture body
+                                // directly.
+                                let ep = std::sync::Arc::clone(&ep_for_cb);
+                                let registry = std::sync::Arc::clone(&registry_for_cb);
+                                let identity = std::sync::Arc::clone(&identity_for_cb);
+                                let actor = self_owner_for_cb;
+                                let hlc_tracker = std::sync::Arc::clone(&hlc_tracker_for_cb);
+                                let device_id = device_id_for_cb.clone();
+                                Box::pin(async move {
+                                    // 1. Snapshot iroh state ONCE.
+                                    let node_id_bytes: [u8; 32] = *ep.node_id().as_bytes();
+                                    let home_relay =
+                                        ep.home_relay().map(|r| r.to_string()).unwrap_or_default();
+                                    let direct_addrs = ep.direct_addresses();
+                                    let announced_at_ms = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis()
+                                        as u64;
+
+                                    // 2. Iterate joined communities.
+                                    let community_ids = registry.known_ids().await;
+                                    if community_ids.is_empty() {
+                                        // No-op publish: no communities
+                                        // to announce into. Common
+                                        // pre-pair state.
+                                        return;
+                                    }
+                                    for community_id in community_ids {
+                                        // 3a. Reserve an HLC for this
+                                        //     event. Each community
+                                        //     gets a distinct HLC tick
+                                        //     so the outer envelope's
+                                        //     `id` + `at` stay unique
+                                        //     across the fan-out.
+                                        let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+                                            &hlc_tracker,
+                                            &device_id,
+                                            announced_at_ms,
+                                        )
+                                        .await;
+
+                                        // 3b. Build inner signed payload.
+                                        let payload =
+                                            match crate::reachability_record::build_signed_payload(
+                                                node_id_bytes,
+                                                home_relay.clone(),
+                                                direct_addrs.clone(),
+                                                announced_at_ms,
+                                                &actor,
+                                                &hlc,
+                                                identity.as_ref(),
+                                            ) {
+                                                Ok(p) => p,
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        community_id = ?community_id,
+                                                        error = %e,
+                                                        "ReachabilityAnnounce build_signed_payload failed; \
+                                                         skipping this community"
+                                                    );
+                                                    continue;
+                                                }
+                                            };
+
+                                        // 3c. Mint a fresh event_id +
+                                        //     wrap in EventPayload + sign
+                                        //     the outer envelope.
+                                        let event_id: [u8; 16] = {
+                                            use rand::RngCore;
+                                            let mut buf = [0u8; 16];
+                                            rand::thread_rng().fill_bytes(&mut buf);
+                                            buf
+                                        };
+                                        let envelope = crate::community_membership::EventPayload {
+                                            id: event_id,
+                                            community_id,
+                                            kind:
+                                                crate::community_membership::MembershipEventKind::ReachabilityAnnounce {
+                                                    payload,
+                                                },
+                                            actor,
+                                            at: hlc,
+                                        };
+                                        let signed = match crate::community_membership::sign_event_with_identity(
+                                            &envelope,
+                                            identity.as_ref(),
+                                        ) {
+                                            Ok(s) => s,
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    community_id = ?community_id,
+                                                    error = %e,
+                                                    "ReachabilityAnnounce sign_event_with_identity failed; \
+                                                     skipping this community"
+                                                );
+                                                continue;
+                                            }
+                                        };
+
+                                        // 3d. Insert via the per-community
+                                        //     engine. If the engine isn't
+                                        //     spawned (race with leave?),
+                                        //     log + skip.
+                                        let Some(engine) = registry.engine_arc(&community_id).await
+                                        else {
+                                            tracing::warn!(
+                                                community_id = ?community_id,
+                                                "no engine for community during ReachabilityAnnounce \
+                                                 publish; skipping"
+                                            );
+                                            continue;
+                                        };
+                                        match engine.insert_local_event(signed).await {
+                                            Ok(_) => {
+                                                tracing::debug!(
+                                                    community_id = ?community_id,
+                                                    "ReachabilityAnnounce inserted into community CRDT"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    community_id = ?community_id,
+                                                    error = %e,
+                                                    "ReachabilityAnnounce engine.insert_local_event \
+                                                     failed; continuing with next community"
+                                                );
+                                            }
+                                        }
+                                    }
+                                })
+                                    as futures::future::BoxFuture<'static, ()>
+                            });
+
+                        let publisher = std::sync::Arc::new(
+                            crate::reachability_publisher::ReachabilityPublisher::new(
+                                std::sync::Arc::clone(ep_arc_for_publisher),
+                                publish_fn,
+                            ),
+                        );
+                        // Spawn the publisher loop. The returned
+                        // JoinHandle is intentionally dropped — the
+                        // publisher lives for the lifetime of the tokio
+                        // runtime that hosts start_node's async block.
+                        // The publisher's internal `Arc<Notify>` is
+                        // cloned onto NodeState via `force_handle()`
+                        // below so the `connectivity_force_republish`
+                        // IPC can wake it without holding the publisher
+                        // Arc directly.
+                        let _publisher_handle = std::sync::Arc::clone(&publisher).spawn();
+                        iroh_publisher_arc = Some(publisher);
+                    }
 
                     // ── ZEB-281 Sub-D Phase 4: profile-broadcast publisher spawn ──
                     //
@@ -27818,6 +28011,159 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
     Ok(ceremony_id_hex)
 }
 
+// ── ZEB-321 Phase 1 Task 9: connectivity IPCs ────────────────────────
+//
+// Three Tauri commands surfacing the iroh transport + reachability
+// projection to the frontend debug panel:
+//
+//   * `connectivity_get_my_reachability_record` — snapshot of this
+//     device's `IrohEndpoint` state (node id, home relay, direct
+//     addresses). Read-only — no TOCTOU window.
+//   * `connectivity_list_peer_reachability` — snapshot of the LWW
+//     resolver's known peer-reachability entries. Read-only.
+//   * `connectivity_force_republish` — wakes the publisher loop's
+//     `Notify` so the next iteration publishes immediately. Single-IPC
+//     fire-and-forget; no TOCTOU window. Memory rule
+//     feedback_two_ipc_toctou: safe (no two-IPC commit ceremony).
+//
+// All three are designed to no-op cleanly when iroh boot failed (e.g.
+// keychain unavailable on a sandbox build, bind error). The
+// `_get_my_*` IPC returns `Ok(None)`, the `_list_peer_*` IPC returns
+// `Ok(vec![])` from an empty resolver, and `_force_republish` is a
+// no-op when `iroh_publisher_force` is None.
+//
+// Tauri convention (CLAUDE.md): Rust params snake_case; JS callers use
+// camelCase; the macro's `rename_all` flag in `#[tauri::command]`
+// handles the conversion. DTOs use `#[serde(rename_all = "camelCase")]`
+// so the frontend sees `irohNodeId`, `homeRelayUrl`, etc.
+
+/// Wire payload for the connectivity debug panel — flattened view of
+/// `ReachabilityAnnouncePayload` minus the inner identity signature
+/// (which is on-wire only; the frontend has no use for it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReachabilityRecordDto {
+    /// Hex-encoded iroh `EndpointId` (32 bytes → 64 lowercase hex chars).
+    pub iroh_node_id: String,
+    /// Stringified DERP relay URL; empty string when no relay is
+    /// negotiated yet (or relay mode is disabled).
+    pub home_relay_url: String,
+    /// Direct-traversal hint addresses (each rendered as `ip:port`).
+    /// May be empty Vec when the address-lookup service hasn't yet
+    /// populated direct addrs (typical right after iroh bind).
+    pub direct_addresses: Vec<String>,
+    /// Wall-clock millis when this snapshot was authored. For peers,
+    /// the value from their on-wire `ReachabilityAnnouncePayload`. For
+    /// our own snapshot (`_get_my_*`), 0 — Phase 1 does not track when
+    /// the publisher LAST ran, since the timestamp shown to the user
+    /// is intended to surface PEER freshness (already tracked by the
+    /// resolver). Revisit if a UI need for "when did I last announce"
+    /// emerges in Phase 2.
+    pub announced_at_ms: u64,
+}
+
+/// Peer-keyed entry in the response of `connectivity_list_peer_reachability`.
+/// `owner_address` is the 32-char lowercase-hex `OwnerAddr.0`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerReachabilityDto {
+    pub owner_address: String,
+    pub record: ReachabilityRecordDto,
+}
+
+/// Snapshot of THIS device's reachability state.
+///
+/// Returns `Ok(None)` when iroh isn't running (boot failed, or
+/// pre-`start_node`). The `announced_at_ms` field is always 0 — see
+/// the DTO doc for rationale.
+#[tauri::command(rename_all = "snake_case")]
+async fn connectivity_get_my_reachability_record(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Option<ReachabilityRecordDto>, String> {
+    let g = state
+        .lock()
+        .map_err(|e| format!("NodeState poisoned: {e}"))?;
+    let Some(ep) = g.iroh_endpoint.as_ref() else {
+        return Ok(None);
+    };
+    let node_id_hex = hex::encode(ep.node_id().as_bytes());
+    let home_relay = ep.home_relay().map(|r| r.to_string()).unwrap_or_default();
+    let direct_addrs = ep
+        .direct_addresses()
+        .into_iter()
+        .map(|sa| sa.to_string())
+        .collect();
+    Ok(Some(ReachabilityRecordDto {
+        iroh_node_id: node_id_hex,
+        home_relay_url: home_relay,
+        direct_addresses: direct_addrs,
+        // Phase 1 degraded value — see DTO doc.
+        announced_at_ms: 0,
+    }))
+}
+
+/// Snapshot of all peer-reachability entries known to this device's
+/// LWW resolver. Returns `Ok(vec![])` when the resolver hasn't been
+/// installed (pre-`start_node`) or when no peers have published yet.
+#[tauri::command(rename_all = "snake_case")]
+async fn connectivity_list_peer_reachability(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<PeerReachabilityDto>, String> {
+    let g = state
+        .lock()
+        .map_err(|e| format!("NodeState poisoned: {e}"))?;
+    let Some(resolver) = g.reachability_resolver.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let peers = resolver.list_active_peers();
+    drop(g);
+    let dtos: Vec<PeerReachabilityDto> = peers
+        .into_iter()
+        .map(|(actor, payload)| PeerReachabilityDto {
+            owner_address: hex::encode(actor.0),
+            record: ReachabilityRecordDto {
+                iroh_node_id: hex::encode(payload.iroh_node_id),
+                home_relay_url: payload.home_relay_url,
+                direct_addresses: payload
+                    .direct_addresses
+                    .into_iter()
+                    .map(|sa| sa.to_string())
+                    .collect(),
+                announced_at_ms: payload.announced_at_ms,
+            },
+        })
+        .collect();
+    Ok(dtos)
+}
+
+/// Wake the publisher loop so it runs its publish callback immediately
+/// (next iteration of the `tokio::select!`). No-op when the publisher
+/// wasn't spawned (iroh boot failed, OR no owner identity loaded — see
+/// the publisher construction site in `start_node`).
+///
+/// Returns `Ok(true)` when a notify was actually fired, `Ok(false)`
+/// when the publisher isn't running. Tests assert on this discriminant
+/// to validate that the IPC path reached the publisher; production
+/// callers (debug panel) can ignore the return value.
+///
+/// Fire-and-forget by design: the publisher's `notify_one()` returns
+/// immediately, and the actual publish work runs asynchronously on
+/// the publisher's task. The IPC's success only attests that the
+/// notify was delivered.
+#[tauri::command(rename_all = "snake_case")]
+async fn connectivity_force_republish(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<bool, String> {
+    let g = state
+        .lock()
+        .map_err(|e| format!("NodeState poisoned: {e}"))?;
+    let Some(force) = g.iroh_publisher_force.as_ref() else {
+        return Ok(false);
+    };
+    force.notify_one();
+    Ok(true)
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -27999,6 +28345,10 @@ pub fn run() {
             mint::mint_get_default_currency,
             mint::mint_set_default_currency,
             mint::mint_export_csv,
+            // ZEB-321 Phase 1 Task 9: connectivity debug IPCs.
+            connectivity_get_my_reachability_record,
+            connectivity_list_peer_reachability,
+            connectivity_force_republish,
         ])
         .run(tauri::generate_context!())
         .expect("error while running harmony");
@@ -32791,5 +33141,271 @@ mod zeb_321_event_loop_wiring_tests {
             resolver.resolve(&actor).is_none(),
             "resolver must not have an entry for a non-ReachabilityAnnounce delta"
         );
+    }
+}
+
+// ── ZEB-321 Phase 1 Task 9: connectivity IPC unit tests ──────────────
+//
+// What this module covers:
+//   * `connectivity_force_republish` → publisher's `Notify` wakes
+//     (using a real `ReachabilityPublisher` with a counter callback).
+//   * `connectivity_get_my_reachability_record` → returns `Ok(None)`
+//     when iroh isn't running.
+//   * `connectivity_list_peer_reachability` → empty vec when resolver
+//     isn't installed; populated vec when resolver has entries.
+//   * `connectivity_force_republish` → returns `Ok(false)` when
+//     publisher isn't spawned (no panic; clean no-op).
+//
+// What this module DOES NOT cover (delegated to Task 10's two-engine
+// integration test):
+//   * The publisher's real publish callback firing actual
+//     `insert_local_event` against a `CommunitySyncEngine` (hermetic
+//     bring-up of two engines + identity wiring is the integration
+//     test's job).
+//   * `_get_my_reachability_record` happy path with a live
+//     `IrohEndpoint` — the snapshot fields are wrappers around
+//     already-tested iroh accessors, and the IPC just hex-encodes them.
+//
+// Every test has a `tokio::time::timeout` outer wrapper — the
+// kill-switch pattern enforced by memory rule
+// feedback_implementer_gate_time_budget.
+#[cfg(test)]
+mod zeb_321_connectivity_ipc_tests {
+    use super::*;
+    use crate::reachability_publisher::{PublishFn, ReachabilityPublisher};
+    use std::net::Ipv4Addr;
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+    use tauri::Manager;
+
+    /// Per-test mock app with an empty `NodeState`. Same shape as the
+    /// helper in `tests` (the `post_channel_message` block above).
+    fn mock_app_with_default_node_state() -> tauri::App<tauri::test::MockRuntime> {
+        let app = tauri::test::mock_app();
+        app.manage(StdMutex::new(NodeState::default()));
+        app
+    }
+
+    /// Build a hermetic iroh endpoint on loopback with no
+    /// address-lookup / relay traffic. Cloned from the pattern used in
+    /// `reachability_publisher::tests::build_hermetic_iroh_endpoint`
+    /// (kept private there). Goes through `from_endpoint_for_test` so
+    /// production path stays untouched.
+    async fn build_hermetic_iroh_endpoint() -> std::sync::Arc<crate::iroh_endpoint::IrohEndpoint> {
+        use crate::iroh_endpoint::{alpn, IrohEndpoint};
+        use iroh::endpoint::{presets, Endpoint, RelayMode};
+        use iroh::SecretKey;
+        let secret = SecretKey::generate();
+        let inner = Endpoint::builder(presets::Minimal)
+            .secret_key(secret)
+            .alpns(vec![alpn::HARMONY_ZENOH_V1.to_vec()])
+            .relay_mode(RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr((Ipv4Addr::LOCALHOST, 0))
+            .expect("bind_addr loopback")
+            .bind()
+            .await
+            .expect("bind iroh endpoint");
+        std::sync::Arc::new(IrohEndpoint::from_endpoint_for_test(inner))
+    }
+
+    /// `connectivity_force_republish` is the full IPC contract for
+    /// waking the publisher: when `iroh_publisher_force` is set on
+    /// NodeState, calling the IPC `notify_one()`s the publisher's
+    /// `Notify`. We instantiate a real `ReachabilityPublisher` with a
+    /// counter callback to observe the wake (startup publish + post-
+    /// force publish = 2 counter increments).
+    ///
+    /// 15s outer timeout — same defense-in-depth pattern as Task 5's
+    /// `paired_stream_roundtrip_via_loopback`. The actual select-loop
+    /// roundtrip should fire in microseconds.
+    #[tokio::test]
+    async fn force_republish_wakes_publisher() {
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            force_republish_wakes_publisher_inner(),
+        )
+        .await
+        .expect("force_republish_wakes_publisher must complete within 15s");
+    }
+
+    async fn force_republish_wakes_publisher_inner() {
+        // Callback signals a `Notify` on each publish — the test
+        // awaits the notification rather than polling, matching the
+        // pattern in `reachability_publisher::tests::force_notify_triggers_publish`.
+        let published = std::sync::Arc::new(tokio::sync::Notify::new());
+        let published_clone = std::sync::Arc::clone(&published);
+        let publish: PublishFn = std::sync::Arc::new(move || {
+            let n = std::sync::Arc::clone(&published_clone);
+            Box::pin(async move {
+                n.notify_one();
+            }) as futures::future::BoxFuture<'static, ()>
+        });
+
+        let ep = build_hermetic_iroh_endpoint().await;
+        let publisher = std::sync::Arc::new(ReachabilityPublisher::new(ep, publish));
+        let force_handle = publisher.force_handle();
+        let _publisher_loop = std::sync::Arc::clone(&publisher).spawn();
+
+        // Startup publish lands first.
+        tokio::time::timeout(Duration::from_secs(2), published.notified())
+            .await
+            .expect("startup publish must fire within 2s");
+
+        // Install the force handle on NodeState + invoke the IPC.
+        let app = mock_app_with_default_node_state();
+        {
+            let state_handle = app.state::<StdMutex<NodeState>>();
+            let mut g = state_handle.lock().expect("NodeState lock");
+            g.iroh_publisher_force = Some(force_handle);
+        }
+        let state = app.state::<StdMutex<NodeState>>();
+        let fired = connectivity_force_republish(state)
+            .await
+            .expect("IPC must succeed");
+        assert!(
+            fired,
+            "force_republish must report Ok(true) when publisher is installed"
+        );
+
+        // Force-notify publish lands within microseconds; 2s budget is
+        // very generous (matches the publisher's own unit test).
+        tokio::time::timeout(Duration::from_secs(2), published.notified())
+            .await
+            .expect("force-notify publish must fire within 2s of IPC call");
+    }
+
+    /// `connectivity_force_republish` no-ops cleanly when no publisher
+    /// is installed (iroh boot failed OR pre-`start_node`). The IPC
+    /// returns `Ok(false)`; no panic, no error.
+    #[tokio::test]
+    async fn force_republish_returns_false_when_publisher_missing() {
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            force_republish_returns_false_when_publisher_missing_inner(),
+        )
+        .await
+        .expect("force_republish_returns_false_when_publisher_missing must complete within 15s");
+    }
+
+    async fn force_republish_returns_false_when_publisher_missing_inner() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let fired = connectivity_force_republish(state)
+            .await
+            .expect("IPC must succeed even with no publisher");
+        assert!(
+            !fired,
+            "force_republish must report Ok(false) when no publisher is installed"
+        );
+    }
+
+    /// `connectivity_get_my_reachability_record` returns `Ok(None)`
+    /// when iroh isn't running. Defends against the IPC trying to
+    /// `.unwrap()` an absent endpoint.
+    #[tokio::test]
+    async fn get_my_reachability_returns_none_when_iroh_not_running() {
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            get_my_reachability_returns_none_when_iroh_not_running_inner(),
+        )
+        .await
+        .expect("get_my_reachability_returns_none_when_iroh_not_running must complete within 15s");
+    }
+
+    async fn get_my_reachability_returns_none_when_iroh_not_running_inner() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let got = connectivity_get_my_reachability_record(state)
+            .await
+            .expect("IPC must succeed");
+        assert!(
+            got.is_none(),
+            "expected None when iroh_endpoint is unset, got {got:?}"
+        );
+    }
+
+    /// `connectivity_list_peer_reachability` returns `Ok(vec![])`
+    /// when the resolver isn't installed (pre-`start_node`).
+    #[tokio::test]
+    async fn list_peer_reachability_empty_when_resolver_missing() {
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            list_peer_reachability_empty_when_resolver_missing_inner(),
+        )
+        .await
+        .expect("list_peer_reachability_empty_when_resolver_missing must complete within 15s");
+    }
+
+    async fn list_peer_reachability_empty_when_resolver_missing_inner() {
+        let app = mock_app_with_default_node_state();
+        let state = app.state::<StdMutex<NodeState>>();
+        let got = connectivity_list_peer_reachability(state)
+            .await
+            .expect("IPC must succeed");
+        assert!(
+            got.is_empty(),
+            "expected empty Vec when reachability_resolver is unset, got {got:?}"
+        );
+    }
+
+    /// `connectivity_list_peer_reachability` projects the resolver's
+    /// known entries into DTOs with hex-encoded owner addresses + iroh
+    /// node ids. Smoke-tests the full happy-path projection.
+    #[tokio::test]
+    async fn list_peer_reachability_projects_resolver_entries() {
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            list_peer_reachability_projects_resolver_entries_inner(),
+        )
+        .await
+        .expect("list_peer_reachability_projects_resolver_entries must complete within 15s");
+    }
+
+    async fn list_peer_reachability_projects_resolver_entries_inner() {
+        use crate::owner_state_types::{Hlc, OwnerAddr};
+        use crate::reachability_record::ReachabilityAnnouncePayload;
+        use crate::reachability_resolver::ReachabilityResolver;
+
+        let resolver = ReachabilityResolver::new();
+        let actor = OwnerAddr([0xAB; 16]);
+        let payload = ReachabilityAnnouncePayload {
+            iroh_node_id: [0x55; 32],
+            home_relay_url: "https://relay.example/".to_string(),
+            direct_addresses: vec![],
+            announced_at_ms: 1_700_000_000_000,
+            identity_signature: [0; 64],
+        };
+        let hlc = Hlc {
+            wall_ms: 1_700_000_000_000,
+            logical: 0,
+            device_id: "dev".to_string(),
+        };
+        resolver.update(actor, payload, hlc);
+
+        let app = mock_app_with_default_node_state();
+        {
+            let state_handle = app.state::<StdMutex<NodeState>>();
+            let mut g = state_handle.lock().expect("NodeState lock");
+            g.reachability_resolver = Some(resolver);
+        }
+        let state = app.state::<StdMutex<NodeState>>();
+        let got = connectivity_list_peer_reachability(state)
+            .await
+            .expect("IPC must succeed");
+        assert_eq!(got.len(), 1, "expected exactly one entry, got {got:?}");
+        let entry = &got[0];
+        assert_eq!(
+            entry.owner_address,
+            "ab".repeat(16),
+            "owner_address hex round-trip"
+        );
+        assert_eq!(
+            entry.record.iroh_node_id,
+            "55".repeat(32),
+            "iroh_node_id hex round-trip"
+        );
+        assert_eq!(entry.record.home_relay_url, "https://relay.example/");
+        assert_eq!(entry.record.announced_at_ms, 1_700_000_000_000);
     }
 }
