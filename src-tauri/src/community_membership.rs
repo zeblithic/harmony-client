@@ -5583,8 +5583,7 @@ mod tests {
             payload: payload.clone(),
         };
         let bytes = crate::owner_state_crypto::canonical_cbor_encode(&kind).expect("encode");
-        let decoded: MembershipEventKind =
-            ciborium::de::from_reader(&bytes[..]).expect("decode");
+        let decoded: MembershipEventKind = ciborium::de::from_reader(&bytes[..]).expect("decode");
         assert_eq!(
             decoded,
             MembershipEventKind::ReachabilityAnnounce { payload }
