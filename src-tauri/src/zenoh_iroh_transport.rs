@@ -81,8 +81,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use iroh::{EndpointAddr, EndpointId};
 use zenoh_link::{
-    EndPoint, LinkManagerUnicastTrait, LinkUnicast, LinkUnicastTrait, Locator,
-    NewLinkChannelSender,
+    EndPoint, LinkManagerUnicastTrait, LinkUnicast, LinkUnicastTrait, Locator, NewLinkChannelSender,
 };
 use zenoh_result::{zerror, ZResult};
 

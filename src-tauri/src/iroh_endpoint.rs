@@ -139,7 +139,7 @@ impl IrohEndpoint {
     /// `encrypt_channel_packet_with_nonce` test helper.
     #[cfg(any(test, feature = "test-fixtures"))]
     #[allow(dead_code)] // Only consumed by `#[cfg(test)]` modules; unused
-    // under bare `--features test-fixtures` builds (e.g. clippy --all-targets).
+                        // under bare `--features test-fixtures` builds (e.g. clippy --all-targets).
     pub(crate) fn from_endpoint_for_test(inner: Endpoint) -> Self {
         Self { inner }
     }
