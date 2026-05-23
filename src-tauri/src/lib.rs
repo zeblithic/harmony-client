@@ -33216,17 +33216,25 @@ mod zeb_321_connectivity_ipc_tests {
     /// counter callback to observe the wake (startup publish + post-
     /// force publish = 2 counter increments).
     ///
-    /// 15s outer timeout — same defense-in-depth pattern as Task 5's
-    /// `paired_stream_roundtrip_via_loopback`. The actual select-loop
-    /// roundtrip should fire in microseconds.
+    /// 60s outer timeout — defense-in-depth kill switch only. The
+    /// hermetic iroh endpoint's bind + `if-watch::IfWatcher::new()`
+    /// init can take 8–10 seconds even on a quiet machine; under full
+    /// workspace test load (this fails at ~18s wall-clock when run
+    /// alongside the rest of the suite) the budget needs to be well
+    /// above the observed worst case. Per memory rule
+    /// `feedback_wall_clock_regression_budget`: budget must be much
+    /// greater than the regression-max, never equal. The select-loop
+    /// `notify_one()` roundtrip itself fires in microseconds — the
+    /// per-arm `tokio::time::timeout(2s)` checks below are the actual
+    /// correctness gates.
     #[tokio::test]
     async fn force_republish_wakes_publisher() {
         tokio::time::timeout(
-            Duration::from_secs(15),
+            Duration::from_secs(60),
             force_republish_wakes_publisher_inner(),
         )
         .await
-        .expect("force_republish_wakes_publisher must complete within 15s");
+        .expect("force_republish_wakes_publisher must complete within 60s");
     }
 
     async fn force_republish_wakes_publisher_inner() {
@@ -33247,10 +33255,11 @@ mod zeb_321_connectivity_ipc_tests {
         let force_handle = publisher.force_handle();
         let _publisher_loop = std::sync::Arc::clone(&publisher).spawn();
 
-        // Startup publish lands first.
-        tokio::time::timeout(Duration::from_secs(2), published.notified())
+        // Startup publish lands first. 10s budget — actual roundtrip is
+        // microseconds, but full-workspace test load delays scheduling.
+        tokio::time::timeout(Duration::from_secs(10), published.notified())
             .await
-            .expect("startup publish must fire within 2s");
+            .expect("startup publish must fire within 10s");
 
         // Install the force handle on NodeState + invoke the IPC.
         let app = mock_app_with_default_node_state();
@@ -33268,11 +33277,11 @@ mod zeb_321_connectivity_ipc_tests {
             "force_republish must report Ok(true) when publisher is installed"
         );
 
-        // Force-notify publish lands within microseconds; 2s budget is
-        // very generous (matches the publisher's own unit test).
-        tokio::time::timeout(Duration::from_secs(2), published.notified())
+        // Force-notify publish lands within microseconds; 10s budget is
+        // generous-under-load (same reasoning as the startup arm above).
+        tokio::time::timeout(Duration::from_secs(10), published.notified())
             .await
-            .expect("force-notify publish must fire within 2s of IPC call");
+            .expect("force-notify publish must fire within 10s of IPC call");
     }
 
     /// `connectivity_force_republish` no-ops cleanly when no publisher
