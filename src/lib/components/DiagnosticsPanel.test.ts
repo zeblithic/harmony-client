@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, waitFor } from '@testing-library/svelte';
+import { render, waitFor, fireEvent } from '@testing-library/svelte';
 
 // Mock the IPC layer BEFORE importing the component module. vi.mock calls
 // are hoisted by vitest, so this runs ahead of the static `import` below.
@@ -172,6 +172,122 @@ describe('DiagnosticsPanel', () => {
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith('connectivity_get_my_reachability_record');
       expect(mockInvoke).toHaveBeenCalledWith('connectivity_list_peer_reachability');
+    });
+  });
+
+  // ── ZEB-323 Phase 2b: pkarr section tests ─────────────────────────────────
+
+  it('renders pkarr section toggle', async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'connectivity_get_my_reachability_record') return Promise.resolve(null);
+      if (cmd === 'connectivity_list_peer_reachability') return Promise.resolve([]);
+      if (cmd === 'connectivity_pkarr_publication_status') {
+        return Promise.resolve({ inviteCount: 0, identityActive: false, communityCount: 0 });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { findByTestId } = render(DiagnosticsPanel);
+    const toggle = await findByTestId('pkarr-section-toggle');
+    expect(toggle).toBeTruthy();
+  });
+
+  it('pkarr content is hidden by default (collapsed)', async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'connectivity_get_my_reachability_record') return Promise.resolve(null);
+      if (cmd === 'connectivity_list_peer_reachability') return Promise.resolve([]);
+      if (cmd === 'connectivity_pkarr_publication_status') {
+        return Promise.resolve({ inviteCount: 0, identityActive: false, communityCount: 0 });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { container } = render(DiagnosticsPanel);
+    await waitFor(() => {
+      // Wait for mount to finish.
+      expect(mockInvoke).toHaveBeenCalledWith('connectivity_pkarr_publication_status');
+    });
+    // Content div should not be present while collapsed.
+    expect(container.querySelector('[data-testid="pkarr-content"]')).toBeNull();
+  });
+
+  it('expands pkarr section on toggle click and displays status counts', async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'connectivity_get_my_reachability_record') return Promise.resolve(null);
+      if (cmd === 'connectivity_list_peer_reachability') return Promise.resolve([]);
+      if (cmd === 'connectivity_pkarr_publication_status') {
+        return Promise.resolve({ inviteCount: 2, identityActive: true, communityCount: 3 });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { findByTestId } = render(DiagnosticsPanel);
+
+    const toggle = await findByTestId('pkarr-section-toggle');
+    await fireEvent.click(toggle);
+
+    const inviteCount = await findByTestId('pkarr-invite-count');
+    expect(inviteCount.textContent?.trim()).toBe('2');
+
+    const identityActive = await findByTestId('pkarr-identity-active');
+    expect(identityActive.textContent?.trim()).toBe('Active');
+
+    const communityCount = await findByTestId('pkarr-community-count');
+    expect(communityCount.textContent?.trim()).toBe('3');
+  });
+
+  it('shows "not initialized" when pkarr_publication_status rejects', async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'connectivity_get_my_reachability_record') return Promise.resolve(null);
+      if (cmd === 'connectivity_list_peer_reachability') return Promise.resolve([]);
+      if (cmd === 'connectivity_pkarr_publication_status') {
+        return Promise.reject(new Error('pkarr publisher not initialized'));
+      }
+      return Promise.resolve(null);
+    });
+
+    const { findByTestId } = render(DiagnosticsPanel);
+
+    const toggle = await findByTestId('pkarr-section-toggle');
+    await fireEvent.click(toggle);
+
+    const notReady = await findByTestId('pkarr-not-ready');
+    expect(notReady.textContent).toContain('not initialized');
+  });
+
+  it('shows empty fallback log by default', async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'connectivity_get_my_reachability_record') return Promise.resolve(null);
+      if (cmd === 'connectivity_list_peer_reachability') return Promise.resolve([]);
+      if (cmd === 'connectivity_pkarr_publication_status') {
+        return Promise.resolve({ inviteCount: 0, identityActive: false, communityCount: 0 });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { findByTestId } = render(DiagnosticsPanel);
+
+    const toggle = await findByTestId('pkarr-section-toggle');
+    await fireEvent.click(toggle);
+
+    const empty = await findByTestId('pkarr-fallback-empty');
+    expect(empty.textContent).toContain('No fallback lookups yet');
+  });
+
+  it('calls connectivity_pkarr_publication_status on mount', async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'connectivity_get_my_reachability_record') return Promise.resolve(null);
+      if (cmd === 'connectivity_list_peer_reachability') return Promise.resolve([]);
+      if (cmd === 'connectivity_pkarr_publication_status') {
+        return Promise.resolve({ inviteCount: 0, identityActive: false, communityCount: 0 });
+      }
+      return Promise.resolve(null);
+    });
+
+    render(DiagnosticsPanel);
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith('connectivity_pkarr_publication_status');
     });
   });
 });

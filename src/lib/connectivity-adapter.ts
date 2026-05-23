@@ -18,6 +18,10 @@ import type {
   ReachabilityRecord,
   PeerReachability,
   ConnectivityReachabilityChangedPayload,
+  DiscoveredRecord,
+  PkarrPublicationStatus,
+  RedemptionOutcome,
+  ResolutionProgressEvent,
 } from './types/connectivity';
 
 /**
@@ -95,4 +99,202 @@ export async function onReachabilityChanged(
     const msg = e instanceof Error ? e.message : String(e);
     throw new Error(`connectivity-reachability-changed: ${msg}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// ZEB-323 Phase 2b: pkarr-backed discovery IPCs + events
+// ---------------------------------------------------------------------------
+
+/**
+ * Attempt to redeem an invite via the cross-WAN iroh/pkarr path.
+ *
+ * Resolves with a `RedemptionOutcome` indicating whether the join succeeded,
+ * the inviter was unreachable, or the call should fall back to Reticulum.
+ * Rejects (throws) only on hard IPC-layer failures (process bridge broken,
+ * etc.); expected soft failures are encoded in the outcome status instead.
+ */
+export async function redeemInviteIroh(inviteUrl: string): Promise<RedemptionOutcome> {
+  try {
+    return await invoke<RedemptionOutcome>('connectivity_redeem_invite_iroh', { inviteUrl });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`connectivity_redeem_invite_iroh: ${msg}`);
+  }
+}
+
+/**
+ * Toggle case-B identity-keyed discoverability.
+ *
+ * When `enabled` is `true`, this device publishes its iroh routing to the
+ * pkarr DHT under a key derived from the owner identity public key. Anyone
+ * holding the identity address can then find this device cross-WAN. Persisted
+ * across restarts via `connectivity-settings.json`.
+ */
+export async function setIdentityDiscoverable(enabled: boolean): Promise<void> {
+  try {
+    await invoke('connectivity_set_identity_discoverable', { enabled });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`connectivity_set_identity_discoverable: ${msg}`);
+  }
+}
+
+/**
+ * Read the persisted case-B discoverability setting.
+ *
+ * Returns `false` (default) when the setting file has never been written.
+ */
+export async function getIdentityDiscoverable(): Promise<boolean> {
+  try {
+    return await invoke<boolean>('connectivity_get_identity_discoverable');
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`connectivity_get_identity_discoverable: ${msg}`);
+  }
+}
+
+/**
+ * Query the pkarr DHT for a peer's current iroh routing record given its
+ * 64-byte identity public key as a lowercase hex string.
+ *
+ * Returns `null` when no valid record is found (peer offline or not
+ * discoverable). Throws on hard resolution errors.
+ */
+export async function discoverIdentity(identityPubHex: string): Promise<DiscoveredRecord | null> {
+  try {
+    return await invoke<DiscoveredRecord | null>('connectivity_discover_identity', {
+      identityPubHex,
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`connectivity_discover_identity: ${msg}`);
+  }
+}
+
+/**
+ * Returns a snapshot of active pkarr publication handles by case.
+ *
+ * `inviteCount` — number of pending invite publications (case A).
+ * `identityActive` — whether case-B identity-keyed publishing is live.
+ * `communityCount` — number of per-community publications (case C).
+ */
+export async function pkarrPublicationStatus(): Promise<PkarrPublicationStatus> {
+  try {
+    return await invoke<PkarrPublicationStatus>('connectivity_pkarr_publication_status');
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`connectivity_pkarr_publication_status: ${msg}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ZEB-323 Phase 2b: event subscribers
+// ---------------------------------------------------------------------------
+
+/**
+ * Subscribe to `connectivity-invite-resolution-progress` events.
+ *
+ * The backend emits these during an iroh invite-redemption attempt to let the
+ * UI display stage-by-stage progress. Returns a teardown function — call it
+ * from `onDestroy` to unregister the listener.
+ *
+ * Uses the same destroyed-flag pattern as Phase 1's `onReachabilityChanged`
+ * to guard against the mount/unmount race window.
+ */
+export function onResolutionProgress(
+  cb: (ev: ResolutionProgressEvent) => void,
+): () => void {
+  let unlisten: UnlistenFn | undefined;
+  let destroyed = false;
+  listen<ResolutionProgressEvent>('connectivity-invite-resolution-progress', (e) =>
+    cb(e.payload),
+  )
+    .then((u) => {
+      if (destroyed) {
+        u();
+      } else {
+        unlisten = u;
+      }
+    })
+    .catch((e) =>
+      console.error(
+        'connectivity-invite-resolution-progress listen failed:',
+        e instanceof Error ? e.message : String(e),
+      ),
+    );
+  return () => {
+    destroyed = true;
+    unlisten?.();
+  };
+}
+
+/**
+ * Subscribe to `connectivity-identity-discoverable-changed` events.
+ *
+ * Fired whenever `connectivity_set_identity_discoverable` IPC completes so
+ * that any other panel showing the toggle can sync its state without polling.
+ * Returns a teardown function.
+ */
+export function onIdentityDiscoverableChanged(cb: (enabled: boolean) => void): () => void {
+  let unlisten: UnlistenFn | undefined;
+  let destroyed = false;
+  listen<{ enabled: boolean }>('connectivity-identity-discoverable-changed', (e) =>
+    cb(e.payload.enabled),
+  )
+    .then((u) => {
+      if (destroyed) {
+        u();
+      } else {
+        unlisten = u;
+      }
+    })
+    .catch((e) =>
+      console.error(
+        'connectivity-identity-discoverable-changed listen failed:',
+        e instanceof Error ? e.message : String(e),
+      ),
+    );
+  return () => {
+    destroyed = true;
+    unlisten?.();
+  };
+}
+
+/**
+ * Subscribe to `connectivity-pkarr-fallback-fired` events.
+ *
+ * Emitted by the backend whenever `ReachabilityResolver::resolve_async`
+ * falls back to a pkarr DHT lookup (case C). Each event carries:
+ *   - `peerAddrShort` — first 12 hex chars of the peer's OwnerAddr
+ *   - `communityId`   — hex community id for which the lookup was attempted
+ *   - `hit`           — whether the lookup returned a valid record
+ *
+ * Returns a teardown function.
+ */
+export function onPkarrFallbackFired(
+  cb: (ev: { peerAddrShort: string; communityId: string; hit: boolean }) => void,
+): () => void {
+  let unlisten: UnlistenFn | undefined;
+  let destroyed = false;
+  listen<{ peerAddrShort: string; communityId: string; hit: boolean }>(
+    'connectivity-pkarr-fallback-fired',
+    (e) => cb(e.payload),
+  )
+    .then((u) => {
+      if (destroyed) {
+        u();
+      } else {
+        unlisten = u;
+      }
+    })
+    .catch((e) =>
+      console.error(
+        'connectivity-pkarr-fallback-fired listen failed:',
+        e instanceof Error ? e.message : String(e),
+      ),
+    );
+  return () => {
+    destroyed = true;
+    unlisten?.();
+  };
 }

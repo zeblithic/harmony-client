@@ -1,7 +1,12 @@
 <script lang="ts">
-  import { untrack } from 'svelte';
+  import { untrack, onMount, onDestroy } from 'svelte';
   import Modal from './Modal.svelte';
   import { mapRedeemInviteError } from '../redeem-invite-errors';
+  import {
+    redeemInviteIroh,
+    onResolutionProgress,
+  } from '../connectivity-adapter';
+  import type { RedemptionStage } from '../types/connectivity';
 
   let {
     onSubmit,
@@ -18,9 +23,68 @@
   } = $props();
 
   let url = $state(untrack(() => initialUrl));
-  let canSubmit = $derived(url.trim().startsWith('harmony://invite/') && !pending);
+  let canSubmit = $derived(url.trim().startsWith('harmony://invite/') && !pending && !irohPending);
   let mapped = $derived(error ? mapRedeemInviteError(error) : null);
   const titleId = `redeem-invite-title-${Math.random().toString(36).slice(2)}`;
+
+  // ── Iroh / pkarr path state ──────────────────────────────────────────────
+  let irohPending = $state(false);
+  let irohStage = $state<RedemptionStage | null>(null);
+  let irohError = $state<string | null>(null);
+  let irohSuccess = $state(false);
+  let showFallbackButton = $state(false);
+
+  const STAGE_LABELS: Record<RedemptionStage, string> = {
+    resolving: 'Looking up inviter…',
+    connecting: 'Connecting…',
+    sending: 'Sending join request…',
+    awaiting_countersig: 'Waiting for confirmation…',
+    joined: 'Joined ✓',
+  };
+
+  let stopProgressListener: (() => void) | null = null;
+
+  onMount(() => {
+    stopProgressListener = onResolutionProgress((ev) => {
+      irohStage = ev.stage;
+    });
+  });
+
+  onDestroy(() => {
+    stopProgressListener?.();
+  });
+
+  async function handleIrohRedeem() {
+    const trimmed = url.trim();
+    if (!trimmed.startsWith('harmony://invite/') || irohPending || pending) return;
+    irohPending = true;
+    irohStage = 'resolving';
+    irohError = null;
+    irohSuccess = false;
+    showFallbackButton = false;
+    try {
+      const outcome = await redeemInviteIroh(trimmed);
+      if (outcome.status === 'joined') {
+        irohStage = 'joined';
+        irohSuccess = true;
+      } else if (outcome.status === 'inviter_unreachable') {
+        irohStage = null;
+        irohError =
+          "Couldn't reach the inviter through the network right now. They may be offline; try again later.";
+        showFallbackButton = true;
+      } else {
+        // fallback_reticulum or other — hand off to LAN path
+        irohStage = null;
+        showFallbackButton = true;
+      }
+    } catch (e) {
+      irohStage = null;
+      irohError = e instanceof Error ? e.message : String(e);
+      showFallbackButton = true;
+    } finally {
+      irohPending = false;
+    }
+  }
 
   function handleSubmit() {
     if (!canSubmit) return;
@@ -28,7 +92,7 @@
   }
 </script>
 
-<Modal {onCancel} canCancel={!pending} ariaLabelledby={titleId}>
+<Modal {onCancel} canCancel={!pending && !irohPending} ariaLabelledby={titleId}>
   <h3 class="dialog-title" id={titleId}>Redeem invite link</h3>
 
   {#if mapped}
@@ -45,14 +109,33 @@
     </div>
   {/if}
 
+  {#if irohError}
+    <div class="error-banner" data-testid="iroh-error-banner">
+      <p class="summary">{irohError}</p>
+    </div>
+  {/if}
+
   <textarea
     placeholder="harmony://invite/v1?..."
     bind:value={url}
     class="url-input"
     rows="3"
-    disabled={pending}
+    disabled={pending || irohPending}
     aria-label="Invite link URL"
   ></textarea>
+
+  {#if irohPending && irohStage}
+    <div class="pending-row" data-testid="iroh-progress">
+      <div class="spinner" role="status" aria-label="Connecting via network"></div>
+      <span data-testid="iroh-stage-label">{STAGE_LABELS[irohStage]}</span>
+    </div>
+  {/if}
+
+  {#if irohSuccess}
+    <div class="pending-row" data-testid="iroh-success">
+      <span>Joined ✓</span>
+    </div>
+  {/if}
 
   {#if pending}
     <div class="pending-row">
@@ -62,8 +145,26 @@
   {/if}
 
   <div class="dialog-actions">
-    <button class="cancel-btn" onclick={onCancel} disabled={pending}>Cancel</button>
-    <button class="confirm-btn" onclick={handleSubmit} disabled={!canSubmit}>Redeem</button>
+    <button class="cancel-btn" onclick={onCancel} disabled={pending || irohPending}>Cancel</button>
+    {#if showFallbackButton}
+      <button
+        class="fallback-btn"
+        onclick={handleSubmit}
+        disabled={!url.trim().startsWith('harmony://invite/') || pending}
+        data-testid="fallback-lan-btn"
+      >
+        Try via local network
+      </button>
+    {:else}
+      <button
+        class="iroh-btn"
+        onclick={handleIrohRedeem}
+        disabled={!url.trim().startsWith('harmony://invite/') || pending || irohPending}
+        data-testid="iroh-redeem-btn"
+      >
+        Redeem
+      </button>
+    {/if}
   </div>
 </Modal>
 
@@ -171,8 +272,36 @@
     cursor: not-allowed;
   }
   .cancel-btn:focus-visible,
-  .confirm-btn:focus-visible {
+  .confirm-btn:focus-visible,
+  .iroh-btn:focus-visible,
+  .fallback-btn:focus-visible {
     outline: 2px solid var(--accent, #5865f2);
     outline-offset: 1px;
+  }
+  .iroh-btn {
+    background: var(--accent);
+    color: var(--text-primary);
+    border: none;
+    padding: 8px 16px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.875rem;
+  }
+  .iroh-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .fallback-btn {
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    padding: 8px 16px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.875rem;
+  }
+  .fallback-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
   }
 </style>

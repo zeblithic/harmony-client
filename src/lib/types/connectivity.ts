@@ -45,3 +45,60 @@ export interface PeerReachability {
 export interface ConnectivityReachabilityChangedPayload {
   actor: string;
 }
+
+// ---------------------------------------------------------------------------
+// ZEB-323 Phase 2b: pkarr-backed discovery types
+// ---------------------------------------------------------------------------
+
+/**
+ * Routing record decoded from a pkarr DHT lookup via
+ * `connectivity_discover_identity`. Mirrors the Rust `DiscoveredRecord` DTO
+ * (`#[serde(rename_all = "camelCase")]`).
+ */
+export interface DiscoveredRecord {
+  irohNodeId: string;
+  relayUrl?: string;
+  directAddrs: string[];
+  announcedAtMs: number;
+}
+
+/**
+ * Snapshot of the pkarr publisher's active publication handles, returned by
+ * `connectivity_pkarr_publication_status`. Mirrors `PublicationStatus` DTO.
+ */
+export interface PkarrPublicationStatus {
+  inviteCount: number;
+  identityActive: boolean;
+  communityCount: number;
+}
+
+/**
+ * Result of `connectivity_redeem_invite_iroh`. Mirrors `RedemptionOutcome` DTO.
+ *
+ * `status` is one of `'joined'`, `'inviter_unreachable'`,
+ * `'fallback_reticulum'`, or an opaque backend string for future variants.
+ */
+export interface RedemptionOutcome {
+  status: 'joined' | 'inviter_unreachable' | 'fallback_reticulum' | string;
+  communityId?: string;
+}
+
+/**
+ * The stage a cross-WAN invite redemption is currently at, emitted on the
+ * `connectivity-invite-resolution-progress` event.
+ */
+export type RedemptionStage =
+  | 'resolving'
+  | 'connecting'
+  | 'sending'
+  | 'awaiting_countersig'
+  | 'joined';
+
+/**
+ * Payload of the `connectivity-invite-resolution-progress` event.
+ */
+export interface ResolutionProgressEvent {
+  inviteId: string;
+  stage: RedemptionStage;
+  attemptN: number;
+}
