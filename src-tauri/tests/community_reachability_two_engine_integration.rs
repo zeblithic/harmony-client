@@ -71,10 +71,10 @@ use zenoh_link::{EndPoint, LinkManagerUnicastTrait, LinkUnicast};
 /// no pkarr publisher, no DERP relays. Mirrors the pattern used by
 /// `zenoh_iroh_link::tests::paired_stream_roundtrip_via_loopback` and
 /// `zenoh_iroh_transport::tests::build_hermetic_iroh_endpoint`, except
-/// it goes through [`IrohEndpoint::from_endpoint_for_test`] (gated
-/// behind `#[cfg(any(test, feature = "test-fixtures"))]`, reachable
-/// from integration tests via the `test-fixtures` feature) so the rest
-/// of the test uses the same wrapper production code uses.
+/// it goes through [`IrohEndpoint::from_endpoint_for_integration_test`]
+/// (gated behind `feature = "test-fixtures"`, the `pub` alias of the
+/// in-crate `pub(crate) from_endpoint_for_test`) so the rest of the
+/// test uses the same `IrohEndpoint` wrapper production code uses.
 async fn build_hermetic_endpoint() -> Arc<IrohEndpoint> {
     let secret = SecretKey::generate();
     let inner = Endpoint::builder(presets::Minimal)
@@ -87,7 +87,7 @@ async fn build_hermetic_endpoint() -> Arc<IrohEndpoint> {
         .bind()
         .await
         .expect("bind iroh endpoint");
-    Arc::new(IrohEndpoint::from_endpoint_for_test(inner))
+    Arc::new(IrohEndpoint::from_endpoint_for_integration_test(inner))
 }
 
 #[tokio::test]

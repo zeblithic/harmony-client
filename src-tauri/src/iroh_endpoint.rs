@@ -157,6 +157,24 @@ impl IrohEndpoint {
         Self { inner }
     }
 
+    /// Public alias of [`Self::from_endpoint_for_test`] for integration
+    /// tests (which compile against `pub` items only — `pub(crate)`
+    /// items are not visible from `tests/`).
+    ///
+    /// Cfg-gated to `feature = "test-fixtures"` (no bare `test` — that
+    /// only fires for the crate's own unit tests, which already have
+    /// `pub(crate)` access). Production builds drop this method
+    /// entirely because the gate evaluates false.
+    ///
+    /// First caller: Task 10's
+    /// `community_reachability_two_engine_integration` integration
+    /// test, which builds two hermetic loopback endpoints and exchanges
+    /// CRDT bytes through the Zenoh-over-Iroh transport.
+    #[cfg(feature = "test-fixtures")]
+    pub fn from_endpoint_for_integration_test(inner: Endpoint) -> Self {
+        Self::from_endpoint_for_test(inner)
+    }
+
     /// Gracefully close the endpoint and all open connections.
     ///
     /// Safe to call multiple times — `iroh::Endpoint::close` is
