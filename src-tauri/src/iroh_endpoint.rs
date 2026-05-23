@@ -38,6 +38,7 @@ use std::net::SocketAddr;
 
 use iroh::endpoint::{presets, Endpoint};
 use iroh::{EndpointId, RelayUrl, SecretKey};
+use zeroize::Zeroizing;
 
 /// ALPN registry for harmony-on-iroh sub-protocols. Constants are
 /// referenced by both the endpoint binder (server-side `accept`) and
@@ -56,17 +57,23 @@ const KEYCHAIN_USER: &str = "iroh.secret_key";
 /// subsequent ZEB-321 Phase 1 tasks. Keeping the surface small lets us
 /// swap iroh versions or back the endpoint with a different transport
 /// later without churning every call site.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct IrohEndpoint {
     inner: Endpoint,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum IrohEndpointError {
-    #[error("iroh endpoint bind failed: {0}")]
-    Bind(String),
-    #[error("keychain access failed: {0}")]
-    Keychain(String),
+    #[error("iroh endpoint bind failed")]
+    Bind(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    #[error("keychain {context}")]
+    Keychain {
+        context: String,
+        #[source]
+        source: keyring::Error,
+    },
+    #[error("keychain entry harmony.client/iroh.secret_key length is {len} bytes, expected 32")]
+    KeychainBadLength { len: usize },
 }
 
 impl IrohEndpoint {
@@ -82,7 +89,7 @@ impl IrohEndpoint {
             ])
             .bind()
             .await
-            .map_err(|e| IrohEndpointError::Bind(e.to_string()))?;
+            .map_err(|e| IrohEndpointError::Bind(Box::new(e)))?;
         Ok(Self { inner })
     }
 
@@ -107,14 +114,21 @@ impl IrohEndpoint {
         self.inner.addr().ip_addrs().copied().collect()
     }
 
-    /// Escape hatch for callers that need the full iroh API (e.g. the
-    /// zenoh-over-iroh transport in later tasks, which calls
-    /// `.connect()` / `.accept()` directly).
-    pub fn inner(&self) -> &Endpoint {
+    /// Escape hatch for in-crate callers that need the full iroh API
+    /// (e.g. the zenoh-over-iroh transport in later tasks, which calls
+    /// `.connect()` / `.accept()` directly). Kept `pub(crate)` so the
+    /// public API stays minimal — external callers should add a method
+    /// here rather than reaching into iroh directly.
+    // ZEB-321 Phase 1 Task 5 (IrohZenohLinkManager) is the first caller.
+    #[allow(dead_code)]
+    pub(crate) fn inner(&self) -> &Endpoint {
         &self.inner
     }
 
     /// Gracefully close the endpoint and all open connections.
+    ///
+    /// Safe to call multiple times — `iroh::Endpoint::close` is
+    /// idempotent (second call no-ops on the already-closed endpoint).
     pub async fn shutdown(&self) {
         self.inner.close().await;
     }
@@ -128,34 +142,40 @@ impl IrohEndpoint {
 /// our [`EndpointId`], breaking any peer that knew us by the old id.
 pub fn load_or_create_secret_key() -> Result<SecretKey, IrohEndpointError> {
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER).map_err(|e| {
-        IrohEndpointError::Keychain(format!(
-            "entry creation {KEYCHAIN_SERVICE}/{KEYCHAIN_USER}: {e}"
-        ))
+        IrohEndpointError::Keychain {
+            context: format!("entry creation {KEYCHAIN_SERVICE}/{KEYCHAIN_USER}"),
+            source: e,
+        }
     })?;
     match entry.get_secret() {
         Ok(bytes) => {
+            // Wrap the keychain payload in Zeroizing so the heap copy is
+            // wiped on drop — see identity.rs for the canonical pattern.
+            let bytes = Zeroizing::new(bytes);
             if bytes.len() != 32 {
-                return Err(IrohEndpointError::Keychain(format!(
-                    "keychain entry {KEYCHAIN_SERVICE}/{KEYCHAIN_USER} length is {} bytes, expected 32",
-                    bytes.len()
-                )));
+                return Err(IrohEndpointError::KeychainBadLength { len: bytes.len() });
             }
-            let mut arr = [0u8; 32];
+            let mut arr: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
             arr.copy_from_slice(&bytes);
             Ok(SecretKey::from_bytes(&arr))
         }
         Err(keyring::Error::NoEntry) => {
             let key = SecretKey::generate();
-            entry.set_secret(&key.to_bytes()).map_err(|e| {
-                IrohEndpointError::Keychain(format!(
-                    "keychain write {KEYCHAIN_SERVICE}/{KEYCHAIN_USER}: {e}"
-                ))
-            })?;
+            // Snapshot the secret bytes in a Zeroizing buffer so any
+            // intermediate stack copy is wiped after the keychain write.
+            let key_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(key.to_bytes());
+            entry
+                .set_secret(key_bytes.as_ref())
+                .map_err(|e| IrohEndpointError::Keychain {
+                    context: format!("keychain write {KEYCHAIN_SERVICE}/{KEYCHAIN_USER}"),
+                    source: e,
+                })?;
             Ok(key)
         }
-        Err(e) => Err(IrohEndpointError::Keychain(format!(
-            "keychain read {KEYCHAIN_SERVICE}/{KEYCHAIN_USER}: {e}"
-        ))),
+        Err(e) => Err(IrohEndpointError::Keychain {
+            context: format!("keychain read {KEYCHAIN_SERVICE}/{KEYCHAIN_USER}"),
+            source: e,
+        }),
     }
 }
 
