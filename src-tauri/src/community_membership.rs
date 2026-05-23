@@ -2889,11 +2889,13 @@ pub fn verify_event(
             }
 
             // RCH4: announced_at_ms vs hlc.wall_ms within ±30 min.
-            // Cast to i64 first to allow negative skew. u64 → i64 cast
-            // is safe under realistic wall-clock values (i64::MAX ms ≈
-            // year 292 277 026 596); we don't worry about overflow.
-            let skew = (payload.announced_at_ms as i64) - (event.at.wall_ms as i64);
-            if skew.abs() > REACHABILITY_TIMESTAMP_SKEW_MAX_MS {
+            // Use `u64::abs_diff` so the |skew| computation stays in
+            // unsigned space — the prior `(u64 as i64) - (u64 as i64)`
+            // then `i64::abs()` formulation could overflow at adversarial
+            // wall_ms values (i64::MIN.abs() panics in debug, wraps in
+            // release). Per CodeRabbit on PR #157.
+            let skew = payload.announced_at_ms.abs_diff(event.at.wall_ms);
+            if skew > REACHABILITY_TIMESTAMP_SKEW_MAX_MS {
                 return Err(VerifyError::ReachabilityTimestampSkew);
             }
 
@@ -3058,7 +3060,7 @@ pub const ADMIN_PROPOSAL_EXPIRY_MS: u64 = 30 * 86_400_000;
 /// HLC `wall_ms`. ±30 minutes — generous enough to tolerate normal
 /// device clock drift; tight enough to reject obviously-tampered
 /// records (spec §5.5 silent-drop semantics).
-pub const REACHABILITY_TIMESTAMP_SKEW_MAX_MS: i64 = 30 * 60 * 1000;
+pub const REACHABILITY_TIMESTAMP_SKEW_MAX_MS: u64 = 30 * 60 * 1000;
 
 /// ZEB-250: apply an admin-proposal's effect to the running
 /// materialized state when the proposal has reached quorum within the
@@ -9352,7 +9354,7 @@ mod zeb_321_reachability_verify_tests {
         // outside the RCH4 ±30-min window. Referencing the const keeps
         // this test in sync if the threshold is ever tuned.
         let wall_ms: u64 = 1_000_000_000;
-        let announced_at_ms = wall_ms + (REACHABILITY_TIMESTAMP_SKEW_MAX_MS as u64) + 60 * 1000;
+        let announced_at_ms = wall_ms + REACHABILITY_TIMESTAMP_SKEW_MAX_MS + 60 * 1000;
         let event = make_reachability_event(
             community_id,
             &admin_priv,
