@@ -174,15 +174,26 @@ mod tests {
     use super::*;
 
     /// End-to-end round-trip over a real iroh QUIC connection on
-    /// loopback. Both endpoints run with `RelayMode::Disabled` so the
-    /// test doesn't depend on outbound DERP reachability — see
-    /// `iroh_endpoint::tests` for the mirror of this hermetic pattern.
+    /// loopback. Built with `presets::Minimal` (crypto provider only —
+    /// **no** Address Lookup, **no** pkarr publisher) and explicit
+    /// loopback bind, so the test never touches the network. The
+    /// dialer reaches the acceptor via an explicit `EndpointAddr`
+    /// carrying loopback IP addresses, bypassing iroh's discovery
+    /// layer entirely.
+    ///
+    /// The `presets::N0` preset wires up a pkarr publisher + DNS
+    /// address-lookup service even when `RelayMode::Disabled` is
+    /// applied on top — those make outbound DNS / pkarr queries on
+    /// bind, which hang in offline / sandboxed environments. Mirror
+    /// the in-tree `iroh_endpoint::tests` pattern *for the relay
+    /// piece*, but downgrade the preset for full hermeticity.
     #[tokio::test]
     async fn paired_stream_roundtrip_via_loopback() {
         use crate::iroh_endpoint::alpn;
         use iroh::endpoint::{presets, Endpoint, RelayMode};
-        use iroh::SecretKey;
+        use iroh::{EndpointAddr, SecretKey, TransportAddr};
         use rand::RngCore;
+        use std::net::Ipv4Addr;
 
         // Fresh ephemeral secrets for each endpoint — production uses
         // keychain-persisted keys, but for a one-shot round-trip
@@ -195,30 +206,43 @@ mod tests {
         let key_a = SecretKey::from_bytes(&buf_a);
         let key_b = SecretKey::from_bytes(&buf_b);
 
-        // Hermetic build path (mirror of iroh_endpoint::tests::
-        // iroh_endpoint_inits_with_ephemeral_secret) — `RelayMode::
-        // Disabled` keeps the test off any external relay.
-        let ep_a = Endpoint::builder(presets::N0)
+        // `presets::Minimal` sets only the crypto provider — no
+        // address-lookup service, no relays. We also call
+        // `clear_ip_transports()` so the default 0.0.0.0 / [::] binds
+        // are dropped, then add an explicit loopback IPv4 bind.
+        // Result: neither endpoint touches anything but loopback.
+        // (Pattern mirrors iroh's own `test_bind_addr_clear` test.)
+        let ep_a = Endpoint::builder(presets::Minimal)
             .secret_key(key_a)
             .alpns(vec![alpn::HARMONY_ZENOH_V1.to_vec()])
             .relay_mode(RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr((Ipv4Addr::LOCALHOST, 0))
+            .expect("bind_addr ep_a")
             .bind()
             .await
             .expect("bind ep_a");
-        let ep_b = Endpoint::builder(presets::N0)
+        let ep_b = Endpoint::builder(presets::Minimal)
             .secret_key(key_b)
             .alpns(vec![alpn::HARMONY_ZENOH_V1.to_vec()])
             .relay_mode(RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr((Ipv4Addr::LOCALHOST, 0))
+            .expect("bind_addr ep_b")
             .bind()
             .await
             .expect("bind ep_b");
 
-        // `ep_b.addr()` snapshots the current `EndpointAddr` with
-        // direct IP addrs populated — needed for the dialer to find
-        // ep_b with relays disabled.
-        let ep_b_addr = ep_b.addr();
+        // Build ep_b's full EndpointAddr from its bound sockets —
+        // with no address-lookup service running, `ep_b.addr()` would
+        // not contain direct IPs by itself. We construct it manually
+        // from the known loopback sockets.
         let ep_a_id = ep_a.id();
         let ep_b_id = ep_b.id();
+        let ep_b_addr = EndpointAddr::from_parts(
+            ep_b_id,
+            ep_b.bound_sockets().into_iter().map(TransportAddr::Ip),
+        );
 
         // Accept side runs on ep_b in a spawned task. iroh's
         // open_bi/accept_bi contract requires the dialer to write
