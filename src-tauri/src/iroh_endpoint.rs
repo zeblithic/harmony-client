@@ -128,7 +128,9 @@ impl IrohEndpoint {
 /// our [`EndpointId`], breaking any peer that knew us by the old id.
 pub fn load_or_create_secret_key() -> Result<SecretKey, IrohEndpointError> {
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER).map_err(|e| {
-        IrohEndpointError::Keychain(format!("entry creation {KEYCHAIN_SERVICE}/{KEYCHAIN_USER}: {e}"))
+        IrohEndpointError::Keychain(format!(
+            "entry creation {KEYCHAIN_SERVICE}/{KEYCHAIN_USER}: {e}"
+        ))
     })?;
     match entry.get_secret() {
         Ok(bytes) => {
