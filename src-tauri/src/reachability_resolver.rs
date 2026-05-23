@@ -63,8 +63,16 @@ impl ReachabilityResolver {
 /// `Hlc::is_strictly_newer_than`. Ties on HLC fall through to
 /// `announced_at_ms` then lex `iroh_node_id`, per spec §5.4.
 fn should_replace(prev: &ResolverEntry, next: &ResolverEntry) -> bool {
-    let prev_key = (prev.hlc.wall_ms, prev.hlc.logical, prev.hlc.device_id.as_str());
-    let next_key = (next.hlc.wall_ms, next.hlc.logical, next.hlc.device_id.as_str());
+    let prev_key = (
+        prev.hlc.wall_ms,
+        prev.hlc.logical,
+        prev.hlc.device_id.as_str(),
+    );
+    let next_key = (
+        next.hlc.wall_ms,
+        next.hlc.logical,
+        next.hlc.device_id.as_str(),
+    );
     match next_key.cmp(&prev_key) {
         std::cmp::Ordering::Greater => true,
         std::cmp::Ordering::Less => false,
