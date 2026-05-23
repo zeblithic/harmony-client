@@ -286,14 +286,15 @@ enum ZenohEvent {
 
 /// ZEB-321 Phase 1: bundle of iroh-transport resources constructed at
 /// `start_node` time and threaded into the event loop so the accept-loop
-/// and publisher task can be spawned alongside the rest of the long-
-/// lived background tasks.
+/// can be spawned alongside the rest of the long-lived background tasks.
+/// The publisher is NOT in this bundle (see following paragraph).
 ///
-/// Construction lives in `start_node` (rather than inside `event_loop::run`)
-/// so the per-community membership-delta consumer closure can capture the
-/// resolver and route freshly-inserted `ReachabilityAnnounce` events into
-/// it without a separate plumbing pass. The link manager is passed in
-/// pre-built so the event loop owns only the `spawn_accept_loop` call.
+/// Construction of the endpoint + link manager lives in `start_node`
+/// (rather than inside `event_loop::run`) so the per-community
+/// membership-delta consumer closure can capture the resolver and route
+/// freshly-inserted `ReachabilityAnnounce` events into it without a
+/// separate plumbing pass. The link manager is passed in pre-built so
+/// the event loop owns only the `spawn_accept_loop` call.
 ///
 /// ZEB-321 Phase 1 Task 9 update: the `ReachabilityPublisher` is NOT in
 /// this bundle. The publisher's real `publish_fn` closure needs to

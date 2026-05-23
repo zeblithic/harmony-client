@@ -51,7 +51,7 @@ These five findings shape the architecture below; the spec does not re-derive th
 
 ### 3.1 The cohesive Phase 1 picture
 
-```
+```text
         [Device A — CA, behind NAT]            [Device B — WA, behind NAT]
                 │                                       │
                 │   1. Each device publishes a signed   │
@@ -381,7 +381,7 @@ The `event_loop` task that originally drove Zenoh peer-mode discovery now drives
 
 ### 7.5 Connection lifecycle
 
-```
+```text
 [ReachabilityRecord arrives via CRDT sync]
       │
       ▼
