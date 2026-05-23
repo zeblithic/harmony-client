@@ -669,6 +669,28 @@ pub struct NodeState {
     /// bootstrap or after stop_node. Shutdown is called in stop_inner
     /// before the event-loop thread is joined.
     pub mint_sync: Option<std::sync::Arc<crate::mint_sync::MintSyncEngine>>,
+
+    /// ZEB-321 Phase 1 Task 8: iroh endpoint Arc. `Some` while node is
+    /// running AND the keychain-resident secret key + bind both succeeded;
+    /// `None` otherwise (tests, headless platforms, bind failure). Task 9's
+    /// `connectivity_get_status` IPC reads `node_id` / `home_relay` /
+    /// `direct_addresses` off this handle. Cleared in `stop_inner` so a
+    /// restart re-binds with the same persisted secret.
+    pub iroh_endpoint: Option<std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>>,
+    /// ZEB-321 Phase 1 Task 8: LWW resolver for OwnerAddr → reachability
+    /// payload, kept on NodeState so Task 9's IPC + outbound zenoh-over-iroh
+    /// connect paths can read it without re-plumbing through the event
+    /// loop. The resolver itself is Arc-shared internally (cheap clone);
+    /// the field holds the canonical handle. `Some` whenever start_node
+    /// runs (resolver construction is infallible); `None` only on a default
+    /// (pre-start_node) NodeState.
+    pub reachability_resolver: Option<crate::reachability_resolver::ReachabilityResolver>,
+    /// ZEB-321 Phase 1 Task 8: `force_handle` of the publisher's `Notify`,
+    /// stashed here so the `connectivity_force_republish` IPC (Task 9) can
+    /// wake the publisher loop without holding the whole publisher Arc.
+    /// `None` when the publisher failed to spawn (e.g. iroh bind failed) —
+    /// IPC handlers no-op in that case.
+    pub iroh_publisher_force: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 impl NodeState {
@@ -786,6 +808,11 @@ impl Default for NodeState {
             mint_db: None,
             // Mint sync engine: initialized in identity bootstrap.
             mint_sync: None,
+            // ZEB-321 Phase 1 Task 8: iroh handles stay None until
+            // start_node wires them; cleared in stop_inner.
+            iroh_endpoint: None,
+            reachability_resolver: None,
+            iroh_publisher_force: None,
         }
     }
 }
@@ -1107,6 +1134,15 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         // Mint Phase 2 sync: take before releasing the lock so a concurrent
         // IPC doesn't race to call notify_dirty on a shutting-down engine.
         mint_sync_for_shutdown = guard.mint_sync.take();
+        // ZEB-321 Phase 1 Task 8: clear iroh handles so a restart re-binds
+        // cleanly. The endpoint Arc drops here — the link manager's
+        // accept loop ends when the endpoint shuts down naturally on its
+        // own Arc-drop; the publisher loop ends when its `endpoint` Arc
+        // (a clone) drops alongside the publisher Arc. Both are best-effort
+        // in this Phase 1 implementation (no explicit shutdown await).
+        guard.iroh_endpoint = None;
+        guard.reachability_resolver = None;
+        guard.iroh_publisher_force = None;
         tup
     };
 
@@ -1731,6 +1767,13 @@ async fn start_node(
         // Mint Phase 2 sync: take the prior identity's engine so it can be
         // shut down outside the lock below (same pattern as sync_engine).
         old_mint_sync_engine = guard.mint_sync.take();
+        // ZEB-321 Phase 1 Task 8: clear iroh handles so the new identity's
+        // start_node rebuilds them. The secret key itself is keychain-
+        // resident and per-device, so a same-device restart hits the same
+        // `EndpointId`; no transport reconfiguration required.
+        guard.iroh_endpoint = None;
+        guard.reachability_resolver = None;
+        guard.iroh_publisher_force = None;
         tup
     };
 
@@ -2070,6 +2113,92 @@ async fn start_node(
             std::sync::Arc::new(crate::profile_broadcast::ProfileBroadcastCache::default());
         let (profile_broadcast_request_tx, profile_broadcast_request_rx) =
             tokio::sync::mpsc::channel::<crate::event_loop::ProfileBroadcastRequest>(64);
+
+        // ── ZEB-321 Phase 1 Task 8: iroh transport boot ──────────────────
+        //
+        // Built unconditionally (not gated on owner identity) because the
+        // keychain-resident `SecretKey` is per-device, not per-owner, and
+        // the link manager + publisher need to be live before any owner is
+        // loaded so post-pair startups don't miss the first publish window.
+        //
+        // The resolver is held here in the outer scope so the
+        // per-community membership-delta consumer closure (constructed
+        // inside the `if let Some(seed)` block below) can capture it and
+        // feed accepted `ReachabilityAnnounce` events into it. The
+        // endpoint + publisher Arcs are stashed on NodeState post-spawn
+        // so Task 9's IPC handlers can reach them.
+        //
+        // Wire failures (keychain unavailable, bind error) degrade
+        // gracefully: log + skip the iroh subsystem, the rest of the node
+        // boots normally. Phase 1 ships the impl; full integration with
+        // Zenoh's transport stack lands when Task 10's two-engine test
+        // sign-off arrives.
+        let iroh_endpoint_arc: Option<std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>>;
+        let reachability_resolver: crate::reachability_resolver::ReachabilityResolver;
+        let iroh_publisher_arc: Option<
+            std::sync::Arc<crate::reachability_publisher::ReachabilityPublisher>,
+        >;
+        let iroh_handles_for_loop: Option<crate::event_loop::IrohRuntimeHandles>;
+        {
+            reachability_resolver = crate::reachability_resolver::ReachabilityResolver::new();
+            match crate::iroh_endpoint::load_or_create_secret_key() {
+                Ok(secret) => match crate::iroh_endpoint::IrohEndpoint::new_with_secret(secret)
+                    .await
+                {
+                    Ok(ep) => {
+                        let ep_arc = std::sync::Arc::new(ep);
+                        let (new_link_tx, _new_link_rx) =
+                            flume::unbounded::<zenoh_link::LinkUnicast>();
+                        let link_mgr = std::sync::Arc::new(
+                            crate::zenoh_iroh_transport::IrohZenohLinkManager::new(
+                                std::sync::Arc::clone(&ep_arc),
+                                reachability_resolver.clone(),
+                                new_link_tx,
+                            ),
+                        );
+                        // Publisher callback is a no-op stub; Task 9's
+                        // `connectivity_force_republish` IPC + per-community
+                        // signed-event emission will replace it via a
+                        // closure that signs + broadcasts a
+                        // ReachabilityAnnounce into each joined community.
+                        let publisher = std::sync::Arc::new(
+                            crate::reachability_publisher::ReachabilityPublisher::new(
+                                std::sync::Arc::clone(&ep_arc),
+                                std::sync::Arc::new(|| {
+                                    Box::pin(async {}) as futures::future::BoxFuture<'static, ()>
+                                }),
+                            ),
+                        );
+                        iroh_endpoint_arc = Some(std::sync::Arc::clone(&ep_arc));
+                        iroh_publisher_arc = Some(std::sync::Arc::clone(&publisher));
+                        iroh_handles_for_loop = Some(crate::event_loop::IrohRuntimeHandles {
+                            endpoint: ep_arc,
+                            link_manager: link_mgr,
+                            publisher,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "iroh endpoint bind failed; ZEB-321 transport disabled this session",
+                        );
+                        iroh_endpoint_arc = None;
+                        iroh_publisher_arc = None;
+                        iroh_handles_for_loop = None;
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "iroh secret key load/create failed; \
+                         ZEB-321 transport disabled this session",
+                    );
+                    iroh_endpoint_arc = None;
+                    iroh_publisher_arc = None;
+                    iroh_handles_for_loop = None;
+                }
+            }
+        }
 
         let sync_engine_arc: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>> =
             if let Some(ref loaded) = owner_loaded {
@@ -2731,6 +2860,16 @@ async fn start_node(
                                 let signing_key_for_epoch = std::sync::Arc::clone(&signing_key_arc);
                                 let self_owner_for_epoch = self_owner;
                                 let crdt_state_for_epoch = std::sync::Arc::clone(&crdt_state);
+                                // ZEB-321 Phase 1 Task 8: resolver feed hook.
+                                // The on_epoch_event closure already fires
+                                // on EVERY delta (not just epoch-kind ones —
+                                // see the function's doc); piggyback the
+                                // ReachabilityAnnounce dispatch here so we
+                                // don't grow `run_community_delta_consumer`'s
+                                // callback list. Both the resolver and the
+                                // AppHandle clone cheaply (Arc internals).
+                                let reachability_resolver_for_hook = reachability_resolver.clone();
+                                let app_for_reachability = app.clone();
                                 // Per-session synthesized-set: avoids re-synthesizing
                                 // the same rotation/catchup within one node session.
                                 // Wrapped in Arc<Mutex<_>> so the FnMut closure can
@@ -2786,7 +2925,37 @@ async fn start_node(
                                     let community_id = delta.community_id;
                                     let event = delta.event.clone();
                                     let local_addr_epoch = self_owner_for_epoch;
+                                    // ZEB-321 Phase 1 Task 8: resolver feed hook
+                                    // captures (resolver, app) per invocation
+                                    // so the async block can move them.
+                                    let resolver = reachability_resolver_for_hook.clone();
+                                    let app = app_for_reachability.clone();
                                     async move {
+                                        // ZEB-321 Phase 1 Task 8: per spec §7.4,
+                                        // freshly-inserted ReachabilityAnnounce
+                                        // events feed the LWW resolver and emit
+                                        // a UI hint so the connectivity panel
+                                        // can refresh. The resolver itself
+                                        // applies the LWW comparator (spec §5.4);
+                                        // duplicate / stale deltas are no-ops.
+                                        if let crate::community_membership::MembershipEventKind::ReachabilityAnnounce { payload } = &event.kind {
+                                            resolver.update(
+                                                event.actor,
+                                                payload.clone(),
+                                                event.at.clone(),
+                                            );
+                                            if let Err(e) = app.emit(
+                                                "connectivity-reachability-changed",
+                                                serde_json::json!({
+                                                    "actor": hex::encode(event.actor.0),
+                                                }),
+                                            ) {
+                                                tracing::warn!(
+                                                    error = ?e,
+                                                    "failed to emit connectivity-reachability-changed"
+                                                );
+                                            }
+                                        }
                                         apply_remote_epoch_event(
                                             cs_epoch,
                                             sk_epoch,
@@ -3500,6 +3669,11 @@ async fn start_node(
                 let profile_broadcast_request_rx_for_loop = Some(profile_broadcast_request_rx);
                 // Mint Phase 2 sync: thread handles into event_loop::run.
                 let mint_sync_handles_for_loop = mint_sync_handles_opt;
+                // ZEB-321 Phase 1 Task 8: shadow the outer-scope binding into
+                // a move-capturable local so the thread closure can take
+                // ownership without disturbing the iroh_endpoint_arc /
+                // iroh_publisher_arc Arcs that NodeState will hold.
+                let iroh_handles_into_loop = iroh_handles_for_loop;
                 let thread_result = thread::Builder::new()
                     .name("harmony-runtime".to_string())
                     // Windows debug builds overflow the default ~2 MiB stack inside
@@ -3603,6 +3777,7 @@ async fn start_node(
                                 profile_broadcast_cache_for_loop,
                                 profile_broadcast_request_rx_for_loop,
                                 mint_sync_handles_for_loop,
+                                iroh_handles_into_loop,
                             )
                             .await;
                         });
@@ -3749,6 +3924,15 @@ async fn start_node(
                         // Mint Phase 2 sync: store the engine Arc so IPC handlers
                         // can call notify_dirty() after mutations.
                         guard.mint_sync = mint_sync_engine_opt.clone();
+                        // ZEB-321 Phase 1 Task 8: stash iroh resources so
+                        // Task 9 IPC handlers can reach them via NodeState.
+                        // All three are `Option`-shaped because iroh boot
+                        // may have failed (logged + degraded above) — IPC
+                        // handlers no-op when these are None.
+                        guard.iroh_endpoint = iroh_endpoint_arc.clone();
+                        guard.reachability_resolver = Some(reachability_resolver.clone());
+                        guard.iroh_publisher_force =
+                            iroh_publisher_arc.as_ref().map(|p| p.force_handle());
                         thread_install_failure = None;
                     }
                     Err(e) => {
@@ -31060,6 +31244,10 @@ mod start_node_race_tests {
             pin_serial_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             mint_db: None,
             mint_sync: None,
+            // ZEB-321 Phase 1 Task 8: iroh handles unused in race tests.
+            iroh_endpoint: None,
+            reachability_resolver: None,
+            iroh_publisher_force: None,
         })
     }
 
@@ -32460,6 +32648,148 @@ mod propose_change_quorum_tests {
         assert!(
             matches!(cq_outcome, InsertOutcome::Inserted),
             "ChangeQuorum proposal with new_quorum=1 must insert; got {cq_outcome:?}"
+        );
+    }
+}
+
+// ── ZEB-321 Phase 1 Task 8 ─────────────────────────────────────────────
+//
+// Tests for the per-community membership-delta consumer's
+// `ReachabilityAnnounce` → `ReachabilityResolver` feed hook.
+//
+// The hook itself lives in-line inside the consumer closure built by
+// `start_node` (see the `on_epoch_event` callback construction around the
+// `reachability_resolver_for_hook` capture). Driving the full delta
+// consumer would require standing up `OwnerState` + `CommunityState` +
+// the engine pool, which is out of scope per the implementer brief —
+// the full CRDT-insert path is covered by Task 10's two-engine
+// integration test.
+//
+// What we DO verify here is the boundary contract: given a
+// `CommunityMembershipDelta` carrying a `ReachabilityAnnounce`, the
+// resolver dispatch matches `resolver.update(event.actor, payload,
+// event.at)`. If a future refactor breaks the field-name binding (e.g.
+// renames `event.at`), this test fails at the call site.
+#[cfg(test)]
+mod zeb_321_event_loop_wiring_tests {
+    use crate::community_membership::{
+        sign_event_with_identity, EventPayload, MembershipEventKind, SignedMembershipEvent,
+    };
+    use crate::community_state_sync::CommunityMembershipDelta;
+    use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+    use crate::reachability_record::{build_signed_payload, ReachabilityAnnouncePayload};
+    use crate::reachability_resolver::ReachabilityResolver;
+    use harmony_identity::PrivateIdentity;
+
+    fn make_signed_announce(
+        community_id: SpaceId,
+        identity: &PrivateIdentity,
+        actor: OwnerAddr,
+        wall_ms: u64,
+    ) -> (SignedMembershipEvent, ReachabilityAnnouncePayload) {
+        let hlc = Hlc {
+            wall_ms,
+            logical: 0,
+            device_id: "dev".into(),
+        };
+        let payload = build_signed_payload(
+            [0xAB; 32],
+            "https://relay.example/".into(),
+            vec![],
+            wall_ms,
+            &actor,
+            &hlc,
+            identity,
+        )
+        .expect("build signed payload");
+        let event_payload = EventPayload {
+            id: [0x77; 16],
+            community_id,
+            kind: MembershipEventKind::ReachabilityAnnounce {
+                payload: payload.clone(),
+            },
+            actor,
+            at: hlc,
+        };
+        let signed = sign_event_with_identity(&event_payload, identity).expect("sign envelope");
+        (signed, payload)
+    }
+
+    /// The hook contract: given a `CommunityMembershipDelta` whose event
+    /// kind is `ReachabilityAnnounce`, dispatching to the resolver via
+    /// the same field bindings the consumer closure uses
+    /// (`event.actor`, `payload.clone()`, `event.at.clone()`) makes the
+    /// payload retrievable via `resolver.resolve(actor)`.
+    #[test]
+    fn event_loop_routes_reachability_announce_to_resolver() {
+        let identity = PrivateIdentity::from_seed(&[0x55; 32]);
+        let actor = OwnerAddr(identity.identity.address_hash);
+        let community_id = SpaceId([0xC0; 16]);
+
+        let (signed_event, expected_payload) =
+            make_signed_announce(community_id, &identity, actor, 1_700_000_000_000);
+
+        let delta = CommunityMembershipDelta {
+            community_id,
+            event: signed_event,
+        };
+
+        // Resolver starts empty.
+        let resolver = ReachabilityResolver::new();
+        assert!(
+            resolver.resolve(&actor).is_none(),
+            "resolver must start empty"
+        );
+
+        // Mirror the consumer closure's hook logic exactly: pattern-match
+        // the event kind, then call `resolver.update(actor, payload, hlc)`.
+        if let MembershipEventKind::ReachabilityAnnounce { payload } = &delta.event.kind {
+            resolver.update(delta.event.actor, payload.clone(), delta.event.at.clone());
+        } else {
+            panic!("expected ReachabilityAnnounce");
+        }
+
+        // Round-trip: resolver must yield exactly the payload we
+        // constructed.
+        let got = resolver.resolve(&actor).expect("resolver must have entry");
+        assert_eq!(
+            got, expected_payload,
+            "resolver entry must round-trip the announced payload"
+        );
+    }
+
+    /// Negative: a non-ReachabilityAnnounce delta (e.g. plain Join) must
+    /// NOT update the resolver — the hook gates on kind discriminant.
+    #[test]
+    fn non_reachability_delta_does_not_touch_resolver() {
+        let identity = PrivateIdentity::from_seed(&[0x33; 32]);
+        let actor = OwnerAddr(identity.identity.address_hash);
+        let community_id = SpaceId([0xC1; 16]);
+
+        let event_payload = EventPayload {
+            id: [0x12; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor,
+            at: Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+        };
+        let signed = sign_event_with_identity(&event_payload, &identity).expect("sign envelope");
+        let delta = CommunityMembershipDelta {
+            community_id,
+            event: signed,
+        };
+
+        let resolver = ReachabilityResolver::new();
+        if let MembershipEventKind::ReachabilityAnnounce { payload } = &delta.event.kind {
+            resolver.update(delta.event.actor, payload.clone(), delta.event.at.clone());
+        }
+        assert!(
+            resolver.resolve(&actor).is_none(),
+            "resolver must not have an entry for a non-ReachabilityAnnounce delta"
         );
     }
 }

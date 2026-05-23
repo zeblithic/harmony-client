@@ -173,6 +173,7 @@ async fn spawn_test_runtime() -> Option<TestHarness> {
                     None,
                     None,
                     None, // Mint Phase 2 sync: not exercised in this test
+                    None, // ZEB-321 Phase 1 Task 8: iroh handles not exercised in this test
                 )
                 .await;
             });

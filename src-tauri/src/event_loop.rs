@@ -5,7 +5,7 @@
 //! - Zenoh session (pub/sub, queryables, content fetch)
 //! - 250ms timer tick
 //!
-//! No disk/archive/S3 persistence, no inference, no iroh tunnels.
+//! No disk/archive/S3 persistence, no inference.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -284,6 +284,22 @@ enum ZenohEvent {
     },
 }
 
+/// ZEB-321 Phase 1: bundle of iroh-transport resources constructed at
+/// `start_node` time and threaded into the event loop so the accept-loop
+/// and publisher task can be spawned alongside the rest of the long-
+/// lived background tasks.
+///
+/// Construction lives in `start_node` (rather than inside `event_loop::run`)
+/// so the per-community membership-delta consumer closure can capture the
+/// resolver and route freshly-inserted `ReachabilityAnnounce` events into
+/// it without a separate plumbing pass. The link manager + publisher are
+/// passed in pre-built so the event loop owns only the `spawn_*` calls.
+pub struct IrohRuntimeHandles {
+    pub endpoint: std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>,
+    pub link_manager: std::sync::Arc<crate::zenoh_iroh_transport::IrohZenohLinkManager>,
+    pub publisher: std::sync::Arc<crate::reachability_publisher::ReachabilityPublisher>,
+}
+
 /// Run the NodeRuntime event loop as a background task.
 ///
 /// Sends `Ok(())` on `ready_tx` once UDP + Zenoh + startup actions are
@@ -418,6 +434,13 @@ pub async fn run<R: Runtime>(
     // Mint Phase 2 sync: channel pair bridging MintSyncEngine to Zenoh.
     // `None` when no owner identity is loaded.
     mut mint_sync_handles: Option<MintSyncHandles>,
+    // ZEB-321 Phase 1 Task 8: bundle of iroh-transport resources built in
+    // `start_node`. When `Some`, the event loop spawns the link-manager
+    // accept loop + publisher driver as background tasks; when `None`
+    // (test contexts that bypass `start_node`) the iroh subsystem stays
+    // unwired and the resolver simply never receives updates — the rest
+    // of the event loop is unaffected.
+    iroh_handles: Option<IrohRuntimeHandles>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -502,6 +525,30 @@ pub async fn run<R: Runtime>(
 
     // Channel from spawned Zenoh tasks → main select loop.
     let (zenoh_tx, mut zenoh_rx) = mpsc::channel::<ZenohEvent>(256);
+
+    // ── ZEB-321 Phase 1 Task 8: iroh-transport background tasks ──────────
+    // Spawn the link-manager accept loop (drives inbound iroh→zenoh links
+    // off the endpoint's `accept()`) and the publisher driver (re-emits
+    // this device's `ReachabilityAnnounce` on startup / network change /
+    // 60-min idle / force-republish). The endpoint, link manager, and
+    // publisher are constructed in `start_node` so the per-community
+    // delta-consumer closure can capture the resolver feed hook.
+    //
+    // The returned join handles are intentionally dropped — both spawned
+    // tasks live for the lifetime of the tokio runtime that hosts the
+    // event loop, ending when their internal streams close (endpoint
+    // shutdown for accept loop; runtime drop for publisher).
+    let _iroh_handles_keepalive = iroh_handles.map(|h| {
+        let _accept = h.link_manager.spawn_accept_loop();
+        let _publisher = std::sync::Arc::clone(&h.publisher).spawn();
+        // Keep the Arcs alive for the duration of the event loop. Without
+        // this binding, dropping `h` at end of the closure would drop the
+        // endpoint + publisher Arcs immediately and the spawned tasks
+        // would observe `accept()` returning None / publisher pollers
+        // racing with shutdown. The `_` prefix opts the binding out of
+        // unused-warnings.
+        h
+    });
 
     // ── Phase 3a: SyncEngine wire-up ────────────────────────────────────
     // The SyncEngine itself is constructed in start_node (lib.rs).
