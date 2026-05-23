@@ -179,8 +179,8 @@ async fn inner() {
     // EndpointId will hit `payload_b` and produce the dialable
     // `EndpointAddr` (id + direct_addresses).
     let endpoint_str = hex::encode(ep_b.node_id().as_bytes());
-    let endpoint = EndPoint::new("iroh", &endpoint_str, "", "")
-        .expect("construct iroh endpoint locator");
+    let endpoint =
+        EndPoint::new("iroh", &endpoint_str, "", "").expect("construct iroh endpoint locator");
     let link_a = mgr_a
         .new_link(endpoint)
         .await
@@ -225,11 +225,7 @@ async fn inner() {
         .await
         .expect("B writes ack");
     let mut ack = [0u8; 16];
-    link_a
-        .0
-        .read_exact(&mut ack)
-        .await
-        .expect("A reads ack");
+    link_a.0.read_exact(&mut ack).await.expect("A reads ack");
     assert_eq!(&ack, b"ack-iroh-zenoh-1");
 
     // Graceful close discipline. `LinkUnicastTrait::close` is
