@@ -180,4 +180,46 @@ mod tests {
             assert_eq!(w[0], w[1], "ReachabilityResolver is not order-independent");
         }
     }
+
+    #[test]
+    fn lww_announced_at_ms_breaks_hlc_tie() {
+        // Spec §5.4 tie-break #1: equal HLC, higher announced_at_ms wins.
+        // (HLC equality "shouldn't happen with monotonic clocks" but the
+        // path is spec-mandated and must be deterministic.)
+        let r = ReachabilityResolver::new();
+        let actor = OwnerAddr([0x11; 16]);
+        let hlc = make_hlc(1000, 0, "a");
+        r.update(actor, make_payload(1, 1500), hlc.clone());
+        // Second update has same HLC + higher announced_at_ms → wins.
+        r.update(actor, make_payload(2, 2500), hlc.clone());
+        assert_eq!(r.resolve(&actor).unwrap().iroh_node_id, [2; 32]);
+
+        // Reverse order: lower announced_at_ms must NOT overwrite higher.
+        let r2 = ReachabilityResolver::new();
+        r2.update(actor, make_payload(2, 2500), hlc.clone());
+        r2.update(actor, make_payload(1, 1500), hlc);
+        assert_eq!(r2.resolve(&actor).unwrap().iroh_node_id, [2; 32]);
+    }
+
+    #[test]
+    fn lww_iroh_node_id_breaks_announced_at_ms_tie() {
+        // Spec §5.4 tie-break #2: equal HLC + equal announced_at_ms,
+        // lex-greater iroh_node_id wins. Final defense — guarantees a
+        // deterministic resolution even when the first two columns
+        // collide.
+        let r = ReachabilityResolver::new();
+        let actor = OwnerAddr([0x11; 16]);
+        let hlc = make_hlc(1000, 0, "a");
+        // Lower node_id ([0x01; 32]) seeded first.
+        r.update(actor, make_payload(0x01, 2000), hlc.clone());
+        // Higher node_id ([0x02; 32]) arrives — wins on lex comparison.
+        r.update(actor, make_payload(0x02, 2000), hlc.clone());
+        assert_eq!(r.resolve(&actor).unwrap().iroh_node_id, [0x02; 32]);
+
+        // Reverse order: lower lex must NOT overwrite higher.
+        let r2 = ReachabilityResolver::new();
+        r2.update(actor, make_payload(0x02, 2000), hlc.clone());
+        r2.update(actor, make_payload(0x01, 2000), hlc);
+        assert_eq!(r2.resolve(&actor).unwrap().iroh_node_id, [0x02; 32]);
+    }
 }
