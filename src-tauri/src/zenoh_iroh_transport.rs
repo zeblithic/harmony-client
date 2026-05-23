@@ -326,13 +326,19 @@ mod tests {
         let (new_link_tx, _rx) = flume::unbounded::<LinkUnicast>();
         let mgr = IrohZenohLinkManager::new(Arc::clone(&endpoint), resolver, new_link_tx);
 
-        // Build a locator with a *different* random iroh EndpointId
-        // (one the resolver has never seen). new_link must fail before
-        // any QUIC traffic is attempted.
-        let mut bogus_id_bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bogus_id_bytes);
-        let bogus_id = EndpointId::from_bytes(&bogus_id_bytes)
-            .expect("random bytes happen to be valid Ed25519 pub key");
+        // Build a locator with a *different* iroh EndpointId (one the
+        // resolver has never seen). new_link must fail before any QUIC
+        // traffic is attempted.
+        //
+        // We derive the EndpointId from a fresh SecretKey rather than
+        // calling `EndpointId::from_bytes(random)` directly:
+        // `EndpointId` (an Ed25519 public key) validates input as a
+        // canonical curve point, which random 32-byte buffers only
+        // satisfy roughly half the time. SecretKey::generate() always
+        // produces a valid pub key.
+        let mut bogus_seed = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut bogus_seed);
+        let bogus_id = SecretKey::from_bytes(&bogus_seed).public();
         let bogus_locator = locator_from_endpoint_id(&bogus_id);
 
         let result = mgr.new_link(bogus_locator.to_endpoint()).await;
@@ -415,11 +421,19 @@ mod tests {
 
     /// Sanity: `locator_from_endpoint_id` round-trips through
     /// `parse_endpoint_id`.
+    ///
+    /// Deriving the `EndpointId` from a fresh `SecretKey` (not from
+    /// random bytes) — `EndpointId::from_bytes` validates the input is
+    /// a canonical Ed25519 public key, which random bytes only happen
+    /// to be ~50% of the time (the y-coordinate sign bit must match a
+    /// curve point), so the original `from_bytes(random)` form is
+    /// flaky. Going through `SecretKey::generate().public()`
+    /// guarantees a valid pub key.
     #[test]
     fn locator_round_trips_through_parser() {
         let mut buf = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut buf);
-        let id = EndpointId::from_bytes(&buf).expect("valid pub key");
+        let id = SecretKey::from_bytes(&buf).public();
         let locator = locator_from_endpoint_id(&id);
 
         let parsed = IrohZenohLinkManager::parse_endpoint_id(&locator.to_endpoint())
