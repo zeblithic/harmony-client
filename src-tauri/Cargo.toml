@@ -74,6 +74,9 @@ harmony-compute = { git = "https://github.com/zeblithic/harmony.git", rev = "044
 harmony-telemetry = { git = "https://github.com/zeblithic/harmony.git", rev = "04449d603c042c121ee9836ebd244310adaf7f6a" }
 harmony-mailbox = { git = "https://github.com/zeblithic/harmony.git", rev = "04449d603c042c121ee9836ebd244310adaf7f6a" }
 harmony-owner = { git = "https://github.com/zeblithic/harmony.git", rev = "04449d603c042c121ee9836ebd244310adaf7f6a", features = ["recovery"] }
+# ZEB-323 Phase 2b: pkarr-based discovery policies. Pinned to PR #270's branch
+# (zeb-322-harmony-pkarr-crate); will be updated to merge SHA before this PR merges.
+harmony-pkarr = { git = "https://github.com/zeblithic/harmony", branch = "zeb-322-harmony-pkarr-crate", features = ["test-fixtures"] }
 blake3 = "1"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
