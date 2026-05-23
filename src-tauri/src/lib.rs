@@ -715,6 +715,24 @@ impl NodeState {
         self.thread.is_some()
     }
 
+    /// ZEB-321 Phase 1 PR #157 round 2 (CodeRabbit): abort the iroh
+    /// background tasks and drop all iroh-related Arcs in one place.
+    /// Called from both `stop_inner` and the identity-rebuild path
+    /// inside `start_node` — extracting prevents the two sites from
+    /// drifting (e.g. adding a new iroh field and forgetting to clear
+    /// it on one path).
+    fn clear_iroh_handles(&mut self) {
+        if let Some(h) = self.iroh_publisher_handle.take() {
+            h.abort();
+        }
+        if let Some(h) = self.iroh_inbound_drain_handle.take() {
+            h.abort();
+        }
+        self.iroh_endpoint = None;
+        self.reachability_resolver = None;
+        self.iroh_publisher_force = None;
+    }
+
     /// ZEB-311: test-only helper to set dm_self_owner for integration tests
     /// that exercise IPC paths requiring a caller identity. Only available
     /// under the `test-fixtures` feature (never compiled into production).
@@ -1156,20 +1174,12 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         // (a clone) drops alongside the publisher Arc.
         //
         // ZEB-321 Phase 1 PR #157 round 1: explicitly abort the publisher
-        // + drain tasks. Without abort, the publisher's `loop { select! }`
-        // holds the iroh endpoint Arc forever and keeps firing if-watch
-        // events across restart cycles (Qodo finding). The drain task is
-        // symmetric — it owns the flume receiver whose lifetime gates the
-        // accept loop's `send_async` semantics (Qodo + CodeAnt).
-        if let Some(h) = guard.iroh_publisher_handle.take() {
-            h.abort();
-        }
-        if let Some(h) = guard.iroh_inbound_drain_handle.take() {
-            h.abort();
-        }
-        guard.iroh_endpoint = None;
-        guard.reachability_resolver = None;
-        guard.iroh_publisher_force = None;
+        // + drain tasks via `clear_iroh_handles`. Without abort the
+        // publisher's `loop { select! }` holds the iroh endpoint Arc
+        // forever and keeps firing if-watch events across restart cycles
+        // (Qodo + CodeAnt findings); `clear_iroh_handles` also drops the
+        // endpoint/resolver Arcs and the publisher force Notify.
+        guard.clear_iroh_handles();
         tup
     };
 
@@ -1794,22 +1804,14 @@ async fn start_node(
         // Mint Phase 2 sync: take the prior identity's engine so it can be
         // shut down outside the lock below (same pattern as sync_engine).
         old_mint_sync_engine = guard.mint_sync.take();
-        // ZEB-321 Phase 1 Task 8: clear iroh handles so the new identity's
-        // start_node rebuilds them. The secret key itself is keychain-
-        // resident and per-device, so a same-device restart hits the same
-        // `EndpointId`; no transport reconfiguration required.
-        //
-        // ZEB-321 Phase 1 PR #157 round 1: also abort the publisher + drain
-        // tasks per stop_inner's symmetric path.
-        if let Some(h) = guard.iroh_publisher_handle.take() {
-            h.abort();
-        }
-        if let Some(h) = guard.iroh_inbound_drain_handle.take() {
-            h.abort();
-        }
-        guard.iroh_endpoint = None;
-        guard.reachability_resolver = None;
-        guard.iroh_publisher_force = None;
+        // ZEB-321 Phase 1 Task 8 + PR #157 round 2: clear iroh handles
+        // so the new identity's start_node rebuilds them. The secret key
+        // itself is keychain-resident and per-device, so a same-device
+        // restart hits the same `EndpointId`; no transport reconfiguration
+        // required. `clear_iroh_handles` aborts the publisher + drain
+        // tasks symmetric with stop_inner's path so this site doesn't
+        // drift if a new iroh field is added later.
+        guard.clear_iroh_handles();
         tup
     };
 
@@ -3446,6 +3448,68 @@ async fn start_node(
                     }
 
                     community_registry_arc = Some(std::sync::Arc::clone(&registry));
+
+                    // ── ZEB-321 Phase 1 PR #157 round 2 (Cursor HIGH): replay
+                    //    ReachabilityAnnounce history into the resolver ──
+                    //
+                    // The `ReachabilityResolver` is in-memory only. The hook
+                    // installed by Task 8 (in the per-community delta
+                    // consumer closure further down) updates the resolver
+                    // ONLY on freshly-inserted ReachabilityAnnounce events.
+                    // After a restart, the membership CRDT is reloaded from
+                    // disk but the resolver starts empty — so until a peer
+                    // happens to re-publish (idle interval is 60 minutes
+                    // per spec §5.6), cross-WAN dial against any peer not
+                    // yet re-announced is broken.
+                    //
+                    // Fix: walk the event log of every just-loaded community
+                    // and feed any historical ReachabilityAnnounce events
+                    // into the resolver before the publisher starts. The
+                    // LWW projection means out-of-order replay is safe —
+                    // it converges to the same final state regardless of
+                    // call order.
+                    {
+                        let ids = registry.known_ids().await;
+                        let mut total_replayed = 0usize;
+                        for cid in &ids {
+                            let Some(engine) = registry.engine_arc(cid).await else {
+                                continue;
+                            };
+                            let state_arc = engine.state();
+                            // Briefly hold the per-community state lock to
+                            // snapshot the event-log entries we care about,
+                            // then release before feeding the resolver
+                            // (resolver.update takes its own lock and we
+                            // don't want to hold both at once).
+                            let to_replay: Vec<(
+                                crate::owner_state_types::OwnerAddr,
+                                crate::reachability_record::ReachabilityAnnouncePayload,
+                                crate::owner_state_types::Hlc,
+                            )> = {
+                                let st = state_arc.lock().await;
+                                st.events
+                                    .values()
+                                    .filter_map(|ev| match &ev.kind {
+                                        crate::community_membership::MembershipEventKind::ReachabilityAnnounce { payload } => {
+                                            Some((ev.actor, payload.clone(), ev.at.clone()))
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect()
+                            };
+                            for (actor, payload, hlc) in to_replay {
+                                reachability_resolver.update(actor, payload, hlc);
+                                total_replayed += 1;
+                            }
+                        }
+                        if total_replayed > 0 {
+                            tracing::info!(
+                                replayed = total_replayed,
+                                communities = ids.len(),
+                                "ZEB-321 ReachabilityResolver bootstrap: replayed historical ReachabilityAnnounce events"
+                            );
+                        }
+                    }
 
                     // ── ZEB-321 Phase 1 Task 9: real ReachabilityAnnounce publisher ──
                     //
