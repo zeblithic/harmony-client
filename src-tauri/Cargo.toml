@@ -114,6 +114,13 @@ frost-ristretto255 = { version = "3.0.0", features = ["serde"] }
 # from the plan's draft (NodeId→EndpointId, builder takes a Preset, etc);
 # adaptations are documented in `src/iroh_endpoint.rs`.
 iroh = "0.98"
+# ZEB-321 Phase 1 Task 7: network-interface change watcher used by
+# `reachability_publisher` to debounce republishes on IP / link
+# transitions. `if-watch` v3 exposes its tokio adapter via
+# `if_watch::tokio::IfWatcher`, which implements
+# `Stream<Item = std::io::Result<IfEvent>>` — we drive it via
+# `futures::StreamExt::next()` (no manual `poll_fn` wrapping needed).
+if-watch = { version = "3", features = ["tokio"] }
 
 [dev-dependencies]
 serial_test = "3"
