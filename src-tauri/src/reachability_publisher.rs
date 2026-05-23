@@ -231,14 +231,18 @@ mod tests {
     /// depth pattern as Task 5's `paired_stream_roundtrip_via_loopback`.
     /// The force-notify path should fire in microseconds; if this test
     /// approaches its budget something is wrong with the select loop.
+    /// 30s outer to absorb under-load iroh bind latency (the inner
+    /// hermetic-endpoint helper takes ~10s solo, observed ~14-19s under
+    /// full-suite parallelism — same flake-class as the paired_stream
+    /// fix in c089127). PR #157 round 5.
     #[tokio::test]
     async fn force_notify_triggers_publish() {
         tokio::time::timeout(
-            Duration::from_secs(15),
+            Duration::from_secs(30),
             force_notify_triggers_publish_inner(),
         )
         .await
-        .expect("force_notify_triggers_publish must complete within 15s");
+        .expect("force_notify_triggers_publish must complete within 30s");
     }
 
     async fn force_notify_triggers_publish_inner() {

@@ -3030,16 +3030,43 @@ async fn start_node(
                                         // can refresh. The resolver itself
                                         // applies the LWW comparator (spec §5.4);
                                         // duplicate / stale deltas are no-ops.
-                                        if let crate::community_membership::MembershipEventKind::ReachabilityAnnounce { payload } = &event.kind {
-                                            resolver.update(
-                                                event.actor,
-                                                payload.clone(),
-                                                event.at.clone(),
-                                            );
+                                        // PR #157 round 5 (Cursor): the resolver
+                                        // tracks live cross-WAN reachability. Three
+                                        // event kinds affect it: ReachabilityAnnounce
+                                        // adds/refreshes a (owner, device) slot; Leave
+                                        // evicts all devices for the actor who left;
+                                        // Kick evicts all devices for the target who
+                                        // was kicked. All three emit the same Tauri
+                                        // event so the DiagnosticsPanel re-fetches.
+                                        let mut emit_changed: Option<crate::owner_state_types::OwnerAddr> = None;
+                                        match &event.kind {
+                                            crate::community_membership::MembershipEventKind::ReachabilityAnnounce { payload } => {
+                                                resolver.update(
+                                                    event.actor,
+                                                    payload.clone(),
+                                                    event.at.clone(),
+                                                );
+                                                emit_changed = Some(event.actor);
+                                            }
+                                            crate::community_membership::MembershipEventKind::Leave => {
+                                                let n = resolver.remove_owner(&event.actor);
+                                                if n > 0 {
+                                                    emit_changed = Some(event.actor);
+                                                }
+                                            }
+                                            crate::community_membership::MembershipEventKind::Kick { target, .. } => {
+                                                let n = resolver.remove_owner(target);
+                                                if n > 0 {
+                                                    emit_changed = Some(*target);
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                        if let Some(changed_actor) = emit_changed {
                                             if let Err(e) = app.emit(
                                                 "connectivity-reachability-changed",
                                                 serde_json::json!({
-                                                    "actor": hex::encode(event.actor.0),
+                                                    "actor": hex::encode(changed_actor.0),
                                                 }),
                                             ) {
                                                 tracing::warn!(
@@ -33279,7 +33306,7 @@ mod zeb_321_event_loop_wiring_tests {
         // Resolver starts empty.
         let resolver = ReachabilityResolver::new();
         assert!(
-            resolver.resolve(&actor).is_none(),
+            resolver.resolve(&actor).is_empty(),
             "resolver must start empty"
         );
 
@@ -33292,10 +33319,13 @@ mod zeb_321_event_loop_wiring_tests {
         }
 
         // Round-trip: resolver must yield exactly the payload we
-        // constructed.
-        let got = resolver.resolve(&actor).expect("resolver must have entry");
+        // constructed. PR #157 round 5: resolve() now returns Vec
+        // (multi-device); a single-device announce produces exactly
+        // one entry.
+        let got = resolver.resolve(&actor);
+        assert_eq!(got.len(), 1, "exactly one device's record");
         assert_eq!(
-            got, expected_payload,
+            got[0], expected_payload,
             "resolver entry must round-trip the announced payload"
         );
     }
@@ -33330,9 +33360,157 @@ mod zeb_321_event_loop_wiring_tests {
             resolver.update(delta.event.actor, payload.clone(), delta.event.at.clone());
         }
         assert!(
-            resolver.resolve(&actor).is_none(),
+            resolver.resolve(&actor).is_empty(),
             "resolver must not have an entry for a non-ReachabilityAnnounce delta"
         );
+    }
+
+    /// PR #157 round 5 (Cursor): Leave delta must evict the actor's
+    /// reachability records. Mirrors the consumer-closure hook logic
+    /// in start_node — when the live event's kind matches Leave, we
+    /// call `resolver.remove_owner(&actor)`.
+    #[test]
+    fn leave_delta_evicts_resolver_entries() {
+        let identity = PrivateIdentity::from_seed(&[0x44; 32]);
+        let actor = OwnerAddr(identity.identity.address_hash);
+        let other = OwnerAddr([0xAA; 16]);
+        let resolver = ReachabilityResolver::new();
+
+        // Pre-populate: two devices for `actor`, one for `other`.
+        let payload_a = crate::reachability_record::ReachabilityAnnouncePayload {
+            iroh_node_id: [0x01; 32],
+            home_relay_url: "https://derp.example/".into(),
+            direct_addresses: vec![],
+            announced_at_ms: 1000,
+            identity_signature: [0; 64],
+        };
+        let mut payload_a2 = payload_a.clone();
+        payload_a2.iroh_node_id = [0x02; 32];
+        let mut payload_other = payload_a.clone();
+        payload_other.iroh_node_id = [0xCC; 32];
+        resolver.update(
+            actor,
+            payload_a,
+            Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "a".into(),
+            },
+        );
+        resolver.update(
+            actor,
+            payload_a2,
+            Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "b".into(),
+            },
+        );
+        resolver.update(
+            other,
+            payload_other,
+            Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "c".into(),
+            },
+        );
+        assert_eq!(resolver.resolve(&actor).len(), 2);
+
+        // Apply hook logic for a Leave event.
+        let event_payload = EventPayload {
+            id: [0x55; 16],
+            community_id: SpaceId([0xC1; 16]),
+            kind: MembershipEventKind::Leave,
+            actor,
+            at: Hlc {
+                wall_ms: 2000,
+                logical: 0,
+                device_id: "a".into(),
+            },
+        };
+        let signed = sign_event_with_identity(&event_payload, &identity).expect("sign");
+        let delta = CommunityMembershipDelta {
+            community_id: SpaceId([0xC1; 16]),
+            event: signed,
+        };
+        if let MembershipEventKind::Leave = &delta.event.kind {
+            let n = resolver.remove_owner(&delta.event.actor);
+            assert_eq!(n, 2, "both of actor's devices evicted");
+        } else {
+            panic!("expected Leave");
+        }
+
+        assert!(resolver.resolve(&actor).is_empty(), "actor evicted");
+        assert_eq!(resolver.resolve(&other).len(), 1, "other untouched");
+    }
+
+    /// PR #157 round 5 (Cursor): Kick delta must evict the TARGET's
+    /// reachability records (not the actor's — the actor here is an
+    /// admin doing the kicking).
+    #[test]
+    fn kick_delta_evicts_target_resolver_entries() {
+        let admin_id = PrivateIdentity::from_seed(&[0x55; 32]);
+        let admin = OwnerAddr(admin_id.identity.address_hash);
+        let target = OwnerAddr([0xBB; 16]);
+        let resolver = ReachabilityResolver::new();
+
+        let payload_target = crate::reachability_record::ReachabilityAnnouncePayload {
+            iroh_node_id: [0xBB; 32],
+            home_relay_url: "https://derp.example/".into(),
+            direct_addresses: vec![],
+            announced_at_ms: 1000,
+            identity_signature: [0; 64],
+        };
+        let mut payload_admin = payload_target.clone();
+        payload_admin.iroh_node_id = [0xAA; 32];
+        resolver.update(
+            target,
+            payload_target,
+            Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        );
+        resolver.update(
+            admin,
+            payload_admin,
+            Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "a".into(),
+            },
+        );
+
+        let event_payload = EventPayload {
+            id: [0x66; 16],
+            community_id: SpaceId([0xC2; 16]),
+            kind: MembershipEventKind::Kick {
+                target,
+                reason: None,
+            },
+            actor: admin,
+            at: Hlc {
+                wall_ms: 2000,
+                logical: 0,
+                device_id: "a".into(),
+            },
+        };
+        let signed = sign_event_with_identity(&event_payload, &admin_id).expect("sign");
+        let delta = CommunityMembershipDelta {
+            community_id: SpaceId([0xC2; 16]),
+            event: signed,
+        };
+        if let MembershipEventKind::Kick { target: t, .. } = &delta.event.kind {
+            let n = resolver.remove_owner(t);
+            assert_eq!(n, 1);
+        } else {
+            panic!("expected Kick");
+        }
+
+        assert!(resolver.resolve(&target).is_empty(), "target evicted");
+        assert_eq!(resolver.resolve(&admin).len(), 1, "admin untouched");
     }
 }
 
