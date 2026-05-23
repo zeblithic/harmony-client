@@ -86,6 +86,14 @@ rust_decimal = "1"
 csv = "1"
 chrono = "0.4"
 frost-ristretto255 = { version = "3.0.0", features = ["serde"] }
+# ZEB-321 Phase 1 Task 4: iroh endpoint used by the upcoming
+# zenoh-over-iroh transport and the harmony device handshake. Version
+# pinned at 0.98 (latest stable as of 2026-05). The harmony-* workspace
+# crates we depend on do NOT pull iroh transitively (verified upstream),
+# so we have free choice of version. Note the 0.98 API surface differs
+# from the plan's draft (NodeId→EndpointId, builder takes a Preset, etc);
+# adaptations are documented in `src/iroh_endpoint.rs`.
+iroh = "0.98"
 
 [dev-dependencies]
 serial_test = "3"

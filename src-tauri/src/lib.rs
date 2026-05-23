@@ -45,6 +45,7 @@ mod follows;
 pub mod identity;
 pub mod identity_commands;
 pub mod inbound_packet;
+pub mod iroh_endpoint;
 pub mod library_directory;
 pub mod mail;
 pub mod mail_sync;
