@@ -74,6 +74,10 @@ pub mod voice;
 // ZEB-321 Phase 1 Task 5: zenoh-link::LinkUnicastTrait impl over an
 // iroh QUIC bidi stream pair. Consumed by Task 6's IrohZenohLinkManager.
 pub mod zenoh_iroh_link;
+// ZEB-321 Phase 1 Task 6: zenoh-link::LinkManagerUnicastTrait impl —
+// resolves outbound locators via ReachabilityResolver and opens iroh
+// QUIC bidi streams wrapped in IrohZenohLink.
+pub mod zenoh_iroh_transport;
 
 /// ZEB-262 Phase 4 Task 9: production impl of
 /// `community_invite::AppHandleEmit` on `tauri::AppHandle<R>`. Lets

@@ -55,6 +55,28 @@ impl ReachabilityResolver {
         let map = self.inner.read().expect("resolver read lock");
         map.iter().map(|(k, v)| (*k, v.payload.clone())).collect()
     }
+
+    /// Reverse lookup: given an iroh `EndpointId` byte representation,
+    /// find the matching `(OwnerAddr, payload)` entry.
+    ///
+    /// Used by [`crate::zenoh_iroh_transport::IrohZenohLinkManager`] (Task 6),
+    /// where Zenoh hands us a locator carrying the iroh `EndpointId`
+    /// (not the harmony `OwnerAddr`) — see spec §7.3. We scan
+    /// `list_active_peers()` linearly: `N` is per-community member
+    /// count, expected to stay under ~10³ in Phase 1. If profiling
+    /// later shows this is hot, add a secondary BTreeMap keyed on
+    /// `iroh_node_id` maintained alongside `inner`.
+    // TODO Phase 2: secondary index keyed on `iroh_node_id` if profiling
+    // shows the linear scan is hot.
+    pub fn resolve_by_node_id(
+        &self,
+        node_id_bytes: &[u8; 32],
+    ) -> Option<(OwnerAddr, ReachabilityAnnouncePayload)> {
+        let map = self.inner.read().expect("resolver read lock");
+        map.iter()
+            .find(|(_, entry)| &entry.payload.iroh_node_id == node_id_bytes)
+            .map(|(k, v)| (*k, v.payload.clone()))
+    }
 }
 
 /// LWW comparator. `Hlc` does not derive `Ord` (canonical-CBOR keying

@@ -125,6 +125,25 @@ impl IrohEndpoint {
         &self.inner
     }
 
+    /// Test-only constructor that wraps an already-bound iroh
+    /// `Endpoint`. Lets hermetic-mode tests build the endpoint with
+    /// `presets::Minimal` + explicit loopback bind (no pkarr / DNS
+    /// traffic) and then hand it to higher-level wrappers like
+    /// `IrohZenohLinkManager` without going through
+    /// [`Self::new_with_secret`] (which uses `presets::N0` and hangs
+    /// in offline sandboxes).
+    ///
+    /// Cfg-gated to `test` + the `test-fixtures` feature so it can't
+    /// be reached from a production build. Mirrors the gating
+    /// convention used by `community_channel_log`'s
+    /// `encrypt_channel_packet_with_nonce` test helper.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    #[allow(dead_code)] // Only consumed by `#[cfg(test)]` modules; unused
+    // under bare `--features test-fixtures` builds (e.g. clippy --all-targets).
+    pub(crate) fn from_endpoint_for_test(inner: Endpoint) -> Self {
+        Self { inner }
+    }
+
     /// Gracefully close the endpoint and all open connections.
     ///
     /// Safe to call multiple times — `iroh::Endpoint::close` is

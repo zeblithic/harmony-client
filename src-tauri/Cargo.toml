@@ -45,6 +45,13 @@ zenoh-result = "1"
 # transport module — zenoh-link does not re-export it, so we depend on
 # zenoh-protocol directly.
 zenoh-protocol = "1"
+# ZEB-321 Phase 1 Task 6: `NewLinkChannelSender = flume::Sender<LinkUnicast>`
+# is zenoh-link's outbound-new-link mechanism (see
+# `zenoh-link-commons::unicast`). Constructing `IrohZenohLinkManager`
+# requires a flume sender, so we pull `flume` in directly rather than
+# leaning on the transitive copy zenoh re-exports privately. Pinned to
+# "0.11" — matches the version zenoh-link-commons 1.8 resolves to.
+flume = "0.11"
 tokio = { version = "1", features = ["rt", "net", "time", "sync"] }
 tauri-plugin-dialog = "2"
 futures = "0.3"
