@@ -62,6 +62,7 @@ pub mod owner_state_sync;
 pub mod owner_state_types;
 pub mod pairing;
 pub mod pairing_commands;
+pub mod pkarr_resolver_adapter;
 pub mod pkarr_settings;
 pub mod profile_broadcast;
 // ZEB-321 Phase 1 Task 7: debounced background task that re-emits this
