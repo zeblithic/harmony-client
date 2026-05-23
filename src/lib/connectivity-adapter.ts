@@ -82,8 +82,17 @@ export async function forceRepublish(): Promise<boolean> {
 export async function onReachabilityChanged(
   callback: (payload: ConnectivityReachabilityChangedPayload) => void,
 ): Promise<UnlistenFn> {
-  return await listen<ConnectivityReachabilityChangedPayload>(
-    'connectivity-reachability-changed',
-    (event) => callback(event.payload),
-  );
+  try {
+    return await listen<ConnectivityReachabilityChangedPayload>(
+      'connectivity-reachability-changed',
+      (event) => callback(event.payload),
+    );
+  } catch (e) {
+    // Match the error-normalization pattern used by the three IPC
+    // helpers above so the panel's error surface displays a consistent
+    // "connectivity-reachability-changed: ..." prefix (CodeRabbit
+    // PR #157 round 1).
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`connectivity-reachability-changed: ${msg}`);
+  }
 }

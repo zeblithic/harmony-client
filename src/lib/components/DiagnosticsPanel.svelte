@@ -37,6 +37,12 @@
   let myRecord = $state<ReachabilityRecord | null>(null);
   let peerRecords = $state<PeerReachability[]>([]);
   let unlisten: (() => void) | null = null;
+  // Set true in onDestroy. If onMount's awaited onReachabilityChanged
+  // call resolves AFTER unmount, the listener-registration callback
+  // detects this and tears down immediately so a re-render that
+  // remounts the component doesn't accumulate live listeners
+  // (CodeRabbit PR #157 round 1).
+  let destroyed = false;
   let error = $state<string | null>(null);
 
   async function refresh(): Promise<void> {
@@ -64,12 +70,25 @@
     // some reason) still avoids hitting the IPC layer.
     if (!isDevMode) return;
     await refresh();
-    unlisten = await onReachabilityChanged(() => {
+    // The `await` here is the race window: if the component unmounts
+    // between `refresh()` and the listener resolving, `onDestroy`'s
+    // `if (unlisten)` check finds nothing and the registered listener
+    // leaks. Capture the resolved unlisten into a local first, then
+    // either tear it down immediately (if we've already unmounted) or
+    // hand it to the module-level binding for `onDestroy` to handle
+    // (CodeRabbit PR #157 round 1).
+    const resolved = await onReachabilityChanged(() => {
       void refresh();
     });
+    if (destroyed) {
+      resolved();
+    } else {
+      unlisten = resolved;
+    }
   });
 
   onDestroy(() => {
+    destroyed = true;
     if (unlisten) unlisten();
   });
 </script>
