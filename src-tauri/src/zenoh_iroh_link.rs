@@ -193,9 +193,15 @@ mod tests {
         // teardown sequence can't strand the suite indefinitely
         // (we previously hung on `incoming.closed().await` after the
         // data exchange had already completed — see fix below).
-        tokio::time::timeout(std::time::Duration::from_secs(15), inner())
+        // 30s budget: solo wall-clock is ~10s; under full-suite
+        // nextest parallelism (~80 binaries linking + executing
+        // concurrently) the iroh QUIC handshake observed up to
+        // ~20s — Task 9's regression run flaked at 19.7s on the
+        // original 15s cap. 30s gives 1.5x headroom while still
+        // failing fast on a real deadlock regression.
+        tokio::time::timeout(std::time::Duration::from_secs(30), inner())
             .await
-            .expect("paired_stream_roundtrip must complete within 15s");
+            .expect("paired_stream_roundtrip must complete within 30s");
     }
 
     async fn inner() {
