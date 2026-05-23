@@ -59,8 +59,8 @@ pub fn canonical_payload_bytes(p: &ReachabilityAnnouncePayload) -> Result<Vec<u8
     canonical_cbor_encode(p)
 }
 
-/// Canonical byte string the inner identity signature covers:
-/// CBOR(canonical) of (nd, rl, da, ts, ac, hl). The actor + hlc are pulled
+/// Deterministic byte string the inner identity signature covers:
+/// CBOR of (nd, rl, da, ts, ac, hl). The actor + hlc are pulled
 /// from the surrounding membership envelope; they're NOT part of the
 /// payload struct itself but are bound into the signature so a replay
 /// attacker can't lift a `ReachabilityAnnouncePayload` from one envelope
@@ -72,10 +72,16 @@ pub fn canonical_payload_bytes(p: &ReachabilityAnnouncePayload) -> Result<Vec<u8
 /// only the 5 self-contained fields nd/rl/da/ts/sg); confusing them
 /// would let a peer replay the inner-sig bytes verbatim.
 ///
-/// Encodes via raw `ciborium::into_writer` (not `canonical_cbor_encode`)
-/// because the input struct holds references — and `CanonicalPayload`'s
-/// sealed-trait API can't be impl'd for borrowed `&T`. The encoding
-/// shape is still deterministic given all field serde impls are.
+/// **Not a `CanonicalPayload`**: this function encodes via raw
+/// `ciborium::into_writer` rather than the repo's `canonical_cbor_encode`
+/// helper because the input struct holds references and the
+/// `CanonicalPayload` sealed-trait API requires owned types. The
+/// underlying serde impls for all six fields (`[u8;32]`, `&str`,
+/// `&[SocketAddr]`, `u64`, `&OwnerAddr`, `&Hlc`) are deterministic,
+/// so the byte sequence is stable across runs and machines — sufficient
+/// for sign/verify symmetry. If a future requirement needs strict
+/// canonical (length-prefix-sorted) encoding here, switch to an owned
+/// struct that impls `CanonicalPayload`. Per CodeRabbit on PR #157.
 pub fn inner_signed_bytes(
     iroh_node_id: &[u8; 32],
     home_relay_url: &str,

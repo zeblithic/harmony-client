@@ -244,4 +244,36 @@ mod tests {
         r2.update(actor, make_payload(0x01, 2000), hlc);
         assert_eq!(r2.resolve(&actor).unwrap().iroh_node_id, [0x02; 32]);
     }
+
+    #[test]
+    fn resolve_by_node_id_finds_inserted_entry() {
+        // CodeRabbit PR #157 round 1: positive lookup. The Phase 1
+        // transport reaches peers exclusively via node_id (the locator
+        // form `iroh/<hex-32>`), so resolve_by_node_id is on the hot
+        // path of every outbound `new_link` call.
+        let r = ReachabilityResolver::new();
+        let actor = OwnerAddr([0x55; 16]);
+        let payload = make_payload(0xAB, 1500);
+        r.update(actor, payload.clone(), make_hlc(1500, 0, "a"));
+        let hit = r.resolve_by_node_id(&[0xAB; 32]);
+        assert!(hit.is_some());
+        let (got_addr, got_payload) = hit.unwrap();
+        assert_eq!(got_addr, actor);
+        assert_eq!(got_payload.iroh_node_id, [0xAB; 32]);
+        assert_eq!(got_payload.announced_at_ms, payload.announced_at_ms);
+    }
+
+    #[test]
+    fn resolve_by_node_id_returns_none_for_unknown() {
+        // CodeRabbit PR #157 round 1: negative lookup. A miss must
+        // return None (not panic, not return a default-constructed
+        // entry) so the caller can surface a typed error to Zenoh.
+        let r = ReachabilityResolver::new();
+        r.update(
+            OwnerAddr([0x11; 16]),
+            make_payload(0xAB, 1500),
+            make_hlc(1500, 0, "a"),
+        );
+        assert!(r.resolve_by_node_id(&[0xCD; 32]).is_none());
+    }
 }
