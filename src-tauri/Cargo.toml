@@ -32,6 +32,19 @@ ciborium = "0.2"
 # A desktop app benefits from all transports. Disabling defaults breaks
 # TCP connectivity (previous review confirmed this).
 zenoh = "1"
+# ZEB-321 Phase 1 Task 5: zenoh's pluggable transport surface lives in
+# zenoh-link (LinkUnicastTrait, LinkAuthId, BatchSize, Locator) and
+# zenoh-result (ZResult, zerror!). Both are transitive deps of zenoh
+# itself, but cargo requires an explicit entry to import from them
+# directly. Pinned to "1" to track zenoh's major version; resolves
+# to the same versions Cargo.lock pins for the transitive copies.
+zenoh-link = "1"
+zenoh-result = "1"
+# Needed for `BatchSize` (used in `LinkUnicastTrait::get_mtu`'s return
+# type). `BatchSize` is `pub type BatchSize = u16` in zenoh-protocol's
+# transport module — zenoh-link does not re-export it, so we depend on
+# zenoh-protocol directly.
+zenoh-protocol = "1"
 tokio = { version = "1", features = ["rt", "net", "time", "sync"] }
 tauri-plugin-dialog = "2"
 futures = "0.3"

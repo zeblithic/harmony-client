@@ -2537,6 +2537,9 @@ dependencies = [
  "uuid",
  "x25519-dalek",
  "zenoh",
+ "zenoh-link",
+ "zenoh-protocol",
+ "zenoh-result",
  "zeroize",
 ]
 
