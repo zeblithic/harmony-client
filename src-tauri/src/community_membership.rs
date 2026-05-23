@@ -9217,8 +9217,8 @@ mod zeb_321_reachability_verify_tests {
                 device_id: "t".into(),
             },
         };
-        let admin_join = sign_event_with_identity(&admin_join_payload, admin_priv)
-            .expect("sign admin join");
+        let admin_join =
+            sign_event_with_identity(&admin_join_payload, admin_priv).expect("sign admin join");
         materialize(std::slice::from_ref(&admin_join), admin_addr)
     }
 
@@ -9429,8 +9429,7 @@ mod zeb_321_reachability_verify_tests {
             actor: admin_addr,
             at: hlc,
         };
-        let event =
-            sign_event_with_identity(&payload, &admin_priv).expect("sign envelope");
+        let event = sign_event_with_identity(&payload, &admin_priv).expect("sign envelope");
 
         let ctx = VerifyContext {
             expected_community_id: community_id,

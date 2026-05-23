@@ -108,8 +108,7 @@ pub fn inner_signed_bytes(
         hl: hlc,
     };
     let mut buf = Vec::new();
-    ciborium::into_writer(&input, &mut buf)
-        .map_err(|e| CryptoError::CborEncode(format!("{e}")))?;
+    ciborium::into_writer(&input, &mut buf).map_err(|e| CryptoError::CborEncode(format!("{e}")))?;
     Ok(buf)
 }
 
