@@ -691,6 +691,19 @@ pub struct NodeState {
     /// `None` when the publisher failed to spawn (e.g. iroh bind failed) —
     /// IPC handlers no-op in that case.
     pub iroh_publisher_force: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// ZEB-321 Phase 1 PR #157 round 1 (Qodo): `JoinHandle` of the
+    /// publisher's spawned tokio task. Held so `stop_inner` can `abort()`
+    /// it — otherwise the infinite-loop publisher keeps running after
+    /// stop_node, holds the iroh endpoint Arc alive, and continues firing
+    /// if-watch / idle ticks across restart cycles.
+    pub iroh_publisher_handle: Option<tokio::task::JoinHandle<()>>,
+    /// ZEB-321 Phase 1 PR #157 round 1 (Qodo + CodeAnt): `JoinHandle` of
+    /// the drain task that discards inbound iroh→zenoh links until Phase 2
+    /// wires them into the real `zenoh::Session` ingestion path. Without
+    /// this task the flume receiver would be dropped, the channel would
+    /// close, and `IrohZenohLinkManager::spawn_accept_loop`'s `send_async`
+    /// would fail on every accepted connection. Aborted on stop_inner.
+    pub iroh_inbound_drain_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl NodeState {
@@ -809,10 +822,12 @@ impl Default for NodeState {
             // Mint sync engine: initialized in identity bootstrap.
             mint_sync: None,
             // ZEB-321 Phase 1 Task 8: iroh handles stay None until
-            // start_node wires them; cleared in stop_inner.
+            // start_node wires them; cleared + aborted in stop_inner.
             iroh_endpoint: None,
             reachability_resolver: None,
             iroh_publisher_force: None,
+            iroh_publisher_handle: None,
+            iroh_inbound_drain_handle: None,
         }
     }
 }
@@ -1138,8 +1153,20 @@ fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
         // cleanly. The endpoint Arc drops here — the link manager's
         // accept loop ends when the endpoint shuts down naturally on its
         // own Arc-drop; the publisher loop ends when its `endpoint` Arc
-        // (a clone) drops alongside the publisher Arc. Both are best-effort
-        // in this Phase 1 implementation (no explicit shutdown await).
+        // (a clone) drops alongside the publisher Arc.
+        //
+        // ZEB-321 Phase 1 PR #157 round 1: explicitly abort the publisher
+        // + drain tasks. Without abort, the publisher's `loop { select! }`
+        // holds the iroh endpoint Arc forever and keeps firing if-watch
+        // events across restart cycles (Qodo finding). The drain task is
+        // symmetric — it owns the flume receiver whose lifetime gates the
+        // accept loop's `send_async` semantics (Qodo + CodeAnt).
+        if let Some(h) = guard.iroh_publisher_handle.take() {
+            h.abort();
+        }
+        if let Some(h) = guard.iroh_inbound_drain_handle.take() {
+            h.abort();
+        }
         guard.iroh_endpoint = None;
         guard.reachability_resolver = None;
         guard.iroh_publisher_force = None;
@@ -1771,6 +1798,15 @@ async fn start_node(
         // start_node rebuilds them. The secret key itself is keychain-
         // resident and per-device, so a same-device restart hits the same
         // `EndpointId`; no transport reconfiguration required.
+        //
+        // ZEB-321 Phase 1 PR #157 round 1: also abort the publisher + drain
+        // tasks per stop_inner's symmetric path.
+        if let Some(h) = guard.iroh_publisher_handle.take() {
+            h.abort();
+        }
+        if let Some(h) = guard.iroh_inbound_drain_handle.take() {
+            h.abort();
+        }
         guard.iroh_endpoint = None;
         guard.reachability_resolver = None;
         guard.iroh_publisher_force = None;
@@ -2145,6 +2181,13 @@ async fn start_node(
         let iroh_endpoint_arc: Option<std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>>;
         let reachability_resolver: crate::reachability_resolver::ReachabilityResolver;
         let iroh_handles_for_loop: Option<crate::event_loop::IrohRuntimeHandles>;
+        // ZEB-321 Phase 1 PR #157 round 1 (Qodo + CodeAnt): JoinHandle of
+        // the drain task that discards inbound iroh→zenoh links. We must
+        // own a live receiver — otherwise `IrohZenohLinkManager`'s accept
+        // loop fails every `send_async` with "channel closed" and inbound
+        // links are silently lost. Phase 2 will replace this drain with
+        // the real `zenoh::Session` ingestion path.
+        let mut iroh_inbound_drain_handle: Option<tokio::task::JoinHandle<()>> = None;
         {
             reachability_resolver = crate::reachability_resolver::ReachabilityResolver::new();
             match crate::iroh_endpoint::load_or_create_secret_key() {
@@ -2152,7 +2195,7 @@ async fn start_node(
                     match crate::iroh_endpoint::IrohEndpoint::new_with_secret(secret).await {
                         Ok(ep) => {
                             let ep_arc = std::sync::Arc::new(ep);
-                            let (new_link_tx, _new_link_rx) =
+                            let (new_link_tx, new_link_rx) =
                                 flume::unbounded::<zenoh_link::LinkUnicast>();
                             let link_mgr = std::sync::Arc::new(
                                 crate::zenoh_iroh_transport::IrohZenohLinkManager::new(
@@ -2161,6 +2204,22 @@ async fn start_node(
                                     new_link_tx,
                                 ),
                             );
+                            // Drain task: holds the receiver alive so the
+                            // accept loop's send_async succeeds, then
+                            // discards links until Phase 2 wires them
+                            // into a real Zenoh session. Throttled log
+                            // (one warn per accepted link) makes the
+                            // Phase-1 deferment visible in production
+                            // without spamming.
+                            iroh_inbound_drain_handle = Some(tokio::spawn(async move {
+                                while let Ok(_link) = new_link_rx.recv_async().await {
+                                    tracing::warn!(
+                                        "ZEB-321 Phase 1: discarding inbound \
+                                         iroh/zenoh link (Zenoh session \
+                                         ingestion deferred to Phase 2)"
+                                    );
+                                }
+                            }));
                             iroh_endpoint_arc = Some(std::sync::Arc::clone(&ep_arc));
                             iroh_handles_for_loop = Some(crate::event_loop::IrohRuntimeHandles {
                                 endpoint: ep_arc,
@@ -2199,6 +2258,12 @@ async fn start_node(
         let mut iroh_publisher_arc: Option<
             std::sync::Arc<crate::reachability_publisher::ReachabilityPublisher>,
         > = None;
+        // ZEB-321 Phase 1 PR #157 round 1: capture the publisher's spawn
+        // JoinHandle so stop_inner can abort it. Without abort the
+        // infinite-loop publisher outlives stop_node, holds the iroh
+        // endpoint Arc alive, and continues firing if-watch/idle ticks
+        // across restart cycles (Qodo finding).
+        let mut iroh_publisher_handle: Option<tokio::task::JoinHandle<()>> = None;
 
         let sync_engine_arc: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>> =
             if let Some(ref loaded) = owner_loaded {
@@ -3562,16 +3627,19 @@ async fn start_node(
                                 publish_fn,
                             ),
                         );
-                        // Spawn the publisher loop. The returned
-                        // JoinHandle is intentionally dropped — the
-                        // publisher lives for the lifetime of the tokio
-                        // runtime that hosts start_node's async block.
+                        // Spawn the publisher loop. The JoinHandle is
+                        // captured and stashed on NodeState below so
+                        // stop_inner can `abort()` it — without that,
+                        // the infinite-loop publisher would outlive
+                        // stop_node, keep the iroh endpoint Arc alive,
+                        // and continue firing if-watch/idle ticks
+                        // across restart cycles (PR #157 round 1 Qodo).
                         // The publisher's internal `Arc<Notify>` is
-                        // cloned onto NodeState via `force_handle()`
-                        // below so the `connectivity_force_republish`
-                        // IPC can wake it without holding the publisher
+                        // also cloned onto NodeState via `force_handle()`
+                        // so the `connectivity_force_republish` IPC
+                        // can wake it without holding the publisher
                         // Arc directly.
-                        let _publisher_handle = std::sync::Arc::clone(&publisher).spawn();
+                        iroh_publisher_handle = Some(std::sync::Arc::clone(&publisher).spawn());
                         iroh_publisher_arc = Some(publisher);
                     }
 
@@ -4126,6 +4194,14 @@ async fn start_node(
                         guard.reachability_resolver = Some(reachability_resolver.clone());
                         guard.iroh_publisher_force =
                             iroh_publisher_arc.as_ref().map(|p| p.force_handle());
+                        // ZEB-321 Phase 1 PR #157 round 1: move (take)
+                        // the join handles into NodeState so stop_inner
+                        // can abort the tasks on shutdown. Both are
+                        // Option-shaped (one or both may be None when
+                        // iroh boot failed or no owner identity is
+                        // loaded — see prior blocks).
+                        guard.iroh_publisher_handle = iroh_publisher_handle.take();
+                        guard.iroh_inbound_drain_handle = iroh_inbound_drain_handle.take();
                         thread_install_failure = None;
                     }
                     Err(e) => {
@@ -31598,6 +31674,8 @@ mod start_node_race_tests {
             iroh_endpoint: None,
             reachability_resolver: None,
             iroh_publisher_force: None,
+            iroh_publisher_handle: None,
+            iroh_inbound_drain_handle: None,
         })
     }
 
