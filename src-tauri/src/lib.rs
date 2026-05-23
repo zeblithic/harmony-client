@@ -3481,17 +3481,38 @@ async fn start_node(
                             // then release before feeding the resolver
                             // (resolver.update takes its own lock and we
                             // don't want to hold both at once).
+                            //
+                            // PR #157 round 3 (CodeRabbit): also materialize
+                            // the current membership at snapshot time and
+                            // skip any actor not currently Joined — the live
+                            // verify_event arm enforces RCH5 (actor must be
+                            // a member at insert time), but a member who has
+                            // since Left or been Kicked would re-surface
+                            // here without this filter. Materializing at
+                            // the latest HLC is the correct gate (matches
+                            // the spec's "current member" intent for routing
+                            // — we don't want to dial Alice if she's left).
                             let to_replay: Vec<(
                                 crate::owner_state_types::OwnerAddr,
                                 crate::reachability_record::ReachabilityAnnouncePayload,
                                 crate::owner_state_types::Hlc,
                             )> = {
                                 let st = state_arc.lock().await;
+                                let current = st.materialized(engine.admin_addr());
                                 st.events
                                     .values()
                                     .filter_map(|ev| match &ev.kind {
                                         crate::community_membership::MembershipEventKind::ReachabilityAnnounce { payload } => {
-                                            Some((ev.actor, payload.clone(), ev.at.clone()))
+                                            let still_member = current
+                                                .members
+                                                .get(&ev.actor)
+                                                .map(|s| s.status == crate::community_membership::MemberStatus::Joined)
+                                                .unwrap_or(false);
+                                            if still_member {
+                                                Some((ev.actor, payload.clone(), ev.at.clone()))
+                                            } else {
+                                                None
+                                            }
                                         }
                                         _ => None,
                                     })
