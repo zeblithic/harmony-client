@@ -189,6 +189,16 @@ mod tests {
     /// piece*, but downgrade the preset for full hermeticity.
     #[tokio::test]
     async fn paired_stream_roundtrip_via_loopback() {
+        // Hard wall-clock cap so a future regression in the QUIC
+        // teardown sequence can't strand the suite indefinitely
+        // (we previously hung on `incoming.closed().await` after the
+        // data exchange had already completed — see fix below).
+        tokio::time::timeout(std::time::Duration::from_secs(15), inner())
+            .await
+            .expect("paired_stream_roundtrip must complete within 15s");
+    }
+
+    async fn inner() {
         use crate::iroh_endpoint::alpn;
         use iroh::endpoint::{presets, Endpoint, RelayMode};
         use iroh::{EndpointAddr, SecretKey, TransportAddr};
@@ -244,11 +254,13 @@ mod tests {
             ep_b.bound_sockets().into_iter().map(TransportAddr::Ip),
         );
 
-        // Accept side runs on ep_b in a spawned task. iroh's
-        // open_bi/accept_bi contract requires the dialer to write
-        // first (otherwise accept_bi waits forever) — we honor that
-        // below.
+        // Accept side runs on ep_b in a spawned task. Server wraps its
+        // half in IrohZenohLink and exercises the async trait methods
+        // there too — that way the actual byte transport is going
+        // *through* the wrapper on both sides, not just around it.
         let ep_b_clone = ep_b.clone();
+        let server_src = Locator::new("iroh", ep_b_id.to_string(), "").expect("server src");
+        let server_dst = Locator::new("iroh", ep_a_id.to_string(), "").expect("server dst");
         let accept_task = tokio::spawn(async move {
             let incoming = ep_b_clone
                 .accept()
@@ -256,42 +268,50 @@ mod tests {
                 .expect("incoming connection")
                 .await
                 .expect("connection established");
-            let (mut send, mut recv) = incoming.accept_bi().await.expect("accept_bi");
+            let (send, recv) = incoming.accept_bi().await.expect("accept_bi");
+            let server_link = IrohZenohLink::new(send, recv, server_src, server_dst);
             let mut buf = [0u8; 5];
-            recv.read_exact(&mut buf).await.expect("server read");
+            server_link
+                .read_exact(&mut buf)
+                .await
+                .expect("server link read");
             assert_eq!(&buf, b"hello");
-            send.write_all(b"world").await.expect("server write");
-            send.finish().expect("server finish");
-            // Hold the connection open until the client side has had
-            // a chance to drain its read — dropping `incoming` here
-            // would close the connection prematurely.
+            server_link
+                .write_all(b"world")
+                .await
+                .expect("server link write");
+            server_link.close().await.expect("server link close");
+            // Wait for the client to drive the connection close. This
+            // is the symmetric counterpart to the client's explicit
+            // `conn.close()` below — it gives the QUIC layer time to
+            // flush the "world" reply to the client before the
+            // connection is torn down. (Dropping `incoming` here
+            // immediately would race: server-side teardown can wipe
+            // in-flight bytes, causing the client's read to fail with
+            // "connection lost". See ZEB-321 Task 5 fix: 6-hour stall
+            // followed by 11s race failure, 2026-05-22.)
             let _ = incoming.closed().await;
         });
 
-        // Dial side: open the bidi stream, immediately write so the
-        // accept_task can progress past accept_bi.
+        // Dial side: open the bidi stream, wrap in IrohZenohLink, and
+        // round-trip the data through the wrapper's async trait methods.
         let conn = ep_a
             .connect(ep_b_addr, alpn::HARMONY_ZENOH_V1)
             .await
             .expect("connect");
-        let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
-        send.write_all(b"hello").await.expect("client write");
-        send.finish().expect("client finish");
+        let (send, recv) = conn.open_bi().await.expect("open_bi");
+        let client_src = Locator::new("iroh", ep_a_id.to_string(), "").expect("client src");
+        let client_dst = Locator::new("iroh", ep_b_id.to_string(), "").expect("client dst");
+        let link = IrohZenohLink::new(send, recv, client_src.clone(), client_dst.clone());
+
+        link.write_all(b"hello").await.expect("client link write");
         let mut buf = [0u8; 5];
-        recv.read_exact(&mut buf).await.expect("client read");
+        link.read_exact(&mut buf).await.expect("client link read");
         assert_eq!(&buf, b"world");
 
-        // Wrap the client side in `IrohZenohLink` and exercise the
-        // trait surface to confirm the wrapper compiles + delegates.
-        // We construct locators with the iroh protocol prefix and
-        // the bs58-formatted EndpointId as the address — the
-        // canonical form the LinkManager will use in Task 6.
-        let src = Locator::new("iroh", ep_a_id.to_string(), "").expect("src locator");
-        let dst = Locator::new("iroh", ep_b_id.to_string(), "").expect("dst locator");
-        let link = IrohZenohLink::new(send, recv, src.clone(), dst.clone());
-
-        assert_eq!(link.get_src(), &src);
-        assert_eq!(link.get_dst(), &dst);
+        // Sync trait surface checks.
+        assert_eq!(link.get_src(), &client_src);
+        assert_eq!(link.get_dst(), &client_dst);
         assert_eq!(link.get_mtu(), BatchSize::MAX);
         assert!(link.is_reliable());
         assert!(link.is_streamed());
@@ -302,13 +322,19 @@ mod tests {
         link.close().await.expect("first close");
         link.close().await.expect("second close (idempotent)");
 
-        // Wait for accept side to finish, then shut both endpoints
-        // down cleanly. The accept_task awaits `closed()` so we must
-        // drop the connection before joining; the connection drops
-        // when `link` (which owns send/recv) goes out of scope at
-        // the end of the test, so just close the endpoint.
+        // Drive the connection close from the client side. The server's
+        // `incoming.closed().await` then returns naturally; without this
+        // explicit close the server would either (a) hang forever
+        // waiting for a peer close that never comes, or (b) close its
+        // own end too early and race the client's read. The `0u32` is
+        // an application close code; the byte string is a human-
+        // readable reason transmitted in the QUIC CONNECTION_CLOSE.
         drop(link);
-        let _ = accept_task.await;
+        conn.close(0u32.into(), b"test-done");
+        conn.closed().await;
+
+        // Server returns once its `incoming.closed()` future resolves.
+        accept_task.await.expect("server task panic");
         ep_a.close().await;
         ep_b.close().await;
     }
