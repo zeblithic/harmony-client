@@ -5,7 +5,7 @@
 //! - Zenoh session (pub/sub, queryables, content fetch)
 //! - 250ms timer tick
 //!
-//! No disk/archive/S3 persistence, no inference, no iroh tunnels.
+//! No disk/archive/S3 persistence, no inference.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -284,6 +284,37 @@ enum ZenohEvent {
     },
 }
 
+/// ZEB-321 Phase 1: bundle of iroh-transport resources constructed at
+/// `start_node` time and threaded into the event loop so the accept-loop
+/// can be spawned alongside the rest of the long-lived background tasks.
+/// The publisher is NOT in this bundle (see following paragraph).
+///
+/// Construction of the endpoint + link manager lives in `start_node`
+/// (rather than inside `event_loop::run`) so the per-community
+/// membership-delta consumer closure can capture the resolver and route
+/// freshly-inserted `ReachabilityAnnounce` events into it without a
+/// separate plumbing pass. The link manager is passed in pre-built so
+/// the event loop owns only the `spawn_accept_loop` call.
+///
+/// ZEB-321 Phase 1 Task 9 update: the `ReachabilityPublisher` is NOT in
+/// this bundle. The publisher's real `publish_fn` closure needs to
+/// iterate joined communities + sign `ReachabilityAnnounce` events,
+/// which requires the `CommunitySyncRegistry` + `PrivateIdentity` — both
+/// constructed later in `start_node` than the iroh endpoint. lib.rs owns
+/// the publisher's `Arc` + `JoinHandle` so it can build them once
+/// registry + identity are ready (see start_node body in lib.rs). We
+/// chose this "defer publisher construction" (Option A) over a runtime
+/// `replace_publish_callback` swap (Option B) because it avoids interior
+/// mutability and keeps the publisher's identity stable across its
+/// entire lifetime — there's only ever one publisher per device session,
+/// and the few-line delay until registry/identity are ready costs
+/// nothing (the publisher's startup-publish would have hit a no-op
+/// callback otherwise).
+pub struct IrohRuntimeHandles {
+    pub endpoint: std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>,
+    pub link_manager: std::sync::Arc<crate::zenoh_iroh_transport::IrohZenohLinkManager>,
+}
+
 /// Run the NodeRuntime event loop as a background task.
 ///
 /// Sends `Ok(())` on `ready_tx` once UDP + Zenoh + startup actions are
@@ -418,6 +449,13 @@ pub async fn run<R: Runtime>(
     // Mint Phase 2 sync: channel pair bridging MintSyncEngine to Zenoh.
     // `None` when no owner identity is loaded.
     mut mint_sync_handles: Option<MintSyncHandles>,
+    // ZEB-321 Phase 1 Task 8: bundle of iroh-transport resources built in
+    // `start_node`. When `Some`, the event loop spawns the link-manager
+    // accept loop + publisher driver as background tasks; when `None`
+    // (test contexts that bypass `start_node`) the iroh subsystem stays
+    // unwired and the resolver simply never receives updates — the rest
+    // of the event loop is unaffected.
+    iroh_handles: Option<IrohRuntimeHandles>,
 ) {
     // ── Startup: bind UDP, open Zenoh ────────────────────────────────
     // Each async step is raced against shutdown so stop_node can cancel
@@ -502,6 +540,18 @@ pub async fn run<R: Runtime>(
 
     // Channel from spawned Zenoh tasks → main select loop.
     let (zenoh_tx, mut zenoh_rx) = mpsc::channel::<ZenohEvent>(256);
+
+    // ── ZEB-321 Phase 1 Task 8 (Task 9 + PR #157 round 4 updates): iroh ──
+    // The accept-loop spawn AND the publisher spawn both happen in
+    // `start_node` (lib.rs) — NOT here. lib.rs captures both JoinHandles
+    // into `NodeState` so `clear_iroh_handles` can abort them on stop
+    // (Greptile P1: accept loop previously detached and was never
+    // aborted, leaving stale tasks across restart cycles). The event
+    // loop's only responsibility for iroh is keeping the endpoint +
+    // link_manager Arcs alive for its lifetime; we bind them to a
+    // `_`-prefixed variable so they survive until event_loop exits but
+    // the inner spawn side-effect lives upstream in lib.rs.
+    let _iroh_handles_keepalive = iroh_handles;
 
     // ── Phase 3a: SyncEngine wire-up ────────────────────────────────────
     // The SyncEngine itself is constructed in start_node (lib.rs).

@@ -32,6 +32,26 @@ ciborium = "0.2"
 # A desktop app benefits from all transports. Disabling defaults breaks
 # TCP connectivity (previous review confirmed this).
 zenoh = "1"
+# ZEB-321 Phase 1 Task 5: zenoh's pluggable transport surface lives in
+# zenoh-link (LinkUnicastTrait, LinkAuthId, BatchSize, Locator) and
+# zenoh-result (ZResult, zerror!). Both are transitive deps of zenoh
+# itself, but cargo requires an explicit entry to import from them
+# directly. Pinned to "1" to track zenoh's major version; resolves
+# to the same versions Cargo.lock pins for the transitive copies.
+zenoh-link = "1"
+zenoh-result = "1"
+# Needed for `BatchSize` (used in `LinkUnicastTrait::get_mtu`'s return
+# type). `BatchSize` is `pub type BatchSize = u16` in zenoh-protocol's
+# transport module — zenoh-link does not re-export it, so we depend on
+# zenoh-protocol directly.
+zenoh-protocol = "1"
+# ZEB-321 Phase 1 Task 6: `NewLinkChannelSender = flume::Sender<LinkUnicast>`
+# is zenoh-link's outbound-new-link mechanism (see
+# `zenoh-link-commons::unicast`). Constructing `IrohZenohLinkManager`
+# requires a flume sender, so we pull `flume` in directly rather than
+# leaning on the transitive copy zenoh re-exports privately. Pinned to
+# "0.11" — matches the version zenoh-link-commons 1.8 resolves to.
+flume = "0.11"
 tokio = { version = "1", features = ["rt", "net", "time", "sync"] }
 tauri-plugin-dialog = "2"
 futures = "0.3"
@@ -86,6 +106,21 @@ rust_decimal = "1"
 csv = "1"
 chrono = "0.4"
 frost-ristretto255 = { version = "3.0.0", features = ["serde"] }
+# ZEB-321 Phase 1 Task 4: iroh endpoint used by the upcoming
+# zenoh-over-iroh transport and the harmony device handshake. Version
+# pinned at 0.98 (latest stable as of 2026-05). The harmony-* workspace
+# crates we depend on do NOT pull iroh transitively (verified upstream),
+# so we have free choice of version. Note the 0.98 API surface differs
+# from the plan's draft (NodeId→EndpointId, builder takes a Preset, etc);
+# adaptations are documented in `src/iroh_endpoint.rs`.
+iroh = "0.98"
+# ZEB-321 Phase 1 Task 7: network-interface change watcher used by
+# `reachability_publisher` to debounce republishes on IP / link
+# transitions. `if-watch` v3 exposes its tokio adapter via
+# `if_watch::tokio::IfWatcher`, which implements
+# `Stream<Item = std::io::Result<IfEvent>>` — we drive it via
+# `futures::StreamExt::next()` (no manual `poll_fn` wrapping needed).
+if-watch = { version = "3", features = ["tokio"] }
 
 [dev-dependencies]
 serial_test = "3"
