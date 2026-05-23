@@ -704,6 +704,13 @@ pub struct NodeState {
     /// close, and `IrohZenohLinkManager::spawn_accept_loop`'s `send_async`
     /// would fail on every accepted connection. Aborted on stop_inner.
     pub iroh_inbound_drain_handle: Option<tokio::task::JoinHandle<()>>,
+    /// ZEB-321 Phase 1 PR #157 round 4 (Greptile P1): `JoinHandle` of the
+    /// iroh accept loop spawned via `IrohZenohLinkManager::spawn_accept_loop`.
+    /// Previously dropped (detached) in event_loop.rs, which left the
+    /// loop running across restart cycles. Now captured here so
+    /// `clear_iroh_handles` aborts it alongside the publisher + drain
+    /// tasks for symmetric teardown.
+    pub iroh_accept_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl NodeState {
@@ -726,6 +733,9 @@ impl NodeState {
             h.abort();
         }
         if let Some(h) = self.iroh_inbound_drain_handle.take() {
+            h.abort();
+        }
+        if let Some(h) = self.iroh_accept_handle.take() {
             h.abort();
         }
         self.iroh_endpoint = None;
@@ -846,6 +856,7 @@ impl Default for NodeState {
             iroh_publisher_force: None,
             iroh_publisher_handle: None,
             iroh_inbound_drain_handle: None,
+            iroh_accept_handle: None,
         }
     }
 }
@@ -2190,6 +2201,12 @@ async fn start_node(
         // links are silently lost. Phase 2 will replace this drain with
         // the real `zenoh::Session` ingestion path.
         let mut iroh_inbound_drain_handle: Option<tokio::task::JoinHandle<()>> = None;
+        // ZEB-321 Phase 1 PR #157 round 4 (Greptile P1): JoinHandle of
+        // the iroh accept loop. Captured here (not dropped via
+        // `inspect()` inside event_loop as before) so `clear_iroh_handles`
+        // can abort it on stop_node, preventing detached loops from
+        // outliving the node across restart cycles.
+        let mut iroh_accept_handle: Option<tokio::task::JoinHandle<()>> = None;
         {
             reachability_resolver = crate::reachability_resolver::ReachabilityResolver::new();
             match crate::iroh_endpoint::load_or_create_secret_key() {
@@ -2222,6 +2239,14 @@ async fn start_node(
                                     );
                                 }
                             }));
+                            // PR #157 round 4 (Greptile P1): spawn the
+                            // accept loop here (was previously dropped
+                            // by `inspect()` inside event_loop) so we
+                            // can capture the JoinHandle. The link
+                            // manager Arc held by the spawned task is
+                            // cloned from `link_mgr` below — drop of
+                            // our local `link_mgr` doesn't tear it down.
+                            iroh_accept_handle = Some(link_mgr.spawn_accept_loop());
                             iroh_endpoint_arc = Some(std::sync::Arc::clone(&ep_arc));
                             iroh_handles_for_loop = Some(crate::event_loop::IrohRuntimeHandles {
                                 endpoint: ep_arc,
@@ -4279,14 +4304,17 @@ async fn start_node(
                         guard.reachability_resolver = Some(reachability_resolver.clone());
                         guard.iroh_publisher_force =
                             iroh_publisher_arc.as_ref().map(|p| p.force_handle());
-                        // ZEB-321 Phase 1 PR #157 round 1: move (take)
-                        // the join handles into NodeState so stop_inner
-                        // can abort the tasks on shutdown. Both are
-                        // Option-shaped (one or both may be None when
+                        // ZEB-321 Phase 1 PR #157 round 1 + round 4:
+                        // move (take) the join handles into NodeState so
+                        // stop_inner's `clear_iroh_handles` can abort the
+                        // background tasks on shutdown. All three are
+                        // Option-shaped (one or more may be None when
                         // iroh boot failed or no owner identity is
-                        // loaded — see prior blocks).
+                        // loaded — see prior blocks; the publisher in
+                        // particular is identity-gated).
                         guard.iroh_publisher_handle = iroh_publisher_handle.take();
                         guard.iroh_inbound_drain_handle = iroh_inbound_drain_handle.take();
+                        guard.iroh_accept_handle = iroh_accept_handle.take();
                         thread_install_failure = None;
                     }
                     Err(e) => {
@@ -31761,6 +31789,7 @@ mod start_node_race_tests {
             iroh_publisher_force: None,
             iroh_publisher_handle: None,
             iroh_inbound_drain_handle: None,
+            iroh_accept_handle: None,
         })
     }
 

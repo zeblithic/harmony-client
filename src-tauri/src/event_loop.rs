@@ -541,22 +541,17 @@ pub async fn run<R: Runtime>(
     // Channel from spawned Zenoh tasks → main select loop.
     let (zenoh_tx, mut zenoh_rx) = mpsc::channel::<ZenohEvent>(256);
 
-    // ── ZEB-321 Phase 1 Task 8 (Task 9 update): iroh-transport bg tasks ──
-    // Spawn the link-manager accept loop (drives inbound iroh→zenoh links
-    // off the endpoint's `accept()`). The publisher is spawned by lib.rs
-    // (NOT here) — see `IrohRuntimeHandles`' doc for why.
-    //
-    // The returned join handle is intentionally dropped — the spawned
-    // accept loop lives for the lifetime of the tokio runtime that hosts
-    // the event loop, ending when the endpoint shuts down.
-    // `inspect` keeps `h` in the Option while letting us trigger the
-    // spawn side-effect; the returned Option is bound to a `_`-prefixed
-    // variable so the contained Arcs (endpoint + link manager) live for
-    // the rest of the event loop. Dropping them would race the spawned
-    // accept loop into observing its endpoint shutting down mid-flight.
-    let _iroh_handles_keepalive = iroh_handles.inspect(|h| {
-        let _accept = h.link_manager.spawn_accept_loop();
-    });
+    // ── ZEB-321 Phase 1 Task 8 (Task 9 + PR #157 round 4 updates): iroh ──
+    // The accept-loop spawn AND the publisher spawn both happen in
+    // `start_node` (lib.rs) — NOT here. lib.rs captures both JoinHandles
+    // into `NodeState` so `clear_iroh_handles` can abort them on stop
+    // (Greptile P1: accept loop previously detached and was never
+    // aborted, leaving stale tasks across restart cycles). The event
+    // loop's only responsibility for iroh is keeping the endpoint +
+    // link_manager Arcs alive for its lifetime; we bind them to a
+    // `_`-prefixed variable so they survive until event_loop exits but
+    // the inner spawn side-effect lives upstream in lib.rs.
+    let _iroh_handles_keepalive = iroh_handles;
 
     // ── Phase 3a: SyncEngine wire-up ────────────────────────────────────
     // The SyncEngine itself is constructed in start_node (lib.rs).
