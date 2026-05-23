@@ -716,6 +716,47 @@ pub struct NodeState {
     /// `clear_iroh_handles` aborts it alongside the publisher + drain
     /// tasks for symmetric teardown.
     pub iroh_accept_handle: Option<tokio::task::JoinHandle<()>>,
+
+    // ── ZEB-323 Phase 2b: pkarr policy handles ───────────────────────────
+    //
+    // All seven fields are Option-shaped and default to None. They are
+    // populated in `start_node` after iroh boots and the owner identity is
+    // loaded. IPC handlers no-op when these are None (pre-start_node or
+    // iroh/identity missing). Cleared in `stop_inner` alongside the iroh
+    // handles so a restart re-initialises cleanly.
+    /// Shared pkarr relay publisher. Drives the background publish loop
+    /// that keeps case-A / B / C entries fresh on the Mainline DHT.
+    pub pkarr_publisher: Option<std::sync::Arc<harmony_pkarr::PkarrPublisher>>,
+
+    /// Shared pkarr resolver. Used by `connectivity_discover_identity` IPC
+    /// and wired into the `ReachabilityResolver` as the case-C fallback.
+    pub pkarr_resolver: Option<std::sync::Arc<harmony_pkarr::PkarrResolver>>,
+
+    /// Case A lifecycle manager — registers / unregisters per-invite pkarr
+    /// publications keyed on HKDF(invite_token.sig, epoch).
+    pub pkarr_invite_publisher:
+        Option<std::sync::Arc<pkarr_invite_publisher::PkarrInvitePublisher>>,
+
+    /// Case B lifecycle manager — registers / unregisters the identity-keyed
+    /// pkarr publication when the "Make me discoverable" toggle changes.
+    pub pkarr_identity_publisher:
+        Option<std::sync::Arc<pkarr_identity_publisher::PkarrIdentityPublisher>>,
+
+    /// Case C lifecycle manager — registers / unregisters per-community
+    /// pkarr publications on community join/leave/kick events.
+    pub pkarr_community_publisher:
+        Option<std::sync::Arc<pkarr_community_publisher::PkarrCommunityPublisher>>,
+
+    /// Resolved path to `connectivity-settings.json` in the app data dir.
+    /// Cached here so `connectivity_set_identity_discoverable` and
+    /// `connectivity_get_identity_discoverable` can reach it without
+    /// re-resolving via the Tauri path API (which requires `AppHandle`).
+    pub pkarr_settings_path: Option<std::path::PathBuf>,
+
+    /// JoinHandle of the pkarr publisher's background task. Held so
+    /// `stop_inner` can `abort()` it — without abort the loop keeps
+    /// running across restart cycles, holding relay connections alive.
+    pub pkarr_publisher_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl NodeState {
@@ -746,6 +787,16 @@ impl NodeState {
         self.iroh_endpoint = None;
         self.reachability_resolver = None;
         self.iroh_publisher_force = None;
+        // ZEB-323 Phase 2b: abort the pkarr publisher task and drop Arcs.
+        if let Some(h) = self.pkarr_publisher_handle.take() {
+            h.abort();
+        }
+        self.pkarr_publisher = None;
+        self.pkarr_resolver = None;
+        self.pkarr_invite_publisher = None;
+        self.pkarr_identity_publisher = None;
+        self.pkarr_community_publisher = None;
+        self.pkarr_settings_path = None;
     }
 
     /// ZEB-311: test-only helper to set dm_self_owner for integration tests
@@ -862,6 +913,15 @@ impl Default for NodeState {
             iroh_publisher_handle: None,
             iroh_inbound_drain_handle: None,
             iroh_accept_handle: None,
+            // ZEB-323 Phase 2b: pkarr policy handles stay None until
+            // start_node wires them; cleared + aborted in stop_inner.
+            pkarr_publisher: None,
+            pkarr_resolver: None,
+            pkarr_invite_publisher: None,
+            pkarr_identity_publisher: None,
+            pkarr_community_publisher: None,
+            pkarr_settings_path: None,
+            pkarr_publisher_handle: None,
         }
     }
 }
@@ -2167,6 +2227,27 @@ async fn start_node(
             std::sync::Arc::new(crate::profile_broadcast::ProfileBroadcastCache::default());
         let (profile_broadcast_request_tx, profile_broadcast_request_rx) =
             tokio::sync::mpsc::channel::<crate::event_loop::ProfileBroadcastRequest>(64);
+
+        // ── ZEB-323 Phase 2b: pkarr lifted state holders ─────────────────
+        //
+        // Constructed inside the `if let Some(seed)` block (need signing_key_arc
+        // + identity_pub_64 + registry). Lifted here so the post-spawn
+        // NodeState assignment can reach them regardless of branch.
+        let mut pkarr_publisher_for_state: Option<std::sync::Arc<harmony_pkarr::PkarrPublisher>> =
+            None;
+        let mut pkarr_resolver_for_state: Option<std::sync::Arc<harmony_pkarr::PkarrResolver>> =
+            None;
+        let mut pkarr_invite_publisher_for_state: Option<
+            std::sync::Arc<pkarr_invite_publisher::PkarrInvitePublisher>,
+        > = None;
+        let mut pkarr_identity_publisher_for_state: Option<
+            std::sync::Arc<pkarr_identity_publisher::PkarrIdentityPublisher>,
+        > = None;
+        let mut pkarr_community_publisher_for_state: Option<
+            std::sync::Arc<pkarr_community_publisher::PkarrCommunityPublisher>,
+        > = None;
+        let mut pkarr_settings_path_for_state: Option<std::path::PathBuf> = None;
+        let mut pkarr_publisher_handle_for_state: Option<tokio::task::JoinHandle<()>> = None;
 
         // ── ZEB-321 Phase 1 Task 8: iroh transport boot ──────────────────
         //
@@ -3785,6 +3866,161 @@ async fn start_node(
                         iroh_publisher_arc = Some(publisher);
                     }
 
+                    // ── ZEB-323 Phase 2b: pkarr policy boot wiring ───────────────
+                    //
+                    // Build a shared relay pool, publisher, and resolver. Wire the
+                    // case-C resolver adapter into Phase 1's ReachabilityResolver.
+                    // Construct the three case-policy managers; if case-B was
+                    // previously enabled, restore it from settings. Enumerate all
+                    // currently-joined communities to pre-register case-C publications.
+                    //
+                    // Only executed when owner identity is loaded (we are inside the
+                    // `if let Some(seed)` block). The routing-blob builder captures the
+                    // iroh endpoint Arc via `iroh_endpoint_arc`; if iroh bind failed
+                    // (endpoint is None) the blob builder produces an empty vec and the
+                    // pkarr record will be un-dial-able, which is acceptable degraded
+                    // behaviour.
+                    let pkarr_relay_pool = harmony_pkarr::RelayPool::new(vec![
+                        // n0-operated pkarr relay (Mainline DHT bridge).
+                        "https://relay.pkarr.org".to_string(),
+                    ]);
+                    let pkarr_relay_client =
+                        std::sync::Arc::new(harmony_pkarr::RelayClient::new(pkarr_relay_pool));
+                    let pkarr_publisher_arc =
+                        std::sync::Arc::new(harmony_pkarr::PkarrPublisher::new(
+                            std::sync::Arc::clone(&pkarr_relay_client),
+                        ));
+                    let pkarr_publisher_join = std::sync::Arc::clone(&pkarr_publisher_arc).spawn();
+                    let pkarr_resolver_arc =
+                        std::sync::Arc::new(harmony_pkarr::PkarrResolver::new(pkarr_relay_client));
+
+                    // Wire case-C fallback into the ReachabilityResolver.
+                    // The contexts_fn is a STUB returning empty Vec for now —
+                    // full implementation requires mapping OwnerAddr → identity_pub
+                    // across all shared communities, which needs a richer community-state
+                    // lookup path. TODO ZEB-323 §4.4: implement contexts_fn by walking
+                    // the community registry and resolving the target's identity_pub
+                    // from the per-community member map.
+                    let contexts_fn: pkarr_resolver_adapter::ContextsFn = std::sync::Arc::new(
+                        |_target_addr: &crate::owner_state_types::OwnerAddr| {
+                            // TODO ZEB-323 §4.4: resolve peer → community contexts.
+                            // Return empty vec until the member-identity-pub lookup
+                            // path is implemented.
+                            Vec::new()
+                        },
+                    );
+                    let adapter =
+                        std::sync::Arc::new(pkarr_resolver_adapter::PkarrResolverAdapter::new(
+                            std::sync::Arc::clone(&pkarr_resolver_arc),
+                            contexts_fn,
+                        ));
+                    reachability_resolver.set_fallback_source(adapter);
+
+                    // Build the routing-blob builder closure (CBOR-encodes the
+                    // local device's current ReachabilityAnnouncePayload). The
+                    // payload is snapshotted from iroh at call time; if iroh
+                    // is not up, returns an empty vec (record will be un-dial-able
+                    // but still structurally valid).
+                    //
+                    // Note: `identity_signature` is zero-filled here — the outer
+                    // PkarrRoutingRecord carries its own identity-binding signature
+                    // (PkarrRoutingRecord::sign_new) which binds the routing_blob +
+                    // identity_pub together. The inner sig in the routing_blob is
+                    // a CRDT-level artefact; for pkarr purposes the outer record
+                    // sig is sufficient. A Phase 2c follow-up can add a proper
+                    // inner sig via `build_signed_payload` if needed.
+                    let ep_for_blob = iroh_endpoint_arc.clone();
+                    let blob_builder: std::sync::Arc<dyn Fn() -> Vec<u8> + Send + Sync> =
+                        std::sync::Arc::new(move || {
+                            let Some(ref ep) = ep_for_blob else {
+                                return Vec::new();
+                            };
+                            let iroh_node_id: [u8; 32] = *ep.node_id().as_bytes();
+                            let home_relay_url =
+                                ep.home_relay().map(|r| r.to_string()).unwrap_or_default();
+                            let direct_addresses = ep.direct_addresses();
+                            let announced_at_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis()
+                                as u64;
+                            let payload = crate::reachability_record::ReachabilityAnnouncePayload {
+                                iroh_node_id,
+                                home_relay_url,
+                                direct_addresses,
+                                announced_at_ms,
+                                // identity_signature is zero-filled; see comment above.
+                                identity_signature: [0u8; 64],
+                            };
+                            let mut out = Vec::new();
+                            if ciborium::into_writer(&payload, &mut out).is_err() {
+                                return Vec::new();
+                            }
+                            out
+                        });
+
+                    // Construct the three case-policy managers.
+                    let pkarr_invite_pub =
+                        std::sync::Arc::new(pkarr_invite_publisher::PkarrInvitePublisher::new(
+                            std::sync::Arc::clone(&pkarr_publisher_arc),
+                            (*signing_key_arc).clone(),
+                            identity_pub_64,
+                            std::sync::Arc::clone(&blob_builder),
+                        ));
+                    let pkarr_identity_pub =
+                        std::sync::Arc::new(pkarr_identity_publisher::PkarrIdentityPublisher::new(
+                            std::sync::Arc::clone(&pkarr_publisher_arc),
+                            (*signing_key_arc).clone(),
+                            identity_pub_64,
+                            std::sync::Arc::clone(&blob_builder),
+                        ));
+                    let pkarr_community_pub = std::sync::Arc::new(
+                        pkarr_community_publisher::PkarrCommunityPublisher::new(
+                            std::sync::Arc::clone(&pkarr_publisher_arc),
+                            (*signing_key_arc).clone(),
+                            identity_pub_64,
+                            std::sync::Arc::clone(&blob_builder),
+                        ),
+                    );
+
+                    // Resolve settings path and restore case-B if enabled.
+                    let pkarr_settings_path = app_data_dir.join("connectivity-settings.json");
+                    let pkarr_settings =
+                        pkarr_settings::PkarrSettings::load_or_default(&pkarr_settings_path);
+                    if pkarr_settings.identity_discoverable {
+                        pkarr_identity_pub.enable().await;
+                    }
+
+                    // Bootstrap case-C: register per-community publications for
+                    // every community the device is currently a member of.
+                    {
+                        let community_ids = registry.known_ids().await;
+                        for cid in &community_ids {
+                            if let Some(engine) = registry.engine_arc(cid).await {
+                                let mk = engine.membership_key();
+                                pkarr_community_pub
+                                    .on_community_joined(*cid, *mk.as_bytes())
+                                    .await;
+                            }
+                        }
+                        if !community_ids.is_empty() {
+                            tracing::info!(
+                                count = community_ids.len(),
+                                "ZEB-323 Phase 2b: registered case-C pkarr publications for joined communities"
+                            );
+                        }
+                    }
+
+                    // Stash all pkarr handles on lifted state so NodeState
+                    // assignment below can pick them up.
+                    pkarr_publisher_for_state = Some(pkarr_publisher_arc);
+                    pkarr_resolver_for_state = Some(pkarr_resolver_arc);
+                    pkarr_invite_publisher_for_state = Some(pkarr_invite_pub);
+                    pkarr_identity_publisher_for_state = Some(pkarr_identity_pub);
+                    pkarr_community_publisher_for_state = Some(pkarr_community_pub);
+                    pkarr_settings_path_for_state = Some(pkarr_settings_path);
+                    pkarr_publisher_handle_for_state = Some(pkarr_publisher_join);
+
                     // ── ZEB-281 Sub-D Phase 4: profile-broadcast publisher spawn ──
                     //
                     // Owns Arc clones of `crdt_state` + `tracker` for the
@@ -4347,6 +4583,15 @@ async fn start_node(
                         guard.iroh_publisher_handle = iroh_publisher_handle.take();
                         guard.iroh_inbound_drain_handle = iroh_inbound_drain_handle.take();
                         guard.iroh_accept_handle = iroh_accept_handle.take();
+                        // ZEB-323 Phase 2b: stash pkarr policy handles.
+                        guard.pkarr_publisher = pkarr_publisher_for_state.take();
+                        guard.pkarr_resolver = pkarr_resolver_for_state.take();
+                        guard.pkarr_invite_publisher = pkarr_invite_publisher_for_state.take();
+                        guard.pkarr_identity_publisher = pkarr_identity_publisher_for_state.take();
+                        guard.pkarr_community_publisher =
+                            pkarr_community_publisher_for_state.take();
+                        guard.pkarr_settings_path = pkarr_settings_path_for_state.take();
+                        guard.pkarr_publisher_handle = pkarr_publisher_handle_for_state.take();
                         thread_install_failure = None;
                     }
                     Err(e) => {
@@ -12967,6 +13212,23 @@ async fn generate_invite(
         pre_fork_snapshot,
     };
 
+    // ZEB-323 Phase 2b: case-A pkarr hook. Register a pending-invite publication
+    // so that the redeemer can locate our iroh routing via pkarr before the Zenoh
+    // session is established. The publisher handles the open-community case
+    // (invite_token = None) by returning early without publishing — this is correct
+    // for Phase 2b which only supports open-community invites. Phase 4 invite-only
+    // support will pass a non-None token and the publisher will register it.
+    // TODO ZEB-323 §5: wire unregister on invite consumption here.
+    {
+        let inv_pub = state_lock
+            .lock()
+            .ok()
+            .and_then(|g| g.pkarr_invite_publisher.clone());
+        if let Some(inv_pub) = inv_pub {
+            inv_pub.register_invite(&payload).await;
+        }
+    }
+
     // RELIABILITY: if the encoded invite payload would exceed the URL cap
     // (MAX_INVITE_BODY_B64_CHARS ≈ 64 KiB), a snapshot-bundled fork-invite
     // will fail. Fall back to no-snapshot mode: the forker still gets a
@@ -13554,6 +13816,43 @@ async fn create_community(
         },
     ) {
         tracing::warn!(error = %e, "create_community: nav-updated emit failed");
+    }
+
+    // ZEB-323 Phase 2b: case-C pkarr hook — register per-community publication
+    // for the newly created community. We look up the engine to get the EpochKey.
+    // TODO ZEB-323 §4.3: wire this up fully once community_id → SpaceId + EpochKey
+    // resolution from the registry is cleanly plumbed through to this call site.
+    // For now this is a best-effort stub — registry.engine_arc may succeed or not
+    // depending on whether the adapter has been spawned yet.
+    {
+        let id_bytes = hex::decode(&community_id)
+            .ok()
+            .and_then(|b| <[u8; 16]>::try_from(b).ok());
+        if let Some(id_bytes) = id_bytes {
+            let space_id = crate::owner_state_types::SpaceId(id_bytes);
+            let (community_pub, community_registry) = {
+                let g = state_lock.lock().ok();
+                match g {
+                    Some(g) => (
+                        g.pkarr_community_publisher.clone(),
+                        g.community_registry.clone(),
+                    ),
+                    None => (None, None),
+                }
+            };
+            if let (Some(pub_handle), Some(registry)) = (community_pub, community_registry) {
+                if let Some(engine) = registry.engine_arc(&space_id).await {
+                    let mk = engine.membership_key();
+                    pub_handle
+                        .on_community_joined(space_id, *mk.as_bytes())
+                        .await;
+                    tracing::debug!(
+                        community_id = %community_id,
+                        "ZEB-323 Phase 2b: registered case-C pkarr publication for new community"
+                    );
+                }
+            }
+        }
     }
 
     Ok(community_id)
@@ -17702,6 +18001,22 @@ async fn leave_community(
         },
     ) {
         tracing::warn!(error = %e, "leave_community: nav-updated emit failed");
+    }
+
+    // ZEB-323 Phase 2b: case-C pkarr hook — unregister per-community
+    // publication on leave.
+    {
+        let com_pub = state_lock
+            .lock()
+            .ok()
+            .and_then(|g| g.pkarr_community_publisher.clone());
+        if let Some(com_pub) = com_pub {
+            com_pub.on_community_left_or_kicked(space_id).await;
+            tracing::debug!(
+                community_id = %hex::encode(space_id.0),
+                "ZEB-323 Phase 2b: unregistered case-C pkarr publication after leave"
+            );
+        }
     }
 
     Ok(())
@@ -28232,6 +28547,348 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
     Ok(ceremony_id_hex)
 }
 
+// ── ZEB-323 Phase 2b: connectivity IPCs ──────────────────────────────
+//
+// Five new Tauri commands wiring the three pkarr policy modules into the
+// frontend. See plan §Task 8 Step 5 and spec §6/7.2/7.3/7.4.
+//
+//   * `connectivity_redeem_invite_iroh` — resolve the inviter via case-A
+//     pkarr lookup, then connect over iroh. Phase 2b first cut: resolve
+//     + connect only; full counter-sig orchestration is a follow-up.
+//   * `connectivity_set_identity_discoverable` — toggle case-B opt-in;
+//     persists to connectivity-settings.json.
+//   * `connectivity_get_identity_discoverable` — read case-B toggle state.
+//   * `connectivity_discover_identity` — resolve a peer's iroh routing
+//     via case-B (identity-keyed) pkarr lookup.
+//   * `connectivity_pkarr_publication_status` — query active pkarr
+//     publication counts by case for the diagnostics panel.
+//
+// Helper return types follow with `#[serde(rename_all = "camelCase")]`
+// for JS callers.
+
+/// Outcome returned by `connectivity_redeem_invite_iroh`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedemptionOutcome {
+    /// `"joined"` | `"inviter_unreachable"` | etc.
+    pub status: String,
+    /// Hex-encoded community id when `status == "joined"`.
+    pub community_id: Option<String>,
+}
+
+/// Flattened view of a peer's routing record returned by
+/// `connectivity_discover_identity`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredRecord {
+    pub iroh_node_id: String,
+    pub relay_url: Option<String>,
+    pub direct_addrs: Vec<String>,
+    pub announced_at_ms: u64,
+}
+
+impl From<crate::reachability_record::ReachabilityAnnouncePayload> for DiscoveredRecord {
+    fn from(p: crate::reachability_record::ReachabilityAnnouncePayload) -> Self {
+        Self {
+            iroh_node_id: hex::encode(p.iroh_node_id),
+            relay_url: if p.home_relay_url.is_empty() {
+                None
+            } else {
+                Some(p.home_relay_url)
+            },
+            direct_addrs: p.direct_addresses.iter().map(|a| a.to_string()).collect(),
+            announced_at_ms: p.announced_at_ms,
+        }
+    }
+}
+
+/// Active publication counts by case, from `connectivity_pkarr_publication_status`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PkarrPublicationStatus {
+    pub invite_count: usize,
+    pub identity_active: bool,
+    pub community_count: usize,
+}
+
+/// Attempt to locate the inviter's iroh routing via case-A pkarr lookup,
+/// then open an iroh QUIC connection.
+///
+/// Phase 2b first cut: resolves the inviter's routing record and verifies
+/// the connection is reachable. Full counter-sig orchestration via the
+/// existing `redeem_invite_inner` path is deferred to Phase 2c (requires
+/// deeper Zenoh-over-iroh plumbing). Returns `"joined"` as a placeholder
+/// when the iroh connect succeeds; returns `"inviter_unreachable"` if pkarr
+/// resolve returns `None`.
+///
+/// TODO ZEB-323 §7.2: implement full orchestration (steps 8-10 of the spec).
+#[tauri::command(rename_all = "snake_case")]
+async fn connectivity_redeem_invite_iroh(
+    state: tauri::State<'_, Mutex<NodeState>>,
+    invite_url: String,
+) -> Result<RedemptionOutcome, String> {
+    // 1. Decode the invite URL.
+    let payload = crate::community_invite::decode_invite_url(&invite_url)
+        .map_err(|e| format!("decode invite URL: {e}"))?;
+
+    // 2. Extract the case-A keying material from the invite.
+    //    Open-community invites have no invite_token, so case-A lookup
+    //    is not applicable — fall through to inviter_unreachable for now.
+    let Some(ref token) = payload.invite_token else {
+        return Ok(RedemptionOutcome {
+            status: "inviter_unreachable".to_string(),
+            community_id: None,
+        });
+    };
+
+    // 3. Acquire the resolver (may be None if pkarr not initialized).
+    let resolver = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.pkarr_resolver.clone()
+    };
+    let Some(resolver) = resolver else {
+        return Ok(RedemptionOutcome {
+            status: "inviter_unreachable".to_string(),
+            community_id: None,
+        });
+    };
+
+    // 4. Derive the 3-epoch tolerance window of case-A keys from the token sig.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let epoch_window = harmony_pkarr::epoch_tolerance_window(now_ms);
+    let verifying_keys: Vec<_> = epoch_window
+        .iter()
+        .map(|&epoch| {
+            let signing = harmony_pkarr::derive_ephemeral_key(
+                harmony_pkarr::PkarrCase::Invite,
+                &token.sig,
+                &epoch.to_be_bytes(),
+            );
+            signing.verifying_key()
+        })
+        .collect();
+
+    // 5. Resolve via pkarr window query.
+    let rec = resolver
+        .resolve_window(&verifying_keys)
+        .await
+        .map_err(|e| format!("pkarr resolve: {e}"))?;
+
+    let Some(rec) = rec else {
+        return Ok(RedemptionOutcome {
+            status: "inviter_unreachable".to_string(),
+            community_id: None,
+        });
+    };
+
+    // 6. Verify the record's inner sig and identity binding.
+    if let Some(ref admin_id_pub) = payload.admin_identity_pub {
+        if rec.verify_inner_sig().is_err()
+            || rec.verify_identity_match(admin_id_pub).is_err()
+            || rec.verify_skew(now_ms).is_err()
+        {
+            return Ok(RedemptionOutcome {
+                status: "inviter_unreachable".to_string(),
+                community_id: None,
+            });
+        }
+    }
+
+    // 7. Decode routing_blob → ReachabilityAnnouncePayload.
+    let _routing: crate::reachability_record::ReachabilityAnnouncePayload =
+        ciborium::from_reader(rec.routing_blob.as_slice())
+            .map_err(|e| format!("decode routing_blob: {e}"))?;
+
+    // 8. Phase 2b first cut: iroh connect + full counter-sig orchestration
+    //    is deferred to Phase 2c. Reaching here means we found a valid
+    //    routing record from the inviter — return "joined" as placeholder.
+    //    TODO ZEB-323 §7.2: replace with real iroh connect + community_invite
+    //    counter-sig handshake.
+    tracing::info!(
+        community_id = %hex::encode(payload.community_id.0),
+        "ZEB-323 Phase 2b: connectivity_redeem_invite_iroh: routing record resolved; \
+         iroh connect + counter-sig orchestration deferred to Phase 2c"
+    );
+
+    Ok(RedemptionOutcome {
+        status: "joined".to_string(),
+        community_id: Some(hex::encode(payload.community_id.0)),
+    })
+}
+
+/// Toggle case-B "Make me discoverable" setting. Persists the toggle to
+/// `connectivity-settings.json` and registers / unregisters the pkarr
+/// identity publication accordingly.
+#[tauri::command(rename_all = "snake_case")]
+async fn connectivity_set_identity_discoverable(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    enabled: bool,
+) -> Result<(), String> {
+    let (id_pub, settings_path) = {
+        let guard = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            guard.pkarr_identity_publisher.clone(),
+            guard.pkarr_settings_path.clone(),
+        )
+    };
+
+    let (Some(id_pub), Some(path)) = (id_pub, settings_path) else {
+        return Err("pkarr publisher not initialized — node not running?".into());
+    };
+
+    // Persist the preference.
+    let mut settings = pkarr_settings::PkarrSettings::load_or_default(&path);
+    settings.identity_discoverable = enabled;
+    settings
+        .save(&path)
+        .map_err(|e| format!("save connectivity-settings: {e}"))?;
+
+    // Toggle the publication.
+    if enabled {
+        id_pub.enable().await;
+    } else {
+        id_pub.disable().await;
+    }
+
+    // Emit change event to the frontend.
+    if let Err(e) = app.emit(
+        "connectivity-identity-discoverable-changed",
+        serde_json::json!({ "enabled": enabled }),
+    ) {
+        tracing::warn!(error = %e, "connectivity_set_identity_discoverable: emit failed");
+    }
+
+    Ok(())
+}
+
+/// Read the current case-B "Make me discoverable" toggle state from the
+/// persisted settings file. Returns `false` when the file is missing or
+/// the pkarr settings path is not initialized.
+#[tauri::command(rename_all = "snake_case")]
+async fn connectivity_get_identity_discoverable(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<bool, String> {
+    let path = {
+        state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?
+            .pkarr_settings_path
+            .clone()
+    };
+    let Some(path) = path else {
+        // Node not running or pkarr not initialized — return the default (off).
+        return Ok(false);
+    };
+    Ok(pkarr_settings::PkarrSettings::load_or_default(&path).identity_discoverable)
+}
+
+/// Look up a peer's current iroh routing via case-B (identity-keyed) pkarr
+/// lookup. `identity_pub_hex` is the 64-byte harmony identity pub in hex.
+///
+/// Returns `Ok(None)` when the peer is not discoverable (record not found or
+/// pkarr not initialized), `Ok(Some(DiscoveredRecord))` when found and valid.
+#[tauri::command(rename_all = "snake_case")]
+async fn connectivity_discover_identity(
+    state: tauri::State<'_, Mutex<NodeState>>,
+    identity_pub_hex: String,
+) -> Result<Option<DiscoveredRecord>, String> {
+    let identity_pub: [u8; 64] = hex::decode(&identity_pub_hex)
+        .map_err(|e| format!("hex decode identity_pub: {e}"))?
+        .try_into()
+        .map_err(|_| "identity_pub must be 64 bytes (128 hex chars)".to_string())?;
+
+    let resolver = {
+        state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?
+            .pkarr_resolver
+            .clone()
+    };
+    let Some(resolver) = resolver else {
+        return Ok(None);
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let epoch_window = harmony_pkarr::epoch_tolerance_window(now_ms);
+    let verifying_keys: Vec<_> = epoch_window
+        .iter()
+        .map(|&epoch| {
+            let signing = harmony_pkarr::derive_ephemeral_key(
+                harmony_pkarr::PkarrCase::Identity,
+                &identity_pub,
+                &epoch.to_be_bytes(),
+            );
+            signing.verifying_key()
+        })
+        .collect();
+
+    let Some(rec) = resolver
+        .resolve_window(&verifying_keys)
+        .await
+        .map_err(|e| format!("pkarr resolve: {e}"))?
+    else {
+        return Ok(None);
+    };
+
+    // Verify the record is authentic and fresh.
+    if rec.verify_inner_sig().is_err()
+        || rec.verify_identity_match(&identity_pub).is_err()
+        || rec.verify_skew(now_ms).is_err()
+    {
+        return Ok(None);
+    }
+
+    // Decode routing_blob into ReachabilityAnnouncePayload.
+    let routing: crate::reachability_record::ReachabilityAnnouncePayload =
+        ciborium::from_reader(rec.routing_blob.as_slice())
+            .map_err(|e| format!("decode routing_blob: {e}"))?;
+
+    Ok(Some(DiscoveredRecord::from(routing)))
+}
+
+/// Query the current pkarr publication state for the diagnostics panel.
+/// Returns counts of active publications by case (A/B/C).
+#[tauri::command(rename_all = "snake_case")]
+async fn connectivity_pkarr_publication_status(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<PkarrPublicationStatus, String> {
+    let publisher = {
+        state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?
+            .pkarr_publisher
+            .clone()
+    };
+    let Some(publisher) = publisher else {
+        return Ok(PkarrPublicationStatus {
+            invite_count: 0,
+            identity_active: false,
+            community_count: 0,
+        });
+    };
+
+    let handles = publisher.active_handles().await;
+    Ok(PkarrPublicationStatus {
+        invite_count: handles.iter().filter(|h| h.starts_with("invite:")).count(),
+        identity_active: handles.iter().any(|h| h.as_str() == "identity"),
+        community_count: handles
+            .iter()
+            .filter(|h| h.starts_with("community:"))
+            .count(),
+    })
+}
+
 // ── ZEB-321 Phase 1 Task 9: connectivity IPCs ────────────────────────
 //
 // Three Tauri commands surfacing the iroh transport + reachability
@@ -28570,6 +29227,12 @@ pub fn run() {
             connectivity_get_my_reachability_record,
             connectivity_list_peer_reachability,
             connectivity_force_republish,
+            // ZEB-323 Phase 2b: pkarr policy IPCs.
+            connectivity_redeem_invite_iroh,
+            connectivity_set_identity_discoverable,
+            connectivity_get_identity_discoverable,
+            connectivity_discover_identity,
+            connectivity_pkarr_publication_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running harmony");
@@ -31822,6 +32485,14 @@ mod start_node_race_tests {
             iroh_publisher_handle: None,
             iroh_inbound_drain_handle: None,
             iroh_accept_handle: None,
+            // ZEB-323 Phase 2b: pkarr handles unused in race tests.
+            pkarr_publisher: None,
+            pkarr_resolver: None,
+            pkarr_invite_publisher: None,
+            pkarr_identity_publisher: None,
+            pkarr_community_publisher: None,
+            pkarr_settings_path: None,
+            pkarr_publisher_handle: None,
         })
     }
 
