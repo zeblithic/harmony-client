@@ -29346,6 +29346,15 @@ pub struct HandshakeDialConfig {
     /// (acceptor's CBOR-encoded JoinCountersign). Replaces the
     /// previous direct `std::env::var` read at the call site.
     pub response_read_timeout: std::time::Duration,
+    /// Timeout for the dialer's request writes (length-prefix +
+    /// packet body) and `send.finish()`. ZEB-325 PR #159 R3-2
+    /// (Cursor MEDIUM): previously unbounded — the dial / open_bi /
+    /// response-read awaits were all wrapped, but the request send
+    /// path wasn't, so a misbehaving acceptor's flow-control freeze
+    /// could pin the dialer indefinitely. Production override:
+    /// `HARMONY_INVITE_HANDSHAKE_WRITE_TIMEOUT_MS` (defaults to
+    /// 30_000ms; clamped to >= 1ms).
+    pub write_timeout: std::time::Duration,
 }
 
 impl Default for HandshakeDialConfig {
@@ -29354,6 +29363,7 @@ impl Default for HandshakeDialConfig {
             connect_timeout: std::time::Duration::from_millis(30_000),
             open_bi_timeout: std::time::Duration::from_millis(30_000),
             response_read_timeout: std::time::Duration::from_millis(30_000),
+            write_timeout: std::time::Duration::from_millis(30_000),
         }
     }
 }
@@ -29362,6 +29372,10 @@ impl HandshakeDialConfig {
     /// Production constructor: reads `HARMONY_INVITE_HANDSHAKE_TIMEOUT_MS`
     /// (the historical single-knob env var) and applies it uniformly to
     /// connect, open_bi, and response read. Unset / unparseable → 30s.
+    /// The write-side timeout uses a dedicated
+    /// `HARMONY_INVITE_HANDSHAKE_WRITE_TIMEOUT_MS` knob (added in
+    /// ZEB-325 PR #159 R3-2) so operators can tune request-send
+    /// resilience independently from the read budget.
     ///
     /// ZEB-325 PR #159 R3: clamp to >= 1ms. A zero from env override
     /// would otherwise produce instant `tokio::time::timeout(0, …)`
@@ -29374,10 +29388,17 @@ impl HandshakeDialConfig {
             .unwrap_or(30_000)
             .max(1);
         let d = std::time::Duration::from_millis(ms);
+        let write_ms: u64 = std::env::var("HARMONY_INVITE_HANDSHAKE_WRITE_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30_000)
+            .max(1);
+        let write_d = std::time::Duration::from_millis(write_ms);
         Self {
             connect_timeout: d,
             open_bi_timeout: d,
             response_read_timeout: d,
+            write_timeout: write_d,
         }
     }
 }
@@ -29597,13 +29618,32 @@ async fn connectivity_redeem_invite_iroh(
     // `connectivity-invite-resolution-progress` Tauri event so
     // `RedeemInviteDialog.svelte`'s `onResolutionProgress` listener can
     // surface the redemption stage to the user. ZEB-325 Phase 2c Task 4.
-    let app_for_emit = app.clone();
+    let app_for_progress_emit = app.clone();
     let progress_sink = move |payload: ResolutionProgressPayload| {
-        if let Err(e) = app_for_emit.emit("connectivity-invite-resolution-progress", &payload) {
+        if let Err(e) =
+            app_for_progress_emit.emit("connectivity-invite-resolution-progress", &payload)
+        {
             tracing::warn!(
                 error = %e,
                 stage = ?payload.stage,
                 "connectivity_redeem_invite_iroh: emit progress failed"
+            );
+        }
+    };
+
+    // ZEB-325 PR #159 R3-1 (Cursor HIGH): emit `nav-updated` after a
+    // successful iroh-borne redemption so the sidebar / community list
+    // refreshes without requiring the RedeemInviteDialog to drive a
+    // frontend-side refresh on its own. Mirrors the Reticulum
+    // `redeem_invite` IPC's emit at lib.rs:15829, just sourced from
+    // inside the inner where we still own the dto. Tests pass a no-op
+    // closure (no AppHandle to drive).
+    let app_for_nav_emit = app.clone();
+    let nav_emit_sink = move |payload: NavUpdatedPayload| {
+        if let Err(e) = app_for_nav_emit.emit("nav-updated", &payload) {
+            tracing::warn!(
+                error = %e,
+                "connectivity_redeem_invite_iroh: nav-updated emit failed"
             );
         }
     };
@@ -29659,6 +29699,7 @@ async fn connectivity_redeem_invite_iroh(
         channel_log_registry,
         crate::owner_commands::resolve_identity_dir().ok(),
         progress_sink,
+        nav_emit_sink,
         HandshakeDialConfig::from_env(),
         fence_check,
     )
@@ -29727,6 +29768,13 @@ pub async fn connectivity_redeem_invite_iroh_inner<R: tauri::Runtime, F>(
     >,
     identity_dir: Option<std::path::PathBuf>,
     progress_sink: impl Fn(ResolutionProgressPayload),
+    // ZEB-325 PR #159 R3-1 (Cursor HIGH): sink for the `nav-updated`
+    // Tauri event the wrapper IPC emits on a successful redeem. Mirrors
+    // the Reticulum `redeem_invite` IPC's emit at lib.rs:15829 so the
+    // sidebar refreshes without requiring `RedeemInviteDialog` to drive
+    // a frontend-side refresh. Tests pass a no-op closure (no
+    // AppHandle to drive).
+    nav_emit_sink: impl Fn(NavUpdatedPayload),
     // Per-await timeouts for the dialer side. ZEB-325 PR #159 F3 + F10:
     // previously read directly from `std::env::var` at the call site,
     // which made `connect()` and `open_bi()` unbounded and forced
@@ -30046,13 +30094,75 @@ where
     emit_stage(RedemptionStage::Sending);
 
     // 9. Write [u32 LE length-prefix][packet] then finish().
+    // ZEB-325 PR #159 R3-2 (Cursor MEDIUM): wrap both `write_all` calls
+    // in `tokio::time::timeout(dial_config.write_timeout, …)` so a
+    // misbehaving acceptor that freezes the flow-control window can't
+    // pin the dialer indefinitely. On timeout, surface
+    // `inviter_unreachable` and close the connection with a labelled
+    // CONNECTION_CLOSE for symmetry with the other timeout branches
+    // above. `send.finish()` is non-async (just signals end-of-stream
+    // locally on iroh 0.98); no timeout needed for it.
     let wire_len = wire.len() as u32;
-    send.write_all(&wire_len.to_le_bytes())
-        .await
-        .map_err(|e| format!("write length-prefix: {e}"))?;
-    send.write_all(&wire)
-        .await
-        .map_err(|e| format!("write packet body: {e}"))?;
+    let write_prefix = async {
+        send.write_all(&wire_len.to_le_bytes())
+            .await
+            .map_err(|e| format!("write length-prefix: {e}"))
+    };
+    match tokio::time::timeout(dial_config.write_timeout, write_prefix).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(
+                error = %e,
+                "ZEB-325 Phase 2c option A: handshake request length-prefix write failed"
+            );
+            conn.close(0u32.into(), b"request-write-failed");
+            return Ok(RedemptionOutcome {
+                status: "inviter_unreachable".to_string(),
+                community_id: None,
+            });
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                timeout_ms = dial_config.write_timeout.as_millis() as u64,
+                "ZEB-325 Phase 2c option A: handshake request length-prefix write timeout"
+            );
+            conn.close(0u32.into(), b"write-timeout");
+            return Ok(RedemptionOutcome {
+                status: "inviter_unreachable".to_string(),
+                community_id: None,
+            });
+        }
+    }
+    let write_body = async {
+        send.write_all(&wire)
+            .await
+            .map_err(|e| format!("write packet body: {e}"))
+    };
+    match tokio::time::timeout(dial_config.write_timeout, write_body).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(
+                error = %e,
+                "ZEB-325 Phase 2c option A: handshake request body write failed"
+            );
+            conn.close(0u32.into(), b"request-write-failed");
+            return Ok(RedemptionOutcome {
+                status: "inviter_unreachable".to_string(),
+                community_id: None,
+            });
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                timeout_ms = dial_config.write_timeout.as_millis() as u64,
+                "ZEB-325 Phase 2c option A: handshake request body write timeout"
+            );
+            conn.close(0u32.into(), b"write-timeout");
+            return Ok(RedemptionOutcome {
+                status: "inviter_unreachable".to_string(),
+                community_id: None,
+            });
+        }
+    }
     send.finish().map_err(|e| format!("send.finish: {e}"))?;
 
     // 10. Read response, bounded by dial_config.response_read_timeout.
@@ -30199,6 +30309,21 @@ where
             // Stage 5/5: `joined` — counter-signed Join applied, joiner
             // is now a community member.
             emit_stage(RedemptionStage::Joined);
+            // ZEB-325 PR #159 R3-1 (Cursor HIGH): surface the joined
+            // community to the nav listener so the sidebar updates
+            // automatically, mirroring the Reticulum `redeem_invite`
+            // IPC's emit at lib.rs:15829. Emit failure is non-fatal —
+            // the join already committed, and App.svelte still
+            // synthesizes from late events; we just log.
+            nav_emit_sink(NavUpdatedPayload {
+                action: "added",
+                space_id: dto.community_id.clone(),
+                kind: "community",
+                name: dto.community_name.clone(),
+                members: None,
+                parent_id: None,
+                pending: Some(dto.pending),
+            });
             Ok(RedemptionOutcome {
                 status: "joined".to_string(),
                 community_id: Some(dto.community_id),

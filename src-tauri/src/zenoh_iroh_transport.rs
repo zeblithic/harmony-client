@@ -245,7 +245,17 @@ impl IrohZenohLinkManager {
                         aged_out += 1;
                         continue;
                     }
-                    dispatcher_for_task.handle_connection(conn).await;
+                    // ZEB-325 PR #159 R3-3 (CodeRabbit MAJOR): spawn
+                    // each drained connection so a single slow
+                    // handshake can't block every later queued one
+                    // for its full IO+poll deadline (the dispatcher's
+                    // own per-connection timeouts from PR #159 R2/R3
+                    // bound each task's lifetime — fire-and-forget is
+                    // safe here, no JoinSet needed).
+                    let dispatcher_per_conn = Arc::clone(&dispatcher_for_task);
+                    tokio::spawn(async move {
+                        dispatcher_per_conn.handle_connection(conn).await;
+                    });
                     dispatched += 1;
                 }
                 tracing::info!(

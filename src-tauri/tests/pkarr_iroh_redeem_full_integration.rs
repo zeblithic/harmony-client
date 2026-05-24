@@ -566,6 +566,11 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             Arc::clone(&bob_channel_log_registry),
             None,
             |_| {},
+            // ZEB-325 PR #159 R3-1: no-op nav_emit_sink — the test
+            // doesn't drive an AppHandle, and the post-redeem nav-updated
+            // event is verified by the existing redeem_invite IPC test
+            // path (Reticulum), not here.
+            |_| {},
             // ZEB-325 PR #159 F3 + F10: explicit dial timeouts (replaces
             // the prior env-var read). 10s is more than enough for
             // loopback connect / open_bi / response read; the test still
@@ -574,6 +579,9 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
                 connect_timeout: Duration::from_millis(10_000),
                 open_bi_timeout: Duration::from_millis(10_000),
                 response_read_timeout: Duration::from_millis(10_000),
+                // ZEB-325 PR #159 R3-2: 10s budget for the request-
+                // side writes mirrors the other timeouts.
+                write_timeout: Duration::from_millis(10_000),
             },
             // No fence — integration test doesn't drive NodeState
             // generation; mirrors the |_| Ok(()) sentinel the inner

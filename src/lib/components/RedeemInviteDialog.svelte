@@ -82,13 +82,15 @@
       if (outcome.status === 'joined') {
         // ZEB-325 Phase 2c: full handshake completed (pkarr resolve →
         // iroh connect → PendingJoin → counter-signed Join applied). The
-        // backend has already mutated community state and the nav-updated
-        // event has fired, so the join is visible in the sidebar without
-        // any frontend-side refresh. Show the "Joined ✓" success label
-        // briefly, then dismiss the dialog via `onCancel` — same end
-        // state as the Reticulum path, which closes via the parent's
-        // `onSubmit` handler after `communityService.redeemInvite`
-        // resolves (see App.svelte ~line 1762).
+        // backend has already mutated community state and (per PR #159
+        // R3-1) emits the same `nav-updated` event the Reticulum
+        // `redeem_invite` IPC emits, so the join is visible in the
+        // sidebar without any frontend-side refresh. Show the
+        // "Joined ✓" success label briefly, then dismiss the dialog
+        // via `onCancel` — same end state as the Reticulum path,
+        // which closes via the parent's `onSubmit` handler after
+        // `communityService.redeemInvite` resolves (see App.svelte
+        // ~line 1762).
         //
         // Keep `irohPending` true across the display window so the
         // progress row (`{#if irohPending && irohStage}`) stays visible
