@@ -516,6 +516,8 @@ async fn connectivity_redeem_invite_iroh_completes_join_via_crdt_sync() {
             Arc::clone(&dm_outbox),
             Arc::clone(&channel_log_registry),
             None,
+            |_| {}, // No-op progress sink for this test (sequence covered by
+                    // connectivity_redeem_invite_iroh_emits_progress_events).
         )
         .await
         .expect("inner must Ok (it converts internal errors into outcome.status)");
@@ -546,4 +548,288 @@ async fn connectivity_redeem_invite_iroh_completes_join_via_crdt_sync() {
     .await;
 
     result.expect("Phase 2c end-to-end orchestration test timed out");
+}
+
+// ── ZEB-325 Phase 2c Task 4: progress-events test ──────────────────────────
+//
+// Asserts that connectivity_redeem_invite_iroh_inner emits the full
+// `resolving → connecting → sending → awaiting_countersig → joined`
+// sequence via the `progress_sink` callback. Test-strategy choice B from
+// the Task 4 plan: capture stages in a Vec via the sink rather than
+// mocking the AppHandle event bus — avoids needing a Tauri event
+// recorder and keeps the assertion direct.
+//
+// Reuses the full happy-path setup from the
+// `..._completes_join_via_crdt_sync` test above; both tests drive the
+// same orchestration but assert orthogonal properties.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connectivity_redeem_invite_iroh_emits_progress_events() {
+    let _timeout_guard = RedeemTimeoutGuard::set("500");
+
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = Arc::new(RelayClient::new(pool));
+
+        let publisher = Arc::new(PkarrPublisher::new(Arc::clone(&client)));
+        let _publisher_handle = Arc::clone(&publisher).spawn();
+
+        let alice_sk_raw = ed25519_dalek::SigningKey::from_bytes(&[0xaa; 32]);
+        let alice_sk = Arc::new(alice_sk_raw.clone());
+        let (alice_addr, alice_pub_64) = {
+            let x25519_priv = harmony_app::dm_signing::ed25519_priv_to_x25519(&alice_sk);
+            let x25519_pub =
+                x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*x25519_priv));
+            let ed25519_pub = alice_sk.verifying_key().to_bytes();
+            let mut combined = [0u8; 64];
+            combined[..32].copy_from_slice(x25519_pub.as_bytes());
+            combined[32..].copy_from_slice(&ed25519_pub);
+            let id = harmony_identity::Identity::from_public_bytes(&combined)
+                .expect("from_public_bytes (alice)");
+            (OwnerAddr(id.address_hash), combined)
+        };
+
+        let alice_iroh_node_id = [0xABu8; 32];
+        let routing_blob_builder = {
+            let iroh_id = alice_iroh_node_id;
+            Arc::new(move || {
+                let payload = ReachabilityAnnouncePayload {
+                    iroh_node_id: iroh_id,
+                    home_relay_url: "https://relay.test/".into(),
+                    direct_addresses: vec![],
+                    announced_at_ms: 1_700_000_000_000,
+                    identity_signature: [0xCDu8; 64],
+                };
+                let mut buf = Vec::new();
+                ciborium::into_writer(&payload, &mut buf).expect("encode routing_blob");
+                buf
+            })
+        };
+
+        let inv_pub = PkarrInvitePublisher::new(
+            Arc::clone(&publisher),
+            (*alice_sk).clone(),
+            alice_pub_64,
+            routing_blob_builder,
+        );
+
+        let joiner_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
+        let joiner_sk = signing_key_from_identity(&joiner_identity);
+        let (joiner_addr, joiner_pub_64) = {
+            let x25519_priv = harmony_app::dm_signing::ed25519_priv_to_x25519(&joiner_sk);
+            let x25519_pub =
+                x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*x25519_priv));
+            let ed25519_pub = joiner_sk.verifying_key().to_bytes();
+            let mut combined = [0u8; 64];
+            combined[..32].copy_from_slice(x25519_pub.as_bytes());
+            combined[32..].copy_from_slice(&ed25519_pub);
+            let id = harmony_identity::Identity::from_public_bytes(&combined)
+                .expect("from_public_bytes (joiner)");
+            (OwnerAddr(id.address_hash), combined)
+        };
+
+        let community_id = SpaceId([0xf6; 16]);
+        let membership_key = EpochKey::new([0x42; 32]);
+        let admin_bootstrap = {
+            let payload = harmony_app::community_membership::EventPayload {
+                id: [0x11; 16],
+                community_id,
+                kind: harmony_app::community_membership::MembershipEventKind::Join,
+                actor: alice_addr,
+                at: Hlc {
+                    wall_ms: 900,
+                    logical: 0,
+                    device_id: "alice-dev".into(),
+                },
+            };
+            harmony_app::community_membership::sign_event(&payload, alice_sk.as_ref())
+                .expect("sign admin bootstrap")
+        };
+
+        let token_minted_at = Hlc {
+            wall_ms: 950,
+            logical: 0,
+            device_id: "alice-dev".into(),
+        };
+        let placeholder_token = InviteToken {
+            inviter: alice_addr,
+            invitee_hint: Some(joiner_addr),
+            minted_at: token_minted_at.clone(),
+            expires_at: None,
+            sig: [0u8; 64],
+        };
+        let token_payload_bytes =
+            harmony_app::community_invite::canonical_invite_token_bytes(&placeholder_token)
+                .expect("canonical token bytes");
+        let token_sig: [u8; 64] = alice_sk.sign(&token_payload_bytes).to_bytes();
+        let invite_token = InviteToken {
+            inviter: alice_addr,
+            invitee_hint: Some(joiner_addr),
+            minted_at: token_minted_at,
+            expires_at: None,
+            sig: token_sig,
+        };
+
+        let sealed_epoch_key = {
+            let joiner_ed25519_pub32 = joiner_sk.verifying_key().to_bytes();
+            let x25519_pub = harmony_app::dm_signing::ed25519_pub_to_x25519(&joiner_ed25519_pub32)
+                .expect("ed25519→x25519");
+            harmony_app::dm_signing::seal_to_owner(&x25519_pub, membership_key.as_bytes())
+                .expect("seal epoch key")
+        };
+
+        let invite_payload = CommunityInvitePayload {
+            community_id,
+            epoch_snapshot: InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key,
+                state_snapshot: MaterializedCommunityState::default(),
+            },
+            admin_addr: alice_addr,
+            community_name: "Phase2cProgressCom".into(),
+            is_invite_only: true,
+            expires_at: None,
+            invite_token: Some(invite_token),
+            admin_bootstrap: Some(admin_bootstrap),
+            admin_identity_pub: Some(alice_pub_64),
+            forked_from: None,
+            pre_fork_snapshot: None,
+        };
+
+        inv_pub.register_invite(&invite_payload).await;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+
+        let (cas_op_tx, _cas_op_rx) = mpsc::channel(8);
+        let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx,
+            Duration::from_millis(1000),
+        ));
+        let community_registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+            device_id: "joiner-dev".into(),
+            content_store: cs,
+            identity_resolver: Arc::new(TwoOwnerResolver {
+                admin: alice_addr,
+                admin_pub: alice_pub_64,
+                joiner: joiner_addr,
+                joiner_pub: joiner_pub_64,
+            }),
+            identity_dir: tmp.path().to_path_buf(),
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            error_tx: None,
+            delta_tx: None,
+            self_owner: joiner_addr,
+            signing_key: Arc::clone(&joiner_sk),
+            crdt_state: None,
+            nav_emitter: None,
+        }));
+
+        let (community_adapter_tx, _community_adapter_rx) =
+            mpsc::channel::<CommunityAdapterRequest>(16);
+        let (unicast_send_tx, _unicast_rx) = mpsc::channel::<UnicastSendRequest>(16);
+
+        let dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
+            "joiner-dev".into(),
+            joiner_addr,
+            DeviceIdentityHash(joiner_addr.0),
+            Arc::clone(&joiner_sk),
+            Arc::new(joiner_identity),
+        )));
+
+        let (channel_log_adapter_tx, _channel_log_adapter_rx) =
+            mpsc::unbounded_channel::<ChannelLogAdapterRequest>();
+        let app = tauri::test::mock_app().handle().clone();
+        let channel_log_registry = Arc::new(ChannelLogRegistry::new(ChannelLogRegistryConfig {
+            adapter_request_tx: channel_log_adapter_tx,
+            app,
+            identity_dir: tmp.path().to_path_buf(),
+            self_owner: joiner_addr,
+            self_device_id: "joiner-dev".into(),
+            signing_key: Arc::clone(&joiner_sk),
+            engine_config: ChannelLogEngineConfig::default(),
+        }));
+
+        let crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
+        let hlc_tracker = Arc::new(TokioMutex::new(BTreeMap::new()));
+
+        let pkarr_resolver = Arc::new(PkarrResolver::new(Arc::clone(&client)));
+        let reachability_resolver = ReachabilityResolver::new();
+
+        let invite_url = harmony_app::community_invite::encode_invite_url(&invite_payload)
+            .expect("encode invite url");
+
+        // Wait for the pkarr record to appear (same logic as the
+        // ..._completes_join_via_crdt_sync test).
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_millis() as u64;
+        let epoch_id = current_epoch_id(now_ms);
+        let probe_signing =
+            derive_ephemeral_key(PkarrCase::Invite, &token_sig, &epoch_id.to_be_bytes());
+        let probe_verifying = probe_signing.verifying_key();
+        let mut record_visible = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Ok(Some(_)) = pkarr_resolver.resolve(&probe_verifying).await {
+                record_visible = true;
+                break;
+            }
+        }
+        assert!(
+            record_visible,
+            "pkarr record must appear within 5s before driving the IPC"
+        );
+
+        // ── Stage capture sink: pushes every emitted stage into a Vec. ──
+        let captured: Arc<std::sync::Mutex<Vec<harmony_app::RedemptionStage>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_sink = Arc::clone(&captured);
+        let progress_sink = move |payload: harmony_app::ResolutionProgressPayload| {
+            captured_for_sink
+                .lock()
+                .expect("captured mutex poisoned")
+                .push(payload.stage);
+        };
+
+        let outcome = harmony_app::connectivity_redeem_invite_iroh_inner(
+            invite_url,
+            Some(Arc::clone(&pkarr_resolver)),
+            Some(reachability_resolver.clone()),
+            Arc::clone(&crdt_state),
+            Arc::clone(&hlc_tracker),
+            "joiner-dev".to_string(),
+            joiner_addr,
+            Arc::clone(&joiner_sk),
+            Arc::clone(&community_registry),
+            community_adapter_tx,
+            unicast_send_tx,
+            Arc::clone(&dm_outbox),
+            Arc::clone(&channel_log_registry),
+            None,
+            progress_sink,
+        )
+        .await
+        .expect("inner must Ok");
+
+        assert_eq!(outcome.status, "joined", "happy path expected");
+
+        // Load-bearing: full 5-stage sequence in order.
+        let stages = captured.lock().expect("captured mutex poisoned").clone();
+        assert_eq!(
+            stages,
+            vec![
+                harmony_app::RedemptionStage::Resolving,
+                harmony_app::RedemptionStage::Connecting,
+                harmony_app::RedemptionStage::Sending,
+                harmony_app::RedemptionStage::AwaitingCountersig,
+                harmony_app::RedemptionStage::Joined,
+            ],
+            "expected resolving → connecting → sending → awaiting_countersig → joined"
+        );
+    })
+    .await;
+
+    result.expect("Phase 2c progress-events test timed out");
 }

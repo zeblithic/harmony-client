@@ -29061,6 +29061,53 @@ pub struct RedemptionOutcome {
     pub community_id: Option<String>,
 }
 
+/// Stage of an in-flight cross-WAN invite redemption, emitted from
+/// `connectivity_redeem_invite_iroh` via the
+/// `connectivity-invite-resolution-progress` event for staged UI in
+/// `RedeemInviteDialog.svelte`. ZEB-325 Phase 2c.
+///
+/// Serializes to the snake_case strings the frontend's `RedemptionStage`
+/// type union expects: `"resolving" | "connecting" | "sending" |
+/// "awaiting_countersig" | "joined"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedemptionStage {
+    /// pkarr window-resolve is in flight.
+    Resolving,
+    /// pkarr record verified, ReachabilityResolver seeded, iroh hole-punch
+    /// is about to be triggered by `redeem_invite_inner` via the link
+    /// manager.
+    Connecting,
+    /// `redeem_invite_inner` is about to be invoked — the PendingJoin will
+    /// ride CRDT sync over the iroh-borne Zenoh link.
+    Sending,
+    /// PendingJoin written; awaiting admin's counter-signed Join to arrive
+    /// back via state-root publish.
+    AwaitingCountersig,
+    /// Counter-signed Join received and applied — the joiner is now a
+    /// community member.
+    Joined,
+}
+
+/// Payload of the `connectivity-invite-resolution-progress` Tauri event.
+/// Matches the frontend `ResolutionProgressEvent` shape in
+/// `src/lib/types/connectivity.ts`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolutionProgressPayload {
+    /// Stable per-attempt identifier so the dialog can disambiguate
+    /// progress for parallel redemption attempts. Currently the
+    /// hex-encoded `invite_token.sig` (case-A invites only have this when
+    /// invite-only; open invites take an early-exit branch that emits no
+    /// progress).
+    pub invite_id: String,
+    /// Current stage of the redemption.
+    pub stage: RedemptionStage,
+    /// Attempt number within this redemption. Always 1 for now;
+    /// reserved for future retry-aware UI.
+    pub attempt_n: u32,
+}
+
 /// Flattened view of a peer's routing record returned by
 /// `connectivity_discover_identity`.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -29116,6 +29163,7 @@ pub struct PkarrPublicationStatus {
 /// only snapshots NodeState and delegates.
 #[tauri::command(rename_all = "snake_case")]
 async fn connectivity_redeem_invite_iroh(
+    app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
     invite_url: String,
 ) -> Result<RedemptionOutcome, String> {
@@ -29189,6 +29237,21 @@ async fn connectivity_redeem_invite_iroh(
         std::sync::Arc::clone(&outbox_g.signing_key)
     };
 
+    // Emit staged progress events on the
+    // `connectivity-invite-resolution-progress` Tauri event so
+    // `RedeemInviteDialog.svelte`'s `onResolutionProgress` listener can
+    // surface the redemption stage to the user. ZEB-325 Phase 2c Task 4.
+    let app_for_emit = app.clone();
+    let progress_sink = move |payload: ResolutionProgressPayload| {
+        if let Err(e) = app_for_emit.emit("connectivity-invite-resolution-progress", &payload) {
+            tracing::warn!(
+                error = %e,
+                stage = ?payload.stage,
+                "connectivity_redeem_invite_iroh: emit progress failed"
+            );
+        }
+    };
+
     connectivity_redeem_invite_iroh_inner(
         invite_url,
         pkarr_resolver,
@@ -29204,6 +29267,7 @@ async fn connectivity_redeem_invite_iroh(
         dm_outbox,
         channel_log_registry,
         crate::owner_commands::resolve_identity_dir().ok(),
+        progress_sink,
     )
     .await
 }
@@ -29242,10 +29306,34 @@ pub async fn connectivity_redeem_invite_iroh_inner<R: tauri::Runtime>(
         crate::community_channel_log_engine::ChannelLogRegistry<R>,
     >,
     identity_dir: Option<std::path::PathBuf>,
+    progress_sink: impl Fn(ResolutionProgressPayload),
 ) -> Result<RedemptionOutcome, String> {
     // 1. Decode the invite URL.
     let payload = crate::community_invite::decode_invite_url(&invite_url)
         .map_err(|e| format!("decode invite URL: {e}"))?;
+
+    // Derive a stable per-attempt id from the invite_token signature (or
+    // an empty string for invites that lack one — those take the
+    // missing-token early-exit branch immediately). Same id is threaded
+    // through every progress emission so the dialog can disambiguate
+    // parallel redemptions.
+    let invite_id = payload
+        .invite_token
+        .as_ref()
+        .map(|t| hex::encode(t.sig))
+        .unwrap_or_default();
+    let emit_stage = |stage: RedemptionStage| {
+        progress_sink(ResolutionProgressPayload {
+            invite_id: invite_id.clone(),
+            stage,
+            attempt_n: 1,
+        });
+    };
+
+    // Stage 1/5: `resolving` — function entry; pkarr lookup is about to
+    // start. Emitted before the case-A guards so the UI shows "looking
+    // up" even on early-exit paths (missing token, missing admin_id_pub).
+    emit_stage(RedemptionStage::Resolving);
 
     // 2. Extract the case-A keying material from the invite.
     //    Open-community invites have no invite_token, so case-A lookup
@@ -29330,6 +29418,13 @@ pub async fn connectivity_redeem_invite_iroh_inner<R: tauri::Runtime>(
         ciborium::from_reader(rec.routing_blob.as_slice())
             .map_err(|e| format!("decode routing_blob: {e}"))?;
 
+    // Stage 2/5: `connecting` — pkarr record verified + decoded. The next
+    // step seeds ReachabilityResolver and the iroh hole-punch (when
+    // redeem_invite_inner opens its first link to the inviter) can take
+    // 5-30s; covering that window with a "connecting" stage gives the
+    // user concrete progress instead of a stale "resolving" indicator.
+    emit_stage(RedemptionStage::Connecting);
+
     // 8. Seed ReachabilityResolver so IrohZenohLinkManager.new_link can
     //    open the iroh connection to the inviter on demand. The device
     //    hash is currently unused by `seed_from_pkarr`; pkarr records
@@ -29347,6 +29442,20 @@ pub async fn connectivity_redeem_invite_iroh_inner<R: tauri::Runtime>(
         "ZEB-325 Phase 2c: connectivity_redeem_invite_iroh: pkarr resolved + \
          ReachabilityResolver seeded; proceeding to redeem_invite_inner"
     );
+
+    // Stage 3/5: `sending` — about to write PendingJoin via
+    // redeem_invite_inner; the engine's state-root publisher will carry
+    // it to the inviter over the iroh-borne Zenoh link.
+    emit_stage(RedemptionStage::Sending);
+
+    // Stage 4/5: `awaiting_countersig` — emitted immediately before the
+    // call because redeem_invite_inner blocks on a oneshot internally
+    // (waiting for the admin's counter-signed Join). Threading a
+    // callback into redeem_invite_inner just to emit between insert and
+    // oneshot-wait would be a much larger refactor for negligible
+    // timing precision: the gap between "PendingJoin written" and "wait
+    // for counter-sig" is sub-millisecond, indistinguishable in the UI.
+    emit_stage(RedemptionStage::AwaitingCountersig);
 
     // 9. Drive the full redemption with allow_no_reticulum_destinations=true.
     //    The PendingJoin rides the engine's state-root publisher over the
@@ -29371,10 +29480,15 @@ pub async fn connectivity_redeem_invite_iroh_inner<R: tauri::Runtime>(
     .await;
 
     match result {
-        Ok(dto) => Ok(RedemptionOutcome {
-            status: "joined".to_string(),
-            community_id: Some(dto.community_id),
-        }),
+        Ok(dto) => {
+            // Stage 5/5: `joined` — counter-signed Join applied, joiner
+            // is now a community member.
+            emit_stage(RedemptionStage::Joined);
+            Ok(RedemptionOutcome {
+                status: "joined".to_string(),
+                community_id: Some(dto.community_id),
+            })
+        }
         Err(e) => {
             tracing::warn!(
                 error = %e,
