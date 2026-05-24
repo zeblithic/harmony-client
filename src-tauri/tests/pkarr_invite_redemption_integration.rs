@@ -257,6 +257,15 @@ fn signing_key_from_identity(identity: &PrivateIdentity) -> Arc<ed25519_dalek::S
     Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed_seed))
 }
 
+// ZEB-325 Phase 2c option A pivot: this single-engine test predated the
+// iroh bi-stream handshake. Under option A the IPC opens a real iroh
+// connection to the admin and waits for a JoinCountersign over the
+// wire; a single-engine test can't satisfy that (no admin to accept,
+// no other-process to counter-sign). Two-process coverage is in
+// `tests/pkarr_iroh_redeem_full_integration.rs`. Marked `#[ignore]`
+// rather than deleted so the orchestration shape is still reviewable
+// and the test can be revisited if the wire protocol changes.
+#[ignore = "ZEB-325 option A pivot — superseded by two-process pkarr_iroh_redeem_full_integration test"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connectivity_redeem_invite_iroh_completes_join_via_crdt_sync() {
     // Short oneshot timeout so the test runs in <1s if no counter-sig
@@ -505,6 +514,7 @@ async fn connectivity_redeem_invite_iroh_completes_join_via_crdt_sync() {
             invite_url,
             Some(Arc::clone(&pkarr_resolver)),
             Some(reachability_resolver.clone()),
+            None, // iroh_endpoint — option A would need a real handshake acceptor
             Arc::clone(&crdt_state),
             Arc::clone(&hlc_tracker),
             "joiner-dev".to_string(),
@@ -563,6 +573,13 @@ async fn connectivity_redeem_invite_iroh_completes_join_via_crdt_sync() {
 // `..._completes_join_via_crdt_sync` test above; both tests drive the
 // same orchestration but assert orthogonal properties.
 
+// ZEB-325 Phase 2c option A pivot: same constraint as the
+// `..._completes_join_via_crdt_sync` test above — a single-engine
+// fixture can't satisfy the new iroh-handshake wire requirement.
+// Progress emissions are still exercised end-to-end by the
+// two-process `tests/pkarr_iroh_redeem_full_integration.rs` test
+// (via a closure-captured Vec) once the acceptor wire-path runs.
+#[ignore = "ZEB-325 option A pivot — superseded by two-process pkarr_iroh_redeem_full_integration test"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connectivity_redeem_invite_iroh_emits_progress_events() {
     let _timeout_guard = RedeemTimeoutGuard::set("500");
@@ -797,6 +814,7 @@ async fn connectivity_redeem_invite_iroh_emits_progress_events() {
             invite_url,
             Some(Arc::clone(&pkarr_resolver)),
             Some(reachability_resolver.clone()),
+            None, // iroh_endpoint — option A would need a real handshake acceptor
             Arc::clone(&crdt_state),
             Arc::clone(&hlc_tracker),
             "joiner-dev".to_string(),

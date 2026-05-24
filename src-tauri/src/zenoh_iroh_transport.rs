@@ -86,6 +86,7 @@ use zenoh_link::{
 use zenoh_result::{zerror, ZResult};
 
 use crate::iroh_endpoint::{alpn, IrohEndpoint};
+use crate::iroh_invite_acceptor::IrohHandshakeDispatcher;
 use crate::reachability_resolver::ReachabilityResolver;
 use crate::zenoh_iroh_link::IrohZenohLink;
 
@@ -102,6 +103,27 @@ pub struct IrohZenohLinkManager {
     /// accept loop (spawned via [`IrohZenohLinkManager::spawn_accept_loop`])
     /// produces. Not used by the outbound `new_link` path.
     new_link_tx: NewLinkChannelSender,
+    /// ZEB-325 Phase 2c (option A): late-populated dispatcher for
+    /// inbound connections on ALPNs other than `harmony/zenoh/v1`.
+    /// Currently only `harmony/handshake/v1` is dispatched here;
+    /// future sub-protocols can layer on the same trait.
+    ///
+    /// **Lifecycle.** The link manager is constructed early at app
+    /// boot (before the owner identity / community registry / dm
+    /// outbox are ready); the accept loop is spawned immediately so no
+    /// inbound iroh traffic is dropped during the (possibly long)
+    /// boot window. The handshake dispatcher gets installed later
+    /// (typically inside the `if let Some(seed)` owner-loaded branch
+    /// of `start_node`) once the `community_registry` / `dm_outbox` /
+    /// `crdt_state` / `app` handles are available.
+    ///
+    /// Pre-installation, inbound connections on the handshake ALPN
+    /// land on the warn-log-only path; post-installation they route to
+    /// the trait method `handle_connection`. `OnceCell` ensures the
+    /// install happens at most once — if a future code path needs to
+    /// swap dispatchers, build a fresh manager (cheap) rather than
+    /// mutating live state.
+    handshake_dispatcher: tokio::sync::OnceCell<Arc<dyn IrohHandshakeDispatcher>>,
 }
 
 impl IrohZenohLinkManager {
@@ -114,13 +136,37 @@ impl IrohZenohLinkManager {
             endpoint,
             resolver,
             new_link_tx,
+            handshake_dispatcher: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// ZEB-325 Phase 2c (option A): install the
+    /// `IrohHandshakeDispatcher` used by the accept loop to route
+    /// inbound `harmony/handshake/v1` connections. Returns Err
+    /// (carrying the supplied Arc back to the caller, then dropped) if
+    /// a dispatcher was already installed — OnceCell::set rejects the
+    /// second write.
+    pub fn install_handshake_dispatcher(
+        &self,
+        dispatcher: Arc<dyn IrohHandshakeDispatcher>,
+    ) -> Result<(), Arc<dyn IrohHandshakeDispatcher>> {
+        self.handshake_dispatcher
+            .set(dispatcher)
+            .map_err(|set_err| match set_err {
+                tokio::sync::SetError::AlreadyInitializedError(d) => d,
+                tokio::sync::SetError::InitializingError(d) => d,
+            })
     }
 
     /// Spawn the inbound-link accept loop. Each accepted connection is
     /// filtered on ALPN `harmony/zenoh/v1`, an `accept_bi` stream pair
     /// is wrapped in [`IrohZenohLink`], and the result is dispatched to
     /// Zenoh via the [`NewLinkChannelSender`] this manager owns.
+    ///
+    /// ZEB-325 Phase 2c (option A): when a handshake dispatcher is
+    /// installed via [`Self::with_handshake_dispatcher`], inbound
+    /// connections that negotiate `harmony/handshake/v1` are routed
+    /// there instead of being dropped.
     ///
     /// Returns the join handle; callers should hold it to drive
     /// shutdown explicitly. Endpoint shutdown causes `accept()` to
@@ -146,27 +192,40 @@ impl IrohZenohLinkManager {
                     // case future code registers handshake or other
                     // sub-protocols on the same endpoint.
                     let alpn_used = conn.alpn();
-                    if alpn_used != alpn::HARMONY_ZENOH_V1 {
+                    if alpn_used == alpn::HARMONY_ZENOH_V1 {
+                        let (send, recv) = match conn.accept_bi().await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::warn!("iroh accept_bi failed: {e}");
+                                return;
+                            }
+                        };
+                        let peer_id = conn.remote_id();
+                        let src = locator_from_endpoint_id(&mgr.endpoint.node_id());
+                        let dst = locator_from_endpoint_id(&peer_id);
+                        let link: Arc<dyn LinkUnicastTrait> =
+                            Arc::new(IrohZenohLink::new(send, recv, src, dst));
+                        if let Err(e) = mgr.new_link_tx.send_async(LinkUnicast(link)).await {
+                            tracing::warn!("zenoh new_link channel closed: {e}");
+                        }
+                    } else if alpn_used == alpn::HARMONY_HANDSHAKE_V1 {
+                        // ZEB-325 Phase 2c (option A): inbound invite
+                        // handshake. The dispatcher owns the
+                        // connection from here.
+                        if let Some(dispatcher) = mgr.handshake_dispatcher.get().cloned() {
+                            dispatcher.handle_connection(conn).await;
+                        } else {
+                            tracing::warn!(
+                                "harmony/handshake/v1 connection received but no \
+                                 handshake_dispatcher installed yet (NodeState not fully \
+                                 booted with an owner identity?); dropping"
+                            );
+                        }
+                    } else {
                         tracing::debug!(
-                            "ignoring non-zenoh ALPN: {:?}",
+                            "ignoring unknown ALPN: {:?}",
                             std::str::from_utf8(alpn_used).unwrap_or("<binary>")
                         );
-                        return;
-                    }
-                    let (send, recv) = match conn.accept_bi().await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::warn!("iroh accept_bi failed: {e}");
-                            return;
-                        }
-                    };
-                    let peer_id = conn.remote_id();
-                    let src = locator_from_endpoint_id(&mgr.endpoint.node_id());
-                    let dst = locator_from_endpoint_id(&peer_id);
-                    let link: Arc<dyn LinkUnicastTrait> =
-                        Arc::new(IrohZenohLink::new(send, recv, src, dst));
-                    if let Err(e) = mgr.new_link_tx.send_async(LinkUnicast(link)).await {
-                        tracing::warn!("zenoh new_link channel closed: {e}");
                     }
                 });
             }
