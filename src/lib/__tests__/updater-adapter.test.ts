@@ -54,4 +54,35 @@ describe("checkForUpdate", () => {
     const result = await checkForUpdate();
     expect(result).toBe(fakeUpdate);
   });
+
+  // ZEB-328 PR #160 R3 (Greptile): SemVer 2.0 §11 — stable > any pre-release
+  // of the same release. Previous Intl.Collator-only comparator would have
+  // incorrectly suppressed `1.0.0` when `1.0.0-alpha.5` was dismissed.
+  it("does NOT suppress stable release when a pre-release of the same release was dismissed", async () => {
+    localStorage.setItem("harmony.updater.dismissed_version", "1.0.0-alpha.5");
+    const fakeUpdate = { version: "1.0.0", available: true };
+    (check as ReturnType<typeof vi.fn>).mockResolvedValue(fakeUpdate);
+    const result = await checkForUpdate();
+    expect(result).toBe(fakeUpdate);
+  });
+
+  // The mirror case: if the user dismissed stable, an older pre-release
+  // of the same release should NOT re-notify.
+  it("suppresses pre-release when stable release of the same version was dismissed", async () => {
+    localStorage.setItem("harmony.updater.dismissed_version", "1.0.0");
+    const fakeUpdate = { version: "1.0.0-alpha.1", available: true };
+    (check as ReturnType<typeof vi.fn>).mockResolvedValue(fakeUpdate);
+    const result = await checkForUpdate();
+    expect(result).toBeNull();
+  });
+
+  // Defensive: confirm release-component numeric compare still works
+  // (e.g., 0.1.10 > 0.1.2).
+  it("correctly orders numeric release components (0.1.10 > 0.1.2)", async () => {
+    localStorage.setItem("harmony.updater.dismissed_version", "0.1.2");
+    const fakeUpdate = { version: "0.1.10", available: true };
+    (check as ReturnType<typeof vi.fn>).mockResolvedValue(fakeUpdate);
+    const result = await checkForUpdate();
+    expect(result).toBe(fakeUpdate);
+  });
 });

@@ -18,8 +18,14 @@
       await update.downloadAndInstall();
       // downloadAndInstall restarts the app; we normally never reach here.
     } catch (e) {
-      applying = false;
       applyError = e instanceof Error ? e.message : String(e);
+    } finally {
+      // ZEB-328 PR #160 R3 (Greptile): always reset `applying` so the
+      // toast doesn't freeze if downloadAndInstall resolves without
+      // triggering the OS-level restart (test mocks, edge cases where
+      // the restart silently fails, etc.). Without this, the user gets
+      // a permanently-disabled toast with no path forward.
+      applying = false;
     }
   }
 

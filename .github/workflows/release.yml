@@ -34,18 +34,28 @@ jobs:
       # and gives a clear error message instead of cryptic downstream failures.
       - name: Sanitize + validate version input
         id: ver
+        # ZEB-328 PR #160 R3 (CodeRabbit nitpick): pass raw input via env
+        # so the value is never interpolated into the shell-line itself
+        # (where `${{ ... }}` is template-substituted before shell sees it).
+        env:
+          RAW_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          INPUT="${{ inputs.version }}"
+          # ZEB-328 PR #160 R3 (Cursor MED): bash regex on the whole
+          # variable (NOT echo|grep, which returns 0 if ANY line of a
+          # multi-line input matches and would let `0.1.0\nrm -rf /`
+          # bypass validation, then write a newline to GITHUB_OUTPUT
+          # corrupting downstream step outputs).
+          #
           # SemVer 2.0 grammar (simplified to what we use):
           # MAJOR.MINOR.PATCH (-pre-release-identifier(.pre-release-identifier)*)?
           # Where pre-release identifiers are [0-9A-Za-z-]+
-          if ! echo "$INPUT" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'; then
-            echo "::error::version input '$INPUT' is not valid SemVer 2.0"
+          if [[ ! "$RAW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo "::error::version input is not valid SemVer 2.0 (multi-line or invalid)."
             echo "Expected e.g. '0.1.0-alpha.1' or '0.1.0'"
             exit 1
           fi
-          echo "version=$INPUT" >> "$GITHUB_OUTPUT"
+          echo "version=$RAW_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Confirm version input matches tauri.conf.json
         env:
@@ -134,11 +144,15 @@ jobs:
         include:
           - os: macos-14
             target: aarch64-apple-darwin
-          # macos-13 = Intel runner. GitHub has signaled deprecation but
-          # as of the spec's auth date it remains a valid label. If GitHub
-          # retires it before we deprecate Intel support, cut this matrix
-          # leg + drop the corresponding darwin-x86_64 manifest entry.
-          - os: macos-13
+          # ZEB-328 PR #160 R3 (CodeRabbit CRITICAL): macos-13 was
+          # retired by GitHub on 2025-12-04. macos-15-intel is the
+          # current Intel x86_64 runner replacement. If GitHub later
+          # deprecates -intel runners entirely (consumer Apple HW is
+          # all ARM now; Intel runners run on virtualization), we'll
+          # need to either cross-compile Intel from macos-15 ARM or
+          # drop Intel support — track via GH runner-deprecation
+          # announcements.
+          - os: macos-15-intel
             target: x86_64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
