@@ -17,12 +17,15 @@
 The two single-engine tests
 (`connectivity_redeem_invite_iroh_completes_join_via_crdt_sync`,
 `connectivity_redeem_invite_iroh_emits_progress_events`) in
-`pkarr_invite_redemption_integration.rs` are now `#[ignore]`'d: they
-relied on a single-engine masking quirk (Bob's own PendingJoin insert
-fires the redemption oneshot regardless of whether a counter-sign
-ever arrives) that the option A pivot makes structurally impossible.
-Two-process coverage in `pkarr_iroh_redeem_full_integration.rs`
-supersedes them.
+`pkarr_invite_redemption_integration.rs` were originally `#[ignore]`'d
+because they relied on a single-engine masking quirk (Bob's own
+PendingJoin insert fires the redemption oneshot regardless of whether
+a counter-sign ever arrives) that the option A pivot makes
+structurally impossible. PR #159 round-1 review (CodeRabbit NITPICK
+F9) noted that the ignored bodies still asserted post-handshake
+`"joined"` with `iroh_endpoint: None`, which can never succeed under
+option A; both tests have been deleted. Two-process coverage in
+`pkarr_iroh_redeem_full_integration.rs` supersedes them.
 
 ---
 
@@ -58,6 +61,7 @@ supersedes them.
 - [ ] **Step 0.1: Verify on the right branch off the right commit**
 
 Run:
+
 ```bash
 git rev-parse --abbrev-ref HEAD  # expected: zeb-321-phase2c-invite-handshake
 git merge-base HEAD origin/main  # expected: 3c4c21d (Phase 2b merge)
@@ -66,6 +70,7 @@ git merge-base HEAD origin/main  # expected: 3c4c21d (Phase 2b merge)
 - [ ] **Step 0.2: Capture orphan-failure baseline (do NOT commit; reference only)**
 
 Run from `src-tauri/`:
+
 ```bash
 cargo nextest run --locked --workspace --all-targets --features test-fixtures --no-fail-fast 2>&1 | tee /tmp/zeb325_baseline.txt | tail -50
 ```
@@ -117,12 +122,15 @@ Edit `src-tauri/src/lib.rs:14682-14706` — the `redeem_invite_inner` signature.
 Edit the two fast-fail sites:
 
 At `src-tauri/src/lib.rs:15018-15028`, change:
+
 ```rust
 if destinations.is_empty() {
     // existing rollback + Err return
 }
 ```
+
 To:
+
 ```rust
 if destinations.is_empty() {
     if allow_no_reticulum_destinations {
@@ -153,9 +161,11 @@ if destinations.is_empty() {
 The `any_sent` check at `15058-15071` only runs when `destinations` was non-empty — i.e., inside the `else` branch above. It does NOT need a flag; if we got into the fan-out at all, at least one send is required.
 
 Update every caller of `redeem_invite_inner` to pass `false` (preserving existing behavior). Find them with:
+
 ```bash
 grep -n "redeem_invite_inner(" src-tauri/src/lib.rs src-tauri/tests/ 2>/dev/null
 ```
+
 Expected callers (from earlier exploration): lib.rs:15507, 15628, 15995, 16146, 16268, 16371. Update each one.
 
 - [ ] **Step 1.3: Run the test, verify it passes**
@@ -168,6 +178,7 @@ Expected: PASS.
 ```bash
 cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(redeem_invite) or test(pkarr)'
 ```
+
 Expected: all PASS.
 
 - [ ] **Step 1.5: Commit**
@@ -299,139 +310,23 @@ Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>"
 
 ---
 
-## Task 3: Wire `connectivity_redeem_invite_iroh` to seed + redeem
+## Task 3: Wire `connectivity_redeem_invite_iroh` to the iroh handshake
 
 **Files:**
-- Modify: `src-tauri/src/lib.rs:28668-28777` (the `connectivity_redeem_invite_iroh` IPC body)
 
-- [ ] **Step 3.1: Write the failing test**
+- Modify: `src-tauri/src/lib.rs` — the `connectivity_redeem_invite_iroh` IPC + its `_inner` helper
 
-Add an integration test in `src-tauri/tests/pkarr_invite_redemption_integration.rs` (extending the existing case-A test). New test name: `connectivity_redeem_invite_iroh_completes_join_via_crdt_sync`.
+> **Option-A pivot note (see top of file for context).** The original plan described an option-C wiring that called `redeem_invite_inner` and relied on Bob's `PendingJoin` reaching Alice via Zenoh CRDT sync over the iroh-borne link. That path was blocked on two production gaps (event-loop iroh→zenoh ingestion deferral + `PublisherNotJoined` gate dropping non-member publishes). The replacement option-A flow shipped in commits `ccf7a55` (the handshake protocol + acceptor) and `8bbafd6` (the two-process integration test). The Step-3.1/3.2 sketches that previously lived here have been removed; see those two commits for the actual implementation. The high-level shape is:
 
-Test shape (per existing case-A pattern, but extended):
-- Spawn Alice's state with an iroh endpoint + Zenoh session + community engine where she's the admin
-- Publish Alice's pkarr record (case A, keyed by an invite token sig)
-- Spawn Bob's state with an iroh endpoint + Zenoh session (no community engine yet)
-- Bob's `connectivity_redeem_invite_iroh` is invoked with the invite URL
-- Verify: Bob ends up with community state where he's a member (post-counter-sig)
-- Verify: the returned outcome.status is `"joined"` (NOT `"pkarr_resolved_no_handshake"`)
+- [ ] **Step 3.1 (option A): Add a `harmony/handshake/v1` ALPN bi-stream protocol**
 
-Run the test. Expected: FAIL (currently returns `"pkarr_resolved_no_handshake"`).
+The dialer (Bob) opens an iroh bi-stream on the existing-but-unused `harmony/handshake/v1` ALPN, writes a length-prefixed `CommunityInviteSigned` packet, reads back the CBOR-encoded `JoinCountersign`, and feeds both into `redeem_invite_inner_with_overrides` via `pre_minted` + `pre_delivered_countersign`. The acceptor (Alice) decodes the packet, delegates to `community_invite::handle_unicast` (which fires the existing auto-counter-sign post-Inserted hook), polls her engine state for the JoinCountersign filtered on `actor == self_owner`, and writes the response.
 
-- [ ] **Step 3.2: Implement the wiring**
+- [ ] **Step 3.2 (option A): Install the acceptor onto the existing `IrohZenohLinkManager` accept loop**
 
-Edit `src-tauri/src/lib.rs:28755-28777`. After step 7 (decode routing_blob), replace the stub:
+`IrohInviteHandshakeAcceptor` implements `IrohHandshakeDispatcher`; production wiring at lib.rs installs it via `link_mgr.install_handshake_dispatcher(..)` once `community_registry` / `dm_outbox` / `crdt_state` are all available at boot.
 
-```rust
-// 8. Seed ReachabilityResolver so IrohZenohLinkManager.new_link can
-//    open an iroh connection to the inviter on demand.
-let reachability_resolver = {
-    let g = state.lock().map_err(|e| format!("NodeState poisoned: {e}"))?;
-    g.reachability_resolver.clone()
-};
-let Some(reachability_resolver) = reachability_resolver else {
-    return Ok(RedemptionOutcome {
-        status: "inviter_unreachable".to_string(),
-        community_id: None,
-    });
-};
-let routing: crate::reachability_record::ReachabilityAnnouncePayload =
-    ciborium::from_reader(rec.routing_blob.as_slice())
-        .map_err(|e| format!("decode routing_blob: {e}"))?;
-
-// Derive the inviter's device hash from the iroh NodeId (or wherever
-// it's available). The inviter's owner-addr is in payload.admin_addr.
-let inviter_addr = payload.admin_addr;
-let inviter_device_hash: DeviceIdentityHash = /* derive from routing.iroh_node_id or pkarr signer */;
-
-reachability_resolver
-    .seed_from_pkarr(inviter_addr, inviter_device_hash, routing.clone())
-    .await;
-
-// 9. Call redeem_invite_inner with allow_no_reticulum_destinations=true.
-//    The CRDT-sync path will carry the PendingJoin to Alice via the
-//    iroh-borne Zenoh link IrohZenohLinkManager.new_link opens.
-let (crdt_state, hlc_tracker, device_id, self_owner, signing_key,
-     community_registry, community_adapter_tx, unicast_send_tx,
-     dm_outbox, channel_log_registry, identity_dir) = {
-    let g = state.lock().map_err(|e| format!("NodeState poisoned: {e}"))?;
-    (g.crdt_state.clone(),
-     g.hlc_tracker.clone(),
-     g.device_id.clone(),
-     g.self_owner.expect("self_owner set"),
-     g.signing_key.clone(),
-     g.community_registry.clone(),
-     g.community_adapter_tx.clone(),
-     g.unicast_send_tx.clone(),
-     g.dm_outbox.clone(),
-     g.channel_log_registry.clone(),
-     g.identity_dir.clone())
-};
-
-let result = redeem_invite_inner(
-    invite_url,
-    crdt_state,
-    hlc_tracker,
-    device_id,
-    self_owner,
-    signing_key,
-    community_registry,
-    community_adapter_tx,
-    unicast_send_tx,
-    dm_outbox,
-    channel_log_registry,
-    || Ok(()),  // no fence check for iroh redeem
-    identity_dir,
-    true,  // allow_no_reticulum_destinations — Phase 2c
-).await;
-
-match result {
-    Ok(dto) => Ok(RedemptionOutcome {
-        status: "joined".to_string(),
-        community_id: Some(hex::encode(payload.community_id.0)),
-        // ... whatever other fields RedemptionOutcome has ...
-    }),
-    Err(e) => {
-        tracing::warn!(error = %e, "Phase 2c redeem_invite_inner failed");
-        Ok(RedemptionOutcome {
-            status: "inviter_unreachable".to_string(),
-            community_id: None,
-        })
-    }
-}
-```
-
-(Adapt the exact NodeState field names + RedemptionOutcome shape to match the actual code by reading lib.rs around the existing redeem_invite IPC at line 15420.)
-
-- [ ] **Step 3.3: Run the test, verify it passes**
-
-```bash
-cargo nextest run --locked --features test-fixtures -E 'test(=connectivity_redeem_invite_iroh_completes_join_via_crdt_sync)'
-```
-Expected: PASS.
-
-- [ ] **Step 3.4: Commit**
-
-```bash
-git add src-tauri/src/lib.rs src-tauri/tests/pkarr_invite_redemption_integration.rs
-git commit -m "feat(zeb-325): wire connectivity_redeem_invite_iroh to redeem_invite_inner
-
-After pkarr resolves the inviter's routing record:
-1. Seed ReachabilityResolver via seed_from_pkarr so IrohZenohLinkManager
-   can open the iroh connection on demand.
-2. Call redeem_invite_inner with allow_no_reticulum_destinations=true.
-3. Return status='joined' on success (replacing 'pkarr_resolved_no_handshake').
-
-The CRDT-sync path carries the PendingJoin to the inviter via the
-iroh-borne Zenoh link; the existing engine post-Inserted hook
-counter-signs and the state-root publish carries the response back to
-the joiner via the same link.
-
-Integration test extends pkarr_invite_redemption_integration.rs with
-the full end-to-end flow: two engines + iroh + pkarr → join completes.
-
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>"
-```
+See commits `ccf7a55` (acceptor + dialer + ALPN dispatch) and `8bbafd6` (two-process integration test) for the actual code. The legacy Step-3.1 single-engine test was deleted in PR #159 (CodeRabbit NITPICK F9).
 
 ---
 
@@ -470,6 +365,7 @@ The frontend `onResolutionProgress` listener (already wired in RedeemInviteDialo
 ```bash
 cargo nextest run --locked --features test-fixtures -E 'test(=connectivity_redeem_invite_iroh_emits_progress_events)'
 ```
+
 Expected: PASS.
 
 - [ ] **Step 4.4: Commit**
@@ -553,80 +449,40 @@ Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>"
 
 ---
 
-## Task 6: Two-process integration test (no Reticulum destinations)
+## Task 6: Two-process integration test (option A)
 
 **Files:**
+
 - Create: `src-tauri/tests/pkarr_iroh_redeem_full_integration.rs`
 
-This is the highest-value test. It validates that the entire chain — pkarr publish → pkarr resolve → seed → iroh connect-on-demand → Zenoh CRDT sync → PendingJoin → counter-sign → state-root → membership state — works end-to-end with NO Reticulum destinations available.
+This is the highest-value test. It validates the option-A wire handshake end-to-end: two distinct iroh endpoints on loopback, Alice runs the production `IrohInviteHandshakeAcceptor` on her link manager's accept loop, Bob's IPC dials Alice's handshake ALPN, and both sides converge on the counter-signed `Join`.
 
-- [ ] **Step 6.1: Write the test**
+> **Option-A pivot note (see top of file for context).** The original Task 6 sketch was for option C (pure CRDT sync; no acceptor required). That was reverted in commits `92997b9` / `1c65a87` once the production gaps surfaced. The replacement option-A test shipped in commit `8bbafd6` against the protocol introduced in `ccf7a55`. See those commits for the actual code; the high-level shape is below.
 
-Follow Phase 1's two-process integration test pattern (search for the existing test under `src-tauri/tests/` exercising two distinct IrohEndpoints over DERP). Add a new integration test file:
+- [ ] **Step 6.1: Write the test (option A)**
 
-```rust
-//! Phase 2c full integration: Bob (no prior contact with Alice) joins
-//! Alice's community using ONLY the pkarr+iroh+Zenoh path, with zero
-//! Reticulum destinations available.
+The test wires up:
 
-#[tokio::test]
-async fn bob_joins_alice_community_via_pure_iroh_path() {
-    // 1. Spawn Alice's NodeState with iroh endpoint, Zenoh session,
-    //    community engine where she's a member with admin power.
-    //    Activate Alice's pkarr identity publisher (case B) OR have
-    //    Alice generate an invite + publish case-A record.
-    // 2. Spawn Bob's NodeState with iroh endpoint, Zenoh session,
-    //    EMPTY community list, EMPTY Reticulum destinations.
-    // 3. Wait for Alice's pkarr publication to land on a mock relay.
-    // 4. Bob invokes connectivity_redeem_invite_iroh with the invite URL.
-    // 5. Assert: within 30s, Bob's NodeState has Alice's community in
-    //    its space list with himself as a member.
-    // 6. Assert: the returned RedemptionOutcome.status == "joined".
-}
-```
+- Two hermetic iroh endpoints on loopback (no DERP, no IP transports cleared apart from loopback).
+- Alice's `IrohZenohLinkManager` accept loop with the production `IrohInviteHandshakeAcceptor` installed via `install_handshake_dispatcher` (passes an explicit `HandshakeAcceptorConfig` so IO timeouts are short).
+- Alice's `CommunitySyncRegistry` containing her admin-bootstrapped community.
+- Bob's `CommunitySyncRegistry` (empty), a real `MockPkarrRelay` round-trip so the IPC exercises pkarr + iroh end-to-end without test-specific short-circuits, and `connectivity_redeem_invite_iroh_inner` driven with explicit `HandshakeDialConfig` (no env mutation — see PR #159 F10).
 
-Test infrastructure needs:
-- Mock pkarr relay (use `MockPkarrRelay` from harmony-pkarr test-fixtures)
-- Two iroh endpoints (one per "process" — both in the same tokio runtime, distinct keys, both registered with their own IrohZenohLinkManager)
-- Two Zenoh sessions configured to use the iroh transport
-- DERP relay: real n0 hosted relay (existing Phase 1 integration test uses this)
+Load-bearing assertions: `outcome.status == "joined"`, Bob's CRDT contains the admin bootstrap + PendingJoin + JoinCountersign, Bob materializes as `Joined`, and Alice's CRDT shows Bob's PendingJoin + her own auto-counter-sign.
 
 - [ ] **Step 6.2: Run the test**
 
+Run:
+
 ```bash
-cargo nextest run --locked --features test-fixtures -E 'test(=bob_joins_alice_community_via_pure_iroh_path)'
+cargo nextest run --locked --features test-fixtures --test pkarr_iroh_redeem_full_integration
 ```
 
-Expected: PASS within 30s timeout. If it fails, the failure is the most informative thing in the whole plan — it'll point at which integration step actually breaks.
-
-If the test reveals additional missing infrastructure (e.g., Zenoh peer-discovery doesn't fire on iroh-only setup, or seed_from_pkarr's provenance interacts badly with Phase 1's LWW projection), file the gap as a discovered-during-implementation note, fix it inline (this is the load-bearing test), and re-run.
+Expected: PASS within ~20s on loopback. The outer `tokio::time::timeout(60s, ...)` guard catches any unbounded await.
 
 - [ ] **Step 6.3: Commit**
 
-```bash
-git add src-tauri/tests/pkarr_iroh_redeem_full_integration.rs
-git commit -m "test(zeb-325): two-process integration — pure-iroh community join
-
-Bob (no prior contact with Alice, zero Reticulum destinations) joins
-Alice's community via the full pkarr+iroh+Zenoh-CRDT-sync handshake.
-End-to-end coverage of the Phase 2c path:
-
-- Pkarr publish + resolve via mock relay
-- ReachabilityResolver seed
-- IrohZenohLinkManager opens iroh connection on demand
-- Bob's spawned engine inserts PendingJoin locally
-- State-root publish reaches Alice via the iroh-borne Zenoh link
-- Alice's engine counter-signs; state-root publish carries back
-- Bob's oneshot fires; redeem_invite_inner returns Ok
-- Bob's NodeState shows him as a member of Alice's community
-
-This is the load-bearing validation that Phase 2c actually works
-end-to-end. If Phase 4's cross-WAN canary (ZEB-172) discovers a real
-NAT topology that breaks, the failure is in transport, not in the
-orchestration this test pins.
-
-Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>"
-```
+The actual commit shipped as `8bbafd6` ("test(zeb-325): option A two-process integration test"). See the existing commit message for the rationale.
 
 ---
 
@@ -659,17 +515,20 @@ git push -u origin zeb-321-phase2c-invite-handshake
 
 - [ ] **Step 7.4: Create the PR**
 
+Run:
+
 ```bash
 gh pr create --title "feat(zeb-325): Phase 2c invite handshake — complete iroh-redeem join" \
   --body "$(cat <<'EOF'
 ## Summary
 
-Closes the Phase 2c stub from PR #158. `connectivity_redeem_invite_iroh` now completes the cross-WAN invite handshake end-to-end via the pure-CRDT-sync path:
+Closes the Phase 2c stub from PR #158. `connectivity_redeem_invite_iroh` now completes the cross-WAN invite handshake end-to-end via a direct iroh bi-stream on the `harmony/handshake/v1` ALPN (option A — see pivot note in the plan doc):
 
-1. Pkarr-resolve the inviter's routing record (Phase 2b — already shipped)
-2. Seed ReachabilityResolver with the resolved record so Phase 1's IrohZenohLinkManager can open the iroh connection on demand
-3. Call `redeem_invite_inner` with new `allow_no_reticulum_destinations: bool = true` parameter — skips the destinations-empty fast-fail
-4. Bob's spawned community engine inserts PendingJoin locally → state-root publishes via Zenoh-over-iroh → reaches Alice → her engine counter-signs → state-root publishes back → Bob's oneshot fires → join complete
+1. Pkarr-resolve the inviter's routing record (Phase 2b — already shipped).
+2. Seed ReachabilityResolver with the resolved record for future Phase 1 CRDT-sync paths (harmless on option A's direct-handshake flow).
+3. Open an iroh bi-stream to the inviter's iroh NodeId on `harmony/handshake/v1`; write a length-prefixed `CommunityInviteSigned` packet.
+4. Inviter's `IrohInviteHandshakeAcceptor` decodes the packet, runs `community_invite::handle_unicast` against her engine (which triggers the existing auto-counter-sign post-Inserted hook), polls for the JoinCountersign filtered on `actor == self_owner`, CBOR-encodes the response.
+5. Joiner reads the response, calls `redeem_invite_inner_with_overrides` with `pre_minted` + `pre_delivered_countersign` so the inner's oneshot resolves immediately on the engine's post-Inserted hook. Return `status="joined"` on success or `status="join_failed"` if the local commit failed after a valid countersign was delivered.
 
 ## Phasing context
 
@@ -689,18 +548,14 @@ Part of [ZEB-321](https://linear.app/zeblith/issue/ZEB-321) — closes [ZEB-325]
 
 Spec §7.2: \`docs/specs/2026-05-23-zeb-321-phase2-discovery-bootstrap-design.md\` (commit \`cb5cca5\`).
 
-Per spec the architecture is option C (pure Zenoh-CRDT-sync, no new wire protocol). Verified pre-conditions:
-
-- Bob's spawned engine subscribes to community Zenoh keyspace unconditionally (no membership gate)
-- IrohZenohLinkManager.new_link opens iroh connections on demand from ReachabilityResolver
-- verify_event rule P6 explicitly permits PendingJoin from non-members
-- The existing wait-for-counter-sig oneshot fires regardless of transport
+This PR ships **option A** (direct iroh bi-stream on `harmony/handshake/v1`) rather than the spec's option C (pure Zenoh-CRDT-sync). The option-C path remains blocked on two production gaps — \`event_loop.rs\` Phase 1 discards inbound iroh→zenoh links into a drain task, and \`community_state_sync::handle_incoming_publish\` drops non-member publishes at the \`PublisherNotJoined\` gate before per-event verify — both of which are out of scope for ZEB-325. See the pivot note at the top of the plan doc for the full rationale; the option-A protocol is documented in \`src-tauri/src/iroh_invite_acceptor.rs\` and the dialer in \`src-tauri/src/lib.rs::connectivity_redeem_invite_iroh_inner\`.
 
 ## Out of scope (separate tickets)
 
 - Case-B identity-key publicness (CodeRabbit P1 deferred from PR #270) — separate design ticket
 - Mobile push, liveness, rebinding — Phase 3
 - Reticulum deprecation — Phase 3+ after empirical proof iroh path is solid
+- Option-C revival (Zenoh CRDT sync over iroh-borne link) — requires unblocking the two production gaps noted above
 
 ## Test plan
 
@@ -709,7 +564,7 @@ Per spec the architecture is option C (pure Zenoh-CRDT-sync, no new wire protoco
 - [ ] cargo nextest run --locked --workspace --all-targets --features test-fixtures
 - [ ] npx tsc --noEmit
 - [ ] npx vitest run
-- [ ] New integration test \`bob_joins_alice_community_via_pure_iroh_path\` validates full chain
+- [ ] New two-process integration test \`bob_joins_alice_via_iroh_handshake_option_a\` validates the full option-A wire path
 - [ ] Manual smoke: redeem an invite across two machines on real WAN (Phase 4 canary will formalize)
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
