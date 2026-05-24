@@ -46,6 +46,7 @@ pub mod identity;
 pub mod identity_commands;
 pub mod inbound_packet;
 pub mod iroh_endpoint;
+pub mod iroh_invite_acceptor;
 pub mod library_directory;
 pub mod mail;
 pub mod mail_sync;
@@ -2280,6 +2281,16 @@ async fn start_node(
         let iroh_endpoint_arc: Option<std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>>;
         let reachability_resolver: crate::reachability_resolver::ReachabilityResolver;
         let iroh_handles_for_loop: Option<crate::event_loop::IrohRuntimeHandles>;
+        // ZEB-325 Phase 2c: outer-scope clone of the iroh link manager so
+        // the owner-loaded block below can install the handshake
+        // dispatcher once `community_registry` / `dm_outbox` /
+        // `crdt_state` are ready. The link manager is built inside the
+        // iroh-bind branch below and consumed (moved) by
+        // `iroh_handles_for_loop`; we keep a separate Arc clone here for
+        // the later install. Stays `None` when iroh bind failed.
+        let mut iroh_link_mgr_for_handshake: Option<
+            std::sync::Arc<crate::zenoh_iroh_transport::IrohZenohLinkManager>,
+        > = None;
         // ZEB-321 Phase 1 PR #157 round 1 (Qodo + CodeAnt): JoinHandle of
         // the drain task that discards inbound iroh→zenoh links. We must
         // own a live receiver — otherwise `IrohZenohLinkManager`'s accept
@@ -2334,6 +2345,10 @@ async fn start_node(
                             // our local `link_mgr` doesn't tear it down.
                             iroh_accept_handle = Some(link_mgr.spawn_accept_loop());
                             iroh_endpoint_arc = Some(std::sync::Arc::clone(&ep_arc));
+                            // ZEB-325 Phase 2c: clone the link manager
+                            // Arc for the post-owner-load handshake
+                            // dispatcher install below.
+                            iroh_link_mgr_for_handshake = Some(std::sync::Arc::clone(&link_mgr));
                             iroh_handles_for_loop = Some(crate::event_loop::IrohRuntimeHandles {
                                 endpoint: ep_arc,
                                 link_manager: link_mgr,
@@ -4052,6 +4067,39 @@ async fn start_node(
                             crate::profile_broadcast::PUBLISHER_DEBOUNCE,
                             crate::profile_broadcast::PUBLISHER_REFRESH_INTERVAL,
                         ));
+
+                    // ZEB-325 Phase 2c: install the iroh invite-handshake
+                    // dispatcher onto the iroh link manager now that
+                    // community_registry + dm_outbox + crdt_state are all
+                    // available. Skipped when iroh bind failed earlier
+                    // (link manager Arc is None) — those sessions have no
+                    // inbound iroh traffic to dispatch.
+                    if let Some(ref link_mgr) = iroh_link_mgr_for_handshake {
+                        let acceptor = std::sync::Arc::new(
+                            crate::iroh_invite_acceptor::IrohInviteHandshakeAcceptor::<
+                                tauri::AppHandle<tauri::Wry>,
+                            >::with_config(
+                                std::sync::Arc::clone(&registry),
+                                std::sync::Arc::clone(&outbox),
+                                std::sync::Arc::clone(&crdt_state),
+                                Some(std::sync::Arc::new(app.clone())),
+                                crate::iroh_invite_acceptor::HandshakeAcceptorConfig::from_env(),
+                            ),
+                        );
+                        if let Err(_dispatcher_back) =
+                            link_mgr.install_handshake_dispatcher(acceptor).await
+                        {
+                            // Pre-installed (idempotent restart? OnceCell
+                            // refused the second set). Production
+                            // shouldn't hit this — log so it's diagnosable
+                            // if it ever fires.
+                            tracing::warn!(
+                                "ZEB-325 Phase 2c: handshake_dispatcher already \
+                                 installed on iroh link manager — keeping the \
+                                 prior instance"
+                            );
+                        }
+                    }
 
                     // Lift the per-identity handles out for NodeState
                     // assignment below.
@@ -14645,6 +14693,50 @@ pub fn mint_redemption(
     })
 }
 
+/// ZEB-325 Phase 2c (option A): optional overrides for the iroh
+/// bi-stream handshake redemption path. Lets the iroh inner caller
+/// (`connectivity_redeem_invite_iroh_inner`) inject a pre-built
+/// `MintedCommunity` (so the bootstrap_join.id matches what was just
+/// sent on the wire to Alice — `mint_redemption` randomizes the event
+/// id, so any fresh mint would target a different countersign) plus a
+/// pre-delivered `JoinCountersign` event that the handshake response
+/// already produced. When `pre_delivered_countersign` is `Some`, the
+/// inner inserts it into the engine immediately after the PendingJoin
+/// insert in the invite-only branch; the engine's post-Inserted hook
+/// then fires the redemption oneshot (target_event_id == bootstrap_join.id)
+/// and the await at step 7d resolves with no wire round-trip.
+///
+/// Default = both `None` = behave exactly like the pre-handshake
+/// `redeem_invite_inner` path (mint locally; await counter-sign via
+/// the existing unicast/CRDT-sync routes).
+#[derive(Default)]
+pub struct RedeemInviteOverrides {
+    /// Pre-minted bootstrap artifacts. When `Some`, skip the internal
+    /// `mint_redemption` call. The caller MUST have called
+    /// `mint_redemption` with the same `payload`, `self_owner`,
+    /// `signing_key`, and reserved HLC the inner would have used — the
+    /// only way to guarantee that is to expose the reserved HLC, so
+    /// callers that need this must reserve HLC themselves and rebuild
+    /// the same `MintedCommunity`. The option-A iroh inner does exactly
+    /// this. `community_id` / `membership_key` are deterministic
+    /// derivations of the invite payload, so they always match; only
+    /// `bootstrap_join.id` (random 16 bytes) is non-deterministic.
+    pub pre_minted: Option<MintedCommunity>,
+
+    /// Pre-delivered `JoinCountersign` event. When `Some`, inserted
+    /// into the joiner's engine immediately after the local PendingJoin
+    /// insert in the invite-only branch. The countersign's
+    /// `target_event_id` must equal `pre_minted.bootstrap_join.id` for
+    /// the post-Inserted hook to wake the registered oneshot.
+    pub pre_delivered_countersign: Option<crate::community_membership::SignedMembershipEvent>,
+
+    /// Admin identity pub for inserting the pre-delivered countersign.
+    /// The joiner's engine has no resolver entry for admin pre-bootstrap,
+    /// so `insert_local_event_with_pubs` is called with explicit pubs.
+    /// Must be `Some` whenever `pre_delivered_countersign` is `Some`.
+    pub admin_identity_pub: Option<[u8; 64]>,
+}
+
 /// ZEB-262 Phase 4: invite-only `redeem_invite` inner helper. Encodes
 /// the 10-step flow per spec §"Send path: redeem_invite":
 ///
@@ -14678,8 +14770,63 @@ pub fn mint_redemption(
 /// passes a closure that captures `&Mutex<NodeState>` + the snapshot.
 /// `Fn` (not `FnOnce`) so future-proof retries can re-call without
 /// consuming.
+///
+/// **Overrides.** Thin wrapper around `redeem_invite_inner_with_overrides`
+/// that passes the default (no overrides). Existing callers stay
+/// unchanged; the iroh-handshake redemption path (ZEB-325 Phase 2c
+/// option A) uses the explicit-overrides variant directly.
 #[allow(clippy::too_many_arguments)]
 pub async fn redeem_invite_inner<R: tauri::Runtime, F>(
+    url: String,
+    crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    hlc_tracker: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+    >,
+    device_id: String,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
+    community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
+    unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
+    dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
+    channel_log_registry: std::sync::Arc<
+        crate::community_channel_log_engine::ChannelLogRegistry<R>,
+    >,
+    fence_check: F,
+    identity_dir: Option<std::path::PathBuf>,
+    allow_no_reticulum_destinations: bool,
+) -> Result<RedeemInviteResultDto, String>
+where
+    F: Fn() -> Result<(), String>,
+{
+    redeem_invite_inner_with_overrides(
+        url,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        signing_key,
+        community_registry,
+        community_adapter_tx,
+        unicast_send_tx,
+        dm_outbox,
+        channel_log_registry,
+        fence_check,
+        identity_dir,
+        allow_no_reticulum_destinations,
+        RedeemInviteOverrides::default(),
+    )
+    .await
+}
+
+/// Same as `redeem_invite_inner` but accepts an explicit
+/// `RedeemInviteOverrides`. ZEB-325 Phase 2c option A: lets the
+/// iroh-handshake redemption path inject a pre-built `MintedCommunity`
+/// (matching the bootstrap_join.id sent on the wire to admin) and a
+/// pre-delivered `JoinCountersign` event so the oneshot await resolves
+/// without needing the Reticulum unicast or CRDT-sync round-trip.
+#[allow(clippy::too_many_arguments)]
+pub async fn redeem_invite_inner_with_overrides<R: tauri::Runtime, F>(
     url: String,
     crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     hlc_tracker: std::sync::Arc<
@@ -14701,6 +14848,17 @@ pub async fn redeem_invite_inner<R: tauri::Runtime, F>(
     // Write failure is always non-fatal — the join proceeds; the user just won't
     // see pre-fork history.
     identity_dir: Option<std::path::PathBuf>,
+    // ZEB-325 Phase 2c: when true, skip the Reticulum-destinations fast-fail
+    // (`destinations.is_empty()` early-Err). The caller has guaranteed an
+    // alternate transport (typically iroh-borne Zenoh CRDT sync) and the
+    // PendingJoin event will reach the admin via the engine's state-root
+    // publisher rather than the per-device unicast fan-out. Default false at
+    // every existing callsite to preserve current redeem_invite IPC semantics
+    // (no known device → invite cannot route).
+    allow_no_reticulum_destinations: bool,
+    // ZEB-325 Phase 2c option A: pre-minted artifacts + pre-delivered
+    // counter-sign event. See `RedeemInviteOverrides` docs.
+    overrides: RedeemInviteOverrides,
 ) -> Result<RedeemInviteResultDto, String>
 where
     F: Fn() -> Result<(), String>,
@@ -14716,11 +14874,35 @@ where
 
     // 4. ZEB-267: atomic HLC reservation. Replaces the
     //    snapshot-then-release pattern + post-commit advance.
-    let join_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    //
+    // ZEB-325 Phase 2c option A: skip HLC reservation when the caller
+    // passed `pre_minted`; the caller already reserved a matching HLC
+    // when they minted to produce the request packet sent on the iroh
+    // bi-stream. Reserving a second HLC here would burn a fresh slot
+    // and drift the tracker for no benefit.
+    let join_hlc = if overrides.pre_minted.is_some() {
+        // Borrowed from the pre-minted bootstrap_join; only used by
+        // step 9's commit (space.created_at), never re-bumped against
+        // the tracker.
+        overrides
+            .pre_minted
+            .as_ref()
+            .map(|m| m.bootstrap_join.at.clone())
+            .expect("pre_minted.is_some checked above")
+    } else {
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await
+    };
 
     // 5. Mint (pure helper — no side effects on owner-state yet).
-    let minted = mint_redemption(&payload, self_owner, signing_key.as_ref(), join_hlc)?;
+    // ZEB-325 Phase 2c option A: skip when the caller pre-minted (the
+    // caller's MintedCommunity is the source of truth — its
+    // bootstrap_join.id is what the wire packet was signed against, so
+    // a fresh mint here would produce a different random event_id and
+    // mismatch the JoinCountersign's target_event_id).
+    let minted = match overrides.pre_minted {
+        Some(m) => m,
+        None => mint_redemption(&payload, self_owner, signing_key.as_ref(), join_hlc)?,
+    };
 
     // ZEB-271: open a channel-log transaction. Protects against remote
     // ChannelCreate events that arrive via Zenoh sync between
@@ -15012,63 +15194,204 @@ where
             }
         }
 
-        // 7c. Resolve inviter's Reticulum destination(s) and send.
-        let inviter_addr = payload.admin_addr;
-        let destinations = resolve_destinations_for_owner(crdt_state.as_ref(), inviter_addr).await;
-        if destinations.is_empty() {
-            // No known device for inviter → drop oneshot.
-            let _ = community_registry
-                .take_pending_redemption(&minted.bootstrap_join.id)
-                .await;
-            // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
-            return Err(format!(
-                "no known device for inviter {} — invite cannot route",
-                hex::encode(inviter_addr.0)
-            ));
-        }
-        // Per-destination fan-out with at-least-one-success semantics.
+        // ZEB-325 Phase 2c option A: pre-delivered counter-sign injection.
+        // The iroh-handshake redemption path has already received the
+        // admin's JoinCountersign event over the bi-stream response;
+        // insert it now so the engine's post-Inserted hook fires the
+        // oneshot we registered at 7a (the hook calls
+        // `notify_pending_redemption_in_map` on the JoinCountersign's
+        // `target_event_id`, which equals our `bootstrap_join.id`).
         //
-        // The inviter may have multiple devices (any of which can
-        // counter-sign). Reticulum unicast is best-effort per
-        // destination — if even one queue-side `try_send` succeeds the
-        // packet is on its way and we cannot retract it, so a partial
-        // failure followed by local rollback would leave the receiver
-        // counter-signing while we tear down the engine here. Track
-        // success across the loop and ONLY roll back when all
-        // destinations failed.
-        let mut any_sent = false;
-        let mut last_err: Option<String> = None;
-        for destination_hash in &destinations {
-            match unicast_send_tx.try_send(crate::dm_outbox::UnicastSendRequest {
-                destination_hash: *destination_hash,
-                packet: wire.clone(),
-            }) {
-                Ok(()) => any_sent = true,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        destination_hash = %hex::encode(destination_hash),
-                        "redeem_invite unicast try_send failed for destination — \
-                         continuing fan-out"
+        // The await at 7d resolves immediately; the Reticulum unicast
+        // fan-out below is skipped because the caller MUST set
+        // `allow_no_reticulum_destinations=true` for this path
+        // (otherwise the empty-destinations path would Err on cold
+        // first-contact joins that have no DM cache entry for the
+        // inviter).
+        if let Some(cs) = overrides.pre_delivered_countersign.clone() {
+            let admin_pub = match overrides.admin_identity_pub {
+                Some(p) => p,
+                None => {
+                    let _ = community_registry
+                        .take_pending_redemption(&minted.bootstrap_join.id)
+                        .await;
+                    return Err(
+                        "pre_delivered_countersign requires admin_identity_pub override".into(),
                     );
-                    last_err = Some(e.to_string());
+                }
+            };
+            // Sanity-check: countersign must target the bootstrap_join
+            // we just inserted (otherwise the hook fires on the wrong
+            // key and the oneshot await falls back to the wire path).
+            let target_matches = matches!(
+                &cs.kind,
+                crate::community_membership::MembershipEventKind::JoinCountersign {
+                    target_event_id,
+                } if *target_event_id == minted.bootstrap_join.id
+            );
+            if !target_matches {
+                let _ = community_registry
+                    .take_pending_redemption(&minted.bootstrap_join.id)
+                    .await;
+                return Err(format!(
+                    "pre_delivered_countersign target_event_id does not match bootstrap_join.id={}",
+                    hex::encode(minted.bootstrap_join.id)
+                ));
+            }
+            match engine_arc
+                .insert_local_event_with_pubs(cs, admin_pub, None)
+                .await
+            {
+                Ok(crate::community_state_crdt::InsertOutcome::Inserted) => {
+                    // Hook fired — the post-Inserted clear hook calls
+                    // notify_pending_redemption_in_map on the
+                    // countersign's `target_event_id`
+                    // (== minted.bootstrap_join.id), which wakes the
+                    // oneshot we registered at step 7a.
+                }
+                Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => {
+                    // ZEB-325 PR #159 F6: the post-Inserted hook only
+                    // fires on Inserted, not AlreadyKnown. If the
+                    // countersign was already in the engine via some
+                    // other path (CRDT-sync race, retried IPC, etc.),
+                    // the await on the oneshot below would block until
+                    // the 5s timeout. Drain the registered oneshot
+                    // explicitly so the await resolves immediately
+                    // with success rather than spinning the timeout
+                    // path.
+                    //
+                    // `notify_pending_redemption` is a no-op if the
+                    // oneshot wasn't registered (e.g. open-community
+                    // branch); calling it unconditionally here is
+                    // safe.
+                    tracing::debug!(
+                        community_id = %hex::encode(minted.community_id.0),
+                        event_id = %hex::encode(minted.bootstrap_join.id),
+                        "ZEB-325 PR #159 F6: pre_delivered_countersign \
+                         AlreadyKnown — firing pending-redemption oneshot \
+                         manually so the await at step 7d resolves"
+                    );
+                    community_registry
+                        .notify_pending_redemption(&minted.bootstrap_join.id)
+                        .await;
+                }
+                Ok(crate::community_state_crdt::InsertOutcome::Rejected(verify_err)) => {
+                    let _ = community_registry
+                        .take_pending_redemption(&minted.bootstrap_join.id)
+                        .await;
+                    return Err(format!(
+                        "engine rejected pre_delivered_countersign: {verify_err}"
+                    ));
+                }
+                Err(insert_err) => {
+                    let _ = community_registry
+                        .take_pending_redemption(&minted.bootstrap_join.id)
+                        .await;
+                    return Err(format!(
+                        "engine.insert_local_event_with_pubs (pre_delivered_countersign): {insert_err}"
+                    ));
                 }
             }
         }
-        if !any_sent {
-            let _ = community_registry
-                .take_pending_redemption(&minted.bootstrap_join.id)
-                .await;
-            // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
-            return Err(format!(
-                "unicast_send_tx try_send failed for all {} destination(s){}",
-                destinations.len(),
-                last_err
-                    .as_deref()
-                    .map(|s| format!(" (last error: {s})"))
-                    .unwrap_or_default()
-            ));
-        }
+
+        // 7c. Resolve inviter's Reticulum destination(s) and send.
+        //
+        // ZEB-325 PR #159 R6 (Cursor HIGH): when `pre_delivered_countersign`
+        // is Some, the countersign has already been inserted locally at
+        // step 7b above — Reticulum fan-out is not the request channel
+        // for this redemption (iroh already discharged it). Skip the
+        // entire fan-out block. Without this guard, a joiner with stale
+        // Reticulum DM cache for the inviter (destinations non-empty)
+        // would take the fan-out path; if every `try_send` failed
+        // (likely as Reticulum is being deprioritized) the function
+        // would Err and the rollback would tear down the engine even
+        // though the countersign is already committed.
+        //
+        // The original `allow_no_reticulum_destinations` gate below
+        // remains correct for the empty-destinations case it was
+        // designed for, but it's now subordinate to the stronger
+        // signal: "we already have the countersign, no transport
+        // request is needed."
+        let inviter_addr = payload.admin_addr;
+        if overrides.pre_delivered_countersign.is_some() {
+            tracing::debug!(
+                inviter = %hex::encode(inviter_addr.0),
+                "redeem_invite_inner: pre_delivered_countersign present — skipping \
+                 Reticulum unicast fan-out (countersign already inserted at step 7b)"
+            );
+        } else {
+            let destinations =
+                resolve_destinations_for_owner(crdt_state.as_ref(), inviter_addr).await;
+            if destinations.is_empty() {
+                if allow_no_reticulum_destinations {
+                    // ZEB-325 Phase 2c: no Reticulum destinations — but the caller
+                    // has guaranteed an alternate transport (iroh-borne Zenoh CRDT
+                    // sync). Skip the Reticulum unicast fan-out entirely and
+                    // proceed to the oneshot await; the engine's state-root
+                    // publisher will carry the PendingJoin to the inviter via
+                    // Zenoh once an iroh link is up.
+                    tracing::debug!(
+                        inviter = %hex::encode(inviter_addr.0),
+                        "redeem_invite_inner: no Reticulum destinations; relying on CRDT sync \
+                         (allow_no_reticulum_destinations=true)"
+                    );
+                } else {
+                    // No known device for inviter → drop oneshot.
+                    let _ = community_registry
+                        .take_pending_redemption(&minted.bootstrap_join.id)
+                        .await;
+                    // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
+                    return Err(format!(
+                        "no known device for inviter {} — invite cannot route",
+                        hex::encode(inviter_addr.0)
+                    ));
+                }
+            } else {
+                // Per-destination fan-out with at-least-one-success semantics.
+                //
+                // The inviter may have multiple devices (any of which can
+                // counter-sign). Reticulum unicast is best-effort per
+                // destination — if even one queue-side `try_send` succeeds the
+                // packet is on its way and we cannot retract it, so a partial
+                // failure followed by local rollback would leave the receiver
+                // counter-signing while we tear down the engine here. Track
+                // success across the loop and ONLY roll back when all
+                // destinations failed.
+                let mut any_sent = false;
+                let mut last_err: Option<String> = None;
+                for destination_hash in &destinations {
+                    match unicast_send_tx.try_send(crate::dm_outbox::UnicastSendRequest {
+                        destination_hash: *destination_hash,
+                        packet: wire.clone(),
+                    }) {
+                        Ok(()) => any_sent = true,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                destination_hash = %hex::encode(destination_hash),
+                                "redeem_invite unicast try_send failed for destination — \
+                                 continuing fan-out"
+                            );
+                            last_err = Some(e.to_string());
+                        }
+                    }
+                }
+                if !any_sent {
+                    let _ = community_registry
+                        .take_pending_redemption(&minted.bootstrap_join.id)
+                        .await;
+                    // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
+                    return Err(format!(
+                        "unicast_send_tx try_send failed for all {} destination(s){}",
+                        destinations.len(),
+                        last_err
+                            .as_deref()
+                            .map(|s| format!(" (last error: {s})"))
+                            .unwrap_or_default()
+                    ));
+                }
+            }
+        } // end: else { … } from R6 pre_delivered_countersign guard
 
         // 7d. Await oneshot ≤ T (env-overridable for tests).
         // ZEB-254: 5s fast-path timeout (down from 15s). On timeout,
@@ -15518,6 +15841,7 @@ async fn redeem_invite(
         channel_log_registry,
         fence_check,
         crate::owner_commands::resolve_identity_dir().ok(),
+        false, // ZEB-325: redeem_invite IPC keeps Reticulum-required semantics.
     )
     .await?;
 
@@ -15639,6 +15963,7 @@ where
         channel_log_registry,
         fence_check,
         crate::owner_commands::resolve_identity_dir().ok(),
+        false, // ZEB-325: open-community wrapper keeps Reticulum-required semantics.
     )
     .await
 }
@@ -16005,7 +16330,8 @@ mod redeem_invite_inner_tests {
             std::sync::Arc::clone(&fixture.dm_outbox),
             std::sync::Arc::clone(&fixture.channel_log_registry),
             || Ok(()),
-            None, // identity_dir: no fork fields in this test
+            None,  // identity_dir: no fork fields in this test
+            false, // ZEB-325: happy path uses Reticulum-required semantics.
         )
         .await;
 
@@ -16023,6 +16349,420 @@ mod redeem_invite_inner_tests {
                 .has_pending_transaction_for_test(&community_id),
             "happy path: channel_log transaction must be committed (no lingering pending entry)"
         );
+    }
+
+    // ── ZEB-325 Phase 2c: allow_no_reticulum_destinations gate ─────────────────
+
+    /// ZEB-325 Phase 2c: when caller passes `allow_no_reticulum_destinations =
+    /// true` and `resolve_destinations_for_owner` returns empty, the function
+    /// must NOT early-return with "no known device for inviter"; it must
+    /// proceed straight to the oneshot await. With no admin device sending a
+    /// counter-sign (which is the whole point of the iroh path — the wire
+    /// goes via CRDT sync, but in this unit test there is no Zenoh session),
+    /// the oneshot will time out after `HARMONY_REDEEM_INVITE_TIMEOUT_MS`
+    /// (we set it to 500ms for speed). The function must then return Ok with
+    /// `pending: true`, encoding "PendingJoin is on the wire; admins will
+    /// counter-sign when they next come online" — same semantics as the
+    /// existing 5s fast-path timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redeem_invite_inner_allow_no_reticulum_destinations_skips_fast_fail() {
+        // Speed the oneshot timeout (default 5s) so the test runs in <1s.
+        // SAFETY: env var; nextest isolates each test in its own process so
+        // no cross-test races.
+        // SAFETY: set_var is unsafe in Rust 2024; this test owns its env.
+        unsafe {
+            std::env::set_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS", "500");
+        }
+
+        // ── Custom fixture (cannot use build_redeem_invite_test_fixture) ──
+        //
+        // ZEB-254 verify_event for PendingJoin (community_membership.rs:
+        // PendingJoinJoinerPubMismatch) requires that
+        // `Identity::from_public_bytes(joiner_identity_pub).address_hash`
+        // equals `event.actor.0`. mint_redemption builds joiner_identity_pub
+        // from `signing_key` alone: X25519 priv derived via
+        // ed25519_priv_to_x25519 (dalek to_scalar_bytes), Ed25519 pub from
+        // signing_key.verifying_key(). The shared fixture's `self_owner` is
+        // derived from `PrivateIdentity::from_seed`'s HKDF-x25519 (independent
+        // of ed25519), so its address_hash does NOT match the mint-derived
+        // hash — fine for the OPEN happy_path test (Join verifies by signature
+        // alone), but fails the PendingJoin actor-hash gate. This test builds
+        // its own registry whose self_owner + resolver agree with the
+        // signing-key-derived joiner_identity_pub.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+
+        let joiner_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
+        let signing_key = signing_key_from_identity(&joiner_identity);
+        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
+        let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
+        let admin_pub = admin_identity.identity.to_public_bytes();
+
+        // Derive the joiner pub/addr the same way mint_redemption will.
+        let (joiner_self_owner, joiner_pub_64) = {
+            let x25519_priv = crate::dm_signing::ed25519_priv_to_x25519(&signing_key);
+            let x25519_pub =
+                x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*x25519_priv));
+            let ed25519_pub = signing_key.verifying_key().to_bytes();
+            let mut combined = [0u8; 64];
+            combined[..32].copy_from_slice(x25519_pub.as_bytes());
+            combined[32..].copy_from_slice(&ed25519_pub);
+            let id = harmony_identity::Identity::from_public_bytes(&combined)
+                .expect("from_public_bytes (signing-key-derived joiner pub)");
+            (OwnerAddr(id.address_hash), combined)
+        };
+
+        struct TwoOwnerResolver {
+            admin: OwnerAddr,
+            admin_pub: [u8; 64],
+            joiner: OwnerAddr,
+            joiner_pub: [u8; 64],
+        }
+        #[async_trait::async_trait]
+        impl crate::community_state_sync::IdentityResolver for TwoOwnerResolver {
+            async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+                if *addr == self.admin {
+                    Some(self.admin_pub)
+                } else if *addr == self.joiner {
+                    Some(self.joiner_pub)
+                } else {
+                    None
+                }
+            }
+        }
+
+        let (cas_op_tx, _cas_op_rx) = mpsc::channel(8);
+        let cs: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(RuntimeContentStore::new(
+            cas_op_tx,
+            std::time::Duration::from_millis(1000),
+        ));
+        let community_registry =
+            std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+                device_id: "joiner-dev".into(),
+                content_store: cs,
+                identity_resolver: std::sync::Arc::new(TwoOwnerResolver {
+                    admin: admin_addr,
+                    admin_pub,
+                    joiner: joiner_self_owner,
+                    joiner_pub: joiner_pub_64,
+                }),
+                identity_dir: tmp.path().to_path_buf(),
+                debounce_ms: crate::community_state_sync::DEFAULT_DEBOUNCE_MS,
+                error_tx: None,
+                delta_tx: None,
+                self_owner: joiner_self_owner,
+                signing_key: std::sync::Arc::clone(&signing_key),
+                crdt_state: None,
+                nav_emitter: None,
+            }));
+
+        let (community_adapter_tx, _community_adapter_rx) =
+            mpsc::channel::<crate::event_loop::CommunityAdapterRequest>(16);
+        let (unicast_send_tx, _unicast_rx) = mpsc::channel::<UnicastSendRequest>(16);
+
+        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new(
+            "joiner-dev".into(),
+            joiner_self_owner,
+            DeviceIdentityHash(joiner_self_owner.0),
+            std::sync::Arc::clone(&signing_key),
+            std::sync::Arc::new(joiner_identity),
+        )));
+
+        let (channel_log_adapter_tx, _channel_log_adapter_rx) =
+            mpsc::unbounded_channel::<crate::event_loop::ChannelLogAdapterRequest>();
+        let app = tauri::test::mock_app().handle().clone();
+        let channel_log_registry =
+            std::sync::Arc::new(ChannelLogRegistry::new(ChannelLogRegistryConfig {
+                adapter_request_tx: channel_log_adapter_tx,
+                app,
+                identity_dir: tmp.path().to_path_buf(),
+                self_owner: joiner_self_owner,
+                self_device_id: "joiner-dev".into(),
+                signing_key: std::sync::Arc::clone(&signing_key),
+                engine_config: ChannelLogEngineConfig::default(),
+            }));
+
+        let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
+        let hlc_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+
+        // ── Build the invite-only payload ──
+        let community_id = SpaceId([0xf6; 16]);
+        let membership_key = EpochKey::new([0x42; 32]);
+
+        // Build the admin's signed bootstrap-Join event (required for
+        // invite-only payloads since ZEB-260 Phase 4).
+        let admin_bootstrap = {
+            let payload = crate::community_membership::EventPayload {
+                id: [0x11; 16],
+                community_id,
+                kind: crate::community_membership::MembershipEventKind::Join,
+                actor: admin_addr,
+                at: Hlc {
+                    wall_ms: 900,
+                    logical: 0,
+                    device_id: "admin-dev".into(),
+                },
+            };
+            crate::community_membership::sign_event_with_identity(&payload, &admin_identity)
+                .expect("sign admin bootstrap")
+        };
+
+        // Build the admin-signed invite-token (admin sigs over canonical
+        // CBOR of inviter/invitee_hint/minted_at).
+        let token_minted_at = Hlc {
+            wall_ms: 950,
+            logical: 0,
+            device_id: "admin-dev".into(),
+        };
+        let placeholder_token = crate::community_invite::InviteToken {
+            inviter: admin_addr,
+            invitee_hint: Some(joiner_self_owner),
+            minted_at: token_minted_at.clone(),
+            expires_at: None,
+            sig: [0u8; 64],
+        };
+        let token_payload_bytes =
+            crate::community_invite::canonical_invite_token_bytes(&placeholder_token)
+                .expect("canonical token bytes");
+        let token_sig = admin_identity.sign(&token_payload_bytes);
+        let invite_token = crate::community_invite::InviteToken {
+            inviter: admin_addr,
+            invitee_hint: Some(joiner_self_owner),
+            minted_at: token_minted_at,
+            expires_at: None,
+            sig: token_sig,
+        };
+
+        // Seal the epoch key to the joiner's x25519 pub (derived from the
+        // joiner's ed25519 signing key, matching mint_redemption's derivation).
+        let sealed_epoch_key = {
+            let joiner_ed25519_pub32 = signing_key.verifying_key().to_bytes();
+            let x25519_pub = crate::dm_signing::ed25519_pub_to_x25519(&joiner_ed25519_pub32)
+                .expect("ed25519→x25519");
+            crate::dm_signing::seal_to_owner(&x25519_pub, membership_key.as_bytes())
+                .expect("seal epoch key")
+        };
+
+        let invite_payload = CommunityInvitePayload {
+            community_id,
+            epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key,
+                state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
+            },
+            admin_addr,
+            community_name: "Phase2cTestCom".into(),
+            is_invite_only: true,
+            expires_at: None,
+            invite_token: Some(invite_token),
+            admin_bootstrap: Some(admin_bootstrap),
+            admin_identity_pub: Some(admin_pub),
+            forked_from: None,
+            pre_fork_snapshot: None,
+        };
+
+        let invite_url =
+            crate::community_invite::encode_invite_url(&invite_payload).expect("encode invite url");
+
+        // Pre-call: owner-state has no devices for admin_addr →
+        // resolve_destinations_for_owner returns empty.
+        // (Implicit from OwnerState::default().)
+
+        // Drive with allow_no_reticulum_destinations = true.
+        let result = redeem_invite_inner(
+            invite_url,
+            std::sync::Arc::clone(&crdt_state),
+            std::sync::Arc::clone(&hlc_tracker),
+            "joiner-dev".to_string(),
+            joiner_self_owner,
+            std::sync::Arc::clone(&signing_key),
+            std::sync::Arc::clone(&community_registry),
+            community_adapter_tx,
+            unicast_send_tx,
+            std::sync::Arc::clone(&dm_outbox),
+            std::sync::Arc::clone(&channel_log_registry),
+            || Ok(()),
+            None,
+            true, // allow_no_reticulum_destinations
+        )
+        .await;
+
+        // Must Ok (not the "no known device for inviter" Err that would
+        // fire with allow_no_reticulum_destinations = false). The gate
+        // bypass is the load-bearing assertion: function proceeded past
+        // the destinations.is_empty() check instead of early-returning Err.
+        let dto = result.expect(
+            "redeem_invite_inner with allow_no_reticulum_destinations=true \
+             and empty destinations must NOT early-return Err; it must \
+             proceed past the destinations fast-fail to the oneshot await",
+        );
+
+        // The PendingJoin is on the wire (engine state-root publisher will
+        // carry it via Zenoh CRDT sync once an iroh link is up). Note:
+        // `dto.pending` here may be false because the engine's local
+        // `insert_local_event` hook (community_state_sync.rs ~1523) fires
+        // the oneshot keyed on `event.id` (which equals the PendingJoin id
+        // we register against), so the oneshot await returns Ok immediately
+        // rather than timing out. This is identical to the OPEN happy_path
+        // semantics. Either way, the load-bearing assertion is "Ok, not the
+        // pre-Phase-2c early-Err". When iroh-borne CRDT sync actually
+        // delivers a JoinCountersign from the admin, dto.pending=false
+        // accurately reflects the joined state.
+        assert_eq!(dto.community_id, hex::encode(community_id.0));
+        assert_eq!(dto.community_name, "Phase2cTestCom");
+        assert!(dto.is_invite_only);
+
+        // Belt-and-suspenders: prove the gate is load-bearing. Re-run with
+        // allow_no_reticulum_destinations = false and verify we get the
+        // expected pre-Phase-2c Err. We have to rebuild the invite_url and
+        // a fresh registry (the prior call mutated state). Construct only
+        // what's needed for the call to reach the destinations check.
+        let tmp2 = tempfile::TempDir::new().expect("tempdir 2");
+        let (cas_op_tx2, _cas_op_rx2) = mpsc::channel(8);
+        let cs2: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(RuntimeContentStore::new(
+            cas_op_tx2,
+            std::time::Duration::from_millis(1000),
+        ));
+        let community_registry2 =
+            std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+                device_id: "joiner-dev".into(),
+                content_store: cs2,
+                identity_resolver: std::sync::Arc::new(TwoOwnerResolver {
+                    admin: admin_addr,
+                    admin_pub,
+                    joiner: joiner_self_owner,
+                    joiner_pub: joiner_pub_64,
+                }),
+                identity_dir: tmp2.path().to_path_buf(),
+                debounce_ms: crate::community_state_sync::DEFAULT_DEBOUNCE_MS,
+                error_tx: None,
+                delta_tx: None,
+                self_owner: joiner_self_owner,
+                signing_key: std::sync::Arc::clone(&signing_key),
+                crdt_state: None,
+                nav_emitter: None,
+            }));
+        let (adapter_tx2, _adapter_rx2) =
+            mpsc::channel::<crate::event_loop::CommunityAdapterRequest>(16);
+        let (unicast_tx2, _unicast_rx2) = mpsc::channel::<UnicastSendRequest>(16);
+        let crdt_state2 = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
+        let hlc_tracker2 = std::sync::Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+
+        // Re-encode the same invite_payload (different community_id so the
+        // registry doesn't reject as duplicate). Rebuild signed admin
+        // bootstrap + invite_token for the new community_id.
+        let community_id_b = SpaceId([0xf7; 16]);
+        let admin_bootstrap_b = {
+            let payload = crate::community_membership::EventPayload {
+                id: [0x12; 16],
+                community_id: community_id_b,
+                kind: crate::community_membership::MembershipEventKind::Join,
+                actor: admin_addr,
+                at: Hlc {
+                    wall_ms: 900,
+                    logical: 0,
+                    device_id: "admin-dev".into(),
+                },
+            };
+            crate::community_membership::sign_event_with_identity(&payload, &admin_identity)
+                .expect("sign admin bootstrap (run 2)")
+        };
+        let placeholder_token_b = crate::community_invite::InviteToken {
+            inviter: admin_addr,
+            invitee_hint: Some(joiner_self_owner),
+            minted_at: Hlc {
+                wall_ms: 950,
+                logical: 0,
+                device_id: "admin-dev".into(),
+            },
+            expires_at: None,
+            sig: [0u8; 64],
+        };
+        let token_payload_bytes_b =
+            crate::community_invite::canonical_invite_token_bytes(&placeholder_token_b)
+                .expect("canonical token bytes (run 2)");
+        let token_sig_b = admin_identity.sign(&token_payload_bytes_b);
+        let invite_token_b = crate::community_invite::InviteToken {
+            sig: token_sig_b,
+            ..placeholder_token_b
+        };
+        let sealed_epoch_key_b = {
+            let joiner_ed25519_pub32 = signing_key.verifying_key().to_bytes();
+            let x25519_pub = crate::dm_signing::ed25519_pub_to_x25519(&joiner_ed25519_pub32)
+                .expect("ed25519→x25519 (run 2)");
+            crate::dm_signing::seal_to_owner(&x25519_pub, membership_key.as_bytes())
+                .expect("seal epoch key (run 2)")
+        };
+        let invite_payload_b = CommunityInvitePayload {
+            community_id: community_id_b,
+            epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: sealed_epoch_key_b,
+                state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
+            },
+            admin_addr,
+            community_name: "Phase2cTestComB".into(),
+            is_invite_only: true,
+            expires_at: None,
+            invite_token: Some(invite_token_b),
+            admin_bootstrap: Some(admin_bootstrap_b),
+            admin_identity_pub: Some(admin_pub),
+            forked_from: None,
+            pre_fork_snapshot: None,
+        };
+        let invite_url_b = crate::community_invite::encode_invite_url(&invite_payload_b)
+            .expect("encode invite url (run 2)");
+        let dm_outbox_b = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new(
+            "joiner-dev".into(),
+            joiner_self_owner,
+            DeviceIdentityHash(joiner_self_owner.0),
+            std::sync::Arc::clone(&signing_key),
+            std::sync::Arc::new(PrivateIdentity::from_seed(&[0xbb; 32])),
+        )));
+        let (channel_log_adapter_tx_b, _channel_log_adapter_rx_b) =
+            mpsc::unbounded_channel::<crate::event_loop::ChannelLogAdapterRequest>();
+        let app_b = tauri::test::mock_app().handle().clone();
+        let channel_log_registry_b =
+            std::sync::Arc::new(ChannelLogRegistry::new(ChannelLogRegistryConfig {
+                adapter_request_tx: channel_log_adapter_tx_b,
+                app: app_b,
+                identity_dir: tmp2.path().to_path_buf(),
+                self_owner: joiner_self_owner,
+                self_device_id: "joiner-dev".into(),
+                signing_key: std::sync::Arc::clone(&signing_key),
+                engine_config: ChannelLogEngineConfig::default(),
+            }));
+
+        let baseline_err = redeem_invite_inner(
+            invite_url_b,
+            std::sync::Arc::clone(&crdt_state2),
+            std::sync::Arc::clone(&hlc_tracker2),
+            "joiner-dev".to_string(),
+            joiner_self_owner,
+            std::sync::Arc::clone(&signing_key),
+            std::sync::Arc::clone(&community_registry2),
+            adapter_tx2,
+            unicast_tx2,
+            std::sync::Arc::clone(&dm_outbox_b),
+            std::sync::Arc::clone(&channel_log_registry_b),
+            || Ok(()),
+            None,
+            false, // baseline: pre-Phase-2c semantics → must Err
+        )
+        .await;
+        let err_msg = baseline_err.expect_err(
+            "with allow_no_reticulum_destinations=false and empty destinations, \
+             redeem_invite_inner must surface the pre-Phase-2c 'no known device' Err",
+        );
+        assert!(
+            err_msg.contains("no known device for inviter"),
+            "expected 'no known device for inviter' Err, got: {err_msg}",
+        );
+
+        // Cleanup the env var so it doesn't bleed into other tests.
+        // (nextest isolates per-process so this is belt-and-suspenders.)
+        unsafe {
+            std::env::remove_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS");
+        }
     }
 
     // ── Existing tests ─────────────────────────────────────────────────────────
@@ -16157,6 +16897,7 @@ mod redeem_invite_inner_tests {
             std::sync::Arc::clone(&fixture.channel_log_registry),
             || Ok(()),
             Some(tmp.path().to_path_buf()),
+            false, // ZEB-325: fork-invite test uses Reticulum-required semantics.
         )
         .await;
 
@@ -16279,6 +17020,7 @@ mod redeem_invite_inner_tests {
             std::sync::Arc::clone(&fixture.channel_log_registry),
             || Ok(()),
             Some(tmp.path().to_path_buf()),
+            false, // ZEB-325: fork-invite test uses Reticulum-required semantics.
         )
         .await;
 
@@ -16382,6 +17124,7 @@ mod redeem_invite_inner_tests {
             std::sync::Arc::clone(&fixture.channel_log_registry),
             || Ok(()),
             Some(tmp.path().to_path_buf()),
+            false, // ZEB-325: fork-invite test uses Reticulum-required semantics.
         )
         .await;
 
@@ -28603,19 +29346,167 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
 // Helper return types follow with `#[serde(rename_all = "camelCase")]`
 // for JS callers.
 
+/// Tunable timeouts for the dialer side of the ZEB-325 Phase 2c invite
+/// handshake. Each `tokio::time::timeout(..)` wrapping a
+/// `connect` / `open_bi` / response-read call uses one of these
+/// durations.
+///
+/// Production wiring (the `connectivity_redeem_invite_iroh` IPC) calls
+/// [`Self::from_env`] so operators can override without recompiling;
+/// integration tests construct directly to keep wall-clock short and
+/// to avoid mutating process env (`std::env::set_var` is unsafe in
+/// multithreaded contexts — see ZEB-325 PR #159 F10).
+#[derive(Debug, Clone, Copy)]
+pub struct HandshakeDialConfig {
+    /// Timeout for the QUIC `connect()` call (initial dial + hole-
+    /// punch). Distinct from the response-read timeout so diagnostics
+    /// can tell "couldn't reach the inviter at all" apart from
+    /// "reached them but they never responded".
+    pub connect_timeout: std::time::Duration,
+    /// Timeout for `Connection::open_bi()` after `connect()` succeeds.
+    /// Usually returns near-immediately on a healthy connection;
+    /// bounded for the pathological case where the peer never opens
+    /// its receive window.
+    pub open_bi_timeout: std::time::Duration,
+    /// Timeout for reading the length-prefixed handshake response
+    /// (acceptor's CBOR-encoded JoinCountersign). Replaces the
+    /// previous direct `std::env::var` read at the call site.
+    pub response_read_timeout: std::time::Duration,
+    /// Timeout for the dialer's request writes (length-prefix +
+    /// packet body) and `send.finish()`. ZEB-325 PR #159 R3-2
+    /// (Cursor MEDIUM): previously unbounded — the dial / open_bi /
+    /// response-read awaits were all wrapped, but the request send
+    /// path wasn't, so a misbehaving acceptor's flow-control freeze
+    /// could pin the dialer indefinitely. Production override:
+    /// `HARMONY_INVITE_HANDSHAKE_WRITE_TIMEOUT_MS` (defaults to
+    /// 30_000ms; clamped to >= 1ms).
+    pub write_timeout: std::time::Duration,
+}
+
+impl Default for HandshakeDialConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout: std::time::Duration::from_millis(30_000),
+            open_bi_timeout: std::time::Duration::from_millis(30_000),
+            response_read_timeout: std::time::Duration::from_millis(30_000),
+            write_timeout: std::time::Duration::from_millis(30_000),
+        }
+    }
+}
+
+impl HandshakeDialConfig {
+    /// Production constructor: reads `HARMONY_INVITE_HANDSHAKE_TIMEOUT_MS`
+    /// (the historical single-knob env var) and applies it uniformly to
+    /// connect, open_bi, and response read. Unset / unparseable → 30s.
+    /// The write-side timeout uses a dedicated
+    /// `HARMONY_INVITE_HANDSHAKE_WRITE_TIMEOUT_MS` knob (added in
+    /// ZEB-325 PR #159 R3-2) so operators can tune request-send
+    /// resilience independently from the read budget.
+    ///
+    /// ZEB-325 PR #159 R3: clamp to >= 1ms. A zero from env override
+    /// would otherwise produce instant `tokio::time::timeout(0, …)`
+    /// failures, surfacing `inviter_unreachable` on every redeem +
+    /// (if the caller retries) a tight loop.
+    pub fn from_env() -> Self {
+        let ms: u64 = std::env::var("HARMONY_INVITE_HANDSHAKE_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30_000)
+            .max(1);
+        let d = std::time::Duration::from_millis(ms);
+        let write_ms: u64 = std::env::var("HARMONY_INVITE_HANDSHAKE_WRITE_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30_000)
+            .max(1);
+        let write_d = std::time::Duration::from_millis(write_ms);
+        Self {
+            connect_timeout: d,
+            open_bi_timeout: d,
+            response_read_timeout: d,
+            write_timeout: write_d,
+        }
+    }
+}
+
 /// Outcome returned by `connectivity_redeem_invite_iroh`.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RedemptionOutcome {
-    /// `"pkarr_resolved_no_handshake"` | `"inviter_unreachable"` |
-    /// `"missing_admin_identity_pub"` | `"not_yet_implemented"` etc.
-    /// NOTE: `"joined"` is intentionally never returned here — this IPC
-    /// only resolves pkarr records. Full join (iroh connect + counter-sig)
-    /// is Phase 2c (ZEB-323 §7.2).
+    /// Lifecycle status of the redemption attempt.
+    ///
+    /// * `"joined"` — full handshake completed; the joiner is now a
+    ///   member. `community_id` is `Some(hex)`.
+    /// * `"inviter_unreachable"` — pkarr couldn't find / verify the
+    ///   record, OR the iroh dial / open_bi / response read failed
+    ///   before the inviter delivered a JoinCountersign. The inviter
+    ///   was NOT reached. `community_id` is `None`.
+    /// * `"join_failed"` — pkarr resolved AND the iroh handshake
+    ///   completed AND a valid JoinCountersign was delivered, but the
+    ///   subsequent local `redeem_invite_inner_with_overrides` failed
+    ///   (engine insert error, fence violation, commit rollback,
+    ///   etc.). The inviter WAS reached; the failure is local.
+    ///   `community_id` is `Some(hex)` so the frontend can surface
+    ///   "we found Alice but local insert failed". Added in ZEB-325
+    ///   PR #159 F1.
+    /// * `"missing_admin_identity_pub"` — open invite (no
+    ///   admin_identity_pub binding); case-A discovery is not
+    ///   applicable. `community_id` is `None`.
+    /// * `"pkarr_resolved_no_handshake"` — legacy Phase 2b stub status;
+    ///   no longer returned by Phase 2c+. Kept in the type union for
+    ///   frontend defensive parsing.
     pub status: String,
-    /// Hex-encoded community id when the pkarr record was resolved
-    /// (`status == "pkarr_resolved_no_handshake"`).
+    /// Hex-encoded community id when the IPC was able to identify the
+    /// community (`status` ∈ `"joined" | "join_failed" |
+    /// "pkarr_resolved_no_handshake"`).
     pub community_id: Option<String>,
+}
+
+/// Stage of an in-flight cross-WAN invite redemption, emitted from
+/// `connectivity_redeem_invite_iroh` via the
+/// `connectivity-invite-resolution-progress` event for staged UI in
+/// `RedeemInviteDialog.svelte`. ZEB-325 Phase 2c.
+///
+/// Serializes to the snake_case strings the frontend's `RedemptionStage`
+/// type union expects: `"resolving" | "connecting" | "sending" |
+/// "awaiting_countersig" | "joined"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedemptionStage {
+    /// pkarr window-resolve is in flight.
+    Resolving,
+    /// pkarr record verified, ReachabilityResolver seeded, iroh hole-punch
+    /// is about to be triggered by `redeem_invite_inner` via the link
+    /// manager.
+    Connecting,
+    /// `redeem_invite_inner` is about to be invoked — the PendingJoin will
+    /// ride CRDT sync over the iroh-borne Zenoh link.
+    Sending,
+    /// PendingJoin written; awaiting admin's counter-signed Join to arrive
+    /// back via state-root publish.
+    AwaitingCountersig,
+    /// Counter-signed Join received and applied — the joiner is now a
+    /// community member.
+    Joined,
+}
+
+/// Payload of the `connectivity-invite-resolution-progress` Tauri event.
+/// Matches the frontend `ResolutionProgressEvent` shape in
+/// `src/lib/types/connectivity.ts`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolutionProgressPayload {
+    /// Stable per-attempt identifier so the dialog can disambiguate
+    /// progress for parallel redemption attempts. Currently the
+    /// hex-encoded `invite_token.sig` (case-A invites only have this when
+    /// invite-only; open invites take an early-exit branch that emits no
+    /// progress).
+    pub invite_id: String,
+    /// Current stage of the redemption.
+    pub stage: RedemptionStage,
+    /// Attempt number within this redemption. Always 1 for now;
+    /// reserved for future retry-aware UI.
+    pub attempt_n: u32,
 }
 
 /// Flattened view of a peer's routing record returned by
@@ -28654,61 +29545,339 @@ pub struct PkarrPublicationStatus {
 }
 
 /// Attempt to locate the inviter's iroh routing via case-A pkarr lookup,
-/// then open an iroh QUIC connection.
+/// seed the local `ReachabilityResolver` with the discovered routing record
+/// so the iroh-borne Zenoh link can be opened on demand, then drive the full
+/// invite redemption via `redeem_invite_inner` with
+/// `allow_no_reticulum_destinations=true`. The PendingJoin reaches the
+/// inviter via CRDT sync over the iroh link; the counter-signed Join
+/// arrives back the same way.
 ///
-/// Phase 2b first cut: resolves the inviter's routing record and verifies
-/// the connection is reachable. Full counter-sig orchestration via the
-/// existing `redeem_invite_inner` path is deferred to Phase 2c (requires
-/// deeper Zenoh-over-iroh plumbing). Returns `"joined"` as a placeholder
-/// when the iroh connect succeeds; returns `"inviter_unreachable"` if pkarr
-/// resolve returns `None`.
+/// Returns `"joined"` on successful redemption; `"inviter_unreachable"`
+/// when pkarr cannot find the record or the record fails verification;
+/// `"missing_admin_identity_pub"` when the invite is open (no admin
+/// identity binding) and case-A discovery is not applicable.
 ///
-/// TODO ZEB-323 §7.2: implement full orchestration (steps 8-10 of the spec).
+/// Implementation is split into a `pub` `connectivity_redeem_invite_iroh_inner`
+/// helper so integration tests can drive the orchestration with explicit
+/// resources (pkarr resolver, reachability resolver, NodeState handles)
+/// without spinning up the full Tauri AppState. The Tauri command itself
+/// only snapshots NodeState and delegates.
 #[tauri::command(rename_all = "snake_case")]
 async fn connectivity_redeem_invite_iroh(
+    app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
     invite_url: String,
 ) -> Result<RedemptionOutcome, String> {
+    // Snapshot NodeState handles in a single guard scope, then drop the
+    // std lock BEFORE any `.await`. Mirrors the `redeem_invite` IPC.
+    let (
+        pkarr_resolver,
+        reachability_resolver,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        community_registry,
+        community_adapter_tx,
+        unicast_send_tx,
+        channel_log_registry,
+        dm_outbox,
+        iroh_endpoint,
+    ) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.pkarr_resolver.clone(),
+            g.reachability_resolver.clone(),
+            g.crdt_state.clone(),
+            g.hlc_tracker.clone(),
+            g.dm_device_id.clone(),
+            g.dm_self_owner,
+            g.community_registry.clone(),
+            g.community_adapter_request_tx.clone(),
+            g.unicast_send_tx.clone(),
+            g.channel_log_registry.clone(),
+            g.dm_outbox.clone(),
+            g.iroh_endpoint.clone(),
+        )
+    };
+
+    // The full handshake needs every NodeState handle below; any missing
+    // one means the node isn't fully booted and the IPC should surface
+    // `inviter_unreachable` rather than panic-unwrap.
+    let (
+        Some(crdt_state),
+        Some(hlc_tracker),
+        Some(device_id),
+        Some(self_owner),
+        Some(community_registry),
+        Some(community_adapter_tx),
+        Some(unicast_send_tx),
+        Some(channel_log_registry),
+        Some(dm_outbox),
+    ) = (
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        community_registry,
+        community_adapter_tx,
+        unicast_send_tx,
+        channel_log_registry,
+        dm_outbox,
+    )
+    else {
+        return Ok(RedemptionOutcome {
+            status: "inviter_unreachable".to_string(),
+            community_id: None,
+        });
+    };
+
+    // signing_key is owned by dm_outbox; pull it once under the tokio mutex.
+    let signing_key = {
+        let outbox_g = dm_outbox.lock().await;
+        std::sync::Arc::clone(&outbox_g.signing_key)
+    };
+
+    // Emit staged progress events on the
+    // `connectivity-invite-resolution-progress` Tauri event so
+    // `RedeemInviteDialog.svelte`'s `onResolutionProgress` listener can
+    // surface the redemption stage to the user. ZEB-325 Phase 2c Task 4.
+    let app_for_progress_emit = app.clone();
+    let progress_sink = move |payload: ResolutionProgressPayload| {
+        if let Err(e) =
+            app_for_progress_emit.emit("connectivity-invite-resolution-progress", &payload)
+        {
+            tracing::warn!(
+                error = %e,
+                stage = ?payload.stage,
+                "connectivity_redeem_invite_iroh: emit progress failed"
+            );
+        }
+    };
+
+    // ZEB-325 PR #159 R3-1 (Cursor HIGH): emit `nav-updated` after a
+    // successful iroh-borne redemption so the sidebar / community list
+    // refreshes without requiring the RedeemInviteDialog to drive a
+    // frontend-side refresh on its own. Mirrors the Reticulum
+    // `redeem_invite` IPC's emit at lib.rs:15829, just sourced from
+    // inside the inner where we still own the dto. Tests pass a no-op
+    // closure (no AppHandle to drive).
+    let app_for_nav_emit = app.clone();
+    let nav_emit_sink = move |payload: NavUpdatedPayload| {
+        if let Err(e) = app_for_nav_emit.emit("nav-updated", &payload) {
+            tracing::warn!(
+                error = %e,
+                "connectivity_redeem_invite_iroh: nav-updated emit failed"
+            );
+        }
+    };
+
+    // Capture the std-mutex handle + snapshot generation under a fresh
+    // lock so the inner can re-check on commit (ZEB-325 PR #159 F8:
+    // previously the iroh path used `|| Ok(())` and bypassed the
+    // generation fence the regular `redeem_invite` IPC threads).
+    let (state_lock_for_fence, snapshot_generation_for_fence) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        // `tauri::State` is `Clone`-able by value (Rust borrow-aliasing
+        // rule), so we materialize a fresh handle for the closure.
+        (state.clone(), g.generation)
+    };
+    let fence_check = move || -> Result<(), String> {
+        let g = state_lock_for_fence
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation_for_fence {
+            return Err(format!(
+                "node generation changed during connectivity_redeem_invite_iroh \
+                 (was {}, now {}); redemption minted on a detached crdt_state and \
+                 won't be persisted — engine spawn suppressed",
+                snapshot_generation_for_fence, g.generation
+            ));
+        }
+        if g.community_registry.is_none() {
+            return Err(
+                "community_registry was torn down during connectivity_redeem_invite_iroh \
+                 — engine spawn suppressed"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    };
+
+    connectivity_redeem_invite_iroh_inner(
+        invite_url,
+        pkarr_resolver,
+        reachability_resolver,
+        iroh_endpoint,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        signing_key,
+        community_registry,
+        community_adapter_tx,
+        unicast_send_tx,
+        dm_outbox,
+        channel_log_registry,
+        crate::owner_commands::resolve_identity_dir().ok(),
+        progress_sink,
+        nav_emit_sink,
+        HandshakeDialConfig::from_env(),
+        fence_check,
+    )
+    .await
+}
+
+/// Inner orchestration body of `connectivity_redeem_invite_iroh`, split out
+/// so integration tests can drive it with explicit resources rather than
+/// the full Tauri AppState. ZEB-325 Phase 2c **option A**: direct iroh
+/// bi-stream handshake on the `harmony/handshake/v1` ALPN.
+///
+/// Flow:
+///
+///   1. Decode invite URL.
+///   2. Case-A guards (invite_token + admin_identity_pub required).
+///   3. Pkarr window-resolve the inviter's routing record.
+///   4. Verify inner sig + identity binding + clock skew.
+///   5. Decode the inner `ReachabilityAnnouncePayload`.
+///   6. Seed local `ReachabilityResolver` (still useful for future
+///      Zenoh-CRDT-sync once Phase 1's iroh→zenoh ingestion wiring
+///      lands; harmless on option A's direct-handshake path).
+///   7. Synthesize `EndpointAddr` from the verified routing record and
+///      open an iroh bi-stream to the inviter on
+///      `alpn::HARMONY_HANDSHAKE_V1`.
+///   8. Reserve HLC + `mint_redemption`; build the
+///      `CommunityInviteSigned` packet via
+///      `community_invite::encode_packet` (same envelope `handle_unicast`
+///      consumes on the receive side).
+///   9. Write `[u32 LE length-prefix][packet bytes]` to the send half;
+///      `finish().await` to flush.
+///  10. Read `[u32 LE length-prefix][response packet]` from the recv
+///      half, bounded by `dial_config.response_read_timeout`
+///      (production reads `HARMONY_INVITE_HANDSHAKE_TIMEOUT_MS` via
+///      `HandshakeDialConfig::from_env`; integration tests pass an
+///      explicit config with sub-second values).
+///  11. CBOR-decode the response as a `SignedMembershipEvent`
+///      (JoinCountersign). Defensively reject if the wrapped event isn't
+///      a JoinCountersign targeting our just-minted `bootstrap_join.id`.
+///  12. Call `redeem_invite_inner_with_overrides` with `pre_minted=Some(...)`
+///      (so the inner reuses the same bootstrap_join.id we just sent —
+///      `mint_redemption` randomizes the event id, so a fresh mint inside
+///      would target a different event and the JoinCountersign hook
+///      wouldn't fire), `pre_delivered_countersign=Some(...)`, and
+///      `allow_no_reticulum_destinations=true`. The inner's oneshot await
+///      resolves immediately because Step 12's countersign insert fires
+///      the post-Inserted hook on `target_event_id == bootstrap_join.id`.
+#[allow(clippy::too_many_arguments)]
+pub async fn connectivity_redeem_invite_iroh_inner<R: tauri::Runtime, F>(
+    invite_url: String,
+    pkarr_resolver: Option<std::sync::Arc<harmony_pkarr::PkarrResolver>>,
+    reachability_resolver: Option<crate::reachability_resolver::ReachabilityResolver>,
+    iroh_endpoint: Option<std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>>,
+    crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    hlc_tracker: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+    >,
+    device_id: String,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
+    community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
+    unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
+    dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
+    channel_log_registry: std::sync::Arc<
+        crate::community_channel_log_engine::ChannelLogRegistry<R>,
+    >,
+    identity_dir: Option<std::path::PathBuf>,
+    progress_sink: impl Fn(ResolutionProgressPayload),
+    // ZEB-325 PR #159 R3-1 (Cursor HIGH): sink for the `nav-updated`
+    // Tauri event the wrapper IPC emits on a successful redeem. Mirrors
+    // the Reticulum `redeem_invite` IPC's emit at lib.rs:15829 so the
+    // sidebar refreshes without requiring `RedeemInviteDialog` to drive
+    // a frontend-side refresh. Tests pass a no-op closure (no
+    // AppHandle to drive).
+    nav_emit_sink: impl Fn(NavUpdatedPayload),
+    // Per-await timeouts for the dialer side. ZEB-325 PR #159 F3 + F10:
+    // previously read directly from `std::env::var` at the call site,
+    // which made `connect()` and `open_bi()` unbounded and forced
+    // integration tests to mutate process env (unsafe in multithreaded
+    // contexts). Production wiring supplies `HandshakeDialConfig::from_env`.
+    dial_config: HandshakeDialConfig,
+    // Generation-fence closure. ZEB-325 PR #159 F8: previously this IPC
+    // hardcoded `|| Ok(())`, which let the iroh path mutate stale
+    // `crdt_state` / `community_registry` / `dm_outbox` and report
+    // `"joined"` for a stale identity if the node was stopped during
+    // the handshake. Production wiring captures `&Mutex<NodeState>` +
+    // snapshot_generation (mirroring the regular `redeem_invite` IPC at
+    // lib.rs:15751-15774). Tests that don't drive the fence pass
+    // `|| Ok(())`.
+    fence_check: F,
+) -> Result<RedemptionOutcome, String>
+where
+    F: Fn() -> Result<(), String>,
+{
     // 1. Decode the invite URL.
     let payload = crate::community_invite::decode_invite_url(&invite_url)
         .map_err(|e| format!("decode invite URL: {e}"))?;
 
-    // 2. Extract the case-A keying material from the invite.
-    //    Open-community invites have no invite_token, so case-A lookup
-    //    is not applicable — fall through to inviter_unreachable for now.
+    let invite_id = payload
+        .invite_token
+        .as_ref()
+        .map(|t| hex::encode(t.sig))
+        .unwrap_or_default();
+    let emit_stage = |stage: RedemptionStage| {
+        progress_sink(ResolutionProgressPayload {
+            invite_id: invite_id.clone(),
+            stage,
+            attempt_n: 1,
+        });
+    };
+
+    // Stage 1/5: `resolving` — function entry. Emitted before the
+    // case-A guards so the UI shows "looking up" even on early-exit
+    // paths (missing token, missing admin_id_pub).
+    emit_stage(RedemptionStage::Resolving);
+
+    // 2. Case-A keying material guards.
     let Some(ref token) = payload.invite_token else {
         return Ok(RedemptionOutcome {
             status: "inviter_unreachable".to_string(),
             community_id: None,
         });
     };
-
-    // 2b. Guard: open-community invites also have no admin_identity_pub,
-    //     meaning we cannot verify the inner sig / identity binding. Skip
-    //     early with an explicit status rather than silently omitting the
-    //     verification step below (Fix for round-1 review HIGH finding).
-    if payload.admin_identity_pub.is_none() {
+    let Some(admin_id_pub) = payload.admin_identity_pub else {
         return Ok(RedemptionOutcome {
             status: "missing_admin_identity_pub".to_string(),
             community_id: None,
         });
-    }
-
-    // 3. Acquire the resolver (may be None if pkarr not initialized).
-    let resolver = {
-        let g = state
-            .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        g.pkarr_resolver.clone()
     };
-    let Some(resolver) = resolver else {
+
+    // 3. Acquire the resolvers + iroh endpoint.
+    let Some(resolver) = pkarr_resolver else {
+        return Ok(RedemptionOutcome {
+            status: "inviter_unreachable".to_string(),
+            community_id: None,
+        });
+    };
+    let Some(reachability_resolver) = reachability_resolver else {
+        return Ok(RedemptionOutcome {
+            status: "inviter_unreachable".to_string(),
+            community_id: None,
+        });
+    };
+    let Some(iroh_endpoint) = iroh_endpoint else {
+        // No iroh endpoint = no way to dial; surface as unreachable.
         return Ok(RedemptionOutcome {
             status: "inviter_unreachable".to_string(),
             community_id: None,
         });
     };
 
-    // 4. Derive the 3-epoch tolerance window of case-A keys from the token sig.
+    // 4. Derive 3-epoch tolerance window of case-A keys.
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -28731,7 +29900,6 @@ async fn connectivity_redeem_invite_iroh(
         .resolve_window(&verifying_keys)
         .await
         .map_err(|e| format!("pkarr resolve: {e}"))?;
-
     let Some(rec) = rec else {
         return Ok(RedemptionOutcome {
             status: "inviter_unreachable".to_string(),
@@ -28739,41 +29907,514 @@ async fn connectivity_redeem_invite_iroh(
         });
     };
 
-    // 6. Verify the record's inner sig and identity binding.
-    if let Some(ref admin_id_pub) = payload.admin_identity_pub {
-        if rec.verify_inner_sig().is_err()
-            || rec.verify_identity_match(admin_id_pub).is_err()
-            || rec.verify_skew(now_ms).is_err()
-        {
+    // 6. Verify the record's inner sig, identity binding, and skew.
+    if rec.verify_inner_sig().is_err()
+        || rec.verify_identity_match(&admin_id_pub).is_err()
+        || rec.verify_skew(now_ms).is_err()
+    {
+        return Ok(RedemptionOutcome {
+            status: "inviter_unreachable".to_string(),
+            community_id: None,
+        });
+    }
+
+    // 7. Decode the inner routing payload.
+    let routing: crate::reachability_record::ReachabilityAnnouncePayload =
+        ciborium::from_reader(rec.routing_blob.as_slice())
+            .map_err(|e| format!("decode routing_blob: {e}"))?;
+
+    // Seed the local ReachabilityResolver. Option A doesn't strictly
+    // need this — the iroh bi-stream below opens with an explicit
+    // EndpointAddr — but the seed remains useful for future Zenoh-CRDT-
+    // sync once Phase 1's iroh→zenoh ingestion is wired, and is
+    // harmless on the option-A path.
+    let inviter_addr = payload.admin_addr;
+    let inviter_device_hash = crate::owner_state_types::DeviceIdentityHash([0u8; 16]);
+    reachability_resolver
+        .seed_from_pkarr(inviter_addr, inviter_device_hash, routing.clone())
+        .await;
+
+    tracing::info!(
+        community_id = %hex::encode(payload.community_id.0),
+        inviter = %hex::encode(inviter_addr.0),
+        "ZEB-325 Phase 2c option A: pkarr resolved + ReachabilityResolver seeded; \
+         opening iroh handshake bi-stream"
+    );
+
+    // Stage 2/5: `connecting` — about to dial the inviter's iroh
+    // endpoint on `harmony/handshake/v1`.
+    emit_stage(RedemptionStage::Connecting);
+
+    // 7'. Synthesize an EndpointAddr from the verified routing record.
+    // Mirrors `IrohZenohLinkManager::new_link` (which would do the same
+    // synthesis for a Zenoh ALPN dial). The `iroh_node_id` is the iroh
+    // EndpointId (32-byte Ed25519 pub); skip malformed relay URLs
+    // silently (direct addrs alone may still succeed).
+    let alice_iroh_id = iroh::EndpointId::from_bytes(&routing.iroh_node_id)
+        .map_err(|e| format!("decode inviter iroh_node_id: {e}"))?;
+    let mut alice_addr = iroh::EndpointAddr::new(alice_iroh_id);
+    if !routing.home_relay_url.is_empty() {
+        match routing.home_relay_url.parse::<iroh::RelayUrl>() {
+            Ok(url) => alice_addr = alice_addr.with_relay_url(url),
+            Err(e) => tracing::trace!(
+                "skip malformed home_relay_url {:?}: {e}",
+                routing.home_relay_url
+            ),
+        }
+    }
+    for da in &routing.direct_addresses {
+        alice_addr = alice_addr.with_ip_addr(*da);
+    }
+
+    // 8. Open the iroh QUIC connection on the handshake ALPN.
+    //
+    // ZEB-325 PR #159 F3: bound `connect()` and `open_bi()` by the
+    // dialer config so a peer that we can route packets to but that
+    // never finishes the QUIC handshake (NAT in flux, blackhole, etc.)
+    // cannot pin this IPC for the duration of the underlying
+    // QUIC-level timeout (minutes, on some configurations). Distinct
+    // tracing for dial-timeout vs open_bi-timeout vs response-timeout
+    // so diagnostics can attribute failures.
+    let conn = match tokio::time::timeout(
+        dial_config.connect_timeout,
+        iroh_endpoint
+            .inner()
+            .connect(alice_addr, crate::iroh_endpoint::alpn::HARMONY_HANDSHAKE_V1),
+    )
+    .await
+    {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                error = %e,
+                inviter = %hex::encode(inviter_addr.0),
+                "ZEB-325 Phase 2c option A: iroh connect failed"
+            );
+            return Ok(RedemptionOutcome {
+                status: "inviter_unreachable".to_string(),
+                community_id: None,
+            });
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                timeout_ms = dial_config.connect_timeout.as_millis() as u64,
+                inviter = %hex::encode(inviter_addr.0),
+                "ZEB-325 Phase 2c option A: iroh connect timeout (dial)"
+            );
+            return Ok(RedemptionOutcome {
+                status: "inviter_unreachable".to_string(),
+                community_id: None,
+            });
+        }
+    };
+    let (mut send, mut recv) =
+        match tokio::time::timeout(dial_config.open_bi_timeout, conn.open_bi()).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    inviter = %hex::encode(inviter_addr.0),
+                    "ZEB-325 Phase 2c option A: open_bi failed"
+                );
+                conn.close(0u32.into(), b"open_bi-failed");
+                return Ok(RedemptionOutcome {
+                    status: "inviter_unreachable".to_string(),
+                    community_id: None,
+                });
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    timeout_ms = dial_config.open_bi_timeout.as_millis() as u64,
+                    inviter = %hex::encode(inviter_addr.0),
+                    "ZEB-325 Phase 2c option A: open_bi timeout"
+                );
+                conn.close(0u32.into(), b"open_bi-timeout");
+                return Ok(RedemptionOutcome {
+                    status: "inviter_unreachable".to_string(),
+                    community_id: None,
+                });
+            }
+        };
+
+    // 8'. Reserve HLC + mint. We mint up-front so the bootstrap_join.id
+    // committed to the wire packet is the SAME id the redeem inner
+    // below uses (mint_redemption randomizes the 16-byte event_id).
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let join_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let minted = match mint_redemption(&payload, self_owner, signing_key.as_ref(), join_hlc) {
+        Ok(m) => m,
+        Err(e) => {
+            return Err(format!("mint_redemption: {e}"));
+        }
+    };
+
+    // 8''. Build the CommunityInviteSigned packet (same shape
+    // `redeem_invite_inner`'s invite-only branch builds for Reticulum
+    // unicast). The signed wrapper carries our joiner_identity_pub +
+    // signing_device_hash + the invite_token; `handle_unicast` on
+    // Alice's side re-verifies the Path B envelope sig before inserting
+    // the PendingJoin into her engine.
+    let invite_token_for_packet = payload
+        .invite_token
+        .clone()
+        .ok_or_else(|| "invite_token missing — case-A guard should have rejected".to_string())?;
+    let (joiner_identity_pub, joiner_device_hash, sign_key_for_packet) = {
+        // ZEB-325 Phase 2c option A: derive `joiner_identity_pub` via
+        // the SAME `ed25519_priv_to_x25519` (RFC 7748 §5 birational
+        // map) that `mint_redemption` uses to build the PendingJoin's
+        // own `joiner_identity_pub` field. The composite must hash
+        // (via `Identity::from_public_bytes → address_hash`) to
+        // `self_owner` — both `verify_signature::ActorPubkeyMismatch`
+        // and `handle_unicast`'s F6 trust-narrowing reject otherwise.
+        //
+        // We CANNOT reuse `dm_outbox.private_identity.identity.to_public_bytes()`
+        // here in tests where the signing key was generated standalone
+        // (not via `PrivateIdentity::from_seed`'s HKDF chain): the two
+        // X25519 derivations produce different pub bytes, which hash
+        // to different `OwnerAddr`s. Production passes through both
+        // paths consistently (identity loaded from disk drives both
+        // the signing key and the PrivateIdentity), but the explicit
+        // birational derivation here makes the option-A path robust
+        // against future divergence and matches the bytes the engine's
+        // verify already expects.
+        let outbox_g = dm_outbox.lock().await;
+        let sk = std::sync::Arc::clone(&outbox_g.signing_key);
+        drop(outbox_g);
+
+        let x25519_priv = crate::dm_signing::ed25519_priv_to_x25519(sk.as_ref());
+        let x25519_pub =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*x25519_priv));
+        let ed25519_pub = sk.verifying_key().to_bytes();
+        let mut joiner_pub = [0u8; 64];
+        joiner_pub[..32].copy_from_slice(x25519_pub.as_bytes());
+        joiner_pub[32..].copy_from_slice(&ed25519_pub);
+
+        // `signing_device_hash` is decoded-defended in `decode_packet`
+        // as `SHA256(joiner_identity_pub)[..16]`; derive from the
+        // (birational) composite we just built so the structural check
+        // passes on the receiver.
+        let joiner_dh = crate::owner_state_types::DeviceIdentityHash(
+            crate::community_invite::device_hash_from_identity_pub(&joiner_pub),
+        );
+        (joiner_pub, joiner_dh, sk)
+    };
+    let signed = crate::community_invite::CommunityInviteSigned {
+        community_id: minted.community_id,
+        join_event: minted.bootstrap_join.clone(),
+        invite_token: invite_token_for_packet,
+        joiner_identity_pub,
+        signing_device_hash: joiner_device_hash,
+        created_at: minted.bootstrap_join.at.clone(),
+    };
+    let packet =
+        crate::community_invite::build_signed_invite_packet(signed, sign_key_for_packet.as_ref())
+            .map_err(|e| format!("build_signed_invite_packet: {e}"))?;
+    let wire = crate::community_invite::encode_packet(&packet)
+        .map_err(|e| format!("encode_packet: {e}"))?;
+
+    // Stage 3/5: `sending` — about to write the request packet.
+    emit_stage(RedemptionStage::Sending);
+
+    // 9. Write [u32 LE length-prefix][packet] then finish().
+    // ZEB-325 PR #159 R3-2 (Cursor MEDIUM): wrap both `write_all` calls
+    // in `tokio::time::timeout(dial_config.write_timeout, …)` so a
+    // misbehaving acceptor that freezes the flow-control window can't
+    // pin the dialer indefinitely. On timeout, surface
+    // `inviter_unreachable` and close the connection with a labelled
+    // CONNECTION_CLOSE for symmetry with the other timeout branches
+    // above. `send.finish()` is non-async (just signals end-of-stream
+    // locally on iroh 0.98); no timeout needed for it.
+    let wire_len = wire.len() as u32;
+    let write_prefix = async {
+        send.write_all(&wire_len.to_le_bytes())
+            .await
+            .map_err(|e| format!("write length-prefix: {e}"))
+    };
+    match tokio::time::timeout(dial_config.write_timeout, write_prefix).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(
+                error = %e,
+                "ZEB-325 Phase 2c option A: handshake request length-prefix write failed"
+            );
+            conn.close(0u32.into(), b"request-write-failed");
+            return Ok(RedemptionOutcome {
+                status: "inviter_unreachable".to_string(),
+                community_id: None,
+            });
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                timeout_ms = dial_config.write_timeout.as_millis() as u64,
+                "ZEB-325 Phase 2c option A: handshake request length-prefix write timeout"
+            );
+            conn.close(0u32.into(), b"write-timeout");
             return Ok(RedemptionOutcome {
                 status: "inviter_unreachable".to_string(),
                 community_id: None,
             });
         }
     }
+    let write_body = async {
+        send.write_all(&wire)
+            .await
+            .map_err(|e| format!("write packet body: {e}"))
+    };
+    match tokio::time::timeout(dial_config.write_timeout, write_body).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(
+                error = %e,
+                "ZEB-325 Phase 2c option A: handshake request body write failed"
+            );
+            conn.close(0u32.into(), b"request-write-failed");
+            return Ok(RedemptionOutcome {
+                status: "inviter_unreachable".to_string(),
+                community_id: None,
+            });
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                timeout_ms = dial_config.write_timeout.as_millis() as u64,
+                "ZEB-325 Phase 2c option A: handshake request body write timeout"
+            );
+            conn.close(0u32.into(), b"write-timeout");
+            return Ok(RedemptionOutcome {
+                status: "inviter_unreachable".to_string(),
+                community_id: None,
+            });
+        }
+    }
+    // ZEB-325 PR #159 R4-1 (CodeRabbit MAJOR): normalize send.finish()
+    // failure to inviter_unreachable + log + close, matching the
+    // write_all branches above. Propagating via `?` would have
+    // surfaced a raw Err(String) to the caller instead of the
+    // structured outcome the rest of this function returns.
+    if let Err(e) = send.finish() {
+        tracing::warn!(
+            error = %e,
+            "ZEB-325 Phase 2c option A: handshake send.finish() failed"
+        );
+        conn.close(0u32.into(), b"send-finish-failed");
+        return Ok(RedemptionOutcome {
+            status: "inviter_unreachable".to_string(),
+            community_id: None,
+        });
+    }
 
-    // 7. Decode routing_blob → ReachabilityAnnouncePayload.
-    let _routing: crate::reachability_record::ReachabilityAnnouncePayload =
-        ciborium::from_reader(rec.routing_blob.as_slice())
-            .map_err(|e| format!("decode routing_blob: {e}"))?;
+    // Stage 4/5: `awaiting_countersig` — emitted BEFORE the read so
+    // the UI displays "Waiting for confirmation…" during the actual
+    // network wait (response_read_timeout window, up to 30s) while
+    // Alice processes the PendingJoin and signs the countersign.
+    // ZEB-325 PR #159 R5 (Greptile P2): earlier this emit fired after
+    // read_response completed, making the stage invisible during the
+    // round-trip — users only saw `sending` for the full network wait.
+    emit_stage(RedemptionStage::AwaitingCountersig);
 
-    // 8. Phase 2b first cut: iroh connect + full counter-sig orchestration
-    //    is deferred to Phase 2c. Reaching here means we found a valid
-    //    routing record from the inviter — return an honest status that
-    //    the frontend renders as "found on network, handshake pending".
-    //    The "joined" status is intentionally NOT returned here; the user
-    //    has NOT joined the community yet. Phase 2c will complete the
-    //    orchestration (ZEB-323 §7.2).
-    tracing::info!(
-        community_id = %hex::encode(payload.community_id.0),
-        "ZEB-323 Phase 2b: connectivity_redeem_invite_iroh: routing record resolved; \
-         iroh connect + counter-sig orchestration deferred to Phase 2c"
+    // 10. Read response, bounded by dial_config.response_read_timeout.
+    // ZEB-325 PR #159 F3: distinct tracing for response-read timeout vs
+    // dial / open_bi timeouts (above) so diagnostics can attribute
+    // failures cleanly.
+    let read_response = async {
+        let mut len_buf = [0u8; 4];
+        recv.read_exact(&mut len_buf)
+            .await
+            .map_err(|e| format!("read length-prefix: {e}"))?;
+        let len = u32::from_le_bytes(len_buf) as usize;
+        if len == 0 || len > crate::iroh_invite_acceptor::HANDSHAKE_MAX_PACKET_LEN {
+            return Err(format!(
+                "response length out of bounds: len={} max={}",
+                len,
+                crate::iroh_invite_acceptor::HANDSHAKE_MAX_PACKET_LEN
+            ));
+        }
+        let mut body = vec![0u8; len];
+        recv.read_exact(&mut body)
+            .await
+            .map_err(|e| format!("read response body: {e}"))?;
+        Ok::<Vec<u8>, String>(body)
+    };
+    let response_bytes =
+        match tokio::time::timeout(dial_config.response_read_timeout, read_response).await {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    "ZEB-325 Phase 2c option A: handshake response read failed"
+                );
+                // ZEB-325 PR #159 R5: explicit close for symmetry with
+                // the dial / open_bi failure paths above. Without this
+                // the connection stays open until QUIC's idle timeout
+                // fires — the acceptor side sees a stalled stream and
+                // its IO timeout has to fire before resources are
+                // released. CONNECTION_CLOSE lets the peer release
+                // immediately.
+                conn.close(0u32.into(), b"response-read-failed");
+                return Ok(RedemptionOutcome {
+                    status: "inviter_unreachable".to_string(),
+                    community_id: None,
+                });
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    timeout_ms = dial_config.response_read_timeout.as_millis() as u64,
+                    "ZEB-325 Phase 2c option A: handshake response timeout (read)"
+                );
+                conn.close(0u32.into(), b"response-read-timeout");
+                return Ok(RedemptionOutcome {
+                    status: "inviter_unreachable".to_string(),
+                    community_id: None,
+                });
+            }
+        };
+
+    // 11. CBOR-decode response as SignedMembershipEvent.
+    let countersign: crate::community_membership::SignedMembershipEvent =
+        match ciborium::from_reader(response_bytes.as_slice()) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "ZEB-325 Phase 2c option A: response CBOR decode failed");
+                return Ok(RedemptionOutcome {
+                    status: "inviter_unreachable".to_string(),
+                    community_id: None,
+                });
+            }
+        };
+    // Defensive: ensure it's a JoinCountersign for our bootstrap_join.
+    let target_ok = matches!(
+        &countersign.kind,
+        crate::community_membership::MembershipEventKind::JoinCountersign { target_event_id }
+        if *target_event_id == minted.bootstrap_join.id
     );
+    if !target_ok {
+        tracing::warn!(
+            "ZEB-325 Phase 2c option A: response is not a JoinCountersign for our bootstrap_join.id"
+        );
+        return Ok(RedemptionOutcome {
+            status: "inviter_unreachable".to_string(),
+            community_id: None,
+        });
+    }
+    if countersign.community_id != minted.community_id {
+        tracing::warn!("ZEB-325 Phase 2c option A: countersign community_id mismatch");
+        return Ok(RedemptionOutcome {
+            status: "inviter_unreachable".to_string(),
+            community_id: None,
+        });
+    }
 
-    Ok(RedemptionOutcome {
-        status: "pkarr_resolved_no_handshake".to_string(),
-        community_id: Some(hex::encode(payload.community_id.0)),
-    })
+    // Cleanly close the iroh connection. The acceptor's
+    // `handle_connection` awaits `conn.closed()` to keep its
+    // Connection Arc alive until we drive close from here — without
+    // this explicit close the acceptor would either hold the
+    // connection open indefinitely (waiting for our drop to be
+    // observed remotely) or tear down too early and race our read.
+    // Pattern from `zenoh_iroh_link::tests::paired_stream_roundtrip_via_loopback`.
+    //
+    // ZEB-325 PR #159 R4-4 (Cursor LOW): on the success path we have
+    // ALREADY received Alice's countersign (the read above completed
+    // OK), so our outbound request bytes are guaranteed to have been
+    // acknowledged by the QUIC layer — Alice could not have authored
+    // and delivered a countersign for our bootstrap_join.id without
+    // first reading our request packet. The original rationale for
+    // awaiting `conn.closed()` here was to prevent OUTBOUND data drop
+    // before delivery (Bob's request stream); that risk is already
+    // discharged on the success path. Calling `conn.close()` sends
+    // the CONNECTION_CLOSE frame; QUIC handles the 3×PTO drain
+    // (~300-900ms) in the background after we drop the Connection.
+    // Dropping the `conn.closed().await` here lets us return the IPC
+    // response immediately instead of pinning the redeem call on the
+    // drain. The acceptor's symmetric wait still bounds itself by
+    // `io_deadline` (see `iroh_invite_acceptor.rs::handle_connection`
+    // R2/R3 timeout work), so no acceptor-side leak risk.
+    drop(send);
+    drop(recv);
+    conn.close(0u32.into(), b"handshake-complete");
+    drop(conn);
+
+    // 12. Drive the inner with overrides: pre_minted (same artifacts
+    // we already wired into the wire packet) and pre_delivered_countersign
+    // (so the oneshot await resolves on the engine's post-Inserted hook
+    // for the JoinCountersign's target_event_id, which equals our
+    // pre_minted.bootstrap_join.id).
+    let overrides = RedeemInviteOverrides {
+        pre_minted: Some(minted),
+        pre_delivered_countersign: Some(countersign),
+        admin_identity_pub: Some(admin_id_pub),
+    };
+    let result = redeem_invite_inner_with_overrides(
+        invite_url,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        signing_key,
+        community_registry,
+        community_adapter_tx,
+        unicast_send_tx,
+        dm_outbox,
+        channel_log_registry,
+        fence_check,
+        identity_dir,
+        true, // allow_no_reticulum_destinations
+        overrides,
+    )
+    .await;
+
+    match result {
+        Ok(dto) => {
+            // Stage 5/5: `joined` — counter-signed Join applied, joiner
+            // is now a community member.
+            emit_stage(RedemptionStage::Joined);
+            // ZEB-325 PR #159 R3-1 (Cursor HIGH): surface the joined
+            // community to the nav listener so the sidebar updates
+            // automatically, mirroring the Reticulum `redeem_invite`
+            // IPC's emit at lib.rs:15829. Emit failure is non-fatal —
+            // the join already committed, and App.svelte still
+            // synthesizes from late events; we just log.
+            nav_emit_sink(NavUpdatedPayload {
+                action: "added",
+                space_id: dto.community_id.clone(),
+                kind: "community",
+                name: dto.community_name.clone(),
+                members: None,
+                parent_id: None,
+                pending: Some(dto.pending),
+            });
+            Ok(RedemptionOutcome {
+                status: "joined".to_string(),
+                community_id: Some(dto.community_id),
+            })
+        }
+        Err(e) => {
+            // ZEB-325 PR #159 F1: distinguish post-handshake local
+            // commit failure from "couldn't reach the inviter".
+            //
+            // The handshake response was already CBOR-decoded into a
+            // JoinCountersign for `minted.bootstrap_join.id` above
+            // (target_ok + community_id sanity checks both passed). So
+            // by the time we get here, the inviter WAS reached and
+            // delivered a valid countersign — the failure is local
+            // (engine insert error, fence violation, commit rollback,
+            // pending-redemption registry race, etc.). Surface that
+            // distinctly so the UI can show "we found Alice but local
+            // insert failed" instead of "Alice is unreachable".
+            tracing::warn!(
+                error = %e,
+                community_id = %hex::encode(payload.community_id.0),
+                "ZEB-325 Phase 2c option A: redeem_invite_inner_with_overrides failed \
+                 after iroh handshake countersign delivery"
+            );
+            Ok(RedemptionOutcome {
+                status: "join_failed".to_string(),
+                community_id: Some(hex::encode(payload.community_id.0)),
+            })
+        }
+    }
 }
 
 /// Toggle case-B "Make me discoverable" setting. Persists the toggle to

@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
-use crate::owner_state_types::{Hlc, OwnerAddr};
+use crate::owner_state_types::{DeviceIdentityHash, Hlc, OwnerAddr};
 use crate::reachability_record::ReachabilityAnnouncePayload;
 
 /// Async fallback called by `resolve_async` when the in-memory CRDT cache has
@@ -168,6 +168,52 @@ impl ReachabilityResolver {
             .fallback_source
             .write()
             .expect("fallback_source poisoned") = Some(fb);
+    }
+
+    /// ZEB-325 Phase 2c (Task 2): seed the in-memory routing map with a
+    /// pkarr-resolved record so the synchronous `resolve_by_node_id`
+    /// path (used by Phase 1's `IrohZenohLinkManager.new_link`) can
+    /// find the inviter's iroh routing on demand.
+    ///
+    /// Called by `connectivity_redeem_invite_iroh` immediately after a
+    /// pkarr record has been verified, so the subsequent
+    /// `redeem_invite_inner` call's CRDT-sync `PendingJoin` publish has
+    /// a route through `IrohZenohLinkManager`. Distinct from the Phase 2b
+    /// async fallback hook (`set_fallback_source`): that hook fires on
+    /// `resolve_async` cache misses for ongoing routing resolution; this
+    /// is a deterministic one-shot pre-seed before invoking the redemption
+    /// flow.
+    ///
+    /// The `device_hash` parameter records the inviter's bound-device
+    /// identity for API parity with the caller in
+    /// `connectivity_redeem_invite_iroh` (Task 3). The resolver's
+    /// composite key uses `payload.iroh_node_id` (matching `update()`),
+    /// because the Phase 1 transport reaches peers exclusively via
+    /// `EndpointId` — see spec §7.3 and the docstring on
+    /// `resolve_by_node_id` above.
+    ///
+    /// Uses the same HLC construction pattern as `resolve_async`'s cache
+    /// population (`wall_ms = payload.announced_at_ms, logical = 0,
+    /// device_id = ""`) so any subsequent higher-HLC CRDT-sourced record
+    /// wins under the existing LWW comparator — no separate provenance
+    /// channel needed for the Phase 2c first cut.
+    ///
+    /// `async` for API alignment with the Task 3 IPC handler (which
+    /// `.await`s this call between two sync-locked sections). The
+    /// implementation itself is non-blocking — the underlying `RwLock`
+    /// is `std::sync`, not `tokio::sync`.
+    pub async fn seed_from_pkarr(
+        &self,
+        owner_addr: OwnerAddr,
+        _device_hash: DeviceIdentityHash,
+        payload: ReachabilityAnnouncePayload,
+    ) {
+        let hlc = Hlc {
+            wall_ms: payload.announced_at_ms,
+            logical: 0,
+            device_id: String::new(),
+        };
+        self.update(owner_addr, payload, hlc);
     }
 
     /// Async resolve: checks the in-memory CRDT cache first (via the
@@ -560,6 +606,48 @@ mod fallback_tests {
         let warm = r.resolve(&addr);
         assert_eq!(warm.len(), 1);
         assert_eq!(warm[0].iroh_node_id, stub_payload.iroh_node_id);
+    }
+
+    /// ZEB-325 Phase 2c (Task 2): `seed_from_pkarr` writes a pkarr-resolved
+    /// `ReachabilityAnnouncePayload` directly into the in-memory map so that
+    /// Phase 1's synchronous `resolve_by_node_id` path (used by
+    /// `IrohZenohLinkManager.new_link`) can find the inviter's iroh routing
+    /// immediately after `connectivity_redeem_invite_iroh` resolves the
+    /// pkarr record — without waiting for the async fallback hook to fire.
+    #[tokio::test]
+    async fn seed_from_pkarr_makes_record_resolvable_by_node_id() {
+        use crate::owner_state_types::DeviceIdentityHash;
+
+        let resolver = ReachabilityResolver::new();
+        let owner_addr = OwnerAddr([0x77; 16]);
+        let device_hash = DeviceIdentityHash([0x77; 16]);
+        let payload = make_payload(0xBE, 4200);
+
+        // Before seeding: resolver has no record for this addr.
+        assert!(resolver.resolve(&owner_addr).is_empty());
+        assert!(resolver.resolve_by_node_id(&payload.iroh_node_id).is_none());
+
+        // Seed from pkarr (Phase 2c entry point).
+        resolver
+            .seed_from_pkarr(owner_addr, device_hash, payload.clone())
+            .await;
+
+        // After seeding: `resolve()` returns the record and
+        // `resolve_by_node_id()` (the hot path used by
+        // IrohZenohLinkManager.new_link) finds it.
+        let resolved = resolver.resolve(&owner_addr);
+        assert_eq!(resolved.len(), 1, "seeded record must be retrievable");
+        assert_eq!(resolved[0].iroh_node_id, payload.iroh_node_id);
+        assert_eq!(resolved[0].announced_at_ms, payload.announced_at_ms);
+
+        let by_node = resolver.resolve_by_node_id(&payload.iroh_node_id);
+        assert!(
+            by_node.is_some(),
+            "resolve_by_node_id must find seeded entry"
+        );
+        let (got_owner, got_payload) = by_node.unwrap();
+        assert_eq!(got_owner, owner_addr);
+        assert_eq!(got_payload.iroh_node_id, payload.iroh_node_id);
     }
 
     /// CodeRabbit PR #158 round 2: Clone must share fallback_source, not

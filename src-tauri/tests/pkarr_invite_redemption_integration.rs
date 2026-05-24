@@ -1,8 +1,10 @@
-//! Case A integration test: pkarr invite-redemption publish → resolve.
+//! Case A integration tests: pkarr invite-redemption publish → resolve,
+//! plus the Phase 2c (ZEB-325) end-to-end orchestration test that drives
+//! `connectivity_redeem_invite_iroh_inner` through to a `"joined"` outcome.
 //!
 //! Alice publishes her iroh routing under HKDF(invite_token.sig, epoch) via
 //! `PkarrInvitePublisher`. Bob independently derives the same key from the
-//! invite token and resolves via `PkarrResolver`. Test uses `MockPkarrRelay`
+//! invite token and resolves via `PkarrResolver`. Tests use `MockPkarrRelay`
 //! as the relay, so no live DHT is needed.
 
 use std::sync::Arc;
@@ -163,3 +165,17 @@ async fn case_a_publish_then_resolve_round_trip() {
 
     result.expect("case A integration test timed out");
 }
+
+// ZEB-325 Phase 2c option A pivot: the two end-to-end orchestration
+// tests that previously lived in this file
+// (`connectivity_redeem_invite_iroh_completes_join_via_crdt_sync` and
+// `connectivity_redeem_invite_iroh_emits_progress_events`) were
+// `#[ignore]`'d after the option C → option A pivot because they
+// relied on a single-engine masking quirk that the new wire
+// handshake makes structurally impossible. ZEB-325 PR #159 round-1
+// review (CodeRabbit NITPICK F9) noted the ignored tests still
+// asserted the post-handshake `"joined"` outcome with
+// `iroh_endpoint: None`, which can never succeed under option A;
+// they have been deleted. End-to-end coverage now lives entirely in
+// `tests/pkarr_iroh_redeem_full_integration.rs`, which exercises the
+// real two-process iroh bi-stream handshake.

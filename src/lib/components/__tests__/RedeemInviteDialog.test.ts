@@ -184,6 +184,45 @@ describe('RedeemInviteDialog', () => {
     expect(onSubmit).toHaveBeenCalledWith('harmony://invite/v1?ci=x');
   });
 
+  it('shows reach-but-local-failure message and NO fallback button when join_failed', async () => {
+    // ZEB-325 PR #159 R1: status='join_failed' means the inviter was reached
+    // and a valid JoinCountersign was delivered, but the local insert/commit
+    // failed (engine insert, fence violation, commit rollback). The
+    // Reticulum LAN fallback would just re-run the same local path against
+    // the same local engine state — so the fallback button MUST be suppressed
+    // and the error banner MUST distinguish this from "couldn't reach the
+    // inviter". The community_id (truncated) is surfaced as a correlation
+    // hint for bug reports.
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'connectivity_redeem_invite_iroh') {
+        return Promise.resolve({
+          status: 'join_failed',
+          communityId: 'abcdef0123456789',
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { getByTestId, getByPlaceholderText, queryByTestId } = render(RedeemInviteDialog, {
+      props: { onSubmit: vi.fn(), onCancel: vi.fn() },
+    });
+
+    const input = getByPlaceholderText(/harmony:\/\/invite/) as HTMLTextAreaElement;
+    await fireEvent.input(input, { target: { value: 'harmony://invite/v1?ci=x' } });
+    await fireEvent.click(getByTestId('iroh-redeem-btn'));
+
+    await waitFor(() => {
+      const banner = getByTestId('iroh-error-banner');
+      expect(banner.textContent).toContain('Reached the inviter');
+      expect(banner.textContent).toContain("couldn’t complete the join locally");
+      // community_id hint is surfaced (truncated to first 12 chars).
+      expect(banner.textContent).toContain('abcdef012345');
+    });
+    // The LAN fallback button is suppressed for join_failed — Reticulum
+    // can't help a local insert failure.
+    expect(queryByTestId('fallback-lan-btn')).toBeNull();
+  });
+
   it('shows fallback button and error on IPC rejection', async () => {
     mockInvoke.mockImplementation((cmd: string) => {
       if (cmd === 'connectivity_redeem_invite_iroh') {
@@ -234,5 +273,56 @@ describe('RedeemInviteDialog', () => {
 
     // Clean up the hanging promise.
     resolveRedeemPromise({ status: 'pkarr_resolved_no_handshake' });
+  });
+
+  // ── ZEB-325 Phase 2c: iroh joined path ────────────────────────────────────
+
+  it('shows "Joined ✓" when iroh redeem returns status="joined"', async () => {
+    // ZEB-325 Phase 2c: connectivity_redeem_invite_iroh now completes the
+    // full handshake (pkarr resolve → iroh connect → PendingJoin → counter-
+    // signed Join). On success the IPC returns status='joined' with the
+    // community id. The UI must render the "Joined ✓" success label from
+    // STAGE_LABELS and dismiss the dialog via onCancel.
+    //
+    // ZEB-325 PR #159 F11: drive the dismiss timer through fake timers
+    // rather than `joinedDismissDelayMs: 0`. The 0ms variant raced the
+    // dismiss macrotask under some scheduler interleavings — the
+    // dialog's `onCancel` fires after a setTimeout(0), which can land
+    // after `waitFor`'s default 1s budget on slow CI runners. With
+    // `vi.useFakeTimers({ shouldAdvanceTime: true })` the test
+    // deterministically advances time before asserting and is robust
+    // to any host-process scheduling pressure.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const onCancel = vi.fn();
+      mockInvoke.mockImplementation((cmd: string) => {
+        if (cmd === 'connectivity_redeem_invite_iroh') {
+          return Promise.resolve({ status: 'joined', communityId: 'abc123' });
+        }
+        return Promise.resolve(null);
+      });
+
+      const { getByTestId, getByPlaceholderText } = render(RedeemInviteDialog, {
+        // 50ms delay + explicit advance keeps the test deterministic
+        // without depending on `setTimeout(0)` macrotask ordering.
+        props: { onSubmit: vi.fn(), onCancel, joinedDismissDelayMs: 50 },
+      });
+
+      const input = getByPlaceholderText(/harmony:\/\/invite/) as HTMLTextAreaElement;
+      await fireEvent.input(input, { target: { value: 'harmony://invite/v1?ci=x' } });
+      await fireEvent.click(getByTestId('iroh-redeem-btn'));
+
+      // The success label appears.
+      await waitFor(() => {
+        const label = getByTestId('iroh-stage-label');
+        expect(label.textContent).toContain('Joined');
+      });
+
+      // Advance past the 50ms dismiss timer; onCancel must fire.
+      await vi.advanceTimersByTimeAsync(50);
+      expect(onCancel).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
