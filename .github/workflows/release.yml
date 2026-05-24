@@ -1,0 +1,235 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'SemVer + pre-release (e.g., 0.1.0-alpha.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: write    # for gh release create + gh-pages push
+
+jobs:
+  precheck:
+    name: Precheck (version match + gates + tag clear)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Confirm version input matches tauri.conf.json
+        run: |
+          CONFIG_VERSION=$(jq -r .version src-tauri/tauri.conf.json)
+          if [ "$CONFIG_VERSION" != "${{ inputs.version }}" ]; then
+            echo "::error::version mismatch: input=${{ inputs.version }} config=$CONFIG_VERSION"
+            echo "Bump tauri.conf.json version + commit before triggering."
+            exit 1
+          fi
+
+      - name: Confirm tag does not already exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "v${{ inputs.version }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "::error::release v${{ inputs.version }} already exists"
+            exit 1
+          fi
+
+      - name: Install Rust toolchain (honors rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: npm ci
+        run: npm ci
+
+      - name: cargo fmt --check
+        working-directory: src-tauri
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        working-directory: src-tauri
+        run: cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
+
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest --locked
+
+      - name: cargo nextest
+        working-directory: src-tauri
+        run: cargo nextest run --locked --workspace --all-targets --features test-fixtures
+
+      - name: tsc --noEmit
+        run: npx tsc --noEmit
+
+      - name: vitest
+        run: npx vitest run
+
+  build:
+    name: Build (${{ matrix.os }})
+    needs: precheck
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux build deps
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev libsoup-3.0-dev javascriptcoregtk-4.1
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: npm ci
+        run: npm ci
+
+      - name: tauri build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build -- --target ${{ matrix.target }}
+
+      - name: Sanity-check artifact presence
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la src-tauri/target/${{ matrix.target }}/release/bundle/ || true
+          find src-tauri/target/${{ matrix.target }}/release/bundle/ -name "*.sig" | head -1
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.target }}
+          path: |
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.dmg
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.msi
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.AppImage
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.tar.gz
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.sig
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.zip
+          if-no-files-found: warn
+
+  release:
+    name: Create GitHub Release + update manifest
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Flatten artifact tree
+        run: |
+          mkdir -p release-files
+          find artifacts/ -type f \( -name "*.dmg" -o -name "*.msi" -o -name "*.AppImage" -o -name "*.tar.gz" -o -name "*.sig" -o -name "*.zip" \) -exec cp {} release-files/ \;
+          ls -la release-files/
+
+      - name: Create draft GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v${{ inputs.version }}" \
+            --title "v${{ inputs.version }}" \
+            --generate-notes \
+            --draft \
+            release-files/*
+
+      - name: Regenerate latest.json + push to gh-pages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.version }}"
+          REPO="${{ github.repository }}"
+          REPO_URL="https://github.com/${REPO}"
+          PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          sig_for() {
+            local pattern="$1"
+            local sig_file
+            sig_file=$(find release-files/ -name "${pattern}" -name "*.sig" | head -1)
+            [ -n "$sig_file" ] && cat "$sig_file" || echo ""
+          }
+          url_for() {
+            local pattern="$1"
+            local file
+            file=$(find release-files/ -name "${pattern}" ! -name "*.sig" | head -1)
+            if [ -n "$file" ]; then
+              echo "${REPO_URL}/releases/download/v${VERSION}/$(basename "$file")"
+            else
+              echo ""
+            fi
+          }
+
+          cat > latest.json <<EOF
+          {
+            "version": "${VERSION}",
+            "notes": "See ${REPO_URL}/releases/tag/v${VERSION}",
+            "pub_date": "${PUB_DATE}",
+            "platforms": {
+              "darwin-aarch64": {
+                "signature": "$(sig_for '*aarch64*.app.tar.gz*')",
+                "url": "$(url_for '*aarch64*.app.tar.gz')"
+              },
+              "darwin-x86_64": {
+                "signature": "$(sig_for '*x64*.app.tar.gz*')",
+                "url": "$(url_for '*x64*.app.tar.gz')"
+              },
+              "windows-x86_64": {
+                "signature": "$(sig_for '*nsis.zip*')",
+                "url": "$(url_for '*nsis.zip')"
+              },
+              "linux-x86_64": {
+                "signature": "$(sig_for '*amd64.AppImage.tar.gz*')",
+                "url": "$(url_for '*amd64.AppImage.tar.gz')"
+              }
+            }
+          }
+          EOF
+          cat latest.json
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin gh-pages
+          git worktree add /tmp/gh-pages gh-pages
+          cp latest.json /tmp/gh-pages/latest.json
+          cd /tmp/gh-pages
+          git add latest.json
+          git commit -m "release: v${VERSION} manifest" || echo "no changes"
+          git push origin gh-pages
+
+      - name: Publish release (un-draft)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "v${{ inputs.version }}" --draft=false
