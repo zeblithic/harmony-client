@@ -19,5 +19,27 @@
         "minHeight": 300
       }
     ]
+  },
+  "bundle": {
+    "active": true,
+    "category": "SocialNetworking",
+    "targets": ["dmg", "msi", "appimage"],
+    "shortDescription": "Harmony — federated, polycentric social fabric",
+    "longDescription": "Harmony is a federated, polycentric social fabric built on user-owned identity and self-hosted infrastructure. This is the desktop client."
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": [
+        {
+          "schemes": ["harmony"]
+        }
+      ]
+    },
+    "updater": {
+      "endpoints": [
+        "https://zeblithic.github.io/harmony-client/latest.json"
+      ],
+      "pubkey": "PLACEHOLDER_REPLACE_WITH_OP_3_OUTPUT"
+    }
   }
 }
