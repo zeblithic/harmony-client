@@ -29789,12 +29789,43 @@ pub async fn connectivity_redeem_invite_iroh_inner<R: tauri::Runtime>(
         .clone()
         .ok_or_else(|| "invite_token missing — case-A guard should have rejected".to_string())?;
     let (joiner_identity_pub, joiner_device_hash, sign_key_for_packet) = {
+        // ZEB-325 Phase 2c option A: derive `joiner_identity_pub` via
+        // the SAME `ed25519_priv_to_x25519` (RFC 7748 §5 birational
+        // map) that `mint_redemption` uses to build the PendingJoin's
+        // own `joiner_identity_pub` field. The composite must hash
+        // (via `Identity::from_public_bytes → address_hash`) to
+        // `self_owner` — both `verify_signature::ActorPubkeyMismatch`
+        // and `handle_unicast`'s F6 trust-narrowing reject otherwise.
+        //
+        // We CANNOT reuse `dm_outbox.private_identity.identity.to_public_bytes()`
+        // here in tests where the signing key was generated standalone
+        // (not via `PrivateIdentity::from_seed`'s HKDF chain): the two
+        // X25519 derivations produce different pub bytes, which hash
+        // to different `OwnerAddr`s. Production passes through both
+        // paths consistently (identity loaded from disk drives both
+        // the signing key and the PrivateIdentity), but the explicit
+        // birational derivation here makes the option-A path robust
+        // against future divergence and matches the bytes the engine's
+        // verify already expects.
         let outbox_g = dm_outbox.lock().await;
-        let joiner_pub = outbox_g.private_identity.identity.to_public_bytes();
-        let joiner_dh = crate::owner_state_types::DeviceIdentityHash(
-            outbox_g.private_identity.identity.address_hash,
-        );
         let sk = std::sync::Arc::clone(&outbox_g.signing_key);
+        drop(outbox_g);
+
+        let x25519_priv = crate::dm_signing::ed25519_priv_to_x25519(sk.as_ref());
+        let x25519_pub =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*x25519_priv));
+        let ed25519_pub = sk.verifying_key().to_bytes();
+        let mut joiner_pub = [0u8; 64];
+        joiner_pub[..32].copy_from_slice(x25519_pub.as_bytes());
+        joiner_pub[32..].copy_from_slice(&ed25519_pub);
+
+        // `signing_device_hash` is decoded-defended in `decode_packet`
+        // as `SHA256(joiner_identity_pub)[..16]`; derive from the
+        // (birational) composite we just built so the structural check
+        // passes on the receiver.
+        let joiner_dh = crate::owner_state_types::DeviceIdentityHash(
+            crate::community_invite::device_hash_from_identity_pub(&joiner_pub),
+        );
         (joiner_pub, joiner_dh, sk)
     };
     let signed = crate::community_invite::CommunityInviteSigned {
@@ -29910,9 +29941,17 @@ pub async fn connectivity_redeem_invite_iroh_inner<R: tauri::Runtime>(
         });
     }
 
-    // Drop the iroh connection bookkeeping — the bi-stream is done.
+    // Cleanly close the iroh connection. The acceptor's
+    // `handle_connection` awaits `conn.closed()` to keep its
+    // Connection Arc alive until we drive close from here — without
+    // this explicit close the acceptor would either hold the
+    // connection open indefinitely (waiting for our drop to be
+    // observed remotely) or tear down too early and race our read.
+    // Pattern from `zenoh_iroh_link::tests::paired_stream_roundtrip_via_loopback`.
     drop(send);
     drop(recv);
+    conn.close(0u32.into(), b"handshake-complete");
+    conn.closed().await;
     drop(conn);
 
     // Stage 4/5: `awaiting_countersig` — emitted between receive and

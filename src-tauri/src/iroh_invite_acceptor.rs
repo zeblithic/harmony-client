@@ -288,10 +288,16 @@ where
                 );
             }
         }
-        // Connection is dropped at the end of this scope; iroh
-        // transparently tears it down. The bi-stream send half was
-        // already finish()ed (or errored), and the recv half saw EOF
-        // when the dialer finished its send half.
+        // CRITICAL: wait for the dialer to drive the connection close
+        // before letting the `conn` Arc drop. Without this, dropping
+        // the Connection here races the QUIC layer's in-flight delivery
+        // of the response bytes — Bob sees `read length-prefix:
+        // connection lost` despite our `send.finish()` flushing
+        // locally. Pattern lifted verbatim from
+        // `zenoh_iroh_link::IrohZenohLink::tests::paired_stream_roundtrip_via_loopback`,
+        // which observed an identical 6-hour symptom during Phase 1
+        // Task 5 (2026-05-22).
+        let _ = conn.closed().await;
     }
 }
 
