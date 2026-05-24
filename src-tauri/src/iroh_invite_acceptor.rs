@@ -125,10 +125,18 @@ impl HandshakeAcceptorConfig {
     /// contexts — see ZEB-325 PR #159 round-1 review).
     pub fn from_env() -> Self {
         fn read_ms(name: &str, default_ms: u64) -> Duration {
+            // ZEB-325 PR #159 R3: clamp to >= 1ms. A zero from env
+            // override would otherwise produce instant `tokio::time::
+            // timeout(0, …)` failures + a tight retry loop on the
+            // caller. The minimum is intentionally tiny rather than
+            // capped at a sane floor (e.g. 100ms) so tests can still
+            // force fast timeouts; production operators are expected
+            // to set reasonable values.
             let ms = std::env::var(name)
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(default_ms);
+                .unwrap_or(default_ms)
+                .max(1);
             Duration::from_millis(ms)
         }
         Self {

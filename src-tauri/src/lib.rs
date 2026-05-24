@@ -29362,11 +29362,17 @@ impl HandshakeDialConfig {
     /// Production constructor: reads `HARMONY_INVITE_HANDSHAKE_TIMEOUT_MS`
     /// (the historical single-knob env var) and applies it uniformly to
     /// connect, open_bi, and response read. Unset / unparseable → 30s.
+    ///
+    /// ZEB-325 PR #159 R3: clamp to >= 1ms. A zero from env override
+    /// would otherwise produce instant `tokio::time::timeout(0, …)`
+    /// failures, surfacing `inviter_unreachable` on every redeem +
+    /// (if the caller retries) a tight loop.
     pub fn from_env() -> Self {
         let ms: u64 = std::env::var("HARMONY_INVITE_HANDSHAKE_TIMEOUT_MS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(30_000);
+            .unwrap_or(30_000)
+            .max(1);
         let d = std::time::Duration::from_millis(ms);
         Self {
             connect_timeout: d,
@@ -30080,6 +30086,14 @@ where
                     error = %e,
                     "ZEB-325 Phase 2c option A: handshake response read failed"
                 );
+                // ZEB-325 PR #159 R5: explicit close for symmetry with
+                // the dial / open_bi failure paths above. Without this
+                // the connection stays open until QUIC's idle timeout
+                // fires — the acceptor side sees a stalled stream and
+                // its IO timeout has to fire before resources are
+                // released. CONNECTION_CLOSE lets the peer release
+                // immediately.
+                conn.close(0u32.into(), b"response-read-failed");
                 return Ok(RedemptionOutcome {
                     status: "inviter_unreachable".to_string(),
                     community_id: None,
@@ -30090,6 +30104,7 @@ where
                     timeout_ms = dial_config.response_read_timeout.as_millis() as u64,
                     "ZEB-325 Phase 2c option A: handshake response timeout (read)"
                 );
+                conn.close(0u32.into(), b"response-read-timeout");
                 return Ok(RedemptionOutcome {
                     status: "inviter_unreachable".to_string(),
                     community_id: None,

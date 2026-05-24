@@ -475,7 +475,7 @@ Load-bearing assertions: `outcome.status == "joined"`, Bob's CRDT contains the a
 Run:
 
 ```bash
-cargo nextest run --locked --features test-fixtures --test pkarr_iroh_redeem_full_integration
+cd src-tauri && cargo nextest run --locked --all-targets --features test-fixtures --test pkarr_iroh_redeem_full_integration
 ```
 
 Expected: PASS within ~20s on loopback. The outer `tokio::time::timeout(60s, ...)` guard catches any unbounded await.
