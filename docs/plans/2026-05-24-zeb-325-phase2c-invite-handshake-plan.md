@@ -2,9 +2,33 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+## Pivot note — 2026-05-24 (option C → option A)
+
+**TL;DR.** Option C (pure Zenoh-CRDT-sync over the iroh-borne link) is blocked on two production gaps the original plan did not anticipate: (1) `event_loop.rs` Phase 1 still discards inbound iroh→zenoh links into a drain task (the real Zenoh-session ingestion is deferred), and (2) `community_state_sync::handle_incoming_publish` drops non-member publishes at the `PublisherNotJoined` gate before any per-event `verify_event` runs, so Bob's PendingJoin publish never reaches Alice's engine even when the link IS up. The reverted Task 6 test (commit `92997b9`, kept in git for archival via the revert in `1c65a87`) documented these gaps in `KNOWN-BLOCKED-PHASE-2C-PUBLISH-GATE`.
+
+**Pivoted to option A: direct iroh bi-stream handshake on the unused `harmony/handshake/v1` ALPN** (already registered in `iroh_endpoint.rs:49,88,252` since Phase 1 Task 4; never wired). Bob opens a `harmony/handshake/v1` bi-stream to Alice's iroh NodeId, writes the existing `CommunityInviteSigned` packet (Reticulum unicast wire shape, length-prefixed), reads back a CBOR-encoded `JoinCountersign` event, and feeds it into a new `redeem_invite_inner_with_overrides` variant via `pre_minted` + `pre_delivered_countersign` so the existing oneshot await fires immediately on the engine's post-Inserted hook. Alice's side runs a new `IrohInviteHandshakeAcceptor` installed onto the existing `IrohZenohLinkManager` accept loop via a `OnceCell` slot populated late at boot once `community_registry` / `dm_outbox` / `crdt_state` are all available.
+
+**Bugs surfaced + fixed during the option A test wire-up** (see `tests/pkarr_iroh_redeem_full_integration.rs`):
+- `joiner_identity_pub` derivation mismatch between iroh inner (HKDF X25519) and `mint_redemption` (birational map). Fixed by deriving the envelope's `joiner_identity_pub` the SAME way mint does, plus computing `signing_device_hash` from the resulting composite. The same divergence may exist on the legacy Reticulum unicast invite-only path; not fixed here (out of scope for option A pivot), but worth a follow-up ticket if invite-only Reticulum redemption is observed failing with `JoinSigInvalid` in production.
+- Connection close race: dropping the acceptor's `Connection` after `send.finish()` raced QUIC delivery, leaving Bob with "connection lost" on the response read. Fixed by `conn.closed().await` on the acceptor + explicit `conn.close()` + `conn.closed().await` on Bob's side. Mirrors `zenoh_iroh_link`'s `paired_stream_roundtrip_via_loopback` lesson.
+
+**Tasks 1-3 below are kept** (the `allow_no_reticulum_destinations` param, `seed_from_pkarr`, and the `connectivity_redeem_invite_iroh_inner` extraction all remain useful — seed_from_pkarr in particular keeps the door open for option C once both production gaps are addressed). **Task 4 (progress events) is kept** structurally but the Sending/AwaitingCountersig stages now bracket the iroh write/read rather than the CRDT publish/await. **Task 5 (frontend) is kept**. **Task 6 (two-process test) was reverted and rewritten** against the option A flow.
+
+The two single-engine tests
+(`connectivity_redeem_invite_iroh_completes_join_via_crdt_sync`,
+`connectivity_redeem_invite_iroh_emits_progress_events`) in
+`pkarr_invite_redemption_integration.rs` are now `#[ignore]`'d: they
+relied on a single-engine masking quirk (Bob's own PendingJoin insert
+fires the redemption oneshot regardless of whether a counter-sign
+ever arrives) that the option A pivot makes structurally impossible.
+Two-process coverage in `pkarr_iroh_redeem_full_integration.rs`
+supersedes them.
+
+---
+
 **Goal:** Complete the cross-WAN invite-redemption handshake so `connectivity_redeem_invite_iroh` actually completes a join instead of returning `pkarr_resolved_no_handshake`.
 
-**Architecture:** Per spec §7.2 + verified pre-conditions in ZEB-325. Option C: pure Zenoh-CRDT-sync. Bob seeds the ReachabilityResolver with the pkarr-resolved routing record so Phase 1's IrohZenohLinkManager can open the iroh connection on demand; Bob then calls the existing `redeem_invite_inner` with a new `allow_no_reticulum_destinations: bool` parameter that skips the Reticulum-destinations fast-fail. Bob's local PendingJoin insert + state-root publish reach Alice via the iroh-borne Zenoh link; her engine counter-signs and her state-root publish carries the counter-signed event back to Bob via the same link, firing his existing wait-for-counter-sig oneshot.
+**Architecture:** Per spec §7.2 + verified pre-conditions in ZEB-325. ~~Option C: pure Zenoh-CRDT-sync.~~ See the pivot note above — implementation is now option A (direct iroh bi-stream handshake on `harmony/handshake/v1`). Bob seeds the ReachabilityResolver with the pkarr-resolved routing record so Phase 1's IrohZenohLinkManager can open the iroh connection on demand; ~~Bob then calls the existing `redeem_invite_inner` with a new `allow_no_reticulum_destinations: bool` parameter that skips the Reticulum-destinations fast-fail. Bob's local PendingJoin insert + state-root publish reach Alice via the iroh-borne Zenoh link; her engine counter-signs and her state-root publish carries the counter-signed event back to Bob via the same link, firing his existing wait-for-counter-sig oneshot.~~ Bob opens an iroh bi-stream on the handshake ALPN, sends the CommunityInviteSigned packet, receives the JoinCountersign in the response, and feeds it into `redeem_invite_inner_with_overrides` to complete the join.
 
 **Tech Stack:** Rust (Tokio), iroh 0.98, Zenoh 1, Svelte 5 runes, Tauri 2.
 
