@@ -27,7 +27,8 @@ The shape we're aiming for: zeblith bumps a version field, triggers a workflow, 
 ┌─────────────────┐   workflow_dispatch     ┌──────────────────────────────────┐
 │  Operator       │ ────────────────────►   │  .github/workflows/release.yml   │
 │  (zeblith)      │   version=0.1.0-alpha.N │                                  │
-└─────────────────┘                         │  ① ci.yml passing check (gate)  │
+└─────────────────┘                         │  ① inline gates (fmt/clippy/    │
+                                            │     nextest/tsc/vitest)          │
                                             │  ② matrix:                       │
                                             │     - macos-14   (ARM build)     │
                                             │     - macos-13   (Intel build)   │
