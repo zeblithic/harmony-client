@@ -8,31 +8,79 @@ on:
         required: true
         type: string
 
+# ZEB-328 PR #160 R2 (CodeRabbit MAJOR): serialize release runs.
+# Multiple manual dispatches racing on tag creation or gh-pages writes
+# would clobber each other; cancel-in-progress: false means a second
+# dispatch queues behind the first instead of cancelling it.
+concurrency:
+  group: release-${{ github.workflow }}
+  cancel-in-progress: false
+
+# ZEB-328 PR #160 R2 (CodeRabbit MAJOR): default permissions are read-only;
+# the release job overrides to `contents: write` for its scope only.
 permissions:
-  contents: write    # for gh release create + gh-pages push
+  contents: read
 
 jobs:
   precheck:
-    name: Precheck (version match + gates + tag clear)
+    name: Precheck (version match + gates + tag clear + pubkey real)
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
+      # ZEB-328 PR #160 R2 (CodeRabbit MAJOR): validate the workflow_dispatch
+      # input against a strict SemVer regex BEFORE any shell interpolation.
+      # Prevents accidental (or malicious) injection via the version field
+      # and gives a clear error message instead of cryptic downstream failures.
+      - name: Sanitize + validate version input
+        id: ver
+        run: |
+          set -euo pipefail
+          INPUT="${{ inputs.version }}"
+          # SemVer 2.0 grammar (simplified to what we use):
+          # MAJOR.MINOR.PATCH (-pre-release-identifier(.pre-release-identifier)*)?
+          # Where pre-release identifiers are [0-9A-Za-z-]+
+          if ! echo "$INPUT" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'; then
+            echo "::error::version input '$INPUT' is not valid SemVer 2.0"
+            echo "Expected e.g. '0.1.0-alpha.1' or '0.1.0'"
+            exit 1
+          fi
+          echo "version=$INPUT" >> "$GITHUB_OUTPUT"
+
       - name: Confirm version input matches tauri.conf.json
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
         run: |
           CONFIG_VERSION=$(jq -r .version src-tauri/tauri.conf.json)
-          if [ "$CONFIG_VERSION" != "${{ inputs.version }}" ]; then
-            echo "::error::version mismatch: input=${{ inputs.version }} config=$CONFIG_VERSION"
+          if [ "$CONFIG_VERSION" != "$VERSION" ]; then
+            echo "::error::version mismatch: input=$VERSION config=$CONFIG_VERSION"
             echo "Bump tauri.conf.json version + commit before triggering."
+            exit 1
+          fi
+
+      # ZEB-328 PR #160 R2 (CodeRabbit CRITICAL): verify the operator has
+      # swapped the placeholder pubkey (OP-3) for the real ed25519 verifying
+      # key from `~/.tauri/harmony-updater.key.pub` BEFORE building. Shipping
+      # the placeholder would make every signature-verify call fail at
+      # auto-update time; installed clients couldn't apply any update.
+      - name: Verify updater pubkey is not the placeholder
+        run: |
+          set -euo pipefail
+          PUBKEY=$(jq -r .plugins.updater.pubkey src-tauri/tauri.conf.json)
+          if [ "$PUBKEY" = "PLACEHOLDER_REPLACE_WITH_OP_3_OUTPUT" ] || [ -z "$PUBKEY" ] || [ "$PUBKEY" = "null" ]; then
+            echo "::error::tauri.conf.json plugins.updater.pubkey is unset or still placeholder."
+            echo "Operator: complete OP-3 (paste the real ed25519 public key from ~/.tauri/harmony-updater.key.pub) before triggering release."
+            echo "See docs/release-process.md §1 OP-3."
             exit 1
           fi
 
       - name: Confirm tag does not already exist
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          if gh release view "v${{ inputs.version }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "::error::release v${{ inputs.version }} already exists"
+          if gh release view "v${VERSION}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "::error::release v${VERSION} already exists"
             exit 1
           fi
 
@@ -75,12 +123,21 @@ jobs:
     name: Build (${{ matrix.os }})
     needs: precheck
     runs-on: ${{ matrix.os }}
+    # ZEB-328 PR #160 R2 (CodeRabbit MAJOR): least-privilege — build only
+    # needs to read source + upload artifacts (which uses a separate
+    # implicit permission, not contents:write).
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: macos-14
             target: aarch64-apple-darwin
+          # macos-13 = Intel runner. GitHub has signaled deprecation but
+          # as of the spec's auth date it remains a valid label. If GitHub
+          # retires it before we deprecate Intel support, cut this matrix
+          # leg + drop the corresponding darwin-x86_64 manifest entry.
           - os: macos-13
             target: x86_64-apple-darwin
           - os: windows-latest
@@ -141,6 +198,10 @@ jobs:
     name: Create draft GitHub Release with per-platform artifacts
     needs: build
     runs-on: ubuntu-22.04
+    # ZEB-328 PR #160 R2 (CodeRabbit MAJOR): contents:write scoped to
+    # this job only (workflow-wide default is contents:read).
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -161,15 +222,23 @@ jobs:
           # Tauri names both macOS updater bundles `Harmony.app.tar.gz`;
           # rename in place to include the target triple so subsequent
           # release-asset upload + operator manifest gen can disambiguate.
+          # ZEB-328 PR #160 R2 (Cursor HIGH): Tauri writes the .app.tar.gz
+          # under `bundle/macos/`, NOT directly under bundle/. upload-artifact@v4
+          # preserves the nested path, so we search recursively rather than
+          # checking the root of each artifact dir.
           for d in artifacts/bundle-aarch64-apple-darwin artifacts/bundle-x86_64-apple-darwin; do
-            if [ -d "$d" ]; then
-              arch=$(basename "$d" | sed 's/bundle-//')
-              if [ -f "$d/Harmony.app.tar.gz" ]; then
-                mv -v "$d/Harmony.app.tar.gz" "$d/Harmony_${arch}.app.tar.gz"
-              fi
-              if [ -f "$d/Harmony.app.tar.gz.sig" ]; then
-                mv -v "$d/Harmony.app.tar.gz.sig" "$d/Harmony_${arch}.app.tar.gz.sig"
-              fi
+            if [ ! -d "$d" ]; then continue; fi
+            arch=$(basename "$d" | sed 's/bundle-//')
+            # Locate Harmony.app.tar.gz at any depth under this target's artifact dir.
+            tar_file=$(find "$d" -type f -name "Harmony.app.tar.gz" | head -1)
+            sig_file=$(find "$d" -type f -name "Harmony.app.tar.gz.sig" | head -1)
+            if [ -n "$tar_file" ]; then
+              new_tar="$(dirname "$tar_file")/Harmony_${arch}.app.tar.gz"
+              mv -vf "$tar_file" "$new_tar"
+            fi
+            if [ -n "$sig_file" ]; then
+              new_sig="$(dirname "$sig_file")/Harmony_${arch}.app.tar.gz.sig"
+              mv -vf "$sig_file" "$new_sig"
             fi
           done
 
@@ -219,9 +288,14 @@ jobs:
       - name: Create draft GitHub Release (operator publishes after smoke test)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # ZEB-328 PR #160 R2 (CodeRabbit MAJOR): pass via env var, not
+          # raw `${{ inputs.version }}` interpolation in the shell line.
+          # Precheck already validates SemVer-strict; this is defense in
+          # depth — env vars are not re-interpreted as shell tokens.
+          VERSION: ${{ inputs.version }}
         run: |
-          gh release create "v${{ inputs.version }}" \
-            --title "v${{ inputs.version }}" \
+          gh release create "v${VERSION}" \
+            --title "v${VERSION}" \
             --generate-notes \
             --draft \
             release-files/*

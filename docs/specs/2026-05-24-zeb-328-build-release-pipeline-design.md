@@ -385,7 +385,7 @@ Simpler — Linux users tend to expect AppImage friction:
 
 Operator-only, NOT in tester-visible docs.
 
-1. **Preflight** — check `ci.yml` green on `main`, no draft PRs to merge first, decide version.
+1. **Preflight** — run the five quality gates locally on `main` (`cargo fmt --check`, `cargo clippy`, `cargo nextest run`, `npx tsc --noEmit`, `npx vitest run`), no draft PRs to merge first, decide version. (No `ci.yml` to check — gates run inline in release.yml per §5.2; preflight is the operator's safety net.)
 2. **Bump + commit** — exact commands.
 3. **Trigger workflow** — `gh workflow run release.yml -f version=…`.
 4. **Watch the workflow** — what to expect (build times, common failures).
@@ -498,7 +498,7 @@ Same as 11.3 plus:
 - Tauri 2 deep links: <https://v2.tauri.app/plugin/deep-link/>
 - GitHub Actions free tier: <https://docs.github.com/en/billing/managing-billing-for-github-actions/about-billing-for-github-actions#about-billing-for-github-actions>
 - GitHub Pages: <https://docs.github.com/en/pages>
-- Existing CI workflow (disabled): `.github/workflows/ci.yml.disabled` — re-enabling is in this sub-project's scope
+- Existing CI workflow (disabled): `.github/workflows/ci.yml.disabled` — stays disabled per `feedback_ci_disabled` HARD RULE. Release gates run inline in `release.yml`'s precheck job (§5.2), NOT via re-enabling `ci.yml`.
 - Existing keychain integration: `src-tauri/src/identity.rs` (search for `keyring::Entry::new`)
 - macOS XprotectService dev-tools setup: `feedback_xprotectservice_dev_tools` (developer-only, NOT a release-pipeline concern but a tester-pipeline one if testers' macs hang on first-launch)
 - `harmony://invite/` URL scheme: `src-tauri/src/community_invite.rs:695` (`URL_PREFIX`)
