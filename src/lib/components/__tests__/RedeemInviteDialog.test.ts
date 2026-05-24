@@ -184,6 +184,45 @@ describe('RedeemInviteDialog', () => {
     expect(onSubmit).toHaveBeenCalledWith('harmony://invite/v1?ci=x');
   });
 
+  it('shows reach-but-local-failure message and NO fallback button when join_failed', async () => {
+    // ZEB-325 PR #159 R1: status='join_failed' means the inviter was reached
+    // and a valid JoinCountersign was delivered, but the local insert/commit
+    // failed (engine insert, fence violation, commit rollback). The
+    // Reticulum LAN fallback would just re-run the same local path against
+    // the same local engine state — so the fallback button MUST be suppressed
+    // and the error banner MUST distinguish this from "couldn't reach the
+    // inviter". The community_id (truncated) is surfaced as a correlation
+    // hint for bug reports.
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'connectivity_redeem_invite_iroh') {
+        return Promise.resolve({
+          status: 'join_failed',
+          communityId: 'abcdef0123456789',
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { getByTestId, getByPlaceholderText, queryByTestId } = render(RedeemInviteDialog, {
+      props: { onSubmit: vi.fn(), onCancel: vi.fn() },
+    });
+
+    const input = getByPlaceholderText(/harmony:\/\/invite/) as HTMLTextAreaElement;
+    await fireEvent.input(input, { target: { value: 'harmony://invite/v1?ci=x' } });
+    await fireEvent.click(getByTestId('iroh-redeem-btn'));
+
+    await waitFor(() => {
+      const banner = getByTestId('iroh-error-banner');
+      expect(banner.textContent).toContain('Reached the inviter');
+      expect(banner.textContent).toContain("couldn’t complete the join locally");
+      // community_id hint is surfaced (truncated to first 12 chars).
+      expect(banner.textContent).toContain('abcdef012345');
+    });
+    // The LAN fallback button is suppressed for join_failed — Reticulum
+    // can't help a local insert failure.
+    expect(queryByTestId('fallback-lan-btn')).toBeNull();
+  });
+
   it('shows fallback button and error on IPC rejection', async () => {
     mockInvoke.mockImplementation((cmd: string) => {
       if (cmd === 'connectivity_redeem_invite_iroh') {

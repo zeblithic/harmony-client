@@ -85,6 +85,11 @@ export interface PkarrPublicationStatus {
  *  - `'inviter_unreachable'` — pkarr lookup returned nothing OR the post-
  *    seed redeem path failed (backend collapses both into one user-facing
  *    message).
+ *  - `'join_failed'` — ZEB-325 PR #159 F1: the inviter WAS reached and a
+ *    valid JoinCountersign was delivered, but the subsequent local
+ *    `redeem_invite_inner_with_overrides` errored (engine insert, fence,
+ *    commit rollback, etc.). `communityId` is set so the frontend can
+ *    surface "we found Alice but the local insert failed".
  *  - `'missing_admin_identity_pub'` — invite has no admin identity key for
  *    verification; cannot safely complete discovery.
  *  - `'fallback_reticulum'` — use the LAN Reticulum path instead.
@@ -95,6 +100,7 @@ export interface RedemptionOutcome {
     | 'joined'
     | 'pkarr_resolved_no_handshake'
     | 'inviter_unreachable'
+    | 'join_failed'
     | 'missing_admin_identity_pub'
     | 'fallback_reticulum'
     | string;

@@ -118,6 +118,24 @@
         irohError =
           "Couldn't reach the inviter through the network right now. They may be offline; try again later.";
         showFallbackButton = true;
+      } else if (outcome.status === 'join_failed') {
+        // ZEB-325 PR #159 R1: the inviter WAS reached and we received a
+        // valid JoinCountersign, but the local insert/commit failed
+        // (engine insert error, fence violation, commit rollback, etc.).
+        // The Reticulum LAN fallback won't help — it runs the same
+        // `redeem_invite_inner` against the same local engine state — so
+        // suppress the fallback button. The community_id is included so
+        // bug reports can correlate. Suggest restart-and-retry as the
+        // first remediation; persistent failure is a bug.
+        irohStage = null;
+        const communityHint = outcome.communityId
+          ? ` (community ${outcome.communityId.slice(0, 12)}…)`
+          : '';
+        irohError =
+          'Reached the inviter but couldn’t complete the join locally' +
+          communityHint +
+          '. Try restarting the app and redeeming again; if it keeps failing, please report it as a bug.';
+        showFallbackButton = false;
       } else {
         // missing_admin_identity_pub, fallback_reticulum, or other — hand off to LAN path
         irohStage = null;
