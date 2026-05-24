@@ -30180,6 +30180,15 @@ where
         });
     }
 
+    // Stage 4/5: `awaiting_countersig` — emitted BEFORE the read so
+    // the UI displays "Waiting for confirmation…" during the actual
+    // network wait (response_read_timeout window, up to 30s) while
+    // Alice processes the PendingJoin and signs the countersign.
+    // ZEB-325 PR #159 R5 (Greptile P2): earlier this emit fired after
+    // read_response completed, making the stage invisible during the
+    // round-trip — users only saw `sending` for the full network wait.
+    emit_stage(RedemptionStage::AwaitingCountersig);
+
     // 10. Read response, bounded by dial_config.response_read_timeout.
     // ZEB-325 PR #159 F3: distinct tracing for response-read timeout vs
     // dial / open_bi timeouts (above) so diagnostics can attribute
@@ -30300,11 +30309,6 @@ where
     drop(recv);
     conn.close(0u32.into(), b"handshake-complete");
     drop(conn);
-
-    // Stage 4/5: `awaiting_countersig` — emitted between receive and
-    // the inner call so the UI tracks the (sub-millisecond) commit
-    // window distinctly from the read window.
-    emit_stage(RedemptionStage::AwaitingCountersig);
 
     // 12. Drive the inner with overrides: pre_minted (same artifacts
     // we already wired into the wire packet) and pre_delivered_countersign

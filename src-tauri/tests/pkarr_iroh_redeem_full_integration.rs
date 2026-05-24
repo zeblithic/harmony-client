@@ -335,7 +335,6 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             .insert_local_event(alice_minted.bootstrap_join.clone())
             .await
             .expect("alice bootstrap insert");
-        std::mem::forget(dir_alice);
 
         // ── 4. Alice's dm_outbox + crdt_state (acceptor dependencies). ──
         let alice_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
