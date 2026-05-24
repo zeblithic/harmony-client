@@ -2,8 +2,8 @@
 //! when user opts in via "Make me discoverable" toggle. Persisted via PkarrSettings.
 
 use harmony_pkarr::{
-    current_epoch_id, derive_ephemeral_key, PkarrCase, PkarrPublisher, PkarrRoutingRecord,
-    RecordBuilder,
+    current_epoch_id, derive_ephemeral_key, EphemeralKeyBuilder, PkarrCase, PkarrPublisher,
+    PkarrRoutingRecord, RecordBuilder,
 };
 use std::sync::Arc;
 
@@ -34,12 +34,17 @@ impl PkarrIdentityPublisher {
     /// Register this device's identity publication. Called when the user enables
     /// "Make me discoverable" in settings (case B opt-in).
     pub async fn enable(&self) {
-        let epoch_id = current_epoch_id(now_ms());
-        let signing = derive_ephemeral_key(
-            PkarrCase::Identity,
-            &self.identity_pub,
-            &epoch_id.to_be_bytes(),
-        );
+        // Re-derive the ephemeral key on EVERY publish so it tracks the
+        // current epoch (see [`pkarr_invite_publisher`] for the bug history).
+        let id_pub_for_key = self.identity_pub;
+        let key_builder: EphemeralKeyBuilder = Arc::new(move |at_ms| {
+            let epoch_id = current_epoch_id(at_ms);
+            derive_ephemeral_key(
+                PkarrCase::Identity,
+                &id_pub_for_key,
+                &epoch_id.to_be_bytes(),
+            )
+        });
 
         let id_sk = self.identity_signing_key.clone();
         let id_pub = self.identity_pub;
@@ -50,7 +55,7 @@ impl PkarrIdentityPublisher {
         });
 
         self.publisher
-            .register(HANDLE.to_string(), signing, builder)
+            .register(HANDLE.to_string(), key_builder, builder)
             .await;
     }
 
@@ -58,13 +63,6 @@ impl PkarrIdentityPublisher {
     pub async fn disable(&self) {
         self.publisher.unregister(HANDLE).await;
     }
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time")
-        .as_millis() as u64
 }
 
 #[cfg(test)]

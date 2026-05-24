@@ -5,8 +5,8 @@
 //! so multiple concurrent invites coexist without DHT key collision.
 
 use harmony_pkarr::{
-    current_epoch_id, derive_ephemeral_key, PkarrCase, PkarrPublisher, PkarrRoutingRecord,
-    RecordBuilder,
+    current_epoch_id, derive_ephemeral_key, EphemeralKeyBuilder, PkarrCase, PkarrPublisher,
+    PkarrRoutingRecord, RecordBuilder,
 };
 use std::sync::Arc;
 
@@ -46,8 +46,16 @@ impl PkarrInvitePublisher {
             // per-invite secret to key an HKDF record on.
             return;
         };
-        let epoch_id = current_epoch_id(now_ms());
-        let signing = derive_ephemeral_key(PkarrCase::Invite, &token.sig, &epoch_id.to_be_bytes());
+        // Re-derive the ephemeral key on EVERY publish so it tracks the
+        // current epoch. Capturing the key once at registration would silently
+        // break case-A discovery after the first epoch boundary (resolvers
+        // query the current-epoch key ± tolerance; a frozen old-epoch key
+        // falls outside the window after one or two boundaries).
+        let token_sig = token.sig;
+        let key_builder: EphemeralKeyBuilder = Arc::new(move |at_ms| {
+            let epoch_id = current_epoch_id(at_ms);
+            derive_ephemeral_key(PkarrCase::Invite, &token_sig, &epoch_id.to_be_bytes())
+        });
 
         let id_sk = self.identity_signing_key.clone();
         let id_pub = self.identity_pub;
@@ -58,7 +66,7 @@ impl PkarrInvitePublisher {
         });
 
         let handle = format!("invite:{}", hex::encode(token.sig));
-        self.publisher.register(handle, signing, builder).await;
+        self.publisher.register(handle, key_builder, builder).await;
     }
 
     /// Called when the invite is consumed, expires, or is revoked.
@@ -66,13 +74,6 @@ impl PkarrInvitePublisher {
         let handle = format!("invite:{}", hex::encode(invite_token_sig));
         self.publisher.unregister(&handle).await;
     }
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time")
-        .as_millis() as u64
 }
 
 #[cfg(test)]

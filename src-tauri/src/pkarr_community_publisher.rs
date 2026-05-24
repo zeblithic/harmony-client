@@ -3,8 +3,8 @@
 //! members' resolvers when Phase 1's CRDT-broadcast routing is stale.
 
 use harmony_pkarr::{
-    current_epoch_id, derive_ephemeral_key, PkarrCase, PkarrPublisher, PkarrRoutingRecord,
-    RecordBuilder,
+    current_epoch_id, derive_ephemeral_key, EphemeralKeyBuilder, PkarrCase, PkarrPublisher,
+    PkarrRoutingRecord, RecordBuilder,
 };
 use std::sync::Arc;
 
@@ -35,11 +35,16 @@ impl PkarrCommunityPublisher {
     /// Called when this device joins (or creates) a community. Registers a
     /// per-community pkarr publication under HKDF(EpochKey ‖ identity_pub, epoch).
     pub async fn on_community_joined(&self, community_id: SpaceId, epoch_key: [u8; 32]) {
-        let epoch_id = current_epoch_id(now_ms());
-        let mut info = Vec::with_capacity(64 + 8);
-        info.extend_from_slice(&self.identity_pub);
-        info.extend_from_slice(&epoch_id.to_be_bytes());
-        let signing = derive_ephemeral_key(PkarrCase::Community, &epoch_key, &info);
+        // Re-derive the ephemeral key on EVERY publish so it tracks the
+        // current epoch (see [`pkarr_invite_publisher`] for the bug history).
+        let id_pub_for_key = self.identity_pub;
+        let key_builder: EphemeralKeyBuilder = Arc::new(move |at_ms| {
+            let epoch_id = current_epoch_id(at_ms);
+            let mut info = Vec::with_capacity(64 + 8);
+            info.extend_from_slice(&id_pub_for_key);
+            info.extend_from_slice(&epoch_id.to_be_bytes());
+            derive_ephemeral_key(PkarrCase::Community, &epoch_key, &info)
+        });
 
         let id_sk = self.identity_signing_key.clone();
         let id_pub = self.identity_pub;
@@ -50,7 +55,7 @@ impl PkarrCommunityPublisher {
         });
 
         let handle = format!("community:{}", hex::encode(community_id.0));
-        self.publisher.register(handle, signing, builder).await;
+        self.publisher.register(handle, key_builder, builder).await;
     }
 
     /// Called when this device leaves or is kicked from a community. Removes the
@@ -59,13 +64,6 @@ impl PkarrCommunityPublisher {
         let handle = format!("community:{}", hex::encode(community_id.0));
         self.publisher.unregister(&handle).await;
     }
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time")
-        .as_millis() as u64
 }
 
 #[cfg(test)]
