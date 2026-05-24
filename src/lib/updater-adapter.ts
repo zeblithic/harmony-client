@@ -8,18 +8,20 @@ const DISMISSED_VERSION_KEY = "harmony.updater.dismissed_version";
  * ZEB-328 PR #160 R3 (Greptile): plain `Intl.Collator` over the full string
  * misorders alpha-vs-stable. Per SemVer 2.0 §11, a stable version (no
  * pre-release suffix) is greater than ANY pre-release of the same release.
- * `Intl.Collator` would compare `"1.0.0"` < `"1.0.0-alpha.1"` because the
- * second string is longer — the opposite of correct. Bites us at the
- * alpha → stable transition: a user who dismissed `1.0.0-alpha.5` would
- * be incorrectly suppressed from seeing `1.0.0`.
  *
- * Strategy: split on the first `-`, compare the release parts first with
- * numeric collator (so `0.1.10 > 0.1.2`), then apply the §11 rule for
+ * ZEB-328 PR #160 R4 (CodeRabbit nitpick): per SemVer 2.0 §10, build
+ * metadata (anything after `+`) is ignored in precedence. Strip it
+ * before splitting on `-`.
+ *
+ * Strategy: strip build metadata, split on the first `-`, compare the
+ * release parts numerically (so `0.1.10 > 0.1.2`), apply §11 rule for
  * pre-release tiebreak.
  */
 function semverCompare(a: string, b: string): number {
-  const [aRelease, aPre] = a.split(/-(.+)/, 2);
-  const [bRelease, bPre] = b.split(/-(.+)/, 2);
+  // §10: drop build metadata (everything after the first '+').
+  const stripBuild = (v: string) => v.split("+", 1)[0];
+  const [aRelease, aPre] = stripBuild(a).split(/-(.+)/, 2);
+  const [bRelease, bPre] = stripBuild(b).split(/-(.+)/, 2);
   const collator = new Intl.Collator(undefined, { numeric: true });
   const relCmp = collator.compare(aRelease, bRelease);
   if (relCmp !== 0) return relCmp;
@@ -50,8 +52,19 @@ export async function checkForUpdate(): Promise<Update | null> {
     return null;
   }
 
+  // ZEB-328 PR #160 R4 (Cursor MED): "Skip this version" semantics are
+  // PER-VERSION (per spec §6.4), not "suppress all ≤ this version". The
+  // previous `semverCompare(update.version, dismissed) <= 0` form would,
+  // after dismissing a stable `1.0.0`, silently suppress any future
+  // pre-release of the same release (e.g., `1.0.0-alpha.11` — which is
+  // SemVer-§11-less-than `1.0.0`). Strict equality matches user intent:
+  // "I dismissed exactly this version; show me anything else, including
+  // new pre-releases I haven't seen."
+  //
+  // semverCompare is retained (used by the per-version comparison test
+  // suite + future range checks if we ever need them).
   const dismissed = localStorage.getItem(DISMISSED_VERSION_KEY);
-  if (dismissed && semverCompare(update.version, dismissed) <= 0) {
+  if (dismissed && semverCompare(update.version, dismissed) === 0) {
     return null;
   }
 
