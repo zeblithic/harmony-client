@@ -120,7 +120,7 @@ No tag-driven trigger — keeps the surface area minimal and prevents accidental
 Before any build, a `precheck` job:
 
 1. Verifies the input version matches the `version` field in `tauri.conf.json` (fail if mismatch — forces operator to bump and commit before triggering).
-2. Verifies `ci.yml`'s latest run on the triggering branch is green (fail if not — ensures we never release on red). This re-enables `ci.yml` (currently `ci.yml.disabled`) as a separate workstream within this sub-project.
+2. Runs all five quality gates inline (per CLAUDE.md): `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`, `cargo nextest run --locked --workspace --all-targets --features test-fixtures`, `npx tsc --noEmit`, `npx vitest run`. Fails the workflow if any gate fails. **We deliberately do NOT re-enable the standalone `ci.yml` workflow** — per the project's `feedback_ci_disabled` HARD RULE, PR-time CI stays off (AI bot reviews cover that surface). Gates run here only at release-trigger time, so the no-CI PR experience is preserved while releases are still gated on green.
 3. Verifies `gh release view v{version}` returns 404 (fail if a release with that tag already exists — prevents accidental clobber).
 
 ### 5.3 Matrix builds
@@ -431,14 +431,16 @@ Tauri 2.10.1 today (`@tauri-apps/cli` in `package.json`, `tauri-build` etc. in `
 
 ## 11. Test plan
 
-### 11.1 Automated (in CI, BEFORE release workflow can trigger)
+### 11.1 Inline at release-trigger time (precheck job in release.yml, BEFORE matrix builds)
 
-`ci.yml` re-enabled. Gates (per CLAUDE.md):
+Per §5.2: gates run inline in the release workflow's precheck job, NOT via a standalone `ci.yml`. Gates (per CLAUDE.md):
 - `cargo fmt --all -- --check`
 - `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`
 - `cargo nextest run --locked --workspace --all-targets --features test-fixtures`
 - `npx tsc --noEmit`
 - `npx vitest run`
+
+Operator should still run these locally before bumping the version — release.yml's precheck is the safety net, not the first line of defense.
 
 ### 11.2 Workflow-internal (per matrix job, AFTER `npm run tauri build`)
 
