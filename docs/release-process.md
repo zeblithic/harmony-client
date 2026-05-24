@@ -211,9 +211,9 @@ See §3 below. Do this before publishing the draft release.
 
 ---
 
-### Step 6: Edit draft release notes and publish
+### Step 6: Edit draft release notes (still draft — do NOT un-draft yet)
 
-The workflow creates a draft release. Add narrative framing, then publish:
+The workflow creates a draft release with auto-generated notes. Add narrative framing:
 
 ```bash
 gh release edit v0.1.0-alpha.N+1 \
@@ -233,7 +233,107 @@ gh release edit v0.1.0-alpha.N+1 \
 ## What's Changed
 EOF
 )"
+```
 
+> ⚠️ Don't un-draft yet. Run Step 6a (manifest gen + push) first, then verify, then un-draft in Step 6b. The workflow deliberately stops at "draft + artifacts uploaded" so a broken bundle never reaches installed clients via the auto-updater channel before you've smoke-tested.
+
+---
+
+### Step 6a: Generate + push the update manifest
+
+Download the signed updater bundles from the draft release, extract signatures, build `latest.json`, push to `gh-pages`. The workflow doesn't do this because GitHub Pages serves the manifest to all installed clients within ~30s — pushing before smoke-test means a broken release auto-updates to everyone immediately.
+
+```bash
+set -euo pipefail
+VERSION="0.1.0-alpha.N+1"
+REPO_URL="https://github.com/zeblithic/harmony-client"
+WORKDIR="$(mktemp -d -t harmony-release-XXXXXX)"
+cd "$WORKDIR"
+
+# Download all .sig files (we only need the signatures + URL construction)
+gh release download "v${VERSION}" --repo zeblithic/harmony-client --pattern '*.sig' -D sigs/
+
+# Fail loudly if any expected signature is missing
+required_sigs=(
+  "Harmony_aarch64-apple-darwin.app.tar.gz.sig"
+  "Harmony_x86_64-apple-darwin.app.tar.gz.sig"
+)
+missing=()
+for s in "${required_sigs[@]}"; do
+  if [ ! -f "sigs/$s" ]; then missing+=("$s"); fi
+done
+# Windows + Linux .sig basenames are version-stamped, glob-check:
+for glob in '*-setup.nsis.zip.sig' '*amd64.AppImage.tar.gz.sig'; do
+  if ! ls sigs/$glob >/dev/null 2>&1; then missing+=("$glob"); fi
+done
+if [ ${#missing[@]} -gt 0 ]; then
+  echo "MISSING SIGNATURES — refusing to generate manifest:"
+  printf '  - %s\n' "${missing[@]}"
+  exit 1
+fi
+
+PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+WIN_SIG_FILE=$(ls sigs/*-setup.nsis.zip.sig | head -1)
+WIN_URL_FILE=$(basename "$WIN_SIG_FILE" .sig)
+LIN_SIG_FILE=$(ls sigs/*amd64.AppImage.tar.gz.sig | head -1)
+LIN_URL_FILE=$(basename "$LIN_SIG_FILE" .sig)
+
+cat > latest.json <<EOF
+{
+  "version": "${VERSION}",
+  "notes": "See ${REPO_URL}/releases/tag/v${VERSION}",
+  "pub_date": "${PUB_DATE}",
+  "platforms": {
+    "darwin-aarch64": {
+      "signature": "$(cat sigs/Harmony_aarch64-apple-darwin.app.tar.gz.sig)",
+      "url": "${REPO_URL}/releases/download/v${VERSION}/Harmony_aarch64-apple-darwin.app.tar.gz"
+    },
+    "darwin-x86_64": {
+      "signature": "$(cat sigs/Harmony_x86_64-apple-darwin.app.tar.gz.sig)",
+      "url": "${REPO_URL}/releases/download/v${VERSION}/Harmony_x86_64-apple-darwin.app.tar.gz"
+    },
+    "windows-x86_64": {
+      "signature": "$(cat "$WIN_SIG_FILE")",
+      "url": "${REPO_URL}/releases/download/v${VERSION}/${WIN_URL_FILE}"
+    },
+    "linux-x86_64": {
+      "signature": "$(cat "$LIN_SIG_FILE")",
+      "url": "${REPO_URL}/releases/download/v${VERSION}/${LIN_URL_FILE}"
+    }
+  }
+}
+EOF
+cat latest.json   # sanity-check it parses + all URLs/sigs present
+
+# Push to gh-pages
+cd /tmp
+rm -rf harmony-gh-pages
+git clone --branch gh-pages --single-branch git@github.com:zeblithic/harmony-client.git harmony-gh-pages
+cp -f "${WORKDIR}/latest.json" harmony-gh-pages/latest.json
+cd harmony-gh-pages
+git add latest.json
+git commit -m "release: v${VERSION} manifest"
+git push origin gh-pages
+cd -
+
+rm -rf "$WORKDIR"
+```
+
+After the push, GitHub Pages refreshes within ~30s. Verify before un-drafting:
+
+```bash
+sleep 45
+curl -s https://zeblithic.github.io/harmony-client/latest.json | jq '.version, .platforms | keys'
+# Expected: "0.1.0-alpha.N+1" + all 4 platform keys present
+```
+
+---
+
+### Step 6b: Un-draft the release
+
+Only after Step 6a verifies the manifest is live and well-formed:
+
+```bash
 gh release edit v0.1.0-alpha.N+1 \
   --repo zeblithic/harmony-client \
   --draft=false

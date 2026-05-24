@@ -22,6 +22,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "category": "SocialNetworking",
     "targets": ["dmg", "msi", "appimage"],
     "shortDescription": "Harmony — federated, polycentric social fabric",

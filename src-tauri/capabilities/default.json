@@ -5,6 +5,8 @@
   "permissions": [
     "core:default",
     "core:webview:allow-create-webview-window",
-    "dialog:default"
+    "dialog:default",
+    "updater:default",
+    "deep-link:default"
   ]
 }

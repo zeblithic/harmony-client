@@ -138,7 +138,7 @@ jobs:
           if-no-files-found: warn
 
   release:
-    name: Create GitHub Release + update manifest
+    name: Create draft GitHub Release with per-platform artifacts
     needs: build
     runs-on: ubuntu-22.04
     steps:
@@ -149,13 +149,74 @@ jobs:
         with:
           path: artifacts/
 
-      - name: Flatten artifact tree
+      # ZEB-328 PR #160 R1 (Cursor HIGH): keep per-platform subdirectories
+      # so the macOS ARM (`Harmony.app.tar.gz`) and macOS Intel
+      # (`Harmony.app.tar.gz`) updater bundles don't collide on basename
+      # during the flatten step. The operator-side manifest generator
+      # (documented in docs/release-process.md §2) reads
+      # artifacts/bundle-{target}/... directly to disambiguate them.
+      - name: Rename macOS updater bundles per-arch (avoid name collision)
         run: |
+          set -euo pipefail
+          # Tauri names both macOS updater bundles `Harmony.app.tar.gz`;
+          # rename in place to include the target triple so subsequent
+          # release-asset upload + operator manifest gen can disambiguate.
+          for d in artifacts/bundle-aarch64-apple-darwin artifacts/bundle-x86_64-apple-darwin; do
+            if [ -d "$d" ]; then
+              arch=$(basename "$d" | sed 's/bundle-//')
+              if [ -f "$d/Harmony.app.tar.gz" ]; then
+                mv -v "$d/Harmony.app.tar.gz" "$d/Harmony_${arch}.app.tar.gz"
+              fi
+              if [ -f "$d/Harmony.app.tar.gz.sig" ]; then
+                mv -v "$d/Harmony.app.tar.gz.sig" "$d/Harmony_${arch}.app.tar.gz.sig"
+              fi
+            fi
+          done
+
+      - name: Stage release files (per-platform subdirs preserved)
+        run: |
+          set -euo pipefail
           mkdir -p release-files
-          find artifacts/ -type f \( -name "*.dmg" -o -name "*.msi" -o -name "*.AppImage" -o -name "*.tar.gz" -o -name "*.sig" -o -name "*.zip" \) -exec cp {} release-files/ \;
+          # Now safe to flatten — every basename is unique post-rename.
+          # ZEB-328 PR #160 R1 (Qodo): cp -f to avoid any interactive
+          # prompt in a non-interactive workflow.
+          find artifacts/ -type f \( -name "*.dmg" -o -name "*.msi" -o -name "*.AppImage" -o -name "*.tar.gz" -o -name "*.sig" -o -name "*.zip" \) -exec cp -f {} release-files/ \;
           ls -la release-files/
 
-      - name: Create draft GitHub Release
+      # ZEB-328 PR #160 R1 (Qodo MED): fail loudly if any expected
+      # platform's updater bundle didn't make it through the build.
+      # Catches matrix-job silent failures (one OS green-passes but
+      # produces no bundle due to bundler misconfig) BEFORE we ship a
+      # broken release.
+      - name: Verify all platform bundles present
+        run: |
+          set -euo pipefail
+          required=(
+            "Harmony_aarch64-apple-darwin.app.tar.gz"
+            "Harmony_aarch64-apple-darwin.app.tar.gz.sig"
+            "Harmony_x86_64-apple-darwin.app.tar.gz"
+            "Harmony_x86_64-apple-darwin.app.tar.gz.sig"
+          )
+          missing=()
+          for f in "${required[@]}"; do
+            if [ ! -f "release-files/$f" ]; then
+              missing+=("$f")
+            fi
+          done
+          # Windows + Linux updater bundle basenames vary by version, glob-check them:
+          for glob in '*-setup.nsis.zip' '*-setup.nsis.zip.sig' '*amd64.AppImage.tar.gz' '*amd64.AppImage.tar.gz.sig'; do
+            if ! ls release-files/$glob >/dev/null 2>&1; then
+              missing+=("$glob")
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing expected release artifacts:"
+            printf '  - %s\n' "${missing[@]}"
+            exit 1
+          fi
+          echo "All expected platform bundles present."
+
+      - name: Create draft GitHub Release (operator publishes after smoke test)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -165,71 +226,10 @@ jobs:
             --draft \
             release-files/*
 
-      - name: Regenerate latest.json + push to gh-pages
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          VERSION="${{ inputs.version }}"
-          REPO="${{ github.repository }}"
-          REPO_URL="https://github.com/${REPO}"
-          PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-          sig_for() {
-            local pattern="$1"
-            local sig_file
-            sig_file=$(find release-files/ -name "${pattern}" -name "*.sig" | head -1)
-            [ -n "$sig_file" ] && cat "$sig_file" || echo ""
-          }
-          url_for() {
-            local pattern="$1"
-            local file
-            file=$(find release-files/ -name "${pattern}" ! -name "*.sig" | head -1)
-            if [ -n "$file" ]; then
-              echo "${REPO_URL}/releases/download/v${VERSION}/$(basename "$file")"
-            else
-              echo ""
-            fi
-          }
-
-          cat > latest.json <<EOF
-          {
-            "version": "${VERSION}",
-            "notes": "See ${REPO_URL}/releases/tag/v${VERSION}",
-            "pub_date": "${PUB_DATE}",
-            "platforms": {
-              "darwin-aarch64": {
-                "signature": "$(sig_for '*aarch64*.app.tar.gz*')",
-                "url": "$(url_for '*aarch64*.app.tar.gz')"
-              },
-              "darwin-x86_64": {
-                "signature": "$(sig_for '*x64*.app.tar.gz*')",
-                "url": "$(url_for '*x64*.app.tar.gz')"
-              },
-              "windows-x86_64": {
-                "signature": "$(sig_for '*nsis.zip*')",
-                "url": "$(url_for '*nsis.zip')"
-              },
-              "linux-x86_64": {
-                "signature": "$(sig_for '*amd64.AppImage.tar.gz*')",
-                "url": "$(url_for '*amd64.AppImage.tar.gz')"
-              }
-            }
-          }
-          EOF
-          cat latest.json
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch origin gh-pages
-          git worktree add /tmp/gh-pages gh-pages
-          cp latest.json /tmp/gh-pages/latest.json
-          cd /tmp/gh-pages
-          git add latest.json
-          git commit -m "release: v${VERSION} manifest" || echo "no changes"
-          git push origin gh-pages
-
-      - name: Publish release (un-draft)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "v${{ inputs.version }}" --draft=false
+      # ZEB-328 PR #160 R1 (Cursor MED): the workflow stops at "draft
+      # release created". Operator (zeblith) is responsible for the
+      # manual smoke test on each platform per docs/release-process.md
+      # §3 BEFORE running the manifest update + un-draft commands
+      # documented in docs/release-process.md §2. Auto-publishing
+      # before smoke-test risks shipping a broken auto-update path to
+      # all installed clients within the ~30s GitHub-Pages refresh.
