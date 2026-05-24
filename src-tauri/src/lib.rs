@@ -73,6 +73,7 @@ pub mod profile_broadcast;
 // ZEB-321 Phase 1 Task 7: debounced background task that re-emits this
 // device's ReachabilityAnnounce on startup / network change / idle tick /
 // manual force-notify. Wired into the event loop by Task 8.
+pub mod network_health;
 pub mod reachability_publisher;
 pub mod reachability_record;
 pub mod reachability_resolver;
