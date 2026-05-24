@@ -56,6 +56,9 @@
   import { onMount } from 'svelte';
   import type { Update } from '@tauri-apps/plugin-updater';
   import { checkForUpdate } from './lib/updater-adapter';
+  import { listen } from '@tauri-apps/api/event';
+  import { getCurrent as getCurrentDeepLink } from '@tauri-apps/plugin-deep-link';
+  import { extractHarmonyInviteUrl } from './lib/deep-link-router';
   import UpdateAvailableToast from './lib/components/UpdateAvailableToast.svelte';
 
   let innerWidth = $state(window.innerWidth);
@@ -784,6 +787,33 @@
   // ── ZEB-328: startup update check ──────────────────────────────────
   onMount(async () => {
     availableUpdate = await checkForUpdate();
+
+    // ZEB-328: handle deep-link URLs received while the app was already running.
+    const unlistenDeepLink = await listen<string[]>('deep-link-received', (event) => {
+      const url = extractHarmonyInviteUrl(event.payload);
+      if (url) {
+        redeemUrl = url;
+        redeemError = null;
+        showRedeemInvite = true;
+      }
+    });
+
+    // ZEB-328: handle deep-link URLs that arrived BEFORE we subscribed
+    // (e.g., the OS launched the app via harmony:// URL — plugin queues
+    // these so getCurrent() returns them at first read).
+    const queued = await getCurrentDeepLink();
+    if (queued) {
+      const url = extractHarmonyInviteUrl(queued);
+      if (url) {
+        redeemUrl = url;
+        redeemError = null;
+        showRedeemInvite = true;
+      }
+    }
+
+    return () => {
+      unlistenDeepLink();
+    };
   });
 
   let flashcardStats = $state(initialSessionStats());
