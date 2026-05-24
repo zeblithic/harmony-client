@@ -501,3 +501,7 @@ Same as 11.3 plus:
 - Existing keychain integration: `src-tauri/src/identity.rs` (search for `keyring::Entry::new`)
 - macOS XprotectService dev-tools setup: `feedback_xprotectservice_dev_tools` (developer-only, NOT a release-pipeline concern but a tester-pipeline one if testers' macs hang on first-launch)
 - `harmony://invite/` URL scheme: `src-tauri/src/community_invite.rs:695` (`URL_PREFIX`)
+
+## Operator playbook
+
+See [`docs/release-process.md`](../release-process.md) for the operator-only release-cutting procedure, one-time bootstrap (OP-1 through OP-7), and severe-incident playbooks.
