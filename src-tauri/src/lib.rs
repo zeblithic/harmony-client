@@ -29097,20 +29097,151 @@ pub struct PkarrPublicationStatus {
 }
 
 /// Attempt to locate the inviter's iroh routing via case-A pkarr lookup,
-/// then open an iroh QUIC connection.
+/// seed the local `ReachabilityResolver` with the discovered routing record
+/// so the iroh-borne Zenoh link can be opened on demand, then drive the full
+/// invite redemption via `redeem_invite_inner` with
+/// `allow_no_reticulum_destinations=true`. The PendingJoin reaches the
+/// inviter via CRDT sync over the iroh link; the counter-signed Join
+/// arrives back the same way.
 ///
-/// Phase 2b first cut: resolves the inviter's routing record and verifies
-/// the connection is reachable. Full counter-sig orchestration via the
-/// existing `redeem_invite_inner` path is deferred to Phase 2c (requires
-/// deeper Zenoh-over-iroh plumbing). Returns `"joined"` as a placeholder
-/// when the iroh connect succeeds; returns `"inviter_unreachable"` if pkarr
-/// resolve returns `None`.
+/// Returns `"joined"` on successful redemption; `"inviter_unreachable"`
+/// when pkarr cannot find the record or the record fails verification;
+/// `"missing_admin_identity_pub"` when the invite is open (no admin
+/// identity binding) and case-A discovery is not applicable.
 ///
-/// TODO ZEB-323 §7.2: implement full orchestration (steps 8-10 of the spec).
+/// Implementation is split into a `pub` `connectivity_redeem_invite_iroh_inner`
+/// helper so integration tests can drive the orchestration with explicit
+/// resources (pkarr resolver, reachability resolver, NodeState handles)
+/// without spinning up the full Tauri AppState. The Tauri command itself
+/// only snapshots NodeState and delegates.
 #[tauri::command(rename_all = "snake_case")]
 async fn connectivity_redeem_invite_iroh(
     state: tauri::State<'_, Mutex<NodeState>>,
     invite_url: String,
+) -> Result<RedemptionOutcome, String> {
+    // Snapshot NodeState handles in a single guard scope, then drop the
+    // std lock BEFORE any `.await`. Mirrors the `redeem_invite` IPC.
+    let (
+        pkarr_resolver,
+        reachability_resolver,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        community_registry,
+        community_adapter_tx,
+        unicast_send_tx,
+        channel_log_registry,
+        dm_outbox,
+    ) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.pkarr_resolver.clone(),
+            g.reachability_resolver.clone(),
+            g.crdt_state.clone(),
+            g.hlc_tracker.clone(),
+            g.dm_device_id.clone(),
+            g.dm_self_owner,
+            g.community_registry.clone(),
+            g.community_adapter_request_tx.clone(),
+            g.unicast_send_tx.clone(),
+            g.channel_log_registry.clone(),
+            g.dm_outbox.clone(),
+        )
+    };
+
+    // The full handshake needs every NodeState handle below; any missing
+    // one means the node isn't fully booted and the IPC should surface
+    // `inviter_unreachable` rather than panic-unwrap.
+    let (
+        Some(crdt_state),
+        Some(hlc_tracker),
+        Some(device_id),
+        Some(self_owner),
+        Some(community_registry),
+        Some(community_adapter_tx),
+        Some(unicast_send_tx),
+        Some(channel_log_registry),
+        Some(dm_outbox),
+    ) = (
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        community_registry,
+        community_adapter_tx,
+        unicast_send_tx,
+        channel_log_registry,
+        dm_outbox,
+    )
+    else {
+        return Ok(RedemptionOutcome {
+            status: "inviter_unreachable".to_string(),
+            community_id: None,
+        });
+    };
+
+    // signing_key is owned by dm_outbox; pull it once under the tokio mutex.
+    let signing_key = {
+        let outbox_g = dm_outbox.lock().await;
+        std::sync::Arc::clone(&outbox_g.signing_key)
+    };
+
+    connectivity_redeem_invite_iroh_inner(
+        invite_url,
+        pkarr_resolver,
+        reachability_resolver,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        signing_key,
+        community_registry,
+        community_adapter_tx,
+        unicast_send_tx,
+        dm_outbox,
+        channel_log_registry,
+        crate::owner_commands::resolve_identity_dir().ok(),
+    )
+    .await
+}
+
+/// Inner orchestration body of `connectivity_redeem_invite_iroh`, split out
+/// so integration tests can drive it with explicit resources rather than
+/// the full Tauri AppState. Phase 2c implementation per ZEB-325 spec §7.2.
+///
+/// Flow:
+///   1. Decode invite URL.
+///   2. Guard: case-A discovery requires `invite_token` + `admin_identity_pub`.
+///   3. Pkarr window-resolve the inviter's routing record.
+///   4. Verify the record's inner sig, identity binding, and skew.
+///   5. Decode the inner `ReachabilityAnnouncePayload`.
+///   6. Seed the local `ReachabilityResolver` so subsequent iroh-link
+///      open requests (via `IrohZenohLinkManager`) can connect on demand.
+///   7. Drive `redeem_invite_inner` with `allow_no_reticulum_destinations=true`;
+///      the PendingJoin rides CRDT sync over the iroh-borne Zenoh link.
+#[allow(clippy::too_many_arguments)]
+pub async fn connectivity_redeem_invite_iroh_inner<R: tauri::Runtime>(
+    invite_url: String,
+    pkarr_resolver: Option<std::sync::Arc<harmony_pkarr::PkarrResolver>>,
+    reachability_resolver: Option<crate::reachability_resolver::ReachabilityResolver>,
+    crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    hlc_tracker: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+    >,
+    device_id: String,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
+    community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
+    unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
+    dm_outbox: std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
+    channel_log_registry: std::sync::Arc<
+        crate::community_channel_log_engine::ChannelLogRegistry<R>,
+    >,
+    identity_dir: Option<std::path::PathBuf>,
 ) -> Result<RedemptionOutcome, String> {
     // 1. Decode the invite URL.
     let payload = crate::community_invite::decode_invite_url(&invite_url)
@@ -29118,7 +29249,7 @@ async fn connectivity_redeem_invite_iroh(
 
     // 2. Extract the case-A keying material from the invite.
     //    Open-community invites have no invite_token, so case-A lookup
-    //    is not applicable — fall through to inviter_unreachable for now.
+    //    is not applicable — fall through to inviter_unreachable.
     let Some(ref token) = payload.invite_token else {
         return Ok(RedemptionOutcome {
             status: "inviter_unreachable".to_string(),
@@ -29129,22 +29260,23 @@ async fn connectivity_redeem_invite_iroh(
     // 2b. Guard: open-community invites also have no admin_identity_pub,
     //     meaning we cannot verify the inner sig / identity binding. Skip
     //     early with an explicit status rather than silently omitting the
-    //     verification step below (Fix for round-1 review HIGH finding).
-    if payload.admin_identity_pub.is_none() {
+    //     verification step below (round-1 review HIGH finding).
+    let Some(admin_id_pub) = payload.admin_identity_pub else {
         return Ok(RedemptionOutcome {
             status: "missing_admin_identity_pub".to_string(),
             community_id: None,
         });
-    }
-
-    // 3. Acquire the resolver (may be None if pkarr not initialized).
-    let resolver = {
-        let g = state
-            .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        g.pkarr_resolver.clone()
     };
-    let Some(resolver) = resolver else {
+
+    // 3. Acquire the resolvers (either may be None if pkarr / reachability
+    //    were not initialized — e.g. headless platforms, bind failure).
+    let Some(resolver) = pkarr_resolver else {
+        return Ok(RedemptionOutcome {
+            status: "inviter_unreachable".to_string(),
+            community_id: None,
+        });
+    };
+    let Some(reachability_resolver) = reachability_resolver else {
         return Ok(RedemptionOutcome {
             status: "inviter_unreachable".to_string(),
             community_id: None,
@@ -29182,41 +29314,79 @@ async fn connectivity_redeem_invite_iroh(
         });
     };
 
-    // 6. Verify the record's inner sig and identity binding.
-    if let Some(ref admin_id_pub) = payload.admin_identity_pub {
-        if rec.verify_inner_sig().is_err()
-            || rec.verify_identity_match(admin_id_pub).is_err()
-            || rec.verify_skew(now_ms).is_err()
-        {
-            return Ok(RedemptionOutcome {
-                status: "inviter_unreachable".to_string(),
-                community_id: None,
-            });
-        }
+    // 6. Verify the record's inner sig, identity binding, and skew.
+    if rec.verify_inner_sig().is_err()
+        || rec.verify_identity_match(&admin_id_pub).is_err()
+        || rec.verify_skew(now_ms).is_err()
+    {
+        return Ok(RedemptionOutcome {
+            status: "inviter_unreachable".to_string(),
+            community_id: None,
+        });
     }
 
-    // 7. Decode routing_blob → ReachabilityAnnouncePayload.
-    let _routing: crate::reachability_record::ReachabilityAnnouncePayload =
+    // 7. Decode the inner routing payload.
+    let routing: crate::reachability_record::ReachabilityAnnouncePayload =
         ciborium::from_reader(rec.routing_blob.as_slice())
             .map_err(|e| format!("decode routing_blob: {e}"))?;
 
-    // 8. Phase 2b first cut: iroh connect + full counter-sig orchestration
-    //    is deferred to Phase 2c. Reaching here means we found a valid
-    //    routing record from the inviter — return an honest status that
-    //    the frontend renders as "found on network, handshake pending".
-    //    The "joined" status is intentionally NOT returned here; the user
-    //    has NOT joined the community yet. Phase 2c will complete the
-    //    orchestration (ZEB-323 §7.2).
+    // 8. Seed ReachabilityResolver so IrohZenohLinkManager.new_link can
+    //    open the iroh connection to the inviter on demand. The device
+    //    hash is currently unused by `seed_from_pkarr`; pkarr records
+    //    only carry the inviter's `iroh_node_id`, so we synthesise a
+    //    zero hash. Phase 2c spec §7.2 step 8.
+    let inviter_addr = payload.admin_addr;
+    let inviter_device_hash = crate::owner_state_types::DeviceIdentityHash([0u8; 16]);
+    reachability_resolver
+        .seed_from_pkarr(inviter_addr, inviter_device_hash, routing)
+        .await;
+
     tracing::info!(
         community_id = %hex::encode(payload.community_id.0),
-        "ZEB-323 Phase 2b: connectivity_redeem_invite_iroh: routing record resolved; \
-         iroh connect + counter-sig orchestration deferred to Phase 2c"
+        inviter = %hex::encode(inviter_addr.0),
+        "ZEB-325 Phase 2c: connectivity_redeem_invite_iroh: pkarr resolved + \
+         ReachabilityResolver seeded; proceeding to redeem_invite_inner"
     );
 
-    Ok(RedemptionOutcome {
-        status: "pkarr_resolved_no_handshake".to_string(),
-        community_id: Some(hex::encode(payload.community_id.0)),
-    })
+    // 9. Drive the full redemption with allow_no_reticulum_destinations=true.
+    //    The PendingJoin rides the engine's state-root publisher over the
+    //    iroh-borne Zenoh link; admin's counter-signed Join arrives the
+    //    same way. No Reticulum fan-out is required.
+    let result = redeem_invite_inner(
+        invite_url,
+        crdt_state,
+        hlc_tracker,
+        device_id,
+        self_owner,
+        signing_key,
+        community_registry,
+        community_adapter_tx,
+        unicast_send_tx,
+        dm_outbox,
+        channel_log_registry,
+        || Ok(()), // No fence check: the iroh-redeem path has no NodeState generation handle.
+        identity_dir,
+        true, // allow_no_reticulum_destinations — Phase 2c.
+    )
+    .await;
+
+    match result {
+        Ok(dto) => Ok(RedemptionOutcome {
+            status: "joined".to_string(),
+            community_id: Some(dto.community_id),
+        }),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                community_id = %hex::encode(payload.community_id.0),
+                "ZEB-325 Phase 2c: redeem_invite_inner failed after pkarr-resolved seed"
+            );
+            Ok(RedemptionOutcome {
+                status: "inviter_unreachable".to_string(),
+                community_id: None,
+            })
+        }
+    }
 }
 
 /// Toggle case-B "Make me discoverable" setting. Persists the toggle to
