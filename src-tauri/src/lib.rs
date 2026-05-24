@@ -4078,11 +4078,12 @@ async fn start_node(
                         let acceptor = std::sync::Arc::new(
                             crate::iroh_invite_acceptor::IrohInviteHandshakeAcceptor::<
                                 tauri::AppHandle<tauri::Wry>,
-                            >::new(
+                            >::with_config(
                                 std::sync::Arc::clone(&registry),
                                 std::sync::Arc::clone(&outbox),
                                 std::sync::Arc::clone(&crdt_state),
                                 Some(std::sync::Arc::new(app.clone())),
+                                crate::iroh_invite_acceptor::HandshakeAcceptorConfig::from_env(),
                             ),
                         );
                         if let Err(_dispatcher_back) =
@@ -15241,11 +15242,38 @@ where
                 .insert_local_event_with_pubs(cs, admin_pub, None)
                 .await
             {
-                Ok(crate::community_state_crdt::InsertOutcome::Inserted)
-                | Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => {
-                    // Hook fired (Inserted path) or no-op (AlreadyKnown:
-                    // CRDT sync raced the iroh handshake — fine, oneshot
-                    // was already resolved by the earlier insert).
+                Ok(crate::community_state_crdt::InsertOutcome::Inserted) => {
+                    // Hook fired — the post-Inserted clear hook calls
+                    // notify_pending_redemption_in_map on the
+                    // countersign's `target_event_id`
+                    // (== minted.bootstrap_join.id), which wakes the
+                    // oneshot we registered at step 7a.
+                }
+                Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => {
+                    // ZEB-325 PR #159 F6: the post-Inserted hook only
+                    // fires on Inserted, not AlreadyKnown. If the
+                    // countersign was already in the engine via some
+                    // other path (CRDT-sync race, retried IPC, etc.),
+                    // the await on the oneshot below would block until
+                    // the 5s timeout. Drain the registered oneshot
+                    // explicitly so the await resolves immediately
+                    // with success rather than spinning the timeout
+                    // path.
+                    //
+                    // `notify_pending_redemption` is a no-op if the
+                    // oneshot wasn't registered (e.g. open-community
+                    // branch); calling it unconditionally here is
+                    // safe.
+                    tracing::debug!(
+                        community_id = %hex::encode(minted.community_id.0),
+                        event_id = %hex::encode(minted.bootstrap_join.id),
+                        "ZEB-325 PR #159 F6: pre_delivered_countersign \
+                         AlreadyKnown — firing pending-redemption oneshot \
+                         manually so the await at step 7d resolves"
+                    );
+                    community_registry
+                        .notify_pending_redemption(&minted.bootstrap_join.id)
+                        .await;
                 }
                 Ok(crate::community_state_crdt::InsertOutcome::Rejected(verify_err)) => {
                     let _ = community_registry
@@ -29292,18 +29320,92 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
 // Helper return types follow with `#[serde(rename_all = "camelCase")]`
 // for JS callers.
 
+/// Tunable timeouts for the dialer side of the ZEB-325 Phase 2c invite
+/// handshake. Each `tokio::time::timeout(..)` wrapping a
+/// `connect` / `open_bi` / response-read call uses one of these
+/// durations.
+///
+/// Production wiring (the `connectivity_redeem_invite_iroh` IPC) calls
+/// [`Self::from_env`] so operators can override without recompiling;
+/// integration tests construct directly to keep wall-clock short and
+/// to avoid mutating process env (`std::env::set_var` is unsafe in
+/// multithreaded contexts — see ZEB-325 PR #159 F10).
+#[derive(Debug, Clone, Copy)]
+pub struct HandshakeDialConfig {
+    /// Timeout for the QUIC `connect()` call (initial dial + hole-
+    /// punch). Distinct from the response-read timeout so diagnostics
+    /// can tell "couldn't reach the inviter at all" apart from
+    /// "reached them but they never responded".
+    pub connect_timeout: std::time::Duration,
+    /// Timeout for `Connection::open_bi()` after `connect()` succeeds.
+    /// Usually returns near-immediately on a healthy connection;
+    /// bounded for the pathological case where the peer never opens
+    /// its receive window.
+    pub open_bi_timeout: std::time::Duration,
+    /// Timeout for reading the length-prefixed handshake response
+    /// (acceptor's CBOR-encoded JoinCountersign). Replaces the
+    /// previous direct `std::env::var` read at the call site.
+    pub response_read_timeout: std::time::Duration,
+}
+
+impl Default for HandshakeDialConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout: std::time::Duration::from_millis(30_000),
+            open_bi_timeout: std::time::Duration::from_millis(30_000),
+            response_read_timeout: std::time::Duration::from_millis(30_000),
+        }
+    }
+}
+
+impl HandshakeDialConfig {
+    /// Production constructor: reads `HARMONY_INVITE_HANDSHAKE_TIMEOUT_MS`
+    /// (the historical single-knob env var) and applies it uniformly to
+    /// connect, open_bi, and response read. Unset / unparseable → 30s.
+    pub fn from_env() -> Self {
+        let ms: u64 = std::env::var("HARMONY_INVITE_HANDSHAKE_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30_000);
+        let d = std::time::Duration::from_millis(ms);
+        Self {
+            connect_timeout: d,
+            open_bi_timeout: d,
+            response_read_timeout: d,
+        }
+    }
+}
+
 /// Outcome returned by `connectivity_redeem_invite_iroh`.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RedemptionOutcome {
-    /// `"pkarr_resolved_no_handshake"` | `"inviter_unreachable"` |
-    /// `"missing_admin_identity_pub"` | `"not_yet_implemented"` etc.
-    /// NOTE: `"joined"` is intentionally never returned here — this IPC
-    /// only resolves pkarr records. Full join (iroh connect + counter-sig)
-    /// is Phase 2c (ZEB-323 §7.2).
+    /// Lifecycle status of the redemption attempt.
+    ///
+    /// * `"joined"` — full handshake completed; the joiner is now a
+    ///   member. `community_id` is `Some(hex)`.
+    /// * `"inviter_unreachable"` — pkarr couldn't find / verify the
+    ///   record, OR the iroh dial / open_bi / response read failed
+    ///   before the inviter delivered a JoinCountersign. The inviter
+    ///   was NOT reached. `community_id` is `None`.
+    /// * `"join_failed"` — pkarr resolved AND the iroh handshake
+    ///   completed AND a valid JoinCountersign was delivered, but the
+    ///   subsequent local `redeem_invite_inner_with_overrides` failed
+    ///   (engine insert error, fence violation, commit rollback,
+    ///   etc.). The inviter WAS reached; the failure is local.
+    ///   `community_id` is `Some(hex)` so the frontend can surface
+    ///   "we found Alice but local insert failed". Added in ZEB-325
+    ///   PR #159 F1.
+    /// * `"missing_admin_identity_pub"` — open invite (no
+    ///   admin_identity_pub binding); case-A discovery is not
+    ///   applicable. `community_id` is `None`.
+    /// * `"pkarr_resolved_no_handshake"` — legacy Phase 2b stub status;
+    ///   no longer returned by Phase 2c+. Kept in the type union for
+    ///   frontend defensive parsing.
     pub status: String,
-    /// Hex-encoded community id when the pkarr record was resolved
-    /// (`status == "pkarr_resolved_no_handshake"`).
+    /// Hex-encoded community id when the IPC was able to identify the
+    /// community (`status` ∈ `"joined" | "join_failed" |
+    /// "pkarr_resolved_no_handshake"`).
     pub community_id: Option<String>,
 }
 
@@ -29500,6 +29602,40 @@ async fn connectivity_redeem_invite_iroh(
         }
     };
 
+    // Capture the std-mutex handle + snapshot generation under a fresh
+    // lock so the inner can re-check on commit (ZEB-325 PR #159 F8:
+    // previously the iroh path used `|| Ok(())` and bypassed the
+    // generation fence the regular `redeem_invite` IPC threads).
+    let (state_lock_for_fence, snapshot_generation_for_fence) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        // `tauri::State` is `Clone`-able by value (Rust borrow-aliasing
+        // rule), so we materialize a fresh handle for the closure.
+        (state.clone(), g.generation)
+    };
+    let fence_check = move || -> Result<(), String> {
+        let g = state_lock_for_fence
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation_for_fence {
+            return Err(format!(
+                "node generation changed during connectivity_redeem_invite_iroh \
+                 (was {}, now {}); redemption minted on a detached crdt_state and \
+                 won't be persisted — engine spawn suppressed",
+                snapshot_generation_for_fence, g.generation
+            ));
+        }
+        if g.community_registry.is_none() {
+            return Err(
+                "community_registry was torn down during connectivity_redeem_invite_iroh \
+                 — engine spawn suppressed"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    };
+
     connectivity_redeem_invite_iroh_inner(
         invite_url,
         pkarr_resolver,
@@ -29517,6 +29653,8 @@ async fn connectivity_redeem_invite_iroh(
         channel_log_registry,
         crate::owner_commands::resolve_identity_dir().ok(),
         progress_sink,
+        HandshakeDialConfig::from_env(),
+        fence_check,
     )
     .await
 }
@@ -29546,8 +29684,10 @@ async fn connectivity_redeem_invite_iroh(
 ///   9. Write `[u32 LE length-prefix][packet bytes]` to the send half;
 ///      `finish().await` to flush.
 ///  10. Read `[u32 LE length-prefix][response packet]` from the recv
-///      half with a 30s timeout
-///      (env-overridable: `HARMONY_INVITE_HANDSHAKE_TIMEOUT_MS`).
+///      half, bounded by `dial_config.response_read_timeout`
+///      (production reads `HARMONY_INVITE_HANDSHAKE_TIMEOUT_MS` via
+///      `HandshakeDialConfig::from_env`; integration tests pass an
+///      explicit config with sub-second values).
 ///  11. CBOR-decode the response as a `SignedMembershipEvent`
 ///      (JoinCountersign). Defensively reject if the wrapped event isn't
 ///      a JoinCountersign targeting our just-minted `bootstrap_join.id`.
@@ -29560,7 +29700,7 @@ async fn connectivity_redeem_invite_iroh(
 ///      resolves immediately because Step 12's countersign insert fires
 ///      the post-Inserted hook on `target_event_id == bootstrap_join.id`.
 #[allow(clippy::too_many_arguments)]
-pub async fn connectivity_redeem_invite_iroh_inner<R: tauri::Runtime>(
+pub async fn connectivity_redeem_invite_iroh_inner<R: tauri::Runtime, F>(
     invite_url: String,
     pkarr_resolver: Option<std::sync::Arc<harmony_pkarr::PkarrResolver>>,
     reachability_resolver: Option<crate::reachability_resolver::ReachabilityResolver>,
@@ -29581,7 +29721,25 @@ pub async fn connectivity_redeem_invite_iroh_inner<R: tauri::Runtime>(
     >,
     identity_dir: Option<std::path::PathBuf>,
     progress_sink: impl Fn(ResolutionProgressPayload),
-) -> Result<RedemptionOutcome, String> {
+    // Per-await timeouts for the dialer side. ZEB-325 PR #159 F3 + F10:
+    // previously read directly from `std::env::var` at the call site,
+    // which made `connect()` and `open_bi()` unbounded and forced
+    // integration tests to mutate process env (unsafe in multithreaded
+    // contexts). Production wiring supplies `HandshakeDialConfig::from_env`.
+    dial_config: HandshakeDialConfig,
+    // Generation-fence closure. ZEB-325 PR #159 F8: previously this IPC
+    // hardcoded `|| Ok(())`, which let the iroh path mutate stale
+    // `crdt_state` / `community_registry` / `dm_outbox` and report
+    // `"joined"` for a stale identity if the node was stopped during
+    // the handshake. Production wiring captures `&Mutex<NodeState>` +
+    // snapshot_generation (mirroring the regular `redeem_invite` IPC at
+    // lib.rs:15751-15774). Tests that don't drive the fence pass
+    // `|| Ok(())`.
+    fence_check: F,
+) -> Result<RedemptionOutcome, String>
+where
+    F: Fn() -> Result<(), String>,
+{
     // 1. Decode the invite URL.
     let payload = crate::community_invite::decode_invite_url(&invite_url)
         .map_err(|e| format!("decode invite URL: {e}"))?;
@@ -29729,13 +29887,24 @@ pub async fn connectivity_redeem_invite_iroh_inner<R: tauri::Runtime>(
     }
 
     // 8. Open the iroh QUIC connection on the handshake ALPN.
-    let conn = match iroh_endpoint
-        .inner()
-        .connect(alice_addr, crate::iroh_endpoint::alpn::HARMONY_HANDSHAKE_V1)
-        .await
+    //
+    // ZEB-325 PR #159 F3: bound `connect()` and `open_bi()` by the
+    // dialer config so a peer that we can route packets to but that
+    // never finishes the QUIC handshake (NAT in flux, blackhole, etc.)
+    // cannot pin this IPC for the duration of the underlying
+    // QUIC-level timeout (minutes, on some configurations). Distinct
+    // tracing for dial-timeout vs open_bi-timeout vs response-timeout
+    // so diagnostics can attribute failures.
+    let conn = match tokio::time::timeout(
+        dial_config.connect_timeout,
+        iroh_endpoint
+            .inner()
+            .connect(alice_addr, crate::iroh_endpoint::alpn::HARMONY_HANDSHAKE_V1),
+    )
+    .await
     {
-        Ok(c) => c,
-        Err(e) => {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
             tracing::warn!(
                 error = %e,
                 inviter = %hex::encode(inviter_addr.0),
@@ -29746,14 +29915,11 @@ pub async fn connectivity_redeem_invite_iroh_inner<R: tauri::Runtime>(
                 community_id: None,
             });
         }
-    };
-    let (mut send, mut recv) = match conn.open_bi().await {
-        Ok(s) => s,
-        Err(e) => {
+        Err(_elapsed) => {
             tracing::warn!(
-                error = %e,
+                timeout_ms = dial_config.connect_timeout.as_millis() as u64,
                 inviter = %hex::encode(inviter_addr.0),
-                "ZEB-325 Phase 2c option A: open_bi failed"
+                "ZEB-325 Phase 2c option A: iroh connect timeout (dial)"
             );
             return Ok(RedemptionOutcome {
                 status: "inviter_unreachable".to_string(),
@@ -29761,6 +29927,34 @@ pub async fn connectivity_redeem_invite_iroh_inner<R: tauri::Runtime>(
             });
         }
     };
+    let (mut send, mut recv) =
+        match tokio::time::timeout(dial_config.open_bi_timeout, conn.open_bi()).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    inviter = %hex::encode(inviter_addr.0),
+                    "ZEB-325 Phase 2c option A: open_bi failed"
+                );
+                conn.close(0u32.into(), b"open_bi-failed");
+                return Ok(RedemptionOutcome {
+                    status: "inviter_unreachable".to_string(),
+                    community_id: None,
+                });
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    timeout_ms = dial_config.open_bi_timeout.as_millis() as u64,
+                    inviter = %hex::encode(inviter_addr.0),
+                    "ZEB-325 Phase 2c option A: open_bi timeout"
+                );
+                conn.close(0u32.into(), b"open_bi-timeout");
+                return Ok(RedemptionOutcome {
+                    status: "inviter_unreachable".to_string(),
+                    community_id: None,
+                });
+            }
+        };
 
     // 8'. Reserve HLC + mint. We mint up-front so the bootstrap_join.id
     // committed to the wire packet is the SAME id the redeem inner
@@ -29855,11 +30049,10 @@ pub async fn connectivity_redeem_invite_iroh_inner<R: tauri::Runtime>(
         .map_err(|e| format!("write packet body: {e}"))?;
     send.finish().map_err(|e| format!("send.finish: {e}"))?;
 
-    // 10. Read response with 30s timeout (env-overridable).
-    let timeout_ms: u64 = std::env::var("HARMONY_INVITE_HANDSHAKE_TIMEOUT_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30_000);
+    // 10. Read response, bounded by dial_config.response_read_timeout.
+    // ZEB-325 PR #159 F3: distinct tracing for response-read timeout vs
+    // dial / open_bi timeouts (above) so diagnostics can attribute
+    // failures cleanly.
     let read_response = async {
         let mut len_buf = [0u8; 4];
         recv.read_exact(&mut len_buf)
@@ -29880,9 +30073,7 @@ pub async fn connectivity_redeem_invite_iroh_inner<R: tauri::Runtime>(
         Ok::<Vec<u8>, String>(body)
     };
     let response_bytes =
-        match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), read_response)
-            .await
-        {
+        match tokio::time::timeout(dial_config.response_read_timeout, read_response).await {
             Ok(Ok(b)) => b,
             Ok(Err(e)) => {
                 tracing::warn!(
@@ -29896,8 +30087,8 @@ pub async fn connectivity_redeem_invite_iroh_inner<R: tauri::Runtime>(
             }
             Err(_elapsed) => {
                 tracing::warn!(
-                    timeout_ms,
-                    "ZEB-325 Phase 2c option A: handshake response timeout"
+                    timeout_ms = dial_config.response_read_timeout.as_millis() as u64,
+                    "ZEB-325 Phase 2c option A: handshake response timeout (read)"
                 );
                 return Ok(RedemptionOutcome {
                     status: "inviter_unreachable".to_string(),
@@ -29981,7 +30172,7 @@ pub async fn connectivity_redeem_invite_iroh_inner<R: tauri::Runtime>(
         unicast_send_tx,
         dm_outbox,
         channel_log_registry,
-        || Ok(()), // No fence check — option A has no NodeState generation handle.
+        fence_check,
         identity_dir,
         true, // allow_no_reticulum_destinations
         overrides,
@@ -29999,6 +30190,18 @@ pub async fn connectivity_redeem_invite_iroh_inner<R: tauri::Runtime>(
             })
         }
         Err(e) => {
+            // ZEB-325 PR #159 F1: distinguish post-handshake local
+            // commit failure from "couldn't reach the inviter".
+            //
+            // The handshake response was already CBOR-decoded into a
+            // JoinCountersign for `minted.bootstrap_join.id` above
+            // (target_ok + community_id sanity checks both passed). So
+            // by the time we get here, the inviter WAS reached and
+            // delivered a valid countersign — the failure is local
+            // (engine insert error, fence violation, commit rollback,
+            // pending-redemption registry race, etc.). Surface that
+            // distinctly so the UI can show "we found Alice but local
+            // insert failed" instead of "Alice is unreachable".
             tracing::warn!(
                 error = %e,
                 community_id = %hex::encode(payload.community_id.0),
@@ -30006,8 +30209,8 @@ pub async fn connectivity_redeem_invite_iroh_inner<R: tauri::Runtime>(
                  after iroh handshake countersign delivery"
             );
             Ok(RedemptionOutcome {
-                status: "inviter_unreachable".to_string(),
-                community_id: None,
+                status: "join_failed".to_string(),
+                community_id: Some(hex::encode(payload.community_id.0)),
             })
         }
     }

@@ -68,39 +68,14 @@ use tokio::sync::{mpsc, Mutex as TokioMutex};
 use zenoh_link::LinkUnicast;
 
 // ────────────────────────────────────────────────────────────────────────────
-// Process-global env-var guard (parallel-test safety for the
-// HARMONY_REDEEM_INVITE_TIMEOUT_MS env var the redeem_invite_inner
-// invite-only fast-path reads).
+// ZEB-325 PR #159 F10: the prior version of this test mutated
+// `HARMONY_REDEEM_INVITE_TIMEOUT_MS` via `std::env::set_var` (unsafe in
+// multithreaded contexts under Rust 2024). The value being set (5000ms)
+// equaled the default the inner reads, so the mutation was a no-op for
+// behaviour. It has been removed; the test relies on the inner's default
+// timeout and on the dialer / acceptor configs threaded explicitly
+// through `HandshakeDialConfig` and `HandshakeAcceptorConfig` below.
 // ────────────────────────────────────────────────────────────────────────────
-
-static REDEEM_TIMEOUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-struct RedeemTimeoutGuard {
-    _lock: std::sync::MutexGuard<'static, ()>,
-    prior: Option<std::ffi::OsString>,
-}
-impl RedeemTimeoutGuard {
-    fn set(value: &str) -> Self {
-        let lock = REDEEM_TIMEOUT_ENV_LOCK
-            .lock()
-            .expect("timeout env lock poisoned");
-        let prior = std::env::var_os("HARMONY_REDEEM_INVITE_TIMEOUT_MS");
-        // SAFETY: under the static lock; restored on Drop.
-        unsafe { std::env::set_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS", value) };
-        Self { _lock: lock, prior }
-    }
-}
-impl Drop for RedeemTimeoutGuard {
-    fn drop(&mut self) {
-        // SAFETY: restore prior env state under the same static lock.
-        unsafe {
-            match self.prior.take() {
-                Some(v) => std::env::set_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS", v),
-                None => std::env::remove_var("HARMONY_REDEEM_INVITE_TIMEOUT_MS"),
-            }
-        }
-    }
-}
 
 // ────────────────────────────────────────────────────────────────────────────
 // Two-owner identity resolver — both engines need to resolve each
@@ -233,8 +208,6 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
         )
         .with_test_writer()
         .try_init();
-
-    let _timeout_guard = RedeemTimeoutGuard::set("5000");
 
     tokio::time::timeout(Duration::from_secs(60), async {
         // ── 1. Identities. ───────────────────────────────────────────────
@@ -377,12 +350,22 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
         // Install the production handshake acceptor onto Alice's link
         // manager. Using `None` for the app handle keeps the warn-only
         // emit_degraded path active; sufficient for the test.
+        //
+        // ZEB-325 PR #159 F10: pass an explicit short-deadline config
+        // so a test-driven IO stall would surface as
+        // `HandshakeAcceptError::IoTimeout` within seconds rather than
+        // pinning the test until the 60s tokio::timeout fires above.
         let alice_acceptor: Arc<IrohInviteHandshakeAcceptor<()>> =
-            Arc::new(IrohInviteHandshakeAcceptor::<()>::new(
+            Arc::new(IrohInviteHandshakeAcceptor::<()>::with_config(
                 Arc::clone(&registry_alice),
                 Arc::clone(&alice_dm_outbox),
                 Arc::clone(&alice_crdt_state),
                 None,
+                harmony_app::iroh_invite_acceptor::HandshakeAcceptorConfig {
+                    io_deadline: Duration::from_millis(10_000),
+                    poll_deadline: Duration::from_millis(10_000),
+                    poll_interval: Duration::from_millis(20),
+                },
             ));
         if alice_link_mgr
             .install_handshake_dispatcher(alice_acceptor)
@@ -582,6 +565,19 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             Arc::clone(&bob_channel_log_registry),
             None,
             |_| {},
+            // ZEB-325 PR #159 F3 + F10: explicit dial timeouts (replaces
+            // the prior env-var read). 10s is more than enough for
+            // loopback connect / open_bi / response read; the test still
+            // completes well under the outer 60s tokio::timeout guard.
+            harmony_app::HandshakeDialConfig {
+                connect_timeout: Duration::from_millis(10_000),
+                open_bi_timeout: Duration::from_millis(10_000),
+                response_read_timeout: Duration::from_millis(10_000),
+            },
+            // No fence — integration test doesn't drive NodeState
+            // generation; mirrors the |_| Ok(()) sentinel the inner
+            // unit-test rig uses.
+            || Ok(()),
         )
         .await
         .expect(

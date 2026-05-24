@@ -57,6 +57,97 @@ use crate::community_state_sync::CommunitySyncRegistry;
 use crate::dm_outbox::DmOutbox;
 use crate::owner_state_crdt::OwnerState;
 
+/// Default per-await IO deadline for the inbound handshake. Each
+/// `accept_bi` / `read_exact` / `write_all` / `send.finish()` /
+/// `conn.closed()` call is wrapped in `tokio::time::timeout` with this
+/// duration so a peer that completes the ALPN handshake but then
+/// stalls indefinitely on the wire cannot leak a per-connection task.
+///
+/// 30s is far longer than any legitimate inbound packet roundtrip on
+/// loopback or WAN; chosen to be larger than the dialer's default 30s
+/// `HARMONY_INVITE_HANDSHAKE_TIMEOUT_MS` so the dialer's read-side
+/// timeout usually fires first under normal failure modes.
+pub const DEFAULT_ACCEPTOR_IO_DEADLINE_MS: u64 = 30_000;
+
+/// Default poll deadline for the counter-sign event. Slightly shorter
+/// than the dialer's 30s timeout so the response stream tear-down
+/// races with the dialer's read-timeout in a deterministic order
+/// (acceptor closes first → dialer sees EOF rather than connection-
+/// reset).
+pub const DEFAULT_ACCEPTOR_POLL_DEADLINE_MS: u64 = 25_000;
+
+/// Default poll interval while waiting for the auto-counter-sign to
+/// land in `CommunityState`. 20 ms is short enough that the typical
+/// counter-sign window (≤ 100 ms after PendingJoin insert) finishes
+/// in ≤ 5 polls, and long enough that we don't burn CPU on the engine
+/// mutex on the rare "admin offline" path.
+pub const DEFAULT_ACCEPTOR_POLL_INTERVAL_MS: u64 = 20;
+
+/// Tunable timeouts for the inbound handshake handler. Tests can
+/// construct this directly (sub-second values to keep the suite
+/// fast); production reads the env-var overrides described on
+/// [`HandshakeAcceptorConfig::from_env`] and falls back to the
+/// `DEFAULT_ACCEPTOR_*` constants.
+#[derive(Debug, Clone, Copy)]
+pub struct HandshakeAcceptorConfig {
+    /// Per-await IO timeout: bounds `accept_bi`, both `read_exact`
+    /// calls, both `write_all` calls, `send.finish()`, and
+    /// `conn.closed()`.
+    pub io_deadline: Duration,
+    /// Maximum time to wait for the JoinCountersign to land in
+    /// `CommunityState` after `handle_unicast` inserts the
+    /// `PendingJoin` (which triggers the auto-counter-sign post-
+    /// Inserted hook).
+    pub poll_deadline: Duration,
+    /// Sleep between polls of the engine state for the JoinCountersign.
+    pub poll_interval: Duration,
+}
+
+impl Default for HandshakeAcceptorConfig {
+    fn default() -> Self {
+        Self {
+            io_deadline: Duration::from_millis(DEFAULT_ACCEPTOR_IO_DEADLINE_MS),
+            poll_deadline: Duration::from_millis(DEFAULT_ACCEPTOR_POLL_DEADLINE_MS),
+            poll_interval: Duration::from_millis(DEFAULT_ACCEPTOR_POLL_INTERVAL_MS),
+        }
+    }
+}
+
+impl HandshakeAcceptorConfig {
+    /// Production constructor: reads optional env overrides
+    /// `HARMONY_INVITE_HANDSHAKE_ACCEPTOR_IO_DEADLINE_MS`,
+    /// `HARMONY_INVITE_HANDSHAKE_ACCEPTOR_POLL_DEADLINE_MS`,
+    /// `HARMONY_INVITE_HANDSHAKE_ACCEPTOR_POLL_INTERVAL_MS`. Any
+    /// unparseable or unset value falls back to the corresponding
+    /// `DEFAULT_ACCEPTOR_*` constant. Tests should construct
+    /// `HandshakeAcceptorConfig { .. }` directly instead of mutating
+    /// process env (`std::env::set_var` is unsafe in multithreaded
+    /// contexts — see ZEB-325 PR #159 round-1 review).
+    pub fn from_env() -> Self {
+        fn read_ms(name: &str, default_ms: u64) -> Duration {
+            let ms = std::env::var(name)
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(default_ms);
+            Duration::from_millis(ms)
+        }
+        Self {
+            io_deadline: read_ms(
+                "HARMONY_INVITE_HANDSHAKE_ACCEPTOR_IO_DEADLINE_MS",
+                DEFAULT_ACCEPTOR_IO_DEADLINE_MS,
+            ),
+            poll_deadline: read_ms(
+                "HARMONY_INVITE_HANDSHAKE_ACCEPTOR_POLL_DEADLINE_MS",
+                DEFAULT_ACCEPTOR_POLL_DEADLINE_MS,
+            ),
+            poll_interval: read_ms(
+                "HARMONY_INVITE_HANDSHAKE_ACCEPTOR_POLL_INTERVAL_MS",
+                DEFAULT_ACCEPTOR_POLL_INTERVAL_MS,
+            ),
+        }
+    }
+}
+
 /// Pluggable dispatcher invoked by `IrohZenohLinkManager`'s accept
 /// loop when an inbound connection negotiates an ALPN other than
 /// `harmony/zenoh/v1`. The link manager passes the accepted
@@ -80,20 +171,6 @@ pub trait IrohHandshakeDispatcher: Send + Sync + 'static {
 /// stay safe on memory-pressured devices.
 pub const HANDSHAKE_MAX_PACKET_LEN: usize = 256 * 1024;
 
-/// Default poll deadline for the counter-sign event. Slightly shorter
-/// than the dialer's 30s timeout so the response stream tear-down
-/// races with the dialer's read-timeout in a deterministic order
-/// (acceptor closes first → dialer sees EOF rather than connection-
-/// reset).
-const ACCEPTOR_POLL_DEADLINE_MS: u64 = 25_000;
-
-/// Poll interval while waiting for the auto-counter-sign to land in
-/// `CommunityState`. 20 ms is short enough that the typical
-/// counter-sign window (≤ 100 ms after PendingJoin insert) finishes
-/// in ≤ 5 polls, and long enough that we don't burn CPU on the engine
-/// mutex on the rare "admin offline" path.
-const ACCEPTOR_POLL_INTERVAL_MS: u64 = 20;
-
 /// Production dispatcher: wires `handle_connection` into the existing
 /// `community_invite::handle_unicast` path against NodeState handles.
 ///
@@ -111,23 +188,52 @@ where
     /// path; `None` falls through to the warn-log-only branch (matches
     /// the test-stub convention).
     app: Option<Arc<H>>,
+    /// Per-handler timeouts. Production wiring constructs this via
+    /// [`HandshakeAcceptorConfig::from_env`] so operators can override
+    /// without recompiling; tests construct directly to keep wall-clock
+    /// short. `Default::default()` uses the `DEFAULT_ACCEPTOR_*`
+    /// constants.
+    config: HandshakeAcceptorConfig,
 }
 
 impl<H> IrohInviteHandshakeAcceptor<H>
 where
     H: AppHandleEmit + Send + Sync + 'static,
 {
+    /// Build an acceptor with the default timeouts. Equivalent to
+    /// `with_config(.., HandshakeAcceptorConfig::default())`.
     pub fn new(
         community_registry: Arc<CommunitySyncRegistry>,
         dm_outbox: Arc<TokioMutex<DmOutbox>>,
         crdt_state: Arc<TokioMutex<OwnerState>>,
         app: Option<Arc<H>>,
     ) -> Self {
+        Self::with_config(
+            community_registry,
+            dm_outbox,
+            crdt_state,
+            app,
+            HandshakeAcceptorConfig::default(),
+        )
+    }
+
+    /// Build an acceptor with explicit timeouts. Production wiring
+    /// passes `HandshakeAcceptorConfig::from_env()`; tests pass a
+    /// short-deadline config to keep the suite fast and to assert on
+    /// `HandshakeAcceptError::IoTimeout` without races.
+    pub fn with_config(
+        community_registry: Arc<CommunitySyncRegistry>,
+        dm_outbox: Arc<TokioMutex<DmOutbox>>,
+        crdt_state: Arc<TokioMutex<OwnerState>>,
+        app: Option<Arc<H>>,
+        config: HandshakeAcceptorConfig,
+    ) -> Self {
         Self {
             community_registry,
             dm_outbox,
             crdt_state,
             app,
+            config,
         }
     }
 
@@ -144,20 +250,42 @@ where
         &self,
         conn: &Connection,
     ) -> Result<EventId, HandshakeAcceptError> {
+        // Snapshot self_owner from dm_outbox up-front so the
+        // JoinCountersign poll below can filter on the local owner's
+        // signature (ZEB-325 PR #159 F5: without this, the poll picks
+        // an arbitrary JoinCountersign for the same target_event_id,
+        // which becomes nondeterministic once a second already-joined
+        // member also countersigns the same pending join).
+        let self_owner = {
+            let outbox_g = self.dm_outbox.lock().await;
+            outbox_g.self_owner
+        };
+
         // Accept the bi-stream the dialer just opened. The dialer
         // writes-then-finish()es on the send half, so accept_bi() must
         // be the very first await after connection acceptance — any
         // delay risks the dialer's stream sitting in the QUIC receive
         // window with no consumer.
-        let (mut send, mut recv) = conn
-            .accept_bi()
+        //
+        // ZEB-325 PR #159 F2/F4: wrap every await in tokio::time::timeout
+        // bounded by config.io_deadline so a stalled peer can't leak the
+        // per-connection task indefinitely.
+        let (mut send, mut recv) = tokio::time::timeout(self.config.io_deadline, conn.accept_bi())
             .await
+            .map_err(|_| HandshakeAcceptError::IoTimeout {
+                step: "accept_bi",
+                deadline_ms: self.config.io_deadline.as_millis() as u64,
+            })?
             .map_err(|e| HandshakeAcceptError::AcceptBi(e.to_string()))?;
 
         // Read [u32 LE length-prefix][packet].
         let mut len_buf = [0u8; 4];
-        recv.read_exact(&mut len_buf)
+        tokio::time::timeout(self.config.io_deadline, recv.read_exact(&mut len_buf))
             .await
+            .map_err(|_| HandshakeAcceptError::IoTimeout {
+                step: "read length-prefix",
+                deadline_ms: self.config.io_deadline.as_millis() as u64,
+            })?
             .map_err(|e| HandshakeAcceptError::ReadPrefix(e.to_string()))?;
         let len = u32::from_le_bytes(len_buf) as usize;
         if len == 0 || len > HANDSHAKE_MAX_PACKET_LEN {
@@ -167,8 +295,12 @@ where
             });
         }
         let mut packet_bytes = vec![0u8; len];
-        recv.read_exact(&mut packet_bytes)
+        tokio::time::timeout(self.config.io_deadline, recv.read_exact(&mut packet_bytes))
             .await
+            .map_err(|_| HandshakeAcceptError::IoTimeout {
+                step: "read packet body",
+                deadline_ms: self.config.io_deadline.as_millis() as u64,
+            })?
             .map_err(|e| HandshakeAcceptError::ReadPacket(e.to_string()))?;
 
         // Peek-decode the request to extract the bootstrap_join.id we
@@ -203,23 +335,29 @@ where
         // directly (bypasses the post-Inserted hook), so we cannot
         // wait on the pending_redemptions oneshot; the engine's state
         // is the canonical signal.
+        //
+        // ZEB-325 PR #159 F5: filter on `actor == self_owner` so a
+        // second member also countersigning the same pending join can't
+        // race us into responding with their signature (map-iteration
+        // order is unspecified).
         let state_arc = self
             .community_registry
             .state_for(&community_id)
             .await
             .ok_or(HandshakeAcceptError::CommunityNotFound { community_id })?;
-        let deadline = Instant::now() + Duration::from_millis(ACCEPTOR_POLL_DEADLINE_MS);
+        let deadline = Instant::now() + self.config.poll_deadline;
         let countersign = loop {
             let found: Option<SignedMembershipEvent> = {
                 let g = state_arc.lock().await;
                 g.events
                     .values()
                     .find(|e| {
-                        matches!(
-                            &e.kind,
-                            MembershipEventKind::JoinCountersign { target_event_id }
-                            if *target_event_id == bootstrap_join_id
-                        )
+                        e.actor == self_owner
+                            && matches!(
+                                &e.kind,
+                                MembershipEventKind::JoinCountersign { target_event_id }
+                                if *target_event_id == bootstrap_join_id
+                            )
                     })
                     .cloned()
             };
@@ -229,10 +367,10 @@ where
             if Instant::now() >= deadline {
                 return Err(HandshakeAcceptError::CountersignTimeout {
                     target_event_id: bootstrap_join_id,
-                    deadline_ms: ACCEPTOR_POLL_DEADLINE_MS,
+                    deadline_ms: self.config.poll_deadline.as_millis() as u64,
                 });
             }
-            tokio::time::sleep(Duration::from_millis(ACCEPTOR_POLL_INTERVAL_MS)).await;
+            tokio::time::sleep(self.config.poll_interval).await;
         };
 
         // Encode the response: canonical CBOR of the SignedMembershipEvent.
@@ -253,12 +391,24 @@ where
         let response_len = response_bytes.len() as u32;
 
         // Write [u32 LE length-prefix][cbor bytes] then finish().
-        send.write_all(&response_len.to_le_bytes())
+        tokio::time::timeout(
+            self.config.io_deadline,
+            send.write_all(&response_len.to_le_bytes()),
+        )
+        .await
+        .map_err(|_| HandshakeAcceptError::IoTimeout {
+            step: "write length-prefix",
+            deadline_ms: self.config.io_deadline.as_millis() as u64,
+        })?
+        .map_err(|e| HandshakeAcceptError::WritePrefix(e.to_string()))?;
+        tokio::time::timeout(self.config.io_deadline, send.write_all(&response_bytes))
             .await
-            .map_err(|e| HandshakeAcceptError::WritePrefix(e.to_string()))?;
-        send.write_all(&response_bytes)
-            .await
+            .map_err(|_| HandshakeAcceptError::IoTimeout {
+                step: "write response body",
+                deadline_ms: self.config.io_deadline.as_millis() as u64,
+            })?
             .map_err(|e| HandshakeAcceptError::WriteResponse(e.to_string()))?;
+        // `send.finish()` is sync — no timeout needed.
         send.finish()
             .map_err(|e| HandshakeAcceptError::Finish(e.to_string()))?;
 
@@ -297,7 +447,15 @@ where
         // `zenoh_iroh_link::IrohZenohLink::tests::paired_stream_roundtrip_via_loopback`,
         // which observed an identical 6-hour symptom during Phase 1
         // Task 5 (2026-05-22).
-        let _ = conn.closed().await;
+        //
+        // ZEB-325 PR #159 F2/F4: bound conn.closed() by the same
+        // io_deadline used for the per-stream awaits above so a peer
+        // that successfully reads the response but never tears the
+        // connection down (intentionally or otherwise) can't pin our
+        // task forever. Timeout here is best-effort tear-down: we
+        // already finished writing the response, so a late close is
+        // a leak-of-task concern, not a correctness one.
+        let _ = tokio::time::timeout(self.config.io_deadline, conn.closed()).await;
     }
 }
 
@@ -339,4 +497,13 @@ pub enum HandshakeAcceptError {
     WriteResponse(String),
     #[error("send.finish: {0}")]
     Finish(String),
+    /// ZEB-325 PR #159 F2/F4: a per-await IO timeout fired before the
+    /// QUIC operation completed. `step` identifies which stage stalled
+    /// (`accept_bi`, `read length-prefix`, `read packet body`,
+    /// `write length-prefix`, `write response body`).
+    #[error("IO timeout in {step} after {deadline_ms}ms")]
+    IoTimeout {
+        step: &'static str,
+        deadline_ms: u64,
+    },
 }
