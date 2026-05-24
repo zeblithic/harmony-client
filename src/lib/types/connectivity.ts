@@ -76,20 +76,28 @@ export interface PkarrPublicationStatus {
  * Result of `connectivity_redeem_invite_iroh`. Mirrors `RedemptionOutcome` DTO.
  *
  * `status` values:
- *  - `'pkarr_resolved_no_handshake'` — inviter found on the DHT; full join
- *    (iroh connect + counter-sig) is Phase 2c (ZEB-323 §7.2). NOT "joined".
- *  - `'inviter_unreachable'` — pkarr lookup returned nothing.
+ *  - `'joined'` — ZEB-325 Phase 2c: full handshake completed (pkarr resolve
+ *    → iroh connect → PendingJoin → counter-signed Join applied). The
+ *    `communityId` is set to the joined community.
+ *  - `'pkarr_resolved_no_handshake'` — pkarr resolved but the inner redeem
+ *    handshake failed; defensive fallback (Phase 2c is meant to eliminate
+ *    this; surfaced if `redeem_invite_inner` errs after a successful seed).
+ *  - `'inviter_unreachable'` — pkarr lookup returned nothing OR the post-
+ *    seed redeem path failed (backend collapses both into one user-facing
+ *    message).
  *  - `'missing_admin_identity_pub'` — invite has no admin identity key for
  *    verification; cannot safely complete discovery.
  *  - `'fallback_reticulum'` — use the LAN Reticulum path instead.
  *  - An opaque backend string for future variants.
- *
- * NOTE: `'joined'` is intentionally NOT a valid status from this IPC.
- * This command resolves pkarr records only; community join state is only
- * mutated by the `redeem_invite` IPC (Reticulum path).
  */
 export interface RedemptionOutcome {
-  status: 'pkarr_resolved_no_handshake' | 'inviter_unreachable' | 'missing_admin_identity_pub' | 'fallback_reticulum' | string;
+  status:
+    | 'joined'
+    | 'pkarr_resolved_no_handshake'
+    | 'inviter_unreachable'
+    | 'missing_admin_identity_pub'
+    | 'fallback_reticulum'
+    | string;
   communityId?: string;
 }
 

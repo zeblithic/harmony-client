@@ -235,4 +235,42 @@ describe('RedeemInviteDialog', () => {
     // Clean up the hanging promise.
     resolveRedeemPromise({ status: 'pkarr_resolved_no_handshake' });
   });
+
+  // ── ZEB-325 Phase 2c: iroh joined path ────────────────────────────────────
+
+  it('shows "Joined ✓" when iroh redeem returns status="joined"', async () => {
+    // ZEB-325 Phase 2c: connectivity_redeem_invite_iroh now completes the
+    // full handshake (pkarr resolve → iroh connect → PendingJoin → counter-
+    // signed Join). On success the IPC returns status='joined' with the
+    // community id. The UI must render the "Joined ✓" success label from
+    // STAGE_LABELS and dismiss the dialog via onCancel.
+    const onCancel = vi.fn();
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'connectivity_redeem_invite_iroh') {
+        return Promise.resolve({ status: 'joined', communityId: 'abc123' });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { getByTestId, getByPlaceholderText } = render(RedeemInviteDialog, {
+      // joinedDismissDelayMs=0 fires the post-success dismiss timer on
+      // the next macrotask so waitFor doesn't race a 1.2s default.
+      props: { onSubmit: vi.fn(), onCancel, joinedDismissDelayMs: 0 },
+    });
+
+    const input = getByPlaceholderText(/harmony:\/\/invite/) as HTMLTextAreaElement;
+    await fireEvent.input(input, { target: { value: 'harmony://invite/v1?ci=x' } });
+    await fireEvent.click(getByTestId('iroh-redeem-btn'));
+
+    // The success label appears.
+    await waitFor(() => {
+      const label = getByTestId('iroh-stage-label');
+      expect(label.textContent).toContain('Joined');
+    });
+
+    // Dialog dismisses itself via onCancel after the success display.
+    await waitFor(() => {
+      expect(onCancel).toHaveBeenCalled();
+    });
+  });
 });

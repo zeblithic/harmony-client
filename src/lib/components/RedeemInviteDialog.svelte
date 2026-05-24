@@ -14,12 +14,19 @@
     error = null,
     pending = false,
     initialUrl = '',
+    joinedDismissDelayMs = 1200,
   }: {
     onSubmit: (url: string) => void;
     onCancel: () => void;
     error?: string | null;
     pending?: boolean;
     initialUrl?: string;
+    /**
+     * ZEB-325 Phase 2c: how long to keep the dialog open displaying
+     * "Joined ✓" before auto-dismissing via `onCancel`. Tests override
+     * this to 0 to avoid timer flake.
+     */
+    joinedDismissDelayMs?: number;
   } = $props();
 
   let url = $state(untrack(() => initialUrl));
@@ -32,6 +39,11 @@
   let irohStage = $state<RedemptionStage | null>(null);
   let irohError = $state<string | null>(null);
   let showFallbackButton = $state(false);
+  /**
+   * ZEB-325 Phase 2c: handle for the post-`joined` dismiss timer so it can
+   * be cancelled if the dialog is torn down before it fires.
+   */
+  let joinedDismissTimer: ReturnType<typeof setTimeout> | null = null;
 
   const STAGE_LABELS: Record<RedemptionStage, string> = {
     resolving: 'Looking up inviter…',
@@ -51,6 +63,10 @@
 
   onDestroy(() => {
     stopProgressListener?.();
+    if (joinedDismissTimer !== null) {
+      clearTimeout(joinedDismissTimer);
+      joinedDismissTimer = null;
+    }
   });
 
   async function handleIrohRedeem() {
@@ -60,16 +76,42 @@
     irohStage = 'resolving';
     irohError = null;
     showFallbackButton = false;
+    let suppressFinally = false;
     try {
       const outcome = await redeemInviteIroh(trimmed);
+      if (outcome.status === 'joined') {
+        // ZEB-325 Phase 2c: full handshake completed (pkarr resolve →
+        // iroh connect → PendingJoin → counter-signed Join applied). The
+        // backend has already mutated community state and the nav-updated
+        // event has fired, so the join is visible in the sidebar without
+        // any frontend-side refresh. Show the "Joined ✓" success label
+        // briefly, then dismiss the dialog via `onCancel` — same end
+        // state as the Reticulum path, which closes via the parent's
+        // `onSubmit` handler after `communityService.redeemInvite`
+        // resolves (see App.svelte ~line 1762).
+        //
+        // Keep `irohPending` true across the display window so the
+        // progress row (`{#if irohPending && irohStage}`) stays visible
+        // and Cancel stays disabled; the timer clears both before firing
+        // `onCancel`.
+        irohStage = 'joined';
+        suppressFinally = true;
+        joinedDismissTimer = setTimeout(() => {
+          joinedDismissTimer = null;
+          irohPending = false;
+          onCancel();
+        }, joinedDismissDelayMs);
+        return;
+      }
       if (outcome.status === 'pkarr_resolved_no_handshake') {
-        // Found the inviter on the pkarr DHT, but the full join handshake
-        // (iroh connect + counter-sig exchange) is not yet implemented
-        // (Phase 2c, ZEB-323 §7.2). Show the LAN fallback path instead.
+        // Defensive fallback: Phase 2c should now always return `joined`
+        // on the pkarr-resolved branch, but if `redeem_invite_inner` fails
+        // after a successful pkarr seed the backend still surfaces this
+        // status. Surface the LAN fallback so the user has a recovery path.
         irohStage = null;
         irohError =
-          'Found the inviter on the network, but the full join handshake is not yet available ' +
-          '(Phase 2c). Use the local network fallback to join now.';
+          'Found the inviter on the network, but the full join handshake did not complete. ' +
+          'Use the local network fallback to join now.';
         showFallbackButton = true;
       } else if (outcome.status === 'inviter_unreachable') {
         irohStage = null;
@@ -86,7 +128,12 @@
       irohError = e instanceof Error ? e.message : String(e);
       showFallbackButton = true;
     } finally {
-      irohPending = false;
+      // The `joined` branch defers `irohPending = false` to the dismiss
+      // timer so the "Joined ✓" label stays visible across the display
+      // window. Every other branch clears it here.
+      if (!suppressFinally) {
+        irohPending = false;
+      }
     }
   }
 
