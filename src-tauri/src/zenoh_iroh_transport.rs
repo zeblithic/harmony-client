@@ -742,6 +742,209 @@ mod tests {
         }
     }
 
+    /// ZEB-325 PR #159 R4-2 (CodeRabbit NITPICK): regression dispatcher
+    /// for the parallel-drain test. Each invocation:
+    ///   1. Atomically bumps an "observed" counter + records its index.
+    ///   2. The FIRST call (index 0) blocks on a Notify until the
+    ///      second call has been observed — proving the drain is NOT
+    ///      sequential (a sequential drain would never reach the
+    ///      second call before the first returns).
+    ///   3. Bumps a separate "completed" counter when it returns.
+    struct GatingDispatcher {
+        observed: Arc<std::sync::atomic::AtomicUsize>,
+        completed: Arc<std::sync::atomic::AtomicUsize>,
+        release_first: Arc<tokio::sync::Notify>,
+        // Signals that the second observation has happened, so the
+        // test (or the first call itself) knows when to release the
+        // gate. Kept separate from `observed` so we don't conflate
+        // "second seen" with "ordering of bumps". `Notify::notify_one`
+        // permit semantics: missed notifies before await still wake.
+        second_observed: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl IrohHandshakeDispatcher for GatingDispatcher {
+        async fn handle_connection(&self, _conn: Connection) {
+            // fetch_add returns the prior value, so index 0 is the
+            // first observation.
+            let idx = self
+                .observed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if idx == 0 {
+                // Block until the second connection is observed.
+                // 5s ceiling so a regression (sequential drain) fails
+                // fast with a clear assertion instead of hanging the
+                // test's outer 15s timeout.
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    self.second_observed.notified(),
+                )
+                .await;
+                // Then wait for the test to release us.
+                self.release_first.notified().await;
+            } else {
+                // Second (or later) call signals first to unblock.
+                self.second_observed.notify_one();
+            }
+            self.completed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// ZEB-325 PR #159 R4-2 (CodeRabbit NITPICK): regression for the
+    /// R3-3 spawn-per-conn fix. The original sequential drain would
+    /// have processed boot-window queued handshake connections one at
+    /// a time — a single slow handshake (real production case: 8s
+    /// engine bootstrap inside the acceptor) would have pinned every
+    /// queued connection behind it for its full IO+poll deadline.
+    ///
+    /// The R3-3 fix replaced the sequential drain with
+    /// `tokio::spawn` per-connection. Without this test, a future
+    /// revert to sequential drain would still pass the original
+    /// one-connection boot-window test (which only enqueues one).
+    ///
+    /// Strategy:
+    ///   - Pre-install: enqueue TWO connections.
+    ///   - Install a GatingDispatcher whose first call blocks until
+    ///     its second call has been observed.
+    ///   - Assert both connections are observed (proves parallelism).
+    ///   - Release the gate, assert both complete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn drain_dispatches_queued_connections_in_parallel() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            drain_dispatches_queued_connections_in_parallel_inner(),
+        )
+        .await
+        .expect("test must finish within 45s");
+    }
+
+    async fn drain_dispatches_queued_connections_in_parallel_inner() {
+        // Alice: link manager with accept loop, no dispatcher installed.
+        let alice_ep = build_hermetic_iroh_endpoint().await;
+        let resolver = ReachabilityResolver::new();
+        let (new_link_tx, _rx) = flume::unbounded::<LinkUnicast>();
+        let alice_mgr = Arc::new(IrohZenohLinkManager::new(
+            Arc::clone(&alice_ep),
+            resolver,
+            new_link_tx,
+        ));
+        let _accept_handle = alice_mgr.spawn_accept_loop();
+
+        // Two bob endpoints — each dials independently so we get two
+        // distinct queued connections on alice. Using two endpoints
+        // (rather than two streams over one conn) matches what the
+        // production accept loop enqueues: one Connection per inbound
+        // dial.
+        let bob1_ep = build_hermetic_iroh_endpoint().await;
+        let bob2_ep = build_hermetic_iroh_endpoint().await;
+
+        let alice_node_id = alice_ep.node_id();
+        let alice_socket = *alice_ep
+            .bound_sockets()
+            .first()
+            .expect("alice has a bound socket");
+        let mut alice_addr = EndpointAddr::new(alice_node_id);
+        alice_addr = alice_addr.with_ip_addr(alice_socket);
+
+        // Dial both bobs sequentially. (Dialing in parallel would
+        // race the accept-side enqueue and risk one being processed
+        // by the fast path if install happened to land in between,
+        // which the test doesn't exercise.)
+        let _conn1 = bob1_ep
+            .inner()
+            .connect(alice_addr.clone(), alpn::HARMONY_HANDSHAKE_V1)
+            .await
+            .expect("dial #1 alice on handshake ALPN");
+        let _conn2 = bob2_ep
+            .inner()
+            .connect(alice_addr, alpn::HARMONY_HANDSHAKE_V1)
+            .await
+            .expect("dial #2 alice on handshake ALPN");
+
+        // Wait for both to land on the queue.
+        for _ in 0..200 {
+            let depth = alice_mgr.pending_handshakes.lock().await.len();
+            if depth >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            alice_mgr.pending_handshakes.lock().await.len(),
+            2,
+            "both handshake connections should be queued pre-install"
+        );
+
+        // Install the gating dispatcher.
+        let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let second_observed = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new(GatingDispatcher {
+            observed: Arc::clone(&observed),
+            completed: Arc::clone(&completed),
+            release_first: Arc::clone(&release_first),
+            second_observed: Arc::clone(&second_observed),
+        });
+        let install_res = alice_mgr.install_handshake_dispatcher(gate).await;
+        assert!(install_res.is_ok(), "install must succeed");
+
+        // Wait for BOTH dispatches to be observed (the parallel
+        // invariant). The first is blocked inside handle_connection,
+        // so a sequential drain would never get to the second within
+        // any reasonable budget — observed would stay at 1 until the
+        // (untriggered) gate releases.
+        for _ in 0..200 {
+            if observed.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let observed_now = observed.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            observed_now, 2,
+            "drain must dispatch both queued connections in parallel; \
+             observed only {observed_now}/2 within 2s — this is the regression \
+             signal for the R3-3 spawn-per-conn fix"
+        );
+
+        // At this point the second dispatch has completed (only the
+        // first is blocked on release_first). Verify completed has
+        // advanced past the gate for the second call.
+        for _ in 0..50 {
+            if completed.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            completed.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the second dispatch must have completed while the first is blocked"
+        );
+
+        // Release the first dispatch and assert it completes too.
+        release_first.notify_one();
+        for _ in 0..200 {
+            if completed.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            completed.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "both dispatches must complete after release"
+        );
+
+        // Post-drain the queue is empty.
+        assert_eq!(alice_mgr.pending_handshakes.lock().await.len(), 0);
+
+        alice_ep.shutdown().await;
+        bob1_ep.shutdown().await;
+        bob2_ep.shutdown().await;
+    }
+
     /// Sanity: `locator_from_endpoint_id` round-trips through
     /// `parse_endpoint_id`.
     ///

@@ -30163,7 +30163,22 @@ where
             });
         }
     }
-    send.finish().map_err(|e| format!("send.finish: {e}"))?;
+    // ZEB-325 PR #159 R4-1 (CodeRabbit MAJOR): normalize send.finish()
+    // failure to inviter_unreachable + log + close, matching the
+    // write_all branches above. Propagating via `?` would have
+    // surfaced a raw Err(String) to the caller instead of the
+    // structured outcome the rest of this function returns.
+    if let Err(e) = send.finish() {
+        tracing::warn!(
+            error = %e,
+            "ZEB-325 Phase 2c option A: handshake send.finish() failed"
+        );
+        conn.close(0u32.into(), b"send-finish-failed");
+        return Ok(RedemptionOutcome {
+            status: "inviter_unreachable".to_string(),
+            community_id: None,
+        });
+    }
 
     // 10. Read response, bounded by dial_config.response_read_timeout.
     // ZEB-325 PR #159 F3: distinct tracing for response-read timeout vs
@@ -30264,10 +30279,26 @@ where
     // connection open indefinitely (waiting for our drop to be
     // observed remotely) or tear down too early and race our read.
     // Pattern from `zenoh_iroh_link::tests::paired_stream_roundtrip_via_loopback`.
+    //
+    // ZEB-325 PR #159 R4-4 (Cursor LOW): on the success path we have
+    // ALREADY received Alice's countersign (the read above completed
+    // OK), so our outbound request bytes are guaranteed to have been
+    // acknowledged by the QUIC layer — Alice could not have authored
+    // and delivered a countersign for our bootstrap_join.id without
+    // first reading our request packet. The original rationale for
+    // awaiting `conn.closed()` here was to prevent OUTBOUND data drop
+    // before delivery (Bob's request stream); that risk is already
+    // discharged on the success path. Calling `conn.close()` sends
+    // the CONNECTION_CLOSE frame; QUIC handles the 3×PTO drain
+    // (~300-900ms) in the background after we drop the Connection.
+    // Dropping the `conn.closed().await` here lets us return the IPC
+    // response immediately instead of pinning the redeem call on the
+    // drain. The acceptor's symmetric wait still bounds itself by
+    // `io_deadline` (see `iroh_invite_acceptor.rs::handle_connection`
+    // R2/R3 timeout work), so no acceptor-side leak risk.
     drop(send);
     drop(recv);
     conn.close(0u32.into(), b"handshake-complete");
-    conn.closed().await;
     drop(conn);
 
     // Stage 4/5: `awaiting_countersig` — emitted between receive and

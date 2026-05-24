@@ -36,7 +36,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::{Signer, SigningKey};
@@ -549,6 +549,13 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
         );
 
         // ── 7. Drive Bob's IPC. ─────────────────────────────────────────
+        // ZEB-325 PR #159 R4-3 (CodeRabbit NITPICK): capture nav-updated
+        // emits so we can assert the iroh-redeem path emits exactly one
+        // {"added", "community", ...} payload — the R3 fix would have
+        // regressed silently with the prior `|_| {}` sink.
+        let nav_emits: Arc<Mutex<Vec<harmony_app::NavUpdatedPayload>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let nav_emits_sink = Arc::clone(&nav_emits);
         let outcome = harmony_app::connectivity_redeem_invite_iroh_inner(
             invite_url,
             Some(Arc::clone(&pkarr_resolver)),
@@ -566,11 +573,17 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             Arc::clone(&bob_channel_log_registry),
             None,
             |_| {},
-            // ZEB-325 PR #159 R3-1: no-op nav_emit_sink — the test
-            // doesn't drive an AppHandle, and the post-redeem nav-updated
-            // event is verified by the existing redeem_invite IPC test
-            // path (Reticulum), not here.
-            |_| {},
+            // ZEB-325 PR #159 R4-3 (CodeRabbit NITPICK): record each
+            // nav-updated emit into the shared Vec so we can assert on
+            // the count + shape after the redeem completes. Mutex (not
+            // tokio::sync::Mutex) is fine because the sink is a sync
+            // `Fn` closure and the test only reads after the await.
+            move |payload: harmony_app::NavUpdatedPayload| {
+                nav_emits_sink
+                    .lock()
+                    .expect("nav_emits mutex")
+                    .push(payload);
+            },
             // ZEB-325 PR #159 F3 + F10: explicit dial timeouts (replaces
             // the prior env-var read). 10s is more than enough for
             // loopback connect / open_bi / response read; the test still
@@ -607,6 +620,30 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             outcome.community_id.as_deref(),
             Some(hex::encode(community_id.0).as_str()),
             "community_id must echo Alice's invite"
+        );
+
+        // ZEB-325 PR #159 R4-3 (CodeRabbit NITPICK): assert exactly one
+        // nav-updated emit with the expected shape — guards the R3 fix
+        // that wired nav_emit_sink into the iroh-redeem joined path.
+        let emits = nav_emits.lock().expect("nav_emits mutex").clone();
+        assert_eq!(
+            emits.len(),
+            1,
+            "iroh-redeem joined path must emit exactly one nav-updated; got {} \
+             emits: {:?}",
+            emits.len(),
+            emits
+        );
+        let emit = &emits[0];
+        assert_eq!(emit.action, "added", "nav-updated action must be 'added'");
+        assert_eq!(
+            emit.kind, "community",
+            "nav-updated kind must be 'community'"
+        );
+        assert_eq!(
+            emit.space_id,
+            hex::encode(community_id.0),
+            "nav-updated space_id must match the joined community"
         );
 
         // Bob's CRDT must contain ≥ 3 events: admin bootstrap (from the
