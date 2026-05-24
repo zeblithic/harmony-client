@@ -76,10 +76,14 @@
 //! - **`ZResult` / `zerror!`** — come from `zenoh_result`, not from
 //!   `zenoh_link` (already discovered in Task 5).
 
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use iroh::endpoint::Connection;
 use iroh::{EndpointAddr, EndpointId};
+use tokio::sync::Mutex as TokioMutex;
 use zenoh_link::{
     EndPoint, LinkManagerUnicastTrait, LinkUnicast, LinkUnicastTrait, Locator, NewLinkChannelSender,
 };
@@ -92,6 +96,31 @@ use crate::zenoh_iroh_link::IrohZenohLink;
 
 /// Locator protocol identifier for harmony's zenoh-over-iroh links.
 const IROH_LOCATOR_PROTOCOL: &str = "iroh";
+
+/// ZEB-325 PR #159 R2: bounded grace-period queue for inbound
+/// `harmony/handshake/v1` connections that arrive before the
+/// `IrohInviteHandshakeAcceptor` has been installed. The link manager
+/// is constructed early at app boot (so no inbound iroh traffic is
+/// dropped during the bind window), but the acceptor depends on the
+/// owner identity + community registry + dm outbox + CRDT state, all
+/// of which load later. Without this queue, every inbound handshake
+/// arriving in that boot window was silently dropped — Bob's redeem
+/// then surfaced `inviter_unreachable` despite Alice being online.
+///
+/// 32 entries is well above any realistic boot-window collision rate
+/// (a community typically sees < 1 inbound redemption per minute), and
+/// small enough that a runaway dialer cannot OOM the queue. Drop-
+/// oldest when full: a slow boot plus spam from an adversarial peer
+/// shouldn't displace fresh legitimate traffic indefinitely, but the
+/// 30s aging below means stale entries fall out anyway.
+const HANDSHAKE_PENDING_QUEUE_CAP: usize = 32;
+
+/// ZEB-325 PR #159 R2: maximum age for a queued handshake connection.
+/// Once the dispatcher is installed, drain skips entries older than
+/// this — the dialer's own response-read timeout (default 30s, see
+/// `HandshakeDialConfig`) will already have fired, so processing
+/// them would only write a JoinCountersign into a closed connection.
+const HANDSHAKE_PENDING_MAX_AGE: Duration = Duration::from_secs(30);
 
 /// Plug-in link manager that lets Zenoh open + accept links over an
 /// iroh `Endpoint`, using [`ReachabilityResolver`] to translate a
@@ -117,13 +146,28 @@ pub struct IrohZenohLinkManager {
     /// of `start_node`) once the `community_registry` / `dm_outbox` /
     /// `crdt_state` / `app` handles are available.
     ///
-    /// Pre-installation, inbound connections on the handshake ALPN
-    /// land on the warn-log-only path; post-installation they route to
-    /// the trait method `handle_connection`. `OnceCell` ensures the
-    /// install happens at most once — if a future code path needs to
-    /// swap dispatchers, build a fresh manager (cheap) rather than
-    /// mutating live state.
+    /// Pre-installation, inbound connections on the handshake ALPN are
+    /// pushed onto [`Self::pending_handshakes`] (a bounded grace-
+    /// period queue) and drained when the dispatcher installs.
+    /// `OnceCell` ensures the install happens at most once — if a
+    /// future code path needs to swap dispatchers, build a fresh
+    /// manager (cheap) rather than mutating live state.
+    ///
+    /// ## Invariant
+    ///
+    /// `pending_handshakes` is only ever non-empty while
+    /// `handshake_dispatcher.get().is_none()`. The accept path and
+    /// install path both take `pending_handshakes`'s mutex around the
+    /// OnceCell observation/mutation to enforce this.
     handshake_dispatcher: tokio::sync::OnceCell<Arc<dyn IrohHandshakeDispatcher>>,
+    /// ZEB-325 PR #159 R2: grace-period queue for inbound
+    /// `harmony/handshake/v1` connections that arrive before the
+    /// dispatcher installs. Bounded to `HANDSHAKE_PENDING_QUEUE_CAP`
+    /// (32) with drop-oldest semantics; drained by
+    /// `install_handshake_dispatcher` with `HANDSHAKE_PENDING_MAX_AGE`
+    /// (30s) aging applied. See the module-level constants for
+    /// rationale.
+    pending_handshakes: TokioMutex<VecDeque<(Connection, Instant)>>,
 }
 
 impl IrohZenohLinkManager {
@@ -137,25 +181,82 @@ impl IrohZenohLinkManager {
             resolver,
             new_link_tx,
             handshake_dispatcher: tokio::sync::OnceCell::new(),
+            pending_handshakes: TokioMutex::new(VecDeque::with_capacity(
+                HANDSHAKE_PENDING_QUEUE_CAP,
+            )),
         }
     }
 
-    /// ZEB-325 Phase 2c (option A): install the
+    /// ZEB-325 Phase 2c (option A) + PR #159 R2: install the
     /// `IrohHandshakeDispatcher` used by the accept loop to route
-    /// inbound `harmony/handshake/v1` connections. Returns Err
-    /// (carrying the supplied Arc back to the caller, then dropped) if
-    /// a dispatcher was already installed — OnceCell::set rejects the
-    /// second write.
-    pub fn install_handshake_dispatcher(
-        &self,
+    /// inbound `harmony/handshake/v1` connections, AND drain any
+    /// connections that arrived during the boot window.
+    ///
+    /// Locking order (see `pending_handshakes` doc-comment): the
+    /// pending-queue mutex is acquired BEFORE setting the OnceCell,
+    /// then held across the drain. The accept loop takes the same
+    /// mutex around its OnceCell observation, so the dispatcher
+    /// transition Some↔None is atomic w.r.t. enqueue/drain: future
+    /// inbound connections see the dispatcher and take the fast path,
+    /// while everything queued before install is owned by this drain.
+    ///
+    /// Returns Err (carrying the supplied Arc back to the caller, then
+    /// dropped) if a dispatcher was already installed — OnceCell::set
+    /// rejects the second write. In that case the queue is NOT
+    /// drained (the prior install would have done so).
+    pub async fn install_handshake_dispatcher(
+        self: &Arc<Self>,
         dispatcher: Arc<dyn IrohHandshakeDispatcher>,
     ) -> Result<(), Arc<dyn IrohHandshakeDispatcher>> {
-        self.handshake_dispatcher
-            .set(dispatcher)
-            .map_err(|set_err| match set_err {
+        // Acquire the queue lock FIRST so any racing accept-side
+        // enqueue blocks on this critical section. Inside the lock,
+        // set the OnceCell and snapshot the queue contents.
+        let mut queue = self.pending_handshakes.lock().await;
+        if let Err(set_err) = self.handshake_dispatcher.set(Arc::clone(&dispatcher)) {
+            return Err(match set_err {
                 tokio::sync::SetError::AlreadyInitializedError(d) => d,
                 tokio::sync::SetError::InitializingError(d) => d,
-            })
+            });
+        }
+        let drained: Vec<(Connection, Instant)> = queue.drain(..).collect();
+        // Drop the lock before dispatching so accept-side fast-path
+        // observers don't have to wait for handle_connection to run.
+        drop(queue);
+
+        if !drained.is_empty() {
+            let queued_count = drained.len();
+            let dispatcher_for_task = dispatcher;
+            tokio::spawn(async move {
+                let mut dispatched = 0usize;
+                let mut aged_out = 0usize;
+                for (conn, enqueued_at) in drained {
+                    let age = enqueued_at.elapsed();
+                    if age > HANDSHAKE_PENDING_MAX_AGE {
+                        tracing::warn!(
+                            age_ms = age.as_millis() as u64,
+                            max_age_ms = HANDSHAKE_PENDING_MAX_AGE.as_millis() as u64,
+                            "ZEB-325 PR #159 R2: dropping aged-out queued handshake \
+                             connection (dialer's read timeout will already have fired)"
+                        );
+                        // Close defensively in case the remote is
+                        // still alive — gives them a clean
+                        // CONNECTION_CLOSE frame instead of a stall.
+                        conn.close(0u32.into(), b"boot-queue-aged-out");
+                        aged_out += 1;
+                        continue;
+                    }
+                    dispatcher_for_task.handle_connection(conn).await;
+                    dispatched += 1;
+                }
+                tracing::info!(
+                    queued_count,
+                    dispatched,
+                    aged_out,
+                    "ZEB-325 PR #159 R2: drained boot-window handshake queue"
+                );
+            });
+        }
+        Ok(())
     }
 
     /// Spawn the inbound-link accept loop. Each accepted connection is
@@ -209,16 +310,42 @@ impl IrohZenohLinkManager {
                             tracing::warn!("zenoh new_link channel closed: {e}");
                         }
                     } else if alpn_used == alpn::HARMONY_HANDSHAKE_V1 {
-                        // ZEB-325 Phase 2c (option A): inbound invite
-                        // handshake. The dispatcher owns the
-                        // connection from here.
+                        // ZEB-325 Phase 2c (option A) + PR #159 R2:
+                        // inbound invite handshake. Take the pending-
+                        // queue mutex around the dispatcher OnceCell
+                        // observation so install_handshake_dispatcher's
+                        // drain sees a consistent
+                        // queue-empty-while-dispatcher-set invariant.
+                        // Fast path: dispatcher already installed →
+                        // dispatch directly without enqueue.
+                        // Slow path: queue the connection with the
+                        // current Instant; install_handshake_dispatcher
+                        // will drain and dispatch (or age-out + close)
+                        // once the owner identity loads.
+                        let mut queue = mgr.pending_handshakes.lock().await;
                         if let Some(dispatcher) = mgr.handshake_dispatcher.get().cloned() {
+                            drop(queue);
                             dispatcher.handle_connection(conn).await;
                         } else {
-                            tracing::warn!(
-                                "harmony/handshake/v1 connection received but no \
-                                 handshake_dispatcher installed yet (NodeState not fully \
-                                 booted with an owner identity?); dropping"
+                            // Drop-oldest when at capacity. The aging
+                            // pass during drain prunes stale entries
+                            // too, but the bound guards against runaway
+                            // dialers in the pre-install window.
+                            if queue.len() >= HANDSHAKE_PENDING_QUEUE_CAP {
+                                if let Some((stale, _)) = queue.pop_front() {
+                                    tracing::warn!(
+                                        cap = HANDSHAKE_PENDING_QUEUE_CAP,
+                                        "ZEB-325 PR #159 R2: handshake queue at capacity; \
+                                         evicting oldest queued connection"
+                                    );
+                                    stale.close(0u32.into(), b"boot-queue-evicted");
+                                }
+                            }
+                            queue.push_back((conn, Instant::now()));
+                            tracing::debug!(
+                                queue_depth = queue.len(),
+                                "ZEB-325 PR #159 R2: queued inbound handshake (dispatcher \
+                                 not yet installed; will drain after owner identity loads)"
                             );
                         }
                     } else {
@@ -348,12 +475,22 @@ mod tests {
     /// (which uses `presets::N0` + pkarr + DNS and hangs offline)
     /// stays untouched.
     async fn build_hermetic_iroh_endpoint() -> Arc<IrohEndpoint> {
+        // ZEB-325 PR #159 R2: register BOTH ALPNs so the accept loop
+        // can route handshake-ALPN connections through the dispatcher
+        // dispatcher OR enqueue path. Production binds the same set
+        // (see iroh_endpoint.rs:88, :252). Older callers in this
+        // module only needed HARMONY_ZENOH_V1 (their tests exercise
+        // the new_link path); the new boot-window test exercises the
+        // handshake ALPN path.
         let mut buf = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut buf);
         let secret = SecretKey::from_bytes(&buf);
         let inner = Endpoint::builder(presets::Minimal)
             .secret_key(secret)
-            .alpns(vec![alpn::HARMONY_ZENOH_V1.to_vec()])
+            .alpns(vec![
+                alpn::HARMONY_ZENOH_V1.to_vec(),
+                alpn::HARMONY_HANDSHAKE_V1.to_vec(),
+            ])
             .relay_mode(RelayMode::Disabled)
             .clear_ip_transports()
             .bind_addr((Ipv4Addr::LOCALHOST, 0))
@@ -476,6 +613,123 @@ mod tests {
 
         // Wrong node id → None.
         assert!(resolver.resolve_by_node_id(&[0xEE; 32]).is_none());
+    }
+
+    /// ZEB-325 PR #159 R2: inbound `harmony/handshake/v1` connections
+    /// that arrive BEFORE the dispatcher is installed are queued and
+    /// then drained when install runs. The drain dispatches each
+    /// queued connection on the newly-installed dispatcher.
+    ///
+    /// Without the queue, those connections were silently dropped
+    /// (Bob saw `inviter_unreachable` despite Alice being online).
+    /// This test simulates that boot-window race: dial first, install
+    /// second, assert the dispatcher receives the connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn handshake_connection_queued_pre_install_dispatched_on_install() {
+        // 45s outer timeout — uses real iroh QUIC + hermetic
+        // loopback bind; under heavy nextest contention each iroh
+        // bind can take 10-15s. The existing integration test
+        // (`pkarr_iroh_redeem_full_integration`) uses a 60s outer
+        // timeout for similar reasons.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            handshake_connection_queued_pre_install_dispatched_on_install_inner(),
+        )
+        .await
+        .expect("test must finish within 45s");
+    }
+
+    async fn handshake_connection_queued_pre_install_dispatched_on_install_inner() {
+        // Alice: link manager with accept loop, no dispatcher installed.
+        let alice_ep = build_hermetic_iroh_endpoint().await;
+        let resolver = ReachabilityResolver::new();
+        let (new_link_tx, _rx) = flume::unbounded::<LinkUnicast>();
+        let alice_mgr = Arc::new(IrohZenohLinkManager::new(
+            Arc::clone(&alice_ep),
+            resolver,
+            new_link_tx,
+        ));
+        let _accept_handle = alice_mgr.spawn_accept_loop();
+
+        // Bob: bare iroh endpoint to dial alice on the handshake ALPN.
+        let bob_ep = build_hermetic_iroh_endpoint().await;
+
+        // Build bob's EndpointAddr pointing at alice's loopback bound
+        // socket. iroh's `connect` needs at least a direct addr (no
+        // pkarr / relay in this hermetic build).
+        let alice_node_id = alice_ep.node_id();
+        let mut alice_addr = EndpointAddr::new(alice_node_id);
+        let alice_socket = *alice_ep
+            .bound_sockets()
+            .first()
+            .expect("alice has a bound socket");
+        alice_addr = alice_addr.with_ip_addr(alice_socket);
+
+        // Dial bob → alice on the handshake ALPN. The accept loop will
+        // observe no dispatcher and push the Connection onto the
+        // pending queue.
+        let _conn = bob_ep
+            .inner()
+            .connect(alice_addr, alpn::HARMONY_HANDSHAKE_V1)
+            .await
+            .expect("dial alice on handshake ALPN");
+
+        // Wait for the accept-side task to enqueue. The accept loop is
+        // async — we poll the queue depth with a short backoff until
+        // it observes the connection (or the outer 15s timeout fires).
+        for _ in 0..100 {
+            let depth = alice_mgr.pending_handshakes.lock().await.len();
+            if depth >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            alice_mgr.pending_handshakes.lock().await.len(),
+            1,
+            "handshake connection should be queued pre-install"
+        );
+
+        // Install a stub dispatcher; drain should hand the queued
+        // connection off to it.
+        let dispatched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stub = Arc::new(StubDispatcher {
+            count: Arc::clone(&dispatched),
+        });
+        let install_res = alice_mgr.install_handshake_dispatcher(stub).await;
+        assert!(install_res.is_ok(), "install must succeed");
+
+        // Drain runs in a spawned task; wait briefly for it to land.
+        for _ in 0..100 {
+            if dispatched.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            dispatched.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "drain must dispatch the queued connection"
+        );
+        // Post-drain the queue is empty (invariant: empty whenever
+        // dispatcher is set).
+        assert_eq!(alice_mgr.pending_handshakes.lock().await.len(), 0);
+
+        alice_ep.shutdown().await;
+        bob_ep.shutdown().await;
+    }
+
+    /// Stub dispatcher: counts invocations, drops the connection on
+    /// receipt. Used by the queue-drain test above.
+    struct StubDispatcher {
+        count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl IrohHandshakeDispatcher for StubDispatcher {
+        async fn handle_connection(&self, _conn: Connection) {
+            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     /// Sanity: `locator_from_endpoint_id` round-trips through

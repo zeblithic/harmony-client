@@ -369,6 +369,7 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             ));
         if alice_link_mgr
             .install_handshake_dispatcher(alice_acceptor)
+            .await
             .is_err()
         {
             panic!("first install must succeed (OnceCell empty)");

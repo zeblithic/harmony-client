@@ -4087,7 +4087,7 @@ async fn start_node(
                             ),
                         );
                         if let Err(_dispatcher_back) =
-                            link_mgr.install_handshake_dispatcher(acceptor)
+                            link_mgr.install_handshake_dispatcher(acceptor).await
                         {
                             // Pre-installed (idempotent restart? OnceCell
                             // refused the second set). Production
