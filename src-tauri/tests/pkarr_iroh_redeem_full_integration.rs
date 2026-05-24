@@ -36,6 +36,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -57,7 +58,7 @@ use harmony_app::event_loop::{ChannelLogAdapterRequest, CommunityAdapterRequest}
 use harmony_app::iroh_endpoint::{alpn, IrohEndpoint};
 use harmony_app::iroh_invite_acceptor::IrohInviteHandshakeAcceptor;
 use harmony_app::owner_state_crdt::OwnerState;
-use harmony_app::owner_state_types::{DeviceIdentityHash, Hlc, OwnerAddr};
+use harmony_app::owner_state_types::{DeviceIdentityHash, Hlc, OwnerAddr, OwnerDeviceEntry};
 use harmony_app::reachability_record::ReachabilityAnnouncePayload;
 use harmony_app::reachability_resolver::ReachabilityResolver;
 use harmony_app::zenoh_iroh_transport::IrohZenohLinkManager;
@@ -387,7 +388,18 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
         });
 
         let (bob_unicast_tx, mut bob_unicast_rx) = mpsc::channel::<UnicastSendRequest>(8);
-        tokio::spawn(async move { while bob_unicast_rx.recv().await.is_some() {} });
+        // ZEB-325 PR #159 R6 (Cursor HIGH): count Reticulum unicast sends so
+        // the post-redeem assertion can prove the iroh-redeem path skipped
+        // the fan-out entirely when pre_delivered_countersign was in hand.
+        // Pre-fix, populating bob_crdt_state with alice's device (below)
+        // would have caused the fan-out to fire — the counter would be ≥1.
+        let bob_unicast_count = Arc::new(AtomicUsize::new(0));
+        let bob_unicast_count_sink = Arc::clone(&bob_unicast_count);
+        tokio::spawn(async move {
+            while bob_unicast_rx.recv().await.is_some() {
+                bob_unicast_count_sink.fetch_add(1, Ordering::Relaxed);
+            }
+        });
 
         let bob_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
             "bob-dev".into(),
@@ -413,6 +425,28 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
 
         let bob_crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
         let bob_hlc_tracker = Arc::new(TokioMutex::new(BTreeMap::<String, Hlc>::new()));
+
+        // ZEB-325 PR #159 R6 (Cursor HIGH): pre-populate bob's owner_device_cache
+        // with a fabricated alice device so `resolve_destinations_for_owner`
+        // returns non-empty for alice_addr. This simulates "stale Reticulum
+        // DM cache from prior interactions" — the exact condition that, pre-
+        // fix, would have driven the iroh-redeem path into the Reticulum
+        // fan-out branch and Err'd if every try_send failed.
+        {
+            let mut g = bob_crdt_state.lock().await;
+            g.owner_device_cache.devices.insert(
+                alice_addr,
+                OwnerDeviceEntry {
+                    devices: vec![DeviceIdentityHash([0xAAu8; 16])],
+                    device_identity_pubs: vec![None],
+                    learned_at: Hlc {
+                        wall_ms: 100_000,
+                        logical: 0,
+                        device_id: "alice-dev".into(),
+                    },
+                },
+            );
+        }
 
         // Seed Bob's ReachabilityResolver with Alice's routing record
         // directly. The IPC's iroh dial uses the routing record from the
@@ -643,6 +677,22 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             emit.space_id,
             hex::encode(community_id.0),
             "nav-updated space_id must match the joined community"
+        );
+
+        // ZEB-325 PR #159 R6 (Cursor HIGH) regression: when bob's owner_device_cache
+        // contains a (fabricated) alice device AND the iroh path delivered
+        // the JoinCountersign via the bi-stream, the Reticulum fan-out must
+        // be skipped entirely — the unicast channel must have received 0
+        // packets. Pre-fix, the fan-out would have fired and (because the
+        // fabricated DeviceIdentityHash doesn't correspond to any real
+        // Reticulum destination) eventually Err'd, rolling back the join.
+        assert_eq!(
+            bob_unicast_count.load(Ordering::Relaxed),
+            0,
+            "iroh-redeem path must NOT enqueue any Reticulum unicast sends \
+             when pre_delivered_countersign is present (R6 regression): \
+             counter={}",
+            bob_unicast_count.load(Ordering::Relaxed)
         );
 
         // Bob's CRDT must contain ≥ 3 events: admin bootstrap (from the

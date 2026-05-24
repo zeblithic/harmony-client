@@ -15295,77 +15295,103 @@ where
         }
 
         // 7c. Resolve inviter's Reticulum destination(s) and send.
+        //
+        // ZEB-325 PR #159 R6 (Cursor HIGH): when `pre_delivered_countersign`
+        // is Some, the countersign has already been inserted locally at
+        // step 7b above — Reticulum fan-out is not the request channel
+        // for this redemption (iroh already discharged it). Skip the
+        // entire fan-out block. Without this guard, a joiner with stale
+        // Reticulum DM cache for the inviter (destinations non-empty)
+        // would take the fan-out path; if every `try_send` failed
+        // (likely as Reticulum is being deprioritized) the function
+        // would Err and the rollback would tear down the engine even
+        // though the countersign is already committed.
+        //
+        // The original `allow_no_reticulum_destinations` gate below
+        // remains correct for the empty-destinations case it was
+        // designed for, but it's now subordinate to the stronger
+        // signal: "we already have the countersign, no transport
+        // request is needed."
         let inviter_addr = payload.admin_addr;
-        let destinations = resolve_destinations_for_owner(crdt_state.as_ref(), inviter_addr).await;
-        if destinations.is_empty() {
-            if allow_no_reticulum_destinations {
-                // ZEB-325 Phase 2c: no Reticulum destinations — but the caller
-                // has guaranteed an alternate transport (iroh-borne Zenoh CRDT
-                // sync). Skip the Reticulum unicast fan-out entirely and
-                // proceed to the oneshot await; the engine's state-root
-                // publisher will carry the PendingJoin to the inviter via
-                // Zenoh once an iroh link is up.
-                tracing::debug!(
-                    inviter = %hex::encode(inviter_addr.0),
-                    "redeem_invite_inner: no Reticulum destinations; relying on CRDT sync \
-                     (allow_no_reticulum_destinations=true)"
-                );
-            } else {
-                // No known device for inviter → drop oneshot.
-                let _ = community_registry
-                    .take_pending_redemption(&minted.bootstrap_join.id)
-                    .await;
-                // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
-                return Err(format!(
-                    "no known device for inviter {} — invite cannot route",
-                    hex::encode(inviter_addr.0)
-                ));
-            }
+        if overrides.pre_delivered_countersign.is_some() {
+            tracing::debug!(
+                inviter = %hex::encode(inviter_addr.0),
+                "redeem_invite_inner: pre_delivered_countersign present — skipping \
+                 Reticulum unicast fan-out (countersign already inserted at step 7b)"
+            );
         } else {
-            // Per-destination fan-out with at-least-one-success semantics.
-            //
-            // The inviter may have multiple devices (any of which can
-            // counter-sign). Reticulum unicast is best-effort per
-            // destination — if even one queue-side `try_send` succeeds the
-            // packet is on its way and we cannot retract it, so a partial
-            // failure followed by local rollback would leave the receiver
-            // counter-signing while we tear down the engine here. Track
-            // success across the loop and ONLY roll back when all
-            // destinations failed.
-            let mut any_sent = false;
-            let mut last_err: Option<String> = None;
-            for destination_hash in &destinations {
-                match unicast_send_tx.try_send(crate::dm_outbox::UnicastSendRequest {
-                    destination_hash: *destination_hash,
-                    packet: wire.clone(),
-                }) {
-                    Ok(()) => any_sent = true,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            destination_hash = %hex::encode(destination_hash),
-                            "redeem_invite unicast try_send failed for destination — \
-                             continuing fan-out"
-                        );
-                        last_err = Some(e.to_string());
+            let destinations =
+                resolve_destinations_for_owner(crdt_state.as_ref(), inviter_addr).await;
+            if destinations.is_empty() {
+                if allow_no_reticulum_destinations {
+                    // ZEB-325 Phase 2c: no Reticulum destinations — but the caller
+                    // has guaranteed an alternate transport (iroh-borne Zenoh CRDT
+                    // sync). Skip the Reticulum unicast fan-out entirely and
+                    // proceed to the oneshot await; the engine's state-root
+                    // publisher will carry the PendingJoin to the inviter via
+                    // Zenoh once an iroh link is up.
+                    tracing::debug!(
+                        inviter = %hex::encode(inviter_addr.0),
+                        "redeem_invite_inner: no Reticulum destinations; relying on CRDT sync \
+                         (allow_no_reticulum_destinations=true)"
+                    );
+                } else {
+                    // No known device for inviter → drop oneshot.
+                    let _ = community_registry
+                        .take_pending_redemption(&minted.bootstrap_join.id)
+                        .await;
+                    // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
+                    return Err(format!(
+                        "no known device for inviter {} — invite cannot route",
+                        hex::encode(inviter_addr.0)
+                    ));
+                }
+            } else {
+                // Per-destination fan-out with at-least-one-success semantics.
+                //
+                // The inviter may have multiple devices (any of which can
+                // counter-sign). Reticulum unicast is best-effort per
+                // destination — if even one queue-side `try_send` succeeds the
+                // packet is on its way and we cannot retract it, so a partial
+                // failure followed by local rollback would leave the receiver
+                // counter-signing while we tear down the engine here. Track
+                // success across the loop and ONLY roll back when all
+                // destinations failed.
+                let mut any_sent = false;
+                let mut last_err: Option<String> = None;
+                for destination_hash in &destinations {
+                    match unicast_send_tx.try_send(crate::dm_outbox::UnicastSendRequest {
+                        destination_hash: *destination_hash,
+                        packet: wire.clone(),
+                    }) {
+                        Ok(()) => any_sent = true,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                destination_hash = %hex::encode(destination_hash),
+                                "redeem_invite unicast try_send failed for destination — \
+                                 continuing fan-out"
+                            );
+                            last_err = Some(e.to_string());
+                        }
                     }
                 }
+                if !any_sent {
+                    let _ = community_registry
+                        .take_pending_redemption(&minted.bootstrap_join.id)
+                        .await;
+                    // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
+                    return Err(format!(
+                        "unicast_send_tx try_send failed for all {} destination(s){}",
+                        destinations.len(),
+                        last_err
+                            .as_deref()
+                            .map(|s| format!(" (last error: {s})"))
+                            .unwrap_or_default()
+                    ));
+                }
             }
-            if !any_sent {
-                let _ = community_registry
-                    .take_pending_redemption(&minted.bootstrap_join.id)
-                    .await;
-                // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
-                return Err(format!(
-                    "unicast_send_tx try_send failed for all {} destination(s){}",
-                    destinations.len(),
-                    last_err
-                        .as_deref()
-                        .map(|s| format!(" (last error: {s})"))
-                        .unwrap_or_default()
-                ));
-            }
-        }
+        } // end: else { … } from R6 pre_delivered_countersign guard
 
         // 7d. Await oneshot ≤ T (env-overridable for tests).
         // ZEB-254: 5s fast-path timeout (down from 15s). On timeout,
