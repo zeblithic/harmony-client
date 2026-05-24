@@ -53,6 +53,10 @@
   import { getThreadMeta } from './lib/feed-utils';
   import { findNode, findNearestFolder } from './lib/nav-utils';
   import { isTauri } from './lib/tauri-env';
+  import { onMount } from 'svelte';
+  import type { Update } from '@tauri-apps/plugin-updater';
+  import { checkForUpdate } from './lib/updater-adapter';
+  import UpdateAvailableToast from './lib/components/UpdateAvailableToast.svelte';
 
   let innerWidth = $state(window.innerWidth);
   let collapsed = $derived(innerWidth <= 768);
@@ -221,6 +225,9 @@
   // id. The dialog `pending`/`error` state stays in App.svelte rather
   // than the dialog component so a re-open after an error gets a fresh
   // state without remounting (and so multiple dialogs can be cycled).
+  // ── ZEB-328: in-app update notification ────────────────────────────
+  let availableUpdate = $state<Update | null>(null);
+
   let showCreateCommunity = $state(false);
   let showRedeemInvite = $state(false);
   let createPending = $state(false);
@@ -773,6 +780,12 @@
       console.warn('[harmony-client] Tauri init failed:', err);
     }
   })();
+
+  // ── ZEB-328: startup update check ──────────────────────────────────
+  onMount(async () => {
+    availableUpdate = await checkForUpdate();
+  });
+
   let flashcardStats = $state(initialSessionStats());
   let trustVersion = $state(0);
 
@@ -1869,6 +1882,16 @@
       />
     </div>
   </div>
+{/if}
+
+{#if availableUpdate}
+  <!-- ZEB-328: update notification toast. Non-blocking; shown after startup
+       check. Dismissed via Later (session-only) or Skip (persisted to
+       localStorage so the same version is suppressed on next launch). -->
+  <UpdateAvailableToast
+    update={availableUpdate}
+    onDismiss={() => (availableUpdate = null)}
+  />
 {/if}
 
 
