@@ -15543,6 +15543,43 @@ async fn redeem_invite(
         tracing::warn!(error = %e, "redeem_invite: nav-updated emit failed");
     }
 
+    // ZEB-323 Phase 2b: case-C pkarr hook — register per-community
+    // publication so the joiner starts broadcasting their membership
+    // routing record. Mirrors the create_community hook pattern.
+    // This is best-effort — a registry miss (engine not yet spawned)
+    // is silently skipped; the bootstrap scan in the event loop will
+    // catch it on next startup.
+    {
+        let id_bytes = hex::decode(&dto.community_id)
+            .ok()
+            .and_then(|b| <[u8; 16]>::try_from(b).ok());
+        if let Some(id_bytes) = id_bytes {
+            let space_id = crate::owner_state_types::SpaceId(id_bytes);
+            let (community_pub, registry) = {
+                let g = state_lock.lock().ok();
+                match g {
+                    Some(g) => (
+                        g.pkarr_community_publisher.clone(),
+                        g.community_registry.clone(),
+                    ),
+                    None => (None, None),
+                }
+            };
+            if let (Some(pub_handle), Some(registry)) = (community_pub, registry) {
+                if let Some(engine) = registry.engine_arc(&space_id).await {
+                    let mk = engine.membership_key();
+                    pub_handle
+                        .on_community_joined(space_id, *mk.as_bytes())
+                        .await;
+                    tracing::debug!(
+                        community_id = %dto.community_id,
+                        "ZEB-323 Phase 2b: registered case-C pkarr publication after redeem_invite"
+                    );
+                }
+            }
+        }
+    }
+
     Ok(dto)
 }
 
@@ -28570,9 +28607,14 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RedemptionOutcome {
-    /// `"joined"` | `"inviter_unreachable"` | etc.
+    /// `"pkarr_resolved_no_handshake"` | `"inviter_unreachable"` |
+    /// `"missing_admin_identity_pub"` | `"not_yet_implemented"` etc.
+    /// NOTE: `"joined"` is intentionally never returned here — this IPC
+    /// only resolves pkarr records. Full join (iroh connect + counter-sig)
+    /// is Phase 2c (ZEB-323 §7.2).
     pub status: String,
-    /// Hex-encoded community id when `status == "joined"`.
+    /// Hex-encoded community id when the pkarr record was resolved
+    /// (`status == "pkarr_resolved_no_handshake"`).
     pub community_id: Option<String>,
 }
 
@@ -28641,6 +28683,17 @@ async fn connectivity_redeem_invite_iroh(
         });
     };
 
+    // 2b. Guard: open-community invites also have no admin_identity_pub,
+    //     meaning we cannot verify the inner sig / identity binding. Skip
+    //     early with an explicit status rather than silently omitting the
+    //     verification step below (Fix for round-1 review HIGH finding).
+    if payload.admin_identity_pub.is_none() {
+        return Ok(RedemptionOutcome {
+            status: "missing_admin_identity_pub".to_string(),
+            community_id: None,
+        });
+    }
+
     // 3. Acquire the resolver (may be None if pkarr not initialized).
     let resolver = {
         let g = state
@@ -28706,9 +28759,11 @@ async fn connectivity_redeem_invite_iroh(
 
     // 8. Phase 2b first cut: iroh connect + full counter-sig orchestration
     //    is deferred to Phase 2c. Reaching here means we found a valid
-    //    routing record from the inviter — return "joined" as placeholder.
-    //    TODO ZEB-323 §7.2: replace with real iroh connect + community_invite
-    //    counter-sig handshake.
+    //    routing record from the inviter — return an honest status that
+    //    the frontend renders as "found on network, handshake pending".
+    //    The "joined" status is intentionally NOT returned here; the user
+    //    has NOT joined the community yet. Phase 2c will complete the
+    //    orchestration (ZEB-323 §7.2).
     tracing::info!(
         community_id = %hex::encode(payload.community_id.0),
         "ZEB-323 Phase 2b: connectivity_redeem_invite_iroh: routing record resolved; \
@@ -28716,7 +28771,7 @@ async fn connectivity_redeem_invite_iroh(
     );
 
     Ok(RedemptionOutcome {
-        status: "joined".to_string(),
+        status: "pkarr_resolved_no_handshake".to_string(),
         community_id: Some(hex::encode(payload.community_id.0)),
     })
 }

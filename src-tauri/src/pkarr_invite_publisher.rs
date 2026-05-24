@@ -37,8 +37,13 @@ impl PkarrInvitePublisher {
     /// Called from the IPC layer after `generate_invite` succeeds.
     pub async fn register_invite(&self, invite: &CommunityInvitePayload) {
         let Some(token) = &invite.invite_token else {
-            // Open community invites don't carry a token sig in the same way;
-            // skip pkarr publish for now (Phase 3 may extend).
+            // Open-community invites (invite_token: None) intentionally skip
+            // case-A pkarr publish. The case-A primitive exists for the
+            // ZEB-217 Phase 4 invite-only flow (counter-sig redemption), which
+            // will supply a non-None invite_token. For Phase 2b open invites,
+            // joiners must already share a transport (LAN Reticulum or the
+            // future Phase 2c iroh-via-identity-discovery path) — there is no
+            // per-invite secret to key an HKDF record on.
             return;
         };
         let epoch_id = current_epoch_id(now_ms());

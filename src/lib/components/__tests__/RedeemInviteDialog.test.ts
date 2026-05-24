@@ -91,7 +91,7 @@ describe('RedeemInviteDialog', () => {
   it('iroh redeem button calls connectivity_redeem_invite_iroh with trimmed URL', async () => {
     mockInvoke.mockImplementation((cmd: string) => {
       if (cmd === 'connectivity_redeem_invite_iroh') {
-        return Promise.resolve({ status: 'joined', communityId: 'c1' });
+        return Promise.resolve({ status: 'pkarr_resolved_no_handshake', communityId: 'c1' });
       }
       return Promise.resolve(null);
     });
@@ -112,10 +112,13 @@ describe('RedeemInviteDialog', () => {
     });
   });
 
-  it('shows success state when outcome.status is joined', async () => {
+  it('shows fallback button and "found on network" message when pkarr_resolved_no_handshake', async () => {
+    // ZEB-323 Phase 2b: pkarr resolution succeeds but the full iroh join
+    // handshake is deferred to Phase 2c. The UI should NOT show "Joined ✓";
+    // instead it should show the LAN fallback path with an informational message.
     mockInvoke.mockImplementation((cmd: string) => {
       if (cmd === 'connectivity_redeem_invite_iroh') {
-        return Promise.resolve({ status: 'joined' });
+        return Promise.resolve({ status: 'pkarr_resolved_no_handshake', communityId: 'c1' });
       }
       return Promise.resolve(null);
     });
@@ -129,7 +132,9 @@ describe('RedeemInviteDialog', () => {
     await fireEvent.click(getByTestId('iroh-redeem-btn'));
 
     await waitFor(() => {
-      expect(getByTestId('iroh-success')).toBeTruthy();
+      const banner = getByTestId('iroh-error-banner');
+      expect(banner.textContent?.toLowerCase()).toContain('found the inviter on the network');
+      expect(getByTestId('fallback-lan-btn')).toBeTruthy();
     });
   });
 
@@ -228,6 +233,6 @@ describe('RedeemInviteDialog', () => {
     });
 
     // Clean up the hanging promise.
-    resolveRedeemPromise({ status: 'joined' });
+    resolveRedeemPromise({ status: 'pkarr_resolved_no_handshake' });
   });
 });

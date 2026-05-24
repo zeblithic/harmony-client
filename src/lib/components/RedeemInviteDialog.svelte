@@ -31,7 +31,6 @@
   let irohPending = $state(false);
   let irohStage = $state<RedemptionStage | null>(null);
   let irohError = $state<string | null>(null);
-  let irohSuccess = $state(false);
   let showFallbackButton = $state(false);
 
   const STAGE_LABELS: Record<RedemptionStage, string> = {
@@ -60,20 +59,25 @@
     irohPending = true;
     irohStage = 'resolving';
     irohError = null;
-    irohSuccess = false;
     showFallbackButton = false;
     try {
       const outcome = await redeemInviteIroh(trimmed);
-      if (outcome.status === 'joined') {
-        irohStage = 'joined';
-        irohSuccess = true;
+      if (outcome.status === 'pkarr_resolved_no_handshake') {
+        // Found the inviter on the pkarr DHT, but the full join handshake
+        // (iroh connect + counter-sig exchange) is not yet implemented
+        // (Phase 2c, ZEB-323 §7.2). Show the LAN fallback path instead.
+        irohStage = null;
+        irohError =
+          'Found the inviter on the network, but the full join handshake is not yet available ' +
+          '(Phase 2c). Use the local network fallback to join now.';
+        showFallbackButton = true;
       } else if (outcome.status === 'inviter_unreachable') {
         irohStage = null;
         irohError =
           "Couldn't reach the inviter through the network right now. They may be offline; try again later.";
         showFallbackButton = true;
       } else {
-        // fallback_reticulum or other — hand off to LAN path
+        // missing_admin_identity_pub, fallback_reticulum, or other — hand off to LAN path
         irohStage = null;
         showFallbackButton = true;
       }
@@ -128,12 +132,6 @@
     <div class="pending-row" data-testid="iroh-progress">
       <div class="spinner" role="status" aria-label="Connecting via network"></div>
       <span data-testid="iroh-stage-label">{STAGE_LABELS[irohStage]}</span>
-    </div>
-  {/if}
-
-  {#if irohSuccess}
-    <div class="pending-row" data-testid="iroh-success">
-      <span>Joined ✓</span>
     </div>
   {/if}
 

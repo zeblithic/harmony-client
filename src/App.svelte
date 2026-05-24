@@ -8,6 +8,7 @@
   import FileBrowser from './lib/components/FileBrowser.svelte';
   import FileDetailPanel from './lib/components/FileDetailPanel.svelte';
   import NotificationSettingsPanel from './lib/components/NotificationSettingsPanel.svelte';
+  import NetworkDiscoverabilitySettings from './lib/components/NetworkDiscoverabilitySettings.svelte';
   import ProfileEditor from './lib/components/ProfileEditor.svelte';
   import IdentityPanel from './lib/components/IdentityPanel.svelte';
   import BackupStalenessWarning from './lib/components/BackupStalenessWarning.svelte';
@@ -1456,6 +1457,7 @@
       onClose={() => { showSettings = false; }}
       onTrustChange={handleTrustChange}
     />
+    <NetworkDiscoverabilitySettings />
   {/snippet}
   {#snippet vineFeed()}
     <VineFeed

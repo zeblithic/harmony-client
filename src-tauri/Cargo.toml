@@ -76,7 +76,9 @@ harmony-mailbox = { git = "https://github.com/zeblithic/harmony.git", rev = "044
 harmony-owner = { git = "https://github.com/zeblithic/harmony.git", rev = "04449d603c042c121ee9836ebd244310adaf7f6a", features = ["recovery"] }
 # ZEB-323 Phase 2b: pkarr-based discovery policies. Pinned to PR #270's branch
 # (zeb-322-harmony-pkarr-crate); will be updated to merge SHA before this PR merges.
-harmony-pkarr = { git = "https://github.com/zeblithic/harmony", branch = "zeb-322-harmony-pkarr-crate", features = ["test-fixtures"] }
+# NOTE: test-fixtures feature is activated only for dev-dependencies below so
+# MockPkarrRelay is excluded from release binaries (round-1 review fix).
+harmony-pkarr = { git = "https://github.com/zeblithic/harmony", branch = "zeb-322-harmony-pkarr-crate" }
 blake3 = "1"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
@@ -132,6 +134,9 @@ serial_test = "3"
 # be redundant and would misleadingly suggest test-only usage.
 tauri = { version = "2", features = ["test"] }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "test-util"] }
+# Activate test-fixtures feature for harmony-pkarr in dev/test builds only,
+# so MockPkarrRelay (an axum HTTP server) is excluded from release binaries.
+harmony-pkarr = { git = "https://github.com/zeblithic/harmony", branch = "zeb-322-harmony-pkarr-crate", features = ["test-fixtures"] }
 
 # ZEB-156: the rev above (04449d60) is harmony main after PR #269 merged
 # — it includes the narrow `NodeRuntime::remove_content` +
