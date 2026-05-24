@@ -90,7 +90,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_then_unregister_does_not_panic() {
+    async fn unregister_without_prior_register_is_safe() {
         let relay = MockPkarrRelay::start().await;
         let pool = RelayPool::new(vec![relay.base_url.clone()]);
         let client = Arc::new(RelayClient::new(pool));
