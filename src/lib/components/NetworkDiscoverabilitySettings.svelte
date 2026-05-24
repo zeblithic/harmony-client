@@ -22,6 +22,9 @@
   // Current persisted value — loaded on mount, updated on toggle.
   let enabled = $state(false);
   let loading = $state(true);
+  // True while a setIdentityDiscoverable call is in-flight. Prevents a second
+  // toggle click from racing the first write (CodeRabbit PR #158 round 2).
+  let pending = $state(false);
   let error = $state<string | null>(null);
 
   // Cleanup for the event listener.
@@ -49,10 +52,12 @@
   });
 
   async function handleToggle(e: Event) {
+    if (pending) return;
     const target = e.target as HTMLInputElement;
     const newVal = target.checked;
     // Optimistic update.
     enabled = newVal;
+    pending = true;
     try {
       await setIdentityDiscoverable(newVal);
       error = null;
@@ -60,6 +65,8 @@
       // Roll back.
       enabled = !newVal;
       error = err instanceof Error ? err.message : String(err);
+    } finally {
+      pending = false;
     }
   }
 </script>
@@ -88,7 +95,7 @@
         role="switch"
         class="visually-hidden"
         checked={enabled}
-        disabled={loading}
+        disabled={loading || pending}
         onchange={handleToggle}
         data-testid="discoverability-toggle"
         aria-checked={enabled}
