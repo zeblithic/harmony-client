@@ -1,6 +1,7 @@
 <script lang="ts">
   /**
    * ZEB-321 Phase 1: dev-mode connectivity diagnostics.
+   * ZEB-323 Phase 2b: extended with pkarr publication status section.
    *
    * Renders nothing in production builds — the `{#if isDevMode}` block
    * gates the entire DOM tree, and `import.meta.env.DEV` is a Vite
@@ -22,10 +23,13 @@
     listPeerReachability,
     forceRepublish,
     onReachabilityChanged,
+    pkarrPublicationStatus,
+    onPkarrFallbackFired,
   } from '../connectivity-adapter';
   import type {
     ReachabilityRecord,
     PeerReachability,
+    PkarrPublicationStatus,
   } from '../types/connectivity';
 
   // Vite injects `import.meta.env.DEV` as a build-time boolean. In tests
@@ -44,6 +48,24 @@
   // (CodeRabbit PR #157 round 1).
   let destroyed = false;
   let error = $state<string | null>(null);
+
+  // ── ZEB-323 Phase 2b: pkarr section ─────────────────────────────────────
+  let pkarrStatus = $state<PkarrPublicationStatus | null>(null);
+  let pkarrFallbackEvents = $state<
+    { peerAddrShort: string; communityId: string; hit: boolean }[]
+  >([]);
+  let pkarrSectionOpen = $state(false);
+  let stopFallbackListener: (() => void) | null = null;
+  let pkarrRefreshInterval: ReturnType<typeof setInterval> | null = null;
+
+  async function refreshPkarr(): Promise<void> {
+    try {
+      pkarrStatus = await pkarrPublicationStatus();
+    } catch {
+      // Non-fatal — pkarr not yet initialized on this boot is expected.
+      pkarrStatus = null;
+    }
+  }
 
   async function refresh(): Promise<void> {
     try {
@@ -85,11 +107,24 @@
     } else {
       unlisten = resolved;
     }
+
+    // Phase 2b pkarr section: initial fetch + 5-second auto-refresh.
+    await refreshPkarr();
+    pkarrRefreshInterval = setInterval(() => {
+      void refreshPkarr();
+    }, 5000);
+
+    // Subscribe to fallback-fired events; keep the last 5.
+    stopFallbackListener = onPkarrFallbackFired((ev) => {
+      pkarrFallbackEvents = [ev, ...pkarrFallbackEvents].slice(0, 5);
+    });
   });
 
   onDestroy(() => {
     destroyed = true;
     if (unlisten) unlisten();
+    if (pkarrRefreshInterval !== null) clearInterval(pkarrRefreshInterval);
+    stopFallbackListener?.();
   });
 </script>
 
@@ -137,6 +172,51 @@
         </ul>
       {/if}
     </section>
+
+    <section data-testid="pkarr-section">
+      <button
+        class="collapsible-header"
+        onclick={() => { pkarrSectionOpen = !pkarrSectionOpen; }}
+        aria-expanded={pkarrSectionOpen}
+        data-testid="pkarr-section-toggle"
+      >
+        <h4 style="display:inline;margin:0;">Network Discovery (pkarr)</h4>
+        <span>{pkarrSectionOpen ? '▲' : '▼'}</span>
+      </button>
+
+      {#if pkarrSectionOpen}
+        <div class="pkarr-content" data-testid="pkarr-content">
+          {#if pkarrStatus === null}
+            <p data-testid="pkarr-not-ready">pkarr publisher not initialized yet.</p>
+          {:else}
+            <dl>
+              <dt>Pending invite publications (case A)</dt>
+              <dd data-testid="pkarr-invite-count">{pkarrStatus.inviteCount}</dd>
+              <dt>Identity-keyed publication (case B)</dt>
+              <dd data-testid="pkarr-identity-active">{pkarrStatus.identityActive ? 'Active' : 'Inactive'}</dd>
+              <dt>Per-community publications (case C)</dt>
+              <dd data-testid="pkarr-community-count">{pkarrStatus.communityCount}</dd>
+            </dl>
+          {/if}
+
+          <div class="pkarr-fallback-log" data-testid="pkarr-fallback-log">
+            <strong>Recent fallback events (last 5)</strong>
+            {#if pkarrFallbackEvents.length === 0}
+              <p data-testid="pkarr-fallback-empty">No fallback lookups yet.</p>
+            {:else}
+              <ul>
+                {#each pkarrFallbackEvents as ev, i (i)}
+                  <li data-testid="pkarr-fallback-event">
+                    {ev.peerAddrShort}… in {ev.communityId.slice(0, 8)}… —
+                    {ev.hit ? 'hit ✓' : 'miss ✗'}
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+          </div>
+        </div>
+      {/if}
+    </section>
   </div>
 {/if}
 
@@ -158,5 +238,28 @@
   }
   dt {
     font-weight: bold;
+  }
+  .collapsible-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 4px 0;
+    color: inherit;
+    font-family: inherit;
+    font-size: inherit;
+    text-align: left;
+    gap: 8px;
+  }
+  .pkarr-content {
+    margin-top: 8px;
+  }
+  .pkarr-fallback-log {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px dashed #666;
   }
 </style>

@@ -13,11 +13,21 @@
 //! comparator runs per-key, so each (owner, device) pair maintains its
 //! own latest record independently.
 
+use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
 use crate::owner_state_types::{Hlc, OwnerAddr};
 use crate::reachability_record::ReachabilityAnnouncePayload;
+
+/// Async fallback called by `resolve_async` when the in-memory CRDT cache has
+/// no entry for a given owner. Implemented by `PkarrResolverAdapter` (case C)
+/// and by test stubs. The concrete impl is injected at boot via
+/// `set_fallback_source`.
+#[async_trait]
+pub trait ReachabilityFallback: Send + Sync {
+    async fn resolve(&self, addr: &OwnerAddr) -> Vec<ReachabilityAnnouncePayload>;
+}
 
 /// Composite key: harmony owner + iroh endpoint. Same-owner-different-
 /// device entries coexist; same-owner-same-device updates are LWW.
@@ -29,15 +39,40 @@ pub struct ResolverEntry {
     pub hlc: Hlc,
 }
 
-#[derive(Default, Debug)]
 pub struct ReachabilityResolver {
     inner: Arc<RwLock<BTreeMap<ResolverKey, ResolverEntry>>>,
+    /// Wrapped in an outer `Arc` so that all clones share the same
+    /// `RwLock` — wiring the fallback via `set_fallback_source` on any
+    /// clone is immediately visible to all others (CodeRabbit PR #158 round 2).
+    fallback_source: Arc<RwLock<Option<Arc<dyn ReachabilityFallback>>>>,
+}
+
+impl std::fmt::Debug for ReachabilityResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReachabilityResolver")
+            .field("inner", &self.inner)
+            .field("fallback_source", &"<dyn ReachabilityFallback>")
+            .finish()
+    }
+}
+
+impl Default for ReachabilityResolver {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(BTreeMap::new())),
+            fallback_source: Arc::new(RwLock::new(None)),
+        }
+    }
 }
 
 impl Clone for ReachabilityResolver {
     fn clone(&self) -> Self {
         ReachabilityResolver {
             inner: Arc::clone(&self.inner),
+            // Clone the Arc so all instances share the same RwLock.
+            // Wiring the fallback on any clone is visible to all others
+            // (CodeRabbit PR #158 round 2 correctness fix).
+            fallback_source: Arc::clone(&self.fallback_source),
         }
     }
 }
@@ -123,6 +158,57 @@ impl ReachabilityResolver {
             map.remove(&k);
         }
         n
+    }
+
+    /// Register a pkarr-backed fallback source. Called once at boot by
+    /// lib.rs after wiring `PkarrResolverAdapter`. Thread-safe; may be
+    /// called any number of times (latest wins).
+    pub fn set_fallback_source(&self, fb: Arc<dyn ReachabilityFallback>) {
+        *self
+            .fallback_source
+            .write()
+            .expect("fallback_source poisoned") = Some(fb);
+    }
+
+    /// Async resolve: checks the in-memory CRDT cache first (via the
+    /// existing sync `resolve()`), then falls back to the registered
+    /// `ReachabilityFallback` (e.g. pkarr) on a cache miss. Fallback
+    /// payloads are inserted into the cache so subsequent sync `resolve()`
+    /// calls return them without hitting pkarr again.
+    ///
+    /// The cache-population HLC is constructed with `wall_ms` equal to
+    /// the payload's `announced_at_ms`; logical=0, device_id="". This
+    /// makes pkarr-sourced entries subordinate to any CRDT-sourced entry
+    /// with a higher HLC — the existing LWW logic in `update()` handles
+    /// the ordering correctly.
+    pub async fn resolve_async(&self, addr: &OwnerAddr) -> Vec<ReachabilityAnnouncePayload> {
+        // 1. Sync cache check.
+        let cached = self.resolve(addr);
+        if !cached.is_empty() {
+            return cached;
+        }
+        // 2. Fallback to pkarr if configured.
+        let fb = {
+            let guard = self
+                .fallback_source
+                .read()
+                .expect("fallback_source poisoned");
+            guard.clone()
+        };
+        let Some(fb) = fb else {
+            return Vec::new();
+        };
+        let payloads = fb.resolve(addr).await;
+        // 3. Populate cache so subsequent sync resolves hit warm.
+        for payload in &payloads {
+            let hlc = Hlc {
+                wall_ms: payload.announced_at_ms,
+                logical: 0,
+                device_id: String::new(),
+            };
+            self.update(*addr, payload.clone(), hlc);
+        }
+        payloads
     }
 }
 
@@ -418,5 +504,99 @@ mod tests {
         assert_eq!(r.remove_owner(&actor), 1);
         // Second remove is a no-op — also 0.
         assert_eq!(r.remove_owner(&actor), 0);
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    fn make_payload(node_id_byte: u8, announced_at_ms: u64) -> ReachabilityAnnouncePayload {
+        ReachabilityAnnouncePayload {
+            iroh_node_id: [node_id_byte; 32],
+            home_relay_url: "https://derp.example/".into(),
+            direct_addresses: vec![],
+            announced_at_ms,
+            identity_signature: [0; 64],
+        }
+    }
+
+    struct StubFallback {
+        responses: std::sync::Mutex<Vec<ReachabilityAnnouncePayload>>,
+    }
+
+    #[async_trait]
+    impl ReachabilityFallback for StubFallback {
+        async fn resolve(&self, _addr: &OwnerAddr) -> Vec<ReachabilityAnnouncePayload> {
+            self.responses.lock().unwrap().clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_async_returns_empty_when_no_fallback_and_no_cached() {
+        let r = ReachabilityResolver::new();
+        let addr = OwnerAddr([0u8; 16]);
+        let out = r.resolve_async(&addr).await;
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_async_falls_back_to_pkarr_on_cache_miss() {
+        let r = ReachabilityResolver::new();
+        let addr = OwnerAddr([0u8; 16]);
+        let stub_payload = make_payload(0x42, 9000);
+        let stub = Arc::new(StubFallback {
+            responses: std::sync::Mutex::new(vec![stub_payload.clone()]),
+        });
+        r.set_fallback_source(stub);
+
+        let out = r.resolve_async(&addr).await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].iroh_node_id, stub_payload.iroh_node_id);
+
+        // Subsequent sync resolve hits warm cache.
+        let warm = r.resolve(&addr);
+        assert_eq!(warm.len(), 1);
+        assert_eq!(warm[0].iroh_node_id, stub_payload.iroh_node_id);
+    }
+
+    /// CodeRabbit PR #158 round 2: Clone must share fallback_source, not
+    /// snapshot it. If the caller clones before wiring the fallback and then
+    /// wires via the original, the clone must see the fallback too — otherwise
+    /// boot wiring on the original silently leaves every clone dark.
+    ///
+    /// Uses DISTINCT addresses per resolver so neither can warm-cache from
+    /// the other's resolve call, isolating the fallback-source sharing.
+    #[tokio::test]
+    async fn clone_shares_fallback_source() {
+        let r = ReachabilityResolver::new();
+        // Clone BEFORE wiring the fallback — this is the boot-wiring ordering
+        // that triggered the bug.
+        let clone = r.clone();
+
+        let stub_payload = make_payload(0x07, 5500);
+        let stub = Arc::new(StubFallback {
+            responses: std::sync::Mutex::new(vec![stub_payload.clone()]),
+        });
+        // Wire fallback on the original only.
+        r.set_fallback_source(stub);
+
+        // Use a distinct address for the clone so neither warm-caches the
+        // other's resolve result. The clone hasn't seen addr_clone before,
+        // so it MUST go through fallback_source to produce results.
+        let addr_orig = OwnerAddr([0x07u8; 16]);
+        let addr_clone = OwnerAddr([0x08u8; 16]);
+
+        // Resolve on original first (populates its cache for addr_orig only).
+        let from_orig = r.resolve_async(&addr_orig).await;
+        // Resolve on clone using a fresh address — forces the fallback path.
+        let from_clone = clone.resolve_async(&addr_clone).await;
+
+        assert_eq!(from_orig.len(), 1, "original must resolve via fallback");
+        assert_eq!(from_clone.len(), 1, "clone must share fallback_source Arc");
+        assert_eq!(from_orig[0].iroh_node_id, stub_payload.iroh_node_id);
+        assert_eq!(from_clone[0].iroh_node_id, stub_payload.iroh_node_id);
     }
 }

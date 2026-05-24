@@ -45,3 +45,70 @@ export interface PeerReachability {
 export interface ConnectivityReachabilityChangedPayload {
   actor: string;
 }
+
+// ---------------------------------------------------------------------------
+// ZEB-323 Phase 2b: pkarr-backed discovery types
+// ---------------------------------------------------------------------------
+
+/**
+ * Routing record decoded from a pkarr DHT lookup via
+ * `connectivity_discover_identity`. Mirrors the Rust `DiscoveredRecord` DTO
+ * (`#[serde(rename_all = "camelCase")]`).
+ */
+export interface DiscoveredRecord {
+  irohNodeId: string;
+  relayUrl?: string;
+  directAddrs: string[];
+  announcedAtMs: number;
+}
+
+/**
+ * Snapshot of the pkarr publisher's active publication handles, returned by
+ * `connectivity_pkarr_publication_status`. Mirrors `PublicationStatus` DTO.
+ */
+export interface PkarrPublicationStatus {
+  inviteCount: number;
+  identityActive: boolean;
+  communityCount: number;
+}
+
+/**
+ * Result of `connectivity_redeem_invite_iroh`. Mirrors `RedemptionOutcome` DTO.
+ *
+ * `status` values:
+ *  - `'pkarr_resolved_no_handshake'` — inviter found on the DHT; full join
+ *    (iroh connect + counter-sig) is Phase 2c (ZEB-323 §7.2). NOT "joined".
+ *  - `'inviter_unreachable'` — pkarr lookup returned nothing.
+ *  - `'missing_admin_identity_pub'` — invite has no admin identity key for
+ *    verification; cannot safely complete discovery.
+ *  - `'fallback_reticulum'` — use the LAN Reticulum path instead.
+ *  - An opaque backend string for future variants.
+ *
+ * NOTE: `'joined'` is intentionally NOT a valid status from this IPC.
+ * This command resolves pkarr records only; community join state is only
+ * mutated by the `redeem_invite` IPC (Reticulum path).
+ */
+export interface RedemptionOutcome {
+  status: 'pkarr_resolved_no_handshake' | 'inviter_unreachable' | 'missing_admin_identity_pub' | 'fallback_reticulum' | string;
+  communityId?: string;
+}
+
+/**
+ * The stage a cross-WAN invite redemption is currently at, emitted on the
+ * `connectivity-invite-resolution-progress` event.
+ */
+export type RedemptionStage =
+  | 'resolving'
+  | 'connecting'
+  | 'sending'
+  | 'awaiting_countersig'
+  | 'joined';
+
+/**
+ * Payload of the `connectivity-invite-resolution-progress` event.
+ */
+export interface ResolutionProgressEvent {
+  inviteId: string;
+  stage: RedemptionStage;
+  attemptN: number;
+}
