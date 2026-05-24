@@ -7,6 +7,7 @@ use harmony_content::storage_tier::{ContentPolicy, FilterBroadcastConfig, Storag
 use harmony_runtime::{NodeConfig, NodeRuntime};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
+use tauri_plugin_deep_link::DeepLinkExt;
 
 pub mod backup_state;
 pub mod community_channel_log;
@@ -30741,6 +30742,21 @@ async fn connectivity_force_republish(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_deep_link::init())
+        .setup(|app| {
+            // ZEB-328: deep-link handler — forward harmony:// URLs to the frontend.
+            // Frontend's deep-link listener (Task 6) opens RedeemInviteDialog
+            // with the URL.
+            let app_handle = app.handle().clone();
+            app.deep_link().on_open_url(move |event| {
+                let urls: Vec<String> = event.urls().iter().map(|u| u.to_string()).collect();
+                if let Err(e) = app_handle.emit("deep-link-received", &urls) {
+                    tracing::warn!(error = %e, "deep-link emit failed");
+                }
+            });
+            Ok(())
+        })
         .manage(Mutex::new(NodeState::default()))
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, position }) =

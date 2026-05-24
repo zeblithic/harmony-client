@@ -1,0 +1,323 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'SemVer + pre-release (e.g., 0.1.0-alpha.1)'
+        required: true
+        type: string
+
+# ZEB-328 PR #160 R2 (CodeRabbit MAJOR): serialize release runs.
+# Multiple manual dispatches racing on tag creation or gh-pages writes
+# would clobber each other; cancel-in-progress: false means a second
+# dispatch queues behind the first instead of cancelling it.
+concurrency:
+  group: release-${{ github.workflow }}
+  cancel-in-progress: false
+
+# ZEB-328 PR #160 R2 (CodeRabbit MAJOR): default permissions are read-only;
+# the release job overrides to `contents: write` for its scope only.
+permissions:
+  contents: read
+
+jobs:
+  precheck:
+    name: Precheck (version match + gates + tag clear + pubkey real)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # ZEB-328 PR #160 R2 (CodeRabbit MAJOR): validate the workflow_dispatch
+      # input against a strict SemVer regex BEFORE any shell interpolation.
+      # Prevents accidental (or malicious) injection via the version field
+      # and gives a clear error message instead of cryptic downstream failures.
+      - name: Sanitize + validate version input
+        id: ver
+        # ZEB-328 PR #160 R3 (CodeRabbit nitpick): pass raw input via env
+        # so the value is never interpolated into the shell-line itself
+        # (where `${{ ... }}` is template-substituted before shell sees it).
+        env:
+          RAW_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # ZEB-328 PR #160 R3 (Cursor MED): bash regex on the whole
+          # variable (NOT echo|grep, which returns 0 if ANY line of a
+          # multi-line input matches and would let `0.1.0\nrm -rf /`
+          # bypass validation, then write a newline to GITHUB_OUTPUT
+          # corrupting downstream step outputs).
+          #
+          # SemVer 2.0 grammar (simplified to what we use):
+          # MAJOR.MINOR.PATCH (-pre-release-identifier(.pre-release-identifier)*)?
+          # Where pre-release identifiers are [0-9A-Za-z-]+
+          if [[ ! "$RAW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo "::error::version input is not valid SemVer 2.0 (multi-line or invalid)."
+            echo "Expected e.g. '0.1.0-alpha.1' or '0.1.0'"
+            exit 1
+          fi
+          echo "version=$RAW_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Confirm version input matches tauri.conf.json
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          CONFIG_VERSION=$(jq -r .version src-tauri/tauri.conf.json)
+          if [ "$CONFIG_VERSION" != "$VERSION" ]; then
+            echo "::error::version mismatch: input=$VERSION config=$CONFIG_VERSION"
+            echo "Bump tauri.conf.json version + commit before triggering."
+            exit 1
+          fi
+
+      # ZEB-328 PR #160 R2 (CodeRabbit CRITICAL): verify the operator has
+      # swapped the placeholder pubkey (OP-3) for the real ed25519 verifying
+      # key from `~/.tauri/harmony-updater.key.pub` BEFORE building. Shipping
+      # the placeholder would make every signature-verify call fail at
+      # auto-update time; installed clients couldn't apply any update.
+      - name: Verify updater pubkey is not the placeholder
+        run: |
+          set -euo pipefail
+          PUBKEY=$(jq -r .plugins.updater.pubkey src-tauri/tauri.conf.json)
+          if [ "$PUBKEY" = "PLACEHOLDER_REPLACE_WITH_OP_3_OUTPUT" ] || [ -z "$PUBKEY" ] || [ "$PUBKEY" = "null" ]; then
+            echo "::error::tauri.conf.json plugins.updater.pubkey is unset or still placeholder."
+            echo "Operator: complete OP-3 (paste the real ed25519 public key from ~/.tauri/harmony-updater.key.pub) before triggering release."
+            echo "See docs/release-process.md §1 OP-3."
+            exit 1
+          fi
+
+      - name: Confirm tag does not already exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          if gh release view "v${VERSION}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "::error::release v${VERSION} already exists"
+            exit 1
+          fi
+
+      - name: Install Rust toolchain (honors rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: npm ci
+        run: npm ci
+
+      - name: cargo fmt --check
+        working-directory: src-tauri
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        working-directory: src-tauri
+        run: cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
+
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest --locked
+
+      - name: cargo nextest
+        working-directory: src-tauri
+        run: cargo nextest run --locked --workspace --all-targets --features test-fixtures
+
+      - name: tsc --noEmit
+        run: npx tsc --noEmit
+
+      - name: vitest
+        run: npx vitest run
+
+  build:
+    name: Build (${{ matrix.os }})
+    needs: precheck
+    runs-on: ${{ matrix.os }}
+    # ZEB-328 PR #160 R2 (CodeRabbit MAJOR): least-privilege — build only
+    # needs to read source + upload artifacts (which uses a separate
+    # implicit permission, not contents:write).
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          # ZEB-328 PR #160 R3 (CodeRabbit CRITICAL): macos-13 was
+          # retired by GitHub on 2025-12-04. macos-15-intel is the
+          # current Intel x86_64 runner replacement. If GitHub later
+          # deprecates -intel runners entirely (consumer Apple HW is
+          # all ARM now; Intel runners run on virtualization), we'll
+          # need to either cross-compile Intel from macos-15 ARM or
+          # drop Intel support — track via GH runner-deprecation
+          # announcements.
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux build deps
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev libsoup-3.0-dev javascriptcoregtk-4.1
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: npm ci
+        run: npm ci
+
+      - name: tauri build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build -- --target ${{ matrix.target }}
+
+      - name: Sanity-check artifact presence
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la src-tauri/target/${{ matrix.target }}/release/bundle/ || true
+          find src-tauri/target/${{ matrix.target }}/release/bundle/ -name "*.sig" | head -1
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.target }}
+          path: |
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.dmg
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.msi
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.AppImage
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.tar.gz
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.sig
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.zip
+          if-no-files-found: warn
+
+  release:
+    name: Create draft GitHub Release with per-platform artifacts
+    needs: build
+    runs-on: ubuntu-22.04
+    # ZEB-328 PR #160 R2 (CodeRabbit MAJOR): contents:write scoped to
+    # this job only (workflow-wide default is contents:read).
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      # ZEB-328 PR #160 R1 (Cursor HIGH): keep per-platform subdirectories
+      # so the macOS ARM (`Harmony.app.tar.gz`) and macOS Intel
+      # (`Harmony.app.tar.gz`) updater bundles don't collide on basename
+      # during the flatten step. The operator-side manifest generator
+      # (documented in docs/release-process.md §2) reads
+      # artifacts/bundle-{target}/... directly to disambiguate them.
+      - name: Rename macOS updater bundles per-arch (avoid name collision)
+        run: |
+          set -euo pipefail
+          # Tauri names both macOS updater bundles `Harmony.app.tar.gz`;
+          # rename in place to include the target triple so subsequent
+          # release-asset upload + operator manifest gen can disambiguate.
+          # ZEB-328 PR #160 R2 (Cursor HIGH): Tauri writes the .app.tar.gz
+          # under `bundle/macos/`, NOT directly under bundle/. upload-artifact@v4
+          # preserves the nested path, so we search recursively rather than
+          # checking the root of each artifact dir.
+          for d in artifacts/bundle-aarch64-apple-darwin artifacts/bundle-x86_64-apple-darwin; do
+            if [ ! -d "$d" ]; then continue; fi
+            arch=$(basename "$d" | sed 's/bundle-//')
+            # Locate Harmony.app.tar.gz at any depth under this target's artifact dir.
+            tar_file=$(find "$d" -type f -name "Harmony.app.tar.gz" | head -1)
+            sig_file=$(find "$d" -type f -name "Harmony.app.tar.gz.sig" | head -1)
+            if [ -n "$tar_file" ]; then
+              new_tar="$(dirname "$tar_file")/Harmony_${arch}.app.tar.gz"
+              mv -vf "$tar_file" "$new_tar"
+            fi
+            if [ -n "$sig_file" ]; then
+              new_sig="$(dirname "$sig_file")/Harmony_${arch}.app.tar.gz.sig"
+              mv -vf "$sig_file" "$new_sig"
+            fi
+          done
+
+      - name: Stage release files (per-platform subdirs preserved)
+        run: |
+          set -euo pipefail
+          mkdir -p release-files
+          # Now safe to flatten — every basename is unique post-rename.
+          # ZEB-328 PR #160 R1 (Qodo): cp -f to avoid any interactive
+          # prompt in a non-interactive workflow.
+          find artifacts/ -type f \( -name "*.dmg" -o -name "*.msi" -o -name "*.AppImage" -o -name "*.tar.gz" -o -name "*.sig" -o -name "*.zip" \) -exec cp -f {} release-files/ \;
+          ls -la release-files/
+
+      # ZEB-328 PR #160 R1 (Qodo MED): fail loudly if any expected
+      # platform's updater bundle didn't make it through the build.
+      # Catches matrix-job silent failures (one OS green-passes but
+      # produces no bundle due to bundler misconfig) BEFORE we ship a
+      # broken release.
+      - name: Verify all platform bundles present
+        run: |
+          set -euo pipefail
+          required=(
+            "Harmony_aarch64-apple-darwin.app.tar.gz"
+            "Harmony_aarch64-apple-darwin.app.tar.gz.sig"
+            "Harmony_x86_64-apple-darwin.app.tar.gz"
+            "Harmony_x86_64-apple-darwin.app.tar.gz.sig"
+          )
+          missing=()
+          for f in "${required[@]}"; do
+            if [ ! -f "release-files/$f" ]; then
+              missing+=("$f")
+            fi
+          done
+          # Windows + Linux updater bundle basenames vary by version, glob-check them:
+          for glob in '*-setup.nsis.zip' '*-setup.nsis.zip.sig' '*amd64.AppImage.tar.gz' '*amd64.AppImage.tar.gz.sig'; do
+            if ! ls release-files/$glob >/dev/null 2>&1; then
+              missing+=("$glob")
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing expected release artifacts:"
+            printf '  - %s\n' "${missing[@]}"
+            exit 1
+          fi
+          echo "All expected platform bundles present."
+
+      - name: Create draft GitHub Release (operator publishes after smoke test)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # ZEB-328 PR #160 R2 (CodeRabbit MAJOR): pass via env var, not
+          # raw `${{ inputs.version }}` interpolation in the shell line.
+          # Precheck already validates SemVer-strict; this is defense in
+          # depth — env vars are not re-interpreted as shell tokens.
+          VERSION: ${{ inputs.version }}
+        run: |
+          gh release create "v${VERSION}" \
+            --title "v${VERSION}" \
+            --generate-notes \
+            --draft \
+            release-files/*
+
+      # ZEB-328 PR #160 R1 (Cursor MED): the workflow stops at "draft
+      # release created". Operator (zeblith) is responsible for the
+      # manual smoke test on each platform per docs/release-process.md
+      # §3 BEFORE running the manifest update + un-draft commands
+      # documented in docs/release-process.md §2. Auto-publishing
+      # before smoke-test risks shipping a broken auto-update path to
+      # all installed clients within the ~30s GitHub-Pages refresh.

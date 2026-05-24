@@ -53,6 +53,11 @@
   import { getThreadMeta } from './lib/feed-utils';
   import { findNode, findNearestFolder } from './lib/nav-utils';
   import { isTauri } from './lib/tauri-env';
+  import { onMount } from 'svelte';
+  import type { Update } from '@tauri-apps/plugin-updater';
+  import { checkForUpdate } from './lib/updater-adapter';
+  import { extractHarmonyInviteUrl } from './lib/deep-link-router';
+  import UpdateAvailableToast from './lib/components/UpdateAvailableToast.svelte';
 
   let innerWidth = $state(window.innerWidth);
   let collapsed = $derived(innerWidth <= 768);
@@ -221,6 +226,9 @@
   // id. The dialog `pending`/`error` state stays in App.svelte rather
   // than the dialog component so a re-open after an error gets a fresh
   // state without remounting (and so multiple dialogs can be cycled).
+  // ── ZEB-328: in-app update notification ────────────────────────────
+  let availableUpdate = $state<Update | null>(null);
+
   let showCreateCommunity = $state(false);
   let showRedeemInvite = $state(false);
   let createPending = $state(false);
@@ -773,6 +781,73 @@
       console.warn('[harmony-client] Tauri init failed:', err);
     }
   })();
+
+  // ── ZEB-328: startup update check + deep-link routing ─────────────
+  // PR #160 R1: matches the rest of App.svelte's pattern — isTauri()
+  // guard up front + dynamic imports of Tauri APIs only inside the
+  // guarded block. Static imports of @tauri-apps/* were tree-shaken
+  // into the dev bundle and would either throw or no-op outside
+  // Tauri; the dynamic-import shape sidesteps both.
+  //
+  // Ordering matters: subscribe to `deep-link-received` BEFORE any
+  // awaits that could span the gap where the OS hands us a URL.
+  // The earlier ordering put `checkForUpdate()` first, leaving a
+  // ~few-hundred-ms window where a warm-app deep-link could be
+  // missed (cold-launch was covered by getCurrent(); warm wasn't).
+  onMount(async () => {
+    if (!isTauri()) {
+      return;   // Web/dev mode: skip Tauri-plugin work entirely
+    }
+    let unlistenDeepLink: (() => void) | undefined;
+    try {
+      const { listen } = await import('@tauri-apps/api/event');
+      const { getCurrent: getCurrentDeepLink } = await import('@tauri-apps/plugin-deep-link');
+
+      // (1) Subscribe FIRST so warm-launch handoffs aren't dropped
+      // during the subsequent awaits.
+      unlistenDeepLink = await listen<string[]>('deep-link-received', (event) => {
+        const url = extractHarmonyInviteUrl(event.payload);
+        if (url) {
+          redeemUrl = url;
+          redeemError = null;
+          showRedeemInvite = true;
+        }
+      });
+
+      // (2) Drain URLs queued by the deep-link plugin from before the
+      // listener was registered (cold-launch path: OS launches the
+      // app with a harmony:// URL → plugin queues it → first
+      // getCurrent() returns it).
+      try {
+        const queued = await getCurrentDeepLink();
+        if (queued) {
+          const url = extractHarmonyInviteUrl(queued);
+          if (url) {
+            redeemUrl = url;
+            redeemError = null;
+            showRedeemInvite = true;
+          }
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.warn(`[harmony-client] deep-link getCurrent() failed: ${msg}`);
+      }
+
+      // (3) Updater check LAST. `checkForUpdate()` is self-protecting
+      // (try/catch internal, returns null on failure) but doing it
+      // after the listener registration means a slow updater
+      // endpoint can never cause us to drop a deep-link.
+      availableUpdate = await checkForUpdate();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn(`[harmony-client] ZEB-328 startup setup failed: ${msg}`);
+    }
+
+    return () => {
+      unlistenDeepLink?.();
+    };
+  });
+
   let flashcardStats = $state(initialSessionStats());
   let trustVersion = $state(0);
 
@@ -1869,6 +1944,16 @@
       />
     </div>
   </div>
+{/if}
+
+{#if availableUpdate}
+  <!-- ZEB-328: update notification toast. Non-blocking; shown after startup
+       check. Dismissed via Later (session-only) or Skip (persisted to
+       localStorage so the same version is suppressed on next launch). -->
+  <UpdateAvailableToast
+    update={availableUpdate}
+    onDismiss={() => (availableUpdate = null)}
+  />
 {/if}
 
 
