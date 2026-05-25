@@ -10,6 +10,8 @@
    * Uses the existing extractHarmonyInviteUrl validator from
    * deep-link-router so we don't drift from the canonical URL shape.
    */
+  import { onMount } from 'svelte';
+  import { getVersion } from '@tauri-apps/api/app';
   import { extractHarmonyInviteUrl } from '../deep-link-router';
 
   interface Props {
@@ -19,8 +21,17 @@
   }
   const { open, onDismiss, onJoinWithInvite }: Props = $props();
 
+  let appVersion = $state<string>('unknown');
   let inviteUrl = $state('');
   let inviteError = $state<string | null>(null);
+
+  onMount(async () => {
+    try {
+      appVersion = await getVersion();
+    } catch {
+      // Outside Tauri (dev/browser) — leave as 'unknown'.
+    }
+  });
 
   function handleJoin() {
     const trimmed = inviteUrl.trim();
@@ -66,6 +77,7 @@
       class="modal-content"
       data-testid="welcome-modal"
       role="dialog"
+      aria-modal="true"
       aria-labelledby="welcome-title"
     >
       <h2 id="welcome-title">Welcome to Harmony alpha</h2>
@@ -111,6 +123,7 @@
       </div>
 
       <footer>
+        <span class="version" data-testid="welcome-version">v{appVersion}</span>
         <a
           data-testid="welcome-feedback-link"
           href="https://github.com/zeblithic/harmony-client/blob/main/docs/feedback.md"
@@ -198,6 +211,13 @@
   footer {
     margin-top: 1rem;
     font-size: 0.85rem;
+  }
+  .version {
+    display: inline-block;
+    margin-right: 1rem;
+    font-size: 0.85rem;
+    color: var(--text-secondary, #aaa);
+    opacity: 0.7;
   }
   footer a {
     color: var(--accent, #5865f2);
