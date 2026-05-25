@@ -191,10 +191,25 @@ impl IrohEndpoint {
 /// Load a persisted iroh `SecretKey` from the OS keychain, or generate
 /// and persist a fresh one on first run.
 ///
+/// Returns `(secret_key, freshly_created)` so callers can know whether a
+/// new identity was just minted (true) or an existing entry was loaded
+/// (false). The `freshly_created` flag drives the first-run welcome
+/// modal in `start_node` (ZEB-331).
+///
 /// On keychain read failure we surface [`IrohEndpointError::Keychain`]
 /// rather than silently re-generating — losing the secret key changes
 /// our [`EndpointId`], breaking any peer that knew us by the old id.
-pub fn load_or_create_secret_key() -> Result<SecretKey, IrohEndpointError> {
+///
+/// # Freshness testing note
+///
+/// The freshness behavior is unit-tested only at the serialization
+/// boundary (`StartNodeResponse`). The keychain branch — that the
+/// `Err(keyring::Error::NoEntry)` arm produces `freshly_created=true` and
+/// the `Ok(bytes)` arm produces `freshly_created=false` — is verified by
+/// the Task 10 manual smoke checklist (deleting the keychain entry and
+/// confirming the welcome modal fires) until a mock-keyring abstraction
+/// is introduced.
+pub fn load_or_create_secret_key() -> Result<(SecretKey, bool), IrohEndpointError> {
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER).map_err(|e| {
         IrohEndpointError::Keychain {
             context: format!("entry creation {KEYCHAIN_SERVICE}/{KEYCHAIN_USER}"),
@@ -211,7 +226,7 @@ pub fn load_or_create_secret_key() -> Result<SecretKey, IrohEndpointError> {
             }
             let mut arr: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
             arr.copy_from_slice(&bytes);
-            Ok(SecretKey::from_bytes(&arr))
+            Ok((SecretKey::from_bytes(&arr), false))
         }
         Err(keyring::Error::NoEntry) => {
             let key = SecretKey::generate();
@@ -224,7 +239,7 @@ pub fn load_or_create_secret_key() -> Result<SecretKey, IrohEndpointError> {
                     context: format!("keychain write {KEYCHAIN_SERVICE}/{KEYCHAIN_USER}"),
                     source: e,
                 })?;
-            Ok(key)
+            Ok((key, true))
         }
         Err(e) => Err(IrohEndpointError::Keychain {
             context: format!("keychain read {KEYCHAIN_SERVICE}/{KEYCHAIN_USER}"),

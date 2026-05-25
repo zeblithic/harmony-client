@@ -994,6 +994,19 @@ pub struct ZenohStatus {
     pub error: Option<String>,
 }
 
+/// Response from `start_node` IPC. Frontend reads `freshly_created` to
+/// decide whether to show the first-run welcome modal (ZEB-331).
+///
+/// Forward-compat: callers MUST treat a missing `freshlyCreated` field as
+/// `false`, so an older backend mid-deploy never spuriously re-fires the
+/// welcome modal for returning users.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartNodeResponse {
+    pub node_addr: String,
+    pub freshly_created: bool,
+}
+
 /// Profile published to/received from the network.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1666,7 +1679,7 @@ async fn start_node(
     endpoint: Option<String>,
     app: AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
-) -> Result<(), String> {
+) -> Result<StartNodeResponse, String> {
     // ── Atomic stop→identity→config→spawn→store ─────────────────────
     // Everything from stop through handle registration runs under the
     // lock (with a brief drop for the blocking thread join). This
@@ -2371,10 +2384,16 @@ async fn start_node(
         // can abort it on stop_node, preventing detached loops from
         // outliving the node across restart cycles.
         let mut iroh_accept_handle: Option<tokio::task::JoinHandle<()>> = None;
+        // ZEB-331: freshly_created is true when load_or_create_secret_key
+        // mints a new iroh identity (Err(keyring::Error::NoEntry) branch).
+        // Defaults to false so the welcome modal does not fire on keychain
+        // read failure or when the iroh endpoint is disabled.
+        let mut freshly_created = false;
         {
             reachability_resolver = crate::reachability_resolver::ReachabilityResolver::new();
             match crate::iroh_endpoint::load_or_create_secret_key() {
-                Ok(secret) => {
+                Ok((secret, fc)) => {
+                    freshly_created = fc;
                     match crate::iroh_endpoint::IrohEndpoint::new_with_secret(secret).await {
                         Ok(ep) => {
                             let ep_arc = std::sync::Arc::new(ep);
@@ -4242,6 +4261,10 @@ async fn start_node(
             };
 
         let node_addr_for_state = node_addr.clone();
+        // ZEB-331: second clone for the StartNodeResponse returned to the
+        // frontend — node_addr moves into NodeConfig and node_addr_for_state
+        // moves into guard.node_addr, so we carry this out via the tuple.
+        let node_addr_for_response = node_addr.clone();
         let config = NodeConfig {
             storage_budget: StorageBudget {
                 cache_capacity: 512,
@@ -4873,6 +4896,8 @@ async fn start_node(
           // own clone of each.
           // Mint engine is also carried out so the failure-cleanup path can
           // call engine.shutdown() if thread spawn fails (CURSOR MEDIUM fix).
+          // ZEB-331: node_addr_for_response + freshly_created carried out here
+          // so they're accessible at StartNodeResponse construction after block.
         (
             current_generation,
             thread_install_failure,
@@ -4887,6 +4912,8 @@ async fn start_node(
             // shutdown can run before this start_node attempt errors out.
             dfrost_log_registry_arc.clone(),
             mint_sync_engine_opt,
+            node_addr_for_response,
+            freshly_created,
         )
     };
     let (
@@ -4900,6 +4927,8 @@ async fn start_node(
         profile_broadcast_publisher_for_cleanup,
         dfrost_log_registry_for_cleanup,
         mint_engine_for_cleanup,
+        node_addr_for_response,
+        freshly_created,
     ) = our_gen;
 
     // ZEB-221 + thread-spawn-failure cleanup + lock-poison cleanup: all
@@ -5231,7 +5260,10 @@ async fn start_node(
                     error: None,
                 },
             );
-            Ok(())
+            Ok(StartNodeResponse {
+                node_addr: node_addr_for_response,
+                freshly_created,
+            })
         }
         Ok(Err(e)) => Err(e),
         Err(_) => Err("runtime thread exited before reporting startup status".to_string()),
@@ -31109,6 +31141,8 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_os::init())
+        .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             // ZEB-328: deep-link handler — forward harmony:// URLs to the frontend.
             // Frontend's deep-link listener (Task 6) opens RedeemInviteDialog
@@ -36549,5 +36583,39 @@ mod zeb_321_connectivity_ipc_tests {
         );
         assert_eq!(entry.record.home_relay_url, "https://relay.example/");
         assert_eq!(entry.record.announced_at_ms, 1_700_000_000_000);
+    }
+}
+
+#[cfg(test)]
+mod start_node_response_tests {
+    use super::*;
+
+    #[test]
+    fn start_node_response_serializes_to_camel_case() {
+        let r = StartNodeResponse {
+            node_addr: "iroh:abc123".to_string(),
+            freshly_created: true,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            json.contains("\"freshlyCreated\":true"),
+            "expected camelCase freshlyCreated in {json}",
+        );
+        assert!(
+            json.contains("\"nodeAddr\":\"iroh:abc123\""),
+            "expected camelCase nodeAddr in {json}",
+        );
+        assert!(!json.contains("freshly_created"));
+        assert!(!json.contains("node_addr"));
+    }
+
+    #[test]
+    fn start_node_response_freshly_created_false_serializes() {
+        let r = StartNodeResponse {
+            node_addr: "iroh:xyz".to_string(),
+            freshly_created: false,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"freshlyCreated\":false"));
     }
 }

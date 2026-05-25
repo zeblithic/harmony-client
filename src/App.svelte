@@ -59,6 +59,10 @@
   import { checkForUpdate } from './lib/updater-adapter';
   import { extractHarmonyInviteUrl } from './lib/deep-link-router';
   import UpdateAvailableToast from './lib/components/UpdateAvailableToast.svelte';
+  import WelcomeModal from './lib/components/WelcomeModal.svelte';
+  import HelpMenuButton from './lib/components/HelpMenuButton.svelte';
+  import FeedbackModal from './lib/components/FeedbackModal.svelte';
+  import AboutModal from './lib/components/AboutModal.svelte';
 
   let innerWidth = $state(window.innerWidth);
   let collapsed = $derived(innerWidth <= 768);
@@ -229,6 +233,26 @@
   // state without remounting (and so multiple dialogs can be cycled).
   // ── ZEB-328: in-app update notification ────────────────────────────
   let availableUpdate = $state<Update | null>(null);
+  // ── ZEB-331: first-run welcome + feedback + about ─────────────────
+  let showWelcomeModal = $state(false);
+  let feedbackModalOpen = $state(false);
+  let aboutModalOpen = $state(false);
+
+  // ZEB-331 R3: persist welcome acknowledgement to localStorage so a
+  // failed start_node mid-keychain-write doesn't permanently swallow
+  // the welcome. Called from every site that completes onboarding:
+  // Dismiss, Join-with-invite, and deep-link-suppresses-welcome
+  // (Cursor R5 "deep-link skips welcome ack" — joining via harmony://
+  // is itself an onboarding-complete action). Safe to call when the
+  // flag is already set.
+  function acknowledgeWelcome(): void {
+    try {
+      window.localStorage.setItem('harmony.onboarding.welcomeAcknowledged', 'true');
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.debug('[harmony-client] welcomeAcknowledged write failed:', msg);
+    }
+  }
 
   let showCreateCommunity = $state(false);
   let showRedeemInvite = $state(false);
@@ -669,6 +693,38 @@
       } catch (err) {
         console.warn('[harmony-client] auto-start_node failed:', err);
       }
+      // ZEB-331 R3 (Cursor Medium "welcome lost after failed start"):
+      // gate welcome on a persistent localStorage flag rather than on
+      // the in-memory freshlyCreated signal from start_node. The IPC
+      // returns freshlyCreated for forward-compat / future analytics
+      // but it isn't load-bearing for welcome anymore — start_node
+      // has ~2900 lines of post-keychain-write setup, and any failure
+      // path there would have lost the in-memory signal and prevented
+      // the welcome from ever appearing on subsequent successful
+      // starts. localStorage decouples "welcome owed to user" from
+      // start_node lifecycle so a failed first start retries on next
+      // launch.
+      //
+      // Race resolution (Flow 5 cont.): a deep-link can arrive during
+      // start_node. The deep-link handler sets showRedeemInvite=true +
+      // showWelcomeModal=false. Don't flash welcome over the redeem
+      // dialog.
+      try {
+        const acked =
+          window.localStorage.getItem('harmony.onboarding.welcomeAcknowledged');
+        if (acked !== 'true' && !showRedeemInvite) {
+          showWelcomeModal = true;
+        }
+      } catch (e) {
+        // localStorage unavailable (incognito / sandbox / quota): show
+        // welcome — safer to greet than to silently skip a possibly-new
+        // user. The next dismiss will try the write again.
+        const msg = e instanceof Error ? e.message : String(e);
+        console.debug('[harmony-client] welcomeAcknowledged read failed:', msg);
+        if (!showRedeemInvite) {
+          showWelcomeModal = true;
+        }
+      }
 
       // ZEB-281 Sub-D Phase 4 R1: hydrate the per-community
       // shared_in_profile mirror from the backend so the toggle in
@@ -812,6 +868,8 @@
           redeemUrl = url;
           redeemError = null;
           showRedeemInvite = true;
+          showWelcomeModal = false;
+          acknowledgeWelcome(); // joining via deep-link is onboarding-complete
         }
       });
 
@@ -827,6 +885,8 @@
             redeemUrl = url;
             redeemError = null;
             showRedeemInvite = true;
+            showWelcomeModal = false;
+            acknowledgeWelcome(); // cold-launch invite = onboarding-complete
           }
         }
       } catch (e) {
@@ -1960,6 +2020,55 @@
   />
 {/if}
 
+<!-- ZEB-331: first-run welcome modal. Shown until the user
+     acknowledges (Skip / Join / Esc / backdrop) — persisted via
+     localStorage so a failed start_node mid-keychain-write doesn't
+     permanently swallow the welcome (R3 Cursor Medium). Suppressed
+     by deep-link handlers (Flow 5 — both warm-launch and cold-
+     launch paths set showWelcomeModal=false when a harmony:// URL
+     is received). -->
+<WelcomeModal
+  open={showWelcomeModal}
+  onDismiss={() => {
+    showWelcomeModal = false;
+    acknowledgeWelcome();
+  }}
+  onJoinWithInvite={(url) => {
+    redeemUrl = url;
+    redeemError = null;
+    showRedeemInvite = true;
+    showWelcomeModal = false;
+    acknowledgeWelcome();
+  }}
+/>
+
+<!-- ZEB-331: fixed-position help button overlay. Position top-right. -->
+<div class="help-overlay">
+  <HelpMenuButton
+    onSubmitFeedback={() => (feedbackModalOpen = true)}
+    onShowAbout={() => (aboutModalOpen = true)}
+    onOpenNetworkHealth={() => switchMode('network')}
+    onOpenDocs={async () => {
+      try {
+        const { open: shellOpen } = await import('@tauri-apps/plugin-shell');
+        await shellOpen('https://github.com/zeblithic/harmony-client/blob/main/README.md');
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.warn('[zeb-331] failed to open docs:', msg);
+      }
+    }}
+  />
+</div>
+
+<FeedbackModal
+  open={feedbackModalOpen}
+  onDismiss={() => (feedbackModalOpen = false)}
+/>
+
+<AboutModal
+  open={aboutModalOpen}
+  onDismiss={() => (aboutModalOpen = false)}
+/>
 
 <style>
   :global(.text-message) {
@@ -2049,6 +2158,16 @@
     white-space: normal;
     overflow-wrap: anywhere;
     max-width: calc(100% - 40px);
+  }
+
+  /* ZEB-331: HelpMenuButton fixed-position overlay. Below modal z-index
+     (1000) so modals always layer above the (?) icon; above general
+     content so it's always reachable. */
+  .help-overlay {
+    position: fixed;
+    top: 12px;
+    right: 12px;
+    z-index: 50;
   }
 
 </style>
