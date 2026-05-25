@@ -53,7 +53,7 @@ Sub-C is **pure-frontend UX scaffolding** wrapping existing IPCs, plus one tiny 
 
 | Path | Change |
 |---|---|
-| `src/App.svelte` | Boot sequence reads `freshlyCreated` from `start_node`; mounts `WelcomeModal` when true; wires `HelpMenuButton` callbacks |
+| `src/App.svelte` | Boot sequence calls `start_node`; mounts `WelcomeModal` when `localStorage['harmony.onboarding.welcomeAcknowledged']` !== `'true'` (R3 — see §3.6); wires `HelpMenuButton` callbacks |
 | `src/lib/components/Layout.svelte` | Mounts `HelpMenuButton` in top-right chrome alongside existing controls |
 | `src-tauri/src/lib.rs` | `start_node` IPC returns `{ node_addr: String, freshly_created: bool }` instead of bare success |
 
@@ -312,32 +312,38 @@ pub async fn start_node(
 
 ## 5. Data flow
 
-### 5.1 Flow 1: First-run boot (fresh identity)
+### 5.1 Flow 1: First-run boot (welcome owed to user)
+
+R3 update: welcome trigger is gated on `localStorage['harmony.onboarding.welcomeAcknowledged']`, not on `start_node`'s `freshlyCreated` (see §3.6 for rationale — start_node has many post-keychain-write failure paths that would lose the in-memory signal).
 
 ```
 App.svelte Tauri-init IIFE
-  └─ const { nodeAddr, freshlyCreated } = await invoke('start_node', { endpoint: null })
-       → { nodeAddr: "iroh:abc…", freshlyCreated: true }
-  └─ if (freshlyCreated) showWelcomeModal = true
+  └─ await invoke('start_node', { endpoint: null })  // success or failure both proceed
   └─ existing service wiring continues (messageService, mailService, navService, ...)
+  └─ welcomeAcknowledged = localStorage.getItem('harmony.onboarding.welcomeAcknowledged')
+  └─ if (welcomeAcknowledged !== 'true' && !showRedeemInvite) showWelcomeModal = true
   └─ WelcomeModal renders over normal UI
        User either:
          (a) pastes harmony:// invite → "Join now" → onJoinWithInvite(url)
               → App.svelte: redeemUrl = url; redeemError = null;
-                            showRedeemInvite = true; showWelcomeModal = false
+                            showRedeemInvite = true; showWelcomeModal = false;
+                            localStorage.welcomeAcknowledged = 'true'
               → existing RedeemInviteDialog flow (Phase 2c handshake)
-         (b) "Skip for now" / Esc / backdrop → onDismiss() → showWelcomeModal = false
+         (b) "Skip for now" / Esc / backdrop → onDismiss()
+              → showWelcomeModal = false;
+                localStorage.welcomeAcknowledged = 'true'
               → user lands in empty app; ambient guidance takes over
 ```
 
-### 5.2 Flow 2: Returning-user boot (existing keychain identity)
+### 5.2 Flow 2: Returning-user boot (welcome previously acknowledged)
 
 ```
-start_node → { nodeAddr, freshlyCreated: false }
-  └─ showWelcomeModal stays false → silent boot, app renders normally
+await invoke('start_node', { endpoint: null })
+  └─ welcomeAcknowledged = localStorage.getItem('harmony.onboarding.welcomeAcknowledged')
+  └─ welcomeAcknowledged === 'true' → showWelcomeModal stays false → silent boot
 ```
 
-This is the post-reinstall path. Keychain portability invariant means the identity persists across reinstalls on the same OS user; we don't pester returning users.
+This is the post-acknowledgement path. The user has previously dismissed or joined a community via the welcome; we don't pester returning users.
 
 ### 5.3 Flow 3: Submit Feedback (no diagnostics)
 
@@ -439,7 +445,7 @@ R3 update: welcome trigger now depends on localStorage, not on `start_node`'s `f
 | `start_node` returned Err (post-keychain-write failure), `welcomeAcknowledged !== 'true'` | Welcome modal still fires — localStorage-gated trigger is resilient to mid-`start_node` failures |
 | Any `start_node` outcome, `showRedeemInvite === true` (deep-link won) | Welcome modal stays closed (Flow 5) — deep-link wins the race |
 | localStorage unavailable (sandbox / quota / incognito) | Default to showing welcome — safer to greet than to silently skip a possibly-new user |
-| `start_node` rejects | Existing handler logs `auto-start_node failed`; welcome modal stays closed. Boot-degraded behavior is pre-existing; Sub-C doesn't change this path |
+| `start_node` rejects | Existing handler logs `auto-start_node failed`; the welcome modal trigger still consults `welcomeAcknowledged` (covered by row above) — welcome can still fire on a failed start so the user isn't permanently denied the welcome by a mid-bring-up error. Boot-degraded service behavior is pre-existing; Sub-C doesn't change the service-init recovery path |
 
 ### 6.4 HelpMenuButton dropdown
 
