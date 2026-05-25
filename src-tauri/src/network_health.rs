@@ -536,11 +536,15 @@ pub fn format_export_markdown(
         snapshot.pkarr_status.community_publish_count
     );
     for hit in &snapshot.pkarr_status.recent_fallback_events {
+        // Defense-in-depth: route through `r()` even though the field
+        // names imply upstream pre-redaction. A future bug populating
+        // these with full hex must not slip past the [0-9a-f]{32,}
+        // regex guard exercised by the redaction tests.
         let _ = writeln!(
             out,
             "fallback {} in {} -> {}",
-            hit.peer_addr_short,
-            hit.community_id_short,
+            r(&hit.peer_addr_short),
+            r(&hit.community_id_short),
             if hit.hit { "hit" } else { "miss" }
         );
     }
@@ -1430,6 +1434,29 @@ mod tests {
                 md
             );
         }
+    }
+
+    #[test]
+    fn format_export_redacted_handles_full_hex_in_pkarr_fallback_fields() {
+        // Greptile PR #161 R2 P1: defense-in-depth — if a future bug
+        // populates pkarr fallback short-fields with full hex strings,
+        // the format_export_markdown redactor must still strip them.
+        let mut snap = fixture_snapshot_with_full_ids();
+        snap.pkarr_status
+            .recent_fallback_events
+            .push(PkarrFallbackHit {
+                peer_addr_short: "deadbeef".repeat(4),    // 32 chars hex
+                community_id_short: "cafef00d".repeat(4), // 32 chars hex
+                hit: true,
+                captured_at_ms: 1_700_000_000_000,
+            });
+        let md = format_export_markdown(&snap, None, false);
+        let re = regex::Regex::new(r"[0-9a-f]{32,}").unwrap();
+        assert!(
+            re.find(&md).is_none(),
+            "redacted export leaked full hex from pkarr fallback fields: {}",
+            md
+        );
     }
 
     #[test]

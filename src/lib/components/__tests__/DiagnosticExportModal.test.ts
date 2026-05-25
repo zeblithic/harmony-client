@@ -66,7 +66,10 @@ describe('DiagnosticExportModal', () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.assign(navigator, { clipboard: { writeText } });
     render(DiagnosticExportModal, { onClose: () => {} });
-    await waitFor(() => screen.getByTestId('export-copy'));
+    // Wait for the initial export payload to resolve — Copy is
+    // disabled while loading (PR #161 R2 P2 fix) so we must wait
+    // for the preview to render before clicking.
+    await waitFor(() => screen.getByTestId('export-preview'));
     await fireEvent.click(screen.getByTestId('export-copy'));
     await waitFor(() => expect(writeText).toHaveBeenCalledWith(REDACTED_FIXTURE));
   });
@@ -76,7 +79,8 @@ describe('DiagnosticExportModal', () => {
     (saveDialog as ReturnType<typeof vi.fn>).mockResolvedValue('/tmp/x.txt');
     (writeTextFile as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     render(DiagnosticExportModal, { onClose: () => {} });
-    await waitFor(() => screen.getByTestId('export-save'));
+    // Wait for load complete — Save is disabled while loading.
+    await waitFor(() => screen.getByTestId('export-preview'));
     await fireEvent.click(screen.getByTestId('export-save'));
     await waitFor(() =>
       expect(writeTextFile).toHaveBeenCalledWith('/tmp/x.txt', REDACTED_FIXTURE),

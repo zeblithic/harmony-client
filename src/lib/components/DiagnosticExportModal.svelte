@@ -102,8 +102,8 @@
       Include full identifiers (default off)
     </label>
     <div class="actions">
-      <button onclick={copy} data-testid="export-copy">Copy</button>
-      <button onclick={saveToFile} data-testid="export-save">Save as .txt</button>
+      <button onclick={copy} disabled={loading} data-testid="export-copy">Copy</button>
+      <button onclick={saveToFile} disabled={loading} data-testid="export-save">Save as .txt</button>
       <button onclick={onClose} data-testid="export-cancel">Cancel</button>
     </div>
     {#if copiedToast}
