@@ -396,6 +396,18 @@ impl NetworkHealthService {
     pub async fn cached_last_self_test(&self) -> Option<SelfTestReport> {
         self.last_self_test.read().await.clone()
     }
+
+    /// ZEB-329 Phase 1 helper: cache a report into `last_self_test`
+    /// from outside the module (used by the Phase-1 synthetic IPC stub
+    /// in lib.rs). Production `run_self_test` already writes to
+    /// `last_self_test` internally — this is only for the Phase-1
+    /// stub where the IPC bypasses `run_self_test` entirely.
+    ///
+    /// TODO(zeb-329-followup): remove this method once Task 7's IPC
+    /// synthetic path is replaced with the real `run_self_test` call.
+    pub async fn cache_synthetic_self_test(&self, report: SelfTestReport) {
+        *self.last_self_test.write().await = Some(report);
+    }
 }
 
 /// Spec §5.4: server-side redaction is the only path that emits

@@ -30970,35 +30970,30 @@ async fn network_health_snapshot(
     Ok(snap)
 }
 
-/// Spec §5.3 + §6.1: run the self-test.
+/// Spec §5.3 + §6.1. Returns Err only on truly exceptional cases
+/// (AppState lock poisoned). Step failures live inside the report.
 ///
-/// **Phase 1 stub:** returns an all-`Skipped` synthetic report so the
-/// frontend renders without an error toast. The production self-test
-/// trait wiring (`IrohSelfTest`, `PkarrSelfTest`, `PingDispatcher`
-/// production impls + per-peer ping fan-out) is deferred to a
-/// follow-up — see TODO inside the function body.
+/// Phase 1: returns a synthetic all-Skipped report because production
+/// self-test traits (IrohSelfTest, PkarrSelfTest, PingDispatcher) are
+/// not yet wired into NetworkHealthService boot. When the service is
+/// Some, we ALSO write the synthetic into `last_self_test` so the
+/// export IPC shows it — matches the user's mental model that
+/// "running the test populates what export shows".
 ///
-/// Returns `Err` only when the service hasn't been wired yet
-/// (`network_health == None`); step failures live inside the report
-/// per spec §6.2 (Pass / Fail / Skipped), not as command-level errors.
+/// TODO(zeb-329-followup): replace the synthetic path with
+/// `svc.run_self_test(prod_iroh_test, prod_pkarr_test, prod_dispatcher).await`
+/// once the production trait wiring lands.
 #[tauri::command(rename_all = "snake_case")]
 async fn network_health_run_self_test(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<crate::network_health::SelfTestReport, String> {
     let svc = {
-        let g = state
+        state
             .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        g.network_health.clone()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?
+            .network_health
+            .clone()
     };
-    let Some(_svc) = svc else {
-        return Err("network_health service not yet initialized".into());
-    };
-    // TODO(zeb-329-followup): wire production IrohSelfTest /
-    // PkarrSelfTest / PingDispatcher impls and replace this synthetic
-    // report with `_svc.run_self_test(iroh_test, pkarr_test, ping,
-    // peers).await`. Until then we emit an all-Skipped report so the
-    // UI does not break on missing trait impls (spec §6.1).
     let now = crate::network_health::__now_ms_for_ipc();
     let synthetic = crate::network_health::SelfTestReport {
         started_at_ms: now,
@@ -31007,30 +31002,37 @@ async fn network_health_run_self_test(
             crate::network_health::SelfTestStep {
                 name: "endpoint".into(),
                 outcome: crate::network_health::StepOutcome::Skipped {
-                    reason: "production self-test traits not yet wired (zeb-329 follow-up)".into(),
+                    reason: "production self-test traits not yet wired".into(),
                 },
             },
             crate::network_health::SelfTestStep {
                 name: "relay".into(),
                 outcome: crate::network_health::StepOutcome::Skipped {
-                    reason: "production self-test traits not yet wired (zeb-329 follow-up)".into(),
+                    reason: "production self-test traits not yet wired".into(),
                 },
             },
             crate::network_health::SelfTestStep {
                 name: "pkarr_publish".into(),
                 outcome: crate::network_health::StepOutcome::Skipped {
-                    reason: "production self-test traits not yet wired (zeb-329 follow-up)".into(),
+                    reason: "production self-test traits not yet wired".into(),
                 },
             },
             crate::network_health::SelfTestStep {
                 name: "pkarr_resolve".into(),
                 outcome: crate::network_health::StepOutcome::Skipped {
-                    reason: "production self-test traits not yet wired (zeb-329 follow-up)".into(),
+                    reason: "production self-test traits not yet wired".into(),
                 },
             },
         ],
         peer_results: vec![],
     };
+    // Cache the synthetic so the export IPC includes it — matches the
+    // user's mental model that running the test populates what they
+    // see in export. Safe because the synthetic is deterministic +
+    // structurally indistinguishable from a real all-Skipped result.
+    if let Some(svc) = svc.as_ref() {
+        svc.cache_synthetic_self_test(synthetic.clone()).await;
+    }
     Ok(synthetic)
 }
 
