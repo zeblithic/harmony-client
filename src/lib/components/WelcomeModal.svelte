@@ -99,8 +99,9 @@
 
       <p>
         Harmony is a federated chat where communities are self-governing.
-        You're testing v0.1.0-alpha, so expect rough edges — please report
-        issues via the <strong>(?)</strong> icon in the top-right.
+        You're testing v0.1.0-alpha, so expect rough edges. Once you close
+        this window, the <strong>(?)</strong> menu in the top-right has
+        feedback, troubleshooting docs, and other resources.
       </p>
 
       <p>

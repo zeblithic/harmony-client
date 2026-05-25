@@ -385,8 +385,12 @@ User toggles "Attach network diagnostics" ON
 
 ```
 Deep-link plugin delivers harmony:// URL (cold or warm launch)
-  → existing handler at App.svelte:809 sets redeemUrl + showRedeemInvite = true
+  → existing handler at App.svelte:849 sets redeemUrl + showRedeemInvite = true
   → ALSO sets showWelcomeModal = false  // deep-link wins; reduce modal stacking
+  → ALSO sets localStorage.welcomeAcknowledged = 'true'  (R5)
+       deep-link arrival is itself an onboarding-complete action; without
+       this the next launch would re-show welcome to a user who has
+       already joined a community
   → RedeemInviteDialog handles the join
   → user lands in the joined community; welcome modal skipped intentionally
 ```

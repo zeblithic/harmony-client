@@ -238,6 +238,22 @@
   let feedbackModalOpen = $state(false);
   let aboutModalOpen = $state(false);
 
+  // ZEB-331 R3: persist welcome acknowledgement to localStorage so a
+  // failed start_node mid-keychain-write doesn't permanently swallow
+  // the welcome. Called from every site that completes onboarding:
+  // Dismiss, Join-with-invite, and deep-link-suppresses-welcome
+  // (Cursor R5 "deep-link skips welcome ack" — joining via harmony://
+  // is itself an onboarding-complete action). Safe to call when the
+  // flag is already set.
+  function acknowledgeWelcome(): void {
+    try {
+      window.localStorage.setItem('harmony.onboarding.welcomeAcknowledged', 'true');
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.debug('[harmony-client] welcomeAcknowledged write failed:', msg);
+    }
+  }
+
   let showCreateCommunity = $state(false);
   let showRedeemInvite = $state(false);
   let createPending = $state(false);
@@ -853,6 +869,7 @@
           redeemError = null;
           showRedeemInvite = true;
           showWelcomeModal = false;
+          acknowledgeWelcome(); // joining via deep-link is onboarding-complete
         }
       });
 
@@ -869,6 +886,7 @@
             redeemError = null;
             showRedeemInvite = true;
             showWelcomeModal = false;
+            acknowledgeWelcome(); // cold-launch invite = onboarding-complete
           }
         }
       } catch (e) {
@@ -2013,24 +2031,14 @@
   open={showWelcomeModal}
   onDismiss={() => {
     showWelcomeModal = false;
-    try {
-      window.localStorage.setItem('harmony.onboarding.welcomeAcknowledged', 'true');
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      console.debug('[harmony-client] welcomeAcknowledged write failed:', msg);
-    }
+    acknowledgeWelcome();
   }}
   onJoinWithInvite={(url) => {
     redeemUrl = url;
     redeemError = null;
     showRedeemInvite = true;
     showWelcomeModal = false;
-    try {
-      window.localStorage.setItem('harmony.onboarding.welcomeAcknowledged', 'true');
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      console.debug('[harmony-client] welcomeAcknowledged write failed:', msg);
-    }
+    acknowledgeWelcome();
   }}
 />
 
