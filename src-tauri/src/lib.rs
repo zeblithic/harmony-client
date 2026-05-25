@@ -31109,6 +31109,8 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_os::init())
+        .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             // ZEB-328: deep-link handler — forward harmony:// URLs to the frontend.
             // Frontend's deep-link listener (Task 6) opens RedeemInviteDialog

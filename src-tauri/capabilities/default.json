@@ -8,6 +8,8 @@
     "dialog:default",
     "fs:allow-write-text-file",
     "updater:default",
-    "deep-link:default"
+    "deep-link:default",
+    "os:default",
+    "shell:allow-open"
   ]
 }
