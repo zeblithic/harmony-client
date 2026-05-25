@@ -45,7 +45,7 @@
     onOpenDocs();
   }
 
-  // Click-outside / Escape listeners — attached only while dropdown open
+  // Click-outside / Escape / Arrow / Tab listeners — attached only while dropdown open
   // to avoid pollution and to allow other (?)-like buttons to coexist.
   $effect(() => {
     if (!dropdownOpen) return;
@@ -55,7 +55,28 @@
       }
     }
     function onKey(e: KeyboardEvent) {
-      if (e.key === 'Escape') close();
+      if (e.key === 'Escape') {
+        close();
+        return;
+      }
+      if (e.key === 'Tab') {
+        close();
+        // Don't preventDefault — let Tab continue to the next focusable element naturally.
+        return;
+      }
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        const items = containerEl?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]');
+        if (!items || items.length === 0) return;
+        const currentIdx = Array.from(items).findIndex((el) => el === document.activeElement);
+        let nextIdx: number;
+        if (e.key === 'ArrowDown') {
+          nextIdx = currentIdx === -1 ? 0 : (currentIdx + 1) % items.length;
+        } else {
+          nextIdx = currentIdx === -1 ? items.length - 1 : (currentIdx - 1 + items.length) % items.length;
+        }
+        items[nextIdx]?.focus();
+      }
     }
     document.addEventListener('mousedown', onMouseDown);
     window.addEventListener('keydown', onKey);
@@ -63,6 +84,17 @@
       document.removeEventListener('mousedown', onMouseDown);
       window.removeEventListener('keydown', onKey);
     };
+  });
+
+  // Auto-focus first menu item when dropdown opens so keyboard users can
+  // navigate immediately. queueMicrotask defers until menuitem buttons exist in DOM.
+  $effect(() => {
+    if (dropdownOpen && containerEl) {
+      queueMicrotask(() => {
+        const first = containerEl?.querySelector<HTMLButtonElement>('[role="menuitem"]');
+        first?.focus();
+      });
+    }
   });
 </script>
 
@@ -74,12 +106,14 @@
     aria-label="Help and feedback"
     aria-haspopup="menu"
     aria-expanded={dropdownOpen}
+    aria-controls="help-menu-dropdown-list"
     onclick={toggleDropdown}
   >
     ?
   </button>
   {#if dropdownOpen}
     <div
+      id="help-menu-dropdown-list"
       class="help-dropdown"
       data-testid="help-menu-dropdown"
       role="menu"

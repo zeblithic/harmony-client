@@ -86,4 +86,40 @@ describe('HelpMenuButton', () => {
     expect(props.onOpenDocs).toHaveBeenCalled();
     expect(screen.queryByTestId('help-menu-dropdown')).toBeNull();
   });
+
+  it('opening dropdown focuses first menu item', async () => {
+    render(HelpMenuButton, defaultProps());
+    await fireEvent.click(screen.getByTestId('help-menu-button'));
+    // queueMicrotask schedules focus — flush via a tick
+    await new Promise((r) => setTimeout(r, 0));
+    expect(document.activeElement).toBe(screen.getByTestId('help-menu-feedback'));
+  });
+
+  it('ArrowDown cycles focus to next item', async () => {
+    render(HelpMenuButton, defaultProps());
+    await fireEvent.click(screen.getByTestId('help-menu-button'));
+    await new Promise((r) => setTimeout(r, 0));
+    // Focus starts on feedback (first item). ArrowDown → network
+    await fireEvent.keyDown(window, { key: 'ArrowDown' });
+    expect(document.activeElement).toBe(screen.getByTestId('help-menu-network'));
+    await fireEvent.keyDown(window, { key: 'ArrowDown' });
+    expect(document.activeElement).toBe(screen.getByTestId('help-menu-about'));
+  });
+
+  it('ArrowUp from first item wraps to last', async () => {
+    render(HelpMenuButton, defaultProps());
+    await fireEvent.click(screen.getByTestId('help-menu-button'));
+    await new Promise((r) => setTimeout(r, 0));
+    // Focus on first; ArrowUp wraps to last (docs)
+    await fireEvent.keyDown(window, { key: 'ArrowUp' });
+    expect(document.activeElement).toBe(screen.getByTestId('help-menu-docs'));
+  });
+
+  it('Tab closes the dropdown', async () => {
+    render(HelpMenuButton, defaultProps());
+    await fireEvent.click(screen.getByTestId('help-menu-button'));
+    expect(screen.getByTestId('help-menu-dropdown')).toBeInTheDocument();
+    await fireEvent.keyDown(window, { key: 'Tab' });
+    expect(screen.queryByTestId('help-menu-dropdown')).toBeNull();
+  });
 });
