@@ -60,6 +60,9 @@
   import { extractHarmonyInviteUrl } from './lib/deep-link-router';
   import UpdateAvailableToast from './lib/components/UpdateAvailableToast.svelte';
   import WelcomeModal from './lib/components/WelcomeModal.svelte';
+  import HelpMenuButton from './lib/components/HelpMenuButton.svelte';
+  import FeedbackModal from './lib/components/FeedbackModal.svelte';
+  import AboutModal from './lib/components/AboutModal.svelte';
   import type { StartNodeResponse } from './lib/types/onboarding';
 
   let innerWidth = $state(window.innerWidth);
@@ -1992,6 +1995,35 @@
   }}
 />
 
+<!-- ZEB-331: fixed-position help button overlay. Position top-right. -->
+<div class="help-overlay">
+  <HelpMenuButton
+    onSubmitFeedback={() => (feedbackModalOpen = true)}
+    onShowAbout={() => (aboutModalOpen = true)}
+    onOpenNetworkHealth={() => switchMode('network')}
+    onOpenDocs={async () => {
+      try {
+        const { open: shellOpen } = await import('@tauri-apps/plugin-shell');
+        await shellOpen('https://github.com/zeblithic/harmony-client/blob/main/README.md');
+      } catch (e) {
+        console.warn(
+          '[zeb-331] failed to open docs:',
+          e instanceof Error ? e.message : String(e),
+        );
+      }
+    }}
+  />
+</div>
+
+<FeedbackModal
+  open={feedbackModalOpen}
+  onDismiss={() => (feedbackModalOpen = false)}
+/>
+
+<AboutModal
+  open={aboutModalOpen}
+  onDismiss={() => (aboutModalOpen = false)}
+/>
 
 <style>
   :global(.text-message) {
@@ -2081,6 +2113,16 @@
     white-space: normal;
     overflow-wrap: anywhere;
     max-width: calc(100% - 40px);
+  }
+
+  /* ZEB-331: HelpMenuButton fixed-position overlay. Below modal z-index
+     (1000) so modals always layer above the (?) icon; above general
+     content so it's always reachable. */
+  .help-overlay {
+    position: fixed;
+    top: 12px;
+    right: 12px;
+    z-index: 50;
   }
 
 </style>
