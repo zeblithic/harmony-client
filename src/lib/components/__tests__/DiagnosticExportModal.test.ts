@@ -88,6 +88,30 @@ describe('DiagnosticExportModal', () => {
     expect(saveDialog).toHaveBeenCalled();
   });
 
+  it('Copy and Save are disabled after a failed re-fetch even though loading is false', async () => {
+    // PR #161 R3 (CodeRabbit Major): privacy regression guard.
+    // Initial load succeeds (markdown holds redacted content), user
+    // toggles includeFullIds → re-fetch rejects → loading flips back
+    // to false. Copy/Save must remain disabled — otherwise they would
+    // leak the OLD markdown despite the new toggle state.
+    (invoke as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce(REDACTED_FIXTURE) // initial load
+      .mockRejectedValueOnce(new Error('network')); // toggled re-fetch fails
+    render(DiagnosticExportModal, { onClose: () => {} });
+    await waitFor(() => screen.getByTestId('export-preview'));
+    // Initial load succeeded; copy is enabled
+    const copyBtn = screen.getByTestId('export-copy') as HTMLButtonElement;
+    expect(copyBtn.disabled).toBe(false);
+    // Toggle includeFullIds → triggers re-fetch which will reject
+    const toggle = screen.getByTestId('export-full-toggle') as HTMLInputElement;
+    await fireEvent.click(toggle);
+    // Wait for error to render (loading flipped back to false)
+    await waitFor(() => screen.getByTestId('export-error'));
+    // Copy + Save must now be disabled despite loading === false
+    expect((screen.getByTestId('export-copy') as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByTestId('export-save') as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it('Cancel button calls onClose', async () => {
     (invoke as ReturnType<typeof vi.fn>).mockResolvedValue(REDACTED_FIXTURE);
     const onClose = vi.fn();

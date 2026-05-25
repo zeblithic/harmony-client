@@ -21,6 +21,15 @@
   let loading = $state(true);
   let error = $state<string | null>(null);
   let copiedToast = $state(false);
+  // PR #161 R3 (CodeRabbit Major): privacy guard. `loading` alone is
+  // insufficient to gate Copy/Save: if exportPayload succeeds with
+  // include_full_ids=true (markdown holds full IDs), the user toggles
+  // back to off, and the re-fetch fails (network glitch), `loading`
+  // flips to false but `markdown` still holds the stale full-ID
+  // content. Copy/Save would re-enable and leak the OLD markdown
+  // despite the checkbox being OFF. `hasFreshPreview` tracks whether
+  // the markdown matches the latest successful load.
+  let hasFreshPreview = $state(false);
   // PR #161 R1 (CodeRabbit Major): monotonic request counter. Rapid
   // toggling of `includeFullIds` can overlap `load()` invocations; a
   // slower older `exportPayload` response could otherwise finish last
@@ -37,10 +46,12 @@
     const requestId = ++latestRequest;
     loading = true;
     error = null;
+    hasFreshPreview = false;
     try {
       const result = await exportPayload(full);
       if (requestId !== latestRequest) return; // superseded by a newer load()
       markdown = result;
+      hasFreshPreview = true;
     } catch (e) {
       if (requestId !== latestRequest) return;
       error = e instanceof Error ? e.message : String(e);
@@ -102,8 +113,8 @@
       Include full identifiers (default off)
     </label>
     <div class="actions">
-      <button onclick={copy} disabled={loading} data-testid="export-copy">Copy</button>
-      <button onclick={saveToFile} disabled={loading} data-testid="export-save">Save as .txt</button>
+      <button onclick={copy} disabled={loading || !hasFreshPreview} data-testid="export-copy">Copy</button>
+      <button onclick={saveToFile} disabled={loading || !hasFreshPreview} data-testid="export-save">Save as .txt</button>
       <button onclick={onClose} data-testid="export-cancel">Cancel</button>
     </div>
     {#if copiedToast}
