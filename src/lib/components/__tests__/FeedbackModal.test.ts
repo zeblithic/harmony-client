@@ -203,4 +203,18 @@ describe('FeedbackModal', () => {
     await fireEvent.click(screen.getByTestId('feedback-cancel'));
     expect(onDismiss).toHaveBeenCalled();
   });
+
+  it('resets state when modal closes (does not persist draft)', async () => {
+    const { rerender } = render(FeedbackModal, { open: true, onDismiss: () => {} });
+    // Type a draft
+    const textarea = screen.getByTestId('feedback-description');
+    await fireEvent.input(textarea, { target: { value: 'draft message' } });
+    expect((textarea as HTMLTextAreaElement).value).toBe('draft message');
+    // Close the modal
+    await rerender({ open: false, onDismiss: () => {} });
+    // Reopen
+    await rerender({ open: true, onDismiss: () => {} });
+    const reopened = screen.getByTestId('feedback-description') as HTMLTextAreaElement;
+    expect(reopened.value).toBe('');
+  });
 });

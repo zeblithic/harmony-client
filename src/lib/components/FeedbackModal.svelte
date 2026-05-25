@@ -56,10 +56,8 @@
       if (requestId !== latestRequest) return;
       diagnosticsError = 'Diagnostics unavailable — submit without?';
       // Underlying error captured for console only:
-      console.warn(
-        '[zeb-331] network_health_export_payload failed:',
-        e instanceof Error ? e.message : String(e),
-      );
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn('[zeb-331] network_health_export_payload failed:', msg);
     }
   }
 
@@ -95,10 +93,8 @@
         onDismiss();
       } catch (e) {
         // shell.open failure → clipboard fallback
-        console.warn(
-          '[zeb-331] shell.open failed:',
-          e instanceof Error ? e.message : String(e),
-        );
+        const msg = e instanceof Error ? e.message : String(e);
+        console.warn('[zeb-331] shell.open failed:', msg);
         try {
           await navigator.clipboard.writeText(url);
           toastMsg =
@@ -119,6 +115,20 @@
       onDismiss();
     }
   }
+
+  // Spec §6.7: feedback drafts do NOT persist across modal dismissal.
+  // Reset all form state when modal closes so reopen shows a clean form.
+  $effect(() => {
+    if (!open) {
+      description = '';
+      attachDiagnostics = false;
+      submitting = false;
+      diagnosticsPreview = null;
+      diagnosticsError = null;
+      toastMsg = null;
+      latestRequest++; // invalidate any in-flight diagnostics request
+    }
+  });
 
   // Esc dismiss while open.
   $effect(() => {

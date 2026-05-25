@@ -125,4 +125,19 @@ describe('WelcomeModal', () => {
     const versionEl = screen.getByTestId('welcome-version');
     expect(versionEl).toBeInTheDocument();
   });
+
+  it('clears inviteError on input change after a failed Join', async () => {
+    render(WelcomeModal, {
+      open: true,
+      onDismiss: () => {},
+      onJoinWithInvite: () => {},
+    });
+    const input = screen.getByTestId('welcome-invite-input');
+    // Trigger an error (empty input → inline error)
+    await fireEvent.click(screen.getByTestId('welcome-join'));
+    expect(screen.getByTestId('welcome-invite-error')).toBeInTheDocument();
+    // Typing should clear the error
+    await fireEvent.input(input, { target: { value: 'harmony://invite/v1?p=test' } });
+    expect(screen.queryByTestId('welcome-invite-error')).toBeNull();
+  });
 });

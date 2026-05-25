@@ -20,7 +20,7 @@ export interface StartNodeResponse {
    * as `false` so older backends never accidentally re-show the welcome
    * modal.
    */
-  freshlyCreated: boolean;
+  freshlyCreated?: boolean;
 }
 
 /** Non-identifying environment info attached to feedback submissions. */

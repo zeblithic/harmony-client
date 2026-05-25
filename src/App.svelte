@@ -681,7 +681,14 @@
         // Forward-compat: an older backend that returned bare void / null
         // produces undefined here; treat as freshly_created=false (privacy-
         // safe default — never re-show the welcome to a returning user).
-        if (response?.freshlyCreated === true) {
+        //
+        // Race resolution (Flow 5 cont.): a deep-link can arrive while
+        // this `await invoke` is in flight. The deep-link handler sets
+        // `showRedeemInvite = true` + `showWelcomeModal = false`. If
+        // we get here with `showRedeemInvite` already set, the user has
+        // committed to an explicit action — don't flash the welcome over
+        // the redeem dialog. Deep-link wins at both ingress points.
+        if (response?.freshlyCreated === true && !showRedeemInvite) {
           showWelcomeModal = true;
         }
       } catch (err) {
@@ -2006,10 +2013,8 @@
         const { open: shellOpen } = await import('@tauri-apps/plugin-shell');
         await shellOpen('https://github.com/zeblithic/harmony-client/blob/main/README.md');
       } catch (e) {
-        console.warn(
-          '[zeb-331] failed to open docs:',
-          e instanceof Error ? e.message : String(e),
-        );
+        const msg = e instanceof Error ? e.message : String(e);
+        console.warn('[zeb-331] failed to open docs:', msg);
       }
     }}
   />

@@ -20,8 +20,10 @@
   onMount(async () => {
     try {
       appVersion = await getVersion();
-    } catch {
-      // Outside Tauri (dev/browser) — leave as 'unknown'.
+    } catch (e) {
+      // Outside Tauri (dev/browser) — leave appVersion as 'unknown'.
+      const msg = e instanceof Error ? e.message : String(e);
+      console.debug('[zeb-331] AboutModal getVersion failed:', msg);
     }
   });
 

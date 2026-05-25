@@ -28,8 +28,10 @@
   onMount(async () => {
     try {
       appVersion = await getVersion();
-    } catch {
-      // Outside Tauri (dev/browser) — leave as 'unknown'.
+    } catch (e) {
+      // Outside Tauri (dev/browser) — leave appVersion as 'unknown'.
+      const msg = e instanceof Error ? e.message : String(e);
+      console.debug('[zeb-331] WelcomeModal getVersion failed:', msg);
     }
   });
 
@@ -104,6 +106,7 @@
           type="text"
           placeholder="harmony://invite/v1?..."
           bind:value={inviteUrl}
+          oninput={() => { inviteError = null; }}
         />
         {#if inviteError}
           <p class="error" data-testid="welcome-invite-error">{inviteError}</p>

@@ -51,6 +51,7 @@ The welcome modal fires only on **fresh identity** — when no `harmony.client` 
 To force the modal again (e.g., for testing the fresh-install path):
 
 **macOS:**
+
 ```bash
 security delete-generic-password -s "harmony.client"
 ```
