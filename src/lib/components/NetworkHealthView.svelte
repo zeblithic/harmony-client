@@ -6,10 +6,7 @@
    * Renders summary card + per-peer rows + self-test results pane +
    * "Submit diagnostics" button.
    *
-   * Note: the "Submit diagnostics" button is a placeholder for Task 10.
-   * Task 11 will replace it with the real DiagnosticExportModal trigger
-   * (the modal component doesn't exist yet). Keeping the import out
-   * preserves tsc-clean for this task.
+   * Task 11: "Submit diagnostics" button now opens DiagnosticExportModal.
    *
    * Svelte 5 runes (`$state`, `$effect`) mirror DiagnosticsPanel.svelte's
    * established pattern. Race-safe cleanup (destroyed flag + unlisten)
@@ -28,11 +25,15 @@
     SelfTestReport,
     PeerHealth,
   } from '../types/network-health';
+  import DiagnosticExportModal from './DiagnosticExportModal.svelte';
 
   let snap = $state<NetworkHealthSnapshot | null>(null);
   let report = $state<SelfTestReport | null>(null);
   let runningSelfTest = $state(false);
   let selfTestError = $state<string | null>(null);
+  // Task 11: open/close state for the DiagnosticExportModal. Opened by
+  // the "Submit diagnostics…" button; closed via the modal's onClose prop.
+  let exportOpen = $state(false);
 
   let unlisten: (() => void) | null = null;
   let destroyed = false;
@@ -198,18 +199,21 @@
     </section>
 
     <!--
-      Task 10 placeholder. Task 11 will replace this with a real button
-      that opens DiagnosticExportModal (component not yet created).
+      Task 11: opens DiagnosticExportModal. Modal owns its own fetch
+      cycle (calls exportPayload(includeFullIds) on mount + on toggle).
     -->
     <button
-      disabled
-      title="Diagnostic export wiring lands in Task 11"
+      onclick={() => (exportOpen = true)}
       data-testid="nh-export-button"
     >
       Submit diagnostics…
     </button>
   {/if}
 </div>
+
+{#if exportOpen}
+  <DiagnosticExportModal onClose={() => (exportOpen = false)} />
+{/if}
 
 <style>
   .network-health {

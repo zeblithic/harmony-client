@@ -264,6 +264,9 @@
         <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'mint'}
           aria-label="Mint" aria-pressed={appMode === 'mint'}
           onclick={() => onModeChange?.('mint')}>💰 Mint</button>
+        <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'network'}
+          aria-label="Network" aria-pressed={appMode === 'network'}
+          onclick={() => onModeChange?.('network')}>Network</button>
       </div>
       <button
         type="button"
@@ -271,7 +274,7 @@
         aria-label="Open network visualization"
         onclick={openNetworkWindow}
       >
-        Network
+        Network Viz
       </button>
     </div>
   {:else}

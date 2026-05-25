@@ -42,6 +42,7 @@
     "@tauri-apps/api": "^2.10.1",
     "@tauri-apps/plugin-deep-link": "^2.4.9",
     "@tauri-apps/plugin-dialog": "^2.7.0",
+    "@tauri-apps/plugin-fs": "^2.5.1",
     "@tauri-apps/plugin-updater": "^2.10.1",
     "buffer": "^6.0.3",
     "d3-force": "^3.0.0",

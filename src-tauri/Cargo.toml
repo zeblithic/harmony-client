@@ -128,6 +128,7 @@ iroh = "0.98"
 # `Stream<Item = std::io::Result<IfEvent>>` — we drive it via
 # `futures::StreamExt::next()` (no manual `poll_fn` wrapping needed).
 if-watch = { version = "3", features = ["tokio"] }
+tauri-plugin-fs = "2.5.1"
 
 [dev-dependencies]
 serial_test = "3"
