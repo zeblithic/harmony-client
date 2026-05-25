@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Troubleshooting docs
+    url: https://github.com/zeblithic/harmony-client/blob/main/docs/troubleshooting.md
+    about: Common install / network issues with documented fixes. Worth a skim before filing.
+  - name: Feedback flow guide
+    url: https://github.com/zeblithic/harmony-client/blob/main/docs/feedback.md
+    about: How to submit feedback through the in-app (?) menu (auto-attaches redacted diagnostics).
+  - name: Cross-WAN validation playbook
+    url: https://github.com/zeblithic/harmony-client/blob/main/docs/cross-wan-validation.md
+    about: Two-host network testing playbook — useful if you're debugging connectivity.
