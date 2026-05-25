@@ -168,8 +168,11 @@ describe('FeedbackModal', () => {
     await fireEvent.click(toggle);
     // Third click ON → invoke #2 pending
     await fireEvent.click(toggle);
-    // Resolve OLDEST first (stale), then NEWEST (latest)
+    // Resolve OLDEST first (stale), then NEWEST (latest). Insert a
+    // microtask yield between to make ordering explicit and ensure the
+    // stale resolution path runs before the fresh one.
     resolvers[0]('STALE_CONTENT');
+    await Promise.resolve();
     resolvers[1]('FRESH_CONTENT');
     await waitFor(() =>
       expect(screen.getByTestId('feedback-diagnostics-preview')).toHaveTextContent('FRESH_CONTENT'),

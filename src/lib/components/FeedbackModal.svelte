@@ -142,6 +142,7 @@
       class="modal-content"
       data-testid="feedback-modal"
       role="dialog"
+      aria-modal="true"
       aria-labelledby="feedback-title"
     >
       <h2 id="feedback-title">Submit feedback</h2>
