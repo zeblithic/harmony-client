@@ -21,16 +21,31 @@
   let loading = $state(true);
   let error = $state<string | null>(null);
   let copiedToast = $state(false);
+  // PR #161 R1 (CodeRabbit Major): monotonic request counter. Rapid
+  // toggling of `includeFullIds` can overlap `load()` invocations; a
+  // slower older `exportPayload` response could otherwise finish last
+  // and overwrite the current redaction state. We capture the
+  // requestId at call time and only assign state when it still
+  // matches the latest issued id.
+  //
+  // NOT `$state`: this is internal control-flow bookkeeping, not UI
+  // state. Wrapping in `$state` would cause the `$effect` below to
+  // re-fire on every `load()` (effect_update_depth_exceeded).
+  let latestRequest = 0;
 
   async function load(full: boolean): Promise<void> {
+    const requestId = ++latestRequest;
     loading = true;
     error = null;
     try {
-      markdown = await exportPayload(full);
+      const result = await exportPayload(full);
+      if (requestId !== latestRequest) return; // superseded by a newer load()
+      markdown = result;
     } catch (e) {
+      if (requestId !== latestRequest) return;
       error = e instanceof Error ? e.message : String(e);
     } finally {
-      loading = false;
+      if (requestId === latestRequest) loading = false;
     }
   }
 

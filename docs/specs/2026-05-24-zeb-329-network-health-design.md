@@ -37,7 +37,7 @@ The existing `DiagnosticsPanel.svelte` (Phase 1, dev-mode-only) is the raw-data 
 
 ## 3. Architecture
 
-```
+```text
 ┌───────────────────────────────────────────────────────────────────────┐
 │  Frontend (Svelte 5)                                                  │
 │  ┌─────────────────────────────────┐    ┌───────────────────────────┐ │
@@ -218,7 +218,7 @@ Add a "Network" sidebar item routing to `/network`. Exact placement determined a
 
 ### 5.1 Page load (cold)
 
-```
+```text
 User navigates to /network
     ↓
 NetworkHealthView.svelte onMount
@@ -252,7 +252,7 @@ Typical wall-clock: <50 ms (all in-process reads, no network).
 
 The rate-limiter (in `network_health.rs`) emits at most one Tauri event every 2s:
 
-```
+```text
 rate-limiter task → app_handle.emit("network-health-changed", ()) → listener → snapshot() refetch
 ```
 
@@ -262,7 +262,7 @@ rate-limiter task → app_handle.emit("network-health-changed", ()) → listener
 
 ### 5.3 Self-test
 
-```
+```text
 User clicks "Run self-test"
     ↓
 View calls adapter.runSelfTest()  ── IPC ──▶  network_health_run_self_test
@@ -294,7 +294,7 @@ Tiny accept handler in `iroh_endpoint.rs` echoes one byte and closes. Used only 
 
 ### 5.4 Diagnostic export
 
-```
+```text
 User clicks "Submit diagnostics"
     ↓
 DiagnosticExportModal opens
@@ -332,7 +332,7 @@ Stored in `AppState` as `Arc<RwLock<Option<SelfTestReport>>>`, populated by `net
 
 ### 5.5 State coupling summary
 
-```
+```rust
 NetworkHealthService holds:
   - Arc<IrohEndpoint>          (from AppState, already there)
   - ReachabilityResolver       (from AppState, already there)
@@ -405,7 +405,7 @@ Not raw Rust error chains. The export carries these strings verbatim; tester pas
 
 **Network panel itself never shows a top-level "error" banner.** Snapshot is always well-formed; partial data renders as partial data. If the IPC genuinely throws (Tauri layer failure, app shutting down), we render a single line:
 
-```
+```text
 ⚠ Diagnostics unavailable — try restarting Harmony.  [Retry]
 ```
 
@@ -439,7 +439,7 @@ Not raw Rust error chains. The export carries these strings verbatim; tester pas
 
 Plain-language + raw on hover (default mode):
 
-```
+```text
 ✓ Direct connections work          …
   Most peers reach you without a
   relay. Best speed.
@@ -454,7 +454,7 @@ Hover on the `…`: `NAT classification: full-cone (open NAT — peers can conne
 
 Compact one-line format:
 
-```
+```text
 ✓ alice@…    direct   18ms   3s ago
 ⚠ bob@…      relay    97ms   2m ago
 ✗ carol@…    timeout                 (no reachability record)
@@ -467,7 +467,7 @@ Click on a row → inline expand showing `iroh_node_id`, shared communities, `re
 
 Replaces the "Run self-test" button while running + after completion:
 
-```
+```text
 Running self-test…
   ✓ Iroh endpoint listening              (12ms)
   ✓ Home relay reachable                 (24ms)
@@ -487,7 +487,7 @@ All local checks passed. 2 of 12 known peers reached.
 
 ### 7.4 Diagnostic export modal
 
-```
+```text
 ┌─ Diagnostic export ──────────────────────────────┐
 │ Review what you're about to share:               │
 │ ──────────────────────────────────────────────── │
@@ -588,7 +588,7 @@ All component tests use Svelte 5 runes + vitest (matches `DiagnosticsPanel.test.
 
 ~250 lines of markdown. Structure:
 
-```
+```markdown
 # Cross-WAN validation playbook
 
 ## What you need

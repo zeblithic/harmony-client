@@ -768,6 +768,17 @@ pub struct NodeState {
     /// this is `None`. Cleared in `clear_iroh_handles` so a restart
     /// rebuilds against the fresh iroh / resolver.
     pub network_health: Option<std::sync::Arc<crate::network_health::NetworkHealthService>>,
+    /// ZEB-329 PR #161 R1 (CodeRabbit Major): shared cell holding the
+    /// `NetworkHealthService` Arc captured by the `on_epoch_event`
+    /// closure built deep inside `start_node`. Stored on NodeState so
+    /// `clear_iroh_handles` can null the inner `Option` on
+    /// stop/restart — without this, the cell's strong Arc keeps the
+    /// previous `NetworkHealthService` (and its spawned rate-limiter
+    /// task) alive across restart cycles, leaking stale
+    /// `network-health-changed` notifications from the prior runtime.
+    pub network_health_hook_cell: std::sync::Arc<
+        std::sync::RwLock<Option<std::sync::Arc<crate::network_health::NetworkHealthService>>>,
+    >,
 }
 
 impl NodeState {
@@ -813,6 +824,16 @@ impl NodeState {
         // spawned rate-limiter task winds down when its sender (held
         // inside the Arc) is dropped.
         self.network_health = None;
+        // ZEB-329 PR #161 R1 (CodeRabbit Major): also clear the hook
+        // cell's inner Option so the previous NetworkHealthService
+        // (and its spawned rate-limiter task) can be reaped on
+        // stop/restart. Without this, the on_epoch_event closure's
+        // captured cell keeps a second strong Arc alive, leaking
+        // stale `network-health-changed` notifications from the
+        // prior runtime.
+        if let Ok(mut cell) = self.network_health_hook_cell.write() {
+            *cell = None;
+        }
     }
 
     /// ZEB-311: test-only helper to set dm_self_owner for integration tests
@@ -940,6 +961,9 @@ impl Default for NodeState {
             pkarr_publisher_handle: None,
             // ZEB-329: stays None until start_node wires it.
             network_health: None,
+            // ZEB-329 PR #161 R1: empty cell; start_node populates it
+            // under the install lock alongside `network_health`.
+            network_health_hook_cell: std::sync::Arc::new(std::sync::RwLock::new(None)),
         }
     }
 }
@@ -2311,9 +2335,19 @@ async fn start_node(
         // populated under the install lock alongside the iroh stash;
         // the closure reads it on each invocation. A None read is a
         // graceful no-op (pre-install or iroh-bind-failed).
+        // ZEB-329 PR #161 R1 (CodeRabbit Major): use the NodeState-
+        // owned cell so `clear_iroh_handles` can null its inner Option
+        // on stop/restart. Previously a fresh local Arc — the old cell
+        // (still captured by the closure constructed below) kept a
+        // strong Arc<NetworkHealthService> alive across restarts and
+        // leaked stale `network-health-changed` notifications from the
+        // prior runtime.
         let network_health_hook_cell: std::sync::Arc<
             std::sync::RwLock<Option<std::sync::Arc<crate::network_health::NetworkHealthService>>>,
-        > = std::sync::Arc::new(std::sync::RwLock::new(None));
+        > = {
+            let guard = state.lock().expect("NodeState mutex poisoned");
+            std::sync::Arc::clone(&guard.network_health_hook_cell)
+        };
         // ZEB-325 Phase 2c: outer-scope clone of the iroh link manager so
         // the owner-loaded block below can install the handshake
         // dispatcher once `community_registry` / `dm_outbox` /
@@ -34543,6 +34577,9 @@ mod start_node_race_tests {
             // ZEB-329: race-test NodeStates never wire the network
             // health service — set to None.
             network_health: None,
+            // ZEB-329 PR #161 R1: empty hook cell (race tests never
+            // exercise the network-health notify path).
+            network_health_hook_cell: std::sync::Arc::new(std::sync::RwLock::new(None)),
         })
     }
 

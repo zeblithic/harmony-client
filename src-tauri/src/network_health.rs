@@ -639,16 +639,28 @@ pub async fn handle_ping_accept(conn: iroh::endpoint::Connection) {
     if conn.alpn() != crate::iroh_endpoint::alpn::HARMONY_PING_V1 {
         return;
     }
-    let Ok((mut send, mut recv)) = conn.accept_bi().await else {
+    // PR #161 R1 (Qodo Security): bound each await at 5s. Without
+    // these, a hostile peer can open a HARMONY_PING_V1 connection
+    // and never send a byte, pinning this spawned task until iroh's
+    // idle timeout fires. Mirrors the `conn.closed()` bound below
+    // and the production precedent in `iroh_invite_acceptor.rs`
+    // (PR #159 F2/F4).
+    let Ok(Ok((mut send, mut recv))) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), conn.accept_bi()).await
+    else {
         return;
     };
     let mut buf = [0u8; 1];
-    if recv.read_exact(&mut buf).await.is_err() {
+    let Ok(Ok(())) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), recv.read_exact(&mut buf)).await
+    else {
         return;
-    }
-    if send.write_all(&buf).await.is_err() {
+    };
+    let Ok(Ok(())) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), send.write_all(&buf)).await
+    else {
         return;
-    }
+    };
     let _ = send.finish();
     // Hold the connection open until the client drives the close.
     // QUIC: `send.finish()` only marks the stream finished locally —
@@ -676,27 +688,33 @@ pub async fn ping_peer(
     node_id: iroh::EndpointId,
     timeout: std::time::Duration,
 ) -> Result<std::time::Duration, String> {
+    // PR #161 R1 (CodeRabbit): spec §6.2 requires bounded canonical
+    // reason strings on user-facing self-test output. Raw transport
+    // error chains (`{e}`) leak internal addresses / cert details /
+    // peer IDs into the exported diagnostic and the Network Health
+    // panel. Use a fixed label per failure site; the underlying
+    // error is still observable via tracing logs at the call sites.
     let start = std::time::Instant::now();
     let result = tokio::time::timeout(timeout, async {
         let conn = endpoint
             .inner()
             .connect(node_id, crate::iroh_endpoint::alpn::HARMONY_PING_V1)
             .await
-            .map_err(|e| format!("connect failed: {e}"))?;
+            .map_err(|_| "connect failed".to_string())?;
         let (mut send, mut recv) = conn
             .open_bi()
             .await
-            .map_err(|e| format!("open_bi failed: {e}"))?;
+            .map_err(|_| "open_bi failed".to_string())?;
         send.write_all(&[0x42])
             .await
-            .map_err(|e| format!("write_all failed: {e}"))?;
-        send.finish().map_err(|e| format!("finish failed: {e}"))?;
+            .map_err(|_| "write_all failed".to_string())?;
+        send.finish().map_err(|_| "finish failed".to_string())?;
         let mut buf = [0u8; 1];
         recv.read_exact(&mut buf)
             .await
-            .map_err(|e| format!("read_exact failed: {e}"))?;
+            .map_err(|_| "read_exact failed".to_string())?;
         if buf[0] != 0x42 {
-            return Err(format!("unexpected echo byte: {}", buf[0]));
+            return Err("unexpected echo byte".to_string());
         }
         Ok::<(), String>(())
     })
