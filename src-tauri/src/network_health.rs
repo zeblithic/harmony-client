@@ -658,7 +658,14 @@ pub async fn handle_ping_accept(conn: iroh::endpoint::Connection) {
     // Mirrors the close-handshake pattern documented in
     // `zenoh_iroh_link.rs::paired_stream_roundtrip` (ZEB-321 Task 5,
     // 2026-05-22: same race cost 6 hours of debug).
-    let _ = conn.closed().await;
+    //
+    // Bounded at 5s: a peer that successfully reads the echo byte but
+    // never tears the connection down (hostile, crashed, or
+    // network-partitioned) must not pin this accept-task until iroh's
+    // idle timeout fires. Mirrors the production precedent in
+    // `iroh_invite_acceptor.rs` (PR #159 F2/F4 added the same bound
+    // for exactly this reason).
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed()).await;
 }
 
 /// Connect-side: open a HARMONY_PING_V1 bi-stream to `node_id`, write
