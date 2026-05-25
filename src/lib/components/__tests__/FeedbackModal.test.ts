@@ -217,4 +217,45 @@ describe('FeedbackModal', () => {
     const reopened = screen.getByTestId('feedback-description') as HTMLTextAreaElement;
     expect(reopened.value).toBe('');
   });
+
+  it('reset-on-close does NOT wipe payload during in-flight submit (CodeRabbit R2 regression)', async () => {
+    // Race scenario: shellOpen is still pending while parent flips open=false.
+    // Without the !submitting gate, the reset effect would wipe `description`
+    // before handleSubmit's URL build had completed — but URL is already
+    // built before shellOpen, so what we really guard against is the
+    // observed-state during the await: if submitting=false were forced by
+    // the reset, the in-flight finally would have nothing to undo.
+    // We assert the URL passed to shellOpen contains the actual description.
+    let resolveShellOpen: () => void = () => {};
+    const shellOpenPromise = new Promise<void>((res) => {
+      resolveShellOpen = res;
+    });
+    (shellOpen as ReturnType<typeof vi.fn>).mockReturnValue(shellOpenPromise);
+
+    const { rerender } = render(FeedbackModal, {
+      open: true,
+      onDismiss: () => {},
+    });
+    const textarea = screen.getByTestId('feedback-description');
+    await fireEvent.input(textarea, {
+      target: { value: 'race regression description payload' },
+    });
+
+    // Kick submit — handleSubmit's shellOpen will hang on our gated promise.
+    await fireEvent.click(screen.getByTestId('feedback-submit'));
+
+    // While submit is in flight, parent-driven close (e.g. Escape, route change).
+    await rerender({ open: false, onDismiss: () => {} });
+
+    // Resolve shellOpen — finally{} clears submitting → reset effect re-fires.
+    resolveShellOpen();
+    await shellOpenPromise;
+
+    // The URL handed to shellOpen MUST contain the real description, not '' —
+    // proves reset didn't wipe state mid-await.
+    const calls = (shellOpen as ReturnType<typeof vi.fn>).mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+    const urlArg = calls[0]?.[0] as string;
+    expect(urlArg).toContain('race%20regression%20description%20payload');
+  });
 });

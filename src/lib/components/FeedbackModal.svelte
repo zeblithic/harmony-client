@@ -118,11 +118,15 @@
 
   // Spec §6.7: feedback drafts do NOT persist across modal dismissal.
   // Reset all form state when modal closes so reopen shows a clean form.
+  // Gate on !submitting so an in-flight handleSubmit (whose awaits could
+  // straddle a parent-driven close) can finish reading description /
+  // diagnosticsPreview before they're wiped. The finally block in
+  // handleSubmit clears `submitting`, which re-fires this effect and
+  // performs the reset on the next tick.
   $effect(() => {
-    if (!open) {
+    if (!open && !submitting) {
       description = '';
       attachDiagnostics = false;
-      submitting = false;
       diagnosticsPreview = null;
       diagnosticsError = null;
       toastMsg = null;

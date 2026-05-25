@@ -91,8 +91,8 @@
       </p>
 
       <p>
-        An identity has been created on this device. You can name yourself
-        and customize your avatar in <strong>Settings → Profile</strong>
+        A device identity is ready to use. You can name yourself and
+        customize your avatar in <strong>Settings → Profile</strong>
         whenever you like.
       </p>
 
