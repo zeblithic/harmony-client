@@ -322,8 +322,9 @@ pub struct NetworkHealthService {
     resolver: std::sync::Arc<dyn ReachabilitySnapshot>,
     membership: std::sync::Arc<dyn MyMembershipSet + Send + Sync>,
     last_self_test: std::sync::Arc<tokio::sync::RwLock<Option<SelfTestReport>>>,
-    /// Channel into the rate-limiter task — Task 4 adds this.
-    #[allow(dead_code)]
+    /// Channel into the rate-limiter task. `None` until `spawn_rate_limiter`
+    /// is called at boot; `notify()` is a no-op while None so unit tests
+    /// that don't exercise event emission can construct the service freely.
     notify_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
@@ -533,6 +534,73 @@ pub fn format_export_markdown(
     }
 
     out
+}
+
+// ── Rate-limiter task + notify() API (spec §5.2) ────────────────────
+
+const RATE_LIMIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Event name emitted to the frontend when the rate-limiter fires.
+pub const NETWORK_HEALTH_CHANGED_EVENT: &str = "network-health-changed";
+
+/// Indirection over Tauri's `app_handle.emit(...)` so the rate-limiter
+/// task can be tested without a real app. Production impl is a thin
+/// wrapper around `tauri::AppHandle`.
+pub trait NotifyEmitter: Send + Sync {
+    fn emit_change(&self);
+}
+
+impl NetworkHealthService {
+    /// Spawn the rate-limiter task and wire `self.notify_tx`. Call once
+    /// at boot, AFTER iroh + resolver are constructed (spec §5.5).
+    ///
+    /// Idempotent: a second call replaces the channel + spawns a new
+    /// task; the old task drains its channel and exits when its sender
+    /// is dropped.
+    pub fn spawn_rate_limiter<E: NotifyEmitter + Send + 'static>(&mut self, emitter: E) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        self.notify_tx = Some(tx);
+        tokio::spawn(async move {
+            let mut last_emit: Option<std::time::Instant> = None;
+            while rx.recv().await.is_some() {
+                // Drain any other queued notifies that arrived since the
+                // last poll — we only need to know "something happened".
+                while rx.try_recv().is_ok() {}
+                let now = std::time::Instant::now();
+                let due = last_emit
+                    .map(|t| now.duration_since(t) >= RATE_LIMIT_WINDOW)
+                    .unwrap_or(true);
+                if due {
+                    emitter.emit_change();
+                    last_emit = Some(std::time::Instant::now());
+                } else {
+                    // Sleep until the window edge so subsequent notifies
+                    // in this window collapse into one delayed emit.
+                    let last = last_emit.expect("else branch implies last_emit is Some");
+                    let remaining = RATE_LIMIT_WINDOW
+                        .checked_sub(now.duration_since(last))
+                        .unwrap_or_default();
+                    tokio::time::sleep(remaining).await;
+                    // Drain any notifies queued during the sleep.
+                    while rx.try_recv().is_ok() {}
+                    emitter.emit_change();
+                    last_emit = Some(std::time::Instant::now());
+                }
+            }
+        });
+    }
+
+    /// Send a notify into the rate-limiter. Safe to call from any
+    /// task. No-op when the rate-limiter hasn't been spawned (e.g. in
+    /// unit tests that don't exercise event emission).
+    pub fn notify(&self) {
+        if let Some(tx) = self.notify_tx.as_ref() {
+            // Ignore send errors: the only way send fails is the receiver
+            // dropped, which means the rate-limiter task exited. That's
+            // a boot-shutdown race; nothing to do.
+            let _ = tx.send(());
+        }
+    }
 }
 
 // ── Unit tests ──────────────────────────────────────────────────────
@@ -1012,6 +1080,79 @@ mod tests {
         assert_eq!(
             snap.my_network.unwrap().reachability,
             ReachabilityStatus::Reachable
+        );
+    }
+
+    // ── Rate-limiter tests (Task 4) ──────────────────────────────────
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct CountingEmitter {
+        n: std::sync::Arc<AtomicUsize>,
+    }
+    impl NotifyEmitter for CountingEmitter {
+        fn emit_change(&self) {
+            self.n.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn build_svc_with_rate_limiter() -> (NetworkHealthService, std::sync::Arc<AtomicUsize>) {
+        let mut svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver { records: vec![] }),
+            empty_membership(),
+        );
+        let counter = std::sync::Arc::new(AtomicUsize::new(0));
+        let emitter = CountingEmitter { n: counter.clone() };
+        svc.spawn_rate_limiter(emitter);
+        (svc, counter)
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_collapses_30_rapid_notifies_to_one_emit() {
+        let (svc, counter) = build_svc_with_rate_limiter();
+        for _ in 0..30 {
+            svc.notify();
+        }
+        // Wait past the rate-limit window plus a small grace.
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        let n = counter.load(Ordering::SeqCst);
+        // The first notify emits immediately (last_emit was None); any
+        // further notifies in the 2s window collapse into ONE delayed
+        // emit at the window edge. Total = 2 (one immediate + one delayed).
+        // If notifies stop after the burst, NO further emits fire.
+        assert!(
+            n == 1 || n == 2,
+            "expected 1-2 emits for 30 rapid notifies, got {}",
+            n
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_no_emit_when_no_notifies() {
+        let (_svc, counter) = build_svc_with_rate_limiter();
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_emits_every_window_when_continuously_notified() {
+        // Notify once per 500ms for 5s (10 notifies); expect ~3 emits
+        // (one per 2s window). Use a loose bound because tokio timer
+        // resolution + test runner jitter make exact counts brittle.
+        let (svc, counter) = build_svc_with_rate_limiter();
+        for _ in 0..10 {
+            svc.notify();
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        let n = counter.load(Ordering::SeqCst);
+        assert!(
+            (2..=5).contains(&n),
+            "expected 2-5 emits for 10 notifies spaced 500ms over 5s, got {}",
+            n
         );
     }
 }
