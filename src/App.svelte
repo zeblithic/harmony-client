@@ -63,7 +63,6 @@
   import HelpMenuButton from './lib/components/HelpMenuButton.svelte';
   import FeedbackModal from './lib/components/FeedbackModal.svelte';
   import AboutModal from './lib/components/AboutModal.svelte';
-  import type { StartNodeResponse } from './lib/types/onboarding';
 
   let innerWidth = $state(window.innerWidth);
   let collapsed = $derived(innerWidth <= 768);
@@ -674,25 +673,41 @@
       // Network view's Connect flow can later re-invoke start_node with an
       // endpoint to join a gateway.
       try {
-        const response = (await invoke('start_node', { endpoint: null })) as
-          | StartNodeResponse
-          | undefined
-          | null;
-        // Forward-compat: an older backend that returned bare void / null
-        // produces undefined here; treat as freshly_created=false (privacy-
-        // safe default — never re-show the welcome to a returning user).
-        //
-        // Race resolution (Flow 5 cont.): a deep-link can arrive while
-        // this `await invoke` is in flight. The deep-link handler sets
-        // `showRedeemInvite = true` + `showWelcomeModal = false`. If
-        // we get here with `showRedeemInvite` already set, the user has
-        // committed to an explicit action — don't flash the welcome over
-        // the redeem dialog. Deep-link wins at both ingress points.
-        if (response?.freshlyCreated === true && !showRedeemInvite) {
-          showWelcomeModal = true;
-        }
+        await invoke('start_node', { endpoint: null });
       } catch (err) {
         console.warn('[harmony-client] auto-start_node failed:', err);
+      }
+      // ZEB-331 R3 (Cursor Medium "welcome lost after failed start"):
+      // gate welcome on a persistent localStorage flag rather than on
+      // the in-memory freshlyCreated signal from start_node. The IPC
+      // returns freshlyCreated for forward-compat / future analytics
+      // but it isn't load-bearing for welcome anymore — start_node
+      // has ~2900 lines of post-keychain-write setup, and any failure
+      // path there would have lost the in-memory signal and prevented
+      // the welcome from ever appearing on subsequent successful
+      // starts. localStorage decouples "welcome owed to user" from
+      // start_node lifecycle so a failed first start retries on next
+      // launch.
+      //
+      // Race resolution (Flow 5 cont.): a deep-link can arrive during
+      // start_node. The deep-link handler sets showRedeemInvite=true +
+      // showWelcomeModal=false. Don't flash welcome over the redeem
+      // dialog.
+      try {
+        const acked =
+          window.localStorage.getItem('harmony.onboarding.welcomeAcknowledged');
+        if (acked !== 'true' && !showRedeemInvite) {
+          showWelcomeModal = true;
+        }
+      } catch (e) {
+        // localStorage unavailable (incognito / sandbox / quota): show
+        // welcome — safer to greet than to silently skip a possibly-new
+        // user. The next dismiss will try the write again.
+        const msg = e instanceof Error ? e.message : String(e);
+        console.debug('[harmony-client] welcomeAcknowledged read failed:', msg);
+        if (!showRedeemInvite) {
+          showWelcomeModal = true;
+        }
       }
 
       // ZEB-281 Sub-D Phase 4 R1: hydrate the per-community
@@ -1987,18 +2002,35 @@
   />
 {/if}
 
-<!-- ZEB-331: first-run welcome modal. Shown when start_node returns
-     freshlyCreated=true (Flow 1). Suppressed by deep-link handlers
-     (Flow 5 — both warm-launch and cold-launch paths set
-     showWelcomeModal=false when a harmony:// URL is received). -->
+<!-- ZEB-331: first-run welcome modal. Shown until the user
+     acknowledges (Skip / Join / Esc / backdrop) — persisted via
+     localStorage so a failed start_node mid-keychain-write doesn't
+     permanently swallow the welcome (R3 Cursor Medium). Suppressed
+     by deep-link handlers (Flow 5 — both warm-launch and cold-
+     launch paths set showWelcomeModal=false when a harmony:// URL
+     is received). -->
 <WelcomeModal
   open={showWelcomeModal}
-  onDismiss={() => (showWelcomeModal = false)}
+  onDismiss={() => {
+    showWelcomeModal = false;
+    try {
+      window.localStorage.setItem('harmony.onboarding.welcomeAcknowledged', 'true');
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.debug('[harmony-client] welcomeAcknowledged write failed:', msg);
+    }
+  }}
   onJoinWithInvite={(url) => {
     redeemUrl = url;
     redeemError = null;
     showRedeemInvite = true;
     showWelcomeModal = false;
+    try {
+      window.localStorage.setItem('harmony.onboarding.welcomeAcknowledged', 'true');
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.debug('[harmony-client] welcomeAcknowledged write failed:', msg);
+    }
   }}
 />
 

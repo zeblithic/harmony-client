@@ -147,15 +147,15 @@ function truncateToFit(
     '',
   ].join('\n');
 
-  // Reserve budget for the fixed framing: GITHUB_ISSUES_URL + `?title=` +
-  // encoded title + `&body=` + encoded bodyHead + encoded marker.
-  const frameUrl = composeUrl(title, bodyHead + (payload.diagnostics ?? '') + TRUNCATION_MARKER);
-  if (frameUrl.length <= budget) {
-    return frameUrl;
-  }
-
   // Binary-search the diagnostics chars that fit. Encoding inflation
   // varies per char, so we measure end-to-end URL length.
+  //
+  // Note: we don't first try the full diagnostics with marker appended —
+  // by precondition this function is only called when the no-marker URL
+  // already exceeds `budget`, and bodyHead+full+MARKER is always strictly
+  // longer than bodyHead+full+\n (the MARKER replaces two trailing
+  // newlines with ~32 chars), so an early-return on the unsearched
+  // candidate can never fit. Greptile R2 P2.
   let lo = 0;
   let hi = (payload.diagnostics ?? '').length;
   while (lo < hi) {

@@ -82,18 +82,29 @@ await invoke('start_node', { endpoint: null });
 
 Becomes:
 ```typescript
-const { nodeAddr, freshlyCreated } = await invoke<StartNodeResponse>('start_node', { endpoint: null });
+await invoke('start_node', { endpoint: null });
 // existing service wiring continues
-if (freshlyCreated) showWelcomeModal = true;
+if (localStorage.getItem('harmony.onboarding.welcomeAcknowledged') !== 'true') {
+  showWelcomeModal = true;
+}
 ```
 
-If the response shape lacks `freshlyCreated` (forward-compat scenario — e.g., older backend mid-deploy), treat as `false`. Privacy-safe default: never show welcome on uncertainty.
+The IPC returns `freshlyCreated` as forward-compat metadata (future flows may use it for analytics or one-time prompts like "back up your identity"), but it is **not** the welcome trigger anymore — see §3.6.
 
 ### 3.6 Trigger semantics
 
-Welcome modal fires only when `freshly_created === true`. The backend detection lives in the existing keychain-identity-load path: if `keychain::get("harmony.client")` returns `NotFound`, mint a new identity and set `freshly_created = true`. If the entry exists (post-reinstall, multi-launch), set `freshly_created = false`. This reuses the **identity portability invariant** — keychain entries survive reinstalls on the same OS user, so returning users boot silently.
+**R3 update (Cursor "welcome lost after failed start"):** Welcome modal fires on every launch until the user explicitly acknowledges it via Skip / Join / Esc / backdrop. Acknowledgement persists in `localStorage['harmony.onboarding.welcomeAcknowledged']='true'`. Re-show after acknowledgement requires the user to clear that key (e.g., dev-tools or fresh install).
 
-A tester who explicitly nukes their keychain entry to test fresh-install paths *will* see welcome again. This is a feature, not a bug, for an alpha audience.
+**Why not gate on `freshly_created`?** `start_node` writes the iroh secret to the OS keychain inside `load_or_create_secret_key` (`Err(NoEntry)` branch), then proceeds through ~2900 lines of additional bring-up (endpoint bind, link manager, publisher spawn, zenoh session, identity hydration, CRDT replay). Any error path along the way returns `Err` from `start_node` *after* the keychain write has committed. On the next launch the keychain entry exists, so `freshly_created` would be `false` — and the in-memory signal that the user is owed a welcome is lost forever. Persisting the inverse signal (acknowledgement) in localStorage makes the welcome trigger resilient to mid-`start_node` failures.
+
+**Edge cases:**
+
+- *Failed first start*: keychain mints, `start_node` returns Err, welcome never shows during this session. Next launch: localStorage flag is unset → welcome shows. Resolved.
+- *User force-quits before dismissing*: localStorage flag unset → welcome shows on next launch. Resolved by the same mechanism.
+- *Existing user (post-alpha upgrade)*: when there is a path to "have an identity but no welcome-acknowledged flag," that user will see welcome once on upgrade. Acceptable cost.
+- *localStorage unavailable* (sandbox / incognito / quota): default to showing welcome; the next acknowledgement attempt will retry the write.
+
+A tester who explicitly nukes their keychain entry to test fresh-install paths will also need to clear the localStorage key to see welcome again. The `freshly_created` signal still flows to the frontend so future analytics paths can distinguish "first-time" from "returning, never acknowledged."
 
 ## 4. Components & data types
 
@@ -417,13 +428,17 @@ Deep-link wins because the user has already taken an explicit action (clicking a
 | URL > 8000 chars | Truncate diagnostics body to fit budget (with `…[truncated for URL length]` marker); preserve description + env intact. User sees truncation note in modal before submitting |
 | User clicks Submit while submitting=true | No-op (button disabled) |
 
-### 6.3 Boot sequence — `start_node` interactions
+### 6.3 Boot sequence — `start_node` × welcomeAcknowledged interactions
+
+R3 update: welcome trigger now depends on localStorage, not on `start_node`'s `freshlyCreated`. See §3.6 for rationale.
 
 | Scenario | Behavior |
 |---|---|
-| Success, `freshlyCreated: true` | Welcome modal fires (Flow 1) |
-| Success, `freshlyCreated: false` | Welcome modal stays closed (Flow 2) |
-| Success, response shape lacks `freshlyCreated` (forward-compat) | Treat as `false` — silent boot. Privacy-safe default; never show welcome on uncertainty |
+| Any `start_node` outcome, `welcomeAcknowledged === 'true'` | Welcome modal stays closed (Flow 2) — user has previously acknowledged |
+| Any `start_node` outcome, `welcomeAcknowledged !== 'true'`, no in-flight deep-link | Welcome modal fires (Flow 1) — user owed a welcome |
+| `start_node` returned Err (post-keychain-write failure), `welcomeAcknowledged !== 'true'` | Welcome modal still fires — localStorage-gated trigger is resilient to mid-`start_node` failures |
+| Any `start_node` outcome, `showRedeemInvite === true` (deep-link won) | Welcome modal stays closed (Flow 5) — deep-link wins the race |
+| localStorage unavailable (sandbox / quota / incognito) | Default to showing welcome — safer to greet than to silently skip a possibly-new user |
 | `start_node` rejects | Existing handler logs `auto-start_node failed`; welcome modal stays closed. Boot-degraded behavior is pre-existing; Sub-C doesn't change this path |
 
 ### 6.4 HelpMenuButton dropdown

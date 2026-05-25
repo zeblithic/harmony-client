@@ -66,6 +66,19 @@
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   });
+
+  // Reset transient invite state when the modal closes. The
+  // first-run-only flow makes stale state harmless in practice today,
+  // but the symmetry with FeedbackModal keeps the pattern consistent
+  // against future callers (e.g. re-opens after dismissed-but-not-
+  // acknowledged sessions per the welcomeAcknowledged localStorage
+  // gate). Greptile R2 P2.
+  $effect(() => {
+    if (!open) {
+      inviteUrl = '';
+      inviteError = null;
+    }
+  });
 </script>
 
 {#if open}
