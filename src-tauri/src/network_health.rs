@@ -681,6 +681,259 @@ pub async fn ping_peer(
     }
 }
 
+// ── Self-test traits + run_self_test (Task 6, spec §5.3) ───────────
+
+/// Trait extension for self-test operations (spec §5.3). Production
+/// impl lives in lib.rs boot wiring; tests use fakes.
+pub trait IrohSelfTest: Send + Sync {
+    /// True if `Endpoint::is_bound()` (or equivalent). Phase 1
+    /// approximation: any `iroh_node_id_hex()` returning `Some`.
+    fn endpoint_bound(&self) -> bool;
+    /// Round-trip ping to home relay. Returns the RTT or Err string.
+    /// Bounded reason strings per spec §6.2.
+    fn relay_round_trip(
+        &self,
+    ) -> futures::future::BoxFuture<'_, Result<std::time::Duration, String>>;
+}
+
+/// Pkarr self-test surface. Production impl lives in lib.rs boot
+/// wiring; tests use fakes.
+pub trait PkarrSelfTest: Send + Sync {
+    fn publish_identity(
+        &self,
+    ) -> futures::future::BoxFuture<'_, Result<std::time::Duration, String>>;
+    /// Resolve own identity from pkarr, verify the returned payload
+    /// matches the most recent published one. Bounded reason strings
+    /// per spec §6.2.
+    fn resolve_self(&self) -> futures::future::BoxFuture<'_, Result<std::time::Duration, String>>;
+}
+
+/// Trait for ping side. Production impl wraps `ping_peer` (Task 5);
+/// tests substitute a fake that yields scripted results.
+pub trait PingDispatcher: Send + Sync {
+    /// Returns (RTT, mode) on success, error string on failure. Mode
+    /// is approximate — implementer maps iroh connection-mode bytes
+    /// to `ConnectionMode::{Direct,Relay}`.
+    fn ping(
+        &self,
+        peer_node_id_bytes: [u8; 32],
+        timeout: std::time::Duration,
+    ) -> futures::future::BoxFuture<'_, Result<(std::time::Duration, ConnectionMode), String>>;
+}
+
+/// Per-peer ping wall-clock budget. Spec §5.3.
+pub const PEER_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Semaphore cap on concurrent peer pings. Spec §5.3.
+pub const PEER_PING_CONCURRENCY: usize = 32;
+
+impl NetworkHealthService {
+    /// Spec §5.3: self-test runs 4 ordered local steps + per-peer
+    /// parallel pings (semaphore cap 32, 5s timeout each). Result is
+    /// cached for `network_health_export_payload`.
+    ///
+    /// Per spec §6.2: step outcomes are Pass / Fail / Skipped. If an
+    /// upstream step Fails, downstream steps are Skipped (not Failed)
+    /// to avoid "4 things failed!" UI from one root cause.
+    pub async fn run_self_test(
+        &self,
+        iroh_test: &dyn IrohSelfTest,
+        pkarr_test: &dyn PkarrSelfTest,
+        ping: &dyn PingDispatcher,
+    ) -> SelfTestReport {
+        let started_at_ms = now_ms();
+        let mut steps = Vec::new();
+        let mut peer_results = Vec::new();
+
+        // Step 1: endpoint
+        let endpoint_ok = iroh_test.endpoint_bound();
+        steps.push(SelfTestStep {
+            name: "endpoint".into(),
+            outcome: if endpoint_ok {
+                StepOutcome::Pass { duration_ms: 0 }
+            } else {
+                StepOutcome::Fail {
+                    reason: "endpoint not bound".into(),
+                }
+            },
+        });
+
+        // Step 2: relay (skipped if endpoint failed)
+        let relay_ok = if endpoint_ok {
+            match iroh_test.relay_round_trip().await {
+                Ok(d) => {
+                    steps.push(SelfTestStep {
+                        name: "relay".into(),
+                        outcome: StepOutcome::Pass {
+                            duration_ms: d.as_millis() as u32,
+                        },
+                    });
+                    true
+                }
+                Err(reason) => {
+                    steps.push(SelfTestStep {
+                        name: "relay".into(),
+                        outcome: StepOutcome::Fail { reason },
+                    });
+                    false
+                }
+            }
+        } else {
+            steps.push(SelfTestStep {
+                name: "relay".into(),
+                outcome: StepOutcome::Skipped {
+                    reason: "skipped: endpoint not bound".into(),
+                },
+            });
+            false
+        };
+
+        // Step 3: pkarr_publish (skipped if relay failed)
+        let publish_ok = if relay_ok {
+            match pkarr_test.publish_identity().await {
+                Ok(d) => {
+                    steps.push(SelfTestStep {
+                        name: "pkarr_publish".into(),
+                        outcome: StepOutcome::Pass {
+                            duration_ms: d.as_millis() as u32,
+                        },
+                    });
+                    true
+                }
+                Err(reason) => {
+                    steps.push(SelfTestStep {
+                        name: "pkarr_publish".into(),
+                        outcome: StepOutcome::Fail { reason },
+                    });
+                    false
+                }
+            }
+        } else {
+            steps.push(SelfTestStep {
+                name: "pkarr_publish".into(),
+                outcome: StepOutcome::Skipped {
+                    reason: "skipped: relay unreachable".into(),
+                },
+            });
+            false
+        };
+
+        // Step 4: pkarr_resolve (skipped if publish failed)
+        if publish_ok {
+            match pkarr_test.resolve_self().await {
+                Ok(d) => steps.push(SelfTestStep {
+                    name: "pkarr_resolve".into(),
+                    outcome: StepOutcome::Pass {
+                        duration_ms: d.as_millis() as u32,
+                    },
+                }),
+                Err(reason) => steps.push(SelfTestStep {
+                    name: "pkarr_resolve".into(),
+                    outcome: StepOutcome::Fail { reason },
+                }),
+            }
+        } else {
+            steps.push(SelfTestStep {
+                name: "pkarr_resolve".into(),
+                outcome: StepOutcome::Skipped {
+                    reason: "skipped: publish failed".into(),
+                },
+            });
+        }
+
+        // Per-peer pings: only attempt if endpoint is bound. Otherwise
+        // all peer pings are Skipped.
+        let records = self.resolver.list_records();
+        let now = now_ms();
+        let scoped = filter_peers_by_shared_membership(records, &*self.membership, now);
+        if endpoint_ok {
+            // Semaphore-bounded parallel ping. The ping dispatcher itself
+            // is the production wiring extension point — for Phase 1 the
+            // boot site passes a stub that emits Skipped, so the spawned
+            // tasks borrow nothing from `ping` and the per-peer fanout
+            // is iroh-free at unit-test time. Task 7's lib.rs boot
+            // wiring replaces the stub with a resolver→iroh_node_id
+            // lookup that calls `ping_peer`.
+            //
+            // NOTE: `ping` arg is currently unused on the unwired path;
+            // it's kept in the signature so Task 7 can flip the body to
+            // call `ping.ping(...)` without touching the trait. Suppress
+            // the unused-warning here rather than at the function level.
+            let _ = ping;
+            let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(PEER_PING_CONCURRENCY));
+            let mut handles = Vec::with_capacity(scoped.len());
+            for peer in &scoped {
+                let permit = std::sync::Arc::clone(&semaphore)
+                    .acquire_owned()
+                    .await
+                    .expect("semaphore not closed");
+                let owner_addr = peer.owner_addr.clone();
+                let mode_hint = peer.connection_mode;
+                let last_seen = peer.last_seen_ms;
+                // STAGE: Task 7's production NetworkHealthService
+                // construction site replaces this stub closure with a
+                // dispatcher.ping(...) call. For now: emit Skipped so the
+                // peer-results vector is well-formed without iroh.
+                handles.push(tokio::spawn(async move {
+                    drop(permit);
+                    PeerPingResult {
+                        owner_addr,
+                        outcome: StepOutcome::Skipped {
+                            reason: format!(
+                                "phase-1: dispatcher not wired (last_seen={:?}, hint={:?})",
+                                last_seen, mode_hint
+                            ),
+                        },
+                        mode: None,
+                    }
+                }));
+            }
+            for h in handles {
+                if let Ok(r) = h.await {
+                    peer_results.push(r);
+                }
+            }
+        } else {
+            for peer in &scoped {
+                peer_results.push(PeerPingResult {
+                    owner_addr: peer.owner_addr.clone(),
+                    outcome: StepOutcome::Skipped {
+                        reason: "skipped: endpoint not bound".into(),
+                    },
+                    mode: None,
+                });
+            }
+        }
+
+        let report = SelfTestReport {
+            started_at_ms,
+            finished_at_ms: now_ms(),
+            steps,
+            peer_results,
+        };
+
+        // Cache for export_payload (spec §5.4 / §5.5).
+        *self.last_self_test.write().await = Some(report.clone());
+
+        report
+    }
+}
+
+/// Stub used during the wiring stage; replaced by the production
+/// `PingDispatcher` built around `ping_peer` in lib.rs Task 7. Kept
+/// `pub` so the production boot site can fall back to it before the
+/// resolver is ready (and tests can construct it).
+pub struct NullDispatcher;
+
+impl PingDispatcher for NullDispatcher {
+    fn ping(
+        &self,
+        _peer_node_id_bytes: [u8; 32],
+        _timeout: std::time::Duration,
+    ) -> futures::future::BoxFuture<'_, Result<(std::time::Duration, ConnectionMode), String>> {
+        Box::pin(async { Err("dispatcher not wired".into()) })
+    }
+}
+
 // ── Unit tests ──────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1232,5 +1485,175 @@ mod tests {
             "expected 2-5 emits for 10 notifies spaced 500ms over 5s, got {}",
             n
         );
+    }
+
+    // ── Self-test tests (Task 6) ────────────────────────────────────
+
+    use futures::FutureExt;
+
+    struct ScriptedIrohTest {
+        bound: bool,
+        relay: Result<std::time::Duration, String>,
+    }
+    impl IrohSelfTest for ScriptedIrohTest {
+        fn endpoint_bound(&self) -> bool {
+            self.bound
+        }
+        fn relay_round_trip(
+            &self,
+        ) -> futures::future::BoxFuture<'_, Result<std::time::Duration, String>> {
+            let r = self.relay.clone();
+            async move { r }.boxed()
+        }
+    }
+
+    struct ScriptedPkarrTest {
+        publish: Result<std::time::Duration, String>,
+        resolve: Result<std::time::Duration, String>,
+    }
+    impl PkarrSelfTest for ScriptedPkarrTest {
+        fn publish_identity(
+            &self,
+        ) -> futures::future::BoxFuture<'_, Result<std::time::Duration, String>> {
+            let r = self.publish.clone();
+            async move { r }.boxed()
+        }
+        fn resolve_self(
+            &self,
+        ) -> futures::future::BoxFuture<'_, Result<std::time::Duration, String>> {
+            let r = self.resolve.clone();
+            async move { r }.boxed()
+        }
+    }
+
+    fn build_svc_for_self_test() -> NetworkHealthService {
+        NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver { records: vec![] }),
+            empty_membership(),
+        )
+    }
+
+    #[tokio::test]
+    async fn self_test_all_pass_path() {
+        let svc = build_svc_for_self_test();
+        let iroh_t = ScriptedIrohTest {
+            bound: true,
+            relay: Ok(std::time::Duration::from_millis(24)),
+        };
+        let pkarr_t = ScriptedPkarrTest {
+            publish: Ok(std::time::Duration::from_millis(380)),
+            resolve: Ok(std::time::Duration::from_millis(210)),
+        };
+        let report = svc.run_self_test(&iroh_t, &pkarr_t, &NullDispatcher).await;
+        assert_eq!(report.steps.len(), 4);
+        assert_eq!(report.steps[0].name, "endpoint");
+        assert_eq!(report.steps[1].name, "relay");
+        assert_eq!(report.steps[2].name, "pkarr_publish");
+        assert_eq!(report.steps[3].name, "pkarr_resolve");
+        assert!(
+            matches!(report.steps[0].outcome, StepOutcome::Pass { .. }),
+            "endpoint pass"
+        );
+        assert!(
+            matches!(report.steps[1].outcome, StepOutcome::Pass { .. }),
+            "relay pass"
+        );
+        assert!(
+            matches!(report.steps[2].outcome, StepOutcome::Pass { .. }),
+            "pkarr_publish pass"
+        );
+        assert!(
+            matches!(report.steps[3].outcome, StepOutcome::Pass { .. }),
+            "pkarr_resolve pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn self_test_relay_fail_cascades_downstream_to_skipped() {
+        let svc = build_svc_for_self_test();
+        let iroh_t = ScriptedIrohTest {
+            bound: true,
+            relay: Err("relay timeout after 5s".into()),
+        };
+        let pkarr_t = ScriptedPkarrTest {
+            publish: Ok(std::time::Duration::from_millis(380)),
+            resolve: Ok(std::time::Duration::from_millis(210)),
+        };
+        let report = svc.run_self_test(&iroh_t, &pkarr_t, &NullDispatcher).await;
+        assert!(matches!(report.steps[0].outcome, StepOutcome::Pass { .. }));
+        assert!(matches!(report.steps[1].outcome, StepOutcome::Fail { .. }));
+        assert!(
+            matches!(report.steps[2].outcome, StepOutcome::Skipped { .. }),
+            "pkarr_publish skipped"
+        );
+        assert!(
+            matches!(report.steps[3].outcome, StepOutcome::Skipped { .. }),
+            "pkarr_resolve skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn self_test_endpoint_unbound_all_steps_skipped() {
+        let svc = build_svc_for_self_test();
+        let iroh_t = ScriptedIrohTest {
+            bound: false,
+            relay: Ok(std::time::Duration::from_millis(0)),
+        };
+        let pkarr_t = ScriptedPkarrTest {
+            publish: Ok(std::time::Duration::from_millis(0)),
+            resolve: Ok(std::time::Duration::from_millis(0)),
+        };
+        let report = svc.run_self_test(&iroh_t, &pkarr_t, &NullDispatcher).await;
+        assert!(
+            matches!(report.steps[0].outcome, StepOutcome::Fail { .. }),
+            "endpoint fail"
+        );
+        for i in 1..4 {
+            assert!(
+                matches!(report.steps[i].outcome, StepOutcome::Skipped { .. }),
+                "step {} skipped",
+                i
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn self_test_pkarr_resolve_mismatch_reported_as_fail() {
+        let svc = build_svc_for_self_test();
+        let iroh_t = ScriptedIrohTest {
+            bound: true,
+            relay: Ok(std::time::Duration::from_millis(24)),
+        };
+        let pkarr_t = ScriptedPkarrTest {
+            publish: Ok(std::time::Duration::from_millis(380)),
+            resolve: Err("pkarr resolved unexpected payload".into()),
+        };
+        let report = svc.run_self_test(&iroh_t, &pkarr_t, &NullDispatcher).await;
+        match &report.steps[3].outcome {
+            StepOutcome::Fail { reason } => assert_eq!(reason, "pkarr resolved unexpected payload"),
+            other => panic!("expected Fail, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn self_test_result_is_cached_for_export() {
+        let svc = build_svc_for_self_test();
+        let iroh_t = ScriptedIrohTest {
+            bound: true,
+            relay: Ok(std::time::Duration::from_millis(24)),
+        };
+        let pkarr_t = ScriptedPkarrTest {
+            publish: Ok(std::time::Duration::from_millis(380)),
+            resolve: Ok(std::time::Duration::from_millis(210)),
+        };
+        assert!(
+            svc.cached_last_self_test().await.is_none(),
+            "empty cache before run"
+        );
+        let _ = svc.run_self_test(&iroh_t, &pkarr_t, &NullDispatcher).await;
+        let cached = svc.cached_last_self_test().await;
+        assert!(cached.is_some(), "cache populated after run");
     }
 }
