@@ -760,14 +760,14 @@ mod tests {
     fn format_export_includes_schema_version() {
         let snap = fixture_snapshot_with_full_ids();
         let md = format_export_markdown(&snap, None, false);
+        // Tighten per code-review feedback: the previous loose match
+        // accepted "1" anywhere in output, which would pass even if
+        // schemaVersion were omitted (captured_at_ms contains "1").
+        // Bind to the literal emitted token.
         assert!(
-            md.contains("schemaVersion")
-                || md.contains("schema version")
-                || md.contains("schemaversion")
-                || md.contains("Schema")
-                || md.contains("schema_version")
-                || md.contains("1"),
-            "schema version must be present (matched generously since exact format is up to the implementer)"
+            md.contains("schemaVersion: 1"),
+            "schema version token must appear verbatim; output was:\n{}",
+            md
         );
     }
 }
