@@ -862,6 +862,11 @@ impl NetworkHealthService {
             let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(PEER_PING_CONCURRENCY));
             let mut handles = Vec::with_capacity(scoped.len());
             for peer in &scoped {
+                // Permit acquired BEFORE spawn to provide N-of-32 spawn-rate
+                // gating (back-pressure). If Task 7 reflexively moves this
+                // into the spawned task to avoid the parent-loop wait, the
+                // bound semantics break — all permits acquire immediately
+                // and all tasks fan out concurrently.
                 let permit = std::sync::Arc::clone(&semaphore)
                     .acquire_owned()
                     .await
@@ -874,6 +879,11 @@ impl NetworkHealthService {
                 // dispatcher.ping(...) call. For now: emit Skipped so the
                 // peer-results vector is well-formed without iroh.
                 handles.push(tokio::spawn(async move {
+                    // TASK 7 NOTE: move this drop to AFTER the production
+                    // `dispatcher.ping(...).await` — releasing the permit
+                    // here in Phase 1 is safe ONLY because the stub does
+                    // no work. Dropping early in production would defeat
+                    // the semaphore cap and allow unbounded concurrency.
                     drop(permit);
                     PeerPingResult {
                         owner_addr,
