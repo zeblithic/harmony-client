@@ -944,6 +944,179 @@ impl PingDispatcher for NullDispatcher {
     }
 }
 
+// ── Production trait impls (boot-wired in lib.rs) ───────────────────
+//
+// These adapters wire the synthesis-only traits above against the
+// concrete sources (iroh Endpoint, ReachabilityResolver,
+// PkarrPublisher, tauri::AppHandle). Lifetimes are short — each impl
+// holds an `Arc`-shaped or `Clone`-cheap handle and is consulted on
+// demand by `NetworkHealthService::snapshot`.
+
+/// Production `IrohSnapshot` wrapping `Arc<IrohEndpoint>`.
+pub struct ProdIrohSnapshot(pub std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>);
+
+impl IrohSnapshot for ProdIrohSnapshot {
+    fn iroh_node_id_hex(&self) -> Option<String> {
+        Some(hex::encode(self.0.node_id().as_bytes()))
+    }
+    fn home_relay_url(&self) -> Option<String> {
+        self.0.home_relay().map(|r| r.to_string())
+    }
+    fn relay_rtt_ms(&self) -> Option<u32> {
+        // Phase 1: iroh 0.98 does not expose a stable relay-RTT API
+        // suitable for synthesis. Returning `None` keeps the snapshot
+        // safe; testers still get `home_relay_url` to interpret.
+        None
+    }
+    fn direct_addresses(&self) -> Vec<String> {
+        self.0
+            .direct_addresses()
+            .into_iter()
+            .map(|sa| sa.to_string())
+            .collect()
+    }
+    fn nat_classification(&self) -> NatClass {
+        // Phase 1: see `classify_nat` docs — no stable iroh hook yet.
+        NatClass::Unknown
+    }
+}
+
+/// Production `ReachabilitySnapshot` wrapping `ReachabilityResolver`
+/// (cheap to clone — internally `Arc`-shared).
+pub struct ProdReachabilitySnapshot(pub crate::reachability_resolver::ReachabilityResolver);
+
+impl ReachabilitySnapshot for ProdReachabilitySnapshot {
+    fn list_records(&self) -> Vec<ResolverPeerRecord> {
+        self.0
+            .list_active_peers()
+            .into_iter()
+            .map(|(owner, payload)| ResolverPeerRecord {
+                owner_addr: owner.0,
+                // Phase 1: no profile-cache lookup wired here. Follow-up
+                // pulls display names out of the profile-broadcast cache.
+                display_name: None,
+                // Phase 1: no live iroh connection-mode inspection. The
+                // field defaults to NoConnection so the UI shows the
+                // peer without a misleading "Direct/Relay" badge.
+                connection_mode: ConnectionMode::NoConnection,
+                rtt_ms: None,
+                last_seen_ms: Some(payload.announced_at_ms),
+            })
+            .collect()
+    }
+}
+
+/// Production `NotifyEmitter` wrapping `tauri::AppHandle`. The Tauri
+/// emit is fire-and-forget — errors are swallowed because the
+/// rate-limiter task cannot meaningfully react to a closed window.
+pub struct ProdNotifyEmitter(pub tauri::AppHandle);
+
+impl NotifyEmitter for ProdNotifyEmitter {
+    fn emit_change(&self) {
+        use tauri::Emitter;
+        let _ = self.0.emit(NETWORK_HEALTH_CHANGED_EVENT, ());
+    }
+}
+
+/// Production `PkarrSnapshot` wrapping the shared `PkarrPublisher`.
+///
+/// **Phase 1 stub:** the upstream `PkarrSnapshot` trait is synchronous
+/// (so it can fan through `NetworkHealthService::snapshot` without
+/// imposing an `async` recursion at every call site), but
+/// `PkarrPublisher::active_handles()` is `async` — it takes an
+/// internal `tokio::Mutex`. Per the plan's "If the type is awkward,
+/// ship a stub returning false/0/empty" allowance, this impl holds
+/// the publisher `Arc` (so the wiring is real / re-pluggable) and
+/// returns conservative defaults. A follow-up ticket either:
+///
+///   * adds a synchronous `try_active_handles() -> Option<Vec<String>>`
+///     accessor to `PkarrPublisher` that returns `None` when the
+///     async mutex is contended, OR
+///   * lifts a periodically-refreshed `ArcSwap<Vec<String>>` snapshot
+///     onto the publisher's spawned loop.
+///
+/// Either path lets this impl read synchronously without blocking the
+/// rate-limiter task or the IPC handler.
+pub struct ProdPkarrSnapshot {
+    #[allow(dead_code)]
+    publisher: std::sync::Arc<harmony_pkarr::PkarrPublisher>,
+}
+
+impl ProdPkarrSnapshot {
+    pub fn new(publisher: std::sync::Arc<harmony_pkarr::PkarrPublisher>) -> Self {
+        Self { publisher }
+    }
+}
+
+impl PkarrSnapshot for ProdPkarrSnapshot {
+    fn identity_published(&self) -> bool {
+        // TODO(zeb-329-followup): surface real state once
+        // `PkarrPublisher` exposes a sync handle accessor (see struct
+        // doc). Defaulting to `false` keeps the UI honest — better to
+        // show "unknown publish state" than to falsely claim success.
+        false
+    }
+    fn identity_last_publish_ms(&self) -> Option<u64> {
+        // TODO(zeb-329-followup): see struct doc.
+        None
+    }
+    fn community_publish_count(&self) -> u32 {
+        // TODO(zeb-329-followup): see struct doc.
+        0
+    }
+    fn recent_fallback_events(&self) -> Vec<PkarrFallbackHit> {
+        // TODO(zeb-329-followup): wire a ring buffer of recent
+        // `PkarrFallback` invocations (see `pkarr_resolver_adapter`).
+        // Phase 1 returns an empty Vec — the panel hides the section.
+        Vec::new()
+    }
+}
+
+/// Production `MyMembershipSet`.
+///
+/// **Phase 1 status (per plan §Task 7 Step 2):** the implementer
+/// search for a clean membership accessor (`grep -nE
+/// "list_my_communities|membership.*list|joined_communities"
+/// src-tauri/src/`) turned up no synchronous, non-NodeState-locking
+/// accessor. The community membership lives behind the per-community
+/// CRDT (`registry.engine_arc(cid).await.materialized(...)`), which
+/// requires:
+///
+///   * an async hop into the community registry
+///   * one async lock per community we know about
+///   * a per-community materialisation pass to filter by
+///     `MemberStatus::Joined`
+///
+/// Wiring that here would force `communities_shared_with` to grow an
+/// async signature, which cascades into making `snapshot()` block on
+/// per-peer async lookups inside its synthesis. That contradicts the
+/// "synthesis only" design of `network_health` (top-of-file doc).
+///
+/// Until a synchronous projection (e.g. a maintained
+/// `OwnerAddr → Vec<CommunityIdHex>` cache fed off the existing
+/// `on_epoch_event` hook) lands, we ship a stub returning empty Vec.
+/// The Network Health panel renders as "no peers" — a documented
+/// graceful degradation per spec §6.1, captured in the PR description.
+pub struct ProdMembership;
+
+impl MyMembershipSet for ProdMembership {
+    fn communities_shared_with(&self, _peer: &[u8; 16]) -> Vec<String> {
+        // TODO(zeb-329-followup): maintain a synchronous
+        // OwnerAddr → Vec<CommunityIdHex> projection updated from the
+        // existing on_epoch_event hook and consult it here.
+        Vec::new()
+    }
+}
+
+/// IPC-internal accessor for the private `now_ms()` clock. Exposed via
+/// `#[doc(hidden)]` so the Tauri command in `lib.rs` (which constructs
+/// the synthetic Phase 1 `SelfTestReport`) can stamp its timestamps
+/// from the same monotonic-wall-clock source as production snapshots.
+#[doc(hidden)]
+pub fn __now_ms_for_ipc() -> u64 {
+    now_ms()
+}
+
 // ── Unit tests ──────────────────────────────────────────────────────
 
 #[cfg(test)]

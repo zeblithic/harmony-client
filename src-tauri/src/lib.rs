@@ -760,6 +760,14 @@ pub struct NodeState {
     /// `stop_inner` can `abort()` it — without abort the loop keeps
     /// running across restart cycles, holding relay connections alive.
     pub pkarr_publisher_handle: Option<tokio::task::JoinHandle<()>>,
+
+    /// ZEB-329: synthesis-only service powering the Network Health
+    /// panel. `None` until boot wiring completes (start_node, after
+    /// `iroh_endpoint` + `reachability_resolver` are constructed); the
+    /// 3 `network_health_*` IPCs early-return an empty snapshot when
+    /// this is `None`. Cleared in `clear_iroh_handles` so a restart
+    /// rebuilds against the fresh iroh / resolver.
+    pub network_health: Option<std::sync::Arc<crate::network_health::NetworkHealthService>>,
 }
 
 impl NodeState {
@@ -800,6 +808,11 @@ impl NodeState {
         self.pkarr_identity_publisher = None;
         self.pkarr_community_publisher = None;
         self.pkarr_settings_path = None;
+        // ZEB-329: drop the synthesis-only service so a restart
+        // rebuilds against the fresh iroh / resolver. The service's
+        // spawned rate-limiter task winds down when its sender (held
+        // inside the Arc) is dropped.
+        self.network_health = None;
     }
 
     /// ZEB-311: test-only helper to set dm_self_owner for integration tests
@@ -925,6 +938,8 @@ impl Default for NodeState {
             pkarr_community_publisher: None,
             pkarr_settings_path: None,
             pkarr_publisher_handle: None,
+            // ZEB-329: stays None until start_node wires it.
+            network_health: None,
         }
     }
 }
@@ -2283,6 +2298,22 @@ async fn start_node(
         let iroh_endpoint_arc: Option<std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>>;
         let reachability_resolver: crate::reachability_resolver::ReachabilityResolver;
         let iroh_handles_for_loop: Option<crate::event_loop::IrohRuntimeHandles>;
+        // ZEB-329: shared cell holding the NetworkHealthService Arc
+        // once boot wiring populates it. The on_epoch_event closure
+        // (constructed below, BEFORE the install site reaches the
+        // wiring step) captures a clone of this cell so it can route
+        // `notify()` calls to the rate-limiter task at delta-time.
+        //
+        // Rationale for the cell vs direct capture: the closure is
+        // built around line ~3120, but the service can only be
+        // constructed once `iroh_endpoint_arc` + `reachability_resolver`
+        // + `pkarr_publisher` are all known (much later). The cell is
+        // populated under the install lock alongside the iroh stash;
+        // the closure reads it on each invocation. A None read is a
+        // graceful no-op (pre-install or iroh-bind-failed).
+        let network_health_hook_cell: std::sync::Arc<
+            std::sync::RwLock<Option<std::sync::Arc<crate::network_health::NetworkHealthService>>>,
+        > = std::sync::Arc::new(std::sync::RwLock::new(None));
         // ZEB-325 Phase 2c: outer-scope clone of the iroh link manager so
         // the owner-loaded block below can install the handshake
         // dispatcher once `community_registry` / `dm_outbox` /
@@ -3065,6 +3096,14 @@ async fn start_node(
                                 // AppHandle clone cheaply (Arc internals).
                                 let reachability_resolver_for_hook = reachability_resolver.clone();
                                 let app_for_reachability = app.clone();
+                                // ZEB-329: capture the shared
+                                // NetworkHealthService cell so the
+                                // closure can notify the rate-limiter
+                                // after resolver mutations. None read
+                                // = graceful no-op (pre-install or
+                                // iroh-bind-failed).
+                                let network_health_for_hook =
+                                    std::sync::Arc::clone(&network_health_hook_cell);
                                 // Per-session synthesized-set: avoids re-synthesizing
                                 // the same rotation/catchup within one node session.
                                 // Wrapped in Arc<Mutex<_>> so the FnMut closure can
@@ -3125,6 +3164,12 @@ async fn start_node(
                                     // so the async block can move them.
                                     let resolver = reachability_resolver_for_hook.clone();
                                     let app = app_for_reachability.clone();
+                                    // ZEB-329: per-invocation clone of
+                                    // the shared cell — the async block
+                                    // takes a read lock once and uses
+                                    // the inner Arc to fire notify().
+                                    let network_health_cell =
+                                        std::sync::Arc::clone(&network_health_for_hook);
                                     async move {
                                         // ZEB-321 Phase 1 Task 8: per spec §7.4,
                                         // freshly-inserted ReachabilityAnnounce
@@ -3149,17 +3194,44 @@ async fn start_node(
                                                     payload.clone(),
                                                     event.at.clone(),
                                                 );
+                                                // ZEB-329: notify the
+                                                // Network Health
+                                                // rate-limiter so the
+                                                // panel re-fetches.
+                                                if let Some(nh) = network_health_cell
+                                                    .read()
+                                                    .ok()
+                                                    .and_then(|g| g.as_ref().cloned())
+                                                {
+                                                    nh.notify();
+                                                }
                                                 emit_changed = Some(event.actor);
                                             }
                                             crate::community_membership::MembershipEventKind::Leave => {
                                                 let n = resolver.remove_owner(&event.actor);
                                                 if n > 0 {
+                                                    // ZEB-329: see comment above.
+                                                    if let Some(nh) = network_health_cell
+                                                        .read()
+                                                        .ok()
+                                                        .and_then(|g| g.as_ref().cloned())
+                                                    {
+                                                        nh.notify();
+                                                    }
                                                     emit_changed = Some(event.actor);
                                                 }
                                             }
                                             crate::community_membership::MembershipEventKind::Kick { target, .. } => {
                                                 let n = resolver.remove_owner(target);
                                                 if n > 0 {
+                                                    // ZEB-329: see comment above.
+                                                    if let Some(nh) = network_health_cell
+                                                        .read()
+                                                        .ok()
+                                                        .and_then(|g| g.as_ref().cloned())
+                                                    {
+                                                        nh.notify();
+                                                    }
                                                     emit_changed = Some(*target);
                                                 }
                                             }
@@ -3684,6 +3756,20 @@ async fn start_node(
                                 communities = ids.len(),
                                 "ZEB-321 ReachabilityResolver bootstrap: replayed historical ReachabilityAnnounce events"
                             );
+                            // ZEB-329: bootstrap replay touches many
+                            // records but logically represents a single
+                            // "resolver-state-changed" event from the
+                            // Network Health panel's perspective. Fire
+                            // ONE notify post-loop; the 2s rate-limiter
+                            // window collapses any redundancy with the
+                            // first post-install delta.
+                            if let Some(nh) = network_health_hook_cell
+                                .read()
+                                .ok()
+                                .and_then(|g| g.as_ref().cloned())
+                            {
+                                nh.notify();
+                            }
                         }
                     }
 
@@ -4642,6 +4728,94 @@ async fn start_node(
                             pkarr_community_publisher_for_state.take();
                         guard.pkarr_settings_path = pkarr_settings_path_for_state.take();
                         guard.pkarr_publisher_handle = pkarr_publisher_handle_for_state.take();
+
+                        // ── ZEB-329: NetworkHealthService boot wiring ──
+                        //
+                        // Spec §5.5 ordering invariant: construct the
+                        // service AFTER iroh + resolver + pkarr handles
+                        // are wired (above), BEFORE the rate-limiter
+                        // task spawn. The rate-limiter task is `tokio
+                        // ::spawn`-ed inside `spawn_rate_limiter`; it
+                        // is safe to invoke from within this std
+                        // `MutexGuard` scope because `tokio::spawn` is
+                        // a synchronous handle return.
+                        //
+                        // When iroh bind failed (`iroh_endpoint_arc`
+                        // is None), the service is not constructed —
+                        // the 3 IPC handlers gracefully return an
+                        // empty snapshot per spec §6.1, so the Network
+                        // Health panel renders as a documented degraded
+                        // state rather than an error toast.
+                        //
+                        // Pkarr publisher absence (no owner identity
+                        // loaded) is tolerated: the snapshot returns
+                        // `false` / `0` / `[]` per the
+                        // `ProdPkarrSnapshot` stub.
+                        if let Some(ep_arc) = iroh_endpoint_arc.as_ref() {
+                            let prod_iroh: std::sync::Arc<dyn crate::network_health::IrohSnapshot> =
+                                std::sync::Arc::new(crate::network_health::ProdIrohSnapshot(
+                                    std::sync::Arc::clone(ep_arc),
+                                ));
+                            let prod_resolver: std::sync::Arc<
+                                dyn crate::network_health::ReachabilitySnapshot,
+                            > = std::sync::Arc::new(
+                                crate::network_health::ProdReachabilitySnapshot(
+                                    reachability_resolver.clone(),
+                                ),
+                            );
+                            let prod_pkarr: std::sync::Arc<
+                                dyn crate::network_health::PkarrSnapshot,
+                            > = if let Some(pub_arc) = guard.pkarr_publisher.as_ref() {
+                                std::sync::Arc::new(crate::network_health::ProdPkarrSnapshot::new(
+                                    std::sync::Arc::clone(pub_arc),
+                                ))
+                            } else {
+                                // No pkarr publisher (no owner identity
+                                // loaded) — install a stub that mirrors
+                                // the Phase 1 ProdPkarrSnapshot behavior
+                                // (all conservative defaults). The
+                                // NetworkHealthService never crashes on
+                                // missing pkarr state per spec §6.1.
+                                std::sync::Arc::new(StubEmptyPkarrSnapshot)
+                            };
+                            let prod_membership: std::sync::Arc<
+                                dyn crate::network_health::MyMembershipSet + Send + Sync,
+                            > = std::sync::Arc::new(crate::network_health::ProdMembership);
+
+                            let mut nh = crate::network_health::NetworkHealthService::new(
+                                prod_iroh,
+                                prod_pkarr,
+                                prod_resolver,
+                                prod_membership,
+                            );
+                            // Spawn the rate-limiter — emits
+                            // `network-health-changed` to the frontend
+                            // when `notify()` fires (event_loop.rs hooks
+                            // around `reachability_resolver.update`).
+                            let emitter = crate::network_health::ProdNotifyEmitter(app.clone());
+                            nh.spawn_rate_limiter(emitter);
+
+                            let nh_arc = std::sync::Arc::new(nh);
+                            guard.network_health = Some(std::sync::Arc::clone(&nh_arc));
+                            // ZEB-329: publish the service into the
+                            // shared cell so the on_epoch_event
+                            // closure's notify hook (captured at
+                            // closure-construction time, well before
+                            // this install site) starts seeing
+                            // `Some(...)` on subsequent resolver
+                            // mutations.
+                            if let Ok(mut cell) = network_health_hook_cell.write() {
+                                *cell = Some(nh_arc);
+                            }
+                        } else {
+                            // iroh bind failed — Network Health panel
+                            // surfaces an empty snapshot via the IPC
+                            // handlers' `None`-guard.
+                            guard.network_health = None;
+                            if let Ok(mut cell) = network_health_hook_cell.write() {
+                                *cell = None;
+                            }
+                        }
                         thread_install_failure = None;
                     }
                     Err(e) => {
@@ -30740,6 +30914,159 @@ async fn connectivity_force_republish(
     Ok(true)
 }
 
+/// ZEB-329 boot helper: stand-in `PkarrSnapshot` used when the pkarr
+/// publisher isn't wired (no owner identity loaded at start_node).
+/// Mirrors `ProdPkarrSnapshot`'s Phase-1 conservative defaults so the
+/// Network Health panel renders without an "unknown publisher" toast.
+struct StubEmptyPkarrSnapshot;
+
+impl crate::network_health::PkarrSnapshot for StubEmptyPkarrSnapshot {
+    fn identity_published(&self) -> bool {
+        false
+    }
+    fn identity_last_publish_ms(&self) -> Option<u64> {
+        None
+    }
+    fn community_publish_count(&self) -> u32 {
+        0
+    }
+    fn recent_fallback_events(&self) -> Vec<crate::network_health::PkarrFallbackHit> {
+        Vec::new()
+    }
+}
+
+// ── ZEB-329: Network Health IPCs ─────────────────────────────────────
+//
+// Three Tauri commands surfacing the synthesis-only NetworkHealthService
+// to the Network Health panel. All three follow the same lock pattern
+// as `connectivity_get_my_reachability_record` above: clone the
+// `Arc<NetworkHealthService>` out of the std `MutexGuard` in a tight
+// scope, drop the guard, then `.await` on the cloned Arc. The std
+// `MutexGuard` is `!Send`; holding it across an await would reject
+// at compile time.
+//
+// Each command tolerates `network_health == None` (pre-start_node,
+// or boot wiring deferred) by returning an empty snapshot / synthetic
+// report (spec §6.1: snapshot never throws).
+
+/// Spec §5.1 + §6.1: return the current synthesized Network Health
+/// snapshot. Returns `NetworkHealthSnapshot::empty()` when the service
+/// hasn't been wired yet (boot ordering / pre-start_node) — the panel
+/// renders gracefully on the empty shape.
+#[tauri::command(rename_all = "snake_case")]
+async fn network_health_snapshot(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<crate::network_health::NetworkHealthSnapshot, String> {
+    let svc = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.network_health.clone()
+    };
+    let snap = match svc {
+        Some(s) => s.snapshot().await,
+        None => crate::network_health::NetworkHealthSnapshot::empty(),
+    };
+    Ok(snap)
+}
+
+/// Spec §5.3 + §6.1: run the self-test.
+///
+/// **Phase 1 stub:** returns an all-`Skipped` synthetic report so the
+/// frontend renders without an error toast. The production self-test
+/// trait wiring (`IrohSelfTest`, `PkarrSelfTest`, `PingDispatcher`
+/// production impls + per-peer ping fan-out) is deferred to a
+/// follow-up — see TODO inside the function body.
+///
+/// Returns `Err` only when the service hasn't been wired yet
+/// (`network_health == None`); step failures live inside the report
+/// per spec §6.2 (Pass / Fail / Skipped), not as command-level errors.
+#[tauri::command(rename_all = "snake_case")]
+async fn network_health_run_self_test(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<crate::network_health::SelfTestReport, String> {
+    let svc = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.network_health.clone()
+    };
+    let Some(_svc) = svc else {
+        return Err("network_health service not yet initialized".into());
+    };
+    // TODO(zeb-329-followup): wire production IrohSelfTest /
+    // PkarrSelfTest / PingDispatcher impls and replace this synthetic
+    // report with `_svc.run_self_test(iroh_test, pkarr_test, ping,
+    // peers).await`. Until then we emit an all-Skipped report so the
+    // UI does not break on missing trait impls (spec §6.1).
+    let now = crate::network_health::__now_ms_for_ipc();
+    let synthetic = crate::network_health::SelfTestReport {
+        started_at_ms: now,
+        finished_at_ms: now,
+        steps: vec![
+            crate::network_health::SelfTestStep {
+                name: "endpoint".into(),
+                outcome: crate::network_health::StepOutcome::Skipped {
+                    reason: "production self-test traits not yet wired (zeb-329 follow-up)".into(),
+                },
+            },
+            crate::network_health::SelfTestStep {
+                name: "relay".into(),
+                outcome: crate::network_health::StepOutcome::Skipped {
+                    reason: "production self-test traits not yet wired (zeb-329 follow-up)".into(),
+                },
+            },
+            crate::network_health::SelfTestStep {
+                name: "pkarr_publish".into(),
+                outcome: crate::network_health::StepOutcome::Skipped {
+                    reason: "production self-test traits not yet wired (zeb-329 follow-up)".into(),
+                },
+            },
+            crate::network_health::SelfTestStep {
+                name: "pkarr_resolve".into(),
+                outcome: crate::network_health::StepOutcome::Skipped {
+                    reason: "production self-test traits not yet wired (zeb-329 follow-up)".into(),
+                },
+            },
+        ],
+        peer_results: vec![],
+    };
+    Ok(synthetic)
+}
+
+/// Spec §5.4: export the current snapshot + last cached self-test
+/// report as redaction-aware markdown.
+///
+/// `include_full_ids = false` is the default-safe path — full node /
+/// owner identifiers are redacted to first-8-of-hex per spec. The
+/// frontend's DiagnosticExportModal exposes the toggle behind an
+/// explicit "include full identifiers" checkbox.
+///
+/// Memory rule `feedback_two_ipc_toctou`: the cached last self-test
+/// is memo-style (read after the most recent `run_self_test`), NOT a
+/// commit token bound to a previous IPC's preview. No TOCTOU window.
+#[tauri::command(rename_all = "snake_case")]
+async fn network_health_export_payload(
+    state: tauri::State<'_, Mutex<NodeState>>,
+    include_full_ids: bool,
+) -> Result<String, String> {
+    let svc = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.network_health.clone()
+    };
+    let (snap, last) = match svc {
+        Some(s) => (s.snapshot().await, s.cached_last_self_test().await),
+        None => (crate::network_health::NetworkHealthSnapshot::empty(), None),
+    };
+    Ok(crate::network_health::format_export_markdown(
+        &snap,
+        last.as_ref(),
+        include_full_ids,
+    ))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -30946,6 +31273,10 @@ pub fn run() {
             connectivity_get_identity_discoverable,
             connectivity_discover_identity,
             connectivity_pkarr_publication_status,
+            // ZEB-329: Network Health IPCs.
+            network_health_snapshot,
+            network_health_run_self_test,
+            network_health_export_payload,
         ])
         .run(tauri::generate_context!())
         .expect("error while running harmony");
@@ -34206,6 +34537,9 @@ mod start_node_race_tests {
             pkarr_community_publisher: None,
             pkarr_settings_path: None,
             pkarr_publisher_handle: None,
+            // ZEB-329: race-test NodeStates never wire the network
+            // health service — set to None.
+            network_health: None,
         })
     }
 
