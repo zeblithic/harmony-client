@@ -45,7 +45,7 @@ The deliverables split into three layers:
 
 ### 3.1 What ships
 
-```
+```text
 docs/
 ├── zeblithic-bootstrap.md          NEW — mint playbook + first-invite generation
 ├── invite-distribution.md          NEW — distribution channels + tracking + rotation
@@ -69,7 +69,7 @@ docs/
 
 ### 3.3 Why doc-only
 
-Per the pre-spec exploration ([Sub-D Pre-Spec Findings](#)):
+Per the pre-spec exploration (notes from the subagent that mapped `community_invite.rs` + `lib.rs` IPCs before spec drafting; findings condensed into §§3-7 below):
 - `create_community` is fully exposed as an IPC, invoked from `CreateCommunityDialog` (`src/App.svelte:1854-1889`).
 - `create_channel` is fully exposed and invoked from `CreateChannelDialog`.
 - `generate_invite` is exposed and invoked from `InviteLinkManager`.
@@ -81,7 +81,7 @@ Adding scripts or helper code would create maintenance burden without value; the
 
 ### 4.1 Outline
 
-```
+```markdown
 # Zeblithic Community Bootstrap
 
 ## Pre-conditions
@@ -144,7 +144,7 @@ The doc draft uses the 5-channel set; you'll edit to taste during your actual mi
 
 ### 5.1 Outline
 
-```
+```markdown
 # Invite Distribution Playbook
 
 ## How invites work in Phase 3
@@ -223,7 +223,7 @@ This is a heavy hammer. It invalidates EVERYONE'S invite, not just the leaked on
 
 ### 6.1 Outline
 
-```
+```markdown
 # Alpha Validation Playbook
 
 ## What "tester journey complete" means
@@ -344,7 +344,7 @@ contact_links:
 
 ### 8.1 Outline
 
-```
+```markdown
 # Triage Runbook: alpha-feedback issues
 
 When a new `alpha-feedback`-labeled issue arrives:
@@ -373,7 +373,7 @@ End of each week: review all open `alpha-feedback` issues. Identify patterns (mu
 
 ## 9. Validation flow end-to-end
 
-```
+```text
 Jake (zeblith)                    Tester                       Repo
 ─────────────                     ──────                       ────
 1. mints Zeblithic

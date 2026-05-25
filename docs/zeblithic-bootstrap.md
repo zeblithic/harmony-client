@@ -36,15 +36,21 @@ Before you start:
 
 Default channel set for Zeblithic alpha. Revise to taste before you actually click through — these are starting recommendations:
 
-| Channel | `write_power` | Purpose |
+| Channel | `write_power` (when surfaced) | Purpose |
 |---|---:|---|
 | `#general` (auto-created) | 0 | Default chat, open to all |
-| `#announcements` | 50 (mod-only write) | Jake-broadcast: releases, alerts, "we're rotating epochs in 1h" |
+| `#announcements` | 50 (mod-only write, **post-v2 only**) | Jake-broadcast: releases, alerts, "we're rotating epochs in 1h" |
 | `#help` | 0 | Tester help requests; first place to look for "I'm stuck" |
-| `#feedback` | 0 | Synchronous impressions; complement to the (?) → Submit Feedback flow |
+| `#feedback` | 0 | Synchronous impressions; complement to the `(?)` → Submit Feedback flow |
 | `#network-health` | 0 | Tester reports of connectivity issues, Network Health screenshots, "I see relay use, is that normal?" |
 
-`write_power = 0` means anyone can write. `write_power = 50` means only mod-tier members (kick power ≥ 50) can write — currently just you.
+**v0.1.0-alpha caveat:** the `CreateChannelDialog` in v2 hides the `write_power` slider — every channel created through the UI gets `write_power=0` (anyone-can-write). The `#announcements` "mod-only" intent in the table above is the eventual v3 target, not what you can achieve through the shipped UI today. For v0.1.0-alpha:
+
+- Either accept that `#announcements` is anyone-write (most testers will respect social convention)
+- Or skip `#announcements` for alpha and re-introduce it post-v3 when the slider is unhidden
+- Or use mod-tier kicking as the moderation backstop if someone writes inappropriately
+
+When v3 unhides the slider (`CreateChannelDialog.svelte:81-83`), revisit this table and re-mint the affected channels with the intended `write_power` values.
 
 ### Per-channel sequence
 
@@ -54,7 +60,7 @@ For each non-auto channel:
 2. **Click `+`** at the bottom of the channel sub-sidebar.
 3. **In the CreateChannelDialog:**
    - **Name:** the channel name without the `#` prefix (e.g. `announcements`)
-   - **write_power:** per the table above
+   - **write_power:** auto-set to `0` (slider hidden in v2 — see caveat above)
    - **Submit.**
 4. **Confirm the channel appears** in the sub-sidebar.
 

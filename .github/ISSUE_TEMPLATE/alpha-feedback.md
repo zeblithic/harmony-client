@@ -13,6 +13,11 @@ filing manually.
 
 If you are filing manually, please keep the sections below — the
 triage runbook expects this structure.
+
+Note: GitHub Issues are an intake surface. Actionable findings are
+mirrored into Linear (the authoritative tracker); see
+docs/triage-alpha-feedback.md for the flow. Your issue stays open as
+the public-facing receipt while the engineering work lives in Linear.
 -->
 
 ## Description

@@ -57,7 +57,7 @@ For each tester:
 
 Adapt to your voice — this is a starting point, not a script.
 
-```
+```text
 Hey [name],
 
 You're getting one of the first invites to test Harmony, the self-sovereign
@@ -110,7 +110,7 @@ Keep a private tracker. **Don't commit it to git** — it contains tester identi
 
 Suggested format (CSV in your password manager, Signal note-to-self, or local text file):
 
-```
+```csv
 tester,channel,url_fragment_last8,sent_at,redeemed_at,notes
 Alice,Signal,a3b9c1d2,2026-05-26,2026-05-26,"Joined immediately, asked about Network Health"
 Bob,email-GPG,e8f7g6h5,2026-05-26,,"Reminded 2026-05-28; says he'll get to it weekend"
@@ -125,7 +125,7 @@ What to track:
 | Channel | So you know how reliable a re-ping is |
 | URL fragment (last 8 chars of base64 payload) | So you can correlate "Bob redeemed" with a specific send if you ever need to |
 | Sent timestamp | So you know when to remind |
-| Redeemed timestamp | Confirm in `CommunitySettingsPanel → Members` (a new admin-power member appearing is a tester redemption) |
+| Redeemed timestamp | Confirm in `CommunitySettingsPanel → Members` (a new member appearing is a tester redemption) |
 | Notes | Anything useful: OS, NAT type, follow-up needed, feedback submitted |
 
 A redemption is visible to you as a new member appearing in Zeblithic. Cross-reference the new member's join time with your tracker's `sent_at` to figure out who it was — Phase 3 doesn't include invitee identity in the URL, so the only correlation is timing.
@@ -144,17 +144,23 @@ Don't pressure. Alpha testers are doing you a favor.
 
 Phase 3 has no per-URL revoke. To invalidate ALL outstanding URLs:
 
-1. **Kick any member from Zeblithic** via `CommunitySettingsPanel → Members → [member] → Kick`. *(Ideally a friendly tester you've coordinated with; they'll need to redeem the new URL after rotation.)*
+1. **Kick any member from Zeblithic** via `CommunitySettingsPanel → Members → [member] → Kick`. **Important:** Kick acts as a ban in v0.1.0-alpha — the kicked member CANNOT rejoin (their next invite-redeem attempt is rejected with `InviteTargetBanned`, and a direct rejoin attempt is rejected with `BannedActorJoin`) until you explicitly unban them.
 2. The Kick triggers an `EpochRotation`: a new EpochKey is generated, the community advances to the next epoch.
 3. **All prior invite URLs become invalid.** Old URLs embed the old EpochKey; they no longer decrypt the current epoch.
 4. **Generate a new URL** via `InviteLinkManager → Generate invite link`. It embeds the new EpochKey.
-5. **Re-distribute** the new URL to anyone you want to keep — including the kicked friendly tester. They re-redeem and rejoin.
+5. **Unban the kicked tester** via `CommunitySettingsPanel → Members → [member] → Unban` (or however the CommunityMembersPanel surfaces the action — check the member row's action menu). This must happen BEFORE you re-invite them, or their redeem will fail.
+6. **Re-distribute** the new URL to anyone you want to keep — including the unbanned friendly tester. They re-redeem and rejoin.
+
+**Two ways to handle the rotation tester:**
+
+- **(a) Use a friendly tester** as above. Coordinate with them in advance ("I'm rotating in 5 minutes, you'll be kicked + need to redeem a new URL after I unban you"). Requires the Unban step.
+- **(b) Use a disposable identity you control** — spin up a second harmony-client install on a second device or VM, redeem an invite as a "dummy" account, and kick that account when you need to rotate. No coordination overhead. Still requires Unban if you want to reuse the same dummy account, OR just create a fresh dummy each rotation.
 
 Rotation is a heavy hammer. It invalidates EVERYONE'S invite, not just the leaked one. For Phase 3 this is the only option. Use it when:
 
 - A URL leaks (publicly, or via a tester's compromised device)
 - You want to formally "close" the alpha cohort (rotate, don't generate a new URL)
-- You suspect (but can't confirm) a leak — the cost is one round of friendly re-distribution
+- You suspect (but can't confirm) a leak — the cost is one round of friendly re-distribution + Unban
 
 ## Pre-mortem: things that go wrong
 

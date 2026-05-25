@@ -1,4 +1,16 @@
-blank_issues_enabled: false
+# blank_issues_enabled is intentionally `true` so Sub-C's in-app feedback flow
+# (`buildGitHubIssueUrl()` in `src/lib/onboarding-env.ts`) keeps working. That
+# flow constructs a direct `/issues/new?title=...&body=...` URL without
+# `template=alpha-feedback.md` selector; setting blank_issues_enabled=false
+# would route those URLs to the template chooser and drop the prefilled
+# title/body. The alpha-feedback template still applies its label + assignee
+# when a tester picks it manually from the chooser.
+#
+# Follow-up: ZEB-NNN-TODO would add `&template=alpha-feedback.md` to
+# buildGitHubIssueUrl so we could flip blank_issues_enabled back to false
+# (tightening the funnel) without breaking the in-app flow. Defer until a
+# real Linear ticket is filed.
+blank_issues_enabled: true
 contact_links:
   - name: Troubleshooting docs
     url: https://github.com/zeblithic/harmony-client/blob/main/docs/troubleshooting.md

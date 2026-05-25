@@ -2,6 +2,8 @@
 
 This is the per-issue runbook for processing GitHub issues labeled `alpha-feedback`. These come primarily from Sub-C's [`FeedbackModal`](../src/lib/components/FeedbackModal.svelte) (the in-app `(?)` → Submit Feedback flow), plus any manual reports filed through the [issue template](../.github/ISSUE_TEMPLATE/alpha-feedback.md).
 
+**Linear is the authoritative tracker.** GitHub Issues with the `alpha-feedback` label are intake-only — every actionable finding is mirrored into a Linear ZEB-NNN ticket as part of the triage workflow below. The GitHub issue stays open as the public-facing receipt; the Linear ticket carries the engineering work. Closing a GitHub issue requires either (a) a linked Linear ticket has been resolved + released, or (b) the disposition is "won't-fix-this-alpha" / "duplicate" / "needs-info-timeout."
+
 Read [`alpha-validation.md`](./alpha-validation.md) first for the higher-level cadence + DoD context.
 
 ## Triage SLA
@@ -14,7 +16,7 @@ Read [`alpha-validation.md`](./alpha-validation.md) first for the higher-level c
 
 For each new `alpha-feedback` issue:
 
-```
+```text
 1. Is the description complete enough to act on?
    ├─ Yes → continue to (2)
    └─ No  → comment requesting specifics ([Template: Need-more-info]), wait for response

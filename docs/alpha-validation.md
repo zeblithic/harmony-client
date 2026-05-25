@@ -66,6 +66,8 @@ If they decline or don't respond within ~3 days, move to the next candidate.
 
 ## Findings → tickets
 
+**Linear is the authoritative tracker** for harmony-client work. GitHub Issues with the `alpha-feedback` label are an intake surface only — every actionable finding flows into a Linear ZEB-NNN ticket within the triage SLA, and progress is tracked there. GitHub Issues serve as the public-facing receipt for testers; Linear serves as the engineering source of truth. Do not let GitHub Issues become a parallel work-tracking system.
+
 Per [ZEB-330](https://linear.app/zeblith/issue/ZEB-330) DoD: **validation findings get filed as FOLLOW-UP tickets, NOT folded into ZEB-330.**
 
 For each `alpha-feedback`-labeled GitHub issue, decide:
