@@ -19,6 +19,7 @@
   import MailReader from './lib/components/MailReader.svelte';
   import MailCompose from './lib/components/MailCompose.svelte';
   import MintLedger from './lib/components/MintLedger.svelte';
+  import NetworkHealthView from './lib/components/NetworkHealthView.svelte';
   import ProfilePopover from './lib/components/ProfilePopover.svelte';
   import VinePublishDialog from './lib/components/VinePublishDialog.svelte';
   import DmCreateDialog from './lib/components/DmCreateDialog.svelte';
@@ -1709,6 +1710,9 @@
     {:else}
       <p style="padding: 1rem;">Mint requires Tauri — run via <code>npm run tauri dev</code>.</p>
     {/if}
+  {/snippet}
+  {#snippet networkPanel()}
+    <NetworkHealthView />
   {/snippet}
 </Layout>
 

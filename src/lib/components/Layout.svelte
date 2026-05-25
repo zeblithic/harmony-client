@@ -2,7 +2,7 @@
   import type { Snippet } from 'svelte';
   import type { AppMode } from '../types';
 
-  let { nav, textFeed, mediaFeed, vineFeed, fileBrowser, fileDetailPanel, spellbookContent, spellbookDetail, mailInbox, mailDetail, mintLedger, settingsPanel, collapsed = false, showSettings = false, mode = 'messages', mailSelected = false }: {
+  let { nav, textFeed, mediaFeed, vineFeed, fileBrowser, fileDetailPanel, spellbookContent, spellbookDetail, mailInbox, mailDetail, mintLedger, networkPanel, settingsPanel, collapsed = false, showSettings = false, mode = 'messages', mailSelected = false }: {
     nav: Snippet;
     textFeed: Snippet;
     mediaFeed: Snippet;
@@ -14,6 +14,7 @@
     mailInbox?: Snippet;
     mailDetail?: Snippet;
     mintLedger?: Snippet;
+    networkPanel?: Snippet;
     settingsPanel?: Snippet;
     collapsed?: boolean;
     showSettings?: boolean;
@@ -22,7 +23,7 @@
   } = $props();
 </script>
 
-<div class="layout" class:collapsed class:files-mode={mode === 'files' && fileBrowser} class:vine-mode={mode === 'vines' && vineFeed} class:spellbook-mode={mode === 'spellbook' && spellbookContent} class:mail-mode={mode === 'mail' && mailInbox} class:mint-mode={mode === 'mint' && mintLedger}>
+<div class="layout" class:collapsed class:files-mode={mode === 'files' && fileBrowser} class:vine-mode={mode === 'vines' && vineFeed} class:spellbook-mode={mode === 'spellbook' && spellbookContent} class:mail-mode={mode === 'mail' && mailInbox} class:mint-mode={mode === 'mint' && mintLedger} class:network-mode={mode === 'network' && networkPanel}>
   <aside class="nav-area">
     {@render nav()}
   </aside>
@@ -66,6 +67,10 @@
   {:else if mode === 'mint' && mintLedger}
     <main class="mint-area">
       {@render mintLedger()}
+    </main>
+  {:else if mode === 'network' && networkPanel}
+    <main class="network-area">
+      {@render networkPanel()}
     </main>
   {:else}
     <main class="text-area">
@@ -202,6 +207,22 @@
   }
   .mint-area {
     grid-area: mint;
+    background: var(--bg-primary);
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .layout.network-mode {
+    grid-template-columns: var(--nav-width) 1fr;
+    grid-template-areas: "nav network";
+  }
+  .layout.network-mode.collapsed {
+    grid-template-columns: var(--nav-width-collapsed) 1fr;
+    grid-template-areas: "nav network";
+  }
+  .network-area {
+    grid-area: network;
     background: var(--bg-primary);
     overflow-y: auto;
     display: flex;

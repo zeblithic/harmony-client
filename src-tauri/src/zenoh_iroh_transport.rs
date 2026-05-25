@@ -358,6 +358,16 @@ impl IrohZenohLinkManager {
                                  not yet installed; will drain after owner identity loads)"
                             );
                         }
+                    } else if alpn_used == alpn::HARMONY_PING_V1 {
+                        // ZEB-329 Task 5 (option B): fold HARMONY_PING_V1
+                        // dispatch into the single accept loop. iroh 0.98's
+                        // `Endpoint::accept()` is backed by a shared
+                        // mutex-protected queue, so a separate ping accept
+                        // loop would round-robin connections with this one.
+                        // Spawn so a slow/hung peer doesn't block the
+                        // accept loop on the next connection.
+                        tracing::debug!("dispatching HARMONY_PING_V1 to handle_ping_accept");
+                        tokio::spawn(crate::network_health::handle_ping_accept(conn));
                     } else {
                         tracing::debug!(
                             "ignoring unknown ALPN: {:?}",
