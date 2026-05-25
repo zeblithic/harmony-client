@@ -603,45 +603,27 @@ impl NetworkHealthService {
     }
 }
 
-// ── HARMONY_PING_V1 self-test loop + connect-side helper ────────────
+// ── HARMONY_PING_V1 accept-side handler + connect-side helper ───────
 
-/// Spec §5.3 + §7.3: tiny accept loop that echoes one byte on the
-/// HARMONY_PING_V1 ALPN. Spawned at boot by NetworkHealthService.
+/// Spec §5.3 + §7.3: handle one inbound HARMONY_PING_V1 connection —
+/// accept one bi-stream, read one byte, echo it back, finish.
 /// Self-test only — produces no app-level state.
 ///
-/// NOTE on dual accept loops: this runs alongside the existing
-/// zenoh-over-iroh accept loop in [`crate::zenoh_iroh_transport`].
-/// iroh's `Endpoint::accept` is a multi-consumer queue under the
-/// hood (each call awaits the next inbound `Incoming`), so two
-/// concurrent loops will round-robin incoming connections.
-/// Practically this is acceptable for HARMONY_PING_V1 because we
-/// gracefully reject non-matching ALPNs in [`handle_ping_accept`]
-/// and inbound zenoh / handshake connections retry through their
-/// own dispatch. The integration test in Task 8 validates this.
-/// If it surfaces as a regression, fold ping dispatch into the
-/// zenoh accept loop (risk #3 option B in the plan).
-pub fn spawn_ping_accept_loop(endpoint: std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>) {
-    tokio::spawn(async move {
-        loop {
-            let Some(incoming) = endpoint.inner().accept().await else {
-                // Endpoint closed; exit.
-                return;
-            };
-            tokio::spawn(handle_ping_accept(incoming));
-        }
-    });
-}
-
-async fn handle_ping_accept(incoming: iroh::endpoint::Incoming) {
-    let Ok(connecting) = incoming.accept() else {
-        return;
-    };
-    let Ok(conn) = connecting.await else {
-        return;
-    };
-    // iroh 0.98: Connection::alpn() returns &[u8] (the negotiated
-    // ALPN, already checked against the bind-time list). Compare
-    // by slice equality — non-matching ALPNs drop without echoing.
+/// Dispatched from [`crate::zenoh_iroh_transport::IrohZenohLinkManager::spawn_accept_loop`]'s
+/// ALPN switch (NOT a separate accept loop). The zenoh-over-iroh
+/// accept loop owns the single consumer of `Endpoint::accept()` and
+/// fans out by negotiated ALPN. This avoids the iroh 0.98 dual-loop
+/// hazard: `Endpoint::accept()` is backed by a shared mutex-protected
+/// queue, so two concurrent callers would round-robin and silently
+/// consume each other's connections.
+///
+/// Takes an already-accepted [`iroh::endpoint::Connection`] because
+/// the zenoh accept loop awaits `incoming` before matching on ALPN
+/// (see `zenoh_iroh_transport.rs` line ~292).
+pub async fn handle_ping_accept(conn: iroh::endpoint::Connection) {
+    // The zenoh accept loop has already checked ALPN; this is defensive
+    // in case `handle_ping_accept` is ever called from a different
+    // dispatch path. iroh 0.98: Connection::alpn() returns &[u8].
     if conn.alpn() != crate::iroh_endpoint::alpn::HARMONY_PING_V1 {
         return;
     }
