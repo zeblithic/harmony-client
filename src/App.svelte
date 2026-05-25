@@ -59,6 +59,8 @@
   import { checkForUpdate } from './lib/updater-adapter';
   import { extractHarmonyInviteUrl } from './lib/deep-link-router';
   import UpdateAvailableToast from './lib/components/UpdateAvailableToast.svelte';
+  import WelcomeModal from './lib/components/WelcomeModal.svelte';
+  import type { StartNodeResponse } from './lib/types/onboarding';
 
   let innerWidth = $state(window.innerWidth);
   let collapsed = $derived(innerWidth <= 768);
@@ -229,6 +231,10 @@
   // state without remounting (and so multiple dialogs can be cycled).
   // ── ZEB-328: in-app update notification ────────────────────────────
   let availableUpdate = $state<Update | null>(null);
+  // ── ZEB-331: first-run welcome + feedback + about ─────────────────
+  let showWelcomeModal = $state(false);
+  let feedbackModalOpen = $state(false);
+  let aboutModalOpen = $state(false);
 
   let showCreateCommunity = $state(false);
   let showRedeemInvite = $state(false);
@@ -665,7 +671,16 @@
       // Network view's Connect flow can later re-invoke start_node with an
       // endpoint to join a gateway.
       try {
-        await invoke('start_node', { endpoint: null });
+        const response = (await invoke('start_node', { endpoint: null })) as
+          | StartNodeResponse
+          | undefined
+          | null;
+        // Forward-compat: an older backend that returned bare void / null
+        // produces undefined here; treat as freshly_created=false (privacy-
+        // safe default — never re-show the welcome to a returning user).
+        if (response?.freshlyCreated === true) {
+          showWelcomeModal = true;
+        }
       } catch (err) {
         console.warn('[harmony-client] auto-start_node failed:', err);
       }
@@ -812,6 +827,7 @@
           redeemUrl = url;
           redeemError = null;
           showRedeemInvite = true;
+          showWelcomeModal = false;
         }
       });
 
@@ -827,6 +843,7 @@
             redeemUrl = url;
             redeemError = null;
             showRedeemInvite = true;
+            showWelcomeModal = false;
           }
         }
       } catch (e) {
@@ -1959,6 +1976,21 @@
     onDismiss={() => (availableUpdate = null)}
   />
 {/if}
+
+<!-- ZEB-331: first-run welcome modal. Shown when start_node returns
+     freshlyCreated=true (Flow 1). Suppressed by deep-link handlers
+     (Flow 5 — both warm-launch and cold-launch paths set
+     showWelcomeModal=false when a harmony:// URL is received). -->
+<WelcomeModal
+  open={showWelcomeModal}
+  onDismiss={() => (showWelcomeModal = false)}
+  onJoinWithInvite={(url) => {
+    redeemUrl = url;
+    redeemError = null;
+    showRedeemInvite = true;
+    showWelcomeModal = false;
+  }}
+/>
 
 
 <style>
