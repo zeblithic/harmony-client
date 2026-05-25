@@ -55,7 +55,7 @@ docs/
 .github/
 └── ISSUE_TEMPLATE/
     ├── alpha-feedback.md           NEW — auto-labeled template matched to Sub-C flow
-    └── config.yml                  NEW (if absent) — disables blank issues, links to other contacts
+    └── config.yml                  NEW (if absent) — allows blank issues (to preserve in-app prefilled URLs), links to other contacts
 ```
 
 5 new docs + 1-2 GitHub-config files. ~600-1200 lines total. No source changes.
@@ -324,7 +324,12 @@ assignees: ['jenglund']
 ### 7.3 Repository-level config (`.github/ISSUE_TEMPLATE/config.yml`)
 
 ```yaml
-blank_issues_enabled: false
+# blank_issues_enabled MUST be true. Sub-C's buildGitHubIssueUrl builds
+# /issues/new?title=...&body=... URLs without &template=alpha-feedback.md,
+# and `false` would redirect those to the chooser and strip the prefilled
+# body. Follow-up: add &template=alpha-feedback.md so we can flip this to
+# false AND get auto-applied labels/assignees on in-app submissions.
+blank_issues_enabled: true
 contact_links:
   - name: Troubleshooting docs
     url: https://github.com/zeblithic/harmony-client/blob/main/docs/troubleshooting.md
@@ -333,6 +338,8 @@ contact_links:
     url: https://github.com/zeblithic/harmony-client/blob/main/docs/feedback.md
     about: How to submit feedback through the in-app flow.
 ```
+
+> **Label gap for in-app submissions.** Because `blank_issues_enabled: true` and `buildGitHubIssueUrl` does not include `&template=alpha-feedback.md`, in-app submissions arrive as blank-form-prefill issues and do NOT carry the `alpha-feedback` label or the `jenglund` assignee automatically. They DO carry the `[alpha-feedback]` title prefix. Until the URL-builder is updated, the triage runbook recommends filtering by title prefix as a fallback (see [`triage-alpha-feedback.md` § Filter notes](../triage-alpha-feedback.md#filter-notes)).
 
 ### 7.4 Open questions for Jake
 

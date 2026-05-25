@@ -56,7 +56,7 @@ If they decline or don't respond within ~3 days, move to the next candidate.
 
 **Week 2 (observation):**
 - Testers explore at their own pace
-- Daily check on `alpha-feedback`-labeled issues (per [`triage-alpha-feedback.md`](./triage-alpha-feedback.md))
+- Daily check on `[alpha-feedback]`-titled issues (per [`triage-alpha-feedback.md` § Filter notes](./triage-alpha-feedback.md#filter-notes) — title-prefix filter catches both manual + in-app intake paths)
 - File follow-up ZEB-NNN tickets for actionable findings — never fold into ZEB-330 itself
 
 **Week 3+ (aggregation):**

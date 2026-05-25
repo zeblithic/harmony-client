@@ -12,6 +12,31 @@ Read [`alpha-validation.md`](./alpha-validation.md) first for the higher-level c
 - Even a holding response ("looking into this, will follow up by X") counts as first-pass. Don't let the issue sit unacknowledged.
 - Aim to fully disposition within 1 week.
 
+## Filter notes
+
+**Two intake paths arrive with different metadata** — filter by title prefix to catch both:
+
+| Path | Carries `alpha-feedback` label? | Carries `[alpha-feedback]` title prefix? |
+|---|---|---|
+| Manual file (uses [issue template](../.github/ISSUE_TEMPLATE/alpha-feedback.md)) | ✅ yes (template `labels:` auto-applies) | ✅ yes (template `title:` auto-fills) |
+| In-app `(?)` → Submit Feedback (`buildGitHubIssueUrl` in [`src/lib/onboarding-env.ts`](../src/lib/onboarding-env.ts)) | ❌ no (URL has no `&template=alpha-feedback.md` param) | ✅ yes (title field is always prefixed) |
+
+Until `buildGitHubIssueUrl` adds `&template=alpha-feedback.md` to its URL (follow-up tracked under Sub-C), **always filter by title prefix** to catch in-app submissions too:
+
+```text
+is:issue is:open "[alpha-feedback]" in:title
+```
+
+Or in `gh` CLI:
+
+```bash
+gh issue list --search '"[alpha-feedback]" in:title' --state open
+```
+
+If you filter by the `alpha-feedback` label only (e.g., `label:alpha-feedback`), you will silently miss every in-app-filed report. Triage by-label only after the URL-builder follow-up ships and you have re-labeled outstanding issues.
+
+When you triage an in-app submission, **manually apply the `alpha-feedback` label and `jenglund` assignee** so subsequent label-based filters work for that issue.
+
 ## Per-issue decision tree
 
 For each new `alpha-feedback` issue:
@@ -145,7 +170,7 @@ Closing for now since I don't have enough context to reproduce. Please reopen wi
 
 End of each week:
 
-1. Review all open `alpha-feedback`-labeled issues
+1. Review all open `[alpha-feedback]`-titled issues (per [§Filter notes](#filter-notes) — title prefix catches both label-carrying and in-app-prefilled paths)
 2. Identify patterns — same issue from 2+ testers, recurring confusion in the same UI area
 3. Cluster into theme tickets where useful (e.g., "Network Health interpretations" if 3 testers ask the same questions)
 4. Update the [tester tracker](./invite-distribution.md#per-tester-tracking) with any tester-specific notes
