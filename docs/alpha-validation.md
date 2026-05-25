@@ -62,15 +62,15 @@ If they decline or don't respond within ~3 days, move to the next candidate.
 **Week 3+ (aggregation):**
 - Group similar findings, cluster into theme tickets if the same issue appears 3+ times
 - Decide which findings are alpha-cycle fixable vs deferred to v0.1.1 / v0.2
-- When the first cohort has reached "complete" (per the [DoD checklist above](#what-tester-journey-complete-means) for ≥2 testers), mark ZEB-330 done
+- Continue until the full [§ When is alpha validation done?](#when-is-alpha-validation-done) checklist clears (not just per-tester journey completion — also intake-triaged, ≥1 follow-up ticket filed, critical-path issues fixed-or-documented); then mark ZEB-330 done
 
 ## Findings → tickets
 
-**Linear is the authoritative tracker** for harmony-client work. GitHub Issues with the `alpha-feedback` label are an intake surface only — every actionable finding flows into a Linear ZEB-NNN ticket within the triage SLA, and progress is tracked there. GitHub Issues serve as the public-facing receipt for testers; Linear serves as the engineering source of truth. Do not let GitHub Issues become a parallel work-tracking system.
+**Linear is the authoritative tracker** for harmony-client work. GitHub Issues with the `[alpha-feedback]` title prefix (whether or not the `alpha-feedback` label was applied at filing time — see [`triage-alpha-feedback.md` § Filter notes](./triage-alpha-feedback.md#filter-notes)) are an intake surface only — every actionable finding flows into a Linear ZEB-NNN ticket within the triage SLA, and progress is tracked there. GitHub Issues serve as the public-facing receipt for testers; Linear serves as the engineering source of truth. Do not let GitHub Issues become a parallel work-tracking system.
 
 Per [ZEB-330](https://linear.app/zeblith/issue/ZEB-330) DoD: **validation findings get filed as FOLLOW-UP tickets, NOT folded into ZEB-330.**
 
-For each `alpha-feedback`-labeled GitHub issue, decide:
+For each `[alpha-feedback]`-titled GitHub issue (label-carrying or to-be-relabeled per [§ Filter notes](./triage-alpha-feedback.md#filter-notes)), decide:
 
 | Disposition | What to do |
 |---|---|
@@ -90,7 +90,7 @@ ZEB-330 DoD is hit when:
 
 - [ ] At least 2 testers have completed the full journey (above)
 - [ ] Each completion is confirmed in your tracker
-- [ ] All `alpha-feedback`-labeled GitHub issues are triaged (closed, dispositioned, or have a linked ZEB-NNN)
+- [ ] All `[alpha-feedback]`-titled GitHub issues (label-carrying AND in-app-prefilled — see [`triage-alpha-feedback.md` § Filter notes](./triage-alpha-feedback.md#filter-notes)) are triaged (closed, dispositioned, or have a linked ZEB-NNN)
 - [ ] At least one follow-up ZEB-NNN ticket has been filed (the bar for "validation produced actionable signal")
 - [ ] Critical-path issues (anything that prevents a new tester from completing the journey) are either fixed or have a workaround documented in [`troubleshooting.md`](./troubleshooting.md)
 

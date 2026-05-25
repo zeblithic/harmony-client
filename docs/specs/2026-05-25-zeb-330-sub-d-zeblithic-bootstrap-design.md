@@ -30,8 +30,8 @@ The deliverables split into three layers:
 1. **Zeblithic mint playbook**: a doc that walks Jake through every click to mint the canonical Zeblithic community with the right initial channel set + governance config + first reusable invite URL.
 2. **Invite distribution playbook**: a doc that walks Jake through generating, distributing, tracking, and rotating invite URLs — including the prominent caveat that open-community URLs in Phase 3 are infinitely reusable and require Kick-triggered epoch rotation to revoke.
 3. **Alpha validation playbook**: a doc that defines what "tester journey complete" looks like end-to-end, the tester-recruit message template, the per-tester tracking format, and the cadence for converting feedback into follow-up tickets.
-4. **Feedback issue template**: `.github/ISSUE_TEMPLATE/alpha-feedback.md` matched to Sub-C's `buildGitHubIssueUrl()` output so the auto-applied `alpha-feedback` label tags every report from the in-app flow.
-5. **Triage runbook**: a brief guide on how Jake processes new `alpha-feedback` issues — what becomes a ZEB-NNN ticket, what gets bundled, what gets closed as won't-fix-this-alpha.
+4. **Feedback issue template**: `.github/ISSUE_TEMPLATE/alpha-feedback.md` structured to match Sub-C's `buildGitHubIssueUrl()` output. The template's `labels: ['alpha-feedback']` + `assignees: ['jenglund']` auto-apply on **manual** filings via the GitHub UI's "New Issue → Alpha feedback" path. In-app submissions go through `/issues/new?title=...&body=...` without `&template=alpha-feedback.md`, so they carry the `[alpha-feedback]` title prefix but NOT the label or assignee — label application moves to a triage step. Adding `&template=alpha-feedback.md` to `buildGitHubIssueUrl` is a tracked Sub-C follow-up.
+5. **Triage runbook**: a brief guide on how Jake processes new `[alpha-feedback]` intake issues (whether label-carrying or in-app-prefilled) — what becomes a ZEB-NNN ticket, what gets bundled, what gets closed as won't-fix-this-alpha.
 
 ### Non-goals
 
@@ -54,7 +54,7 @@ docs/
 
 .github/
 └── ISSUE_TEMPLATE/
-    ├── alpha-feedback.md           NEW — auto-labeled template matched to Sub-C flow
+    ├── alpha-feedback.md           NEW — template matched to Sub-C structure (auto-labels manual filings; in-app filings keep title prefix, label applied at triage)
     └── config.yml                  NEW (if absent) — allows blank issues (to preserve in-app prefilled URLs), links to other contacts
 ```
 
@@ -289,7 +289,7 @@ Sub-C's `buildGitHubIssueUrl()` (`src/lib/onboarding-env.ts`) opens issues with:
 - Body: structured `## Description` + `## Environment` + optional `## Network diagnostics`
 
 Without an issue template that matches, GitHub's "new issue" form would override the title prefix and lose structure. The template solves this by:
-1. Auto-applying `alpha-feedback` label
+1. Auto-applying `alpha-feedback` label + `jenglund` assignee on **manual** filings (the in-app URL omits `&template=`, so in-app filings carry the `[alpha-feedback]` title prefix only; label/assignee application moves to a triage step until the URL-builder follow-up lands)
 2. Providing the same sectional structure as fallback for non-Sub-C-flow reports
 
 ### 7.2 Template content
@@ -354,7 +354,7 @@ contact_links:
 ```markdown
 # Triage Runbook: alpha-feedback issues
 
-When a new `alpha-feedback`-labeled issue arrives:
+When a new `[alpha-feedback]`-titled issue arrives (label-carrying via manual filing, OR title-prefix-only via in-app `buildGitHubIssueUrl` — see [§ Filter notes](#filter-notes) in the runbook for both intake paths):
 
 ## Decision tree
 
@@ -393,8 +393,12 @@ Jake (zeblith)                    Tester                       Repo
                                   8. opens Network Health
                                   9. clicks (?) Submit Feedback
                                                                 10. issue filed
-                                                                    label=alpha-feedback
+                                                                    title=[alpha-feedback] …
+                                                                    label NOT auto-applied
+                                                                    (URL omits &template=)
 11. triages issue ←─────────────────────────────────────────────────── (within 48h)
+    (apply alpha-feedback
+     label + assignee here)
 12. files ZEB-NNN
 13. links issue ↔ ticket
 14. resolves / closes
