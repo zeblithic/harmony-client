@@ -603,6 +603,102 @@ impl NetworkHealthService {
     }
 }
 
+// ── HARMONY_PING_V1 self-test loop + connect-side helper ────────────
+
+/// Spec §5.3 + §7.3: tiny accept loop that echoes one byte on the
+/// HARMONY_PING_V1 ALPN. Spawned at boot by NetworkHealthService.
+/// Self-test only — produces no app-level state.
+///
+/// NOTE on dual accept loops: this runs alongside the existing
+/// zenoh-over-iroh accept loop in [`crate::zenoh_iroh_transport`].
+/// iroh's `Endpoint::accept` is a multi-consumer queue under the
+/// hood (each call awaits the next inbound `Incoming`), so two
+/// concurrent loops will round-robin incoming connections.
+/// Practically this is acceptable for HARMONY_PING_V1 because we
+/// gracefully reject non-matching ALPNs in [`handle_ping_accept`]
+/// and inbound zenoh / handshake connections retry through their
+/// own dispatch. The integration test in Task 8 validates this.
+/// If it surfaces as a regression, fold ping dispatch into the
+/// zenoh accept loop (risk #3 option B in the plan).
+pub fn spawn_ping_accept_loop(endpoint: std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>) {
+    tokio::spawn(async move {
+        loop {
+            let Some(incoming) = endpoint.inner().accept().await else {
+                // Endpoint closed; exit.
+                return;
+            };
+            tokio::spawn(handle_ping_accept(incoming));
+        }
+    });
+}
+
+async fn handle_ping_accept(incoming: iroh::endpoint::Incoming) {
+    let Ok(connecting) = incoming.accept() else {
+        return;
+    };
+    let Ok(conn) = connecting.await else {
+        return;
+    };
+    // iroh 0.98: Connection::alpn() returns &[u8] (the negotiated
+    // ALPN, already checked against the bind-time list). Compare
+    // by slice equality — non-matching ALPNs drop without echoing.
+    if conn.alpn() != crate::iroh_endpoint::alpn::HARMONY_PING_V1 {
+        return;
+    }
+    let Ok((mut send, mut recv)) = conn.accept_bi().await else {
+        return;
+    };
+    let mut buf = [0u8; 1];
+    if recv.read_exact(&mut buf).await.is_err() {
+        return;
+    }
+    if send.write_all(&buf).await.is_err() {
+        return;
+    }
+    let _ = send.finish();
+    // Connection closes when dropped.
+}
+
+/// Connect-side: open a HARMONY_PING_V1 bi-stream to `node_id`, write
+/// one byte, read one byte echo, return RTT. Failure reasons are
+/// bounded strings per spec §6.2.
+pub async fn ping_peer(
+    endpoint: &crate::iroh_endpoint::IrohEndpoint,
+    node_id: iroh::EndpointId,
+    timeout: std::time::Duration,
+) -> Result<std::time::Duration, String> {
+    let start = std::time::Instant::now();
+    let result = tokio::time::timeout(timeout, async {
+        let conn = endpoint
+            .inner()
+            .connect(node_id, crate::iroh_endpoint::alpn::HARMONY_PING_V1)
+            .await
+            .map_err(|e| format!("connect failed: {e}"))?;
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| format!("open_bi failed: {e}"))?;
+        send.write_all(&[0x42])
+            .await
+            .map_err(|e| format!("write_all failed: {e}"))?;
+        send.finish().map_err(|e| format!("finish failed: {e}"))?;
+        let mut buf = [0u8; 1];
+        recv.read_exact(&mut buf)
+            .await
+            .map_err(|e| format!("read_exact failed: {e}"))?;
+        if buf[0] != 0x42 {
+            return Err(format!("unexpected echo byte: {}", buf[0]));
+        }
+        Ok::<(), String>(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => Ok(start.elapsed()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err("timeout".to_string()),
+    }
+}
+
 // ── Unit tests ──────────────────────────────────────────────────────
 
 #[cfg(test)]
