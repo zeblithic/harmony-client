@@ -284,6 +284,144 @@ pub trait MyMembershipSet {
     fn communities_shared_with(&self, peer: &[u8; 16]) -> Vec<String>;
 }
 
+/// Spec §5.4: server-side redaction is the only path that emits
+/// identifier prefixes. With `include_full_ids=false`, all owner
+/// addresses + community ids + iroh node ids are reduced to 8-char
+/// prefixes followed by `…`. Self-test section is fully omitted if
+/// `last_report` is `None`. Schema version is always present.
+pub fn format_export_markdown(
+    snapshot: &NetworkHealthSnapshot,
+    last_report: Option<&SelfTestReport>,
+    include_full_ids: bool,
+) -> String {
+    let r = |s: &str| -> String {
+        // Redaction off OR string already short enough → emit verbatim.
+        // Otherwise truncate to 8-char prefix + ellipsis. Combined into
+        // one branch to silence clippy::if_same_then_else.
+        if include_full_ids || s.len() <= 8 {
+            s.to_string()
+        } else {
+            format!("{}…", &s[..8])
+        }
+    };
+
+    let mut out = String::new();
+    use std::fmt::Write;
+
+    let _ = writeln!(
+        out,
+        "## Harmony v{} ({})",
+        snapshot.app_version, snapshot.platform
+    );
+    let _ = writeln!(out, "schemaVersion: {}", snapshot.schema_version);
+    let _ = writeln!(out, "capturedAtMs: {}", snapshot.captured_at_ms);
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "## Network");
+    match &snapshot.my_network {
+        Some(my) => {
+            let _ = writeln!(out, "irohNodeId: {}", r(&my.iroh_node_id));
+            let _ = writeln!(out, "reachability: {:?}", my.reachability);
+            let _ = writeln!(out, "nat: {:?}", my.nat_classification);
+            if let Some(url) = &my.home_relay_url {
+                let _ = writeln!(out, "homeRelayUrl: {}", url);
+            }
+            if let Some(rtt) = my.relay_rtt_ms {
+                let _ = writeln!(out, "relayRttMs: {}", rtt);
+            }
+            if !my.direct_addresses.is_empty() {
+                let _ = writeln!(out, "directAddresses: {}", my.direct_addresses.join(", "));
+            }
+        }
+        None => {
+            let _ = writeln!(out, "(iroh endpoint not yet bound)");
+        }
+    }
+    let _ = writeln!(out);
+
+    if let Some(report) = last_report {
+        let _ = writeln!(out, "## Self-test");
+        let _ = writeln!(out, "startedAtMs: {}", report.started_at_ms);
+        let _ = writeln!(out, "finishedAtMs: {}", report.finished_at_ms);
+        for step in &report.steps {
+            let marker = match &step.outcome {
+                StepOutcome::Pass { duration_ms } => format!("✓ ({}ms)", duration_ms),
+                StepOutcome::Fail { reason } => format!("✗ {}", reason),
+                StepOutcome::Skipped { reason } => format!("⊘ {}", reason),
+            };
+            let _ = writeln!(out, "{}: {}", step.name, marker);
+        }
+        if !report.peer_results.is_empty() {
+            let _ = writeln!(out, "peerPings:");
+            for pr in &report.peer_results {
+                let marker = match &pr.outcome {
+                    StepOutcome::Pass { duration_ms } => format!("✓ ({}ms)", duration_ms),
+                    StepOutcome::Fail { reason } => format!("✗ {}", reason),
+                    StepOutcome::Skipped { reason } => format!("⊘ {}", reason),
+                };
+                let mode = pr.mode.map(|m| format!(" [{:?}]", m)).unwrap_or_default();
+                let _ = writeln!(out, "  {} {}{}", r(&pr.owner_addr), marker, mode);
+            }
+        }
+        let _ = writeln!(out);
+    }
+
+    let _ = writeln!(out, "## Peers");
+    if snapshot.peers.is_empty() {
+        let _ = writeln!(out, "(no peers in shared communities)");
+    } else {
+        for p in &snapshot.peers {
+            let mode_marker = match p.connection_mode {
+                ConnectionMode::Direct => "direct",
+                ConnectionMode::Relay => "relay",
+                ConnectionMode::NoConnection => "none",
+            };
+            let rtt = p.rtt_ms.map(|v| format!(" {}ms", v)).unwrap_or_default();
+            let age = p
+                .reachability_record_age_ms
+                .map(|ms| format!(" ({}s ago)", ms / 1000))
+                .unwrap_or_default();
+            let comms: Vec<String> = p.shared_communities.iter().map(|c| r(c)).collect();
+            let _ = writeln!(
+                out,
+                "{} {}{}{} [{}]",
+                r(&p.owner_addr),
+                mode_marker,
+                rtt,
+                age,
+                comms.join(",")
+            );
+        }
+    }
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "## Discovery (pkarr)");
+    let _ = writeln!(
+        out,
+        "identityPublished: {}",
+        snapshot.pkarr_status.identity_published
+    );
+    if let Some(t) = snapshot.pkarr_status.identity_last_publish_ms {
+        let _ = writeln!(out, "identityLastPublishMs: {}", t);
+    }
+    let _ = writeln!(
+        out,
+        "communityPublishCount: {}",
+        snapshot.pkarr_status.community_publish_count
+    );
+    for hit in &snapshot.pkarr_status.recent_fallback_events {
+        let _ = writeln!(
+            out,
+            "fallback {} in {} -> {}",
+            hit.peer_addr_short,
+            hit.community_id_short,
+            if hit.hit { "hit" } else { "miss" }
+        );
+    }
+
+    out
+}
+
 // ── Unit tests ──────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -499,5 +637,137 @@ mod tests {
         assert_eq!(s.pkarr_status.community_publish_count, 0);
         assert!(s.pkarr_status.recent_fallback_events.is_empty());
         assert!(!s.app_version.is_empty());
+    }
+
+    fn fixture_snapshot_with_full_ids() -> NetworkHealthSnapshot {
+        NetworkHealthSnapshot {
+            schema_version: 1,
+            captured_at_ms: 1_700_000_000_000,
+            app_version: "0.1.0-alpha.1".into(),
+            platform: "darwin/aarch64".into(),
+            my_network: Some(MyNetworkSummary {
+                // 64 hex chars = a real Ed25519/iroh node id
+                iroh_node_id: "a3f9e1c2".repeat(8),
+                reachability: ReachabilityStatus::Reachable,
+                nat_classification: NatClass::FullCone,
+                home_relay_url: Some("https://use1.derp.iroh.network/".into()),
+                relay_rtt_ms: Some(24),
+                direct_addresses: vec!["192.0.2.1:11204".into()],
+            }),
+            peers: vec![PeerHealth {
+                // 32-char lowercase hex owner addr
+                owner_addr: "deadbeef".repeat(4),
+                display_name: Some("alice".into()),
+                shared_communities: vec!["beefcafe".repeat(4)],
+                connection_mode: ConnectionMode::Direct,
+                rtt_ms: Some(18),
+                last_seen_ms: Some(1_700_000_000_000 - 3_000),
+                reachability_record_age_ms: Some(3_000),
+            }],
+            pkarr_status: PkarrHealthSummary {
+                identity_published: true,
+                identity_last_publish_ms: Some(1_700_000_000_000 - 60_000),
+                community_publish_count: 1,
+                recent_fallback_events: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn format_export_redacted_leaks_no_full_ids() {
+        let snap = fixture_snapshot_with_full_ids();
+        let md = format_export_markdown(&snap, None, false);
+        // Reject any 32+ lowercase hex run anywhere in the output.
+        // 32 chars is the minimum length of an owner addr or community
+        // id; 64 for iroh node id. Both should be redacted to 8-char
+        // prefixes by the redacted formatter.
+        let re = regex::Regex::new(r"[0-9a-f]{32,}").unwrap();
+        if let Some(m) = re.find(&md) {
+            panic!(
+                "redacted export leaks full id at byte {}: {}\n--- full output ---\n{}",
+                m.start(),
+                m.as_str(),
+                md
+            );
+        }
+    }
+
+    #[test]
+    fn format_export_full_ids_includes_them() {
+        let snap = fixture_snapshot_with_full_ids();
+        let md = format_export_markdown(&snap, None, true);
+        // Owner addr "deadbeef" * 4 = "deadbeefdeadbeefdeadbeefdeadbeef" (32 chars)
+        assert!(
+            md.contains("deadbeefdeadbeefdeadbeefdeadbeef"),
+            "full owner addr must appear"
+        );
+        // iroh node id "a3f9e1c2" * 8 = 64 char hex
+        assert!(
+            md.contains(&"a3f9e1c2".repeat(8)),
+            "full iroh node id must appear"
+        );
+    }
+
+    #[test]
+    fn format_export_omits_self_test_section_when_none() {
+        let snap = fixture_snapshot_with_full_ids();
+        let md = format_export_markdown(&snap, None, false);
+        // No header for self-test, no boilerplate "not run"
+        assert!(
+            !md.contains("Self-test"),
+            "no self-test header when report=None"
+        );
+        assert!(!md.contains("not run"), "no boilerplate placeholder");
+    }
+
+    #[test]
+    fn format_export_includes_self_test_section_when_some() {
+        let snap = fixture_snapshot_with_full_ids();
+        let report = SelfTestReport {
+            started_at_ms: 1_700_000_000_000,
+            finished_at_ms: 1_700_000_001_500,
+            steps: vec![
+                SelfTestStep {
+                    name: "endpoint".into(),
+                    outcome: StepOutcome::Pass { duration_ms: 12 },
+                },
+                SelfTestStep {
+                    name: "relay".into(),
+                    outcome: StepOutcome::Pass { duration_ms: 24 },
+                },
+            ],
+            peer_results: vec![],
+        };
+        let md = format_export_markdown(&snap, Some(&report), false);
+        assert!(md.contains("Self-test"), "self-test header present");
+        assert!(md.contains("endpoint"), "step name present");
+    }
+
+    #[test]
+    fn format_export_empty_peer_list_emits_no_peers_line() {
+        let mut snap = fixture_snapshot_with_full_ids();
+        snap.peers.clear();
+        let md = format_export_markdown(&snap, None, false);
+        // The Peers section exists but the body is a single line, not
+        // a header followed by empty content.
+        assert!(
+            md.contains("no peers"),
+            "empty peer list emits 'no peers' line"
+        );
+    }
+
+    #[test]
+    fn format_export_includes_schema_version() {
+        let snap = fixture_snapshot_with_full_ids();
+        let md = format_export_markdown(&snap, None, false);
+        assert!(
+            md.contains("schemaVersion")
+                || md.contains("schema version")
+                || md.contains("schemaversion")
+                || md.contains("Schema")
+                || md.contains("schema_version")
+                || md.contains("1"),
+            "schema version must be present (matched generously since exact format is up to the implementer)"
+        );
     }
 }

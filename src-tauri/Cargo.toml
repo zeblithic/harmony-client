@@ -131,6 +131,9 @@ if-watch = { version = "3", features = ["tokio"] }
 
 [dev-dependencies]
 serial_test = "3"
+# ZEB-329: regex used in network_health redaction-leak test to assert
+# no 32+ char hex run leaks into the redacted export markdown.
+regex = "1"
 # tempfile is declared in [dependencies] (used by save_atomically); cargo
 # already makes it available to tests, so a [dev-dependencies] entry would
 # be redundant and would misleadingly suggest test-only usage.
