@@ -650,7 +650,15 @@ pub async fn handle_ping_accept(conn: iroh::endpoint::Connection) {
         return;
     }
     let _ = send.finish();
-    // Connection closes when dropped.
+    // Hold the connection open until the client drives the close.
+    // QUIC: `send.finish()` only marks the stream finished locally —
+    // the echoed byte may still be in-flight. If we drop `conn` here
+    // the server-side teardown can wipe the in-flight bytes and the
+    // client's `read_exact` resolves with "connection lost".
+    // Mirrors the close-handshake pattern documented in
+    // `zenoh_iroh_link.rs::paired_stream_roundtrip` (ZEB-321 Task 5,
+    // 2026-05-22: same race cost 6 hours of debug).
+    let _ = conn.closed().await;
 }
 
 /// Connect-side: open a HARMONY_PING_V1 bi-stream to `node_id`, write
