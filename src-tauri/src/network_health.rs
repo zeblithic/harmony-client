@@ -284,6 +284,119 @@ pub trait MyMembershipSet {
     fn communities_shared_with(&self, peer: &[u8; 16]) -> Vec<String>;
 }
 
+/// Iroh-side data the snapshot needs. Trait-extracted so unit tests
+/// can substitute a fake without running real iroh. Production impl
+/// in lib.rs boot wiring delegates to `IrohEndpoint`.
+pub trait IrohSnapshot: Send + Sync {
+    fn iroh_node_id_hex(&self) -> Option<String>;
+    fn home_relay_url(&self) -> Option<String>;
+    fn relay_rtt_ms(&self) -> Option<u32>;
+    fn direct_addresses(&self) -> Vec<String>;
+    fn nat_classification(&self) -> NatClass;
+}
+
+/// Pkarr-side data the snapshot needs. Trait-extracted for testability;
+/// production impl reads from `pkarr_publisher.active_handles()` + the
+/// fallback ring buffer.
+pub trait PkarrSnapshot: Send + Sync {
+    fn identity_published(&self) -> bool;
+    fn identity_last_publish_ms(&self) -> Option<u64>;
+    fn community_publish_count(&self) -> u32;
+    fn recent_fallback_events(&self) -> Vec<PkarrFallbackHit>;
+}
+
+/// Resolver-side data. Trait-extracted so the snapshot can be tested
+/// without the full ReachabilityResolver. Production impl reads from
+/// `ReachabilityResolver::list_active_peers()` + iroh-side
+/// connection-mode lookups.
+pub trait ReachabilitySnapshot: Send + Sync {
+    fn list_records(&self) -> Vec<ResolverPeerRecord>;
+}
+
+/// Spec §5.5: state coupling summary. NetworkHealthService owns the
+/// rate-limiter task handle + cached last self-test report; the iroh /
+/// resolver / pkarr handles come from AppState (already constructed).
+pub struct NetworkHealthService {
+    iroh: std::sync::Arc<dyn IrohSnapshot>,
+    pkarr: std::sync::Arc<dyn PkarrSnapshot>,
+    resolver: std::sync::Arc<dyn ReachabilitySnapshot>,
+    membership: std::sync::Arc<dyn MyMembershipSet + Send + Sync>,
+    last_self_test: std::sync::Arc<tokio::sync::RwLock<Option<SelfTestReport>>>,
+    /// Channel into the rate-limiter task — Task 4 adds this.
+    #[allow(dead_code)]
+    notify_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+}
+
+impl NetworkHealthService {
+    pub fn new(
+        iroh: std::sync::Arc<dyn IrohSnapshot>,
+        pkarr: std::sync::Arc<dyn PkarrSnapshot>,
+        resolver: std::sync::Arc<dyn ReachabilitySnapshot>,
+        membership: std::sync::Arc<dyn MyMembershipSet + Send + Sync>,
+    ) -> Self {
+        Self {
+            iroh,
+            pkarr,
+            resolver,
+            membership,
+            last_self_test: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            notify_tx: None,
+        }
+    }
+
+    /// Spec §5.1: read from all sources, synthesize a snapshot. Never
+    /// fails — empty/None fields render gracefully in the UI.
+    pub async fn snapshot(&self) -> NetworkHealthSnapshot {
+        let now = now_ms();
+        // Build MyNetworkSummary with a placeholder reachability so we
+        // can pass it through derive_reachability_status once peers are
+        // known. The two-pass shape keeps derive_reachability_status'
+        // signature peers-first without forcing the iroh read to know
+        // about peers.
+        let my_network = self
+            .iroh
+            .iroh_node_id_hex()
+            .map(|node_id| MyNetworkSummary {
+                iroh_node_id: node_id,
+                reachability: ReachabilityStatus::Reachable, // patched below
+                nat_classification: self.iroh.nat_classification(),
+                home_relay_url: self.iroh.home_relay_url(),
+                relay_rtt_ms: self.iroh.relay_rtt_ms(),
+                direct_addresses: self.iroh.direct_addresses(),
+            });
+
+        let records = self.resolver.list_records();
+        let peers = filter_peers_by_shared_membership(records, &*self.membership, now);
+
+        // Patch reachability status now that we have peers.
+        let my_network = my_network.map(|mut my| {
+            my.reachability = derive_reachability_status(&my, &peers);
+            my
+        });
+
+        NetworkHealthSnapshot {
+            schema_version: 1,
+            captured_at_ms: now,
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            platform: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
+            my_network,
+            peers,
+            pkarr_status: PkarrHealthSummary {
+                identity_published: self.pkarr.identity_published(),
+                identity_last_publish_ms: self.pkarr.identity_last_publish_ms(),
+                community_publish_count: self.pkarr.community_publish_count(),
+                recent_fallback_events: self.pkarr.recent_fallback_events(),
+            },
+        }
+    }
+
+    /// Read the cached last self-test report (Task 5 + 6 populate this).
+    #[allow(dead_code)]
+    pub async fn cached_last_self_test(&self) -> Option<SelfTestReport> {
+        self.last_self_test.read().await.clone()
+    }
+}
+
 /// Spec §5.4: server-side redaction is the only path that emits
 /// identifier prefixes. With `include_full_ids=false`, all owner
 /// addresses + community ids + iroh node ids are reduced to 8-char
@@ -768,6 +881,137 @@ mod tests {
             md.contains("schemaVersion: 1"),
             "schema version token must appear verbatim; output was:\n{}",
             md
+        );
+    }
+
+    // ── Task 3: NetworkHealthService snapshot() tests ──────────────
+
+    struct FakeIroh {
+        ready: bool,
+    }
+    impl IrohSnapshot for FakeIroh {
+        fn iroh_node_id_hex(&self) -> Option<String> {
+            if self.ready {
+                Some("a3f9e1c2".repeat(8))
+            } else {
+                None
+            }
+        }
+        fn home_relay_url(&self) -> Option<String> {
+            if self.ready {
+                Some("https://derp.example/".into())
+            } else {
+                None
+            }
+        }
+        fn relay_rtt_ms(&self) -> Option<u32> {
+            if self.ready {
+                Some(24)
+            } else {
+                None
+            }
+        }
+        fn direct_addresses(&self) -> Vec<String> {
+            if self.ready {
+                vec!["192.0.2.1:11204".into()]
+            } else {
+                vec![]
+            }
+        }
+        fn nat_classification(&self) -> NatClass {
+            NatClass::Unknown
+        }
+    }
+
+    struct FakePkarr;
+    impl PkarrSnapshot for FakePkarr {
+        fn identity_published(&self) -> bool {
+            true
+        }
+        fn identity_last_publish_ms(&self) -> Option<u64> {
+            Some(1_700_000_000_000)
+        }
+        fn community_publish_count(&self) -> u32 {
+            1
+        }
+        fn recent_fallback_events(&self) -> Vec<PkarrFallbackHit> {
+            vec![]
+        }
+    }
+
+    struct FakeResolver {
+        records: Vec<ResolverPeerRecord>,
+    }
+    impl ReachabilitySnapshot for FakeResolver {
+        fn list_records(&self) -> Vec<ResolverPeerRecord> {
+            self.records.clone()
+        }
+    }
+
+    fn empty_membership() -> std::sync::Arc<FakeMembership> {
+        std::sync::Arc::new(FakeMembership {
+            table: std::collections::HashMap::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn snapshot_with_iroh_not_ready_returns_my_network_none() {
+        let svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: false }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver { records: vec![] }),
+            empty_membership(),
+        );
+        let snap = svc.snapshot().await;
+        assert!(snap.my_network.is_none());
+        assert!(snap.peers.is_empty());
+        assert_eq!(snap.schema_version, 1);
+    }
+
+    #[tokio::test]
+    async fn snapshot_with_iroh_ready_empty_resolver() {
+        let svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver { records: vec![] }),
+            empty_membership(),
+        );
+        let snap = svc.snapshot().await;
+        assert!(snap.my_network.is_some());
+        assert_eq!(snap.peers, vec![]);
+        assert_eq!(
+            snap.my_network.as_ref().unwrap().home_relay_url,
+            Some("https://derp.example/".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_with_three_peers_sorted_by_last_seen_desc() {
+        let mut table = std::collections::HashMap::new();
+        for b in [0x11u8, 0x22, 0x33] {
+            table.insert([b; 16], vec!["c1".to_string()]);
+        }
+        let svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver {
+                records: vec![
+                    make_record(0x11, ConnectionMode::Direct, Some(1000)),
+                    make_record(0x22, ConnectionMode::Direct, Some(3000)),
+                    make_record(0x33, ConnectionMode::Direct, Some(2000)),
+                ],
+            }),
+            std::sync::Arc::new(FakeMembership { table }),
+        );
+        let snap = svc.snapshot().await;
+        assert_eq!(snap.peers.len(), 3);
+        assert_eq!(snap.peers[0].last_seen_ms, Some(3000));
+        assert_eq!(snap.peers[1].last_seen_ms, Some(2000));
+        assert_eq!(snap.peers[2].last_seen_ms, Some(1000));
+        // With at least one Direct peer, reachability is Reachable.
+        assert_eq!(
+            snap.my_network.unwrap().reachability,
+            ReachabilityStatus::Reachable
         );
     }
 }
