@@ -17,6 +17,19 @@ Harmony is in private alpha. If you have an invite, install via the docs below a
 Builds are unsigned during alpha; install docs cover the Gatekeeper / SmartScreen workaround
 for your OS.
 
+## Documentation
+
+For alpha testers:
+- [docs/troubleshooting.md](docs/troubleshooting.md) — common install / network issues
+- [docs/feedback.md](docs/feedback.md) — how to submit feedback through the in-app `(?)` menu
+- [docs/cross-wan-validation.md](docs/cross-wan-validation.md) — Network Health panel + two-host network testing playbook
+
+For Jake (running the alpha):
+- [docs/zeblithic-bootstrap.md](docs/zeblithic-bootstrap.md) — mint the canonical Zeblithic community
+- [docs/invite-distribution.md](docs/invite-distribution.md) — generate, distribute, rotate invite URLs
+- [docs/alpha-validation.md](docs/alpha-validation.md) — tester recruitment + journey-completion tracking
+- [docs/triage-alpha-feedback.md](docs/triage-alpha-feedback.md) — per-issue triage runbook
+
 ## Development
 
 Run tests:
