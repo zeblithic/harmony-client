@@ -117,6 +117,18 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      # Precheck runs on ubuntu-22.04, and `cargo clippy` / `cargo nextest`
+      # both compile the full workspace — which transitively pulls
+      # gdk-sys + webkit2gtk-sys (via tauri-runtime-wry's Linux backend).
+      # Those crates' build scripts invoke pkg-config against the system
+      # GTK/WebKit libs; without these apt packages installed first, clippy
+      # fails 1-2 min in with `Package gdk-3.0 was not found`. Mirrors the
+      # identical step in the build job below; kept in lockstep deliberately.
+      - name: Install Linux build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev libsoup-3.0-dev javascriptcoregtk-4.1
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
