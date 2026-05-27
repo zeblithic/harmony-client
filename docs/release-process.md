@@ -165,7 +165,7 @@ Concretely: if `tauri.conf.json` `version` is `0.1.0-alpha.1`, the macOS + Linux
 - GitHub Release name: `v0.1.0 (alpha)` for visibility on the releases page.
 - README + About modal: explicit "alpha" labels visible to users.
 
-**This constraint was caught by Cursor Bugbot on PR #164** — the operator playbook originally used `0.1.0-alpha.N+1` examples that would have broken every Windows build. Lesson: validate the version pattern against ALL platform bundlers before committing to a docs convention.
+**This constraint was caught by Cursor Bugbot during the first-release bootstrap** — the operator playbook originally used `0.1.0-alpha.N+1` examples that would have broken every Windows build. The `release.yml` precheck regex was also tightened to enforce numeric-only at the workflow boundary (catching at "operator passed bad input" instead of at "Windows runner failed 15min into build"). Lesson: validate the version pattern against ALL platform bundlers before committing to a docs convention, and make the enforcement match the policy.
 
 ---
 

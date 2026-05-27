@@ -53,12 +53,18 @@ jobs:
           # bypass validation, then write a newline to GITHUB_OUTPUT
           # corrupting downstream step outputs).
           #
-          # SemVer 2.0 grammar (simplified to what we use):
-          # MAJOR.MINOR.PATCH (-pre-release-identifier(.pre-release-identifier)*)?
-          # Where pre-release identifiers are [0-9A-Za-z-]+
-          if [[ ! "$RAW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
-            echo "::error::version input is not valid SemVer 2.0 (multi-line or invalid)."
-            echo "Expected e.g. '0.1.0-alpha.1' or '0.1.0'"
+          # Numeric SemVer only — MAJOR.MINOR.PATCH with no pre-release suffix.
+          # We deliberately reject the SemVer-2.0 -pre-release-identifier grammar
+          # because WiX/MSI on the Windows matrix job rejects pre-release suffixes
+          # (alpha.N, beta.N, rc.N) — letting one through here would silently burn
+          # ~15 min of Actions minutes before tauri build fails on Windows. See
+          # docs/release-process.md §1.8 for the full constraint write-up. The
+          # "alpha cycle" lives in the 0.x.y range; surface status via release
+          # notes title, README, About modal, NOT the version string.
+          if [[ ! "$RAW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version input is not valid numeric SemVer (multi-line, pre-release suffix, or other invalid form)."
+            echo "Expected e.g. '0.1.0', '0.1.1', '0.2.0' — numeric MAJOR.MINOR.PATCH only."
+            echo "Pre-release suffixes like '-alpha.N' break Windows MSI builds — see docs/release-process.md §1.8."
             exit 1
           fi
           echo "version=$RAW_VERSION" >> "$GITHUB_OUTPUT"
