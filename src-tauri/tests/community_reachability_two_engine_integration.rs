@@ -192,8 +192,7 @@ async fn inner() {
     // we know the full plumbing (send-stream, recv-stream, locator
     // assembly, accept-loop dispatch) works.
     link_a
-        .0
-        .write_all(b"hello-iroh-zenoh")
+        .write_all(b"hello-iroh-zenoh", None)
         .await
         .expect("write through LinkUnicast wrapper");
 
@@ -207,8 +206,7 @@ async fn inner() {
 
     let mut buf = [0u8; 16];
     link_b
-        .0
-        .read_exact(&mut buf)
+        .read_exact(&mut buf, None)
         .await
         .expect("read_exact through B's LinkUnicast wrapper");
     assert_eq!(
@@ -220,20 +218,22 @@ async fn inner() {
     // bi-directional flow through the bidi stream pair, not just
     // one-way fire-and-forget.
     link_b
-        .0
-        .write_all(b"ack-iroh-zenoh-1")
+        .write_all(b"ack-iroh-zenoh-1", None)
         .await
         .expect("B writes ack");
     let mut ack = [0u8; 16];
-    link_a.0.read_exact(&mut ack).await.expect("A reads ack");
+    link_a
+        .read_exact(&mut ack, None)
+        .await
+        .expect("A reads ack");
     assert_eq!(&ack, b"ack-iroh-zenoh-1");
 
     // Graceful close discipline. `LinkUnicastTrait::close` is
     // documented (see `zenoh_iroh_link::IrohZenohLink::close`) to be
     // idempotent and to swallow `ClosedStream`, so both ends can
     // safely call it without coordination.
-    link_a.0.close().await.expect("close A");
-    link_b.0.close().await.expect("close B");
+    link_a.close().await.expect("close A");
+    link_b.close().await.expect("close B");
     drop(link_a);
     drop(link_b);
 

@@ -5305,13 +5305,19 @@ fn stop_node(app: AppHandle, state: tauri::State<'_, Mutex<NodeState>>) -> Resul
 // ── Legacy command aliases (backward compat with frontend) ───────────────
 
 /// Alias: the frontend calls `connect_zenoh` — route to `start_node`.
+///
+/// `start_node` returns `StartNodeResponse` (ZEB-331: `freshlyCreated`
+/// + `nodeAddr` for the first-run welcome modal). This legacy alias
+/// predates that shape and is only kept for backwards compat with stale
+/// frontend builds; discard the response to preserve the
+/// `Result<(), String>` contract.
 #[tauri::command]
 async fn connect_zenoh(
     endpoint: String,
     app: AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
-    start_node(Some(endpoint), app, state).await
+    start_node(Some(endpoint), app, state).await.map(|_| ())
 }
 
 /// Alias: the frontend calls `disconnect_zenoh` — route to `stop_node`.

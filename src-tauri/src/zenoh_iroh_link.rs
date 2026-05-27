@@ -18,28 +18,28 @@
 //!
 //! The plan draft was written against an unverified zenoh-link surface.
 //! What's actually pinned (`zenoh = "1"`, resolving to `zenoh-link
-//! 1.8.0` in `Cargo.lock` today, with `zenoh-link 1.9.0` available)
-//! differs in three places:
+//! 1.9.0` in `Cargo.lock` after PR #162 bumped the family) differs from
+//! the plan in three places:
 //!
 //! - `LinkUnicastTrait` does **not** include `is_local` (the plan had
 //!   it). Removed.
 //! - [`LinkAuthId`] has no `None` variant — the closest fit for a
 //!   QUIC-backed link is `LinkAuthId::Quic(None)` (i.e. QUIC with no
 //!   per-link CN identity beyond the Iroh `EndpointId` already in the
-//!   locator). The 1.9.0 trait surface additionally threads an
-//!   `Option<Priority>` through read/write — we pin 1.8.0 to avoid
-//!   that churn; the priority axis is unused in Phase 1.
+//!   locator).
+//! - The 1.9.0 trait surface threads an `Option<Priority>` through
+//!   `read`/`write`/`read_exact`/`write_all`. We don't surface any
+//!   priority semantics from iroh QUIC (per-stream priority isn't a
+//!   thing in iroh's bidi stream API), so the parameter is accepted
+//!   and ignored — `supports_priorities()` defaults to `false` from
+//!   the trait, and we don't override it.
 //! - `ZResult` and the `zerror!` macro are not re-exported from
 //!   `zenoh-link`; we pull them from `zenoh-result` (already a
 //!   transitive dep — verified in `Cargo.lock`).
 //!
 //! We import these via the existing `zenoh = "1"` direct dep + the
 //! `zenoh-link` / `zenoh-result` transitive deps already in
-//! `Cargo.lock` — no new top-level dep needed. Should the lockfile
-//! ever resolve `zenoh-link` to a major-bumped release with the
-//! `priority` parameter, we'd need to add an explicit pin and adapt
-//! this file; for now relying on the existing transitive resolution
-//! keeps the dep graph minimal.
+//! `Cargo.lock` — no new top-level dep needed.
 
 use std::sync::Arc;
 
@@ -47,7 +47,7 @@ use async_trait::async_trait;
 use iroh::endpoint::{RecvStream, SendStream};
 use tokio::sync::Mutex;
 use zenoh_link::{LinkAuthId, LinkUnicastTrait, Locator};
-use zenoh_protocol::transport::BatchSize;
+use zenoh_protocol::{core::Priority, transport::BatchSize};
 use zenoh_result::{zerror, ZResult};
 
 /// One end of a Zenoh-over-Iroh link: a paired QUIC bidi stream wrapped
@@ -81,21 +81,21 @@ impl IrohZenohLink {
 
 #[async_trait]
 impl LinkUnicastTrait for IrohZenohLink {
-    async fn write(&self, buffer: &[u8]) -> ZResult<usize> {
+    async fn write(&self, buffer: &[u8], _priority: Option<Priority>) -> ZResult<usize> {
         let mut s = self.send.lock().await;
         s.write(buffer)
             .await
             .map_err(|e| zerror!("iroh write: {e}").into())
     }
 
-    async fn write_all(&self, buffer: &[u8]) -> ZResult<()> {
+    async fn write_all(&self, buffer: &[u8], _priority: Option<Priority>) -> ZResult<()> {
         let mut s = self.send.lock().await;
         s.write_all(buffer)
             .await
             .map_err(|e| zerror!("iroh write_all: {e}").into())
     }
 
-    async fn read(&self, buffer: &mut [u8]) -> ZResult<usize> {
+    async fn read(&self, buffer: &mut [u8], _priority: Option<Priority>) -> ZResult<usize> {
         let mut r = self.recv.lock().await;
         // `RecvStream::read` returns `Ok(None)` at clean stream EOF —
         // map that to a read error so the caller sees a terminating
@@ -108,7 +108,7 @@ impl LinkUnicastTrait for IrohZenohLink {
         }
     }
 
-    async fn read_exact(&self, buffer: &mut [u8]) -> ZResult<()> {
+    async fn read_exact(&self, buffer: &mut [u8], _priority: Option<Priority>) -> ZResult<()> {
         let mut r = self.recv.lock().await;
         r.read_exact(buffer)
             .await
@@ -278,12 +278,12 @@ mod tests {
             let server_link = IrohZenohLink::new(send, recv, server_src, server_dst);
             let mut buf = [0u8; 5];
             server_link
-                .read_exact(&mut buf)
+                .read_exact(&mut buf, None)
                 .await
                 .expect("server link read");
             assert_eq!(&buf, b"hello");
             server_link
-                .write_all(b"world")
+                .write_all(b"world", None)
                 .await
                 .expect("server link write");
             server_link.close().await.expect("server link close");
@@ -310,9 +310,13 @@ mod tests {
         let client_dst = Locator::new("iroh", ep_b_id.to_string(), "").expect("client dst");
         let link = IrohZenohLink::new(send, recv, client_src.clone(), client_dst.clone());
 
-        link.write_all(b"hello").await.expect("client link write");
+        link.write_all(b"hello", None)
+            .await
+            .expect("client link write");
         let mut buf = [0u8; 5];
-        link.read_exact(&mut buf).await.expect("client link read");
+        link.read_exact(&mut buf, None)
+            .await
+            .expect("client link read");
         assert_eq!(&buf, b"world");
 
         // Sync trait surface checks.

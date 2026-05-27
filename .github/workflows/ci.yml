@@ -43,20 +43,11 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
-      # Tauri's Linux build needs WebKit/GTK system libraries even when
-      # only the Rust side is being built/tested — the tauri crate's build
-      # script links against them at compile time.
+      # Shared with release.yml via composite action — single source of
+      # truth for the system libs tauri-runtime-wry's Linux backend pulls
+      # in transitively (gdk-sys, webkit2gtk-sys, libsoup-sys, etc).
       - name: Install Tauri Linux deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libgtk-3-dev \
-            libssl-dev \
-            libsoup-3.0-dev \
-            librsvg2-dev \
-            libayatana-appindicator3-dev \
-            build-essential
+        uses: ./.github/actions/install-linux-tauri-deps
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master
         with:
@@ -113,16 +104,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       - name: Install Tauri Linux deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libgtk-3-dev \
-            libssl-dev \
-            libsoup-3.0-dev \
-            librsvg2-dev \
-            libayatana-appindicator3-dev \
-            build-essential
+        uses: ./.github/actions/install-linux-tauri-deps
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master
         with:
@@ -190,16 +172,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       - name: Install Tauri Linux deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libgtk-3-dev \
-            libssl-dev \
-            libsoup-3.0-dev \
-            librsvg2-dev \
-            libayatana-appindicator3-dev \
-            build-essential
+        uses: ./.github/actions/install-linux-tauri-deps
 
       # Use cargo's own TOML parser via `cargo metadata` so single-quoted
       # strings, multi-line definitions, and any other valid TOML form all

@@ -85,7 +85,8 @@ use iroh::endpoint::Connection;
 use iroh::{EndpointAddr, EndpointId};
 use tokio::sync::Mutex as TokioMutex;
 use zenoh_link::{
-    EndPoint, LinkManagerUnicastTrait, LinkUnicast, LinkUnicastTrait, Locator, NewLinkChannelSender,
+    EndPoint, LinkManagerUnicastTrait, LinkUnicast, LinkUnicastTrait, Locator, NewLink,
+    NewLinkChannelSender,
 };
 use zenoh_result::{zerror, ZResult};
 
@@ -316,7 +317,14 @@ impl IrohZenohLinkManager {
                         let dst = locator_from_endpoint_id(&peer_id);
                         let link: Arc<dyn LinkUnicastTrait> =
                             Arc::new(IrohZenohLink::new(send, recv, src, dst));
-                        if let Err(e) = mgr.new_link_tx.send_async(LinkUnicast(link)).await {
+                        // zenoh-link 1.9.0: LinkUnicast now wraps the
+                        // NewLink enum (Single or MixedReliability). We
+                        // open one QUIC bidi stream → one link → Single.
+                        if let Err(e) = mgr
+                            .new_link_tx
+                            .send_async(LinkUnicast(NewLink::Single(link)))
+                            .await
+                        {
                             tracing::warn!("zenoh new_link channel closed: {e}");
                         }
                     } else if alpn_used == alpn::HARMONY_HANDSHAKE_V1 {
@@ -447,7 +455,7 @@ impl LinkManagerUnicastTrait for IrohZenohLinkManager {
         let src = locator_from_endpoint_id(&self.endpoint.node_id());
         let dst = locator_from_endpoint_id(&peer_id);
         let link: Arc<dyn LinkUnicastTrait> = Arc::new(IrohZenohLink::new(send, recv, src, dst));
-        Ok(LinkUnicast(link))
+        Ok(LinkUnicast(NewLink::Single(link)))
     }
 
     async fn new_listener(&self, _endpoint: EndPoint) -> ZResult<Locator> {
