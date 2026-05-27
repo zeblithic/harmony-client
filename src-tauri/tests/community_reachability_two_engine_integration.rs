@@ -46,8 +46,11 @@
 //! though: we don't hold a [`iroh::endpoint::Connection`] handle, only
 //! the wrapped [`LinkUnicastTrait`] streams via [`LinkUnicast`]. So:
 //!
-//! 1. Both sides call `link.0.close()` after the exchange to mark the
+//! 1. Both sides call `link.close()` after the exchange to mark the
 //!    send-halves finished (idempotent — see [`IrohZenohLink::close`]).
+//!    `LinkUnicast: Deref<Target = Arc<dyn LinkUnicastTrait>>` so the
+//!    auto-deref dispatches to the underlying trait method; no need to
+//!    poke at the `NewLink` enum directly.
 //! 2. Drop the link Arcs.
 //! 3. `ep_a.shutdown().await` + `ep_b.shutdown().await` — endpoint
 //!    shutdown is the universal close primitive; it closes all open
