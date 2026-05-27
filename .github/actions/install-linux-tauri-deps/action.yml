@@ -1,0 +1,40 @@
+# Composite action: install the system libraries that tauri-runtime-wry's
+# Linux backend pulls in transitively (gdk-sys, webkit2gtk-sys,
+# javascriptcoregtk-sys, libsoup-sys, etc.). Used by both `precheck` and
+# `build` jobs in release.yml — single source of truth prevents drift
+# between the two (the prior in-line duplication caused exactly that:
+# both copies carried an invalid `javascriptcoregtk-4.1` package name,
+# but only the precheck failure surfaced because the build job never
+# ran).
+#
+# Package notes:
+#   - libgtk-3-dev          → provides gdk-3.0.pc (gdk-sys)
+#   - libwebkit2gtk-4.1-dev → provides webkit2gtk-4.1.pc (webkit2gtk-sys)
+#   - libayatana-appindicator3-dev → tray-icon backend (tao/wry pull this)
+#   - librsvg2-dev          → SVG rasterizer used by Tauri's icon pipeline
+#   - libssl-dev            → reqwest/native-tls transitive
+#   - libsoup-3.0-dev       → libsoup-sys (webkit2gtk's HTTP backend)
+#   - libjavascriptcoregtk-4.1-dev → JS engine bindings (transitively
+#     required by libwebkit2gtk; explicit add is belt-and-suspenders,
+#     and uses the actual package name — the pre-fix value
+#     `javascriptcoregtk-4.1` was not a valid apt package on Ubuntu 22.04,
+#     caught by Cursor on PR #165).
+name: 'Install Linux Tauri build deps'
+description: 'Installs GTK + WebKit + ayatana-appindicator + librsvg + libsoup + javascriptcoregtk dev libraries for tauri-runtime-wry on Ubuntu.'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: apt-get install Tauri Linux deps
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y \
+          libgtk-3-dev \
+          libwebkit2gtk-4.1-dev \
+          libayatana-appindicator3-dev \
+          librsvg2-dev \
+          libssl-dev \
+          libsoup-3.0-dev \
+          libjavascriptcoregtk-4.1-dev
