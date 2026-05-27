@@ -146,11 +146,15 @@ No action needed if PUBLIC. If PRIVATE and you're exceeding 2000 min, consider s
 
 ### 1.8 Why we don't use SemVer pre-release suffixes
 
-**TL;DR:** Windows MSI (WiX) rejects pre-release identifiers. Use clean numeric SemVer like `0.1.0`, `0.1.1`, `0.2.0`. Never `0.1.0-alpha.N`, `-beta.N`, or `-rc.N`.
+**TL;DR:** Use clean numeric SemVer like `0.1.0`, `0.1.1`, `0.2.0`. Never `0.1.0-alpha.N`, `-beta.N`, or `-rc.N`.
 
-WiX — the Microsoft Windows MSI installer toolchain Tauri uses for the Windows matrix job — encodes version metadata as `Major.Minor.Build[.Revision]`: four numeric components, each a UInt16 (max 65535). The MSI Windows Installer format has no slot for SemVer's pre-release suffix; the WiX compiler rejects strings containing letters or dashes after the patch component.
+The original binding constraint was Windows MSI (WiX): four-numeric `Major.Minor.Build[.Revision]` UInt16s, no pre-release suffix possible. We ultimately chose to ship **NSIS** for Windows (smaller installer, no admin elevation, what Tauri's own docs recommend for distribution-style apps) — and NSIS itself is not as strict as WiX about version strings — but we kept the numeric-SemVer policy because:
 
-Concretely: if `tauri.conf.json` `version` is `0.1.0-alpha.1`, the macOS + Linux matrix jobs succeed but the Windows job fails inside `tauri build` with a WiX validation error. The release workflow's "Verify all platform bundles present" step then fails because the required `*-setup.nsis.zip` glob is missing, the draft release is never created, and you've burned ~15 min of Actions minutes on a dead run.
+- macOS `Info.plist`'s `CFBundleShortVersionString` requires plain `X.Y.Z` numeric and won't parse pre-release identifiers anyway.
+- The Tauri updater's `version` field must match exactly across all bundles + the GitHub release tag + the `latest.json` manifest. One canonical form (numeric SemVer) collapses three opportunities for drift into zero.
+- Two-version configurations (one for the SemVer field, one for the bundler) double operator burden — see below.
+
+Historical concrete failure: when `tauri.conf.json` `version` was `0.1.0-alpha.1` (PR #164's first draft), the Windows matrix job failed inside `tauri build` with a WiX validation error before we switched to NSIS. The release workflow's "Verify all platform bundles present" step then fails because the required `*-setup.nsis.zip` glob is missing, the draft release is never created, and you've burned ~15 min of Actions minutes on a dead run.
 
 **Why we don't use Tauri's `bundle.windows.wix.version` override.** Tauri 2.x exposes `bundle.windows.wix.version` to set a Windows-specific 4-numeric version (e.g., `0.1.0.1`) while leaving the SemVer `version` field as `0.1.0-alpha.1`. We don't use it because:
 

@@ -117,6 +117,17 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      # Precheck runs on ubuntu-22.04, and `cargo clippy` / `cargo nextest`
+      # both compile the full workspace — which transitively pulls
+      # gdk-sys + webkit2gtk-sys (via tauri-runtime-wry's Linux backend).
+      # Those crates' build scripts invoke pkg-config against the system
+      # GTK/WebKit libs; without these apt packages installed first, clippy
+      # fails 1-2 min in with `Package gdk-3.0 was not found`. Shared with
+      # the build job via composite action — single source of truth so the
+      # package list cannot drift between jobs.
+      - name: Install Linux build deps
+        uses: ./.github/actions/install-linux-tauri-deps
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -187,9 +198,7 @@ jobs:
 
       - name: Install Linux build deps
         if: matrix.os == 'ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev libsoup-3.0-dev javascriptcoregtk-4.1
+        uses: ./.github/actions/install-linux-tauri-deps
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -219,7 +228,7 @@ jobs:
           name: bundle-${{ matrix.target }}
           path: |
             src-tauri/target/${{ matrix.target }}/release/bundle/**/*.dmg
-            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.msi
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.exe
             src-tauri/target/${{ matrix.target }}/release/bundle/**/*.AppImage
             src-tauri/target/${{ matrix.target }}/release/bundle/**/*.tar.gz
             src-tauri/target/${{ matrix.target }}/release/bundle/**/*.sig
@@ -281,7 +290,7 @@ jobs:
           # Now safe to flatten — every basename is unique post-rename.
           # ZEB-328 PR #160 R1 (Qodo): cp -f to avoid any interactive
           # prompt in a non-interactive workflow.
-          find artifacts/ -type f \( -name "*.dmg" -o -name "*.msi" -o -name "*.AppImage" -o -name "*.tar.gz" -o -name "*.sig" -o -name "*.zip" \) -exec cp -f {} release-files/ \;
+          find artifacts/ -type f \( -name "*.dmg" -o -name "*.exe" -o -name "*.AppImage" -o -name "*.tar.gz" -o -name "*.sig" -o -name "*.zip" \) -exec cp -f {} release-files/ \;
           ls -la release-files/
 
       # ZEB-328 PR #160 R1 (Qodo MED): fail loudly if any expected
@@ -304,8 +313,12 @@ jobs:
               missing+=("$f")
             fi
           done
-          # Windows + Linux updater bundle basenames vary by version, glob-check them:
-          for glob in '*-setup.nsis.zip' '*-setup.nsis.zip.sig' '*amd64.AppImage.tar.gz' '*amd64.AppImage.tar.gz.sig'; do
+          # Windows + Linux updater bundle basenames vary by version, glob-check them.
+          # The `*-setup.exe` glob is the actual NSIS installer that new users
+          # download from the GitHub release page (separate from the updater
+          # bundle `*-setup.nsis.zip`); checking it explicitly prevents the
+          # release from shipping with no Windows installer.
+          for glob in '*-setup.exe' '*-setup.nsis.zip' '*-setup.nsis.zip.sig' '*amd64.AppImage.tar.gz' '*amd64.AppImage.tar.gz.sig'; do
             if ! ls release-files/$glob >/dev/null 2>&1; then
               missing+=("$glob")
             fi
