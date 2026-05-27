@@ -144,6 +144,31 @@ No action needed if PUBLIC. If PRIVATE and you're exceeding 2000 min, consider s
 
 ---
 
+### 1.8 Why we don't use SemVer pre-release suffixes
+
+**TL;DR:** Windows MSI (WiX) rejects pre-release identifiers. Use clean numeric SemVer like `0.1.0`, `0.1.1`, `0.2.0`. Never `0.1.0-alpha.N`, `-beta.N`, or `-rc.N`.
+
+WiX — the Microsoft Windows MSI installer toolchain Tauri uses for the Windows matrix job — encodes version metadata as `Major.Minor.Build[.Revision]`: four numeric components, each a UInt16 (max 65535). The MSI Windows Installer format has no slot for SemVer's pre-release suffix; the WiX compiler rejects strings containing letters or dashes after the patch component.
+
+Concretely: if `tauri.conf.json` `version` is `0.1.0-alpha.1`, the macOS + Linux matrix jobs succeed but the Windows job fails inside `tauri build` with a WiX validation error. The release workflow's "Verify all platform bundles present" step then fails because the required `*-setup.nsis.zip` glob is missing, the draft release is never created, and you've burned ~15 min of Actions minutes on a dead run.
+
+**Why we don't use Tauri's `bundle.windows.wix.version` override.** Tauri 2.x exposes `bundle.windows.wix.version` to set a Windows-specific 4-numeric version (e.g., `0.1.0.1`) while leaving the SemVer `version` field as `0.1.0-alpha.1`. We don't use it because:
+
+1. **Support is inconsistent across Tauri 2.x point releases** — works in some, silently ignored in others. Pinning to a specific Tauri version to make it work is fragile.
+2. **Two version strings doubles operator burden and introduces drift risk** — every bump touches both fields, and the auto-updater manifest may use either, causing version-check mismatches.
+3. **Most large Tauri projects converge on plain-numeric SemVer** — matches Tauri's auto-updater documentation examples, the path of least friction.
+
+**How to signal "alpha" status without a version suffix:**
+
+- The `0.x.y` range IS the alpha cycle by convention. `0.1.0`, `0.1.1`, `0.1.2`, ..., `0.2.0`, etc.
+- Release notes title: `## Harmony v0.1.0 — alpha` for narrative framing.
+- GitHub Release name: `v0.1.0 (alpha)` for visibility on the releases page.
+- README + About modal: explicit "alpha" labels visible to users.
+
+**This constraint was caught by Cursor Bugbot during the first-release bootstrap** — the operator playbook originally used `0.1.0-alpha.N+1` examples that would have broken every Windows build. The `release.yml` precheck regex was also tightened to enforce numeric-only at the workflow boundary (catching at "operator passed bad input" instead of at "Windows runner failed 15min into build"). Lesson: validate the version pattern against ALL platform bundlers before committing to a docs convention, and make the enforcement match the policy.
+
+---
+
 ## 2. Per-release operator flow
 
 Prerequisites: OP-1 through OP-7 complete.
@@ -165,11 +190,11 @@ Check: no draft PRs you meant to include. CI is disabled (`ci.yml.disabled`) —
 
 ### Step 2: Bump version
 
-Edit `src-tauri/tauri.conf.json`: change `"version": "0.1.0-alpha.N"` to `"0.1.0-alpha.N+1"`.
+Edit `src-tauri/tauri.conf.json`: change `"version": "0.1.X"` to `"0.1.X+1"` (numeric SemVer only — see [§1.8](#18-why-we-dont-use-semver-pre-release-suffixes) for why no `-alpha.N` suffix).
 
 ```bash
 git diff src-tauri/tauri.conf.json   # confirm one-line change, nothing else
-git commit -am "release: bump version to 0.1.0-alpha.N+1"
+git commit -am "release: bump version to 0.1.X+1"
 git push
 ```
 
@@ -180,7 +205,7 @@ git push
 ```bash
 gh workflow run release.yml \
   --repo zeblithic/harmony-client \
-  -f version=0.1.0-alpha.N+1
+  -f version=0.1.X+1
 ```
 
 ---
@@ -216,10 +241,10 @@ See §3 below. Do this before publishing the draft release.
 The workflow creates a draft release with auto-generated notes. Add narrative framing:
 
 ```bash
-gh release edit v0.1.0-alpha.N+1 \
+gh release edit v0.1.X+1 \
   --repo zeblithic/harmony-client \
   --notes "$(cat <<'EOF'
-## Harmony v0.1.0-alpha.N+1
+## Harmony v0.1.X+1
 
 ### Highlights
 - <one-paragraph summary of what changed>
@@ -245,7 +270,7 @@ Download the signed updater bundles from the draft release, extract signatures, 
 
 ```bash
 set -euo pipefail
-VERSION="0.1.0-alpha.N+1"
+VERSION="0.1.X+1"
 REPO_URL="https://github.com/zeblithic/harmony-client"
 WORKDIR="$(mktemp -d -t harmony-release-XXXXXX)"
 cd "$WORKDIR"
@@ -324,7 +349,7 @@ After the push, GitHub Pages refreshes within ~30s. Verify before un-drafting:
 ```bash
 sleep 45
 curl -s https://zeblithic.github.io/harmony-client/latest.json | jq '.version, .platforms | keys'
-# Expected: "0.1.0-alpha.N+1" + all 4 platform keys present
+# Expected: "0.1.X+1" + all 4 platform keys present
 ```
 
 ---
@@ -334,7 +359,7 @@ curl -s https://zeblithic.github.io/harmony-client/latest.json | jq '.version, .
 Only after Step 6a verifies the manifest is live and well-formed:
 
 ```bash
-gh release edit v0.1.0-alpha.N+1 \
+gh release edit v0.1.X+1 \
   --repo zeblithic/harmony-client \
   --draft=false
 ```
@@ -346,10 +371,10 @@ gh release edit v0.1.0-alpha.N+1 \
 ```bash
 # Manifest appears within ~30s of release publish
 curl -s https://zeblithic.github.io/harmony-client/latest.json | jq .version
-# Expected: "0.1.0-alpha.N+1"
+# Expected: "0.1.X+1"
 
 # Confirm artifacts are attached
-gh release view v0.1.0-alpha.N+1 --repo zeblithic/harmony-client
+gh release view v0.1.X+1 --repo zeblithic/harmony-client
 # Should list: .dmg (x2), .exe, .AppImage, .tar.gz (x2), and their .sig files
 ```
 
@@ -359,7 +384,7 @@ gh release view v0.1.0-alpha.N+1 --repo zeblithic/harmony-client
 
 Run on at least one platform per release. macOS aarch64 is zeblith's machine; Linux + Windows rely on a tester volunteer for early cuts.
 
-1. **Download artifact.** From the draft release page, download the platform-appropriate artifact (e.g., `harmony_0.1.0-alpha.N+1_aarch64.dmg`).
+1. **Download artifact.** From the draft release page, download the platform-appropriate artifact (e.g., `harmony_0.1.X+1_aarch64.dmg`).
 
 2. **Walk the install doc literally.** Open `docs/install-macos.md` (or `-windows`, `-linux`). Follow every step exactly as written. Note any friction not yet documented.
 
@@ -389,7 +414,7 @@ Pass all 6: publish the release. Any failure: fix or document as a known issue b
 3. Update GH Actions secrets to the new private key + passphrase (OP-2 again).
 4. Update 1Password + lockbox with the new keypair (OP-4 again).
 5. Cut a new release immediately (§2 flow). This is the first release clients will refuse to install without the new pubkey — existing installed clients with the old pubkey embedded **cannot auto-update to this new release**.
-6. **Communicate to ALL testers:** "Manual re-download required. Auto-update from any prior version is broken. Download `v0.1.0-alpha.N+1` from the Releases page and re-install."
+6. **Communicate to ALL testers:** "Manual re-download required. Auto-update from any prior version is broken. Download `v0.1.X+1` from the Releases page and re-install."
 7. Write a post-mortem: how did the key leak? Tighten backup hygiene.
 
 Recovery is possible but requires every tester to manually reinstall. Treat signing key with the same care as a root CA.
@@ -406,7 +431,7 @@ Same recovery path as leak (generate new keypair, ship release, require manual r
 
 1. **Delete the broken release** (removes GitHub Release + tag):
    ```bash
-   gh release delete v0.1.0-alpha.N \
+   gh release delete v0.1.X \
      --repo zeblithic/harmony-client \
      --cleanup-tag --yes
    ```
@@ -422,6 +447,6 @@ Same recovery path as leak (generate new keypair, ship release, require manual r
    # Option B: cut hotfix immediately (faster if the fix is trivial)
    ```
 
-3. **Cut hotfix** `v0.1.0-alpha.N+1` via the §2 flow with the bug fixed.
+3. **Cut hotfix** `v0.1.X+1` via the §2 flow with the bug fixed.
 
 4. Anyone who already downloaded the broken `N` will auto-update to `N+1` once it's published (if `latest.json` was reverted in time; otherwise they may be stranded on `N` until they manually check for updates or relaunch).

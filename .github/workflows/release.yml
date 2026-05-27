@@ -4,7 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'SemVer + pre-release (e.g., 0.1.0-alpha.1)'
+        # WiX/MSI rejects SemVer pre-release identifiers (alpha.N, beta.N, rc.N) —
+        # Windows version metadata is 4-numeric (Major.Minor.Build[.Revision]) with no
+        # text suffixes allowed. Use clean numeric SemVer like 0.1.0, 0.1.1, 0.2.0.
+        # The "alpha cycle" lives in the 0.x.y range; surface "alpha" status via
+        # release notes title + README + About modal, NOT the version string.
+        # See docs/release-process.md §1.8 for the full constraint write-up.
+        description: 'Numeric SemVer (e.g., 0.1.0, 0.1.1). No -alpha.N suffix — breaks Windows MSI.'
         required: true
         type: string
 
@@ -47,12 +53,24 @@ jobs:
           # bypass validation, then write a newline to GITHUB_OUTPUT
           # corrupting downstream step outputs).
           #
-          # SemVer 2.0 grammar (simplified to what we use):
-          # MAJOR.MINOR.PATCH (-pre-release-identifier(.pre-release-identifier)*)?
-          # Where pre-release identifiers are [0-9A-Za-z-]+
-          if [[ ! "$RAW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
-            echo "::error::version input is not valid SemVer 2.0 (multi-line or invalid)."
-            echo "Expected e.g. '0.1.0-alpha.1' or '0.1.0'"
+          # Numeric SemVer only — MAJOR.MINOR.PATCH with no pre-release suffix.
+          # We deliberately reject the SemVer-2.0 -pre-release-identifier grammar
+          # because WiX/MSI on the Windows matrix job rejects pre-release suffixes
+          # (alpha.N, beta.N, rc.N) — letting one through here would silently burn
+          # ~15 min of Actions minutes before tauri build fails on Windows. See
+          # docs/release-process.md §1.8 for the full constraint write-up. The
+          # "alpha cycle" lives in the 0.x.y range; surface status via release
+          # notes title, README, About modal, NOT the version string.
+          #
+          # Per-component pattern (0|[1-9][0-9]*): SemVer 2.0 §2 explicitly
+          # disallows leading zeros on numeric identifiers (so "01.2.3" and
+          # "1.0.01" are rejected; "0.1.0" and "10.20.30" are accepted).
+          # Without this, "01.2.3" would clear precheck and silently produce
+          # confusing "v01.2.3" release tags + npm pkg versions.
+          if [[ ! "$RAW_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::version input is not valid numeric SemVer (multi-line, pre-release suffix, leading zeros, or other invalid form)."
+            echo "Expected e.g. '0.1.0', '0.1.1', '0.2.0', '10.20.30' — numeric MAJOR.MINOR.PATCH, no leading zeros, no suffix."
+            echo "Pre-release suffixes like '-alpha.N' break Windows MSI builds — see docs/release-process.md §1.8."
             exit 1
           fi
           echo "version=$RAW_VERSION" >> "$GITHUB_OUTPUT"
