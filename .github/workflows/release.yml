@@ -4,7 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'SemVer + pre-release (e.g., 0.1.0-alpha.1)'
+        # WiX/MSI rejects SemVer pre-release identifiers (alpha.N, beta.N, rc.N) —
+        # Windows version metadata is 4-numeric (Major.Minor.Build[.Revision]) with no
+        # text suffixes allowed. Use clean numeric SemVer like 0.1.0, 0.1.1, 0.2.0.
+        # The "alpha cycle" lives in the 0.x.y range; surface "alpha" status via
+        # release notes title + README + About modal, NOT the version string.
+        # See docs/release-process.md §1.8 for the full constraint write-up.
+        description: 'Numeric SemVer (e.g., 0.1.0, 0.1.1). No -alpha.N suffix — breaks Windows MSI.'
         required: true
         type: string
 
