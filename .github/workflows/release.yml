@@ -61,9 +61,15 @@ jobs:
           # docs/release-process.md §1.8 for the full constraint write-up. The
           # "alpha cycle" lives in the 0.x.y range; surface status via release
           # notes title, README, About modal, NOT the version string.
-          if [[ ! "$RAW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::version input is not valid numeric SemVer (multi-line, pre-release suffix, or other invalid form)."
-            echo "Expected e.g. '0.1.0', '0.1.1', '0.2.0' — numeric MAJOR.MINOR.PATCH only."
+          #
+          # Per-component pattern (0|[1-9][0-9]*): SemVer 2.0 §2 explicitly
+          # disallows leading zeros on numeric identifiers (so "01.2.3" and
+          # "1.0.01" are rejected; "0.1.0" and "10.20.30" are accepted).
+          # Without this, "01.2.3" would clear precheck and silently produce
+          # confusing "v01.2.3" release tags + npm pkg versions.
+          if [[ ! "$RAW_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::version input is not valid numeric SemVer (multi-line, pre-release suffix, leading zeros, or other invalid form)."
+            echo "Expected e.g. '0.1.0', '0.1.1', '0.2.0', '10.20.30' — numeric MAJOR.MINOR.PATCH, no leading zeros, no suffix."
             echo "Pre-release suffixes like '-alpha.N' break Windows MSI builds — see docs/release-process.md §1.8."
             exit 1
           fi
