@@ -9,7 +9,7 @@ Harmony is in private alpha. These instructions cover the full install flow for 
 Go to **<https://github.com/zeblithic/harmony-client/releases/latest>** and download:
 
 ```
-Harmony_X.Y.Z_x64_en-US.msi
+Harmony_X.Y.Z_x64-setup.exe
 ```
 
 (Replace `X.Y.Z` with the version number shown on the releases page.)
@@ -20,7 +20,7 @@ Harmony currently ships for 64-bit Windows only. ARM Windows is not yet supporte
 
 ## 2. Run the installer — SmartScreen workaround
 
-Double-click the `.msi` file. Because Harmony is an alpha build and does not yet have an extended-validation code-signing certificate, Windows SmartScreen will block it:
+Double-click the `.exe` file. Because Harmony is an alpha build and does not yet have an extended-validation code-signing certificate, Windows SmartScreen will block it:
 
 > **Windows protected your PC**
 > Microsoft Defender SmartScreen prevented an unrecognized app from starting.
@@ -66,7 +66,7 @@ Click **Allow access**. If you click **Cancel**, Harmony can't reach other users
 
 Harmony checks for updates automatically. When a new build is available you'll see a toast notification inside the app with an **Update** button. The update downloads in the background and applies on next restart.
 
-If the toast doesn't appear after a few days and you know a new release is out, re-download the latest `.msi` from the releases page and run it — the installer will upgrade your existing installation in place.
+If the toast doesn't appear after a few days and you know a new release is out, re-download the latest `.exe` from the releases page and run it — the installer will upgrade your existing installation in place.
 
 ---
 
