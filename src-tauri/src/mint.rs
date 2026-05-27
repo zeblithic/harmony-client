@@ -494,17 +494,43 @@ pub struct ListFilter {
 
 /// Validate a transaction date string: must be parseable as `YYYY-MM-DD`.
 fn validate_date(s: &str) -> Result<(), MintError> {
+    // chrono's `%Y` parser is greedy and accepts shorter years like "26"
+    // (interpreted as year 26 AD). For our YYYY-MM-DD contract we require
+    // exactly 10 characters in the `NNNN-NN-NN` shape before delegating
+    // to chrono for the month/day range validation.
+    let bytes = s.as_bytes();
+    let well_formed = bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[..4].iter().all(|b| b.is_ascii_digit())
+        && bytes[5..7].iter().all(|b| b.is_ascii_digit())
+        && bytes[8..10].iter().all(|b| b.is_ascii_digit());
+    if !well_formed {
+        return Err(MintError::Validation(format!(
+            "invalid date '{s}'; expected YYYY-MM-DD"
+        )));
+    }
     chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
         .map(|_| ())
         .map_err(|_| MintError::Validation(format!("invalid date '{s}'; expected YYYY-MM-DD")))
 }
 
-/// Validate an amount string: must be parseable as a decimal number.
+/// Validate an amount string: must be a plain decimal number (no scientific
+/// notation, no thousands separators, optional leading sign, optional `.`
+/// fractional part).
 ///
-/// Uses `rust_decimal::Decimal` which accepts `.` as the decimal separator and
-/// rejects commas, scientific notation, etc.
+/// `rust_decimal::Decimal::from_str` accepts scientific notation (`"1e5"` →
+/// 100000) as of v1.x. Our user-facing amount fields are typed into a numeric
+/// keypad context where scientific notation is never intentional; accepting
+/// it would silently convert a mis-typed `e` into a 5+-magnitude number.
+/// We pre-check for `e`/`E` and reject before handing off to Decimal.
 fn validate_amount(s: &str) -> Result<(), MintError> {
     use std::str::FromStr;
+    if s.bytes().any(|b| b == b'e' || b == b'E') {
+        return Err(MintError::Validation(format!(
+            "invalid amount '{s}': scientific notation not allowed"
+        )));
+    }
     rust_decimal::Decimal::from_str(s)
         .map(|_| ())
         .map_err(|_| MintError::Validation(format!("invalid amount '{s}'")))

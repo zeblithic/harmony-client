@@ -1,23 +1,34 @@
 # Nextest config — see https://nexte.st/docs/configuration/
 #
-# The default profile excludes 21 tests that broke on main between the
+# The default profile excludes 17 tests that broke on main between the
 # last green CI run (2026-05-13, before `ci.yml.disabled`) and PR #166's
 # CI re-enable. None are introduced by PR #166 itself — they accumulated
 # across PRs #160-165 while CI was off. Tracked + scoped in
 # [ZEB-332](https://linear.app/zeblith/issue/ZEB-332).
 #
-# Why exclude rather than fix in #166: the dominant failure mode is
-# Tauri 2.11 ACL drift in the test mock setup (14 of the 21), which
-# needs a `mock_context_with_full_acl` test-fixtures helper that's a
-# separate-PR-shaped change. The remaining 7 are pre-existing
-# folder_ingest/mint orphans per the user's `feedback_unrelated_test_failures`
-# memory — investigating them is also out of scope for #166's
-# "rebase + CI re-enable" goal.
+# Of the original 21 failures, PR #166 fixed 4 real production bugs:
+#   - `validate_amount_rejects_nonnumeric` (mint accepting scientific
+#     notation; rust_decimal 1.x parses `1e5`)
+#   - `validate_date_rejects_malformed` (mint accepting `26-05-19` as
+#     year 26 AD; chrono's `%Y` is greedy)
+#   - `boot_hook_skips_when_empty` (fresh-install client publishes a
+#     useless USD-only snapshot because `apply_migrations` inserts
+#     `default_currency='USD'` and the publish empty-check counts it)
+#   - `publish_skips_when_snapshot_is_empty` (same root cause)
 #
-# Local devs: `cargo nextest run --no-default-filter` to see ALL tests
-# (including the 21 broken ones). The exclusion below is exact-match by
-# test name, so removing entries one at a time as the sweep lands is
-# straightforward — just delete the corresponding `test(=...)` clause.
+# The remaining 17 are real test-infrastructure issues, not production
+# bugs. The dominant failure mode is Tauri 2.11 ACL drift in the test
+# mock setup (14 of the 17), which needs a `mock_context_with_full_acl`
+# test-fixtures helper that's a separate-PR-shaped change. The other 3
+# are pre-existing `folder_ingest` orphans per `feedback_unrelated_test_failures`
+# — tempfile's `.tmp`-prefixed paths get caught by the deny-list filter
+# in `should_filter_name`, so the test never sees its own files.
+#
+# Local devs: pass an explicit `-E test(/regex/)` to run any of the
+# below; the default-filter intersects with `-E`, so use regex match
+# (e.g. `-E 'test(/validate_amount/)'`) rather than exact match.
+# Removing entries one at a time as the sweep lands is straightforward
+# — just delete the corresponding `test(=...)` clause.
 
 [profile.default]
 default-filter = """\
@@ -25,10 +36,6 @@ default-filter = """\
     test(=pre_walk_counts_only_non_filtered_leaves) \
     + test(=walker_honors_cancel_flag_and_cleans_up_registry) \
     + test(=walker_leaf_ingest_does_not_pollute_root_listing) \
-    + test(=validate_amount_rejects_nonnumeric) \
-    + test(=validate_date_rejects_malformed) \
-    + test(=boot_hook_skips_when_empty) \
-    + test(=publish_skips_when_snapshot_is_empty) \
     + test(=ipc_tier3_error_extraction_string_and_error) \
     + test(=add_space_binds_camelcase_params) \
     + test(=delete_outbox_entry_binds_camelcase_params) \

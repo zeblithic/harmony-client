@@ -635,6 +635,27 @@ async fn internal_task(
     }
 }
 
+/// Returns true when a snapshot carries no user-authored data — only
+/// `apply_migrations`-inserted defaults (the schema-init `default_currency =
+/// 'USD'` row stamped with epoch `updated_at`) and no accounts/transactions/
+/// deletion-floor entries. Used by both publish paths to skip the no-op
+/// publish that would otherwise fire on every fresh-install boot-hook.
+///
+/// Migration rows are identified by `updated_at == "1970-01-01T00:00:00Z"`
+/// — see `mint.rs::apply_migrations` for why epoch is the load-bearing
+/// discriminator (any user-edited setting carries `chrono::Utc::now()`).
+fn snapshot_has_no_user_data(snap: &MintSnapshot) -> bool {
+    let user_settings = snap
+        .settings
+        .iter()
+        .filter(|s| s.updated_at != "1970-01-01T00:00:00Z")
+        .count();
+    snap.accounts.is_empty()
+        && snap.transactions.is_empty()
+        && user_settings == 0
+        && snap.account_deletion_floor.is_empty()
+}
+
 async fn publish_root_now(
     mint_db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
     content_store: &Arc<dyn crate::content_store::ContentStore>,
@@ -654,11 +675,7 @@ async fn publish_root_now(
         snap.account_deletion_floor = st.account_deletion_floor.clone();
     }
 
-    if snap.accounts.is_empty()
-        && snap.transactions.is_empty()
-        && snap.settings.is_empty()
-        && snap.account_deletion_floor.is_empty()
-    {
+    if snapshot_has_no_user_data(&snap) {
         tracing::debug!(
             target: "mint_sync",
             accounts = snap.accounts.len(),
@@ -864,11 +881,7 @@ async fn publish_root_now_zenoh(
         snap.account_deletion_floor = st.account_deletion_floor.clone();
     }
 
-    if snap.accounts.is_empty()
-        && snap.transactions.is_empty()
-        && snap.settings.is_empty()
-        && snap.account_deletion_floor.is_empty()
-    {
+    if snapshot_has_no_user_data(&snap) {
         tracing::debug!(
             target: "mint_sync",
             accounts = snap.accounts.len(),
