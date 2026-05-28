@@ -25,7 +25,7 @@ Surfaced during 2026-05-28 alpha bring-up:
 
 Result: the only successful exit from a fresh install in v0.1.0-alpha is to quit the app, manually edit `~/.harmony/owner_state.cbor`, restart. Not viable for testers.
 
-## 3. Architecture — three-state hard-gated state machine
+## 3. Architecture — four-state hard-gated state machine
 
 A single state machine governs the app from launch to main-UI-reachable, with the owner-identity hard gate as the architectural backbone:
 

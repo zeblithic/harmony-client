@@ -1083,6 +1083,12 @@ pub struct TelemetryEventPayload {
 
 const CAPACITY_PREFIX: &str = "harmony/compute/capacity/";
 
+// ZEB-338: the single honest "owner identity not loaded" message. Use this at
+// owner-derived-handle guards so the phrasing can't drift between call sites.
+// (Incremental adoption — applied where edited, not a blanket sweep.)
+const OWNER_NOT_LOADED_MSG: &str =
+    "Owner identity not loaded — please restart the app or recreate identity.";
+
 pub fn parse_capacity(key_expr: &str, payload: &[u8]) -> Option<CapacityUpdate> {
     let node_addr = key_expr.strip_prefix(CAPACITY_PREFIX)?;
     if payload.len() < 33 {
@@ -5602,9 +5608,7 @@ async fn send_dm(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.dm_outbox
-                .clone()
-                .ok_or("node not running or no owner identity")?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_transport.clone().ok_or("dm_transport missing")?,
             g.crdt_state.clone().ok_or(
                 "Owner identity not loaded — please restart the app or recreate identity.",
@@ -5899,9 +5903,7 @@ async fn read_dm_thread(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state
-                .clone()
-                .ok_or("node not running or no owner identity")?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.content_store.clone().ok_or("content_store missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
         )
@@ -6104,9 +6106,7 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.dm_outbox
-                .clone()
-                .ok_or("node not running or no owner identity")?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.crdt_state.clone().ok_or(
                 "Owner identity not loaded — please restart the app or recreate identity.",
             )?,
@@ -6604,9 +6604,7 @@ async fn add_space(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.dm_outbox
-                .clone()
-                .ok_or("node not running or no owner identity")?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.crdt_state.clone().ok_or(
                 "Owner identity not loaded — please restart the app or recreate identity.",
             )?,
