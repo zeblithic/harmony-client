@@ -31,6 +31,14 @@
   let backupError = $state<string | null>(null);
   let backupInFlight = $state(false);
   let appVersion = $state<string>('unknown');
+  // ZEB-338 / PR #169: defense-in-depth escape. App.svelte only opens this gate
+  // when start_node reported NO owner identity, so mint hitting "already exists"
+  // should be unreachable — but if owner_state.cbor exists yet start_node didn't
+  // load it, staying on the explain pane would deadlock the hard gate. Surfacing
+  // a reload (which re-runs start_node → reports present) guarantees an exit.
+  let alreadyExists = $state(false);
+  // ZEB-338 / PR #169: bound to the dialog element for the focus trap.
+  let modalEl = $state<HTMLElement | null>(null);
 
   const svc = new OwnerService();
 
@@ -42,15 +50,79 @@
     }
   });
 
+  // ZEB-338 / PR #169: trap focus inside the hard gate. `aria-modal` alone does
+  // not stop Tab from reaching the background (e.g. the help button), so we mark
+  // sibling overlays inert, move initial focus into the dialog, cycle Tab within
+  // it, and restore focus on close.
+  $effect(() => {
+    if (!open || modalEl === null) return;
+
+    const dialog = modalEl;
+    const backdrop = dialog.parentElement;
+    const root = backdrop?.parentElement ?? null;
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    const inerted: HTMLElement[] = [];
+
+    if (root && backdrop) {
+      for (const child of Array.from(root.children)) {
+        if (child !== backdrop && child instanceof HTMLElement && !child.hasAttribute('inert')) {
+          child.setAttribute('inert', '');
+          inerted.push(child);
+        }
+      }
+    }
+
+    const focusables = (): HTMLElement[] =>
+      Array.from(
+        dialog.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      );
+
+    (focusables()[0] ?? dialog).focus();
+
+    function onKeydown(ev: KeyboardEvent) {
+      if (ev.key !== 'Tab') return;
+      const items = focusables();
+      if (items.length === 0) {
+        ev.preventDefault();
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      const active = document.activeElement;
+      if (ev.shiftKey && active === first) {
+        ev.preventDefault();
+        last.focus();
+      } else if (!ev.shiftKey && active === last) {
+        ev.preventDefault();
+        first.focus();
+      }
+    }
+
+    dialog.addEventListener('keydown', onKeydown);
+
+    return () => {
+      dialog.removeEventListener('keydown', onKeydown);
+      for (const el of inerted) el.removeAttribute('inert');
+      previouslyFocused?.focus?.();
+    };
+  });
+
   async function handleCreateIdentity() {
     stage = 'minting';
     mintError = null;
+    alreadyExists = false;
     try {
       const result = await svc.mint();
       mintResult = result;
       stage = 'backup';
     } catch (e) {
-      mintError = extractError(e);
+      const msg = extractError(e);
+      mintError = msg;
+      // An "already exists" mint failure means an identity is on disk but the
+      // node didn't load it — reload is the only safe exit from the hard gate.
+      alreadyExists = /already exist/i.test(msg);
       stage = 'explain';
     }
   }
@@ -112,11 +184,13 @@
 {#if open}
   <div class="modal-backdrop" data-testid="welcome-modal-backdrop" role="presentation">
     <div
+      bind:this={modalEl}
       class="modal-content"
       data-testid="welcome-modal"
       role="dialog"
       aria-modal="true"
       aria-labelledby="welcome-title"
+      tabindex="-1"
     >
       {#if stage === 'explain' || stage === 'minting'}
         <h2 id="welcome-title">Welcome to Harmony</h2>
@@ -138,15 +212,31 @@
         {#if mintError}
           <p class="error" data-testid="welcome-mint-error">{mintError}</p>
         {/if}
+        {#if alreadyExists}
+          <p class="muted" data-testid="welcome-already-exists-hint">
+            An identity already exists on this device but couldn't be loaded.
+            Reload to try starting it again.
+          </p>
+        {/if}
         <div class="actions">
-          <button
-            class="primary"
-            data-testid="welcome-create-identity"
-            onclick={handleCreateIdentity}
-            disabled={stage === 'minting'}
-          >
-            {stage === 'minting' ? 'Creating your identity…' : 'Create my identity'}
-          </button>
+          {#if alreadyExists}
+            <button
+              class="primary"
+              data-testid="welcome-already-exists-reload"
+              onclick={() => location.reload()}
+            >
+              Reload Harmony
+            </button>
+          {:else}
+            <button
+              class="primary"
+              data-testid="welcome-create-identity"
+              onclick={handleCreateIdentity}
+              disabled={stage === 'minting'}
+            >
+              {stage === 'minting' ? 'Creating your identity…' : 'Create my identity'}
+            </button>
+          {/if}
         </div>
       {:else if stage === 'backup'}
         <h2 id="welcome-title">Your identity is ready</h2>

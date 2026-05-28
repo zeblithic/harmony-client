@@ -96,7 +96,7 @@ describe('WelcomeModal hard gate + flow', () => {
     expect(onMinted).toHaveBeenCalled();
   });
 
-  it('passphrase under 8 chars disables save button', async () => {
+  it('passphrase under the minimum length disables save button', async () => {
     mintMock.mockResolvedValue({ state: {}, recoveryToken: 'tok' });
     const { getByTestId } = render(WelcomeModal, { props: { open: true, onMinted: vi.fn() } });
     await fireEvent.click(getByTestId('welcome-create-identity'));
@@ -133,5 +133,32 @@ describe('WelcomeModal hard gate + flow', () => {
     await fireEvent.click(getByTestId('welcome-modal-backdrop'));
     expect(getByTestId('welcome-modal')).toBeTruthy();
     expect(onMinted).not.toHaveBeenCalled();
+  });
+
+  it('moves initial focus into the dialog (focus trap)', async () => {
+    // PR #169: aria-modal alone does not trap focus; the $effect must pull
+    // focus into the dialog so Tab can be cycled within it.
+    const { getByTestId } = render(WelcomeModal, { props: { open: true, onMinted: vi.fn() } });
+    await vi.waitFor(() => {
+      const active = document.activeElement;
+      const modal = getByTestId('welcome-modal');
+      expect(modal.contains(active)).toBe(true);
+    });
+  });
+
+  it('offers a reload escape when mint reports the identity already exists', async () => {
+    // PR #169: the hard gate must not deadlock when an identity exists on disk
+    // but the node failed to load it. mint() rejects with "already exists";
+    // the explain pane must swap the create button for a reload escape.
+    mintMock.mockRejectedValue('Owner identity already exists on this device. Wipe via Settings to re-mint.');
+    const { getByTestId, queryByTestId } = render(WelcomeModal, {
+      props: { open: true, onMinted: vi.fn() },
+    });
+    await fireEvent.click(getByTestId('welcome-create-identity'));
+    await Promise.resolve(); await Promise.resolve();
+    // Reload escape is present; the create button is gone (clicking it again
+    // would just re-fail).
+    expect(getByTestId('welcome-already-exists-reload')).toBeTruthy();
+    expect(queryByTestId('welcome-create-identity')).toBeNull();
   });
 });
