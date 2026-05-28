@@ -17,7 +17,6 @@ use secrecy::SecretString;
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::Manager;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -42,9 +41,6 @@ use zeroize::Zeroizing;
 /// for the parallel race on those paths.
 pub(crate) static OWNER_STATE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-const ERR_NODE_RUNNING: &str =
-    "Stop the node before minting an owner identity (the node must not be holding owner-scoped keys during mint).";
-
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MintIpcResult {
@@ -65,15 +61,6 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// Refuse the call if the node event-loop thread is running.
-fn require_node_stopped(state: &Mutex<crate::NodeState>) -> Result<(), String> {
-    let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
-    if guard.is_running() {
-        return Err(ERR_NODE_RUNNING.to_string());
-    }
-    Ok(())
 }
 
 fn build_owner_state_view(loaded: &LoadedOwnerState, this_device_name: String) -> OwnerStateView {
@@ -160,13 +147,69 @@ pub async fn mint_owner_identity(
     app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<crate::NodeState>>,
 ) -> Result<MintIpcResult, String> {
-    // Fast-fail outside the blocking pool: gives the user a quick error if
-    // the node is already running, without waiting on the spawn_blocking
-    // queue. The authoritative check happens INSIDE the mint mutex below.
-    require_node_stopped(&state)?;
+    // Forward to the testable inner fn (symmetric with `start_node_inner`).
+    // The restart step is injected as a closure so the inner fn can be
+    // driven from a headless integration test (where a real `AppHandle<Wry>`
+    // — required by `start_node_inner` — cannot be constructed). Production
+    // passes the real node restart.
+    let state_ref: &Mutex<crate::NodeState> = state.inner();
+    mint_owner_identity_inner(state_ref, || async {
+        crate::start_node_inner(None, &app, state_ref)
+            .await
+            .map(|_| ())
+    })
+    .await
+}
+
+/// Core of `mint_owner_identity`, extracted for testability (mirrors
+/// `start_node_inner`). Flow: stop node → mint+persist (under the
+/// owner-state write lock) → restart node.
+///
+/// `restart` performs the node restart given the already-persisted owner
+/// state on disk. Production supplies a closure that calls
+/// `crate::start_node_inner`; tests supply a closure that records invocation
+/// (so they can assert "restart happens after mint, with cbor on disk") or
+/// deliberately fails (to lock the no-rollback invariant below).
+pub(crate) async fn mint_owner_identity_inner<F, Fut>(
+    state: &Mutex<crate::NodeState>,
+    restart: F,
+) -> Result<MintIpcResult, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
     let identity_dir = resolve_identity_dir()?;
     let display_name = "this device".to_string();
-    run_blocking(move || {
+
+    // Idempotent failure if already minted — existing guard, kept. The hard
+    // gate (frontend) means this is normally unreachable, but a race or a
+    // direct DevicesPanel call could hit it.
+    if identity_dir.join("owner_state.cbor").exists() {
+        return Err(
+            "Owner identity already exists on this device. Wipe via Settings to re-mint."
+                .to_string(),
+        );
+    }
+
+    // ── Phase 1: stop the node ──────────────────────────────────────────
+    // ZEB-338: mint takes responsibility for the node lifecycle so the user
+    // never has to "stop the node" by hand (the old require_node_stopped
+    // dead-end). `stop_inner` is async-context-safe — it drives its async
+    // shutdown on an ephemeral runtime inside std::thread::scope, so calling
+    // it from this async fn does NOT panic with a nested runtime.
+    // `None` = stop unconditionally (no generation check).
+    crate::stop_inner(state, None);
+
+    // ── Phase 2: mint + persist ─────────────────────────────────────────
+    // Held under OWNER_STATE_WRITE_LOCK to serialize concurrent mints.
+    // metadata-before-irreversible-write note (feedback_metadata_before_
+    // irreversible_write): the cbor + keychain write here IS the desired
+    // irreversible write. If Phase 3 (restart) fails afterward we do NOT roll
+    // it back — rolling back would lose the user's freshly minted identity
+    // (spec §7.1). The cost of a failed restart is a manual relaunch, which
+    // is strictly better than identity loss.
+    let mint_dir = identity_dir.clone();
+    let mint_result = run_blocking(move || {
         // Hold the process-wide owner-state write mutex for the entire
         // check-and-write window. Without this, concurrent mints could both
         // observe an absent owner_state.cbor and race to write competing
@@ -177,34 +220,30 @@ pub async fn mint_owner_identity(
         let _owner_write_guard = OWNER_STATE_WRITE_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        // Re-check node status under the mint lock to close the TOCTOU
-        // window between the outer fast-fail check and acquiring the lock:
-        // another command could have started the node in that gap.
-        let node_state = app.state::<Mutex<crate::NodeState>>();
-        require_node_stopped(node_state.inner())?;
-        // Refuse if already minted (idempotent failure).
-        if identity_dir.join("owner_state.cbor").exists() {
+        // Re-check under the lock (TOCTOU: another caller could have minted
+        // between the outer check and acquiring the lock).
+        if mint_dir.join("owner_state.cbor").exists() {
             return Err(
                 "Owner identity already exists on this device. Wipe via Settings to re-mint."
                     .to_string(),
             );
         }
         let MintResult {
-            state,
+            state: owner_state,
             recovery_artifact,
             device_signing_key,
         } = mint_owner(now_unix()).map_err(|e| format!("mint_owner: {e}"))?;
         let master_seed: Zeroizing<[u8; 32]> = Zeroizing::new(*recovery_artifact.as_bytes());
         save_owner_state_atomic(
-            &identity_dir,
-            &state,
+            &mint_dir,
+            &owner_state,
             &device_signing_key,
             Some(&*master_seed),
             KeychainStore::new().ok(),
         )?;
         let token = insert_token(master_seed.clone());
         let loaded = LoadedOwnerState {
-            state,
+            state: owner_state,
             device_signing_key,
             master_seed: Some(master_seed),
         };
@@ -213,7 +252,33 @@ pub async fn mint_owner_identity(
             recovery_token: token.to_string(),
         })
     })
-    .await
+    .await?;
+
+    // ── Phase 3: restart the node — now loads owner_state.cbor ──────────
+    // NO ROLLBACK on failure: the mint above already wrote the identity to
+    // disk. If the restart errors we surface it but leave the minted
+    // identity in place (see Phase 2 note + spec §7.1).
+    restart()
+        .await
+        .map_err(|e| format!("Node restart failed after mint: {e}"))?;
+
+    Ok(mint_result)
+}
+
+/// Test-only public shim over [`mint_owner_identity_inner`] so headless
+/// integration tests (a separate crate, no `pub(crate)` visibility) can
+/// drive the mint lifecycle with an injected restart closure. Never
+/// compiled into production (gated behind `test-fixtures`).
+#[cfg(feature = "test-fixtures")]
+pub async fn mint_owner_identity_inner_for_test<F, Fut>(
+    state: &Mutex<crate::NodeState>,
+    restart: F,
+) -> Result<MintIpcResult, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    mint_owner_identity_inner(state, restart).await
 }
 
 #[tauri::command]

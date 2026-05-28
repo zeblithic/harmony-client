@@ -1128,7 +1128,7 @@ fn stop_handles(
 
 /// Stop the running node (if any). Returns after the event loop thread exits.
 /// Returns `true` if a node was actually stopped, `false` if it was a no-op.
-fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
+pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     // ZEB-270 Phase 3 Task 4C: declared in the outer scope so the
     // post-lock shutdown_all block can take it. Assigned inside the
     // lock alongside the other `take()` calls below.
