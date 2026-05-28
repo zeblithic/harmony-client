@@ -57,9 +57,16 @@
   import { onMount } from 'svelte';
   import type { Update } from '@tauri-apps/plugin-updater';
   import { checkForUpdate } from './lib/updater-adapter';
-  import { extractHarmonyInviteUrl } from './lib/deep-link-router';
+  import {
+    extractHarmonyInviteUrl,
+    queueInviteForPostMint,
+    consumeQueuedInvite,
+  } from './lib/deep-link-router';
   import UpdateAvailableToast from './lib/components/UpdateAvailableToast.svelte';
   import WelcomeModal from './lib/components/WelcomeModal.svelte';
+  import BackupReminderBanner from './lib/components/BackupReminderBanner.svelte';
+  import type { MintIpcResult } from './lib/owner-service';
+  import type { StartNodeResponse } from './lib/types/onboarding';
   import HelpMenuButton from './lib/components/HelpMenuButton.svelte';
   import FeedbackModal from './lib/components/FeedbackModal.svelte';
   import AboutModal from './lib/components/AboutModal.svelte';
@@ -235,23 +242,43 @@
   let availableUpdate = $state<Update | null>(null);
   // ── ZEB-331: first-run welcome + feedback + about ─────────────────
   let showWelcomeModal = $state(false);
+  // ZEB-338: backend-authoritative owner-identity presence. Starts false; set
+  // from start_node's response; flipped true by onMinted. Gates the welcome
+  // hard-gate and the deep-link routing branch.
+  let hasOwnerIdentityState = $state(false);
   let feedbackModalOpen = $state(false);
   let aboutModalOpen = $state(false);
 
-  // ZEB-331 R3: persist welcome acknowledgement to localStorage so a
-  // failed start_node mid-keychain-write doesn't permanently swallow
-  // the welcome. Called from every site that completes onboarding:
-  // Dismiss, Join-with-invite, and deep-link-suppresses-welcome
-  // (Cursor R5 "deep-link skips welcome ack" — joining via harmony://
-  // is itself an onboarding-complete action). Safe to call when the
-  // flag is already set.
-  function acknowledgeWelcome(): void {
-    try {
-      window.localStorage.setItem('harmony.onboarding.welcomeAcknowledged', 'true');
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      console.debug('[harmony-client] welcomeAcknowledged write failed:', msg);
+  // ZEB-338: route an incoming harmony:// invite. Pre-mint (no owner identity)
+  // → queue for the post-mint drain. Post-mint → open the redeem dialog.
+  function routeInviteUrl(url: string): void {
+    if (!hasOwnerIdentityState) {
+      queueInviteForPostMint(url);
+      return;
     }
+    redeemUrl = url;
+    redeemError = null;
+    showRedeemInvite = true;
+  }
+
+  // ZEB-338: drain a queued invite into the redeem dialog (called post-mint and
+  // post-boot-when-owner-already-present).
+  function drainQueuedInvite(): void {
+    const queued = consumeQueuedInvite();
+    if (queued !== null) {
+      redeemUrl = queued;
+      redeemError = null;
+      showRedeemInvite = true;
+    }
+  }
+
+  // ZEB-338: WelcomeModal hard-gate completion. Flip owner-present, close the
+  // gate, and drain any invite that was queued pre-mint (Flow 3).
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  async function onMinted(_result: MintIpcResult): Promise<void> {
+    hasOwnerIdentityState = true;
+    showWelcomeModal = false;
+    drainQueuedInvite();
   }
 
   let showCreateCommunity = $state(false);
@@ -688,42 +715,29 @@
       // identity loads and mail_mgr is ready before adapters wire up. The
       // Network view's Connect flow can later re-invoke start_node with an
       // endpoint to join a gateway.
+      let startResp: StartNodeResponse | null = null;
       try {
-        await invoke('start_node', { endpoint: null });
+        startResp = await invoke<StartNodeResponse>('start_node', { endpoint: null });
       } catch (err) {
         console.warn('[harmony-client] auto-start_node failed:', err);
       }
-      // ZEB-331 R3 (Cursor Medium "welcome lost after failed start"):
-      // gate welcome on a persistent localStorage flag rather than on
-      // the in-memory freshlyCreated signal from start_node. The IPC
-      // returns freshlyCreated for forward-compat / future analytics
-      // but it isn't load-bearing for welcome anymore — start_node
-      // has ~2900 lines of post-keychain-write setup, and any failure
-      // path there would have lost the in-memory signal and prevented
-      // the welcome from ever appearing on subsequent successful
-      // starts. localStorage decouples "welcome owed to user" from
-      // start_node lifecycle so a failed first start retries on next
-      // launch.
-      //
-      // Race resolution (Flow 5 cont.): a deep-link can arrive during
-      // start_node. The deep-link handler sets showRedeemInvite=true +
-      // showWelcomeModal=false. Don't flash welcome over the redeem
-      // dialog.
-      try {
-        const acked =
-          window.localStorage.getItem('harmony.onboarding.welcomeAcknowledged');
-        if (acked !== 'true' && !showRedeemInvite) {
-          showWelcomeModal = true;
-        }
-      } catch (e) {
-        // localStorage unavailable (incognito / sandbox / quota): show
-        // welcome — safer to greet than to silently skip a possibly-new
-        // user. The next dismiss will try the write again.
-        const msg = e instanceof Error ? e.message : String(e);
-        console.debug('[harmony-client] welcomeAcknowledged read failed:', msg);
-        if (!showRedeemInvite) {
-          showWelcomeModal = true;
-        }
+
+      // ZEB-338: hard gate on backend owner-identity presence. Forward-compat:
+      // treat missing hasOwnerIdentity as false (older backend → show
+      // onboarding). This replaces the old localStorage welcome-ack gate; the
+      // backend keychain is now the authoritative source of "is this a new
+      // user".
+      hasOwnerIdentityState = startResp?.hasOwnerIdentity === true;
+      if (hasOwnerIdentityState) {
+        showWelcomeModal = false;
+        // Returning user who clicked an invite before start_node resolved:
+        // drain it. (routeInviteUrl queued it because hasOwnerIdentityState
+        // was still false at the time.)
+        drainQueuedInvite();
+      } else {
+        // No owner identity → hard gate. (A deep-link that already arrived was
+        // queued by routeInviteUrl, not shown over the welcome.)
+        showWelcomeModal = true;
       }
 
       // ZEB-281 Sub-D Phase 4 R1: hydrate the per-community
@@ -865,11 +879,7 @@
       unlistenDeepLink = await listen<string[]>('deep-link-received', (event) => {
         const url = extractHarmonyInviteUrl(event.payload);
         if (url) {
-          redeemUrl = url;
-          redeemError = null;
-          showRedeemInvite = true;
-          showWelcomeModal = false;
-          acknowledgeWelcome(); // joining via deep-link is onboarding-complete
+          routeInviteUrl(url);
         }
       });
 
@@ -882,11 +892,7 @@
         if (queued) {
           const url = extractHarmonyInviteUrl(queued);
           if (url) {
-            redeemUrl = url;
-            redeemError = null;
-            showRedeemInvite = true;
-            showWelcomeModal = false;
-            acknowledgeWelcome(); // cold-launch invite = onboarding-complete
+            routeInviteUrl(url);
           }
         }
       } catch (e) {
@@ -2020,27 +2026,20 @@
   />
 {/if}
 
-<!-- ZEB-331: first-run welcome modal. Shown until the user
-     acknowledges (Skip / Join / Esc / backdrop) — persisted via
-     localStorage so a failed start_node mid-keychain-write doesn't
-     permanently swallow the welcome (R3 Cursor Medium). Suppressed
-     by deep-link handlers (Flow 5 — both warm-launch and cold-
-     launch paths set showWelcomeModal=false when a harmony:// URL
-     is received). -->
-<WelcomeModal
-  open={showWelcomeModal}
-  onDismiss={() => {
-    showWelcomeModal = false;
-    acknowledgeWelcome();
-  }}
-  onJoinWithInvite={(url) => {
-    redeemUrl = url;
-    redeemError = null;
-    showRedeemInvite = true;
-    showWelcomeModal = false;
-    acknowledgeWelcome();
-  }}
-/>
+<!-- ZEB-338: first-run welcome hard-gate. Visibility is owned by
+     hasOwnerIdentityState (backend keychain authoritative): shown only when no
+     owner identity exists, not dismissable, closed by onMinted on successful
+     mint. -->
+<WelcomeModal open={showWelcomeModal} {onMinted} />
+
+<!-- ZEB-338: backup-reminder banner. Self-gates on backup-skipped state;
+     additionally suppressed while the welcome hard-gate is up so we don't
+     stack a backup nag behind the modal. -->
+{#if !showWelcomeModal}
+  <div class="backup-banner-overlay">
+    <BackupReminderBanner />
+  </div>
+{/if}
 
 <!-- ZEB-331: fixed-position help button overlay. Position top-right. -->
 <div class="help-overlay">
@@ -2168,6 +2167,16 @@
     top: 12px;
     right: 12px;
     z-index: 50;
+  }
+
+  /* ZEB-338: backup-reminder banner overlay. Below modal (1000) + help
+     overlay; above app chrome. */
+  .backup-banner-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 40;
   }
 
 </style>
