@@ -68,6 +68,7 @@
   import type { MintIpcResult } from './lib/owner-service';
   import type { StartNodeResponse } from './lib/types/onboarding';
   import { classifyOwnerIdentity, type OwnerIdentityState } from './lib/owner-gate';
+  import { trapFocus } from './lib/focus-trap';
   import HelpMenuButton from './lib/components/HelpMenuButton.svelte';
   import FeedbackModal from './lib/components/FeedbackModal.svelte';
   import AboutModal from './lib/components/AboutModal.svelte';
@@ -251,6 +252,16 @@
   // ZEB-338 / PR #169: message from a failed start_node, shown in the startup
   // error overlay (the non-mint escape from the 'error' state).
   let startNodeError = $state<string | null>(null);
+  // ZEB-338 / PR #169: bound to the startup-error dialog for its focus trap.
+  let startupErrorModalEl = $state<HTMLElement | null>(null);
+
+  // ZEB-338 / PR #169: the startup-error overlay is a blocking dialog, so trap
+  // focus inside it (same util as WelcomeModal) — keyboard users must not be
+  // able to tab into background app controls behind it.
+  $effect(() => {
+    if (ownerIdentityState !== 'error' || startupErrorModalEl === null) return;
+    return trapFocus(startupErrorModalEl);
+  });
   let feedbackModalOpen = $state(false);
   let aboutModalOpen = $state(false);
 
@@ -2059,11 +2070,13 @@
 {#if ownerIdentityState === 'error'}
   <div class="modal-overlay" data-testid="startup-error-backdrop" role="presentation">
     <div
+      bind:this={startupErrorModalEl}
       class="modal-content startup-error-modal"
       data-testid="startup-error-modal"
       role="alertdialog"
       aria-modal="true"
       aria-labelledby="startup-error-title"
+      tabindex="-1"
     >
       <h2 id="startup-error-title">Couldn't start Harmony</h2>
       <p>

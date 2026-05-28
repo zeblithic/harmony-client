@@ -73,8 +73,7 @@
         filterExtensions: ['bin'],
       });
       if (pathToken === null) {
-        inFlight = false;
-        return; // user cancelled
+        return; // user cancelled — finally resets inFlight
       }
       await svc.exportRecoveryFile(token, pathToken, passphrase, null);
       try {

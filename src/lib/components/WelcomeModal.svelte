@@ -16,6 +16,7 @@
   import {
     MIN_RECOVERY_PASSPHRASE_LEN,
   } from '../recovery-policy';
+  import { trapFocus } from '../focus-trap';
 
   interface Props {
     open: boolean;
@@ -50,63 +51,11 @@
     }
   });
 
-  // ZEB-338 / PR #169: trap focus inside the hard gate. `aria-modal` alone does
-  // not stop Tab from reaching the background (e.g. the help button), so we mark
-  // sibling overlays inert, move initial focus into the dialog, cycle Tab within
-  // it, and restore focus on close.
+  // ZEB-338 / PR #169: trap focus inside the hard gate (shared trapFocus util,
+  // also used by App.svelte's startup-error overlay).
   $effect(() => {
     if (!open || modalEl === null) return;
-
-    const dialog = modalEl;
-    const backdrop = dialog.parentElement;
-    const root = backdrop?.parentElement ?? null;
-    const previouslyFocused = document.activeElement as HTMLElement | null;
-    const inerted: HTMLElement[] = [];
-
-    if (root && backdrop) {
-      for (const child of Array.from(root.children)) {
-        if (child !== backdrop && child instanceof HTMLElement && !child.hasAttribute('inert')) {
-          child.setAttribute('inert', '');
-          inerted.push(child);
-        }
-      }
-    }
-
-    const focusables = (): HTMLElement[] =>
-      Array.from(
-        dialog.querySelectorAll<HTMLElement>(
-          'a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])',
-        ),
-      );
-
-    (focusables()[0] ?? dialog).focus();
-
-    function onKeydown(ev: KeyboardEvent) {
-      if (ev.key !== 'Tab') return;
-      const items = focusables();
-      if (items.length === 0) {
-        ev.preventDefault();
-        return;
-      }
-      const first = items[0];
-      const last = items[items.length - 1];
-      const active = document.activeElement;
-      if (ev.shiftKey && active === first) {
-        ev.preventDefault();
-        last.focus();
-      } else if (!ev.shiftKey && active === last) {
-        ev.preventDefault();
-        first.focus();
-      }
-    }
-
-    dialog.addEventListener('keydown', onKeydown);
-
-    return () => {
-      dialog.removeEventListener('keydown', onKeydown);
-      for (const el of inerted) el.removeAttribute('inert');
-      previouslyFocused?.focus?.();
-    };
+    return trapFocus(modalEl);
   });
 
   async function handleCreateIdentity() {
@@ -143,8 +92,7 @@
         filterExtensions: ['bin'],
       });
       if (pathToken === null) {
-        // user cancelled the OS dialog — stay on pane 2
-        backupInFlight = false;
+        // user cancelled the OS dialog — stay on pane 2 (finally resets the flag)
         return;
       }
       await svc.exportRecoveryFile(mintResult.recoveryToken, pathToken, backupPassphrase, null);
