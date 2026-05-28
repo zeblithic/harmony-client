@@ -56,7 +56,10 @@ fn owner_not_loaded_message_only_inlined_in_const_or_docs() {
     let mut offenders = Vec::new();
     for (idx, line) in src.lines().enumerate() {
         let is_doc = line.trim_start().starts_with("///");
-        let is_const_def = prev.contains("const OWNER_NOT_LOADED_MSG");
+        // Tolerate both the current two-line const form (name on the previous
+        // line) and a future same-line reformat (name + literal together).
+        let is_const_def = line.contains("const OWNER_NOT_LOADED_MSG")
+            || prev.contains("const OWNER_NOT_LOADED_MSG");
         if line.contains(LITERAL) && !is_doc && !is_const_def {
             offenders.push(idx + 1);
         }

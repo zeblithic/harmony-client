@@ -23326,7 +23326,7 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
             // ZEB-298+ZEB-312 PR 1: sender for voting-log adapter requests.
             g.voting_log_adapter_request_tx
                 .clone()
-                .ok_or(OWNER_NOT_LOADED_MSG)?,
+                .ok_or("voting_log_adapter_request_tx missing")?,
             // ZEB-298+ZEB-312 PR 2 Task 1: needed to construct the
             // production OwnerDeviceCacheResolver for the voting engine.
             g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -23334,7 +23334,7 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
             // voting engine's Tier 3 lifecycle emit path. Captured at
             // start_node so generic IPC handlers can pass a concrete
             // AppHandle<Wry> without downcasting from AppHandle<R>.
-            g.app_handle_wry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
         )
     };
 
@@ -23610,9 +23610,9 @@ async fn voting_submit_deliberation_statement<R: tauri::Runtime>(
             g.beacon_requester.clone(),
             g.voting_log_adapter_request_tx
                 .clone()
-                .ok_or(OWNER_NOT_LOADED_MSG)?,
+                .ok_or("voting_log_adapter_request_tx missing")?,
             g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.app_handle_wry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
         )
     };
 
@@ -23766,9 +23766,9 @@ async fn voting_cast_deliberation_vote<R: tauri::Runtime>(
             g.beacon_requester.clone(),
             g.voting_log_adapter_request_tx
                 .clone()
-                .ok_or(OWNER_NOT_LOADED_MSG)?,
+                .ok_or("voting_log_adapter_request_tx missing")?,
             g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.app_handle_wry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
         )
     };
 
@@ -23902,9 +23902,9 @@ async fn voting_propose_draft_candidate<R: tauri::Runtime>(
             g.beacon_requester.clone(),
             g.voting_log_adapter_request_tx
                 .clone()
-                .ok_or(OWNER_NOT_LOADED_MSG)?,
+                .ok_or("voting_log_adapter_request_tx missing")?,
             g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.app_handle_wry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
         )
     };
 
@@ -24039,9 +24039,9 @@ async fn voting_approve_draft_candidate<R: tauri::Runtime>(
             g.beacon_requester.clone(),
             g.voting_log_adapter_request_tx
                 .clone()
-                .ok_or(OWNER_NOT_LOADED_MSG)?,
+                .ok_or("voting_log_adapter_request_tx missing")?,
             g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.app_handle_wry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
         )
     };
 
@@ -24201,9 +24201,9 @@ async fn voting_decline_sortition<R: tauri::Runtime>(
             g.beacon_requester.clone(),
             g.voting_log_adapter_request_tx
                 .clone()
-                .ok_or(OWNER_NOT_LOADED_MSG)?,
+                .ok_or("voting_log_adapter_request_tx missing")?,
             g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.app_handle_wry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
         )
     };
 
@@ -24327,9 +24327,9 @@ async fn voting_cast_ratification_ballot<R: tauri::Runtime>(
             g.beacon_requester.clone(),
             g.voting_log_adapter_request_tx
                 .clone()
-                .ok_or(OWNER_NOT_LOADED_MSG)?,
+                .ok_or("voting_log_adapter_request_tx missing")?,
             g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.app_handle_wry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
         )
     };
 
@@ -25406,7 +25406,7 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
             // ZEB-298+ZEB-312 PR 1: sender for voting-log adapter requests.
             g.voting_log_adapter_request_tx
                 .clone()
-                .ok_or(OWNER_NOT_LOADED_MSG)?,
+                .ok_or("voting_log_adapter_request_tx missing")?,
             // ZEB-298+ZEB-312 PR 2 Task 1: needed to construct the
             // production OwnerDeviceCacheResolver for the voting engine.
             g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -25414,7 +25414,7 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
             // voting engine's Tier 3 lifecycle emit path. Captured at
             // start_node so generic IPC handlers can pass a concrete
             // AppHandle<Wry> without downcasting from AppHandle<R>.
-            g.app_handle_wry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
         )
     };
 
@@ -25691,7 +25691,7 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
             // ZEB-298+ZEB-312 PR 1: sender for voting-log adapter requests.
             g.voting_log_adapter_request_tx
                 .clone()
-                .ok_or(OWNER_NOT_LOADED_MSG)?,
+                .ok_or("voting_log_adapter_request_tx missing")?,
             // ZEB-298+ZEB-312 PR 2 Task 1: needed to construct the
             // production OwnerDeviceCacheResolver for the voting engine.
             g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -25699,7 +25699,7 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
             // voting engine's Tier 3 lifecycle emit path. Captured at
             // start_node so generic IPC handlers can pass a concrete
             // AppHandle<Wry> without downcasting from AppHandle<R>.
-            g.app_handle_wry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
         )
     };
 
@@ -25832,7 +25832,7 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
             // ZEB-298+ZEB-312 PR 1: sender for voting-log adapter requests.
             g.voting_log_adapter_request_tx
                 .clone()
-                .ok_or(OWNER_NOT_LOADED_MSG)?,
+                .ok_or("voting_log_adapter_request_tx missing")?,
             // ZEB-298+ZEB-312 PR 1: needed to build NodeStateMembershipResolver.
             g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -25843,7 +25843,7 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
             // voting engine's Tier 3 lifecycle emit path. Captured at
             // start_node so generic IPC handlers can pass a concrete
             // AppHandle<Wry> without downcasting from AppHandle<R>.
-            g.app_handle_wry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
         )
     };
 
@@ -30420,8 +30420,14 @@ async fn connectivity_set_identity_discoverable(
         )
     };
 
-    let (Some(id_pub), Some(path)) = (id_pub, settings_path) else {
+    // id_pub is owner-identity material; settings_path is a config/startup
+    // dependency — keep their failure messages distinct so a missing settings
+    // path doesn't misdirect the user toward recreating their identity.
+    let Some(id_pub) = id_pub else {
         return Err(OWNER_NOT_LOADED_MSG.into());
+    };
+    let Some(path) = settings_path else {
+        return Err("pkarr_settings_path missing".into());
     };
 
     // Persist the preference.
