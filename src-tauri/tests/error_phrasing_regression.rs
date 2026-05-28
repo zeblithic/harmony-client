@@ -39,3 +39,33 @@ fn no_node_not_running_or_no_owner_identity_phrasing_in_lib_rs() {
          identity' in src/lib.rs — use OWNER_NOT_LOADED_MSG"
     );
 }
+
+#[test]
+fn owner_not_loaded_message_only_inlined_in_const_or_docs() {
+    // PR #169 review (CodeRabbit + Greptile): every *code* site must reference
+    // OWNER_NOT_LOADED_MSG rather than an inline copy of its value, so the
+    // message can't silently drift across call sites. The literal is permitted
+    // only in (a) the const definition and (b) `///` doc-comments documenting
+    // the returned error text.
+    const LITERAL: &str =
+        "Owner identity not loaded — please restart the app or recreate identity.";
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+        .expect("read src/lib.rs");
+
+    let mut prev = "";
+    let mut offenders = Vec::new();
+    for (idx, line) in src.lines().enumerate() {
+        let is_doc = line.trim_start().starts_with("///");
+        let is_const_def = prev.contains("const OWNER_NOT_LOADED_MSG");
+        if line.contains(LITERAL) && !is_doc && !is_const_def {
+            offenders.push(idx + 1);
+        }
+        prev = line;
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "inline copies of the owner-not-loaded message at lib.rs lines {offenders:?} — \
+         reference OWNER_NOT_LOADED_MSG instead so the text stays single-sourced"
+    );
+}

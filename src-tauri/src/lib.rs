@@ -5610,9 +5610,7 @@ async fn send_dm(
         (
             g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_transport.clone().ok_or("dm_transport missing")?,
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
@@ -6107,9 +6105,7 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             // ZEB-234: snapshot the fence handles so delete_outbox_entry
@@ -6605,9 +6601,7 @@ async fn add_space(
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
@@ -11390,12 +11384,8 @@ async fn list_community_members(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
 
@@ -11578,16 +11568,10 @@ async fn list_community_forks(
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        let self_owner = g
-            .dm_self_owner
-            .ok_or("Owner identity not loaded — please restart the app or recreate identity.")?;
+        let self_owner = g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?;
         (
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             self_owner,
         )
     };
@@ -11757,16 +11741,10 @@ async fn get_community_lineage(
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        let self_owner = g
-            .dm_self_owner
-            .ok_or("Owner identity not loaded — please restart the app or recreate identity.")?;
+        let self_owner = g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?;
         (
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             self_owner,
         )
     };
@@ -12404,12 +12382,8 @@ async fn create_channel(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     };
@@ -12650,12 +12624,8 @@ async fn modify_channel(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     };
@@ -12811,15 +12781,9 @@ async fn delete_channel(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     };
@@ -12988,12 +12952,8 @@ async fn list_channels(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
 
@@ -13349,12 +13309,8 @@ async fn generate_invite(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
 
@@ -14081,24 +14037,16 @@ async fn create_community(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.community_adapter_request_tx
                 .clone()
                 .ok_or("community_adapter_request_tx missing")?,
-            g.channel_log_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.channel_log_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     }; // std `state_lock` guard dropped here.
@@ -16043,27 +15991,17 @@ async fn redeem_invite(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.community_adapter_request_tx
                 .clone()
                 .ok_or("community_adapter_request_tx missing")?,
-            g.unicast_send_tx.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.channel_log_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.unicast_send_tx.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.channel_log_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     }; // std lock dropped here.
@@ -16282,30 +16220,18 @@ async fn join_open_community(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.library_directory.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.library_directory.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.community_adapter_request_tx
                 .clone()
                 .ok_or("community_adapter_request_tx missing")?,
-            g.unicast_send_tx.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.channel_log_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.unicast_send_tx.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.channel_log_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     }; // std lock dropped here.
@@ -17800,12 +17726,8 @@ async fn list_libraries(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.library_directory.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.library_directory.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
     let crdt_g = crdt_state.lock().await;
@@ -17853,12 +17775,8 @@ async fn list_discovered_libraries(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.library_directory.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.library_directory.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
 
@@ -17985,18 +17903,10 @@ async fn add_library(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.library_directory.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.hlc_tracker.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_device_id.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.library_directory.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     };
@@ -18061,18 +17971,10 @@ async fn remove_library(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.library_directory.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.hlc_tracker.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_device_id.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.library_directory.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     };
@@ -18128,9 +18030,7 @@ async fn browse_library(
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        g.library_directory
-            .clone()
-            .ok_or("Owner identity not loaded — please restart the app or recreate identity.")?
+        g.library_directory.clone().ok_or(OWNER_NOT_LOADED_MSG)?
     };
     let aggregated = match library_addr {
         None => library_directory.snapshot_all().await,
@@ -18188,18 +18088,12 @@ async fn set_space_shared_in_profile(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.profile_broadcast_publisher.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.hlc_tracker.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_device_id.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.profile_broadcast_publisher
+                .clone()
+                .ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     };
@@ -18315,9 +18209,7 @@ async fn list_shared_in_profile_communities(
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        g.crdt_state
-            .clone()
-            .ok_or("Owner identity not loaded — please restart the app or recreate identity.")?
+        g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?
     };
     let g = crdt_state.lock().await;
     let mut ids: Vec<String> = g
@@ -18356,12 +18248,12 @@ async fn subscribe_peer_profile(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.profile_broadcast_cache.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.profile_broadcast_request_tx.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.profile_broadcast_cache
+                .clone()
+                .ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.profile_broadcast_request_tx
+                .clone()
+                .ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.profile_broadcast_next_subscription_id),
         )
     };
@@ -18402,7 +18294,7 @@ async fn unsubscribe_peer_profile(
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         g.profile_broadcast_request_tx
             .clone()
-            .ok_or("Owner identity not loaded — please restart the app or recreate identity.")?
+            .ok_or(OWNER_NOT_LOADED_MSG)?
     };
     request_tx
         .send(crate::event_loop::ProfileBroadcastRequest::Unsubscribe { subscription_id })
@@ -18426,7 +18318,7 @@ async fn get_cached_peer_profile(
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         g.profile_broadcast_cache
             .clone()
-            .ok_or("Owner identity not loaded — please restart the app or recreate identity.")?
+            .ok_or(OWNER_NOT_LOADED_MSG)?
     };
     Ok(cache.get_cached(subscription_id).await)
 }
@@ -18815,12 +18707,8 @@ async fn leave_community(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     };
@@ -19498,12 +19386,8 @@ async fn kick_from_community(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     };
@@ -19860,12 +19744,8 @@ async fn set_power_level(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     };
@@ -20026,12 +19906,8 @@ async fn unban_from_community(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     };
@@ -20133,12 +20009,8 @@ async fn list_recent_moderation_events(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
 
@@ -20272,12 +20144,8 @@ async fn list_pending_joins(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_self_owner.ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
 
@@ -20435,12 +20303,8 @@ async fn list_recent_counter_signs(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_self_owner.ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
 
@@ -20635,12 +20499,8 @@ async fn list_pending_admin_proposals(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_self_owner.ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
 
@@ -21018,12 +20878,8 @@ async fn countersign_admin_proposal(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     };
@@ -21229,12 +21085,8 @@ async fn propose_change_quorum(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     };
@@ -22903,15 +22755,9 @@ async fn voting_create_tier1_poll<R: tauri::Runtime>(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.voting_logs),
             // Tasks 21-23: channel_log_registry is needed for the
             // poll-kind chat-message fanout below. May be absent in
@@ -23059,9 +22905,7 @@ async fn voting_cast_tier1_ballot<R: tauri::Runtime>(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.voting_logs),
         )
     };
@@ -23470,15 +23314,9 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.voting_logs),
             g.channel_log_registry.clone(),
             std::sync::Arc::clone(&g.voting_log_engines),
@@ -23486,21 +23324,17 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
             g.dfrost_log_registry.clone(),
             g.beacon_requester.clone(),
             // ZEB-298+ZEB-312 PR 1: sender for voting-log adapter requests.
-            g.voting_log_adapter_request_tx.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.voting_log_adapter_request_tx
+                .clone()
+                .ok_or(OWNER_NOT_LOADED_MSG)?,
             // ZEB-298+ZEB-312 PR 2 Task 1: needed to construct the
             // production OwnerDeviceCacheResolver for the voting engine.
-            g.dm_identity_pub_64.ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
             // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle for the
             // voting engine's Tier 3 lifecycle emit path. Captured at
             // start_node so generic IPC handlers can pass a concrete
             // AppHandle<Wry> without downcasting from AppHandle<R>.
-            g.app_handle_wry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.app_handle_wry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
 
@@ -23766,31 +23600,19 @@ async fn voting_submit_deliberation_statement<R: tauri::Runtime>(
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner.ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.voting_logs),
             std::sync::Arc::clone(&g.voting_log_engines),
             g.dfrost_log_registry.clone(),
             g.beacon_requester.clone(),
-            g.voting_log_adapter_request_tx.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_identity_pub_64.ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.app_handle_wry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.voting_log_adapter_request_tx
+                .clone()
+                .ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.app_handle_wry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
 
@@ -23934,31 +23756,19 @@ async fn voting_cast_deliberation_vote<R: tauri::Runtime>(
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner.ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.voting_logs),
             std::sync::Arc::clone(&g.voting_log_engines),
             g.dfrost_log_registry.clone(),
             g.beacon_requester.clone(),
-            g.voting_log_adapter_request_tx.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_identity_pub_64.ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.app_handle_wry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.voting_log_adapter_request_tx
+                .clone()
+                .ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.app_handle_wry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
 
@@ -24082,31 +23892,19 @@ async fn voting_propose_draft_candidate<R: tauri::Runtime>(
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner.ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.voting_logs),
             std::sync::Arc::clone(&g.voting_log_engines),
             g.dfrost_log_registry.clone(),
             g.beacon_requester.clone(),
-            g.voting_log_adapter_request_tx.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_identity_pub_64.ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.app_handle_wry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.voting_log_adapter_request_tx
+                .clone()
+                .ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.app_handle_wry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
 
@@ -24231,31 +24029,19 @@ async fn voting_approve_draft_candidate<R: tauri::Runtime>(
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner.ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.voting_logs),
             std::sync::Arc::clone(&g.voting_log_engines),
             g.dfrost_log_registry.clone(),
             g.beacon_requester.clone(),
-            g.voting_log_adapter_request_tx.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_identity_pub_64.ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.app_handle_wry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.voting_log_adapter_request_tx
+                .clone()
+                .ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.app_handle_wry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
 
@@ -24405,31 +24191,19 @@ async fn voting_decline_sortition<R: tauri::Runtime>(
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner.ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.voting_logs),
             std::sync::Arc::clone(&g.voting_log_engines),
             g.dfrost_log_registry.clone(),
             g.beacon_requester.clone(),
-            g.voting_log_adapter_request_tx.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_identity_pub_64.ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.app_handle_wry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.voting_log_adapter_request_tx
+                .clone()
+                .ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.app_handle_wry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
 
@@ -24543,31 +24317,19 @@ async fn voting_cast_ratification_ballot<R: tauri::Runtime>(
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner.ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.voting_logs),
             std::sync::Arc::clone(&g.voting_log_engines),
             g.dfrost_log_registry.clone(),
             g.beacon_requester.clone(),
-            g.voting_log_adapter_request_tx.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_identity_pub_64.ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.app_handle_wry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.voting_log_adapter_request_tx
+                .clone()
+                .ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.app_handle_wry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
 
@@ -25633,36 +25395,26 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.voting_logs),
             std::sync::Arc::clone(&g.voting_log_engines),
             // ZEB-309 Task 11: pass dfrost handles so new engines get wired.
             g.dfrost_log_registry.clone(),
             g.beacon_requester.clone(),
             // ZEB-298+ZEB-312 PR 1: sender for voting-log adapter requests.
-            g.voting_log_adapter_request_tx.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.voting_log_adapter_request_tx
+                .clone()
+                .ok_or(OWNER_NOT_LOADED_MSG)?,
             // ZEB-298+ZEB-312 PR 2 Task 1: needed to construct the
             // production OwnerDeviceCacheResolver for the voting engine.
-            g.dm_identity_pub_64.ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
             // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle for the
             // voting engine's Tier 3 lifecycle emit path. Captured at
             // start_node so generic IPC handlers can pass a concrete
             // AppHandle<Wry> without downcasting from AppHandle<R>.
-            g.app_handle_wry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.app_handle_wry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
 
@@ -25785,15 +25537,9 @@ async fn voting_signal_tier2<R: tauri::Runtime>(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.voting_logs),
         )
     };
@@ -25934,36 +25680,26 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.voting_logs),
             std::sync::Arc::clone(&g.voting_log_engines),
             // ZEB-309 Task 11: pass dfrost handles so new engines get wired.
             g.dfrost_log_registry.clone(),
             g.beacon_requester.clone(),
             // ZEB-298+ZEB-312 PR 1: sender for voting-log adapter requests.
-            g.voting_log_adapter_request_tx.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.voting_log_adapter_request_tx
+                .clone()
+                .ok_or(OWNER_NOT_LOADED_MSG)?,
             // ZEB-298+ZEB-312 PR 2 Task 1: needed to construct the
             // production OwnerDeviceCacheResolver for the voting engine.
-            g.dm_identity_pub_64.ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
             // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle for the
             // voting engine's Tier 3 lifecycle emit path. Captured at
             // start_node so generic IPC handlers can pass a concrete
             // AppHandle<Wry> without downcasting from AppHandle<R>.
-            g.app_handle_wry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.app_handle_wry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
 
@@ -26087,37 +25823,27 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.voting_logs),
             std::sync::Arc::clone(&g.voting_log_engines),
             // ZEB-309 Task 11: pass dfrost handles so new engines get wired.
             g.dfrost_log_registry.clone(),
             g.beacon_requester.clone(),
             // ZEB-298+ZEB-312 PR 1: sender for voting-log adapter requests.
-            g.voting_log_adapter_request_tx.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.voting_log_adapter_request_tx
+                .clone()
+                .ok_or(OWNER_NOT_LOADED_MSG)?,
             // ZEB-298+ZEB-312 PR 1: needed to build NodeStateMembershipResolver.
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.crdt_state.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             // ZEB-298+ZEB-312 PR 2 Task 1: needed to construct the
             // production OwnerDeviceCacheResolver for the voting engine.
-            g.dm_identity_pub_64.ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
             // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle for the
             // voting engine's Tier 3 lifecycle emit path. Captured at
             // start_node so generic IPC handlers can pass a concrete
             // AppHandle<Wry> without downcasting from AppHandle<R>.
-            g.app_handle_wry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.app_handle_wry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
 
@@ -27252,18 +26978,10 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
             .lock()
             .map_err(|e| format!("dfrost_initiate_dkg: NodeState poisoned: {e}"))?;
         (
-            g.hlc_tracker.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_device_id.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_self_owner.ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.dfrost_logs),
             g.dfrost_log_registry.clone(),
         )
@@ -27584,18 +27302,10 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
             .lock()
             .map_err(|e| format!("dfrost_contribute_dkg_round: NodeState poisoned: {e}"))?;
         (
-            g.hlc_tracker.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_device_id.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_self_owner.ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.dfrost_logs),
             g.dfrost_log_registry.clone(),
         )
@@ -27834,9 +27544,7 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
             let g = state_lock
                 .lock()
                 .map_err(|e| format!("dfrost_contribute_dkg_round: NodeState poisoned: {e}"))?;
-            g.community_registry
-                .clone()
-                .ok_or("Owner identity not loaded — please restart the app or recreate identity.")?
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?
         };
 
         // Snapshot pending state: members (for OwnerAddr↔Identifier
@@ -28365,18 +28073,10 @@ pub(crate) async fn dfrost_request_vrf_beacon_inner(
             .lock()
             .map_err(|e| format!("dfrost_request_vrf_beacon: NodeState poisoned: {e}"))?;
         (
-            g.hlc_tracker.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_device_id.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_self_owner.ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.dfrost_logs),
             g.dfrost_log_registry.clone(),
         )
@@ -28637,18 +28337,10 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
             .lock()
             .map_err(|e| format!("dfrost_contribute_threshold_sign: NodeState poisoned: {e}"))?;
         (
-            g.hlc_tracker.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_device_id.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_self_owner.ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.dfrost_logs),
             g.dfrost_log_registry.clone(),
         )
@@ -29302,22 +28994,12 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
             .lock()
             .map_err(|e| format!("dfrost_propose_refresh: NodeState poisoned: {e}"))?;
         (
-            g.hlc_tracker.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_device_id.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_self_owner.ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.dfrost_logs),
-            g.community_registry.clone().ok_or(
-                "Owner identity not loaded — please restart the app or recreate identity.",
-            )?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dfrost_log_registry.clone(),
         )
     };
@@ -30739,9 +30421,7 @@ async fn connectivity_set_identity_discoverable(
     };
 
     let (Some(id_pub), Some(path)) = (id_pub, settings_path) else {
-        return Err(
-            "Owner identity not loaded — please restart the app or recreate identity.".into(),
-        );
+        return Err(OWNER_NOT_LOADED_MSG.into());
     };
 
     // Persist the preference.
