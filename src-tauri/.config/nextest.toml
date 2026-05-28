@@ -24,31 +24,34 @@
 # — tempfile's `.tmp`-prefixed paths get caught by the deny-list filter
 # in `should_filter_name`, so the test never sees its own files.
 #
-# Local devs: pass an explicit `-E test(/regex/)` to run any of the
-# below; the default-filter intersects with `-E`, so use regex match
-# (e.g. `-E 'test(/validate_amount/)'`) rather than exact match.
-# Removing entries one at a time as the sweep lands is straightforward
-# — just delete the corresponding `test(=...)` clause.
+# Local devs: pass an explicit `-E test(NAME)` (substring) or
+# `-E test(/regex/)` to run any of the below; the default-filter
+# intersects with `-E`, so use substring or regex (the `=` exact-match
+# form does NOT match short names — empirical verification on
+# nextest 0.9.x: `test(=pre_walk_counts_only_non_filtered_leaves)`
+# returns 0 hits, `test(pre_walk_counts_only_non_filtered_leaves)`
+# returns 1 hit). Removing entries one at a time as the sweep lands is
+# straightforward — just delete the corresponding `test(...)` clause.
 
 [profile.default]
 default-filter = """\
   not (\
-    test(=pre_walk_counts_only_non_filtered_leaves) \
-    + test(=walker_honors_cancel_flag_and_cleans_up_registry) \
-    + test(=walker_leaf_ingest_does_not_pollute_root_listing) \
-    + test(=ipc_tier3_error_extraction_string_and_error) \
-    + test(=add_space_binds_camelcase_params) \
-    + test(=delete_outbox_entry_binds_camelcase_params) \
-    + test(=read_dm_thread_binds_camelcase_params) \
-    + test(=send_dm_binds_camelcase_params) \
-    + test(=deny_list_skips_ds_store_thumbs_db_and_dotfiles) \
-    + test(=empty_subdir_appears_in_root_manifest_as_folder_with_no_leaves) \
-    + test(=flat_dir_three_leaves_sorted_alphabetically) \
-    + test(=nested_two_level_tree_builds_bottom_up_with_single_sidecar) \
-    + test(=per_leaf_io_error_is_recorded_and_walk_continues) \
-    + test(=root_walk_failure_message_is_surfaced_in_failed_list) \
-    + test(=symlink_to_directory_is_not_followed) \
-    + test(=symlink_to_file_is_skipped) \
-    + test(=cancel_mid_walk_settles_with_cancelled_true_and_no_root_sidecar)\
+    test(pre_walk_counts_only_non_filtered_leaves) \
+    + test(walker_honors_cancel_flag_and_cleans_up_registry) \
+    + test(walker_leaf_ingest_does_not_pollute_root_listing) \
+    + test(ipc_tier3_error_extraction_string_and_error) \
+    + test(add_space_binds_camelcase_params) \
+    + test(delete_outbox_entry_binds_camelcase_params) \
+    + test(read_dm_thread_binds_camelcase_params) \
+    + test(send_dm_binds_camelcase_params) \
+    + test(deny_list_skips_ds_store_thumbs_db_and_dotfiles) \
+    + test(empty_subdir_appears_in_root_manifest_as_folder_with_no_leaves) \
+    + test(flat_dir_three_leaves_sorted_alphabetically) \
+    + test(nested_two_level_tree_builds_bottom_up_with_single_sidecar) \
+    + test(per_leaf_io_error_is_recorded_and_walk_continues) \
+    + test(root_walk_failure_message_is_surfaced_in_failed_list) \
+    + test(symlink_to_directory_is_not_followed) \
+    + test(symlink_to_file_is_skipped) \
+    + test(cancel_mid_walk_settles_with_cancelled_true_and_no_root_sidecar)\
   )\
   """

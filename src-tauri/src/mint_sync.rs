@@ -1594,6 +1594,51 @@ mod tests {
         handle.await.unwrap();
     }
 
+    #[test]
+    fn snapshot_with_only_epoch_setting_is_treated_as_empty() {
+        // Migration default rows (`apply_migrations` inserts
+        // `default_currency='USD'` stamped with the epoch) must not count
+        // as user data — otherwise every fresh-install boot-hook publishes
+        // a no-op snapshot. This is the load-bearing migration-row
+        // discriminator behavior.
+        let snap = MintSnapshot {
+            schema_version: 1,
+            accounts: vec![],
+            transactions: vec![],
+            settings: vec![SettingRow {
+                key: "default_currency".into(),
+                value: "USD".into(),
+                updated_at: "1970-01-01T00:00:00Z".into(),
+            }],
+            account_deletion_floor: HashMap::new(),
+            captured_at: "2026-05-27T12:00:00Z".into(),
+        };
+        assert!(snapshot_has_no_user_data(&snap));
+    }
+
+    #[test]
+    fn snapshot_with_non_epoch_setting_is_not_empty() {
+        // CodeRabbit PR #166: the boundary in the other direction. A
+        // settings-only snapshot whose `updated_at` is anything other than
+        // the epoch represents a real user edit (currency switch, theme
+        // pref, etc.) and MUST publish — even with zero accounts and zero
+        // transactions, otherwise we'd silently drop the only state the
+        // user has authored on a new device.
+        let snap = MintSnapshot {
+            schema_version: 1,
+            accounts: vec![],
+            transactions: vec![],
+            settings: vec![SettingRow {
+                key: "default_currency".into(),
+                value: "EUR".into(),
+                updated_at: "2026-05-27T12:00:00Z".into(),
+            }],
+            account_deletion_floor: HashMap::new(),
+            captured_at: "2026-05-27T12:00:00Z".into(),
+        };
+        assert!(!snapshot_has_no_user_data(&snap));
+    }
+
     #[tokio::test]
     async fn boot_hook_skips_when_empty() {
         let conn = Arc::new(std::sync::Mutex::new(fresh_db()));

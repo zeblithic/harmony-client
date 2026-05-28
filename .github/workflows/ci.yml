@@ -191,16 +191,23 @@ jobs:
           workspaces: src-tauri
           key: test-large
 
+      # `--test folder_ingest_walker_integration` scopes compilation to
+      # the one integration-test binary that houses the slow test.
+      # Without it, `cargo nextest run -E ...` still compiles the
+      # entire workspace's 55+ test binaries (the `-E` filter selects
+      # which tests RUN, not which COMPILE), and the runner's ~14 GiB
+      # of free disk fills up linking unrelated test binaries — exactly
+      # what failed PR #166 round 3 ("No space left on device" while
+      # linking `pkarr_iroh_redeem_full_integration`).
+      #
       # `-E 'test(nested_bundle_tree_round_trip)'` is nextest's filter
-      # expression — selects only tests whose name matches. The HARMONY_
-      # LARGE_TESTS env var is the actual runtime gate (the test skips
-      # itself if absent); the nextest filter narrows the compilation +
-      # scheduling surface so we don't pay to rebuild + load 2382 unused
-      # test binaries.
-      - name: cargo nextest run -E 'test(nested_bundle_tree_round_trip)'
+      # expression — within the one bin compiled above, select only the
+      # gated test. The HARMONY_LARGE_TESTS env var is the actual
+      # runtime gate (the test skips itself if absent).
+      - name: cargo nextest run --test folder_ingest_walker_integration
         env:
           HARMONY_LARGE_TESTS: "1"
-        run: cargo nextest run --locked --features test-fixtures --no-fail-fast -E 'test(nested_bundle_tree_round_trip)'
+        run: cargo nextest run --locked --features test-fixtures --no-fail-fast --test folder_ingest_walker_integration -E 'test(nested_bundle_tree_round_trip)'
 
   # Validates `rust-version` declared in src-tauri/Cargo.toml. The `rust-check`
   # job above runs on stable for newer clippy lints + fastest iteration; this
