@@ -1686,6 +1686,21 @@ async fn start_node(
     app: AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<StartNodeResponse, String> {
+    // ZEB-338: thin forwarder. Real logic lives in start_node_inner so the
+    // self-lifecycle mint IPC (owner_commands::mint_owner_identity) can
+    // restart the node after writing owner_state.cbor without duplicating
+    // ~3600 lines. `tauri::State` derefs to `&Mutex<NodeState>`.
+    start_node_inner(endpoint, &app, &state).await
+}
+
+/// ZEB-338: extracted body of `start_node`. Callable from any IPC that holds
+/// an `&AppHandle` and `&Mutex<NodeState>` (the command wrapper above, and
+/// `mint_owner_identity`'s node-restart phase).
+pub(crate) async fn start_node_inner(
+    endpoint: Option<String>,
+    app: &AppHandle,
+    state: &Mutex<NodeState>,
+) -> Result<StartNodeResponse, String> {
     // ── Atomic stop→identity→config→spawn→store ─────────────────────
     // Everything from stop through handle registration runs under the
     // lock (with a brief drop for the blocking thread join). This
@@ -1819,7 +1834,7 @@ async fn start_node(
     // continues to detect "later install completed" rather than the
     // strictly weaker "later attempt started" — see Cursor bug report on
     // PR #124.
-    let my_install_seq: u64 = reserve_install_seq(&state)?;
+    let my_install_seq: u64 = reserve_install_seq(state)?;
     let (
         old_shutdown,
         old_thread,
@@ -4377,7 +4392,7 @@ async fn start_node(
             // `!Send`). Each arm either assigns `guard` synchronously or
             // breaks the labeled block with `lock_failure_msg` set.
             let mut guard;
-            match check_install_seq_or_supersede(&state, my_install_seq) {
+            match check_install_seq_or_supersede(state, my_install_seq) {
                 Ok(g) => {
                     guard = g;
                 }
@@ -5286,7 +5301,7 @@ async fn start_node(
     // replaced our handles; passing our generation avoids tearing
     // down the newer node.
     if result.is_err() {
-        let _ = stop_inner(&state, Some(our_gen));
+        let _ = stop_inner(state, Some(our_gen));
     }
 
     result
