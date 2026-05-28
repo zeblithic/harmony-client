@@ -21,6 +21,14 @@ export interface StartNodeResponse {
    * modal.
    */
   freshlyCreated?: boolean;
+  /**
+   * ZEB-338: true iff an owner identity loaded during this start_node call.
+   * The frontend hard-gates the WelcomeModal on this:
+   * `showWelcomeModal = !hasOwnerIdentity`.
+   * Forward-compat: treat missing/undefined as `false` (older backend mid-
+   * deploy → show onboarding, the safe default).
+   */
+  hasOwnerIdentity?: boolean;
 }
 
 /** Non-identifying environment info attached to feedback submissions. */

@@ -1006,6 +1006,11 @@ pub struct ZenohStatus {
 pub struct StartNodeResponse {
     pub node_addr: String,
     pub freshly_created: bool,
+    /// ZEB-338: true iff an owner identity (owner_state.cbor) loaded during
+    /// this start_node call. Frontend hard-gates the WelcomeModal on this:
+    /// `showWelcomeModal = !hasOwnerIdentity`. Forward-compat: frontend
+    /// treats a missing field as `false` (older backend → show onboarding).
+    pub has_owner_identity: bool,
 }
 
 /// Profile published to/received from the network.
@@ -2148,6 +2153,8 @@ async fn start_node(
             &identity_dir,
             crate::identity::KeychainStore::new().ok(),
         )?;
+        // ZEB-338: snapshot before owner_loaded is moved/destructured downstream.
+        let has_owner_identity = owner_loaded.is_some();
 
         let mut sync_handles_opt: Option<crate::event_loop::SyncEngineHandles> = None;
         // Mint Phase 2 sync: built alongside SyncEngine when owner identity loads.
@@ -4899,6 +4906,7 @@ async fn start_node(
           // call engine.shutdown() if thread spawn fails (CURSOR MEDIUM fix).
           // ZEB-331: node_addr_for_response + freshly_created carried out here
           // so they're accessible at StartNodeResponse construction after block.
+          // ZEB-338: has_owner_identity also carried out here.
         (
             current_generation,
             thread_install_failure,
@@ -4915,6 +4923,7 @@ async fn start_node(
             mint_sync_engine_opt,
             node_addr_for_response,
             freshly_created,
+            has_owner_identity,
         )
     };
     let (
@@ -4930,6 +4939,7 @@ async fn start_node(
         mint_engine_for_cleanup,
         node_addr_for_response,
         freshly_created,
+        has_owner_identity,
     ) = our_gen;
 
     // ZEB-221 + thread-spawn-failure cleanup + lock-poison cleanup: all
@@ -5264,6 +5274,7 @@ async fn start_node(
             Ok(StartNodeResponse {
                 node_addr: node_addr_for_response,
                 freshly_created,
+                has_owner_identity,
             })
         }
         Ok(Err(e)) => Err(e),
@@ -36832,6 +36843,7 @@ mod start_node_response_tests {
         let r = StartNodeResponse {
             node_addr: "iroh:abc123".to_string(),
             freshly_created: true,
+            has_owner_identity: false,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(
@@ -36851,8 +36863,40 @@ mod start_node_response_tests {
         let r = StartNodeResponse {
             node_addr: "iroh:xyz".to_string(),
             freshly_created: false,
+            has_owner_identity: false,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("\"freshlyCreated\":false"));
+    }
+}
+
+#[cfg(test)]
+mod start_node_response_wire_tests {
+    use super::StartNodeResponse;
+
+    #[test]
+    fn start_node_response_serializes_has_owner_identity_in_camel_case() {
+        let r = StartNodeResponse {
+            node_addr: "iroh:abc".to_string(),
+            freshly_created: true,
+            has_owner_identity: false,
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["nodeAddr"], "iroh:abc");
+        assert_eq!(json["freshlyCreated"], true);
+        assert_eq!(json["hasOwnerIdentity"], false);
+        // Exactly three keys — no snake_case leakage, no extra fields.
+        assert_eq!(json.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn start_node_response_has_owner_identity_true_shape() {
+        let r = StartNodeResponse {
+            node_addr: "iroh:xyz".to_string(),
+            freshly_created: false,
+            has_owner_identity: true,
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["hasOwnerIdentity"], true);
     }
 }
