@@ -1,93 +1,116 @@
 <script lang="ts">
   /**
-   * ZEB-331 — First-run welcome modal (spec §4.1).
+   * ZEB-338 — First-run welcome modal as a HARD GATE.
    *
-   * Fires when `start_node` returns freshlyCreated=true (Flow 1).
-   * Suppressed when a harmony:// deep-link is delivered during boot
-   * (Flow 5 — handled by parent setting open=false in the deep-link
-   * receiver).
+   * Mounts iff start_node returns hasOwnerIdentity=false. The only exit is a
+   * successful mint (no skip-to-dismiss, no Esc, no backdrop). After mint,
+   * pane 2 offers an (optional, severity-confirmed) recovery-file backup.
    *
-   * Uses the existing extractHarmonyInviteUrl validator from
-   * deep-link-router so we don't drift from the canonical URL shape.
+   * Reuses OwnerService for mint + backup so the path-token flow
+   * (requestExportSavePath → exportRecoveryFile) matches DevicesPanel.
+   * The master_seed / recoveryToken are NEVER rendered (redaction invariant).
    */
   import { onMount } from 'svelte';
   import { getVersion } from '@tauri-apps/api/app';
-  import { extractHarmonyInviteUrl } from '../deep-link-router';
+  import { OwnerService, extractError, type MintIpcResult } from '../owner-service';
+  import {
+    MIN_RECOVERY_PASSPHRASE_LEN,
+  } from '../recovery-policy';
 
   interface Props {
     open: boolean;
-    onDismiss: () => void;
-    onJoinWithInvite: (url: string) => void;
+    onMinted: (mintResult: MintIpcResult) => void | Promise<void>;
   }
-  const { open, onDismiss, onJoinWithInvite }: Props = $props();
+  const { open, onMinted }: Props = $props();
 
+  type Stage = 'explain' | 'minting' | 'backup' | 'skip-confirm';
+  let stage = $state<Stage>('explain');
+  let mintResult = $state<MintIpcResult | null>(null);
+  let mintError = $state<string | null>(null);
+  let backupPassphrase = $state('');
+  let backupError = $state<string | null>(null);
+  let backupInFlight = $state(false);
   let appVersion = $state<string>('unknown');
-  let inviteUrl = $state('');
-  let inviteError = $state<string | null>(null);
+
+  const svc = new OwnerService();
 
   onMount(async () => {
     try {
       appVersion = await getVersion();
     } catch (e) {
-      // Outside Tauri (dev/browser) — leave appVersion as 'unknown'.
-      const msg = e instanceof Error ? e.message : String(e);
-      console.debug('[zeb-331] WelcomeModal getVersion failed:', msg);
+      console.debug('[zeb-338] WelcomeModal getVersion failed:', extractError(e));
     }
   });
 
-  function handleJoin() {
-    const trimmed = inviteUrl.trim();
-    if (trimmed.length === 0) {
-      inviteError = 'Paste an invite URL or click Skip for now.';
-      return;
-    }
-    const validated = extractHarmonyInviteUrl([trimmed]);
-    if (validated === null) {
-      inviteError = "That doesn't look like a harmony:// invite.";
-      return;
-    }
-    inviteError = null;
-    onJoinWithInvite(validated);
-  }
-
-  function handleBackdropClick(e: MouseEvent) {
-    // Only fire when click landed on the backdrop, not on the modal body.
-    if (e.target === e.currentTarget) {
-      onDismiss();
+  async function handleCreateIdentity() {
+    stage = 'minting';
+    mintError = null;
+    try {
+      const result = await svc.mint();
+      mintResult = result;
+      stage = 'backup';
+    } catch (e) {
+      mintError = extractError(e);
+      stage = 'explain';
     }
   }
 
-  // Esc key listener — attached/removed based on `open`.
-  $effect(() => {
-    if (!open) return;
-    function onKey(e: KeyboardEvent) {
-      if (e.key === 'Escape') onDismiss();
+  async function handleSaveBackup() {
+    if (mintResult === null) return;
+    if ([...backupPassphrase].length < MIN_RECOVERY_PASSPHRASE_LEN) {
+      backupError = `Passphrase must be at least ${MIN_RECOVERY_PASSPHRASE_LEN} characters.`;
+      return;
     }
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  });
+    if (backupInFlight) return;
+    backupInFlight = true;
+    backupError = null;
+    try {
+      const pathToken = await svc.requestExportSavePath({
+        defaultFilename: 'owner-recovery.bin',
+        filterName: 'Recovery file',
+        filterExtensions: ['bin'],
+      });
+      if (pathToken === null) {
+        // user cancelled the OS dialog — stay on pane 2
+        backupInFlight = false;
+        return;
+      }
+      await svc.exportRecoveryFile(mintResult.recoveryToken, pathToken, backupPassphrase, null);
+      try {
+        localStorage.setItem('harmony.onboarding.recoveryArtifactBackedUp', 'true');
+      } catch (e) {
+        console.debug('[zeb-338] backedUp flag write failed:', extractError(e));
+      }
+      backupPassphrase = '';
+      await onMinted(mintResult);
+    } catch (e) {
+      backupError = extractError(e);
+    } finally {
+      backupInFlight = false;
+    }
+  }
 
-  // Reset transient invite state when the modal closes. The
-  // first-run-only flow makes stale state harmless in practice today,
-  // but the symmetry with FeedbackModal keeps the pattern consistent
-  // against future callers (e.g. re-opens after dismissed-but-not-
-  // acknowledged sessions per the welcomeAcknowledged localStorage
-  // gate). Greptile R2 P2.
-  $effect(() => {
-    if (!open) {
-      inviteUrl = '';
-      inviteError = null;
+  function handleSkipRequest() {
+    stage = 'skip-confirm';
+  }
+
+  function handleSkipCancel() {
+    stage = 'backup';
+  }
+
+  async function handleSkipConfirm() {
+    if (mintResult === null) return;
+    try {
+      localStorage.setItem('harmony.onboarding.backupSkipped', 'true');
+    } catch (e) {
+      console.debug('[zeb-338] backupSkipped flag write failed:', extractError(e));
     }
-  });
+    await onMinted(mintResult);
+  }
 </script>
 
 {#if open}
-  <div
-    class="modal-backdrop"
-    data-testid="welcome-modal-backdrop"
-    onclick={handleBackdropClick}
-    role="presentation"
-  >
+  <div class="modal-backdrop" data-testid="welcome-modal-backdrop" role="presentation">
     <div
       class="modal-content"
       data-testid="welcome-modal"
@@ -95,49 +118,86 @@
       aria-modal="true"
       aria-labelledby="welcome-title"
     >
-      <h2 id="welcome-title">Welcome to Harmony alpha</h2>
-
-      <p>
-        Harmony is a federated chat where communities are self-governing.
-        You're testing v0.1.0-alpha, so expect rough edges. Once you close
-        this window, the <strong>(?)</strong> menu in the top-right has
-        feedback, troubleshooting docs, and other resources.
-      </p>
-
-      <p>
-        A device identity is ready to use. You can name yourself and
-        customize your avatar in <strong>Settings → Profile</strong>
-        whenever you like.
-      </p>
-
-      <div class="invite-section">
-        <label for="welcome-invite-input">
-          Have a <code>harmony://</code> invite?
-        </label>
-        <input
-          id="welcome-invite-input"
-          data-testid="welcome-invite-input"
-          type="text"
-          placeholder="harmony://invite/v1?..."
-          bind:value={inviteUrl}
-          oninput={() => { inviteError = null; }}
-        />
-        {#if inviteError}
-          <p class="error" data-testid="welcome-invite-error">{inviteError}</p>
+      {#if stage === 'explain' || stage === 'minting'}
+        <h2 id="welcome-title">Welcome to Harmony</h2>
+        <p>
+          Harmony is a federated, polycentric social fabric built on
+          user-owned identity. Your identity lives <strong>only on this
+          device</strong> — there's no central account, no server holding
+          your data.
+        </p>
+        <p>
+          When you create your identity you'll get a recovery artifact to back
+          up. Save it somewhere safe — it's the only way to prove this identity
+          is yours if you ever lose this device.
+        </p>
+        <p class="muted">
+          Single-device only in v0.1.0-alpha — multi-device sync ships in a
+          later release.
+        </p>
+        {#if mintError}
+          <p class="error" data-testid="welcome-mint-error">{mintError}</p>
         {/if}
         <div class="actions">
           <button
-            data-testid="welcome-join"
             class="primary"
-            onclick={handleJoin}
+            data-testid="welcome-create-identity"
+            onclick={handleCreateIdentity}
+            disabled={stage === 'minting'}
           >
-            Join now
+            {stage === 'minting' ? 'Creating your identity…' : 'Create my identity'}
           </button>
-          <button data-testid="welcome-skip" onclick={onDismiss}>
+        </div>
+      {:else if stage === 'backup'}
+        <h2 id="welcome-title">Your identity is ready</h2>
+        <p>
+          Back up your recovery artifact now. Without it, you can't prove this
+          identity is yours if this device is lost.
+        </p>
+        <p class="muted">
+          The recovery file is encrypted with your passphrase. Save it
+          somewhere safe (USB drive, password-manager attachment, etc.).
+        </p>
+        <label for="welcome-backup-pass">Passphrase (≥{MIN_RECOVERY_PASSPHRASE_LEN} chars)</label>
+        <input
+          id="welcome-backup-pass"
+          data-testid="welcome-backup-passphrase"
+          type="password"
+          bind:value={backupPassphrase}
+          oninput={() => { backupError = null; }}
+        />
+        {#if backupError}
+          <p class="error" data-testid="welcome-backup-error">{backupError}</p>
+        {/if}
+        <div class="actions">
+          <button
+            class="primary"
+            data-testid="welcome-save-backup"
+            onclick={handleSaveBackup}
+            disabled={[...backupPassphrase].length < MIN_RECOVERY_PASSPHRASE_LEN || backupInFlight}
+          >
+            {backupInFlight ? 'Saving…' : 'Save recovery file'}
+          </button>
+          <button data-testid="welcome-skip-backup" onclick={handleSkipRequest} disabled={backupInFlight}>
             Skip for now
           </button>
         </div>
-      </div>
+      {:else if stage === 'skip-confirm'}
+        <h2 id="welcome-title">Are you sure?</h2>
+        <p>
+          Without a backup, if you lose this device you lose this identity
+          permanently. There's no central recovery — this is what
+          "self-sovereign" means.
+        </p>
+        <div class="actions">
+          <button data-testid="welcome-skip-cancel" onclick={handleSkipCancel}>
+            Cancel
+          </button>
+          <button class="danger" data-testid="welcome-skip-confirm" onclick={handleSkipConfirm}>
+            I accept the risk
+          </button>
+        </div>
+      {/if}
 
       <footer>
         <span class="version" data-testid="welcome-version">v{appVersion}</span>
@@ -172,26 +232,11 @@
     max-width: 520px;
     width: 90%;
   }
-  .modal-content h2 {
-    margin: 0 0 1rem;
-    font-size: 1.25rem;
-  }
-  .modal-content p {
-    margin: 0 0 1rem;
-    line-height: 1.5;
-  }
-  .invite-section {
-    margin: 1.5rem 0 1rem;
-    padding: 1rem;
-    background: var(--bg-tertiary, #1f1f1f);
-    border-radius: 4px;
-  }
-  .invite-section label {
-    display: block;
-    margin-bottom: 0.5rem;
-    font-size: 0.9rem;
-  }
-  .invite-section input {
+  .modal-content h2 { margin: 0 0 1rem; font-size: 1.25rem; }
+  .modal-content p { margin: 0 0 1rem; line-height: 1.5; }
+  .muted { color: var(--text-secondary, #aaa); font-size: 0.9rem; }
+  label { display: block; margin-bottom: 0.4rem; font-size: 0.9rem; }
+  input {
     width: 100%;
     box-sizing: border-box;
     padding: 0.5rem;
@@ -199,15 +244,9 @@
     color: var(--text-primary, #fff);
     border: 1px solid var(--border, #444);
     border-radius: 4px;
-    font-family: monospace;
-    font-size: 0.85rem;
     margin-bottom: 0.5rem;
   }
-  .actions {
-    display: flex;
-    gap: 0.5rem;
-    margin-top: 0.5rem;
-  }
+  .actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
   .actions button {
     padding: 0.5rem 1rem;
     border: 1px solid var(--border, #444);
@@ -216,31 +255,12 @@
     border-radius: 4px;
     cursor: pointer;
   }
-  .actions button.primary {
-    background: var(--accent, #5865f2);
-    border-color: var(--accent, #5865f2);
-  }
-  .error {
-    color: crimson;
-    font-size: 0.85rem;
-    margin: 0 0 0.5rem;
-  }
-  footer {
-    margin-top: 1rem;
-    font-size: 0.85rem;
-  }
-  .version {
-    display: inline-block;
-    margin-right: 1rem;
-    font-size: 0.85rem;
-    color: var(--text-secondary, #aaa);
-    opacity: 0.7;
-  }
-  footer a {
-    color: var(--accent, #5865f2);
-    text-decoration: none;
-  }
-  footer a:hover {
-    text-decoration: underline;
-  }
+  .actions button.primary { background: var(--accent, #5865f2); border-color: var(--accent, #5865f2); }
+  .actions button.danger { background: var(--danger, #d9534f); border-color: var(--danger, #d9534f); }
+  .actions button:disabled { opacity: 0.5; cursor: default; }
+  .error { color: crimson; font-size: 0.85rem; margin: 0 0 0.5rem; }
+  footer { margin-top: 1rem; font-size: 0.85rem; }
+  .version { display: inline-block; margin-right: 1rem; color: var(--text-secondary, #aaa); opacity: 0.7; }
+  footer a { color: var(--accent, #5865f2); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
 </style>
