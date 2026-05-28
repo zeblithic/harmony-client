@@ -403,7 +403,23 @@ Run on at least one platform per release. macOS aarch64 is zeblith's machine; Li
    - `RedeemInviteDialog` opens with the URL pre-populated
    - This validates `bundle.deepLinks` config + per-OS protocol registration
 
-Pass all 6: publish the release. Any failure: fix or document as a known issue before publishing.
+### First-run onboarding (ZEB-338) — required on every release
+
+Run on a machine with NO existing Harmony identity (or wipe first). This exercises the owner-identity hard gate that unblocks fresh installs.
+
+1. **Wipe identity.** Remove `~/.harmony/` and the `harmony.client` keychain entry:
+   - macOS: `rm -rf ~/.harmony` then in Keychain Access delete the `harmony.client` entry (or `security delete-generic-password -s harmony.client`).
+   - Windows: delete `%USERPROFILE%\.harmony` and the `harmony.client` entry in Credential Manager.
+   - Linux: `rm -rf ~/.harmony` and clear the libsecret entry (`secret-tool clear service harmony.client`).
+2. **Launch.** The `WelcomeModal` appears at the **"Create my identity"** pane and is a HARD GATE — pressing `Esc` and clicking outside the modal do NOT dismiss it.
+3. **Create identity.** Click **Create my identity**. A "Creating your identity…" state shows for ~3 s (the node stops, mints, and restarts), then the pane transitions to the backup step.
+4. **Save backup.** Enter a passphrase of at least `MIN_RECOVERY_PASSPHRASE_LEN` characters (currently **12**), click **Save recovery file**, pick a temp path. Export succeeds.
+5. **Main UI works.** Modal closes; the main UI loads; **+ Create community** succeeds (no "Owner identity not loaded" / "crdt_state missing" error — that error must NEVER be reachable through the UI now).
+6. **Returning user.** Quit + relaunch — the main UI loads directly (no Welcome), and NO backup banner (you backed up).
+7. **Skip path.** Wipe again, relaunch, this time click **Skip for now → I accept the risk**. The main UI loads with a persistent backup-reminder banner. Relaunch → the banner persists. Click **Back up now**, save → the banner disappears and stays gone on the next launch.
+8. **(If a Zeblithic invite URL is available) Deep-link + fresh install.** Wipe, then open the `harmony://invite/...` URL to launch the app. The Welcome modal still hard-gates first; after you mint + back up (or skip), the `RedeemInviteDialog` opens automatically with the invite pre-filled.
+
+Pass all 6 base steps **and** the first-run onboarding checklist: publish the release. Any failure: fix or document as a known issue before publishing.
 
 ---
 
