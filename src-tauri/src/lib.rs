@@ -56,6 +56,7 @@ pub mod mint_sync;
 pub mod mint_sync_persist;
 pub mod mint_sync_types;
 pub mod owner_commands;
+pub mod owner_loaded;
 pub mod owner_state;
 pub mod owner_state_crdt;
 pub mod owner_state_crypto;
@@ -36589,6 +36590,236 @@ mod zeb_321_connectivity_ipc_tests {
         );
         assert_eq!(entry.record.home_relay_url, "https://relay.example/");
         assert_eq!(entry.record.announced_at_ms, 1_700_000_000_000);
+    }
+}
+
+/// ZEB-338: unit tests for `owner_loaded::require_owner_loaded`.
+///
+/// Placed here (not in `owner_loaded.rs`) because `NodeState` fields are
+/// private to this module. Tests in sub-modules cannot set private fields
+/// directly; placing them here gives `use super::*` access.
+///
+/// Coverage gap: the happy-path `require_owner_loaded → Ok(handles)` test
+/// is OMITTED because `NodeState.channel_log_registry` is typed
+/// `ChannelLogRegistry<tauri::Wry>`, and there is no supported way to
+/// construct a `ChannelLogRegistry<tauri::Wry>` in tests (only
+/// `MockRuntime` is available via `tauri::test::mock_app()`). The `NotLoaded`
+/// paths for all 8 nullable fields are covered below. The `Ok` path is
+/// exercised indirectly by integration tests that call owner-touching IPCs
+/// against a running `start_node` fixture.
+#[cfg(test)]
+mod owner_loaded_tests {
+    use super::*;
+    use crate::community_state_sync::{CommunityRegistryConfig, CommunitySyncRegistry};
+    use crate::content_store::InMemoryStub;
+    use crate::dm_outbox::DmOutbox;
+    use crate::owner_loaded::{require_owner_loaded, OwnerLoadError};
+    use crate::owner_state_crdt::OwnerState;
+    use crate::owner_state_types::{DeviceIdentityHash, Hlc, OwnerAddr};
+    use harmony_identity::PrivateIdentity;
+    use std::collections::BTreeMap;
+    use tokio::sync::mpsc;
+
+    // ── Fixture helpers ──────────────────────────────────────────────────────
+
+    fn signing_key_from_identity(
+        identity: &PrivateIdentity,
+    ) -> std::sync::Arc<ed25519_dalek::SigningKey> {
+        let sk_bytes_full = identity.to_private_bytes();
+        let ed_seed: [u8; 32] = sk_bytes_full[32..64]
+            .try_into()
+            .expect("ed25519 seed slice 32..64");
+        std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed_seed))
+    }
+
+    /// Build the seven owner fields that do NOT require `tauri::Wry`.
+    /// Returns (NodeState with 7/8 owner fields as Some, receiver kept alive).
+    ///
+    /// `channel_log_registry` is left as `None` because
+    /// `ChannelLogRegistry<tauri::Wry>` cannot be constructed in tests.
+    /// See module-level coverage-gap note above.
+    fn node_state_with_seven_owner_fields() -> (
+        NodeState,
+        mpsc::Receiver<crate::event_loop::CommunityAdapterRequest>,
+    ) {
+        let identity = PrivateIdentity::from_seed(&[0xab; 32]);
+        let self_owner = OwnerAddr(identity.identity.address_hash);
+        let signing_key = signing_key_from_identity(&identity);
+        let identity_pub_64 = identity.identity.to_public_bytes();
+
+        // Minimal identity resolver: admits only self_owner.
+        struct SelfOnlyResolver {
+            owner: OwnerAddr,
+            pub_64: [u8; 64],
+        }
+        #[async_trait::async_trait]
+        impl crate::community_state_sync::IdentityResolver for SelfOnlyResolver {
+            async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+                if *addr == self.owner {
+                    Some(self.pub_64)
+                } else {
+                    None
+                }
+            }
+        }
+
+        let cs: std::sync::Arc<dyn crate::content_store::ContentStore> =
+            std::sync::Arc::new(InMemoryStub::default());
+
+        let community_registry =
+            std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+                device_id: "owner-loaded-test".into(),
+                content_store: cs,
+                identity_resolver: std::sync::Arc::new(SelfOnlyResolver {
+                    owner: self_owner,
+                    pub_64: identity_pub_64,
+                }),
+                identity_dir: std::path::PathBuf::from(""),
+                debounce_ms: crate::community_state_sync::DEFAULT_DEBOUNCE_MS,
+                error_tx: None,
+                delta_tx: None,
+                self_owner,
+                signing_key: std::sync::Arc::clone(&signing_key),
+                crdt_state: None,
+                nav_emitter: None,
+            }));
+
+        let (community_adapter_request_tx, community_adapter_rx) =
+            mpsc::channel::<crate::event_loop::CommunityAdapterRequest>(4);
+
+        let device_hash = DeviceIdentityHash(identity.identity.address_hash);
+        let private_identity = std::sync::Arc::new(identity);
+        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new(
+            "owner-loaded-test".into(),
+            self_owner,
+            device_hash,
+            std::sync::Arc::clone(&signing_key),
+            private_identity,
+        )));
+
+        let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
+        let hlc_tracker: std::sync::Arc<tokio::sync::Mutex<BTreeMap<String, Hlc>>> =
+            std::sync::Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+
+        let ns = NodeState {
+            crdt_state: Some(std::sync::Arc::clone(&crdt_state)),
+            hlc_tracker: Some(std::sync::Arc::clone(&hlc_tracker)),
+            dm_device_id: Some("owner-loaded-test".into()),
+            dm_self_owner: Some(self_owner),
+            community_registry: Some(std::sync::Arc::clone(&community_registry)),
+            community_adapter_request_tx: Some(community_adapter_request_tx),
+            channel_log_registry: None, // Wry only — see coverage-gap note
+            dm_outbox: Some(std::sync::Arc::clone(&dm_outbox)),
+            generation: 7,
+            ..NodeState::default()
+        };
+
+        (ns, community_adapter_rx)
+    }
+
+    // ── Tests ────────────────────────────────────────────────────────────────
+
+    /// Precondition check: all 7 buildable owner fields present but
+    /// `channel_log_registry` absent → NotLoaded.
+    /// This also serves as a smoke test that `require_owner_loaded` compiles
+    /// and returns the expected error variant when the Wry registry is absent.
+    #[test]
+    fn require_owner_loaded_returns_not_loaded_when_channel_log_registry_none() {
+        let (ns, _rx) = node_state_with_seven_owner_fields();
+        let state = Mutex::new(ns);
+        assert!(matches!(
+            require_owner_loaded(&state),
+            Err(OwnerLoadError::NotLoaded)
+        ));
+    }
+
+    #[test]
+    fn require_owner_loaded_returns_not_loaded_when_crdt_state_none() {
+        let (mut ns, _rx) = node_state_with_seven_owner_fields();
+        ns.crdt_state = None;
+        let state = Mutex::new(ns);
+        assert!(matches!(
+            require_owner_loaded(&state),
+            Err(OwnerLoadError::NotLoaded)
+        ));
+    }
+
+    #[test]
+    fn require_owner_loaded_returns_not_loaded_when_hlc_tracker_none() {
+        let (mut ns, _rx) = node_state_with_seven_owner_fields();
+        ns.hlc_tracker = None;
+        let state = Mutex::new(ns);
+        assert!(matches!(
+            require_owner_loaded(&state),
+            Err(OwnerLoadError::NotLoaded)
+        ));
+    }
+
+    #[test]
+    fn require_owner_loaded_returns_not_loaded_when_dm_device_id_none() {
+        let (mut ns, _rx) = node_state_with_seven_owner_fields();
+        ns.dm_device_id = None;
+        let state = Mutex::new(ns);
+        assert!(matches!(
+            require_owner_loaded(&state),
+            Err(OwnerLoadError::NotLoaded)
+        ));
+    }
+
+    #[test]
+    fn require_owner_loaded_returns_not_loaded_when_dm_self_owner_none() {
+        let (mut ns, _rx) = node_state_with_seven_owner_fields();
+        ns.dm_self_owner = None;
+        let state = Mutex::new(ns);
+        assert!(matches!(
+            require_owner_loaded(&state),
+            Err(OwnerLoadError::NotLoaded)
+        ));
+    }
+
+    #[test]
+    fn require_owner_loaded_returns_not_loaded_when_community_registry_none() {
+        let (mut ns, _rx) = node_state_with_seven_owner_fields();
+        ns.community_registry = None;
+        let state = Mutex::new(ns);
+        assert!(matches!(
+            require_owner_loaded(&state),
+            Err(OwnerLoadError::NotLoaded)
+        ));
+    }
+
+    #[test]
+    fn require_owner_loaded_returns_not_loaded_when_community_adapter_request_tx_none() {
+        let (mut ns, _rx) = node_state_with_seven_owner_fields();
+        ns.community_adapter_request_tx = None;
+        let state = Mutex::new(ns);
+        assert!(matches!(
+            require_owner_loaded(&state),
+            Err(OwnerLoadError::NotLoaded)
+        ));
+    }
+
+    #[test]
+    fn require_owner_loaded_returns_not_loaded_when_dm_outbox_none() {
+        let (mut ns, _rx) = node_state_with_seven_owner_fields();
+        ns.dm_outbox = None;
+        let state = Mutex::new(ns);
+        assert!(matches!(
+            require_owner_loaded(&state),
+            Err(OwnerLoadError::NotLoaded)
+        ));
+    }
+
+    /// Verify the `From<OwnerLoadError> for String` impl produces a
+    /// user-visible non-empty message (not an empty string or panic).
+    #[test]
+    fn owner_load_error_not_loaded_to_string_is_non_empty() {
+        let msg = String::from(OwnerLoadError::NotLoaded);
+        assert!(!msg.is_empty(), "NotLoaded error message must not be empty");
+        assert!(
+            !msg.contains("node not running"),
+            "NotLoaded must not use old misleading phrasing; got: {msg}"
+        );
     }
 }
 
