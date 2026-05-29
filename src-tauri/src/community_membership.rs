@@ -6596,7 +6596,8 @@ mod zeb_254_join_countersign_verify_tests {
         let target = [9u8; 16];
         let event = make_join_countersign_event(&admin_priv, admin_addr, community_id, target);
         let mut mat = MaterializedMembership::default();
-        mat.members.insert(admin_addr, joined_with_enrolled(&admin_priv));
+        mat.members
+            .insert(admin_addr, joined_with_enrolled(&admin_priv));
         mat.power_levels.insert(admin_addr, POWER_THRESHOLDS.invite);
         let ctx = VerifyContext {
             expected_community_id: community_id,
@@ -6641,7 +6642,8 @@ mod zeb_254_join_countersign_verify_tests {
         let target = [0xDEu8; 16]; // does not exist in prior state
         let event = make_join_countersign_event(&admin_priv, admin_addr, community_id, target);
         let mut mat = MaterializedMembership::default();
-        mat.members.insert(admin_addr, joined_with_enrolled(&admin_priv));
+        mat.members
+            .insert(admin_addr, joined_with_enrolled(&admin_priv));
         mat.power_levels.insert(admin_addr, POWER_THRESHOLDS.invite);
         let ctx = VerifyContext {
             expected_community_id: community_id,

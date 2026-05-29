@@ -276,7 +276,11 @@ fn attach_and_verify_countersig_round_trip() {
     let cs = event_with_cs.countersig.as_ref().unwrap();
     assert_eq!(cs.signer, admin);
 
-    verify_countersig(&event_with_cs, &harmony_app::community_membership::MaterializedMembership::default()).expect("countersig must verify");
+    verify_countersig(
+        &event_with_cs,
+        &harmony_app::community_membership::MaterializedMembership::default(),
+    )
+    .expect("countersig must verify");
 }
 
 #[test]
@@ -308,8 +312,11 @@ fn verify_countersig_rejects_when_payload_changed_after_countersign() {
         device_id: "d".into(),
     };
 
-    let err =
-        verify_countersig(&event_with_cs, &harmony_app::community_membership::MaterializedMembership::default()).expect_err("must reject mutated payload");
+    let err = verify_countersig(
+        &event_with_cs,
+        &harmony_app::community_membership::MaterializedMembership::default(),
+    )
+    .expect_err("must reject mutated payload");
     // verify_countersig may surface this as CounterSigInvalid (the
     // attached sig doesn't match the new payload bytes).
     assert!(matches!(
@@ -361,7 +368,11 @@ fn verify_countersig_rejects_pubkey_not_matching_signer() {
         sig: admin_sig, // but signed by admin
     });
 
-    let err = verify_countersig(&event, &harmony_app::community_membership::MaterializedMembership::default()).expect_err("must reject");
+    let err = verify_countersig(
+        &event,
+        &harmony_app::community_membership::MaterializedMembership::default(),
+    )
+    .expect_err("must reject");
     // Either:
     //   - verifier picks up carol's identity_pub (matches cs.signer ✓)
     //     but the sig is from admin → CounterSigInvalid
