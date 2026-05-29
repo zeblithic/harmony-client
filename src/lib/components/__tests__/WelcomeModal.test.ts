@@ -1,143 +1,164 @@
-import { describe, it, expect, vi } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { render, fireEvent } from '@testing-library/svelte';
 import WelcomeModal from '../WelcomeModal.svelte';
 
-vi.mock('@tauri-apps/api/app', () => ({
-  getVersion: vi.fn().mockResolvedValue('0.1.0-alpha.1'),
+// vi.hoisted ensures these are available at mock-factory call time
+// (vi.mock is hoisted to the top of the file by Vitest, so module-level
+// vi.fn() declarations would be undefined when the factory runs).
+const { mintMock, requestExportSavePathMock, exportRecoveryFileMock } = vi.hoisted(() => ({
+  mintMock: vi.fn(),
+  requestExportSavePathMock: vi.fn(),
+  exportRecoveryFileMock: vi.fn(),
 }));
 
-describe('WelcomeModal', () => {
-  it('renders when open=true', () => {
-    render(WelcomeModal, {
-      open: true,
-      onDismiss: () => {},
-      onJoinWithInvite: () => {},
+// Mock the OwnerService so mint() returns a recoveryToken that looks like
+// real hex seed material — the test asserts it NEVER reaches the DOM.
+vi.mock('../../owner-service', () => ({
+  OwnerService: class {
+    mint = mintMock;
+    requestExportSavePath = requestExportSavePathMock;
+    exportRecoveryFile = exportRecoveryFileMock;
+  },
+  extractError: (e: unknown) => (e instanceof Error ? e.message : String(e)),
+}));
+
+beforeEach(() => {
+  mintMock.mockReset();
+  requestExportSavePathMock.mockReset();
+  exportRecoveryFileMock.mockReset();
+  localStorage.clear();
+  sessionStorage.clear();
+});
+
+describe('WelcomeModal recovery-artifact redaction invariant', () => {
+  it('pane 2 DOM never contains hex seed/token material', async () => {
+    // A recoveryToken that contains a long hex run — if it leaked into the
+    // DOM, the regex below would catch it.
+    mintMock.mockResolvedValue({
+      state: { ownerId: 'x', ownerDisplayName: 'x', devices: [], canBackUp: true },
+      recoveryToken: 'deadbeefdeadbeefdeadbeefdeadbeef0123456789abcdef0123456789abcdef',
     });
-    expect(screen.getByTestId('welcome-modal')).toBeInTheDocument();
-    expect(screen.getByText(/Welcome to Harmony alpha/i)).toBeInTheDocument();
-  });
-
-  it('does not render when open=false', () => {
-    render(WelcomeModal, {
-      open: false,
-      onDismiss: () => {},
-      onJoinWithInvite: () => {},
+    const { getByTestId, container } = render(WelcomeModal, {
+      props: { open: true, onMinted: vi.fn() },
     });
-    expect(screen.queryByTestId('welcome-modal')).toBeNull();
+    await fireEvent.click(getByTestId('welcome-create-identity'));
+    // wait a tick for the mint promise + stage transition
+    await Promise.resolve();
+    await Promise.resolve();
+    // Pane 2 ('backup') is now showing. Assert no 32+ hex-char run in the DOM.
+    expect(container.innerHTML).not.toMatch(/[0-9a-f]{32,}/);
+  });
+});
+
+describe('WelcomeModal hard gate + flow', () => {
+  it('renders explain pane when open and no mint yet', () => {
+    const { getByTestId } = render(WelcomeModal, { props: { open: true, onMinted: vi.fn() } });
+    expect(getByTestId('welcome-create-identity')).toBeTruthy();
   });
 
-  it('empty paste + "Join now" → inline error, modal stays', async () => {
-    const onJoinWithInvite = vi.fn();
-    const onDismiss = vi.fn();
-    render(WelcomeModal, { open: true, onDismiss, onJoinWithInvite });
-    await fireEvent.click(screen.getByTestId('welcome-join'));
-    expect(screen.getByTestId('welcome-invite-error')).toHaveTextContent(
-      /paste an invite url or click skip/i,
-    );
-    expect(onJoinWithInvite).not.toHaveBeenCalled();
-    expect(onDismiss).not.toHaveBeenCalled();
+  it('clicks create-my-identity invokes mint with no args', async () => {
+    mintMock.mockResolvedValue({ state: {}, recoveryToken: 'tok' });
+    const { getByTestId } = render(WelcomeModal, { props: { open: true, onMinted: vi.fn() } });
+    await fireEvent.click(getByTestId('welcome-create-identity'));
+    expect(mintMock).toHaveBeenCalledWith();
   });
 
-  it('malformed URL + "Join now" → inline error', async () => {
-    const onJoinWithInvite = vi.fn();
-    render(WelcomeModal, {
-      open: true,
-      onDismiss: () => {},
-      onJoinWithInvite,
-    });
-    const input = screen.getByTestId('welcome-invite-input');
-    await fireEvent.input(input, { target: { value: 'https://example.com' } });
-    await fireEvent.click(screen.getByTestId('welcome-join'));
-    expect(screen.getByTestId('welcome-invite-error')).toHaveTextContent(
-      /doesn't look like a harmony:\/\/ invite/i,
-    );
-    expect(onJoinWithInvite).not.toHaveBeenCalled();
+  it('transitions to backup pane on mint success', async () => {
+    mintMock.mockResolvedValue({ state: {}, recoveryToken: 'tok' });
+    const { getByTestId } = render(WelcomeModal, { props: { open: true, onMinted: vi.fn() } });
+    await fireEvent.click(getByTestId('welcome-create-identity'));
+    await Promise.resolve(); await Promise.resolve();
+    expect(getByTestId('welcome-save-backup')).toBeTruthy();
   });
 
-  it('valid harmony:// URL + "Join now" → onJoinWithInvite (parent orchestrates dismissal)', async () => {
-    const onJoinWithInvite = vi.fn();
-    const onDismiss = vi.fn();
-    render(WelcomeModal, { open: true, onDismiss, onJoinWithInvite });
-    const input = screen.getByTestId('welcome-invite-input');
-    const validUrl = 'harmony://invite/v1?p=test';
-    await fireEvent.input(input, { target: { value: validUrl } });
-    await fireEvent.click(screen.getByTestId('welcome-join'));
-    await waitFor(() => expect(onJoinWithInvite).toHaveBeenCalledWith(validUrl));
-    // Component contract: parent (App.svelte) controls dismissal by setting
-    // open=false after handling onJoinWithInvite. The component itself does
-    // NOT call onDismiss on a successful join.
-    expect(onDismiss).not.toHaveBeenCalled();
+  it('stays on explain pane with inline error on mint failure', async () => {
+    mintMock.mockRejectedValue('mint blew up');
+    const { getByTestId } = render(WelcomeModal, { props: { open: true, onMinted: vi.fn() } });
+    await fireEvent.click(getByTestId('welcome-create-identity'));
+    await Promise.resolve(); await Promise.resolve();
+    expect(getByTestId('welcome-mint-error').textContent).toContain('mint blew up');
+    expect(getByTestId('welcome-create-identity')).toBeTruthy();
   });
 
-  it('"Skip for now" → onDismiss', async () => {
-    const onDismiss = vi.fn();
-    render(WelcomeModal, {
-      open: true,
-      onDismiss,
-      onJoinWithInvite: () => {},
-    });
-    await fireEvent.click(screen.getByTestId('welcome-skip'));
-    expect(onDismiss).toHaveBeenCalled();
+  it('save recovery file calls export with pathToken + passphrase', async () => {
+    mintMock.mockResolvedValue({ state: {}, recoveryToken: 'tok' });
+    requestExportSavePathMock.mockResolvedValue('path-token-uuid');
+    exportRecoveryFileMock.mockResolvedValue({ identityHash: 'h', byteLen: 1, path: '/x' });
+    const onMinted = vi.fn();
+    const { getByTestId } = render(WelcomeModal, { props: { open: true, onMinted } });
+    await fireEvent.click(getByTestId('welcome-create-identity'));
+    await Promise.resolve(); await Promise.resolve();
+    await fireEvent.input(getByTestId('welcome-backup-passphrase'), { target: { value: 'longenoughpass' } });
+    await fireEvent.click(getByTestId('welcome-save-backup'));
+    await Promise.resolve(); await Promise.resolve();
+    expect(exportRecoveryFileMock).toHaveBeenCalledWith('tok', 'path-token-uuid', 'longenoughpass', null);
+    expect(localStorage.getItem('harmony.onboarding.recoveryArtifactBackedUp')).toBe('true');
+    expect(onMinted).toHaveBeenCalled();
   });
 
-  it('Escape key → onDismiss', async () => {
-    const onDismiss = vi.fn();
-    render(WelcomeModal, {
-      open: true,
-      onDismiss,
-      onJoinWithInvite: () => {},
-    });
+  it('passphrase under the minimum length disables save button', async () => {
+    mintMock.mockResolvedValue({ state: {}, recoveryToken: 'tok' });
+    const { getByTestId } = render(WelcomeModal, { props: { open: true, onMinted: vi.fn() } });
+    await fireEvent.click(getByTestId('welcome-create-identity'));
+    await Promise.resolve(); await Promise.resolve();
+    await fireEvent.input(getByTestId('welcome-backup-passphrase'), { target: { value: 'short' } });
+    expect((getByTestId('welcome-save-backup') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('skip → confirm sets backupSkipped and calls onMinted', async () => {
+    mintMock.mockResolvedValue({ state: {}, recoveryToken: 'tok' });
+    const onMinted = vi.fn();
+    const { getByTestId } = render(WelcomeModal, { props: { open: true, onMinted } });
+    await fireEvent.click(getByTestId('welcome-create-identity'));
+    await Promise.resolve(); await Promise.resolve();
+    await fireEvent.click(getByTestId('welcome-skip-backup'));
+    await fireEvent.click(getByTestId('welcome-skip-confirm'));
+    await Promise.resolve();
+    expect(localStorage.getItem('harmony.onboarding.backupSkipped')).toBe('true');
+    expect(onMinted).toHaveBeenCalled();
+  });
+
+  it('hard gate ignores Escape keypress', async () => {
+    const onMinted = vi.fn();
+    const { getByTestId } = render(WelcomeModal, { props: { open: true, onMinted } });
     await fireEvent.keyDown(window, { key: 'Escape' });
-    expect(onDismiss).toHaveBeenCalled();
+    // modal still rendered, onMinted never called
+    expect(getByTestId('welcome-modal')).toBeTruthy();
+    expect(onMinted).not.toHaveBeenCalled();
   });
 
-  it('backdrop click → onDismiss', async () => {
-    const onDismiss = vi.fn();
-    render(WelcomeModal, {
-      open: true,
-      onDismiss,
-      onJoinWithInvite: () => {},
-    });
-    await fireEvent.click(screen.getByTestId('welcome-modal-backdrop'));
-    expect(onDismiss).toHaveBeenCalled();
+  it('hard gate ignores backdrop click', async () => {
+    const onMinted = vi.fn();
+    const { getByTestId } = render(WelcomeModal, { props: { open: true, onMinted } });
+    await fireEvent.click(getByTestId('welcome-modal-backdrop'));
+    expect(getByTestId('welcome-modal')).toBeTruthy();
+    expect(onMinted).not.toHaveBeenCalled();
   });
 
-  it('renders feedback-docs footer link', () => {
-    render(WelcomeModal, {
-      open: true,
-      onDismiss: () => {},
-      onJoinWithInvite: () => {},
+  it('moves initial focus into the dialog (focus trap)', async () => {
+    // PR #169: aria-modal alone does not trap focus; the $effect must pull
+    // focus into the dialog so Tab can be cycled within it.
+    const { getByTestId } = render(WelcomeModal, { props: { open: true, onMinted: vi.fn() } });
+    await vi.waitFor(() => {
+      const active = document.activeElement;
+      const modal = getByTestId('welcome-modal');
+      expect(modal.contains(active)).toBe(true);
     });
-    const link = screen.getByTestId('welcome-feedback-link');
-    expect(link.tagName).toBe('A');
-    expect(link.getAttribute('href')).toContain('feedback.md');
   });
 
-  it('renders version label in footer', async () => {
-    render(WelcomeModal, {
-      open: true,
-      onDismiss: () => {},
-      onJoinWithInvite: () => {},
+  it('offers a reload escape when mint reports the identity already exists', async () => {
+    // PR #169: the hard gate must not deadlock when an identity exists on disk
+    // but the node failed to load it. mint() rejects with "already exists";
+    // the explain pane must swap the create button for a reload escape.
+    mintMock.mockRejectedValue('Owner identity already exists on this device. Wipe via Settings to re-mint.');
+    const { getByTestId, queryByTestId } = render(WelcomeModal, {
+      props: { open: true, onMinted: vi.fn() },
     });
-    // Version is fetched via onMount; just verify the element exists.
-    // The actual version string depends on whether Tauri is available
-    // in the test environment (typically 'unknown').
-    const versionEl = screen.getByTestId('welcome-version');
-    expect(versionEl).toBeInTheDocument();
-  });
-
-  it('clears inviteError on input change after a failed Join', async () => {
-    render(WelcomeModal, {
-      open: true,
-      onDismiss: () => {},
-      onJoinWithInvite: () => {},
-    });
-    const input = screen.getByTestId('welcome-invite-input');
-    // Trigger an error (empty input → inline error)
-    await fireEvent.click(screen.getByTestId('welcome-join'));
-    expect(screen.getByTestId('welcome-invite-error')).toBeInTheDocument();
-    // Typing should clear the error
-    await fireEvent.input(input, { target: { value: 'harmony://invite/v1?p=test' } });
-    expect(screen.queryByTestId('welcome-invite-error')).toBeNull();
+    await fireEvent.click(getByTestId('welcome-create-identity'));
+    await Promise.resolve(); await Promise.resolve();
+    // Reload escape is present; the create button is gone (clicking it again
+    // would just re-fail).
+    expect(getByTestId('welcome-already-exists-reload')).toBeTruthy();
+    expect(queryByTestId('welcome-create-identity')).toBeNull();
   });
 });

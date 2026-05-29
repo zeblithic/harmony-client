@@ -56,6 +56,7 @@ pub mod mint_sync;
 pub mod mint_sync_persist;
 pub mod mint_sync_types;
 pub mod owner_commands;
+pub mod owner_loaded;
 pub mod owner_state;
 pub mod owner_state_crdt;
 pub mod owner_state_crypto;
@@ -1005,6 +1006,11 @@ pub struct ZenohStatus {
 pub struct StartNodeResponse {
     pub node_addr: String,
     pub freshly_created: bool,
+    /// ZEB-338: true iff an owner identity (owner_state.cbor) loaded during
+    /// this start_node call. Frontend hard-gates the WelcomeModal on this:
+    /// `showWelcomeModal = !hasOwnerIdentity`. Forward-compat: frontend
+    /// treats a missing field as `false` (older backend → show onboarding).
+    pub has_owner_identity: bool,
 }
 
 /// Profile published to/received from the network.
@@ -1077,6 +1083,12 @@ pub struct TelemetryEventPayload {
 
 const CAPACITY_PREFIX: &str = "harmony/compute/capacity/";
 
+// ZEB-338: the single honest "owner identity not loaded" message. Use this at
+// owner-derived-handle guards so the phrasing can't drift between call sites.
+// (Incremental adoption — applied where edited, not a blanket sweep.)
+const OWNER_NOT_LOADED_MSG: &str =
+    "Owner identity not loaded — please restart the app or recreate identity.";
+
 pub fn parse_capacity(key_expr: &str, payload: &[u8]) -> Option<CapacityUpdate> {
     let node_addr = key_expr.strip_prefix(CAPACITY_PREFIX)?;
     if payload.len() < 33 {
@@ -1122,7 +1134,7 @@ fn stop_handles(
 
 /// Stop the running node (if any). Returns after the event loop thread exits.
 /// Returns `true` if a node was actually stopped, `false` if it was a no-op.
-fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
+pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
     // ZEB-270 Phase 3 Task 4C: declared in the outer scope so the
     // post-lock shutdown_all block can take it. Assigned inside the
     // lock alongside the other `take()` calls below.
@@ -1680,6 +1692,21 @@ async fn start_node(
     app: AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<StartNodeResponse, String> {
+    // ZEB-338: thin forwarder. Real logic lives in start_node_inner so the
+    // self-lifecycle mint IPC (owner_commands::mint_owner_identity) can
+    // restart the node after writing owner_state.cbor without duplicating
+    // ~3600 lines. `tauri::State` derefs to `&Mutex<NodeState>`.
+    start_node_inner(endpoint, &app, &state).await
+}
+
+/// ZEB-338: extracted body of `start_node`. Callable from any IPC that holds
+/// an `&AppHandle` and `&Mutex<NodeState>` (the command wrapper above, and
+/// `mint_owner_identity`'s node-restart phase).
+pub(crate) async fn start_node_inner(
+    endpoint: Option<String>,
+    app: &AppHandle,
+    state: &Mutex<NodeState>,
+) -> Result<StartNodeResponse, String> {
     // ── Atomic stop→identity→config→spawn→store ─────────────────────
     // Everything from stop through handle registration runs under the
     // lock (with a brief drop for the blocking thread join). This
@@ -1813,7 +1840,7 @@ async fn start_node(
     // continues to detect "later install completed" rather than the
     // strictly weaker "later attempt started" — see Cursor bug report on
     // PR #124.
-    let my_install_seq: u64 = reserve_install_seq(&state)?;
+    let my_install_seq: u64 = reserve_install_seq(state)?;
     let (
         old_shutdown,
         old_thread,
@@ -2147,6 +2174,8 @@ async fn start_node(
             &identity_dir,
             crate::identity::KeychainStore::new().ok(),
         )?;
+        // ZEB-338: snapshot before owner_loaded is moved/destructured downstream.
+        let has_owner_identity = owner_loaded.is_some();
 
         let mut sync_handles_opt: Option<crate::event_loop::SyncEngineHandles> = None;
         // Mint Phase 2 sync: built alongside SyncEngine when owner identity loads.
@@ -4369,7 +4398,7 @@ async fn start_node(
             // `!Send`). Each arm either assigns `guard` synchronously or
             // breaks the labeled block with `lock_failure_msg` set.
             let mut guard;
-            match check_install_seq_or_supersede(&state, my_install_seq) {
+            match check_install_seq_or_supersede(state, my_install_seq) {
                 Ok(g) => {
                     guard = g;
                 }
@@ -4898,6 +4927,7 @@ async fn start_node(
           // call engine.shutdown() if thread spawn fails (CURSOR MEDIUM fix).
           // ZEB-331: node_addr_for_response + freshly_created carried out here
           // so they're accessible at StartNodeResponse construction after block.
+          // ZEB-338: has_owner_identity also carried out here.
         (
             current_generation,
             thread_install_failure,
@@ -4914,6 +4944,7 @@ async fn start_node(
             mint_sync_engine_opt,
             node_addr_for_response,
             freshly_created,
+            has_owner_identity,
         )
     };
     let (
@@ -4929,6 +4960,7 @@ async fn start_node(
         mint_engine_for_cleanup,
         node_addr_for_response,
         freshly_created,
+        has_owner_identity,
     ) = our_gen;
 
     // ZEB-221 + thread-spawn-failure cleanup + lock-poison cleanup: all
@@ -5263,6 +5295,7 @@ async fn start_node(
             Ok(StartNodeResponse {
                 node_addr: node_addr_for_response,
                 freshly_created,
+                has_owner_identity,
             })
         }
         Ok(Err(e)) => Err(e),
@@ -5274,7 +5307,7 @@ async fn start_node(
     // replaced our handles; passing our generation avoids tearing
     // down the newer node.
     if result.is_err() {
-        let _ = stop_inner(&state, Some(our_gen));
+        let _ = stop_inner(state, Some(our_gen));
     }
 
     result
@@ -5575,11 +5608,9 @@ async fn send_dm(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.dm_outbox
-                .clone()
-                .ok_or("node not running or no owner identity")?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_transport.clone().ok_or("dm_transport missing")?,
-            g.crdt_state.clone().ok_or("crdt_state missing")?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
@@ -5870,9 +5901,7 @@ async fn read_dm_thread(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state
-                .clone()
-                .ok_or("node not running or no owner identity")?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.content_store.clone().ok_or("content_store missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
         )
@@ -6075,10 +6104,8 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.dm_outbox
-                .clone()
-                .ok_or("node not running or no owner identity")?,
-            g.crdt_state.clone().ok_or("crdt_state missing")?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             // ZEB-234: snapshot the fence handles so delete_outbox_entry
@@ -6573,10 +6600,8 @@ async fn add_space(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.dm_outbox
-                .clone()
-                .ok_or("node not running or no owner identity")?,
-            g.crdt_state.clone().ok_or("crdt_state missing")?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
@@ -11333,7 +11358,7 @@ pub fn member_info_for(
 ///
 /// Errors:
 /// - `Err("invalid community_id hex: ...")` — couldn't parse hex.
-/// - `Err("no community_registry — node not running?")` — start_node
+/// - `Err("Owner identity not loaded — please restart the app or recreate identity.")` — start_node
 ///   hasn't wired the registry.
 /// - `Err("no Space for community {hex} in owner-state")` — we
 ///   haven't joined this community (or we left and removed the Space).
@@ -11359,12 +11384,8 @@ async fn list_community_members(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
-            g.community_registry
-                .clone()
-                .ok_or("no community_registry — node not running?")?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
 
@@ -11525,8 +11546,8 @@ pub fn build_fork_descendants(
 /// Errors:
 /// - `Err("invalid community_id hex: ...")` — couldn't parse hex.
 /// - `Err("community_id must be 16 bytes (32 hex chars)")` — wrong length.
-/// - `Err("crdt_state missing — node not running?")` — node not started.
-/// - `Err("no community_registry — node not running?")` — registry missing.
+/// - `Err("Owner identity not loaded — please restart the app or recreate identity.")` — node not started.
+/// - `Err("Owner identity not loaded — please restart the app or recreate identity.")` — registry missing.
 /// - `Err("no Space for community {hex} in owner-state")` — community absent.
 /// - `Err("no engine for community {hex} — not joined or not yet started")` —
 ///   engine absent.
@@ -11547,16 +11568,10 @@ async fn list_community_forks(
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        let self_owner = g
-            .dm_self_owner
-            .ok_or("self_owner missing — node not running?")?;
+        let self_owner = g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?;
         (
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
-            g.community_registry
-                .clone()
-                .ok_or("no community_registry — node not running?")?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             self_owner,
         )
     };
@@ -11704,8 +11719,8 @@ pub fn build_community_lineage_dto(
 /// Errors:
 /// - `Err("invalid community_id hex: ...")` — couldn't parse hex.
 /// - `Err("community_id must be 16 bytes (32 hex chars)")` — wrong length.
-/// - `Err("crdt_state missing — node not running?")` — node not started.
-/// - `Err("no community_registry — node not running?")` — registry missing.
+/// - `Err("Owner identity not loaded — please restart the app or recreate identity.")` — node not started.
+/// - `Err("Owner identity not loaded — please restart the app or recreate identity.")` — registry missing.
 /// - `Err("no Space for community {hex} in owner-state")` — community absent.
 /// - `Err("no engine for community {hex} — not joined or not yet started")` —
 ///   engine absent.
@@ -11726,16 +11741,10 @@ async fn get_community_lineage(
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        let self_owner = g
-            .dm_self_owner
-            .ok_or("self_owner missing — node not running?")?;
+        let self_owner = g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?;
         (
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
-            g.community_registry
-                .clone()
-                .ok_or("no community_registry — node not running?")?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             self_owner,
         )
     };
@@ -12373,12 +12382,8 @@ async fn create_channel(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry
-                .clone()
-                .ok_or("community_registry missing — node not running?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     };
@@ -12619,12 +12624,8 @@ async fn modify_channel(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry
-                .clone()
-                .ok_or("community_registry missing — node not running?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     };
@@ -12731,8 +12732,8 @@ async fn modify_channel(
 /// - `Err("invalid community_id hex: ...")` / `Err("invalid channel_id hex: ...")`.
 /// - `Err("community_id must be 16 bytes (32 hex chars)")` / same for channel_id.
 /// - `Err("hlc_tracker missing" / "dm_device_id missing" / ...)`.
-/// - `Err("crdt_state missing — node not running?")`.
-/// - `Err("community_registry missing — node not running?")`.
+/// - `Err("Owner identity not loaded — please restart the app or recreate identity.")`.
+/// - `Err("Owner identity not loaded — please restart the app or recreate identity.")`.
 /// - `Err("no Space for community {hex} in owner-state")` / kind check.
 /// - `Err("community Space missing admin_addr (corrupt row?)")`.
 /// - `Err("no engine for community {hex} — ...")`.
@@ -12780,15 +12781,9 @@ async fn delete_channel(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry
-                .clone()
-                .ok_or("community_registry missing — node not running?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dm_outbox missing — no owner identity?")?,
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     };
@@ -12957,12 +12952,8 @@ async fn list_channels(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
-            g.community_registry
-                .clone()
-                .ok_or("no community_registry — node not running?")?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
 
@@ -13289,7 +13280,7 @@ pub fn build_open_invite_url(
 ///
 /// Errors:
 /// - `Err("invalid community_id hex: ...")` — bad hex.
-/// - `Err("no community_registry — node not running?")` — registry not
+/// - `Err("Owner identity not loaded — please restart the app or recreate identity.")` — registry not
 ///   wired (start_node hasn't run).
 /// - `Err("no Space for community {hex} in owner-state")` — the
 ///   community isn't in our local owner-state (we haven't joined or
@@ -13318,12 +13309,8 @@ async fn generate_invite(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
-            g.community_registry
-                .clone()
-                .ok_or("no community_registry — node not running?")?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
 
@@ -14050,24 +14037,16 @@ async fn create_community(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry
-                .clone()
-                .ok_or("community_registry missing — node not running?")?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.community_adapter_request_tx
                 .clone()
                 .ok_or("community_adapter_request_tx missing")?,
-            g.channel_log_registry
-                .clone()
-                .ok_or("channel_log_registry missing — node not running?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.channel_log_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     }; // std `state_lock` guard dropped here.
@@ -16012,27 +15991,17 @@ async fn redeem_invite(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry
-                .clone()
-                .ok_or("community_registry missing — node not running?")?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.community_adapter_request_tx
                 .clone()
                 .ok_or("community_adapter_request_tx missing")?,
-            g.unicast_send_tx
-                .clone()
-                .ok_or("unicast_send_tx missing — no owner identity?")?,
-            g.channel_log_registry
-                .clone()
-                .ok_or("channel_log_registry missing — node not running?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.unicast_send_tx.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.channel_log_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     }; // std lock dropped here.
@@ -16251,30 +16220,18 @@ async fn join_open_community(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.library_directory
-                .clone()
-                .ok_or("library_directory missing — node not running?")?,
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
+            g.library_directory.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry
-                .clone()
-                .ok_or("community_registry missing — node not running?")?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.community_adapter_request_tx
                 .clone()
                 .ok_or("community_adapter_request_tx missing")?,
-            g.unicast_send_tx
-                .clone()
-                .ok_or("unicast_send_tx missing — no owner identity?")?,
-            g.channel_log_registry
-                .clone()
-                .ok_or("channel_log_registry missing — node not running?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.unicast_send_tx.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.channel_log_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     }; // std lock dropped here.
@@ -17769,12 +17726,8 @@ async fn list_libraries(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
-            g.library_directory
-                .clone()
-                .ok_or("library_directory missing — node not running?")?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.library_directory.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
     let crdt_g = crdt_state.lock().await;
@@ -17822,12 +17775,8 @@ async fn list_discovered_libraries(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
-            g.library_directory
-                .clone()
-                .ok_or("library_directory missing — node not running?")?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.library_directory.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
 
@@ -17954,18 +17903,10 @@ async fn add_library(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
-            g.library_directory
-                .clone()
-                .ok_or("library_directory missing — node not running?")?,
-            g.hlc_tracker
-                .clone()
-                .ok_or("hlc_tracker missing — node not running?")?,
-            g.dm_device_id
-                .clone()
-                .ok_or("dm_device_id missing — node not running?")?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.library_directory.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     };
@@ -18030,18 +17971,10 @@ async fn remove_library(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
-            g.library_directory
-                .clone()
-                .ok_or("library_directory missing — node not running?")?,
-            g.hlc_tracker
-                .clone()
-                .ok_or("hlc_tracker missing — node not running?")?,
-            g.dm_device_id
-                .clone()
-                .ok_or("dm_device_id missing — node not running?")?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.library_directory.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     };
@@ -18097,9 +18030,7 @@ async fn browse_library(
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        g.library_directory
-            .clone()
-            .ok_or("library_directory missing — node not running?")?
+        g.library_directory.clone().ok_or(OWNER_NOT_LOADED_MSG)?
     };
     let aggregated = match library_addr {
         None => library_directory.snapshot_all().await,
@@ -18157,18 +18088,12 @@ async fn set_space_shared_in_profile(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.profile_broadcast_publisher
                 .clone()
-                .ok_or("profile_broadcast_publisher missing — node not running?")?,
-            g.hlc_tracker
-                .clone()
-                .ok_or("hlc_tracker missing — node not running?")?,
-            g.dm_device_id
-                .clone()
-                .ok_or("dm_device_id missing — node not running?")?,
+                .ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     };
@@ -18284,9 +18209,7 @@ async fn list_shared_in_profile_communities(
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        g.crdt_state
-            .clone()
-            .ok_or("crdt_state missing — node not running?")?
+        g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?
     };
     let g = crdt_state.lock().await;
     let mut ids: Vec<String> = g
@@ -18327,10 +18250,10 @@ async fn subscribe_peer_profile(
         (
             g.profile_broadcast_cache
                 .clone()
-                .ok_or("profile_broadcast_cache missing — node not running?")?,
+                .ok_or(OWNER_NOT_LOADED_MSG)?,
             g.profile_broadcast_request_tx
                 .clone()
-                .ok_or("profile_broadcast_request_tx missing — node not running?")?,
+                .ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.profile_broadcast_next_subscription_id),
         )
     };
@@ -18371,7 +18294,7 @@ async fn unsubscribe_peer_profile(
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         g.profile_broadcast_request_tx
             .clone()
-            .ok_or("profile_broadcast_request_tx missing — node not running?")?
+            .ok_or(OWNER_NOT_LOADED_MSG)?
     };
     request_tx
         .send(crate::event_loop::ProfileBroadcastRequest::Unsubscribe { subscription_id })
@@ -18395,7 +18318,7 @@ async fn get_cached_peer_profile(
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         g.profile_broadcast_cache
             .clone()
-            .ok_or("profile_broadcast_cache missing — node not running?")?
+            .ok_or(OWNER_NOT_LOADED_MSG)?
     };
     Ok(cache.get_cached(subscription_id).await)
 }
@@ -18784,12 +18707,8 @@ async fn leave_community(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry
-                .clone()
-                .ok_or("community_registry missing — node not running?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     };
@@ -19467,12 +19386,8 @@ async fn kick_from_community(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry
-                .clone()
-                .ok_or("community_registry missing — node not running?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     };
@@ -19829,12 +19744,8 @@ async fn set_power_level(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry
-                .clone()
-                .ok_or("community_registry missing — node not running?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     };
@@ -19995,12 +19906,8 @@ async fn unban_from_community(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry
-                .clone()
-                .ok_or("community_registry missing — node not running?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     };
@@ -20102,12 +20009,8 @@ async fn list_recent_moderation_events(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
-            g.community_registry
-                .clone()
-                .ok_or("no community_registry — node not running?")?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
 
@@ -20241,11 +20144,8 @@ async fn list_pending_joins(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.community_registry
-                .clone()
-                .ok_or("no community_registry — node not running?")?,
-            g.dm_self_owner
-                .ok_or("dm_self_owner missing — no owner identity?")?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
 
@@ -20403,11 +20303,8 @@ async fn list_recent_counter_signs(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.community_registry
-                .clone()
-                .ok_or("no community_registry — node not running?")?,
-            g.dm_self_owner
-                .ok_or("dm_self_owner missing — no owner identity?")?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
 
@@ -20602,11 +20499,8 @@ async fn list_pending_admin_proposals(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.community_registry
-                .clone()
-                .ok_or("no community_registry — node not running?")?,
-            g.dm_self_owner
-                .ok_or("dm_self_owner missing — no owner identity?")?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
         )
     };
 
@@ -20984,12 +20878,8 @@ async fn countersign_admin_proposal(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry
-                .clone()
-                .ok_or("community_registry missing — node not running?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     };
@@ -21195,12 +21085,8 @@ async fn propose_change_quorum(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry
-                .clone()
-                .ok_or("community_registry missing — node not running?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
     };
@@ -22869,15 +22755,9 @@ async fn voting_create_tier1_poll<R: tauri::Runtime>(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry
-                .clone()
-                .ok_or("community_registry missing — node not running?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dm_outbox missing — no owner identity?")?,
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.voting_logs),
             // Tasks 21-23: channel_log_registry is needed for the
             // poll-kind chat-message fanout below. May be absent in
@@ -23025,9 +22905,7 @@ async fn voting_cast_tier1_ballot<R: tauri::Runtime>(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.voting_logs),
         )
     };
@@ -23436,15 +23314,9 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry
-                .clone()
-                .ok_or("community_registry missing — node not running?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dm_outbox missing — no owner identity?")?,
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.voting_logs),
             g.channel_log_registry.clone(),
             std::sync::Arc::clone(&g.voting_log_engines),
@@ -23454,18 +23326,15 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
             // ZEB-298+ZEB-312 PR 1: sender for voting-log adapter requests.
             g.voting_log_adapter_request_tx
                 .clone()
-                .ok_or("voting_log_adapter_request_tx missing — node not running?")?,
+                .ok_or("voting_log_adapter_request_tx missing")?,
             // ZEB-298+ZEB-312 PR 2 Task 1: needed to construct the
             // production OwnerDeviceCacheResolver for the voting engine.
-            g.dm_identity_pub_64
-                .ok_or("dm_identity_pub_64 missing — node not running?")?,
+            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
             // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle for the
             // voting engine's Tier 3 lifecycle emit path. Captured at
             // start_node so generic IPC handlers can pass a concrete
             // AppHandle<Wry> without downcasting from AppHandle<R>.
-            g.app_handle_wry
-                .clone()
-                .ok_or("app_handle_wry missing — node not running?")?,
+            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
         )
     };
 
@@ -23731,29 +23600,19 @@ async fn voting_submit_deliberation_statement<R: tauri::Runtime>(
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner
-                .ok_or("dm_self_owner missing — no owner identity?")?,
-            g.community_registry
-                .clone()
-                .ok_or("community_registry missing — node not running?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dm_outbox missing — no owner identity?")?,
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.voting_logs),
             std::sync::Arc::clone(&g.voting_log_engines),
             g.dfrost_log_registry.clone(),
             g.beacon_requester.clone(),
             g.voting_log_adapter_request_tx
                 .clone()
-                .ok_or("voting_log_adapter_request_tx missing — node not running?")?,
-            g.dm_identity_pub_64
-                .ok_or("dm_identity_pub_64 missing — node not running?")?,
-            g.app_handle_wry
-                .clone()
-                .ok_or("app_handle_wry missing — node not running?")?,
+                .ok_or("voting_log_adapter_request_tx missing")?,
+            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
         )
     };
 
@@ -23897,29 +23756,19 @@ async fn voting_cast_deliberation_vote<R: tauri::Runtime>(
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner
-                .ok_or("dm_self_owner missing — no owner identity?")?,
-            g.community_registry
-                .clone()
-                .ok_or("community_registry missing — node not running?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dm_outbox missing — no owner identity?")?,
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.voting_logs),
             std::sync::Arc::clone(&g.voting_log_engines),
             g.dfrost_log_registry.clone(),
             g.beacon_requester.clone(),
             g.voting_log_adapter_request_tx
                 .clone()
-                .ok_or("voting_log_adapter_request_tx missing — node not running?")?,
-            g.dm_identity_pub_64
-                .ok_or("dm_identity_pub_64 missing — node not running?")?,
-            g.app_handle_wry
-                .clone()
-                .ok_or("app_handle_wry missing — node not running?")?,
+                .ok_or("voting_log_adapter_request_tx missing")?,
+            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
         )
     };
 
@@ -24043,29 +23892,19 @@ async fn voting_propose_draft_candidate<R: tauri::Runtime>(
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner
-                .ok_or("dm_self_owner missing — no owner identity?")?,
-            g.community_registry
-                .clone()
-                .ok_or("community_registry missing — node not running?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dm_outbox missing — no owner identity?")?,
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.voting_logs),
             std::sync::Arc::clone(&g.voting_log_engines),
             g.dfrost_log_registry.clone(),
             g.beacon_requester.clone(),
             g.voting_log_adapter_request_tx
                 .clone()
-                .ok_or("voting_log_adapter_request_tx missing — node not running?")?,
-            g.dm_identity_pub_64
-                .ok_or("dm_identity_pub_64 missing — node not running?")?,
-            g.app_handle_wry
-                .clone()
-                .ok_or("app_handle_wry missing — node not running?")?,
+                .ok_or("voting_log_adapter_request_tx missing")?,
+            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
         )
     };
 
@@ -24190,29 +24029,19 @@ async fn voting_approve_draft_candidate<R: tauri::Runtime>(
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner
-                .ok_or("dm_self_owner missing — no owner identity?")?,
-            g.community_registry
-                .clone()
-                .ok_or("community_registry missing — node not running?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dm_outbox missing — no owner identity?")?,
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.voting_logs),
             std::sync::Arc::clone(&g.voting_log_engines),
             g.dfrost_log_registry.clone(),
             g.beacon_requester.clone(),
             g.voting_log_adapter_request_tx
                 .clone()
-                .ok_or("voting_log_adapter_request_tx missing — node not running?")?,
-            g.dm_identity_pub_64
-                .ok_or("dm_identity_pub_64 missing — node not running?")?,
-            g.app_handle_wry
-                .clone()
-                .ok_or("app_handle_wry missing — node not running?")?,
+                .ok_or("voting_log_adapter_request_tx missing")?,
+            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
         )
     };
 
@@ -24362,29 +24191,19 @@ async fn voting_decline_sortition<R: tauri::Runtime>(
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner
-                .ok_or("dm_self_owner missing — no owner identity?")?,
-            g.community_registry
-                .clone()
-                .ok_or("community_registry missing — node not running?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dm_outbox missing — no owner identity?")?,
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.voting_logs),
             std::sync::Arc::clone(&g.voting_log_engines),
             g.dfrost_log_registry.clone(),
             g.beacon_requester.clone(),
             g.voting_log_adapter_request_tx
                 .clone()
-                .ok_or("voting_log_adapter_request_tx missing — node not running?")?,
-            g.dm_identity_pub_64
-                .ok_or("dm_identity_pub_64 missing — node not running?")?,
-            g.app_handle_wry
-                .clone()
-                .ok_or("app_handle_wry missing — node not running?")?,
+                .ok_or("voting_log_adapter_request_tx missing")?,
+            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
         )
     };
 
@@ -24498,29 +24317,19 @@ async fn voting_cast_ratification_ballot<R: tauri::Runtime>(
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner
-                .ok_or("dm_self_owner missing — no owner identity?")?,
-            g.community_registry
-                .clone()
-                .ok_or("community_registry missing — node not running?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dm_outbox missing — no owner identity?")?,
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.voting_logs),
             std::sync::Arc::clone(&g.voting_log_engines),
             g.dfrost_log_registry.clone(),
             g.beacon_requester.clone(),
             g.voting_log_adapter_request_tx
                 .clone()
-                .ok_or("voting_log_adapter_request_tx missing — node not running?")?,
-            g.dm_identity_pub_64
-                .ok_or("dm_identity_pub_64 missing — node not running?")?,
-            g.app_handle_wry
-                .clone()
-                .ok_or("app_handle_wry missing — node not running?")?,
+                .ok_or("voting_log_adapter_request_tx missing")?,
+            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
         )
     };
 
@@ -25586,15 +25395,9 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry
-                .clone()
-                .ok_or("community_registry missing — node not running?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dm_outbox missing — no owner identity?")?,
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.voting_logs),
             std::sync::Arc::clone(&g.voting_log_engines),
             // ZEB-309 Task 11: pass dfrost handles so new engines get wired.
@@ -25603,18 +25406,15 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
             // ZEB-298+ZEB-312 PR 1: sender for voting-log adapter requests.
             g.voting_log_adapter_request_tx
                 .clone()
-                .ok_or("voting_log_adapter_request_tx missing — node not running?")?,
+                .ok_or("voting_log_adapter_request_tx missing")?,
             // ZEB-298+ZEB-312 PR 2 Task 1: needed to construct the
             // production OwnerDeviceCacheResolver for the voting engine.
-            g.dm_identity_pub_64
-                .ok_or("dm_identity_pub_64 missing — node not running?")?,
+            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
             // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle for the
             // voting engine's Tier 3 lifecycle emit path. Captured at
             // start_node so generic IPC handlers can pass a concrete
             // AppHandle<Wry> without downcasting from AppHandle<R>.
-            g.app_handle_wry
-                .clone()
-                .ok_or("app_handle_wry missing — node not running?")?,
+            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
         )
     };
 
@@ -25737,15 +25537,9 @@ async fn voting_signal_tier2<R: tauri::Runtime>(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry
-                .clone()
-                .ok_or("community_registry missing — node not running?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dm_outbox missing — no owner identity?")?,
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.voting_logs),
         )
     };
@@ -25886,15 +25680,9 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry
-                .clone()
-                .ok_or("community_registry missing — node not running?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dm_outbox missing — no owner identity?")?,
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.voting_logs),
             std::sync::Arc::clone(&g.voting_log_engines),
             // ZEB-309 Task 11: pass dfrost handles so new engines get wired.
@@ -25903,18 +25691,15 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
             // ZEB-298+ZEB-312 PR 1: sender for voting-log adapter requests.
             g.voting_log_adapter_request_tx
                 .clone()
-                .ok_or("voting_log_adapter_request_tx missing — node not running?")?,
+                .ok_or("voting_log_adapter_request_tx missing")?,
             // ZEB-298+ZEB-312 PR 2 Task 1: needed to construct the
             // production OwnerDeviceCacheResolver for the voting engine.
-            g.dm_identity_pub_64
-                .ok_or("dm_identity_pub_64 missing — node not running?")?,
+            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
             // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle for the
             // voting engine's Tier 3 lifecycle emit path. Captured at
             // start_node so generic IPC handlers can pass a concrete
             // AppHandle<Wry> without downcasting from AppHandle<R>.
-            g.app_handle_wry
-                .clone()
-                .ok_or("app_handle_wry missing — node not running?")?,
+            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
         )
     };
 
@@ -26038,9 +25823,7 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dm_outbox missing — no owner identity?")?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.voting_logs),
             std::sync::Arc::clone(&g.voting_log_engines),
             // ZEB-309 Task 11: pass dfrost handles so new engines get wired.
@@ -26049,25 +25832,18 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
             // ZEB-298+ZEB-312 PR 1: sender for voting-log adapter requests.
             g.voting_log_adapter_request_tx
                 .clone()
-                .ok_or("voting_log_adapter_request_tx missing — node not running?")?,
+                .ok_or("voting_log_adapter_request_tx missing")?,
             // ZEB-298+ZEB-312 PR 1: needed to build NodeStateMembershipResolver.
-            g.community_registry
-                .clone()
-                .ok_or("community_registry missing — node not running?")?,
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             // ZEB-298+ZEB-312 PR 2 Task 1: needed to construct the
             // production OwnerDeviceCacheResolver for the voting engine.
-            g.dm_identity_pub_64
-                .ok_or("dm_identity_pub_64 missing — node not running?")?,
+            g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
             // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle for the
             // voting engine's Tier 3 lifecycle emit path. Captured at
             // start_node so generic IPC handlers can pass a concrete
             // AppHandle<Wry> without downcasting from AppHandle<R>.
-            g.app_handle_wry
-                .clone()
-                .ok_or("app_handle_wry missing — node not running?")?,
+            g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
         )
     };
 
@@ -27202,17 +26978,10 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
             .lock()
             .map_err(|e| format!("dfrost_initiate_dkg: NodeState poisoned: {e}"))?;
         (
-            g.hlc_tracker
-                .clone()
-                .ok_or("dfrost_initiate_dkg: hlc_tracker missing — node not running?")?,
-            g.dm_device_id
-                .clone()
-                .ok_or("dfrost_initiate_dkg: dm_device_id missing — no owner identity?")?,
-            g.dm_self_owner
-                .ok_or("dfrost_initiate_dkg: dm_self_owner missing — no owner identity?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dfrost_initiate_dkg: dm_outbox missing — no owner identity?")?,
+            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.dfrost_logs),
             g.dfrost_log_registry.clone(),
         )
@@ -27533,17 +27302,10 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
             .lock()
             .map_err(|e| format!("dfrost_contribute_dkg_round: NodeState poisoned: {e}"))?;
         (
-            g.hlc_tracker
-                .clone()
-                .ok_or("dfrost_contribute_dkg_round: hlc_tracker missing — node not running?")?,
-            g.dm_device_id
-                .clone()
-                .ok_or("dfrost_contribute_dkg_round: dm_device_id missing — no owner identity?")?,
-            g.dm_self_owner
-                .ok_or("dfrost_contribute_dkg_round: dm_self_owner missing — no owner identity?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dfrost_contribute_dkg_round: dm_outbox missing — no owner identity?")?,
+            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.dfrost_logs),
             g.dfrost_log_registry.clone(),
         )
@@ -27782,9 +27544,7 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
             let g = state_lock
                 .lock()
                 .map_err(|e| format!("dfrost_contribute_dkg_round: NodeState poisoned: {e}"))?;
-            g.community_registry.clone().ok_or(
-                "dfrost_contribute_dkg_round: community_registry missing — node not running?",
-            )?
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?
         };
 
         // Snapshot pending state: members (for OwnerAddr↔Identifier
@@ -28313,17 +28073,10 @@ pub(crate) async fn dfrost_request_vrf_beacon_inner(
             .lock()
             .map_err(|e| format!("dfrost_request_vrf_beacon: NodeState poisoned: {e}"))?;
         (
-            g.hlc_tracker
-                .clone()
-                .ok_or("dfrost_request_vrf_beacon: hlc_tracker missing — node not running?")?,
-            g.dm_device_id
-                .clone()
-                .ok_or("dfrost_request_vrf_beacon: dm_device_id missing — no owner identity?")?,
-            g.dm_self_owner
-                .ok_or("dfrost_request_vrf_beacon: dm_self_owner missing — no owner identity?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dfrost_request_vrf_beacon: dm_outbox missing — no owner identity?")?,
+            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.dfrost_logs),
             g.dfrost_log_registry.clone(),
         )
@@ -28584,18 +28337,10 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
             .lock()
             .map_err(|e| format!("dfrost_contribute_threshold_sign: NodeState poisoned: {e}"))?;
         (
-            g.hlc_tracker.clone().ok_or(
-                "dfrost_contribute_threshold_sign: hlc_tracker missing — node not running?",
-            )?,
-            g.dm_device_id.clone().ok_or(
-                "dfrost_contribute_threshold_sign: dm_device_id missing — no owner identity?",
-            )?,
-            g.dm_self_owner.ok_or(
-                "dfrost_contribute_threshold_sign: dm_self_owner missing — no owner identity?",
-            )?,
-            g.dm_outbox.clone().ok_or(
-                "dfrost_contribute_threshold_sign: dm_outbox missing — no owner identity?",
-            )?,
+            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.dfrost_logs),
             g.dfrost_log_registry.clone(),
         )
@@ -29249,21 +28994,12 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
             .lock()
             .map_err(|e| format!("dfrost_propose_refresh: NodeState poisoned: {e}"))?;
         (
-            g.hlc_tracker
-                .clone()
-                .ok_or("dfrost_propose_refresh: hlc_tracker missing — node not running?")?,
-            g.dm_device_id
-                .clone()
-                .ok_or("dfrost_propose_refresh: dm_device_id missing — no owner identity?")?,
-            g.dm_self_owner
-                .ok_or("dfrost_propose_refresh: dm_self_owner missing — no owner identity?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dfrost_propose_refresh: dm_outbox missing — no owner identity?")?,
+            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             std::sync::Arc::clone(&g.dfrost_logs),
-            g.community_registry
-                .clone()
-                .ok_or("dfrost_propose_refresh: community_registry missing — node not running?")?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dfrost_log_registry.clone(),
         )
     };
@@ -30684,8 +30420,14 @@ async fn connectivity_set_identity_discoverable(
         )
     };
 
-    let (Some(id_pub), Some(path)) = (id_pub, settings_path) else {
-        return Err("pkarr publisher not initialized — node not running?".into());
+    // id_pub is owner-identity material; settings_path is a config/startup
+    // dependency — keep their failure messages distinct so a missing settings
+    // path doesn't misdirect the user toward recreating their identity.
+    let Some(id_pub) = id_pub else {
+        return Err(OWNER_NOT_LOADED_MSG.into());
+    };
+    let Some(path) = settings_path else {
+        return Err("pkarr_settings_path missing".into());
     };
 
     // Persist the preference.
@@ -36592,6 +36334,236 @@ mod zeb_321_connectivity_ipc_tests {
     }
 }
 
+/// ZEB-338: unit tests for `owner_loaded::require_owner_loaded`.
+///
+/// Placed here (not in `owner_loaded.rs`) because `NodeState` fields are
+/// private to this module. Tests in sub-modules cannot set private fields
+/// directly; placing them here gives `use super::*` access.
+///
+/// Coverage gap: the happy-path `require_owner_loaded → Ok(handles)` test
+/// is OMITTED because `NodeState.channel_log_registry` is typed
+/// `ChannelLogRegistry<tauri::Wry>`, and there is no supported way to
+/// construct a `ChannelLogRegistry<tauri::Wry>` in tests (only
+/// `MockRuntime` is available via `tauri::test::mock_app()`). The `NotLoaded`
+/// paths for all 8 nullable fields are covered below. The `Ok` path is
+/// exercised indirectly by integration tests that call owner-touching IPCs
+/// against a running `start_node` fixture.
+#[cfg(test)]
+mod owner_loaded_tests {
+    use super::*;
+    use crate::community_state_sync::{CommunityRegistryConfig, CommunitySyncRegistry};
+    use crate::content_store::InMemoryStub;
+    use crate::dm_outbox::DmOutbox;
+    use crate::owner_loaded::{require_owner_loaded, OwnerLoadError};
+    use crate::owner_state_crdt::OwnerState;
+    use crate::owner_state_types::{DeviceIdentityHash, Hlc, OwnerAddr};
+    use harmony_identity::PrivateIdentity;
+    use std::collections::BTreeMap;
+    use tokio::sync::mpsc;
+
+    // ── Fixture helpers ──────────────────────────────────────────────────────
+
+    fn signing_key_from_identity(
+        identity: &PrivateIdentity,
+    ) -> std::sync::Arc<ed25519_dalek::SigningKey> {
+        let sk_bytes_full = identity.to_private_bytes();
+        let ed_seed: [u8; 32] = sk_bytes_full[32..64]
+            .try_into()
+            .expect("ed25519 seed slice 32..64");
+        std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed_seed))
+    }
+
+    /// Build the seven owner fields that do NOT require `tauri::Wry`.
+    /// Returns (NodeState with 7/8 owner fields as Some, receiver kept alive).
+    ///
+    /// `channel_log_registry` is left as `None` because
+    /// `ChannelLogRegistry<tauri::Wry>` cannot be constructed in tests.
+    /// See module-level coverage-gap note above.
+    fn node_state_with_seven_owner_fields() -> (
+        NodeState,
+        mpsc::Receiver<crate::event_loop::CommunityAdapterRequest>,
+    ) {
+        let identity = PrivateIdentity::from_seed(&[0xab; 32]);
+        let self_owner = OwnerAddr(identity.identity.address_hash);
+        let signing_key = signing_key_from_identity(&identity);
+        let identity_pub_64 = identity.identity.to_public_bytes();
+
+        // Minimal identity resolver: admits only self_owner.
+        struct SelfOnlyResolver {
+            owner: OwnerAddr,
+            pub_64: [u8; 64],
+        }
+        #[async_trait::async_trait]
+        impl crate::community_state_sync::IdentityResolver for SelfOnlyResolver {
+            async fn resolve(&self, addr: &OwnerAddr) -> Option<[u8; 64]> {
+                if *addr == self.owner {
+                    Some(self.pub_64)
+                } else {
+                    None
+                }
+            }
+        }
+
+        let cs: std::sync::Arc<dyn crate::content_store::ContentStore> =
+            std::sync::Arc::new(InMemoryStub::default());
+
+        let community_registry =
+            std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+                device_id: "owner-loaded-test".into(),
+                content_store: cs,
+                identity_resolver: std::sync::Arc::new(SelfOnlyResolver {
+                    owner: self_owner,
+                    pub_64: identity_pub_64,
+                }),
+                identity_dir: std::path::PathBuf::from(""),
+                debounce_ms: crate::community_state_sync::DEFAULT_DEBOUNCE_MS,
+                error_tx: None,
+                delta_tx: None,
+                self_owner,
+                signing_key: std::sync::Arc::clone(&signing_key),
+                crdt_state: None,
+                nav_emitter: None,
+            }));
+
+        let (community_adapter_request_tx, community_adapter_rx) =
+            mpsc::channel::<crate::event_loop::CommunityAdapterRequest>(4);
+
+        let device_hash = DeviceIdentityHash(identity.identity.address_hash);
+        let private_identity = std::sync::Arc::new(identity);
+        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new(
+            "owner-loaded-test".into(),
+            self_owner,
+            device_hash,
+            std::sync::Arc::clone(&signing_key),
+            private_identity,
+        )));
+
+        let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
+        let hlc_tracker: std::sync::Arc<tokio::sync::Mutex<BTreeMap<String, Hlc>>> =
+            std::sync::Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+
+        let ns = NodeState {
+            crdt_state: Some(std::sync::Arc::clone(&crdt_state)),
+            hlc_tracker: Some(std::sync::Arc::clone(&hlc_tracker)),
+            dm_device_id: Some("owner-loaded-test".into()),
+            dm_self_owner: Some(self_owner),
+            community_registry: Some(std::sync::Arc::clone(&community_registry)),
+            community_adapter_request_tx: Some(community_adapter_request_tx),
+            channel_log_registry: None, // Wry only — see coverage-gap note
+            dm_outbox: Some(std::sync::Arc::clone(&dm_outbox)),
+            generation: 7,
+            ..NodeState::default()
+        };
+
+        (ns, community_adapter_rx)
+    }
+
+    // ── Tests ────────────────────────────────────────────────────────────────
+
+    /// Precondition check: all 7 buildable owner fields present but
+    /// `channel_log_registry` absent → NotLoaded.
+    /// This also serves as a smoke test that `require_owner_loaded` compiles
+    /// and returns the expected error variant when the Wry registry is absent.
+    #[test]
+    fn require_owner_loaded_returns_not_loaded_when_channel_log_registry_none() {
+        let (ns, _rx) = node_state_with_seven_owner_fields();
+        let state = Mutex::new(ns);
+        assert!(matches!(
+            require_owner_loaded(&state),
+            Err(OwnerLoadError::NotLoaded)
+        ));
+    }
+
+    #[test]
+    fn require_owner_loaded_returns_not_loaded_when_crdt_state_none() {
+        let (mut ns, _rx) = node_state_with_seven_owner_fields();
+        ns.crdt_state = None;
+        let state = Mutex::new(ns);
+        assert!(matches!(
+            require_owner_loaded(&state),
+            Err(OwnerLoadError::NotLoaded)
+        ));
+    }
+
+    #[test]
+    fn require_owner_loaded_returns_not_loaded_when_hlc_tracker_none() {
+        let (mut ns, _rx) = node_state_with_seven_owner_fields();
+        ns.hlc_tracker = None;
+        let state = Mutex::new(ns);
+        assert!(matches!(
+            require_owner_loaded(&state),
+            Err(OwnerLoadError::NotLoaded)
+        ));
+    }
+
+    #[test]
+    fn require_owner_loaded_returns_not_loaded_when_dm_device_id_none() {
+        let (mut ns, _rx) = node_state_with_seven_owner_fields();
+        ns.dm_device_id = None;
+        let state = Mutex::new(ns);
+        assert!(matches!(
+            require_owner_loaded(&state),
+            Err(OwnerLoadError::NotLoaded)
+        ));
+    }
+
+    #[test]
+    fn require_owner_loaded_returns_not_loaded_when_dm_self_owner_none() {
+        let (mut ns, _rx) = node_state_with_seven_owner_fields();
+        ns.dm_self_owner = None;
+        let state = Mutex::new(ns);
+        assert!(matches!(
+            require_owner_loaded(&state),
+            Err(OwnerLoadError::NotLoaded)
+        ));
+    }
+
+    #[test]
+    fn require_owner_loaded_returns_not_loaded_when_community_registry_none() {
+        let (mut ns, _rx) = node_state_with_seven_owner_fields();
+        ns.community_registry = None;
+        let state = Mutex::new(ns);
+        assert!(matches!(
+            require_owner_loaded(&state),
+            Err(OwnerLoadError::NotLoaded)
+        ));
+    }
+
+    #[test]
+    fn require_owner_loaded_returns_not_loaded_when_community_adapter_request_tx_none() {
+        let (mut ns, _rx) = node_state_with_seven_owner_fields();
+        ns.community_adapter_request_tx = None;
+        let state = Mutex::new(ns);
+        assert!(matches!(
+            require_owner_loaded(&state),
+            Err(OwnerLoadError::NotLoaded)
+        ));
+    }
+
+    #[test]
+    fn require_owner_loaded_returns_not_loaded_when_dm_outbox_none() {
+        let (mut ns, _rx) = node_state_with_seven_owner_fields();
+        ns.dm_outbox = None;
+        let state = Mutex::new(ns);
+        assert!(matches!(
+            require_owner_loaded(&state),
+            Err(OwnerLoadError::NotLoaded)
+        ));
+    }
+
+    /// Verify the `From<OwnerLoadError> for String` impl produces a
+    /// user-visible non-empty message (not an empty string or panic).
+    #[test]
+    fn owner_load_error_not_loaded_to_string_is_non_empty() {
+        let msg = String::from(OwnerLoadError::NotLoaded);
+        assert!(!msg.is_empty(), "NotLoaded error message must not be empty");
+        assert!(
+            !msg.contains("node not running"),
+            "NotLoaded must not use old misleading phrasing; got: {msg}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod start_node_response_tests {
     use super::*;
@@ -36601,6 +36573,7 @@ mod start_node_response_tests {
         let r = StartNodeResponse {
             node_addr: "iroh:abc123".to_string(),
             freshly_created: true,
+            has_owner_identity: false,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(
@@ -36620,8 +36593,40 @@ mod start_node_response_tests {
         let r = StartNodeResponse {
             node_addr: "iroh:xyz".to_string(),
             freshly_created: false,
+            has_owner_identity: false,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("\"freshlyCreated\":false"));
+    }
+}
+
+#[cfg(test)]
+mod start_node_response_wire_tests {
+    use super::StartNodeResponse;
+
+    #[test]
+    fn start_node_response_serializes_has_owner_identity_in_camel_case() {
+        let r = StartNodeResponse {
+            node_addr: "iroh:abc".to_string(),
+            freshly_created: true,
+            has_owner_identity: false,
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["nodeAddr"], "iroh:abc");
+        assert_eq!(json["freshlyCreated"], true);
+        assert_eq!(json["hasOwnerIdentity"], false);
+        // Exactly three keys — no snake_case leakage, no extra fields.
+        assert_eq!(json.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn start_node_response_has_owner_identity_true_shape() {
+        let r = StartNodeResponse {
+            node_addr: "iroh:xyz".to_string(),
+            freshly_created: false,
+            has_owner_identity: true,
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["hasOwnerIdentity"], true);
     }
 }

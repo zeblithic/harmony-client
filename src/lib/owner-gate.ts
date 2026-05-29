@@ -1,0 +1,39 @@
+import type { StartNodeResponse } from './types/onboarding';
+
+/**
+ * ZEB-338 / PR #169 — backend-authoritative owner-identity gate state.
+ *
+ * Distinguishing these four is load-bearing. The original implementation
+ * collapsed them into a boolean (`startResp?.hasOwnerIdentity === true`), which
+ * made `start_node` *failure* indistinguishable from "no owner identity". That
+ * dumped returning users into the non-dismissible WelcomeModal — and
+ * `mint_owner_identity` refuses to re-mint when `owner_state.cbor` already
+ * exists, so they were permanently trapped (the exact deadlock class this
+ * feature exists to remove).
+ *
+ * - `unknown` — boot in flight; `start_node` has not resolved yet.
+ * - `present` — `start_node` succeeded AND reports an owner identity.
+ * - `missing` — `start_node` succeeded AND explicitly reports no owner identity
+ *               (the genuine first-run case → show WelcomeModal hard gate).
+ * - `error`   — `start_node` threw; we must NOT assume "no identity" and must
+ *               NOT show the mint gate. Surface a retry instead.
+ */
+export type OwnerIdentityState = 'unknown' | 'present' | 'missing' | 'error';
+
+/**
+ * Classify the owner-identity gate from a `start_node` outcome.
+ *
+ * @param resp   the resolved {@link StartNodeResponse}, or null if it threw
+ * @param failed true iff the `start_node` invoke rejected
+ *
+ * Forward-compat: an older backend that omits `hasOwnerIdentity` classifies as
+ * `missing` (undefined is not `=== true`), so onboarding is shown rather than
+ * silently skipped.
+ */
+export function classifyOwnerIdentity(
+  resp: StartNodeResponse | null,
+  failed: boolean,
+): OwnerIdentityState {
+  if (failed || resp == null) return 'error';
+  return resp.hasOwnerIdentity === true ? 'present' : 'missing';
+}

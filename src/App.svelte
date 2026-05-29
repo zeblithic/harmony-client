@@ -57,9 +57,18 @@
   import { onMount } from 'svelte';
   import type { Update } from '@tauri-apps/plugin-updater';
   import { checkForUpdate } from './lib/updater-adapter';
-  import { extractHarmonyInviteUrl } from './lib/deep-link-router';
+  import {
+    extractHarmonyInviteUrl,
+    queueInviteForPostMint,
+    consumeQueuedInvite,
+  } from './lib/deep-link-router';
   import UpdateAvailableToast from './lib/components/UpdateAvailableToast.svelte';
   import WelcomeModal from './lib/components/WelcomeModal.svelte';
+  import BackupReminderBanner from './lib/components/BackupReminderBanner.svelte';
+  import type { MintIpcResult } from './lib/owner-service';
+  import type { StartNodeResponse } from './lib/types/onboarding';
+  import { classifyOwnerIdentity, type OwnerIdentityState } from './lib/owner-gate';
+  import { trapFocus } from './lib/focus-trap';
   import HelpMenuButton from './lib/components/HelpMenuButton.svelte';
   import FeedbackModal from './lib/components/FeedbackModal.svelte';
   import AboutModal from './lib/components/AboutModal.svelte';
@@ -235,23 +244,60 @@
   let availableUpdate = $state<Update | null>(null);
   // ── ZEB-331: first-run welcome + feedback + about ─────────────────
   let showWelcomeModal = $state(false);
+  // ZEB-338 / PR #169: backend-authoritative owner-identity gate. Four states
+  // (see owner-gate.ts) so a start_node *failure* is never mistaken for "no
+  // owner identity" — that mistake trapped returning users in the mint gate.
+  // 'unknown' until start_node resolves; 'present' after a successful mint.
+  let ownerIdentityState = $state<OwnerIdentityState>('unknown');
+  // ZEB-338 / PR #169: message from a failed start_node, shown in the startup
+  // error overlay (the non-mint escape from the 'error' state).
+  let startNodeError = $state<string | null>(null);
+  // ZEB-338 / PR #169: bound to the startup-error dialog for its focus trap.
+  let startupErrorModalEl = $state<HTMLElement | null>(null);
+
+  // ZEB-338 / PR #169: the startup-error overlay is a blocking dialog, so trap
+  // focus inside it (same util as WelcomeModal) — keyboard users must not be
+  // able to tab into background app controls behind it.
+  $effect(() => {
+    if (ownerIdentityState !== 'error' || startupErrorModalEl === null) return;
+    return trapFocus(startupErrorModalEl);
+  });
   let feedbackModalOpen = $state(false);
   let aboutModalOpen = $state(false);
 
-  // ZEB-331 R3: persist welcome acknowledgement to localStorage so a
-  // failed start_node mid-keychain-write doesn't permanently swallow
-  // the welcome. Called from every site that completes onboarding:
-  // Dismiss, Join-with-invite, and deep-link-suppresses-welcome
-  // (Cursor R5 "deep-link skips welcome ack" — joining via harmony://
-  // is itself an onboarding-complete action). Safe to call when the
-  // flag is already set.
-  function acknowledgeWelcome(): void {
-    try {
-      window.localStorage.setItem('harmony.onboarding.welcomeAcknowledged', 'true');
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      console.debug('[harmony-client] welcomeAcknowledged write failed:', msg);
+  // ZEB-338: route an incoming harmony:// invite. Pre-mint (no owner identity)
+  // → queue for the post-mint drain. Post-mint → open the redeem dialog.
+  function routeInviteUrl(url: string): void {
+    if (ownerIdentityState !== 'present') {
+      // No loaded owner identity yet (first run, boot-in-flight, or a startup
+      // error) → queue for the post-mint / post-recovery drain.
+      queueInviteForPostMint(url);
+      return;
     }
+    redeemUrl = url;
+    redeemError = null;
+    showRedeemInvite = true;
+  }
+
+  // ZEB-338: drain a queued invite into the redeem dialog (called post-mint and
+  // post-boot-when-owner-already-present).
+  function drainQueuedInvite(): void {
+    const queued = consumeQueuedInvite();
+    if (queued !== null) {
+      redeemUrl = queued;
+      redeemError = null;
+      showRedeemInvite = true;
+    }
+  }
+
+  // ZEB-338: WelcomeModal hard-gate completion. Flip owner-present, close the
+  // gate, and drain any invite that was queued pre-mint (Flow 3).
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  async function onMinted(_result: MintIpcResult): Promise<void> {
+    ownerIdentityState = 'present';
+    startNodeError = null;
+    showWelcomeModal = false;
+    drainQueuedInvite();
   }
 
   let showCreateCommunity = $state(false);
@@ -688,42 +734,40 @@
       // identity loads and mail_mgr is ready before adapters wire up. The
       // Network view's Connect flow can later re-invoke start_node with an
       // endpoint to join a gateway.
+      let startResp: StartNodeResponse | null = null;
+      let startFailed = false;
       try {
-        await invoke('start_node', { endpoint: null });
+        startResp = await invoke<StartNodeResponse>('start_node', { endpoint: null });
       } catch (err) {
-        console.warn('[harmony-client] auto-start_node failed:', err);
+        // feedback_tauri_error_extraction: production rejections are strings,
+        // tests use Error objects — normalize either way.
+        startFailed = true;
+        startNodeError = err instanceof Error ? err.message : String(err);
+        console.warn('[harmony-client] auto-start_node failed:', startNodeError);
       }
-      // ZEB-331 R3 (Cursor Medium "welcome lost after failed start"):
-      // gate welcome on a persistent localStorage flag rather than on
-      // the in-memory freshlyCreated signal from start_node. The IPC
-      // returns freshlyCreated for forward-compat / future analytics
-      // but it isn't load-bearing for welcome anymore — start_node
-      // has ~2900 lines of post-keychain-write setup, and any failure
-      // path there would have lost the in-memory signal and prevented
-      // the welcome from ever appearing on subsequent successful
-      // starts. localStorage decouples "welcome owed to user" from
-      // start_node lifecycle so a failed first start retries on next
-      // launch.
-      //
-      // Race resolution (Flow 5 cont.): a deep-link can arrive during
-      // start_node. The deep-link handler sets showRedeemInvite=true +
-      // showWelcomeModal=false. Don't flash welcome over the redeem
-      // dialog.
-      try {
-        const acked =
-          window.localStorage.getItem('harmony.onboarding.welcomeAcknowledged');
-        if (acked !== 'true' && !showRedeemInvite) {
-          showWelcomeModal = true;
-        }
-      } catch (e) {
-        // localStorage unavailable (incognito / sandbox / quota): show
-        // welcome — safer to greet than to silently skip a possibly-new
-        // user. The next dismiss will try the write again.
-        const msg = e instanceof Error ? e.message : String(e);
-        console.debug('[harmony-client] welcomeAcknowledged read failed:', msg);
-        if (!showRedeemInvite) {
-          showWelcomeModal = true;
-        }
+
+      // ZEB-338 / PR #169: gate on backend owner-identity presence, but keep
+      // start_node *failure* distinct from "no owner identity". Forward-compat:
+      // an older backend that omits hasOwnerIdentity classifies as 'missing'
+      // (onboarding shown), never silently skipped. The backend keychain is the
+      // authoritative source of "is this a new user".
+      ownerIdentityState = classifyOwnerIdentity(startResp, startFailed);
+      if (ownerIdentityState === 'present') {
+        showWelcomeModal = false;
+        // Returning user who clicked an invite before start_node resolved:
+        // drain it. (routeInviteUrl queued it because the owner wasn't loaded
+        // yet at the time.)
+        drainQueuedInvite();
+      } else if (ownerIdentityState === 'missing') {
+        // Genuine first run → hard gate. (A deep-link that already arrived was
+        // queued by routeInviteUrl, not shown over the welcome.)
+        showWelcomeModal = true;
+      } else {
+        // 'error': start_node threw. Do NOT show the mint gate — if an identity
+        // already exists on disk but failed to load, the non-dismissible mint
+        // gate would deadlock (mint refuses "already exists"). The startup-error
+        // overlay offers a retry instead.
+        showWelcomeModal = false;
       }
 
       // ZEB-281 Sub-D Phase 4 R1: hydrate the per-community
@@ -865,11 +909,7 @@
       unlistenDeepLink = await listen<string[]>('deep-link-received', (event) => {
         const url = extractHarmonyInviteUrl(event.payload);
         if (url) {
-          redeemUrl = url;
-          redeemError = null;
-          showRedeemInvite = true;
-          showWelcomeModal = false;
-          acknowledgeWelcome(); // joining via deep-link is onboarding-complete
+          routeInviteUrl(url);
         }
       });
 
@@ -882,11 +922,7 @@
         if (queued) {
           const url = extractHarmonyInviteUrl(queued);
           if (url) {
-            redeemUrl = url;
-            redeemError = null;
-            showRedeemInvite = true;
-            showWelcomeModal = false;
-            acknowledgeWelcome(); // cold-launch invite = onboarding-complete
+            routeInviteUrl(url);
           }
         }
       } catch (e) {
@@ -2020,27 +2056,58 @@
   />
 {/if}
 
-<!-- ZEB-331: first-run welcome modal. Shown until the user
-     acknowledges (Skip / Join / Esc / backdrop) — persisted via
-     localStorage so a failed start_node mid-keychain-write doesn't
-     permanently swallow the welcome (R3 Cursor Medium). Suppressed
-     by deep-link handlers (Flow 5 — both warm-launch and cold-
-     launch paths set showWelcomeModal=false when a harmony:// URL
-     is received). -->
-<WelcomeModal
-  open={showWelcomeModal}
-  onDismiss={() => {
-    showWelcomeModal = false;
-    acknowledgeWelcome();
-  }}
-  onJoinWithInvite={(url) => {
-    redeemUrl = url;
-    redeemError = null;
-    showRedeemInvite = true;
-    showWelcomeModal = false;
-    acknowledgeWelcome();
-  }}
-/>
+<!-- ZEB-338: first-run welcome hard-gate. Visibility is owned by
+     ownerIdentityState === 'missing' (backend keychain authoritative): shown
+     only when start_node succeeded and reported no owner identity, not
+     dismissable, closed by onMinted on successful mint. A start_node *failure*
+     shows the startup-error overlay below instead — never this mint gate. -->
+<WelcomeModal open={showWelcomeModal} {onMinted} />
+
+<!-- ZEB-338 / PR #169: startup-error overlay. When start_node fails we must not
+     show the mint gate (an existing-but-unloaded identity would deadlock it),
+     so surface an honest error + retry. Reload re-runs the whole boot, which
+     re-invokes start_node and re-classifies the gate. -->
+{#if ownerIdentityState === 'error'}
+  <div class="modal-overlay" data-testid="startup-error-backdrop" role="presentation">
+    <div
+      bind:this={startupErrorModalEl}
+      class="modal-content startup-error-modal"
+      data-testid="startup-error-modal"
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="startup-error-title"
+      tabindex="-1"
+    >
+      <h2 id="startup-error-title">Couldn't start Harmony</h2>
+      <p>
+        The Harmony node failed to start, so the app can't load your identity
+        yet. Your data is untouched — this is usually a temporary problem (for
+        example, another copy of Harmony is still running).
+      </p>
+      {#if startNodeError}
+        <p class="error" data-testid="startup-error-detail">{startNodeError}</p>
+      {/if}
+      <div class="startup-error-actions">
+        <button
+          class="primary"
+          data-testid="startup-error-retry"
+          onclick={() => location.reload()}
+        >
+          Retry
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+<!-- ZEB-338: backup-reminder banner. Self-gates on backup-skipped state; only
+     shown once an owner identity is loaded so it never stacks behind the mint
+     gate or the startup-error overlay. -->
+{#if ownerIdentityState === 'present'}
+  <div class="backup-banner-overlay">
+    <BackupReminderBanner />
+  </div>
+{/if}
 
 <!-- ZEB-331: fixed-position help button overlay. Position top-right. -->
 <div class="help-overlay">
@@ -2168,6 +2235,55 @@
     top: 12px;
     right: 12px;
     z-index: 50;
+  }
+
+  /* ZEB-338: backup-reminder banner overlay. Below modal (1000) + help
+     overlay; above app chrome. */
+  .backup-banner-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 40;
+  }
+
+  /* ZEB-338 / PR #169: startup-error overlay (start_node failed). */
+  .startup-error-modal {
+    color: var(--text-primary, #fff);
+    padding: 1.5rem;
+    max-width: 520px;
+    width: 90%;
+  }
+  .startup-error-modal h2 {
+    margin: 0 0 1rem;
+    font-size: 1.25rem;
+  }
+  .startup-error-modal p {
+    margin: 0 0 1rem;
+    line-height: 1.5;
+  }
+  .startup-error-modal .error {
+    color: var(--danger, #d9534f);
+    font-family: var(--font-mono, monospace);
+    font-size: 0.85rem;
+    word-break: break-word;
+  }
+  .startup-error-actions {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+  }
+  .startup-error-actions button {
+    padding: 0.5rem 1rem;
+    border: 1px solid var(--border, #444);
+    background: var(--bg-tertiary, #1f1f1f);
+    color: var(--text-primary, #fff);
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .startup-error-actions button.primary {
+    background: var(--accent, #5865f2);
+    border-color: var(--accent, #5865f2);
   }
 
 </style>
