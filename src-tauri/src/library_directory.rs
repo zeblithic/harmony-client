@@ -1398,6 +1398,7 @@ mod tests {
             },
             sig: [0u8; 64],
             countersig: None,
+            enrollment: None,
         };
         let payload = CommunityInvitePayload {
             community_id,
@@ -2646,6 +2647,7 @@ mod tests {
             },
             sig: [0u8; 64],
             countersig: None,
+            enrollment: None,
         };
 
         let payload = CommunityInvitePayload {

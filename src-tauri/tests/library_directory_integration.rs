@@ -97,6 +97,7 @@ fn invite_only_url() -> String {
         },
         sig: [0u8; 64],
         countersig: None,
+        enrollment: None,
     };
     let payload = CommunityInvitePayload {
         community_id,

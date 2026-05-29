@@ -77,6 +77,7 @@ fn fixture_signed_event_zeb285(kind: MembershipEventKind) -> SignedMembershipEve
         at: fixture_hlc(),
         sig: [0xBB; 64],
         countersig: None,
+        enrollment: None,
     }
 }
 

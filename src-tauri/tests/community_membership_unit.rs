@@ -71,6 +71,7 @@ fn signed_event_round_trips_through_canonical_cbor() {
         },
         sig: [0xAA; 64],
         countersig: None,
+        enrollment: None,
     };
 
     let bytes = canonical_cbor_encode(&event).expect("encode");
@@ -97,6 +98,7 @@ fn signed_event_with_countersig_round_trips() {
         },
         sig: [0xAA; 64],
         countersig: Some(countersig.clone()),
+        enrollment: None,
     };
 
     let bytes = canonical_cbor_encode(&event).expect("encode");
@@ -2666,6 +2668,7 @@ fn materialize_channel_create_adds_to_map() {
         },
         sig: [0; 64],
         countersig: None,
+        enrollment: None,
     };
     let ch_id = ChannelId([0xAB; 16]);
     let ch_create = SignedMembershipEvent {
@@ -2684,6 +2687,7 @@ fn materialize_channel_create_adds_to_map() {
         },
         sig: [0; 64],
         countersig: None,
+        enrollment: None,
     };
 
     let m: MaterializedMembership = materialize(&[admin_join, ch_create.clone()], admin);
@@ -2714,6 +2718,7 @@ fn materialize_channel_create_duplicate_is_first_wins_idempotent() {
         },
         sig: [0; 64],
         countersig: None,
+        enrollment: None,
     };
     let ch_id = ChannelId([0xAB; 16]);
     let ch_first = SignedMembershipEvent {
@@ -2732,6 +2737,7 @@ fn materialize_channel_create_duplicate_is_first_wins_idempotent() {
         },
         sig: [0; 64],
         countersig: None,
+        enrollment: None,
     };
     let ch_second = SignedMembershipEvent {
         id: [0x03; 16],
@@ -2749,6 +2755,7 @@ fn materialize_channel_create_duplicate_is_first_wins_idempotent() {
         },
         sig: [0; 64],
         countersig: None,
+        enrollment: None,
     };
 
     let m = materialize(&[admin_join, ch_first, ch_second], admin);
@@ -2776,6 +2783,7 @@ fn materialize_channel_modify_partial_update_preserves_unmodified_field() {
         },
         sig: [0; 64],
         countersig: None,
+        enrollment: None,
     };
     let ch_id = ChannelId([0xAB; 16]);
     let ch_create = SignedMembershipEvent {
@@ -2794,6 +2802,7 @@ fn materialize_channel_modify_partial_update_preserves_unmodified_field() {
         },
         sig: [0; 64],
         countersig: None,
+        enrollment: None,
     };
     // Only modify name — write_power should stay at 0.
     let ch_modify = SignedMembershipEvent {
@@ -2812,6 +2821,7 @@ fn materialize_channel_modify_partial_update_preserves_unmodified_field() {
         },
         sig: [0; 64],
         countersig: None,
+        enrollment: None,
     };
 
     let m = materialize(&[admin_join, ch_create, ch_modify], admin);
@@ -2837,6 +2847,7 @@ fn materialize_channel_delete_tombstones_in_place() {
         },
         sig: [0; 64],
         countersig: None,
+        enrollment: None,
     };
     let ch_id = ChannelId([0xAB; 16]);
     let ch_create = SignedMembershipEvent {
@@ -2855,6 +2866,7 @@ fn materialize_channel_delete_tombstones_in_place() {
         },
         sig: [0; 64],
         countersig: None,
+        enrollment: None,
     };
     let ch_delete = SignedMembershipEvent {
         id: [0x03; 16],
@@ -2868,6 +2880,7 @@ fn materialize_channel_delete_tombstones_in_place() {
         },
         sig: [0; 64],
         countersig: None,
+        enrollment: None,
     };
 
     let m = materialize(&[admin_join, ch_create, ch_delete], admin);
@@ -2900,6 +2913,7 @@ fn materialize_channel_modify_on_unknown_channel_is_noop() {
         },
         sig: [0; 64],
         countersig: None,
+        enrollment: None,
     };
     let ch_modify = SignedMembershipEvent {
         id: [0x02; 16],
@@ -2917,6 +2931,7 @@ fn materialize_channel_modify_on_unknown_channel_is_noop() {
         },
         sig: [0; 64],
         countersig: None,
+        enrollment: None,
     };
 
     let m = materialize(&[admin_join, ch_modify], admin);
@@ -2945,6 +2960,7 @@ fn verify_event_channel_create_succeeds_for_admin_at_bootstrap_power() {
         },
         sig: [0; 64],
         countersig: None,
+        enrollment: None,
     };
     let prior_state = materialize(&[admin_join], admin_addr);
 

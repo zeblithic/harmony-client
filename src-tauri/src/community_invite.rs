@@ -1904,6 +1904,7 @@ mod tests {
             },
             sig: [0u8; 64],
             countersig: None,
+            enrollment: None,
         };
 
         CommunityInvitePayload {
@@ -2080,6 +2081,7 @@ mod tests {
             // not crypto verification.
             sig: [0u8; 64],
             countersig: None,
+            enrollment: None,
         };
 
         let mut identity_pubs: BTreeMap<OwnerAddr, [u8; 64]> = BTreeMap::new();
@@ -2185,6 +2187,7 @@ mod tests {
             },
             sig: [0u8; 64],
             countersig: None,
+            enrollment: None,
         };
 
         let mut identity_pubs: BTreeMap<OwnerAddr, [u8; 64]> = BTreeMap::new();

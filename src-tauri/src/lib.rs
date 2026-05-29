@@ -11955,6 +11955,7 @@ mod list_community_forks_tests {
             at: hlc_at(wall_ms),
             sig: [0u8; 64],
             countersig: None,
+            enrollment: None,
         }
     }
 
@@ -12237,6 +12238,7 @@ mod list_community_forks_tests {
                 },
                 sig: [0u8; 64],
                 countersig: None,
+                enrollment: None,
             },
         );
         events.insert(
@@ -12255,6 +12257,7 @@ mod list_community_forks_tests {
                 },
                 sig: [0u8; 64],
                 countersig: None,
+                enrollment: None,
             },
         );
 
@@ -32593,6 +32596,7 @@ mod create_channel_delta_tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         };
         let payload = delta_to_channel_config_change(&CommunityMembershipDelta {
             community_id,
@@ -32623,6 +32627,7 @@ mod create_channel_delta_tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         };
         let payload = delta_to_channel_config_change(&CommunityMembershipDelta {
             community_id,
@@ -32646,6 +32651,7 @@ mod create_channel_delta_tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         };
         let payload = delta_to_channel_config_change(&CommunityMembershipDelta {
             community_id,
@@ -32680,6 +32686,7 @@ mod create_channel_delta_tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         };
         let delta = CommunityMembershipDelta {
             community_id,
@@ -32742,6 +32749,7 @@ mod create_channel_delta_tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         };
         tx.send(CommunityMembershipDelta {
             community_id,
@@ -33837,6 +33845,7 @@ mod pending_join_audit_feed_tests {
             },
             sig: [0u8; 64],
             countersig: None,
+            enrollment: None,
         }
     }
 
@@ -34807,6 +34816,7 @@ mod list_pending_admin_proposals_tests {
             at: hlc(wall_ms),
             sig: [0u8; 64],
             countersig: None,
+            enrollment: None,
         }
     }
 

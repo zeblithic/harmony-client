@@ -7,6 +7,7 @@
 //!
 //! See `docs/specs/2026-05-05-zeb-217-sub-c-communities-design.md`.
 
+use harmony_owner::certs::EnrollmentCert;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -336,10 +337,12 @@ pub struct ChannelId(
 
 /// One signed event in a community's membership CRDT.
 ///
-/// Wire format: 8-key CBOR map. All keys are 2 chars (text(2) = 3 bytes
-/// each) to satisfy the same-length-keys invariant at this nesting
-/// level. Adjacently-tagged inner enums (MembershipEventKind,
-/// CounterSignature) follow the same rule recursively.
+/// Wire format: 6- to 8-key CBOR map — 6 mandatory keys, plus `cs`
+/// (invite-only Join countersig) and `en` (ZEB-339 enrollment cert on
+/// identity-introducing events), each omitted when None. All keys are
+/// 2 chars (text(2) = 3 bytes each) to satisfy the same-length-keys
+/// invariant at this nesting level. Adjacently-tagged inner enums
+/// (MembershipEventKind, CounterSignature) follow the same rule recursively.
 ///
 /// `sig` covers the canonical-CBOR encoding of (id, community_id, kind,
 /// actor, at) — countersig is excluded so an inviter can append their
@@ -380,6 +383,16 @@ pub struct SignedMembershipEvent {
     /// power level at the time of the join.
     #[serde(rename = "cs", skip_serializing_if = "Option::is_none", default)]
     pub countersig: Option<CounterSignature>,
+
+    /// ZEB-339: enrollment proof for the signer. REQUIRED on identity-
+    /// introducing events (bootstrap Join, Join, PendingJoin); absent
+    /// otherwise (the verifier resolves the signer's device key from
+    /// materialized membership). Sits OUTSIDE the signed EventPayload —
+    /// safe because cert.owner_id must equal the signed `actor`, the cert
+    /// is master-signed (unforgeable), and the event sig must verify under
+    /// cert.device_pubkeys.
+    #[serde(rename = "en", skip_serializing_if = "Option::is_none", default)]
+    pub enrollment: Option<EnrollmentCert>,
 }
 
 /// Counter-signature appended by an existing community member to vouch
@@ -500,6 +513,7 @@ pub fn sign_event(
         at: payload.at.clone(),
         sig,
         countersig: None,
+        enrollment: None,
     })
 }
 
@@ -526,6 +540,7 @@ pub fn sign_event_with_identity(
         at: payload.at.clone(),
         sig,
         countersig: None,
+        enrollment: None,
     })
 }
 
@@ -3783,6 +3798,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         }
     }
 
@@ -3819,6 +3835,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         }
     }
 
@@ -3837,6 +3854,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         }
     }
 
@@ -3857,6 +3875,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         }
     }
 
@@ -3893,6 +3912,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         }
     }
 
@@ -3915,6 +3935,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         }
     }
 
@@ -4051,6 +4072,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         };
         let kick = make_kick_event(0x01, admin, bob, 100);
         let rot = make_rotation_event(
@@ -4228,6 +4250,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         };
         let alice_join = make_join_event(0x01, alice, 51);
         let bob_join = make_join_event(0x02, bob, 52);
@@ -4440,6 +4463,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         };
         // Carol joins (to be kicked).
         let carol_join = make_join_event(0x02, carol, 20);
@@ -4501,6 +4525,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         };
         let bob_join = make_join_event(0x02, bob, 10);
         // Kick carol (not bob) so we have a rotation to establish epoch=1.
@@ -4626,6 +4651,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         }
     }
 
@@ -4649,6 +4675,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         }
     }
 
@@ -4739,6 +4766,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         };
         let kick = make_kick_event(0x01, admin_addr, target_addr, 10);
         let prior = materialize(
@@ -5044,6 +5072,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         };
 
         // Carol joins AFTER the rotation (epoch is now 1, carol was Invited).
@@ -5358,6 +5387,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         };
         let after = materialize(&[admin_join, fork], admin);
 
@@ -5402,6 +5432,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         };
 
         let m = materialize(&[admin_join, fork], admin);
@@ -5731,6 +5762,44 @@ mod tests {
                 "MembershipEventKind::ReachabilityAnnounce outer key {s:?} violates 2-char invariant"
             );
         }
+    }
+
+    // ── ZEB-339 Task 1: SignedMembershipEvent enrollment field round-trip ─────
+
+    /// ZEB-339: a steady-state event (enrollment=None) encodes with NO `en`
+    /// key (back-compat), and round-trips cleanly through canonical CBOR.
+    #[test]
+    fn signed_event_enrollment_roundtrips_and_defaults_absent() {
+        use crate::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
+
+        let ev = SignedMembershipEvent {
+            id: [1u8; 16],
+            community_id: SpaceId([2u8; 16]),
+            kind: MembershipEventKind::Leave,
+            actor: OwnerAddr([3u8; 16]),
+            at: Hlc {
+                wall_ms: 0,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            sig: [0u8; 64],
+            countersig: None,
+            enrollment: None,
+        };
+        let bytes = canonical_cbor_encode(&ev).unwrap();
+
+        // `bytes` is a 6-key map with NO `en` key (skip_serializing_if drops it
+        // when None) — i.e. byte-identical to a pre-ZEB-339 wire event. Decoding
+        // it here therefore doubles as the back-compat proof: old en-less bytes
+        // decode via `serde(default)` to enrollment=None rather than erroring.
+        let val: ciborium::Value = ciborium::de::from_reader(&bytes[..]).unwrap();
+        let map = val.as_map().expect("outer is map");
+        let has_en = map.iter().any(|(k, _)| k.as_text() == Some("en"));
+        assert!(!has_en, "`en` key must be absent when enrollment is None");
+
+        let back: SignedMembershipEvent = canonical_cbor_decode(&bytes).unwrap();
+        assert_eq!(back, ev);
+        assert!(back.enrollment.is_none());
     }
 }
 
@@ -8367,6 +8436,7 @@ mod zeb_250_materialize_prepass_tests {
                 },
                 sig: [0; 64],
                 countersig: None,
+                enrollment: None,
             },
             SignedMembershipEvent {
                 id: [0xBB; 16],
@@ -8382,6 +8452,7 @@ mod zeb_250_materialize_prepass_tests {
                 },
                 sig: [0; 64],
                 countersig: None,
+                enrollment: None,
             },
         ];
         // No assertion on effect yet — Task 8 wires the main-pass
@@ -8417,6 +8488,7 @@ mod zeb_250_admin_proposal_materialize_tests {
             kind,
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         }
     }
 

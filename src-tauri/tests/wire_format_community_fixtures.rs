@@ -31,6 +31,7 @@ fn fixture_signed_event(kind: MembershipEventKind) -> SignedMembershipEvent {
         at: fixture_hlc(),
         sig: [0xBB; 64],
         countersig: None,
+        enrollment: None,
     }
 }
 
@@ -228,6 +229,7 @@ fn community_invite_payload_invite_only_wire_bytes_pinned() {
         at: fixture_hlc(),
         sig: [0xEE; 64],
         countersig: None,
+        enrollment: None,
     };
 
     let p = CommunityInvitePayload {

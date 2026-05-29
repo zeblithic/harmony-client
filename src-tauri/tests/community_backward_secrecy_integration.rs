@@ -627,6 +627,7 @@ fn offline_catchup_through_multiple_rotations() {
             },
             sig: [0u8; 64],
             countersig: None,
+            enrollment: None,
         };
         // Just advance admin's space directly (we're not calling insert_local_event).
         let prev_epoch = admin_space.current_epoch.unwrap_or(0);
@@ -682,6 +683,7 @@ fn offline_catchup_through_multiple_rotations() {
         },
         sig: [0u8; 64],
         countersig: None,
+        enrollment: None,
     };
 
     // B applies the catchup.
@@ -1128,6 +1130,7 @@ fn concurrent_kicks_self_heal_end_to_end() {
         at: hlc(200),
         sig: [0; 64],
         countersig: None,
+        enrollment: None,
     };
     let join_y = SignedMembershipEvent {
         id: [0x12; 16],
@@ -1137,6 +1140,7 @@ fn concurrent_kicks_self_heal_end_to_end() {
         at: hlc(300),
         sig: [0; 64],
         countersig: None,
+        enrollment: None,
     };
     let join_z = SignedMembershipEvent {
         id: [0x13; 16],
@@ -1146,6 +1150,7 @@ fn concurrent_kicks_self_heal_end_to_end() {
         at: hlc(400),
         sig: [0; 64],
         countersig: None,
+        enrollment: None,
     };
 
     // Admin kicks X and Y simultaneously.
@@ -1316,6 +1321,7 @@ fn leaver_cooperative_rotation() {
         at: hlc(200),
         sig: [0; 64],
         countersig: None,
+        enrollment: None,
     };
 
     // B leaves cooperatively.
@@ -1403,6 +1409,7 @@ fn leaver_cooperative_rotation() {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         }
     };
     apply_rotation_to_space(&mut admin_space, &rotation2, admin_addr, &admin_signing_key);
@@ -1466,6 +1473,7 @@ fn leaver_malicious_self_include_rejected_admin_self_heals() {
         at: hlc(200),
         sig: [0; 64],
         countersig: None,
+        enrollment: None,
     };
     let leave_b = make_signed_event(
         0x10,
@@ -1587,6 +1595,7 @@ fn leaver_malicious_self_include_rejected_admin_self_heals() {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         }
     };
     apply_rotation_to_space(&mut admin_space, &rot_event, admin_addr, &admin_signing_key);
