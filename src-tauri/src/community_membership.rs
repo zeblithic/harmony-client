@@ -1168,6 +1168,12 @@ pub struct MemberState {
     pub joined_at: Hlc,
     #[serde(rename = "la", skip_serializing_if = "Option::is_none", default)]
     pub left_at: Option<Hlc>,
+    /// ZEB-339: ed25519 verify keys vouched under this member's owner_id,
+    /// learned from the EnrollmentCert carried on their Join. A SET so an
+    /// owner with multiple devices in a community is representable (eventual
+    /// state); populated with exactly one today.
+    #[serde(rename = "ek", default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub enrolled_device_keys: BTreeSet<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1185,6 +1191,63 @@ pub enum MemberStatus {
     /// JoinCountersign is materialized.
     #[serde(rename = "p")]
     PendingJoin,
+}
+
+/// ZEB-339 test helper: a realistic owner with an enrolled device key.
+/// Produced by `mint_test_owner`; consumed by membership tests that need
+/// the new `actor = owner_id ≠ address_hash(device_key)` signing model.
+#[cfg(any(test, feature = "test-fixtures"))]
+#[derive(Debug, Clone)]
+pub struct TestOwner {
+    pub owner: OwnerAddr,
+    pub device_key: ed25519_dalek::SigningKey,
+    pub cert: EnrollmentCert,
+}
+
+/// ZEB-339 test helper: produce a realistic owner — owner_id (master),
+/// an enrolled device signing key, and a self-minted Master EnrollmentCert
+/// binding them. `seed` makes it deterministic.
+///
+/// Note on seeds: the master key derives from `[seed; 32]` and the device
+/// key from `[seed ^ 0xFF; 32]`, so seeds `N` and `N ^ 0xFF` share raw key
+/// material (with master/device roles swapped). Use seeds in `0x01..=0xFE`
+/// and avoid pairing `N` with `N ^ 0xFF` in the same test.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn mint_test_owner(seed: u8) -> TestOwner {
+    use harmony_owner::pubkey_bundle::{ClassicalKeys, PubKeyBundle};
+    let master_sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+    let master_bundle = PubKeyBundle {
+        classical: ClassicalKeys {
+            ed25519_verify: master_sk.verifying_key().to_bytes(),
+            x25519_pub: [0u8; 32],
+        },
+        post_quantum: None,
+    };
+    let owner_id = master_bundle.identity_hash();
+    let device_sk = ed25519_dalek::SigningKey::from_bytes(&[seed ^ 0xFF; 32]);
+    let device_bundle = PubKeyBundle {
+        classical: ClassicalKeys {
+            ed25519_verify: device_sk.verifying_key().to_bytes(),
+            x25519_pub: [0u8; 32],
+        },
+        post_quantum: None,
+    };
+    let device_id = device_bundle.identity_hash();
+    let cert = EnrollmentCert::sign_master(
+        &master_sk,
+        master_bundle,
+        device_id,
+        device_bundle,
+        1_700_000_000,
+        None,
+    )
+    .expect("sign_master");
+    cert.verify().expect("self-minted cert verifies");
+    TestOwner {
+        owner: OwnerAddr(owner_id),
+        device_key: device_sk,
+        cert,
+    }
 }
 
 /// Materialized state for one channel in a community. Built by
@@ -1488,12 +1551,24 @@ pub fn materialize_with_now(
                     Some(MemberStatus::Joined) | Some(MemberStatus::Banned) => false,
                 };
                 if should_refresh {
+                    // ZEB-339: preserve any prior enrolled keys (so a rejoin
+                    // doesn't drop a previously-learned device key), then
+                    // insert the key from the cert carried on this Join.
+                    let mut enrolled = m
+                        .members
+                        .get(&event.actor)
+                        .map(|s| s.enrolled_device_keys.clone())
+                        .unwrap_or_default();
+                    if let Some(cert) = event.enrollment.as_ref() {
+                        enrolled.insert(cert.device_pubkeys.classical.ed25519_verify);
+                    }
                     m.members.insert(
                         event.actor,
                         MemberState {
                             status: MemberStatus::Joined,
                             joined_at: event.at.clone(),
                             left_at: None,
+                            enrolled_device_keys: enrolled,
                         },
                     );
                     // ZEB-249: if any rotation has already happened
@@ -1576,6 +1651,7 @@ pub fn materialize_with_now(
                             status: MemberStatus::Invited,
                             joined_at: event.at.clone(),
                             left_at: None,
+                            enrolled_device_keys: BTreeSet::new(),
                         },
                     );
                 }
@@ -1926,6 +2002,22 @@ pub fn materialize_with_now(
                     }
                     _ => {
                         if countersigned {
+                            // ZEB-339: preserve any prior enrolled keys (a
+                            // PendingJoin→countersign transition must not drop
+                            // keys already learned from a prior Join) AND ingest
+                            // the joiner's own cert carried on this PendingJoin
+                            // event — for a first-join-via-invite this is the
+                            // ONLY place the joiner's enrolled device key is
+                            // learned, so without it their later steady-state
+                            // events would fail SignerNotEnrolledForActor.
+                            let mut enrolled = m
+                                .members
+                                .get(&event.actor)
+                                .map(|s| s.enrolled_device_keys.clone())
+                                .unwrap_or_default();
+                            if let Some(cert) = event.enrollment.as_ref() {
+                                enrolled.insert(cert.device_pubkeys.classical.ed25519_verify);
+                            }
                             m.members.insert(
                                 event.actor,
                                 MemberState {
@@ -1939,6 +2031,7 @@ pub fn materialize_with_now(
                                     // answer.
                                     joined_at: event.at.clone(),
                                     left_at: None,
+                                    enrolled_device_keys: enrolled,
                                 },
                             );
                             // ZEB-254: mirror the Join arm's catchup invariant — a member
@@ -1955,6 +2048,7 @@ pub fn materialize_with_now(
                                     status: MemberStatus::PendingJoin,
                                     joined_at: event.at.clone(),
                                     left_at: None,
+                                    enrolled_device_keys: BTreeSet::new(),
                                 },
                             );
                         }
@@ -3445,6 +3539,7 @@ mod auto_exec_tests {
                     device_id: "test".to_string(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         // Power 99 is still below the 100 admin threshold — Joined alone
@@ -3477,6 +3572,7 @@ mod auto_exec_tests {
                     device_id: "test".to_string(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         assert!(local_actor_can_mint_set_power(&mat, self_owner));
@@ -3512,6 +3608,7 @@ mod auto_exec_tests {
                     logical: 0,
                     device_id: "test".to_string(),
                 }),
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         assert!(
@@ -3542,6 +3639,7 @@ mod auto_exec_tests {
                     logical: 0,
                     device_id: "test".to_string(),
                 }),
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         assert!(
@@ -5801,6 +5899,79 @@ mod tests {
         assert_eq!(back, ev);
         assert!(back.enrollment.is_none());
     }
+
+    // ── ZEB-339 Task 2: materialize ingests enrolled_device_keys from Join cert ─
+
+    /// ZEB-339: materialize inserts the ed25519 verify key from the
+    /// EnrollmentCert carried on a Join event into
+    /// `MemberState.enrolled_device_keys`.
+    #[test]
+    fn materialize_records_enrolled_device_key_from_join_cert() {
+        let admin = mint_test_owner(0x11);
+        let payload = EventPayload {
+            id: [1u8; 16],
+            community_id: SpaceId([9u8; 16]),
+            kind: MembershipEventKind::Join,
+            actor: admin.owner,
+            at: Hlc {
+                wall_ms: 0,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        };
+        let join = sign_event(&payload, &admin.device_key).unwrap();
+        let join = SignedMembershipEvent {
+            enrollment: Some(admin.cert.clone()),
+            ..join
+        };
+        let m = materialize(&[join], admin.owner);
+        let ek = &m.members.get(&admin.owner).unwrap().enrolled_device_keys;
+        assert!(
+            ek.contains(&admin.device_key.verifying_key().to_bytes()),
+            "enrolled_device_keys must contain the device key from the cert"
+        );
+    }
+
+    /// ZEB-339 back-compat: a `MemberState` CBOR blob without the `ek`
+    /// key (pre-ZEB-339 wire format) decodes to an empty
+    /// `enrolled_device_keys` set via `#[serde(default)]`, rather than
+    /// failing. This is the round-trip proof: encode a MemberState with
+    /// an empty set (skip_serializing_if drops the key), confirm `ek` is
+    /// absent from the CBOR map, then decode and assert the set is empty.
+    #[test]
+    fn member_state_enrolled_device_keys_back_compat_decode() {
+        use crate::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
+
+        let ms = MemberState {
+            status: MemberStatus::Joined,
+            joined_at: Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            left_at: None,
+            enrolled_device_keys: BTreeSet::new(),
+        };
+
+        let bytes = canonical_cbor_encode(&ms).unwrap();
+
+        // `ek` must be absent from the map (skip_serializing_if = BTreeSet::is_empty)
+        let val: ciborium::Value = ciborium::de::from_reader(&bytes[..]).unwrap();
+        let map = val.as_map().expect("MemberState encodes as map");
+        let has_ek = map.iter().any(|(k, _)| k.as_text() == Some("ek"));
+        assert!(
+            !has_ek,
+            "`ek` key must be absent when enrolled_device_keys is empty (back-compat wire)"
+        );
+
+        // Decode back — must produce an empty set, not an error.
+        let back: MemberState = canonical_cbor_decode(&bytes).unwrap();
+        assert!(
+            back.enrolled_device_keys.is_empty(),
+            "decoded MemberState.enrolled_device_keys must be empty when `ek` was absent"
+        );
+        assert_eq!(back.status, MemberStatus::Joined);
+    }
 }
 
 // ── ZEB-254 PendingJoin verify_event unit tests ───────────────────────────────
@@ -6019,6 +6190,7 @@ mod zeb_254_pending_join_verify_tests {
                     device_id: "t".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         let ctx = VerifyContext {
@@ -6062,6 +6234,7 @@ mod zeb_254_pending_join_verify_tests {
                     device_id: "t".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         let ctx = VerifyContext {
@@ -6107,6 +6280,7 @@ mod zeb_254_pending_join_verify_tests {
                     device_id: "t".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         let ctx = VerifyContext {
@@ -6154,6 +6328,7 @@ mod zeb_254_pending_join_verify_tests {
                     logical: 0,
                     device_id: "t".into(),
                 }),
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         let ctx = VerifyContext {
@@ -6261,6 +6436,7 @@ mod zeb_254_join_countersign_verify_tests {
                     device_id: "t".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         mat.power_levels.insert(admin_addr, POWER_THRESHOLDS.invite);
@@ -6319,6 +6495,7 @@ mod zeb_254_join_countersign_verify_tests {
                     device_id: "t".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         mat.power_levels.insert(admin_addr, POWER_THRESHOLDS.invite);
@@ -6539,6 +6716,45 @@ mod zeb_254_materialize_tests {
         assert_eq!(
             mat.members.get(&joiner_addr).map(|m| m.status),
             Some(MemberStatus::Joined)
+        );
+    }
+
+    /// ZEB-339: a first-join-via-invite (PendingJoin + countersign, no prior
+    /// Join) must learn the joiner's enrolled device key from the cert carried
+    /// on the PendingJoin event — otherwise the joiner ends up Joined with an
+    /// empty key set and their later steady-state events fail verification.
+    #[test]
+    fn materialize_pending_join_countersign_ingests_enrollment_key() {
+        let community = SpaceId([7u8; 16]);
+        let (joiner_priv, joiner_addr, joiner_pub) = synth_identity(1);
+        let (admin_priv, admin_addr, _) = synth_identity(2);
+        let owner = mint_test_owner(0x44);
+        let mut pending = synth_pending_join(
+            &joiner_priv,
+            joiner_addr,
+            joiner_pub,
+            community,
+            1_700_000_000_000,
+            1,
+        );
+        pending.enrollment = Some(owner.cert.clone());
+        let cs = synth_join_countersign(
+            &admin_priv,
+            admin_addr,
+            community,
+            pending.id,
+            1_700_000_001_000,
+            2,
+        );
+        let mat = materialize(&[pending, cs], admin_addr);
+        let ek = &mat
+            .members
+            .get(&joiner_addr)
+            .expect("joiner is a member after countersign")
+            .enrolled_device_keys;
+        assert!(
+            ek.contains(&owner.cert.device_pubkeys.classical.ed25519_verify),
+            "PendingJoin→countersign must ingest the joiner's enrolled device key from event.enrollment"
         );
     }
 
@@ -7334,6 +7550,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "a".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.members.insert(
@@ -7346,6 +7563,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "o".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -7414,6 +7632,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "a".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.members.insert(
@@ -7426,6 +7645,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "t".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(actor_addr, 50);
@@ -7469,6 +7689,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "a".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -7511,6 +7732,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "a".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.members.insert(
@@ -7523,6 +7745,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "t".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -7566,6 +7789,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "a".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.members.insert(
@@ -7578,6 +7802,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "r".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -7621,6 +7846,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "a".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.members.insert(
@@ -7633,6 +7859,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "m".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -7675,6 +7902,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "a".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -7713,6 +7941,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "a".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -7753,6 +7982,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "a1".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.members.insert(
@@ -7765,6 +7995,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "a2".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin1_addr, 100);
@@ -7819,6 +8050,7 @@ mod zeb_250_admin_proposal_verify_tests {
                         device_id: "t".into(),
                     },
                     left_at: None,
+                    enrolled_device_keys: BTreeSet::new(),
                 },
             );
             prior.power_levels.insert(addr, 100);
@@ -7883,6 +8115,7 @@ mod zeb_250_admin_proposal_verify_tests {
                         device_id: "t".into(),
                     },
                     left_at: None,
+                    enrolled_device_keys: BTreeSet::new(),
                 },
             );
         }
@@ -7969,6 +8202,7 @@ mod zeb_250_admin_countersign_verify_tests {
                     device_id: "a".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -8019,6 +8253,7 @@ mod zeb_250_admin_countersign_verify_tests {
                     device_id: "m".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(mod_addr, 50);
@@ -8054,6 +8289,7 @@ mod zeb_250_admin_countersign_verify_tests {
                     device_id: "a".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -8166,6 +8402,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
                     device_id: "a".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.members.insert(
@@ -8178,6 +8415,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
                     device_id: "t".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -8322,6 +8560,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
                     device_id: "a".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.members.insert(
@@ -8334,6 +8573,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
                     device_id: "t".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         // Store actor power as 101 directly in prior_state (bypasses PowerLevelOutOfRange,

@@ -11970,6 +11970,7 @@ mod list_community_forks_tests {
                 status,
                 joined_at: hlc_at(0),
                 left_at: None,
+                enrolled_device_keys: std::collections::BTreeSet::new(),
             },
         );
         m
@@ -12087,6 +12088,7 @@ mod list_community_forks_tests {
                 status: MemberStatus::Banned,
                 joined_at: hlc_at(50),
                 left_at: Some(hlc_at(150)),
+                enrolled_device_keys: std::collections::BTreeSet::new(),
             },
         );
 
@@ -22290,6 +22292,7 @@ mod community_member_dto_tests {
                 status: MemberStatus::Joined,
                 joined_at: hlc(100, "a"),
                 left_at: None,
+                enrolled_device_keys: std::collections::BTreeSet::new(),
             },
         );
         members.insert(
@@ -22298,6 +22301,7 @@ mod community_member_dto_tests {
                 status: MemberStatus::Joined,
                 joined_at: hlc(200, "b"),
                 left_at: None,
+                enrolled_device_keys: std::collections::BTreeSet::new(),
             },
         );
         members.insert(
@@ -22306,6 +22310,7 @@ mod community_member_dto_tests {
                 status: MemberStatus::Joined,
                 joined_at: hlc(150, "c"),
                 left_at: None,
+                enrolled_device_keys: std::collections::BTreeSet::new(),
             },
         );
         members.insert(
@@ -22314,6 +22319,7 @@ mod community_member_dto_tests {
                 status: MemberStatus::Joined,
                 joined_at: hlc(300, "d"),
                 left_at: None,
+                enrolled_device_keys: std::collections::BTreeSet::new(),
             },
         );
 
@@ -22354,6 +22360,7 @@ mod community_member_dto_tests {
                 status: MemberStatus::Left,
                 joined_at: hlc(100, "x"),
                 left_at: Some(hlc(200, "x")),
+                enrolled_device_keys: std::collections::BTreeSet::new(),
             },
         );
         members.insert(
@@ -22362,6 +22369,7 @@ mod community_member_dto_tests {
                 status: MemberStatus::Banned,
                 joined_at: hlc(50, "y"),
                 left_at: Some(hlc(150, "y")),
+                enrolled_device_keys: std::collections::BTreeSet::new(),
             },
         );
         let materialized = MaterializedMembership {
