@@ -758,11 +758,13 @@ pub enum VerifyError {
     /// claiming someone else's NodeId.
     ReachabilityInnerSigInvalid,
 
-    /// ZEB-321 RCH3: the actor field of a ReachabilityAnnounce envelope
-    /// does not match the OwnerAddr derived from the identity that
-    /// produced the inner signature.
-    ReachabilityActorMismatch,
-
+    // ZEB-321 RCH3 (ReachabilityActorMismatch) was REMOVED in ZEB-339: the
+    // actor↔signer binding is now enforced upstream by verify_membership_signer
+    // (signer.owner == event.actor, proven via the EnrollmentCert), and the
+    // inner reachability signature is verified against that same resolved
+    // enrolled device key — so the old address-derivation form (which assumed
+    // address_hash(signing_key) == actor) is both unnecessary and, under the
+    // owner/device split, false by construction.
     /// ZEB-321 RCH4: the payload's `announced_at_ms` differs from the
     /// event's HLC `wall_ms` by more than ±30 minutes. Sanity check —
     /// rejects obviously-tampered records (the spec's "silent drop").
@@ -942,9 +944,6 @@ impl std::fmt::Display for VerifyError {
             VerifyError::KickRequiresQuorum => write!(f, "ZEB-250: direct Kick of an admin rejected (admin_quorum > 1 — use AdminProposal)"),
             VerifyError::ReachabilityInnerSigInvalid => {
                 write!(f, "ZEB-321 RCH2 inner ReachabilityAnnounce signature invalid")
-            }
-            VerifyError::ReachabilityActorMismatch => {
-                write!(f, "ZEB-321 RCH3 ReachabilityAnnounce actor != inner-signer")
             }
             VerifyError::ReachabilityTimestampSkew => {
                 write!(f, "ZEB-321 RCH4 ReachabilityAnnounce timestamp skew > 30min")
@@ -1749,6 +1748,17 @@ pub fn materialize_with_now(
                         .get(&event.actor)
                         .map(|s| s.enrolled_device_keys.clone())
                         .unwrap_or_default();
+                    // SECURITY INVARIANT (load-bearing): the cert is ingested
+                    // WITHOUT re-verification here. This is safe ONLY because an
+                    // event reaches the materialized log exclusively via
+                    // `CommunityState::insert_event` → `verify_event` →
+                    // `enrolled_key_from_cert` (which runs `cert.verify()`, the
+                    // Master-issuer gate, and the cert.owner_id == actor bind).
+                    // `materialize` only ever replays already-verified events.
+                    // The ingested key is the IDENTICAL field that
+                    // `verify_membership_signer` validated the signature under.
+                    // If a future path ever inserts events into the log bypassing
+                    // `verify_event` (e.g. snapshot-seed / import), re-verify here.
                     if let Some(cert) = event.enrollment.as_ref() {
                         enrolled.insert(cert.device_pubkeys.classical.ed25519_verify);
                     }
@@ -2205,6 +2215,11 @@ pub fn materialize_with_now(
                                 .get(&event.actor)
                                 .map(|s| s.enrolled_device_keys.clone())
                                 .unwrap_or_default();
+                            // SECURITY INVARIANT: ingested without re-verification
+                            // — safe only because this PendingJoin event was
+                            // already accepted by verify_event/enrolled_key_from_cert
+                            // before reaching the materialized log. See the Join
+                            // arm above for the full rationale.
                             if let Some(cert) = event.enrollment.as_ref() {
                                 enrolled.insert(cert.device_pubkeys.classical.ed25519_verify);
                             }
