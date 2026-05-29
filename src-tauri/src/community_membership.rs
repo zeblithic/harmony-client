@@ -4654,7 +4654,7 @@ mod tests {
     fn verify_event_rejects_unauthorized_epoch_rotation_from_never_member() {
         let community_id = SpaceId([0xc0; 16]);
         let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
-        let (attacker_priv, attacker_pub, attacker_addr) = make_identity(0xee);
+        let (attacker_priv, _attacker_pub, attacker_addr) = make_identity(0xee);
 
         // Build a prior state where admin is joined (epoch 0, no members other than admin).
         // We use materialize with an admin-join event so power_levels has admin at 100.
@@ -4715,7 +4715,7 @@ mod tests {
     fn verify_event_rejects_unauthorized_epoch_catchup_non_admin() {
         let community_id = SpaceId([0xc0; 16]);
         let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
-        let (bob_priv, bob_pub, bob_addr) = make_identity(0xb1);
+        let (bob_priv, _bob_pub, bob_addr) = make_identity(0xb1);
 
         // Admin + bob join.
         let admin_join_payload = EventPayload {
@@ -5031,7 +5031,7 @@ mod tests {
     #[test]
     fn unban_event_succeeds_when_actor_is_admin_and_target_is_banned() {
         let community_id = SpaceId([0xc0; 16]);
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
         let (_, _, target_addr) = make_identity(0xb1);
 
         // Prior state: admin joined, target joined then kicked (Banned).
@@ -5085,7 +5085,7 @@ mod tests {
     fn unban_event_rejected_when_actor_is_moderator() {
         let community_id = SpaceId([0xc0; 16]);
         let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
-        let (mod_priv, mod_pub, mod_addr) = make_identity(0xb1);
+        let (mod_priv, _mod_pub, mod_addr) = make_identity(0xb1);
         let (_, _, target_addr) = make_identity(0xc1);
 
         // Build prior state: mod_addr has power 50, target is Banned.
@@ -5150,7 +5150,7 @@ mod tests {
     #[test]
     fn unban_event_rejected_when_target_is_not_banned() {
         let community_id = SpaceId([0xc0; 16]);
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
         let (_, _, target_addr) = make_identity(0xb1);
 
         // Prior state: admin joined, target joined (NOT banned).
@@ -5192,7 +5192,7 @@ mod tests {
     #[test]
     fn unban_event_rejected_when_target_is_unknown() {
         let community_id = SpaceId([0xc0; 16]);
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
         let (_, _, unknown_addr) = make_identity(0xdd);
 
         // Prior state: only admin joined; unknown_addr never appeared.
@@ -5233,7 +5233,7 @@ mod tests {
     #[test]
     fn kick_event_rejected_when_reason_exceeds_max_chars() {
         let community_id = SpaceId([0xc0; 16]);
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
         let (_, _, target_addr) = make_identity(0xb1);
 
         let admin_join = make_enrolled_join(0x01, &admin_priv, 1);
@@ -5274,7 +5274,7 @@ mod tests {
     #[test]
     fn unban_event_rejected_when_reason_exceeds_max_chars() {
         let community_id = SpaceId([0xc0; 16]);
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
         let (_, _, target_addr) = make_identity(0xb1);
 
         // Set up Banned target via prior Kick
@@ -5533,8 +5533,8 @@ mod tests {
     #[test]
     fn verify_event_fork_allows_any_joined_member() {
         let community_id = SpaceId([0xc0; 16]);
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
-        let (regular_priv, regular_pub, regular_addr) = make_identity(0xb1);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
+        let (regular_priv, _regular_pub, regular_addr) = make_identity(0xb1);
 
         // Admin joins (power 100 from bootstrap).
         let admin_join = sign_with_identity(
@@ -5633,7 +5633,7 @@ mod tests {
     fn verify_event_fork_rejects_non_member() {
         let community_id = SpaceId([0xc0; 16]);
         let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
-        let (outsider_priv, outsider_pub, outsider_addr) = make_identity(0xcc);
+        let (outsider_priv, _outsider_pub, outsider_addr) = make_identity(0xcc);
 
         let admin_join = sign_with_identity(
             EventPayload {
@@ -7752,7 +7752,7 @@ mod zeb_250_admin_proposal_verify_tests {
 
     #[test]
     fn admin_proposal_accepted_when_actor_admin() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, other_addr) = make_identity(0x02);
         let mut prior = MaterializedMembership::default();
         prior.members.insert(
@@ -7804,7 +7804,7 @@ mod zeb_250_admin_proposal_verify_tests {
 
     #[test]
     fn admin_proposal_rejected_when_actor_not_joined() {
-        let (actor_priv, actor_pub, actor_addr) = make_identity(0x01);
+        let (actor_priv, _actor_pub, actor_addr) = make_identity(0x01);
         let mut prior = MaterializedMembership::default();
         let evt = make_admin_proposal_event(
             [0x10; 16],
@@ -7833,7 +7833,7 @@ mod zeb_250_admin_proposal_verify_tests {
 
     #[test]
     fn admin_proposal_rejected_when_actor_power_below_100() {
-        let (actor_priv, actor_pub, actor_addr) = make_identity(0x01);
+        let (actor_priv, _actor_pub, actor_addr) = make_identity(0x01);
         let (_, _, target_addr) = make_identity(0x02);
         let mut prior = MaterializedMembership::default();
         prior.members.insert(
@@ -7888,7 +7888,7 @@ mod zeb_250_admin_proposal_verify_tests {
 
     #[test]
     fn admin_proposal_setpower_rejected_when_target_not_in_members() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, ghost_addr) = make_identity(0xfe);
         let mut prior = MaterializedMembership::default();
         prior.members.insert(
@@ -7929,7 +7929,7 @@ mod zeb_250_admin_proposal_verify_tests {
 
     #[test]
     fn admin_proposal_setpower_rejected_when_level_out_of_range() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, target_addr) = make_identity(0x02);
         let mut prior = MaterializedMembership::default();
         prior.members.insert(
@@ -7984,7 +7984,7 @@ mod zeb_250_admin_proposal_verify_tests {
 
     #[test]
     fn admin_proposal_setpower_rejected_when_not_admin_affecting() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, regular_addr) = make_identity(0x02);
         let mut prior = MaterializedMembership::default();
         prior.members.insert(
@@ -8039,7 +8039,7 @@ mod zeb_250_admin_proposal_verify_tests {
 
     #[test]
     fn admin_proposal_kick_rejected_when_target_not_admin() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, mod_addr) = make_identity(0x02);
         let mut prior = MaterializedMembership::default();
         prior.members.insert(
@@ -8094,7 +8094,7 @@ mod zeb_250_admin_proposal_verify_tests {
 
     #[test]
     fn admin_proposal_change_quorum_rejected_when_below_one() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let mut prior = MaterializedMembership::default();
         prior.members.insert(
             admin_addr,
@@ -8131,7 +8131,7 @@ mod zeb_250_admin_proposal_verify_tests {
 
     #[test]
     fn admin_proposal_change_quorum_rejected_when_exceeds_admin_count() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let mut prior = MaterializedMembership::default();
         prior.members.insert(
             admin_addr,
@@ -8169,7 +8169,7 @@ mod zeb_250_admin_proposal_verify_tests {
 
     #[test]
     fn admin_proposal_change_quorum_accepted_when_equals_admin_count() {
-        let (admin1_priv, admin1_pub, admin1_addr) = make_identity(0x01);
+        let (admin1_priv, _admin1_pub, admin1_addr) = make_identity(0x01);
         let (_, _, admin2_addr) = make_identity(0x02);
         let mut prior = MaterializedMembership::default();
         prior.members.insert(
@@ -8227,7 +8227,7 @@ mod zeb_250_admin_proposal_verify_tests {
     /// would be 3 and the proposal would wrongly pass AP5.
     #[test]
     fn admin_proposal_change_quorum_rejects_when_quorum_would_exceed_live_admin_count() {
-        let (admin1_priv, admin1_pub, admin1_addr) = make_identity(0x01);
+        let (admin1_priv, _admin1_pub, admin1_addr) = make_identity(0x01);
         let (_, _, admin2_addr) = make_identity(0x02);
         let (_, _, admin3_addr) = make_identity(0x03);
 
@@ -8293,7 +8293,7 @@ mod zeb_250_admin_proposal_verify_tests {
     /// MAX_MODERATION_REASON_CHARS length cap, matching the direct Kick path.
     #[test]
     fn admin_proposal_kick_rejected_when_reason_exceeds_length_cap() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, target_addr) = make_identity(0x02);
 
         let mut prior = MaterializedMembership::default();
@@ -8380,7 +8380,7 @@ mod zeb_250_admin_countersign_verify_tests {
 
     #[test]
     fn admin_countersign_accepted_when_actor_admin() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let mut prior = MaterializedMembership::default();
         prior.members.insert(
             admin_addr,
@@ -8409,7 +8409,7 @@ mod zeb_250_admin_countersign_verify_tests {
 
     #[test]
     fn admin_countersign_rejected_when_actor_not_joined() {
-        let (actor_priv, actor_pub, actor_addr) = make_identity(0x01);
+        let (actor_priv, _actor_pub, actor_addr) = make_identity(0x01);
         let mut prior = MaterializedMembership::default();
         let evt =
             make_admin_countersign_event([0x10; 16], &actor_priv, actor_addr, [0x55; 16], 1_000);
@@ -8430,7 +8430,7 @@ mod zeb_250_admin_countersign_verify_tests {
 
     #[test]
     fn admin_countersign_rejected_when_actor_power_below_100() {
-        let (mod_priv, mod_pub, mod_addr) = make_identity(0x01);
+        let (mod_priv, _mod_pub, mod_addr) = make_identity(0x01);
         let mut prior = MaterializedMembership::default();
         prior.members.insert(
             mod_addr,
@@ -8464,7 +8464,7 @@ mod zeb_250_admin_countersign_verify_tests {
         // Lenient forward-ref: AC must verify even when the target
         // AdminProposal is not yet in the log. prior_state has no
         // record of [0x55; 16] — and that's fine.
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let mut prior = MaterializedMembership::default();
         prior.members.insert(
             admin_addr,
@@ -8617,7 +8617,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
     /// is rejected when admin_quorum > 1.
     #[test]
     fn direct_setpower_to_100_rejected_when_admin_quorum_above_1() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, target_addr) = make_identity(0x02);
         let mut prior = prior_with_admin_and_target(admin_addr, target_addr, 0, 2);
         let evt = make_setpower_event([0x10; 16], &admin_priv, admin_addr, target_addr, 100, 1_000);
@@ -8637,7 +8637,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
     /// to a lower level is rejected when admin_quorum > 1.
     #[test]
     fn direct_setpower_demote_admin_rejected_when_admin_quorum_above_1() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, target_addr) = make_identity(0x02);
         // Target is currently an admin (power 100).
         let mut prior = prior_with_admin_and_target(admin_addr, target_addr, 100, 3);
@@ -8668,7 +8668,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
     /// accepted regardless of admin_quorum — non-admin-affecting moderation.
     #[test]
     fn direct_setpower_to_non_admin_accepted_regardless_of_quorum() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, target_addr) = make_identity(0x02);
         // Target has power 0 (not an admin), new level is 50 (mod, not admin).
         let mut prior = prior_with_admin_and_target(admin_addr, target_addr, 0, 5);
@@ -8726,7 +8726,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
         // actor a hypothetical "super-admin" stored directly in power_levels as 101
         // (bypassing the PowerLevelOutOfRange check which only applies to SetPower
         // events, not to power_levels stored in prior_state).
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, target_addr) = make_identity(0x02);
         let mut prior = MaterializedMembership {
             admin_quorum: 2,
@@ -8779,7 +8779,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
     /// regardless of admin_quorum — non-admin-affecting moderation.
     #[test]
     fn direct_kick_of_mod_accepted_regardless_of_quorum() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, target_addr) = make_identity(0x02);
         // Target is a moderator (power 50), not an admin.
         let mut prior = prior_with_admin_and_target(admin_addr, target_addr, 50, 5);
@@ -8798,7 +8798,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
     /// both accepted when admin_quorum == 1.
     #[test]
     fn direct_setpower_admin_actions_accepted_when_admin_quorum_equals_1() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, target_addr) = make_identity(0x02);
         // admin_quorum == 1 (the default).
         let mut prior = prior_with_admin_and_target(admin_addr, target_addr, 0, 1);

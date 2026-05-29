@@ -32228,7 +32228,7 @@ mod list_community_members_ipc_tests {
         let community_id = SpaceId([5; 16]);
         let identity = PrivateIdentity::from_seed(&[0xab; 32]);
         let admin = OwnerAddr(identity.identity.address_hash);
-        let identity_pub = identity.identity.to_public_bytes();
+        let _identity_pub = identity.identity.to_public_bytes();
 
         let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
         {
@@ -32979,7 +32979,7 @@ mod unban_from_community_tests {
         payload: EventPayload,
         identity: &PrivateIdentity,
         admin: OwnerAddr,
-        actor_pub: &[u8; 64],
+        _actor_pub: &[u8; 64],
     ) {
         let ev = sign_event_with_identity(&payload, identity).expect("sign");
         let ctx = VerifyContext {
@@ -34430,7 +34430,7 @@ mod admin_action_result_routing_tests {
         payload: EventPayload,
         identity: &PrivateIdentity,
         admin: OwnerAddr,
-        actor_pub: &[u8; 64],
+        _actor_pub: &[u8; 64],
     ) {
         let ev = sign_event_with_identity(&payload, identity).expect("sign");
         let ctx = VerifyContext {
@@ -35166,7 +35166,7 @@ mod countersign_admin_proposal_tests {
         payload: EventPayload,
         identity: &PrivateIdentity,
         admin: OwnerAddr,
-        actor_pub: &[u8; 64],
+        _actor_pub: &[u8; 64],
     ) {
         let ev = sign_event_with_identity(&payload, identity).expect("sign");
         let ctx = VerifyContext {
@@ -35352,7 +35352,7 @@ mod countersign_admin_proposal_tests {
         let sk_bytes = second_identity.to_private_bytes();
         let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
-        let second_pub = second_identity.identity.to_public_bytes();
+        let _second_pub = second_identity.identity.to_public_bytes();
 
         let cs_ev = mint_admin_countersign_event(
             community_id,
@@ -35490,7 +35490,7 @@ mod countersign_admin_proposal_tests {
         let sk_bytes = second_identity.to_private_bytes();
         let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
-        let second_pub = second_identity.identity.to_public_bytes();
+        let _second_pub = second_identity.identity.to_public_bytes();
 
         let cs_ev = mint_admin_countersign_event(
             community_id,
@@ -35553,7 +35553,7 @@ mod propose_change_quorum_tests {
         payload: EventPayload,
         identity: &PrivateIdentity,
         admin: OwnerAddr,
-        actor_pub: &[u8; 64],
+        _actor_pub: &[u8; 64],
     ) {
         let ev = sign_event_with_identity(&payload, identity).expect("sign");
         let ctx = VerifyContext {
