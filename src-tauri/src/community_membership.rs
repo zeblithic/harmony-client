@@ -1420,6 +1420,26 @@ pub fn mint_test_owner(seed: u8) -> TestOwner {
     }
 }
 
+/// ZEB-339 test helper: the singleton set of `owner`'s enrolled device key,
+/// for seeding a hand-built `MemberState.enrolled_device_keys`.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn test_enrolled_keys(owner: &TestOwner) -> BTreeSet<[u8; 32]> {
+    let mut s = BTreeSet::new();
+    s.insert(owner.cert.device_pubkeys.classical.ed25519_verify);
+    s
+}
+
+/// ZEB-339 test helper: ensure `owner`'s enrolled device key is present on
+/// their materialized `MemberState`, so a steady-state event the owner signs
+/// can have its signer resolved. No-op if the owner has no member entry.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn test_enroll_member(prior: &mut MaterializedMembership, owner: &TestOwner) {
+    if let Some(m) = prior.members.get_mut(&owner.owner) {
+        m.enrolled_device_keys
+            .insert(owner.cert.device_pubkeys.classical.ed25519_verify);
+    }
+}
+
 /// Materialized state for one channel in a community. Built by
 /// `materialize` from `ChannelCreate`/`ChannelModify`/`ChannelDelete`
 /// event replay. `deleted_at` is `Some` once a `ChannelDelete` has been
@@ -4132,6 +4152,35 @@ mod tests {
         }
     }
 
+    /// ZEB-339: build a cert-bearing Join for `owner`, signed by their enrolled
+    /// device key. Used to seed `prior_state` so a steady-state event the same
+    /// owner later signs can have its signer resolved from materialized
+    /// `enrolled_device_keys`.
+    fn make_enrolled_join(
+        id_byte: u8,
+        owner: &TestOwner,
+        at_wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        let mut id = [0xfd; 16];
+        id[15] = id_byte;
+        let payload = EventPayload {
+            id,
+            community_id: SpaceId([0xc0; 16]),
+            kind: MembershipEventKind::Join,
+            actor: owner.owner,
+            at: Hlc {
+                wall_ms: at_wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+        };
+        let ev = sign_event(&payload, &owner.device_key).expect("sign enrolled join");
+        SignedMembershipEvent {
+            enrollment: Some(owner.cert.clone()),
+            ..ev
+        }
+    }
+
     fn make_catchup_event(
         id_byte: u8,
         actor: OwnerAddr,
@@ -4651,9 +4700,13 @@ mod tests {
             is_invite_only: false,
         };
         let result = verify_event(&rotation_event, &prior, &ctx);
+        // ZEB-339: a never-member's event is rejected at signer resolution
+        // (step 1) — no materialized membership means no enrolled device key —
+        // before the EpochEventUnauthorized power gate is reached. The security
+        // property (unauthorized epoch event rejected) is preserved.
         assert!(
-            matches!(result, Err(VerifyError::EpochEventUnauthorized)),
-            "EpochRotation from never-member must be rejected with EpochEventUnauthorized; got {result:?}"
+            matches!(result, Err(VerifyError::SignerNotEnrolledForActor)),
+            "EpochRotation from never-member must be rejected with SignerNotEnrolledForActor; got {result:?}"
         );
     }
 
@@ -4982,7 +5035,7 @@ mod tests {
         let (_, _, target_addr) = make_identity(0xb1);
 
         // Prior state: admin joined, target joined then kicked (Banned).
-        let admin_join = make_join_event(0x01, admin_addr, 1);
+        let admin_join = make_enrolled_join(0x01, &admin_priv, 1);
         let target_join = make_join_event(0x02, target_addr, 2);
         let kick = make_kick_event(0x01, admin_addr, target_addr, 10);
         let prior = materialize(
@@ -5031,13 +5084,13 @@ mod tests {
     #[test]
     fn unban_event_rejected_when_actor_is_moderator() {
         let community_id = SpaceId([0xc0; 16]);
-        let (_admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
         let (mod_priv, mod_pub, mod_addr) = make_identity(0xb1);
         let (_, _, target_addr) = make_identity(0xc1);
 
         // Build prior state: mod_addr has power 50, target is Banned.
-        let admin_join = make_join_event(0x01, admin_addr, 1);
-        let mod_join = make_join_event(0x02, mod_addr, 2);
+        let admin_join = make_enrolled_join(0x01, &admin_priv, 1);
+        let mod_join = make_enrolled_join(0x02, &mod_priv, 2);
         let target_join = make_join_event(0x03, target_addr, 3);
         let setpwr_mod = SignedMembershipEvent {
             id: [0x04; 16],
@@ -5101,7 +5154,7 @@ mod tests {
         let (_, _, target_addr) = make_identity(0xb1);
 
         // Prior state: admin joined, target joined (NOT banned).
-        let admin_join = make_join_event(0x01, admin_addr, 1);
+        let admin_join = make_enrolled_join(0x01, &admin_priv, 1);
         let target_join = make_join_event(0x02, target_addr, 2);
         let prior = materialize(&[admin_join, target_join], admin_addr);
         assert_eq!(prior.members[&target_addr].status, MemberStatus::Joined);
@@ -5143,7 +5196,7 @@ mod tests {
         let (_, _, unknown_addr) = make_identity(0xdd);
 
         // Prior state: only admin joined; unknown_addr never appeared.
-        let admin_join = make_join_event(0x01, admin_addr, 1);
+        let admin_join = make_enrolled_join(0x01, &admin_priv, 1);
         let prior = materialize(&[admin_join], admin_addr);
         assert!(!prior.members.contains_key(&unknown_addr));
 
@@ -5183,7 +5236,7 @@ mod tests {
         let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
         let (_, _, target_addr) = make_identity(0xb1);
 
-        let admin_join = make_join_event(0x01, admin_addr, 1);
+        let admin_join = make_enrolled_join(0x01, &admin_priv, 1);
         let target_join = make_join_event(0x02, target_addr, 2);
         let prior = materialize(&[admin_join, target_join], admin_addr);
 
@@ -5225,7 +5278,7 @@ mod tests {
         let (_, _, target_addr) = make_identity(0xb1);
 
         // Set up Banned target via prior Kick
-        let admin_join = make_join_event(0x01, admin_addr, 1);
+        let admin_join = make_enrolled_join(0x01, &admin_priv, 1);
         let target_join = make_join_event(0x02, target_addr, 2);
         let kick = make_kick_event(0x01, admin_addr, target_addr, 10);
         let prior = materialize(&[admin_join, target_join, kick], admin_addr);
@@ -5620,10 +5673,13 @@ mod tests {
             admin_addr,
             is_invite_only: false,
         };
+        // ZEB-339: a never-member's Fork is rejected at signer resolution
+        // (step 1) before the ActorNotJoined gate — no materialized membership
+        // means no enrolled device key. Security property preserved.
         assert_eq!(
             verify_event(&fork, &prior, &ctx),
-            Err(VerifyError::ActorNotJoined),
-            "fork by non-member should reject with ActorNotJoined"
+            Err(VerifyError::SignerNotEnrolledForActor),
+            "fork by non-member should reject with SignerNotEnrolledForActor"
         );
     }
 
@@ -5723,13 +5779,24 @@ mod tests {
         use crate::community_invite::{BoundedChannelLogSnapshot, PreForkSnapshot};
         use std::collections::BTreeMap;
 
+        // ZEB-339: verify_snapshot_event still uses the single-identity model
+        // (PreForkSnapshot.identity_pubs); build these events with a real
+        // PrivateIdentity so the identity_pub→actor binding holds. (Fork
+        // snapshot migration onto the cert model is a later task.)
+        let snap_identity = |seed: u8| -> (harmony_identity::PrivateIdentity, [u8; 64], OwnerAddr) {
+            let private = harmony_identity::PrivateIdentity::from_seed(&[seed; 32]);
+            let public = private.public_identity();
+            let pub_bytes = public.to_public_bytes();
+            let addr = OwnerAddr(public.address_hash);
+            (private, pub_bytes, addr)
+        };
         let original_id = SpaceId([0xa0; 16]);
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xaa);
-        let (regular_priv, regular_pub, regular_addr) = make_identity(0xbb);
+        let (admin_priv, admin_pub, admin_addr) = snap_identity(0xaa);
+        let (regular_priv, regular_pub, regular_addr) = snap_identity(0xbb);
 
         // Bootstrap: admin joins, then regular joins, then admin promotes regular.
-        let admin_join = sign_with_identity(
-            EventPayload {
+        let admin_join = sign_event_with_identity(
+            &EventPayload {
                 id: [0x01; 16],
                 community_id: original_id,
                 kind: MembershipEventKind::Join,
@@ -5741,9 +5808,10 @@ mod tests {
                 },
             },
             &admin_priv,
-        );
-        let regular_join = sign_with_identity(
-            EventPayload {
+        )
+        .expect("sign");
+        let regular_join = sign_event_with_identity(
+            &EventPayload {
                 id: [0x02; 16],
                 community_id: original_id,
                 kind: MembershipEventKind::Join,
@@ -5755,9 +5823,10 @@ mod tests {
                 },
             },
             &regular_priv,
-        );
-        let set_power = sign_with_identity(
-            EventPayload {
+        )
+        .expect("sign");
+        let set_power = sign_event_with_identity(
+            &EventPayload {
                 id: [0x03; 16],
                 community_id: original_id,
                 kind: MembershipEventKind::SetPower {
@@ -5772,7 +5841,8 @@ mod tests {
                 },
             },
             &admin_priv,
-        );
+        )
+        .expect("sign");
 
         let mut identity_pubs = BTreeMap::new();
         identity_pubs.insert(admin_addr, admin_pub);
@@ -7723,6 +7793,7 @@ mod zeb_250_admin_proposal_verify_tests {
             },
             1_000,
         );
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
@@ -7734,7 +7805,7 @@ mod zeb_250_admin_proposal_verify_tests {
     #[test]
     fn admin_proposal_rejected_when_actor_not_joined() {
         let (actor_priv, actor_pub, actor_addr) = make_identity(0x01);
-        let prior = MaterializedMembership::default();
+        let mut prior = MaterializedMembership::default();
         let evt = make_admin_proposal_event(
             [0x10; 16],
             &actor_priv,
@@ -7745,14 +7816,18 @@ mod zeb_250_admin_proposal_verify_tests {
             },
             1_000,
         );
+        test_enroll_member(&mut prior, &actor_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr: actor_addr,
             is_invite_only: false,
         };
+        // ZEB-339: a non-member actor fails signer resolution (step 1) before
+        // the AdminProposalActorNotJoined gate — no materialized membership
+        // means no enrolled device key.
         assert_eq!(
             verify_event(&evt, &prior, &ctx),
-            Err(VerifyError::AdminProposalActorNotJoined)
+            Err(VerifyError::SignerNotEnrolledForActor)
         );
     }
 
@@ -7799,6 +7874,7 @@ mod zeb_250_admin_proposal_verify_tests {
             },
             1_000,
         );
+        test_enroll_member(&mut prior, &actor_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr: actor_addr,
@@ -7839,6 +7915,7 @@ mod zeb_250_admin_proposal_verify_tests {
             },
             1_000,
         );
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
@@ -7893,6 +7970,7 @@ mod zeb_250_admin_proposal_verify_tests {
             },
             1_000,
         );
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
@@ -7947,6 +8025,7 @@ mod zeb_250_admin_proposal_verify_tests {
             },
             1_000,
         );
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
@@ -8001,6 +8080,7 @@ mod zeb_250_admin_proposal_verify_tests {
             },
             1_000,
         );
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
@@ -8037,6 +8117,7 @@ mod zeb_250_admin_proposal_verify_tests {
             ProposalKind::ChangeQuorum { new_quorum: 0 },
             1_000,
         );
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
@@ -8074,6 +8155,7 @@ mod zeb_250_admin_proposal_verify_tests {
             ProposalKind::ChangeQuorum { new_quorum: 2 },
             1_000,
         );
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
@@ -8125,6 +8207,7 @@ mod zeb_250_admin_proposal_verify_tests {
             ProposalKind::ChangeQuorum { new_quorum: 2 },
             1_000,
         );
+        test_enroll_member(&mut prior, &admin1_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr: admin1_addr,
@@ -8179,6 +8262,7 @@ mod zeb_250_admin_proposal_verify_tests {
             ProposalKind::ChangeQuorum { new_quorum: 3 },
             1_000,
         );
+        test_enroll_member(&mut prior, &admin1_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr: admin1_addr,
@@ -8247,6 +8331,7 @@ mod zeb_250_admin_proposal_verify_tests {
             },
             1_000,
         );
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
@@ -8313,6 +8398,7 @@ mod zeb_250_admin_countersign_verify_tests {
         prior.power_levels.insert(admin_addr, 100);
         let evt =
             make_admin_countersign_event([0x10; 16], &admin_priv, admin_addr, [0x55; 16], 1_000);
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
@@ -8324,17 +8410,21 @@ mod zeb_250_admin_countersign_verify_tests {
     #[test]
     fn admin_countersign_rejected_when_actor_not_joined() {
         let (actor_priv, actor_pub, actor_addr) = make_identity(0x01);
-        let prior = MaterializedMembership::default();
+        let mut prior = MaterializedMembership::default();
         let evt =
             make_admin_countersign_event([0x10; 16], &actor_priv, actor_addr, [0x55; 16], 1_000);
+        test_enroll_member(&mut prior, &actor_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr: actor_addr,
             is_invite_only: false,
         };
+        // ZEB-339: a non-member actor fails signer resolution (step 1) before
+        // the AdminCountersignActorNotJoined gate — no materialized membership
+        // means no enrolled device key.
         assert_eq!(
             verify_event(&evt, &prior, &ctx),
-            Err(VerifyError::AdminCountersignActorNotJoined)
+            Err(VerifyError::SignerNotEnrolledForActor)
         );
     }
 
@@ -8357,6 +8447,7 @@ mod zeb_250_admin_countersign_verify_tests {
         );
         prior.power_levels.insert(mod_addr, 50);
         let evt = make_admin_countersign_event([0x10; 16], &mod_priv, mod_addr, [0x55; 16], 1_000);
+        test_enroll_member(&mut prior, &mod_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr: mod_addr,
@@ -8396,6 +8487,7 @@ mod zeb_250_admin_countersign_verify_tests {
             [0x55; 16], // target absent from prior_state
             5_000,
         );
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
@@ -8527,8 +8619,9 @@ mod zeb_250_direct_event_quorum_gate_tests {
     fn direct_setpower_to_100_rejected_when_admin_quorum_above_1() {
         let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, target_addr) = make_identity(0x02);
-        let prior = prior_with_admin_and_target(admin_addr, target_addr, 0, 2);
+        let mut prior = prior_with_admin_and_target(admin_addr, target_addr, 0, 2);
         let evt = make_setpower_event([0x10; 16], &admin_priv, admin_addr, target_addr, 100, 1_000);
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
@@ -8547,7 +8640,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
         let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, target_addr) = make_identity(0x02);
         // Target is currently an admin (power 100).
-        let prior = prior_with_admin_and_target(admin_addr, target_addr, 100, 3);
+        let mut prior = prior_with_admin_and_target(admin_addr, target_addr, 100, 3);
         // Actor also has power 100, so actor_power > target_power is false —
         // but that existing check runs first; need actor with higher power
         // conceptually. Actually existing check: actor_power <= target_power → reject.
@@ -8559,6 +8652,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
         //   2. level <= max ✓
         // So actor=100, target=100, level=50 is valid up to the quorum gate.
         let evt = make_setpower_event([0x10; 16], &admin_priv, admin_addr, target_addr, 50, 1_000);
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
@@ -8577,8 +8671,9 @@ mod zeb_250_direct_event_quorum_gate_tests {
         let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, target_addr) = make_identity(0x02);
         // Target has power 0 (not an admin), new level is 50 (mod, not admin).
-        let prior = prior_with_admin_and_target(admin_addr, target_addr, 0, 5);
+        let mut prior = prior_with_admin_and_target(admin_addr, target_addr, 0, 5);
         let evt = make_setpower_event([0x10; 16], &admin_priv, admin_addr, target_addr, 50, 1_000);
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
@@ -8668,6 +8763,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
         prior.power_levels.insert(admin_addr, 101);
         prior.power_levels.insert(target_addr, 100);
         let evt = make_kick_event_signed([0x10; 16], &admin_priv, admin_addr, target_addr, 1_000);
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
@@ -8686,8 +8782,9 @@ mod zeb_250_direct_event_quorum_gate_tests {
         let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, target_addr) = make_identity(0x02);
         // Target is a moderator (power 50), not an admin.
-        let prior = prior_with_admin_and_target(admin_addr, target_addr, 50, 5);
+        let mut prior = prior_with_admin_and_target(admin_addr, target_addr, 50, 5);
         let evt = make_kick_event_signed([0x10; 16], &admin_priv, admin_addr, target_addr, 1_000);
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
@@ -8704,11 +8801,12 @@ mod zeb_250_direct_event_quorum_gate_tests {
         let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, target_addr) = make_identity(0x02);
         // admin_quorum == 1 (the default).
-        let prior = prior_with_admin_and_target(admin_addr, target_addr, 0, 1);
+        let mut prior = prior_with_admin_and_target(admin_addr, target_addr, 0, 1);
 
         // Direct SetPower to level 100 — must be accepted.
         let setpower_evt =
             make_setpower_event([0x10; 16], &admin_priv, admin_addr, target_addr, 100, 1_000);
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
