@@ -784,6 +784,27 @@ pub enum VerifyError {
     /// ZEB-321 RCH5: the actor is not a current community member at
     /// the event's HLC (read via membership projection).
     ReachabilityActorNotMember,
+
+    // ── ZEB-339 enrolled-device cert error taxonomy ────────────────────────
+    /// ZEB-339: Join/PendingJoin/bootstrap arrived with no `enrollment` cert.
+    MissingEnrollmentCert,
+    /// ZEB-339: `cert.verify()` failed (bad master sig / hash(master)!=owner_id
+    /// / device-id mismatch / unknown version), OR a non-`Master` issuer
+    /// (e.g. `Quorum`) was carried — the community path cannot fully verify
+    /// quorum signatures (that needs `OwnerState` walk-back), so it rejects
+    /// them rather than accept on structural-checks-only (spec §10).
+    EnrollmentCertInvalid,
+    /// ZEB-339: `cert.owner_id != event.actor.0`.
+    EnrollmentOwnerMismatch,
+    /// ZEB-339: no enrolled device key matching the signing key was found for
+    /// `actor`. Two origins: (a) a steady-state event whose materialized
+    /// `members[actor].enrolled_device_keys` set contains no matching key, or
+    /// (b) a resolved signer whose `owner` does not equal the event's `actor`
+    /// (a caller-binding precondition in `verify_membership_signer`).
+    SignerNotEnrolledForActor,
+    /// ZEB-339: counter-signer's signing key is not in the counter-signer's
+    /// materialized `enrolled_device_keys`.
+    CounterSignerNotEnrolled,
 }
 
 impl std::fmt::Display for VerifyError {
@@ -945,6 +966,34 @@ impl std::fmt::Display for VerifyError {
             VerifyError::ReachabilityActorNotMember => {
                 write!(f, "ZEB-321 RCH5 ReachabilityAnnounce actor is not a community member")
             }
+            VerifyError::MissingEnrollmentCert => {
+                write!(f, "ZEB-339: identity-introducing event carries no enrollment cert")
+            }
+            VerifyError::EnrollmentCertInvalid => {
+                write!(
+                    f,
+                    "ZEB-339: enrollment cert failed verification (bad master sig, hash mismatch, \
+                     device-id mismatch, or unknown version)"
+                )
+            }
+            VerifyError::EnrollmentOwnerMismatch => {
+                write!(
+                    f,
+                    "ZEB-339: cert.owner_id does not match event.actor"
+                )
+            }
+            VerifyError::SignerNotEnrolledForActor => {
+                write!(
+                    f,
+                    "ZEB-339: no enrolled device key matching the signing key found for actor"
+                )
+            }
+            VerifyError::CounterSignerNotEnrolled => {
+                write!(
+                    f,
+                    "ZEB-339: counter-signer's device key is not enrolled for their identity"
+                )
+            }
         }
     }
 }
@@ -1066,6 +1115,86 @@ pub fn verify_countersig(
         .verifying_key
         .verify_strict(&bytes, &sig)
         .map_err(|_| VerifyError::CounterSigInvalid)
+}
+
+// ── ZEB-339 enrolled-device signing primitives ────────────────────────────────
+
+/// The minimal proven fact: this ed25519 key is a device enrolled under `owner`.
+///
+/// Produced by [`enrolled_key_from_cert`] (cert path) or by a materialized-
+/// state lookup (already-enrolled member path). Consumed by
+/// [`verify_membership_signer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnrolledDeviceKey {
+    pub owner: OwnerAddr,
+    pub device_ed25519: [u8; 32],
+}
+
+/// Verify the event was authored by `signer`'s enrolled device key, over the
+/// canonical EventPayload. `signer.owner` must equal `event.actor`.
+///
+/// Uses `verify_strict` to reject non-canonical S values and small-order R
+/// points (signature malleability) — same rationale as [`verify_signature`].
+///
+/// Returns `Err(SignerNotEnrolledForActor)` if owner ≠ actor (a caller-binding
+/// precondition: the resolved signer belongs to a different owner than the
+/// event's actor).
+/// Returns `Err(SignatureInvalid)` if the ed25519 bytes are malformed or the
+/// signature doesn't verify.
+pub fn verify_membership_signer(
+    event: &SignedMembershipEvent,
+    signer: &EnrolledDeviceKey,
+) -> Result<(), VerifyError> {
+    if signer.owner != event.actor {
+        return Err(VerifyError::SignerNotEnrolledForActor);
+    }
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&signer.device_ed25519)
+        .map_err(|_| VerifyError::SignatureInvalid)?;
+    let bytes = canonical_cbor_encode(&EventPayload::from(event))?;
+    let sig = Signature::from_bytes(&event.sig);
+    vk.verify_strict(&bytes, &sig)
+        .map_err(|_| VerifyError::SignatureInvalid)
+}
+
+/// Resolve an `EnrolledDeviceKey` from an identity-introducing event's carried
+/// `EnrollmentCert`: verify the cert, bind `owner == actor`, return the device
+/// key.
+///
+/// Returns `Err(MissingEnrollmentCert)` if `enrollment` is `None`.
+/// Returns `Err(EnrollmentCertInvalid)` if `cert.verify()` fails OR the issuer
+/// is non-`Master` (see below).
+/// Returns `Err(EnrollmentOwnerMismatch)` if `cert.owner_id != event.actor.0`.
+///
+/// Issuer policy (spec §10): only `EnrollmentIssuer::Master` certs are accepted
+/// here. `cert.verify()` performs only STRUCTURAL checks for `Quorum` issuers
+/// (it does not verify the quorum signatures — that requires an `OwnerState`
+/// walk-back the community path does not have). Alpha mints Master certs only,
+/// so we reject `Quorum` gracefully rather than accept one on structural checks
+/// alone, which would admit unverified signatures.
+pub fn enrolled_key_from_cert(
+    event: &SignedMembershipEvent,
+) -> Result<EnrolledDeviceKey, VerifyError> {
+    let cert = event
+        .enrollment
+        .as_ref()
+        .ok_or(VerifyError::MissingEnrollmentCert)?;
+    cert.verify()
+        .map_err(|_| VerifyError::EnrollmentCertInvalid)?;
+    // Reject non-Master issuers: the community path cannot fully verify Quorum
+    // signatures, and cert.verify() only structurally-checks them (spec §10).
+    if !matches!(
+        cert.issuer,
+        harmony_owner::certs::EnrollmentIssuer::Master { .. }
+    ) {
+        return Err(VerifyError::EnrollmentCertInvalid);
+    }
+    if cert.owner_id != event.actor.0 {
+        return Err(VerifyError::EnrollmentOwnerMismatch);
+    }
+    Ok(EnrolledDeviceKey {
+        owner: event.actor,
+        device_ed25519: cert.device_pubkeys.classical.ed25519_verify,
+    })
 }
 
 /// Materialized view computed from a community's signed event log.
@@ -9768,6 +9897,253 @@ mod zeb_321_reachability_verify_tests {
         assert!(
             matches!(result, Err(VerifyError::ReachabilityInnerSigInvalid)),
             "all-zero inner sig must produce ReachabilityInnerSigInvalid; got {result:?}"
+        );
+    }
+}
+
+// ── ZEB-339 verify_membership_signer / enrolled_key_from_cert unit tests ──────
+
+#[cfg(test)]
+mod zeb_339_signer_verify_tests {
+    use super::*;
+
+    #[test]
+    fn verify_signer_accepts_cert_signed_event() {
+        let o = mint_test_owner(0x21);
+        let ev = sign_event(
+            &EventPayload {
+                id: [1u8; 16],
+                community_id: SpaceId([7u8; 16]),
+                kind: MembershipEventKind::Join,
+                actor: o.owner,
+                at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &o.device_key,
+        )
+        .unwrap();
+        let ev = SignedMembershipEvent {
+            enrollment: Some(o.cert.clone()),
+            ..ev
+        };
+        let signer = EnrolledDeviceKey {
+            owner: o.owner,
+            device_ed25519: o.cert.device_pubkeys.classical.ed25519_verify,
+        };
+        assert!(verify_membership_signer(&ev, &signer).is_ok());
+    }
+
+    #[test]
+    fn verify_signer_rejects_tampered_event() {
+        let o = mint_test_owner(0x22);
+        let mut ev = sign_event(
+            &EventPayload {
+                id: [1u8; 16],
+                community_id: SpaceId([7u8; 16]),
+                kind: MembershipEventKind::Join,
+                actor: o.owner,
+                at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &o.device_key,
+        )
+        .unwrap();
+        ev.id = [2u8; 16]; // tamper after signing
+        let signer = EnrolledDeviceKey {
+            owner: o.owner,
+            device_ed25519: o.device_key.verifying_key().to_bytes(),
+        };
+        assert_eq!(
+            verify_membership_signer(&ev, &signer),
+            Err(VerifyError::SignatureInvalid)
+        );
+    }
+
+    #[test]
+    fn enrolled_key_from_cert_accepts_valid_cert() {
+        let o = mint_test_owner(0x23);
+        let ev = sign_event(
+            &EventPayload {
+                id: [1u8; 16],
+                community_id: SpaceId([7u8; 16]),
+                kind: MembershipEventKind::Join,
+                actor: o.owner,
+                at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &o.device_key,
+        )
+        .unwrap();
+        let ev = SignedMembershipEvent {
+            enrollment: Some(o.cert.clone()),
+            ..ev
+        };
+        let edk = enrolled_key_from_cert(&ev).expect("valid cert must succeed");
+        assert_eq!(edk.owner, o.owner);
+        assert_eq!(
+            edk.device_ed25519,
+            o.cert.device_pubkeys.classical.ed25519_verify
+        );
+    }
+
+    #[test]
+    fn enrollment_cert_forged_sig_rejected() {
+        let mut o = mint_test_owner(0x24);
+        o.cert.signature[0] ^= 1; // flip one byte to forge
+        let ev = sign_event(
+            &EventPayload {
+                id: [1u8; 16],
+                community_id: SpaceId([7u8; 16]),
+                kind: MembershipEventKind::Join,
+                actor: o.owner,
+                at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &o.device_key,
+        )
+        .unwrap();
+        let ev = SignedMembershipEvent {
+            enrollment: Some(o.cert.clone()),
+            ..ev
+        };
+        assert_eq!(
+            enrolled_key_from_cert(&ev),
+            Err(VerifyError::EnrollmentCertInvalid)
+        );
+    }
+
+    #[test]
+    fn enrollment_cert_owner_mismatch_rejected() {
+        // Use a valid cert from owner A but an event whose actor = owner B.
+        // This isolates EnrollmentOwnerMismatch from the cert's internal
+        // hash check (the cert itself is valid; only the actor binding is wrong).
+        let owner_a = mint_test_owner(0x25);
+        let owner_b = mint_test_owner(0x26);
+        let ev = sign_event(
+            &EventPayload {
+                id: [1u8; 16],
+                community_id: SpaceId([7u8; 16]),
+                kind: MembershipEventKind::Join,
+                actor: owner_b.owner, // actor = B
+                at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &owner_b.device_key,
+        )
+        .unwrap();
+        let ev = SignedMembershipEvent {
+            enrollment: Some(owner_a.cert.clone()), // cert = A (valid cert, wrong owner)
+            ..ev
+        };
+        assert_eq!(
+            enrolled_key_from_cert(&ev),
+            Err(VerifyError::EnrollmentOwnerMismatch)
+        );
+    }
+
+    #[test]
+    fn enrollment_cert_missing_rejected() {
+        let o = mint_test_owner(0x27);
+        let ev = sign_event(
+            &EventPayload {
+                id: [1u8; 16],
+                community_id: SpaceId([7u8; 16]),
+                kind: MembershipEventKind::Join,
+                actor: o.owner,
+                at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &o.device_key,
+        )
+        .unwrap();
+        assert_eq!(ev.enrollment, None, "precondition: event carries no cert");
+        assert_eq!(
+            enrolled_key_from_cert(&ev),
+            Err(VerifyError::MissingEnrollmentCert)
+        );
+    }
+
+    /// ZEB-339 (spec §10): a `Quorum`-issued cert is rejected by the community
+    /// path even when it passes `cert.verify()`'s STRUCTURAL checks, because
+    /// quorum signatures cannot be verified here (no OwnerState walk-back).
+    /// Construct a structurally-valid Quorum cert by hand and confirm rejection.
+    #[test]
+    fn enrollment_cert_quorum_issuer_rejected() {
+        use harmony_owner::certs::{EnrollmentCert, EnrollmentIssuer};
+        use harmony_owner::pubkey_bundle::{ClassicalKeys, PubKeyBundle};
+
+        let device_sk = ed25519_dalek::SigningKey::from_bytes(&[0x55; 32]);
+        let device_bundle = PubKeyBundle {
+            classical: ClassicalKeys {
+                ed25519_verify: device_sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
+            post_quantum: None,
+        };
+        let device_id = device_bundle.identity_hash();
+        let owner_id = [0xABu8; 16];
+        // Structurally-valid Quorum cert: 2 distinct signers, parity, version 1,
+        // device_pubkeys.identity_hash() == device_id. cert.verify() passes its
+        // Quorum structural branch (it does NOT verify the signatures).
+        let quorum_cert = EnrollmentCert {
+            version: 1,
+            owner_id,
+            device_id,
+            device_pubkeys: device_bundle,
+            issued_at: 1_700_000_000,
+            expires_at: None,
+            issuer: EnrollmentIssuer::Quorum {
+                signers: vec![[1u8; 16], [2u8; 16]],
+                signatures: vec![vec![0u8; 64], vec![0u8; 64]],
+            },
+            signature: vec![],
+        };
+        quorum_cert
+            .verify()
+            .expect("hand-built Quorum cert passes structural verify()");
+
+        let ev = sign_event(
+            &EventPayload {
+                id: [1u8; 16],
+                community_id: SpaceId([7u8; 16]),
+                kind: MembershipEventKind::Join,
+                actor: OwnerAddr(owner_id),
+                at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &device_sk,
+        )
+        .unwrap();
+        let ev = SignedMembershipEvent {
+            enrollment: Some(quorum_cert),
+            ..ev
+        };
+        // Despite passing structural verify() AND owner_id == actor, the Quorum
+        // issuer is rejected before the owner check.
+        assert_eq!(
+            enrolled_key_from_cert(&ev),
+            Err(VerifyError::EnrollmentCertInvalid)
         );
     }
 }
