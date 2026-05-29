@@ -253,9 +253,6 @@ async fn two_members_dag_sync_full_event_log() {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(matches!(
@@ -282,9 +279,6 @@ async fn two_members_dag_sync_full_event_log() {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(matches!(
@@ -448,9 +442,6 @@ async fn forged_signature_event_is_rejected_on_receive() {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(matches!(
@@ -689,9 +680,6 @@ async fn malformed_wire_packet_does_not_panic_engine() {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(matches!(
@@ -724,9 +712,6 @@ async fn malformed_wire_packet_does_not_panic_engine() {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(matches!(
@@ -891,9 +876,6 @@ async fn replay_of_same_root_publish_is_idempotent() {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(matches!(
@@ -920,9 +902,6 @@ async fn replay_of_same_root_publish_is_idempotent() {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(matches!(
@@ -955,9 +934,6 @@ async fn replay_of_same_root_publish_is_idempotent() {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(matches!(
@@ -1215,9 +1191,6 @@ async fn spoofed_publish_does_not_block_real_publisher() {
         expected_community_id: community_id,
         admin_addr: alice_addr,
         is_invite_only: false,
-        actor_identity_pub: &alice_pub,
-        countersigner_identity_pub: None,
-        admin_identity_pub: None,
     };
     {
         let state_a = registry_a
@@ -1675,9 +1648,6 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
         expected_community_id: community_id,
         admin_addr: alice_addr,
         is_invite_only: false,
-        actor_identity_pub: &alice_pub,
-        countersigner_identity_pub: None,
-        admin_identity_pub: None,
     };
     {
         let state_a = registry_a

@@ -1741,28 +1741,15 @@ pub async fn handle_unicast<H: AppHandleEmit>(
         //
         // The post-Inserted hook (Task 10) detects PendingJoin +
         // self-has-power and auto-emits JoinCountersign.
-        let joiner_identity_pub = match &join_event.kind {
-            crate::community_membership::MembershipEventKind::PendingJoin {
-                joiner_identity_pub,
-                ..
-            } => *joiner_identity_pub,
-            // Safety: is_pending_join_shape already confirmed the arm.
-            _ => unreachable!("is_pending_join_shape mismatch"),
-        };
-        // F6 trust-narrowing: the embedded PendingJoin.joiner_identity_pub
-        // must match the envelope's already-verified pub (from Path B sig
-        // verification in verify_packet_pure). A mismatch means the event
-        // was constructed with a different pub than the one that signed the
-        // envelope — reject before inserting into the engine.
-        if joiner_identity_pub != signed.joiner_identity_pub {
-            tracing::warn!(
-                "ZEB-254 handle_unicast: PendingJoin.joiner_identity_pub mismatch \
-                 with envelope.joiner_identity_pub — rejecting"
-            );
-            let e = CommunityInviteVerifyError::JoinSigInvalid;
-            emit_degraded(app, &signed.community_id, e.reason_tag());
-            return Err(e);
-        }
+        // ZEB-339: PendingJoin no longer carries an inline joiner_identity_pub
+        // (the joiner's enrolled device key is proven by the carried
+        // EnrollmentCert and verified inside verify_event). The envelope's
+        // joiner_identity_pub — already verified via the Path B app-sig binding
+        // in verify_packet_pure step 5 — is passed to the resolver-bypass
+        // insert path. The former F6 event↔envelope pub cross-check is
+        // subsumed by the cert→actor binding inside verify_event. (Task 8 will
+        // rework this redemption path onto the cert model end-to-end.)
+        let joiner_identity_pub = signed.joiner_identity_pub;
         match engine_arc
             .insert_local_event_with_pubs(join_event, joiner_identity_pub, None)
             .await

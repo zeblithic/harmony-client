@@ -1432,13 +1432,17 @@ impl CommunitySyncEngine {
         let admin_first_seen =
             event.actor == self.admin_addr && self.admin_identity_pub.get().is_none();
 
+        // ZEB-339: VerifyContext no longer carries caller-resolved pubs;
+        // verify_event resolves the signer from the carried EnrollmentCert
+        // (Join/PendingJoin) or the actor's materialized enrolled_device_keys
+        // (steady-state). The resolver-derived pubs are retained only to keep
+        // the admin_identity_pub OnceLock (consumed by the publisher-auth path)
+        // populated — they no longer feed the membership verify.
+        let _ = countersigner_pub;
         let ctx = crate::community_membership::VerifyContext {
             expected_community_id: self.community_id,
             admin_addr: self.admin_addr,
             is_invite_only: self.is_invite_only,
-            actor_identity_pub: &actor_pub,
-            countersigner_identity_pub: countersigner_pub.as_ref(),
-            admin_identity_pub: self.admin_identity_pub.get(),
         };
 
         let outcome = {
@@ -1624,21 +1628,24 @@ impl CommunitySyncEngine {
             None
         };
 
+        // ZEB-339: pubs no longer feed VerifyContext (signer resolved from
+        // cert / materialized keys); resolver lookups above are retained as a
+        // missing-actor guard and to feed the publisher-auth OnceLock.
+        let _ = (
+            &first_actor_pub,
+            &first_countersigner_pub,
+            &second_actor_pub,
+            &second_countersigner_pub,
+        );
         let first_ctx = crate::community_membership::VerifyContext {
             expected_community_id: self.community_id,
             admin_addr: self.admin_addr,
             is_invite_only: self.is_invite_only,
-            actor_identity_pub: &first_actor_pub,
-            countersigner_identity_pub: first_countersigner_pub.as_ref(),
-            admin_identity_pub: self.admin_identity_pub.get(),
         };
         let second_ctx = crate::community_membership::VerifyContext {
             expected_community_id: self.community_id,
             admin_addr: self.admin_addr,
             is_invite_only: self.is_invite_only,
-            actor_identity_pub: &second_actor_pub,
-            countersigner_identity_pub: second_countersigner_pub.as_ref(),
-            admin_identity_pub: self.admin_identity_pub.get(),
         };
 
         // C5: pre-validate BOTH events before any state mutation.
@@ -1951,13 +1958,13 @@ async fn spawn_auto_counter_sign_task(
     // We bypass `insert_local_event` to avoid needing an Arc<CommunitySyncEngine>
     // back-reference (which would create a reference cycle). The insert uses
     // the same VerifyContext shape as `insert_event_with_resolved_pubs`.
+    // ZEB-339: signer resolved from materialized membership; self_pub /
+    // admin_identity_pub no longer feed the slim VerifyContext.
+    let _ = (&self_pub, &admin_identity_pub);
     let ctx_v = crate::community_membership::VerifyContext {
         expected_community_id: community_id,
         admin_addr,
         is_invite_only,
-        actor_identity_pub: &self_pub,
-        countersigner_identity_pub: None,
-        admin_identity_pub: admin_identity_pub.get(),
     };
 
     // R3 (C4): clone before the move into insert_event so we can emit a
@@ -3307,18 +3314,23 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
                 // address (P6 binding), so this fallback is safe —
                 // a forged event with a mismatching inline pub will
                 // still be rejected downstream.
-                if let crate::community_membership::MembershipEventKind::PendingJoin {
-                    joiner_identity_pub,
-                    ..
-                } = &event.kind
-                {
+                if matches!(
+                    &event.kind,
+                    crate::community_membership::MembershipEventKind::PendingJoin { .. }
+                ) {
+                    // ZEB-339: PendingJoin no longer carries an inline
+                    // joiner_identity_pub; the joiner's enrolled device key is
+                    // proven by the carried EnrollmentCert and verified inside
+                    // verify_event. The resolver result is no longer threaded
+                    // into verify; a placeholder keeps the publisher-auth
+                    // bookkeeping below unchanged pending Task 9 rework.
                     tracing::debug!(
                         community_id = ?ctx.community_id,
                         actor = ?event.actor,
                         "R4-2: cold OwnerDeviceCache for PendingJoin actor; \
-                         using inline joiner_identity_pub fallback"
+                         enrolled-cert path handles signer resolution"
                     );
-                    *joiner_identity_pub
+                    [0u8; 64]
                 } else {
                     tracing::warn!(
                         community_id = ?ctx.community_id,
@@ -3434,19 +3446,16 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             let admin_first_seen =
                 event.actor == ctx.admin_addr && ctx.admin_identity_pub.get().is_none();
 
-            // Inline `Option::as_ref` because rustc can't always infer
-            // the right `AsRef` impl on `[u8; 64]`.
-            let cs_pub_ref: Option<&[u8; 64]> = match &cs_pub_owned {
-                Some(p) => Some(p),
-                None => None,
-            };
+            // ZEB-339: VerifyContext no longer carries caller-resolved pubs.
+            // The resolver-based actor_pub/cs_pub resolution above remains
+            // for the publisher-auth path (Task 9 rework); it is no longer
+            // threaded into verify_event, which now resolves signers from
+            // the carried cert / materialized membership.
+            let _ = (&actor_pub, &cs_pub_owned);
             let ctx_v = VerifyContext {
                 expected_community_id: ctx.community_id,
                 admin_addr: ctx.admin_addr,
                 is_invite_only: ctx.is_invite_only,
-                actor_identity_pub: &actor_pub,
-                countersigner_identity_pub: cs_pub_ref,
-                admin_identity_pub: ctx.admin_identity_pub.get(),
             };
             // Clone before `insert_event` consumes the event so we can
             // surface the delta if the outcome is `Inserted`. The clone

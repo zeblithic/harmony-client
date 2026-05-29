@@ -47,7 +47,6 @@ const EXPECTED_SPACE_PENDING_JOIN_HEX: &str = "b06269645033333333333333333333333
 fn pending_join_canonical_cbor_pinned() {
     let kind = MembershipEventKind::PendingJoin {
         invite_token: synth_invite_token(),
-        joiner_identity_pub: [0x55; 64],
     };
     let encoded = canonical_cbor_encode(&kind).expect("encode");
     let actual_hex = hex::encode(&encoded);

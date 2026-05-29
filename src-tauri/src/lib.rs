@@ -14857,24 +14857,15 @@ pub fn mint_redemption(
     // full identity_pub. Distributed via the community CRDT so admins
     // who were offline at redemption time can counter-sign asynchronously.
     let event_kind = if payload.is_invite_only {
-        use crate::dm_signing::ed25519_priv_to_x25519;
-        let x25519_priv = ed25519_priv_to_x25519(signing_key);
-        let x25519_pub =
-            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*x25519_priv));
-        let ed25519_pub_bytes = signing_key.verifying_key().to_bytes();
-        let mut identity_pub = [0u8; 64];
-        identity_pub[..32].copy_from_slice(x25519_pub.as_bytes());
-        identity_pub[32..].copy_from_slice(&ed25519_pub_bytes);
-
+        // ZEB-339: PendingJoin no longer carries an inline joiner_identity_pub;
+        // the joiner's enrolled device key is proven by the EnrollmentCert
+        // attached to the signed event and verified inside verify_event.
         let invite_token = payload
             .invite_token
             .clone()
             .ok_or_else(|| "invite-only payload is missing invite_token".to_string())?;
 
-        MembershipEventKind::PendingJoin {
-            invite_token,
-            joiner_identity_pub: identity_pub,
-        }
+        MembershipEventKind::PendingJoin { invite_token }
     } else {
         MembershipEventKind::Join
     };
@@ -17484,26 +17475,16 @@ mod redeem_invite_inner_tests {
             mint_redemption(&payload, joiner_addr, &joiner_sk, hlc).expect("mint invite-only");
 
         match &minted.bootstrap_join.kind {
-            MembershipEventKind::PendingJoin {
-                invite_token: t,
-                joiner_identity_pub,
-            } => {
+            MembershipEventKind::PendingJoin { invite_token: t } => {
                 assert_eq!(
                     t.inviter, admin_addr,
                     "InviteToken should be carried through"
                 );
-                assert_eq!(
-                    joiner_identity_pub.len(),
-                    64,
-                    "joiner_identity_pub must be 64 bytes"
-                );
-                // The Ed25519 half (bytes 32-64) MUST match the signing_key's verifying key.
-                let ed_pub = joiner_sk.verifying_key().to_bytes();
-                assert_eq!(
-                    &joiner_identity_pub[32..],
-                    &ed_pub,
-                    "Ed25519 half must match"
-                );
+                // ZEB-339: PendingJoin no longer carries an inline
+                // joiner_identity_pub; the joiner's enrolled device key is
+                // proven by the EnrollmentCert on the signed event. (T10
+                // migrates this assertion onto the cert model.)
+                let _ = &joiner_sk;
             }
             other => panic!("expected PendingJoin kind, got {:?}", other),
         }
@@ -32270,9 +32251,6 @@ mod list_community_members_ipc_tests {
                     expected_community_id: community_id,
                     admin_addr: admin,
                     is_invite_only: false,
-                    actor_identity_pub: &identity_pub,
-                    countersigner_identity_pub: None,
-                    admin_identity_pub: None,
                 },
             );
             assert!(
@@ -33008,9 +32986,6 @@ mod unban_from_community_tests {
             expected_community_id: payload.community_id,
             admin_addr: admin,
             is_invite_only: false,
-            actor_identity_pub: actor_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         let outcome = state.insert_event(ev, &ctx);
         assert!(
@@ -33118,9 +33093,6 @@ mod unban_from_community_tests {
                     expected_community_id: community_id,
                     admin_addr: admin,
                     is_invite_only: false,
-                    actor_identity_pub: &admin_pub,
-                    countersigner_identity_pub: None,
-                    admin_identity_pub: None,
                 },
             )
         };
@@ -33269,9 +33241,6 @@ mod unban_from_community_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &mod_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
 
@@ -33354,9 +33323,6 @@ mod unban_from_community_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
 
@@ -33439,9 +33405,6 @@ mod unban_from_community_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(
@@ -33535,9 +33498,6 @@ mod unban_from_community_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(matches!(sp_outcome, InsertOutcome::Inserted));
@@ -33558,9 +33518,6 @@ mod unban_from_community_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(matches!(kick_outcome, InsertOutcome::Inserted));
@@ -33581,9 +33538,6 @@ mod unban_from_community_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(matches!(unban_outcome, InsertOutcome::Inserted));
@@ -33736,9 +33690,6 @@ mod unban_from_community_tests {
                     expected_community_id: community_id,
                     admin_addr: admin,
                     is_invite_only: false,
-                    actor_identity_pub: &admin_pub,
-                    countersigner_identity_pub: None,
-                    admin_identity_pub: None,
                 },
             );
             assert!(
@@ -33903,7 +33854,6 @@ mod pending_join_audit_feed_tests {
             MAX_MS,
             MembershipEventKind::PendingJoin {
                 invite_token: make_token(admin, None),
-                joiner_identity_pub: [0u8; 64],
             },
             community_id,
         );
@@ -33915,7 +33865,6 @@ mod pending_join_audit_feed_tests {
             MAX_MS - 1_000,
             MembershipEventKind::PendingJoin {
                 invite_token: make_token(admin, None),
-                joiner_identity_pub: [0u8; 64],
             },
             community_id,
         );
@@ -33937,7 +33886,6 @@ mod pending_join_audit_feed_tests {
             EXPIRED_MS,
             MembershipEventKind::PendingJoin {
                 invite_token: make_token(admin, None),
-                joiner_identity_pub: [0u8; 64],
             },
             community_id,
         );
@@ -33999,7 +33947,6 @@ mod pending_join_audit_feed_tests {
             1_000,
             MembershipEventKind::PendingJoin {
                 invite_token: make_token(admin, Some(hint_addr)),
-                joiner_identity_pub: [0u8; 64],
             },
             community_id,
         );
@@ -34035,7 +33982,6 @@ mod pending_join_audit_feed_tests {
             100,
             MembershipEventKind::PendingJoin {
                 invite_token: make_token(self_owner, None),
-                joiner_identity_pub: [0u8; 64],
             },
             community_id,
         );
@@ -34045,7 +33991,6 @@ mod pending_join_audit_feed_tests {
             200,
             MembershipEventKind::PendingJoin {
                 invite_token: make_token(self_owner, None),
-                joiner_identity_pub: [0u8; 64],
             },
             community_id,
         );
@@ -34055,7 +34000,6 @@ mod pending_join_audit_feed_tests {
             300,
             MembershipEventKind::PendingJoin {
                 invite_token: make_token(other_admin, None),
-                joiner_identity_pub: [0u8; 64],
             },
             community_id,
         );
@@ -34493,9 +34437,6 @@ mod admin_action_result_routing_tests {
             expected_community_id: payload.community_id,
             admin_addr: admin,
             is_invite_only: false,
-            actor_identity_pub: actor_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         let outcome = state.insert_event(ev, &ctx);
         assert!(
@@ -34575,9 +34516,6 @@ mod admin_action_result_routing_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         // admin_quorum == 1 → direct SetPower accepted (Completed path).
@@ -34663,9 +34601,6 @@ mod admin_action_result_routing_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(
@@ -34692,9 +34627,6 @@ mod admin_action_result_routing_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(
@@ -34727,9 +34659,6 @@ mod admin_action_result_routing_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         match direct_outcome {
@@ -34771,9 +34700,6 @@ mod admin_action_result_routing_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(
@@ -35247,9 +35173,6 @@ mod countersign_admin_proposal_tests {
             expected_community_id: payload.community_id,
             admin_addr: admin,
             is_invite_only: false,
-            actor_identity_pub: actor_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         let outcome = state.insert_event(ev, &ctx);
         assert!(
@@ -35328,9 +35251,6 @@ mod countersign_admin_proposal_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(
@@ -35354,9 +35274,6 @@ mod countersign_admin_proposal_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(
@@ -35391,9 +35308,6 @@ mod countersign_admin_proposal_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(
@@ -35454,9 +35368,6 @@ mod countersign_admin_proposal_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &second_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(
@@ -35485,9 +35396,6 @@ mod countersign_admin_proposal_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &second_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         // CRDT must reject duplicate countersign (duplicate actor for same proposal).
@@ -35598,9 +35506,6 @@ mod countersign_admin_proposal_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &second_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(
@@ -35655,9 +35560,6 @@ mod propose_change_quorum_tests {
             expected_community_id: payload.community_id,
             admin_addr: admin,
             is_invite_only: false,
-            actor_identity_pub: actor_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         let outcome = state.insert_event(ev, &ctx);
         assert!(
@@ -35728,9 +35630,6 @@ mod propose_change_quorum_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(
@@ -35772,9 +35671,6 @@ mod propose_change_quorum_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(

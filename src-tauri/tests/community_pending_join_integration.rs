@@ -179,7 +179,6 @@ async fn pending_join_accepted_via_engine_insert_after_bind_admin_identity_pub()
         community_id,
         kind: MembershipEventKind::PendingJoin {
             invite_token: token,
-            joiner_identity_pub: joiner_pub,
         },
         actor: joiner_addr,
         at: Hlc {
@@ -363,7 +362,6 @@ async fn admin_engine_auto_counter_signs_on_pending_join_insert() {
         community_id,
         kind: MembershipEventKind::PendingJoin {
             invite_token: token,
-            joiner_identity_pub: joiner_pub,
         },
         actor: joiner_addr,
         at: Hlc {
@@ -483,7 +481,6 @@ async fn admin_engine_idempotent_no_duplicate_counter_sign() {
         community_id,
         kind: MembershipEventKind::PendingJoin {
             invite_token: token,
-            joiner_identity_pub: joiner_pub,
         },
         actor: joiner_addr,
         at: Hlc {
@@ -718,7 +715,6 @@ async fn joiner_engine_clears_pending_join_at_on_countersign() {
         community_id,
         kind: MembershipEventKind::PendingJoin {
             invite_token: invite_token.clone(),
-            joiner_identity_pub: joiner_pub,
         },
         actor: joiner_addr,
         at: Hlc {
@@ -998,7 +994,6 @@ async fn pending_join_cancellation_via_leave() {
         community_id,
         kind: MembershipEventKind::PendingJoin {
             invite_token: token,
-            joiner_identity_pub: joiner_pub,
         },
         actor: joiner_addr,
         at: Hlc {
@@ -1159,7 +1154,6 @@ async fn pending_join_resolves_under_two_admin_race() {
         community_id,
         kind: MembershipEventKind::PendingJoin {
             invite_token: token,
-            joiner_identity_pub: joiner_pub,
         },
         actor: joiner_addr,
         at: Hlc {
@@ -1339,7 +1333,6 @@ async fn pending_join_resolves_when_admin_comes_online() {
         community_id,
         kind: MembershipEventKind::PendingJoin {
             invite_token: token,
-            joiner_identity_pub: joiner_pub,
         },
         actor: joiner_addr,
         at: Hlc {
@@ -1519,7 +1512,6 @@ async fn boot_reconcile_engine_accepts_pending_join_via_opportunistic_late_bind(
         community_id,
         kind: MembershipEventKind::PendingJoin {
             invite_token: token,
-            joiner_identity_pub: joiner_pub,
         },
         actor: joiner_addr,
         at: Hlc {
@@ -1637,7 +1629,6 @@ async fn boot_reconcile_engine_accepts_pending_join_via_state_root_late_bind() {
         community_id,
         kind: MembershipEventKind::PendingJoin {
             invite_token: token,
-            joiner_identity_pub: joiner_pub,
         },
         actor: joiner_addr,
         at: Hlc {
@@ -1816,7 +1807,6 @@ async fn restart_recovery_already_known_pending_join_triggers_counter_sign() {
         community_id,
         kind: MembershipEventKind::PendingJoin {
             invite_token: token,
-            joiner_identity_pub: joiner_pub,
         },
         actor: joiner_addr,
         at: Hlc {
