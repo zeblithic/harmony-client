@@ -87,15 +87,33 @@
   // components read through resolveCard() inside $derived so the upgrade
   // is transparent — no snapshot, always a live read.
   const memberCardService = new MemberCardService();
+  // ZEB-341 Task 8: reactivity seam. The service stays a plain class with a
+  // plain Map; it calls onUpdate() after any poll mutates the card map. We
+  // bump this $state counter so the resolveCard() reads inside MemberRow /
+  // ChannelMessageFeed $derived re-run and peer names fill in live.
+  let cardVersion = $state(0);
+  memberCardService.onUpdate = () => {
+    cardVersion++;
+  };
   // selfOwnerId is the OwnerAddr hex (32 chars) obtained from get_owner_state.
   // Set at startup (after start_node) and kept stable for the session.
   let selfOwnerId = $state<string | null>(null);
 
   // Expose a resolver function that components call inside $derived.
-  // Defined as a function (not a one-time snapshot) so that when Task 8
-  // converts cards to $state the reactive reads continue to work.
+  // Reading cardVersion registers the reactive dependency so consumers
+  // re-run when a peer card arrives (Task 8).
   function resolveCard(ownerIdHex: string) {
+    cardVersion; // reactive dep: re-run derived consumers when cards change
     return memberCardService.resolve(ownerIdHex);
+  }
+
+  // ZEB-341 Task 8: lifecycle hooks threaded down to CommunityMembersPanel,
+  // which knows the visible-member set. No-ops until the adapter wires up.
+  function subscribeVisibleCards(ownerIdHexes: string[]) {
+    void memberCardService.subscribeVisible(ownerIdHexes);
+  }
+  function unsubscribeCards() {
+    void memberCardService.unsubscribeAll();
   }
 
   async function handleProfileSave(profile: Profile) {
@@ -730,6 +748,10 @@
       tauriAdapter = adapter;
       libraryDirectoryService = new LibraryDirectoryService(adapter);
       profileBroadcastService = new ProfileBroadcastService(adapter);
+      // ZEB-341 Task 8: the MemberCardService is constructed early (so
+      // seedSelf/resolve work at boot before Tauri-init); wire the adapter
+      // now so cross-peer subscriptions can start.
+      memberCardService.setAdapter(adapter);
 
       // ZEB-298 PR 2 Task 10 — wire the voting adapter so the
       // delegate-on-behalf Tauri event can fire toast notifications.
@@ -1630,6 +1652,8 @@
           sharedInProfileByCommunity = next;
         }}
         {resolveCard}
+        {subscribeVisibleCards}
+        {unsubscribeCards}
       />
     {:else}
       <TextFeed

@@ -40,6 +40,8 @@
     onSelectCommunity,
     votingAdapter,
     resolveCard,
+    subscribeVisibleCards,
+    unsubscribeCards,
   }: {
     communityId: string;
     communityName: string;
@@ -54,6 +56,10 @@
     trustService?: TrustService;
     /** ZEB-341: optional card resolver — undefined until owner identity loads. */
     resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
+    /** ZEB-341 Task 8: subscribe to cross-peer cards for the visible member set. */
+    subscribeVisibleCards?: (ownerIdHexes: string[]) => void;
+    /** ZEB-341 Task 8: tear down all card subscriptions when the panel unmounts. */
+    unsubscribeCards?: () => void;
     /** ZEB-291 Phase 2: connected VotingAdapter. When present, a
      *  Proposals tab appears next to Channels — switches the middle
      *  column to the Tier 2 governance panel. Optional so existing
@@ -458,6 +464,8 @@
         {communityService}
         ownAddress={ownAddress}
         {resolveCard}
+        {subscribeVisibleCards}
+        {unsubscribeCards}
       />
     </div>
   </div>

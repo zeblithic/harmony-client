@@ -15,6 +15,8 @@
     communityService,
     ownAddress,
     resolveCard,
+    subscribeVisibleCards,
+    unsubscribeCards,
   }: {
     communityId: string;
     communityName: string;
@@ -22,6 +24,10 @@
     ownAddress: string;
     /** ZEB-341: optional card resolver for display names. */
     resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
+    /** ZEB-341 Task 8: subscribe to cross-peer cards for the visible member set. */
+    subscribeVisibleCards?: (ownerIdHexes: string[]) => void;
+    /** ZEB-341 Task 8: tear down all card subscriptions when this panel unmounts. */
+    unsubscribeCards?: () => void;
   } = $props();
 
   let members: CommunityMember[] = $state([]);
@@ -99,6 +105,15 @@
       (m) => m.status === 'banned' && matchesSearch(m, searchTrimmed)
     )
   );
+
+  // ZEB-341 Task 8: as the visible member set loads/changes, (re)subscribe to
+  // each member's owner_id card. The service diffs internally (subscribes new,
+  // unsubscribes departed) and excludes self, so calling it on every change is
+  // idempotent. `member.address` is the lowercase owner_id hex.
+  $effect(() => {
+    const addrs = members.map((m) => m.address);
+    subscribeVisibleCards?.(addrs);
+  });
 
   async function refresh() {
     // Only show the loading skeleton on the very first fetch — subsequent
@@ -228,6 +243,8 @@
 
   onDestroy(() => {
     communityService.onMembersChanged = prevOnMembersChanged;
+    // ZEB-341 Task 8: tear down card subscriptions + poll loop on unmount.
+    unsubscribeCards?.();
   });
 </script>
 
