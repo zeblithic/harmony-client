@@ -3197,7 +3197,13 @@ pub(crate) async fn start_node_inner(
                             // materialize's staleness-gate at §4.2).
                             {
                                 let community_registry_for_heal = std::sync::Arc::clone(&registry);
-                                let signing_key_for_heal = std::sync::Arc::clone(&signing_key_arc);
+                                // ZEB-339 fix: EpochRotation/EpochCatchup are
+                                // MembershipEvents verified via
+                                // resolve_enrolled_signer, which matches
+                                // against enrolled_device_keys (device #2).
+                                // Must sign with community_signing_key_arc
+                                // (device #2), NOT the Reticulum signing_key_arc.
+                                let signing_key_for_heal = std::sync::Arc::clone(&community_signing_key_arc);
                                 let hlc_tracker_for_heal = std::sync::Arc::clone(&tracker);
                                 let device_id_for_heal = device_id.clone();
                                 let self_owner_for_heal = self_owner;
@@ -3264,7 +3270,7 @@ pub(crate) async fn start_node_inner(
                                 );
                                 move |delta: crate::community_state_sync::CommunityMembershipDelta| {
                                     let registry = std::sync::Arc::clone(&community_registry_for_heal);
-                                    let signing_key = std::sync::Arc::clone(&signing_key_for_heal);
+                                    let community_signing_key = std::sync::Arc::clone(&signing_key_for_heal);
                                     let hlc_tracker = std::sync::Arc::clone(&hlc_tracker_for_heal);
                                     let device_id = device_id_for_heal.clone();
                                     let self_owner = self_owner_for_heal;
@@ -3382,7 +3388,7 @@ pub(crate) async fn start_node_inner(
                                         self_heal_community_observer(
                                             delta.community_id,
                                             registry,
-                                            signing_key,
+                                            community_signing_key,
                                             hlc_tracker,
                                             device_id,
                                             self_owner,
@@ -22011,7 +22017,7 @@ pub type SynthCatchupsSet = std::sync::Arc<
 pub async fn self_heal_community_observer(
     community_id: crate::owner_state_types::SpaceId,
     registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
-    signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    community_signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
     hlc_tracker: std::sync::Arc<
         tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
     >,
@@ -22154,7 +22160,7 @@ pub async fn self_heal_community_observer(
             triggered_by,
             current_epoch,
             recipients,
-            &signing_key,
+            &community_signing_key,
             hlc,
         ) {
             Ok(r) => r,
@@ -22305,7 +22311,7 @@ pub async fn self_heal_community_observer(
             triggered_by,
             current_epoch,
             recipients,
-            &signing_key,
+            &community_signing_key,
             hlc,
         ) {
             Ok(c) => c,
