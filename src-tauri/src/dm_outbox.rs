@@ -483,7 +483,7 @@ impl DmOutbox {
         }
     }
 
-    /// Test-only constructor that bypasses the ZEB-339 `debug_assert!`
+    /// Test-only constructor that bypasses the ZEB-339 `assert!`
     /// invariant checks in `DmOutbox::new`. Use this in integration tests
     /// that are still using synthetic/mismatched enrolled-device material
     /// (e.g. a cert minted with a different seed than the community owner
@@ -2239,7 +2239,7 @@ mod tests {
 
     /// Test-only helper: build a `DmOutbox` with synthetic materials for
     /// tests that don't exercise community-signing paths. Constructs the
-    /// struct directly (bypassing `DmOutbox::new`'s `debug_assert!` checks)
+    /// struct directly (bypassing `DmOutbox::new`'s `assert!` checks)
     /// so that tests which need a specific `self_owner` for DM space
     /// membership or ack-address assertions can supply an arbitrary address
     /// without needing a matching `EnrollmentCert`.
@@ -2268,7 +2268,7 @@ mod tests {
         // ZEB-339: synthetic community_signing_key + enrollment_cert for tests
         // that don't exercise community-signing paths. Uses a fixed seed so
         // the helper stays deterministic. The cert's owner_id does NOT match
-        // self_owner (the debug_assert in DmOutbox::new is bypassed below by
+        // self_owner (the assert in DmOutbox::new is bypassed below by
         // constructing the struct directly — production callers must use new()).
         let test_owner = crate::community_membership::mint_test_owner(0xAB);
         let community_signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(
@@ -2334,7 +2334,7 @@ mod tests {
         // ZEB-339: supply synthetic community_signing_key + enrollment_cert;
         // this test only exercises the Reticulum signing_key / private_identity
         // binding, not the community cert binding. Use new_synthetic to bypass
-        // the cert.owner_id debug_assert (self_owner here is Reticulum-derived,
+        // the cert.owner_id assert (self_owner here is Reticulum-derived,
         // not from a harmony-owner master key).
         let test_owner_for_countersign = crate::community_membership::mint_test_owner(0xCC);
         let community_signing_key_for_countersign =
