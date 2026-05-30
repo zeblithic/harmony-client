@@ -14,7 +14,8 @@
 //! per-engine.
 
 use harmony_app::community_membership::{
-    sign_event, ChannelId, EventPayload, MembershipEventKind, VerifyError,
+    mint_test_owner, sign_event, ChannelId, EventPayload, MembershipEventKind,
+    SignedMembershipEvent, TestOwner, VerifyError,
 };
 use harmony_app::community_state_crdt::InsertOutcome;
 use harmony_app::community_state_sync::{
@@ -23,7 +24,6 @@ use harmony_app::community_state_sync::{
 };
 use harmony_app::content_store::{CasOp, ContentStore, RuntimeContentStore};
 use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
-use harmony_identity::PrivateIdentity;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,14 +47,14 @@ impl IdentityResolver for TwoIdentityResolver {
     }
 }
 
-/// Reach into `PrivateIdentity`'s ed25519 seed the same way production
-/// and the open-flow integration test do (canonical 32-byte ed25519 seed
-/// lives in bytes 32..64 of `to_private_bytes()`).
-fn signing_key_from(identity: &PrivateIdentity) -> ed25519_dalek::SigningKey {
-    let priv_bytes = identity.to_private_bytes();
-    let mut secret = [0u8; 32];
-    secret.copy_from_slice(&priv_bytes[32..64]);
-    ed25519_dalek::SigningKey::from_bytes(&secret)
+/// ZEB-339: attach the owner's Master enrollment cert to a Join event so the
+/// receiving engine's `materialize`/`verify_event` learns the owner's enrolled
+/// device key. Steady-state events (ChannelCreate, etc.) carry no cert.
+fn with_join_cert(event: SignedMembershipEvent, owner: &TestOwner) -> SignedMembershipEvent {
+    SignedMembershipEvent {
+        enrollment: Some(owner.cert.clone()),
+        ..event
+    }
 }
 
 /// Spawn the in-memory CAS servicer used by `RuntimeContentStore`.
@@ -146,18 +146,19 @@ fn spawn_forwarder(
 /// `MaterializedMembership.channels`.
 #[tokio::test]
 async fn alice_creates_channel_bob_materializes_via_state_sync() {
-    let alice = PrivateIdentity::from_seed(&[0xAA; 32]);
-    let bob = PrivateIdentity::from_seed(&[0xBB; 32]);
-    let alice_addr = OwnerAddr(alice.identity.address_hash);
-    let bob_addr = OwnerAddr(bob.identity.address_hash);
-    let alice_pub = alice.identity.to_public_bytes();
-    let bob_pub = bob.identity.to_public_bytes();
-    let alice_sk = Arc::new(signing_key_from(&alice));
-    let bob_sk = Arc::new(signing_key_from(&bob));
+    let alice = mint_test_owner(0xAA);
+    let bob = mint_test_owner(0xBB);
+    let alice_addr = alice.owner;
+    let bob_addr = bob.owner;
+    let alice_sk = Arc::new(alice.device_key.clone());
+    let bob_sk = Arc::new(bob.device_key.clone());
 
+    // ZEB-339: signer resolution uses the carried EnrollmentCert (Join) /
+    // materialized enrolled keys (steady-state), not the resolver — so the
+    // resolver's identity_pubs are unused for membership verify here.
     let resolver: Arc<dyn IdentityResolver> = Arc::new(TwoIdentityResolver {
-        a: (alice_addr, alice_pub),
-        b: (bob_addr, bob_pub),
+        a: (alice_addr, [0u8; 64]),
+        b: (bob_addr, [0u8; 64]),
     });
 
     let cas_op_tx = spawn_shared_cas();
@@ -260,7 +261,10 @@ async fn alice_creates_channel_bob_materializes_via_state_sync() {
         actor: alice_addr,
         at: alice_join_at.clone(),
     };
-    let alice_join = sign_event(&alice_join_payload, alice_sk.as_ref()).expect("sign join");
+    let alice_join = with_join_cert(
+        sign_event(&alice_join_payload, alice_sk.as_ref()).expect("sign join"),
+        &alice,
+    );
     let outcome = alice_engine
         .insert_local_event(alice_join.clone())
         .await
@@ -384,18 +388,19 @@ async fn alice_creates_channel_bob_materializes_via_state_sync() {
 /// Bob as Joined with power 0.
 #[tokio::test]
 async fn joined_sub_mod_member_channel_create_rejected_with_channel_admin_insufficient_power() {
-    let alice = PrivateIdentity::from_seed(&[0xAA; 32]);
-    let bob = PrivateIdentity::from_seed(&[0xBB; 32]);
-    let alice_addr = OwnerAddr(alice.identity.address_hash);
-    let bob_addr = OwnerAddr(bob.identity.address_hash);
-    let alice_pub = alice.identity.to_public_bytes();
-    let bob_pub = bob.identity.to_public_bytes();
-    let alice_sk = Arc::new(signing_key_from(&alice));
-    let bob_sk = Arc::new(signing_key_from(&bob));
+    let alice = mint_test_owner(0xAA);
+    let bob = mint_test_owner(0xBB);
+    let alice_addr = alice.owner;
+    let bob_addr = bob.owner;
+    let alice_sk = Arc::new(alice.device_key.clone());
+    let bob_sk = Arc::new(bob.device_key.clone());
 
+    // ZEB-339: signer resolution uses the carried EnrollmentCert (Join) /
+    // materialized enrolled keys (steady-state), not the resolver — so the
+    // resolver's identity_pubs are unused for membership verify here.
     let resolver: Arc<dyn IdentityResolver> = Arc::new(TwoIdentityResolver {
-        a: (alice_addr, alice_pub),
-        b: (bob_addr, bob_pub),
+        a: (alice_addr, [0u8; 64]),
+        b: (bob_addr, [0u8; 64]),
     });
 
     let cas_op_tx = spawn_shared_cas();
@@ -462,7 +467,10 @@ async fn joined_sub_mod_member_channel_create_rejected_with_channel_admin_insuff
         actor: alice_addr,
         at: alice_join_at,
     };
-    let alice_join = sign_event(&alice_join_payload, alice_sk.as_ref()).expect("sign alice join");
+    let alice_join = with_join_cert(
+        sign_event(&alice_join_payload, alice_sk.as_ref()).expect("sign alice join"),
+        &alice,
+    );
     let outcome = bob_engine
         .insert_local_event(alice_join)
         .await
@@ -483,7 +491,10 @@ async fn joined_sub_mod_member_channel_create_rejected_with_channel_admin_insuff
             device_id: "bob-dev".into(),
         },
     };
-    let bob_join = sign_event(&bob_join_payload, bob_sk.as_ref()).expect("sign bob join");
+    let bob_join = with_join_cert(
+        sign_event(&bob_join_payload, bob_sk.as_ref()).expect("sign bob join"),
+        &bob,
+    );
     let outcome = bob_engine
         .insert_local_event(bob_join)
         .await
@@ -530,18 +541,18 @@ async fn joined_sub_mod_member_channel_create_rejected_with_channel_admin_insuff
 /// state shows Alice as Joined AND the `general` channel present.
 #[tokio::test]
 async fn default_general_channel_round_trips_through_state_sync() {
-    let alice = PrivateIdentity::from_seed(&[0xCC; 32]);
-    let bob = PrivateIdentity::from_seed(&[0xDD; 32]);
-    let alice_addr = OwnerAddr(alice.identity.address_hash);
-    let bob_addr = OwnerAddr(bob.identity.address_hash);
-    let alice_pub = alice.identity.to_public_bytes();
-    let bob_pub = bob.identity.to_public_bytes();
-    let alice_sk = Arc::new(signing_key_from(&alice));
-    let bob_sk = Arc::new(signing_key_from(&bob));
+    let alice = mint_test_owner(0xCC);
+    let bob = mint_test_owner(0xDD);
+    let alice_addr = alice.owner;
+    let bob_addr = bob.owner;
+    let alice_sk = Arc::new(alice.device_key.clone());
+    let bob_sk = Arc::new(bob.device_key.clone());
 
+    // ZEB-339: signer resolution uses the carried EnrollmentCert / materialized
+    // enrolled keys, not the resolver — resolver pubs unused for membership.
     let resolver: Arc<dyn IdentityResolver> = Arc::new(TwoIdentityResolver {
-        a: (alice_addr, alice_pub),
-        b: (bob_addr, bob_pub),
+        a: (alice_addr, [0u8; 64]),
+        b: (bob_addr, [0u8; 64]),
     });
 
     let cas_op_tx = spawn_shared_cas();
@@ -640,7 +651,10 @@ async fn default_general_channel_round_trips_through_state_sync() {
         actor: alice_addr,
         at: alice_join_at.clone(),
     };
-    let alice_join = sign_event(&alice_join_payload, alice_sk.as_ref()).expect("sign join");
+    let alice_join = with_join_cert(
+        sign_event(&alice_join_payload, alice_sk.as_ref()).expect("sign join"),
+        &alice,
+    );
     let outcome = alice_engine
         .insert_local_event(alice_join.clone())
         .await
