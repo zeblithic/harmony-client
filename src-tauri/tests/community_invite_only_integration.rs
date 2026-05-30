@@ -654,7 +654,11 @@ async fn community_invite_only_tampered_admin_bootstrap_rejects() {
         admin_identity_pub: Some(alice_identity.identity.to_public_bytes()),
         forked_from: None,
         pre_fork_snapshot: None,
-        inviter_enrollment: None,
+        // ZEB-339: encode_invite_url requires invite-only payloads to carry the
+        // inviter's EnrollmentCert. Its content is irrelevant to this test (we
+        // assert on the tampered admin_bootstrap.sig rejection), so any valid
+        // cert satisfies the presence check.
+        inviter_enrollment: Some(harmony_app::community_membership::mint_test_owner(0xAA).cert),
     })
     .expect("encode URL");
 
