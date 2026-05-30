@@ -14258,7 +14258,6 @@ mod create_community_inner_tests {
     use crate::content_store::{ContentStore, RuntimeContentStore};
     use crate::owner_state_crdt::OwnerState;
     use crate::owner_state_types::{Hlc, OwnerAddr};
-    use harmony_identity::PrivateIdentity;
     use std::collections::BTreeMap;
     use tokio::sync::mpsc;
 
@@ -16511,16 +16510,6 @@ mod redeem_invite_inner_tests {
     use tokio::sync::mpsc;
 
     // ── Fixture helper ────────────────────────────────────────────────────────
-
-    pub(super) fn signing_key_from_identity(
-        identity: &PrivateIdentity,
-    ) -> std::sync::Arc<ed25519_dalek::SigningKey> {
-        let sk_bytes_full = identity.to_private_bytes();
-        let ed_seed: [u8; 32] = sk_bytes_full[32..64]
-            .try_into()
-            .expect("ed25519 seed slice 32..64");
-        std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed_seed))
-    }
 
     pub(super) struct RedeemInviteTestFixture {
         pub(super) crdt_state: std::sync::Arc<tokio::sync::Mutex<OwnerState>>,

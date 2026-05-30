@@ -136,14 +136,6 @@ fn register_owner(owner: &TestOwner) {
     });
 }
 
-fn owner_for(addr: OwnerAddr) -> TestOwner {
-    OWNER_REGISTRY.with(|r| {
-        r.borrow()
-            .get(&addr)
-            .cloned()
-            .expect("owner must be registered via make_test_identity")
-    })
-}
 
 /// ZEB-339: build a deterministic enrolled-device owner from a one-byte seed.
 /// Returns `(TestOwner, dummy_pub, owner_addr)` so existing `(priv, pub, addr)`
@@ -1362,7 +1354,7 @@ fn materialize_replays_in_hlc_order_not_input_order() {
 #[test]
 fn verify_event_accepts_valid_join_in_open_community() {
     let (_admin_priv, _admin_id_pub, admin) = make_test_identity(100);
-    let (alice_priv, alice_id_pub, alice) = make_test_identity(1);
+    let (alice_priv, _alice_id_pub, alice) = make_test_identity(1);
 
     // Pre-existing materialized state: admin has joined.
     let prior_state = materialize(
@@ -1396,7 +1388,7 @@ fn verify_event_accepts_valid_join_in_open_community() {
 #[test]
 fn verify_event_rejects_invite_only_join_without_countersig() {
     let (_admin_priv, _admin_id_pub, admin) = make_test_identity(100);
-    let (alice_priv, alice_id_pub, alice) = make_test_identity(1);
+    let (alice_priv, _alice_id_pub, alice) = make_test_identity(1);
 
     let prior_state = materialize(&[], admin);
 
@@ -1430,7 +1422,7 @@ fn verify_event_accepts_admin_self_join_in_invite_only_community_without_counter
     // member, but no one is Joined initially. Admin is implicitly
     // trusted by virtue of being admin_addr; their self-Join is the
     // bootstrap event that puts the first Joined member into the CRDT.
-    let (admin_priv, admin_id_pub, admin) = make_test_identity(100);
+    let (admin_priv, _admin_id_pub, admin) = make_test_identity(100);
 
     let prior_state = materialize(&[], admin); // empty community
 
@@ -1463,7 +1455,7 @@ fn verify_event_rejects_admin_invite_only_join_with_spurious_countersig() {
     // input. Reject as UnexpectedCounterSig (consistent with how
     // open-community Join with countersig is rejected). Defends against
     // wire-malleability via the countersig field.
-    let (admin_priv, admin_id_pub, admin) = make_test_identity(100);
+    let (admin_priv, _admin_id_pub, admin) = make_test_identity(100);
     let (someone_priv, _someone_id_pub, _someone) = make_test_identity(2);
 
     let prior_state = materialize(&[], admin);
@@ -1495,8 +1487,8 @@ fn verify_event_rejects_admin_invite_only_join_with_spurious_countersig() {
 
 #[test]
 fn verify_event_accepts_invite_only_join_with_valid_countersig() {
-    let (admin_priv, admin_id_pub, admin) = make_test_identity(100);
-    let (alice_priv, alice_id_pub, alice) = make_test_identity(1);
+    let (admin_priv, _admin_id_pub, admin) = make_test_identity(100);
+    let (alice_priv, _alice_id_pub, alice) = make_test_identity(1);
 
     let prior_state = materialize(
         &[make_signed(1, MembershipEventKind::Join, admin, 100)],
@@ -1529,7 +1521,7 @@ fn verify_event_accepts_invite_only_join_with_valid_countersig() {
 #[test]
 fn verify_event_rejects_kick_when_actor_power_below_threshold() {
     let (_admin_priv, _admin_id_pub, admin) = make_test_identity(100);
-    let (alice_priv, alice_id_pub, alice) = make_test_identity(1);
+    let (alice_priv, _alice_id_pub, alice) = make_test_identity(1);
     let (_bob_priv, _bob_id_pub, bob) = make_test_identity(2);
 
     let prior_state = materialize(
@@ -1574,7 +1566,7 @@ fn verify_event_rejects_kick_on_target_who_never_joined() {
     // materialize() would insert a brand-new MemberState with status
     // Banned and joined_at=kick_time, claiming the target was a member
     // when they never were. Reject at verify time to keep state honest.
-    let (admin_priv, admin_id_pub, admin) = make_test_identity(100);
+    let (admin_priv, _admin_id_pub, admin) = make_test_identity(100);
     let stranger = OwnerAddr([0xEEu8; 16]); // never appeared in any event
 
     let prior_state = materialize(
@@ -1618,7 +1610,7 @@ fn verify_event_accepts_kick_on_left_member() {
     // wants to make sure they don't come back). Target = Left should
     // still pass the membership check — they ARE in the members map,
     // just not Joined. Power-side checks then govern the rest.
-    let (admin_priv, admin_id_pub, admin) = make_test_identity(100);
+    let (admin_priv, _admin_id_pub, admin) = make_test_identity(100);
     let (alice_priv, _alice_id_pub, alice) = make_test_identity(1);
 
     let alice_join = {
@@ -1689,7 +1681,7 @@ fn verify_event_accepts_kick_on_left_member() {
 
 #[test]
 fn verify_event_rejects_kick_when_target_power_equals_actor() {
-    let (admin_priv, admin_id_pub, admin) = make_test_identity(100);
+    let (admin_priv, _admin_id_pub, admin) = make_test_identity(100);
     let (_admin2_priv, _admin2_id_pub, admin2) = make_test_identity(99);
 
     let prior_state = materialize(
@@ -1738,7 +1730,7 @@ fn verify_event_rejects_kick_when_target_power_equals_actor() {
 #[test]
 fn verify_event_rejects_setpower_when_actor_power_insufficient() {
     let (_admin_priv, _admin_id_pub, admin) = make_test_identity(100);
-    let (alice_priv, alice_id_pub, alice) = make_test_identity(1);
+    let (alice_priv, _alice_id_pub, alice) = make_test_identity(1);
     let (_bob_priv, _bob_id_pub, bob) = make_test_identity(2);
 
     let prior_state = materialize(
@@ -1790,7 +1782,7 @@ fn verify_event_rejects_invite_targeting_banned_member() {
     // case — leaving the Phase-4 IPC caller to incorrectly assume the
     // invite took effect. Reject at verify time so the caller surfaces
     // a clear error and the UI can prompt admin to unban first.
-    let (admin_priv, admin_id_pub, admin) = make_test_identity(100);
+    let (admin_priv, _admin_id_pub, admin) = make_test_identity(100);
     let (alice_priv, _alice_id_pub, alice) = make_test_identity(1);
 
     // alice joined, then admin kicked her.
@@ -1867,7 +1859,7 @@ fn verify_event_rejects_invite_from_non_joined_actor() {
     // accepts anyone — so a non-member can otherwise emit a valid
     // Invite. Membership must be the operative gate.
     let (_admin_priv, _admin_id_pub, admin) = make_test_identity(100);
-    let (alice_priv, alice_id_pub, alice) = make_test_identity(1);
+    let (alice_priv, _alice_id_pub, alice) = make_test_identity(1);
     let (_bob_priv, _bob_id_pub, bob) = make_test_identity(2);
 
     // Only admin has joined; alice has NOT.
@@ -1905,7 +1897,7 @@ fn verify_event_rejects_invite_from_non_joined_actor() {
 #[test]
 fn verify_event_rejects_kick_from_non_joined_actor() {
     let (_admin_priv, _admin_id_pub, admin) = make_test_identity(100);
-    let (alice_priv, alice_id_pub, alice) = make_test_identity(1);
+    let (alice_priv, _alice_id_pub, alice) = make_test_identity(1);
     let (_bob_priv, _bob_id_pub, bob) = make_test_identity(2);
 
     // Alice has high power (somehow assigned), but never Joined.
@@ -1959,7 +1951,7 @@ fn verify_event_rejects_kick_from_non_joined_actor() {
 #[test]
 fn verify_event_rejects_setpower_from_non_joined_actor() {
     let (_admin_priv, _admin_id_pub, admin) = make_test_identity(100);
-    let (alice_priv, alice_id_pub, alice) = make_test_identity(1);
+    let (alice_priv, _alice_id_pub, alice) = make_test_identity(1);
     let (_bob_priv, _bob_id_pub, bob) = make_test_identity(2);
 
     let prior_state = materialize(
@@ -2014,8 +2006,8 @@ fn verify_event_rejects_invite_only_join_with_non_joined_countersigner() {
     // attacker who somehow obtained an invite token from a non-member
     // could vouch for arbitrary joiners.
     let (_admin_priv, _admin_id_pub, admin) = make_test_identity(100);
-    let (alice_priv, alice_id_pub, alice) = make_test_identity(1);
-    let (outsider_priv, outsider_id_pub, outsider) = make_test_identity(99);
+    let (alice_priv, _alice_id_pub, alice) = make_test_identity(1);
+    let (outsider_priv, _outsider_id_pub, outsider) = make_test_identity(99);
 
     // Only admin Joined; outsider exists in power_levels (e.g., from a
     // pre-departure SetPower) but has never Joined.
@@ -2071,7 +2063,7 @@ fn verify_event_rejects_leave_from_banned_actor() {
     // A subsequent Join would no longer hit the Banned guard, letting
     // the kicked actor rejoin trivially. Reject Leave from Banned.
     let (admin_priv, _admin_id_pub, admin) = make_test_identity(100);
-    let (alice_priv, alice_id_pub, alice) = make_test_identity(1);
+    let (alice_priv, _alice_id_pub, alice) = make_test_identity(1);
 
     // Set up: alice joined, then admin kicked her.
     let prior_state = materialize(
@@ -2299,7 +2291,7 @@ fn verify_event_rejects_join_replay_after_kick() {
     // Kick = effective ban until an explicit unban flow exists
     // (deferred to a follow-up).
     let (admin_priv, _admin_id_pub, admin) = make_test_identity(100);
-    let (alice_priv, alice_id_pub, alice) = make_test_identity(1);
+    let (alice_priv, _alice_id_pub, alice) = make_test_identity(1);
 
     // alice joined, then was kicked by admin.
     let prior_state = materialize(
@@ -2375,7 +2367,7 @@ fn verify_event_rejects_setpower_when_level_exceeds_max() {
     // SetPower must NOT be able to assign 200/255/etc. — the cap is
     // structural to the moderation model (no member can hold a power
     // higher than admin can revoke).
-    let (admin_priv, admin_id_pub, admin) = make_test_identity(100);
+    let (admin_priv, _admin_id_pub, admin) = make_test_identity(100);
     let (_bob_priv, _bob_id_pub, bob) = make_test_identity(2);
 
     let prior_state = materialize(
@@ -2415,7 +2407,7 @@ fn verify_event_rejects_setpower_when_level_exceeds_max() {
 #[test]
 fn verify_event_accepts_setpower_at_max_boundary() {
     // Boundary check: level == POWER_THRESHOLDS.max (100) is allowed.
-    let (admin_priv, admin_id_pub, admin) = make_test_identity(100);
+    let (admin_priv, _admin_id_pub, admin) = make_test_identity(100);
     let (_bob_priv, _bob_id_pub, bob) = make_test_identity(2);
 
     let prior_state = materialize(
@@ -2459,7 +2451,7 @@ fn verify_event_rejects_countersig_on_open_community_join() {
     // (sig excludes countersig, so a peer can append/strip/replace
     // it without invalidating the actor sig). Reject explicitly.
     let (admin_priv, _admin_id_pub, admin) = make_test_identity(100);
-    let (alice_priv, alice_id_pub, alice) = make_test_identity(1);
+    let (alice_priv, _alice_id_pub, alice) = make_test_identity(1);
 
     let prior_state = materialize(
         &[make_signed(1, MembershipEventKind::Join, admin, 100)],
@@ -2494,7 +2486,7 @@ fn verify_event_rejects_countersig_on_open_community_join() {
 #[test]
 fn verify_event_rejects_countersig_on_invite_event() {
     // Even with the right context, Invite events never carry countersigs.
-    let (admin_priv, admin_id_pub, admin) = make_test_identity(100);
+    let (admin_priv, _admin_id_pub, admin) = make_test_identity(100);
     let (_bob_priv, _bob_id_pub, bob) = make_test_identity(2);
 
     let prior_state = materialize(
@@ -2536,7 +2528,7 @@ fn verify_event_rejects_event_for_wrong_community() {
     // wrong community's state. Bind the verification to the expected
     // community_id at the top of verify_event.
     let (_admin_priv, _admin_id_pub, admin) = make_test_identity(100);
-    let (alice_priv, alice_id_pub, alice) = make_test_identity(1);
+    let (alice_priv, _alice_id_pub, alice) = make_test_identity(1);
 
     let community_a = SpaceId([0xAA; 16]);
     let community_b = SpaceId([0xBB; 16]);
@@ -2628,7 +2620,7 @@ fn verify_event_rejects_when_actor_pubkey_doesnt_bind_to_actor() {
 fn kick_self_rejected_with_kick_target_power_not_lower() {
     // Admin kicks self — admin power 100, target (self) power 100, so
     // target.power not strictly less than actor.power → reject.
-    let (admin_priv, admin_id_pub, admin) = make_test_identity(0xa1);
+    let (admin_priv, _admin_id_pub, admin) = make_test_identity(0xa1);
 
     let prior_state = materialize(
         &[make_signed(1, MembershipEventKind::Join, admin, 1000)],
@@ -2665,7 +2657,7 @@ fn kick_self_rejected_with_kick_target_power_not_lower() {
 fn set_power_out_of_range_rejected() {
     // SetPower with level=200 — exceeds POWER_THRESHOLDS.max (100). Even
     // an admin can't bypass this; it's a wire-format range check.
-    let (admin_priv, admin_id_pub, admin) = make_test_identity(0xa2);
+    let (admin_priv, _admin_id_pub, admin) = make_test_identity(0xa2);
     let target = OwnerAddr([0xbb; 16]);
 
     let prior_state = materialize(
@@ -2703,7 +2695,7 @@ fn set_power_admin_self_demote_inserts() {
     // range; no power-level transition rule rejects it). The user-
     // visible warning lives in the future Phase 5 UI, not in
     // verify_event.
-    let (admin_priv, admin_id_pub, admin) = make_test_identity(0xa3);
+    let (admin_priv, _admin_id_pub, admin) = make_test_identity(0xa3);
 
     let prior_state = materialize(
         &[make_signed(1, MembershipEventKind::Join, admin, 1000)],
@@ -3028,7 +3020,7 @@ fn materialize_channel_modify_on_unknown_channel_is_noop() {
 fn verify_event_channel_create_succeeds_for_admin_at_bootstrap_power() {
     // Admin's bootstrap power is 100 (set in materialize). prior_state
     // built from just the admin's Join.
-    let (admin_priv, admin_pub, admin_addr) = make_test_identity(0xAA);
+    let (admin_priv, _admin_pub, admin_addr) = make_test_identity(0xAA);
     let community_id = SpaceId([0x37; 16]);
 
     // ZEB-339: build admin's Join via the enrolled-device helper so its cert is
@@ -3077,7 +3069,7 @@ fn verify_event_channel_create_succeeds_for_admin_at_bootstrap_power() {
 #[test]
 fn verify_event_channel_create_rejects_below_mod_power() {
     let (admin_priv, _admin_pub, admin_addr) = make_test_identity(0xAA);
-    let (sub_priv, sub_pub, sub_addr) = make_test_identity(0xBB);
+    let (sub_priv, _sub_pub, sub_addr) = make_test_identity(0xBB);
     let community_id = SpaceId([0x37; 16]);
 
     // Admin Joins via signed payload to populate prior_state correctly.
@@ -3144,7 +3136,7 @@ fn verify_event_channel_create_rejects_below_mod_power() {
 fn verify_event_channel_create_accepts_at_kick_threshold() {
     // A mod (power exactly 50, the kick threshold) is allowed to modify channels.
     let (admin_priv, _admin_pub, admin_addr) = make_test_identity(0xAA);
-    let (mod_priv, mod_pub, mod_addr) = make_test_identity(0xBB);
+    let (mod_priv, _mod_pub, mod_addr) = make_test_identity(0xBB);
     let community_id = SpaceId([0x37; 16]);
 
     let admin_join_payload = EventPayload {
@@ -3280,7 +3272,7 @@ fn admin_with_channel_prior_state(
 
 #[test]
 fn verify_event_channel_create_rejects_empty_name() {
-    let (admin_priv, admin_pub, admin_addr) = make_test_identity(0xAA);
+    let (admin_priv, _admin_pub, admin_addr) = make_test_identity(0xAA);
     let community_id = SpaceId([0x37; 16]);
     let admin_join_payload = EventPayload {
         id: [0x01; 16],
@@ -3327,7 +3319,7 @@ fn verify_event_channel_create_rejects_empty_name() {
 
 #[test]
 fn verify_event_channel_create_rejects_oversized_name() {
-    let (admin_priv, admin_pub, admin_addr) = make_test_identity(0xAA);
+    let (admin_priv, _admin_pub, admin_addr) = make_test_identity(0xAA);
     let community_id = SpaceId([0x37; 16]);
     let admin_join_payload = EventPayload {
         id: [0x01; 16],
@@ -3375,7 +3367,7 @@ fn verify_event_channel_create_rejects_oversized_name() {
 
 #[test]
 fn verify_event_channel_create_rejects_write_power_above_max() {
-    let (admin_priv, admin_pub, admin_addr) = make_test_identity(0xAA);
+    let (admin_priv, _admin_pub, admin_addr) = make_test_identity(0xAA);
     let community_id = SpaceId([0x37; 16]);
     let admin_join_payload = EventPayload {
         id: [0x01; 16],
@@ -3422,7 +3414,7 @@ fn verify_event_channel_create_rejects_write_power_above_max() {
 
 #[test]
 fn verify_event_channel_modify_rejects_all_none() {
-    let (admin_priv, admin_pub, admin_addr) = make_test_identity(0xAA);
+    let (admin_priv, _admin_pub, admin_addr) = make_test_identity(0xAA);
     let community_id = SpaceId([0x37; 16]);
     let ch_id = ChannelId([0xAB; 16]);
     let prior_state =
@@ -3461,7 +3453,7 @@ fn verify_event_channel_modify_rejects_all_none() {
 fn verify_event_channel_modify_allows_unknown_channel_id() {
     // DAG-sync may deliver Modify before Create; verify_event must NOT
     // reject Modify-on-unknown — materialize safely no-ops on unknown.
-    let (admin_priv, admin_pub, admin_addr) = make_test_identity(0xAA);
+    let (admin_priv, _admin_pub, admin_addr) = make_test_identity(0xAA);
     let community_id = SpaceId([0x37; 16]);
     let admin_join_payload = EventPayload {
         id: [0x01; 16],
@@ -3510,7 +3502,7 @@ fn verify_event_channel_delete_allows_already_tombstoned_for_replica_convergence
     // would otherwise diverge across replicas based on receive order;
     // materialize handles redundant deletes via first-delete-wins
     // idempotency.
-    let (admin_priv, admin_pub, admin_addr) = make_test_identity(0xAA);
+    let (admin_priv, _admin_pub, admin_addr) = make_test_identity(0xAA);
     let community_id = SpaceId([0x37; 16]);
 
     let admin_join_payload = EventPayload {
@@ -3590,7 +3582,7 @@ fn verify_event_channel_modify_allows_value_matching_for_replica_convergence() {
     // rename would otherwise diverge across replicas based on receive
     // order; materialize handles redundant modifies via the
     // get_mut + only-Some-applies pattern (no-op when values match).
-    let (admin_priv, admin_pub, admin_addr) = make_test_identity(0xAA);
+    let (admin_priv, _admin_pub, admin_addr) = make_test_identity(0xAA);
     let community_id = SpaceId([0x37; 16]);
 
     let admin_join_payload = EventPayload {
@@ -3658,7 +3650,7 @@ fn verify_event_channel_modify_allows_value_matching_for_replica_convergence() {
 #[test]
 fn verify_event_channel_modify_accepts_partial_change() {
     // Only one of (name, write_power) changes — should still be accepted.
-    let (admin_priv, admin_pub, admin_addr) = make_test_identity(0xAA);
+    let (admin_priv, _admin_pub, admin_addr) = make_test_identity(0xAA);
     let community_id = SpaceId([0x37; 16]);
 
     let admin_join_payload = EventPayload {
@@ -3727,7 +3719,7 @@ fn verify_event_channel_delete_allows_unknown_channel_for_dag_sync_safety() {
     // cross-blob ordering can deliver Delete before its corresponding
     // Create. materialize handles unknown delete as no-op; the eventual
     // arrival of Create + replay converges correctly.
-    let (admin_priv, admin_pub, admin_addr) = make_test_identity(0xAA);
+    let (admin_priv, _admin_pub, admin_addr) = make_test_identity(0xAA);
     let community_id = SpaceId([0x37; 16]);
 
     let admin_join_payload = EventPayload {
@@ -3775,7 +3767,7 @@ fn verify_event_channel_create_allows_duplicate_channel_id_for_replica_convergen
     // ensures convergence (first-create-wins). Verify-time rejection
     // would cause log divergence (some replicas store both, some only
     // one) without changing the materialized view.
-    let (admin_priv, admin_pub, admin_addr) = make_test_identity(0xAA);
+    let (admin_priv, _admin_pub, admin_addr) = make_test_identity(0xAA);
     let community_id = SpaceId([0x37; 16]);
 
     let admin_join_payload = EventPayload {

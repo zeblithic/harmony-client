@@ -1294,7 +1294,7 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
     let push_event = |state: &mut CommunityState,
                       actor: OwnerAddr,
                       actor_id: &TestOwner,
-                      actor_pub: &[u8; 64],
+                      _actor_pub: &[u8; 64],
                       kind: MembershipEventKind,
                       dev: &str,
                       wall: u64,

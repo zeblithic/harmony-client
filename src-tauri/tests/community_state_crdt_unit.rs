@@ -56,7 +56,7 @@ fn hlc(wall_ms: u64) -> Hlc {
 
 #[test]
 fn insert_rejects_event_with_wrong_community() {
-    let (identity, identity_pub, addr) = make_test_identity(0xa1);
+    let (identity, _identity_pub, addr) = make_test_identity(0xa1);
     let community_id = SpaceId([1u8; 16]);
     let other_community = SpaceId([2u8; 16]);
 
@@ -91,7 +91,7 @@ fn insert_rejects_event_with_wrong_community() {
 
 #[test]
 fn insert_accepts_admin_self_join_in_open_community() {
-    let (identity, identity_pub, addr) = make_test_identity(0xa1);
+    let (identity, _identity_pub, addr) = make_test_identity(0xa1);
     let community_id = SpaceId([1u8; 16]);
 
     let payload = EventPayload {
@@ -121,7 +121,7 @@ fn insert_accepts_admin_self_join_in_open_community() {
 
 #[test]
 fn insert_is_idempotent_on_duplicate_event_id() {
-    let (identity, identity_pub, addr) = make_test_identity(0xa1);
+    let (identity, _identity_pub, addr) = make_test_identity(0xa1);
     let community_id = SpaceId([1u8; 16]);
 
     let payload = EventPayload {
@@ -151,7 +151,7 @@ fn insert_is_idempotent_on_duplicate_event_id() {
 /// Returned tuple matches the call-site shape of the other tests so
 /// future tests can extend the log without rewriting setup.
 fn state_with_admin_self_join(seed: u8, community_id: SpaceId) -> (CommunityState, OwnerAddr) {
-    let (identity, identity_pub, addr) = make_test_identity(seed);
+    let (identity, _identity_pub, addr) = make_test_identity(seed);
     let payload = EventPayload {
         id: [3u8; 16],
         community_id,
@@ -188,7 +188,7 @@ fn materialize_now_reflects_admin_self_join() {
 
 #[test]
 fn materialized_cache_returns_same_object_until_insert() {
-    let (identity, identity_pub, addr) = make_test_identity(0xa1);
+    let (identity, _identity_pub, addr) = make_test_identity(0xa1);
     let community_id = SpaceId([1u8; 16]);
     let mut state = CommunityState::new(community_id);
 
