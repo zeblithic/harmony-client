@@ -14798,6 +14798,63 @@ mod create_community_inner_tests {
         crate::community_membership::verify_signature(&minted.bootstrap_join, &identity_pub)
             .expect("bootstrap join signature must verify against self identity_pub");
     }
+
+    /// ZEB-339 headline: drives the real `mint_community_creation` mint path
+    /// with an enrolled device key (#2) + this device's own EnrollmentCert and
+    /// asserts the bootstrap Join is cert-bearing AND passes the full
+    /// `verify_event` against empty materialized membership. This is the test
+    /// that proves the original "Create community → ActorPubkeyMismatch" bug is
+    /// fixed at the mint level: the cert resolves the bootstrap signer's
+    /// enrolled device key with no prior membership state.
+    #[test]
+    fn zeb339_create_community_bootstrap_join_is_cert_bearing_and_verifies() {
+        use crate::community_membership::{
+            mint_test_owner, verify_event, MaterializedMembership, VerifyContext,
+        };
+
+        // The harmony-owner: master cert binding owner_id -> enrolled device #2.
+        let owner = mint_test_owner(0x39);
+        // The community-membership signing key IS device #2 (the cert's bound key).
+        let device_key = ed25519_dalek::SigningKey::from_bytes(&owner.device_key.to_bytes());
+
+        let creation_hlc = crate::owner_state_types::Hlc {
+            wall_ms: 1_700_000_000_000,
+            logical: 0,
+            device_id: "owner-dev".to_string(),
+        };
+
+        let minted = mint_community_creation(
+            "ZEB-339 Validation",
+            false, // open community (the original bug repro)
+            owner.owner,
+            &device_key,
+            &owner.cert,
+            creation_hlc,
+        )
+        .expect("mint_community_creation must succeed");
+
+        // 1. The bootstrap Join MUST carry this device's EnrollmentCert.
+        assert!(
+            minted.bootstrap_join.enrollment.is_some(),
+            "bootstrap Join must be cert-bearing (identity-introducing event)"
+        );
+
+        // 2. The bootstrap Join MUST verify against EMPTY materialized
+        //    membership — the cert is what lets verify_event resolve the
+        //    signer's enrolled device key with no prior state. This is the
+        //    exact path that previously failed with ActorPubkeyMismatch.
+        let ctx = VerifyContext {
+            expected_community_id: minted.community_id,
+            admin_addr: owner.owner,
+            is_invite_only: false,
+        };
+        verify_event(
+            &minted.bootstrap_join,
+            &MaterializedMembership::default(),
+            &ctx,
+        )
+        .expect("cert-bearing bootstrap Join must verify against empty membership");
+    }
 }
 
 // ── ZEB-217 Sub-C Phase 3 Task 10: redeem_invite ─────────────────────
@@ -17172,9 +17229,14 @@ mod redeem_invite_inner_tests {
             device_id: device_id.to_string(),
         };
 
-        let minted =
-            mint_redemption(&payload, self_owner, &signing_key, &enrollment_cert, join_hlc)
-                .expect("mint");
+        let minted = mint_redemption(
+            &payload,
+            self_owner,
+            &signing_key,
+            &enrollment_cert,
+            join_hlc,
+        )
+        .expect("mint");
 
         assert_eq!(minted.community_id, payload.community_id);
         assert_eq!(minted.space.id, payload.community_id);
