@@ -260,7 +260,12 @@ async fn alice_redeems_invite_only_against_bob_admin() {
     // arg is plumbed for future expansion.
     let crdt_a = Arc::new(TokioMutex::new(OwnerState::default()));
 
-    // ZEB-339: supply synthetic community_signing_key + enrollment_cert per outbox.
+    // ZEB-339: supply synthetic community_signing_key + enrollment_cert per
+    // outbox. Use new_synthetic because alice_addr/bob_addr are Reticulum-
+    // derived addresses (from PrivateIdentity) that don't match the cert
+    // owner_id from mint_test_owner. This is intentional test scaffolding
+    // (cert wiring incomplete until Task 10); new_synthetic bypasses the
+    // owner_id debug_assert in DmOutbox::new.
     let alice_test_owner_invite = harmony_app::community_membership::mint_test_owner(0xD7);
     let alice_community_sk_invite = Arc::new(ed25519_dalek::SigningKey::from_bytes(
         &alice_test_owner_invite.device_key.to_bytes(),
@@ -273,7 +278,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
     let bob_enrollment_invite = bob_test_owner_invite.cert;
     // Alice's dm_outbox carries the PrivateIdentity that handle_unicast
     // grabs to verify the InviteToken sig + countersign Bob's Join.
-    let alice_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
+    let alice_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new_synthetic(
         "alice-dev".into(),
         alice_addr,
         DeviceIdentityHash(alice.identity.address_hash),
@@ -284,7 +289,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
     )));
     // Bob's dm_outbox: redeem_invite_inner reads bob's
     // private_identity + signing_key under its lock.
-    let bob_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
+    let bob_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new_synthetic(
         "bob-dev".into(),
         bob_addr,
         DeviceIdentityHash(bob.identity.address_hash),

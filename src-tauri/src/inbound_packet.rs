@@ -110,13 +110,15 @@ mod tests {
     fn make_outbox() -> Arc<TokioMutex<DmOutbox>> {
         let signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]));
         let private_identity = Arc::new(harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]));
-        // ZEB-339: supply synthetic community_signing_key + enrollment_cert.
+        // ZEB-339: use new_synthetic because OwnerAddr([0x01;16]) is an
+        // arbitrary address not matching any mint_test_owner cert. These
+        // tests exercise inbound packet routing, not community-signing.
         let test_owner = crate::community_membership::mint_test_owner(0xDE);
         let community_signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(
             &test_owner.device_key.to_bytes(),
         ));
         let enrollment_cert = test_owner.cert;
-        Arc::new(TokioMutex::new(DmOutbox::new(
+        Arc::new(TokioMutex::new(DmOutbox::new_synthetic(
             "dev".into(),
             OwnerAddr([0x01; 16]),
             DeviceIdentityHash([0xaa; 16]),

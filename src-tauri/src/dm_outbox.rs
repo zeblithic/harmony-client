@@ -446,6 +446,56 @@ impl DmOutbox {
         community_signing_key: Arc<ed25519_dalek::SigningKey>,
         enrollment_cert: harmony_owner::certs::EnrollmentCert,
     ) -> Self {
+        // ZEB-339: defense-in-depth — validate enrolled materials in
+        // debug/test builds. These three invariants must hold for any
+        // correctly-plumbed DmOutbox; a violation indicates a wiring bug
+        // (e.g. cert from owner A paired with self_owner from owner B, or a
+        // mismatched community_signing_key). Fires fast in tests without
+        // touching the production API or any call site.
+        debug_assert!(
+            enrollment_cert.verify().is_ok(),
+            "DmOutbox: enrollment_cert must verify"
+        );
+        debug_assert_eq!(
+            enrollment_cert.owner_id, self_owner.0,
+            "DmOutbox: cert.owner_id must match self_owner"
+        );
+        debug_assert_eq!(
+            enrollment_cert.device_pubkeys.classical.ed25519_verify,
+            community_signing_key.verifying_key().to_bytes(),
+            "DmOutbox: cert device key must match community_signing_key"
+        );
+        Self {
+            device_id,
+            self_owner,
+            our_signing_device_hash,
+            signing_key,
+            private_identity,
+            community_signing_key,
+            enrollment_cert,
+            in_flight: HashSet::new(),
+            backoff: HashMap::new(),
+        }
+    }
+
+    /// Test-only constructor that bypasses the ZEB-339 `debug_assert!`
+    /// invariant checks in `DmOutbox::new`. Use this in integration tests
+    /// that are still using synthetic/mismatched enrolled-device material
+    /// (e.g. a cert minted with a different seed than the community owner
+    /// addr). Tests that build fully consistent material MUST use `new`.
+    ///
+    /// The `test-fixtures` gate ensures this constructor is never available
+    /// in production builds.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn new_synthetic(
+        device_id: String,
+        self_owner: OwnerAddr,
+        our_signing_device_hash: DeviceIdentityHash,
+        signing_key: Arc<ed25519_dalek::SigningKey>,
+        private_identity: Arc<harmony_identity::PrivateIdentity>,
+        community_signing_key: Arc<ed25519_dalek::SigningKey>,
+        enrollment_cert: harmony_owner::certs::EnrollmentCert,
+    ) -> Self {
         Self {
             device_id,
             self_owner,
@@ -2182,14 +2232,17 @@ mod tests {
     use crate::content_store::InMemoryStub;
     use crate::owner_state_types::{ContentId, DmContentKey, InboxEntry, Space, TransportBinding};
 
-    /// Test-only helper: build a `DmOutbox` with synthetic signing key +
-    /// device hash that don't actually verify against each other. Most
-    /// tests in this module are sender-side / state-machine-only paths that
-    /// never invoke handle_cidnotify_lifted (which is the only consumer of the new
-    /// signing fields), so synthetic values suffice. Tests that DO verify
-    /// signature bytes (the handle_invite suite, the handle_cidnotify_lifted suite
-    /// added in Phase 3b Task 10) construct keys + hashes from
-    /// `harmony_identity::PrivateIdentity::from_seed` directly.
+    /// Test-only helper: build a `DmOutbox` with synthetic materials for
+    /// tests that don't exercise community-signing paths. Constructs the
+    /// struct directly (bypassing `DmOutbox::new`'s `debug_assert!` checks)
+    /// so that tests which need a specific `self_owner` for DM space
+    /// membership or ack-address assertions can supply an arbitrary address
+    /// without needing a matching `EnrollmentCert`.
+    ///
+    /// Tests that DO exercise community-signing invariants (cert verify,
+    /// cert↔key binding, cert↔owner binding) should call `DmOutbox::new`
+    /// directly with consistent `mint_test_owner` material — the
+    /// `dm_outbox_community_signing_key_and_enrollment_cert` test does this.
     fn make_outbox_synthetic(device_id: &str, self_owner: OwnerAddr) -> DmOutbox {
         // Derive all three identity-bound fields (signing_key,
         // private_identity, DeviceIdentityHash) from a single
@@ -2209,22 +2262,27 @@ mod tests {
         let private_identity = std::sync::Arc::new(private_identity);
         // ZEB-339: synthetic community_signing_key + enrollment_cert for tests
         // that don't exercise community-signing paths. Uses a fixed seed so
-        // the helper stays deterministic; tests verifying community-signing
-        // semantics construct their own DmOutbox directly.
+        // the helper stays deterministic. The cert's owner_id does NOT match
+        // self_owner (the debug_assert in DmOutbox::new is bypassed below by
+        // constructing the struct directly — production callers must use new()).
         let test_owner = crate::community_membership::mint_test_owner(0xAB);
         let community_signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(
             &test_owner.device_key.to_bytes(),
         ));
         let enrollment_cert = test_owner.cert;
-        DmOutbox::new(
-            device_id.into(),
+        // Bypass DmOutbox::new to avoid firing the owner_id debug_assert
+        // for synthetic test outboxes that use an arbitrary self_owner.
+        DmOutbox {
+            device_id: device_id.into(),
             self_owner,
-            device_hash,
+            our_signing_device_hash: device_hash,
             signing_key,
             private_identity,
             community_signing_key,
             enrollment_cert,
-        )
+            in_flight: HashSet::new(),
+            backoff: HashMap::new(),
+        }
     }
 
     /// ZEB-262 Phase 4 Task 2: assert that `DmOutbox.signing_key` and
@@ -2271,7 +2329,9 @@ mod tests {
 
         // ZEB-339: supply synthetic community_signing_key + enrollment_cert;
         // this test only exercises the Reticulum signing_key / private_identity
-        // binding, so a deterministic test owner suffices.
+        // binding, not the community cert binding. Use new_synthetic to bypass
+        // the cert.owner_id debug_assert (self_owner here is Reticulum-derived,
+        // not from a harmony-owner master key).
         let test_owner_for_countersign = crate::community_membership::mint_test_owner(0xCC);
         let community_signing_key_for_countersign =
             std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(
@@ -2279,7 +2339,7 @@ mod tests {
             ));
         let enrollment_cert_for_countersign = test_owner_for_countersign.cert;
 
-        let outbox = DmOutbox::new(
+        let outbox = DmOutbox::new_synthetic(
             "dev".into(),
             self_owner,
             device_hash,
@@ -2423,7 +2483,8 @@ mod tests {
 
     #[test]
     fn dm_outbox_constructs_with_empty_state() {
-        let o = make_outbox_synthetic("dev", OwnerAddr([0xaa; 16]));
+        let alice = OwnerAddr([0xaa; 16]);
+        let o = make_outbox_synthetic("dev", alice);
         assert_eq!(o.device_id, "dev");
         assert_eq!(o.self_owner, OwnerAddr([0xaa; 16]));
         assert!(o.in_flight.is_empty());
@@ -2612,8 +2673,9 @@ mod tests {
     #[tokio::test]
     async fn send_dm_unknown_space_rejects() {
         let mut state = OwnerState::default();
+        let alice = OwnerAddr([0x01; 16]);
         let cas = InMemoryStub::default();
-        let mut o = make_outbox_synthetic("dev", OwnerAddr([0x01; 16]));
+        let mut o = make_outbox_synthetic("dev", alice);
         let err = o
             .send_dm(
                 &mut state,
@@ -2758,7 +2820,8 @@ mod tests {
     #[tokio::test]
     async fn handle_unicast_invalid_packet_returns_decode_error() {
         let mut state = OwnerState::default();
-        let mut outbox = make_outbox_synthetic("device", OwnerAddr([0xff; 16]));
+        let alice = OwnerAddr([0xaa; 16]);
+        let mut outbox = make_outbox_synthetic("device", alice);
         let cas = InMemoryStub::default();
         let (tx, _rx) = tokio::sync::mpsc::channel::<UnicastSendRequest>(8);
 
@@ -3699,7 +3762,9 @@ mod tests {
         use crate::owner_state_crdt::OwnerState;
 
         let mut state = OwnerState::default();
-        let mut outbox = make_outbox_synthetic("device", OwnerAddr([2; 16]));
+        let alice = OwnerAddr([0xaa; 16]);
+        let mut outbox = make_outbox_synthetic("device", alice);
+        let self_owner = outbox.self_owner;
 
         // Build a real signed DmInvite via PrivateIdentity::from_seed.
         let private = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
@@ -3710,7 +3775,8 @@ mod tests {
         let signed = crate::dm_envelope::DmInviteSigned {
             space_id: SpaceId([7; 16]),
             kind: SpaceKind::Dm,
-            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            // self_owner must be in members for handle_invite's sanity gate 3.
+            members: vec![OwnerAddr([1; 16]), self_owner],
             inviter: OwnerAddr([1; 16]),
             content_key: DmContentKey::new([0xaa; 32]),
             sender_devices: vec![device_hash],
@@ -3766,7 +3832,9 @@ mod tests {
         use crate::owner_state_crdt::OwnerState;
 
         let mut state = OwnerState::default();
-        let mut outbox = make_outbox_synthetic("local-dev", OwnerAddr([2; 16]));
+        let alice = OwnerAddr([0xaa; 16]);
+        let mut outbox = make_outbox_synthetic("local-dev", alice);
+        let self_owner = outbox.self_owner;
 
         let private = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
         let public = private.public_identity();
@@ -3784,7 +3852,7 @@ mod tests {
         let signed = crate::dm_envelope::DmInviteSigned {
             space_id: SpaceId([7; 16]),
             kind: SpaceKind::Dm,
-            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            members: vec![OwnerAddr([1; 16]), self_owner],
             inviter: OwnerAddr([1; 16]),
             content_key: DmContentKey::new([0xaa; 32]),
             sender_devices: vec![device_hash],
@@ -3835,7 +3903,9 @@ mod tests {
         // binding rule".
         use crate::owner_state_crdt::OwnerState;
         let mut state = OwnerState::default();
-        let mut outbox = make_outbox_synthetic("device", OwnerAddr([2; 16]));
+        let alice = OwnerAddr([0xaa; 16]);
+        let mut outbox = make_outbox_synthetic("device", alice);
+        let self_owner = outbox.self_owner;
 
         let private = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
         let public = private.public_identity();
@@ -3846,7 +3916,8 @@ mod tests {
         let signed = crate::dm_envelope::DmInviteSigned {
             space_id: SpaceId([7; 16]),
             kind: SpaceKind::GroupDm,
-            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16]), inviter_addr], // sorted ascending
+            // self_owner must appear so handle_invite's sanity gate 3 passes.
+            members: vec![OwnerAddr([1; 16]), self_owner, inviter_addr], // sorted ascending
             inviter: inviter_addr,
             content_key: DmContentKey::new([0xaa; 32]),
             sender_devices: vec![device_hash],
@@ -3878,7 +3949,8 @@ mod tests {
     async fn handle_invite_inviter_not_in_members_drops() {
         use crate::owner_state_crdt::OwnerState;
         let mut state = OwnerState::default();
-        let mut outbox = make_outbox_synthetic("device", OwnerAddr([2; 16]));
+        let alice = OwnerAddr([0xaa; 16]);
+        let mut outbox = make_outbox_synthetic("device", alice);
 
         let private = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
         let public = private.public_identity();
@@ -3916,7 +3988,8 @@ mod tests {
     async fn handle_invite_signing_device_not_in_sender_devices_drops() {
         use crate::owner_state_crdt::OwnerState;
         let mut state = OwnerState::default();
-        let mut outbox = make_outbox_synthetic("device", OwnerAddr([2; 16]));
+        let alice = OwnerAddr([0xaa; 16]);
+        let mut outbox = make_outbox_synthetic("device", alice);
 
         let private = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
         let public = private.public_identity();
@@ -3969,7 +4042,8 @@ mod tests {
         use crate::owner_state_crdt::OwnerState;
         let mut state = OwnerState::default();
         // self_owner NOT in invite.members.
-        let mut outbox = make_outbox_synthetic("device", OwnerAddr([99; 16]));
+        let alice = OwnerAddr([0xaa; 16]);
+        let mut outbox = make_outbox_synthetic("device", alice);
 
         let private = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
         let public = private.public_identity();
@@ -4006,7 +4080,9 @@ mod tests {
     async fn handle_invite_tampered_signature_drops() {
         use crate::owner_state_crdt::OwnerState;
         let mut state = OwnerState::default();
-        let mut outbox = make_outbox_synthetic("device", OwnerAddr([2; 16]));
+        let alice = OwnerAddr([0xaa; 16]);
+        let mut outbox = make_outbox_synthetic("device", alice);
+        let self_owner = outbox.self_owner;
 
         let private = harmony_identity::PrivateIdentity::from_seed(&[0x42; 32]);
         let public = private.public_identity();
@@ -4016,7 +4092,7 @@ mod tests {
         let signed = crate::dm_envelope::DmInviteSigned {
             space_id: SpaceId([7; 16]),
             kind: SpaceKind::Dm,
-            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            members: vec![OwnerAddr([1; 16]), self_owner],
             inviter: OwnerAddr([1; 16]),
             content_key: DmContentKey::new([0xaa; 32]),
             sender_devices: vec![device_hash],

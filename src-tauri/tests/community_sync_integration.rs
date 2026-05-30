@@ -2571,13 +2571,6 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
     let alice = PrivateIdentity::from_seed(&[0xa1; 32]);
     let alice_addr = OwnerAddr(alice.identity.address_hash);
     let alice_pub = alice.identity.to_public_bytes();
-    let alice_signing = {
-        let priv_bytes = alice.to_private_bytes();
-        let mut seed = [0u8; 32];
-        seed.copy_from_slice(&priv_bytes[32..64]);
-        Arc::new(ed25519_dalek::SigningKey::from_bytes(&seed))
-    };
-
     // ZEB-339: Bob (the joiner) is an enrolled-device owner — his redemption
     // Join's actor = owner_id, signed by his device key, carrying his Master
     // cert (passed into redeem_invite_inner). A separate PrivateIdentity backs
@@ -2638,7 +2631,6 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         harmony_app::community_membership::sign_event_with_identity(&payload, &alice)
             .expect("sign admin bootstrap")
     };
-    let _ = &alice_signing;
     // CR Major (PR #106 R6): use a real sealed_epoch_key so the snapshot
     // decrypts successfully and any Err must come from the intended
     // "inviter unreachable" rollback branch, not from AEAD failure.
@@ -2742,12 +2734,16 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
     // dm_outbox for the inner helper to read `private_identity` +
     // `signing_key` under-lock. The DmOutbox::new signature matches
     // production; we share `bob` via Arc.
-    // ZEB-339: supply synthetic community_signing_key + enrollment_cert.
-    let bob_test_owner_sync = harmony_app::community_membership::mint_test_owner(0xDC);
+    // ZEB-339: use Bob's real owner material (bob_owner, seed 0xB2) for the
+    // DmOutbox community_signing_key + enrollment_cert so debug_assert in
+    // DmOutbox::new passes (cert.owner_id == bob_addr.0). The dual-identity
+    // pattern here: bob_signing_key (device #3, Reticulum transport) is
+    // separate from community_signing_key (device #2, enrolled key from
+    // bob_owner) — both owned by Bob, different key roles.
     let bob_community_sk_sync = Arc::new(ed25519_dalek::SigningKey::from_bytes(
-        &bob_test_owner_sync.device_key.to_bytes(),
+        &bob_owner.device_key.to_bytes(),
     ));
-    let bob_enrollment_sync = bob_test_owner_sync.cert;
+    let bob_enrollment_sync = bob_owner.cert.clone();
     let dm_outbox = Arc::new(Mutex::new(DmOutbox::new(
         "bob-dev".into(),
         bob_addr,

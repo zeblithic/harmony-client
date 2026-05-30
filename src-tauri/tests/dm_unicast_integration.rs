@@ -260,7 +260,10 @@ async fn dm_full_round_trip_through_unicast_channel() {
         &bob_test_owner_uni1.device_key.to_bytes(),
     ));
     let bob_enrollment_uni1 = bob_test_owner_uni1.cert;
-    let alice_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
+    // ZEB-339: use new_synthetic because alice_owner/bob_owner are Reticulum-
+    // derived addresses not matching any mint_test_owner cert. These outboxes
+    // test DM unicast send/receive, not community-signing paths.
+    let alice_outbox = Arc::new(TokioMutex::new(DmOutbox::new_synthetic(
         "alice-device".into(),
         alice_owner,
         alice_device,
@@ -270,7 +273,7 @@ async fn dm_full_round_trip_through_unicast_channel() {
         alice_enrollment_uni1,
     )));
 
-    let bob_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
+    let bob_outbox = Arc::new(TokioMutex::new(DmOutbox::new_synthetic(
         "bob-device".into(),
         bob_owner,
         bob_device,
@@ -577,7 +580,7 @@ async fn dm_offline_recipient_then_online_delivers() {
         alice_device,
         alice_signing_key.clone(),
     ));
-    // ZEB-339: supply synthetic community_signing_key + enrollment_cert per outbox.
+    // ZEB-339: use new_synthetic — same rationale as first test.
     let alice_test_owner_uni2 = harmony_app::community_membership::mint_test_owner(0xD5);
     let alice_community_sk_uni2 = Arc::new(ed25519_dalek::SigningKey::from_bytes(
         &alice_test_owner_uni2.device_key.to_bytes(),
@@ -588,7 +591,7 @@ async fn dm_offline_recipient_then_online_delivers() {
         &bob_test_owner_uni2.device_key.to_bytes(),
     ));
     let bob_enrollment_uni2 = bob_test_owner_uni2.cert;
-    let alice_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
+    let alice_outbox = Arc::new(TokioMutex::new(DmOutbox::new_synthetic(
         "alice-device".into(),
         alice_owner,
         alice_device,
@@ -597,7 +600,7 @@ async fn dm_offline_recipient_then_online_delivers() {
         alice_community_sk_uni2,
         alice_enrollment_uni2,
     )));
-    let bob_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
+    let bob_outbox = Arc::new(TokioMutex::new(DmOutbox::new_synthetic(
         "bob-device".into(),
         bob_owner,
         bob_device,

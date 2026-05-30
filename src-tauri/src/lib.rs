@@ -16619,7 +16619,10 @@ mod redeem_invite_inner_tests {
             mpsc::channel::<crate::event_loop::CommunityAdapterRequest>(16);
         let (unicast_send_tx, _unicast_rx) = mpsc::channel::<UnicastSendRequest>(16);
 
-        // ZEB-339: supply synthetic community_signing_key + enrollment_cert.
+        // ZEB-339: use new_synthetic because the DmOutbox cert is a separate
+        // DM-layer fixture that intentionally doesn't match self_owner (which
+        // comes from joiner_owner=mint_test_owner(0xBB)). The community-redeem
+        // join uses fixture_enrollment_cert (joiner_owner.cert) separately.
         let test_owner_lib16471 = crate::community_membership::mint_test_owner(0xE1);
         let community_signing_key_lib16471 = std::sync::Arc::new(
             ed25519_dalek::SigningKey::from_bytes(&test_owner_lib16471.device_key.to_bytes()),
@@ -16629,7 +16632,7 @@ mod redeem_invite_inner_tests {
         // Join) must bind self_owner → signing_key, i.e. the joiner's own cert.
         // The DmOutbox cert above stays a separate DM-layer fixture.
         let fixture_enrollment_cert = joiner_owner.cert.clone();
-        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new(
+        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new_synthetic(
             "joiner-dev".into(),
             self_owner,
             DeviceIdentityHash(joiner_identity.identity.address_hash),
@@ -16890,7 +16893,8 @@ mod redeem_invite_inner_tests {
             mpsc::channel::<crate::event_loop::CommunityAdapterRequest>(16);
         let (unicast_send_tx, _unicast_rx) = mpsc::channel::<UnicastSendRequest>(16);
 
-        // ZEB-339: supply synthetic community_signing_key + enrollment_cert.
+        // ZEB-339: use new_synthetic — DmOutbox cert is a separate DM-layer
+        // fixture; the community-redeem join uses enrollment_cert (joiner_owner.cert).
         let test_owner_lib16712 = crate::community_membership::mint_test_owner(0xE2);
         let community_signing_key_lib16712 = std::sync::Arc::new(
             ed25519_dalek::SigningKey::from_bytes(&test_owner_lib16712.device_key.to_bytes()),
@@ -16900,7 +16904,7 @@ mod redeem_invite_inner_tests {
         // cert (binds joiner_self_owner → signing_key); the DmOutbox cert above
         // stays a separate DM-layer fixture.
         let enrollment_cert = joiner_owner.cert.clone();
-        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new(
+        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new_synthetic(
             "joiner-dev".into(),
             joiner_self_owner,
             DeviceIdentityHash(joiner_self_owner.0),
@@ -17185,6 +17189,7 @@ mod redeem_invite_inner_tests {
         // (a separate DM-layer fixture), and use the joiner's own cert as
         // enrollment_cert_b (matching joiner_self_owner) for the second
         // redeem_invite_inner call.
+        // ZEB-339: use new_synthetic — same rationale as dm_outbox above.
         let test_owner_lib16973 = crate::community_membership::mint_test_owner(0xE3);
         let community_signing_key_lib16973 = std::sync::Arc::new(
             ed25519_dalek::SigningKey::from_bytes(&test_owner_lib16973.device_key.to_bytes()),
@@ -17193,7 +17198,7 @@ mod redeem_invite_inner_tests {
         // The enrollment cert passed to redeem_invite_inner MUST match the joiner's
         // self_owner (cert.owner_id == joiner_self_owner.0). Use the joiner's cert.
         let enrollment_cert_b = joiner_owner.cert.clone();
-        let dm_outbox_b = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new(
+        let dm_outbox_b = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new_synthetic(
             "joiner-dev".into(),
             joiner_self_owner,
             DeviceIdentityHash(joiner_self_owner.0),
@@ -36752,13 +36757,15 @@ mod owner_loaded_tests {
 
         let device_hash = DeviceIdentityHash(identity.identity.address_hash);
         let private_identity = std::sync::Arc::new(identity);
-        // ZEB-339: supply synthetic community_signing_key + enrollment_cert.
+        // ZEB-339: use new_synthetic because self_owner is Reticulum-derived
+        // (identity.identity.address_hash) and doesn't match any mint_test_owner
+        // cert's owner_id. This test exercises NodeState wiring, not community-signing.
         let test_owner_lib36414 = crate::community_membership::mint_test_owner(0xE4);
         let community_signing_key_lib36414 = std::sync::Arc::new(
             ed25519_dalek::SigningKey::from_bytes(&test_owner_lib36414.device_key.to_bytes()),
         );
         let enrollment_cert_lib36414 = test_owner_lib36414.cert;
-        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new(
+        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new_synthetic(
             "owner-loaded-test".into(),
             self_owner,
             device_hash,
