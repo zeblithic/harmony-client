@@ -247,9 +247,170 @@ impl ProfileCardCache {
     }
 }
 
+/// Sign a card, canonical-CBOR-encode it, and publish to its owner_id topic.
+/// Returns the (topic, bytes) actually published so callers can cache them
+/// for periodic refresh.
+pub async fn publish_card_once(
+    signer: &SigningKey,
+    owner_id: [u8; 16],
+    display_name: String,
+    status_text: String,
+    enrollment: EnrollmentCert,
+    shared_at: Hlc,
+    sink: &dyn crate::profile_broadcast::ProfileBroadcastPublishSink,
+) -> Result<(String, Vec<u8>), String> {
+    let card = sign_card(
+        signer,
+        owner_id,
+        display_name,
+        status_text,
+        enrollment,
+        shared_at,
+    )
+    .map_err(|e| e.to_string())?;
+    let bytes = canonical_cbor_encode(&card).map_err(|e| e.to_string())?;
+    let topic = card_topic_for(&owner_id);
+    sink.publish(topic.clone(), bytes.clone()).await?;
+    Ok((topic, bytes))
+}
+
+/// Re-publish the last self-card every `refresh` so peers that subscribe
+/// AFTER the user's last profile-save still receive it (the subscriber side
+/// uses live declare_subscriber with no retained value). Name/status are NOT
+/// persisted backend-side, so this caches the already-signed bytes rather
+/// than re-reading a source. HLC is baked in at sign time; re-publishing the
+/// same bytes is idempotent at peers (equal-HLC -> no-op via newer-wins).
+pub const PROFILE_CARD_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// A published card on the wire: its Zenoh topic and the signed canonical-CBOR
+/// bytes. Cached so the refresh task can re-emit the exact same payload.
+type CardWire = (String, Vec<u8>);
+
+/// Caches the last signed self-card and re-publishes it on an interval so that
+/// peers who subscribe after the user's last profile-save still receive it.
+pub struct ProfileCardPublisher {
+    latest: std::sync::Arc<Mutex<Option<CardWire>>>, // (topic, signed CBOR)
+    sink: std::sync::Arc<dyn crate::profile_broadcast::ProfileBroadcastPublishSink>,
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl ProfileCardPublisher {
+    pub fn spawn(
+        sink: std::sync::Arc<dyn crate::profile_broadcast::ProfileBroadcastPublishSink>,
+        refresh: std::time::Duration,
+    ) -> std::sync::Arc<Self> {
+        let latest: std::sync::Arc<Mutex<Option<CardWire>>> = std::sync::Arc::new(Mutex::new(None));
+        let task = {
+            let latest_for_task = std::sync::Arc::clone(&latest);
+            let sink_for_task = std::sync::Arc::clone(&sink);
+            tokio::spawn(async move {
+                let mut iv = tokio::time::interval(refresh);
+                iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                iv.tick().await; // consume immediate first tick
+                loop {
+                    iv.tick().await;
+                    let snapshot = latest_for_task.lock().await.clone();
+                    if let Some((topic, bytes)) = snapshot {
+                        if let Err(e) = sink_for_task.publish(topic, bytes).await {
+                            tracing::warn!(error = %e, "profile card refresh publish failed");
+                        }
+                    }
+                }
+            })
+        };
+        std::sync::Arc::new(Self {
+            latest,
+            sink,
+            task: Mutex::new(Some(task)),
+        })
+    }
+
+    /// Publish a freshly-signed card NOW and remember it for periodic refresh.
+    pub async fn publish_now(&self, topic: String, bytes: Vec<u8>) -> Result<(), String> {
+        *self.latest.lock().await = Some((topic.clone(), bytes.clone()));
+        self.sink.publish(topic, bytes).await
+    }
+
+    /// Abort the refresh task. Idempotent. (Mirrors ProfileBroadcastPublisher::shutdown.)
+    pub async fn shutdown(&self) {
+        if let Some(h) = self.task.lock().await.take() {
+            h.abort();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CapturingSink {
+        out: std::sync::Arc<Mutex<Vec<CardWire>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::profile_broadcast::ProfileBroadcastPublishSink for CapturingSink {
+        async fn publish(&self, topic: String, payload: Vec<u8>) -> Result<(), String> {
+            self.out.lock().await.push((topic, payload));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_card_once_emits_a_card_that_verifies() {
+        let owner = crate::community_membership::mint_test_owner(0x70);
+        let out = std::sync::Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
+        let sink = CapturingSink { out: out.clone() };
+        let (topic, _bytes) = publish_card_once(
+            &owner.device_key,
+            owner.owner.0,
+            "Pat".into(),
+            "afk".into(),
+            owner.cert.clone(),
+            Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            &sink,
+        )
+        .await
+        .expect("publish");
+        assert_eq!(topic, card_topic_for(&owner.owner.0));
+        let g = out.lock().await;
+        assert_eq!(g.len(), 1);
+        let decoded: ProfileCardBroadcast = ciborium::de::from_reader(&g[0].1[..]).unwrap();
+        assert_eq!(verify_card(&decoded).unwrap(), owner.owner.0);
+    }
+
+    #[tokio::test]
+    async fn card_publisher_publishes_now_and_refreshes() {
+        let owner = crate::community_membership::mint_test_owner(0x71);
+        let out = std::sync::Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
+        let sink = std::sync::Arc::new(CapturingSink { out: out.clone() });
+        let pubr = ProfileCardPublisher::spawn(sink.clone(), std::time::Duration::from_millis(40));
+        let card = sign_card(
+            &owner.device_key,
+            owner.owner.0,
+            "Al".into(),
+            "".into(),
+            owner.cert.clone(),
+            Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .unwrap();
+        let bytes = canonical_cbor_encode(&card).unwrap();
+        pubr.publish_now(card_topic_for(&owner.owner.0), bytes)
+            .await
+            .unwrap();
+        assert_eq!(out.lock().await.len(), 1, "publish_now emits immediately");
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        pubr.shutdown().await;
+        let n = out.lock().await.len();
+        assert!(n >= 2, "refresh re-published at least once (got {n})");
+    }
 
     #[tokio::test]
     async fn card_cache_register_insert_get_roundtrip() {
