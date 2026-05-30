@@ -1099,7 +1099,7 @@ mod admin_bootstrap_helpers {
         mint_test_owner, sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent,
         TestOwner,
     };
-    use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
+    use harmony_app::owner_state_types::{EpochKey, Hlc, SpaceId};
 
     pub fn fixture_hlc() -> Hlc {
         Hlc {
@@ -1140,10 +1140,7 @@ mod admin_bootstrap_helpers {
     /// carries cert). Used to trigger step 6 (kind check) without
     /// tripping step 5 (cert-based sig check) — the signature and cert
     /// are valid, but kind != Join.
-    pub fn admin_leave_event(
-        community_id: SpaceId,
-        admin: &TestOwner,
-    ) -> SignedMembershipEvent {
+    pub fn admin_leave_event(community_id: SpaceId, admin: &TestOwner) -> SignedMembershipEvent {
         let payload = EventPayload {
             id: [0xCC; 16],
             community_id,

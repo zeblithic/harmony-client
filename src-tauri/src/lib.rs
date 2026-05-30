@@ -17123,9 +17123,8 @@ mod redeem_invite_inner_tests {
                     device_id: "admin-dev".into(),
                 },
             };
-            let mut ev =
-                crate::community_membership::sign_event(&payload, &admin_owner.device_key)
-                    .expect("sign admin bootstrap (run 2)");
+            let mut ev = crate::community_membership::sign_event(&payload, &admin_owner.device_key)
+                .expect("sign admin bootstrap (run 2)");
             ev.enrollment = Some(admin_owner.cert.clone());
             ev
         };
@@ -17145,7 +17144,10 @@ mod redeem_invite_inner_tests {
                 .expect("canonical token bytes (run 2)");
         let token_sig_b = {
             use ed25519_dalek::Signer as _;
-            admin_owner.device_key.sign(&token_payload_bytes_b).to_bytes()
+            admin_owner
+                .device_key
+                .sign(&token_payload_bytes_b)
+                .to_bytes()
         };
         let invite_token_b = crate::community_invite::InviteToken {
             sig: token_sig_b,
