@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { CommunityMember } from '../types';
+  import type { ResolvedCard } from '../member-card-service';
 
   export type KebabAction =
     | 'kick'
@@ -13,10 +14,13 @@
     member,
     viewer,
     onaction,
+    resolveCard,
   }: {
     member: CommunityMember;
     viewer: { addr: string; power: number; isLastAdmin: boolean };
     onaction?: (detail: { action: KebabAction; member: CommunityMember }) => void;
+    /** ZEB-341: optional card resolver for member display names. */
+    resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
   } = $props();
 
   let menuOpen = $state(false);
@@ -83,7 +87,13 @@
     kebabActions(viewer.power, member.power, member.status, isSelf, viewer.isLastAdmin)
   );
   let label = $derived(tierLabel(member.power, member.status));
-  let displayName = $derived(member.displayName ?? member.address.slice(0, 8));
+  // ZEB-341 Task 1: resolve display name via card service (self-first, offline).
+  // Falls back to member.displayName (backend-provided) then address prefix.
+  // Read through resolveCard() inside $derived so Task 8's reactive Map upgrade
+  // triggers a re-render automatically — no one-time snapshot.
+  let displayName = $derived(
+    member.displayName ?? resolveCard?.(member.address)?.displayName ?? member.address.slice(0, 8)
+  );
   let joinedDate = $derived(
     member.joinedAt != null
       ? new Date(member.joinedAt).toLocaleDateString()

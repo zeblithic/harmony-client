@@ -16,6 +16,7 @@
   import CommunityProposalsPanel from './CommunityProposalsPanel.svelte';
   import Tier3ProposalPanel from './Tier3ProposalPanel.svelte';
   import type { VotingAdapter } from '../voting-adapter';
+  import type { ResolvedCard } from '../member-card-service';
 
   let {
     communityId,
@@ -38,6 +39,7 @@
     onForkSuccess,
     onSelectCommunity,
     votingAdapter,
+    resolveCard,
   }: {
     communityId: string;
     communityName: string;
@@ -50,6 +52,8 @@
     communityService: CommunityService;
     channelMessageService: ChannelMessageService;
     trustService?: TrustService;
+    /** ZEB-341: optional card resolver — undefined until owner identity loads. */
+    resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
     /** ZEB-291 Phase 2: connected VotingAdapter. When present, a
      *  Proposals tab appears next to Channels — switches the middle
      *  column to the Tier 2 governance panel. Optional so existing
@@ -364,6 +368,7 @@
         snapshotMessages={preForkSnapshot?.channelLog?.[activeChannel.channelId] ?? []}
         originalCommunityName={preForkSnapshot?.originalCommunityName ?? ''}
         forkedAtMs={preForkSnapshot?.forkedAtMs ?? 0}
+        {resolveCard}
       />
     {:else}
       <div class="empty-channels">
@@ -452,6 +457,7 @@
         {communityName}
         {communityService}
         ownAddress={ownAddress}
+        {resolveCard}
       />
     </div>
   </div>

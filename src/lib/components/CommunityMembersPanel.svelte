@@ -4,6 +4,7 @@
   import type { CommunityMember, ModerationEvent } from '../types';
   import MemberRow from './MemberRow.svelte';
   import type { KebabAction } from './MemberRow.svelte';
+  import type { ResolvedCard } from '../member-card-service';
   import ModerationReasonDialog from './ModerationReasonDialog.svelte';
   import LastAdminWarningDialog from './LastAdminWarningDialog.svelte';
   import RecentActionsBadge from './RecentActionsBadge.svelte';
@@ -13,11 +14,14 @@
     communityName,
     communityService,
     ownAddress,
+    resolveCard,
   }: {
     communityId: string;
     communityName: string;
     communityService: CommunityService;
     ownAddress: string;
+    /** ZEB-341: optional card resolver for display names. */
+    resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
   } = $props();
 
   let members: CommunityMember[] = $state([]);
@@ -283,6 +287,7 @@
         <MemberRow
           {member}
           {viewer}
+          {resolveCard}
           onaction={(detail) => onMemberAction(detail)}
         />
       {/each}
@@ -299,6 +304,7 @@
             <MemberRow
               {member}
               {viewer}
+              {resolveCard}
               onaction={(detail) => onMemberAction(detail)}
             />
           {/each}

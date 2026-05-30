@@ -65,8 +65,9 @@
   import UpdateAvailableToast from './lib/components/UpdateAvailableToast.svelte';
   import WelcomeModal from './lib/components/WelcomeModal.svelte';
   import BackupReminderBanner from './lib/components/BackupReminderBanner.svelte';
-  import type { MintIpcResult } from './lib/owner-service';
+  import type { MintIpcResult, OwnerStateView } from './lib/owner-service';
   import type { StartNodeResponse } from './lib/types/onboarding';
+  import { MemberCardService } from './lib/member-card-service';
   import { classifyOwnerIdentity, type OwnerIdentityState } from './lib/owner-gate';
   import { trapFocus } from './lib/focus-trap';
   import HelpMenuButton from './lib/components/HelpMenuButton.svelte';
@@ -80,9 +81,34 @@
 
   let myProfile = $state(loadProfile());
 
+  // ZEB-341 Task 1: self-first member-card resolution.
+  // A single MemberCardService instance for the app lifetime. Task 8 will
+  // convert the internal Map to Svelte 5 $state so peer cards re-render;
+  // components read through resolveCard() inside $derived so the upgrade
+  // is transparent — no snapshot, always a live read.
+  const memberCardService = new MemberCardService();
+  // selfOwnerId is the OwnerAddr hex (32 chars) obtained from get_owner_state.
+  // Set at startup (after start_node) and kept stable for the session.
+  let selfOwnerId = $state<string | null>(null);
+
+  // Expose a resolver function that components call inside $derived.
+  // Defined as a function (not a one-time snapshot) so that when Task 8
+  // converts cards to $state the reactive reads continue to work.
+  function resolveCard(ownerIdHex: string) {
+    return memberCardService.resolve(ownerIdHex);
+  }
+
   async function handleProfileSave(profile: Profile) {
     saveProfile(profile);
     myProfile = profile;
+    // Re-seed the card whenever the profile is saved so the name updates
+    // immediately without a network round-trip (self-first, ZEB-341 Task 1).
+    if (selfOwnerId !== null) {
+      memberCardService.seedSelf(selfOwnerId, {
+        displayName: profile.displayName,
+        statusText: profile.statusText ?? '',
+      });
+    }
     // messageService.ownDisplayName / vineService.ownDisplayName are kept
     // in sync by a `$effect` later in the script (single source of truth).
     // Publish to network if Tauri is available.
@@ -293,10 +319,17 @@
   // ZEB-338: WelcomeModal hard-gate completion. Flip owner-present, close the
   // gate, and drain any invite that was queued pre-mint (Flow 3).
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  async function onMinted(_result: MintIpcResult): Promise<void> {
+  async function onMinted(result: MintIpcResult): Promise<void> {
     ownerIdentityState = 'present';
     startNodeError = null;
     showWelcomeModal = false;
+    // ZEB-341 Task 1: seed the card using the newly-minted owner identity.
+    // MintIpcResult.state.ownerId is available from the mint response.
+    selfOwnerId = result.state.ownerId;
+    memberCardService.seedSelf(result.state.ownerId, {
+      displayName: myProfile.displayName,
+      statusText: myProfile.statusText ?? '',
+    });
     drainQueuedInvite();
   }
 
@@ -754,6 +787,22 @@
       ownerIdentityState = classifyOwnerIdentity(startResp, startFailed);
       if (ownerIdentityState === 'present') {
         showWelcomeModal = false;
+        // ZEB-341 Task 1: fetch the owner identity hex so we can seed
+        // MemberCardService with the viewer's own display name immediately.
+        // owner_id is the 32-char lowercase hex of the 16-byte OwnerAddr —
+        // same format as MemberInfoDto.addr and ChannelMessageDto.author.
+        try {
+          const ownerState = await invoke<OwnerStateView | null>('get_owner_state');
+          if (ownerState !== null) {
+            selfOwnerId = ownerState.ownerId;
+            memberCardService.seedSelf(ownerState.ownerId, {
+              displayName: myProfile.displayName,
+              statusText: myProfile.statusText ?? '',
+            });
+          }
+        } catch (err) {
+          console.debug('[harmony-client] get_owner_state not yet available:', err);
+        }
         // Returning user who clicked an invite before start_node resolved:
         // drain it. (routeInviteUrl queued it because the owner wasn't loaded
         // yet at the time.)
@@ -1580,6 +1629,7 @@
           next.set(cid, shared);
           sharedInProfileByCommunity = next;
         }}
+        {resolveCard}
       />
     {:else}
       <TextFeed

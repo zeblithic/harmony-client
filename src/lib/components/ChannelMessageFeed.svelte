@@ -8,6 +8,7 @@
   import Avatar from './Avatar.svelte';
   import PollMessage from './PollMessage.svelte';
   import { buildUnifiedTimeline, type TimelineRow } from '../fork-timeline';
+  import type { ResolvedCard } from '../member-card-service';
 
   let {
     communityId,
@@ -33,6 +34,8 @@
      * the card renders instantly without a per-message round trip.
      */
     votingAdapter,
+    /** ZEB-341: optional card resolver for author display names. */
+    resolveCard,
   }: {
     communityId: string;
     channelId: string;
@@ -47,6 +50,7 @@
     originalCommunityName?: string;
     forkedAtMs?: number;
     votingAdapter?: VotingAdapter;
+    resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
   } = $props();
 
   // Local mirror of service.byChannel cache for this channel.
@@ -347,7 +351,8 @@
           </div>
           <div class="content-col">
             <header class="msg-meta">
-              <span class="author">{msg.author.slice(0, 8)}</span>
+              <!-- ZEB-341 Task 1: show resolved display name when available (self-first, offline). -->
+              <span class="author">{resolveCard?.(msg.author)?.displayName ?? msg.author.slice(0, 8)}</span>
               <time class="ts" datetime={new Date(msg.at.wallMs).toISOString()}>{formatTimestamp(msg.at)}</time>
               {#if row.isPreFork}
                 <span class="pre-fork-badge" aria-label="From original community">from {originalCommunityName}</span>
