@@ -401,6 +401,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         admin_identity_pub: Some(alice.identity.to_public_bytes()),
         forked_from: None,
         pre_fork_snapshot: None,
+        inviter_enrollment: None,
     })
     .expect("encode URL");
 
@@ -653,6 +654,7 @@ async fn community_invite_only_tampered_admin_bootstrap_rejects() {
         admin_identity_pub: Some(alice_identity.identity.to_public_bytes()),
         forked_from: None,
         pre_fork_snapshot: None,
+        inviter_enrollment: None,
     })
     .expect("encode URL");
 

@@ -213,6 +213,7 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
         admin_identity_pub: None,
         forked_from: None,
         pre_fork_snapshot: None,
+        inviter_enrollment: None,
     };
     for (target_addr, target_signing) in [(bob_addr, &bob_signing), (carol_addr, &carol_signing)] {
         // Reserve against the TARGET's own device id, not Alice's

@@ -539,6 +539,7 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             admin_identity_pub: Some(alice_pub),
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         };
         let invite_url =
             community_invite::encode_invite_url(&invite_payload).expect("encode invite");

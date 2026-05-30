@@ -192,6 +192,7 @@ fn community_invite_payload_open_wire_bytes_pinned() {
         admin_identity_pub: None,
         forked_from: None,
         pre_fork_snapshot: None,
+        inviter_enrollment: None,
     };
     let bytes = canonical_cbor_encode(&p).expect("encode");
     let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
@@ -248,6 +249,7 @@ fn community_invite_payload_invite_only_wire_bytes_pinned() {
         admin_identity_pub: Some([0xAB; 64]),
         forked_from: None,
         pre_fork_snapshot: None,
+        inviter_enrollment: None,
     };
     let bytes = canonical_cbor_encode(&p).expect("encode");
     let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();

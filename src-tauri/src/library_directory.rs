@@ -1351,6 +1351,7 @@ mod tests {
             admin_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         };
         encode_invite_url(&payload).expect("encode open invite url")
     }
@@ -1426,6 +1427,7 @@ mod tests {
             admin_identity_pub: Some([0u8; 64]),
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         };
         encode_invite_url(&payload).expect("encode invite-only url")
     }
@@ -2676,6 +2678,7 @@ mod tests {
             admin_identity_pub: Some(admin_identity.identity.to_public_bytes()),
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         };
         let invite_url = encode_invite_url(&payload).expect("encode invite-only url");
 
@@ -2738,6 +2741,7 @@ mod tests {
             admin_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         };
         let invite_url = encode_invite_url(&payload).expect("encode open url");
 
@@ -2808,6 +2812,7 @@ mod tests {
             admin_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         };
         let invite_url = encode_invite_url(&payload).expect("encode mismatched url");
 

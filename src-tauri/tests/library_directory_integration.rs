@@ -71,6 +71,7 @@ fn open_invite_url_for(community_id: SpaceId, admin_seed: [u8; 32]) -> String {
         admin_identity_pub: None,
         forked_from: None,
         pre_fork_snapshot: None,
+        inviter_enrollment: None,
     };
     encode_invite_url(&payload).expect("encode open invite url")
 }
@@ -125,6 +126,7 @@ fn invite_only_url() -> String {
         admin_identity_pub: Some([0u8; 64]),
         forked_from: None,
         pre_fork_snapshot: None,
+        inviter_enrollment: None,
     };
     encode_invite_url(&payload).expect("encode invite-only url")
 }
@@ -686,6 +688,7 @@ async fn click_to_join_redeem_invite_smoke() {
         admin_identity_pub: None,
         forked_from: None,
         pre_fork_snapshot: None,
+        inviter_enrollment: None,
     };
     let founder_invite_url =
         harmony_app::build_open_invite_url(&invite_payload).expect("build open invite url");

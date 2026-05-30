@@ -1063,6 +1063,24 @@ pub fn attach_countersig_with_identity(
     Ok(out)
 }
 
+/// ZEB-339: attach a counter-signature produced by the signer's enrolled
+/// device key (#2). The verifier resolves the signer's key from materialized
+/// membership, so the countersig MUST be made with device #2.
+pub fn attach_countersig_with_device_key(
+    event: &SignedMembershipEvent,
+    signer_owner: OwnerAddr,
+    signer_key: &ed25519_dalek::SigningKey,
+) -> Result<SignedMembershipEvent, CryptoError> {
+    let bytes = canonical_cbor_encode(&EventPayload::from(event))?;
+    let sig = signer_key.sign(&bytes).to_bytes();
+    let mut out = event.clone();
+    out.countersig = Some(CounterSignature {
+        signer: signer_owner,
+        sig,
+    });
+    Ok(out)
+}
+
 /// Verify the counter-signature on an event, with a pubkey-to-claimed-
 /// signer binding check.
 ///
@@ -6741,6 +6759,45 @@ mod zeb_254_join_countersign_verify_tests {
             "expected Ok (out-of-order delivery), got {:?}",
             result
         );
+    }
+
+    #[test]
+    fn countersig_with_device_key_verifies_under_materialized_enrolled_key() {
+        // ZEB-339: a Join event countersigned with the counter-signer's
+        // enrolled device key (#2) verifies under verify_countersig, which
+        // resolves the signer from the counter-signer's materialized
+        // enrolled_device_keys (seeded from a cert-bearing Join).
+        let community_id = SpaceId([7u8; 16]);
+        // The joiner authors a Join event signed by their device #2.
+        let joiner = mint_test_owner(0x31);
+        let join_payload = EventPayload {
+            id: [0x10u8; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: joiner.owner,
+            at: Hlc {
+                wall_ms: 1_700_000_001_000,
+                logical: 0,
+                device_id: "joiner-device".into(),
+            },
+        };
+        let join_event = sign_event(&join_payload, &joiner.device_key).expect("sign Join");
+
+        // The counter-signer attaches a countersig with THEIR device key (#2).
+        let signer = mint_test_owner(0x32);
+        let countersigned =
+            attach_countersig_with_device_key(&join_event, signer.owner, &signer.device_key)
+                .expect("attach device-key countersig");
+
+        // prior_state: the counter-signer is Joined and carries their enrolled
+        // device key (as it would be materialized from a cert-bearing Join).
+        let mut prior_state = MaterializedMembership::default();
+        prior_state
+            .members
+            .insert(signer.owner, joined_with_enrolled(&signer));
+
+        verify_countersig(&countersigned, &prior_state)
+            .expect("device-key countersig verifies under materialized enrolled key");
     }
 
     #[test]

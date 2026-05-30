@@ -13376,14 +13376,23 @@ async fn generate_invite(
         .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
-    let (crdt_state, community_registry) = {
+    let (crdt_state, community_registry, dm_outbox) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
         )
+    };
+    // ZEB-339: snapshot the local owner's EnrollmentCert (the inviter is the
+    // local owner). Carried in invite-only payloads so a joiner who has not
+    // synced the community log can verify the inviter's owner->device binding
+    // (and thus the InviteToken signature) at first contact.
+    let inviter_enrollment_cert = {
+        let outbox_g = dm_outbox.lock().await;
+        outbox_g.enrollment_cert.clone()
     };
 
     let space = {
@@ -13565,6 +13574,14 @@ async fn generate_invite(
         admin_identity_pub: None,
         forked_from,
         pre_fork_snapshot,
+        // ZEB-339: required for invite-only payloads (open-community payloads
+        // carry None — encode/decode only require it when is_invite_only).
+        // The inviter is the local owner, so this is our own EnrollmentCert.
+        inviter_enrollment: if is_invite_only {
+            Some(inviter_enrollment_cert)
+        } else {
+            None
+        },
     };
 
     // ZEB-323 Phase 2b: case-A pkarr hook. Register a pending-invite publication
@@ -16716,6 +16733,7 @@ mod redeem_invite_inner_tests {
             admin_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         };
 
         let invite_url =
@@ -16972,6 +16990,7 @@ mod redeem_invite_inner_tests {
             admin_identity_pub: Some(admin_pub),
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         };
 
         let invite_url =
@@ -17123,6 +17142,7 @@ mod redeem_invite_inner_tests {
             admin_identity_pub: Some(admin_pub),
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         };
         let invite_url_b = crate::community_invite::encode_invite_url(&invite_payload_b)
             .expect("encode invite url (run 2)");
@@ -17225,6 +17245,7 @@ mod redeem_invite_inner_tests {
             admin_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         };
 
         let device_id = "joiner-dev";
@@ -17313,6 +17334,7 @@ mod redeem_invite_inner_tests {
             admin_identity_pub: None,
             forked_from: Some(original_id),
             pre_fork_snapshot: Some(snapshot.clone()),
+            inviter_enrollment: None,
         };
 
         let invite_url =
@@ -17437,6 +17459,7 @@ mod redeem_invite_inner_tests {
             admin_identity_pub: None,
             forked_from: Some(original_id),
             pre_fork_snapshot: Some(snapshot.clone()),
+            inviter_enrollment: None,
         };
 
         let invite_url =
@@ -17542,6 +17565,7 @@ mod redeem_invite_inner_tests {
             admin_identity_pub: None,
             forked_from: Some(original_id),
             pre_fork_snapshot: Some(snapshot.clone()),
+            inviter_enrollment: None,
         };
 
         let invite_url =
@@ -17634,6 +17658,7 @@ mod redeem_invite_inner_tests {
             admin_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         };
 
         let hlc = Hlc {
@@ -17706,6 +17731,7 @@ mod redeem_invite_inner_tests {
             admin_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         };
 
         let hlc = Hlc {
@@ -17767,6 +17793,7 @@ mod join_open_community_tests {
             admin_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         };
         let invite_url = encode_invite_url(&payload).expect("encode open url");
         let entry = LibraryDirectoryEntry {
@@ -32572,6 +32599,7 @@ mod generate_invite_helper_tests {
             admin_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         };
         let url = build_open_invite_url(&payload).expect("url");
         let decoded = decode_invite_url(&url).expect("decode");
@@ -32627,6 +32655,7 @@ mod generate_invite_helper_tests {
             admin_identity_pub: None,
             forked_from: Some(original_id),
             pre_fork_snapshot: Some(snapshot.clone()),
+            inviter_enrollment: None,
         };
 
         let url = build_open_invite_url(&payload).expect("encode fork-invite url");

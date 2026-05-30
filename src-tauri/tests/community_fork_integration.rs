@@ -794,6 +794,7 @@ async fn fork_invite_carries_snapshot_to_invitee() {
         admin_identity_pub: None,
         forked_from: Some(community_id),
         pre_fork_snapshot: Some(snapshot.clone()),
+        inviter_enrollment: None,
     };
 
     // Verify the payload encodes and decodes correctly (the invite wire format).

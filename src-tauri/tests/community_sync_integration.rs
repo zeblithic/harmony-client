@@ -2302,6 +2302,7 @@ mod task3_kick_setpower_round_trip {
             admin_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         };
         let minted_b = mint_redemption(
             &invite_payload,
@@ -2636,6 +2637,7 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         admin_identity_pub: Some(alice_pub),
         forked_from: None,
         pre_fork_snapshot: None,
+        inviter_enrollment: None,
     })
     .expect("encode URL");
 
