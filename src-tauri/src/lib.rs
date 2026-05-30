@@ -14343,15 +14343,17 @@ mod create_community_inner_tests {
     async fn build_create_community_test_fixture() -> CreateCommunityTestFixture {
         let tmp = tempfile::TempDir::new().expect("tempdir");
 
-        let identity = PrivateIdentity::from_seed(&[0xc0; 32]);
-        let self_owner = OwnerAddr(identity.identity.address_hash);
-        let identity_pub_64 = identity.identity.to_public_bytes();
-        let signing_key = signing_key_from_identity(&identity);
+        // ZEB-339: an enrolled-device owner — self_owner = owner_id, the engine
+        // signs with the device key, and the fixture's cert binds them so
+        // create_community_inner's bootstrap Join carries a matching cert.
+        let owner = crate::community_membership::mint_test_owner(0xC0);
+        let self_owner = owner.owner;
+        let identity_pub_64 = [0u8; 64];
+        let signing_key = std::sync::Arc::new(owner.device_key.clone());
 
         // Community registry — delta_tx wired so ChannelCreate deltas
-        // flow to the consumer task (spawned below). The resolver returns
-        // self_owner's identity_pub so verify_event admits the local
-        // admin's events.
+        // flow to the consumer task. Signer resolution uses the cert /
+        // materialized enrolled keys, not the resolver.
         struct SingleOwnerResolver {
             owner: OwnerAddr,
             pub_64: [u8; 64],
@@ -14510,10 +14512,7 @@ mod create_community_inner_tests {
             device_id: "test-dev".into(),
             self_owner,
             signing_key,
-            // ZEB-339: synthetic cert (compile/wiring only — these real-mint-path
-            // tests are migrated in Task 10; the cert's owner_id does not match
-            // this fixture's identity-derived self_owner).
-            enrollment_cert: crate::community_membership::mint_test_owner(0).cert,
+            enrollment_cert: owner.cert.clone(),
             community_registry,
             community_adapter_tx,
             channel_log_registry,
@@ -14739,23 +14738,12 @@ mod create_community_inner_tests {
 
     #[test]
     fn mint_creation_produces_consistent_id_join_event_and_space() {
-        let identity = PrivateIdentity::from_seed(&[0xc1; 32]);
-        let self_owner = OwnerAddr(identity.identity.address_hash);
-        // Reach into the PrivateIdentity's signing path the same way
-        // production does: the canonical 32-byte seed lives in bytes
-        // 32..64 of `to_private_bytes()` (X25519_secret(32) ||
-        // Ed25519_secret(32)). dm_outbox stores the SigningKey
-        // constructed from those bytes; mirror that here so the test
-        // signs with the same key the IPC will use in production.
-        let sk_bytes_full = identity.to_private_bytes();
-        let ed_seed: [u8; 32] = sk_bytes_full[32..64]
-            .try_into()
-            .expect("ed25519 seed slice 32..64");
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&ed_seed);
-        // ZEB-339: synthetic cert (compile/wiring only — Task 10 migrates this
-        // test to the cert/enrolled-key model; the cert's owner_id does not
-        // match this identity-derived self_owner).
-        let enrollment_cert = crate::community_membership::mint_test_owner(0xC1).cert;
+        // ZEB-339: enrolled-device owner — self_owner = owner_id, the bootstrap
+        // Join is signed by the device key and carries the matching cert.
+        let owner = crate::community_membership::mint_test_owner(0xC1);
+        let self_owner = owner.owner;
+        let signing_key = owner.device_key.clone();
+        let enrollment_cert = owner.cert.clone();
 
         let device_id = "creator-dev";
         let wall_now_ms = 1_700_000_000_000u64;
@@ -14824,12 +14812,15 @@ mod create_community_inner_tests {
             minted2.space.current_epoch_key.as_ref().unwrap().as_bytes(),
         );
 
-        // Bootstrap signature MUST verify against self_owner's
-        // identity_pub — the engine's verify_event will run the same
-        // check on insert_local_event.
-        let identity_pub = identity.identity.to_public_bytes();
-        crate::community_membership::verify_signature(&minted.bootstrap_join, &identity_pub)
-            .expect("bootstrap join signature must verify against self identity_pub");
+        // ZEB-339: the bootstrap Join is signed by the enrolled device key (#2)
+        // and carries the owner's Master cert. Its signature MUST resolve via the
+        // carried cert (owner_id → device key) — the engine's verify_event runs
+        // the same `enrolled_key_from_cert` + `verify_membership_signer` check on
+        // insert_local_event.
+        let signer = crate::community_membership::enrolled_key_from_cert(&minted.bootstrap_join)
+            .expect("bootstrap join cert must resolve enrolled device key");
+        crate::community_membership::verify_membership_signer(&minted.bootstrap_join, &signer)
+            .expect("bootstrap join signature must verify against enrolled device key");
     }
 
     /// ZEB-339 headline: drives the real `mint_community_creation` mint path
@@ -16586,10 +16577,14 @@ mod redeem_invite_inner_tests {
     pub(super) async fn build_redeem_invite_test_fixture() -> RedeemInviteTestFixture {
         let tmp = tempfile::TempDir::new().expect("tempdir");
 
-        // Joiner identity (self).
+        // Joiner identity (self) — ZEB-339 enrolled-device owner. self_owner =
+        // owner_id, the redemption Join is signed by the device key, and the
+        // fixture's enrollment_cert binds them. A separate PrivateIdentity backs
+        // the DM-layer DmOutbox plumbing.
+        let joiner_owner = crate::community_membership::mint_test_owner(0xBB);
+        let self_owner = joiner_owner.owner;
+        let signing_key = std::sync::Arc::new(joiner_owner.device_key.clone());
         let joiner_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
-        let self_owner = OwnerAddr(joiner_identity.identity.address_hash);
-        let signing_key = signing_key_from_identity(&joiner_identity);
 
         // Admin identity (invite creator). Used only for invite payload construction.
         let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
@@ -16653,7 +16648,10 @@ mod redeem_invite_inner_tests {
             ed25519_dalek::SigningKey::from_bytes(&test_owner_lib16471.device_key.to_bytes()),
         );
         let enrollment_cert_lib16471 = test_owner_lib16471.cert;
-        let fixture_enrollment_cert = enrollment_cert_lib16471.clone();
+        // ZEB-339: the FIXTURE's enrollment_cert (used for the community redeem
+        // Join) must bind self_owner → signing_key, i.e. the joiner's own cert.
+        // The DmOutbox cert above stays a separate DM-layer fixture.
+        let fixture_enrollment_cert = joiner_owner.cert.clone();
         let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new(
             "joiner-dev".into(),
             self_owner,
@@ -17223,20 +17221,13 @@ mod redeem_invite_inner_tests {
 
     #[test]
     fn mint_redemption_produces_self_join_and_matching_space() {
-        let identity = PrivateIdentity::from_seed(&[0xab; 32]);
-        let identity_pub = identity.identity.to_public_bytes();
-        let self_owner = OwnerAddr(identity.identity.address_hash);
-        // Mirror Task 9's test pattern: pull the canonical 32-byte
-        // Ed25519 seed from bytes 32..64 of `to_private_bytes()`. The
-        // production IPC borrows this same SigningKey from `dm_outbox`.
-        let sk_bytes_full = identity.to_private_bytes();
-        let ed_seed: [u8; 32] = sk_bytes_full[32..64]
-            .try_into()
-            .expect("ed25519 seed slice 32..64");
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&ed_seed);
-        // ZEB-339: synthetic cert (compile/wiring only — Task 10 migrates this
-        // test to the cert/enrolled-key model).
-        let enrollment_cert = crate::community_membership::mint_test_owner(0xD2).cert;
+        // ZEB-339: enrolled-device owner — self_owner = owner_id, the redemption
+        // Join is signed by the device key and carries the matching cert.
+        let owner = crate::community_membership::mint_test_owner(0xAB);
+        let identity_pub = [0u8; 64];
+        let self_owner = owner.owner;
+        let signing_key = owner.device_key.clone();
+        let enrollment_cert = owner.cert.clone();
 
         let payload = CommunityInvitePayload {
             community_id: SpaceId([0xee; 16]),
@@ -17629,15 +17620,15 @@ mod redeem_invite_inner_tests {
             InviteEpochSnapshot, InviteToken, MaterializedCommunityState,
         };
         use crate::community_membership::MembershipEventKind;
-        use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
 
         let admin_addr = OwnerAddr([0x11; 16]);
         let community_id = SpaceId([0x33; 16]);
-        let joiner_sk = SigningKey::generate(&mut OsRng);
-        // ZEB-339: synthetic cert (compile/wiring only — Task 10 migrates this test).
-        let enrollment_cert = crate::community_membership::mint_test_owner(0xD3).cert;
-        let joiner_addr = OwnerAddr([0x22; 16]);
+        // ZEB-339: joiner is an enrolled-device owner — addr/signing-key/cert
+        // all derive from one minted owner so the redemption Join is consistent.
+        let joiner_owner = crate::community_membership::mint_test_owner(0xD3);
+        let joiner_sk = joiner_owner.device_key.clone();
+        let enrollment_cert = joiner_owner.cert.clone();
+        let joiner_addr = joiner_owner.owner;
 
         let token = InviteToken {
             inviter: admin_addr,
@@ -17692,15 +17683,15 @@ mod redeem_invite_inner_tests {
         };
         use crate::community_membership::MembershipEventKind;
         use crate::dm_signing::{ed25519_priv_to_x25519, seal_to_owner};
-        use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
 
         let admin_addr = OwnerAddr([0x11; 16]);
         let community_id = SpaceId([0x33; 16]);
-        let joiner_sk = SigningKey::generate(&mut OsRng);
-        // ZEB-339: synthetic cert (compile/wiring only — Task 10 migrates this test).
-        let enrollment_cert = crate::community_membership::mint_test_owner(0xD3).cert;
-        let joiner_addr = OwnerAddr([0x22; 16]);
+        // ZEB-339: joiner is an enrolled-device owner; the seal targets the X25519
+        // derived from their device key, and the cert binds owner→device key.
+        let joiner_owner = crate::community_membership::mint_test_owner(0xD3);
+        let joiner_sk = joiner_owner.device_key.clone();
+        let enrollment_cert = joiner_owner.cert.clone();
+        let joiner_addr = joiner_owner.owner;
 
         // Derive joiner's X25519 pub for the seal.
         let joiner_x25519_priv = ed25519_priv_to_x25519(&joiner_sk);
