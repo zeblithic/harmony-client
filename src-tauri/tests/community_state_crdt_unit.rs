@@ -1,13 +1,41 @@
 //! Unit tests for community_state_crdt.rs Phase 2 types.
 
 use harmony_app::community_membership::{
-    sign_event_with_identity, EventPayload, MemberStatus, MembershipEventKind, VerifyContext,
-    VerifyError,
+    mint_test_owner, sign_event, EventPayload, MemberStatus, MembershipEventKind,
+    SignedMembershipEvent, TestOwner, VerifyContext, VerifyError,
 };
 use harmony_app::community_state_crdt::{CommunityState, InsertOutcome};
 use harmony_app::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
 use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
-use harmony_identity::PrivateIdentity;
+
+/// ZEB-339: build a deterministic enrolled-device owner. Returns
+/// `(TestOwner, dummy_pub, owner_addr)` so existing `(identity, pub, addr)`
+/// destructures keep compiling; the actor is `owner.owner` (owner_id) and
+/// events are signed by the enrolled device key (#2).
+fn make_test_identity(seed: u8) -> (TestOwner, [u8; 64], OwnerAddr) {
+    let owner = mint_test_owner(seed);
+    let addr = owner.owner;
+    (owner, [0u8; 64], addr)
+}
+
+/// ZEB-339: sign a membership event with the owner's enrolled device key,
+/// attaching the Master cert on identity-introducing events (Join/PendingJoin)
+/// so materialize/insert populates `enrolled_device_keys`.
+fn sign_event_with_identity(
+    payload: &EventPayload,
+    owner: &TestOwner,
+) -> Result<SignedMembershipEvent, harmony_app::owner_state_crypto::CryptoError> {
+    let ev = sign_event(payload, &owner.device_key)?;
+    Ok(match ev.kind {
+        MembershipEventKind::Join | MembershipEventKind::PendingJoin { .. } => {
+            SignedMembershipEvent {
+                enrollment: Some(owner.cert.clone()),
+                ..ev
+            }
+        }
+        _ => ev,
+    })
+}
 
 #[test]
 fn empty_community_state_round_trips() {
@@ -16,13 +44,6 @@ fn empty_community_state_round_trips() {
     let decoded: CommunityState = canonical_cbor_decode(&bytes).expect("decode");
     assert_eq!(decoded.community_id, s.community_id);
     assert!(decoded.events.is_empty());
-}
-
-fn make_test_identity(seed: u8) -> (PrivateIdentity, [u8; 64], OwnerAddr) {
-    let identity = PrivateIdentity::from_seed(&[seed; 32]);
-    let identity_pub = identity.identity.to_public_bytes();
-    let addr = OwnerAddr(identity.identity.address_hash);
-    (identity, identity_pub, addr)
 }
 
 fn hlc(wall_ms: u64) -> Hlc {
