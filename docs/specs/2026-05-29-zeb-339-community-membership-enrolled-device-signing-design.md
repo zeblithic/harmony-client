@@ -65,7 +65,7 @@ Two facts make this clean and cheap:
 
 A verifier with only the event + its enrollment cert can confirm, with no prior state and no central authority:
 
-```
+```text
 event.actor = owner_id ─────────────────────────────┐
                                                      │ must match
 EnrollmentCert (Master{master_pubkey})               ▼

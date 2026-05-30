@@ -292,6 +292,59 @@ mod tests {
         verify_inner_signature(&p, &actor, &hlc, &public.verifying_key).expect("verify");
     }
 
+    /// ZEB-339: verify `build_signed_payload_with_key` (the enrolled-device
+    /// variant) produces a payload whose inner signature verifies under the
+    /// matching `VerifyingKey`, and FAILS if either the actor (OwnerAddr) or
+    /// the HLC used to compute the signed bytes is mutated.
+    #[test]
+    fn build_signed_payload_with_key_verifies_and_rejects_mutation() {
+        // Fixed, deterministic ed25519 keypair from a known seed.
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+
+        let actor = OwnerAddr([0xAA; 16]);
+        let hlc = Hlc {
+            wall_ms: 1_700_000_000_000,
+            logical: 0,
+            device_id: "test-dev".into(),
+        };
+
+        let p = build_signed_payload_with_key(
+            [0xAB; 32],
+            "https://derp.example/".into(),
+            vec![],
+            1_700_000_000_000,
+            &actor,
+            &hlc,
+            &signing_key,
+        )
+        .expect("build_signed_payload_with_key");
+
+        // Correct actor + hlc: signature must verify.
+        verify_inner_signature(&p, &actor, &hlc, &verifying_key)
+            .expect("inner sig must verify with correct actor + hlc");
+
+        // Mutated actor: signature must FAIL.
+        let wrong_actor = OwnerAddr([0xBB; 16]);
+        assert_eq!(
+            verify_inner_signature(&p, &wrong_actor, &hlc, &verifying_key),
+            Err(InnerSigError::Invalid),
+            "inner sig must fail with wrong actor"
+        );
+
+        // Mutated HLC: signature must FAIL.
+        let wrong_hlc = Hlc {
+            wall_ms: 1_700_000_000_001, // one ms later
+            logical: 0,
+            device_id: "test-dev".into(),
+        };
+        assert_eq!(
+            verify_inner_signature(&p, &actor, &wrong_hlc, &verifying_key),
+            Err(InnerSigError::Invalid),
+            "inner sig must fail with wrong hlc"
+        );
+    }
+
     #[test]
     fn inner_sig_rejects_tampered_node_id() {
         let identity = PrivateIdentity::from_seed(&[0xAA; 32]);

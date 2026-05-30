@@ -594,14 +594,17 @@ mod verify_rejection_tests {
         ed25519_dalek::SigningKey::from_bytes(&seed)
     }
 
-    /// Common harness: build a fully valid CommunityInviteSigned + a
-    /// matching InviteToken signed by `self_device_sk` (the counter-signer's
-    /// enrolled device key). Tests then mutate one field and assert the right
-    /// reject discriminant.
-    /// ZEB-339: mint an enrolled-device joiner and a Join event carrying the
-    /// joiner's Master EnrollmentCert, signed by the joiner's device key (#2).
-    /// `seed` is taken from the supplied identity so the joiner stays
-    /// deterministic per test. Returns `(join_event, joiner_owner, joiner_pub)`.
+    /// Mint a ZEB-339 enrolled-device Join event for use in verify_packet tests.
+    ///
+    /// **Dual-identity pattern**: this helper mints a `TestOwner` (seed derived
+    /// from `joiner_identity`) which carries the enrolled device key (#2) used
+    /// as the event actor and signer. The returned `joiner_pub` is the SEPARATE
+    /// Reticulum `joiner_identity_pub` (64-byte combined [x25519 || ed25519]),
+    /// used for DM/transport layer. Importantly, `joiner.owner` (the community
+    /// actor) does NOT equal the `OwnerAddr` derived from `joiner_identity` (the
+    /// Reticulum transport identity) — they are from different key systems.
+    /// This mirrors production: a user has a harmony-owner master key (community
+    /// actor) and a separate Reticulum identity key (DM/transport).
     fn minted_join_event(
         joiner_identity: &harmony_identity::PrivateIdentity,
         community_id: SpaceId,
@@ -1216,6 +1219,9 @@ mod admin_bootstrap_helpers {
         // admin_identity_pub: 64-byte [x25519 || ed25519] representation.
         // The engine ignores it post-ZEB-339 (VerifyContext no longer carries
         // it), but the field must be Some for step 1 (BootstrapMissing gate).
+        // The x25519 half (combined[0..32]) is intentionally zeroed because
+        // x25519 is unused in post-ZEB-339 verify_admin_bootstrap — verification
+        // uses the cert's device key exclusively. No check reads combined[0..32].
         let admin_pub = {
             let ed25519_pub = admin.cert.device_pubkeys.classical.ed25519_verify;
             let mut combined = [0u8; 64];

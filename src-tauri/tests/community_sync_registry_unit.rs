@@ -293,11 +293,15 @@ async fn pending_redemption_oneshot_fires_when_event_id_inserts_via_local() {
     }
 
     // ZEB-339: enrolled-device owner — actor = owner_id, the self-Join is signed
-    // by the device key and carries the owner's Master cert so verify_event
-    // resolves the signer and the pending-redemption oneshot fires on insert.
+    // by the device key and carries the owner's EnrollmentCert so verify_event
+    // resolves the signer from the cert (not via AdminResolver) and the
+    // pending-redemption oneshot fires on insert.
+    // `admin_pub` is zeroed ([0u8;64]) to assert that the AdminResolver is
+    // intentionally NOT consulted during cert-bearing Join verification — the
+    // EnrollmentCert binding takes precedence.
     let owner = harmony_app::community_membership::mint_test_owner(0x55);
     let admin_addr = owner.owner;
-    let admin_pub = [0u8; 64];
+    let admin_pub = [0u8; 64]; // zeroed: AdminResolver NOT consulted for cert-bearing Joins
     let admin_sk = Arc::new(owner.device_key.clone());
 
     let (cas_op_tx, _cas_op_rx) = mpsc::channel(8);
@@ -392,11 +396,15 @@ async fn pending_redemption_unregistered_when_no_match() {
     }
 
     // ZEB-339: enrolled-device owner — actor = owner_id, the self-Join is signed
-    // by the device key and carries the owner's Master cert so verify_event
-    // resolves the signer and the pending-redemption oneshot fires on insert.
+    // by the device key and carries the owner's EnrollmentCert so verify_event
+    // resolves the signer from the cert (not via AdminResolver) and the
+    // pending-redemption oneshot fires on insert.
+    // `admin_pub` is zeroed ([0u8;64]) to assert that the AdminResolver is
+    // intentionally NOT consulted during cert-bearing Join verification — the
+    // EnrollmentCert binding takes precedence.
     let owner = harmony_app::community_membership::mint_test_owner(0x55);
     let admin_addr = owner.owner;
-    let admin_pub = [0u8; 64];
+    let admin_pub = [0u8; 64]; // zeroed: AdminResolver NOT consulted for cert-bearing Joins
     let admin_sk = Arc::new(owner.device_key.clone());
 
     let (cas_op_tx, _cas_op_rx) = mpsc::channel(8);
