@@ -42,6 +42,7 @@
     resolveCard,
     subscribeVisibleCards,
     unsubscribeCards,
+    onOpenCard,
   }: {
     communityId: string;
     communityName: string;
@@ -60,6 +61,11 @@
     subscribeVisibleCards?: (ownerIdHexes: string[]) => void;
     /** ZEB-341 Task 8: tear down all card subscriptions when the panel unmounts. */
     unsubscribeCards?: () => void;
+    /** ZEB-341: open the owner_id card popover for a clicked member/author. */
+    onOpenCard?: (
+      payload: { ownerIdHex: string; displayName: string; statusText: string; power?: number; status?: string },
+      ev: MouseEvent,
+    ) => void;
     /** ZEB-291 Phase 2: connected VotingAdapter. When present, a
      *  Proposals tab appears next to Channels — switches the middle
      *  column to the Tier 2 governance panel. Optional so existing
@@ -375,6 +381,7 @@
         originalCommunityName={preForkSnapshot?.originalCommunityName ?? ''}
         forkedAtMs={preForkSnapshot?.forkedAtMs ?? 0}
         {resolveCard}
+        {onOpenCard}
       />
     {:else}
       <div class="empty-channels">
@@ -466,6 +473,7 @@
         {resolveCard}
         {subscribeVisibleCards}
         {unsubscribeCards}
+        {onOpenCard}
       />
     </div>
   </div>

@@ -3,7 +3,7 @@
   import type { CommunityService } from '../community-service';
   import type { CommunityMember, ModerationEvent } from '../types';
   import MemberRow from './MemberRow.svelte';
-  import type { KebabAction } from './MemberRow.svelte';
+  import type { KebabAction, OpenCardPayload } from './MemberRow.svelte';
   import type { ResolvedCard } from '../member-card-service';
   import ModerationReasonDialog from './ModerationReasonDialog.svelte';
   import LastAdminWarningDialog from './LastAdminWarningDialog.svelte';
@@ -17,6 +17,7 @@
     resolveCard,
     subscribeVisibleCards,
     unsubscribeCards,
+    onOpenCard,
   }: {
     communityId: string;
     communityName: string;
@@ -28,6 +29,8 @@
     subscribeVisibleCards?: (ownerIdHexes: string[]) => void;
     /** ZEB-341 Task 8: tear down all card subscriptions when this panel unmounts. */
     unsubscribeCards?: () => void;
+    /** ZEB-341: open the owner_id card popover for a clicked member. */
+    onOpenCard?: (payload: OpenCardPayload, ev: MouseEvent) => void;
   } = $props();
 
   let members: CommunityMember[] = $state([]);
@@ -305,6 +308,7 @@
           {member}
           {viewer}
           {resolveCard}
+          {onOpenCard}
           onaction={(detail) => onMemberAction(detail)}
         />
       {/each}
@@ -322,6 +326,7 @@
               {member}
               {viewer}
               {resolveCard}
+              {onOpenCard}
               onaction={(detail) => onMemberAction(detail)}
             />
           {/each}

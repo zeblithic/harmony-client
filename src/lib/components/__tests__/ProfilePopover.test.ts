@@ -157,6 +157,114 @@ describe('ProfilePopover', () => {
     await waitFor(() => expect(getByText('Test Community')).toBeTruthy());
   });
 
+  // ── ZEB-341: owner-card mode ───────────────────────────────────────
+  const OWNER_HEX = 'ab'.repeat(16);
+
+  it('owner-card mode renders name, status, owner_id and Admin role', () => {
+    render(ProfilePopover, {
+      props: {
+        mode: 'owner-card',
+        card: { ownerIdHex: OWNER_HEX, displayName: 'Alice', statusText: 'hi', power: 100 },
+        x: 10,
+        y: 10,
+        onClose: vi.fn(),
+      },
+    });
+    expect(screen.getByText('Alice')).toBeTruthy();
+    expect(screen.getByText('hi')).toBeTruthy();
+    expect(screen.getByText(OWNER_HEX)).toBeTruthy();
+    expect(screen.getByText('Admin')).toBeTruthy();
+    // Reticulum-only sections are absent in owner-card mode.
+    expect(screen.queryByText('Public memberships')).toBeNull();
+    expect(screen.queryByText('Notification sounds')).toBeNull();
+  });
+
+  it('owner-card mode derives Moderator and Member roles from power', () => {
+    const { unmount } = render(ProfilePopover, {
+      props: {
+        mode: 'owner-card',
+        card: { ownerIdHex: OWNER_HEX, displayName: 'Mod', statusText: '', power: 50 },
+        x: 0,
+        y: 0,
+        onClose: vi.fn(),
+      },
+    });
+    expect(screen.getByText('Moderator')).toBeTruthy();
+    unmount();
+    render(ProfilePopover, {
+      props: {
+        mode: 'owner-card',
+        card: { ownerIdHex: OWNER_HEX, displayName: 'Regular', statusText: '', power: 0 },
+        x: 0,
+        y: 0,
+        onClose: vi.fn(),
+      },
+    });
+    expect(screen.getByText('Member')).toBeTruthy();
+  });
+
+  it('owner-card mode with undefined power omits the role line', () => {
+    render(ProfilePopover, {
+      props: {
+        mode: 'owner-card',
+        card: { ownerIdHex: OWNER_HEX, displayName: 'Author', statusText: '' },
+        x: 0,
+        y: 0,
+        onClose: vi.fn(),
+      },
+    });
+    expect(screen.getByText('Author')).toBeTruthy();
+    expect(screen.getByText(OWNER_HEX)).toBeTruthy();
+    expect(screen.queryByText('Admin')).toBeNull();
+    expect(screen.queryByText('Moderator')).toBeNull();
+    expect(screen.queryByText('Member')).toBeNull();
+  });
+
+  it('owner-card mode shows "Name unavailable" when displayName is empty', () => {
+    render(ProfilePopover, {
+      props: {
+        mode: 'owner-card',
+        card: { ownerIdHex: OWNER_HEX, displayName: '', statusText: '' },
+        x: 0,
+        y: 0,
+        onClose: vi.fn(),
+      },
+    });
+    expect(screen.getByText('Name unavailable')).toBeTruthy();
+    expect(screen.getByText(OWNER_HEX)).toBeTruthy();
+  });
+
+  it('owner-card mode copies owner_id on click', async () => {
+    const writeText = vi.fn();
+    Object.assign(navigator, { clipboard: { writeText } });
+    render(ProfilePopover, {
+      props: {
+        mode: 'owner-card',
+        card: { ownerIdHex: OWNER_HEX, displayName: 'Alice', statusText: '', power: 100 },
+        x: 0,
+        y: 0,
+        onClose: vi.fn(),
+      },
+    });
+    await fireEvent.click(screen.getByLabelText('Copy owner ID'));
+    expect(writeText).toHaveBeenCalledWith(OWNER_HEX);
+  });
+
+  it('owner-card mode closes on Escape', async () => {
+    const onClose = vi.fn();
+    render(ProfilePopover, {
+      props: {
+        mode: 'owner-card',
+        card: { ownerIdHex: OWNER_HEX, displayName: 'Alice', statusText: '', power: 100 },
+        x: 0,
+        y: 0,
+        onClose,
+      },
+    });
+    await fireEvent.keyDown(window, { key: 'Escape' });
+    expect(onClose).toHaveBeenCalled();
+  });
+
   it('popover_shows_no_memberships_after_timeout', async () => {
     vi.useFakeTimers();
     try {

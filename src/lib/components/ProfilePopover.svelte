@@ -8,8 +8,25 @@
   } from '../profile-broadcast-service';
   import Avatar from './Avatar.svelte';
 
+  /**
+   * ZEB-341: owner_id card payload for the click-to-view surface. Distinct
+   * from the Reticulum {@link Profile} world — keyed by owner_id hex, resolved
+   * via the MemberCardService.
+   */
+  export type OwnerCard = {
+    ownerIdHex: string;
+    displayName: string;
+    statusText: string;
+    /** Community power level. 100=Admin, 50=Moderator, else Member. Omitted
+     *  (undefined) for message authors not in the member list → no role line. */
+    power?: number;
+    status?: string;
+  };
+
   let {
+    mode = 'reticulum',
     profile,
+    card,
     x,
     y,
     onClose,
@@ -17,16 +34,53 @@
     profileBroadcastService,
     resolveCommunityName,
   }: {
-    profile: Profile;
+    /** 'reticulum' = existing avatar-click profile popover; 'owner-card' =
+     *  ZEB-341 owner_id card popover. */
+    mode?: 'reticulum' | 'owner-card';
+    /** Required in 'reticulum' mode. */
+    profile?: Profile;
+    /** Required in 'owner-card' mode. */
+    card?: OwnerCard;
     x: number;
     y: number;
     onClose: () => void;
-    ownAddress: string;
-    profileBroadcastService: ProfileBroadcastService;
-    resolveCommunityName: (communityIdHex: string) => string | null;
+    /** Required in 'reticulum' mode. */
+    ownAddress?: string;
+    /** Required in 'reticulum' mode. */
+    profileBroadcastService?: ProfileBroadcastService;
+    /** Required in 'reticulum' mode. */
+    resolveCommunityName?: (communityIdHex: string) => string | null;
   } = $props();
 
   const SOUND_LABELS = { quiet: 'Quiet', standard: 'Standard', loud: 'Loud' } as const;
+
+  function roleLabel(power: number): string {
+    if (power === 100) return 'Admin';
+    if (power === 50) return 'Moderator';
+    return 'Member';
+  }
+
+  let copied = $state(false);
+  let copyTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function copyOwnerId() {
+    const hex = card?.ownerIdHex;
+    if (!hex) return;
+    void navigator.clipboard?.writeText(hex);
+    copied = true;
+    if (copyTimer) clearTimeout(copyTimer);
+    copyTimer = setTimeout(() => {
+      copied = false;
+      copyTimer = null;
+    }, 1500);
+  }
+
+  function onCopyKeydown(e: KeyboardEvent) {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      copyOwnerId();
+    }
+  }
 
   let subscriptionId = $state<number | null>(null);
   let memberships = $state<ProfileMembershipBroadcastInfo | null>(null);
@@ -61,11 +115,15 @@
   // independent: re-running the listener effect should not tear down
   // the subscription, and vice versa.
   $effect(() => {
+    // ZEB-341: owner-card mode does not subscribe to anything and must not
+    // require profileBroadcastService. Early-return before touching any
+    // Reticulum-profile dep.
+    if (mode === 'owner-card') return;
     // Snapshot reactive deps so this effect tracks only the address
     // identity of the profile we're showing.
-    const peerAddr = profile.address;
+    const peerAddr = profile!.address;
     const ownAddr = untrack(() => ownAddress);
-    const svc = untrack(() => profileBroadcastService);
+    const svc = untrack(() => profileBroadcastService)!;
 
     if (peerAddr === ownAddr) {
       // Don't subscribe to ourselves; the section isn't rendered.
@@ -168,6 +226,31 @@
 </script>
 
 <div class="profile-popover" style="left: {x}px; top: {y}px;">
+{#if mode === 'owner-card' && card}
+  <div class="popover-header">
+    <Avatar address={card.ownerIdHex} displayName={card.displayName} size={64} />
+    <div class="popover-identity">
+      <div class="popover-name">{card.displayName || 'Name unavailable'}</div>
+      {#if card.statusText}
+        <div class="popover-status">{card.statusText}</div>
+      {/if}
+      <button
+        type="button"
+        class="popover-ownerid"
+        title="Copy owner ID"
+        aria-label="Copy owner ID"
+        onclick={copyOwnerId}
+        onkeydown={onCopyKeydown}
+      >
+        <span class="ownerid-hex">{card.ownerIdHex}</span>
+        <span class="ownerid-copy-hint">{copied ? 'Copied' : 'Copy'}</span>
+      </button>
+    </div>
+  </div>
+  {#if card.power !== undefined}
+    <div class="popover-role">{roleLabel(card.power)}</div>
+  {/if}
+{:else if profile}
   <div class="popover-header">
     <Avatar address={profile.address} displayName={profile.displayName} avatarUrl={profile.avatarUrl} size={64} />
     <div class="popover-identity">
@@ -199,12 +282,13 @@
       {:else}
         <ul class="memberships-list">
           {#each memberships.communityIds as communityId}
-            <li>{resolveCommunityName(communityId) ?? communityId.slice(0, 8) + '…'}</li>
+            <li>{resolveCommunityName?.(communityId) ?? communityId.slice(0, 8) + '…'}</li>
           {/each}
         </ul>
       {/if}
     </div>
   {/if}
+{/if}
 </div>
 
 <style>
@@ -252,6 +336,52 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .popover-ownerid {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    margin-top: 4px;
+    padding: 2px 4px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    cursor: pointer;
+    text-align: left;
+  }
+  .popover-ownerid:hover {
+    background: var(--bg-secondary);
+    border-color: var(--border);
+  }
+  .popover-ownerid:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 1px;
+  }
+  .ownerid-hex {
+    font-size: 11px;
+    color: var(--text-muted);
+    font-family: monospace;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+    min-width: 0;
+  }
+  .ownerid-copy-hint {
+    font-size: 10px;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    flex-shrink: 0;
+  }
+  .popover-role {
+    border-top: 1px solid var(--border);
+    padding-top: 10px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
   }
 
   .popover-sounds {

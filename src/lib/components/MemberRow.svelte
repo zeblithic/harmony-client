@@ -10,17 +10,29 @@
     | 'demote-mod'
     | 'demote-member';
 
+  /** ZEB-341: payload the leaf assembles for the owner_id card popover. */
+  export type OpenCardPayload = {
+    ownerIdHex: string;
+    displayName: string;
+    statusText: string;
+    power?: number;
+    status?: string;
+  };
+
   let {
     member,
     viewer,
     onaction,
     resolveCard,
+    onOpenCard,
   }: {
     member: CommunityMember;
     viewer: { addr: string; power: number; isLastAdmin: boolean };
     onaction?: (detail: { action: KebabAction; member: CommunityMember }) => void;
     /** ZEB-341: optional card resolver for member display names. */
     resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
+    /** ZEB-341: open the owner_id card popover for this member. */
+    onOpenCard?: (payload: OpenCardPayload, ev: MouseEvent) => void;
   } = $props();
 
   let menuOpen = $state(false);
@@ -112,6 +124,19 @@
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape') menuOpen = false;
   }
+
+  function handleNameClick(ev: MouseEvent) {
+    onOpenCard?.(
+      {
+        ownerIdHex: member.address,
+        displayName,
+        statusText: resolveCard?.(member.address)?.statusText ?? '',
+        power: member.power,
+        status: member.status,
+      },
+      ev,
+    );
+  }
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -120,7 +145,13 @@
     {displayName.slice(0, 1).toUpperCase()}
   </div>
   <div class="member-info">
-    <span class="name">{displayName}{isSelf ? ' (you)' : ''}</span>
+    {#if onOpenCard}
+      <button type="button" class="name name-btn" onclick={handleNameClick}>
+        {displayName}{isSelf ? ' (you)' : ''}
+      </button>
+    {:else}
+      <span class="name">{displayName}{isSelf ? ' (you)' : ''}</span>
+    {/if}
     <span class="addr">{member.address}</span>
   </div>
   <span class="tier-badge" data-status={member.status} data-power={member.power}>
@@ -198,6 +229,24 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .name-btn {
+    background: transparent;
+    border: none;
+    padding: 0;
+    margin: 0;
+    text-align: left;
+    cursor: pointer;
+    font: inherit;
+    max-width: 100%;
+  }
+  .name-btn:hover {
+    text-decoration: underline;
+  }
+  .name-btn:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 1px;
+    border-radius: 2px;
   }
   .addr {
     font-size: 0.65rem;

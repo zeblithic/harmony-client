@@ -570,6 +570,41 @@
   let popoverX = $state(0);
   let popoverY = $state(0);
 
+  // ── ZEB-341: owner_id card popover (click-to-view on members/authors) ──
+  // Keyed by owner_id hex — a distinct world from the Reticulum `Profile`
+  // popover above. Its own x/y avoids regressing the avatar-click path.
+  let popoverCard = $state<{
+    ownerIdHex: string;
+    displayName: string;
+    statusText: string;
+    power?: number;
+    status?: string;
+  } | null>(null);
+  let popoverCardX = $state(0);
+  let popoverCardY = $state(0);
+
+  function openMemberCard(
+    payload: { ownerIdHex: string; displayName: string; statusText: string; power?: number; status?: string },
+    event: MouseEvent,
+  ) {
+    // Toggle-close if the same owner_id is re-clicked (mirrors the avatar path).
+    if (popoverCard?.ownerIdHex === payload.ownerIdHex) {
+      popoverCard = null;
+      return;
+    }
+    const el =
+      (event.currentTarget as HTMLElement | null) ??
+      ((event.target as HTMLElement).closest('button') as HTMLElement | null);
+    const rect = el?.getBoundingClientRect();
+    const POPOVER_WIDTH = 300;
+    const POPOVER_HEIGHT = 180;
+    if (rect) {
+      popoverCardX = Math.min(rect.right + 8, window.innerWidth - POPOVER_WIDTH - 8);
+      popoverCardY = Math.min(rect.top, window.innerHeight - POPOVER_HEIGHT - 8);
+    }
+    popoverCard = payload;
+  }
+
   function handleAvatarClick(address: string, event: MouseEvent) {
     if (popoverProfile?.address === address) {
       popoverProfile = null;
@@ -1654,6 +1689,7 @@
         {resolveCard}
         {subscribeVisibleCards}
         {unsubscribeCards}
+        onOpenCard={openMemberCard}
       />
     {:else}
       <TextFeed
@@ -1903,6 +1939,16 @@
       );
       return node?.name ?? null;
     }}
+  />
+{/if}
+
+{#if popoverCard}
+  <ProfilePopover
+    mode="owner-card"
+    card={popoverCard}
+    x={popoverCardX}
+    y={popoverCardY}
+    onClose={() => (popoverCard = null)}
   />
 {/if}
 
