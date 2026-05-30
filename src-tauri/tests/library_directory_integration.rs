@@ -126,7 +126,10 @@ fn invite_only_url() -> String {
         admin_identity_pub: Some([0u8; 64]),
         forked_from: None,
         pre_fork_snapshot: None,
-        inviter_enrollment: None,
+        // ZEB-339: encode_invite_url requires invite-only payloads to carry the
+        // inviter's EnrollmentCert. Its content is irrelevant — this URL must be
+        // rejected at receive (verify_entry rejects invite-only directory entries).
+        inviter_enrollment: Some(harmony_app::community_membership::mint_test_owner(0xC1).cert),
     };
     encode_invite_url(&payload).expect("encode invite-only url")
 }
@@ -745,15 +748,16 @@ async fn click_to_join_redeem_invite_smoke() {
     // channels whose receivers are kept alive so try_send doesn't
     // observe Closed.
     let tmp = tempfile::TempDir::new().expect("tempdir");
+    // ZEB-339: the joiner is an enrolled-device owner — actor = owner_id, its
+    // redemption Join is signed by the device key (#2) and carries the joiner's
+    // Master enrollment cert (passed into redeem_invite_inner). A separate
+    // PrivateIdentity backs the DM-layer DmOutbox plumbing below (unrelated to
+    // community membership verification).
+    let joiner = harmony_app::community_membership::mint_test_owner(0xBB);
+    let joiner_owner = joiner.owner;
+    let joiner_pub_64 = [0u8; 64];
+    let joiner_signing_key = Arc::new(joiner.device_key.clone());
     let joiner_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
-    let joiner_owner = OwnerAddr(joiner_identity.identity.address_hash);
-    let joiner_pub_64 = joiner_identity.identity.to_public_bytes();
-    let joiner_signing_key = {
-        let private_bytes = joiner_identity.to_private_bytes();
-        let mut secret = [0u8; 32];
-        secret.copy_from_slice(&private_bytes[32..64]);
-        Arc::new(ed25519_dalek::SigningKey::from_bytes(&secret))
-    };
 
     // Identity resolver — admits the joiner's own signature on the
     // bootstrap Join. Founder isn't reached on the OPEN path (no
@@ -866,8 +870,7 @@ async fn click_to_join_redeem_invite_smoke() {
         "joiner-dev".into(),
         joiner_owner,
         Arc::clone(&joiner_signing_key),
-        // ZEB-339: synthetic cert (compile/wiring only — allowed-RED until Task 10).
-        harmony_app::community_membership::mint_test_owner(0).cert,
+        joiner.cert.clone(),
         Arc::clone(&community_registry),
         community_adapter_tx,
         unicast_send_tx,
