@@ -10,6 +10,10 @@ use crate::owner_state_types::Hlc;
 use ed25519_dalek::{Signer, SigningKey};
 use harmony_owner::certs::{EnrollmentCert, EnrollmentIssuer};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use tokio::sync::Mutex;
+
+pub use crate::profile_broadcast::SubscriptionId;
 
 pub const PROFILE_CARD_TOPIC_PREFIX: &str = "harmony/discovery/profile/owner/";
 pub const MAX_DISPLAY_NAME_BYTES: usize = 64;
@@ -150,9 +154,190 @@ pub fn verify_card(card: &ProfileCardBroadcast) -> Result<[u8; 16], CardVerifyEr
     Ok(card.owner_id)
 }
 
+/// Snapshot of the latest verified profile card broadcast for a subscription.
+/// Wire keys are camelCase to match the frontend DTO convention.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveredCardInfo {
+    #[serde(rename = "ownerIdHex")]
+    pub owner_id_hex: String,
+    #[serde(rename = "displayName")]
+    pub display_name: String,
+    #[serde(rename = "statusText")]
+    pub status_text: String,
+}
+
+/// Per-subscription cached card entry. Holds the highest-HLC verified card
+/// observed so far + the expected owner_id the subscription targets.
+#[derive(Debug, Clone)]
+struct CachedCard {
+    owner_id: [u8; 16],
+    display_name: String,
+    status_text: String,
+    shared_at: Hlc,
+}
+
+/// Per-slot state: (expected_owner, latest cached card).
+#[derive(Debug, Default, Clone)]
+struct CardSlot {
+    expected_owner: [u8; 16],
+    latest: Option<CachedCard>,
+}
+
+/// In-process cache of verified peer profile card broadcasts. Spec §7.
+///
+/// Newer-HLC-wins: uses `Hlc::is_strictly_newer_than` for ordering (lexicographic
+/// on `(wall_ms, logical, device_id)`). `Hlc` does not derive `PartialOrd`.
+#[derive(Default)]
+pub struct ProfileCardCache {
+    slots: Mutex<HashMap<SubscriptionId, CardSlot>>,
+}
+
+impl ProfileCardCache {
+    /// Register a subscription. Idempotent — a pre-existing entry for the
+    /// same `sub` is left untouched (avoids evicting a cached card on re-register).
+    pub async fn register(&self, sub: SubscriptionId, expected_owner: [u8; 16]) {
+        self.slots.lock().await.entry(sub).or_insert(CardSlot {
+            expected_owner,
+            latest: None,
+        });
+    }
+
+    /// Drop a subscription from the cache. Idempotent — missing sub is OK.
+    pub async fn drop_subscription(&self, sub: SubscriptionId) {
+        self.slots.lock().await.remove(&sub);
+    }
+
+    /// Insert a VERIFIED card (caller already ran `verify_card` + attribution).
+    ///
+    /// Silently ignores the card if:
+    /// - the subscription slot does not exist,
+    /// - `card.owner_id` != the slot's expected owner (defense-in-depth), or
+    /// - the card is not strictly newer than the cached entry (replay guard).
+    pub async fn insert_verified(&self, sub: SubscriptionId, card: &ProfileCardBroadcast) {
+        let mut g = self.slots.lock().await;
+        if let Some(slot) = g.get_mut(&sub) {
+            if card.owner_id != slot.expected_owner {
+                return;
+            }
+            let is_newer = match &slot.latest {
+                Some(e) => card.shared_at.is_strictly_newer_than(&e.shared_at),
+                None => true,
+            };
+            if is_newer {
+                slot.latest = Some(CachedCard {
+                    owner_id: card.owner_id,
+                    display_name: card.display_name.clone(),
+                    status_text: card.status_text.clone(),
+                    shared_at: card.shared_at.clone(),
+                });
+            }
+        }
+    }
+
+    /// Snapshot the latest verified card for a subscription as the frontend DTO.
+    pub async fn get_cached(&self, sub: SubscriptionId) -> Option<DiscoveredCardInfo> {
+        let g = self.slots.lock().await;
+        let slot = g.get(&sub)?;
+        let c = slot.latest.as_ref()?;
+        Some(DiscoveredCardInfo {
+            owner_id_hex: hex::encode(c.owner_id),
+            display_name: c.display_name.clone(),
+            status_text: c.status_text.clone(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn card_cache_register_insert_get_roundtrip() {
+        let cache = ProfileCardCache::default();
+        let owner = crate::community_membership::mint_test_owner(0x60);
+        cache.register(1, owner.owner.0).await;
+        assert_eq!(cache.get_cached(1).await, None, "no broadcast yet -> None");
+        let card = sign_card(
+            &owner.device_key,
+            owner.owner.0,
+            "Cy".into(),
+            "yo".into(),
+            owner.cert.clone(),
+            Hlc {
+                wall_ms: 5,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .unwrap();
+        cache.insert_verified(1, &card).await;
+        let got = cache.get_cached(1).await.expect("cached");
+        assert_eq!(got.display_name, "Cy");
+        assert_eq!(got.status_text, "yo");
+        assert_eq!(got.owner_id_hex, hex::encode(owner.owner.0));
+        cache.drop_subscription(1).await;
+        assert_eq!(cache.get_cached(1).await, None);
+    }
+
+    #[tokio::test]
+    async fn card_cache_newer_hlc_wins() {
+        let cache = ProfileCardCache::default();
+        let owner = crate::community_membership::mint_test_owner(0x61);
+        cache.register(2, owner.owner.0).await;
+        let older = sign_card(
+            &owner.device_key,
+            owner.owner.0,
+            "old".into(),
+            "".into(),
+            owner.cert.clone(),
+            Hlc {
+                wall_ms: 10,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .unwrap();
+        let newer = sign_card(
+            &owner.device_key,
+            owner.owner.0,
+            "new".into(),
+            "".into(),
+            owner.cert.clone(),
+            Hlc {
+                wall_ms: 20,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .unwrap();
+        cache.insert_verified(2, &newer).await;
+        cache.insert_verified(2, &older).await; // stale -> ignored
+        assert_eq!(cache.get_cached(2).await.unwrap().display_name, "new");
+    }
+
+    #[tokio::test]
+    async fn card_cache_insert_ignores_owner_id_mismatch() {
+        // defense-in-depth: a card whose owner_id != the slot's expected owner is ignored
+        let cache = ProfileCardCache::default();
+        let a = crate::community_membership::mint_test_owner(0x62);
+        let b = crate::community_membership::mint_test_owner(0x63);
+        cache.register(3, a.owner.0).await; // slot expects owner A
+        let b_card = sign_card(
+            &b.device_key,
+            b.owner.0,
+            "B".into(),
+            "".into(),
+            b.cert.clone(),
+            Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .unwrap();
+        cache.insert_verified(3, &b_card).await; // owner_id == B != expected A -> ignored
+        assert_eq!(cache.get_cached(3).await, None);
+    }
 
     #[test]
     fn sign_card_round_trips_and_signature_verifies_under_device_key() {
