@@ -19060,7 +19060,10 @@ async fn leave_community(
             // 5. Mint the rotation (leaver is the signer — cooperative leave path).
             let rotation = {
                 let outbox_g = dm_outbox.lock().await;
-                let signing_key = outbox_g.signing_key.as_ref();
+                // ZEB-339: EpochRotation is a steady-state community-membership
+                // event verified via verify_event's enrolled-key resolution —
+                // sign with the enrolled device key (#2), no cert.
+                let signing_key = outbox_g.community_signing_key.as_ref();
                 mint_epoch_rotation_event(
                     space_id,
                     self_owner,
@@ -19786,7 +19789,9 @@ async fn kick_from_community(
         // 5. Mint the EpochRotation event referencing the Kick's EventId.
         let rotation = {
             let outbox_g = dm_outbox.lock().await;
-            let signing_key = outbox_g.signing_key.as_ref();
+            // ZEB-339: EpochRotation steady-state membership event — enrolled
+            // device key (#2), no cert.
+            let signing_key = outbox_g.community_signing_key.as_ref();
             mint_epoch_rotation_event(
                 space_id,
                 self_owner,
@@ -21411,7 +21416,9 @@ async fn propose_change_quorum(
     // Mint AdminProposal{ChangeQuorum}.
     let proposal = {
         let outbox_g = dm_outbox.lock().await;
-        let signing_key = outbox_g.signing_key.as_ref();
+        // ZEB-339: AdminProposal(ChangeQuorum) steady-state membership event —
+        // enrolled device key (#2), no cert.
+        let signing_key = outbox_g.community_signing_key.as_ref();
         mint_admin_proposal_change_quorum_event(
             space_id,
             self_owner,
