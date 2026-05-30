@@ -584,35 +584,51 @@ mod verify_rejection_tests {
     /// Common harness: build a fully valid CommunityInviteSigned + a
     /// matching InviteToken signed by `self_identity`. Tests then mutate
     /// one field and assert the right reject discriminant.
-    fn make_valid_packet(
-        self_identity: &harmony_identity::PrivateIdentity,
+    /// ZEB-339: mint an enrolled-device joiner and a Join event carrying the
+    /// joiner's Master EnrollmentCert, signed by the joiner's device key (#2).
+    /// `seed` is taken from the supplied identity so the joiner stays
+    /// deterministic per test. Returns `(join_event, joiner_owner, joiner_pub)`.
+    fn minted_join_event(
         joiner_identity: &harmony_identity::PrivateIdentity,
         community_id: SpaceId,
-    ) -> CommunityInviteSigned {
-        let self_owner = OwnerAddr(self_identity.identity.address_hash);
-        let joiner_owner = OwnerAddr(joiner_identity.identity.address_hash);
-        let joiner_pub = joiner_identity.identity.to_public_bytes();
-        let joiner_sk = {
-            let priv_bytes = joiner_identity.to_private_bytes();
-            let mut seed = [0u8; 32];
-            seed.copy_from_slice(&priv_bytes[32..64]);
-            ed25519_dalek::SigningKey::from_bytes(&seed)
-        };
+    ) -> (
+        harmony_app::community_membership::SignedMembershipEvent,
+        OwnerAddr,
+        [u8; 64],
+    ) {
+        let seed = joiner_identity.identity.address_hash[0] | 0x01;
+        let joiner = harmony_app::community_membership::mint_test_owner(seed);
         let join_event = sign_event(
             &EventPayload {
                 id: [0x44; 16],
                 community_id,
                 kind: MembershipEventKind::Join,
-                actor: joiner_owner,
+                actor: joiner.owner,
                 at: Hlc {
                     wall_ms: 1000,
                     logical: 0,
                     device_id: "j".into(),
                 },
             },
-            &joiner_sk,
+            &joiner.device_key,
         )
         .expect("sign Join");
+        let join_event = harmony_app::community_membership::SignedMembershipEvent {
+            enrollment: Some(joiner.cert.clone()),
+            ..join_event
+        };
+        let joiner_pub = joiner_identity.identity.to_public_bytes();
+        (join_event, joiner.owner, joiner_pub)
+    }
+
+    fn make_valid_packet(
+        self_identity: &harmony_identity::PrivateIdentity,
+        joiner_identity: &harmony_identity::PrivateIdentity,
+        community_id: SpaceId,
+    ) -> CommunityInviteSigned {
+        let self_owner = OwnerAddr(self_identity.identity.address_hash);
+        let (join_event, joiner_owner, joiner_pub) =
+            minted_join_event(joiner_identity, community_id);
 
         // Build an InviteToken signed by self over the same canonical bytes
         // verify_packet_pure reconstructs (mirrors the v1 single-shot
@@ -869,29 +885,8 @@ mod verify_rejection_tests {
         let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xc4; 32]);
         let community_id = SpaceId([0x10; 16]);
         let self_owner = OwnerAddr(self_id.identity.address_hash);
-        let joiner_owner = OwnerAddr(joiner_id.identity.address_hash);
-        let joiner_pub = joiner_id.identity.to_public_bytes();
-        let joiner_sk = {
-            let priv_bytes = joiner_id.to_private_bytes();
-            let mut seed = [0u8; 32];
-            seed.copy_from_slice(&priv_bytes[32..64]);
-            ed25519_dalek::SigningKey::from_bytes(&seed)
-        };
-        let join_event = sign_event(
-            &EventPayload {
-                id: [0x44; 16],
-                community_id,
-                kind: MembershipEventKind::Join,
-                actor: joiner_owner,
-                at: Hlc {
-                    wall_ms: 1000,
-                    logical: 0,
-                    device_id: "j".into(),
-                },
-            },
-            &joiner_sk,
-        )
-        .expect("sign Join");
+        let (join_event, joiner_owner, joiner_pub) =
+            minted_join_event(&joiner_id, community_id);
 
         // Sign with expires_at = Some(...).
         let unsigned_with_expiry = InviteToken {
@@ -949,6 +944,7 @@ mod verify_rejection_tests {
         let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xbe; 32]);
         let community_id = SpaceId([0x10; 16]);
         let signed = make_valid_packet(&self_id, &joiner_id, community_id);
+        let expected_actor = signed.join_event.actor;
 
         let join_event = verify_packet_pure(
             &signed,
@@ -957,7 +953,7 @@ mod verify_rejection_tests {
             &self_id,
         )
         .expect("must admit");
-        assert_eq!(join_event.actor, OwnerAddr(joiner_id.identity.address_hash));
+        assert_eq!(join_event.actor, expected_actor);
     }
 
     /// Positive control for the `expires_at = Some(future)` admit path.
@@ -969,29 +965,8 @@ mod verify_rejection_tests {
         let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xc6; 32]);
         let community_id = SpaceId([0x10; 16]);
         let self_owner = OwnerAddr(self_id.identity.address_hash);
-        let joiner_owner = OwnerAddr(joiner_id.identity.address_hash);
-        let joiner_pub = joiner_id.identity.to_public_bytes();
-        let joiner_sk = {
-            let priv_bytes = joiner_id.to_private_bytes();
-            let mut seed = [0u8; 32];
-            seed.copy_from_slice(&priv_bytes[32..64]);
-            ed25519_dalek::SigningKey::from_bytes(&seed)
-        };
-        let join_event = sign_event(
-            &EventPayload {
-                id: [0x44; 16],
-                community_id,
-                kind: MembershipEventKind::Join,
-                actor: joiner_owner,
-                at: Hlc {
-                    wall_ms: 1000,
-                    logical: 0,
-                    device_id: "j".into(),
-                },
-            },
-            &joiner_sk,
-        )
-        .expect("sign Join");
+        let (join_event, joiner_owner, joiner_pub) =
+            minted_join_event(&joiner_id, community_id);
 
         // expires_at = 1_000_000 (well after `now_ms` = 2000 and
         // `created_at = 1100`). Both arms (created_at < expires_at and
