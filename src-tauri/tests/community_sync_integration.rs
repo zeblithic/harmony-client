@@ -25,7 +25,8 @@
 //!   early-exit; B's CRDT shows exactly 1 event.
 
 use harmony_app::community_membership::{
-    mint_test_owner, sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent, TestOwner,
+    mint_test_owner, sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent,
+    TestOwner,
 };
 use harmony_app::community_state_crdt::CommunityState;
 use harmony_app::community_state_sync::{

@@ -136,7 +136,6 @@ fn register_owner(owner: &TestOwner) {
     });
 }
 
-
 /// ZEB-339: build a deterministic enrolled-device owner from a one-byte seed.
 /// Returns `(TestOwner, dummy_pub, owner_addr)` so existing `(priv, pub, addr)`
 /// destructures keep compiling. The middle element is a placeholder — under the
@@ -579,8 +578,7 @@ fn make_signed(
     // the signer. Otherwise (pure structural/ordering tests using arbitrary
     // OwnerAddr literals) fall back to a fixed key — those events never go
     // through verify_event.
-    let registered =
-        OWNER_REGISTRY.with(|r| r.borrow().get(&actor).cloned());
+    let registered = OWNER_REGISTRY.with(|r| r.borrow().get(&actor).cloned());
     match registered {
         Some(owner) => sign_event_with_identity(&payload, &owner).expect("sign"),
         None => {

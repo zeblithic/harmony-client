@@ -9,10 +9,11 @@
 //! This test inserts a PendingJoin through the engine's
 //! `insert_local_event_with_pubs` path to confirm the plumbing is live.
 
-use harmony_app::community_invite::{canonical_invite_token_bytes, InviteToken};
 use ed25519_dalek::Signer;
+use harmony_app::community_invite::{canonical_invite_token_bytes, InviteToken};
 use harmony_app::community_membership::{
-    mint_test_owner, sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent, TestOwner,
+    mint_test_owner, sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent,
+    TestOwner,
 };
 use harmony_app::community_state_crdt::{CommunityState, InsertOutcome};
 use harmony_app::community_state_sync::{
@@ -914,9 +915,12 @@ async fn legacy_invite_only_join_with_countersig_still_accepted() {
         sign_event_with_identity(&joiner_join_payload, &joiner_priv).expect("sign joiner join");
 
     // Admin attaches countersig with their enrolled device key (ZEB-339).
-    let joiner_join_with_cs =
-        attach_countersig_with_device_key(&joiner_join_unsigned, admin_priv.owner, &admin_priv.device_key)
-            .expect("attach countersig");
+    let joiner_join_with_cs = attach_countersig_with_device_key(
+        &joiner_join_unsigned,
+        admin_priv.owner,
+        &admin_priv.device_key,
+    )
+    .expect("attach countersig");
 
     // Insert through the engine — countersigner_identity_pub = Some(admin_pub).
     let outcome = engine

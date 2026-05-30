@@ -339,19 +339,19 @@ async fn pending_redemption_oneshot_fires_when_event_id_inserts_via_local() {
     let join = harmony_app::community_membership::SignedMembershipEvent {
         enrollment: Some(owner.cert.clone()),
         ..sign_event(
-        &EventPayload {
-            id: event_id,
-            community_id: cid,
-            kind: MembershipEventKind::Join,
-            actor: admin_addr,
-            at: Hlc {
-                wall_ms: 1000,
-                logical: 0,
-                device_id: "admin-dev".into(),
+            &EventPayload {
+                id: event_id,
+                community_id: cid,
+                kind: MembershipEventKind::Join,
+                actor: admin_addr,
+                at: Hlc {
+                    wall_ms: 1000,
+                    logical: 0,
+                    device_id: "admin-dev".into(),
+                },
             },
-        },
-        admin_sk.as_ref(),
-    )
+            admin_sk.as_ref(),
+        )
         .unwrap()
     };
 
@@ -443,19 +443,19 @@ async fn pending_redemption_unregistered_when_no_match() {
     let join = harmony_app::community_membership::SignedMembershipEvent {
         enrollment: Some(owner.cert.clone()),
         ..sign_event(
-        &EventPayload {
-            id: inserted_id,
-            community_id: cid,
-            kind: MembershipEventKind::Join,
-            actor: admin_addr,
-            at: Hlc {
-                wall_ms: 1000,
-                logical: 0,
-                device_id: "admin-dev".into(),
+            &EventPayload {
+                id: inserted_id,
+                community_id: cid,
+                kind: MembershipEventKind::Join,
+                actor: admin_addr,
+                at: Hlc {
+                    wall_ms: 1000,
+                    logical: 0,
+                    device_id: "admin-dev".into(),
+                },
             },
-        },
-        admin_sk.as_ref(),
-    )
+            admin_sk.as_ref(),
+        )
         .unwrap()
     };
 

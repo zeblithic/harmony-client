@@ -40,7 +40,6 @@ fn sign_event_with_identity(
     })
 }
 
-
 /// `IdentityResolver` backed by an in-memory `HashMap`. Used across the
 /// receive-side rejection tests below; maps a fixed `OwnerAddr` →
 /// `identity_pub` set, returns `None` for any other addr. More general

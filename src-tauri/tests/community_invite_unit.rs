@@ -885,8 +885,7 @@ mod verify_rejection_tests {
         let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xc4; 32]);
         let community_id = SpaceId([0x10; 16]);
         let self_owner = OwnerAddr(self_id.identity.address_hash);
-        let (join_event, joiner_owner, joiner_pub) =
-            minted_join_event(&joiner_id, community_id);
+        let (join_event, joiner_owner, joiner_pub) = minted_join_event(&joiner_id, community_id);
 
         // Sign with expires_at = Some(...).
         let unsigned_with_expiry = InviteToken {
@@ -965,8 +964,7 @@ mod verify_rejection_tests {
         let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xc6; 32]);
         let community_id = SpaceId([0x10; 16]);
         let self_owner = OwnerAddr(self_id.identity.address_hash);
-        let (join_event, joiner_owner, joiner_pub) =
-            minted_join_event(&joiner_id, community_id);
+        let (join_event, joiner_owner, joiner_pub) = minted_join_event(&joiner_id, community_id);
 
         // expires_at = 1_000_000 (well after `now_ms` = 2000 and
         // `created_at = 1100`). Both arms (created_at < expires_at and
