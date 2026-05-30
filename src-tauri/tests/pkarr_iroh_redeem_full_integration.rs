@@ -346,7 +346,15 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             &alice_test_owner_pkarr.device_key.to_bytes(),
         ));
         let alice_enrollment_pkarr = alice_test_owner_pkarr.cert;
-        let alice_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
+        // Clone the cert before it is moved into DmOutbox; the invite
+        // payload below also needs it for inviter_enrollment.
+        let alice_enrollment_for_invite = alice_enrollment_pkarr.clone();
+        // ZEB-339: use new_synthetic because this test still uses synthetic
+        // enrollment material (cert owner_id ≠ alice_addr — a Reticulum-derived
+        // address). This wiring is intentionally incomplete and marked as
+        // "allowed-RED until Task 10". Production paths use DmOutbox::new
+        // with fully consistent mint_test_owner or LoadedOwnerState material.
+        let alice_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new_synthetic(
             "alice-dev".into(),
             alice_addr,
             DeviceIdentityHash(alice_identity.identity.address_hash),
@@ -417,7 +425,9 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             &bob_test_owner_pkarr.device_key.to_bytes(),
         ));
         let bob_enrollment_pkarr = bob_test_owner_pkarr.cert;
-        let bob_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
+        // ZEB-339: same new_synthetic rationale as alice above — synthetic
+        // cert owner_id ≠ bob_addr (a Reticulum-derived address).
+        let bob_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new_synthetic(
             "bob-dev".into(),
             bob_addr,
             DeviceIdentityHash(bob_identity.identity.address_hash),
@@ -539,7 +549,11 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             admin_identity_pub: Some(alice_pub),
             forked_from: None,
             pre_fork_snapshot: None,
-            inviter_enrollment: None,
+            // ZEB-339: invite-only payloads REQUIRE an inviter EnrollmentCert
+            // (encode_invite_url returns Err otherwise). Use Alice's enrolled-
+            // device cert (same cert that backs her DmOutbox) so the joiner
+            // can verify the inviter's owner→device binding.
+            inviter_enrollment: Some(alice_enrollment_for_invite),
         };
         let invite_url =
             community_invite::encode_invite_url(&invite_payload).expect("encode invite");
