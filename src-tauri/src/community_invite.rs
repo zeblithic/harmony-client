@@ -1079,14 +1079,6 @@ pub enum RedeemBootstrapVerifyError {
     /// "redeem_invite: invite-only payload missing admin bootstrap".
     BootstrapMissing,
 
-    /// `admin_identity_pub` bytes are not a valid Ed25519 + X25519 pair
-    /// (rejected by `harmony_identity::Identity::from_public_bytes`).
-    BootstrapInvalidPubkey,
-
-    /// `Identity::from_public_bytes(admin_identity_pub).address_hash`
-    /// does not equal `payload.admin_addr.0`.
-    BootstrapAddressMismatch,
-
     /// `admin_bootstrap.actor` does not equal `payload.admin_addr`.
     BootstrapActorMismatch,
 
@@ -1109,14 +1101,6 @@ impl std::fmt::Display for RedeemBootstrapVerifyError {
             Self::BootstrapMissing => write!(
                 f,
                 "redeem_invite: invite-only payload missing admin bootstrap"
-            ),
-            Self::BootstrapInvalidPubkey => write!(
-                f,
-                "redeem_invite: admin_identity_pub is not a valid identity"
-            ),
-            Self::BootstrapAddressMismatch => write!(
-                f,
-                "redeem_invite: admin_identity_pub.address_hash != admin_addr"
             ),
             Self::BootstrapActorMismatch => write!(
                 f,
@@ -1148,8 +1132,6 @@ impl RedeemBootstrapVerifyError {
     pub fn reason_tag(&self) -> &'static str {
         match self {
             Self::BootstrapMissing => "bootstrap_missing",
-            Self::BootstrapInvalidPubkey => "bootstrap_invalid_pubkey",
-            Self::BootstrapAddressMismatch => "bootstrap_address_mismatch",
             Self::BootstrapActorMismatch => "bootstrap_actor_mismatch",
             Self::BootstrapCommunityMismatch => "bootstrap_community_mismatch",
             Self::BootstrapSignatureInvalid => "bootstrap_signature_invalid",
@@ -1385,11 +1367,11 @@ pub fn build_signed_invite_packet(
 }
 
 /// Pure verify helper: takes a [`CommunityInviteSigned`], the local self
-/// owner addr, a wall-clock function, and the local `PrivateIdentity` for
-/// the InviteToken sig check. Returns the joiner's signed Join event on
-/// success — caller is then responsible for the engine-coupled checks
-/// (community known, self joined, self power sufficient) before
-/// counter-signing.
+/// owner addr, a wall-clock function, and the counter-signer's enrolled
+/// device #2 ed25519 verify key for the InviteToken sig check. Returns the
+/// joiner's signed Join event on success — caller is then responsible for
+/// the engine-coupled checks (community known, self joined, self power
+/// sufficient) before counter-signing.
 ///
 /// Order of checks chosen so cheaper / more diagnostic rejections fire
 /// before expensive crypto:
@@ -1400,7 +1382,12 @@ pub fn build_signed_invite_packet(
 ///   5. Inner Join event sig (1× Ed25519 verify_strict via
 ///      `community_membership::verify_signature`)
 ///   6. InviteToken sig (1× Ed25519 verify_strict against the canonical
-///      token payload)
+///      token payload, verified against `self_device_ed25519`)
+///
+/// `self_device_ed25519` must be the counter-signer's enrolled device #2
+/// ed25519 verifying key (32 bytes). This aligns step 6 with
+/// `verify_event`'s P5 gate (`verify_invite_token_sig_with_enrolled`),
+/// which resolves the same key from materialized membership.
 ///
 /// Membership-state-dependent checks (`SelfNotJoined`, `CommunityUnknown`,
 /// `SelfPowerInsufficient`) are NOT raised here — they require engine
@@ -1409,7 +1396,7 @@ pub fn verify_packet_pure<F>(
     signed: &CommunityInviteSigned,
     self_owner: crate::owner_state_types::OwnerAddr,
     now_fn: F,
-    self_identity: &harmony_identity::PrivateIdentity,
+    self_device_ed25519: &[u8; 32],
 ) -> Result<crate::community_membership::SignedMembershipEvent, CommunityInviteVerifyError>
 where
     F: FnOnce() -> u64,
@@ -1478,11 +1465,13 @@ where
     crate::community_membership::verify_membership_signer(&signed.join_event, &signer)
         .map_err(|_| CommunityInviteVerifyError::JoinSigInvalid)?;
 
-    // 6. InviteToken sig — delegate to the shared helper so this path
-    //    stays in sync with `verify_event`'s P5 gate without duplicating
-    //    the canonical-encode + Signature::from_bytes + verify_strict logic.
-    let admin_identity_pub = self_identity.identity.to_public_bytes();
-    verify_invite_token_signature(&signed.invite_token, &admin_identity_pub)
+    // 6. InviteToken sig — verify against the counter-signer's enrolled
+    //    device #2 key (ZEB-339 consistency fix). Step 4 already binds
+    //    `signed.invite_token.inviter == self_owner`, so this is exactly
+    //    the key that `verify_event`'s P5 gate (`verify_invite_token_sig_with_enrolled`)
+    //    resolves from materialized membership. Both paths now agree: only a
+    //    device-#2-signed token satisfies the invite-only redemption chain.
+    verify_invite_token_sig_device_key(&signed.invite_token, self_device_ed25519)
         .map_err(|_| CommunityInviteVerifyError::InviteTokenSigInvalid)?;
 
     Ok(signed.join_event.clone())
@@ -1578,6 +1567,30 @@ pub fn verify_invite_token_signature(
         .map_err(|_| CommunityInviteVerifyError::InviteTokenSigInvalid)
 }
 
+/// ZEB-339: verify an InviteToken's signature against a 32-byte ed25519
+/// device verifying key directly. Mirrors the inner loop of
+/// `community_membership::verify_invite_token_sig_with_enrolled` but takes
+/// a single concrete key rather than iterating over a set. Used by
+/// `verify_packet_pure` step 6, where the counter-signer IS the sole
+/// owner of the device key (resolved from `community_signing_key` in
+/// `handle_unicast`).
+///
+/// Returns `Err(CommunityInviteVerifyError::InviteTokenSigInvalid)` on any
+/// failure (malformed key bytes, bad signature).
+pub fn verify_invite_token_sig_device_key(
+    token: &InviteToken,
+    device_ed25519: &[u8; 32],
+) -> Result<(), CommunityInviteVerifyError> {
+    let token_canonical = canonical_invite_token_bytes(token)
+        .map_err(|_| CommunityInviteVerifyError::InviteTokenSigInvalid)?;
+    use ed25519_dalek::Signature;
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(device_ed25519)
+        .map_err(|_| CommunityInviteVerifyError::InviteTokenSigInvalid)?;
+    let sig = Signature::from_bytes(&token.sig);
+    vk.verify_strict(&token_canonical, &sig)
+        .map_err(|_| CommunityInviteVerifyError::InviteTokenSigInvalid)
+}
+
 // =====================================================================
 // ZEB-262 Phase 4 Task 9 — receive-side dispatch
 // =====================================================================
@@ -1663,9 +1676,10 @@ pub async fn handle_unicast<H: AppHandleEmit>(
 
     // 2. Snapshot self_owner + private_identity + community_signing_key (#2)
     //    from dm_outbox under its lock; drop the guard before any further
-    //    `.await`. ZEB-339: the legacy counter-sign path signs with the
-    //    enrolled device key (#2), which `verify_countersig` resolves from
-    //    the counter-signer's materialized enrolled_device_keys.
+    //    `.await`. ZEB-339: `verify_packet_pure` step 6 now verifies the
+    //    InviteToken sig against the enrolled device key (#2), consistent
+    //    with `verify_event`'s P5 gate. `self_private_identity` is kept for
+    //    the `countersigner_pub` Reticulum transport field further below.
     let (self_owner, self_private_identity, community_signing_key) = {
         let outbox_g = dm_outbox.lock().await;
         (
@@ -1683,7 +1697,10 @@ pub async fn handle_unicast<H: AppHandleEmit>(
     }
     // 3b. Pure verify chain (community_id agreement, invitee_hint,
     //     expiry/clock-skew, InviteToken signer == self, Join sig,
-    //     InviteToken sig).
+    //     InviteToken sig). Step 6 verifies the InviteToken sig against the
+    //     counter-signer's enrolled device key (#2), consistent with
+    //     `verify_event`'s P5 gate.
+    let self_device_vk = community_signing_key.verifying_key().to_bytes();
     let join_event = match verify_packet_pure(
         &signed,
         self_owner,
@@ -1693,7 +1710,7 @@ pub async fn handle_unicast<H: AppHandleEmit>(
                 .unwrap_or_default()
                 .as_millis() as u64
         },
-        self_private_identity.as_ref(),
+        &self_device_vk,
     ) {
         Ok(e) => e,
         Err(e) => {
