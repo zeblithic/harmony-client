@@ -32520,20 +32520,38 @@ mod pin_persistence_tests {
 mod list_community_members_ipc_tests {
     use super::*;
     use crate::community_membership::{
-        sign_event_with_identity, EventPayload, MembershipEventKind,
+        mint_test_owner, sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent,
+        TestOwner,
     };
     use crate::community_state_crdt::CommunityState;
     use crate::owner_state_types::*;
-    use harmony_identity::PrivateIdentity;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+
+    /// ZEB-339: sign with the owner's enrolled device key, attaching the Master
+    /// cert on identity-introducing events (Join/PendingJoin).
+    fn sign_event_with_identity(
+        payload: &EventPayload,
+        owner: &TestOwner,
+    ) -> Result<SignedMembershipEvent, crate::owner_state_crypto::CryptoError> {
+        let ev = sign_event(payload, &owner.device_key)?;
+        Ok(match ev.kind {
+            MembershipEventKind::Join | MembershipEventKind::PendingJoin { .. } => {
+                SignedMembershipEvent {
+                    enrollment: Some(owner.cert.clone()),
+                    ..ev
+                }
+            }
+            _ => ev,
+        })
+    }
 
     #[tokio::test]
     async fn list_members_returns_sorted_dto_for_known_community() {
         let community_id = SpaceId([5; 16]);
-        let identity = PrivateIdentity::from_seed(&[0xab; 32]);
-        let admin = OwnerAddr(identity.identity.address_hash);
-        let _identity_pub = identity.identity.to_public_bytes();
+        let identity = mint_test_owner(0xab);
+        let admin = identity.owner;
+        let _identity_pub = [0u8; 64];
 
         let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
         {
@@ -33262,15 +33280,33 @@ mod channel_message_ipc_tests {
 mod unban_from_community_tests {
     use super::*;
     use crate::community_membership::{
-        sign_event_with_identity, EventPayload, MembershipEventKind, VerifyContext,
+        mint_test_owner, sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent,
+        TestOwner, VerifyContext,
     };
     use crate::community_state_crdt::{CommunityState, InsertOutcome};
     use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
-    use harmony_identity::PrivateIdentity;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
     // ── shared fixture helpers ─────────────────────────────────────────
+
+    /// ZEB-339: sign with the owner's enrolled device key, attaching the Master
+    /// cert on identity-introducing events (Join/PendingJoin).
+    fn sign_event_with_identity(
+        payload: &EventPayload,
+        owner: &TestOwner,
+    ) -> Result<SignedMembershipEvent, crate::owner_state_crypto::CryptoError> {
+        let ev = sign_event(payload, &owner.device_key)?;
+        Ok(match ev.kind {
+            MembershipEventKind::Join | MembershipEventKind::PendingJoin { .. } => {
+                SignedMembershipEvent {
+                    enrollment: Some(owner.cert.clone()),
+                    ..ev
+                }
+            }
+            _ => ev,
+        })
+    }
 
     fn hlc(wall: u64, dev: &str) -> Hlc {
         Hlc {
@@ -33284,7 +33320,7 @@ mod unban_from_community_tests {
     fn insert_ok(
         state: &mut CommunityState,
         payload: EventPayload,
-        identity: &PrivateIdentity,
+        identity: &TestOwner,
         admin: OwnerAddr,
         _actor_pub: &[u8; 64],
     ) {
@@ -33311,13 +33347,13 @@ mod unban_from_community_tests {
     async fn unban_from_community_happy_path() {
         let community_id = SpaceId([0x10; 16]);
 
-        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
-        let admin = OwnerAddr(admin_identity.identity.address_hash);
-        let admin_pub = admin_identity.identity.to_public_bytes();
+        let admin_identity = mint_test_owner(0xaa);
+        let admin = admin_identity.owner;
+        let admin_pub = [0u8; 64];
 
-        let member_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
-        let member = OwnerAddr(member_identity.identity.address_hash);
-        let member_pub = member_identity.identity.to_public_bytes();
+        let member_identity = mint_test_owner(0xbb);
+        let member = member_identity.owner;
+        let member_pub = [0u8; 64];
 
         let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
 
@@ -33378,9 +33414,7 @@ mod unban_from_community_tests {
         );
 
         // Admin unbans member (uses mint_unban_event helper to build the event).
-        let sk_bytes = admin_identity.to_private_bytes();
-        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+        let signing_key = admin_identity.device_key.clone();
         let unban_ev = mint_unban_event(
             community_id,
             admin,
@@ -33437,17 +33471,17 @@ mod unban_from_community_tests {
     async fn unban_from_community_returns_err_when_actor_lacks_power() {
         let community_id = SpaceId([0x11; 16]);
 
-        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
-        let admin = OwnerAddr(admin_identity.identity.address_hash);
-        let admin_pub = admin_identity.identity.to_public_bytes();
+        let admin_identity = mint_test_owner(0xaa);
+        let admin = admin_identity.owner;
+        let admin_pub = [0u8; 64];
 
-        let mod_identity = PrivateIdentity::from_seed(&[0xcc; 32]);
-        let moderator = OwnerAddr(mod_identity.identity.address_hash);
-        let mod_pub = mod_identity.identity.to_public_bytes();
+        let mod_identity = mint_test_owner(0xcc);
+        let moderator = mod_identity.owner;
+        let mod_pub = [0u8; 64];
 
-        let member_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
-        let member = OwnerAddr(member_identity.identity.address_hash);
-        let member_pub = member_identity.identity.to_public_bytes();
+        let member_identity = mint_test_owner(0xbb);
+        let member = member_identity.owner;
+        let member_pub = [0u8; 64];
 
         let mut state = CommunityState::new(community_id);
 
@@ -33529,9 +33563,7 @@ mod unban_from_community_tests {
         );
 
         // Moderator attempts to unban — should be rejected (power 50 < 100).
-        let mod_sk_bytes = mod_identity.to_private_bytes();
-        let mod_sk_seed: [u8; 32] = mod_sk_bytes[32..64].try_into().unwrap();
-        let mod_signing_key = ed25519_dalek::SigningKey::from_bytes(&mod_sk_seed);
+        let mod_signing_key = mod_identity.device_key.clone();
         let unban_ev = mint_unban_event(
             community_id,
             moderator,
@@ -33571,13 +33603,13 @@ mod unban_from_community_tests {
     async fn unban_from_community_returns_err_when_target_not_banned() {
         let community_id = SpaceId([0x12; 16]);
 
-        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
-        let admin = OwnerAddr(admin_identity.identity.address_hash);
-        let admin_pub = admin_identity.identity.to_public_bytes();
+        let admin_identity = mint_test_owner(0xaa);
+        let admin = admin_identity.owner;
+        let admin_pub = [0u8; 64];
 
-        let member_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
-        let member = OwnerAddr(member_identity.identity.address_hash);
-        let member_pub = member_identity.identity.to_public_bytes();
+        let member_identity = mint_test_owner(0xbb);
+        let member = member_identity.owner;
+        let member_pub = [0u8; 64];
 
         let mut state = CommunityState::new(community_id);
 
@@ -33611,9 +33643,7 @@ mod unban_from_community_tests {
         );
 
         // Admin attempts to unban a Joined member — should fail.
-        let sk_bytes = admin_identity.to_private_bytes();
-        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+        let signing_key = admin_identity.device_key.clone();
         let unban_ev = mint_unban_event(
             community_id,
             admin,
@@ -33653,13 +33683,13 @@ mod unban_from_community_tests {
     async fn kick_from_community_signs_reason_into_event() {
         let community_id = SpaceId([0x13; 16]);
 
-        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
-        let admin = OwnerAddr(admin_identity.identity.address_hash);
-        let admin_pub = admin_identity.identity.to_public_bytes();
+        let admin_identity = mint_test_owner(0xaa);
+        let admin = admin_identity.owner;
+        let admin_pub = [0u8; 64];
 
-        let member_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
-        let member = OwnerAddr(member_identity.identity.address_hash);
-        let member_pub = member_identity.identity.to_public_bytes();
+        let member_identity = mint_test_owner(0xbb);
+        let member = member_identity.owner;
+        let member_pub = [0u8; 64];
 
         let mut state = CommunityState::new(community_id);
 
@@ -33693,9 +33723,7 @@ mod unban_from_community_tests {
         );
 
         // Kick member with reason.
-        let sk_bytes = admin_identity.to_private_bytes();
-        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+        let signing_key = admin_identity.device_key.clone();
         let kick_ev = mint_kick_event(
             community_id,
             admin,
@@ -33747,13 +33775,13 @@ mod unban_from_community_tests {
     async fn list_recent_moderation_events_filters_to_kick_unban_setpower() {
         let community_id = SpaceId([0x14; 16]);
 
-        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
-        let admin = OwnerAddr(admin_identity.identity.address_hash);
-        let admin_pub = admin_identity.identity.to_public_bytes();
+        let admin_identity = mint_test_owner(0xaa);
+        let admin = admin_identity.owner;
+        let admin_pub = [0u8; 64];
 
-        let member_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
-        let member = OwnerAddr(member_identity.identity.address_hash);
-        let member_pub = member_identity.identity.to_public_bytes();
+        let member_identity = mint_test_owner(0xbb);
+        let member = member_identity.owner;
+        let member_pub = [0u8; 64];
 
         let mut state = CommunityState::new(community_id);
 
@@ -33785,9 +33813,7 @@ mod unban_from_community_tests {
             &member_pub,
         );
 
-        let sk_bytes = admin_identity.to_private_bytes();
-        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+        let signing_key = admin_identity.device_key.clone();
 
         // SetPower event (SHOULD appear).
         let sp_ev = mint_set_power_event(
@@ -33928,15 +33954,13 @@ mod unban_from_community_tests {
     async fn list_recent_moderation_events_respects_limit_and_orders_by_hlc_desc() {
         let community_id = SpaceId([0x15; 16]);
 
-        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
-        let admin = OwnerAddr(admin_identity.identity.address_hash);
-        let admin_pub = admin_identity.identity.to_public_bytes();
+        let admin_identity = mint_test_owner(0xaa);
+        let admin = admin_identity.owner;
+        let admin_pub = [0u8; 64];
 
         // 5 distinct "members" to kick (to avoid same-target restrictions
         // — a re-kick of an already-Banned member would be rejected).
-        let victims: Vec<PrivateIdentity> = (0u8..5)
-            .map(|i| PrivateIdentity::from_seed(&[0xd0 + i; 32]))
-            .collect();
+        let victims: Vec<TestOwner> = (0u8..5).map(|i| mint_test_owner(0xd0 + i)).collect();
 
         let mut state = CommunityState::new(community_id);
 
@@ -33957,8 +33981,8 @@ mod unban_from_community_tests {
 
         // Each victim joins.
         for (i, victim_id) in victims.iter().enumerate() {
-            let victim = OwnerAddr(victim_id.identity.address_hash);
-            let victim_pub = victim_id.identity.to_public_bytes();
+            let victim = victim_id.owner;
+            let victim_pub = [0u8; 64];
             insert_ok(
                 &mut state,
                 EventPayload {
@@ -33974,14 +33998,12 @@ mod unban_from_community_tests {
             );
         }
 
-        let sk_bytes = admin_identity.to_private_bytes();
-        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+        let signing_key = admin_identity.device_key.clone();
 
         // Kick each victim at wall_ms 100, 200, 300, 400, 500.
         let wall_times = [100u64, 200, 300, 400, 500];
         for (i, victim_id) in victims.iter().enumerate() {
-            let victim = OwnerAddr(victim_id.identity.address_hash);
+            let victim = victim_id.owner;
             let kick_ev = mint_kick_event(
                 community_id,
                 admin,
@@ -34718,11 +34740,29 @@ mod start_node_race_tests {
 mod admin_action_result_routing_tests {
     use super::*;
     use crate::community_membership::{
-        sign_event_with_identity, EventPayload, MembershipEventKind, ProposalKind, VerifyContext,
+        mint_test_owner, sign_event, EventPayload, MembershipEventKind, ProposalKind,
+        SignedMembershipEvent, TestOwner, VerifyContext,
     };
     use crate::community_state_crdt::{CommunityState, InsertOutcome};
     use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
-    use harmony_identity::PrivateIdentity;
+
+    /// ZEB-339: sign with the owner's enrolled device key, attaching the Master
+    /// cert on identity-introducing events (Join/PendingJoin).
+    fn sign_event_with_identity(
+        payload: &EventPayload,
+        owner: &TestOwner,
+    ) -> Result<SignedMembershipEvent, crate::owner_state_crypto::CryptoError> {
+        let ev = sign_event(payload, &owner.device_key)?;
+        Ok(match ev.kind {
+            MembershipEventKind::Join | MembershipEventKind::PendingJoin { .. } => {
+                SignedMembershipEvent {
+                    enrollment: Some(owner.cert.clone()),
+                    ..ev
+                }
+            }
+            _ => ev,
+        })
+    }
 
     fn hlc(wall: u64, dev: &str) -> Hlc {
         Hlc {
@@ -34735,7 +34775,7 @@ mod admin_action_result_routing_tests {
     fn insert_ok(
         state: &mut CommunityState,
         payload: EventPayload,
-        identity: &PrivateIdentity,
+        identity: &TestOwner,
         admin: OwnerAddr,
         _actor_pub: &[u8; 64],
     ) {
@@ -34763,13 +34803,13 @@ mod admin_action_result_routing_tests {
     async fn set_power_level_returns_completed_when_quorum_1() {
         let community_id = SpaceId([0xa1; 16]);
 
-        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
-        let admin = OwnerAddr(admin_identity.identity.address_hash);
-        let admin_pub = admin_identity.identity.to_public_bytes();
+        let admin_identity = mint_test_owner(0xaa);
+        let admin = admin_identity.owner;
+        let admin_pub = [0u8; 64];
 
-        let member_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
-        let member = OwnerAddr(member_identity.identity.address_hash);
-        let member_pub = member_identity.identity.to_public_bytes();
+        let member_identity = mint_test_owner(0xbb);
+        let member = member_identity.owner;
+        let member_pub = [0u8; 64];
 
         let mut state = CommunityState::new(community_id);
         // admin_quorum defaults to 1 — no change needed.
@@ -34803,9 +34843,7 @@ mod admin_action_result_routing_tests {
 
         // Promote member to admin (level == 100). With admin_quorum == 1 this
         // must succeed as a direct SetPower (the Completed path).
-        let sk_bytes = admin_identity.to_private_bytes();
-        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+        let signing_key = admin_identity.device_key.clone();
 
         let sp_event = mint_set_power_event(
             community_id,
@@ -34850,13 +34888,13 @@ mod admin_action_result_routing_tests {
     async fn set_power_level_routes_to_proposal_when_quorum_above_1_and_target_becomes_admin() {
         let community_id = SpaceId([0xa2; 16]);
 
-        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
-        let admin = OwnerAddr(admin_identity.identity.address_hash);
-        let admin_pub = admin_identity.identity.to_public_bytes();
+        let admin_identity = mint_test_owner(0xaa);
+        let admin = admin_identity.owner;
+        let admin_pub = [0u8; 64];
 
-        let member_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
-        let member = OwnerAddr(member_identity.identity.address_hash);
-        let member_pub = member_identity.identity.to_public_bytes();
+        let member_identity = mint_test_owner(0xbb);
+        let member = member_identity.owner;
+        let member_pub = [0u8; 64];
 
         let mut state = CommunityState::new(community_id);
 
@@ -34887,9 +34925,7 @@ mod admin_action_result_routing_tests {
             &member_pub,
         );
 
-        let sk_bytes = admin_identity.to_private_bytes();
-        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+        let signing_key = admin_identity.device_key.clone();
 
         // Step 1: promote the member to admin (SetPower 100) while admin_quorum==1.
         // This is valid as a direct event (no quorum gate yet).
@@ -35452,12 +35488,29 @@ mod list_pending_admin_proposals_tests {
 mod countersign_admin_proposal_tests {
     use super::*;
     use crate::community_membership::{
-        sign_event_with_identity, EventPayload, MembershipEventKind, ProposalKind, VerifyContext,
-        ADMIN_PROPOSAL_EXPIRY_MS,
+        mint_test_owner, sign_event, EventPayload, MembershipEventKind, ProposalKind,
+        SignedMembershipEvent, TestOwner, VerifyContext, ADMIN_PROPOSAL_EXPIRY_MS,
     };
     use crate::community_state_crdt::{CommunityState, InsertOutcome};
     use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
-    use harmony_identity::PrivateIdentity;
+
+    /// ZEB-339: sign with the owner's enrolled device key, attaching the Master
+    /// cert on identity-introducing events (Join/PendingJoin).
+    fn sign_event_with_identity(
+        payload: &EventPayload,
+        owner: &TestOwner,
+    ) -> Result<SignedMembershipEvent, crate::owner_state_crypto::CryptoError> {
+        let ev = sign_event(payload, &owner.device_key)?;
+        Ok(match ev.kind {
+            MembershipEventKind::Join | MembershipEventKind::PendingJoin { .. } => {
+                SignedMembershipEvent {
+                    enrollment: Some(owner.cert.clone()),
+                    ..ev
+                }
+            }
+            _ => ev,
+        })
+    }
 
     fn hlc(wall: u64, dev: &str) -> Hlc {
         Hlc {
@@ -35471,7 +35524,7 @@ mod countersign_admin_proposal_tests {
     fn insert_ok(
         state: &mut CommunityState,
         payload: EventPayload,
-        identity: &PrivateIdentity,
+        identity: &TestOwner,
         admin: OwnerAddr,
         _actor_pub: &[u8; 64],
     ) {
@@ -35495,19 +35548,19 @@ mod countersign_admin_proposal_tests {
         community_id: SpaceId,
     ) -> (
         CommunityState,
-        PrivateIdentity,
+        TestOwner,
         OwnerAddr,
-        PrivateIdentity,
+        TestOwner,
         OwnerAddr,
         [u8; 16],
     ) {
-        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
-        let admin = OwnerAddr(admin_identity.identity.address_hash);
-        let admin_pub = admin_identity.identity.to_public_bytes();
+        let admin_identity = mint_test_owner(0xaa);
+        let admin = admin_identity.owner;
+        let admin_pub = [0u8; 64];
 
-        let second_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
-        let second = OwnerAddr(second_identity.identity.address_hash);
-        let second_pub = second_identity.identity.to_public_bytes();
+        let second_identity = mint_test_owner(0xbb);
+        let second = second_identity.owner;
+        let second_pub = [0u8; 64];
 
         let mut state = CommunityState::new(community_id);
 
@@ -35540,9 +35593,7 @@ mod countersign_admin_proposal_tests {
             &second_pub,
         );
         // Promote second to admin power=100 (direct, quorum still 1)
-        let sk_bytes = admin_identity.to_private_bytes();
-        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+        let signing_key = admin_identity.device_key.clone();
         let promote_ev = mint_set_power_event(
             community_id,
             admin,
@@ -35656,10 +35707,8 @@ mod countersign_admin_proposal_tests {
         assert_eq!(m.admin_quorum, 2);
 
         // Now let second countersign — should bump to 2.
-        let sk_bytes = second_identity.to_private_bytes();
-        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
-        let _second_pub = second_identity.identity.to_public_bytes();
+        let signing_key = second_identity.device_key.clone();
+        let _second_pub = [0u8; 64];
 
         let cs_ev = mint_admin_countersign_event(
             community_id,
@@ -35794,10 +35843,8 @@ mod countersign_admin_proposal_tests {
         assert!(signers_before < 2, "quorum not yet reached");
 
         // Add second admin countersign.
-        let sk_bytes = second_identity.to_private_bytes();
-        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
-        let _second_pub = second_identity.identity.to_public_bytes();
+        let signing_key = second_identity.device_key.clone();
+        let _second_pub = [0u8; 64];
 
         let cs_ev = mint_admin_countersign_event(
             community_id,
@@ -35841,11 +35888,29 @@ mod countersign_admin_proposal_tests {
 mod propose_change_quorum_tests {
     use super::*;
     use crate::community_membership::{
-        sign_event_with_identity, EventPayload, MembershipEventKind, VerifyContext,
+        mint_test_owner, sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent,
+        TestOwner, VerifyContext,
     };
     use crate::community_state_crdt::{CommunityState, InsertOutcome};
     use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
-    use harmony_identity::PrivateIdentity;
+
+    /// ZEB-339: sign with the owner's enrolled device key, attaching the Master
+    /// cert on identity-introducing events (Join/PendingJoin).
+    fn sign_event_with_identity(
+        payload: &EventPayload,
+        owner: &TestOwner,
+    ) -> Result<SignedMembershipEvent, crate::owner_state_crypto::CryptoError> {
+        let ev = sign_event(payload, &owner.device_key)?;
+        Ok(match ev.kind {
+            MembershipEventKind::Join | MembershipEventKind::PendingJoin { .. } => {
+                SignedMembershipEvent {
+                    enrollment: Some(owner.cert.clone()),
+                    ..ev
+                }
+            }
+            _ => ev,
+        })
+    }
 
     fn hlc(wall: u64, dev: &str) -> Hlc {
         Hlc {
@@ -35858,7 +35923,7 @@ mod propose_change_quorum_tests {
     fn insert_ok(
         state: &mut CommunityState,
         payload: EventPayload,
-        identity: &PrivateIdentity,
+        identity: &TestOwner,
         admin: OwnerAddr,
         _actor_pub: &[u8; 64],
     ) {
@@ -35896,9 +35961,9 @@ mod propose_change_quorum_tests {
         // requesting new_quorum=2 would exceed the admin count.
         let community_id = SpaceId([0xd0; 16]);
 
-        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
-        let admin = OwnerAddr(admin_identity.identity.address_hash);
-        let admin_pub = admin_identity.identity.to_public_bytes();
+        let admin_identity = mint_test_owner(0xaa);
+        let admin = admin_identity.owner;
+        let admin_pub = [0u8; 64];
 
         let mut state = CommunityState::new(community_id);
 
@@ -35919,9 +35984,7 @@ mod propose_change_quorum_tests {
         );
 
         // Give the admin power=100 explicitly so the power_levels map is populated.
-        let sk_bytes = admin_identity.to_private_bytes();
-        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+        let signing_key = admin_identity.device_key.clone();
         let sp_ev = mint_set_power_event(
             community_id,
             admin,
