@@ -10038,6 +10038,312 @@ mod zeb_321_reachability_verify_tests {
 
 // ── ZEB-339 verify_membership_signer / enrolled_key_from_cert unit tests ──────
 
+// ZEB-339 (spec §9.2): cross-owner end-to-end test.
+//
+// Two distinct owners (creator + joiner) each have their own
+// owner_id / device_key / cert — built via `mint_test_owner`.
+// The test builds an event log purely from carried certs + materialized
+// state (no shared identity cache / resolver).
+//
+// Event sequence (invite-only community, creator = admin):
+// - Event 1: creator bootstrap Join (carries creator.cert)
+// - Event 2: joiner PendingJoin (carries joiner.cert + InviteToken
+//   signed by creator.device_key)
+// - Event 3: creator JoinCountersign (signed by creator.device_key,
+//   resolved from materialized membership enrolled keys)
+//
+// Each event is verified via verify_event(event, prior_state, &ctx).
+// The point: a verifier with ONLY the events + certs (no cache)
+// accepts a different owner's cert-bearing and steady-state events.
+#[cfg(test)]
+mod zeb_339_cross_owner_e2e_tests {
+    use super::*;
+    use crate::community_invite::{canonical_invite_token_bytes, InviteToken};
+    use ed25519_dalek::Signer;
+
+    #[test]
+    fn cross_owner_e2e_invite_path_verifies_from_certs_only() {
+        // ── Setup ─────────────────────────────────────────────────────────────
+        // Use seeds that don't collide via the seed ^ 0xFF master/device swap:
+        // creator=0x10, joiner=0x20. Avoid 0x10 ^ 0xFF = 0xEF and 0x20 ^ 0xFF = 0xDF.
+        let creator = mint_test_owner(0x10);
+        let joiner = mint_test_owner(0x20);
+        let community_id = SpaceId([0xCC; 16]);
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr: creator.owner,
+            is_invite_only: true,
+        };
+
+        // ── Event 1: creator bootstrap Join ─────────────────────────────────
+        // In an invite-only community the admin self-Join is exempt from the
+        // countersig requirement (bootstrap rule).
+        let creator_join_payload = EventPayload {
+            id: [0x01u8; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: creator.owner,
+            at: Hlc {
+                wall_ms: 1_700_000_001_000,
+                logical: 0,
+                device_id: "creator-dev".into(),
+            },
+        };
+        let creator_join = {
+            let ev = sign_event(&creator_join_payload, &creator.device_key).unwrap();
+            SignedMembershipEvent {
+                enrollment: Some(creator.cert.clone()),
+                ..ev
+            }
+        };
+
+        // Verify event 1 against EMPTY prior_state — the cert is the only
+        // trust anchor; no shared identity cache involved.
+        let prior_e1 = prior_state_at_event(&[], &creator_join, creator.owner);
+        assert_eq!(
+            prior_e1.members.len(),
+            0,
+            "prior state for first event must be empty"
+        );
+        verify_event(&creator_join, &prior_e1, &ctx)
+            .expect("creator bootstrap Join must verify from cert alone against empty state");
+
+        // ── Event 2: joiner PendingJoin ──────────────────────────────────────
+        // InviteToken: signed by creator.device_key (not by creator's old
+        // identity/Reticulum key). ZEB-339 P5 verifies it against
+        // creator's enrolled device key from materialized membership.
+        let mut token = InviteToken {
+            inviter: creator.owner,
+            invitee_hint: Some(joiner.owner),
+            minted_at: Hlc {
+                wall_ms: 1_700_000_002_000,
+                logical: 0,
+                device_id: "creator-dev".into(),
+            },
+            expires_at: None, // open-ended
+            sig: [0u8; 64],
+        };
+        let token_bytes = canonical_invite_token_bytes(&token).expect("encode token");
+        token.sig = creator.device_key.sign(&token_bytes).to_bytes();
+
+        let joiner_pending_payload = EventPayload {
+            id: [0x02u8; 16],
+            community_id,
+            kind: MembershipEventKind::PendingJoin {
+                invite_token: token,
+            },
+            actor: joiner.owner,
+            at: Hlc {
+                wall_ms: 1_700_000_003_000,
+                logical: 0,
+                device_id: "joiner-dev".into(),
+            },
+        };
+        let joiner_pending = {
+            let ev = sign_event(&joiner_pending_payload, &joiner.device_key).unwrap();
+            SignedMembershipEvent {
+                enrollment: Some(joiner.cert.clone()),
+                ..ev
+            }
+        };
+
+        // Verify event 2 against prior_state that contains only event 1.
+        // The inviter's (creator's) enrolled key must already be in the
+        // materialized membership so P5 can resolve it.
+        let prior_e2 = prior_state_at_event(
+            std::slice::from_ref(&creator_join),
+            &joiner_pending,
+            creator.owner,
+        );
+        assert!(
+            prior_e2.members.contains_key(&creator.owner),
+            "creator must be materialized before joiner PendingJoin verification"
+        );
+        // The creator's enrolled device key must be present in prior_state
+        // (populated by materializing the cert carried on event 1).
+        let creator_member_state = prior_e2.members.get(&creator.owner).unwrap();
+        assert!(
+            creator_member_state
+                .enrolled_device_keys
+                .contains(&creator.cert.device_pubkeys.classical.ed25519_verify),
+            "creator's enrolled device key must be in materialized state (ZEB-339)"
+        );
+        verify_event(&joiner_pending, &prior_e2, &ctx).expect(
+            "joiner PendingJoin must verify from cert + creator's materialized enrolled key",
+        );
+
+        // ── Event 3: creator JoinCountersign approving the PendingJoin ───────
+        // Signed by creator.device_key — this is a STEADY-STATE event, so
+        // verify_event resolves the signer from materialized enrolled keys
+        // (not from a cert).
+        let countersign_payload = EventPayload {
+            id: [0x03u8; 16],
+            community_id,
+            kind: MembershipEventKind::JoinCountersign {
+                target_event_id: joiner_pending.id,
+            },
+            actor: creator.owner,
+            at: Hlc {
+                wall_ms: 1_700_000_004_000,
+                logical: 0,
+                device_id: "creator-dev".into(),
+            },
+        };
+        let creator_countersign = sign_event(&countersign_payload, &creator.device_key).unwrap();
+
+        // Verify event 3 against prior state of events 1 + 2.
+        // Creator's enrolled key was learned from event 1's cert, so the
+        // steady-state signer resolution (no cert carried) must succeed.
+        let two_events = [creator_join.clone(), joiner_pending.clone()];
+        let prior_e3 = prior_state_at_event(&two_events, &creator_countersign, creator.owner);
+        verify_event(&creator_countersign, &prior_e3, &ctx)
+            .expect("creator JoinCountersign must verify from materialized enrolled key (no cert)");
+
+        // ── Final materialization: both creator and joiner must be Joined ─────
+        let all_events = [
+            creator_join.clone(),
+            joiner_pending.clone(),
+            creator_countersign.clone(),
+        ];
+        let final_state = materialize(&all_events, creator.owner);
+
+        let creator_state = final_state
+            .members
+            .get(&creator.owner)
+            .expect("creator must be materialized");
+        assert_eq!(
+            creator_state.status,
+            MemberStatus::Joined,
+            "creator must be Joined"
+        );
+        assert!(
+            creator_state
+                .enrolled_device_keys
+                .contains(&creator.cert.device_pubkeys.classical.ed25519_verify),
+            "creator's enrolled device key must be in final materialized state"
+        );
+
+        let joiner_state = final_state
+            .members
+            .get(&joiner.owner)
+            .expect("joiner must be materialized");
+        assert_eq!(
+            joiner_state.status,
+            MemberStatus::Joined,
+            "joiner must be Joined after JoinCountersign"
+        );
+        assert!(
+            joiner_state
+                .enrolled_device_keys
+                .contains(&joiner.cert.device_pubkeys.classical.ed25519_verify),
+            "joiner's enrolled device key must be in final materialized state"
+        );
+    }
+}
+
+// ZEB-339 (spec §9.6): signing regression guard.
+//
+// Explicitly encodes the invariant that community events are signed by an
+// enrolled DEVICE key (#2), NOT by the owner's Reticulum/master key —
+// i.e. `actor (owner_id) ≠ address_hash(signing_device_key)`.
+//
+// This module would BREAK if community signing ever reverted to the old
+// single-identity model where the signing key was derived from the same
+// seed as the owner_id, making `actor == address_hash(signing_key)`.
+//
+// ZEB-339 regression guard — if community signing reverts to the
+// Reticulum/owner key (actor == address_hash(signing_key)), this test
+// module breaks.
+#[cfg(test)]
+mod zeb_339_signing_regression_guard {
+    use super::*;
+    use harmony_owner::pubkey_bundle::{ClassicalKeys, PubKeyBundle};
+
+    // Two assertions:
+    // (a) owner_id ≠ address_hash(device_signing_key): the owner/device SPLIT
+    //     is real — the signer is NOT the actor's own address.
+    // (b) bootstrap Join verifies ONLY because the cert binds device→owner:
+    //     passes with cert, fails MissingEnrollmentCert without.
+    //
+    // ZEB-339 regression guard: if signing reverts to the Reticulum/owner key
+    // (actor == address_hash(signing_key)), assertion (a) fires.
+    #[test]
+    fn owner_and_device_key_address_hash_differ_and_cert_is_load_bearing() {
+        let o = mint_test_owner(0x42);
+
+        // ── (a) Owner/device SPLIT: owner_id ≠ address_hash(device_key) ─────
+        // Compute what address_hash(device_pubkey) would be — the value that
+        // would be used as the actor address if signing reverted to the old
+        // single-identity model.
+        let device_pubkey_bundle = PubKeyBundle {
+            classical: ClassicalKeys {
+                ed25519_verify: o.device_key.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
+            post_quantum: None,
+        };
+        let device_identity_hash = device_pubkey_bundle.identity_hash();
+        let device_addr = OwnerAddr(device_identity_hash);
+
+        // The actor address is the OWNER (master key) address, not the device
+        // key's address. If this ever becomes equal (i.e. signing reverted to
+        // the Reticulum/owner key model), the test breaks with a clear message.
+        assert_ne!(
+            o.owner, device_addr,
+            "ZEB-339 regression: owner_id == address_hash(device_signing_key) — \
+             community signing has reverted to the old single-identity model"
+        );
+
+        // ── (b) Cert is load-bearing: verify_event passes with cert, fails without ─
+        let community_id = SpaceId([0xBB; 16]);
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr: o.owner,
+            is_invite_only: false,
+        };
+
+        let payload = EventPayload {
+            id: [0x42u8; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: o.owner,
+            at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "regrdev".into(),
+            },
+        };
+
+        // With cert: must verify against empty prior_state.
+        let ev_with_cert = {
+            let ev = sign_event(&payload, &o.device_key).unwrap();
+            SignedMembershipEvent {
+                enrollment: Some(o.cert.clone()),
+                ..ev
+            }
+        };
+        verify_event(&ev_with_cert, &MaterializedMembership::default(), &ctx)
+            .expect("cert-bearing bootstrap Join must verify");
+
+        // Without cert: must fail — the verifier has no way to resolve the
+        // signer's device key from materialized state (no prior member record)
+        // and no cert to extract it from.
+        let ev_no_cert = sign_event(&payload, &o.device_key).unwrap();
+        assert_eq!(
+            ev_no_cert.enrollment, None,
+            "precondition: event carries no cert"
+        );
+        let err = verify_event(&ev_no_cert, &MaterializedMembership::default(), &ctx)
+            .expect_err("cert-absent bootstrap Join must fail");
+        assert_eq!(
+            err,
+            VerifyError::MissingEnrollmentCert,
+            "ZEB-339 regression: cert-absent Join should fail with MissingEnrollmentCert, \
+             not SignatureInvalid (which would indicate the signer is still the owner/Reticulum key)"
+        );
+    }
+}
+
 #[cfg(test)]
 mod zeb_339_signer_verify_tests {
     use super::*;

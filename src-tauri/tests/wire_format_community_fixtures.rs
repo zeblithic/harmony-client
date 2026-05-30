@@ -501,3 +501,119 @@ fn signed_event_channel_delete_wire_bytes_pinned() {
         "ChannelDelete wire format changed"
     );
 }
+
+// ── ZEB-339 wire-format fixtures ──────────────────────────────────────────────
+//
+// Pin: (a) a Join event WITH an EnrollmentCert in the `en` field, and
+//      (b) confirm a certless Join (enrollment=None) still encodes without
+//          the `en` key + decodes cleanly (backward compat).
+//
+// Determinism note: `mint_test_owner(seed)` uses:
+//   - master_sk = SigningKey::from_bytes(&[seed; 32])  — deterministic
+//   - device_sk = SigningKey::from_bytes(&[seed ^ 0xFF; 32])  — deterministic
+//   - EnrollmentCert::sign_master signs with ed25519 (RFC 8032 deterministic)
+// → the full cert bytes are byte-deterministic for a fixed seed.
+// Full-byte pinning is therefore safe and preferred.
+
+/// ZEB-339: a deterministic Join event carrying an EnrollmentCert (`en` key
+/// present). Built from `mint_test_owner(0x5A)` so the cert + event sig are
+/// byte-deterministic. Pinned bytes prove the `en` field survives a
+/// canonical encode → decode round-trip and that the CBOR map now contains
+/// the `en` key.
+///
+/// If this assertion fires after a deliberate wire-format change, rebuild by
+/// running the test with `-- --nocapture`, reading the "ACTUAL" line, and
+/// updating PINNED below. Wire drift without a deliberate change is a
+/// regression — debug before regenerating.
+#[test]
+fn signed_event_join_with_cert_wire_bytes_pinned() {
+    use harmony_app::community_membership::{mint_test_owner, sign_event, EventPayload};
+    use harmony_app::owner_state_crypto::canonical_cbor_decode;
+
+    let o = mint_test_owner(0x5A);
+
+    let payload = EventPayload {
+        id: [0x5Au8; 16],
+        community_id: SpaceId([0x5Bu8; 16]),
+        kind: MembershipEventKind::Join,
+        actor: o.owner,
+        at: Hlc {
+            wall_ms: 1_700_000_000_000,
+            logical: 0,
+            device_id: "zeb339".into(),
+        },
+    };
+
+    let ev_unsigned = sign_event(&payload, &o.device_key).expect("sign");
+    let event = harmony_app::community_membership::SignedMembershipEvent {
+        enrollment: Some(o.cert.clone()),
+        ..ev_unsigned
+    };
+
+    let bytes = canonical_cbor_encode(&event).expect("encode");
+    let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    eprintln!("signed_event_join_with_cert hex: {hex}");
+
+    // Round-trip: decode back and verify structural equality.
+    let decoded: harmony_app::community_membership::SignedMembershipEvent =
+        canonical_cbor_decode(&bytes).expect("decode");
+    assert_eq!(decoded, event, "round-trip identity");
+    assert!(
+        decoded.enrollment.is_some(),
+        "decoded event must carry enrollment cert"
+    );
+    assert_eq!(
+        decoded.enrollment.as_ref().unwrap().owner_id,
+        o.owner.0,
+        "decoded cert.owner_id must match actor"
+    );
+    // Verify the decoded cert still passes structural cert verification.
+    decoded
+        .enrollment
+        .as_ref()
+        .unwrap()
+        .verify()
+        .expect("decoded cert must pass cert.verify()");
+
+    // Pin the canonical bytes. ed25519 is RFC 8032 deterministic, and
+    // `mint_test_owner` uses fixed-seed keys, so the cert + event sig are
+    // byte-deterministic for a given seed. These bytes were captured from
+    // a first-run eprintln and pinned here. Regenerate ONLY on a deliberate
+    // wire-format change; drift without a deliberate change is a regression.
+    const PINNED_HEX: &str = "a7626964505a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a626369505b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b626b6ea1627467616a6261635003f9be208e69c938081b0ec4c5fc8d16626174a361771b0000018bcfe56800616c006164667a65623333396273675840f9a284b7cea8ac457776efd9dd8dc4bf14e8ff7251f8e1ac1a4c4157411e2a46f2d8b4f4f7695a080f4716e5dae871880725f21045e50f609ce5d43f913ba40862656ea86776657273696f6e01686f776e65725f69645003f9be208e69c938081b0ec4c5fc8d16696465766963655f6964509ef262c19db67df0c5bf0d32bf8a0f2b6e6465766963655f7075626b657973a269636c6173736963616ca26e656432353531395f766572696679582029e5833a915a6429a4e3a7948475c338ef436eb82be89c92f059704403db9d556a7832353531395f707562582000000000000000000000000000000000000000000000000000000000000000006c706f73745f7175616e74756df6696973737565645f61741a6553f1006a657870697265735f6174f666697373756572a1664d6173746572a16d6d61737465725f7075626b6579a269636c6173736963616ca26e656432353531395f76657269667958200d7550754e0800a5d237eef5826035766b9b3e5a15868a940ab289958788e3b06a7832353531395f707562582000000000000000000000000000000000000000000000000000000000000000006c706f73745f7175616e74756df6697369676e617475726558407dae3cbf1e7f31a44634d654434939fdf997aef51cdf1039338aaa91d1aeb306861b2822d47eb72678310617a21d47173e73c1dc06a36f30bd2178673c4e0d08";
+    assert_eq!(
+        hex, PINNED_HEX,
+        "ZEB-339 Join-with-cert wire format changed — \
+         debug encoder drift, regen ONLY on deliberate wire-format change"
+    );
+}
+
+/// ZEB-339 back-compat: a certless Join event (enrollment=None) must still
+/// encode WITHOUT the `en` key and decode cleanly.
+///
+/// This confirms old pre-ZEB-339 events (no `en`/`ek` fields) remain
+/// decodeable after the field was added with `skip_serializing_if = "Option::is_none"`
+/// + `default`. This test mirrors the existing `signed_event_join_wire_bytes_pinned`
+/// fixture above but explicitly checks the absence of `en` and the decode path.
+#[test]
+fn signed_event_join_certless_back_compat_decodes() {
+    use harmony_app::community_membership::SignedMembershipEvent;
+    use harmony_app::owner_state_crypto::canonical_cbor_decode;
+
+    // The existing pinned certless-join bytes from signed_event_join_wire_bytes_pinned.
+    // These bytes were produced before ZEB-339 (enrollment=None, no `en` key).
+    let pinned_certless_hex = "a662696450424242424242424242424242424242426263695037373737373737373737373737373737626b6ea1627467616a6261635011111111111111111111111111111111626174a361771b0000018bcfe56800616c006164636669786273675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let bytes = hex::decode(pinned_certless_hex).expect("decode hex");
+    let event: SignedMembershipEvent = canonical_cbor_decode(&bytes).expect("certless decode");
+    assert_eq!(
+        event.enrollment, None,
+        "pre-ZEB-339 event without `en` key must decode with enrollment=None"
+    );
+    assert_eq!(event.kind, MembershipEventKind::Join, "kind must be Join");
+    // Re-encode and confirm it round-trips to identical bytes (no `en` key injected).
+    let reencoded = canonical_cbor_encode(&event).expect("re-encode");
+    assert_eq!(
+        reencoded, bytes,
+        "certless Join must re-encode to identical bytes (no `en` key injected)"
+    );
+}
