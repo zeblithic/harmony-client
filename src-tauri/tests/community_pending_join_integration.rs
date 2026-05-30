@@ -10,8 +10,9 @@
 //! `insert_local_event_with_pubs` path to confirm the plumbing is live.
 
 use harmony_app::community_invite::{canonical_invite_token_bytes, InviteToken};
+use ed25519_dalek::Signer;
 use harmony_app::community_membership::{
-    sign_event_with_identity, EventPayload, MembershipEventKind,
+    mint_test_owner, sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent, TestOwner,
 };
 use harmony_app::community_state_crdt::{CommunityState, InsertOutcome};
 use harmony_app::community_state_sync::{
@@ -20,31 +21,47 @@ use harmony_app::community_state_sync::{
 };
 use harmony_app::content_store::{CasOp, ContentStore, RuntimeContentStore};
 use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
-use harmony_identity::PrivateIdentity;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
-/// Build a `PrivateIdentity` from a seed byte, plus its 64-byte pub and OwnerAddr.
-fn make_identity(seed: u8) -> (PrivateIdentity, [u8; 64], OwnerAddr) {
-    let private = PrivateIdentity::from_seed(&[seed; 32]);
-    let public = private.public_identity();
-    let pub_bytes = public.to_public_bytes();
-    let addr = OwnerAddr(public.address_hash);
-    (private, pub_bytes, addr)
+/// ZEB-339: build an enrolled-device owner from a seed. Returns
+/// `(TestOwner, dummy_pub, owner_addr)` so existing `(priv, pub, addr)`
+/// destructures keep compiling. The actor is `owner.owner` (owner_id); events
+/// are signed by the enrolled device key (#2).
+fn make_identity(seed: u8) -> (TestOwner, [u8; 64], OwnerAddr) {
+    let owner = mint_test_owner(seed);
+    let addr = owner.owner;
+    (owner, [0u8; 64], addr)
 }
 
-/// Extract an ed25519 `SigningKey` from a `PrivateIdentity`'s raw secret bytes.
-/// The layout is `X25519_secret(32) || Ed25519_secret(32)`.
-fn signing_key_from(id: &PrivateIdentity) -> ed25519_dalek::SigningKey {
-    let bytes = id.to_private_bytes();
-    let mut secret = [0u8; 32];
-    secret.copy_from_slice(&bytes[32..64]);
-    ed25519_dalek::SigningKey::from_bytes(&secret)
+/// ZEB-339: the owner's enrolled device signing key (#2).
+fn signing_key_from(owner: &TestOwner) -> ed25519_dalek::SigningKey {
+    owner.device_key.clone()
 }
 
-/// Build a signed InviteToken with the admin's signing key.
+/// ZEB-339: sign a membership event with the owner's enrolled device key,
+/// attaching the Master cert on identity-introducing events (Join/PendingJoin).
+fn sign_event_with_identity(
+    payload: &EventPayload,
+    owner: &TestOwner,
+) -> Result<SignedMembershipEvent, harmony_app::owner_state_crypto::CryptoError> {
+    let ev = sign_event(payload, &owner.device_key)?;
+    Ok(match ev.kind {
+        MembershipEventKind::Join | MembershipEventKind::PendingJoin { .. } => {
+            SignedMembershipEvent {
+                enrollment: Some(owner.cert.clone()),
+                ..ev
+            }
+        }
+        _ => ev,
+    })
+}
+
+/// ZEB-339: build a signed InviteToken. The token sig now verifies against the
+/// inviter's ENROLLED device key (P5 `verify_invite_token_sig_with_enrolled`),
+/// so it is signed with the admin's device key (#2), not their identity key.
 fn make_signed_token(
-    admin_private: &PrivateIdentity,
+    admin_owner: &TestOwner,
     admin_addr: OwnerAddr,
     invitee_hint: Option<OwnerAddr>,
     expires_at: Option<u64>,
@@ -61,7 +78,7 @@ fn make_signed_token(
         sig: [0u8; 64],
     };
     let bytes = canonical_invite_token_bytes(&tok).expect("encode token");
-    tok.sig = admin_private.sign(&bytes);
+    tok.sig = admin_owner.device_key.sign(&bytes).to_bytes();
     tok
 }
 
@@ -790,9 +807,7 @@ async fn joiner_engine_clears_pending_join_at_on_countersign() {
 
 // ── ZEB-254 Task 15: two-engine integration tests ────────────────────────────
 
-use harmony_app::community_membership::{
-    attach_countersig_with_identity, MemberStatus, SignedMembershipEvent,
-};
+use harmony_app::community_membership::{attach_countersig_with_device_key, MemberStatus};
 
 /// Drain all events from `from_state` that are not yet in `to_engine`
 /// and insert them into `to_engine`, resolving the per-event actor pub from
@@ -898,9 +913,10 @@ async fn legacy_invite_only_join_with_countersig_still_accepted() {
     let joiner_join_unsigned =
         sign_event_with_identity(&joiner_join_payload, &joiner_priv).expect("sign joiner join");
 
-    // Admin attaches countersig (legacy invite-only wire shape).
-    let joiner_join_with_cs = attach_countersig_with_identity(&joiner_join_unsigned, &admin_priv)
-        .expect("attach countersig");
+    // Admin attaches countersig with their enrolled device key (ZEB-339).
+    let joiner_join_with_cs =
+        attach_countersig_with_device_key(&joiner_join_unsigned, admin_priv.owner, &admin_priv.device_key)
+            .expect("attach countersig");
 
     // Insert through the engine — countersigner_identity_pub = Some(admin_pub).
     let outcome = engine
@@ -1135,8 +1151,12 @@ async fn pending_join_resolves_under_two_admin_race() {
     };
     let admin2_join_unsigned =
         sign_event_with_identity(&admin2_join_payload, &admin2_priv).expect("sign admin2 join");
-    let admin2_join_with_cs = attach_countersig_with_identity(&admin2_join_unsigned, &admin1_priv)
-        .expect("admin1 countersigs admin2 join");
+    let admin2_join_with_cs = attach_countersig_with_device_key(
+        &admin2_join_unsigned,
+        admin1_priv.owner,
+        &admin1_priv.device_key,
+    )
+    .expect("admin1 countersigs admin2 join");
     joiner_engine
         .insert_local_event_with_pubs(admin2_join_with_cs, admin2_pub, Some(admin1_pub))
         .await
