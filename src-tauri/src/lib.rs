@@ -3203,7 +3203,8 @@ pub(crate) async fn start_node_inner(
                                 // against enrolled_device_keys (device #2).
                                 // Must sign with community_signing_key_arc
                                 // (device #2), NOT the Reticulum signing_key_arc.
-                                let signing_key_for_heal = std::sync::Arc::clone(&community_signing_key_arc);
+                                let signing_key_for_heal =
+                                    std::sync::Arc::clone(&community_signing_key_arc);
                                 let hlc_tracker_for_heal = std::sync::Arc::clone(&tracker);
                                 let device_id_for_heal = device_id.clone();
                                 let self_owner_for_heal = self_owner;
