@@ -18,7 +18,6 @@ pub use crate::profile_broadcast::SubscriptionId;
 pub const PROFILE_CARD_TOPIC_PREFIX: &str = "harmony/discovery/profile/owner/";
 pub const MAX_DISPLAY_NAME_BYTES: usize = 64;
 pub const MAX_STATUS_TEXT_BYTES: usize = 128;
-#[allow(dead_code)]
 pub const MAX_CARD_WIRE_BYTES: usize = 4_096;
 
 /// Build a broadcast topic key for the given owner_id.

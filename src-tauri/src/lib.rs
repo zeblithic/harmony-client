@@ -582,6 +582,16 @@ pub struct NodeState {
     /// Persisted only across IPC calls within a single node lifetime;
     /// reset on stop_node.
     profile_broadcast_next_subscription_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// ZEB-341: profile-card peer cache. Shared with the event-loop's
+    /// card subscriber task pool. Always Some while node is running.
+    profile_card_cache: Option<std::sync::Arc<crate::profile_card_broadcast::ProfileCardCache>>,
+    /// ZEB-341: control channel into the event-loop's profile-card
+    /// subscriber task pool. IPC handlers send `Subscribe`/`Unsubscribe`.
+    profile_card_request_tx:
+        Option<tokio::sync::mpsc::Sender<crate::event_loop::ProfileCardRequest>>,
+    /// ZEB-341: monotonic subscription-id allocator for card subscriptions.
+    /// Reset on stop_node.
+    profile_card_next_subscription_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// ZEB-290 Phase 1 Task 11 (+ ZEB-291 Phase 2 Task 19 shape migration):
     /// per-community voting-event logs. Holds an `Arc<tokio::Mutex<VotingLog>>`
     /// per `SpaceId`; lazily populated on first local
@@ -918,6 +928,11 @@ impl Default for NodeState {
             profile_broadcast_cache: None,
             profile_broadcast_request_tx: None,
             profile_broadcast_next_subscription_id: std::sync::Arc::new(
+                std::sync::atomic::AtomicU64::new(1),
+            ),
+            profile_card_cache: None,
+            profile_card_request_tx: None,
+            profile_card_next_subscription_id: std::sync::Arc::new(
                 std::sync::atomic::AtomicU64::new(1),
             ),
             // ZEB-290 Phase 1 Task 11 + ZEB-291 Task 19 migration: voting
@@ -1320,6 +1335,10 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         guard.profile_broadcast_cache = None;
         guard.profile_broadcast_request_tx = None;
         guard.profile_broadcast_next_subscription_id =
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        guard.profile_card_cache = None;
+        guard.profile_card_request_tx = None;
+        guard.profile_card_next_subscription_id =
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
         // Mint Phase 2 sync: take before releasing the lock so a concurrent
         // IPC doesn't race to call notify_dirty on a shutting-down engine.
@@ -1993,6 +2012,10 @@ pub(crate) async fn start_node_inner(
         guard.profile_broadcast_request_tx = None;
         guard.profile_broadcast_next_subscription_id =
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        guard.profile_card_cache = None;
+        guard.profile_card_request_tx = None;
+        guard.profile_card_next_subscription_id =
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
         // Mint Phase 2 sync: take the prior identity's engine so it can be
         // shut down outside the lock below (same pattern as sync_engine).
         old_mint_sync_engine = guard.mint_sync.take();
@@ -2354,6 +2377,12 @@ pub(crate) async fn start_node_inner(
             std::sync::Arc::new(crate::profile_broadcast::ProfileBroadcastCache::default());
         let (profile_broadcast_request_tx, profile_broadcast_request_rx) =
             tokio::sync::mpsc::channel::<crate::event_loop::ProfileBroadcastRequest>(64);
+        // ZEB-341: profile-card subscriber cache + request channel (sibling
+        // to the profile-broadcast pair above; rx moved into event_loop::run).
+        let profile_card_cache_arc =
+            std::sync::Arc::new(crate::profile_card_broadcast::ProfileCardCache::default());
+        let (profile_card_request_tx, profile_card_request_rx) =
+            tokio::sync::mpsc::channel::<crate::event_loop::ProfileCardRequest>(64);
 
         // ── ZEB-323 Phase 2b: pkarr lifted state holders ─────────────────
         //
@@ -4653,6 +4682,11 @@ pub(crate) async fn start_node_inner(
                 let profile_broadcast_cache_for_loop =
                     Some(std::sync::Arc::clone(&profile_broadcast_cache_arc));
                 let profile_broadcast_request_rx_for_loop = Some(profile_broadcast_request_rx);
+                // ZEB-341: thread the profile-card cache + request rx into
+                // event_loop::run, mirroring the profile-broadcast pair.
+                let profile_card_cache_for_loop =
+                    Some(std::sync::Arc::clone(&profile_card_cache_arc));
+                let profile_card_request_rx_for_loop = Some(profile_card_request_rx);
                 // Mint Phase 2 sync: thread handles into event_loop::run.
                 let mint_sync_handles_for_loop = mint_sync_handles_opt;
                 // ZEB-321 Phase 1 Task 8: shadow the outer-scope binding into
@@ -4762,6 +4796,8 @@ pub(crate) async fn start_node_inner(
                                 library_request_rx_for_loop,
                                 profile_broadcast_cache_for_loop,
                                 profile_broadcast_request_rx_for_loop,
+                                profile_card_cache_for_loop,
+                                profile_card_request_rx_for_loop,
                                 mint_sync_handles_for_loop,
                                 iroh_handles_into_loop,
                             )
@@ -4907,6 +4943,13 @@ pub(crate) async fn start_node_inner(
                             Some(std::sync::Arc::clone(&profile_broadcast_cache_arc));
                         guard.profile_broadcast_request_tx = Some(profile_broadcast_request_tx);
                         guard.profile_broadcast_next_subscription_id =
+                            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+                        // ZEB-341: store the profile-card cache + request_tx,
+                        // mirroring the profile-broadcast assignment above.
+                        guard.profile_card_cache =
+                            Some(std::sync::Arc::clone(&profile_card_cache_arc));
+                        guard.profile_card_request_tx = Some(profile_card_request_tx);
+                        guard.profile_card_next_subscription_id =
                             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
                         // Mint Phase 2 sync: store the engine Arc so IPC handlers
                         // can call notify_dirty() after mutations.
@@ -18769,6 +18812,100 @@ async fn get_cached_peer_profile(
     Ok(cache.get_cached(subscription_id).await)
 }
 
+/// IPC: ZEB-341. Subscribe to a peer's profile-card topic (keyed by their
+/// 16-byte owner_id). Returns a u64 SubscriptionId the frontend uses to
+/// address subsequent unsubscribe/get_cached calls + to filter incoming
+/// `member-card-received` events.
+#[tauri::command]
+async fn subscribe_member_card(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    owner_id_hex: String,
+) -> Result<u64, String> {
+    let (cache, request_tx, next_id) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.profile_card_cache.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.profile_card_request_tx
+                .clone()
+                .ok_or(OWNER_NOT_LOADED_MSG)?,
+            std::sync::Arc::clone(&g.profile_card_next_subscription_id),
+        )
+    };
+
+    let parsed = crate::library_directory::parse_owner_addr_hex(&owner_id_hex)
+        .map_err(|e| format!("invalid owner_id hex: {e}"))?;
+    let owner_id = parsed.0;
+    let id = next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    cache.register(id, owner_id).await;
+    // If the request channel is closing (event-loop shutdown raced this
+    // IPC), roll back the cache entry before surfacing the error so we
+    // don't leave a phantom subscription.
+    if let Err(e) = request_tx
+        .send(crate::event_loop::ProfileCardRequest::Subscribe {
+            subscription_id: id,
+            owner_id,
+        })
+        .await
+    {
+        cache.drop_subscription(id).await;
+        return Err(format!("profile_card_request_tx send: {e}"));
+    }
+    Ok(id)
+}
+
+/// IPC: ZEB-341. Unsubscribe from a previously-registered peer card
+/// subscription. The event-loop's subscriber pool aborts the Zenoh
+/// subscriber task AND drops the cache entry.
+#[tauri::command]
+async fn unsubscribe_member_card(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    subscription_id: u64,
+) -> Result<(), String> {
+    let request_tx = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.profile_card_request_tx
+            .clone()
+            .ok_or(OWNER_NOT_LOADED_MSG)?
+    };
+    request_tx
+        .send(crate::event_loop::ProfileCardRequest::Unsubscribe { subscription_id })
+        .await
+        .map_err(|e| format!("profile_card_request_tx send: {e}"))?;
+    Ok(())
+}
+
+/// IPC: ZEB-341. Snapshot the latest verified card for a subscription.
+/// Returns `Ok(None)` when the subscription is known but no card has been
+/// received yet (loading state) or when the subscription has been dropped.
+#[tauri::command]
+async fn get_cached_member_card(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    subscription_id: u64,
+) -> Result<Option<crate::profile_card_broadcast::DiscoveredCardInfo>, String> {
+    let cache = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.profile_card_cache.clone().ok_or(OWNER_NOT_LOADED_MSG)?
+    };
+    Ok(cache.get_cached(subscription_id).await)
+}
+
+#[cfg(test)]
+mod member_card_ipc_tests {
+    //! ZEB-341: contract test for the hex parser the subscribe IPC relies on.
+    #[test]
+    fn member_card_owner_id_hex_parses_16_bytes() {
+        let id = crate::library_directory::parse_owner_addr_hex(&"ab".repeat(16)).unwrap();
+        assert_eq!(id.0.len(), 16);
+        assert!(crate::library_directory::parse_owner_addr_hex("zz").is_err());
+    }
+}
+
 #[cfg(test)]
 mod library_directory_lww_tests {
     //! Unit tests for the pure LWW helpers behind `add_library` /
@@ -31517,6 +31654,10 @@ pub fn run() {
             subscribe_peer_profile,
             unsubscribe_peer_profile,
             get_cached_peer_profile,
+            // ZEB-341: profile-card subscriber IPC trio.
+            subscribe_member_card,
+            unsubscribe_member_card,
+            get_cached_member_card,
             // ZEB-290 Phase 1 Task 11: Tier 1 voting IPCs.
             voting_create_tier1_poll,
             voting_cast_tier1_ballot,
@@ -34804,6 +34945,11 @@ mod start_node_race_tests {
             profile_broadcast_cache: None,
             profile_broadcast_request_tx: None,
             profile_broadcast_next_subscription_id: std::sync::Arc::new(
+                std::sync::atomic::AtomicU64::new(1),
+            ),
+            profile_card_cache: None,
+            profile_card_request_tx: None,
+            profile_card_next_subscription_id: std::sync::Arc::new(
                 std::sync::atomic::AtomicU64::new(1),
             ),
             voting_logs: std::sync::Arc::new(tokio::sync::Mutex::new(
