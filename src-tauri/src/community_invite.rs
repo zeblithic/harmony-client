@@ -1156,8 +1156,8 @@ impl RedeemBootstrapVerifyError {
     }
 }
 
-/// Run the six-step binding chain that admits the admin's signed
-/// bootstrap event into the joiner's engine (ZEB-260). Pure / sync.
+/// Run the binding chain that admits the admin's signed bootstrap event
+/// into the joiner's engine (ZEB-260, updated ZEB-339). Pure / sync.
 ///
 /// Returns `Ok((&admin_bootstrap, &admin_identity_pub))` on success so
 /// the caller can pass them to `engine.insert_local_event_with_pubs`.
@@ -1166,16 +1166,18 @@ impl RedeemBootstrapVerifyError {
 /// The chain (each step's failure → distinct error variant):
 ///   1. Required fields present (`admin_bootstrap` + `admin_identity_pub`
 ///      both `Some`). [BootstrapMissing]
-///   2. `Identity::from_public_bytes(admin_identity_pub).address_hash ==
-///      payload.admin_addr.0`. [BootstrapInvalidPubkey or
-///      BootstrapAddressMismatch]
+///   2. (Removed ZEB-339) — the old flat `address_hash == admin_addr`
+///      check is incompatible with the owner/device split. The actor
+///      binding is enforced by step 3 instead.
 ///   3. `admin_bootstrap.actor == payload.admin_addr`.
 ///      [BootstrapActorMismatch]
 ///   4. `admin_bootstrap.community_id == payload.community_id`.
 ///      [BootstrapCommunityMismatch]
-///   5. Ed25519 signature verify of `admin_bootstrap` under
-///      `admin_identity_pub` (delegates to
-///      `community_membership::verify_signature`). [BootstrapSignatureInvalid]
+///   5. ZEB-339: cert-based verification — `enrolled_key_from_cert` extracts
+///      the admin's enrolled device key from the carried `EnrollmentCert`
+///      (cert.owner_id == admin_bootstrap.actor, which step 3 binds to
+///      admin_addr), then `verify_membership_signer` checks the signature
+///      under that key. [BootstrapSignatureInvalid]
 ///   6. Sanity: `admin_bootstrap.kind == Join` and `countersig is None`.
 ///      [BootstrapKindInvalid]
 ///
@@ -1204,12 +1206,12 @@ pub fn verify_admin_bootstrap(
         .as_ref()
         .ok_or(RedeemBootstrapVerifyError::BootstrapMissing)?;
 
-    // 2. identity_pub ↔ admin_addr binding.
-    let admin_identity = harmony_identity::Identity::from_public_bytes(admin_identity_pub)
-        .map_err(|_| RedeemBootstrapVerifyError::BootstrapInvalidPubkey)?;
-    if admin_identity.address_hash != payload.admin_addr.0 {
-        return Err(RedeemBootstrapVerifyError::BootstrapAddressMismatch);
-    }
+    // Step 2 removed (ZEB-339): the old flat `address_hash == admin_addr`
+    // check is incompatible with the owner/device split introduced by
+    // ZEB-339. Under ZEB-339, admin_addr is an owner/master hash (not
+    // the address_hash of any runtime key). The actor↔admin_addr binding
+    // is still enforced by step 3 below; the cryptographic owner↔device
+    // binding is enforced by the cert in step 5.
 
     // 3. bootstrap.actor ↔ admin_addr binding.
     if admin_bootstrap.actor != payload.admin_addr {
@@ -1221,8 +1223,16 @@ pub fn verify_admin_bootstrap(
         return Err(RedeemBootstrapVerifyError::BootstrapCommunityMismatch);
     }
 
-    // 5. Ed25519 signature verify.
-    crate::community_membership::verify_signature(admin_bootstrap, admin_identity_pub)
+    // 5. ZEB-339: cert-based verification. The admin's bootstrap Join is
+    // device-#2-signed and carries the admin's EnrollmentCert.
+    // enrolled_key_from_cert extracts the device key from the cert and
+    // verifies cert.owner_id == admin_bootstrap.actor (which step 3 bound
+    // to admin_addr). verify_membership_signer then checks the signature
+    // under that enrolled device key — same model as verify_packet_pure's
+    // inner join_event check.
+    let signer = crate::community_membership::enrolled_key_from_cert(admin_bootstrap)
+        .map_err(|_| RedeemBootstrapVerifyError::BootstrapSignatureInvalid)?;
+    crate::community_membership::verify_membership_signer(admin_bootstrap, &signer)
         .map_err(|_| RedeemBootstrapVerifyError::BootstrapSignatureInvalid)?;
 
     // 6. Sanity: self-Join with no countersig.

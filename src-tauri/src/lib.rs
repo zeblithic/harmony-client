@@ -16807,9 +16807,26 @@ mod redeem_invite_inner_tests {
         let joiner_self_owner = joiner_owner.owner;
         let signing_key = std::sync::Arc::new(joiner_owner.device_key.clone());
         let joiner_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
-        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
-        let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
-        let admin_pub = admin_identity.identity.to_public_bytes();
+        // ZEB-339: admin is now an enrolled-device owner. admin_addr is the
+        // master/owner hash; the bootstrap Join is signed by the device key and
+        // carries the admin's EnrollmentCert. verify_admin_bootstrap uses
+        // enrolled_key_from_cert + verify_membership_signer (cert model).
+        // The invite token is also signed by the admin's device key so
+        // verify_invite_token_sig_with_enrolled can validate it against the
+        // enrolled device key materialized from the admin's bootstrap Join.
+        let admin_owner = crate::community_membership::mint_test_owner(0xAA);
+        let admin_addr = admin_owner.owner;
+        // admin_pub: a 64-byte [x25519 || ed25519] representation used by the
+        // TwoOwnerResolver (for the legacy rehydration path) and bound as
+        // admin_identity_pub on the engine. The engine ignores it post-ZEB-339
+        // (VerifyContext no longer carries it), but we must supply a plausible
+        // value so bind_admin_identity_pub succeeds.
+        let admin_pub = {
+            let ed25519_pub = admin_owner.cert.device_pubkeys.classical.ed25519_verify;
+            let mut combined = [0u8; 64];
+            combined[32..].copy_from_slice(&ed25519_pub);
+            combined
+        };
 
         // The 64-byte joiner pub carried for the DM/transport layer (X25519 ||
         // Ed25519 derived from the joiner's device key). Not consumed by the
@@ -16914,8 +16931,12 @@ mod redeem_invite_inner_tests {
         let community_id = SpaceId([0xf6; 16]);
         let membership_key = EpochKey::new([0x42; 32]);
 
-        // Build the admin's signed bootstrap-Join event (required for
-        // invite-only payloads since ZEB-260 Phase 4).
+        // ZEB-339: build the admin's cert-bearing bootstrap-Join. The event
+        // is signed by the admin's device key and carries the admin's
+        // EnrollmentCert so verify_admin_bootstrap can run enrolled_key_from_cert
+        // + verify_membership_signer (cert model). After insertion, the admin's
+        // device key is materialized into enrolled_device_keys, which allows
+        // verify_invite_token_sig_with_enrolled to validate the invite token.
         let admin_bootstrap = {
             let payload = crate::community_membership::EventPayload {
                 id: [0x11; 16],
@@ -16928,12 +16949,16 @@ mod redeem_invite_inner_tests {
                     device_id: "admin-dev".into(),
                 },
             };
-            crate::community_membership::sign_event_with_identity(&payload, &admin_identity)
-                .expect("sign admin bootstrap")
+            let mut ev = crate::community_membership::sign_event(&payload, &admin_owner.device_key)
+                .expect("sign admin bootstrap");
+            ev.enrollment = Some(admin_owner.cert.clone());
+            ev
         };
 
-        // Build the admin-signed invite-token (admin sigs over canonical
-        // CBOR of inviter/invitee_hint/minted_at).
+        // Build the admin-signed invite-token. ZEB-339: the token is signed
+        // by the admin's device key so verify_invite_token_sig_with_enrolled
+        // (P5 in verify_event for PendingJoin) can validate it against the
+        // enrolled device key materialized from the admin's bootstrap Join.
         let token_minted_at = Hlc {
             wall_ms: 950,
             logical: 0,
@@ -16949,7 +16974,10 @@ mod redeem_invite_inner_tests {
         let token_payload_bytes =
             crate::community_invite::canonical_invite_token_bytes(&placeholder_token)
                 .expect("canonical token bytes");
-        let token_sig = admin_identity.sign(&token_payload_bytes);
+        let token_sig = {
+            use ed25519_dalek::Signer as _;
+            admin_owner.device_key.sign(&token_payload_bytes).to_bytes()
+        };
         let invite_token = crate::community_invite::InviteToken {
             inviter: admin_addr,
             invitee_hint: Some(joiner_self_owner),
@@ -17081,6 +17109,7 @@ mod redeem_invite_inner_tests {
         // Re-encode the same invite_payload (different community_id so the
         // registry doesn't reject as duplicate). Rebuild signed admin
         // bootstrap + invite_token for the new community_id.
+        // ZEB-339: use the same admin_owner (cert model) as run 1.
         let community_id_b = SpaceId([0xf7; 16]);
         let admin_bootstrap_b = {
             let payload = crate::community_membership::EventPayload {
@@ -17094,8 +17123,11 @@ mod redeem_invite_inner_tests {
                     device_id: "admin-dev".into(),
                 },
             };
-            crate::community_membership::sign_event_with_identity(&payload, &admin_identity)
-                .expect("sign admin bootstrap (run 2)")
+            let mut ev =
+                crate::community_membership::sign_event(&payload, &admin_owner.device_key)
+                    .expect("sign admin bootstrap (run 2)");
+            ev.enrollment = Some(admin_owner.cert.clone());
+            ev
         };
         let placeholder_token_b = crate::community_invite::InviteToken {
             inviter: admin_addr,
@@ -17111,7 +17143,10 @@ mod redeem_invite_inner_tests {
         let token_payload_bytes_b =
             crate::community_invite::canonical_invite_token_bytes(&placeholder_token_b)
                 .expect("canonical token bytes (run 2)");
-        let token_sig_b = admin_identity.sign(&token_payload_bytes_b);
+        let token_sig_b = {
+            use ed25519_dalek::Signer as _;
+            admin_owner.device_key.sign(&token_payload_bytes_b).to_bytes()
+        };
         let invite_token_b = crate::community_invite::InviteToken {
             sig: token_sig_b,
             ..placeholder_token_b
@@ -17139,17 +17174,23 @@ mod redeem_invite_inner_tests {
             admin_identity_pub: Some(admin_pub),
             forked_from: None,
             pre_fork_snapshot: None,
-            inviter_enrollment: None,
+            // ZEB-339: invite-only payloads must carry the inviter's cert.
+            inviter_enrollment: Some(crate::community_membership::mint_test_owner(0xA2).cert),
         };
         let invite_url_b = crate::community_invite::encode_invite_url(&invite_payload_b)
             .expect("encode invite url (run 2)");
-        // ZEB-339: supply synthetic community_signing_key + enrollment_cert.
+        // ZEB-339: supply synthetic community_signing_key for the DmOutbox
+        // (a separate DM-layer fixture), and use the joiner's own cert as
+        // enrollment_cert_b (matching joiner_self_owner) for the second
+        // redeem_invite_inner call.
         let test_owner_lib16973 = crate::community_membership::mint_test_owner(0xE3);
         let community_signing_key_lib16973 = std::sync::Arc::new(
             ed25519_dalek::SigningKey::from_bytes(&test_owner_lib16973.device_key.to_bytes()),
         );
         let enrollment_cert_lib16973 = test_owner_lib16973.cert;
-        let enrollment_cert_b = enrollment_cert_lib16973.clone();
+        // The enrollment cert passed to redeem_invite_inner MUST match the joiner's
+        // self_owner (cert.owner_id == joiner_self_owner.0). Use the joiner's cert.
+        let enrollment_cert_b = joiner_owner.cert.clone();
         let dm_outbox_b = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new(
             "joiner-dev".into(),
             joiner_self_owner,

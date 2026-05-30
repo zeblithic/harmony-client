@@ -1096,23 +1096,10 @@ mod admin_bootstrap_helpers {
         CommunityInvitePayload, InviteEpochSnapshot, InviteToken, MaterializedCommunityState,
     };
     use harmony_app::community_membership::{
-        sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent,
+        mint_test_owner, sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent,
+        TestOwner,
     };
     use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
-
-    /// Deterministic keys: `seed` selects the identity (e.g., 0xAA for
-    /// admin in the test). Returns `(identity_pub_64, signing_key,
-    /// owner_addr)`.
-    pub fn identity_set(seed: u8) -> ([u8; 64], ed25519_dalek::SigningKey, OwnerAddr) {
-        let private = harmony_identity::PrivateIdentity::from_seed(&[seed; 32]);
-        let pub_bytes = private.identity.to_public_bytes();
-        let priv_bytes = private.to_private_bytes();
-        let mut ed_seed = [0u8; 32];
-        ed_seed.copy_from_slice(&priv_bytes[32..64]);
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&ed_seed);
-        let addr = OwnerAddr(private.identity.address_hash);
-        (pub_bytes, signing_key, addr)
-    }
 
     pub fn fixture_hlc() -> Hlc {
         Hlc {
@@ -1122,48 +1109,71 @@ mod admin_bootstrap_helpers {
         }
     }
 
-    /// Build a known-good admin self-Join (signed) for the given
-    /// community_id + admin identity.
+    /// ZEB-339: produce a deterministic enrolled-device admin owner.
+    /// Returns a `TestOwner` whose `owner` field is the master hash and
+    /// whose `cert` binds the device signing key to that master.
+    pub fn admin_owner(seed: u8) -> TestOwner {
+        mint_test_owner(seed)
+    }
+
+    /// Build a cert-bearing admin self-Join (signed by device key) for
+    /// the given community_id + admin TestOwner. ZEB-339: the event must
+    /// carry the admin's EnrollmentCert so `enrolled_key_from_cert` can
+    /// extract and verify the signer.
     pub fn admin_bootstrap_event(
         community_id: SpaceId,
-        admin_addr: OwnerAddr,
-        signing_key: &ed25519_dalek::SigningKey,
+        admin: &TestOwner,
     ) -> SignedMembershipEvent {
         let payload = EventPayload {
             id: [0xCC; 16],
             community_id,
             kind: MembershipEventKind::Join,
-            actor: admin_addr,
+            actor: admin.owner,
             at: fixture_hlc(),
         };
-        sign_event(&payload, signing_key).expect("sign admin bootstrap")
+        let mut ev = sign_event(&payload, &admin.device_key).expect("sign admin bootstrap");
+        ev.enrollment = Some(admin.cert.clone());
+        ev
     }
 
-    /// Build a validly-signed admin Leave event. Used to trigger step 6
-    /// (kind check) without tripping step 5 (signature check) — the
-    /// signature is valid, but kind != Join.
+    /// Build a cert-bearing admin Leave event (signed by device key,
+    /// carries cert). Used to trigger step 6 (kind check) without
+    /// tripping step 5 (cert-based sig check) — the signature and cert
+    /// are valid, but kind != Join.
     pub fn admin_leave_event(
         community_id: SpaceId,
-        admin_addr: OwnerAddr,
-        signing_key: &ed25519_dalek::SigningKey,
+        admin: &TestOwner,
     ) -> SignedMembershipEvent {
         let payload = EventPayload {
             id: [0xCC; 16],
             community_id,
             kind: MembershipEventKind::Leave,
-            actor: admin_addr,
+            actor: admin.owner,
             at: fixture_hlc(),
         };
-        sign_event(&payload, signing_key).expect("sign admin leave")
+        let mut ev = sign_event(&payload, &admin.device_key).expect("sign admin leave");
+        ev.enrollment = Some(admin.cert.clone());
+        ev
     }
 
     /// Build a known-good invite-only `CommunityInvitePayload` with
-    /// well-formed `admin_bootstrap` + `admin_identity_pub`. The 9
-    /// per-branch tests below mutate one field at a time.
+    /// well-formed `admin_bootstrap` (cert-bearing, ZEB-339 model) +
+    /// `admin_identity_pub`. The per-branch tests below mutate one field
+    /// at a time.
     pub fn good_invite_only_payload() -> CommunityInvitePayload {
-        let (admin_pub, admin_sk, admin_addr) = identity_set(0xAA);
+        let admin = admin_owner(0xAA);
+        let admin_addr = admin.owner;
+        // admin_identity_pub: 64-byte [x25519 || ed25519] representation.
+        // The engine ignores it post-ZEB-339 (VerifyContext no longer carries
+        // it), but the field must be Some for step 1 (BootstrapMissing gate).
+        let admin_pub = {
+            let ed25519_pub = admin.cert.device_pubkeys.classical.ed25519_verify;
+            let mut combined = [0u8; 64];
+            combined[32..].copy_from_slice(&ed25519_pub);
+            combined
+        };
         let community_id = SpaceId([0x37; 16]);
-        let bootstrap = admin_bootstrap_event(community_id, admin_addr, &admin_sk);
+        let bootstrap = admin_bootstrap_event(community_id, &admin);
 
         CommunityInvitePayload {
             community_id,
@@ -1229,43 +1239,17 @@ mod verify_admin_bootstrap_tests {
         );
     }
 
-    #[test]
-    fn rejects_invalid_admin_pubkey() {
-        let mut p = good_invite_only_payload();
-        // Build a 64-byte pub where bytes 32-63 (the Ed25519 portion) are
-        // [0x7F; 32]. This compressed point does not decompress to a valid
-        // Ed25519 curve point under ed25519-dalek 2.x / curve25519-dalek 4.x
-        // (verified empirically: Identity::from_public_bytes returns Err for
-        // this input). The X25519 first half (all zeros) is always valid.
-        let mut bad_pub = [0u8; 64];
-        bad_pub[32..].copy_from_slice(&[0x7F; 32]);
-        p.admin_identity_pub = Some(bad_pub);
-        assert_eq!(
-            verify_admin_bootstrap(&p).unwrap_err(),
-            RedeemBootstrapVerifyError::BootstrapInvalidPubkey
-        );
-    }
-
-    #[test]
-    fn rejects_admin_address_mismatch() {
-        let mut p = good_invite_only_payload();
-        // Use a different identity's pubkey but keep the original
-        // admin_addr → the pubkey.address_hash will mismatch.
-        let (other_pub, _other_sk, _other_addr) = identity_set(0xBB);
-        p.admin_identity_pub = Some(other_pub);
-        assert_eq!(
-            verify_admin_bootstrap(&p).unwrap_err(),
-            RedeemBootstrapVerifyError::BootstrapAddressMismatch
-        );
-    }
+    // NOTE: rejects_invalid_admin_pubkey and rejects_admin_address_mismatch
+    // have been removed (ZEB-339). Step 2 (the flat identity_pub address_hash
+    // == admin_addr gate) no longer exists in verify_admin_bootstrap; the
+    // admin_identity_pub field is no longer gated against admin_addr.
+    // Cryptographic binding is now enforced by step 5 (cert model) instead.
 
     #[test]
     fn rejects_admin_actor_mismatch() {
         let mut p = good_invite_only_payload();
-        // Mutate the bootstrap's actor to a different address. Admin's
-        // signature was over the original actor field, so this would
-        // also fail step 5 (signature) — but step 3 fires first because
-        // the chain checks actor before sig.
+        // Mutate the bootstrap's actor to a different address. Step 3 fires
+        // first (actor != admin_addr) before step 5 (cert check).
         let mut bs = p.admin_bootstrap.as_ref().expect("bootstrap").clone();
         bs.actor = OwnerAddr([0xFF; 16]);
         p.admin_bootstrap = Some(bs);
@@ -1291,7 +1275,9 @@ mod verify_admin_bootstrap_tests {
     fn rejects_invalid_admin_signature() {
         let mut p = good_invite_only_payload();
         let mut bs = p.admin_bootstrap.as_ref().expect("bootstrap").clone();
-        // Flip a single bit in the signature.
+        // Flip a single bit in the signature. The cert is still valid (carries
+        // the correct enrolled device key), but verify_membership_signer rejects
+        // the corrupted sig.
         bs.sig[0] ^= 0x01;
         p.admin_bootstrap = Some(bs);
         assert_eq!(
@@ -1301,17 +1287,43 @@ mod verify_admin_bootstrap_tests {
     }
 
     #[test]
-    fn rejects_admin_bootstrap_with_countersig() {
+    fn rejects_bootstrap_missing_cert() {
+        // ZEB-339: a Join event without an EnrollmentCert cannot pass step 5
+        // (enrolled_key_from_cert requires a cert). The error folds into
+        // BootstrapSignatureInvalid.
         let mut p = good_invite_only_payload();
         let mut bs = p.admin_bootstrap.as_ref().expect("bootstrap").clone();
-        // Inject a synthetic countersig. The sig itself can be garbage —
-        // step 6 (kind/countersig sanity) fires before any crypto on the
+        bs.enrollment = None; // strip the cert
+        p.admin_bootstrap = Some(bs);
+        assert_eq!(
+            verify_admin_bootstrap(&p).unwrap_err(),
+            RedeemBootstrapVerifyError::BootstrapSignatureInvalid
+        );
+    }
+
+    #[test]
+    fn rejects_admin_bootstrap_with_countersig() {
+        // ZEB-339: the bootstrap carries a cert, so step 5 passes; step 6
+        // (kind/countersig sanity) fires because countersig is Some.
+        let admin = admin_owner(0xAA);
+        let community_id = SpaceId([0x37; 16]);
+        let mut bs = admin_bootstrap_event(community_id, &admin);
+        // Inject a synthetic countersig. Step 6 fires before any crypto on the
         // countersig itself.
         bs.countersig = Some(CounterSignature {
             signer: OwnerAddr([0xEE; 16]),
             sig: [0x77; 64],
         });
+        let admin_pub = {
+            let ed25519_pub = admin.cert.device_pubkeys.classical.ed25519_verify;
+            let mut combined = [0u8; 64];
+            combined[32..].copy_from_slice(&ed25519_pub);
+            combined
+        };
+        let mut p = good_invite_only_payload();
         p.admin_bootstrap = Some(bs);
+        p.admin_addr = admin.owner;
+        p.admin_identity_pub = Some(admin_pub);
         assert_eq!(
             verify_admin_bootstrap(&p).unwrap_err(),
             RedeemBootstrapVerifyError::BootstrapKindInvalid
@@ -1320,12 +1332,17 @@ mod verify_admin_bootstrap_tests {
 
     #[test]
     fn rejects_admin_bootstrap_non_join_kind() {
-        // Build from scratch with identity_set so we have the signing key.
-        // Replace the bootstrap with a validly-signed Leave event so that
-        // step 5 (sig verify) passes and step 6 (kind check) fires.
-        let (admin_pub, admin_sk, admin_addr) = identity_set(0xAA);
+        // ZEB-339: use a cert-bearing Leave event so that step 5 (cert check +
+        // sig verify) passes, and step 6 (kind check) fires.
+        let admin = admin_owner(0xAA);
         let community_id = SpaceId([0x37; 16]);
-        let leave_bootstrap = admin_leave_event(community_id, admin_addr, &admin_sk);
+        let leave_bootstrap = admin_leave_event(community_id, &admin);
+        let admin_pub = {
+            let ed25519_pub = admin.cert.device_pubkeys.classical.ed25519_verify;
+            let mut combined = [0u8; 64];
+            combined[32..].copy_from_slice(&ed25519_pub);
+            combined
+        };
 
         let p = harmony_app::community_invite::CommunityInvitePayload {
             community_id,
@@ -1337,12 +1354,12 @@ mod verify_admin_bootstrap_tests {
                 state_snapshot: harmony_app::community_invite::MaterializedCommunityState::default(
                 ),
             },
-            admin_addr,
+            admin_addr: admin.owner,
             community_name: "TestCom".into(),
             is_invite_only: true,
             expires_at: None,
             invite_token: Some(harmony_app::community_invite::InviteToken {
-                inviter: admin_addr,
+                inviter: admin.owner,
                 invitee_hint: None,
                 minted_at: fixture_hlc(),
                 expires_at: None,
