@@ -25,7 +25,7 @@
 //!   early-exit; B's CRDT shows exactly 1 event.
 
 use harmony_app::community_membership::{
-    sign_event_with_identity, EventPayload, MembershipEventKind,
+    mint_test_owner, sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent, TestOwner,
 };
 use harmony_app::community_state_crdt::CommunityState;
 use harmony_app::community_state_sync::{
@@ -44,17 +44,32 @@ use tokio::sync::{mpsc, Mutex};
 // Shared test scaffolding
 // ---------------------------------------------------------------------
 
-/// Reach into `PrivateIdentity`'s ed25519 seed (canonical 32-byte seed
-/// at bytes [32..64] of `to_private_bytes()`) and return a matching
-/// `ed25519_dalek::SigningKey`. ZEB-256 Task 6: receive-side sig-verify
-/// requires the engine's signing key to match the publisher's
-/// `identity_pub`, so registry config + engine config can no longer
-/// hand-wave with a dummy `[0x42; 32]` seed.
-fn signing_key_from(identity: &PrivateIdentity) -> Arc<ed25519_dalek::SigningKey> {
-    let private_bytes = identity.to_private_bytes();
-    let mut secret = [0u8; 32];
-    secret.copy_from_slice(&private_bytes[32..64]);
-    Arc::new(ed25519_dalek::SigningKey::from_bytes(&secret))
+/// ZEB-339: return the owner's enrolled device signing key (#2), wrapped in
+/// `Arc` for the registry/engine config + mint helpers. Under the enrolled-
+/// device model the actor (`owner_id`) is distinct from the signing key; both
+/// the publisher-sig and verify_event paths resolve the signer from the
+/// materialized enrolled key (learned from the owner's cert-bearing Join).
+fn signing_key_from(owner: &TestOwner) -> Arc<ed25519_dalek::SigningKey> {
+    Arc::new(owner.device_key.clone())
+}
+
+/// ZEB-339: sign a membership event with the owner's enrolled device key,
+/// attaching the Master cert on identity-introducing events (Join/PendingJoin)
+/// so the engine learns the owner's enrolled device key.
+fn sign_event_with_identity(
+    payload: &EventPayload,
+    owner: &TestOwner,
+) -> Result<SignedMembershipEvent, harmony_app::owner_state_crypto::CryptoError> {
+    let ev = sign_event(payload, &owner.device_key)?;
+    Ok(match ev.kind {
+        MembershipEventKind::Join | MembershipEventKind::PendingJoin { .. } => {
+            SignedMembershipEvent {
+                enrollment: Some(owner.cert.clone()),
+                ..ev
+            }
+        }
+        _ => ev,
+    })
 }
 
 /// Static `IdentityResolver` backed by an in-memory `HashMap`. The
@@ -148,16 +163,16 @@ async fn two_members_dag_sync_full_event_log() {
     let community_id = SpaceId([1u8; 16]);
     let mk = EpochKey::new([0x42; 32]);
 
-    let id_admin = PrivateIdentity::from_seed(&[0xa1; 32]);
-    let admin = OwnerAddr(id_admin.identity.address_hash);
-    let admin_pub = id_admin.identity.to_public_bytes();
+    let id_admin = mint_test_owner(0xa1);
+    let admin = id_admin.owner;
+    let admin_pub = [0u8; 64];
     let admin_signing = signing_key_from(&id_admin);
 
     // For B to publish under its own identity, derive a separate
     // PrivateIdentity. This test does not exercise B's publish path,
     // but the registry needs a valid signing-key/self_owner pair.
-    let id_b = PrivateIdentity::from_seed(&[0xb1; 32]);
-    let b_owner = OwnerAddr(id_b.identity.address_hash);
+    let id_b = mint_test_owner(0xb1);
+    let b_owner = id_b.owner;
     let b_signing = signing_key_from(&id_b);
 
     let mut resolver_map = std::collections::HashMap::new();
@@ -371,9 +386,9 @@ async fn forged_signature_event_is_rejected_on_receive() {
     let community_id = SpaceId([2u8; 16]);
     let mk = EpochKey::new([0x55; 32]);
 
-    let id_admin = PrivateIdentity::from_seed(&[0xb1; 32]);
-    let admin = OwnerAddr(id_admin.identity.address_hash);
-    let admin_pub = id_admin.identity.to_public_bytes();
+    let id_admin = mint_test_owner(0xb1);
+    let admin = id_admin.owner;
+    let admin_pub = [0u8; 64];
     let admin_signing = signing_key_from(&id_admin);
 
     let mut resolver_map = std::collections::HashMap::new();
@@ -592,9 +607,9 @@ async fn malformed_wire_packet_does_not_panic_engine() {
     let community_id = SpaceId([3u8; 16]);
     let mk = EpochKey::new([0x77; 32]);
 
-    let id_admin = PrivateIdentity::from_seed(&[0xc1; 32]);
-    let admin = OwnerAddr(id_admin.identity.address_hash);
-    let admin_pub = id_admin.identity.to_public_bytes();
+    let id_admin = mint_test_owner(0xc1);
+    let admin = id_admin.owner;
+    let admin_pub = [0u8; 64];
     let admin_signing = signing_key_from(&id_admin);
 
     let mut resolver_map = std::collections::HashMap::new();
@@ -791,9 +806,9 @@ async fn replay_of_same_root_publish_is_idempotent() {
     let community_id = SpaceId([4u8; 16]);
     let mk = EpochKey::new([0x88; 32]);
 
-    let id_admin = PrivateIdentity::from_seed(&[0xd1; 32]);
-    let admin = OwnerAddr(id_admin.identity.address_hash);
-    let admin_pub = id_admin.identity.to_public_bytes();
+    let id_admin = mint_test_owner(0xd1);
+    let admin = id_admin.owner;
+    let admin_pub = [0u8; 64];
     let admin_signing = signing_key_from(&id_admin);
 
     let mut resolver_map = std::collections::HashMap::new();
@@ -1050,9 +1065,9 @@ async fn spoofed_publish_does_not_block_real_publisher() {
     // with `alice_signing`; both registries' resolvers map
     // `alice_addr → alice_pub` so receive-side sig-verify can rebuild
     // the public key it checks the signature against.
-    let id_alice = PrivateIdentity::from_seed(&[0xa1; 32]);
-    let alice_addr = OwnerAddr(id_alice.identity.address_hash);
-    let alice_pub = id_alice.identity.to_public_bytes();
+    let id_alice = mint_test_owner(0xa1);
+    let alice_addr = id_alice.owner;
+    let alice_pub = [0u8; 64];
     let alice_signing = signing_key_from(&id_alice);
 
     // Bob — the attacker. Bob is also a community member (so Bob has
@@ -1064,9 +1079,9 @@ async fn spoofed_publish_does_not_block_real_publisher() {
     // shared MK + per-event sigs — Bob's spoof would have advanced B's
     // tracker for `(alice_addr, "a-dev")` to HLC `huge`, censoring
     // every subsequent legitimate Alice publish.
-    let id_bob = PrivateIdentity::from_seed(&[0xb1; 32]);
-    let bob_addr = OwnerAddr(id_bob.identity.address_hash);
-    let bob_pub = id_bob.identity.to_public_bytes();
+    let id_bob = mint_test_owner(0xb1);
+    let bob_addr = id_bob.owner;
+    let bob_pub = [0u8; 64];
     let bob_signing = signing_key_from(&id_bob);
 
     // Both Alice and Bob in the resolver. Alice is the publisher we're
@@ -1532,17 +1547,17 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
     // Alice is the admin AND the publisher under test. She'll Join then
     // Leave — exercising the tracker's behavior across a Leave so we
     // can verify her per-device entry survives the membership change.
-    let id_alice = PrivateIdentity::from_seed(&[0xa1; 32]);
-    let alice_addr = OwnerAddr(id_alice.identity.address_hash);
-    let alice_pub = id_alice.identity.to_public_bytes();
+    let id_alice = mint_test_owner(0xa1);
+    let alice_addr = id_alice.owner;
+    let alice_pub = [0u8; 64];
     let alice_signing = signing_key_from(&id_alice);
 
     // B is a passive observer — receives Alice's publishes, surfaces
     // tracker advances. B doesn't publish in this test, but the
     // registry config requires a real signing key + self_owner, so we
     // give B a distinct identity.
-    let id_b = PrivateIdentity::from_seed(&[0xb1; 32]);
-    let b_owner = OwnerAddr(id_b.identity.address_hash);
+    let id_b = mint_test_owner(0xb1);
+    let b_owner = id_b.owner;
     let b_signing = signing_key_from(&id_b);
 
     // Resolver carries both Alice and B's identity_pubs. Receive-side
@@ -1550,7 +1565,7 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
     // every publish A signs.
     let mut resolver_map = std::collections::HashMap::new();
     resolver_map.insert(alice_addr, alice_pub);
-    resolver_map.insert(b_owner, id_b.identity.to_public_bytes());
+    resolver_map.insert(b_owner, [0u8; 64]);
     let resolver: Arc<dyn IdentityResolver> = Arc::new(StaticResolver { map: resolver_map });
 
     // Wire: A's publisher → B's subscriber. One-way — B never publishes.
@@ -1917,8 +1932,8 @@ async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
         Duration::from_millis(1000),
     ));
 
-    let identity = PrivateIdentity::from_seed(&[0xab; 32]);
-    let self_owner = OwnerAddr(identity.identity.address_hash);
+    let identity = mint_test_owner(0xab);
+    let self_owner = identity.owner;
     let signing_key = signing_key_from(&identity);
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1988,8 +2003,7 @@ async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
         "test-dev".into(),
         self_owner,
         Arc::clone(&signing_key),
-        // ZEB-339: synthetic cert (compile/wiring only — allowed-RED until Task 10).
-        harmony_app::community_membership::mint_test_owner(0).cert,
+        identity.cert.clone(),
         Arc::clone(&registry),
         adapter_tx,
         channel_log_registry,
@@ -2112,12 +2126,12 @@ mod task3_kick_setpower_round_trip {
     }
 
     async fn build_fixture(seed_a: u8, seed_b: u8) -> Fixture {
-        let identity_a = PrivateIdentity::from_seed(&[seed_a; 32]);
-        let identity_b = PrivateIdentity::from_seed(&[seed_b; 32]);
-        let owner_a = OwnerAddr(identity_a.identity.address_hash);
-        let owner_b = OwnerAddr(identity_b.identity.address_hash);
-        let pub_a = identity_a.identity.to_public_bytes();
-        let pub_b = identity_b.identity.to_public_bytes();
+        let identity_a = mint_test_owner(seed_a);
+        let identity_b = mint_test_owner(seed_b);
+        let owner_a = identity_a.owner;
+        let owner_b = identity_b.owner;
+        let pub_a = [0u8; 64];
+        let pub_b = [0u8; 64];
         let signing_a = signing_key_from(&identity_a);
         let signing_b = signing_key_from(&identity_b);
 
@@ -2176,7 +2190,7 @@ mod task3_kick_setpower_round_trip {
             false,
             owner_a,
             &signing_a,
-            &harmony_app::community_membership::mint_test_owner(0).cert,
+            &identity_a.cert,
             Hlc {
                 wall_ms: 100_000,
                 logical: 0,
@@ -2308,7 +2322,7 @@ mod task3_kick_setpower_round_trip {
             &invite_payload,
             owner_b,
             &signing_b,
-            &harmony_app::community_membership::mint_test_owner(0).cert,
+            &identity_b.cert,
             Hlc {
                 wall_ms: 200_000,
                 logical: 0,
@@ -2548,14 +2562,30 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         }
     }
 
+    // ZEB-339: the admin-bootstrap + InviteToken path still uses the IDENTITY
+    // model (verify_admin_bootstrap binds admin_identity_pub → admin_addr and
+    // verifies the bootstrap sig against it), so Alice is a PrivateIdentity here
+    // and her bootstrap Join is signed by her identity key. The invite-only
+    // payload additionally carries her enrolled-device cert (inviter_enrollment).
     let alice = PrivateIdentity::from_seed(&[0xa1; 32]);
     let alice_addr = OwnerAddr(alice.identity.address_hash);
     let alice_pub = alice.identity.to_public_bytes();
+    let alice_signing = {
+        let priv_bytes = alice.to_private_bytes();
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&priv_bytes[32..64]);
+        Arc::new(ed25519_dalek::SigningKey::from_bytes(&seed))
+    };
 
+    // ZEB-339: Bob (the joiner) is an enrolled-device owner — his redemption
+    // Join's actor = owner_id, signed by his device key, carrying his Master
+    // cert (passed into redeem_invite_inner). A separate PrivateIdentity backs
+    // the DM-layer DmOutbox plumbing (unrelated to community Join verification).
+    let bob_owner = mint_test_owner(0xB2);
+    let bob_addr = bob_owner.owner;
+    let bob_signing_key = signing_key_from(&bob_owner);
     let bob = Arc::new(PrivateIdentity::from_seed(&[0xb2; 32]));
-    let bob_addr = OwnerAddr(bob.identity.address_hash);
     let bob_device_hash = DeviceIdentityHash(bob.identity.address_hash);
-    let bob_signing_key = signing_key_from(&bob);
 
     // Build an invite-only URL Alice would have generated for Bob. The
     // InviteToken sig is computed via `PrivateIdentity::sign` over the
@@ -2604,8 +2634,10 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
                 device_id: "alice-dev".into(),
             },
         };
-        sign_event_with_identity(&payload, &alice).expect("sign admin bootstrap")
+        harmony_app::community_membership::sign_event_with_identity(&payload, &alice)
+            .expect("sign admin bootstrap")
     };
+    let _ = &alice_signing;
     // CR Major (PR #106 R6): use a real sealed_epoch_key so the snapshot
     // decrypts successfully and any Err must come from the intended
     // "inviter unreachable" rollback branch, not from AEAD failure.
@@ -2637,7 +2669,10 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         admin_identity_pub: Some(alice_pub),
         forked_from: None,
         pre_fork_snapshot: None,
-        inviter_enrollment: None,
+        // ZEB-339: invite-only payloads must carry the inviter's EnrollmentCert.
+        // This test fails before the joiner verifies it (inviter unreachable →
+        // timeout → rollback), so any valid cert satisfies the presence check.
+        inviter_enrollment: Some(mint_test_owner(0xA1).cert),
     })
     .expect("encode URL");
 
@@ -2759,8 +2794,7 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         "bob-dev".into(),
         bob_addr,
         Arc::clone(&bob_signing_key),
-        // ZEB-339: synthetic cert (compile/wiring only — allowed-RED until Task 10).
-        harmony_app::community_membership::mint_test_owner(0).cert,
+        bob_owner.cert.clone(),
         Arc::clone(&registry),
         adapter_tx,
         unicast_tx,
