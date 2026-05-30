@@ -71,6 +71,7 @@ fn open_invite_url_for(community_id: SpaceId, admin_seed: [u8; 32]) -> String {
         admin_identity_pub: None,
         forked_from: None,
         pre_fork_snapshot: None,
+        inviter_enrollment: None,
     };
     encode_invite_url(&payload).expect("encode open invite url")
 }
@@ -97,6 +98,8 @@ fn invite_only_url() -> String {
         },
         sig: [0u8; 64],
         countersig: None,
+        // ZEB-339: bootstrap-Join must embed the admin's EnrollmentCert.
+        enrollment: Some(harmony_app::community_membership::mint_test_owner(0xC2).cert),
     };
     let payload = CommunityInvitePayload {
         community_id,
@@ -124,6 +127,10 @@ fn invite_only_url() -> String {
         admin_identity_pub: Some([0u8; 64]),
         forked_from: None,
         pre_fork_snapshot: None,
+        // ZEB-339: encode_invite_url requires invite-only payloads to carry the
+        // inviter's EnrollmentCert. Its content is irrelevant — this URL must be
+        // rejected at receive (verify_entry rejects invite-only directory entries).
+        inviter_enrollment: Some(harmony_app::community_membership::mint_test_owner(0xC1).cert),
     };
     encode_invite_url(&payload).expect("encode invite-only url")
 }
@@ -685,6 +692,7 @@ async fn click_to_join_redeem_invite_smoke() {
         admin_identity_pub: None,
         forked_from: None,
         pre_fork_snapshot: None,
+        inviter_enrollment: None,
     };
     let founder_invite_url =
         harmony_app::build_open_invite_url(&invite_payload).expect("build open invite url");
@@ -741,15 +749,16 @@ async fn click_to_join_redeem_invite_smoke() {
     // channels whose receivers are kept alive so try_send doesn't
     // observe Closed.
     let tmp = tempfile::TempDir::new().expect("tempdir");
+    // ZEB-339: the joiner is an enrolled-device owner — actor = owner_id, its
+    // redemption Join is signed by the device key (#2) and carries the joiner's
+    // Master enrollment cert (passed into redeem_invite_inner). A separate
+    // PrivateIdentity backs the DM-layer DmOutbox plumbing below (unrelated to
+    // community membership verification).
+    let joiner = harmony_app::community_membership::mint_test_owner(0xBB);
+    let joiner_owner = joiner.owner;
+    let joiner_pub_64 = [0u8; 64];
+    let joiner_signing_key = Arc::new(joiner.device_key.clone());
     let joiner_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
-    let joiner_owner = OwnerAddr(joiner_identity.identity.address_hash);
-    let joiner_pub_64 = joiner_identity.identity.to_public_bytes();
-    let joiner_signing_key = {
-        let private_bytes = joiner_identity.to_private_bytes();
-        let mut secret = [0u8; 32];
-        secret.copy_from_slice(&private_bytes[32..64]);
-        Arc::new(ed25519_dalek::SigningKey::from_bytes(&secret))
-    };
 
     // Identity resolver — admits the joiner's own signature on the
     // bootstrap Join. Founder isn't reached on the OPEN path (no
@@ -813,12 +822,20 @@ async fn click_to_join_redeem_invite_smoke() {
         mpsc::channel::<harmony_app::event_loop::CommunityAdapterRequest>(16);
     let (unicast_send_tx, _unicast_rx) = mpsc::channel::<UnicastSendRequest>(16);
 
+    // ZEB-339: use joiner's real owner material (seed 0xBB) for community
+    // signing so DmOutbox::new's debug_assert passes (cert.owner_id == joiner_owner).
+    let joiner_community_sk_lib = Arc::new(ed25519_dalek::SigningKey::from_bytes(
+        &joiner.device_key.to_bytes(),
+    ));
+    let joiner_enrollment_lib = joiner.cert.clone();
     let dm_outbox = Arc::new(Mutex::new(DmOutbox::new(
         "joiner-dev".into(),
         joiner_owner,
         DeviceIdentityHash(joiner_identity.identity.address_hash),
         Arc::clone(&joiner_signing_key),
         Arc::new(joiner_identity),
+        joiner_community_sk_lib,
+        joiner_enrollment_lib,
     )));
 
     let (channel_log_adapter_tx, _channel_log_adapter_rx) =
@@ -854,6 +871,7 @@ async fn click_to_join_redeem_invite_smoke() {
         "joiner-dev".into(),
         joiner_owner,
         Arc::clone(&joiner_signing_key),
+        joiner.cert.clone(),
         Arc::clone(&community_registry),
         community_adapter_tx,
         unicast_send_tx,

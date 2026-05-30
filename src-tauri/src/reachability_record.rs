@@ -148,6 +148,42 @@ pub fn build_signed_payload(
     })
 }
 
+/// ZEB-339: sign a fresh `ReachabilityAnnouncePayload`'s inner
+/// `identity_signature` with the harmony-owner ENROLLED device key (#2).
+///
+/// T4 rewired RCH2 verification to check the inner `identity_signature`
+/// against the resolved enrolled device key (not the Reticulum identity),
+/// so the production reachability mint MUST sign the inner sig with device
+/// #2. Caller is responsible for ensuring `actor` matches the enrolled
+/// device key's owner.
+pub fn build_signed_payload_with_key(
+    iroh_node_id: [u8; 32],
+    home_relay_url: String,
+    direct_addresses: Vec<SocketAddr>,
+    announced_at_ms: u64,
+    actor: &OwnerAddr,
+    hlc: &Hlc,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<ReachabilityAnnouncePayload, CryptoError> {
+    use ed25519_dalek::Signer;
+    let inner = inner_signed_bytes(
+        &iroh_node_id,
+        &home_relay_url,
+        &direct_addresses,
+        announced_at_ms,
+        actor,
+        hlc,
+    )?;
+    let sig = signing_key.sign(&inner).to_bytes();
+    Ok(ReachabilityAnnouncePayload {
+        iroh_node_id,
+        home_relay_url,
+        direct_addresses,
+        announced_at_ms,
+        identity_signature: sig,
+    })
+}
+
 /// Verify the inner identity signature against the given Ed25519
 /// verifying key — the 32-byte Ed25519 half of the 64-byte
 /// `harmony_identity::Identity::to_public_bytes()`.
@@ -254,6 +290,59 @@ mod tests {
         .expect("sign");
 
         verify_inner_signature(&p, &actor, &hlc, &public.verifying_key).expect("verify");
+    }
+
+    /// ZEB-339: verify `build_signed_payload_with_key` (the enrolled-device
+    /// variant) produces a payload whose inner signature verifies under the
+    /// matching `VerifyingKey`, and FAILS if either the actor (OwnerAddr) or
+    /// the HLC used to compute the signed bytes is mutated.
+    #[test]
+    fn build_signed_payload_with_key_verifies_and_rejects_mutation() {
+        // Fixed, deterministic ed25519 keypair from a known seed.
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+
+        let actor = OwnerAddr([0xAA; 16]);
+        let hlc = Hlc {
+            wall_ms: 1_700_000_000_000,
+            logical: 0,
+            device_id: "test-dev".into(),
+        };
+
+        let p = build_signed_payload_with_key(
+            [0xAB; 32],
+            "https://derp.example/".into(),
+            vec![],
+            1_700_000_000_000,
+            &actor,
+            &hlc,
+            &signing_key,
+        )
+        .expect("build_signed_payload_with_key");
+
+        // Correct actor + hlc: signature must verify.
+        verify_inner_signature(&p, &actor, &hlc, &verifying_key)
+            .expect("inner sig must verify with correct actor + hlc");
+
+        // Mutated actor: signature must FAIL.
+        let wrong_actor = OwnerAddr([0xBB; 16]);
+        assert_eq!(
+            verify_inner_signature(&p, &wrong_actor, &hlc, &verifying_key),
+            Err(InnerSigError::Invalid),
+            "inner sig must fail with wrong actor"
+        );
+
+        // Mutated HLC: signature must FAIL.
+        let wrong_hlc = Hlc {
+            wall_ms: 1_700_000_000_001, // one ms later
+            logical: 0,
+            device_id: "test-dev".into(),
+        };
+        assert_eq!(
+            verify_inner_signature(&p, &actor, &wrong_hlc, &verifying_key),
+            Err(InnerSigError::Invalid),
+            "inner sig must fail with wrong hlc"
+        );
     }
 
     #[test]

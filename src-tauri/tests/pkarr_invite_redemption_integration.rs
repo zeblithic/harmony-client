@@ -63,6 +63,7 @@ fn fixture_invite_payload(inviter: OwnerAddr) -> CommunityInvitePayload {
         admin_identity_pub: None,
         forked_from: None,
         pre_fork_snapshot: None,
+        inviter_enrollment: None,
     }
 }
 

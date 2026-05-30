@@ -292,15 +292,17 @@ async fn pending_redemption_oneshot_fires_when_event_id_inserts_via_local() {
         }
     }
 
-    let identity = harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]);
-    let admin_addr = OwnerAddr(identity.identity.address_hash);
-    let admin_pub = identity.identity.to_public_bytes();
-    let admin_sk = {
-        let priv_bytes = identity.to_private_bytes();
-        let mut seed = [0u8; 32];
-        seed.copy_from_slice(&priv_bytes[32..64]);
-        Arc::new(ed25519_dalek::SigningKey::from_bytes(&seed))
-    };
+    // ZEB-339: enrolled-device owner — actor = owner_id, the self-Join is signed
+    // by the device key and carries the owner's EnrollmentCert so verify_event
+    // resolves the signer from the cert (not via AdminResolver) and the
+    // pending-redemption oneshot fires on insert.
+    // `admin_pub` is zeroed ([0u8;64]) to assert that the AdminResolver is
+    // intentionally NOT consulted during cert-bearing Join verification — the
+    // EnrollmentCert binding takes precedence.
+    let owner = harmony_app::community_membership::mint_test_owner(0x55);
+    let admin_addr = owner.owner;
+    let admin_pub = [0u8; 64]; // zeroed: AdminResolver NOT consulted for cert-bearing Joins
+    let admin_sk = Arc::new(owner.device_key.clone());
 
     let (cas_op_tx, _cas_op_rx) = mpsc::channel(8);
     let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
@@ -338,21 +340,24 @@ async fn pending_redemption_oneshot_fires_when_event_id_inserts_via_local() {
 
     // Mint a self-Join event and register a oneshot keyed on its EventId.
     let event_id = [0x77u8; 16];
-    let join = sign_event(
-        &EventPayload {
-            id: event_id,
-            community_id: cid,
-            kind: MembershipEventKind::Join,
-            actor: admin_addr,
-            at: Hlc {
-                wall_ms: 1000,
-                logical: 0,
-                device_id: "admin-dev".into(),
+    let join = harmony_app::community_membership::SignedMembershipEvent {
+        enrollment: Some(owner.cert.clone()),
+        ..sign_event(
+            &EventPayload {
+                id: event_id,
+                community_id: cid,
+                kind: MembershipEventKind::Join,
+                actor: admin_addr,
+                at: Hlc {
+                    wall_ms: 1000,
+                    logical: 0,
+                    device_id: "admin-dev".into(),
+                },
             },
-        },
-        admin_sk.as_ref(),
-    )
-    .unwrap();
+            admin_sk.as_ref(),
+        )
+        .unwrap()
+    };
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     registry.register_pending_redemption(event_id, tx).await;
@@ -390,15 +395,17 @@ async fn pending_redemption_unregistered_when_no_match() {
         }
     }
 
-    let identity = harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]);
-    let admin_addr = OwnerAddr(identity.identity.address_hash);
-    let admin_pub = identity.identity.to_public_bytes();
-    let admin_sk = {
-        let priv_bytes = identity.to_private_bytes();
-        let mut seed = [0u8; 32];
-        seed.copy_from_slice(&priv_bytes[32..64]);
-        Arc::new(ed25519_dalek::SigningKey::from_bytes(&seed))
-    };
+    // ZEB-339: enrolled-device owner — actor = owner_id, the self-Join is signed
+    // by the device key and carries the owner's EnrollmentCert so verify_event
+    // resolves the signer from the cert (not via AdminResolver) and the
+    // pending-redemption oneshot fires on insert.
+    // `admin_pub` is zeroed ([0u8;64]) to assert that the AdminResolver is
+    // intentionally NOT consulted during cert-bearing Join verification — the
+    // EnrollmentCert binding takes precedence.
+    let owner = harmony_app::community_membership::mint_test_owner(0x55);
+    let admin_addr = owner.owner;
+    let admin_pub = [0u8; 64]; // zeroed: AdminResolver NOT consulted for cert-bearing Joins
+    let admin_sk = Arc::new(owner.device_key.clone());
 
     let (cas_op_tx, _cas_op_rx) = mpsc::channel(8);
     let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
@@ -441,21 +448,24 @@ async fn pending_redemption_unregistered_when_no_match() {
     let inserted_id = [0x11u8; 16];
     assert_ne!(registered_id, inserted_id);
 
-    let join = sign_event(
-        &EventPayload {
-            id: inserted_id,
-            community_id: cid,
-            kind: MembershipEventKind::Join,
-            actor: admin_addr,
-            at: Hlc {
-                wall_ms: 1000,
-                logical: 0,
-                device_id: "admin-dev".into(),
+    let join = harmony_app::community_membership::SignedMembershipEvent {
+        enrollment: Some(owner.cert.clone()),
+        ..sign_event(
+            &EventPayload {
+                id: inserted_id,
+                community_id: cid,
+                kind: MembershipEventKind::Join,
+                actor: admin_addr,
+                at: Hlc {
+                    wall_ms: 1000,
+                    logical: 0,
+                    device_id: "admin-dev".into(),
+                },
             },
-        },
-        admin_sk.as_ref(),
-    )
-    .unwrap();
+            admin_sk.as_ref(),
+        )
+        .unwrap()
+    };
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     registry

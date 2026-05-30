@@ -1,13 +1,41 @@
 //! Unit tests for community_state_crdt.rs Phase 2 types.
 
 use harmony_app::community_membership::{
-    sign_event_with_identity, EventPayload, MemberStatus, MembershipEventKind, VerifyContext,
-    VerifyError,
+    mint_test_owner, sign_event, EventPayload, MemberStatus, MembershipEventKind,
+    SignedMembershipEvent, TestOwner, VerifyContext, VerifyError,
 };
 use harmony_app::community_state_crdt::{CommunityState, InsertOutcome};
 use harmony_app::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
 use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
-use harmony_identity::PrivateIdentity;
+
+/// ZEB-339: build a deterministic enrolled-device owner. Returns
+/// `(TestOwner, dummy_pub, owner_addr)` so existing `(identity, pub, addr)`
+/// destructures keep compiling; the actor is `owner.owner` (owner_id) and
+/// events are signed by the enrolled device key (#2).
+fn make_test_identity(seed: u8) -> (TestOwner, [u8; 64], OwnerAddr) {
+    let owner = mint_test_owner(seed);
+    let addr = owner.owner;
+    (owner, [0u8; 64], addr)
+}
+
+/// ZEB-339: sign a membership event with the owner's enrolled device key,
+/// attaching the Master cert on identity-introducing events (Join/PendingJoin)
+/// so materialize/insert populates `enrolled_device_keys`.
+fn sign_event_with_identity(
+    payload: &EventPayload,
+    owner: &TestOwner,
+) -> Result<SignedMembershipEvent, harmony_app::owner_state_crypto::CryptoError> {
+    let ev = sign_event(payload, &owner.device_key)?;
+    Ok(match ev.kind {
+        MembershipEventKind::Join | MembershipEventKind::PendingJoin { .. } => {
+            SignedMembershipEvent {
+                enrollment: Some(owner.cert.clone()),
+                ..ev
+            }
+        }
+        _ => ev,
+    })
+}
 
 #[test]
 fn empty_community_state_round_trips() {
@@ -16,13 +44,6 @@ fn empty_community_state_round_trips() {
     let decoded: CommunityState = canonical_cbor_decode(&bytes).expect("decode");
     assert_eq!(decoded.community_id, s.community_id);
     assert!(decoded.events.is_empty());
-}
-
-fn make_test_identity(seed: u8) -> (PrivateIdentity, [u8; 64], OwnerAddr) {
-    let identity = PrivateIdentity::from_seed(&[seed; 32]);
-    let identity_pub = identity.identity.to_public_bytes();
-    let addr = OwnerAddr(identity.identity.address_hash);
-    (identity, identity_pub, addr)
 }
 
 fn hlc(wall_ms: u64) -> Hlc {
@@ -35,7 +56,7 @@ fn hlc(wall_ms: u64) -> Hlc {
 
 #[test]
 fn insert_rejects_event_with_wrong_community() {
-    let (identity, identity_pub, addr) = make_test_identity(0xa1);
+    let (identity, _identity_pub, addr) = make_test_identity(0xa1);
     let community_id = SpaceId([1u8; 16]);
     let other_community = SpaceId([2u8; 16]);
 
@@ -55,9 +76,6 @@ fn insert_rejects_event_with_wrong_community() {
             expected_community_id: community_id,
             admin_addr: addr,
             is_invite_only: false,
-            actor_identity_pub: &identity_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         },
     );
 
@@ -73,7 +91,7 @@ fn insert_rejects_event_with_wrong_community() {
 
 #[test]
 fn insert_accepts_admin_self_join_in_open_community() {
-    let (identity, identity_pub, addr) = make_test_identity(0xa1);
+    let (identity, _identity_pub, addr) = make_test_identity(0xa1);
     let community_id = SpaceId([1u8; 16]);
 
     let payload = EventPayload {
@@ -93,9 +111,6 @@ fn insert_accepts_admin_self_join_in_open_community() {
             expected_community_id: community_id,
             admin_addr: addr,
             is_invite_only: false,
-            actor_identity_pub: &identity_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         },
     );
 
@@ -106,7 +121,7 @@ fn insert_accepts_admin_self_join_in_open_community() {
 
 #[test]
 fn insert_is_idempotent_on_duplicate_event_id() {
-    let (identity, identity_pub, addr) = make_test_identity(0xa1);
+    let (identity, _identity_pub, addr) = make_test_identity(0xa1);
     let community_id = SpaceId([1u8; 16]);
 
     let payload = EventPayload {
@@ -123,9 +138,6 @@ fn insert_is_idempotent_on_duplicate_event_id() {
         expected_community_id: community_id,
         admin_addr: addr,
         is_invite_only: false,
-        actor_identity_pub: &identity_pub,
-        countersigner_identity_pub: None,
-        admin_identity_pub: None,
     };
     assert_eq!(
         state.insert_event(event.clone(), &ctx),
@@ -139,7 +151,7 @@ fn insert_is_idempotent_on_duplicate_event_id() {
 /// Returned tuple matches the call-site shape of the other tests so
 /// future tests can extend the log without rewriting setup.
 fn state_with_admin_self_join(seed: u8, community_id: SpaceId) -> (CommunityState, OwnerAddr) {
-    let (identity, identity_pub, addr) = make_test_identity(seed);
+    let (identity, _identity_pub, addr) = make_test_identity(seed);
     let payload = EventPayload {
         id: [3u8; 16],
         community_id,
@@ -155,9 +167,6 @@ fn state_with_admin_self_join(seed: u8, community_id: SpaceId) -> (CommunityStat
             expected_community_id: community_id,
             admin_addr: addr,
             is_invite_only: false,
-            actor_identity_pub: &identity_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         },
     );
     assert_eq!(outcome, InsertOutcome::Inserted);
@@ -179,7 +188,7 @@ fn materialize_now_reflects_admin_self_join() {
 
 #[test]
 fn materialized_cache_returns_same_object_until_insert() {
-    let (identity, identity_pub, addr) = make_test_identity(0xa1);
+    let (identity, _identity_pub, addr) = make_test_identity(0xa1);
     let community_id = SpaceId([1u8; 16]);
     let mut state = CommunityState::new(community_id);
 
@@ -207,9 +216,6 @@ fn materialized_cache_returns_same_object_until_insert() {
             expected_community_id: community_id,
             admin_addr: addr,
             is_invite_only: false,
-            actor_identity_pub: &identity_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         },
     );
 

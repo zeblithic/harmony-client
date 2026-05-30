@@ -40,7 +40,6 @@ use harmony_app::content_store::{CasOp, ContentStore, RuntimeContentStore};
 use harmony_app::dm_outbox::reserve_next_hlc_for_device;
 use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 use harmony_app::{mint_community_creation, mint_kick_event, mint_redemption};
-use harmony_identity::PrivateIdentity;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
@@ -62,37 +61,28 @@ impl IdentityResolver for ThreeWayResolver {
     }
 }
 
-fn signing_key_from(identity: &PrivateIdentity) -> Arc<ed25519_dalek::SigningKey> {
-    let bytes = identity.to_private_bytes();
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&bytes[32..64]);
-    Arc::new(ed25519_dalek::SigningKey::from_bytes(&seed))
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
     // ── Setup: admin Alice (power 100), two kick targets Bob/Carol ──
-    let alice = PrivateIdentity::from_seed(&[0xa1; 32]);
-    let bob = PrivateIdentity::from_seed(&[0xb0; 32]);
-    let carol = PrivateIdentity::from_seed(&[0xc0; 32]);
+    let alice = harmony_app::community_membership::mint_test_owner(0xA1);
+    let bob = harmony_app::community_membership::mint_test_owner(0xB0);
+    let carol = harmony_app::community_membership::mint_test_owner(0xC0);
 
-    let alice_addr = OwnerAddr(alice.identity.address_hash);
-    let bob_addr = OwnerAddr(bob.identity.address_hash);
-    let carol_addr = OwnerAddr(carol.identity.address_hash);
+    let alice_addr = alice.owner;
+    let bob_addr = bob.owner;
+    let carol_addr = carol.owner;
 
-    let alice_pub = alice.identity.to_public_bytes();
-    let bob_pub = bob.identity.to_public_bytes();
-    let carol_pub = carol.identity.to_public_bytes();
+    let alice_signing = Arc::new(alice.device_key.clone());
+    let bob_signing = Arc::new(bob.device_key.clone());
+    let carol_signing = Arc::new(carol.device_key.clone());
 
-    let alice_signing = signing_key_from(&alice);
-    let bob_signing = signing_key_from(&bob);
-    let carol_signing = signing_key_from(&carol);
-
+    // ZEB-339: signer resolution uses the EnrollmentCert / materialized enrolled
+    // keys, not the resolver — so the resolver's identity_pubs are unused here.
     let resolver: Arc<dyn IdentityResolver> = Arc::new(ThreeWayResolver {
         entries: vec![
-            (alice_addr, alice_pub),
-            (bob_addr, bob_pub),
-            (carol_addr, carol_pub),
+            (alice_addr, [0u8; 64]),
+            (bob_addr, [0u8; 64]),
+            (carol_addr, [0u8; 64]),
         ],
     });
 
@@ -141,6 +131,7 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
         false, // open
         alice_addr,
         &alice_signing,
+        &alice.cert,
         bootstrap_hlc,
     )
     .expect("mint_community_creation");
@@ -211,8 +202,12 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
         admin_identity_pub: None,
         forked_from: None,
         pre_fork_snapshot: None,
+        inviter_enrollment: None,
     };
-    for (target_addr, target_signing) in [(bob_addr, &bob_signing), (carol_addr, &carol_signing)] {
+    for (target_addr, target_signing, target_cert) in [
+        (bob_addr, &bob_signing, &bob.cert),
+        (carol_addr, &carol_signing, &carol.cert),
+    ] {
         // Reserve against the TARGET's own device id, not Alice's
         // device id — the resulting Join is self-authored by the
         // target, so the tracker entry that should advance is
@@ -229,6 +224,7 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
             &invite_payload,
             target_addr,
             target_signing,
+            target_cert,
             target_join_hlc,
         )
         .expect("mint_redemption");

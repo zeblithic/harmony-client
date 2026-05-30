@@ -66,6 +66,7 @@ fn community_invite_payload_round_trips_open_form() {
         admin_identity_pub: None,
         forked_from: None,
         pre_fork_snapshot: None,
+        inviter_enrollment: None,
     };
 
     let bytes = canonical_cbor_encode(&p).expect("encode");
@@ -111,6 +112,7 @@ fn community_invite_payload_round_trips_invite_only_form() {
         admin_identity_pub: None,
         forked_from: None,
         pre_fork_snapshot: None,
+        inviter_enrollment: None,
     };
 
     let bytes = canonical_cbor_encode(&p).expect("encode");
@@ -180,6 +182,7 @@ fn invite_url_round_trips_open_payload() {
         admin_identity_pub: None,
         forked_from: None,
         pre_fork_snapshot: None,
+        inviter_enrollment: None,
     };
 
     let url = encode_invite_url(&payload).expect("encode");
@@ -254,6 +257,7 @@ fn decode_trims_whitespace() {
         admin_identity_pub: None,
         forked_from: None,
         pre_fork_snapshot: None,
+        inviter_enrollment: None,
     };
     let url = encode_invite_url(&payload).expect("encode");
     let padded = format!("  \n{url}\t  ");
@@ -316,6 +320,7 @@ fn encode_rejects_open_community_with_admin_identity_pub_set() {
         admin_identity_pub: Some([0xAB; 64]),
         forked_from: None,
         pre_fork_snapshot: None,
+        inviter_enrollment: None,
     };
     assert!(matches!(
         encode_invite_url(&payload).unwrap_err(),
@@ -368,6 +373,7 @@ fn encode_rejects_open_community_with_admin_bootstrap_set() {
         admin_identity_pub: None,
         forked_from: None,
         pre_fork_snapshot: None,
+        inviter_enrollment: None,
     };
     assert!(matches!(
         encode_invite_url(&payload).unwrap_err(),
@@ -575,42 +581,81 @@ mod verify_rejection_tests {
     use harmony_app::community_membership::{sign_event, EventPayload, MembershipEventKind};
     use harmony_app::owner_state_types::{DeviceIdentityHash, Hlc, OwnerAddr, SpaceId};
 
-    /// Common harness: build a fully valid CommunityInviteSigned + a
-    /// matching InviteToken signed by `self_identity`. Tests then mutate
-    /// one field and assert the right reject discriminant.
-    fn make_valid_packet(
-        self_identity: &harmony_identity::PrivateIdentity,
+    /// Extract the ed25519 signing key embedded in a `PrivateIdentity`
+    /// (bytes 32..64 of `to_private_bytes()`). Used to produce a device-key
+    /// analogue for counter-signer identities in unit tests where a full
+    /// `TestOwner` (mint_test_owner) isn't needed.
+    fn device_sk_from_identity(
+        id: &harmony_identity::PrivateIdentity,
+    ) -> ed25519_dalek::SigningKey {
+        let priv_bytes = id.to_private_bytes();
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&priv_bytes[32..64]);
+        ed25519_dalek::SigningKey::from_bytes(&seed)
+    }
+
+    /// Mint a ZEB-339 enrolled-device Join event for use in verify_packet tests.
+    ///
+    /// **Dual-identity pattern**: this helper mints a `TestOwner` (seed derived
+    /// from `joiner_identity`) which carries the enrolled device key (#2) used
+    /// as the event actor and signer. The returned `joiner_pub` is the SEPARATE
+    /// Reticulum `joiner_identity_pub` (64-byte combined [x25519 || ed25519]),
+    /// used for DM/transport layer. Importantly, `joiner.owner` (the community
+    /// actor) does NOT equal the `OwnerAddr` derived from `joiner_identity` (the
+    /// Reticulum transport identity) — they are from different key systems.
+    /// This mirrors production: a user has a harmony-owner master key (community
+    /// actor) and a separate Reticulum identity key (DM/transport).
+    fn minted_join_event(
         joiner_identity: &harmony_identity::PrivateIdentity,
         community_id: SpaceId,
-    ) -> CommunityInviteSigned {
-        let self_owner = OwnerAddr(self_identity.identity.address_hash);
-        let joiner_owner = OwnerAddr(joiner_identity.identity.address_hash);
-        let joiner_pub = joiner_identity.identity.to_public_bytes();
-        let joiner_sk = {
-            let priv_bytes = joiner_identity.to_private_bytes();
-            let mut seed = [0u8; 32];
-            seed.copy_from_slice(&priv_bytes[32..64]);
-            ed25519_dalek::SigningKey::from_bytes(&seed)
-        };
+    ) -> (
+        harmony_app::community_membership::SignedMembershipEvent,
+        OwnerAddr,
+        [u8; 64],
+    ) {
+        let seed = joiner_identity.identity.address_hash[0] | 0x01;
+        let joiner = harmony_app::community_membership::mint_test_owner(seed);
         let join_event = sign_event(
             &EventPayload {
                 id: [0x44; 16],
                 community_id,
                 kind: MembershipEventKind::Join,
-                actor: joiner_owner,
+                actor: joiner.owner,
                 at: Hlc {
                     wall_ms: 1000,
                     logical: 0,
                     device_id: "j".into(),
                 },
             },
-            &joiner_sk,
+            &joiner.device_key,
         )
         .expect("sign Join");
+        let join_event = harmony_app::community_membership::SignedMembershipEvent {
+            enrollment: Some(joiner.cert.clone()),
+            ..join_event
+        };
+        let joiner_pub = joiner_identity.identity.to_public_bytes();
+        (join_event, joiner.owner, joiner_pub)
+    }
 
-        // Build an InviteToken signed by self over the same canonical bytes
-        // verify_packet_pure reconstructs (mirrors the v1 single-shot
-        // inviter-must-be-self contract).
+    /// Build a fully valid `CommunityInviteSigned`. The InviteToken is signed
+    /// by `self_device_sk` (ZEB-339: must match what `verify_packet_pure` step
+    /// 6 verifies — the counter-signer's enrolled device key, not the Reticulum
+    /// identity key).
+    fn make_valid_packet(
+        self_identity: &harmony_identity::PrivateIdentity,
+        self_device_sk: &ed25519_dalek::SigningKey,
+        joiner_identity: &harmony_identity::PrivateIdentity,
+        community_id: SpaceId,
+    ) -> CommunityInviteSigned {
+        use ed25519_dalek::Signer as _;
+        let self_owner = OwnerAddr(self_identity.identity.address_hash);
+        let (join_event, joiner_owner, joiner_pub) =
+            minted_join_event(joiner_identity, community_id);
+
+        // Build an InviteToken signed by the counter-signer's enrolled device
+        // key (#2). ZEB-339: verify_packet_pure step 6 now verifies against
+        // self_device_sk.verifying_key(), consistent with verify_event's P5 gate.
         let unsigned_token = InviteToken {
             inviter: self_owner,
             invitee_hint: Some(joiner_owner),
@@ -624,7 +669,7 @@ mod verify_rejection_tests {
         };
         let token_payload_bytes =
             canonical_invite_token_bytes(&unsigned_token).expect("encode token payload");
-        let token_sig = self_identity.sign(&token_payload_bytes);
+        let token_sig = self_device_sk.sign(&token_payload_bytes).to_bytes();
         let invite_token = InviteToken {
             sig: token_sig,
             ..unsigned_token
@@ -651,9 +696,10 @@ mod verify_rejection_tests {
     #[test]
     fn community_invite_join_sig_invalid_rejected() {
         let self_id = harmony_identity::PrivateIdentity::from_seed(&[0xa1; 32]);
+        let self_device_sk = device_sk_from_identity(&self_id);
         let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xb2; 32]);
         let community_id = SpaceId([0x10; 16]);
-        let mut signed = make_valid_packet(&self_id, &joiner_id, community_id);
+        let mut signed = make_valid_packet(&self_id, &self_device_sk, &joiner_id, community_id);
 
         // Flip a byte in the inner Join sig.
         signed.join_event.sig[0] ^= 0xff;
@@ -662,7 +708,7 @@ mod verify_rejection_tests {
             &signed,
             OwnerAddr(self_id.identity.address_hash),
             now_ms,
-            &self_id,
+            &self_device_sk.verifying_key().to_bytes(),
         )
         .expect_err("must reject");
         assert!(matches!(err, CommunityInviteVerifyError::JoinSigInvalid));
@@ -671,9 +717,10 @@ mod verify_rejection_tests {
     #[test]
     fn community_invite_token_sig_invalid_rejected() {
         let self_id = harmony_identity::PrivateIdentity::from_seed(&[0xa3; 32]);
+        let self_device_sk = device_sk_from_identity(&self_id);
         let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xb4; 32]);
         let community_id = SpaceId([0x10; 16]);
-        let mut signed = make_valid_packet(&self_id, &joiner_id, community_id);
+        let mut signed = make_valid_packet(&self_id, &self_device_sk, &joiner_id, community_id);
 
         signed.invite_token.sig[0] ^= 0xff;
 
@@ -681,7 +728,7 @@ mod verify_rejection_tests {
             &signed,
             OwnerAddr(self_id.identity.address_hash),
             now_ms,
-            &self_id,
+            &self_device_sk.verifying_key().to_bytes(),
         )
         .expect_err("must reject");
         assert!(matches!(
@@ -694,9 +741,10 @@ mod verify_rejection_tests {
     fn community_invite_signer_mismatch_rejected() {
         // InviteToken.signer is some other OwnerAddr (not self).
         let self_id = harmony_identity::PrivateIdentity::from_seed(&[0xa5; 32]);
+        let self_device_sk = device_sk_from_identity(&self_id);
         let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xb6; 32]);
         let community_id = SpaceId([0x10; 16]);
-        let mut signed = make_valid_packet(&self_id, &joiner_id, community_id);
+        let mut signed = make_valid_packet(&self_id, &self_device_sk, &joiner_id, community_id);
 
         signed.invite_token.inviter = OwnerAddr([0xaa; 16]); // not self
 
@@ -704,7 +752,7 @@ mod verify_rejection_tests {
             &signed,
             OwnerAddr(self_id.identity.address_hash),
             now_ms,
-            &self_id,
+            &self_device_sk.verifying_key().to_bytes(),
         )
         .expect_err("must reject");
         assert!(matches!(
@@ -717,9 +765,10 @@ mod verify_rejection_tests {
     fn community_invite_id_mismatch_rejected() {
         // signed.community_id != signed.join_event.community_id.
         let self_id = harmony_identity::PrivateIdentity::from_seed(&[0xa7; 32]);
+        let self_device_sk = device_sk_from_identity(&self_id);
         let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xb8; 32]);
         let community_id = SpaceId([0x10; 16]);
-        let mut signed = make_valid_packet(&self_id, &joiner_id, community_id);
+        let mut signed = make_valid_packet(&self_id, &self_device_sk, &joiner_id, community_id);
 
         signed.community_id = SpaceId([0xff; 16]); // mismatch
 
@@ -727,7 +776,7 @@ mod verify_rejection_tests {
             &signed,
             OwnerAddr(self_id.identity.address_hash),
             now_ms,
-            &self_id,
+            &self_device_sk.verifying_key().to_bytes(),
         )
         .expect_err("must reject");
         assert!(matches!(
@@ -740,9 +789,10 @@ mod verify_rejection_tests {
     fn community_invite_invitee_hint_mismatch_rejected() {
         // join_event.actor != invite_token.invitee_hint.
         let self_id = harmony_identity::PrivateIdentity::from_seed(&[0xa9; 32]);
+        let self_device_sk = device_sk_from_identity(&self_id);
         let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xba; 32]);
         let community_id = SpaceId([0x10; 16]);
-        let mut signed = make_valid_packet(&self_id, &joiner_id, community_id);
+        let mut signed = make_valid_packet(&self_id, &self_device_sk, &joiner_id, community_id);
 
         signed.invite_token.invitee_hint = Some(OwnerAddr([0xcc; 16]));
 
@@ -750,7 +800,7 @@ mod verify_rejection_tests {
             &signed,
             OwnerAddr(self_id.identity.address_hash),
             now_ms,
-            &self_id,
+            &self_device_sk.verifying_key().to_bytes(),
         )
         .expect_err("must reject");
         assert!(matches!(
@@ -763,9 +813,10 @@ mod verify_rejection_tests {
     fn community_invite_expired_clock_skew_rejected() {
         // created_at.wall_ms is way in the future relative to now.
         let self_id = harmony_identity::PrivateIdentity::from_seed(&[0xab; 32]);
+        let self_device_sk = device_sk_from_identity(&self_id);
         let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xbc; 32]);
         let community_id = SpaceId([0x10; 16]);
-        let mut signed = make_valid_packet(&self_id, &joiner_id, community_id);
+        let mut signed = make_valid_packet(&self_id, &self_device_sk, &joiner_id, community_id);
 
         // Now is 2000 ms; created_at is set to 999_999_999 ms — way past
         // the 60_000 ms clock-skew tolerance.
@@ -775,7 +826,7 @@ mod verify_rejection_tests {
             &signed,
             OwnerAddr(self_id.identity.address_hash),
             now_ms,
-            &self_id,
+            &self_device_sk.verifying_key().to_bytes(),
         )
         .expect_err("must reject");
         assert!(matches!(err, CommunityInviteVerifyError::Expired));
@@ -848,8 +899,14 @@ mod verify_rejection_tests {
             },
         };
 
-        let err =
-            verify_packet_pure(&signed, self_owner, now_ms, &self_id).expect_err("must reject");
+        let self_device_sk = device_sk_from_identity(&self_id);
+        let err = verify_packet_pure(
+            &signed,
+            self_owner,
+            now_ms,
+            &self_device_sk.verifying_key().to_bytes(),
+        )
+        .expect_err("must reject");
         assert!(matches!(err, CommunityInviteVerifyError::Expired));
     }
 
@@ -860,34 +917,14 @@ mod verify_rejection_tests {
         // InviteTokenSigInvalid (the inviter's sig binds the canonical
         // bytes including `xa`).
         let self_id = harmony_identity::PrivateIdentity::from_seed(&[0xc3; 32]);
+        let self_device_sk = device_sk_from_identity(&self_id);
         let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xc4; 32]);
         let community_id = SpaceId([0x10; 16]);
         let self_owner = OwnerAddr(self_id.identity.address_hash);
-        let joiner_owner = OwnerAddr(joiner_id.identity.address_hash);
-        let joiner_pub = joiner_id.identity.to_public_bytes();
-        let joiner_sk = {
-            let priv_bytes = joiner_id.to_private_bytes();
-            let mut seed = [0u8; 32];
-            seed.copy_from_slice(&priv_bytes[32..64]);
-            ed25519_dalek::SigningKey::from_bytes(&seed)
-        };
-        let join_event = sign_event(
-            &EventPayload {
-                id: [0x44; 16],
-                community_id,
-                kind: MembershipEventKind::Join,
-                actor: joiner_owner,
-                at: Hlc {
-                    wall_ms: 1000,
-                    logical: 0,
-                    device_id: "j".into(),
-                },
-            },
-            &joiner_sk,
-        )
-        .expect("sign Join");
+        let (join_event, joiner_owner, joiner_pub) = minted_join_event(&joiner_id, community_id);
 
-        // Sign with expires_at = Some(...).
+        // Sign with expires_at = Some(...) using the counter-signer's device key.
+        use ed25519_dalek::Signer as _;
         let unsigned_with_expiry = InviteToken {
             inviter: self_owner,
             invitee_hint: Some(joiner_owner),
@@ -901,7 +938,7 @@ mod verify_rejection_tests {
         };
         let token_bytes =
             canonical_invite_token_bytes(&unsigned_with_expiry).expect("encode token payload");
-        let token_sig = self_id.sign(&token_bytes);
+        let token_sig = self_device_sk.sign(&token_bytes).to_bytes();
 
         // Attacker swaps to expires_at = None but keeps the sig.
         let stripped_token = InviteToken {
@@ -929,8 +966,13 @@ mod verify_rejection_tests {
             },
         };
 
-        let err = verify_packet_pure(&signed, self_owner, now_ms, &self_id)
-            .expect_err("must reject — sig binds expires_at");
+        let err = verify_packet_pure(
+            &signed,
+            self_owner,
+            now_ms,
+            &self_device_sk.verifying_key().to_bytes(),
+        )
+        .expect_err("must reject — sig binds expires_at");
         assert!(matches!(
             err,
             CommunityInviteVerifyError::InviteTokenSigInvalid
@@ -940,18 +982,20 @@ mod verify_rejection_tests {
     #[test]
     fn community_invite_valid_packet_admits() {
         let self_id = harmony_identity::PrivateIdentity::from_seed(&[0xad; 32]);
+        let self_device_sk = device_sk_from_identity(&self_id);
         let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xbe; 32]);
         let community_id = SpaceId([0x10; 16]);
-        let signed = make_valid_packet(&self_id, &joiner_id, community_id);
+        let signed = make_valid_packet(&self_id, &self_device_sk, &joiner_id, community_id);
+        let expected_actor = signed.join_event.actor;
 
         let join_event = verify_packet_pure(
             &signed,
             OwnerAddr(self_id.identity.address_hash),
             now_ms,
-            &self_id,
+            &self_device_sk.verifying_key().to_bytes(),
         )
         .expect("must admit");
-        assert_eq!(join_event.actor, OwnerAddr(joiner_id.identity.address_hash));
+        assert_eq!(join_event.actor, expected_actor);
     }
 
     /// Positive control for the `expires_at = Some(future)` admit path.
@@ -959,37 +1003,17 @@ mod verify_rejection_tests {
     /// would still pass the rejection tests; this catches that.
     #[test]
     fn community_invite_valid_packet_with_future_expires_at_admits() {
+        use ed25519_dalek::Signer as _;
         let self_id = harmony_identity::PrivateIdentity::from_seed(&[0xc5; 32]);
+        let self_device_sk = device_sk_from_identity(&self_id);
         let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xc6; 32]);
         let community_id = SpaceId([0x10; 16]);
         let self_owner = OwnerAddr(self_id.identity.address_hash);
-        let joiner_owner = OwnerAddr(joiner_id.identity.address_hash);
-        let joiner_pub = joiner_id.identity.to_public_bytes();
-        let joiner_sk = {
-            let priv_bytes = joiner_id.to_private_bytes();
-            let mut seed = [0u8; 32];
-            seed.copy_from_slice(&priv_bytes[32..64]);
-            ed25519_dalek::SigningKey::from_bytes(&seed)
-        };
-        let join_event = sign_event(
-            &EventPayload {
-                id: [0x44; 16],
-                community_id,
-                kind: MembershipEventKind::Join,
-                actor: joiner_owner,
-                at: Hlc {
-                    wall_ms: 1000,
-                    logical: 0,
-                    device_id: "j".into(),
-                },
-            },
-            &joiner_sk,
-        )
-        .expect("sign Join");
+        let (join_event, joiner_owner, joiner_pub) = minted_join_event(&joiner_id, community_id);
 
         // expires_at = 1_000_000 (well after `now_ms` = 2000 and
         // `created_at = 1100`). Both arms (created_at < expires_at and
-        // now < expires_at) admit.
+        // now < expires_at) admit. Token signed by the device key (ZEB-339).
         let unsigned_token = InviteToken {
             inviter: self_owner,
             invitee_hint: Some(joiner_owner),
@@ -1003,7 +1027,7 @@ mod verify_rejection_tests {
         };
         let token_bytes =
             canonical_invite_token_bytes(&unsigned_token).expect("encode token payload");
-        let token_sig = self_id.sign(&token_bytes);
+        let token_sig = self_device_sk.sign(&token_bytes).to_bytes();
         let invite_token = InviteToken {
             sig: token_sig,
             ..unsigned_token
@@ -1022,8 +1046,13 @@ mod verify_rejection_tests {
             },
         };
 
-        let admitted = verify_packet_pure(&signed, self_owner, now_ms, &self_id)
-            .expect("future expires_at must admit");
+        let admitted = verify_packet_pure(
+            &signed,
+            self_owner,
+            now_ms,
+            &self_device_sk.verifying_key().to_bytes(),
+        )
+        .expect("future expires_at must admit");
         assert_eq!(admitted.actor, joiner_owner);
     }
 
@@ -1102,8 +1131,14 @@ mod verify_rejection_tests {
         fn now_after_expiry() -> u64 {
             1500
         }
-        let err = verify_packet_pure(&signed, self_owner, now_after_expiry, &self_id)
-            .expect_err("must reject — receive-time past expiry");
+        let self_device_sk = device_sk_from_identity(&self_id);
+        let err = verify_packet_pure(
+            &signed,
+            self_owner,
+            now_after_expiry,
+            &self_device_sk.verifying_key().to_bytes(),
+        )
+        .expect_err("must reject — receive-time past expiry");
         assert!(matches!(err, CommunityInviteVerifyError::Expired));
     }
 }
@@ -1117,23 +1152,10 @@ mod admin_bootstrap_helpers {
         CommunityInvitePayload, InviteEpochSnapshot, InviteToken, MaterializedCommunityState,
     };
     use harmony_app::community_membership::{
-        sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent,
+        mint_test_owner, sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent,
+        TestOwner,
     };
-    use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
-
-    /// Deterministic keys: `seed` selects the identity (e.g., 0xAA for
-    /// admin in the test). Returns `(identity_pub_64, signing_key,
-    /// owner_addr)`.
-    pub fn identity_set(seed: u8) -> ([u8; 64], ed25519_dalek::SigningKey, OwnerAddr) {
-        let private = harmony_identity::PrivateIdentity::from_seed(&[seed; 32]);
-        let pub_bytes = private.identity.to_public_bytes();
-        let priv_bytes = private.to_private_bytes();
-        let mut ed_seed = [0u8; 32];
-        ed_seed.copy_from_slice(&priv_bytes[32..64]);
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&ed_seed);
-        let addr = OwnerAddr(private.identity.address_hash);
-        (pub_bytes, signing_key, addr)
-    }
+    use harmony_app::owner_state_types::{EpochKey, Hlc, SpaceId};
 
     pub fn fixture_hlc() -> Hlc {
         Hlc {
@@ -1143,48 +1165,71 @@ mod admin_bootstrap_helpers {
         }
     }
 
-    /// Build a known-good admin self-Join (signed) for the given
-    /// community_id + admin identity.
+    /// ZEB-339: produce a deterministic enrolled-device admin owner.
+    /// Returns a `TestOwner` whose `owner` field is the master hash and
+    /// whose `cert` binds the device signing key to that master.
+    pub fn admin_owner(seed: u8) -> TestOwner {
+        mint_test_owner(seed)
+    }
+
+    /// Build a cert-bearing admin self-Join (signed by device key) for
+    /// the given community_id + admin TestOwner. ZEB-339: the event must
+    /// carry the admin's EnrollmentCert so `enrolled_key_from_cert` can
+    /// extract and verify the signer.
     pub fn admin_bootstrap_event(
         community_id: SpaceId,
-        admin_addr: OwnerAddr,
-        signing_key: &ed25519_dalek::SigningKey,
+        admin: &TestOwner,
     ) -> SignedMembershipEvent {
         let payload = EventPayload {
             id: [0xCC; 16],
             community_id,
             kind: MembershipEventKind::Join,
-            actor: admin_addr,
+            actor: admin.owner,
             at: fixture_hlc(),
         };
-        sign_event(&payload, signing_key).expect("sign admin bootstrap")
+        let mut ev = sign_event(&payload, &admin.device_key).expect("sign admin bootstrap");
+        ev.enrollment = Some(admin.cert.clone());
+        ev
     }
 
-    /// Build a validly-signed admin Leave event. Used to trigger step 6
-    /// (kind check) without tripping step 5 (signature check) — the
-    /// signature is valid, but kind != Join.
-    pub fn admin_leave_event(
-        community_id: SpaceId,
-        admin_addr: OwnerAddr,
-        signing_key: &ed25519_dalek::SigningKey,
-    ) -> SignedMembershipEvent {
+    /// Build a cert-bearing admin Leave event (signed by device key,
+    /// carries cert). Used to trigger step 6 (kind check) without
+    /// tripping step 5 (cert-based sig check) — the signature and cert
+    /// are valid, but kind != Join.
+    pub fn admin_leave_event(community_id: SpaceId, admin: &TestOwner) -> SignedMembershipEvent {
         let payload = EventPayload {
             id: [0xCC; 16],
             community_id,
             kind: MembershipEventKind::Leave,
-            actor: admin_addr,
+            actor: admin.owner,
             at: fixture_hlc(),
         };
-        sign_event(&payload, signing_key).expect("sign admin leave")
+        let mut ev = sign_event(&payload, &admin.device_key).expect("sign admin leave");
+        ev.enrollment = Some(admin.cert.clone());
+        ev
     }
 
     /// Build a known-good invite-only `CommunityInvitePayload` with
-    /// well-formed `admin_bootstrap` + `admin_identity_pub`. The 9
-    /// per-branch tests below mutate one field at a time.
+    /// well-formed `admin_bootstrap` (cert-bearing, ZEB-339 model) +
+    /// `admin_identity_pub`. The per-branch tests below mutate one field
+    /// at a time.
     pub fn good_invite_only_payload() -> CommunityInvitePayload {
-        let (admin_pub, admin_sk, admin_addr) = identity_set(0xAA);
+        let admin = admin_owner(0xAA);
+        let admin_addr = admin.owner;
+        // admin_identity_pub: 64-byte [x25519 || ed25519] representation.
+        // The engine ignores it post-ZEB-339 (VerifyContext no longer carries
+        // it), but the field must be Some for step 1 (BootstrapMissing gate).
+        // The x25519 half (combined[0..32]) is intentionally zeroed because
+        // x25519 is unused in post-ZEB-339 verify_admin_bootstrap — verification
+        // uses the cert's device key exclusively. No check reads combined[0..32].
+        let admin_pub = {
+            let ed25519_pub = admin.cert.device_pubkeys.classical.ed25519_verify;
+            let mut combined = [0u8; 64];
+            combined[32..].copy_from_slice(&ed25519_pub);
+            combined
+        };
         let community_id = SpaceId([0x37; 16]);
-        let bootstrap = admin_bootstrap_event(community_id, admin_addr, &admin_sk);
+        let bootstrap = admin_bootstrap_event(community_id, &admin);
 
         CommunityInvitePayload {
             community_id,
@@ -1208,6 +1253,7 @@ mod admin_bootstrap_helpers {
             admin_identity_pub: Some(admin_pub),
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         }
     }
 }
@@ -1249,43 +1295,17 @@ mod verify_admin_bootstrap_tests {
         );
     }
 
-    #[test]
-    fn rejects_invalid_admin_pubkey() {
-        let mut p = good_invite_only_payload();
-        // Build a 64-byte pub where bytes 32-63 (the Ed25519 portion) are
-        // [0x7F; 32]. This compressed point does not decompress to a valid
-        // Ed25519 curve point under ed25519-dalek 2.x / curve25519-dalek 4.x
-        // (verified empirically: Identity::from_public_bytes returns Err for
-        // this input). The X25519 first half (all zeros) is always valid.
-        let mut bad_pub = [0u8; 64];
-        bad_pub[32..].copy_from_slice(&[0x7F; 32]);
-        p.admin_identity_pub = Some(bad_pub);
-        assert_eq!(
-            verify_admin_bootstrap(&p).unwrap_err(),
-            RedeemBootstrapVerifyError::BootstrapInvalidPubkey
-        );
-    }
-
-    #[test]
-    fn rejects_admin_address_mismatch() {
-        let mut p = good_invite_only_payload();
-        // Use a different identity's pubkey but keep the original
-        // admin_addr → the pubkey.address_hash will mismatch.
-        let (other_pub, _other_sk, _other_addr) = identity_set(0xBB);
-        p.admin_identity_pub = Some(other_pub);
-        assert_eq!(
-            verify_admin_bootstrap(&p).unwrap_err(),
-            RedeemBootstrapVerifyError::BootstrapAddressMismatch
-        );
-    }
+    // NOTE: rejects_invalid_admin_pubkey and rejects_admin_address_mismatch
+    // have been removed (ZEB-339). Step 2 (the flat identity_pub address_hash
+    // == admin_addr gate) no longer exists in verify_admin_bootstrap; the
+    // admin_identity_pub field is no longer gated against admin_addr.
+    // Cryptographic binding is now enforced by step 5 (cert model) instead.
 
     #[test]
     fn rejects_admin_actor_mismatch() {
         let mut p = good_invite_only_payload();
-        // Mutate the bootstrap's actor to a different address. Admin's
-        // signature was over the original actor field, so this would
-        // also fail step 5 (signature) — but step 3 fires first because
-        // the chain checks actor before sig.
+        // Mutate the bootstrap's actor to a different address. Step 3 fires
+        // first (actor != admin_addr) before step 5 (cert check).
         let mut bs = p.admin_bootstrap.as_ref().expect("bootstrap").clone();
         bs.actor = OwnerAddr([0xFF; 16]);
         p.admin_bootstrap = Some(bs);
@@ -1311,7 +1331,9 @@ mod verify_admin_bootstrap_tests {
     fn rejects_invalid_admin_signature() {
         let mut p = good_invite_only_payload();
         let mut bs = p.admin_bootstrap.as_ref().expect("bootstrap").clone();
-        // Flip a single bit in the signature.
+        // Flip a single bit in the signature. The cert is still valid (carries
+        // the correct enrolled device key), but verify_membership_signer rejects
+        // the corrupted sig.
         bs.sig[0] ^= 0x01;
         p.admin_bootstrap = Some(bs);
         assert_eq!(
@@ -1321,17 +1343,43 @@ mod verify_admin_bootstrap_tests {
     }
 
     #[test]
-    fn rejects_admin_bootstrap_with_countersig() {
+    fn rejects_bootstrap_missing_cert() {
+        // ZEB-339: a Join event without an EnrollmentCert cannot pass step 5
+        // (enrolled_key_from_cert requires a cert). The error folds into
+        // BootstrapSignatureInvalid.
         let mut p = good_invite_only_payload();
         let mut bs = p.admin_bootstrap.as_ref().expect("bootstrap").clone();
-        // Inject a synthetic countersig. The sig itself can be garbage —
-        // step 6 (kind/countersig sanity) fires before any crypto on the
+        bs.enrollment = None; // strip the cert
+        p.admin_bootstrap = Some(bs);
+        assert_eq!(
+            verify_admin_bootstrap(&p).unwrap_err(),
+            RedeemBootstrapVerifyError::BootstrapSignatureInvalid
+        );
+    }
+
+    #[test]
+    fn rejects_admin_bootstrap_with_countersig() {
+        // ZEB-339: the bootstrap carries a cert, so step 5 passes; step 6
+        // (kind/countersig sanity) fires because countersig is Some.
+        let admin = admin_owner(0xAA);
+        let community_id = SpaceId([0x37; 16]);
+        let mut bs = admin_bootstrap_event(community_id, &admin);
+        // Inject a synthetic countersig. Step 6 fires before any crypto on the
         // countersig itself.
         bs.countersig = Some(CounterSignature {
             signer: OwnerAddr([0xEE; 16]),
             sig: [0x77; 64],
         });
+        let admin_pub = {
+            let ed25519_pub = admin.cert.device_pubkeys.classical.ed25519_verify;
+            let mut combined = [0u8; 64];
+            combined[32..].copy_from_slice(&ed25519_pub);
+            combined
+        };
+        let mut p = good_invite_only_payload();
         p.admin_bootstrap = Some(bs);
+        p.admin_addr = admin.owner;
+        p.admin_identity_pub = Some(admin_pub);
         assert_eq!(
             verify_admin_bootstrap(&p).unwrap_err(),
             RedeemBootstrapVerifyError::BootstrapKindInvalid
@@ -1340,12 +1388,17 @@ mod verify_admin_bootstrap_tests {
 
     #[test]
     fn rejects_admin_bootstrap_non_join_kind() {
-        // Build from scratch with identity_set so we have the signing key.
-        // Replace the bootstrap with a validly-signed Leave event so that
-        // step 5 (sig verify) passes and step 6 (kind check) fires.
-        let (admin_pub, admin_sk, admin_addr) = identity_set(0xAA);
+        // ZEB-339: use a cert-bearing Leave event so that step 5 (cert check +
+        // sig verify) passes, and step 6 (kind check) fires.
+        let admin = admin_owner(0xAA);
         let community_id = SpaceId([0x37; 16]);
-        let leave_bootstrap = admin_leave_event(community_id, admin_addr, &admin_sk);
+        let leave_bootstrap = admin_leave_event(community_id, &admin);
+        let admin_pub = {
+            let ed25519_pub = admin.cert.device_pubkeys.classical.ed25519_verify;
+            let mut combined = [0u8; 64];
+            combined[32..].copy_from_slice(&ed25519_pub);
+            combined
+        };
 
         let p = harmony_app::community_invite::CommunityInvitePayload {
             community_id,
@@ -1357,12 +1410,12 @@ mod verify_admin_bootstrap_tests {
                 state_snapshot: harmony_app::community_invite::MaterializedCommunityState::default(
                 ),
             },
-            admin_addr,
+            admin_addr: admin.owner,
             community_name: "TestCom".into(),
             is_invite_only: true,
             expires_at: None,
             invite_token: Some(harmony_app::community_invite::InviteToken {
-                inviter: admin_addr,
+                inviter: admin.owner,
                 invitee_hint: None,
                 minted_at: fixture_hlc(),
                 expires_at: None,
@@ -1372,6 +1425,7 @@ mod verify_admin_bootstrap_tests {
             admin_identity_pub: Some(admin_pub),
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         };
         assert_eq!(
             verify_admin_bootstrap(&p).unwrap_err(),

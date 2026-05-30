@@ -77,6 +77,7 @@ fn fixture_signed_event_zeb285(kind: MembershipEventKind) -> SignedMembershipEve
         at: fixture_hlc(),
         sig: [0xBB; 64],
         countersig: None,
+        enrollment: None,
     }
 }
 
@@ -160,6 +161,7 @@ fn community_invite_with_fork_fields_pinned() {
         admin_identity_pub: None,
         forked_from: Some(SpaceId([0xa0; 16])),
         pre_fork_snapshot: Some(snapshot),
+        inviter_enrollment: None,
     };
 
     let bytes = canonical_cbor_encode(&payload).expect("encode");

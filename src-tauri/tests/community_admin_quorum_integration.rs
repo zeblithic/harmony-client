@@ -43,6 +43,7 @@ fn ev(
         kind,
         sig: [0; 64],
         countersig: None,
+        enrollment: None,
     }
 }
 

@@ -260,23 +260,43 @@ async fn alice_redeems_invite_only_against_bob_admin() {
     // arg is plumbed for future expansion.
     let crdt_a = Arc::new(TokioMutex::new(OwnerState::default()));
 
+    // ZEB-339: supply synthetic community_signing_key + enrollment_cert per
+    // outbox. Use new_synthetic because alice_addr/bob_addr are Reticulum-
+    // derived addresses (from PrivateIdentity) that don't match the cert
+    // owner_id from mint_test_owner. This is intentional test scaffolding
+    // (cert wiring incomplete until Task 10); new_synthetic bypasses the
+    // owner_id debug_assert in DmOutbox::new.
+    let alice_test_owner_invite = harmony_app::community_membership::mint_test_owner(0xD7);
+    let alice_community_sk_invite = Arc::new(ed25519_dalek::SigningKey::from_bytes(
+        &alice_test_owner_invite.device_key.to_bytes(),
+    ));
+    let alice_enrollment_invite = alice_test_owner_invite.cert;
+    let bob_test_owner_invite = harmony_app::community_membership::mint_test_owner(0xD8);
+    let bob_community_sk_invite = Arc::new(ed25519_dalek::SigningKey::from_bytes(
+        &bob_test_owner_invite.device_key.to_bytes(),
+    ));
+    let bob_enrollment_invite = bob_test_owner_invite.cert;
     // Alice's dm_outbox carries the PrivateIdentity that handle_unicast
     // grabs to verify the InviteToken sig + countersign Bob's Join.
-    let alice_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
+    let alice_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new_synthetic(
         "alice-dev".into(),
         alice_addr,
         DeviceIdentityHash(alice.identity.address_hash),
         Arc::clone(&alice_sk),
         Arc::new(dup_identity(&alice)),
+        alice_community_sk_invite,
+        alice_enrollment_invite,
     )));
     // Bob's dm_outbox: redeem_invite_inner reads bob's
     // private_identity + signing_key under its lock.
-    let bob_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
+    let bob_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new_synthetic(
         "bob-dev".into(),
         bob_addr,
         DeviceIdentityHash(bob.identity.address_hash),
         Arc::clone(&bob_sk),
         Arc::new(dup_identity(&bob)),
+        bob_community_sk_invite,
+        bob_enrollment_invite,
     )));
 
     // Bob's adapter request channel. Bob's redeem_invite_inner
@@ -296,6 +316,8 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         true,
         alice_addr,
         alice_sk.as_ref(),
+        // ZEB-339: synthetic cert (compile/wiring only — allowed-RED until Task 10).
+        &harmony_app::community_membership::mint_test_owner(0).cert,
         Hlc {
             wall_ms: 100_000,
             logical: 0,
@@ -384,6 +406,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         admin_identity_pub: Some(alice.identity.to_public_bytes()),
         forked_from: None,
         pre_fork_snapshot: None,
+        inviter_enrollment: None,
     })
     .expect("encode URL");
 
@@ -484,6 +507,8 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         "bob-dev".into(),
         bob_addr,
         Arc::clone(&bob_sk),
+        // ZEB-339: synthetic cert (compile/wiring only — allowed-RED until Task 10).
+        harmony_app::community_membership::mint_test_owner(0).cert,
         Arc::clone(&registry_b),
         bob_adapter_tx,
         bob_unicast_tx,
@@ -580,13 +605,16 @@ async fn community_invite_only_tampered_admin_bootstrap_rejects() {
     use harmony_app::community_membership::{sign_event, EventPayload, MembershipEventKind};
     use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 
-    let alice_identity = PrivateIdentity::from_seed(&[0xAA; 32]);
-    let alice_addr = OwnerAddr(alice_identity.identity.address_hash);
-    let alice_priv_bytes = alice_identity.to_private_bytes();
-    let alice_ed_seed: [u8; 32] = alice_priv_bytes[32..64]
-        .try_into()
-        .expect("ed25519 seed slice 32..64");
-    let alice_sk = ed25519_dalek::SigningKey::from_bytes(&alice_ed_seed);
+    // ZEB-339: build alice's bootstrap from a minted owner so it carries a
+    // valid Master EnrollmentCert bound to her device key. This makes the
+    // event pass encode_invite_url's embedded-cert gate AND lets
+    // verify_admin_bootstrap resolve the signer via enrolled_key_from_cert,
+    // so the tampered signature surfaces as BootstrapSignatureInvalid for the
+    // RIGHT reason (sig mismatch under the enrolled key) rather than tripping
+    // an earlier gate.
+    let alice_owner = harmony_app::community_membership::mint_test_owner(0x5A);
+    let alice_addr = alice_owner.owner;
+    let alice_sk = alice_owner.device_key.clone();
 
     let bob_identity = PrivateIdentity::from_seed(&[0xBB; 32]);
     let bob_addr = OwnerAddr(bob_identity.identity.address_hash);
@@ -604,6 +632,9 @@ async fn community_invite_only_tampered_admin_bootstrap_rejects() {
         },
     };
     let mut alice_bootstrap = sign_event(&bootstrap_payload, &alice_sk).expect("sign");
+    // Embed alice's enrollment cert so the bootstrap clears the ZEB-339 gate;
+    // verification then fails on the tampered signature, not a missing cert.
+    alice_bootstrap.enrollment = Some(alice_owner.cert.clone());
     // Tamper: flip a single bit in the signature.
     alice_bootstrap.sig[0] ^= 0x01;
 
@@ -631,9 +662,17 @@ async fn community_invite_only_tampered_admin_bootstrap_rejects() {
             sig: [0xEE; 64],
         }),
         admin_bootstrap: Some(alice_bootstrap),
-        admin_identity_pub: Some(alice_identity.identity.to_public_bytes()),
+        // admin_identity_pub is ignored by post-ZEB-339 verify_admin_bootstrap
+        // (which uses the cert's device key exclusively); only presence matters
+        // for the encode gate.
+        admin_identity_pub: Some([0u8; 64]),
         forked_from: None,
         pre_fork_snapshot: None,
+        // ZEB-339: encode_invite_url requires invite-only payloads to carry the
+        // inviter's EnrollmentCert. Its content is irrelevant to this test (we
+        // assert on the tampered admin_bootstrap.sig rejection), so any valid
+        // cert satisfies the presence check.
+        inviter_enrollment: Some(harmony_app::community_membership::mint_test_owner(0xAA).cert),
     })
     .expect("encode URL");
 

@@ -7,6 +7,7 @@
 //!
 //! See `docs/specs/2026-05-05-zeb-217-sub-c-communities-design.md`.
 
+use harmony_owner::certs::EnrollmentCert;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -229,15 +230,6 @@ pub enum MembershipEventKind {
     PendingJoin {
         #[serde(rename = "it")]
         invite_token: crate::community_invite::InviteToken,
-        /// 64-byte concatenation of X25519_pub || Ed25519_pub matching
-        /// `harmony_identity::Identity::to_public_bytes()`. Same shape
-        /// as `CommunityInviteSigned.joiner_identity_pub` (community_invite.rs:258).
-        #[serde(
-            rename = "jp",
-            serialize_with = "serialize_bytes_as_bstr",
-            deserialize_with = "deserialize_bytes_from_bstr"
-        )]
-        joiner_identity_pub: [u8; 64],
     },
 
     /// ZEB-254: counter-sign approving a PendingJoin. Pairs by
@@ -336,10 +328,12 @@ pub struct ChannelId(
 
 /// One signed event in a community's membership CRDT.
 ///
-/// Wire format: 8-key CBOR map. All keys are 2 chars (text(2) = 3 bytes
-/// each) to satisfy the same-length-keys invariant at this nesting
-/// level. Adjacently-tagged inner enums (MembershipEventKind,
-/// CounterSignature) follow the same rule recursively.
+/// Wire format: 6- to 8-key CBOR map — 6 mandatory keys, plus `cs`
+/// (invite-only Join countersig) and `en` (ZEB-339 enrollment cert on
+/// identity-introducing events), each omitted when None. All keys are
+/// 2 chars (text(2) = 3 bytes each) to satisfy the same-length-keys
+/// invariant at this nesting level. Adjacently-tagged inner enums
+/// (MembershipEventKind, CounterSignature) follow the same rule recursively.
 ///
 /// `sig` covers the canonical-CBOR encoding of (id, community_id, kind,
 /// actor, at) — countersig is excluded so an inviter can append their
@@ -380,6 +374,16 @@ pub struct SignedMembershipEvent {
     /// power level at the time of the join.
     #[serde(rename = "cs", skip_serializing_if = "Option::is_none", default)]
     pub countersig: Option<CounterSignature>,
+
+    /// ZEB-339: enrollment proof for the signer. REQUIRED on identity-
+    /// introducing events (bootstrap Join, Join, PendingJoin); absent
+    /// otherwise (the verifier resolves the signer's device key from
+    /// materialized membership). Sits OUTSIDE the signed EventPayload —
+    /// safe because cert.owner_id must equal the signed `actor`, the cert
+    /// is master-signed (unforgeable), and the event sig must verify under
+    /// cert.device_pubkeys.
+    #[serde(rename = "en", skip_serializing_if = "Option::is_none", default)]
+    pub enrollment: Option<EnrollmentCert>,
 }
 
 /// Counter-signature appended by an existing community member to vouch
@@ -500,6 +504,7 @@ pub fn sign_event(
         at: payload.at.clone(),
         sig,
         countersig: None,
+        enrollment: None,
     })
 }
 
@@ -526,6 +531,7 @@ pub fn sign_event_with_identity(
         at: payload.at.clone(),
         sig,
         countersig: None,
+        enrollment: None,
     })
 }
 
@@ -692,10 +698,6 @@ pub enum VerifyError {
     /// is at or before the event's wall_ms.
     PendingJoinTokenExpired,
 
-    /// ZEB-254: PendingJoin's joiner_identity_pub does not hash (via
-    /// SHA-256[..16]) to the event's actor address.
-    PendingJoinJoinerPubMismatch,
-
     /// ZEB-254 P6: PendingJoin actor's prior state is `Joined | Banned |
     /// Invited | PendingJoin` — cannot accept a pending Join for an
     /// already-engaged member. Rule: reject if prior state is any of those
@@ -756,11 +758,13 @@ pub enum VerifyError {
     /// claiming someone else's NodeId.
     ReachabilityInnerSigInvalid,
 
-    /// ZEB-321 RCH3: the actor field of a ReachabilityAnnounce envelope
-    /// does not match the OwnerAddr derived from the identity that
-    /// produced the inner signature.
-    ReachabilityActorMismatch,
-
+    // ZEB-321 RCH3 (ReachabilityActorMismatch) was REMOVED in ZEB-339: the
+    // actor↔signer binding is now enforced upstream by verify_membership_signer
+    // (signer.owner == event.actor, proven via the EnrollmentCert), and the
+    // inner reachability signature is verified against that same resolved
+    // enrolled device key — so the old address-derivation form (which assumed
+    // address_hash(signing_key) == actor) is both unnecessary and, under the
+    // owner/device split, false by construction.
     /// ZEB-321 RCH4: the payload's `announced_at_ms` differs from the
     /// event's HLC `wall_ms` by more than ±30 minutes. Sanity check —
     /// rejects obviously-tampered records (the spec's "silent drop").
@@ -769,6 +773,27 @@ pub enum VerifyError {
     /// ZEB-321 RCH5: the actor is not a current community member at
     /// the event's HLC (read via membership projection).
     ReachabilityActorNotMember,
+
+    // ── ZEB-339 enrolled-device cert error taxonomy ────────────────────────
+    /// ZEB-339: Join/PendingJoin/bootstrap arrived with no `enrollment` cert.
+    MissingEnrollmentCert,
+    /// ZEB-339: `cert.verify()` failed (bad master sig / hash(master)!=owner_id
+    /// / device-id mismatch / unknown version), OR a non-`Master` issuer
+    /// (e.g. `Quorum`) was carried — the community path cannot fully verify
+    /// quorum signatures (that needs `OwnerState` walk-back), so it rejects
+    /// them rather than accept on structural-checks-only (spec §10).
+    EnrollmentCertInvalid,
+    /// ZEB-339: `cert.owner_id != event.actor.0`.
+    EnrollmentOwnerMismatch,
+    /// ZEB-339: no enrolled device key matching the signing key was found for
+    /// `actor`. Two origins: (a) a steady-state event whose materialized
+    /// `members[actor].enrolled_device_keys` set contains no matching key, or
+    /// (b) a resolved signer whose `owner` does not equal the event's `actor`
+    /// (a caller-binding precondition in `verify_membership_signer`).
+    SignerNotEnrolledForActor,
+    /// ZEB-339: counter-signer's signing key is not in the counter-signer's
+    /// materialized `enrolled_device_keys`.
+    CounterSignerNotEnrolled,
 }
 
 impl std::fmt::Display for VerifyError {
@@ -888,7 +913,6 @@ impl std::fmt::Display for VerifyError {
             }
             VerifyError::PendingJoinTokenInvalid => write!(f, "ZEB-254 PendingJoin InviteToken invalid (inviter/invitee_hint/sig)"),
             VerifyError::PendingJoinTokenExpired => write!(f, "ZEB-254 PendingJoin InviteToken expired"),
-            VerifyError::PendingJoinJoinerPubMismatch => write!(f, "ZEB-254 PendingJoin joiner_identity_pub hash != actor"),
             VerifyError::PendingJoinAlreadyMember => write!(f, "ZEB-254 PendingJoin actor's prior state is already-engaged"),
             VerifyError::JoinCountersignActorNotJoined => write!(f, "ZEB-254 JoinCountersign actor is not Joined"),
             VerifyError::JoinCountersignActorPowerInsufficient => write!(f, "ZEB-254 JoinCountersign actor power < invite_threshold"),
@@ -921,14 +945,39 @@ impl std::fmt::Display for VerifyError {
             VerifyError::ReachabilityInnerSigInvalid => {
                 write!(f, "ZEB-321 RCH2 inner ReachabilityAnnounce signature invalid")
             }
-            VerifyError::ReachabilityActorMismatch => {
-                write!(f, "ZEB-321 RCH3 ReachabilityAnnounce actor != inner-signer")
-            }
             VerifyError::ReachabilityTimestampSkew => {
                 write!(f, "ZEB-321 RCH4 ReachabilityAnnounce timestamp skew > 30min")
             }
             VerifyError::ReachabilityActorNotMember => {
                 write!(f, "ZEB-321 RCH5 ReachabilityAnnounce actor is not a community member")
+            }
+            VerifyError::MissingEnrollmentCert => {
+                write!(f, "ZEB-339: identity-introducing event carries no enrollment cert")
+            }
+            VerifyError::EnrollmentCertInvalid => {
+                write!(
+                    f,
+                    "ZEB-339: enrollment cert failed verification (bad master sig, hash mismatch, \
+                     device-id mismatch, or unknown version)"
+                )
+            }
+            VerifyError::EnrollmentOwnerMismatch => {
+                write!(
+                    f,
+                    "ZEB-339: cert.owner_id does not match event.actor"
+                )
+            }
+            VerifyError::SignerNotEnrolledForActor => {
+                write!(
+                    f,
+                    "ZEB-339: no enrolled device key matching the signing key found for actor"
+                )
+            }
+            VerifyError::CounterSignerNotEnrolled => {
+                write!(
+                    f,
+                    "ZEB-339: counter-signer's device key is not enrolled for their identity"
+                )
             }
         }
     }
@@ -1014,6 +1063,24 @@ pub fn attach_countersig_with_identity(
     Ok(out)
 }
 
+/// ZEB-339: attach a counter-signature produced by the signer's enrolled
+/// device key (#2). The verifier resolves the signer's key from materialized
+/// membership, so the countersig MUST be made with device #2.
+pub fn attach_countersig_with_device_key(
+    event: &SignedMembershipEvent,
+    signer_owner: OwnerAddr,
+    signer_key: &ed25519_dalek::SigningKey,
+) -> Result<SignedMembershipEvent, CryptoError> {
+    let bytes = canonical_cbor_encode(&EventPayload::from(event))?;
+    let sig = signer_key.sign(&bytes).to_bytes();
+    let mut out = event.clone();
+    out.countersig = Some(CounterSignature {
+        signer: signer_owner,
+        sig,
+    });
+    Ok(out)
+}
+
 /// Verify the counter-signature on an event, with a pubkey-to-claimed-
 /// signer binding check.
 ///
@@ -1028,29 +1095,164 @@ pub fn attach_countersig_with_identity(
 ///    bytes the actor signed.
 ///
 /// Returns CounterSigRequired if the countersig is missing.
-/// Returns CounterSignerPubkeyMismatch if step 1 fails.
-/// Returns CounterSigInvalid if step 2 fails.
+/// Returns CounterSignerNotEnrolled if the signer is not a materialized
+/// member, or none of their enrolled device keys verifies the countersig.
 /// Power-level checking on the signer happens elsewhere (verify_event)
 /// — this function is purely cryptographic.
+///
+/// ZEB-339: resolves the countersigner's enrolled device key(s) from the
+/// materialized membership rather than from a caller-supplied identity_pub.
 pub fn verify_countersig(
     event: &SignedMembershipEvent,
-    signer_identity_pub: &[u8; 64],
+    prior_state: &MaterializedMembership,
 ) -> Result<(), VerifyError> {
     let cs = event
         .countersig
         .as_ref()
         .ok_or(VerifyError::CounterSigRequired)?;
-    let identity = harmony_identity::Identity::from_public_bytes(signer_identity_pub)
-        .map_err(|_| VerifyError::InvalidIdentityPub)?;
-    if identity.address_hash != cs.signer.0 {
-        return Err(VerifyError::CounterSignerPubkeyMismatch);
-    }
+    let member = prior_state
+        .members
+        .get(&cs.signer)
+        .ok_or(VerifyError::CounterSignerNotEnrolled)?;
     let bytes = canonical_cbor_encode(&EventPayload::from(event))?;
     let sig = Signature::from_bytes(&cs.sig);
-    identity
-        .verifying_key
-        .verify_strict(&bytes, &sig)
-        .map_err(|_| VerifyError::CounterSigInvalid)
+    for key in &member.enrolled_device_keys {
+        if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(key) {
+            if vk.verify_strict(&bytes, &sig).is_ok() {
+                return Ok(());
+            }
+        }
+    }
+    Err(VerifyError::CounterSignerNotEnrolled)
+}
+
+// ── ZEB-339 enrolled-device signing primitives ────────────────────────────────
+
+/// The minimal proven fact: this ed25519 key is a device enrolled under `owner`.
+///
+/// Produced by [`enrolled_key_from_cert`] (cert path) or by a materialized-
+/// state lookup (already-enrolled member path). Consumed by
+/// [`verify_membership_signer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnrolledDeviceKey {
+    pub owner: OwnerAddr,
+    pub device_ed25519: [u8; 32],
+}
+
+/// Verify the event was authored by `signer`'s enrolled device key, over the
+/// canonical EventPayload. `signer.owner` must equal `event.actor`.
+///
+/// Uses `verify_strict` to reject non-canonical S values and small-order R
+/// points (signature malleability) — same rationale as [`verify_signature`].
+///
+/// Returns `Err(SignerNotEnrolledForActor)` if owner ≠ actor (a caller-binding
+/// precondition: the resolved signer belongs to a different owner than the
+/// event's actor).
+/// Returns `Err(SignatureInvalid)` if the ed25519 bytes are malformed or the
+/// signature doesn't verify.
+pub fn verify_membership_signer(
+    event: &SignedMembershipEvent,
+    signer: &EnrolledDeviceKey,
+) -> Result<(), VerifyError> {
+    if signer.owner != event.actor {
+        return Err(VerifyError::SignerNotEnrolledForActor);
+    }
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&signer.device_ed25519)
+        .map_err(|_| VerifyError::SignatureInvalid)?;
+    let bytes = canonical_cbor_encode(&EventPayload::from(event))?;
+    let sig = Signature::from_bytes(&event.sig);
+    vk.verify_strict(&bytes, &sig)
+        .map_err(|_| VerifyError::SignatureInvalid)
+}
+
+/// Resolve an `EnrolledDeviceKey` from an identity-introducing event's carried
+/// `EnrollmentCert`: verify the cert, bind `owner == actor`, return the device
+/// key.
+///
+/// Returns `Err(MissingEnrollmentCert)` if `enrollment` is `None`.
+/// Returns `Err(EnrollmentCertInvalid)` if `cert.verify()` fails OR the issuer
+/// is non-`Master` (see below).
+/// Returns `Err(EnrollmentOwnerMismatch)` if `cert.owner_id != event.actor.0`.
+///
+/// Issuer policy (spec §10): only `EnrollmentIssuer::Master` certs are accepted
+/// here. `cert.verify()` performs only STRUCTURAL checks for `Quorum` issuers
+/// (it does not verify the quorum signatures — that requires an `OwnerState`
+/// walk-back the community path does not have). Alpha mints Master certs only,
+/// so we reject `Quorum` gracefully rather than accept one on structural checks
+/// alone, which would admit unverified signatures.
+pub fn enrolled_key_from_cert(
+    event: &SignedMembershipEvent,
+) -> Result<EnrolledDeviceKey, VerifyError> {
+    let cert = event
+        .enrollment
+        .as_ref()
+        .ok_or(VerifyError::MissingEnrollmentCert)?;
+    cert.verify()
+        .map_err(|_| VerifyError::EnrollmentCertInvalid)?;
+    // Reject non-Master issuers: the community path cannot fully verify Quorum
+    // signatures, and cert.verify() only structurally-checks them (spec §10).
+    if !matches!(
+        cert.issuer,
+        harmony_owner::certs::EnrollmentIssuer::Master { .. }
+    ) {
+        return Err(VerifyError::EnrollmentCertInvalid);
+    }
+    if cert.owner_id != event.actor.0 {
+        return Err(VerifyError::EnrollmentOwnerMismatch);
+    }
+    Ok(EnrolledDeviceKey {
+        owner: event.actor,
+        device_ed25519: cert.device_pubkeys.classical.ed25519_verify,
+    })
+}
+
+/// Steady-state signer resolution: find the actor's enrolled device key (from
+/// materialized membership) that verifies this event's signature.
+fn resolve_enrolled_signer(
+    prior_state: &MaterializedMembership,
+    event: &SignedMembershipEvent,
+) -> Result<EnrolledDeviceKey, VerifyError> {
+    let member = prior_state
+        .members
+        .get(&event.actor)
+        .ok_or(VerifyError::SignerNotEnrolledForActor)?;
+    let bytes = canonical_cbor_encode(&EventPayload::from(event))?;
+    let sig = Signature::from_bytes(&event.sig);
+    for key in &member.enrolled_device_keys {
+        if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(key) {
+            if vk.verify_strict(&bytes, &sig).is_ok() {
+                return Ok(EnrolledDeviceKey {
+                    owner: event.actor,
+                    device_ed25519: *key,
+                });
+            }
+        }
+    }
+    Err(VerifyError::SignerNotEnrolledForActor)
+}
+
+/// ZEB-339: verify an InviteToken's signature against the inviter's enrolled
+/// device key(s), resolved from materialized membership. The inviter is a
+/// Joined member whose enrolled key is in `prior_state`.
+fn verify_invite_token_sig_with_enrolled(
+    token: &crate::community_invite::InviteToken,
+    prior_state: &MaterializedMembership,
+) -> Result<(), VerifyError> {
+    let member = prior_state
+        .members
+        .get(&token.inviter)
+        .ok_or(VerifyError::PendingJoinTokenInvalid)?;
+    let token_bytes = crate::community_invite::canonical_invite_token_bytes(token)
+        .map_err(|_| VerifyError::PendingJoinTokenInvalid)?;
+    let sig = Signature::from_bytes(&token.sig);
+    for key in &member.enrolled_device_keys {
+        if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(key) {
+            if vk.verify_strict(&token_bytes, &sig).is_ok() {
+                return Ok(());
+            }
+        }
+    }
+    Err(VerifyError::PendingJoinTokenInvalid)
 }
 
 /// Materialized view computed from a community's signed event log.
@@ -1153,6 +1355,12 @@ pub struct MemberState {
     pub joined_at: Hlc,
     #[serde(rename = "la", skip_serializing_if = "Option::is_none", default)]
     pub left_at: Option<Hlc>,
+    /// ZEB-339: ed25519 verify keys vouched under this member's owner_id,
+    /// learned from the EnrollmentCert carried on their Join. A SET so an
+    /// owner with multiple devices in a community is representable (eventual
+    /// state); populated with exactly one today.
+    #[serde(rename = "ek", default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub enrolled_device_keys: BTreeSet<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1170,6 +1378,83 @@ pub enum MemberStatus {
     /// JoinCountersign is materialized.
     #[serde(rename = "p")]
     PendingJoin,
+}
+
+/// ZEB-339 test helper: a realistic owner with an enrolled device key.
+/// Produced by `mint_test_owner`; consumed by membership tests that need
+/// the new `actor = owner_id ≠ address_hash(device_key)` signing model.
+#[cfg(any(test, feature = "test-fixtures"))]
+#[derive(Debug, Clone)]
+pub struct TestOwner {
+    pub owner: OwnerAddr,
+    pub device_key: ed25519_dalek::SigningKey,
+    pub cert: EnrollmentCert,
+}
+
+/// ZEB-339 test helper: produce a realistic owner — owner_id (master),
+/// an enrolled device signing key, and a self-minted Master EnrollmentCert
+/// binding them. `seed` makes it deterministic.
+///
+/// Note on seeds: the master key derives from `[seed; 32]` and the device
+/// key from `[seed ^ 0xFF; 32]`, so seeds `N` and `N ^ 0xFF` share raw key
+/// material (with master/device roles swapped). Use seeds in `0x01..=0xFE`
+/// and avoid pairing `N` with `N ^ 0xFF` in the same test.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn mint_test_owner(seed: u8) -> TestOwner {
+    use harmony_owner::pubkey_bundle::{ClassicalKeys, PubKeyBundle};
+    let master_sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+    let master_bundle = PubKeyBundle {
+        classical: ClassicalKeys {
+            ed25519_verify: master_sk.verifying_key().to_bytes(),
+            x25519_pub: [0u8; 32],
+        },
+        post_quantum: None,
+    };
+    let owner_id = master_bundle.identity_hash();
+    let device_sk = ed25519_dalek::SigningKey::from_bytes(&[seed ^ 0xFF; 32]);
+    let device_bundle = PubKeyBundle {
+        classical: ClassicalKeys {
+            ed25519_verify: device_sk.verifying_key().to_bytes(),
+            x25519_pub: [0u8; 32],
+        },
+        post_quantum: None,
+    };
+    let device_id = device_bundle.identity_hash();
+    let cert = EnrollmentCert::sign_master(
+        &master_sk,
+        master_bundle,
+        device_id,
+        device_bundle,
+        1_700_000_000,
+        None,
+    )
+    .expect("sign_master");
+    cert.verify().expect("self-minted cert verifies");
+    TestOwner {
+        owner: OwnerAddr(owner_id),
+        device_key: device_sk,
+        cert,
+    }
+}
+
+/// ZEB-339 test helper: the singleton set of `owner`'s enrolled device key,
+/// for seeding a hand-built `MemberState.enrolled_device_keys`.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn test_enrolled_keys(owner: &TestOwner) -> BTreeSet<[u8; 32]> {
+    let mut s = BTreeSet::new();
+    s.insert(owner.cert.device_pubkeys.classical.ed25519_verify);
+    s
+}
+
+/// ZEB-339 test helper: ensure `owner`'s enrolled device key is present on
+/// their materialized `MemberState`, so a steady-state event the owner signs
+/// can have its signer resolved. No-op if the owner has no member entry.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn test_enroll_member(prior: &mut MaterializedMembership, owner: &TestOwner) {
+    if let Some(m) = prior.members.get_mut(&owner.owner) {
+        m.enrolled_device_keys
+            .insert(owner.cert.device_pubkeys.classical.ed25519_verify);
+    }
 }
 
 /// Materialized state for one channel in a community. Built by
@@ -1473,12 +1758,35 @@ pub fn materialize_with_now(
                     Some(MemberStatus::Joined) | Some(MemberStatus::Banned) => false,
                 };
                 if should_refresh {
+                    // ZEB-339: preserve any prior enrolled keys (so a rejoin
+                    // doesn't drop a previously-learned device key), then
+                    // insert the key from the cert carried on this Join.
+                    let mut enrolled = m
+                        .members
+                        .get(&event.actor)
+                        .map(|s| s.enrolled_device_keys.clone())
+                        .unwrap_or_default();
+                    // SECURITY INVARIANT (load-bearing): the cert is ingested
+                    // WITHOUT re-verification here. This is safe ONLY because an
+                    // event reaches the materialized log exclusively via
+                    // `CommunityState::insert_event` → `verify_event` →
+                    // `enrolled_key_from_cert` (which runs `cert.verify()`, the
+                    // Master-issuer gate, and the cert.owner_id == actor bind).
+                    // `materialize` only ever replays already-verified events.
+                    // The ingested key is the IDENTICAL field that
+                    // `verify_membership_signer` validated the signature under.
+                    // If a future path ever inserts events into the log bypassing
+                    // `verify_event` (e.g. snapshot-seed / import), re-verify here.
+                    if let Some(cert) = event.enrollment.as_ref() {
+                        enrolled.insert(cert.device_pubkeys.classical.ed25519_verify);
+                    }
                     m.members.insert(
                         event.actor,
                         MemberState {
                             status: MemberStatus::Joined,
                             joined_at: event.at.clone(),
                             left_at: None,
+                            enrolled_device_keys: enrolled,
                         },
                     );
                     // ZEB-249: if any rotation has already happened
@@ -1561,6 +1869,7 @@ pub fn materialize_with_now(
                             status: MemberStatus::Invited,
                             joined_at: event.at.clone(),
                             left_at: None,
+                            enrolled_device_keys: BTreeSet::new(),
                         },
                     );
                 }
@@ -1911,6 +2220,27 @@ pub fn materialize_with_now(
                     }
                     _ => {
                         if countersigned {
+                            // ZEB-339: preserve any prior enrolled keys (a
+                            // PendingJoin→countersign transition must not drop
+                            // keys already learned from a prior Join) AND ingest
+                            // the joiner's own cert carried on this PendingJoin
+                            // event — for a first-join-via-invite this is the
+                            // ONLY place the joiner's enrolled device key is
+                            // learned, so without it their later steady-state
+                            // events would fail SignerNotEnrolledForActor.
+                            let mut enrolled = m
+                                .members
+                                .get(&event.actor)
+                                .map(|s| s.enrolled_device_keys.clone())
+                                .unwrap_or_default();
+                            // SECURITY INVARIANT: ingested without re-verification
+                            // — safe only because this PendingJoin event was
+                            // already accepted by verify_event/enrolled_key_from_cert
+                            // before reaching the materialized log. See the Join
+                            // arm above for the full rationale.
+                            if let Some(cert) = event.enrollment.as_ref() {
+                                enrolled.insert(cert.device_pubkeys.classical.ed25519_verify);
+                            }
                             m.members.insert(
                                 event.actor,
                                 MemberState {
@@ -1924,6 +2254,7 @@ pub fn materialize_with_now(
                                     // answer.
                                     joined_at: event.at.clone(),
                                     left_at: None,
+                                    enrolled_device_keys: enrolled,
                                 },
                             );
                             // ZEB-254: mirror the Join arm's catchup invariant — a member
@@ -1934,12 +2265,32 @@ pub fn materialize_with_now(
                                 m.pending_catchup_for.insert(event.actor);
                             }
                         } else if !expired {
+                            // ZEB-339: ingest the joiner's cert key even for an
+                            // un-countersigned PendingJoin. The PendingJoin event
+                            // is identity-introducing and carries the joiner's
+                            // cert; recording their enrolled device key here lets
+                            // their own subsequent events verify (e.g. cancelling
+                            // the pending join via Leave) before any countersign
+                            // arrives. Status stays PendingJoin, so the per-kind
+                            // authorization gates still block privileged actions.
+                            // Same SECURITY INVARIANT as the Join arm: the event
+                            // was already accepted by verify_event before reaching
+                            // the materialized log.
+                            let mut enrolled = m
+                                .members
+                                .get(&event.actor)
+                                .map(|s| s.enrolled_device_keys.clone())
+                                .unwrap_or_default();
+                            if let Some(cert) = event.enrollment.as_ref() {
+                                enrolled.insert(cert.device_pubkeys.classical.ed25519_verify);
+                            }
                             m.members.insert(
                                 event.actor,
                                 MemberState {
                                     status: MemberStatus::PendingJoin,
                                     joined_at: event.at.clone(),
                                     left_at: None,
+                                    enrolled_device_keys: enrolled,
                                 },
                             );
                         }
@@ -2158,30 +2509,16 @@ pub fn prior_state_at_hlc(
 /// community would be unbootstrappable (every Join would need a
 /// countersig from a Joined member, but no one is Joined initially).
 ///
-/// `actor_identity_pub` is the canonical 64-byte combined identity
-/// public bytes (`X25519_pub(32) || Ed25519_pub(32)`) for the OwnerAddr
-/// claimed in `event.actor`. Sub-A's owner-device cache is the source.
-/// verify_event derives the address_hash from these bytes and checks
-/// it matches `event.actor` — so a caller cache-lookup bug, a stale
-/// cache entry, or a key-substitution attack all surface as
-/// ActorPubkeyMismatch instead of being silently accepted.
-///
-/// `countersigner_identity_pub` is None for open communities, for
-/// non-Join events, and for admin self-Join in invite-only. For all
-/// other invite-only Joins it MUST be Some, with the hashed bytes
-/// matching `event.countersig.signer`.
-pub struct VerifyContext<'a> {
+/// ZEB-339: verify_event no longer takes caller-resolved identity_pubs.
+/// The actor's signer is resolved either from the event's carried
+/// `EnrollmentCert` (identity-introducing events) or from the actor's
+/// materialized `enrolled_device_keys` (steady-state events). Countersig
+/// and InviteToken signers are likewise resolved from materialized
+/// membership. The context now carries only policy/binding scalars.
+pub struct VerifyContext {
     pub expected_community_id: SpaceId,
     pub admin_addr: OwnerAddr,
     pub is_invite_only: bool,
-    pub actor_identity_pub: &'a [u8; 64],
-    pub countersigner_identity_pub: Option<&'a [u8; 64]>,
-    /// ZEB-254: admin's identity_pub (X25519_pub || Ed25519_pub). Required
-    /// when verifying PendingJoin events because the verify gate needs to
-    /// check the InviteToken's signature against the admin's known pub.
-    /// For legacy paths (open community, legacy Join with countersig), this
-    /// field can be None; the existing verify paths don't reference it.
-    pub admin_identity_pub: Option<&'a [u8; 64]>,
 }
 
 /// Full membership-event verification per ZEB-217 spec §"Verification".
@@ -2256,9 +2593,16 @@ pub fn verify_event(
         return Err(VerifyError::UnexpectedCounterSig);
     }
 
-    // 1. Actor's identity_pub must hash to event.actor AND its
-    //    Ed25519 component must verify the signature.
-    verify_signature(event, ctx.actor_identity_pub)?;
+    // 1. ZEB-339: resolve the signer's enrolled device key, then verify the sig.
+    let signer = match &event.kind {
+        // Identity-introducing events carry their own cert.
+        MembershipEventKind::Join | MembershipEventKind::PendingJoin { .. } => {
+            enrolled_key_from_cert(event)?
+        }
+        // Steady-state events: resolve from materialized membership.
+        _ => resolve_enrolled_signer(prior_state, event)?,
+    };
+    verify_membership_signer(event, &signer)?;
 
     // 2. Banned-status guard: a Banned actor's Join OR Leave must be
     //    rejected BEFORE materialize() would silently overwrite the
@@ -2314,10 +2658,7 @@ pub fn verify_event(
             .countersig
             .as_ref()
             .ok_or(VerifyError::CounterSigRequired)?;
-        let cs_identity_pub = ctx
-            .countersigner_identity_pub
-            .ok_or(VerifyError::CounterSigRequired)?;
-        verify_countersig(event, cs_identity_pub)?;
+        verify_countersig(event, prior_state)?;
 
         if !is_joined_member(prior_state, &cs.signer) {
             return Err(VerifyError::CounterSignerNotJoined);
@@ -2388,18 +2729,10 @@ pub fn verify_event(
                 return Err(VerifyError::ActorNotJoined);
             }
         }
-        MembershipEventKind::PendingJoin {
-            invite_token,
-            joiner_identity_pub,
-        } => {
-            // P1: joiner_identity_pub must hash to event.actor.
-            // Use harmony_identity::Identity::from_public_bytes which derives
-            // address_hash = SHA256(X25519_pub || Ed25519_pub)[..16].
-            let identity = harmony_identity::Identity::from_public_bytes(joiner_identity_pub)
-                .map_err(|_| VerifyError::PendingJoinJoinerPubMismatch)?;
-            if identity.address_hash != event.actor.0 {
-                return Err(VerifyError::PendingJoinJoinerPubMismatch);
-            }
+        MembershipEventKind::PendingJoin { invite_token } => {
+            // P1: joiner identity binding is now subsumed by
+            // enrolled_key_from_cert (step 1 above), which binds the carried
+            // cert.owner_id == event.actor.
 
             // P2: invite_token.inviter must equal ctx.admin_addr.
             if invite_token.inviter != ctx.admin_addr {
@@ -2421,15 +2754,11 @@ pub fn verify_event(
                 }
             }
 
-            // P5: invite_token signature verifies against admin's identity_pub.
-            let admin_pub = ctx
-                .admin_identity_pub
-                .ok_or(VerifyError::PendingJoinTokenInvalid)?;
-            if crate::community_invite::verify_invite_token_signature(invite_token, admin_pub)
-                .is_err()
-            {
-                return Err(VerifyError::PendingJoinTokenInvalid);
-            }
+            // P5: ZEB-339 — invite_token signature verifies against the
+            // inviter's enrolled device key, resolved from materialized
+            // membership (the inviter is a Joined member). The inviter ==
+            // admin_addr binding is enforced by P2 above.
+            verify_invite_token_sig_with_enrolled(invite_token, prior_state)?;
 
             // P6: prior state must be None | Some(Left).
             let prior_status = prior_state.members.get(&event.actor).map(|m| m.status);
@@ -2843,23 +3172,22 @@ pub fn verify_event(
             // function (uniform with every other variant; surfaces as
             // VerifyError::SignatureInvalid). No work here.
 
-            // Derive harmony Identity once for both RCH2 (Ed25519
-            // verifying key) and RCH3 (address_hash). Avoids re-running
-            // `Identity::from_public_bytes` twice in the same arm.
-            let derived_identity =
-                harmony_identity::Identity::from_public_bytes(ctx.actor_identity_pub)
-                    .map_err(|_| VerifyError::InvalidIdentityPub)?;
+            // ZEB-339: the inner identity signature is produced by the same
+            // enrolled device key that signed the outer event. `signer` was
+            // resolved (and bound to event.actor via verify_membership_signer)
+            // in step 1 above. Derive the Ed25519 verifying key from the
+            // resolved device key for the RCH2 check.
+            let signer_vk = ed25519_dalek::VerifyingKey::from_bytes(&signer.device_ed25519)
+                .map_err(|_| VerifyError::SignatureInvalid)?;
 
             // RCH2: inner identity signature must verify over canonical
-            // CBOR of (nd, rl, da, ts, actor, hlc) using the actor's
-            // Ed25519 verifying key (the back half of the 64-byte
-            // identity_pub: X25519_pub || Ed25519_pub, exposed by
-            // harmony_identity::Identity as `verifying_key`).
+            // CBOR of (nd, rl, da, ts, actor, hlc) using the signer's
+            // enrolled device Ed25519 verifying key.
             crate::reachability_record::verify_inner_signature(
                 payload,
                 &event.actor,
                 &event.at,
-                &derived_identity.verifying_key,
+                &signer_vk,
             )
             .map_err(|e| match e {
                 crate::reachability_record::InnerSigError::Encode => {
@@ -2870,23 +3198,15 @@ pub fn verify_event(
                 }
             })?;
 
-            // RCH3: actor in envelope must equal address derived from the
-            // inner-sig signer. This is the spec's dedicated RCH3 rule —
-            // kept as its own check + discriminant for telemetry
-            // traceability (so RCH3 violations surface distinctly in
-            // error metrics).
-            //
-            // In practice this is UNREACHABLE: verify_signature() at the
-            // top of verify_event already derives event.actor from
-            // ctx.actor_identity_pub and returns
-            // VerifyError::ActorPubkeyMismatch on mismatch. The inner
-            // sig (RCH2) above uses the same key source. If a future
-            // refactor ever splits the inner-sig key from the outer-sig
-            // key, this check becomes load-bearing.
-            let derived_addr = OwnerAddr(derived_identity.address_hash);
-            if derived_addr != event.actor {
-                return Err(VerifyError::ReachabilityActorMismatch);
-            }
+            // RCH3: actor↔signer binding. ZEB-339: the inner sig and outer
+            // sig are produced by the same enrolled device key, and
+            // verify_membership_signer (step 1) already proved
+            // signer.owner == event.actor (the enrolled key resolves under
+            // the actor's materialized membership). The previous
+            // address-derivation form of RCH3 assumed a single-identity
+            // model where address_hash(signing_key) == actor; under the
+            // owner/device split that equality no longer holds, so the
+            // binding is enforced upstream rather than re-derived here.
 
             // RCH4: announced_at_ms vs hlc.wall_ms within ±30 min.
             // Use `u64::abs_diff` so the |skew| computation stays in
@@ -2985,7 +3305,23 @@ pub fn verify_snapshot_event(
             .identity_pubs
             .get(&cs.signer)
             .ok_or(VerifyError::UnknownSigner { signer: cs.signer })?;
-        verify_countersig(event, countersigner_pub)?;
+        // ZEB-339: verify_countersig now resolves the signer from a
+        // MaterializedMembership; the pre-fork snapshot path instead carries
+        // explicit identity_pubs, so the pubkey→signer binding + Ed25519
+        // check is performed inline here (mirrors the former verify_countersig
+        // body). Phase 2 fork hardening will migrate snapshots onto the
+        // cert/materialized-key model.
+        let identity = harmony_identity::Identity::from_public_bytes(countersigner_pub)
+            .map_err(|_| VerifyError::InvalidIdentityPub)?;
+        if identity.address_hash != cs.signer.0 {
+            return Err(VerifyError::CounterSignerPubkeyMismatch);
+        }
+        let bytes = canonical_cbor_encode(&EventPayload::from(event))?;
+        let sig = Signature::from_bytes(&cs.sig);
+        identity
+            .verifying_key
+            .verify_strict(&bytes, &sig)
+            .map_err(|_| VerifyError::CounterSigInvalid)?;
     }
 
     Ok(())
@@ -3430,6 +3766,7 @@ mod auto_exec_tests {
                     device_id: "test".to_string(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         // Power 99 is still below the 100 admin threshold — Joined alone
@@ -3462,6 +3799,7 @@ mod auto_exec_tests {
                     device_id: "test".to_string(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         assert!(local_actor_can_mint_set_power(&mat, self_owner));
@@ -3497,6 +3835,7 @@ mod auto_exec_tests {
                     logical: 0,
                     device_id: "test".to_string(),
                 }),
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         assert!(
@@ -3527,6 +3866,7 @@ mod auto_exec_tests {
                     logical: 0,
                     device_id: "test".to_string(),
                 }),
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         assert!(
@@ -3783,6 +4123,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         }
     }
 
@@ -3819,6 +4160,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         }
     }
 
@@ -3837,6 +4179,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         }
     }
 
@@ -3857,6 +4200,36 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
+        }
+    }
+
+    /// ZEB-339: build a cert-bearing Join for `owner`, signed by their enrolled
+    /// device key. Used to seed `prior_state` so a steady-state event the same
+    /// owner later signs can have its signer resolved from materialized
+    /// `enrolled_device_keys`.
+    fn make_enrolled_join(
+        id_byte: u8,
+        owner: &TestOwner,
+        at_wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        let mut id = [0xfd; 16];
+        id[15] = id_byte;
+        let payload = EventPayload {
+            id,
+            community_id: SpaceId([0xc0; 16]),
+            kind: MembershipEventKind::Join,
+            actor: owner.owner,
+            at: Hlc {
+                wall_ms: at_wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+        };
+        let ev = sign_event(&payload, &owner.device_key).expect("sign enrolled join");
+        SignedMembershipEvent {
+            enrollment: Some(owner.cert.clone()),
+            ..ev
         }
     }
 
@@ -3893,6 +4266,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         }
     }
 
@@ -3915,6 +4289,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         }
     }
 
@@ -4051,6 +4426,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         };
         let kick = make_kick_event(0x01, admin, bob, 100);
         let rot = make_rotation_event(
@@ -4228,6 +4604,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         };
         let alice_join = make_join_event(0x01, alice, 51);
         let bob_join = make_join_event(0x02, bob, 52);
@@ -4261,22 +4638,66 @@ mod tests {
 
     // ── C4: verify_event rejects unauthorized epoch events ────────────────────
 
-    /// Build a test identity from a seed byte. Returns (PrivateIdentity, identity_pub, OwnerAddr).
-    fn make_identity(seed_byte: u8) -> (harmony_identity::PrivateIdentity, [u8; 64], OwnerAddr) {
-        let seed = [seed_byte; 32];
-        let private = harmony_identity::PrivateIdentity::from_seed(&seed);
-        let public = private.public_identity();
-        let identity_pub = public.to_public_bytes();
-        let addr = OwnerAddr(public.address_hash);
-        (private, identity_pub, addr)
+    /// ZEB-339: build a test owner (owner_id + enrolled device key + Master
+    /// cert) from a seed byte. Returns `(TestOwner, dummy_pub, owner_addr)` so
+    /// existing `(priv, pub, addr)` destructures keep compiling; the middle
+    /// element is a placeholder (the old 64-byte identity_pub is no longer
+    /// consumed by VerifyContext).
+    fn make_identity(seed_byte: u8) -> (TestOwner, [u8; 64], OwnerAddr) {
+        let owner = mint_test_owner(seed_byte);
+        let addr = owner.owner;
+        (owner, [0u8; 64], addr)
     }
 
-    /// Helper: sign a membership event payload using a PrivateIdentity.
-    fn sign_with_identity(
-        payload: EventPayload,
-        private: &harmony_identity::PrivateIdentity,
-    ) -> SignedMembershipEvent {
-        sign_event_with_identity(&payload, private).expect("sign_event_with_identity must succeed")
+    /// ZEB-339: sign a membership event payload with the owner's enrolled
+    /// device key. For identity-introducing events (Join / PendingJoin) the
+    /// owner's Master enrollment cert is attached so `materialize` populates
+    /// `enrolled_device_keys` and `verify_event` can resolve the signer.
+    fn sign_with_identity(payload: EventPayload, owner: &TestOwner) -> SignedMembershipEvent {
+        let ev = sign_event(&payload, &owner.device_key).expect("sign_event must succeed");
+        match ev.kind {
+            MembershipEventKind::Join | MembershipEventKind::PendingJoin { .. } => {
+                SignedMembershipEvent {
+                    enrollment: Some(owner.cert.clone()),
+                    ..ev
+                }
+            }
+            _ => ev,
+        }
+    }
+
+    #[test]
+    fn verify_event_accepts_owner_id_actor_signed_by_enrolled_device() {
+        // PRODUCTION pairing: actor = owner_id, signed by device #2 (owner_id has
+        // no signing key). Bootstrap Join, empty prior.
+        let admin = mint_test_owner(0x31);
+        let cid = SpaceId([5u8; 16]);
+        let join = sign_event(
+            &EventPayload {
+                id: [1u8; 16],
+                community_id: cid,
+                kind: MembershipEventKind::Join,
+                actor: admin.owner,
+                at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &admin.device_key,
+        )
+        .unwrap();
+        let join = SignedMembershipEvent {
+            enrollment: Some(admin.cert.clone()),
+            ..join
+        };
+        let prior = MaterializedMembership::default();
+        let ctx = VerifyContext {
+            expected_community_id: cid,
+            admin_addr: admin.owner,
+            is_invite_only: false,
+        };
+        assert_eq!(verify_event(&join, &prior, &ctx), Ok(()));
     }
 
     /// C4: verify_event must reject an EpochRotation issued by a never-member
@@ -4285,7 +4706,7 @@ mod tests {
     fn verify_event_rejects_unauthorized_epoch_rotation_from_never_member() {
         let community_id = SpaceId([0xc0; 16]);
         let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
-        let (attacker_priv, attacker_pub, attacker_addr) = make_identity(0xee);
+        let (attacker_priv, _attacker_pub, attacker_addr) = make_identity(0xee);
 
         // Build a prior state where admin is joined (epoch 0, no members other than admin).
         // We use materialize with an admin-join event so power_levels has admin at 100.
@@ -4329,14 +4750,15 @@ mod tests {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &attacker_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         let result = verify_event(&rotation_event, &prior, &ctx);
+        // ZEB-339: a never-member's event is rejected at signer resolution
+        // (step 1) — no materialized membership means no enrolled device key —
+        // before the EpochEventUnauthorized power gate is reached. The security
+        // property (unauthorized epoch event rejected) is preserved.
         assert!(
-            matches!(result, Err(VerifyError::EpochEventUnauthorized)),
-            "EpochRotation from never-member must be rejected with EpochEventUnauthorized; got {result:?}"
+            matches!(result, Err(VerifyError::SignerNotEnrolledForActor)),
+            "EpochRotation from never-member must be rejected with SignerNotEnrolledForActor; got {result:?}"
         );
     }
 
@@ -4345,7 +4767,7 @@ mod tests {
     fn verify_event_rejects_unauthorized_epoch_catchup_non_admin() {
         let community_id = SpaceId([0xc0; 16]);
         let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
-        let (bob_priv, bob_pub, bob_addr) = make_identity(0xb1);
+        let (bob_priv, _bob_pub, bob_addr) = make_identity(0xb1);
 
         // Admin + bob join.
         let admin_join_payload = EventPayload {
@@ -4402,9 +4824,6 @@ mod tests {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &bob_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         let result = verify_event(&catchup_event, &prior, &ctx);
         assert!(
@@ -4440,6 +4859,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         };
         // Carol joins (to be kicked).
         let carol_join = make_join_event(0x02, carol, 20);
@@ -4501,6 +4921,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         };
         let bob_join = make_join_event(0x02, bob, 10);
         // Kick carol (not bob) so we have a rotation to establish epoch=1.
@@ -4626,6 +5047,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         }
     }
 
@@ -4649,6 +5071,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         }
     }
 
@@ -4660,11 +5083,11 @@ mod tests {
     #[test]
     fn unban_event_succeeds_when_actor_is_admin_and_target_is_banned() {
         let community_id = SpaceId([0xc0; 16]);
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
         let (_, _, target_addr) = make_identity(0xb1);
 
         // Prior state: admin joined, target joined then kicked (Banned).
-        let admin_join = make_join_event(0x01, admin_addr, 1);
+        let admin_join = make_enrolled_join(0x01, &admin_priv, 1);
         let target_join = make_join_event(0x02, target_addr, 2);
         let kick = make_kick_event(0x01, admin_addr, target_addr, 10);
         let prior = materialize(
@@ -4696,9 +5119,6 @@ mod tests {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         let result = verify_event(&unban, &prior, &ctx);
         assert!(
@@ -4716,13 +5136,13 @@ mod tests {
     #[test]
     fn unban_event_rejected_when_actor_is_moderator() {
         let community_id = SpaceId([0xc0; 16]);
-        let (_admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
-        let (mod_priv, mod_pub, mod_addr) = make_identity(0xb1);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
+        let (mod_priv, _mod_pub, mod_addr) = make_identity(0xb1);
         let (_, _, target_addr) = make_identity(0xc1);
 
         // Build prior state: mod_addr has power 50, target is Banned.
-        let admin_join = make_join_event(0x01, admin_addr, 1);
-        let mod_join = make_join_event(0x02, mod_addr, 2);
+        let admin_join = make_enrolled_join(0x01, &admin_priv, 1);
+        let mod_join = make_enrolled_join(0x02, &mod_priv, 2);
         let target_join = make_join_event(0x03, target_addr, 3);
         let setpwr_mod = SignedMembershipEvent {
             id: [0x04; 16],
@@ -4739,6 +5159,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         };
         let kick = make_kick_event(0x01, admin_addr, target_addr, 10);
         let prior = materialize(
@@ -4768,9 +5189,6 @@ mod tests {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &mod_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&unban, &prior, &ctx),
@@ -4784,11 +5202,11 @@ mod tests {
     #[test]
     fn unban_event_rejected_when_target_is_not_banned() {
         let community_id = SpaceId([0xc0; 16]);
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
         let (_, _, target_addr) = make_identity(0xb1);
 
         // Prior state: admin joined, target joined (NOT banned).
-        let admin_join = make_join_event(0x01, admin_addr, 1);
+        let admin_join = make_enrolled_join(0x01, &admin_priv, 1);
         let target_join = make_join_event(0x02, target_addr, 2);
         let prior = materialize(&[admin_join, target_join], admin_addr);
         assert_eq!(prior.members[&target_addr].status, MemberStatus::Joined);
@@ -4812,9 +5230,6 @@ mod tests {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&unban, &prior, &ctx),
@@ -4829,11 +5244,11 @@ mod tests {
     #[test]
     fn unban_event_rejected_when_target_is_unknown() {
         let community_id = SpaceId([0xc0; 16]);
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
         let (_, _, unknown_addr) = make_identity(0xdd);
 
         // Prior state: only admin joined; unknown_addr never appeared.
-        let admin_join = make_join_event(0x01, admin_addr, 1);
+        let admin_join = make_enrolled_join(0x01, &admin_priv, 1);
         let prior = materialize(&[admin_join], admin_addr);
         assert!(!prior.members.contains_key(&unknown_addr));
 
@@ -4856,9 +5271,6 @@ mod tests {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&unban, &prior, &ctx),
@@ -4873,10 +5285,10 @@ mod tests {
     #[test]
     fn kick_event_rejected_when_reason_exceeds_max_chars() {
         let community_id = SpaceId([0xc0; 16]);
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
         let (_, _, target_addr) = make_identity(0xb1);
 
-        let admin_join = make_join_event(0x01, admin_addr, 1);
+        let admin_join = make_enrolled_join(0x01, &admin_priv, 1);
         let target_join = make_join_event(0x02, target_addr, 2);
         let prior = materialize(&[admin_join, target_join], admin_addr);
 
@@ -4901,9 +5313,6 @@ mod tests {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&kick, &prior, &ctx),
@@ -4917,11 +5326,11 @@ mod tests {
     #[test]
     fn unban_event_rejected_when_reason_exceeds_max_chars() {
         let community_id = SpaceId([0xc0; 16]);
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
         let (_, _, target_addr) = make_identity(0xb1);
 
         // Set up Banned target via prior Kick
-        let admin_join = make_join_event(0x01, admin_addr, 1);
+        let admin_join = make_enrolled_join(0x01, &admin_priv, 1);
         let target_join = make_join_event(0x02, target_addr, 2);
         let kick = make_kick_event(0x01, admin_addr, target_addr, 10);
         let prior = materialize(&[admin_join, target_join, kick], admin_addr);
@@ -4947,9 +5356,6 @@ mod tests {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&unban, &prior, &ctx),
@@ -5044,6 +5450,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         };
 
         // Carol joins AFTER the rotation (epoch is now 1, carol was Invited).
@@ -5178,8 +5585,8 @@ mod tests {
     #[test]
     fn verify_event_fork_allows_any_joined_member() {
         let community_id = SpaceId([0xc0; 16]);
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
-        let (regular_priv, regular_pub, regular_addr) = make_identity(0xb1);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
+        let (regular_priv, _regular_pub, regular_addr) = make_identity(0xb1);
 
         // Admin joins (power 100 from bootstrap).
         let admin_join = sign_with_identity(
@@ -5236,9 +5643,6 @@ mod tests {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &regular_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&fork_event, &prior, &ctx),
@@ -5267,9 +5671,6 @@ mod tests {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&admin_fork, &prior, &admin_ctx),
@@ -5284,7 +5685,7 @@ mod tests {
     fn verify_event_fork_rejects_non_member() {
         let community_id = SpaceId([0xc0; 16]);
         let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
-        let (outsider_priv, outsider_pub, outsider_addr) = make_identity(0xcc);
+        let (outsider_priv, _outsider_pub, outsider_addr) = make_identity(0xcc);
 
         let admin_join = sign_with_identity(
             EventPayload {
@@ -5323,14 +5724,14 @@ mod tests {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &outsider_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
+        // ZEB-339: a never-member's Fork is rejected at signer resolution
+        // (step 1) before the ActorNotJoined gate — no materialized membership
+        // means no enrolled device key. Security property preserved.
         assert_eq!(
             verify_event(&fork, &prior, &ctx),
-            Err(VerifyError::ActorNotJoined),
-            "fork by non-member should reject with ActorNotJoined"
+            Err(VerifyError::SignerNotEnrolledForActor),
+            "fork by non-member should reject with SignerNotEnrolledForActor"
         );
     }
 
@@ -5358,6 +5759,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         };
         let after = materialize(&[admin_join, fork], admin);
 
@@ -5402,6 +5804,7 @@ mod tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         };
 
         let m = materialize(&[admin_join, fork], admin);
@@ -5428,13 +5831,24 @@ mod tests {
         use crate::community_invite::{BoundedChannelLogSnapshot, PreForkSnapshot};
         use std::collections::BTreeMap;
 
+        // ZEB-339: verify_snapshot_event still uses the single-identity model
+        // (PreForkSnapshot.identity_pubs); build these events with a real
+        // PrivateIdentity so the identity_pub→actor binding holds. (Fork
+        // snapshot migration onto the cert model is a later task.)
+        let snap_identity = |seed: u8| -> (harmony_identity::PrivateIdentity, [u8; 64], OwnerAddr) {
+            let private = harmony_identity::PrivateIdentity::from_seed(&[seed; 32]);
+            let public = private.public_identity();
+            let pub_bytes = public.to_public_bytes();
+            let addr = OwnerAddr(public.address_hash);
+            (private, pub_bytes, addr)
+        };
         let original_id = SpaceId([0xa0; 16]);
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xaa);
-        let (regular_priv, regular_pub, regular_addr) = make_identity(0xbb);
+        let (admin_priv, admin_pub, admin_addr) = snap_identity(0xaa);
+        let (regular_priv, regular_pub, regular_addr) = snap_identity(0xbb);
 
         // Bootstrap: admin joins, then regular joins, then admin promotes regular.
-        let admin_join = sign_with_identity(
-            EventPayload {
+        let admin_join = sign_event_with_identity(
+            &EventPayload {
                 id: [0x01; 16],
                 community_id: original_id,
                 kind: MembershipEventKind::Join,
@@ -5446,9 +5860,10 @@ mod tests {
                 },
             },
             &admin_priv,
-        );
-        let regular_join = sign_with_identity(
-            EventPayload {
+        )
+        .expect("sign");
+        let regular_join = sign_event_with_identity(
+            &EventPayload {
                 id: [0x02; 16],
                 community_id: original_id,
                 kind: MembershipEventKind::Join,
@@ -5460,9 +5875,10 @@ mod tests {
                 },
             },
             &regular_priv,
-        );
-        let set_power = sign_with_identity(
-            EventPayload {
+        )
+        .expect("sign");
+        let set_power = sign_event_with_identity(
+            &EventPayload {
                 id: [0x03; 16],
                 community_id: original_id,
                 kind: MembershipEventKind::SetPower {
@@ -5477,7 +5893,8 @@ mod tests {
                 },
             },
             &admin_priv,
-        );
+        )
+        .expect("sign");
 
         let mut identity_pubs = BTreeMap::new();
         identity_pubs.insert(admin_addr, admin_pub);
@@ -5659,7 +6076,6 @@ mod tests {
         };
         let kind = MembershipEventKind::PendingJoin {
             invite_token: token,
-            joiner_identity_pub: [4u8; 64],
         };
 
         let encoded = crate::owner_state_crypto::canonical_cbor_encode(&kind).expect("encode");
@@ -5732,6 +6148,117 @@ mod tests {
             );
         }
     }
+
+    // ── ZEB-339 Task 1: SignedMembershipEvent enrollment field round-trip ─────
+
+    /// ZEB-339: a steady-state event (enrollment=None) encodes with NO `en`
+    /// key (back-compat), and round-trips cleanly through canonical CBOR.
+    #[test]
+    fn signed_event_enrollment_roundtrips_and_defaults_absent() {
+        use crate::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
+
+        let ev = SignedMembershipEvent {
+            id: [1u8; 16],
+            community_id: SpaceId([2u8; 16]),
+            kind: MembershipEventKind::Leave,
+            actor: OwnerAddr([3u8; 16]),
+            at: Hlc {
+                wall_ms: 0,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            sig: [0u8; 64],
+            countersig: None,
+            enrollment: None,
+        };
+        let bytes = canonical_cbor_encode(&ev).unwrap();
+
+        // `bytes` is a 6-key map with NO `en` key (skip_serializing_if drops it
+        // when None) — i.e. byte-identical to a pre-ZEB-339 wire event. Decoding
+        // it here therefore doubles as the back-compat proof: old en-less bytes
+        // decode via `serde(default)` to enrollment=None rather than erroring.
+        let val: ciborium::Value = ciborium::de::from_reader(&bytes[..]).unwrap();
+        let map = val.as_map().expect("outer is map");
+        let has_en = map.iter().any(|(k, _)| k.as_text() == Some("en"));
+        assert!(!has_en, "`en` key must be absent when enrollment is None");
+
+        let back: SignedMembershipEvent = canonical_cbor_decode(&bytes).unwrap();
+        assert_eq!(back, ev);
+        assert!(back.enrollment.is_none());
+    }
+
+    // ── ZEB-339 Task 2: materialize ingests enrolled_device_keys from Join cert ─
+
+    /// ZEB-339: materialize inserts the ed25519 verify key from the
+    /// EnrollmentCert carried on a Join event into
+    /// `MemberState.enrolled_device_keys`.
+    #[test]
+    fn materialize_records_enrolled_device_key_from_join_cert() {
+        let admin = mint_test_owner(0x11);
+        let payload = EventPayload {
+            id: [1u8; 16],
+            community_id: SpaceId([9u8; 16]),
+            kind: MembershipEventKind::Join,
+            actor: admin.owner,
+            at: Hlc {
+                wall_ms: 0,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        };
+        let join = sign_event(&payload, &admin.device_key).unwrap();
+        let join = SignedMembershipEvent {
+            enrollment: Some(admin.cert.clone()),
+            ..join
+        };
+        let m = materialize(&[join], admin.owner);
+        let ek = &m.members.get(&admin.owner).unwrap().enrolled_device_keys;
+        assert!(
+            ek.contains(&admin.device_key.verifying_key().to_bytes()),
+            "enrolled_device_keys must contain the device key from the cert"
+        );
+    }
+
+    /// ZEB-339 back-compat: a `MemberState` CBOR blob without the `ek`
+    /// key (pre-ZEB-339 wire format) decodes to an empty
+    /// `enrolled_device_keys` set via `#[serde(default)]`, rather than
+    /// failing. This is the round-trip proof: encode a MemberState with
+    /// an empty set (skip_serializing_if drops the key), confirm `ek` is
+    /// absent from the CBOR map, then decode and assert the set is empty.
+    #[test]
+    fn member_state_enrolled_device_keys_back_compat_decode() {
+        use crate::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
+
+        let ms = MemberState {
+            status: MemberStatus::Joined,
+            joined_at: Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            left_at: None,
+            enrolled_device_keys: BTreeSet::new(),
+        };
+
+        let bytes = canonical_cbor_encode(&ms).unwrap();
+
+        // `ek` must be absent from the map (skip_serializing_if = BTreeSet::is_empty)
+        let val: ciborium::Value = ciborium::de::from_reader(&bytes[..]).unwrap();
+        let map = val.as_map().expect("MemberState encodes as map");
+        let has_ek = map.iter().any(|(k, _)| k.as_text() == Some("ek"));
+        assert!(
+            !has_ek,
+            "`ek` key must be absent when enrolled_device_keys is empty (back-compat wire)"
+        );
+
+        // Decode back — must produce an empty set, not an error.
+        let back: MemberState = canonical_cbor_decode(&bytes).unwrap();
+        assert!(
+            back.enrolled_device_keys.is_empty(),
+            "decoded MemberState.enrolled_device_keys must be empty when `ek` was absent"
+        );
+        assert_eq!(back.status, MemberStatus::Joined);
+    }
 }
 
 // ── ZEB-254 PendingJoin verify_event unit tests ───────────────────────────────
@@ -5743,26 +6270,26 @@ mod zeb_254_pending_join_verify_tests {
 
     /// Build a test identity from a seed byte.
     /// Returns (PrivateIdentity, identity_pub [u8; 64], OwnerAddr).
-    fn make_identity(seed_byte: u8) -> (harmony_identity::PrivateIdentity, [u8; 64], OwnerAddr) {
-        let seed = [seed_byte; 32];
-        let private = harmony_identity::PrivateIdentity::from_seed(&seed);
-        let public = private.public_identity();
-        let identity_pub = public.to_public_bytes();
-        let addr = OwnerAddr(public.address_hash);
-        (private, identity_pub, addr)
+    fn make_identity(seed_byte: u8) -> (TestOwner, [u8; 64], OwnerAddr) {
+        let owner = mint_test_owner(seed_byte);
+        let addr = owner.owner;
+        (owner, [0u8; 64], addr)
     }
 
-    /// Build a signed InviteToken using the admin's identity.
+    /// ZEB-339: build a signed InviteToken, signed by the inviter's enrolled
+    /// device key (the same key materialized into the inviter's
+    /// `enrolled_device_keys`).
     fn make_invite_token(
-        admin_private: &harmony_identity::PrivateIdentity,
-        admin_addr: OwnerAddr,
+        inviter: &TestOwner,
+        inviter_addr: OwnerAddr,
         invitee_hint: Option<OwnerAddr>,
         expires_at: Option<u64>,
     ) -> InviteToken {
         use crate::community_invite::canonical_invite_token_bytes;
+        use ed25519_dalek::Signer;
 
         let mut tok = InviteToken {
-            inviter: admin_addr,
+            inviter: inviter_addr,
             invitee_hint,
             minted_at: Hlc {
                 wall_ms: 1_700_000_000_000,
@@ -5772,17 +6299,17 @@ mod zeb_254_pending_join_verify_tests {
             expires_at,
             sig: [0u8; 64],
         };
-        // Sign canonical bytes via the admin's PrivateIdentity.
         let bytes = canonical_invite_token_bytes(&tok).expect("encode token");
-        tok.sig = admin_private.sign(&bytes);
+        tok.sig = inviter.device_key.sign(&bytes).to_bytes();
         tok
     }
 
-    /// Build a signed PendingJoin event for the given joiner.
+    /// ZEB-339: build a signed PendingJoin event for the given joiner, signed
+    /// by the joiner's enrolled device key with their Master cert attached so
+    /// `enrolled_key_from_cert` can resolve the signer.
     fn make_pending_join_event(
-        joiner_private: &harmony_identity::PrivateIdentity,
+        joiner: &TestOwner,
         joiner_addr: OwnerAddr,
-        joiner_pub: [u8; 64],
         community_id: SpaceId,
         token: InviteToken,
     ) -> SignedMembershipEvent {
@@ -5791,7 +6318,6 @@ mod zeb_254_pending_join_verify_tests {
             community_id,
             kind: MembershipEventKind::PendingJoin {
                 invite_token: token,
-                joiner_identity_pub: joiner_pub,
             },
             actor: joiner_addr,
             at: Hlc {
@@ -5800,13 +6326,40 @@ mod zeb_254_pending_join_verify_tests {
                 device_id: "joiner-device".into(),
             },
         };
-        sign_event_with_identity(&payload, joiner_private).expect("sign PendingJoin")
+        let ev = sign_event(&payload, &joiner.device_key).expect("sign PendingJoin");
+        SignedMembershipEvent {
+            enrollment: Some(joiner.cert.clone()),
+            ..ev
+        }
+    }
+
+    /// ZEB-339: materialize a prior state where `inviter` is a Joined member
+    /// with their enrolled device key present (so P5 token-sig verification
+    /// against the inviter's enrolled key can succeed).
+    fn inviter_prior(inviter: &TestOwner, community_id: SpaceId) -> MaterializedMembership {
+        let join_payload = EventPayload {
+            id: [1u8; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: inviter.owner,
+            at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "admin".into(),
+            },
+        };
+        let join = sign_event(&join_payload, &inviter.device_key).expect("sign inviter join");
+        let join = SignedMembershipEvent {
+            enrollment: Some(inviter.cert.clone()),
+            ..join
+        };
+        materialize(std::slice::from_ref(&join), inviter.owner)
     }
 
     #[test]
     fn pending_join_event_signs_and_verifies() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
-        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
+        let (joiner_priv, _joiner_pub, joiner_addr) = make_identity(0xb1);
         let community_id = SpaceId([7u8; 16]);
         let token = make_invite_token(
             &admin_priv,
@@ -5814,25 +6367,21 @@ mod zeb_254_pending_join_verify_tests {
             Some(joiner_addr),
             Some(1_700_000_100_000),
         );
-        let event =
-            make_pending_join_event(&joiner_priv, joiner_addr, joiner_pub, community_id, token);
+        let event = make_pending_join_event(&joiner_priv, joiner_addr, community_id, token);
         let ctx = VerifyContext {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: true,
-            actor_identity_pub: &joiner_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: Some(&admin_pub),
         };
-        let mat = MaterializedMembership::default();
+        let mat = inviter_prior(&admin_priv, community_id);
         let result = verify_event(&event, &mat, &ctx);
         assert!(result.is_ok(), "expected Ok, got {:?}", result);
     }
 
     #[test]
     fn pending_join_rejected_when_token_invitee_not_actor() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
-        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
+        let (joiner_priv, _joiner_pub, joiner_addr) = make_identity(0xb1);
         let community_id = SpaceId([7u8; 16]);
         // Hint addresses someone else, not the joiner.
         let token = make_invite_token(
@@ -5841,17 +6390,13 @@ mod zeb_254_pending_join_verify_tests {
             Some(OwnerAddr([99u8; 16])),
             Some(1_700_000_100_000),
         );
-        let event =
-            make_pending_join_event(&joiner_priv, joiner_addr, joiner_pub, community_id, token);
+        let event = make_pending_join_event(&joiner_priv, joiner_addr, community_id, token);
         let ctx = VerifyContext {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: true,
-            actor_identity_pub: &joiner_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: Some(&admin_pub),
         };
-        let mat = MaterializedMembership::default();
+        let mat = inviter_prior(&admin_priv, community_id);
         assert!(
             matches!(
                 verify_event(&event, &mat, &ctx),
@@ -5863,8 +6408,8 @@ mod zeb_254_pending_join_verify_tests {
 
     #[test]
     fn pending_join_rejected_when_token_expired() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
-        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
+        let (joiner_priv, _joiner_pub, joiner_addr) = make_identity(0xb1);
         let community_id = SpaceId([7u8; 16]);
         // expires_at is BEFORE the event's wall_ms (1_700_000_001_000).
         let token = make_invite_token(
@@ -5873,17 +6418,13 @@ mod zeb_254_pending_join_verify_tests {
             Some(joiner_addr),
             Some(1_700_000_000_500),
         );
-        let event =
-            make_pending_join_event(&joiner_priv, joiner_addr, joiner_pub, community_id, token);
+        let event = make_pending_join_event(&joiner_priv, joiner_addr, community_id, token);
         let ctx = VerifyContext {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: true,
-            actor_identity_pub: &joiner_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: Some(&admin_pub),
         };
-        let mat = MaterializedMembership::default();
+        let mat = inviter_prior(&admin_priv, community_id);
         assert!(
             matches!(
                 verify_event(&event, &mat, &ctx),
@@ -5896,8 +6437,8 @@ mod zeb_254_pending_join_verify_tests {
     #[test]
     fn pending_join_rejected_when_token_inviter_not_admin() {
         let (rogue_priv, _rogue_pub, rogue_addr) = make_identity(0xc1);
-        let (_admin2_priv, admin2_pub, admin2_addr) = make_identity(0xa2);
-        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+        let (_admin2_priv, _admin2_pub, admin2_addr) = make_identity(0xa2);
+        let (joiner_priv, _joiner_pub, joiner_addr) = make_identity(0xb1);
         let community_id = SpaceId([7u8; 16]);
         // Token is signed by rogue, not admin2.
         let token = make_invite_token(
@@ -5906,16 +6447,12 @@ mod zeb_254_pending_join_verify_tests {
             Some(joiner_addr),
             Some(1_700_000_100_000),
         );
-        let event =
-            make_pending_join_event(&joiner_priv, joiner_addr, joiner_pub, community_id, token);
+        let event = make_pending_join_event(&joiner_priv, joiner_addr, community_id, token);
         // ctx uses admin2 as admin — rogue != admin2, so P2 (inviter != admin) fires.
         let ctx = VerifyContext {
             expected_community_id: community_id,
             admin_addr: admin2_addr,
             is_invite_only: true,
-            actor_identity_pub: &joiner_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: Some(&admin2_pub),
         };
         let mat = MaterializedMembership::default();
         let result = verify_event(&event, &mat, &ctx);
@@ -5928,8 +6465,8 @@ mod zeb_254_pending_join_verify_tests {
 
     #[test]
     fn pending_join_rejected_when_actor_already_joined() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
-        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
+        let (joiner_priv, _joiner_pub, joiner_addr) = make_identity(0xb1);
         let community_id = SpaceId([7u8; 16]);
         let token = make_invite_token(
             &admin_priv,
@@ -5937,9 +6474,8 @@ mod zeb_254_pending_join_verify_tests {
             Some(joiner_addr),
             Some(1_700_000_100_000),
         );
-        let event =
-            make_pending_join_event(&joiner_priv, joiner_addr, joiner_pub, community_id, token);
-        let mut mat = MaterializedMembership::default();
+        let event = make_pending_join_event(&joiner_priv, joiner_addr, community_id, token);
+        let mut mat = inviter_prior(&admin_priv, community_id);
         mat.members.insert(
             joiner_addr,
             MemberState {
@@ -5950,15 +6486,13 @@ mod zeb_254_pending_join_verify_tests {
                     device_id: "t".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         let ctx = VerifyContext {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: true,
-            actor_identity_pub: &joiner_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: Some(&admin_pub),
         };
         assert!(
             matches!(
@@ -5971,8 +6505,8 @@ mod zeb_254_pending_join_verify_tests {
 
     #[test]
     fn pending_join_rejected_when_actor_banned() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
-        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
+        let (joiner_priv, _joiner_pub, joiner_addr) = make_identity(0xb1);
         let community_id = SpaceId([7u8; 16]);
         let token = make_invite_token(
             &admin_priv,
@@ -5980,9 +6514,8 @@ mod zeb_254_pending_join_verify_tests {
             Some(joiner_addr),
             Some(1_700_000_100_000),
         );
-        let event =
-            make_pending_join_event(&joiner_priv, joiner_addr, joiner_pub, community_id, token);
-        let mut mat = MaterializedMembership::default();
+        let event = make_pending_join_event(&joiner_priv, joiner_addr, community_id, token);
+        let mut mat = inviter_prior(&admin_priv, community_id);
         mat.members.insert(
             joiner_addr,
             MemberState {
@@ -5993,15 +6526,13 @@ mod zeb_254_pending_join_verify_tests {
                     device_id: "t".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         let ctx = VerifyContext {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: true,
-            actor_identity_pub: &joiner_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: Some(&admin_pub),
         };
         assert!(
             matches!(
@@ -6016,8 +6547,8 @@ mod zeb_254_pending_join_verify_tests {
     fn pending_join_rejected_when_actor_already_pending() {
         // P6 gate: PendingJoin prior state is itself PendingJoin — must
         // reject because the actor is already-engaged (queue slot taken).
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
-        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
+        let (joiner_priv, _joiner_pub, joiner_addr) = make_identity(0xb1);
         let community_id = SpaceId([7u8; 16]);
         let token = make_invite_token(
             &admin_priv,
@@ -6025,9 +6556,8 @@ mod zeb_254_pending_join_verify_tests {
             Some(joiner_addr),
             Some(1_700_000_100_000),
         );
-        let event =
-            make_pending_join_event(&joiner_priv, joiner_addr, joiner_pub, community_id, token);
-        let mut mat = MaterializedMembership::default();
+        let event = make_pending_join_event(&joiner_priv, joiner_addr, community_id, token);
+        let mut mat = inviter_prior(&admin_priv, community_id);
         mat.members.insert(
             joiner_addr,
             MemberState {
@@ -6038,15 +6568,13 @@ mod zeb_254_pending_join_verify_tests {
                     device_id: "t".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         let ctx = VerifyContext {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: true,
-            actor_identity_pub: &joiner_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: Some(&admin_pub),
         };
         assert!(
             matches!(
@@ -6059,8 +6587,8 @@ mod zeb_254_pending_join_verify_tests {
 
     #[test]
     fn pending_join_accepted_when_actor_was_left() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
-        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
+        let (joiner_priv, _joiner_pub, joiner_addr) = make_identity(0xb1);
         let community_id = SpaceId([7u8; 16]);
         let token = make_invite_token(
             &admin_priv,
@@ -6068,9 +6596,8 @@ mod zeb_254_pending_join_verify_tests {
             Some(joiner_addr),
             Some(1_700_000_100_000),
         );
-        let event =
-            make_pending_join_event(&joiner_priv, joiner_addr, joiner_pub, community_id, token);
-        let mut mat = MaterializedMembership::default();
+        let event = make_pending_join_event(&joiner_priv, joiner_addr, community_id, token);
+        let mut mat = inviter_prior(&admin_priv, community_id);
         mat.members.insert(
             joiner_addr,
             MemberState {
@@ -6085,15 +6612,13 @@ mod zeb_254_pending_join_verify_tests {
                     logical: 0,
                     device_id: "t".into(),
                 }),
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         let ctx = VerifyContext {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: true,
-            actor_identity_pub: &joiner_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: Some(&admin_pub),
         };
         assert!(
             verify_event(&event, &mat, &ctx).is_ok(),
@@ -6102,9 +6627,14 @@ mod zeb_254_pending_join_verify_tests {
     }
 
     #[test]
-    fn pending_join_rejected_when_identity_pub_does_not_hash_to_actor() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
-        let (joiner_priv, joiner_pub, joiner_addr) = make_identity(0xb1);
+    fn pending_join_rejected_when_cert_owner_not_actor() {
+        // ZEB-339: the joiner-binding check is now subsumed by
+        // enrolled_key_from_cert, which rejects a PendingJoin whose carried
+        // cert.owner_id != event.actor. A joiner who attaches someone else's
+        // cert (a different owner's) is rejected with EnrollmentOwnerMismatch.
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
+        let (joiner_priv, _joiner_pub, joiner_addr) = make_identity(0xb1);
+        let other = mint_test_owner(0xd1);
         let community_id = SpaceId([7u8; 16]);
         let token = make_invite_token(
             &admin_priv,
@@ -6112,29 +6642,21 @@ mod zeb_254_pending_join_verify_tests {
             Some(joiner_addr),
             Some(1_700_000_100_000),
         );
-        // Embed a wrong pub — it won't hash to joiner_addr.
-        let wrong_pub = [0x55u8; 64];
-        // The event itself is signed with the real joiner key, but the embedded
-        // joiner_identity_pub in the PendingJoin payload is wrong.
-        let event =
-            make_pending_join_event(&joiner_priv, joiner_addr, wrong_pub, community_id, token);
+        // Build a PendingJoin for the joiner, then swap in a cert minted for a
+        // different owner. enrolled_key_from_cert binds cert.owner_id == actor,
+        // so the mismatched cert must be rejected.
+        let mut event = make_pending_join_event(&joiner_priv, joiner_addr, community_id, token);
+        event.enrollment = Some(other.cert.clone());
         let ctx = VerifyContext {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: true,
-            actor_identity_pub: &joiner_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: Some(&admin_pub),
         };
-        let mat = MaterializedMembership::default();
+        let mat = inviter_prior(&admin_priv, community_id);
         let result = verify_event(&event, &mat, &ctx);
-        // Either PendingJoinJoinerPubMismatch (pub doesn't hash to actor) OR
-        // SignatureInvalid / InvalidIdentityPub (all-0x55 pub may fail key parsing).
         assert!(
-            matches!(result, Err(VerifyError::PendingJoinJoinerPubMismatch))
-                || matches!(result, Err(VerifyError::SignatureInvalid))
-                || matches!(result, Err(VerifyError::InvalidIdentityPub)),
-            "wrong identity_pub must be rejected; got {:?}",
+            matches!(result, Err(VerifyError::EnrollmentOwnerMismatch)),
+            "cert minted for a different owner must yield EnrollmentOwnerMismatch; got {:?}",
             result
         );
     }
@@ -6146,17 +6668,14 @@ mod zeb_254_join_countersign_verify_tests {
 
     /// Build a test identity from a seed byte.
     /// Returns (PrivateIdentity, identity_pub [u8; 64], OwnerAddr).
-    fn make_identity(seed_byte: u8) -> (harmony_identity::PrivateIdentity, [u8; 64], OwnerAddr) {
-        let seed = [seed_byte; 32];
-        let private = harmony_identity::PrivateIdentity::from_seed(&seed);
-        let public = private.public_identity();
-        let identity_pub = public.to_public_bytes();
-        let addr = OwnerAddr(public.address_hash);
-        (private, identity_pub, addr)
+    fn make_identity(seed_byte: u8) -> (TestOwner, [u8; 64], OwnerAddr) {
+        let owner = mint_test_owner(seed_byte);
+        let addr = owner.owner;
+        (owner, [0u8; 64], addr)
     }
 
     fn make_join_countersign_event(
-        admin_private: &harmony_identity::PrivateIdentity,
+        admin: &TestOwner,
         admin_addr: OwnerAddr,
         community_id: SpaceId,
         target_event_id: [u8; 16],
@@ -6172,36 +6691,40 @@ mod zeb_254_join_countersign_verify_tests {
                 device_id: "admin-device".into(),
             },
         };
-        sign_event_with_identity(&payload, admin_private).expect("sign JoinCountersign")
+        sign_event(&payload, &admin.device_key).expect("sign JoinCountersign")
+    }
+
+    /// ZEB-339: a MemberState that is Joined and carries `owner`'s enrolled
+    /// device key, so steady-state signer resolution can find it.
+    fn joined_with_enrolled(owner: &TestOwner) -> MemberState {
+        let mut keys = BTreeSet::new();
+        keys.insert(owner.cert.device_pubkeys.classical.ed25519_verify);
+        MemberState {
+            status: MemberStatus::Joined,
+            joined_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            left_at: None,
+            enrolled_device_keys: keys,
+        }
     }
 
     #[test]
     fn join_countersign_event_signs_and_verifies() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
         let community_id = SpaceId([7u8; 16]);
         let target = [9u8; 16];
         let event = make_join_countersign_event(&admin_priv, admin_addr, community_id, target);
         let mut mat = MaterializedMembership::default();
-        mat.members.insert(
-            admin_addr,
-            MemberState {
-                status: MemberStatus::Joined,
-                joined_at: Hlc {
-                    wall_ms: 1,
-                    logical: 0,
-                    device_id: "t".into(),
-                },
-                left_at: None,
-            },
-        );
+        mat.members
+            .insert(admin_addr, joined_with_enrolled(&admin_priv));
         mat.power_levels.insert(admin_addr, POWER_THRESHOLDS.invite);
         let ctx = VerifyContext {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: true,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: Some(&admin_pub),
         };
         let result = verify_event(&event, &mat, &ctx);
         assert!(result.is_ok(), "expected Ok, got {:?}", result);
@@ -6209,7 +6732,7 @@ mod zeb_254_join_countersign_verify_tests {
 
     #[test]
     fn join_countersign_rejected_when_actor_not_joined() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
         let community_id = SpaceId([7u8; 16]);
         let target = [9u8; 16];
         let event = make_join_countersign_event(&admin_priv, admin_addr, community_id, target);
@@ -6218,14 +6741,15 @@ mod zeb_254_join_countersign_verify_tests {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: true,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: Some(&admin_pub),
         };
         let result = verify_event(&event, &mat, &ctx);
+        // ZEB-339: a non-member actor now fails signer resolution (step 1)
+        // before the per-kind JoinCountersignActorNotJoined gate is reached —
+        // with no materialized member there is no enrolled device key to
+        // resolve the signature against.
         assert!(
-            matches!(result, Err(VerifyError::JoinCountersignActorNotJoined)),
-            "expected JoinCountersignActorNotJoined, got {:?}",
+            matches!(result, Err(VerifyError::SignerNotEnrolledForActor)),
+            "expected SignerNotEnrolledForActor, got {:?}",
             result
         );
     }
@@ -6235,31 +6759,18 @@ mod zeb_254_join_countersign_verify_tests {
         // Out-of-order delivery — JoinCountersign arrives before its
         // target PendingJoin. Verify MUST accept it (target existence
         // is a materialize-time concern, not verify-time).
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
         let community_id = SpaceId([7u8; 16]);
         let target = [0xDEu8; 16]; // does not exist in prior state
         let event = make_join_countersign_event(&admin_priv, admin_addr, community_id, target);
         let mut mat = MaterializedMembership::default();
-        mat.members.insert(
-            admin_addr,
-            MemberState {
-                status: MemberStatus::Joined,
-                joined_at: Hlc {
-                    wall_ms: 1,
-                    logical: 0,
-                    device_id: "t".into(),
-                },
-                left_at: None,
-            },
-        );
+        mat.members
+            .insert(admin_addr, joined_with_enrolled(&admin_priv));
         mat.power_levels.insert(admin_addr, POWER_THRESHOLDS.invite);
         let ctx = VerifyContext {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: true,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: Some(&admin_pub),
         };
         let result = verify_event(&event, &mat, &ctx);
         assert!(
@@ -6267,6 +6778,45 @@ mod zeb_254_join_countersign_verify_tests {
             "expected Ok (out-of-order delivery), got {:?}",
             result
         );
+    }
+
+    #[test]
+    fn countersig_with_device_key_verifies_under_materialized_enrolled_key() {
+        // ZEB-339: a Join event countersigned with the counter-signer's
+        // enrolled device key (#2) verifies under verify_countersig, which
+        // resolves the signer from the counter-signer's materialized
+        // enrolled_device_keys (seeded from a cert-bearing Join).
+        let community_id = SpaceId([7u8; 16]);
+        // The joiner authors a Join event signed by their device #2.
+        let joiner = mint_test_owner(0x31);
+        let join_payload = EventPayload {
+            id: [0x10u8; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: joiner.owner,
+            at: Hlc {
+                wall_ms: 1_700_000_001_000,
+                logical: 0,
+                device_id: "joiner-device".into(),
+            },
+        };
+        let join_event = sign_event(&join_payload, &joiner.device_key).expect("sign Join");
+
+        // The counter-signer attaches a countersig with THEIR device key (#2).
+        let signer = mint_test_owner(0x32);
+        let countersigned =
+            attach_countersig_with_device_key(&join_event, signer.owner, &signer.device_key)
+                .expect("attach device-key countersig");
+
+        // prior_state: the counter-signer is Joined and carries their enrolled
+        // device key (as it would be materialized from a cert-bearing Join).
+        let mut prior_state = MaterializedMembership::default();
+        prior_state
+            .members
+            .insert(signer.owner, joined_with_enrolled(&signer));
+
+        verify_countersig(&countersigned, &prior_state)
+            .expect("device-key countersig verifies under materialized enrolled key");
     }
 
     #[test]
@@ -6301,7 +6851,7 @@ mod zeb_254_materialize_tests {
     fn synth_pending_join(
         actor_private: &harmony_identity::PrivateIdentity,
         actor_addr: OwnerAddr,
-        joiner_pub: [u8; 64],
+        _joiner_pub: [u8; 64],
         community_id: SpaceId,
         at_wall_ms: u64,
         event_id_seed: u8,
@@ -6322,7 +6872,6 @@ mod zeb_254_materialize_tests {
             community_id,
             kind: MembershipEventKind::PendingJoin {
                 invite_token: token,
-                joiner_identity_pub: joiner_pub,
             },
             actor: actor_addr,
             at: Hlc {
@@ -6470,6 +7019,45 @@ mod zeb_254_materialize_tests {
         assert_eq!(
             mat.members.get(&joiner_addr).map(|m| m.status),
             Some(MemberStatus::Joined)
+        );
+    }
+
+    /// ZEB-339: a first-join-via-invite (PendingJoin + countersign, no prior
+    /// Join) must learn the joiner's enrolled device key from the cert carried
+    /// on the PendingJoin event — otherwise the joiner ends up Joined with an
+    /// empty key set and their later steady-state events fail verification.
+    #[test]
+    fn materialize_pending_join_countersign_ingests_enrollment_key() {
+        let community = SpaceId([7u8; 16]);
+        let (joiner_priv, joiner_addr, joiner_pub) = synth_identity(1);
+        let (admin_priv, admin_addr, _) = synth_identity(2);
+        let owner = mint_test_owner(0x44);
+        let mut pending = synth_pending_join(
+            &joiner_priv,
+            joiner_addr,
+            joiner_pub,
+            community,
+            1_700_000_000_000,
+            1,
+        );
+        pending.enrollment = Some(owner.cert.clone());
+        let cs = synth_join_countersign(
+            &admin_priv,
+            admin_addr,
+            community,
+            pending.id,
+            1_700_000_001_000,
+            2,
+        );
+        let mat = materialize(&[pending, cs], admin_addr);
+        let ek = &mat
+            .members
+            .get(&joiner_addr)
+            .expect("joiner is a member after countersign")
+            .enrolled_device_keys;
+        assert!(
+            ek.contains(&owner.cert.device_pubkeys.classical.ed25519_verify),
+            "PendingJoin→countersign must ingest the joiner's enrolled device key from event.enrollment"
         );
     }
 
@@ -7213,25 +7801,28 @@ mod zeb_254_materialize_tests {
 mod zeb_250_admin_proposal_verify_tests {
     use super::*;
 
-    fn make_identity(seed_byte: u8) -> (harmony_identity::PrivateIdentity, [u8; 64], OwnerAddr) {
-        let seed = [seed_byte; 32];
-        let private = harmony_identity::PrivateIdentity::from_seed(&seed);
-        let public = private.public_identity();
-        let identity_pub = public.to_public_bytes();
-        let addr = OwnerAddr(public.address_hash);
-        (private, identity_pub, addr)
+    fn make_identity(seed_byte: u8) -> (TestOwner, [u8; 64], OwnerAddr) {
+        let owner = mint_test_owner(seed_byte);
+        let addr = owner.owner;
+        (owner, [0u8; 64], addr)
     }
 
-    fn sign_with_identity(
-        payload: EventPayload,
-        private: &harmony_identity::PrivateIdentity,
-    ) -> SignedMembershipEvent {
-        sign_event_with_identity(&payload, private).expect("sign_event_with_identity must succeed")
+    fn sign_with_identity(payload: EventPayload, owner: &TestOwner) -> SignedMembershipEvent {
+        let ev = sign_event(&payload, &owner.device_key).expect("sign_event must succeed");
+        match ev.kind {
+            MembershipEventKind::Join | MembershipEventKind::PendingJoin { .. } => {
+                SignedMembershipEvent {
+                    enrollment: Some(owner.cert.clone()),
+                    ..ev
+                }
+            }
+            _ => ev,
+        }
     }
 
     fn make_admin_proposal_event(
         id: [u8; 16],
-        actor_priv: &harmony_identity::PrivateIdentity,
+        actor_priv: &TestOwner,
         actor_addr: OwnerAddr,
         proposal_kind: ProposalKind,
         at_wall_ms: u64,
@@ -7252,7 +7843,7 @@ mod zeb_250_admin_proposal_verify_tests {
 
     #[test]
     fn admin_proposal_accepted_when_actor_admin() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, other_addr) = make_identity(0x02);
         let mut prior = MaterializedMembership::default();
         prior.members.insert(
@@ -7265,6 +7856,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "a".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.members.insert(
@@ -7277,6 +7869,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "o".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -7291,21 +7884,19 @@ mod zeb_250_admin_proposal_verify_tests {
             },
             1_000,
         );
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(verify_event(&evt, &prior, &ctx), Ok(()));
     }
 
     #[test]
     fn admin_proposal_rejected_when_actor_not_joined() {
-        let (actor_priv, actor_pub, actor_addr) = make_identity(0x01);
-        let prior = MaterializedMembership::default();
+        let (actor_priv, _actor_pub, actor_addr) = make_identity(0x01);
+        let mut prior = MaterializedMembership::default();
         let evt = make_admin_proposal_event(
             [0x10; 16],
             &actor_priv,
@@ -7316,23 +7907,24 @@ mod zeb_250_admin_proposal_verify_tests {
             },
             1_000,
         );
+        test_enroll_member(&mut prior, &actor_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr: actor_addr,
             is_invite_only: false,
-            actor_identity_pub: &actor_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
+        // ZEB-339: a non-member actor fails signer resolution (step 1) before
+        // the AdminProposalActorNotJoined gate — no materialized membership
+        // means no enrolled device key.
         assert_eq!(
             verify_event(&evt, &prior, &ctx),
-            Err(VerifyError::AdminProposalActorNotJoined)
+            Err(VerifyError::SignerNotEnrolledForActor)
         );
     }
 
     #[test]
     fn admin_proposal_rejected_when_actor_power_below_100() {
-        let (actor_priv, actor_pub, actor_addr) = make_identity(0x01);
+        let (actor_priv, _actor_pub, actor_addr) = make_identity(0x01);
         let (_, _, target_addr) = make_identity(0x02);
         let mut prior = MaterializedMembership::default();
         prior.members.insert(
@@ -7345,6 +7937,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "a".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.members.insert(
@@ -7357,6 +7950,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "t".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(actor_addr, 50);
@@ -7371,13 +7965,11 @@ mod zeb_250_admin_proposal_verify_tests {
             },
             1_000,
         );
+        test_enroll_member(&mut prior, &actor_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr: actor_addr,
             is_invite_only: false,
-            actor_identity_pub: &actor_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&evt, &prior, &ctx),
@@ -7387,7 +7979,7 @@ mod zeb_250_admin_proposal_verify_tests {
 
     #[test]
     fn admin_proposal_setpower_rejected_when_target_not_in_members() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, ghost_addr) = make_identity(0xfe);
         let mut prior = MaterializedMembership::default();
         prior.members.insert(
@@ -7400,6 +7992,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "a".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -7413,13 +8006,11 @@ mod zeb_250_admin_proposal_verify_tests {
             },
             1_000,
         );
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&evt, &prior, &ctx),
@@ -7429,7 +8020,7 @@ mod zeb_250_admin_proposal_verify_tests {
 
     #[test]
     fn admin_proposal_setpower_rejected_when_level_out_of_range() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, target_addr) = make_identity(0x02);
         let mut prior = MaterializedMembership::default();
         prior.members.insert(
@@ -7442,6 +8033,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "a".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.members.insert(
@@ -7454,6 +8046,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "t".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -7468,13 +8061,11 @@ mod zeb_250_admin_proposal_verify_tests {
             },
             1_000,
         );
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&evt, &prior, &ctx),
@@ -7484,7 +8075,7 @@ mod zeb_250_admin_proposal_verify_tests {
 
     #[test]
     fn admin_proposal_setpower_rejected_when_not_admin_affecting() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, regular_addr) = make_identity(0x02);
         let mut prior = MaterializedMembership::default();
         prior.members.insert(
@@ -7497,6 +8088,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "a".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.members.insert(
@@ -7509,6 +8101,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "r".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -7523,13 +8116,11 @@ mod zeb_250_admin_proposal_verify_tests {
             },
             1_000,
         );
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&evt, &prior, &ctx),
@@ -7539,7 +8130,7 @@ mod zeb_250_admin_proposal_verify_tests {
 
     #[test]
     fn admin_proposal_kick_rejected_when_target_not_admin() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, mod_addr) = make_identity(0x02);
         let mut prior = MaterializedMembership::default();
         prior.members.insert(
@@ -7552,6 +8143,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "a".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.members.insert(
@@ -7564,6 +8156,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "m".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -7578,13 +8171,11 @@ mod zeb_250_admin_proposal_verify_tests {
             },
             1_000,
         );
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&evt, &prior, &ctx),
@@ -7594,7 +8185,7 @@ mod zeb_250_admin_proposal_verify_tests {
 
     #[test]
     fn admin_proposal_change_quorum_rejected_when_below_one() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let mut prior = MaterializedMembership::default();
         prior.members.insert(
             admin_addr,
@@ -7606,6 +8197,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "a".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -7616,13 +8208,11 @@ mod zeb_250_admin_proposal_verify_tests {
             ProposalKind::ChangeQuorum { new_quorum: 0 },
             1_000,
         );
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&evt, &prior, &ctx),
@@ -7632,7 +8222,7 @@ mod zeb_250_admin_proposal_verify_tests {
 
     #[test]
     fn admin_proposal_change_quorum_rejected_when_exceeds_admin_count() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let mut prior = MaterializedMembership::default();
         prior.members.insert(
             admin_addr,
@@ -7644,6 +8234,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "a".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -7655,13 +8246,11 @@ mod zeb_250_admin_proposal_verify_tests {
             ProposalKind::ChangeQuorum { new_quorum: 2 },
             1_000,
         );
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&evt, &prior, &ctx),
@@ -7671,7 +8260,7 @@ mod zeb_250_admin_proposal_verify_tests {
 
     #[test]
     fn admin_proposal_change_quorum_accepted_when_equals_admin_count() {
-        let (admin1_priv, admin1_pub, admin1_addr) = make_identity(0x01);
+        let (admin1_priv, _admin1_pub, admin1_addr) = make_identity(0x01);
         let (_, _, admin2_addr) = make_identity(0x02);
         let mut prior = MaterializedMembership::default();
         prior.members.insert(
@@ -7684,6 +8273,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "a1".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.members.insert(
@@ -7696,6 +8286,7 @@ mod zeb_250_admin_proposal_verify_tests {
                     device_id: "a2".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin1_addr, 100);
@@ -7707,13 +8298,11 @@ mod zeb_250_admin_proposal_verify_tests {
             ProposalKind::ChangeQuorum { new_quorum: 2 },
             1_000,
         );
+        test_enroll_member(&mut prior, &admin1_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr: admin1_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin1_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(verify_event(&evt, &prior, &ctx), Ok(()));
     }
@@ -7729,7 +8318,7 @@ mod zeb_250_admin_proposal_verify_tests {
     /// would be 3 and the proposal would wrongly pass AP5.
     #[test]
     fn admin_proposal_change_quorum_rejects_when_quorum_would_exceed_live_admin_count() {
-        let (admin1_priv, admin1_pub, admin1_addr) = make_identity(0x01);
+        let (admin1_priv, _admin1_pub, admin1_addr) = make_identity(0x01);
         let (_, _, admin2_addr) = make_identity(0x02);
         let (_, _, admin3_addr) = make_identity(0x03);
 
@@ -7750,6 +8339,7 @@ mod zeb_250_admin_proposal_verify_tests {
                         device_id: "t".into(),
                     },
                     left_at: None,
+                    enrolled_device_keys: BTreeSet::new(),
                 },
             );
             prior.power_levels.insert(addr, 100);
@@ -7763,13 +8353,11 @@ mod zeb_250_admin_proposal_verify_tests {
             ProposalKind::ChangeQuorum { new_quorum: 3 },
             1_000,
         );
+        test_enroll_member(&mut prior, &admin1_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr: admin1_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin1_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&evt, &prior, &ctx),
@@ -7796,7 +8384,7 @@ mod zeb_250_admin_proposal_verify_tests {
     /// MAX_MODERATION_REASON_CHARS length cap, matching the direct Kick path.
     #[test]
     fn admin_proposal_kick_rejected_when_reason_exceeds_length_cap() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, target_addr) = make_identity(0x02);
 
         let mut prior = MaterializedMembership::default();
@@ -7814,6 +8402,7 @@ mod zeb_250_admin_proposal_verify_tests {
                         device_id: "t".into(),
                     },
                     left_at: None,
+                    enrolled_device_keys: BTreeSet::new(),
                 },
             );
         }
@@ -7833,13 +8422,11 @@ mod zeb_250_admin_proposal_verify_tests {
             },
             1_000,
         );
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&evt, &prior, &ctx),
@@ -7855,18 +8442,15 @@ mod zeb_250_admin_proposal_verify_tests {
 mod zeb_250_admin_countersign_verify_tests {
     use super::*;
 
-    fn make_identity(seed_byte: u8) -> (harmony_identity::PrivateIdentity, [u8; 64], OwnerAddr) {
-        let seed = [seed_byte; 32];
-        let private = harmony_identity::PrivateIdentity::from_seed(&seed);
-        let public = private.public_identity();
-        let identity_pub = public.to_public_bytes();
-        let addr = OwnerAddr(public.address_hash);
-        (private, identity_pub, addr)
+    fn make_identity(seed_byte: u8) -> (TestOwner, [u8; 64], OwnerAddr) {
+        let owner = mint_test_owner(seed_byte);
+        let addr = owner.owner;
+        (owner, [0u8; 64], addr)
     }
 
     fn make_admin_countersign_event(
         id: [u8; 16],
-        actor_priv: &harmony_identity::PrivateIdentity,
+        actor_priv: &TestOwner,
         actor_addr: OwnerAddr,
         target_event_id: [u8; 16],
         at_wall_ms: u64,
@@ -7882,13 +8466,12 @@ mod zeb_250_admin_countersign_verify_tests {
                 device_id: "test".into(),
             },
         };
-        sign_event_with_identity(&payload, actor_priv)
-            .expect("sign_event_with_identity must succeed")
+        sign_event(&payload, &actor_priv.device_key).expect("sign AdminCountersign")
     }
 
     #[test]
     fn admin_countersign_accepted_when_actor_admin() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let mut prior = MaterializedMembership::default();
         prior.members.insert(
             admin_addr,
@@ -7900,45 +8483,45 @@ mod zeb_250_admin_countersign_verify_tests {
                     device_id: "a".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
         let evt =
             make_admin_countersign_event([0x10; 16], &admin_priv, admin_addr, [0x55; 16], 1_000);
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(verify_event(&evt, &prior, &ctx), Ok(()));
     }
 
     #[test]
     fn admin_countersign_rejected_when_actor_not_joined() {
-        let (actor_priv, actor_pub, actor_addr) = make_identity(0x01);
-        let prior = MaterializedMembership::default();
+        let (actor_priv, _actor_pub, actor_addr) = make_identity(0x01);
+        let mut prior = MaterializedMembership::default();
         let evt =
             make_admin_countersign_event([0x10; 16], &actor_priv, actor_addr, [0x55; 16], 1_000);
+        test_enroll_member(&mut prior, &actor_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr: actor_addr,
             is_invite_only: false,
-            actor_identity_pub: &actor_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
+        // ZEB-339: a non-member actor fails signer resolution (step 1) before
+        // the AdminCountersignActorNotJoined gate — no materialized membership
+        // means no enrolled device key.
         assert_eq!(
             verify_event(&evt, &prior, &ctx),
-            Err(VerifyError::AdminCountersignActorNotJoined)
+            Err(VerifyError::SignerNotEnrolledForActor)
         );
     }
 
     #[test]
     fn admin_countersign_rejected_when_actor_power_below_100() {
-        let (mod_priv, mod_pub, mod_addr) = make_identity(0x01);
+        let (mod_priv, _mod_pub, mod_addr) = make_identity(0x01);
         let mut prior = MaterializedMembership::default();
         prior.members.insert(
             mod_addr,
@@ -7950,17 +8533,16 @@ mod zeb_250_admin_countersign_verify_tests {
                     device_id: "m".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(mod_addr, 50);
         let evt = make_admin_countersign_event([0x10; 16], &mod_priv, mod_addr, [0x55; 16], 1_000);
+        test_enroll_member(&mut prior, &mod_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr: mod_addr,
             is_invite_only: false,
-            actor_identity_pub: &mod_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&evt, &prior, &ctx),
@@ -7973,7 +8555,7 @@ mod zeb_250_admin_countersign_verify_tests {
         // Lenient forward-ref: AC must verify even when the target
         // AdminProposal is not yet in the log. prior_state has no
         // record of [0x55; 16] — and that's fine.
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let mut prior = MaterializedMembership::default();
         prior.members.insert(
             admin_addr,
@@ -7985,6 +8567,7 @@ mod zeb_250_admin_countersign_verify_tests {
                     device_id: "a".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -7995,13 +8578,11 @@ mod zeb_250_admin_countersign_verify_tests {
             [0x55; 16], // target absent from prior_state
             5_000,
         );
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(verify_event(&evt, &prior, &ctx), Ok(()));
     }
@@ -8013,25 +8594,28 @@ mod zeb_250_admin_countersign_verify_tests {
 mod zeb_250_direct_event_quorum_gate_tests {
     use super::*;
 
-    fn make_identity(seed_byte: u8) -> (harmony_identity::PrivateIdentity, [u8; 64], OwnerAddr) {
-        let seed = [seed_byte; 32];
-        let private = harmony_identity::PrivateIdentity::from_seed(&seed);
-        let public = private.public_identity();
-        let identity_pub = public.to_public_bytes();
-        let addr = OwnerAddr(public.address_hash);
-        (private, identity_pub, addr)
+    fn make_identity(seed_byte: u8) -> (TestOwner, [u8; 64], OwnerAddr) {
+        let owner = mint_test_owner(seed_byte);
+        let addr = owner.owner;
+        (owner, [0u8; 64], addr)
     }
 
-    fn sign_with_identity(
-        payload: EventPayload,
-        private: &harmony_identity::PrivateIdentity,
-    ) -> SignedMembershipEvent {
-        sign_event_with_identity(&payload, private).expect("sign_event_with_identity must succeed")
+    fn sign_with_identity(payload: EventPayload, owner: &TestOwner) -> SignedMembershipEvent {
+        let ev = sign_event(&payload, &owner.device_key).expect("sign_event must succeed");
+        match ev.kind {
+            MembershipEventKind::Join | MembershipEventKind::PendingJoin { .. } => {
+                SignedMembershipEvent {
+                    enrollment: Some(owner.cert.clone()),
+                    ..ev
+                }
+            }
+            _ => ev,
+        }
     }
 
     fn make_setpower_event(
         id: [u8; 16],
-        actor_priv: &harmony_identity::PrivateIdentity,
+        actor_priv: &TestOwner,
         actor_addr: OwnerAddr,
         target: OwnerAddr,
         level: u8,
@@ -8053,7 +8637,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
 
     fn make_kick_event_signed(
         id: [u8; 16],
-        actor_priv: &harmony_identity::PrivateIdentity,
+        actor_priv: &TestOwner,
         actor_addr: OwnerAddr,
         target: OwnerAddr,
         at_wall_ms: u64,
@@ -8097,6 +8681,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
                     device_id: "a".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.members.insert(
@@ -8109,6 +8694,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
                     device_id: "t".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.power_levels.insert(admin_addr, 100);
@@ -8122,17 +8708,15 @@ mod zeb_250_direct_event_quorum_gate_tests {
     /// is rejected when admin_quorum > 1.
     #[test]
     fn direct_setpower_to_100_rejected_when_admin_quorum_above_1() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, target_addr) = make_identity(0x02);
-        let prior = prior_with_admin_and_target(admin_addr, target_addr, 0, 2);
+        let mut prior = prior_with_admin_and_target(admin_addr, target_addr, 0, 2);
         let evt = make_setpower_event([0x10; 16], &admin_priv, admin_addr, target_addr, 100, 1_000);
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&evt, &prior, &ctx),
@@ -8144,10 +8728,10 @@ mod zeb_250_direct_event_quorum_gate_tests {
     /// to a lower level is rejected when admin_quorum > 1.
     #[test]
     fn direct_setpower_demote_admin_rejected_when_admin_quorum_above_1() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, target_addr) = make_identity(0x02);
         // Target is currently an admin (power 100).
-        let prior = prior_with_admin_and_target(admin_addr, target_addr, 100, 3);
+        let mut prior = prior_with_admin_and_target(admin_addr, target_addr, 100, 3);
         // Actor also has power 100, so actor_power > target_power is false —
         // but that existing check runs first; need actor with higher power
         // conceptually. Actually existing check: actor_power <= target_power → reject.
@@ -8159,13 +8743,11 @@ mod zeb_250_direct_event_quorum_gate_tests {
         //   2. level <= max ✓
         // So actor=100, target=100, level=50 is valid up to the quorum gate.
         let evt = make_setpower_event([0x10; 16], &admin_priv, admin_addr, target_addr, 50, 1_000);
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&evt, &prior, &ctx),
@@ -8177,18 +8759,16 @@ mod zeb_250_direct_event_quorum_gate_tests {
     /// accepted regardless of admin_quorum — non-admin-affecting moderation.
     #[test]
     fn direct_setpower_to_non_admin_accepted_regardless_of_quorum() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, target_addr) = make_identity(0x02);
         // Target has power 0 (not an admin), new level is 50 (mod, not admin).
-        let prior = prior_with_admin_and_target(admin_addr, target_addr, 0, 5);
+        let mut prior = prior_with_admin_and_target(admin_addr, target_addr, 0, 5);
         let evt = make_setpower_event([0x10; 16], &admin_priv, admin_addr, target_addr, 50, 1_000);
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(verify_event(&evt, &prior, &ctx), Ok(()));
     }
@@ -8237,7 +8817,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
         // actor a hypothetical "super-admin" stored directly in power_levels as 101
         // (bypassing the PowerLevelOutOfRange check which only applies to SetPower
         // events, not to power_levels stored in prior_state).
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, target_addr) = make_identity(0x02);
         let mut prior = MaterializedMembership {
             admin_quorum: 2,
@@ -8253,6 +8833,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
                     device_id: "a".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         prior.members.insert(
@@ -8265,6 +8846,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
                     device_id: "t".into(),
                 },
                 left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
             },
         );
         // Store actor power as 101 directly in prior_state (bypasses PowerLevelOutOfRange,
@@ -8272,13 +8854,11 @@ mod zeb_250_direct_event_quorum_gate_tests {
         prior.power_levels.insert(admin_addr, 101);
         prior.power_levels.insert(target_addr, 100);
         let evt = make_kick_event_signed([0x10; 16], &admin_priv, admin_addr, target_addr, 1_000);
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&evt, &prior, &ctx),
@@ -8290,18 +8870,16 @@ mod zeb_250_direct_event_quorum_gate_tests {
     /// regardless of admin_quorum — non-admin-affecting moderation.
     #[test]
     fn direct_kick_of_mod_accepted_regardless_of_quorum() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, target_addr) = make_identity(0x02);
         // Target is a moderator (power 50), not an admin.
-        let prior = prior_with_admin_and_target(admin_addr, target_addr, 50, 5);
+        let mut prior = prior_with_admin_and_target(admin_addr, target_addr, 50, 5);
         let evt = make_kick_event_signed([0x10; 16], &admin_priv, admin_addr, target_addr, 1_000);
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(verify_event(&evt, &prior, &ctx), Ok(()));
     }
@@ -8311,21 +8889,19 @@ mod zeb_250_direct_event_quorum_gate_tests {
     /// both accepted when admin_quorum == 1.
     #[test]
     fn direct_setpower_admin_actions_accepted_when_admin_quorum_equals_1() {
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0x01);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0x01);
         let (_, _, target_addr) = make_identity(0x02);
         // admin_quorum == 1 (the default).
-        let prior = prior_with_admin_and_target(admin_addr, target_addr, 0, 1);
+        let mut prior = prior_with_admin_and_target(admin_addr, target_addr, 0, 1);
 
         // Direct SetPower to level 100 — must be accepted.
         let setpower_evt =
             make_setpower_event([0x10; 16], &admin_priv, admin_addr, target_addr, 100, 1_000);
+        test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         assert_eq!(
             verify_event(&setpower_evt, &prior, &ctx),
@@ -8367,6 +8943,7 @@ mod zeb_250_materialize_prepass_tests {
                 },
                 sig: [0; 64],
                 countersig: None,
+                enrollment: None,
             },
             SignedMembershipEvent {
                 id: [0xBB; 16],
@@ -8382,6 +8959,7 @@ mod zeb_250_materialize_prepass_tests {
                 },
                 sig: [0; 64],
                 countersig: None,
+                enrollment: None,
             },
         ];
         // No assertion on effect yet — Task 8 wires the main-pass
@@ -8417,6 +8995,7 @@ mod zeb_250_admin_proposal_materialize_tests {
             kind,
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         }
     }
 
@@ -9197,32 +9776,25 @@ mod zeb_250_admin_proposal_materialize_tests {
 #[cfg(test)]
 mod zeb_321_reachability_verify_tests {
     use super::*;
-    use crate::reachability_record::{build_signed_payload, ReachabilityAnnouncePayload};
+    use crate::reachability_record::ReachabilityAnnouncePayload;
 
     /// Build a test identity from a seed byte.
     /// Returns (PrivateIdentity, identity_pub [u8; 64], OwnerAddr).
-    fn make_identity(seed_byte: u8) -> (harmony_identity::PrivateIdentity, [u8; 64], OwnerAddr) {
-        let seed = [seed_byte; 32];
-        let private = harmony_identity::PrivateIdentity::from_seed(&seed);
-        let public = private.public_identity();
-        let identity_pub = public.to_public_bytes();
-        let addr = OwnerAddr(public.address_hash);
-        (private, identity_pub, addr)
+    fn make_identity(seed_byte: u8) -> (TestOwner, [u8; 64], OwnerAddr) {
+        let owner = mint_test_owner(seed_byte);
+        let addr = owner.owner;
+        (owner, [0u8; 64], addr)
     }
 
-    /// Helper: produce a `prior_state` where `actor` is currently
-    /// Joined. Uses materialize on a single Join event so power_levels
-    /// + members reflect the bootstrap-admin shape.
-    fn joined_prior(
-        community_id: SpaceId,
-        admin_priv: &harmony_identity::PrivateIdentity,
-        admin_addr: OwnerAddr,
-    ) -> MaterializedMembership {
+    /// ZEB-339: produce a `prior_state` where `admin` is currently Joined with
+    /// their enrolled device key materialized (so steady-state signer
+    /// resolution + the RCH2 device-key inner-sig check can succeed).
+    fn joined_prior(community_id: SpaceId, admin: &TestOwner) -> MaterializedMembership {
         let admin_join_payload = EventPayload {
             id: [0x01; 16],
             community_id,
             kind: MembershipEventKind::Join,
-            actor: admin_addr,
+            actor: admin.owner,
             at: Hlc {
                 wall_ms: 1,
                 logical: 0,
@@ -9230,35 +9802,51 @@ mod zeb_321_reachability_verify_tests {
             },
         };
         let admin_join =
-            sign_event_with_identity(&admin_join_payload, admin_priv).expect("sign admin join");
-        materialize(std::slice::from_ref(&admin_join), admin_addr)
+            sign_event(&admin_join_payload, &admin.device_key).expect("sign admin join");
+        let admin_join = SignedMembershipEvent {
+            enrollment: Some(admin.cert.clone()),
+            ..admin_join
+        };
+        materialize(std::slice::from_ref(&admin_join), admin.owner)
     }
 
-    /// Build a signed ReachabilityAnnounce event using a real identity.
-    /// `announced_at_ms` and `wall_ms` are passed separately so tests
-    /// can exercise the timestamp-skew gate.
+    /// ZEB-339: build a signed ReachabilityAnnounce event using the owner's
+    /// enrolled device key for BOTH the inner reachability signature and the
+    /// outer envelope signature (matching the production split-key model).
     fn make_reachability_event(
         community_id: SpaceId,
-        identity: &harmony_identity::PrivateIdentity,
+        owner: &TestOwner,
         actor: OwnerAddr,
         announced_at_ms: u64,
         wall_ms: u64,
     ) -> SignedMembershipEvent {
+        use crate::reachability_record::inner_signed_bytes;
+        use ed25519_dalek::Signer;
         let hlc = Hlc {
             wall_ms,
             logical: 0,
             device_id: "t".into(),
         };
-        let payload = build_signed_payload(
-            [0xAB; 32],
-            "https://derp.example/".into(),
-            vec![],
+        let iroh_node_id = [0xAB; 32];
+        let home_relay_url = "https://derp.example/".to_string();
+        let direct_addresses: Vec<std::net::SocketAddr> = vec![];
+        let inner = inner_signed_bytes(
+            &iroh_node_id,
+            &home_relay_url,
+            &direct_addresses,
             announced_at_ms,
             &actor,
             &hlc,
-            identity,
         )
-        .expect("build signed payload");
+        .expect("inner signed bytes");
+        let identity_signature = owner.device_key.sign(&inner).to_bytes();
+        let payload = ReachabilityAnnouncePayload {
+            iroh_node_id,
+            home_relay_url,
+            direct_addresses,
+            announced_at_ms,
+            identity_signature,
+        };
         let payload = EventPayload {
             id: [0x42; 16],
             community_id,
@@ -9266,7 +9854,7 @@ mod zeb_321_reachability_verify_tests {
             actor,
             at: hlc,
         };
-        sign_event_with_identity(&payload, identity).expect("sign envelope")
+        sign_event(&payload, &owner.device_key).expect("sign envelope")
     }
 
     /// Positive end-to-end: joined actor + valid inner sig + matching
@@ -9276,8 +9864,8 @@ mod zeb_321_reachability_verify_tests {
     #[test]
     fn verify_reachability_announce_accepts_valid() {
         let community_id = SpaceId([0xc0; 16]);
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
-        let prior = joined_prior(community_id, &admin_priv, admin_addr);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
+        let prior = joined_prior(community_id, &admin_priv);
 
         let event =
             make_reachability_event(community_id, &admin_priv, admin_addr, 1_000_000, 1_000_000);
@@ -9286,9 +9874,6 @@ mod zeb_321_reachability_verify_tests {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         verify_event(&event, &prior, &ctx).expect("valid ReachabilityAnnounce must verify");
     }
@@ -9302,16 +9887,16 @@ mod zeb_321_reachability_verify_tests {
     #[test]
     fn verify_reachability_announce_rejects_inner_sig_tampering() {
         let community_id = SpaceId([0xc0; 16]);
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
-        let prior = joined_prior(community_id, &admin_priv, admin_addr);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
+        let prior = joined_prior(community_id, &admin_priv);
 
         let mut event =
             make_reachability_event(community_id, &admin_priv, admin_addr, 1_000_000, 1_000_000);
 
         // Flip a bit inside the inner identity_signature.
         // We must re-sign the OUTER envelope after mutating the payload
-        // (else the outer verify_signature would reject with
-        // SignatureInvalid before we reach the RCH2 check).
+        // (else the outer signer-verify would reject with SignatureInvalid
+        // before we reach the RCH2 check).
         if let MembershipEventKind::ReachabilityAnnounce { ref mut payload } = event.kind {
             payload.identity_signature[0] ^= 0xFF;
         } else {
@@ -9325,15 +9910,12 @@ mod zeb_321_reachability_verify_tests {
             at: event.at.clone(),
         };
         let resigned =
-            sign_event_with_identity(&resigned_payload, &admin_priv).expect("re-sign envelope");
+            sign_event(&resigned_payload, &admin_priv.device_key).expect("re-sign envelope");
 
         let ctx = VerifyContext {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         let result = verify_event(&resigned, &prior, &ctx);
         assert!(
@@ -9347,8 +9929,8 @@ mod zeb_321_reachability_verify_tests {
     #[test]
     fn verify_reachability_announce_rejects_timestamp_skew() {
         let community_id = SpaceId([0xc0; 16]);
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
-        let prior = joined_prior(community_id, &admin_priv, admin_addr);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
+        let prior = joined_prior(community_id, &admin_priv);
 
         // announced_at_ms = wall_ms + (skew-max + 1 min), i.e. just
         // outside the RCH4 ±30-min window. Referencing the const keeps
@@ -9367,9 +9949,6 @@ mod zeb_321_reachability_verify_tests {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         let result = verify_event(&event, &prior, &ctx);
         assert!(
@@ -9390,8 +9969,8 @@ mod zeb_321_reachability_verify_tests {
         let community_id = SpaceId([0xc0; 16]);
         let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
         // Bob exists as an identity but has never Joined the community.
-        let (bob_priv, bob_pub, bob_addr) = make_identity(0xbb);
-        let prior = joined_prior(community_id, &admin_priv, admin_addr);
+        let (bob_priv, _bob_pub, bob_addr) = make_identity(0xbb);
+        let prior = joined_prior(community_id, &admin_priv);
 
         let event =
             make_reachability_event(community_id, &bob_priv, bob_addr, 1_000_000, 1_000_000);
@@ -9400,14 +9979,14 @@ mod zeb_321_reachability_verify_tests {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &bob_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         let result = verify_event(&event, &prior, &ctx);
+        // ZEB-339: a non-member fails signer resolution (step 1) before the
+        // RCH5 membership gate — no materialized member means no enrolled
+        // device key to verify the signature against.
         assert!(
-            matches!(result, Err(VerifyError::ReachabilityActorNotMember)),
-            "non-member's ReachabilityAnnounce must produce ReachabilityActorNotMember; got {result:?}"
+            matches!(result, Err(VerifyError::SignerNotEnrolledForActor)),
+            "non-member's ReachabilityAnnounce must produce SignerNotEnrolledForActor; got {result:?}"
         );
     }
 
@@ -9418,8 +9997,8 @@ mod zeb_321_reachability_verify_tests {
     #[test]
     fn verify_reachability_announce_rejects_all_zero_inner_sig() {
         let community_id = SpaceId([0xc0; 16]);
-        let (admin_priv, admin_pub, admin_addr) = make_identity(0xa1);
-        let prior = joined_prior(community_id, &admin_priv, admin_addr);
+        let (admin_priv, _admin_pub, admin_addr) = make_identity(0xa1);
+        let prior = joined_prior(community_id, &admin_priv);
 
         let hlc = Hlc {
             wall_ms: 1_000_000,
@@ -9442,20 +10021,570 @@ mod zeb_321_reachability_verify_tests {
             actor: admin_addr,
             at: hlc,
         };
-        let event = sign_event_with_identity(&payload, &admin_priv).expect("sign envelope");
+        let event = sign_event(&payload, &admin_priv.device_key).expect("sign envelope");
 
         let ctx = VerifyContext {
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
-            actor_identity_pub: &admin_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         let result = verify_event(&event, &prior, &ctx);
         assert!(
             matches!(result, Err(VerifyError::ReachabilityInnerSigInvalid)),
             "all-zero inner sig must produce ReachabilityInnerSigInvalid; got {result:?}"
+        );
+    }
+}
+
+// ── ZEB-339 verify_membership_signer / enrolled_key_from_cert unit tests ──────
+
+// ZEB-339 (spec §9.2): cross-owner end-to-end test.
+//
+// Two distinct owners (creator + joiner) each have their own
+// owner_id / device_key / cert — built via `mint_test_owner`.
+// The test builds an event log purely from carried certs + materialized
+// state (no shared identity cache / resolver).
+//
+// Event sequence (invite-only community, creator = admin):
+// - Event 1: creator bootstrap Join (carries creator.cert)
+// - Event 2: joiner PendingJoin (carries joiner.cert + InviteToken
+//   signed by creator.device_key)
+// - Event 3: creator JoinCountersign (signed by creator.device_key,
+//   resolved from materialized membership enrolled keys)
+//
+// Each event is verified via verify_event(event, prior_state, &ctx).
+// The point: a verifier with ONLY the events + certs (no cache)
+// accepts a different owner's cert-bearing and steady-state events.
+#[cfg(test)]
+mod zeb_339_cross_owner_e2e_tests {
+    use super::*;
+    use crate::community_invite::{canonical_invite_token_bytes, InviteToken};
+    use ed25519_dalek::Signer;
+
+    #[test]
+    fn cross_owner_e2e_invite_path_verifies_from_certs_only() {
+        // ── Setup ─────────────────────────────────────────────────────────────
+        // Use seeds that don't collide via the seed ^ 0xFF master/device swap:
+        // creator=0x10, joiner=0x20. Avoid 0x10 ^ 0xFF = 0xEF and 0x20 ^ 0xFF = 0xDF.
+        let creator = mint_test_owner(0x10);
+        let joiner = mint_test_owner(0x20);
+        let community_id = SpaceId([0xCC; 16]);
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr: creator.owner,
+            is_invite_only: true,
+        };
+
+        // ── Event 1: creator bootstrap Join ─────────────────────────────────
+        // In an invite-only community the admin self-Join is exempt from the
+        // countersig requirement (bootstrap rule).
+        let creator_join_payload = EventPayload {
+            id: [0x01u8; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: creator.owner,
+            at: Hlc {
+                wall_ms: 1_700_000_001_000,
+                logical: 0,
+                device_id: "creator-dev".into(),
+            },
+        };
+        let creator_join = {
+            let ev = sign_event(&creator_join_payload, &creator.device_key).unwrap();
+            SignedMembershipEvent {
+                enrollment: Some(creator.cert.clone()),
+                ..ev
+            }
+        };
+
+        // Verify event 1 against EMPTY prior_state — the cert is the only
+        // trust anchor; no shared identity cache involved.
+        let prior_e1 = prior_state_at_event(&[], &creator_join, creator.owner);
+        assert_eq!(
+            prior_e1.members.len(),
+            0,
+            "prior state for first event must be empty"
+        );
+        verify_event(&creator_join, &prior_e1, &ctx)
+            .expect("creator bootstrap Join must verify from cert alone against empty state");
+
+        // ── Event 2: joiner PendingJoin ──────────────────────────────────────
+        // InviteToken: signed by creator.device_key (not by creator's old
+        // identity/Reticulum key). ZEB-339 P5 verifies it against
+        // creator's enrolled device key from materialized membership.
+        let mut token = InviteToken {
+            inviter: creator.owner,
+            invitee_hint: Some(joiner.owner),
+            minted_at: Hlc {
+                wall_ms: 1_700_000_002_000,
+                logical: 0,
+                device_id: "creator-dev".into(),
+            },
+            expires_at: None, // open-ended
+            sig: [0u8; 64],
+        };
+        let token_bytes = canonical_invite_token_bytes(&token).expect("encode token");
+        token.sig = creator.device_key.sign(&token_bytes).to_bytes();
+
+        let joiner_pending_payload = EventPayload {
+            id: [0x02u8; 16],
+            community_id,
+            kind: MembershipEventKind::PendingJoin {
+                invite_token: token,
+            },
+            actor: joiner.owner,
+            at: Hlc {
+                wall_ms: 1_700_000_003_000,
+                logical: 0,
+                device_id: "joiner-dev".into(),
+            },
+        };
+        let joiner_pending = {
+            let ev = sign_event(&joiner_pending_payload, &joiner.device_key).unwrap();
+            SignedMembershipEvent {
+                enrollment: Some(joiner.cert.clone()),
+                ..ev
+            }
+        };
+
+        // Verify event 2 against prior_state that contains only event 1.
+        // The inviter's (creator's) enrolled key must already be in the
+        // materialized membership so P5 can resolve it.
+        let prior_e2 = prior_state_at_event(
+            std::slice::from_ref(&creator_join),
+            &joiner_pending,
+            creator.owner,
+        );
+        assert!(
+            prior_e2.members.contains_key(&creator.owner),
+            "creator must be materialized before joiner PendingJoin verification"
+        );
+        // The creator's enrolled device key must be present in prior_state
+        // (populated by materializing the cert carried on event 1).
+        let creator_member_state = prior_e2.members.get(&creator.owner).unwrap();
+        assert!(
+            creator_member_state
+                .enrolled_device_keys
+                .contains(&creator.cert.device_pubkeys.classical.ed25519_verify),
+            "creator's enrolled device key must be in materialized state (ZEB-339)"
+        );
+        verify_event(&joiner_pending, &prior_e2, &ctx).expect(
+            "joiner PendingJoin must verify from cert + creator's materialized enrolled key",
+        );
+
+        // ── Event 3: creator JoinCountersign approving the PendingJoin ───────
+        // Signed by creator.device_key — this is a STEADY-STATE event, so
+        // verify_event resolves the signer from materialized enrolled keys
+        // (not from a cert).
+        let countersign_payload = EventPayload {
+            id: [0x03u8; 16],
+            community_id,
+            kind: MembershipEventKind::JoinCountersign {
+                target_event_id: joiner_pending.id,
+            },
+            actor: creator.owner,
+            at: Hlc {
+                wall_ms: 1_700_000_004_000,
+                logical: 0,
+                device_id: "creator-dev".into(),
+            },
+        };
+        let creator_countersign = sign_event(&countersign_payload, &creator.device_key).unwrap();
+
+        // Verify event 3 against prior state of events 1 + 2.
+        // Creator's enrolled key was learned from event 1's cert, so the
+        // steady-state signer resolution (no cert carried) must succeed.
+        let two_events = [creator_join.clone(), joiner_pending.clone()];
+        let prior_e3 = prior_state_at_event(&two_events, &creator_countersign, creator.owner);
+        verify_event(&creator_countersign, &prior_e3, &ctx)
+            .expect("creator JoinCountersign must verify from materialized enrolled key (no cert)");
+
+        // ── Final materialization: both creator and joiner must be Joined ─────
+        let all_events = [
+            creator_join.clone(),
+            joiner_pending.clone(),
+            creator_countersign.clone(),
+        ];
+        let final_state = materialize(&all_events, creator.owner);
+
+        let creator_state = final_state
+            .members
+            .get(&creator.owner)
+            .expect("creator must be materialized");
+        assert_eq!(
+            creator_state.status,
+            MemberStatus::Joined,
+            "creator must be Joined"
+        );
+        assert!(
+            creator_state
+                .enrolled_device_keys
+                .contains(&creator.cert.device_pubkeys.classical.ed25519_verify),
+            "creator's enrolled device key must be in final materialized state"
+        );
+
+        let joiner_state = final_state
+            .members
+            .get(&joiner.owner)
+            .expect("joiner must be materialized");
+        assert_eq!(
+            joiner_state.status,
+            MemberStatus::Joined,
+            "joiner must be Joined after JoinCountersign"
+        );
+        assert!(
+            joiner_state
+                .enrolled_device_keys
+                .contains(&joiner.cert.device_pubkeys.classical.ed25519_verify),
+            "joiner's enrolled device key must be in final materialized state"
+        );
+    }
+}
+
+// ZEB-339 (spec §9.6): signing regression guard.
+//
+// Explicitly encodes the invariant that community events are signed by an
+// enrolled DEVICE key (#2), NOT by the owner's Reticulum/master key —
+// i.e. `actor (owner_id) ≠ address_hash(signing_device_key)`.
+//
+// This module would BREAK if community signing ever reverted to the old
+// single-identity model where the signing key was derived from the same
+// seed as the owner_id, making `actor == address_hash(signing_key)`.
+//
+// ZEB-339 regression guard — if community signing reverts to the
+// Reticulum/owner key (actor == address_hash(signing_key)), this test
+// module breaks.
+#[cfg(test)]
+mod zeb_339_signing_regression_guard {
+    use super::*;
+    use harmony_owner::pubkey_bundle::{ClassicalKeys, PubKeyBundle};
+
+    // Two assertions:
+    // (a) owner_id ≠ address_hash(device_signing_key): the owner/device SPLIT
+    //     is real — the signer is NOT the actor's own address.
+    // (b) bootstrap Join verifies ONLY because the cert binds device→owner:
+    //     passes with cert, fails MissingEnrollmentCert without.
+    //
+    // ZEB-339 regression guard: if signing reverts to the Reticulum/owner key
+    // (actor == address_hash(signing_key)), assertion (a) fires.
+    #[test]
+    fn owner_and_device_key_address_hash_differ_and_cert_is_load_bearing() {
+        let o = mint_test_owner(0x42);
+
+        // ── (a) Owner/device SPLIT: owner_id ≠ address_hash(device_key) ─────
+        // Compute what address_hash(device_pubkey) would be — the value that
+        // would be used as the actor address if signing reverted to the old
+        // single-identity model.
+        let device_pubkey_bundle = PubKeyBundle {
+            classical: ClassicalKeys {
+                ed25519_verify: o.device_key.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
+            post_quantum: None,
+        };
+        let device_identity_hash = device_pubkey_bundle.identity_hash();
+        let device_addr = OwnerAddr(device_identity_hash);
+
+        // The actor address is the OWNER (master key) address, not the device
+        // key's address. If this ever becomes equal (i.e. signing reverted to
+        // the Reticulum/owner key model), the test breaks with a clear message.
+        assert_ne!(
+            o.owner, device_addr,
+            "ZEB-339 regression: owner_id == address_hash(device_signing_key) — \
+             community signing has reverted to the old single-identity model"
+        );
+
+        // ── (b) Cert is load-bearing: verify_event passes with cert, fails without ─
+        let community_id = SpaceId([0xBB; 16]);
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr: o.owner,
+            is_invite_only: false,
+        };
+
+        let payload = EventPayload {
+            id: [0x42u8; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: o.owner,
+            at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "regrdev".into(),
+            },
+        };
+
+        // With cert: must verify against empty prior_state.
+        let ev_with_cert = {
+            let ev = sign_event(&payload, &o.device_key).unwrap();
+            SignedMembershipEvent {
+                enrollment: Some(o.cert.clone()),
+                ..ev
+            }
+        };
+        verify_event(&ev_with_cert, &MaterializedMembership::default(), &ctx)
+            .expect("cert-bearing bootstrap Join must verify");
+
+        // Without cert: must fail — the verifier has no way to resolve the
+        // signer's device key from materialized state (no prior member record)
+        // and no cert to extract it from.
+        let ev_no_cert = sign_event(&payload, &o.device_key).unwrap();
+        assert_eq!(
+            ev_no_cert.enrollment, None,
+            "precondition: event carries no cert"
+        );
+        let err = verify_event(&ev_no_cert, &MaterializedMembership::default(), &ctx)
+            .expect_err("cert-absent bootstrap Join must fail");
+        assert_eq!(
+            err,
+            VerifyError::MissingEnrollmentCert,
+            "ZEB-339 regression: cert-absent Join should fail with MissingEnrollmentCert, \
+             not SignatureInvalid (which would indicate the signer is still the owner/Reticulum key)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod zeb_339_signer_verify_tests {
+    use super::*;
+
+    #[test]
+    fn verify_signer_accepts_cert_signed_event() {
+        let o = mint_test_owner(0x21);
+        let ev = sign_event(
+            &EventPayload {
+                id: [1u8; 16],
+                community_id: SpaceId([7u8; 16]),
+                kind: MembershipEventKind::Join,
+                actor: o.owner,
+                at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &o.device_key,
+        )
+        .unwrap();
+        let ev = SignedMembershipEvent {
+            enrollment: Some(o.cert.clone()),
+            ..ev
+        };
+        let signer = EnrolledDeviceKey {
+            owner: o.owner,
+            device_ed25519: o.cert.device_pubkeys.classical.ed25519_verify,
+        };
+        assert!(verify_membership_signer(&ev, &signer).is_ok());
+    }
+
+    #[test]
+    fn verify_signer_rejects_tampered_event() {
+        let o = mint_test_owner(0x22);
+        let mut ev = sign_event(
+            &EventPayload {
+                id: [1u8; 16],
+                community_id: SpaceId([7u8; 16]),
+                kind: MembershipEventKind::Join,
+                actor: o.owner,
+                at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &o.device_key,
+        )
+        .unwrap();
+        ev.id = [2u8; 16]; // tamper after signing
+        let signer = EnrolledDeviceKey {
+            owner: o.owner,
+            device_ed25519: o.device_key.verifying_key().to_bytes(),
+        };
+        assert_eq!(
+            verify_membership_signer(&ev, &signer),
+            Err(VerifyError::SignatureInvalid)
+        );
+    }
+
+    #[test]
+    fn enrolled_key_from_cert_accepts_valid_cert() {
+        let o = mint_test_owner(0x23);
+        let ev = sign_event(
+            &EventPayload {
+                id: [1u8; 16],
+                community_id: SpaceId([7u8; 16]),
+                kind: MembershipEventKind::Join,
+                actor: o.owner,
+                at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &o.device_key,
+        )
+        .unwrap();
+        let ev = SignedMembershipEvent {
+            enrollment: Some(o.cert.clone()),
+            ..ev
+        };
+        let edk = enrolled_key_from_cert(&ev).expect("valid cert must succeed");
+        assert_eq!(edk.owner, o.owner);
+        assert_eq!(
+            edk.device_ed25519,
+            o.cert.device_pubkeys.classical.ed25519_verify
+        );
+    }
+
+    #[test]
+    fn enrollment_cert_forged_sig_rejected() {
+        let mut o = mint_test_owner(0x24);
+        o.cert.signature[0] ^= 1; // flip one byte to forge
+        let ev = sign_event(
+            &EventPayload {
+                id: [1u8; 16],
+                community_id: SpaceId([7u8; 16]),
+                kind: MembershipEventKind::Join,
+                actor: o.owner,
+                at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &o.device_key,
+        )
+        .unwrap();
+        let ev = SignedMembershipEvent {
+            enrollment: Some(o.cert.clone()),
+            ..ev
+        };
+        assert_eq!(
+            enrolled_key_from_cert(&ev),
+            Err(VerifyError::EnrollmentCertInvalid)
+        );
+    }
+
+    #[test]
+    fn enrollment_cert_owner_mismatch_rejected() {
+        // Use a valid cert from owner A but an event whose actor = owner B.
+        // This isolates EnrollmentOwnerMismatch from the cert's internal
+        // hash check (the cert itself is valid; only the actor binding is wrong).
+        let owner_a = mint_test_owner(0x25);
+        let owner_b = mint_test_owner(0x26);
+        let ev = sign_event(
+            &EventPayload {
+                id: [1u8; 16],
+                community_id: SpaceId([7u8; 16]),
+                kind: MembershipEventKind::Join,
+                actor: owner_b.owner, // actor = B
+                at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &owner_b.device_key,
+        )
+        .unwrap();
+        let ev = SignedMembershipEvent {
+            enrollment: Some(owner_a.cert.clone()), // cert = A (valid cert, wrong owner)
+            ..ev
+        };
+        assert_eq!(
+            enrolled_key_from_cert(&ev),
+            Err(VerifyError::EnrollmentOwnerMismatch)
+        );
+    }
+
+    #[test]
+    fn enrollment_cert_missing_rejected() {
+        let o = mint_test_owner(0x27);
+        let ev = sign_event(
+            &EventPayload {
+                id: [1u8; 16],
+                community_id: SpaceId([7u8; 16]),
+                kind: MembershipEventKind::Join,
+                actor: o.owner,
+                at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &o.device_key,
+        )
+        .unwrap();
+        assert_eq!(ev.enrollment, None, "precondition: event carries no cert");
+        assert_eq!(
+            enrolled_key_from_cert(&ev),
+            Err(VerifyError::MissingEnrollmentCert)
+        );
+    }
+
+    /// ZEB-339 (spec §10): a `Quorum`-issued cert is rejected by the community
+    /// path even when it passes `cert.verify()`'s STRUCTURAL checks, because
+    /// quorum signatures cannot be verified here (no OwnerState walk-back).
+    /// Construct a structurally-valid Quorum cert by hand and confirm rejection.
+    #[test]
+    fn enrollment_cert_quorum_issuer_rejected() {
+        use harmony_owner::certs::{EnrollmentCert, EnrollmentIssuer};
+        use harmony_owner::pubkey_bundle::{ClassicalKeys, PubKeyBundle};
+
+        let device_sk = ed25519_dalek::SigningKey::from_bytes(&[0x55; 32]);
+        let device_bundle = PubKeyBundle {
+            classical: ClassicalKeys {
+                ed25519_verify: device_sk.verifying_key().to_bytes(),
+                x25519_pub: [0u8; 32],
+            },
+            post_quantum: None,
+        };
+        let device_id = device_bundle.identity_hash();
+        let owner_id = [0xABu8; 16];
+        // Structurally-valid Quorum cert: 2 distinct signers, parity, version 1,
+        // device_pubkeys.identity_hash() == device_id. cert.verify() passes its
+        // Quorum structural branch (it does NOT verify the signatures).
+        let quorum_cert = EnrollmentCert {
+            version: 1,
+            owner_id,
+            device_id,
+            device_pubkeys: device_bundle,
+            issued_at: 1_700_000_000,
+            expires_at: None,
+            issuer: EnrollmentIssuer::Quorum {
+                signers: vec![[1u8; 16], [2u8; 16]],
+                signatures: vec![vec![0u8; 64], vec![0u8; 64]],
+            },
+            signature: vec![],
+        };
+        quorum_cert
+            .verify()
+            .expect("hand-built Quorum cert passes structural verify()");
+
+        let ev = sign_event(
+            &EventPayload {
+                id: [1u8; 16],
+                community_id: SpaceId([7u8; 16]),
+                kind: MembershipEventKind::Join,
+                actor: OwnerAddr(owner_id),
+                at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            },
+            &device_sk,
+        )
+        .unwrap();
+        let ev = SignedMembershipEvent {
+            enrollment: Some(quorum_cert),
+            ..ev
+        };
+        // Despite passing structural verify() AND owner_id == actor, the Quorum
+        // issuer is rejected before the owner check.
+        assert_eq!(
+            enrolled_key_from_cert(&ev),
+            Err(VerifyError::EnrollmentCertInvalid)
         );
     }
 }

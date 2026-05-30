@@ -2523,6 +2523,43 @@ pub(crate) async fn start_node_inner(
                         .map(|b| format!("{b:02x}"))
                         .collect::<String>();
 
+                    // ZEB-339: carry the enrolled device key (#2) + this device's own cert
+                    // into runtime. `loaded.device_signing_key` is otherwise dropped after
+                    // deriving the device-id string above.
+                    //
+                    // `SigningKey::from_bytes(&sk.to_bytes())` is the safe clone —
+                    // ed25519-dalek `SigningKey` may not impl `Clone`; `to_bytes()` always
+                    // works (returns the 32-byte seed).
+                    //
+                    // `this_device_id_hash` is the 16-byte `[u8;16]` identity hash used
+                    // ONLY to key into `state.enrollments`. It is DISTINCT from the hex
+                    // `device_id: String` above (which is used for HLC device IDs). Both
+                    // are derived from the same verifying key but serve different roles —
+                    // name them distinctly to prevent confusion.
+                    //
+                    // `derive_this_device_id` in owner_commands.rs uses the exact same
+                    // `PubKeyBundle::classical_only(sk.verifying_key().to_bytes()).identity_hash()`
+                    // pattern, so the lookup key matches how enrollments are stored.
+                    let community_signing_key_arc =
+                        std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(
+                            &loaded.device_signing_key.to_bytes(),
+                        ));
+                    let this_device_id_hash = {
+                        use harmony_owner::pubkey_bundle::PubKeyBundle;
+                        PubKeyBundle::classical_only(
+                            loaded.device_signing_key.verifying_key().to_bytes(),
+                        )
+                        .identity_hash()
+                    };
+                    let own_enrollment_cert = loaded
+                        .state
+                        .enrollments
+                        .get(&this_device_id_hash)
+                        .cloned()
+                        .ok_or_else(|| {
+                            "owner state missing this device's enrollment cert".to_string()
+                        })?;
+
                     let crdt_path = identity_dir.join("owner_state_crdt.cbor");
                     let replay_path = identity_dir.join("state_root_replay.cbor");
                     let initial_crdt = crate::owner_state_persist::load_crdt(&crdt_path)
@@ -2598,6 +2635,8 @@ pub(crate) async fn start_node_inner(
                             our_signing_device_hash,
                             signing_key_arc.clone(),
                             std::sync::Arc::clone(&private_identity_arc),
+                            community_signing_key_arc.clone(),
+                            own_enrollment_cert,
                         ),
                     ));
                     // Production transport: RuntimeUnicastTransport pushes
@@ -2854,7 +2893,16 @@ pub(crate) async fn start_node_inner(
                             // Both values already exist above for the
                             // DmOutbox plumbing.
                             self_owner,
-                            signing_key: std::sync::Arc::clone(&signing_key_arc),
+                            // ZEB-339 Task 9: the community sync engine signs
+                            // (1) the state-root publisher signature and
+                            // (2) the auto-emitted JoinCountersign with the
+                            // ENROLLED device key (device #2), NOT the
+                            // Reticulum identity key. Both are verified against
+                            // the publisher's / signer's materialized
+                            // `enrolled_device_keys`, so they must be produced
+                            // by device #2. (No transport use of this key in
+                            // the engine — it is only the two signing sites.)
+                            signing_key: std::sync::Arc::clone(&community_signing_key_arc),
                             // ZEB-249 §10.6 (Phase A): pass the live owner-state CRDT
                             // so every spawned engine reads the current epoch key
                             // dynamically rather than using its spawn-time capture.
@@ -3158,7 +3206,14 @@ pub(crate) async fn start_node_inner(
                             // materialize's staleness-gate at §4.2).
                             {
                                 let community_registry_for_heal = std::sync::Arc::clone(&registry);
-                                let signing_key_for_heal = std::sync::Arc::clone(&signing_key_arc);
+                                // ZEB-339 fix: EpochRotation/EpochCatchup are
+                                // MembershipEvents verified via
+                                // resolve_enrolled_signer, which matches
+                                // against enrolled_device_keys (device #2).
+                                // Must sign with community_signing_key_arc
+                                // (device #2), NOT the Reticulum signing_key_arc.
+                                let signing_key_for_heal =
+                                    std::sync::Arc::clone(&community_signing_key_arc);
                                 let hlc_tracker_for_heal = std::sync::Arc::clone(&tracker);
                                 let device_id_for_heal = device_id.clone();
                                 let self_owner_for_heal = self_owner;
@@ -3225,7 +3280,7 @@ pub(crate) async fn start_node_inner(
                                 );
                                 move |delta: crate::community_state_sync::CommunityMembershipDelta| {
                                     let registry = std::sync::Arc::clone(&community_registry_for_heal);
-                                    let signing_key = std::sync::Arc::clone(&signing_key_for_heal);
+                                    let community_signing_key = std::sync::Arc::clone(&signing_key_for_heal);
                                     let hlc_tracker = std::sync::Arc::clone(&hlc_tracker_for_heal);
                                     let device_id = device_id_for_heal.clone();
                                     let self_owner = self_owner_for_heal;
@@ -3343,7 +3398,7 @@ pub(crate) async fn start_node_inner(
                                         self_heal_community_observer(
                                             delta.community_id,
                                             registry,
-                                            signing_key,
+                                            community_signing_key,
                                             hlc_tracker,
                                             device_id,
                                             self_owner,
@@ -3887,7 +3942,13 @@ pub(crate) async fn start_node_inner(
                     if let Some(ep_arc_for_publisher) = iroh_endpoint_arc.as_ref() {
                         let ep_for_cb = std::sync::Arc::clone(ep_arc_for_publisher);
                         let registry_for_cb = std::sync::Arc::clone(&registry);
-                        let identity_for_cb = std::sync::Arc::clone(&private_identity_arc);
+                        // ZEB-339: ReachabilityAnnounce is a community-membership
+                        // event. T4 rewired RCH2 verify to check BOTH the outer
+                        // event sig AND the inner `identity_signature` against the
+                        // resolved enrolled device key (#2). Sign both with device
+                        // #2, not the Reticulum-derived PrivateIdentity.
+                        let community_signing_key_for_cb =
+                            std::sync::Arc::clone(&community_signing_key_arc);
                         let self_owner_for_cb = self_owner;
                         let hlc_tracker_for_cb = std::sync::Arc::clone(&tracker);
                         let device_id_for_cb = device_id.clone();
@@ -3899,7 +3960,8 @@ pub(crate) async fn start_node_inner(
                                 // directly.
                                 let ep = std::sync::Arc::clone(&ep_for_cb);
                                 let registry = std::sync::Arc::clone(&registry_for_cb);
-                                let identity = std::sync::Arc::clone(&identity_for_cb);
+                                let community_signing_key =
+                                    std::sync::Arc::clone(&community_signing_key_for_cb);
                                 let actor = self_owner_for_cb;
                                 let hlc_tracker = std::sync::Arc::clone(&hlc_tracker_for_cb);
                                 let device_id = device_id_for_cb.clone();
@@ -3938,15 +4000,18 @@ pub(crate) async fn start_node_inner(
                                         .await;
 
                                         // 3b. Build inner signed payload.
+                                        // ZEB-339: inner `identity_signature` signed
+                                        // with the enrolled device key (#2) — RCH2
+                                        // verify resolves the actor's enrolled key.
                                         let payload =
-                                            match crate::reachability_record::build_signed_payload(
+                                            match crate::reachability_record::build_signed_payload_with_key(
                                                 node_id_bytes,
                                                 home_relay.clone(),
                                                 direct_addrs.clone(),
                                                 announced_at_ms,
                                                 &actor,
                                                 &hlc,
-                                                identity.as_ref(),
+                                                community_signing_key.as_ref(),
                                             ) {
                                                 Ok(p) => p,
                                                 Err(e) => {
@@ -3979,16 +4044,20 @@ pub(crate) async fn start_node_inner(
                                             actor,
                                             at: hlc,
                                         };
-                                        let signed = match crate::community_membership::sign_event_with_identity(
+                                        // ZEB-339: outer SignedMembershipEvent signed
+                                        // with the enrolled device key (#2). Steady-
+                                        // state event — no cert (verifier resolves the
+                                        // signer from materialized membership).
+                                        let signed = match crate::community_membership::sign_event(
                                             &envelope,
-                                            identity.as_ref(),
+                                            community_signing_key.as_ref(),
                                         ) {
                                             Ok(s) => s,
                                             Err(e) => {
                                                 tracing::warn!(
                                                     community_id = ?community_id,
                                                     error = %e,
-                                                    "ReachabilityAnnounce sign_event_with_identity failed; \
+                                                    "ReachabilityAnnounce sign_event failed; \
                                                      skipping this community"
                                                 );
                                                 continue;
@@ -11955,6 +12024,7 @@ mod list_community_forks_tests {
             at: hlc_at(wall_ms),
             sig: [0u8; 64],
             countersig: None,
+            enrollment: None,
         }
     }
 
@@ -11969,6 +12039,7 @@ mod list_community_forks_tests {
                 status,
                 joined_at: hlc_at(0),
                 left_at: None,
+                enrolled_device_keys: std::collections::BTreeSet::new(),
             },
         );
         m
@@ -12086,6 +12157,7 @@ mod list_community_forks_tests {
                 status: MemberStatus::Banned,
                 joined_at: hlc_at(50),
                 left_at: Some(hlc_at(150)),
+                enrolled_device_keys: std::collections::BTreeSet::new(),
             },
         );
 
@@ -12237,6 +12309,7 @@ mod list_community_forks_tests {
                 },
                 sig: [0u8; 64],
                 countersig: None,
+                enrollment: None,
             },
         );
         events.insert(
@@ -12255,6 +12328,7 @@ mod list_community_forks_tests {
                 },
                 sig: [0u8; 64],
                 countersig: None,
+                enrollment: None,
             },
         );
 
@@ -12406,7 +12480,10 @@ async fn create_channel(
         crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
     let event = {
         let outbox_g = dm_outbox.lock().await;
-        let signing_key = outbox_g.signing_key.as_ref();
+        // ZEB-339: ChannelCreate is a steady-state community-membership event —
+        // sign with the enrolled device key (#2); no cert (verifier resolves
+        // the signer from materialized membership).
+        let signing_key = outbox_g.community_signing_key.as_ref();
         mint_channel_create_event(
             space_id,
             self_owner,
@@ -12640,7 +12717,9 @@ async fn modify_channel(
         crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
     let event = {
         let outbox_g = dm_outbox.lock().await;
-        let signing_key = outbox_g.signing_key.as_ref();
+        // ZEB-339: ChannelModify steady-state event — enrolled device key (#2),
+        // no cert.
+        let signing_key = outbox_g.community_signing_key.as_ref();
         mint_channel_modify_event(
             space_id,
             self_owner,
@@ -12864,7 +12943,9 @@ async fn delete_channel(
         crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
     let event = {
         let outbox_g = dm_outbox.lock().await;
-        let signing_key = outbox_g.signing_key.as_ref();
+        // ZEB-339: ChannelDelete steady-state event — enrolled device key (#2),
+        // no cert.
+        let signing_key = outbox_g.community_signing_key.as_ref();
         mint_channel_delete_event(space_id, self_owner, channel_id, signing_key, hlc)?
     };
 
@@ -13304,14 +13385,23 @@ async fn generate_invite(
         .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
-    let (crdt_state, community_registry) = {
+    let (crdt_state, community_registry, dm_outbox) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
         )
+    };
+    // ZEB-339: snapshot the local owner's EnrollmentCert (the inviter is the
+    // local owner). Carried in invite-only payloads so a joiner who has not
+    // synced the community log can verify the inviter's owner->device binding
+    // (and thus the InviteToken signature) at first contact.
+    let inviter_enrollment_cert = {
+        let outbox_g = dm_outbox.lock().await;
+        outbox_g.enrollment_cert.clone()
     };
 
     let space = {
@@ -13493,6 +13583,14 @@ async fn generate_invite(
         admin_identity_pub: None,
         forked_from,
         pre_fork_snapshot,
+        // ZEB-339: required for invite-only payloads (open-community payloads
+        // carry None — encode/decode only require it when is_invite_only).
+        // The inviter is the local owner, so this is our own EnrollmentCert.
+        inviter_enrollment: if is_invite_only {
+            Some(inviter_enrollment_cert)
+        } else {
+            None
+        },
     };
 
     // ZEB-323 Phase 2b: case-A pkarr hook. Register a pending-invite publication
@@ -13588,6 +13686,7 @@ pub fn mint_community_creation(
     is_invite_only: bool,
     self_owner: crate::owner_state_types::OwnerAddr,
     signing_key: &ed25519_dalek::SigningKey,
+    enrollment_cert: &harmony_owner::certs::EnrollmentCert,
     creation_hlc: crate::owner_state_types::Hlc,
 ) -> Result<MintedCommunity, String> {
     use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
@@ -13612,8 +13711,12 @@ pub fn mint_community_creation(
         actor: self_owner,
         at: creation_hlc.clone(),
     };
-    let bootstrap_join =
+    let mut bootstrap_join =
         sign_event(&join_payload, signing_key).map_err(|e| format!("sign bootstrap join: {e}"))?;
+    // ZEB-339: identity-introducing event — attach this device's own
+    // EnrollmentCert so the verifier can resolve the bootstrap signer's
+    // enrolled device key (no materialized membership exists yet).
+    bootstrap_join.enrollment = Some(enrollment_cert.clone());
 
     let space = Space {
         id: community_id,
@@ -13694,6 +13797,7 @@ pub async fn create_community_inner<R: tauri::Runtime>(
     device_id: String,
     self_owner: crate::owner_state_types::OwnerAddr,
     signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    enrollment_cert: harmony_owner::certs::EnrollmentCert,
     community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
     community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
     channel_log_registry: std::sync::Arc<
@@ -13743,6 +13847,7 @@ pub async fn create_community_inner<R: tauri::Runtime>(
         is_invite_only,
         self_owner,
         signing_key.as_ref(),
+        &enrollment_cert,
         creation_hlc,
     )?;
 
@@ -14052,9 +14157,15 @@ async fn create_community(
     }; // std `state_lock` guard dropped here.
 
     // Now safe to `.await` — the std lock has been released.
-    let signing_key = {
+    // ZEB-339: community-membership events sign with the enrolled device
+    // key (#2), NOT the Reticulum transport key. Snapshot both the device
+    // signing key and this device's own EnrollmentCert under the outbox lock.
+    let (community_signing_key, enrollment_cert) = {
         let outbox_g = dm_outbox.lock().await;
-        std::sync::Arc::clone(&outbox_g.signing_key)
+        (
+            std::sync::Arc::clone(&outbox_g.community_signing_key),
+            outbox_g.enrollment_cert.clone(),
+        )
     };
 
     let name_for_emit = name.clone();
@@ -14065,7 +14176,8 @@ async fn create_community(
         hlc_tracker,
         device_id,
         self_owner,
-        signing_key,
+        community_signing_key,
+        enrollment_cert,
         community_registry,
         community_adapter_tx,
         channel_log_registry,
@@ -14146,23 +14258,10 @@ mod create_community_inner_tests {
     use crate::content_store::{ContentStore, RuntimeContentStore};
     use crate::owner_state_crdt::OwnerState;
     use crate::owner_state_types::{Hlc, OwnerAddr};
-    use harmony_identity::PrivateIdentity;
     use std::collections::BTreeMap;
     use tokio::sync::mpsc;
 
     // ── Fixture helper ────────────────────────────────────────────────────────
-
-    /// Extract the canonical Ed25519 signing key from a `PrivateIdentity`.
-    /// Mirrors the pattern used by all other test modules in this file.
-    fn signing_key_from_identity(
-        identity: &PrivateIdentity,
-    ) -> std::sync::Arc<ed25519_dalek::SigningKey> {
-        let sk_bytes_full = identity.to_private_bytes();
-        let ed_seed: [u8; 32] = sk_bytes_full[32..64]
-            .try_into()
-            .expect("ed25519 seed slice 32..64");
-        std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed_seed))
-    }
 
     struct CreateCommunityTestFixture {
         crdt_state: std::sync::Arc<tokio::sync::Mutex<OwnerState>>,
@@ -14170,6 +14269,9 @@ mod create_community_inner_tests {
         device_id: String,
         self_owner: OwnerAddr,
         signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+        // ZEB-339: this device's own EnrollmentCert, passed to
+        // create_community_inner for cert attachment on the bootstrap Join.
+        enrollment_cert: harmony_owner::certs::EnrollmentCert,
         community_registry: std::sync::Arc<CommunitySyncRegistry>,
         community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
         channel_log_registry: std::sync::Arc<ChannelLogRegistry<tauri::test::MockRuntime>>,
@@ -14228,15 +14330,17 @@ mod create_community_inner_tests {
     async fn build_create_community_test_fixture() -> CreateCommunityTestFixture {
         let tmp = tempfile::TempDir::new().expect("tempdir");
 
-        let identity = PrivateIdentity::from_seed(&[0xc0; 32]);
-        let self_owner = OwnerAddr(identity.identity.address_hash);
-        let identity_pub_64 = identity.identity.to_public_bytes();
-        let signing_key = signing_key_from_identity(&identity);
+        // ZEB-339: an enrolled-device owner — self_owner = owner_id, the engine
+        // signs with the device key, and the fixture's cert binds them so
+        // create_community_inner's bootstrap Join carries a matching cert.
+        let owner = crate::community_membership::mint_test_owner(0xC0);
+        let self_owner = owner.owner;
+        let identity_pub_64 = [0u8; 64];
+        let signing_key = std::sync::Arc::new(owner.device_key.clone());
 
         // Community registry — delta_tx wired so ChannelCreate deltas
-        // flow to the consumer task (spawned below). The resolver returns
-        // self_owner's identity_pub so verify_event admits the local
-        // admin's events.
+        // flow to the consumer task. Signer resolution uses the cert /
+        // materialized enrolled keys, not the resolver.
         struct SingleOwnerResolver {
             owner: OwnerAddr,
             pub_64: [u8; 64],
@@ -14395,6 +14499,7 @@ mod create_community_inner_tests {
             device_id: "test-dev".into(),
             self_owner,
             signing_key,
+            enrollment_cert: owner.cert.clone(),
             community_registry,
             community_adapter_tx,
             channel_log_registry,
@@ -14456,6 +14561,7 @@ mod create_community_inner_tests {
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
+            fixture.enrollment_cert.clone(),
             std::sync::Arc::clone(&fixture.community_registry),
             fixture.community_adapter_tx.clone(),
             std::sync::Arc::clone(&fixture.channel_log_registry),
@@ -14545,6 +14651,7 @@ mod create_community_inner_tests {
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
+            fixture.enrollment_cert.clone(),
             std::sync::Arc::clone(&fixture.community_registry),
             fixture.community_adapter_tx.clone(),
             std::sync::Arc::clone(&fixture.channel_log_registry),
@@ -14587,6 +14694,7 @@ mod create_community_inner_tests {
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
+            fixture.enrollment_cert.clone(),
             std::sync::Arc::clone(&fixture.community_registry),
             fixture.community_adapter_tx.clone(),
             std::sync::Arc::clone(&fixture.channel_log_registry),
@@ -14617,19 +14725,12 @@ mod create_community_inner_tests {
 
     #[test]
     fn mint_creation_produces_consistent_id_join_event_and_space() {
-        let identity = PrivateIdentity::from_seed(&[0xc1; 32]);
-        let self_owner = OwnerAddr(identity.identity.address_hash);
-        // Reach into the PrivateIdentity's signing path the same way
-        // production does: the canonical 32-byte seed lives in bytes
-        // 32..64 of `to_private_bytes()` (X25519_secret(32) ||
-        // Ed25519_secret(32)). dm_outbox stores the SigningKey
-        // constructed from those bytes; mirror that here so the test
-        // signs with the same key the IPC will use in production.
-        let sk_bytes_full = identity.to_private_bytes();
-        let ed_seed: [u8; 32] = sk_bytes_full[32..64]
-            .try_into()
-            .expect("ed25519 seed slice 32..64");
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&ed_seed);
+        // ZEB-339: enrolled-device owner — self_owner = owner_id, the bootstrap
+        // Join is signed by the device key and carries the matching cert.
+        let owner = crate::community_membership::mint_test_owner(0xC1);
+        let self_owner = owner.owner;
+        let signing_key = owner.device_key.clone();
+        let enrollment_cert = owner.cert.clone();
 
         let device_id = "creator-dev";
         let wall_now_ms = 1_700_000_000_000u64;
@@ -14647,6 +14748,7 @@ mod create_community_inner_tests {
             false,
             self_owner,
             &signing_key,
+            &enrollment_cert,
             creation_hlc.clone(),
         )
         .expect("mint");
@@ -14686,6 +14788,7 @@ mod create_community_inner_tests {
             false,
             self_owner,
             &signing_key,
+            &enrollment_cert,
             creation_hlc.clone(),
         )
         .expect("mint2");
@@ -14696,12 +14799,72 @@ mod create_community_inner_tests {
             minted2.space.current_epoch_key.as_ref().unwrap().as_bytes(),
         );
 
-        // Bootstrap signature MUST verify against self_owner's
-        // identity_pub — the engine's verify_event will run the same
-        // check on insert_local_event.
-        let identity_pub = identity.identity.to_public_bytes();
-        crate::community_membership::verify_signature(&minted.bootstrap_join, &identity_pub)
-            .expect("bootstrap join signature must verify against self identity_pub");
+        // ZEB-339: the bootstrap Join is signed by the enrolled device key (#2)
+        // and carries the owner's Master cert. Its signature MUST resolve via the
+        // carried cert (owner_id → device key) — the engine's verify_event runs
+        // the same `enrolled_key_from_cert` + `verify_membership_signer` check on
+        // insert_local_event.
+        let signer = crate::community_membership::enrolled_key_from_cert(&minted.bootstrap_join)
+            .expect("bootstrap join cert must resolve enrolled device key");
+        crate::community_membership::verify_membership_signer(&minted.bootstrap_join, &signer)
+            .expect("bootstrap join signature must verify against enrolled device key");
+    }
+
+    /// ZEB-339 headline: drives the real `mint_community_creation` mint path
+    /// with an enrolled device key (#2) + this device's own EnrollmentCert and
+    /// asserts the bootstrap Join is cert-bearing AND passes the full
+    /// `verify_event` against empty materialized membership. This is the test
+    /// that proves the original "Create community → ActorPubkeyMismatch" bug is
+    /// fixed at the mint level: the cert resolves the bootstrap signer's
+    /// enrolled device key with no prior membership state.
+    #[test]
+    fn zeb339_create_community_bootstrap_join_is_cert_bearing_and_verifies() {
+        use crate::community_membership::{
+            mint_test_owner, verify_event, MaterializedMembership, VerifyContext,
+        };
+
+        // The harmony-owner: master cert binding owner_id -> enrolled device #2.
+        let owner = mint_test_owner(0x39);
+        // The community-membership signing key IS device #2 (the cert's bound key).
+        let device_key = ed25519_dalek::SigningKey::from_bytes(&owner.device_key.to_bytes());
+
+        let creation_hlc = crate::owner_state_types::Hlc {
+            wall_ms: 1_700_000_000_000,
+            logical: 0,
+            device_id: "owner-dev".to_string(),
+        };
+
+        let minted = mint_community_creation(
+            "ZEB-339 Validation",
+            false, // open community (the original bug repro)
+            owner.owner,
+            &device_key,
+            &owner.cert,
+            creation_hlc,
+        )
+        .expect("mint_community_creation must succeed");
+
+        // 1. The bootstrap Join MUST carry this device's EnrollmentCert.
+        assert!(
+            minted.bootstrap_join.enrollment.is_some(),
+            "bootstrap Join must be cert-bearing (identity-introducing event)"
+        );
+
+        // 2. The bootstrap Join MUST verify against EMPTY materialized
+        //    membership — the cert is what lets verify_event resolve the
+        //    signer's enrolled device key with no prior state. This is the
+        //    exact path that previously failed with ActorPubkeyMismatch.
+        let ctx = VerifyContext {
+            expected_community_id: minted.community_id,
+            admin_addr: owner.owner,
+            is_invite_only: false,
+        };
+        verify_event(
+            &minted.bootstrap_join,
+            &MaterializedMembership::default(),
+            &ctx,
+        )
+        .expect("cert-bearing bootstrap Join must verify against empty membership");
     }
 }
 
@@ -14787,6 +14950,7 @@ pub fn mint_redemption(
     payload: &crate::community_invite::CommunityInvitePayload,
     self_owner: crate::owner_state_types::OwnerAddr,
     signing_key: &ed25519_dalek::SigningKey,
+    enrollment_cert: &harmony_owner::certs::EnrollmentCert,
     join_hlc: crate::owner_state_types::Hlc,
 ) -> Result<MintedCommunity, String> {
     use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
@@ -14852,24 +15016,15 @@ pub fn mint_redemption(
     // full identity_pub. Distributed via the community CRDT so admins
     // who were offline at redemption time can counter-sign asynchronously.
     let event_kind = if payload.is_invite_only {
-        use crate::dm_signing::ed25519_priv_to_x25519;
-        let x25519_priv = ed25519_priv_to_x25519(signing_key);
-        let x25519_pub =
-            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*x25519_priv));
-        let ed25519_pub_bytes = signing_key.verifying_key().to_bytes();
-        let mut identity_pub = [0u8; 64];
-        identity_pub[..32].copy_from_slice(x25519_pub.as_bytes());
-        identity_pub[32..].copy_from_slice(&ed25519_pub_bytes);
-
+        // ZEB-339: PendingJoin no longer carries an inline joiner_identity_pub;
+        // the joiner's enrolled device key is proven by the EnrollmentCert
+        // attached to the signed event and verified inside verify_event.
         let invite_token = payload
             .invite_token
             .clone()
             .ok_or_else(|| "invite-only payload is missing invite_token".to_string())?;
 
-        MembershipEventKind::PendingJoin {
-            invite_token,
-            joiner_identity_pub: identity_pub,
-        }
+        MembershipEventKind::PendingJoin { invite_token }
     } else {
         MembershipEventKind::Join
     };
@@ -14881,8 +15036,13 @@ pub fn mint_redemption(
         actor: self_owner,
         at: join_hlc.clone(),
     };
-    let bootstrap_join =
+    let mut bootstrap_join =
         sign_event(&join_payload, signing_key).map_err(|e| format!("sign self-join: {e}"))?;
+    // ZEB-339: identity-introducing event (self-Join / PendingJoin) — attach
+    // this device's own EnrollmentCert so the admin/verifier can resolve the
+    // joiner's enrolled device key (the joiner isn't yet in materialized
+    // membership). Verified inside verify_event against the signed `actor`.
+    bootstrap_join.enrollment = Some(enrollment_cert.clone());
 
     let space = Space {
         id: payload.community_id,
@@ -15012,6 +15172,7 @@ pub async fn redeem_invite_inner<R: tauri::Runtime, F>(
     device_id: String,
     self_owner: crate::owner_state_types::OwnerAddr,
     signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    enrollment_cert: harmony_owner::certs::EnrollmentCert,
     community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
     community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
     unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
@@ -15033,6 +15194,7 @@ where
         device_id,
         self_owner,
         signing_key,
+        enrollment_cert,
         community_registry,
         community_adapter_tx,
         unicast_send_tx,
@@ -15062,6 +15224,10 @@ pub async fn redeem_invite_inner_with_overrides<R: tauri::Runtime, F>(
     device_id: String,
     self_owner: crate::owner_state_types::OwnerAddr,
     signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    // ZEB-339: this device's own EnrollmentCert, attached to the self-Join /
+    // PendingJoin minted by `mint_redemption`. Distinct from the Reticulum
+    // unicast packet signing (which still reads `outbox_g.signing_key`).
+    enrollment_cert: harmony_owner::certs::EnrollmentCert,
     community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
     community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
     unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
@@ -15128,7 +15294,13 @@ where
     // mismatch the JoinCountersign's target_event_id).
     let minted = match overrides.pre_minted {
         Some(m) => m,
-        None => mint_redemption(&payload, self_owner, signing_key.as_ref(), join_hlc)?,
+        None => mint_redemption(
+            &payload,
+            self_owner,
+            signing_key.as_ref(),
+            &enrollment_cert,
+            join_hlc,
+        )?,
     };
 
     // ZEB-271: open a channel-log transaction. Protects against remote
@@ -16007,9 +16179,18 @@ async fn redeem_invite(
     }; // std lock dropped here.
 
     // Now safe to `.await` — the std lock has been released.
-    let signing_key = {
+    // ZEB-339: the self-Join / PendingJoin minted by `mint_redemption` signs
+    // with the enrolled device key (#2) and carries this device's own
+    // EnrollmentCert. The invite-only X25519 epoch-key unseal inside
+    // `mint_redemption` also derives from device #2 (the admin seals to the
+    // joiner's enrolled device key). The Reticulum transport key stays inside
+    // the inner's unicast-packet path (read separately from the outbox).
+    let (community_signing_key, enrollment_cert) = {
         let outbox_g = dm_outbox.lock().await;
-        std::sync::Arc::clone(&outbox_g.signing_key)
+        (
+            std::sync::Arc::clone(&outbox_g.community_signing_key),
+            outbox_g.enrollment_cert.clone(),
+        )
     };
 
     // Fence-check closure: re-locks the std NodeState mutex and
@@ -16050,7 +16231,8 @@ async fn redeem_invite(
         hlc_tracker,
         device_id,
         self_owner,
-        signing_key,
+        community_signing_key,
+        enrollment_cert,
         community_registry,
         community_adapter_tx,
         unicast_send_tx,
@@ -16148,6 +16330,7 @@ async fn join_open_community_inner<R, F>(
     device_id: String,
     self_owner: crate::owner_state_types::OwnerAddr,
     signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    enrollment_cert: harmony_owner::certs::EnrollmentCert,
     community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
     community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
     unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
@@ -16173,6 +16356,7 @@ where
         device_id,
         self_owner,
         signing_key,
+        enrollment_cert,
         community_registry,
         community_adapter_tx,
         unicast_send_tx,
@@ -16238,9 +16422,14 @@ async fn join_open_community(
 
     let snapshot = library_directory.snapshot_all().await;
 
-    let signing_key = {
+    // ZEB-339: device #2 + own cert for the self-Join minted by the inner
+    // (community-membership event); transport key stays in the unicast path.
+    let (community_signing_key, enrollment_cert) = {
         let outbox_g = dm_outbox.lock().await;
-        std::sync::Arc::clone(&outbox_g.signing_key)
+        (
+            std::sync::Arc::clone(&outbox_g.community_signing_key),
+            outbox_g.enrollment_cert.clone(),
+        )
     };
 
     let fence_check = {
@@ -16275,7 +16464,8 @@ async fn join_open_community(
         hlc_tracker,
         device_id,
         self_owner,
-        signing_key,
+        community_signing_key,
+        enrollment_cert,
         community_registry,
         community_adapter_tx,
         unicast_send_tx,
@@ -16321,22 +16511,15 @@ mod redeem_invite_inner_tests {
 
     // ── Fixture helper ────────────────────────────────────────────────────────
 
-    pub(super) fn signing_key_from_identity(
-        identity: &PrivateIdentity,
-    ) -> std::sync::Arc<ed25519_dalek::SigningKey> {
-        let sk_bytes_full = identity.to_private_bytes();
-        let ed_seed: [u8; 32] = sk_bytes_full[32..64]
-            .try_into()
-            .expect("ed25519 seed slice 32..64");
-        std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed_seed))
-    }
-
     pub(super) struct RedeemInviteTestFixture {
         pub(super) crdt_state: std::sync::Arc<tokio::sync::Mutex<OwnerState>>,
         pub(super) hlc_tracker: std::sync::Arc<tokio::sync::Mutex<BTreeMap<String, Hlc>>>,
         pub(super) device_id: String,
         pub(super) self_owner: OwnerAddr,
         pub(super) signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+        // ZEB-339: this device's own EnrollmentCert, passed to
+        // redeem_invite_inner for cert attachment on the self-Join.
+        pub(super) enrollment_cert: harmony_owner::certs::EnrollmentCert,
         pub(super) community_registry: std::sync::Arc<CommunitySyncRegistry>,
         pub(super) community_adapter_tx:
             tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
@@ -16371,10 +16554,14 @@ mod redeem_invite_inner_tests {
     pub(super) async fn build_redeem_invite_test_fixture() -> RedeemInviteTestFixture {
         let tmp = tempfile::TempDir::new().expect("tempdir");
 
-        // Joiner identity (self).
+        // Joiner identity (self) — ZEB-339 enrolled-device owner. self_owner =
+        // owner_id, the redemption Join is signed by the device key, and the
+        // fixture's enrollment_cert binds them. A separate PrivateIdentity backs
+        // the DM-layer DmOutbox plumbing.
+        let joiner_owner = crate::community_membership::mint_test_owner(0xBB);
+        let self_owner = joiner_owner.owner;
+        let signing_key = std::sync::Arc::new(joiner_owner.device_key.clone());
         let joiner_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
-        let self_owner = OwnerAddr(joiner_identity.identity.address_hash);
-        let signing_key = signing_key_from_identity(&joiner_identity);
 
         // Admin identity (invite creator). Used only for invite payload construction.
         let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
@@ -16432,12 +16619,27 @@ mod redeem_invite_inner_tests {
             mpsc::channel::<crate::event_loop::CommunityAdapterRequest>(16);
         let (unicast_send_tx, _unicast_rx) = mpsc::channel::<UnicastSendRequest>(16);
 
-        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new(
+        // ZEB-339: use new_synthetic because the DmOutbox cert is a separate
+        // DM-layer fixture that intentionally doesn't match self_owner (which
+        // comes from joiner_owner=mint_test_owner(0xBB)). The community-redeem
+        // join uses fixture_enrollment_cert (joiner_owner.cert) separately.
+        let test_owner_lib16471 = crate::community_membership::mint_test_owner(0xE1);
+        let community_signing_key_lib16471 = std::sync::Arc::new(
+            ed25519_dalek::SigningKey::from_bytes(&test_owner_lib16471.device_key.to_bytes()),
+        );
+        let enrollment_cert_lib16471 = test_owner_lib16471.cert;
+        // ZEB-339: the FIXTURE's enrollment_cert (used for the community redeem
+        // Join) must bind self_owner → signing_key, i.e. the joiner's own cert.
+        // The DmOutbox cert above stays a separate DM-layer fixture.
+        let fixture_enrollment_cert = joiner_owner.cert.clone();
+        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new_synthetic(
             "joiner-dev".into(),
             self_owner,
             DeviceIdentityHash(joiner_identity.identity.address_hash),
             std::sync::Arc::clone(&signing_key),
             std::sync::Arc::new(joiner_identity),
+            community_signing_key_lib16471,
+            enrollment_cert_lib16471,
         )));
 
         let (channel_log_adapter_tx, _channel_log_adapter_rx) =
@@ -16462,6 +16664,7 @@ mod redeem_invite_inner_tests {
             device_id: "joiner-dev".into(),
             self_owner,
             signing_key,
+            enrollment_cert: fixture_enrollment_cert,
             community_registry,
             community_adapter_tx,
             unicast_send_tx,
@@ -16517,6 +16720,7 @@ mod redeem_invite_inner_tests {
             admin_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         };
 
         let invite_url =
@@ -16529,6 +16733,7 @@ mod redeem_invite_inner_tests {
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
+            fixture.enrollment_cert.clone(),
             std::sync::Arc::clone(&fixture.community_registry),
             fixture.community_adapter_tx.clone(),
             fixture.unicast_send_tx.clone(),
@@ -16596,14 +16801,40 @@ mod redeem_invite_inner_tests {
         // signing-key-derived joiner_identity_pub.
         let tmp = tempfile::TempDir::new().expect("tempdir");
 
+        // ZEB-339: the joiner is an enrolled-device owner. mint_redemption builds
+        // a PendingJoin whose actor = owner_id, signed by the device key, carrying
+        // the joiner's Master cert — verify_event resolves the signer via the cert
+        // (cert.owner_id == actor), superseding the old joiner-pub address-hash
+        // gate. A separate PrivateIdentity backs the DM-layer DmOutbox plumbing.
+        let joiner_owner = crate::community_membership::mint_test_owner(0xBB);
+        let joiner_self_owner = joiner_owner.owner;
+        let signing_key = std::sync::Arc::new(joiner_owner.device_key.clone());
         let joiner_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
-        let signing_key = signing_key_from_identity(&joiner_identity);
-        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
-        let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
-        let admin_pub = admin_identity.identity.to_public_bytes();
+        // ZEB-339: admin is now an enrolled-device owner. admin_addr is the
+        // master/owner hash; the bootstrap Join is signed by the device key and
+        // carries the admin's EnrollmentCert. verify_admin_bootstrap uses
+        // enrolled_key_from_cert + verify_membership_signer (cert model).
+        // The invite token is also signed by the admin's device key so
+        // verify_invite_token_sig_with_enrolled can validate it against the
+        // enrolled device key materialized from the admin's bootstrap Join.
+        let admin_owner = crate::community_membership::mint_test_owner(0xAA);
+        let admin_addr = admin_owner.owner;
+        // admin_pub: a 64-byte [x25519 || ed25519] representation used by the
+        // TwoOwnerResolver (for the legacy rehydration path) and bound as
+        // admin_identity_pub on the engine. The engine ignores it post-ZEB-339
+        // (VerifyContext no longer carries it), but we must supply a plausible
+        // value so bind_admin_identity_pub succeeds.
+        let admin_pub = {
+            let ed25519_pub = admin_owner.cert.device_pubkeys.classical.ed25519_verify;
+            let mut combined = [0u8; 64];
+            combined[32..].copy_from_slice(&ed25519_pub);
+            combined
+        };
 
-        // Derive the joiner pub/addr the same way mint_redemption will.
-        let (joiner_self_owner, joiner_pub_64) = {
+        // The 64-byte joiner pub carried for the DM/transport layer (X25519 ||
+        // Ed25519 derived from the joiner's device key). Not consumed by the
+        // ZEB-339 membership signer-resolution path.
+        let joiner_pub_64 = {
             let x25519_priv = crate::dm_signing::ed25519_priv_to_x25519(&signing_key);
             let x25519_pub =
                 x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*x25519_priv));
@@ -16611,9 +16842,7 @@ mod redeem_invite_inner_tests {
             let mut combined = [0u8; 64];
             combined[..32].copy_from_slice(x25519_pub.as_bytes());
             combined[32..].copy_from_slice(&ed25519_pub);
-            let id = harmony_identity::Identity::from_public_bytes(&combined)
-                .expect("from_public_bytes (signing-key-derived joiner pub)");
-            (OwnerAddr(id.address_hash), combined)
+            combined
         };
 
         struct TwoOwnerResolver {
@@ -16664,12 +16893,25 @@ mod redeem_invite_inner_tests {
             mpsc::channel::<crate::event_loop::CommunityAdapterRequest>(16);
         let (unicast_send_tx, _unicast_rx) = mpsc::channel::<UnicastSendRequest>(16);
 
-        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new(
+        // ZEB-339: use new_synthetic — DmOutbox cert is a separate DM-layer
+        // fixture; the community-redeem join uses enrollment_cert (joiner_owner.cert).
+        let test_owner_lib16712 = crate::community_membership::mint_test_owner(0xE2);
+        let community_signing_key_lib16712 = std::sync::Arc::new(
+            ed25519_dalek::SigningKey::from_bytes(&test_owner_lib16712.device_key.to_bytes()),
+        );
+        let enrollment_cert_lib16712 = test_owner_lib16712.cert;
+        // ZEB-339: the cert passed to redeem_invite_inner is the JOINER's own
+        // cert (binds joiner_self_owner → signing_key); the DmOutbox cert above
+        // stays a separate DM-layer fixture.
+        let enrollment_cert = joiner_owner.cert.clone();
+        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new_synthetic(
             "joiner-dev".into(),
             joiner_self_owner,
             DeviceIdentityHash(joiner_self_owner.0),
             std::sync::Arc::clone(&signing_key),
             std::sync::Arc::new(joiner_identity),
+            community_signing_key_lib16712,
+            enrollment_cert_lib16712,
         )));
 
         let (channel_log_adapter_tx, _channel_log_adapter_rx) =
@@ -16693,8 +16935,12 @@ mod redeem_invite_inner_tests {
         let community_id = SpaceId([0xf6; 16]);
         let membership_key = EpochKey::new([0x42; 32]);
 
-        // Build the admin's signed bootstrap-Join event (required for
-        // invite-only payloads since ZEB-260 Phase 4).
+        // ZEB-339: build the admin's cert-bearing bootstrap-Join. The event
+        // is signed by the admin's device key and carries the admin's
+        // EnrollmentCert so verify_admin_bootstrap can run enrolled_key_from_cert
+        // + verify_membership_signer (cert model). After insertion, the admin's
+        // device key is materialized into enrolled_device_keys, which allows
+        // verify_invite_token_sig_with_enrolled to validate the invite token.
         let admin_bootstrap = {
             let payload = crate::community_membership::EventPayload {
                 id: [0x11; 16],
@@ -16707,12 +16953,16 @@ mod redeem_invite_inner_tests {
                     device_id: "admin-dev".into(),
                 },
             };
-            crate::community_membership::sign_event_with_identity(&payload, &admin_identity)
-                .expect("sign admin bootstrap")
+            let mut ev = crate::community_membership::sign_event(&payload, &admin_owner.device_key)
+                .expect("sign admin bootstrap");
+            ev.enrollment = Some(admin_owner.cert.clone());
+            ev
         };
 
-        // Build the admin-signed invite-token (admin sigs over canonical
-        // CBOR of inviter/invitee_hint/minted_at).
+        // Build the admin-signed invite-token. ZEB-339: the token is signed
+        // by the admin's device key so verify_invite_token_sig_with_enrolled
+        // (P5 in verify_event for PendingJoin) can validate it against the
+        // enrolled device key materialized from the admin's bootstrap Join.
         let token_minted_at = Hlc {
             wall_ms: 950,
             logical: 0,
@@ -16728,7 +16978,10 @@ mod redeem_invite_inner_tests {
         let token_payload_bytes =
             crate::community_invite::canonical_invite_token_bytes(&placeholder_token)
                 .expect("canonical token bytes");
-        let token_sig = admin_identity.sign(&token_payload_bytes);
+        let token_sig = {
+            use ed25519_dalek::Signer as _;
+            admin_owner.device_key.sign(&token_payload_bytes).to_bytes()
+        };
         let invite_token = crate::community_invite::InviteToken {
             inviter: admin_addr,
             invitee_hint: Some(joiner_self_owner),
@@ -16763,6 +17016,10 @@ mod redeem_invite_inner_tests {
             admin_identity_pub: Some(admin_pub),
             forked_from: None,
             pre_fork_snapshot: None,
+            // ZEB-339: invite-only payloads must carry the inviter's
+            // EnrollmentCert. This test exercises the no-Reticulum-destinations
+            // fast-fail skip, not cert verification, so any valid cert suffices.
+            inviter_enrollment: Some(crate::community_membership::mint_test_owner(0xA1).cert),
         };
 
         let invite_url =
@@ -16780,6 +17037,7 @@ mod redeem_invite_inner_tests {
             "joiner-dev".to_string(),
             joiner_self_owner,
             std::sync::Arc::clone(&signing_key),
+            enrollment_cert.clone(),
             std::sync::Arc::clone(&community_registry),
             community_adapter_tx,
             unicast_send_tx,
@@ -16855,6 +17113,7 @@ mod redeem_invite_inner_tests {
         // Re-encode the same invite_payload (different community_id so the
         // registry doesn't reject as duplicate). Rebuild signed admin
         // bootstrap + invite_token for the new community_id.
+        // ZEB-339: use the same admin_owner (cert model) as run 1.
         let community_id_b = SpaceId([0xf7; 16]);
         let admin_bootstrap_b = {
             let payload = crate::community_membership::EventPayload {
@@ -16868,8 +17127,10 @@ mod redeem_invite_inner_tests {
                     device_id: "admin-dev".into(),
                 },
             };
-            crate::community_membership::sign_event_with_identity(&payload, &admin_identity)
-                .expect("sign admin bootstrap (run 2)")
+            let mut ev = crate::community_membership::sign_event(&payload, &admin_owner.device_key)
+                .expect("sign admin bootstrap (run 2)");
+            ev.enrollment = Some(admin_owner.cert.clone());
+            ev
         };
         let placeholder_token_b = crate::community_invite::InviteToken {
             inviter: admin_addr,
@@ -16885,7 +17146,13 @@ mod redeem_invite_inner_tests {
         let token_payload_bytes_b =
             crate::community_invite::canonical_invite_token_bytes(&placeholder_token_b)
                 .expect("canonical token bytes (run 2)");
-        let token_sig_b = admin_identity.sign(&token_payload_bytes_b);
+        let token_sig_b = {
+            use ed25519_dalek::Signer as _;
+            admin_owner
+                .device_key
+                .sign(&token_payload_bytes_b)
+                .to_bytes()
+        };
         let invite_token_b = crate::community_invite::InviteToken {
             sig: token_sig_b,
             ..placeholder_token_b
@@ -16913,15 +17180,32 @@ mod redeem_invite_inner_tests {
             admin_identity_pub: Some(admin_pub),
             forked_from: None,
             pre_fork_snapshot: None,
+            // ZEB-339: invite-only payloads must carry the inviter's cert.
+            inviter_enrollment: Some(crate::community_membership::mint_test_owner(0xA2).cert),
         };
         let invite_url_b = crate::community_invite::encode_invite_url(&invite_payload_b)
             .expect("encode invite url (run 2)");
-        let dm_outbox_b = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new(
+        // ZEB-339: supply synthetic community_signing_key for the DmOutbox
+        // (a separate DM-layer fixture), and use the joiner's own cert as
+        // enrollment_cert_b (matching joiner_self_owner) for the second
+        // redeem_invite_inner call.
+        // ZEB-339: use new_synthetic — same rationale as dm_outbox above.
+        let test_owner_lib16973 = crate::community_membership::mint_test_owner(0xE3);
+        let community_signing_key_lib16973 = std::sync::Arc::new(
+            ed25519_dalek::SigningKey::from_bytes(&test_owner_lib16973.device_key.to_bytes()),
+        );
+        let enrollment_cert_lib16973 = test_owner_lib16973.cert;
+        // The enrollment cert passed to redeem_invite_inner MUST match the joiner's
+        // self_owner (cert.owner_id == joiner_self_owner.0). Use the joiner's cert.
+        let enrollment_cert_b = joiner_owner.cert.clone();
+        let dm_outbox_b = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new_synthetic(
             "joiner-dev".into(),
             joiner_self_owner,
             DeviceIdentityHash(joiner_self_owner.0),
             std::sync::Arc::clone(&signing_key),
             std::sync::Arc::new(PrivateIdentity::from_seed(&[0xbb; 32])),
+            community_signing_key_lib16973,
+            enrollment_cert_lib16973,
         )));
         let (channel_log_adapter_tx_b, _channel_log_adapter_rx_b) =
             mpsc::unbounded_channel::<crate::event_loop::ChannelLogAdapterRequest>();
@@ -16944,6 +17228,7 @@ mod redeem_invite_inner_tests {
             "joiner-dev".to_string(),
             joiner_self_owner,
             std::sync::Arc::clone(&signing_key),
+            enrollment_cert_b.clone(),
             std::sync::Arc::clone(&community_registry2),
             adapter_tx2,
             unicast_tx2,
@@ -16974,17 +17259,13 @@ mod redeem_invite_inner_tests {
 
     #[test]
     fn mint_redemption_produces_self_join_and_matching_space() {
-        let identity = PrivateIdentity::from_seed(&[0xab; 32]);
-        let identity_pub = identity.identity.to_public_bytes();
-        let self_owner = OwnerAddr(identity.identity.address_hash);
-        // Mirror Task 9's test pattern: pull the canonical 32-byte
-        // Ed25519 seed from bytes 32..64 of `to_private_bytes()`. The
-        // production IPC borrows this same SigningKey from `dm_outbox`.
-        let sk_bytes_full = identity.to_private_bytes();
-        let ed_seed: [u8; 32] = sk_bytes_full[32..64]
-            .try_into()
-            .expect("ed25519 seed slice 32..64");
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&ed_seed);
+        // ZEB-339: enrolled-device owner — self_owner = owner_id, the redemption
+        // Join is signed by the device key and carries the matching cert.
+        let owner = crate::community_membership::mint_test_owner(0xAB);
+        let identity_pub = [0u8; 64];
+        let self_owner = owner.owner;
+        let signing_key = owner.device_key.clone();
+        let enrollment_cert = owner.cert.clone();
 
         let payload = CommunityInvitePayload {
             community_id: SpaceId([0xee; 16]),
@@ -17002,6 +17283,7 @@ mod redeem_invite_inner_tests {
             admin_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         };
 
         let device_id = "joiner-dev";
@@ -17013,7 +17295,14 @@ mod redeem_invite_inner_tests {
             device_id: device_id.to_string(),
         };
 
-        let minted = mint_redemption(&payload, self_owner, &signing_key, join_hlc).expect("mint");
+        let minted = mint_redemption(
+            &payload,
+            self_owner,
+            &signing_key,
+            &enrollment_cert,
+            join_hlc,
+        )
+        .expect("mint");
 
         assert_eq!(minted.community_id, payload.community_id);
         assert_eq!(minted.space.id, payload.community_id);
@@ -17026,10 +17315,15 @@ mod redeem_invite_inner_tests {
             crate::community_membership::MembershipEventKind::Join
         ));
 
-        // Self-join sig must verify against the joiner's identity_pub —
-        // the engine's verify_event runs the same check on insert.
-        crate::community_membership::verify_signature(&minted.bootstrap_join, &identity_pub)
-            .expect("self-join signature must verify against joiner identity_pub");
+        // ZEB-339: the self-join is signed by the enrolled device key (#2) and
+        // carries the joiner's Master cert; its signature resolves via the cert
+        // (owner_id → device key) — the engine's verify_event runs the same
+        // `enrolled_key_from_cert` + `verify_membership_signer` check on insert.
+        let _ = identity_pub;
+        let signer = crate::community_membership::enrolled_key_from_cert(&minted.bootstrap_join)
+            .expect("self-join cert must resolve enrolled device key");
+        crate::community_membership::verify_membership_signer(&minted.bootstrap_join, &signer)
+            .expect("self-join signature must verify against enrolled device key");
     }
 
     // ── ZEB-285 Task 7: fork-invite carry tests ────────────────────────────────
@@ -17083,6 +17377,7 @@ mod redeem_invite_inner_tests {
             admin_identity_pub: None,
             forked_from: Some(original_id),
             pre_fork_snapshot: Some(snapshot.clone()),
+            inviter_enrollment: None,
         };
 
         let invite_url =
@@ -17095,6 +17390,7 @@ mod redeem_invite_inner_tests {
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
+            fixture.enrollment_cert.clone(),
             std::sync::Arc::clone(&fixture.community_registry),
             fixture.community_adapter_tx.clone(),
             fixture.unicast_send_tx.clone(),
@@ -17206,6 +17502,7 @@ mod redeem_invite_inner_tests {
             admin_identity_pub: None,
             forked_from: Some(original_id),
             pre_fork_snapshot: Some(snapshot.clone()),
+            inviter_enrollment: None,
         };
 
         let invite_url =
@@ -17218,6 +17515,7 @@ mod redeem_invite_inner_tests {
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
+            fixture.enrollment_cert.clone(),
             std::sync::Arc::clone(&fixture.community_registry),
             fixture.community_adapter_tx.clone(),
             fixture.unicast_send_tx.clone(),
@@ -17310,6 +17608,7 @@ mod redeem_invite_inner_tests {
             admin_identity_pub: None,
             forked_from: Some(original_id),
             pre_fork_snapshot: Some(snapshot.clone()),
+            inviter_enrollment: None,
         };
 
         let invite_url =
@@ -17322,6 +17621,7 @@ mod redeem_invite_inner_tests {
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
+            fixture.enrollment_cert.clone(),
             std::sync::Arc::clone(&fixture.community_registry),
             fixture.community_adapter_tx.clone(),
             fixture.unicast_send_tx.clone(),
@@ -17363,13 +17663,15 @@ mod redeem_invite_inner_tests {
             InviteEpochSnapshot, InviteToken, MaterializedCommunityState,
         };
         use crate::community_membership::MembershipEventKind;
-        use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
 
         let admin_addr = OwnerAddr([0x11; 16]);
         let community_id = SpaceId([0x33; 16]);
-        let joiner_sk = SigningKey::generate(&mut OsRng);
-        let joiner_addr = OwnerAddr([0x22; 16]);
+        // ZEB-339: joiner is an enrolled-device owner — addr/signing-key/cert
+        // all derive from one minted owner so the redemption Join is consistent.
+        let joiner_owner = crate::community_membership::mint_test_owner(0xD3);
+        let joiner_sk = joiner_owner.device_key.clone();
+        let enrollment_cert = joiner_owner.cert.clone();
+        let joiner_addr = joiner_owner.owner;
 
         let token = InviteToken {
             inviter: admin_addr,
@@ -17399,6 +17701,7 @@ mod redeem_invite_inner_tests {
             admin_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         };
 
         let hlc = Hlc {
@@ -17406,7 +17709,8 @@ mod redeem_invite_inner_tests {
             logical: 0,
             device_id: "joiner".into(),
         };
-        let minted = mint_redemption(&payload, joiner_addr, &joiner_sk, hlc).expect("mint open");
+        let minted = mint_redemption(&payload, joiner_addr, &joiner_sk, &enrollment_cert, hlc)
+            .expect("mint open");
 
         assert!(
             matches!(minted.bootstrap_join.kind, MembershipEventKind::Join),
@@ -17422,13 +17726,15 @@ mod redeem_invite_inner_tests {
         };
         use crate::community_membership::MembershipEventKind;
         use crate::dm_signing::{ed25519_priv_to_x25519, seal_to_owner};
-        use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
 
         let admin_addr = OwnerAddr([0x11; 16]);
         let community_id = SpaceId([0x33; 16]);
-        let joiner_sk = SigningKey::generate(&mut OsRng);
-        let joiner_addr = OwnerAddr([0x22; 16]);
+        // ZEB-339: joiner is an enrolled-device owner; the seal targets the X25519
+        // derived from their device key, and the cert binds owner→device key.
+        let joiner_owner = crate::community_membership::mint_test_owner(0xD3);
+        let joiner_sk = joiner_owner.device_key.clone();
+        let enrollment_cert = joiner_owner.cert.clone();
+        let joiner_addr = joiner_owner.owner;
 
         // Derive joiner's X25519 pub for the seal.
         let joiner_x25519_priv = ed25519_priv_to_x25519(&joiner_sk);
@@ -17468,6 +17774,7 @@ mod redeem_invite_inner_tests {
             admin_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         };
 
         let hlc = Hlc {
@@ -17475,30 +17782,20 @@ mod redeem_invite_inner_tests {
             logical: 0,
             device_id: "joiner".into(),
         };
-        let minted =
-            mint_redemption(&payload, joiner_addr, &joiner_sk, hlc).expect("mint invite-only");
+        let minted = mint_redemption(&payload, joiner_addr, &joiner_sk, &enrollment_cert, hlc)
+            .expect("mint invite-only");
 
         match &minted.bootstrap_join.kind {
-            MembershipEventKind::PendingJoin {
-                invite_token: t,
-                joiner_identity_pub,
-            } => {
+            MembershipEventKind::PendingJoin { invite_token: t } => {
                 assert_eq!(
                     t.inviter, admin_addr,
                     "InviteToken should be carried through"
                 );
-                assert_eq!(
-                    joiner_identity_pub.len(),
-                    64,
-                    "joiner_identity_pub must be 64 bytes"
-                );
-                // The Ed25519 half (bytes 32-64) MUST match the signing_key's verifying key.
-                let ed_pub = joiner_sk.verifying_key().to_bytes();
-                assert_eq!(
-                    &joiner_identity_pub[32..],
-                    &ed_pub,
-                    "Ed25519 half must match"
-                );
+                // ZEB-339: PendingJoin no longer carries an inline
+                // joiner_identity_pub; the joiner's enrolled device key is
+                // proven by the EnrollmentCert on the signed event. (T10
+                // migrates this assertion onto the cert model.)
+                let _ = &joiner_sk;
             }
             other => panic!("expected PendingJoin kind, got {:?}", other),
         }
@@ -17539,6 +17836,7 @@ mod join_open_community_tests {
             admin_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         };
         let invite_url = encode_invite_url(&payload).expect("encode open url");
         let entry = LibraryDirectoryEntry {
@@ -17589,6 +17887,7 @@ mod join_open_community_tests {
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
+            fixture.enrollment_cert.clone(),
             std::sync::Arc::clone(&fixture.community_registry),
             fixture.community_adapter_tx.clone(),
             fixture.unicast_send_tx.clone(),
@@ -18725,7 +19024,9 @@ async fn leave_community(
         crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
     let leave = {
         let outbox_g = dm_outbox.lock().await;
-        let signing_key = outbox_g.signing_key.as_ref();
+        // ZEB-339: Leave is a steady-state community-membership event — enrolled
+        // device key (#2), no cert.
+        let signing_key = outbox_g.community_signing_key.as_ref();
         mint_leave_event(space_id, self_owner, signing_key, leave_hlc)?
     };
 
@@ -18836,7 +19137,10 @@ async fn leave_community(
             // 5. Mint the rotation (leaver is the signer — cooperative leave path).
             let rotation = {
                 let outbox_g = dm_outbox.lock().await;
-                let signing_key = outbox_g.signing_key.as_ref();
+                // ZEB-339: EpochRotation is a steady-state community-membership
+                // event verified via verify_event's enrolled-key resolution —
+                // sign with the enrolled device key (#2), no cert.
+                let signing_key = outbox_g.community_signing_key.as_ref();
                 mint_epoch_rotation_event(
                     space_id,
                     self_owner,
@@ -19457,7 +19761,9 @@ async fn kick_from_community(
         // Route via AdminProposal — the proposer counts as signer 1.
         let proposal = {
             let outbox_g = dm_outbox.lock().await;
-            let signing_key = outbox_g.signing_key.as_ref();
+            // ZEB-339: AdminProposal(Kick) steady-state event — enrolled device
+            // key (#2), no cert.
+            let signing_key = outbox_g.community_signing_key.as_ref();
             mint_admin_proposal_kick_event(
                 space_id,
                 self_owner,
@@ -19491,7 +19797,8 @@ async fn kick_from_community(
     // Direct kick path (admin_quorum == 1 OR target is not an admin).
     let kick = {
         let outbox_g = dm_outbox.lock().await;
-        let signing_key = outbox_g.signing_key.as_ref();
+        // ZEB-339: Kick steady-state event — enrolled device key (#2), no cert.
+        let signing_key = outbox_g.community_signing_key.as_ref();
         mint_kick_event(space_id, self_owner, target, reason, signing_key, event_hlc)?
     };
 
@@ -19559,7 +19866,9 @@ async fn kick_from_community(
         // 5. Mint the EpochRotation event referencing the Kick's EventId.
         let rotation = {
             let outbox_g = dm_outbox.lock().await;
-            let signing_key = outbox_g.signing_key.as_ref();
+            // ZEB-339: EpochRotation steady-state membership event — enrolled
+            // device key (#2), no cert.
+            let signing_key = outbox_g.community_signing_key.as_ref();
             mint_epoch_rotation_event(
                 space_id,
                 self_owner,
@@ -19809,7 +20118,9 @@ async fn set_power_level(
         // Route via AdminProposal — the proposer counts as signer 1.
         let proposal = {
             let outbox_g = dm_outbox.lock().await;
-            let signing_key = outbox_g.signing_key.as_ref();
+            // ZEB-339: AdminProposal(SetPower) steady-state event — enrolled
+            // device key (#2), no cert.
+            let signing_key = outbox_g.community_signing_key.as_ref();
             mint_admin_proposal_set_power_event(
                 space_id,
                 self_owner,
@@ -19843,7 +20154,8 @@ async fn set_power_level(
     // Direct SetPower path (admin_quorum == 1 OR action is not admin-affecting).
     let event = {
         let outbox_g = dm_outbox.lock().await;
-        let signing_key = outbox_g.signing_key.as_ref();
+        // ZEB-339: SetPower steady-state event — enrolled device key (#2), no cert.
+        let signing_key = outbox_g.community_signing_key.as_ref();
         mint_set_power_event(space_id, self_owner, target, level, signing_key, event_hlc)?
     };
     let outcome = engine_arc
@@ -19922,7 +20234,8 @@ async fn unban_from_community(
         crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
     let event = {
         let outbox_g = dm_outbox.lock().await;
-        let signing_key = outbox_g.signing_key.as_ref();
+        // ZEB-339: Unban steady-state event — enrolled device key (#2), no cert.
+        let signing_key = outbox_g.community_signing_key.as_ref();
         mint_unban_event(space_id, self_owner, target, reason, signing_key, hlc)?
     };
 
@@ -21015,7 +21328,9 @@ async fn countersign_admin_proposal(
     // Mint and insert AdminCountersign.
     let countersign_event = {
         let outbox_g = dm_outbox.lock().await;
-        let signing_key = outbox_g.signing_key.as_ref();
+        // ZEB-339: AdminCountersign steady-state event — enrolled device key
+        // (#2), no cert.
+        let signing_key = outbox_g.community_signing_key.as_ref();
         mint_admin_countersign_event(
             space_id,
             self_owner,
@@ -21178,7 +21493,9 @@ async fn propose_change_quorum(
     // Mint AdminProposal{ChangeQuorum}.
     let proposal = {
         let outbox_g = dm_outbox.lock().await;
-        let signing_key = outbox_g.signing_key.as_ref();
+        // ZEB-339: AdminProposal(ChangeQuorum) steady-state membership event —
+        // enrolled device key (#2), no cert.
+        let signing_key = outbox_g.community_signing_key.as_ref();
         mint_admin_proposal_change_quorum_event(
             space_id,
             self_owner,
@@ -21771,7 +22088,7 @@ pub type SynthCatchupsSet = std::sync::Arc<
 pub async fn self_heal_community_observer(
     community_id: crate::owner_state_types::SpaceId,
     registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
-    signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    community_signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
     hlc_tracker: std::sync::Arc<
         tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
     >,
@@ -21914,7 +22231,7 @@ pub async fn self_heal_community_observer(
             triggered_by,
             current_epoch,
             recipients,
-            &signing_key,
+            &community_signing_key,
             hlc,
         ) {
             Ok(r) => r,
@@ -22065,7 +22382,7 @@ pub async fn self_heal_community_observer(
             triggered_by,
             current_epoch,
             recipients,
-            &signing_key,
+            &community_signing_key,
             hlc,
         ) {
             Ok(c) => c,
@@ -22287,6 +22604,7 @@ mod community_member_dto_tests {
                 status: MemberStatus::Joined,
                 joined_at: hlc(100, "a"),
                 left_at: None,
+                enrolled_device_keys: std::collections::BTreeSet::new(),
             },
         );
         members.insert(
@@ -22295,6 +22613,7 @@ mod community_member_dto_tests {
                 status: MemberStatus::Joined,
                 joined_at: hlc(200, "b"),
                 left_at: None,
+                enrolled_device_keys: std::collections::BTreeSet::new(),
             },
         );
         members.insert(
@@ -22303,6 +22622,7 @@ mod community_member_dto_tests {
                 status: MemberStatus::Joined,
                 joined_at: hlc(150, "c"),
                 left_at: None,
+                enrolled_device_keys: std::collections::BTreeSet::new(),
             },
         );
         members.insert(
@@ -22311,6 +22631,7 @@ mod community_member_dto_tests {
                 status: MemberStatus::Joined,
                 joined_at: hlc(300, "d"),
                 left_at: None,
+                enrolled_device_keys: std::collections::BTreeSet::new(),
             },
         );
 
@@ -22351,6 +22672,7 @@ mod community_member_dto_tests {
                 status: MemberStatus::Left,
                 joined_at: hlc(100, "x"),
                 left_at: Some(hlc(200, "x")),
+                enrolled_device_keys: std::collections::BTreeSet::new(),
             },
         );
         members.insert(
@@ -22359,6 +22681,7 @@ mod community_member_dto_tests {
                 status: MemberStatus::Banned,
                 joined_at: hlc(50, "y"),
                 left_at: Some(hlc(150, "y")),
+                enrolled_device_keys: std::collections::BTreeSet::new(),
             },
         );
         let materialized = MaterializedMembership {
@@ -29618,10 +29941,16 @@ async fn connectivity_redeem_invite_iroh(
         });
     };
 
-    // signing_key is owned by dm_outbox; pull it once under the tokio mutex.
-    let signing_key = {
+    // ZEB-339: the self-Join / PendingJoin minted on this iroh-handshake path
+    // signs with the enrolled device key (#2) and carries this device's own
+    // EnrollmentCert. The Reticulum transport key used to sign the unicast
+    // invite packet is read separately inside the inner from the outbox.
+    let (community_signing_key, enrollment_cert) = {
         let outbox_g = dm_outbox.lock().await;
-        std::sync::Arc::clone(&outbox_g.signing_key)
+        (
+            std::sync::Arc::clone(&outbox_g.community_signing_key),
+            outbox_g.enrollment_cert.clone(),
+        )
     };
 
     // Emit staged progress events on the
@@ -29701,7 +30030,8 @@ async fn connectivity_redeem_invite_iroh(
         hlc_tracker,
         device_id,
         self_owner,
-        signing_key,
+        community_signing_key,
+        enrollment_cert,
         community_registry,
         community_adapter_tx,
         unicast_send_tx,
@@ -29769,6 +30099,9 @@ pub async fn connectivity_redeem_invite_iroh_inner<R: tauri::Runtime, F>(
     device_id: String,
     self_owner: crate::owner_state_types::OwnerAddr,
     signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    // ZEB-339: this device's own EnrollmentCert, attached to the self-Join /
+    // PendingJoin minted by `mint_redemption` on this iroh-handshake path.
+    enrollment_cert: harmony_owner::certs::EnrollmentCert,
     community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
     community_adapter_tx: tokio::sync::mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
     unicast_send_tx: tokio::sync::mpsc::Sender<crate::dm_outbox::UnicastSendRequest>,
@@ -30029,7 +30362,13 @@ where
         .as_millis() as u64;
     let join_hlc =
         crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
-    let minted = match mint_redemption(&payload, self_owner, signing_key.as_ref(), join_hlc) {
+    let minted = match mint_redemption(
+        &payload,
+        self_owner,
+        signing_key.as_ref(),
+        &enrollment_cert,
+        join_hlc,
+    ) {
         Ok(m) => m,
         Err(e) => {
             return Err(format!("mint_redemption: {e}"));
@@ -30337,6 +30676,7 @@ where
         device_id,
         self_owner,
         signing_key,
+        enrollment_cert,
         community_registry,
         community_adapter_tx,
         unicast_send_tx,
@@ -32223,20 +32563,38 @@ mod pin_persistence_tests {
 mod list_community_members_ipc_tests {
     use super::*;
     use crate::community_membership::{
-        sign_event_with_identity, EventPayload, MembershipEventKind,
+        mint_test_owner, sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent,
+        TestOwner,
     };
     use crate::community_state_crdt::CommunityState;
     use crate::owner_state_types::*;
-    use harmony_identity::PrivateIdentity;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+
+    /// ZEB-339: sign with the owner's enrolled device key, attaching the Master
+    /// cert on identity-introducing events (Join/PendingJoin).
+    fn sign_event_with_identity(
+        payload: &EventPayload,
+        owner: &TestOwner,
+    ) -> Result<SignedMembershipEvent, crate::owner_state_crypto::CryptoError> {
+        let ev = sign_event(payload, &owner.device_key)?;
+        Ok(match ev.kind {
+            MembershipEventKind::Join | MembershipEventKind::PendingJoin { .. } => {
+                SignedMembershipEvent {
+                    enrollment: Some(owner.cert.clone()),
+                    ..ev
+                }
+            }
+            _ => ev,
+        })
+    }
 
     #[tokio::test]
     async fn list_members_returns_sorted_dto_for_known_community() {
         let community_id = SpaceId([5; 16]);
-        let identity = PrivateIdentity::from_seed(&[0xab; 32]);
-        let admin = OwnerAddr(identity.identity.address_hash);
-        let identity_pub = identity.identity.to_public_bytes();
+        let identity = mint_test_owner(0xab);
+        let admin = identity.owner;
+        let _identity_pub = [0u8; 64];
 
         let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
         {
@@ -32259,9 +32617,6 @@ mod list_community_members_ipc_tests {
                     expected_community_id: community_id,
                     admin_addr: admin,
                     is_invite_only: false,
-                    actor_identity_pub: &identity_pub,
-                    countersigner_identity_pub: None,
-                    admin_identity_pub: None,
                 },
             );
             assert!(
@@ -32305,6 +32660,7 @@ mod generate_invite_helper_tests {
             admin_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         };
         let url = build_open_invite_url(&payload).expect("url");
         let decoded = decode_invite_url(&url).expect("decode");
@@ -32360,6 +32716,7 @@ mod generate_invite_helper_tests {
             admin_identity_pub: None,
             forked_from: Some(original_id),
             pre_fork_snapshot: Some(snapshot.clone()),
+            inviter_enrollment: None,
         };
 
         let url = build_open_invite_url(&payload).expect("encode fork-invite url");
@@ -32593,6 +32950,7 @@ mod create_channel_delta_tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         };
         let payload = delta_to_channel_config_change(&CommunityMembershipDelta {
             community_id,
@@ -32623,6 +32981,7 @@ mod create_channel_delta_tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         };
         let payload = delta_to_channel_config_change(&CommunityMembershipDelta {
             community_id,
@@ -32646,6 +33005,7 @@ mod create_channel_delta_tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         };
         let payload = delta_to_channel_config_change(&CommunityMembershipDelta {
             community_id,
@@ -32680,6 +33040,7 @@ mod create_channel_delta_tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         };
         let delta = CommunityMembershipDelta {
             community_id,
@@ -32742,6 +33103,7 @@ mod create_channel_delta_tests {
             },
             sig: [0; 64],
             countersig: None,
+            enrollment: None,
         };
         tx.send(CommunityMembershipDelta {
             community_id,
@@ -32961,15 +33323,33 @@ mod channel_message_ipc_tests {
 mod unban_from_community_tests {
     use super::*;
     use crate::community_membership::{
-        sign_event_with_identity, EventPayload, MembershipEventKind, VerifyContext,
+        mint_test_owner, sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent,
+        TestOwner, VerifyContext,
     };
     use crate::community_state_crdt::{CommunityState, InsertOutcome};
     use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
-    use harmony_identity::PrivateIdentity;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
     // ── shared fixture helpers ─────────────────────────────────────────
+
+    /// ZEB-339: sign with the owner's enrolled device key, attaching the Master
+    /// cert on identity-introducing events (Join/PendingJoin).
+    fn sign_event_with_identity(
+        payload: &EventPayload,
+        owner: &TestOwner,
+    ) -> Result<SignedMembershipEvent, crate::owner_state_crypto::CryptoError> {
+        let ev = sign_event(payload, &owner.device_key)?;
+        Ok(match ev.kind {
+            MembershipEventKind::Join | MembershipEventKind::PendingJoin { .. } => {
+                SignedMembershipEvent {
+                    enrollment: Some(owner.cert.clone()),
+                    ..ev
+                }
+            }
+            _ => ev,
+        })
+    }
 
     fn hlc(wall: u64, dev: &str) -> Hlc {
         Hlc {
@@ -32983,18 +33363,15 @@ mod unban_from_community_tests {
     fn insert_ok(
         state: &mut CommunityState,
         payload: EventPayload,
-        identity: &PrivateIdentity,
+        identity: &TestOwner,
         admin: OwnerAddr,
-        actor_pub: &[u8; 64],
+        _actor_pub: &[u8; 64],
     ) {
         let ev = sign_event_with_identity(&payload, identity).expect("sign");
         let ctx = VerifyContext {
             expected_community_id: payload.community_id,
             admin_addr: admin,
             is_invite_only: false,
-            actor_identity_pub: actor_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         let outcome = state.insert_event(ev, &ctx);
         assert!(
@@ -33013,13 +33390,13 @@ mod unban_from_community_tests {
     async fn unban_from_community_happy_path() {
         let community_id = SpaceId([0x10; 16]);
 
-        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
-        let admin = OwnerAddr(admin_identity.identity.address_hash);
-        let admin_pub = admin_identity.identity.to_public_bytes();
+        let admin_identity = mint_test_owner(0xaa);
+        let admin = admin_identity.owner;
+        let admin_pub = [0u8; 64];
 
-        let member_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
-        let member = OwnerAddr(member_identity.identity.address_hash);
-        let member_pub = member_identity.identity.to_public_bytes();
+        let member_identity = mint_test_owner(0xbb);
+        let member = member_identity.owner;
+        let member_pub = [0u8; 64];
 
         let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
 
@@ -33080,9 +33457,7 @@ mod unban_from_community_tests {
         );
 
         // Admin unbans member (uses mint_unban_event helper to build the event).
-        let sk_bytes = admin_identity.to_private_bytes();
-        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+        let signing_key = admin_identity.device_key.clone();
         let unban_ev = mint_unban_event(
             community_id,
             admin,
@@ -33102,9 +33477,6 @@ mod unban_from_community_tests {
                     expected_community_id: community_id,
                     admin_addr: admin,
                     is_invite_only: false,
-                    actor_identity_pub: &admin_pub,
-                    countersigner_identity_pub: None,
-                    admin_identity_pub: None,
                 },
             )
         };
@@ -33142,17 +33514,17 @@ mod unban_from_community_tests {
     async fn unban_from_community_returns_err_when_actor_lacks_power() {
         let community_id = SpaceId([0x11; 16]);
 
-        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
-        let admin = OwnerAddr(admin_identity.identity.address_hash);
-        let admin_pub = admin_identity.identity.to_public_bytes();
+        let admin_identity = mint_test_owner(0xaa);
+        let admin = admin_identity.owner;
+        let admin_pub = [0u8; 64];
 
-        let mod_identity = PrivateIdentity::from_seed(&[0xcc; 32]);
-        let moderator = OwnerAddr(mod_identity.identity.address_hash);
-        let mod_pub = mod_identity.identity.to_public_bytes();
+        let mod_identity = mint_test_owner(0xcc);
+        let moderator = mod_identity.owner;
+        let mod_pub = [0u8; 64];
 
-        let member_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
-        let member = OwnerAddr(member_identity.identity.address_hash);
-        let member_pub = member_identity.identity.to_public_bytes();
+        let member_identity = mint_test_owner(0xbb);
+        let member = member_identity.owner;
+        let member_pub = [0u8; 64];
 
         let mut state = CommunityState::new(community_id);
 
@@ -33234,9 +33606,7 @@ mod unban_from_community_tests {
         );
 
         // Moderator attempts to unban — should be rejected (power 50 < 100).
-        let mod_sk_bytes = mod_identity.to_private_bytes();
-        let mod_sk_seed: [u8; 32] = mod_sk_bytes[32..64].try_into().unwrap();
-        let mod_signing_key = ed25519_dalek::SigningKey::from_bytes(&mod_sk_seed);
+        let mod_signing_key = mod_identity.device_key.clone();
         let unban_ev = mint_unban_event(
             community_id,
             moderator,
@@ -33253,9 +33623,6 @@ mod unban_from_community_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &mod_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
 
@@ -33279,13 +33646,13 @@ mod unban_from_community_tests {
     async fn unban_from_community_returns_err_when_target_not_banned() {
         let community_id = SpaceId([0x12; 16]);
 
-        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
-        let admin = OwnerAddr(admin_identity.identity.address_hash);
-        let admin_pub = admin_identity.identity.to_public_bytes();
+        let admin_identity = mint_test_owner(0xaa);
+        let admin = admin_identity.owner;
+        let admin_pub = [0u8; 64];
 
-        let member_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
-        let member = OwnerAddr(member_identity.identity.address_hash);
-        let member_pub = member_identity.identity.to_public_bytes();
+        let member_identity = mint_test_owner(0xbb);
+        let member = member_identity.owner;
+        let member_pub = [0u8; 64];
 
         let mut state = CommunityState::new(community_id);
 
@@ -33319,9 +33686,7 @@ mod unban_from_community_tests {
         );
 
         // Admin attempts to unban a Joined member — should fail.
-        let sk_bytes = admin_identity.to_private_bytes();
-        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+        let signing_key = admin_identity.device_key.clone();
         let unban_ev = mint_unban_event(
             community_id,
             admin,
@@ -33338,9 +33703,6 @@ mod unban_from_community_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
 
@@ -33364,13 +33726,13 @@ mod unban_from_community_tests {
     async fn kick_from_community_signs_reason_into_event() {
         let community_id = SpaceId([0x13; 16]);
 
-        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
-        let admin = OwnerAddr(admin_identity.identity.address_hash);
-        let admin_pub = admin_identity.identity.to_public_bytes();
+        let admin_identity = mint_test_owner(0xaa);
+        let admin = admin_identity.owner;
+        let admin_pub = [0u8; 64];
 
-        let member_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
-        let member = OwnerAddr(member_identity.identity.address_hash);
-        let member_pub = member_identity.identity.to_public_bytes();
+        let member_identity = mint_test_owner(0xbb);
+        let member = member_identity.owner;
+        let member_pub = [0u8; 64];
 
         let mut state = CommunityState::new(community_id);
 
@@ -33404,9 +33766,7 @@ mod unban_from_community_tests {
         );
 
         // Kick member with reason.
-        let sk_bytes = admin_identity.to_private_bytes();
-        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+        let signing_key = admin_identity.device_key.clone();
         let kick_ev = mint_kick_event(
             community_id,
             admin,
@@ -33423,9 +33783,6 @@ mod unban_from_community_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(
@@ -33461,13 +33818,13 @@ mod unban_from_community_tests {
     async fn list_recent_moderation_events_filters_to_kick_unban_setpower() {
         let community_id = SpaceId([0x14; 16]);
 
-        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
-        let admin = OwnerAddr(admin_identity.identity.address_hash);
-        let admin_pub = admin_identity.identity.to_public_bytes();
+        let admin_identity = mint_test_owner(0xaa);
+        let admin = admin_identity.owner;
+        let admin_pub = [0u8; 64];
 
-        let member_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
-        let member = OwnerAddr(member_identity.identity.address_hash);
-        let member_pub = member_identity.identity.to_public_bytes();
+        let member_identity = mint_test_owner(0xbb);
+        let member = member_identity.owner;
+        let member_pub = [0u8; 64];
 
         let mut state = CommunityState::new(community_id);
 
@@ -33499,9 +33856,7 @@ mod unban_from_community_tests {
             &member_pub,
         );
 
-        let sk_bytes = admin_identity.to_private_bytes();
-        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+        let signing_key = admin_identity.device_key.clone();
 
         // SetPower event (SHOULD appear).
         let sp_ev = mint_set_power_event(
@@ -33519,9 +33874,6 @@ mod unban_from_community_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(matches!(sp_outcome, InsertOutcome::Inserted));
@@ -33542,9 +33894,6 @@ mod unban_from_community_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(matches!(kick_outcome, InsertOutcome::Inserted));
@@ -33565,9 +33914,6 @@ mod unban_from_community_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(matches!(unban_outcome, InsertOutcome::Inserted));
@@ -33651,15 +33997,13 @@ mod unban_from_community_tests {
     async fn list_recent_moderation_events_respects_limit_and_orders_by_hlc_desc() {
         let community_id = SpaceId([0x15; 16]);
 
-        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
-        let admin = OwnerAddr(admin_identity.identity.address_hash);
-        let admin_pub = admin_identity.identity.to_public_bytes();
+        let admin_identity = mint_test_owner(0xaa);
+        let admin = admin_identity.owner;
+        let admin_pub = [0u8; 64];
 
         // 5 distinct "members" to kick (to avoid same-target restrictions
         // — a re-kick of an already-Banned member would be rejected).
-        let victims: Vec<PrivateIdentity> = (0u8..5)
-            .map(|i| PrivateIdentity::from_seed(&[0xd0 + i; 32]))
-            .collect();
+        let victims: Vec<TestOwner> = (0u8..5).map(|i| mint_test_owner(0xd0 + i)).collect();
 
         let mut state = CommunityState::new(community_id);
 
@@ -33680,8 +34024,8 @@ mod unban_from_community_tests {
 
         // Each victim joins.
         for (i, victim_id) in victims.iter().enumerate() {
-            let victim = OwnerAddr(victim_id.identity.address_hash);
-            let victim_pub = victim_id.identity.to_public_bytes();
+            let victim = victim_id.owner;
+            let victim_pub = [0u8; 64];
             insert_ok(
                 &mut state,
                 EventPayload {
@@ -33697,14 +34041,12 @@ mod unban_from_community_tests {
             );
         }
 
-        let sk_bytes = admin_identity.to_private_bytes();
-        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+        let signing_key = admin_identity.device_key.clone();
 
         // Kick each victim at wall_ms 100, 200, 300, 400, 500.
         let wall_times = [100u64, 200, 300, 400, 500];
         for (i, victim_id) in victims.iter().enumerate() {
-            let victim = OwnerAddr(victim_id.identity.address_hash);
+            let victim = victim_id.owner;
             let kick_ev = mint_kick_event(
                 community_id,
                 admin,
@@ -33720,9 +34062,6 @@ mod unban_from_community_tests {
                     expected_community_id: community_id,
                     admin_addr: admin,
                     is_invite_only: false,
-                    actor_identity_pub: &admin_pub,
-                    countersigner_identity_pub: None,
-                    admin_identity_pub: None,
                 },
             );
             assert!(
@@ -33837,6 +34176,7 @@ mod pending_join_audit_feed_tests {
             },
             sig: [0u8; 64],
             countersig: None,
+            enrollment: None,
         }
     }
 
@@ -33886,7 +34226,6 @@ mod pending_join_audit_feed_tests {
             MAX_MS,
             MembershipEventKind::PendingJoin {
                 invite_token: make_token(admin, None),
-                joiner_identity_pub: [0u8; 64],
             },
             community_id,
         );
@@ -33898,7 +34237,6 @@ mod pending_join_audit_feed_tests {
             MAX_MS - 1_000,
             MembershipEventKind::PendingJoin {
                 invite_token: make_token(admin, None),
-                joiner_identity_pub: [0u8; 64],
             },
             community_id,
         );
@@ -33920,7 +34258,6 @@ mod pending_join_audit_feed_tests {
             EXPIRED_MS,
             MembershipEventKind::PendingJoin {
                 invite_token: make_token(admin, None),
-                joiner_identity_pub: [0u8; 64],
             },
             community_id,
         );
@@ -33982,7 +34319,6 @@ mod pending_join_audit_feed_tests {
             1_000,
             MembershipEventKind::PendingJoin {
                 invite_token: make_token(admin, Some(hint_addr)),
-                joiner_identity_pub: [0u8; 64],
             },
             community_id,
         );
@@ -34018,7 +34354,6 @@ mod pending_join_audit_feed_tests {
             100,
             MembershipEventKind::PendingJoin {
                 invite_token: make_token(self_owner, None),
-                joiner_identity_pub: [0u8; 64],
             },
             community_id,
         );
@@ -34028,7 +34363,6 @@ mod pending_join_audit_feed_tests {
             200,
             MembershipEventKind::PendingJoin {
                 invite_token: make_token(self_owner, None),
-                joiner_identity_pub: [0u8; 64],
             },
             community_id,
         );
@@ -34038,7 +34372,6 @@ mod pending_join_audit_feed_tests {
             300,
             MembershipEventKind::PendingJoin {
                 invite_token: make_token(other_admin, None),
-                joiner_identity_pub: [0u8; 64],
             },
             community_id,
         );
@@ -34450,11 +34783,29 @@ mod start_node_race_tests {
 mod admin_action_result_routing_tests {
     use super::*;
     use crate::community_membership::{
-        sign_event_with_identity, EventPayload, MembershipEventKind, ProposalKind, VerifyContext,
+        mint_test_owner, sign_event, EventPayload, MembershipEventKind, ProposalKind,
+        SignedMembershipEvent, TestOwner, VerifyContext,
     };
     use crate::community_state_crdt::{CommunityState, InsertOutcome};
     use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
-    use harmony_identity::PrivateIdentity;
+
+    /// ZEB-339: sign with the owner's enrolled device key, attaching the Master
+    /// cert on identity-introducing events (Join/PendingJoin).
+    fn sign_event_with_identity(
+        payload: &EventPayload,
+        owner: &TestOwner,
+    ) -> Result<SignedMembershipEvent, crate::owner_state_crypto::CryptoError> {
+        let ev = sign_event(payload, &owner.device_key)?;
+        Ok(match ev.kind {
+            MembershipEventKind::Join | MembershipEventKind::PendingJoin { .. } => {
+                SignedMembershipEvent {
+                    enrollment: Some(owner.cert.clone()),
+                    ..ev
+                }
+            }
+            _ => ev,
+        })
+    }
 
     fn hlc(wall: u64, dev: &str) -> Hlc {
         Hlc {
@@ -34467,18 +34818,15 @@ mod admin_action_result_routing_tests {
     fn insert_ok(
         state: &mut CommunityState,
         payload: EventPayload,
-        identity: &PrivateIdentity,
+        identity: &TestOwner,
         admin: OwnerAddr,
-        actor_pub: &[u8; 64],
+        _actor_pub: &[u8; 64],
     ) {
         let ev = sign_event_with_identity(&payload, identity).expect("sign");
         let ctx = VerifyContext {
             expected_community_id: payload.community_id,
             admin_addr: admin,
             is_invite_only: false,
-            actor_identity_pub: actor_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         let outcome = state.insert_event(ev, &ctx);
         assert!(
@@ -34498,13 +34846,13 @@ mod admin_action_result_routing_tests {
     async fn set_power_level_returns_completed_when_quorum_1() {
         let community_id = SpaceId([0xa1; 16]);
 
-        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
-        let admin = OwnerAddr(admin_identity.identity.address_hash);
-        let admin_pub = admin_identity.identity.to_public_bytes();
+        let admin_identity = mint_test_owner(0xaa);
+        let admin = admin_identity.owner;
+        let admin_pub = [0u8; 64];
 
-        let member_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
-        let member = OwnerAddr(member_identity.identity.address_hash);
-        let member_pub = member_identity.identity.to_public_bytes();
+        let member_identity = mint_test_owner(0xbb);
+        let member = member_identity.owner;
+        let member_pub = [0u8; 64];
 
         let mut state = CommunityState::new(community_id);
         // admin_quorum defaults to 1 — no change needed.
@@ -34538,9 +34886,7 @@ mod admin_action_result_routing_tests {
 
         // Promote member to admin (level == 100). With admin_quorum == 1 this
         // must succeed as a direct SetPower (the Completed path).
-        let sk_bytes = admin_identity.to_private_bytes();
-        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+        let signing_key = admin_identity.device_key.clone();
 
         let sp_event = mint_set_power_event(
             community_id,
@@ -34558,9 +34904,6 @@ mod admin_action_result_routing_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         // admin_quorum == 1 → direct SetPower accepted (Completed path).
@@ -34588,13 +34931,13 @@ mod admin_action_result_routing_tests {
     async fn set_power_level_routes_to_proposal_when_quorum_above_1_and_target_becomes_admin() {
         let community_id = SpaceId([0xa2; 16]);
 
-        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
-        let admin = OwnerAddr(admin_identity.identity.address_hash);
-        let admin_pub = admin_identity.identity.to_public_bytes();
+        let admin_identity = mint_test_owner(0xaa);
+        let admin = admin_identity.owner;
+        let admin_pub = [0u8; 64];
 
-        let member_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
-        let member = OwnerAddr(member_identity.identity.address_hash);
-        let member_pub = member_identity.identity.to_public_bytes();
+        let member_identity = mint_test_owner(0xbb);
+        let member = member_identity.owner;
+        let member_pub = [0u8; 64];
 
         let mut state = CommunityState::new(community_id);
 
@@ -34625,9 +34968,7 @@ mod admin_action_result_routing_tests {
             &member_pub,
         );
 
-        let sk_bytes = admin_identity.to_private_bytes();
-        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+        let signing_key = admin_identity.device_key.clone();
 
         // Step 1: promote the member to admin (SetPower 100) while admin_quorum==1.
         // This is valid as a direct event (no quorum gate yet).
@@ -34646,9 +34987,6 @@ mod admin_action_result_routing_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(
@@ -34675,9 +35013,6 @@ mod admin_action_result_routing_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(
@@ -34710,9 +35045,6 @@ mod admin_action_result_routing_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         match direct_outcome {
@@ -34754,9 +35086,6 @@ mod admin_action_result_routing_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(
@@ -34807,6 +35136,7 @@ mod list_pending_admin_proposals_tests {
             at: hlc(wall_ms),
             sig: [0u8; 64],
             countersig: None,
+            enrollment: None,
         }
     }
 
@@ -35201,12 +35531,29 @@ mod list_pending_admin_proposals_tests {
 mod countersign_admin_proposal_tests {
     use super::*;
     use crate::community_membership::{
-        sign_event_with_identity, EventPayload, MembershipEventKind, ProposalKind, VerifyContext,
-        ADMIN_PROPOSAL_EXPIRY_MS,
+        mint_test_owner, sign_event, EventPayload, MembershipEventKind, ProposalKind,
+        SignedMembershipEvent, TestOwner, VerifyContext, ADMIN_PROPOSAL_EXPIRY_MS,
     };
     use crate::community_state_crdt::{CommunityState, InsertOutcome};
     use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
-    use harmony_identity::PrivateIdentity;
+
+    /// ZEB-339: sign with the owner's enrolled device key, attaching the Master
+    /// cert on identity-introducing events (Join/PendingJoin).
+    fn sign_event_with_identity(
+        payload: &EventPayload,
+        owner: &TestOwner,
+    ) -> Result<SignedMembershipEvent, crate::owner_state_crypto::CryptoError> {
+        let ev = sign_event(payload, &owner.device_key)?;
+        Ok(match ev.kind {
+            MembershipEventKind::Join | MembershipEventKind::PendingJoin { .. } => {
+                SignedMembershipEvent {
+                    enrollment: Some(owner.cert.clone()),
+                    ..ev
+                }
+            }
+            _ => ev,
+        })
+    }
 
     fn hlc(wall: u64, dev: &str) -> Hlc {
         Hlc {
@@ -35220,18 +35567,15 @@ mod countersign_admin_proposal_tests {
     fn insert_ok(
         state: &mut CommunityState,
         payload: EventPayload,
-        identity: &PrivateIdentity,
+        identity: &TestOwner,
         admin: OwnerAddr,
-        actor_pub: &[u8; 64],
+        _actor_pub: &[u8; 64],
     ) {
         let ev = sign_event_with_identity(&payload, identity).expect("sign");
         let ctx = VerifyContext {
             expected_community_id: payload.community_id,
             admin_addr: admin,
             is_invite_only: false,
-            actor_identity_pub: actor_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         let outcome = state.insert_event(ev, &ctx);
         assert!(
@@ -35247,19 +35591,19 @@ mod countersign_admin_proposal_tests {
         community_id: SpaceId,
     ) -> (
         CommunityState,
-        PrivateIdentity,
+        TestOwner,
         OwnerAddr,
-        PrivateIdentity,
+        TestOwner,
         OwnerAddr,
         [u8; 16],
     ) {
-        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
-        let admin = OwnerAddr(admin_identity.identity.address_hash);
-        let admin_pub = admin_identity.identity.to_public_bytes();
+        let admin_identity = mint_test_owner(0xaa);
+        let admin = admin_identity.owner;
+        let admin_pub = [0u8; 64];
 
-        let second_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
-        let second = OwnerAddr(second_identity.identity.address_hash);
-        let second_pub = second_identity.identity.to_public_bytes();
+        let second_identity = mint_test_owner(0xbb);
+        let second = second_identity.owner;
+        let second_pub = [0u8; 64];
 
         let mut state = CommunityState::new(community_id);
 
@@ -35292,9 +35636,7 @@ mod countersign_admin_proposal_tests {
             &second_pub,
         );
         // Promote second to admin power=100 (direct, quorum still 1)
-        let sk_bytes = admin_identity.to_private_bytes();
-        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+        let signing_key = admin_identity.device_key.clone();
         let promote_ev = mint_set_power_event(
             community_id,
             admin,
@@ -35310,9 +35652,6 @@ mod countersign_admin_proposal_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(
@@ -35336,9 +35675,6 @@ mod countersign_admin_proposal_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(
@@ -35373,9 +35709,6 @@ mod countersign_admin_proposal_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(
@@ -35417,10 +35750,8 @@ mod countersign_admin_proposal_tests {
         assert_eq!(m.admin_quorum, 2);
 
         // Now let second countersign — should bump to 2.
-        let sk_bytes = second_identity.to_private_bytes();
-        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
-        let second_pub = second_identity.identity.to_public_bytes();
+        let signing_key = second_identity.device_key.clone();
+        let _second_pub = [0u8; 64];
 
         let cs_ev = mint_admin_countersign_event(
             community_id,
@@ -35436,9 +35767,6 @@ mod countersign_admin_proposal_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &second_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(
@@ -35467,9 +35795,6 @@ mod countersign_admin_proposal_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &second_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         // CRDT must reject duplicate countersign (duplicate actor for same proposal).
@@ -35561,10 +35886,8 @@ mod countersign_admin_proposal_tests {
         assert!(signers_before < 2, "quorum not yet reached");
 
         // Add second admin countersign.
-        let sk_bytes = second_identity.to_private_bytes();
-        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
-        let second_pub = second_identity.identity.to_public_bytes();
+        let signing_key = second_identity.device_key.clone();
+        let _second_pub = [0u8; 64];
 
         let cs_ev = mint_admin_countersign_event(
             community_id,
@@ -35580,9 +35903,6 @@ mod countersign_admin_proposal_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &second_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(
@@ -35611,11 +35931,29 @@ mod countersign_admin_proposal_tests {
 mod propose_change_quorum_tests {
     use super::*;
     use crate::community_membership::{
-        sign_event_with_identity, EventPayload, MembershipEventKind, VerifyContext,
+        mint_test_owner, sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent,
+        TestOwner, VerifyContext,
     };
     use crate::community_state_crdt::{CommunityState, InsertOutcome};
     use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
-    use harmony_identity::PrivateIdentity;
+
+    /// ZEB-339: sign with the owner's enrolled device key, attaching the Master
+    /// cert on identity-introducing events (Join/PendingJoin).
+    fn sign_event_with_identity(
+        payload: &EventPayload,
+        owner: &TestOwner,
+    ) -> Result<SignedMembershipEvent, crate::owner_state_crypto::CryptoError> {
+        let ev = sign_event(payload, &owner.device_key)?;
+        Ok(match ev.kind {
+            MembershipEventKind::Join | MembershipEventKind::PendingJoin { .. } => {
+                SignedMembershipEvent {
+                    enrollment: Some(owner.cert.clone()),
+                    ..ev
+                }
+            }
+            _ => ev,
+        })
+    }
 
     fn hlc(wall: u64, dev: &str) -> Hlc {
         Hlc {
@@ -35628,18 +35966,15 @@ mod propose_change_quorum_tests {
     fn insert_ok(
         state: &mut CommunityState,
         payload: EventPayload,
-        identity: &PrivateIdentity,
+        identity: &TestOwner,
         admin: OwnerAddr,
-        actor_pub: &[u8; 64],
+        _actor_pub: &[u8; 64],
     ) {
         let ev = sign_event_with_identity(&payload, identity).expect("sign");
         let ctx = VerifyContext {
             expected_community_id: payload.community_id,
             admin_addr: admin,
             is_invite_only: false,
-            actor_identity_pub: actor_pub,
-            countersigner_identity_pub: None,
-            admin_identity_pub: None,
         };
         let outcome = state.insert_event(ev, &ctx);
         assert!(
@@ -35669,9 +36004,9 @@ mod propose_change_quorum_tests {
         // requesting new_quorum=2 would exceed the admin count.
         let community_id = SpaceId([0xd0; 16]);
 
-        let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
-        let admin = OwnerAddr(admin_identity.identity.address_hash);
-        let admin_pub = admin_identity.identity.to_public_bytes();
+        let admin_identity = mint_test_owner(0xaa);
+        let admin = admin_identity.owner;
+        let admin_pub = [0u8; 64];
 
         let mut state = CommunityState::new(community_id);
 
@@ -35692,9 +36027,7 @@ mod propose_change_quorum_tests {
         );
 
         // Give the admin power=100 explicitly so the power_levels map is populated.
-        let sk_bytes = admin_identity.to_private_bytes();
-        let sk_seed: [u8; 32] = sk_bytes[32..64].try_into().unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_seed);
+        let signing_key = admin_identity.device_key.clone();
         let sp_ev = mint_set_power_event(
             community_id,
             admin,
@@ -35710,9 +36043,6 @@ mod propose_change_quorum_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(
@@ -35754,9 +36084,6 @@ mod propose_change_quorum_tests {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &admin_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(
@@ -36430,12 +36757,22 @@ mod owner_loaded_tests {
 
         let device_hash = DeviceIdentityHash(identity.identity.address_hash);
         let private_identity = std::sync::Arc::new(identity);
-        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new(
+        // ZEB-339: use new_synthetic because self_owner is Reticulum-derived
+        // (identity.identity.address_hash) and doesn't match any mint_test_owner
+        // cert's owner_id. This test exercises NodeState wiring, not community-signing.
+        let test_owner_lib36414 = crate::community_membership::mint_test_owner(0xE4);
+        let community_signing_key_lib36414 = std::sync::Arc::new(
+            ed25519_dalek::SigningKey::from_bytes(&test_owner_lib36414.device_key.to_bytes()),
+        );
+        let enrollment_cert_lib36414 = test_owner_lib36414.cert;
+        let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new_synthetic(
             "owner-loaded-test".into(),
             self_owner,
             device_hash,
             std::sync::Arc::clone(&signing_key),
             private_identity,
+            community_signing_key_lib36414,
+            enrollment_cert_lib36414,
         )));
 
         let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));

@@ -13,7 +13,8 @@
 
 use harmony_app::community_invite::{BoundedChannelLogSnapshot, PreForkSnapshot};
 use harmony_app::community_membership::{
-    sign_event, sign_event_with_identity, EventPayload, MembershipEventKind,
+    mint_test_owner, sign_event, sign_event_with_identity, EventPayload, MembershipEventKind,
+    SignedMembershipEvent, TestOwner,
 };
 use harmony_app::community_state_sync::{
     CommunityRegistryConfig, CommunitySyncRegistry, IdentityResolver, DEFAULT_DEBOUNCE_MS,
@@ -32,15 +33,6 @@ use tokio::sync::{mpsc, Mutex};
 static EVENT_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ── Harness helpers ─────────────────────────────────────────────────────────
-
-/// Extract ed25519_dalek::SigningKey from a PrivateIdentity's private bytes.
-/// Matches the pattern used in community_sync_integration.rs.
-fn signing_key_from(identity: &PrivateIdentity) -> Arc<ed25519_dalek::SigningKey> {
-    let private_bytes = identity.to_private_bytes();
-    let mut secret = [0u8; 32];
-    secret.copy_from_slice(&private_bytes[32..64]);
-    Arc::new(ed25519_dalek::SigningKey::from_bytes(&secret))
-}
 
 /// In-memory identity resolver backed by a HashMap.
 struct StaticResolver {
@@ -92,15 +84,16 @@ fn test_hlc(wall_ms: u64, seq: u32, device: &str) -> Hlc {
     }
 }
 
-/// Create an admin Join event for `actor` into `community_id`, signed with `signing_key`.
+/// Create an admin Join event for `owner` into `community_id`, signed with the
+/// owner's enrolled device key and carrying their Master enrollment cert
+/// (ZEB-339) so receiving engines learn `owner`'s enrolled device key.
 fn make_join_event(
     community_id: SpaceId,
-    actor: OwnerAddr,
-    signing_key: &ed25519_dalek::SigningKey,
+    owner: &TestOwner,
     wall_ms: u64,
     seq: u32,
     device: &str,
-) -> harmony_app::community_membership::SignedMembershipEvent {
+) -> SignedMembershipEvent {
     let id_seq = EVENT_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut id_bytes = [0u8; 16];
     id_bytes[..8].copy_from_slice(&id_seq.to_be_bytes());
@@ -110,10 +103,14 @@ fn make_join_event(
         id: id_bytes,
         community_id,
         kind: MembershipEventKind::Join,
-        actor,
+        actor: owner.owner,
         at: test_hlc(wall_ms, seq, device),
     };
-    sign_event(&payload, signing_key).expect("sign join")
+    let ev = sign_event(&payload, &owner.device_key).expect("sign join");
+    SignedMembershipEvent {
+        enrollment: Some(owner.cert.clone()),
+        ..ev
+    }
 }
 
 /// Result of `run_fork_inner`.
@@ -142,7 +139,7 @@ struct ForkResult {
 /// (can be the same registry for tests that only need one identity).
 #[allow(clippy::too_many_arguments)]
 async fn run_fork_inner(
-    forker_id: &PrivateIdentity,
+    forker: &TestOwner,
     forker_addr: OwnerAddr,
     forker_pub: [u8; 64],
     original_community_id: SpaceId,
@@ -154,7 +151,7 @@ async fn run_fork_inner(
     silent: bool,
     also_leave: bool,
 ) -> ForkResult {
-    let signing_key = signing_key_from(forker_id);
+    let signing_key = Arc::new(forker.device_key.clone());
 
     // Step 1: mint fork community identity.
     let hlc = test_hlc(
@@ -170,6 +167,9 @@ async fn run_fork_inner(
         false,
         forker_addr,
         signing_key.as_ref(),
+        // ZEB-339: the forker's real Master enrollment cert, attached to the
+        // fork's bootstrap Join so the fork engine learns the forker's device key.
+        &forker.cert,
         hlc.clone(),
     )
     .expect("mint_community_creation");
@@ -369,7 +369,7 @@ struct PairedEngines {
     registry_b: Arc<CommunitySyncRegistry>,
     community_id: SpaceId,
     mk: EpochKey,
-    id_a: PrivateIdentity,
+    id_a: TestOwner,
     a_addr: OwnerAddr,
     a_pub: [u8; 64],
     dir_a: tempfile::TempDir,
@@ -391,16 +391,18 @@ impl PairedEngines {
             b
         });
 
-        let id_a = PrivateIdentity::from_seed(&[0xa1; 32]);
-        let a_addr = OwnerAddr(id_a.identity.address_hash);
-        let a_pub = id_a.identity.to_public_bytes();
-        let a_signing = signing_key_from(&id_a);
+        let id_a = mint_test_owner(0xA1);
+        let a_addr = id_a.owner;
+        // ZEB-339: signer resolution uses the cert / materialized enrolled keys,
+        // not the resolver — so resolver pubs are unused for membership verify.
+        let a_pub = [0u8; 64];
+        let a_signing = Arc::new(id_a.device_key.clone());
 
-        let id_b = PrivateIdentity::from_seed(&[0xb1; 32]);
-        let b_addr = OwnerAddr(id_b.identity.address_hash);
-        let b_signing = signing_key_from(&id_b);
+        let id_b = mint_test_owner(0xB1);
+        let b_addr = id_b.owner;
+        let b_signing = Arc::new(id_b.device_key.clone());
 
-        let b_pub = id_b.identity.to_public_bytes();
+        let b_pub = [0u8; 64];
 
         let mut resolver_map = std::collections::HashMap::new();
         resolver_map.insert(a_addr, a_pub);
@@ -461,7 +463,7 @@ impl PairedEngines {
 
         // Bootstrap: insert A's Join into both engines so both have valid
         // membership before fork events arrive.
-        let join_event = make_join_event(community_id, a_addr, &a_signing, 100, 0, "a-dev");
+        let join_event = make_join_event(community_id, &id_a, 100, 0, "a-dev");
 
         // Insert into A's engine.
         let engine_a = registry_a
@@ -792,6 +794,7 @@ async fn fork_invite_carries_snapshot_to_invitee() {
         admin_identity_pub: None,
         forked_from: Some(community_id),
         pre_fork_snapshot: Some(snapshot.clone()),
+        inviter_enrollment: None,
     };
 
     // Verify the payload encodes and decodes correctly (the invite wire format).

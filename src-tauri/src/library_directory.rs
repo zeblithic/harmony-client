@@ -1351,6 +1351,7 @@ mod tests {
             admin_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         };
         encode_invite_url(&payload).expect("encode open invite url")
     }
@@ -1398,6 +1399,8 @@ mod tests {
             },
             sig: [0u8; 64],
             countersig: None,
+            // ZEB-339: bootstrap-Join must embed the admin's EnrollmentCert.
+            enrollment: Some(crate::community_membership::mint_test_owner(0xC3).cert),
         };
         let payload = CommunityInvitePayload {
             community_id,
@@ -1425,6 +1428,10 @@ mod tests {
             admin_identity_pub: Some([0u8; 64]),
             forked_from: None,
             pre_fork_snapshot: None,
+            // ZEB-339: invite-only payloads must carry the inviter's
+            // EnrollmentCert. The directory rejects invite-only entries at
+            // verify time regardless of cert content, so any valid cert suffices.
+            inviter_enrollment: Some(crate::community_membership::mint_test_owner(0xA1).cert),
         };
         encode_invite_url(&payload).expect("encode invite-only url")
     }
@@ -2646,6 +2653,8 @@ mod tests {
             },
             sig: [0u8; 64],
             countersig: None,
+            // ZEB-339: bootstrap-Join must embed the admin's EnrollmentCert.
+            enrollment: Some(crate::community_membership::mint_test_owner(0xC4).cert),
         };
 
         let payload = CommunityInvitePayload {
@@ -2674,6 +2683,9 @@ mod tests {
             admin_identity_pub: Some(admin_identity.identity.to_public_bytes()),
             forked_from: None,
             pre_fork_snapshot: None,
+            // ZEB-339: invite-only payloads must carry the inviter's
+            // EnrollmentCert; rejected at receive regardless of cert content.
+            inviter_enrollment: Some(crate::community_membership::mint_test_owner(0xA2).cert),
         };
         let invite_url = encode_invite_url(&payload).expect("encode invite-only url");
 
@@ -2736,6 +2748,7 @@ mod tests {
             admin_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         };
         let invite_url = encode_invite_url(&payload).expect("encode open url");
 
@@ -2806,6 +2819,7 @@ mod tests {
             admin_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         };
         let invite_url = encode_invite_url(&payload).expect("encode mismatched url");
 

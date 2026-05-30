@@ -14,25 +14,30 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
 use harmony_app::community_membership::{
-    sign_event_with_identity, EventPayload, MembershipEventKind,
+    mint_test_owner, sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent,
+    TestOwner,
 };
 use harmony_app::owner_state_types::Hlc;
 use harmony_identity::PrivateIdentity;
 
-/// Reach into `PrivateIdentity`'s ed25519 seed the same way production
-/// does (see `lib.rs::start_node` and `community_open_flow_integration`):
-/// the canonical 32-byte seed lives in bytes 32..64 of `to_private_bytes()`
-/// (`X25519_secret(32) || Ed25519_secret(32)`). Construct an
-/// `ed25519_dalek::SigningKey` from those bytes so tests sign with the
-/// same key the IPC will use in production. ZEB-256 makes this load-
-/// bearing: receive-side sig-verify in `handle_incoming_publish` checks
-/// `payload.publisher_sig` against the publisher's `identity_pub`, so
-/// the engine's `signing_key` must match.
-fn signing_key_from(identity: &PrivateIdentity) -> ed25519_dalek::SigningKey {
-    let private_bytes = identity.to_private_bytes();
-    let mut secret = [0u8; 32];
-    secret.copy_from_slice(&private_bytes[32..64]);
-    ed25519_dalek::SigningKey::from_bytes(&secret)
+/// ZEB-339: sign a membership event with the owner's enrolled device key (#2),
+/// attaching the owner's Master cert on identity-introducing events (Join /
+/// PendingJoin) so `materialize`/`insert` populates `enrolled_device_keys` and
+/// the engine's publisher-sig + verify_event paths resolve the signer.
+fn sign_event_with_identity(
+    payload: &EventPayload,
+    owner: &TestOwner,
+) -> Result<SignedMembershipEvent, harmony_app::owner_state_crypto::CryptoError> {
+    let ev = sign_event(payload, &owner.device_key)?;
+    Ok(match ev.kind {
+        MembershipEventKind::Join | MembershipEventKind::PendingJoin { .. } => {
+            SignedMembershipEvent {
+                enrollment: Some(owner.cert.clone()),
+                ..ev
+            }
+        }
+        _ => ev,
+    })
 }
 
 /// `IdentityResolver` backed by an in-memory `HashMap`. Used across the
@@ -228,13 +233,13 @@ async fn engine_receives_remote_publish_and_merges_event() {
     let community_id = SpaceId([1u8; 16]);
     let mk = EpochKey::new([0x42; 32]);
 
-    let identity_a = PrivateIdentity::from_seed(&[0xa1; 32]);
-    let admin = OwnerAddr(identity_a.identity.address_hash);
-    let identity_a_pub = identity_a.identity.to_public_bytes();
-    // ZEB-256: engine_a's signing_key must match identity_a's
-    // ed25519 half so engine_b's receive-side sig-verify (against
-    // resolver's identity_a_pub) succeeds.
-    let signing_a = signing_key_from(&identity_a);
+    let identity_a = mint_test_owner(0xA1);
+    let admin = identity_a.owner;
+    // ZEB-339: the publisher sig + verify_event resolve admin's signer from the
+    // materialized enrolled device key (learned from admin's cert-bearing Join),
+    // not the resolver's identity_pub — so it can be a placeholder.
+    let identity_a_pub = [0u8; 64];
+    let signing_a = identity_a.device_key.clone();
 
     let state_a = Arc::new(Mutex::new(CommunityState::new(community_id)));
     let state_b = Arc::new(Mutex::new(CommunityState::new(community_id)));
@@ -272,9 +277,6 @@ async fn engine_receives_remote_publish_and_merges_event() {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &identity_a_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(matches!(
@@ -309,9 +311,6 @@ async fn engine_receives_remote_publish_and_merges_event() {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &identity_a_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(matches!(
@@ -484,13 +483,13 @@ async fn engine_emits_membership_delta_on_remote_insert() {
 
     let community_id = SpaceId([1u8; 16]);
     let mk = EpochKey::new([0x42; 32]);
-    let identity_a = PrivateIdentity::from_seed(&[0xa1; 32]);
-    let admin = OwnerAddr(identity_a.identity.address_hash);
-    let identity_a_pub = identity_a.identity.to_public_bytes();
-    // ZEB-256: engine_a's signing_key must match identity_a's
-    // ed25519 half so engine_b's receive-side sig-verify (against
-    // resolver's identity_a_pub) succeeds.
-    let signing_a = signing_key_from(&identity_a);
+    let identity_a = mint_test_owner(0xA1);
+    let admin = identity_a.owner;
+    // ZEB-339: the publisher sig + verify_event resolve admin's signer from the
+    // materialized enrolled device key (learned from admin's cert-bearing Join),
+    // not the resolver's identity_pub — so it can be a placeholder.
+    let identity_a_pub = [0u8; 64];
+    let signing_a = identity_a.device_key.clone();
 
     let state_a = Arc::new(Mutex::new(CommunityState::new(community_id)));
     let state_b = Arc::new(Mutex::new(CommunityState::new(community_id)));
@@ -548,9 +547,6 @@ async fn engine_emits_membership_delta_on_remote_insert() {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &identity_a_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(
@@ -566,9 +562,6 @@ async fn engine_emits_membership_delta_on_remote_insert() {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &identity_a_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(
@@ -591,9 +584,6 @@ async fn engine_emits_membership_delta_on_remote_insert() {
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
-                actor_identity_pub: &identity_a_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert!(matches!(
@@ -725,9 +715,11 @@ async fn engine_insert_local_event_emits_delta_and_notifies_publish() {
 
     let community_id = SpaceId([2u8; 16]);
     let mk = EpochKey::new([0x33; 32]);
-    let identity = PrivateIdentity::from_seed(&[0xc1; 32]);
-    let admin = OwnerAddr(identity.identity.address_hash);
-    let identity_pub = identity.identity.to_public_bytes();
+    let identity = mint_test_owner(0xC1);
+    let admin = identity.owner;
+    // ZEB-339: signer resolution uses the cert / materialized enrolled key, not
+    // the resolver — identity_pub is a placeholder.
+    let identity_pub = [0u8; 64];
 
     let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
     let tracker = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
@@ -1103,17 +1095,17 @@ async fn spoofed_publisher_addr_rejected_with_publisher_sig_invalid() {
     let community_id = SpaceId([7u8; 16]);
     let mk = EpochKey::new([0xAA; 32]);
 
-    let alice = PrivateIdentity::from_seed(&[0xa1; 32]);
-    let alice_addr = OwnerAddr(alice.identity.address_hash);
-    let alice_pub = alice.identity.to_public_bytes();
+    let alice = mint_test_owner(0xA1);
+    let alice_addr = alice.owner;
+    let alice_pub = [0u8; 64];
 
-    let bob = PrivateIdentity::from_seed(&[0xb1; 32]);
-    let bob_addr = OwnerAddr(bob.identity.address_hash);
-    let bob_pub = bob.identity.to_public_bytes();
-    // Bob's signing key is derived from his identity seed (production
-    // path); the value of the bytes doesn't matter for spoofing intent
-    // — what matters is that it doesn't match alice's identity_pub.
-    let bob_signing = signing_key_from(&bob);
+    let bob = mint_test_owner(0xB1);
+    let bob_addr = bob.owner;
+    let bob_pub = [0u8; 64];
+    // ZEB-339: Bob signs the forged envelope with HIS enrolled device key. The
+    // receiver resolves alice's enrolled device key (from her materialized
+    // cert-bearing Join) and bob's sig fails against it → PublisherSigInvalid.
+    let bob_signing = bob.device_key.clone();
 
     // Build a CommunityState where Alice is Joined (admin self-Join).
     let mut alice_state = CommunityState::new(community_id);
@@ -1136,9 +1128,6 @@ async fn spoofed_publisher_addr_rejected_with_publisher_sig_invalid() {
                 expected_community_id: community_id,
                 admin_addr: alice_addr,
                 is_invite_only: false,
-                actor_identity_pub: &alice_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert_eq!(
@@ -1206,7 +1195,7 @@ async fn spoofed_publisher_addr_rejected_with_publisher_sig_invalid() {
         is_invite_only: false,
         device_id: "b-dev".into(),
         self_owner: bob_addr,
-        signing_key: Arc::new(signing_key_from(&bob)),
+        signing_key: Arc::new(bob.device_key.clone()),
         state: Arc::clone(&state_b),
         tracker: Arc::clone(&tracker_b),
         content_store: cs_b,
@@ -1287,15 +1276,15 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
     let community_id = SpaceId([8u8; 16]);
     let mk = EpochKey::new([0xCC; 32]);
 
-    let admin_id = PrivateIdentity::from_seed(&[0xa0; 32]);
-    let admin_addr = OwnerAddr(admin_id.identity.address_hash);
-    let admin_pub = admin_id.identity.to_public_bytes();
-    let admin_signing = signing_key_from(&admin_id);
+    let admin_id = mint_test_owner(0xA0);
+    let admin_addr = admin_id.owner;
+    let admin_pub = [0u8; 64];
+    let admin_signing = admin_id.device_key.clone();
 
-    let alice = PrivateIdentity::from_seed(&[0xa1; 32]);
-    let alice_addr = OwnerAddr(alice.identity.address_hash);
-    let alice_pub = alice.identity.to_public_bytes();
-    let alice_signing = signing_key_from(&alice);
+    let alice = mint_test_owner(0xA1);
+    let alice_addr = alice.owner;
+    let alice_pub = [0u8; 64];
+    let alice_signing = alice.device_key.clone();
 
     // Build a CommunityState where:
     //   - admin is Joined
@@ -1303,8 +1292,8 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
     let mut state = CommunityState::new(community_id);
     let push_event = |state: &mut CommunityState,
                       actor: OwnerAddr,
-                      actor_id: &PrivateIdentity,
-                      actor_pub: &[u8; 64],
+                      actor_id: &TestOwner,
+                      _actor_pub: &[u8; 64],
                       kind: MembershipEventKind,
                       dev: &str,
                       wall: u64,
@@ -1327,9 +1316,6 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
                 expected_community_id: community_id,
                 admin_addr,
                 is_invite_only: false,
-                actor_identity_pub: actor_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert_eq!(
@@ -1430,7 +1416,7 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
         is_invite_only: false,
         device_id: "b-dev".into(),
         self_owner: admin_addr,
-        signing_key: Arc::new(signing_key_from(&admin_id)),
+        signing_key: Arc::new(admin_id.device_key.clone()),
         state: Arc::clone(&state_b),
         tracker: Arc::clone(&tracker_b),
         content_store: cs_b,
@@ -1524,14 +1510,20 @@ async fn cold_cache_publish_rejected_then_succeeds_after_propagation() {
     let community_id = SpaceId([9u8; 16]);
     let mk = EpochKey::new([0xDD; 32]);
 
-    let alice = PrivateIdentity::from_seed(&[0xa1; 32]);
-    let alice_addr = OwnerAddr(alice.identity.address_hash);
-    let alice_pub = alice.identity.to_public_bytes();
-    let alice_signing = signing_key_from(&alice);
+    let alice = mint_test_owner(0xA1);
+    let alice_addr = alice.owner;
+    let alice_pub = [0u8; 64];
+    let alice_signing = alice.device_key.clone();
 
-    // CommunityState with alice Joined.
-    let mut state = CommunityState::new(community_id);
-    {
+    // ZEB-339: the publisher is authenticated against their MATERIALIZED
+    // enrolled device key (from their cert-bearing Join), NOT a resolver lookup.
+    // So the "cold cache" under the new model is: alice's cert-bearing Join has
+    // not yet propagated into the RECEIVER's CRDT — she isn't materialized, so
+    // her publish is rejected with PublisherNotJoined. Once her Join lands in
+    // the receiver's state (propagation), the same wire packet admits.
+    //
+    // Build alice's cert-bearing Join (also embedded in the published blob).
+    let alice_join = {
         let p = EventPayload {
             id: [1u8; 16],
             community_id,
@@ -1543,16 +1535,16 @@ async fn cold_cache_publish_rejected_then_succeeds_after_propagation() {
                 device_id: "alice-dev".into(),
             },
         };
-        let ev = sign_event_with_identity(&p, &alice).expect("sign");
+        sign_event_with_identity(&p, &alice).expect("sign")
+    };
+    let mut state = CommunityState::new(community_id);
+    {
         let outcome = state.insert_event(
-            ev,
+            alice_join.clone(),
             &harmony_app::community_membership::VerifyContext {
                 expected_community_id: community_id,
                 admin_addr: alice_addr,
                 is_invite_only: false,
-                actor_identity_pub: &alice_pub,
-                countersigner_identity_pub: None,
-                admin_identity_pub: None,
             },
         );
         assert_eq!(
@@ -1588,16 +1580,18 @@ async fn cold_cache_publish_rejected_then_succeeds_after_propagation() {
     let envelope_bytes = canonical_cbor_encode(&envelope).expect("encode env");
     let wire = encrypt_root_publish(&mk, &envelope_bytes).expect("encrypt root");
 
+    // ZEB-339: the resolver is no longer consulted on the publish path; supply
+    // an always-empty one to prove the gate doesn't depend on it.
     let resolver = Arc::new(MutableResolver {
         inner: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     });
     let resolver_for_engine: Arc<dyn harmony_app::community_state_sync::IdentityResolver> =
         Arc::clone(&resolver) as _;
 
-    // B's CRDT pre-seeds alice as Joined so the membership-at-HLC gate
-    // passes; the failure mode under test is the resolver-cold-cache
-    // gate, which sits BETWEEN membership and sig-verify.
-    let state_b = Arc::new(Mutex::new(state));
+    // B's CRDT starts EMPTY — alice's cert-bearing Join hasn't propagated yet,
+    // so she is not a materialized member and her publish is rejected with
+    // PublisherNotJoined (the enrolled-device cold-cache shape).
+    let state_b = Arc::new(Mutex::new(CommunityState::new(community_id)));
     let tracker_b = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
     let cs_b: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
         cas_op_tx,
@@ -1612,7 +1606,7 @@ async fn cold_cache_publish_rejected_then_succeeds_after_propagation() {
         is_invite_only: false,
         device_id: "b-dev".into(),
         self_owner: alice_addr,
-        signing_key: Arc::new(signing_key_from(&alice)),
+        signing_key: Arc::new(alice.device_key.clone()),
         state: Arc::clone(&state_b),
         tracker: Arc::clone(&tracker_b),
         content_store: cs_b,
@@ -1632,24 +1626,46 @@ async fn cold_cache_publish_rejected_then_succeeds_after_propagation() {
         nav_emitter: None,
     });
 
-    // 1. Cold cache: resolver empty → first delivery rejected.
+    // 1. Cold cache: alice not yet materialized in B → first delivery rejected
+    //    with PublisherNotJoined.
     in_tx.send(wire.clone()).await.expect("inject 1");
     let report = tokio::time::timeout(std::time::Duration::from_secs(2), degraded_rx.recv())
         .await
         .expect("degraded report within 2s")
         .expect("degraded channel open");
-    assert_eq!(report.reason_tag, "publisher_unknown");
+    assert_eq!(report.reason_tag, "publisher_not_joined");
     {
         let t = tracker_b.lock().await;
         assert!(
             !t.per_device
                 .contains_key(&(alice_addr, "alice-dev".to_string())),
-            "tracker MUST NOT have advanced on UnknownPublisher"
+            "tracker MUST NOT have advanced on PublisherNotJoined"
         );
     }
+    // The empty resolver was never consulted on the publish path.
+    assert!(
+        resolver.inner.lock().await.is_empty(),
+        "resolver must remain unconsulted on the ZEB-339 publish path"
+    );
+    let _ = alice_pub;
 
-    // 2. Insert alice into resolver — simulating cache propagation.
-    resolver.inner.lock().await.insert(alice_addr, alice_pub);
+    // 2. Propagate alice's cert-bearing Join into B's CRDT — now she is a
+    //    materialized member with her enrolled device key.
+    {
+        let mut sb = state_b.lock().await;
+        let outcome = sb.insert_event(
+            alice_join.clone(),
+            &harmony_app::community_membership::VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: alice_addr,
+                is_invite_only: false,
+            },
+        );
+        assert_eq!(
+            outcome,
+            harmony_app::community_state_crdt::InsertOutcome::Inserted
+        );
+    }
 
     // 3. Re-deliver the SAME wire packet — should now admit.
     in_tx.send(wire).await.expect("inject 2");
@@ -1667,7 +1683,7 @@ async fn cold_cache_publish_rejected_then_succeeds_after_propagation() {
         }
     })
     .await
-    .expect("tracker should advance within 2s after resolver populated");
+    .expect("tracker should advance within 2s after Join propagated");
 
     engine_b.shutdown().await.expect("shutdown");
 }

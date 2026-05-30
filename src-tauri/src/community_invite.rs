@@ -131,12 +131,14 @@ pub struct CommunityInvitePayload {
 
     /// Admin's 64-byte identity_pub (X25519_pub(32) || Ed25519_pub(32),
     /// matching `harmony_identity::Identity::to_public_bytes()`). Required
-    /// for invite-only payloads (ZEB-260) — used to verify
-    /// `admin_bootstrap` and passed into
-    /// `engine.insert_local_event_with_pubs(_, admin_identity_pub, None)`.
-    /// Bound to `admin_addr` via
-    /// `Identity::from_public_bytes(admin_identity_pub).address_hash ==
-    /// admin_addr.0`.
+    /// (present) for invite-only payloads (ZEB-260). ZEB-339: this is the
+    /// admin's RETICULUM transport pub; it is NO LONGER used to verify
+    /// `admin_bootstrap` (that now goes through the admin's EnrollmentCert
+    /// carried on the bootstrap event — see `verify_admin_bootstrap`), and
+    /// the old `address_hash(admin_identity_pub) == admin_addr` binding does
+    /// not hold under the owner/device split (admin_addr is the owner_id /
+    /// master hash). Still threaded into `insert_local_event_with_pubs`,
+    /// which ignores it post-ZEB-339.
     #[serde(
         rename = "ap",
         skip_serializing_if = "Option::is_none",
@@ -162,6 +164,12 @@ pub struct CommunityInvitePayload {
     /// Byte-compatible with pre-ZEB-285 invites when None.
     #[serde(rename = "fs", skip_serializing_if = "Option::is_none", default)]
     pub pre_fork_snapshot: Option<PreForkSnapshot>,
+
+    /// ZEB-339: the inviter's Master EnrollmentCert, so a joiner who has not
+    /// yet synced the community log can verify the inviter's owner->device
+    /// binding (and thus the InviteToken signature) at first contact.
+    #[serde(rename = "ec", skip_serializing_if = "Option::is_none", default)]
+    pub inviter_enrollment: Option<harmony_owner::certs::EnrollmentCert>,
 }
 
 /// The inviter's pre-signed authorization, embedded in the invite link
@@ -736,6 +744,23 @@ pub enum InviteUrlError {
     /// leaving the mint site. ZEB-260 PR #90 round-3 (CodeRabbit).
     #[error("invite-only payload missing invite_token")]
     InviteOnlyMissingToken,
+    /// ZEB-339: invite-only payload missing `inviter_enrollment`. The
+    /// joiner needs the inviter's Master EnrollmentCert to verify the
+    /// inviter's owner->device binding (and thus the InviteToken signature)
+    /// before it has synced the community log. Enforced at both encode and
+    /// decode so an un-verifiable invite-only URL never leaves the mint site.
+    #[error("invite-only payload missing inviter_enrollment")]
+    InviteOnlyMissingInviterEnrollment,
+    /// ZEB-339: invite-only payload whose `admin_bootstrap` is present but
+    /// is missing its embedded EnrollmentCert (`admin_bootstrap.enrollment`).
+    /// `verify_admin_bootstrap` resolves the bootstrap-Join's signer via
+    /// `enrolled_key_from_cert`, which reads `admin_bootstrap.enrollment`;
+    /// without it the URL encodes and decodes cleanly but fails late at
+    /// redeem with `BootstrapSignatureInvalid` (a confusing signature error).
+    /// Enforced at both encode and decode so an un-redeemable invite-only URL
+    /// never leaves the mint site and is rejected clearly on receipt.
+    #[error("invite-only payload's admin_bootstrap is missing its embedded enrollment cert")]
+    InviteOnlyBootstrapMissingEnrollment,
     /// `epoch_snapshot.sealed_epoch_key` has the wrong byte length for
     /// the declared mode. Open communities must carry 32 raw bytes;
     /// invite-only flows must carry the 92-byte X25519-sealed envelope
@@ -812,6 +837,24 @@ pub fn encode_invite_url(payload: &CommunityInvitePayload) -> Result<String, Inv
     {
         return Err(InviteUrlError::InviteOnlyMissingBootstrap);
     }
+    // ZEB-339: invite-only payloads must carry the inviter's EnrollmentCert
+    // so the joiner can verify the inviter's owner->device binding.
+    if payload.is_invite_only && payload.inviter_enrollment.is_none() {
+        return Err(InviteUrlError::InviteOnlyMissingInviterEnrollment);
+    }
+    // ZEB-339: the admin bootstrap-Join must embed the admin's EnrollmentCert,
+    // because verify_admin_bootstrap resolves the signer via enrolled_key_from_cert
+    // (which reads admin_bootstrap.enrollment). Without it the URL encodes and
+    // decodes cleanly but dies at redeem with BootstrapSignatureInvalid — enforce
+    // here so the un-redeemable URL never leaves the mint site.
+    if payload.is_invite_only
+        && payload
+            .admin_bootstrap
+            .as_ref()
+            .is_some_and(|b| b.enrollment.is_none())
+    {
+        return Err(InviteUrlError::InviteOnlyBootstrapMissingEnrollment);
+    }
     if !payload.is_invite_only
         && (payload.admin_bootstrap.is_some() || payload.admin_identity_pub.is_some())
     {
@@ -868,6 +911,25 @@ pub fn decode_invite_url(url: &str) -> Result<CommunityInvitePayload, InviteUrlE
         payload.is_invite_only,
         payload.epoch_snapshot.sealed_epoch_key.len(),
     )?;
+    // ZEB-339: invite-only payloads must carry the inviter's EnrollmentCert
+    // (mirrors the admin_bootstrap / admin_identity_pub presence requirement).
+    if payload.is_invite_only && payload.inviter_enrollment.is_none() {
+        return Err(InviteUrlError::InviteOnlyMissingInviterEnrollment);
+    }
+    // ZEB-339: the admin bootstrap-Join must embed the admin's EnrollmentCert.
+    // The joiner needs it to verify the admin's owner->device binding at redeem:
+    // verify_admin_bootstrap resolves the signer via enrolled_key_from_cert
+    // (which reads admin_bootstrap.enrollment). Without it the URL decodes
+    // cleanly but dies at redeem with BootstrapSignatureInvalid — reject here
+    // so a certless invite-only URL is rejected clearly on receipt.
+    if payload.is_invite_only
+        && payload
+            .admin_bootstrap
+            .as_ref()
+            .is_some_and(|b| b.enrollment.is_none())
+    {
+        return Err(InviteUrlError::InviteOnlyBootstrapMissingEnrollment);
+    }
     // ZEB-285 INVARIANT: forked_from and pre_fork_snapshot must both be
     // Some or both be None. An invite with one set but not the other is
     // malformed — reject it so joiners never enter a half-fork state.
@@ -1054,14 +1116,6 @@ pub enum RedeemBootstrapVerifyError {
     /// "redeem_invite: invite-only payload missing admin bootstrap".
     BootstrapMissing,
 
-    /// `admin_identity_pub` bytes are not a valid Ed25519 + X25519 pair
-    /// (rejected by `harmony_identity::Identity::from_public_bytes`).
-    BootstrapInvalidPubkey,
-
-    /// `Identity::from_public_bytes(admin_identity_pub).address_hash`
-    /// does not equal `payload.admin_addr.0`.
-    BootstrapAddressMismatch,
-
     /// `admin_bootstrap.actor` does not equal `payload.admin_addr`.
     BootstrapActorMismatch,
 
@@ -1084,14 +1138,6 @@ impl std::fmt::Display for RedeemBootstrapVerifyError {
             Self::BootstrapMissing => write!(
                 f,
                 "redeem_invite: invite-only payload missing admin bootstrap"
-            ),
-            Self::BootstrapInvalidPubkey => write!(
-                f,
-                "redeem_invite: admin_identity_pub is not a valid identity"
-            ),
-            Self::BootstrapAddressMismatch => write!(
-                f,
-                "redeem_invite: admin_identity_pub.address_hash != admin_addr"
             ),
             Self::BootstrapActorMismatch => write!(
                 f,
@@ -1123,8 +1169,6 @@ impl RedeemBootstrapVerifyError {
     pub fn reason_tag(&self) -> &'static str {
         match self {
             Self::BootstrapMissing => "bootstrap_missing",
-            Self::BootstrapInvalidPubkey => "bootstrap_invalid_pubkey",
-            Self::BootstrapAddressMismatch => "bootstrap_address_mismatch",
             Self::BootstrapActorMismatch => "bootstrap_actor_mismatch",
             Self::BootstrapCommunityMismatch => "bootstrap_community_mismatch",
             Self::BootstrapSignatureInvalid => "bootstrap_signature_invalid",
@@ -1133,8 +1177,8 @@ impl RedeemBootstrapVerifyError {
     }
 }
 
-/// Run the six-step binding chain that admits the admin's signed
-/// bootstrap event into the joiner's engine (ZEB-260). Pure / sync.
+/// Run the binding chain that admits the admin's signed bootstrap event
+/// into the joiner's engine (ZEB-260, updated ZEB-339). Pure / sync.
 ///
 /// Returns `Ok((&admin_bootstrap, &admin_identity_pub))` on success so
 /// the caller can pass them to `engine.insert_local_event_with_pubs`.
@@ -1143,16 +1187,18 @@ impl RedeemBootstrapVerifyError {
 /// The chain (each step's failure → distinct error variant):
 ///   1. Required fields present (`admin_bootstrap` + `admin_identity_pub`
 ///      both `Some`). [BootstrapMissing]
-///   2. `Identity::from_public_bytes(admin_identity_pub).address_hash ==
-///      payload.admin_addr.0`. [BootstrapInvalidPubkey or
-///      BootstrapAddressMismatch]
+///   2. (Removed ZEB-339) — the old flat `address_hash == admin_addr`
+///      check is incompatible with the owner/device split. The actor
+///      binding is enforced by step 3 instead.
 ///   3. `admin_bootstrap.actor == payload.admin_addr`.
 ///      [BootstrapActorMismatch]
 ///   4. `admin_bootstrap.community_id == payload.community_id`.
 ///      [BootstrapCommunityMismatch]
-///   5. Ed25519 signature verify of `admin_bootstrap` under
-///      `admin_identity_pub` (delegates to
-///      `community_membership::verify_signature`). [BootstrapSignatureInvalid]
+///   5. ZEB-339: cert-based verification — `enrolled_key_from_cert` extracts
+///      the admin's enrolled device key from the carried `EnrollmentCert`
+///      (cert.owner_id == admin_bootstrap.actor, which step 3 binds to
+///      admin_addr), then `verify_membership_signer` checks the signature
+///      under that key. [BootstrapSignatureInvalid]
 ///   6. Sanity: `admin_bootstrap.kind == Join` and `countersig is None`.
 ///      [BootstrapKindInvalid]
 ///
@@ -1181,12 +1227,12 @@ pub fn verify_admin_bootstrap(
         .as_ref()
         .ok_or(RedeemBootstrapVerifyError::BootstrapMissing)?;
 
-    // 2. identity_pub ↔ admin_addr binding.
-    let admin_identity = harmony_identity::Identity::from_public_bytes(admin_identity_pub)
-        .map_err(|_| RedeemBootstrapVerifyError::BootstrapInvalidPubkey)?;
-    if admin_identity.address_hash != payload.admin_addr.0 {
-        return Err(RedeemBootstrapVerifyError::BootstrapAddressMismatch);
-    }
+    // Step 2 removed (ZEB-339): the old flat `address_hash == admin_addr`
+    // check is incompatible with the owner/device split introduced by
+    // ZEB-339. Under ZEB-339, admin_addr is an owner/master hash (not
+    // the address_hash of any runtime key). The actor↔admin_addr binding
+    // is still enforced by step 3 below; the cryptographic owner↔device
+    // binding is enforced by the cert in step 5.
 
     // 3. bootstrap.actor ↔ admin_addr binding.
     if admin_bootstrap.actor != payload.admin_addr {
@@ -1198,8 +1244,16 @@ pub fn verify_admin_bootstrap(
         return Err(RedeemBootstrapVerifyError::BootstrapCommunityMismatch);
     }
 
-    // 5. Ed25519 signature verify.
-    crate::community_membership::verify_signature(admin_bootstrap, admin_identity_pub)
+    // 5. ZEB-339: cert-based verification. The admin's bootstrap Join is
+    // device-#2-signed and carries the admin's EnrollmentCert.
+    // enrolled_key_from_cert extracts the device key from the cert and
+    // verifies cert.owner_id == admin_bootstrap.actor (which step 3 bound
+    // to admin_addr). verify_membership_signer then checks the signature
+    // under that enrolled device key — same model as verify_packet_pure's
+    // inner join_event check.
+    let signer = crate::community_membership::enrolled_key_from_cert(admin_bootstrap)
+        .map_err(|_| RedeemBootstrapVerifyError::BootstrapSignatureInvalid)?;
+    crate::community_membership::verify_membership_signer(admin_bootstrap, &signer)
         .map_err(|_| RedeemBootstrapVerifyError::BootstrapSignatureInvalid)?;
 
     // 6. Sanity: self-Join with no countersig.
@@ -1350,11 +1404,11 @@ pub fn build_signed_invite_packet(
 }
 
 /// Pure verify helper: takes a [`CommunityInviteSigned`], the local self
-/// owner addr, a wall-clock function, and the local `PrivateIdentity` for
-/// the InviteToken sig check. Returns the joiner's signed Join event on
-/// success — caller is then responsible for the engine-coupled checks
-/// (community known, self joined, self power sufficient) before
-/// counter-signing.
+/// owner addr, a wall-clock function, and the counter-signer's enrolled
+/// device #2 ed25519 verify key for the InviteToken sig check. Returns the
+/// joiner's signed Join event on success — caller is then responsible for
+/// the engine-coupled checks (community known, self joined, self power
+/// sufficient) before counter-signing.
 ///
 /// Order of checks chosen so cheaper / more diagnostic rejections fire
 /// before expensive crypto:
@@ -1365,7 +1419,12 @@ pub fn build_signed_invite_packet(
 ///   5. Inner Join event sig (1× Ed25519 verify_strict via
 ///      `community_membership::verify_signature`)
 ///   6. InviteToken sig (1× Ed25519 verify_strict against the canonical
-///      token payload)
+///      token payload, verified against `self_device_ed25519`)
+///
+/// `self_device_ed25519` must be the counter-signer's enrolled device #2
+/// ed25519 verifying key (32 bytes). This aligns step 6 with
+/// `verify_event`'s P5 gate (`verify_invite_token_sig_with_enrolled`),
+/// which resolves the same key from materialized membership.
 ///
 /// Membership-state-dependent checks (`SelfNotJoined`, `CommunityUnknown`,
 /// `SelfPowerInsufficient`) are NOT raised here — they require engine
@@ -1374,7 +1433,7 @@ pub fn verify_packet_pure<F>(
     signed: &CommunityInviteSigned,
     self_owner: crate::owner_state_types::OwnerAddr,
     now_fn: F,
-    self_identity: &harmony_identity::PrivateIdentity,
+    self_device_ed25519: &[u8; 32],
 ) -> Result<crate::community_membership::SignedMembershipEvent, CommunityInviteVerifyError>
 where
     F: FnOnce() -> u64,
@@ -1430,15 +1489,26 @@ where
         });
     }
 
-    // 5. Inner Join event sig.
-    crate::community_membership::verify_signature(&signed.join_event, &signed.joiner_identity_pub)
+    // 5. Inner Join event MEMBERSHIP sig (ZEB-339).
+    //    The inner join_event is a community-membership event: it is signed by
+    //    the joiner's enrolled device key (#2) and carries the joiner's Master
+    //    EnrollmentCert (attached at the redeem mint, Task 7). So its MEMBERSHIP
+    //    signature is verified via the cert (owner->device binding), NOT via the
+    //    Reticulum `joiner_identity_pub`. (The `joiner_identity_pub` /
+    //    `signing_device_hash` defense + the envelope sig stay transport-bound
+    //    and are checked elsewhere — out of ZEB-339 scope.)
+    let signer = crate::community_membership::enrolled_key_from_cert(&signed.join_event)
+        .map_err(|_| CommunityInviteVerifyError::JoinSigInvalid)?;
+    crate::community_membership::verify_membership_signer(&signed.join_event, &signer)
         .map_err(|_| CommunityInviteVerifyError::JoinSigInvalid)?;
 
-    // 6. InviteToken sig — delegate to the shared helper so this path
-    //    stays in sync with `verify_event`'s P5 gate without duplicating
-    //    the canonical-encode + Signature::from_bytes + verify_strict logic.
-    let admin_identity_pub = self_identity.identity.to_public_bytes();
-    verify_invite_token_signature(&signed.invite_token, &admin_identity_pub)
+    // 6. InviteToken sig — verify against the counter-signer's enrolled
+    //    device #2 key (ZEB-339 consistency fix). Step 4 already binds
+    //    `signed.invite_token.inviter == self_owner`, so this is exactly
+    //    the key that `verify_event`'s P5 gate (`verify_invite_token_sig_with_enrolled`)
+    //    resolves from materialized membership. Both paths now agree: only a
+    //    device-#2-signed token satisfies the invite-only redemption chain.
+    verify_invite_token_sig_device_key(&signed.invite_token, self_device_ed25519)
         .map_err(|_| CommunityInviteVerifyError::InviteTokenSigInvalid)?;
 
     Ok(signed.join_event.clone())
@@ -1534,6 +1604,30 @@ pub fn verify_invite_token_signature(
         .map_err(|_| CommunityInviteVerifyError::InviteTokenSigInvalid)
 }
 
+/// ZEB-339: verify an InviteToken's signature against a 32-byte ed25519
+/// device verifying key directly. Mirrors the inner loop of
+/// `community_membership::verify_invite_token_sig_with_enrolled` but takes
+/// a single concrete key rather than iterating over a set. Used by
+/// `verify_packet_pure` step 6, where the counter-signer IS the sole
+/// owner of the device key (resolved from `community_signing_key` in
+/// `handle_unicast`).
+///
+/// Returns `Err(CommunityInviteVerifyError::InviteTokenSigInvalid)` on any
+/// failure (malformed key bytes, bad signature).
+pub fn verify_invite_token_sig_device_key(
+    token: &InviteToken,
+    device_ed25519: &[u8; 32],
+) -> Result<(), CommunityInviteVerifyError> {
+    let token_canonical = canonical_invite_token_bytes(token)
+        .map_err(|_| CommunityInviteVerifyError::InviteTokenSigInvalid)?;
+    use ed25519_dalek::Signature;
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(device_ed25519)
+        .map_err(|_| CommunityInviteVerifyError::InviteTokenSigInvalid)?;
+    let sig = Signature::from_bytes(&token.sig);
+    vk.verify_strict(&token_canonical, &sig)
+        .map_err(|_| CommunityInviteVerifyError::InviteTokenSigInvalid)
+}
+
 // =====================================================================
 // ZEB-262 Phase 4 Task 9 — receive-side dispatch
 // =====================================================================
@@ -1617,13 +1711,18 @@ pub async fn handle_unicast<H: AppHandleEmit>(
         signed_bytes,
     } = packet;
 
-    // 2. Snapshot self_owner + private_identity from dm_outbox under
-    //    its lock; drop the guard before any further `.await`.
-    let (self_owner, self_private_identity) = {
+    // 2. Snapshot self_owner + private_identity + community_signing_key (#2)
+    //    from dm_outbox under its lock; drop the guard before any further
+    //    `.await`. ZEB-339: `verify_packet_pure` step 6 now verifies the
+    //    InviteToken sig against the enrolled device key (#2), consistent
+    //    with `verify_event`'s P5 gate. `self_private_identity` is kept for
+    //    the `countersigner_pub` Reticulum transport field further below.
+    let (self_owner, self_private_identity, community_signing_key) = {
         let outbox_g = dm_outbox.lock().await;
         (
             outbox_g.self_owner,
             std::sync::Arc::clone(&outbox_g.private_identity),
+            std::sync::Arc::clone(&outbox_g.community_signing_key),
         )
     };
 
@@ -1635,7 +1734,10 @@ pub async fn handle_unicast<H: AppHandleEmit>(
     }
     // 3b. Pure verify chain (community_id agreement, invitee_hint,
     //     expiry/clock-skew, InviteToken signer == self, Join sig,
-    //     InviteToken sig).
+    //     InviteToken sig). Step 6 verifies the InviteToken sig against the
+    //     counter-signer's enrolled device key (#2), consistent with
+    //     `verify_event`'s P5 gate.
+    let self_device_vk = community_signing_key.verifying_key().to_bytes();
     let join_event = match verify_packet_pure(
         &signed,
         self_owner,
@@ -1645,7 +1747,7 @@ pub async fn handle_unicast<H: AppHandleEmit>(
                 .unwrap_or_default()
                 .as_millis() as u64
         },
-        self_private_identity.as_ref(),
+        &self_device_vk,
     ) {
         Ok(e) => e,
         Err(e) => {
@@ -1741,28 +1843,15 @@ pub async fn handle_unicast<H: AppHandleEmit>(
         //
         // The post-Inserted hook (Task 10) detects PendingJoin +
         // self-has-power and auto-emits JoinCountersign.
-        let joiner_identity_pub = match &join_event.kind {
-            crate::community_membership::MembershipEventKind::PendingJoin {
-                joiner_identity_pub,
-                ..
-            } => *joiner_identity_pub,
-            // Safety: is_pending_join_shape already confirmed the arm.
-            _ => unreachable!("is_pending_join_shape mismatch"),
-        };
-        // F6 trust-narrowing: the embedded PendingJoin.joiner_identity_pub
-        // must match the envelope's already-verified pub (from Path B sig
-        // verification in verify_packet_pure). A mismatch means the event
-        // was constructed with a different pub than the one that signed the
-        // envelope — reject before inserting into the engine.
-        if joiner_identity_pub != signed.joiner_identity_pub {
-            tracing::warn!(
-                "ZEB-254 handle_unicast: PendingJoin.joiner_identity_pub mismatch \
-                 with envelope.joiner_identity_pub — rejecting"
-            );
-            let e = CommunityInviteVerifyError::JoinSigInvalid;
-            emit_degraded(app, &signed.community_id, e.reason_tag());
-            return Err(e);
-        }
+        // ZEB-339: PendingJoin no longer carries an inline joiner_identity_pub
+        // (the joiner's enrolled device key is proven by the carried
+        // EnrollmentCert and verified inside verify_event). The envelope's
+        // joiner_identity_pub — already verified via the Path B app-sig binding
+        // in verify_packet_pure step 5 — is passed to the resolver-bypass
+        // insert path. The former F6 event↔envelope pub cross-check is
+        // subsumed by the cert→actor binding inside verify_event. (Task 8 will
+        // rework this redemption path onto the cert model end-to-end.)
+        let joiner_identity_pub = signed.joiner_identity_pub;
         match engine_arc
             .insert_local_event_with_pubs(join_event, joiner_identity_pub, None)
             .await
@@ -1783,14 +1872,19 @@ pub async fn handle_unicast<H: AppHandleEmit>(
             }
         }
     } else {
-        // 6. LEGACY path: Attach countersig with our identity.
-        let counter_signed = match crate::community_membership::attach_countersig_with_identity(
+        // 6. LEGACY path: Attach countersig with our enrolled device key (#2).
+        //    ZEB-339: the counter-sig MUST be produced with device #2, since
+        //    `verify_countersig` resolves the counter-signer's key from their
+        //    materialized `enrolled_device_keys` (populated from cert-bearing
+        //    Joins). Signing with the Reticulum identity would no longer verify.
+        let counter_signed = match crate::community_membership::attach_countersig_with_device_key(
             &join_event,
-            self_private_identity.as_ref(),
+            self_owner,
+            community_signing_key.as_ref(),
         ) {
             Ok(e) => e,
             Err(err) => {
-                tracing::warn!(error = %err, "attach_countersig_with_identity failed");
+                tracing::warn!(error = %err, "attach_countersig_with_device_key failed");
                 let e = CommunityInviteVerifyError::CounterSignAttachFailed;
                 emit_degraded(app, &signed.community_id, e.reason_tag());
                 return Err(e);
@@ -1877,6 +1971,7 @@ mod tests {
             admin_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         }
     }
 
@@ -1904,6 +1999,8 @@ mod tests {
             },
             sig: [0u8; 64],
             countersig: None,
+            // ZEB-339: bootstrap-Join must embed the admin's EnrollmentCert.
+            enrollment: Some(crate::community_membership::mint_test_owner(0x6E).cert),
         };
 
         CommunityInvitePayload {
@@ -1932,6 +2029,8 @@ mod tests {
             admin_identity_pub: Some([0u8; 64]),
             forked_from: None,
             pre_fork_snapshot: None,
+            // ZEB-339: invite-only payloads must carry the inviter's cert.
+            inviter_enrollment: Some(crate::community_membership::mint_test_owner(0x7E).cert),
         }
     }
 
@@ -2053,6 +2152,45 @@ mod tests {
         );
     }
 
+    // ── ZEB-339: admin_bootstrap embedded EnrollmentCert gate ──────────
+
+    /// encode_invite_url rejects an invite-only payload whose admin_bootstrap
+    /// is present but carries no embedded EnrollmentCert. Without it the URL
+    /// would encode/decode cleanly then die late at redeem with
+    /// BootstrapSignatureInvalid (verify_admin_bootstrap resolves the signer
+    /// via enrolled_key_from_cert, which reads admin_bootstrap.enrollment).
+    #[test]
+    fn encode_invite_url_rejects_invite_only_bootstrap_missing_enrollment() {
+        let mut payload = make_invite_only_payload_correct();
+        payload.admin_bootstrap.as_mut().unwrap().enrollment = None;
+        let err = encode_invite_url(&payload).unwrap_err();
+        assert!(
+            matches!(err, InviteUrlError::InviteOnlyBootstrapMissingEnrollment),
+            "unexpected err: {err}"
+        );
+    }
+
+    /// decode_invite_url rejects an invite-only URL whose admin_bootstrap is
+    /// present but carries no embedded EnrollmentCert. CBOR-encode directly
+    /// (bypassing encode_invite_url's gate) so the bytes are well-formed but
+    /// the decode-time embedded-cert check rejects them. make_invite_only_
+    /// payload_correct already supplies inviter_enrollment=Some and a 92-byte
+    /// sealed_epoch_key, so no earlier decode gate fires first.
+    #[test]
+    fn decode_invite_url_rejects_invite_only_bootstrap_missing_enrollment() {
+        let mut payload = make_invite_only_payload_correct();
+        payload.admin_bootstrap.as_mut().unwrap().enrollment = None;
+        let cbor = canonical_cbor_encode(&payload).expect("cbor encode");
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&cbor);
+        let url = format!("harmony://invite/{b64}");
+
+        let err = decode_invite_url(&url).unwrap_err();
+        assert!(
+            matches!(err, InviteUrlError::InviteOnlyBootstrapMissingEnrollment),
+            "unexpected err: {err}"
+        );
+    }
+
     // ── ZEB-285 Phase 1: PreForkSnapshot + BoundedChannelLogSnapshot ────
 
     #[test]
@@ -2080,6 +2218,7 @@ mod tests {
             // not crypto verification.
             sig: [0u8; 64],
             countersig: None,
+            enrollment: None,
         };
 
         let mut identity_pubs: BTreeMap<OwnerAddr, [u8; 64]> = BTreeMap::new();
@@ -2143,6 +2282,7 @@ mod tests {
             admin_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
+            inviter_enrollment: None,
         };
 
         let bytes = canonical_cbor_encode(&payload).expect("encode");
@@ -2185,6 +2325,7 @@ mod tests {
             },
             sig: [0u8; 64],
             countersig: None,
+            enrollment: None,
         };
 
         let mut identity_pubs: BTreeMap<OwnerAddr, [u8; 64]> = BTreeMap::new();
@@ -2220,6 +2361,7 @@ mod tests {
             admin_identity_pub: None,
             forked_from: Some(forked_from_id),
             pre_fork_snapshot: Some(snapshot.clone()),
+            inviter_enrollment: None,
         };
 
         let bytes = canonical_cbor_encode(&payload).expect("encode");
@@ -2236,5 +2378,47 @@ mod tests {
             snapshot_original_id
         );
         assert_eq!(decoded.pre_fork_snapshot, Some(snapshot));
+    }
+
+    // ── ZEB-339: inviter_enrollment field ────────────────────────────
+
+    #[test]
+    fn invite_payload_inviter_enrollment_roundtrip() {
+        // ZEB-339: a payload carrying the inviter's EnrollmentCert encodes
+        // and decodes losslessly (the "ec" key round-trips).
+        let cert = crate::community_membership::mint_test_owner(0x5C).cert;
+        let mut payload = make_open_payload_correct();
+        payload.inviter_enrollment = Some(cert.clone());
+
+        let bytes = canonical_cbor_encode(&payload).expect("encode");
+        let decoded: CommunityInvitePayload =
+            ciborium::de::from_reader(&bytes[..]).expect("decode");
+
+        assert_eq!(decoded.inviter_enrollment, Some(cert));
+    }
+
+    #[test]
+    fn invite_payload_without_inviter_enrollment_decodes_to_none() {
+        // ZEB-339 back-compat: a payload WITHOUT the "ec" key (pre-ZEB-339
+        // wire form) decodes with inviter_enrollment = None rather than
+        // failing, and the key is omitted on encode when None.
+        let payload = make_open_payload_correct();
+        assert_eq!(payload.inviter_enrollment, None);
+
+        let bytes = canonical_cbor_encode(&payload).expect("encode");
+        // "ec" must be absent from the wire form when None.
+        let value: ciborium::Value =
+            ciborium::de::from_reader(&bytes[..]).expect("decode as value");
+        let map = value.as_map().expect("outer is map");
+        assert!(
+            !map.iter()
+                .any(|(k, _): &(ciborium::Value, ciborium::Value)| { k.as_text() == Some("ec") }),
+            "inviter_enrollment=None should be omitted (no `ec` key)"
+        );
+
+        // And a payload encoded without "ec" decodes back to None.
+        let decoded: CommunityInvitePayload =
+            ciborium::de::from_reader(&bytes[..]).expect("decode");
+        assert_eq!(decoded.inviter_enrollment, None);
     }
 }
