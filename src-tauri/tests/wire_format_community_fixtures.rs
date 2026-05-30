@@ -591,10 +591,10 @@ fn signed_event_join_with_cert_wire_bytes_pinned() {
 /// ZEB-339 back-compat: a certless Join event (enrollment=None) must still
 /// encode WITHOUT the `en` key and decode cleanly.
 ///
-/// This confirms old pre-ZEB-339 events (no `en`/`ek` fields) remain
-/// decodeable after the field was added with `skip_serializing_if = "Option::is_none"`
-/// + `default`. This test mirrors the existing `signed_event_join_wire_bytes_pinned`
-/// fixture above but explicitly checks the absence of `en` and the decode path.
+/// Confirms old pre-ZEB-339 events (no `en`/`ek` fields) remain decodeable after
+/// the field was added with `skip_serializing_if = "Option::is_none"` and `default`.
+/// Mirrors the existing `signed_event_join_wire_bytes_pinned` fixture but explicitly
+/// checks absence of `en` and round-trip re-encode identity.
 #[test]
 fn signed_event_join_certless_back_compat_decodes() {
     use harmony_app::community_membership::SignedMembershipEvent;
