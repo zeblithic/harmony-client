@@ -108,8 +108,18 @@ mod tests {
     /// patterns. Uses a fresh `PrivateIdentity::from_seed` (NOT clone —
     /// `PrivateIdentity` is `ZeroizeOnDrop` and deliberately non-Clone).
     fn make_outbox() -> Arc<TokioMutex<DmOutbox>> {
-        let signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]));
-        let private_identity = Arc::new(harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]));
+        // Derive signing_key + device hash from a SINGLE PrivateIdentity so the
+        // synthetic transport identity is self-consistent (matches the same-
+        // identity invariant DmOutbox enforces between signing_key and
+        // private_identity; mismatched fixtures could fail future ack/counter-
+        // sign paths for fixture reasons rather than routing behavior).
+        let private_identity = harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]);
+        let priv_bytes = private_identity.to_private_bytes();
+        let mut ed_seed = [0u8; 32];
+        ed_seed.copy_from_slice(&priv_bytes[32..64]);
+        let signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed_seed));
+        let device_hash = DeviceIdentityHash(private_identity.identity.address_hash);
+        let private_identity = Arc::new(private_identity);
         // ZEB-339: use new_synthetic because OwnerAddr([0x01;16]) is an
         // arbitrary address not matching any mint_test_owner cert. These
         // tests exercise inbound packet routing, not community-signing.
@@ -121,7 +131,7 @@ mod tests {
         Arc::new(TokioMutex::new(DmOutbox::new_synthetic(
             "dev".into(),
             OwnerAddr([0x01; 16]),
-            DeviceIdentityHash([0xaa; 16]),
+            device_hash,
             signing_key,
             private_identity,
             community_signing_key,

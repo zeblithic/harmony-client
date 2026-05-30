@@ -446,21 +446,26 @@ impl DmOutbox {
         community_signing_key: Arc<ed25519_dalek::SigningKey>,
         enrollment_cert: harmony_owner::certs::EnrollmentCert,
     ) -> Self {
-        // ZEB-339: defense-in-depth — validate enrolled materials in
-        // debug/test builds. These three invariants must hold for any
-        // correctly-plumbed DmOutbox; a violation indicates a wiring bug
-        // (e.g. cert from owner A paired with self_owner from owner B, or a
-        // mismatched community_signing_key). Fires fast in tests without
-        // touching the production API or any call site.
-        debug_assert!(
+        // ZEB-339: defense-in-depth — validate enrolled materials in ALL
+        // builds (not just debug). These three invariants must hold for any
+        // correctly-plumbed DmOutbox; a violation is a wiring bug (cert from
+        // owner A paired with self_owner from owner B, or a mismatched
+        // community_signing_key) that would otherwise surface much later as
+        // an unverifiable community event. Enforced unconditionally because
+        // the cert↔key binding is security-relevant — fail fast at
+        // construction. `new` is called ~once per node start, so the
+        // cert.verify() cost is negligible. Tests that intentionally use
+        // mismatched synthetic material call `new_synthetic`, which bypasses
+        // these checks by design.
+        assert!(
             enrollment_cert.verify().is_ok(),
             "DmOutbox: enrollment_cert must verify"
         );
-        debug_assert_eq!(
+        assert_eq!(
             enrollment_cert.owner_id, self_owner.0,
             "DmOutbox: cert.owner_id must match self_owner"
         );
-        debug_assert_eq!(
+        assert_eq!(
             enrollment_cert.device_pubkeys.classical.ed25519_verify,
             community_signing_key.verifying_key().to_bytes(),
             "DmOutbox: cert device key must match community_signing_key"
@@ -2270,19 +2275,18 @@ mod tests {
             &test_owner.device_key.to_bytes(),
         ));
         let enrollment_cert = test_owner.cert;
-        // Bypass DmOutbox::new to avoid firing the owner_id debug_assert
-        // for synthetic test outboxes that use an arbitrary self_owner.
-        DmOutbox {
-            device_id: device_id.into(),
+        // Use the test-only `new_synthetic` constructor (which bypasses
+        // DmOutbox::new's enrollment asserts by design) rather than
+        // open-coding the struct — keeps the synthetic setup in one place.
+        DmOutbox::new_synthetic(
+            device_id.into(),
             self_owner,
-            our_signing_device_hash: device_hash,
+            device_hash,
             signing_key,
             private_identity,
             community_signing_key,
             enrollment_cert,
-            in_flight: HashSet::new(),
-            backoff: HashMap::new(),
-        }
+        )
     }
 
     /// ZEB-262 Phase 4 Task 2: assert that `DmOutbox.signing_key` and
