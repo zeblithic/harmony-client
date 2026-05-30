@@ -751,6 +751,16 @@ pub enum InviteUrlError {
     /// decode so an un-verifiable invite-only URL never leaves the mint site.
     #[error("invite-only payload missing inviter_enrollment")]
     InviteOnlyMissingInviterEnrollment,
+    /// ZEB-339: invite-only payload whose `admin_bootstrap` is present but
+    /// is missing its embedded EnrollmentCert (`admin_bootstrap.enrollment`).
+    /// `verify_admin_bootstrap` resolves the bootstrap-Join's signer via
+    /// `enrolled_key_from_cert`, which reads `admin_bootstrap.enrollment`;
+    /// without it the URL encodes and decodes cleanly but fails late at
+    /// redeem with `BootstrapSignatureInvalid` (a confusing signature error).
+    /// Enforced at both encode and decode so an un-redeemable invite-only URL
+    /// never leaves the mint site and is rejected clearly on receipt.
+    #[error("invite-only payload's admin_bootstrap is missing its embedded enrollment cert")]
+    InviteOnlyBootstrapMissingEnrollment,
     /// `epoch_snapshot.sealed_epoch_key` has the wrong byte length for
     /// the declared mode. Open communities must carry 32 raw bytes;
     /// invite-only flows must carry the 92-byte X25519-sealed envelope
@@ -832,6 +842,19 @@ pub fn encode_invite_url(payload: &CommunityInvitePayload) -> Result<String, Inv
     if payload.is_invite_only && payload.inviter_enrollment.is_none() {
         return Err(InviteUrlError::InviteOnlyMissingInviterEnrollment);
     }
+    // ZEB-339: the admin bootstrap-Join must embed the admin's EnrollmentCert,
+    // because verify_admin_bootstrap resolves the signer via enrolled_key_from_cert
+    // (which reads admin_bootstrap.enrollment). Without it the URL encodes and
+    // decodes cleanly but dies at redeem with BootstrapSignatureInvalid — enforce
+    // here so the un-redeemable URL never leaves the mint site.
+    if payload.is_invite_only
+        && payload
+            .admin_bootstrap
+            .as_ref()
+            .is_some_and(|b| b.enrollment.is_none())
+    {
+        return Err(InviteUrlError::InviteOnlyBootstrapMissingEnrollment);
+    }
     if !payload.is_invite_only
         && (payload.admin_bootstrap.is_some() || payload.admin_identity_pub.is_some())
     {
@@ -892,6 +915,20 @@ pub fn decode_invite_url(url: &str) -> Result<CommunityInvitePayload, InviteUrlE
     // (mirrors the admin_bootstrap / admin_identity_pub presence requirement).
     if payload.is_invite_only && payload.inviter_enrollment.is_none() {
         return Err(InviteUrlError::InviteOnlyMissingInviterEnrollment);
+    }
+    // ZEB-339: the admin bootstrap-Join must embed the admin's EnrollmentCert.
+    // The joiner needs it to verify the admin's owner->device binding at redeem:
+    // verify_admin_bootstrap resolves the signer via enrolled_key_from_cert
+    // (which reads admin_bootstrap.enrollment). Without it the URL decodes
+    // cleanly but dies at redeem with BootstrapSignatureInvalid — reject here
+    // so a certless invite-only URL is rejected clearly on receipt.
+    if payload.is_invite_only
+        && payload
+            .admin_bootstrap
+            .as_ref()
+            .is_some_and(|b| b.enrollment.is_none())
+    {
+        return Err(InviteUrlError::InviteOnlyBootstrapMissingEnrollment);
     }
     // ZEB-285 INVARIANT: forked_from and pre_fork_snapshot must both be
     // Some or both be None. An invite with one set but not the other is
@@ -1962,7 +1999,8 @@ mod tests {
             },
             sig: [0u8; 64],
             countersig: None,
-            enrollment: None,
+            // ZEB-339: bootstrap-Join must embed the admin's EnrollmentCert.
+            enrollment: Some(crate::community_membership::mint_test_owner(0x6E).cert),
         };
 
         CommunityInvitePayload {
@@ -2110,6 +2148,45 @@ mod tests {
                     got: 32,
                 }
             ),
+            "unexpected err: {err}"
+        );
+    }
+
+    // ── ZEB-339: admin_bootstrap embedded EnrollmentCert gate ──────────
+
+    /// encode_invite_url rejects an invite-only payload whose admin_bootstrap
+    /// is present but carries no embedded EnrollmentCert. Without it the URL
+    /// would encode/decode cleanly then die late at redeem with
+    /// BootstrapSignatureInvalid (verify_admin_bootstrap resolves the signer
+    /// via enrolled_key_from_cert, which reads admin_bootstrap.enrollment).
+    #[test]
+    fn encode_invite_url_rejects_invite_only_bootstrap_missing_enrollment() {
+        let mut payload = make_invite_only_payload_correct();
+        payload.admin_bootstrap.as_mut().unwrap().enrollment = None;
+        let err = encode_invite_url(&payload).unwrap_err();
+        assert!(
+            matches!(err, InviteUrlError::InviteOnlyBootstrapMissingEnrollment),
+            "unexpected err: {err}"
+        );
+    }
+
+    /// decode_invite_url rejects an invite-only URL whose admin_bootstrap is
+    /// present but carries no embedded EnrollmentCert. CBOR-encode directly
+    /// (bypassing encode_invite_url's gate) so the bytes are well-formed but
+    /// the decode-time embedded-cert check rejects them. make_invite_only_
+    /// payload_correct already supplies inviter_enrollment=Some and a 92-byte
+    /// sealed_epoch_key, so no earlier decode gate fires first.
+    #[test]
+    fn decode_invite_url_rejects_invite_only_bootstrap_missing_enrollment() {
+        let mut payload = make_invite_only_payload_correct();
+        payload.admin_bootstrap.as_mut().unwrap().enrollment = None;
+        let cbor = canonical_cbor_encode(&payload).expect("cbor encode");
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&cbor);
+        let url = format!("harmony://invite/{b64}");
+
+        let err = decode_invite_url(&url).unwrap_err();
+        assert!(
+            matches!(err, InviteUrlError::InviteOnlyBootstrapMissingEnrollment),
             "unexpected err: {err}"
         );
     }

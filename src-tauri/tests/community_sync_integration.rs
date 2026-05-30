@@ -2628,8 +2628,14 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
                 device_id: "alice-dev".into(),
             },
         };
-        harmony_app::community_membership::sign_event_with_identity(&payload, &alice)
-            .expect("sign admin bootstrap")
+        let mut ev = harmony_app::community_membership::sign_event_with_identity(&payload, &alice)
+            .expect("sign admin bootstrap");
+        // ZEB-339: encode_invite_url now requires the bootstrap-Join to embed
+        // the admin's EnrollmentCert. This test rolls back before the joiner
+        // verifies it (inviter unreachable → timeout), so any present cert
+        // satisfies the encode-time presence check.
+        ev.enrollment = Some(mint_test_owner(0xA3).cert);
+        ev
     };
     // CR Major (PR #106 R6): use a real sealed_epoch_key so the snapshot
     // decrypts successfully and any Err must come from the intended

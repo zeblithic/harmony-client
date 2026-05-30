@@ -98,7 +98,8 @@ fn invite_only_url() -> String {
         },
         sig: [0u8; 64],
         countersig: None,
-        enrollment: None,
+        // ZEB-339: bootstrap-Join must embed the admin's EnrollmentCert.
+        enrollment: Some(harmony_app::community_membership::mint_test_owner(0xC2).cert),
     };
     let payload = CommunityInvitePayload {
         community_id,

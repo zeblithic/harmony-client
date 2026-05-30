@@ -1399,7 +1399,8 @@ mod tests {
             },
             sig: [0u8; 64],
             countersig: None,
-            enrollment: None,
+            // ZEB-339: bootstrap-Join must embed the admin's EnrollmentCert.
+            enrollment: Some(crate::community_membership::mint_test_owner(0xC3).cert),
         };
         let payload = CommunityInvitePayload {
             community_id,
@@ -2652,7 +2653,8 @@ mod tests {
             },
             sig: [0u8; 64],
             countersig: None,
-            enrollment: None,
+            // ZEB-339: bootstrap-Join must embed the admin's EnrollmentCert.
+            enrollment: Some(crate::community_membership::mint_test_owner(0xC4).cert),
         };
 
         let payload = CommunityInvitePayload {

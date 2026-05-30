@@ -2238,9 +2238,9 @@ mod tests {
     use crate::owner_state_types::{ContentId, DmContentKey, InboxEntry, Space, TransportBinding};
 
     /// Test-only helper: build a `DmOutbox` with synthetic materials for
-    /// tests that don't exercise community-signing paths. Constructs the
-    /// struct directly (bypassing `DmOutbox::new`'s `assert!` checks)
-    /// so that tests which need a specific `self_owner` for DM space
+    /// tests that don't exercise community-signing paths. Routes through
+    /// `DmOutbox::new_synthetic` (which bypasses `DmOutbox::new`'s `assert!`
+    /// checks) so that tests which need a specific `self_owner` for DM space
     /// membership or ack-address assertions can supply an arbitrary address
     /// without needing a matching `EnrollmentCert`.
     ///
@@ -2268,8 +2268,8 @@ mod tests {
         // ZEB-339: synthetic community_signing_key + enrollment_cert for tests
         // that don't exercise community-signing paths. Uses a fixed seed so
         // the helper stays deterministic. The cert's owner_id does NOT match
-        // self_owner (the assert in DmOutbox::new is bypassed below by
-        // constructing the struct directly — production callers must use new()).
+        // self_owner (the assert in `DmOutbox::new` is bypassed via
+        // `DmOutbox::new_synthetic`; production callers must use `new()`).
         let test_owner = crate::community_membership::mint_test_owner(0xAB);
         let community_signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(
             &test_owner.device_key.to_bytes(),
