@@ -1355,45 +1355,30 @@ impl CommunitySyncEngine {
             });
         }
 
-        let resolver = self
-            .identity_resolver
-            .as_ref()
-            .ok_or(LocalInsertError::MissingIdentityResolver)?;
-
-        let actor_pub = resolver
-            .resolve(&event.actor)
-            .await
-            .ok_or(LocalInsertError::UnknownActor(event.actor))?;
-
-        let countersigner_pub = if let Some(cs) = event.countersig.as_ref() {
-            resolver.resolve(&cs.signer).await
-        } else {
-            None
-        };
-
-        self.insert_event_with_resolved_pubs(event, actor_pub, countersigner_pub)
-            .await
+        // ZEB-339 Task 9: REMOVED the resolver gate. `verify_event` now
+        // derives the actor's (and countersigner's) ed25519 verify key
+        // itself — from the carried EnrollmentCert (Join/PendingJoin) or
+        // the actor's materialized `enrolled_device_keys` (steady-state).
+        // The old `OwnerDeviceCacheResolver` lookup MISSED for remote
+        // `owner_id` actors (its cache is keyed by Reticulum device-hash,
+        // not owner_id), wrongly rejecting them with `UnknownActor`. The
+        // slim VerifyContext below carries no caller-resolved pubs.
+        self.insert_event_with_resolved_pubs(event).await
     }
 
-    /// Variant of `insert_local_event` that accepts already-verified
-    /// actor + countersigner identity pubs, bypassing `IdentityResolver`.
-    ///
-    /// ZEB-262 Phase 4: the invite-only receive path already proves the
-    /// joiner's identity_pub via the inline `joiner_identity_pub` field
-    /// (Path B app-sig binding) BEFORE this insert runs — but the joiner
-    /// is not yet in the receiver's `OwnerDeviceCache`, so the production
-    /// `OwnerDeviceCacheResolver` would return `None` and surface
-    /// `UnknownActor`. That's the bootstrap-by-design case the inline
-    /// pub is for. Pass it through directly here.
-    ///
-    /// The CRDT-layer verify (`VerifyContext.actor_identity_pub`) is
-    /// unchanged — same code path, same expected_community_id binding,
-    /// same admin / invite-only checks. Only resolver lookup is skipped.
+    /// ZEB-339 Task 9: retained as a thin wrapper for the invite-only
+    /// bootstrap callers (`redeem_invite_inner`) that previously had to
+    /// pass an inline `joiner_identity_pub` because the
+    /// `OwnerDeviceCacheResolver` couldn't yet resolve a first-seen
+    /// joiner. `verify_event` now derives signer keys from the carried
+    /// EnrollmentCert / materialized membership, so the inline pubs are
+    /// no longer needed — they are accepted and discarded to keep the
+    /// call sites stable. Routes straight through the shared insert body.
     pub async fn insert_local_event_with_pubs(
         &self,
         event: crate::community_membership::SignedMembershipEvent,
-        actor_identity_pub: [u8; 64],
-        countersigner_identity_pub: Option<[u8; 64]>,
+        _actor_identity_pub: [u8; 64],
+        _countersigner_identity_pub: Option<[u8; 64]>,
     ) -> Result<crate::community_state_crdt::InsertOutcome, LocalInsertError> {
         if event.community_id != self.community_id {
             return Err(LocalInsertError::WrongCommunity {
@@ -1401,18 +1386,16 @@ impl CommunitySyncEngine {
                 got: event.community_id,
             });
         }
-        self.insert_event_with_resolved_pubs(event, actor_identity_pub, countersigner_identity_pub)
-            .await
+        self.insert_event_with_resolved_pubs(event).await
     }
 
     /// Shared body for `insert_local_event` and
     /// `insert_local_event_with_pubs` — runs the verify + state mutate +
-    /// post-Inserted hook chain with already-resolved pubs.
+    /// post-Inserted hook chain. ZEB-339 Task 9: no longer takes
+    /// caller-resolved pubs; `verify_event` derives signer keys itself.
     async fn insert_event_with_resolved_pubs(
         &self,
         event: crate::community_membership::SignedMembershipEvent,
-        actor_pub: [u8; 64],
-        countersigner_pub: Option<[u8; 64]>,
     ) -> Result<crate::community_state_crdt::InsertOutcome, LocalInsertError> {
         // Bind expected_community_id to the engine's configured value,
         // NOT the (caller-controlled) event payload. Without this, a
@@ -1421,24 +1404,14 @@ impl CommunitySyncEngine {
         // claims. The entry-point guard above gives a clearer error class
         // for the common honest mismatch case.
 
-        // ZEB-254 R3 (S2): defer late-bind of admin_identity_pub until AFTER
-        // verify_event accepts the actor's event. Setting the OnceLock here
-        // (pre-insert) would persist a caller-supplied actor_pub even if the
-        // event itself is later rejected by verify — and OnceLock silently
-        // discards subsequent set() attempts, so a bad pub could permanently
-        // poison the binding. We snapshot whether this is the first admin
-        // self-event seen, run verify+insert, and only commit the bind on
-        // a successful `Inserted` outcome.
-        let admin_first_seen =
-            event.actor == self.admin_addr && self.admin_identity_pub.get().is_none();
-
-        // ZEB-339: VerifyContext no longer carries caller-resolved pubs;
+        // ZEB-339 Task 9: VerifyContext carries no caller-resolved pubs;
         // verify_event resolves the signer from the carried EnrollmentCert
-        // (Join/PendingJoin) or the actor's materialized enrolled_device_keys
-        // (steady-state). The resolver-derived pubs are retained only to keep
-        // the admin_identity_pub OnceLock (consumed by the publisher-auth path)
-        // populated — they no longer feed the membership verify.
-        let _ = countersigner_pub;
+        // (Join/PendingJoin) or the actor's materialized
+        // enrolled_device_keys (steady-state). The admin_identity_pub
+        // OnceLock is no longer fed from here — its value has no remaining
+        // verify-path consumer (T4 removed the PendingJoin P5 gate); the
+        // external `bind_admin_identity_pub` / `try_rehydrate` plumbing
+        // (lib.rs) is left intact but inert.
         let ctx = crate::community_membership::VerifyContext {
             expected_community_id: self.community_id,
             admin_addr: self.admin_addr,
@@ -1449,19 +1422,6 @@ impl CommunitySyncEngine {
             let mut state_g = self.state.lock().await;
             state_g.insert_event(event.clone(), &ctx)
         };
-
-        // R3 (S2): commit the admin-pub binding only after verify+insert
-        // succeeded. OnceLock::set returns Err on second-set, which we
-        // discard — concurrent inserts may have already bound it, which
-        // is fine (same admin, same pub).
-        if admin_first_seen
-            && matches!(
-                outcome,
-                crate::community_state_crdt::InsertOutcome::Inserted
-            )
-        {
-            let _ = self.admin_identity_pub.set(actor_pub);
-        }
 
         // C1 restart-recovery: when a PendingJoin returns AlreadyKnown
         // (event was already in the CRDT from disk / prior session), still
@@ -1601,42 +1561,11 @@ impl CommunitySyncEngine {
             });
         }
 
-        let resolver = self
-            .identity_resolver
-            .as_ref()
-            .ok_or(LocalInsertError::MissingIdentityResolver)?;
-
-        // Resolve actor pubs for both events. Both resolves happen
-        // BEFORE the lock — the lock hold is kept as short as possible.
-        let first_actor_pub = resolver
-            .resolve(&first.actor)
-            .await
-            .ok_or(LocalInsertError::UnknownActor(first.actor))?;
-        let first_countersigner_pub = if let Some(cs) = first.countersig.as_ref() {
-            resolver.resolve(&cs.signer).await
-        } else {
-            None
-        };
-
-        let second_actor_pub = resolver
-            .resolve(&second.actor)
-            .await
-            .ok_or(LocalInsertError::UnknownActor(second.actor))?;
-        let second_countersigner_pub = if let Some(cs) = second.countersig.as_ref() {
-            resolver.resolve(&cs.signer).await
-        } else {
-            None
-        };
-
-        // ZEB-339: pubs no longer feed VerifyContext (signer resolved from
-        // cert / materialized keys); resolver lookups above are retained as a
-        // missing-actor guard and to feed the publisher-auth OnceLock.
-        let _ = (
-            &first_actor_pub,
-            &first_countersigner_pub,
-            &second_actor_pub,
-            &second_countersigner_pub,
-        );
+        // ZEB-339 Task 9: REMOVED the resolver gate for both events.
+        // `verify_event` (called below in the pre-validate phase and again
+        // inside `insert_event`) derives signer keys from the carried
+        // EnrollmentCert / materialized membership — the resolver's
+        // owner_id miss no longer rejects valid remote events.
         let first_ctx = crate::community_membership::VerifyContext {
             expected_community_id: self.community_id,
             admin_addr: self.admin_addr,
@@ -2958,10 +2887,54 @@ impl IncomingOutcome {
 /// advance is required for TOCTOU defense — see step 12.
 /// owner-state has neither concern because there's only one owner-
 /// CRDT per identity AND no concurrent `insert_local_event` IPC
+/// ZEB-339 Task 9: verify a state-root publish's signature against the
+/// publisher's materialized enrolled device keys.
+///
+/// Replaces the old resolver-based publisher-auth (Reticulum
+/// `IdentityResolver::resolve` + `address_hash` binding check). The
+/// publisher now signs the state-root with their ENROLLED device key
+/// (device #2); the receiver verifies `payload.publisher_sig` over
+/// `canonical_cbor(CommunityRootSignedPayload::from(&payload))` against
+/// ANY key in the publisher's `MemberState.enrolled_device_keys` set —
+/// the same set materialized by the membership-at-HLC gate from the
+/// publisher's EnrollmentCert-bearing Join.
+///
+/// `member_state` is the publisher's materialized `MemberState` as of
+/// `payload.at` (the membership gate already confirmed `Joined`). A
+/// `None`/empty enrolled-key set OR no matching key yields
+/// `PublisherSigInvalid` — the same observable outcome as the legacy
+/// path (a publish unauthenticated under the claimed addr).
+///
+/// Pure + sync so it can be unit-tested directly without engine setup.
+fn verify_publisher_sig(
+    payload: &CommunityRootPublishPayload,
+    member_state: &crate::community_membership::MemberState,
+) -> Result<(), CommunitySyncError> {
+    use crate::owner_state_crypto::canonical_cbor_encode;
+
+    let signed_bytes = canonical_cbor_encode(&CommunityRootSignedPayload::from(payload))
+        .map_err(|e| CommunitySyncError::CborEncode(e.to_string()))?;
+    let sig = ed25519_dalek::Signature::from_bytes(&payload.publisher_sig);
+
+    for key_bytes in &member_state.enrolled_device_keys {
+        if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(key_bytes) {
+            // verify_strict: rejects non-canonical S + small-order R,
+            // matching `community_membership::verify_signature`'s posture
+            // for signed wire payloads.
+            if vk.verify_strict(&signed_bytes, &sig).is_ok() {
+                return Ok(());
+            }
+        }
+    }
+
+    Err(CommunitySyncError::PublisherSigInvalid {
+        addr: payload.publisher_addr,
+    })
+}
+
 /// path.
 async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOutcome {
     use crate::community_membership::MemberStatus;
-    use crate::owner_state_crypto::canonical_cbor_encode;
 
     // ZEB-249 §10.6 Phase A: snapshot live epoch key state BEFORE any
     // lock on community state.  We collect (current_key, old_keys_rev)
@@ -3093,7 +3066,10 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     //    blocker emerges. See
     //    docs/specs/2026-05-08-zeb-260-invite-only-cold-cache-design.md
     //    for the Case A fix design.
-    {
+    // ZEB-339 Task 9: the membership gate materializes the publisher's
+    // `MemberState` (incl. `enrolled_device_keys`); we retain it for the
+    // sig-verify step below so we don't re-materialize.
+    let publisher_member_state: crate::community_membership::MemberState = {
         let state = ctx.state.lock().await;
         let events: Vec<SignedMembershipEvent> = state.events.values().cloned().collect();
         drop(state);
@@ -3122,82 +3098,30 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
                 left_at: member_state.and_then(|s| s.left_at),
             });
         }
-    }
-
-    // 3. Resolve `publisher_addr` → identity_pub via `IdentityResolver`.
-    //    Distinct from MissingIdentityResolver (config error) vs
-    //    UnknownPublisher (resolver returned None for this addr — cold
-    //    cache or fabricated addr). Tracker NOT advanced on either.
-    let resolver = match ctx.identity_resolver.as_deref() {
-        Some(r) => r,
-        None => {
-            return IncomingOutcome::ErrPreMutation(CommunitySyncError::MissingIdentityResolver);
-        }
-    };
-    let publisher_pub = match resolver.resolve(&payload.publisher_addr).await {
-        Some(p) => p,
-        None => {
-            return IncomingOutcome::ErrPreMutation(CommunitySyncError::UnknownPublisher {
-                addr: payload.publisher_addr,
-            });
-        }
+        // `is_joined` ⇒ `member_state` is `Some`. Yield it for the
+        // ZEB-339 publisher-sig check below.
+        member_state.expect("is_joined implies Some(member_state)")
     };
 
-    // 4. Verify Ed25519 signature over canonical CBOR of
-    //    `CommunityRootSignedPayload::from(&payload)`.
+    // 3+4. ZEB-339 Task 9: verify `payload.publisher_sig` against the
+    //    publisher's MATERIALIZED enrolled device keys (from their
+    //    EnrollmentCert-bearing Join), NOT a Reticulum
+    //    `IdentityResolver` lookup + `address_hash` binding. The
+    //    membership gate above already confirmed the publisher is
+    //    `Joined` at `payload.at` and handed us their `MemberState`;
+    //    `verify_publisher_sig` iterates the `enrolled_device_keys` set
+    //    and accepts the publish iff some key `verify_strict`-validates
+    //    the signature over `canonical_cbor(CommunityRootSignedPayload)`.
+    //    No matching key (or empty set) → `PublisherSigInvalid`. Tracker
+    //    NOT advanced.
     //
-    //    Key→address binding: before consuming the resolved key we
-    //    re-derive `address_hash` from the 64-byte identity public
-    //    bytes and reject if it does not equal `payload.publisher_addr`.
-    //    This is defense-in-depth against a buggy / stale resolver
-    //    handing us the wrong identity for `publisher_addr` — without
-    //    this check, a valid signature from key X would be accepted
-    //    under a falsely-claimed address Y. Mirrors the binding step
-    //    in `community_membership::verify_signature` (line 446) and
-    //    `verify_countersig` (line 522), which use the same
-    //    `harmony_identity::Identity::from_public_bytes` derivation.
-    //
-    //    Use `verify_strict` (not `verify`): strict mode rejects
-    //    signatures with non-canonical S values and small-order R
-    //    points (RFC 8032 strict subset), matching
-    //    `community_membership::verify_signature` and
-    //    `dm_envelope`'s posture for signed wire payloads.
-    {
-        let signed_bytes = match canonical_cbor_encode(&CommunityRootSignedPayload::from(&payload))
-        {
-            Ok(b) => b,
-            Err(e) => {
-                return IncomingOutcome::ErrPreMutation(CommunitySyncError::CborEncode(
-                    e.to_string(),
-                ));
-            }
-        };
-        let identity = match harmony_identity::Identity::from_public_bytes(&publisher_pub) {
-            Ok(i) if i.address_hash == payload.publisher_addr.0 => i,
-            // Either the identity bytes are malformed OR the resolver
-            // returned a key whose `address_hash` does not match the
-            // claimed publisher_addr. Both cases collapse to the same
-            // observable outcome: this publish is unauthenticated under
-            // the claimed addr. Surface as `PublisherSigInvalid` so the
-            // existing degraded-report path handles it (rather than
-            // adding a separate "key did not bind to addr" variant —
-            // the security invariant is identical).
-            _ => {
-                return IncomingOutcome::ErrPreMutation(CommunitySyncError::PublisherSigInvalid {
-                    addr: payload.publisher_addr,
-                });
-            }
-        };
-        let sig = ed25519_dalek::Signature::from_bytes(&payload.publisher_sig);
-        if identity
-            .verifying_key
-            .verify_strict(&signed_bytes, &sig)
-            .is_err()
-        {
-            return IncomingOutcome::ErrPreMutation(CommunitySyncError::PublisherSigInvalid {
-                addr: payload.publisher_addr,
-            });
-        }
+    //    This removes the old resolver gate entirely from the publish
+    //    path: a remote member whose `owner_id` actor the
+    //    `OwnerDeviceCacheResolver` could not resolve (cache keyed by
+    //    Reticulum device-hash, not owner_id) is now authenticated
+    //    directly from trusted local membership state.
+    if let Err(e) = verify_publisher_sig(&payload, &publisher_member_state) {
+        return IncomingOutcome::ErrPreMutation(e);
     }
 
     // 5. Replay-protect via per-(addr, device) RootHlcTracker.
@@ -3267,12 +3191,15 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         });
     }
 
-    // Phase A: pre-resolve identity_pubs OUTSIDE the community state
-    // lock. The resolver awaits owner_state's mutex; holding community
-    // state at the same time would create a lock-order hazard with
-    // Phase 3 IPC handlers that lock owner_state then community_state.
-    // Skip-on-error logs + drops events with unknown actor / cs
-    // identity_pubs; mirrors decrypt_inbox_entries (DM transport).
+    // Phase A: order the inner events for replay. ZEB-339 Task 9: the
+    // old per-event resolver pre-resolution (and the owner_id-miss
+    // skip-and-log that wrongly dropped valid remote events) is GONE —
+    // `verify_event` (called by `insert_event` in Phase B) derives every
+    // signer's ed25519 key itself, from the carried EnrollmentCert
+    // (Join/PendingJoin) or the actor's materialized
+    // `enrolled_device_keys` (steady-state). No identity_resolver round
+    // trip remains in the merge path, so the prior lock-order hazard with
+    // owner-state is also eliminated for this phase.
     //
     // **Replay order matters.** `BTreeMap<EventId, _>::into_values()`
     // walks in `EventId` byte order, but `insert_event` authorizes
@@ -3280,86 +3207,18 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     // already in the local log that strictly precedes the candidate by
     // `event_sort_key`. If two events arrive in the same blob and the
     // later-by-replay-order event is processed first, its earlier
-    // predecessor (still pending in our pre-resolve queue) is missing
-    // from prior_state, and a valid event can land as `Rejected`. Sort
+    // predecessor (still pending in our queue) is missing from
+    // prior_state, and a valid event can land as `Rejected`. Sort
     // explicitly by `event_sort_key` so we merge in the same order
     // `materialize` would replay.
-    let mut events_in_replay_order: Vec<SignedMembershipEvent> =
-        remote.events.into_values().collect();
-    events_in_replay_order.sort_by(|a, b| {
+    let mut resolved: Vec<SignedMembershipEvent> = remote.events.into_values().collect();
+    resolved.sort_by(|a, b| {
         crate::community_membership::event_sort_key(a)
             .cmp(&crate::community_membership::event_sort_key(b))
     });
 
-    let mut resolved: Vec<(SignedMembershipEvent, [u8; 64], Option<[u8; 64]>)> = Vec::new();
-    for event in events_in_replay_order {
-        let actor_pub = match resolver.resolve(&event.actor).await {
-            Some(p) => p,
-            None => {
-                // R4-2: PendingJoin events embed the joiner's
-                // identity_pub inline (`joiner_identity_pub`, the
-                // 64-byte X25519||Ed25519 composite). On state-root
-                // receive the resolver-backed `OwnerDeviceCache` may
-                // not yet hold an entry for a first-seen bootstrap
-                // joiner — that's the by-design bootstrap case the
-                // inline pub field exists for (mirroring
-                // `insert_local_event_with_pubs`, which fast-paths
-                // this on the IPC side; see the docs at lines
-                // 1326-1333 of this file).
-                //
-                // Fall back to the inline pub for PendingJoin only;
-                // otherwise preserve the existing skip-and-log
-                // behavior. `verify_event` for PendingJoin still
-                // cross-checks the inline pub against the actor
-                // address (P6 binding), so this fallback is safe —
-                // a forged event with a mismatching inline pub will
-                // still be rejected downstream.
-                if matches!(
-                    &event.kind,
-                    crate::community_membership::MembershipEventKind::PendingJoin { .. }
-                ) {
-                    // ZEB-339: PendingJoin no longer carries an inline
-                    // joiner_identity_pub; the joiner's enrolled device key is
-                    // proven by the carried EnrollmentCert and verified inside
-                    // verify_event. The resolver result is no longer threaded
-                    // into verify; a placeholder keeps the publisher-auth
-                    // bookkeeping below unchanged pending Task 9 rework.
-                    tracing::debug!(
-                        community_id = ?ctx.community_id,
-                        actor = ?event.actor,
-                        "R4-2: cold OwnerDeviceCache for PendingJoin actor; \
-                         enrolled-cert path handles signer resolution"
-                    );
-                    [0u8; 64]
-                } else {
-                    tracing::warn!(
-                        community_id = ?ctx.community_id,
-                        actor = ?event.actor,
-                        "skipping incoming event: unknown actor identity_pub"
-                    );
-                    continue;
-                }
-            }
-        };
-        let cs_pub: Option<[u8; 64]> = match event.countersig.as_ref() {
-            None => None,
-            Some(cs) => match resolver.resolve(&cs.signer).await {
-                Some(p) => Some(p),
-                None => {
-                    tracing::warn!(
-                        community_id = ?ctx.community_id,
-                        signer = ?cs.signer,
-                        "skipping incoming event: unknown countersigner identity_pub"
-                    );
-                    continue;
-                }
-            },
-        };
-        resolved.push((event, actor_pub, cs_pub));
-    }
-
     // Phase B: lock community state once, run insert_event for each
-    // resolved event, collect rejections for out-of-lock reporting.
+    // event, collect rejections for out-of-lock reporting.
     let mut inserted_any = false;
     let mut rejection_reports: Vec<crate::community_membership::VerifyError> = Vec::new();
     // Buffer inserted-event clones for delta emission AFTER the state
@@ -3415,7 +3274,7 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             }
         }
 
-        for (event, actor_pub, cs_pub_owned) in resolved {
+        for event in resolved {
             if state.events.contains_key(&event.id) {
                 // C1 restart-recovery: even though we've already seen this
                 // event, check whether a self-authored JoinCountersign for
@@ -3437,21 +3296,12 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
                 continue;
             }
 
-            // ZEB-254 R3 (S2): defer late-bind of admin_identity_pub until
-            // AFTER verify_event accepts the actor's event. See the matching
-            // comment in `insert_event_with_resolved_pubs` — binding pre-
-            // verify could permanently poison the OnceLock on a bad
-            // caller-supplied pub. Snapshot the "first admin event" flag
-            // here, then commit the bind only on Inserted below.
-            let admin_first_seen =
-                event.actor == ctx.admin_addr && ctx.admin_identity_pub.get().is_none();
-
-            // ZEB-339: VerifyContext no longer carries caller-resolved pubs.
-            // The resolver-based actor_pub/cs_pub resolution above remains
-            // for the publisher-auth path (Task 9 rework); it is no longer
-            // threaded into verify_event, which now resolves signers from
-            // the carried cert / materialized membership.
-            let _ = (&actor_pub, &cs_pub_owned);
+            // ZEB-339 Task 9: VerifyContext carries no caller-resolved
+            // pubs; verify_event derives signer keys from the carried
+            // cert / materialized membership. The admin_identity_pub
+            // OnceLock late-bind machinery is gone here — its value had
+            // no remaining verify-path consumer (T4 removed the
+            // PendingJoin P5 gate).
             let ctx_v = VerifyContext {
                 expected_community_id: ctx.community_id,
                 admin_addr: ctx.admin_addr,
@@ -3465,13 +3315,6 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             match state.insert_event(event, &ctx_v) {
                 InsertOutcome::Inserted => {
                     inserted_any = true;
-                    // R3 (S2): bind admin pub now that verify accepted it.
-                    // OnceLock::set returns Err on second-set — discard:
-                    // a concurrent insert may have raced us in, which is
-                    // fine (same admin, same pub).
-                    if admin_first_seen {
-                        let _ = ctx.admin_identity_pub.set(actor_pub);
-                    }
                     inserted_events.push(event_clone);
                 }
                 InsertOutcome::AlreadyKnown => {
@@ -3797,11 +3640,14 @@ pub struct CommunityRegistryConfig {
     /// than a per-call argument that could drift.
     pub self_owner: OwnerAddr,
 
-    /// Local Ed25519 signing key, shared across every spawned engine.
-    /// Wrapped in `Arc` so engine spawns are cheap (Arc bump, no
-    /// secret-byte copy). Sourced from the local `PrivateIdentity` at
-    /// `start_node` time; identical handle to the one Phase 3's
-    /// `insert_local_event` uses for membership-event signing.
+    /// ZEB-339 Task 9: ENROLLED device signing key (device #2), shared
+    /// across every spawned engine. Wrapped in `Arc` so engine spawns are
+    /// cheap (Arc bump, no secret-byte copy). Production sources this from
+    /// the loaded enrollment (`community_signing_key_arc`), NOT the
+    /// Reticulum identity key — the engine uses it for the state-root
+    /// publisher signature and the auto-emitted JoinCountersign, both of
+    /// which are verified against the signer's materialized
+    /// `enrolled_device_keys`.
     pub signing_key: Arc<ed25519_dalek::SigningKey>,
 
     /// ZEB-249 §10.6 (Phase A): optional reference to the owner-state
@@ -4819,6 +4665,121 @@ mod tests {
         async fn resolve(&self, _: &OwnerAddr) -> Option<[u8; 64]> {
             None
         }
+    }
+
+    // ---- ZEB-339 Task 9: publisher-auth via materialized enrolled keys ----
+
+    /// Build a signed `CommunityRootPublishPayload` for `publisher_addr`,
+    /// signed with `device_key` (the publisher's enrolled device key).
+    fn build_signed_publish(
+        publisher_addr: OwnerAddr,
+        device_key: &ed25519_dalek::SigningKey,
+    ) -> CommunityRootPublishPayload {
+        use crate::owner_state_crypto::canonical_cbor_encode;
+        use ed25519_dalek::Signer as _;
+        let root_cid = harmony_content::cid::ContentId::for_book(
+            b"zeb-339-publisher-auth-test-blob",
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .expect("cid");
+        let signed = CommunityRootSignedPayload {
+            root_cid,
+            publisher_addr,
+            at: crate::owner_state_types::Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "dev-1".to_string(),
+            },
+        };
+        let signed_bytes = canonical_cbor_encode(&signed).expect("encode");
+        let sig = device_key.sign(&signed_bytes).to_bytes();
+        signed.into_wire(sig, None)
+    }
+
+    /// A `MemberState` for `owner` whose `enrolled_device_keys` carries
+    /// exactly the keys in `keys`.
+    fn joined_member_with_keys(
+        keys: std::collections::BTreeSet<[u8; 32]>,
+    ) -> crate::community_membership::MemberState {
+        crate::community_membership::MemberState {
+            status: crate::community_membership::MemberStatus::Joined,
+            joined_at: crate::owner_state_types::Hlc {
+                wall_ms: 1_699_000_000_000,
+                logical: 0,
+                device_id: "dev-1".to_string(),
+            },
+            left_at: None,
+            enrolled_device_keys: keys,
+        }
+    }
+
+    #[test]
+    fn verify_publisher_sig_accepts_enrolled_device_key() {
+        let owner = crate::community_membership::mint_test_owner(0x11);
+        let payload = build_signed_publish(owner.owner, &owner.device_key);
+        let member =
+            joined_member_with_keys(crate::community_membership::test_enrolled_keys(&owner));
+
+        assert!(
+            verify_publisher_sig(&payload, &member).is_ok(),
+            "publish signed with the member's enrolled device key must verify"
+        );
+    }
+
+    #[test]
+    fn verify_publisher_sig_rejects_non_enrolled_key() {
+        let owner = crate::community_membership::mint_test_owner(0x12);
+        // Sign with a DIFFERENT key that is NOT in the enrolled set.
+        let rogue_key = ed25519_dalek::SigningKey::from_bytes(&[0x77; 32]);
+        let payload = build_signed_publish(owner.owner, &rogue_key);
+        // Member's materialized enrolled set holds only the legit device key.
+        let member =
+            joined_member_with_keys(crate::community_membership::test_enrolled_keys(&owner));
+
+        match verify_publisher_sig(&payload, &member) {
+            Err(CommunitySyncError::PublisherSigInvalid { addr }) => {
+                assert_eq!(addr, owner.owner);
+            }
+            other => panic!("expected PublisherSigInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_publisher_sig_rejects_empty_enrolled_set() {
+        let owner = crate::community_membership::mint_test_owner(0x13);
+        // Even a correctly-signed publish must be rejected if the member
+        // has no enrolled device keys materialized.
+        let payload = build_signed_publish(owner.owner, &owner.device_key);
+        let member = joined_member_with_keys(std::collections::BTreeSet::new());
+
+        match verify_publisher_sig(&payload, &member) {
+            Err(CommunitySyncError::PublisherSigInvalid { addr }) => {
+                assert_eq!(addr, owner.owner);
+            }
+            other => panic!("expected PublisherSigInvalid for empty set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_publisher_sig_rejects_tampered_payload() {
+        let owner = crate::community_membership::mint_test_owner(0x14);
+        let mut payload = build_signed_publish(owner.owner, &owner.device_key);
+        // Tamper with the signed-over HLC after signing: the recomputed
+        // canonical bytes no longer match the signature.
+        payload.at.wall_ms += 1;
+        let member =
+            joined_member_with_keys(crate::community_membership::test_enrolled_keys(&owner));
+
+        assert!(
+            matches!(
+                verify_publisher_sig(&payload, &member),
+                Err(CommunitySyncError::PublisherSigInvalid { .. })
+            ),
+            "a publish whose signed bytes were tampered must not verify"
+        );
     }
 
     /// Test fixture for ZEB-274 spawn-rollback-guard tests. Owns the

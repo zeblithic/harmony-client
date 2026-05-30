@@ -2893,7 +2893,16 @@ pub(crate) async fn start_node_inner(
                             // Both values already exist above for the
                             // DmOutbox plumbing.
                             self_owner,
-                            signing_key: std::sync::Arc::clone(&signing_key_arc),
+                            // ZEB-339 Task 9: the community sync engine signs
+                            // (1) the state-root publisher signature and
+                            // (2) the auto-emitted JoinCountersign with the
+                            // ENROLLED device key (device #2), NOT the
+                            // Reticulum identity key. Both are verified against
+                            // the publisher's / signer's materialized
+                            // `enrolled_device_keys`, so they must be produced
+                            // by device #2. (No transport use of this key in
+                            // the engine — it is only the two signing sites.)
+                            signing_key: std::sync::Arc::clone(&community_signing_key_arc),
                             // ZEB-249 §10.6 (Phase A): pass the live owner-state CRDT
                             // so every spawned engine reads the current epoch key
                             // dynamically rather than using its spawn-time capture.
