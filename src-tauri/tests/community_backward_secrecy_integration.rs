@@ -727,34 +727,44 @@ async fn stale_invite_catchup_unlocks_decryption_end_to_end() {
     use harmony_app::content_store::{ContentStore, RuntimeContentStore};
     use harmony_app::owner_state_crdt::OwnerState;
     use harmony_app::self_heal_community_observer;
-    use harmony_identity::PrivateIdentity;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
 
     let community_id = SpaceId([0x37; 16]);
 
-    // ── Identities ──────────────────────────────────────────────────────────
-    let admin_identity = PrivateIdentity::from_seed(&[0xAA; 32]);
-    let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
-    let admin_pub64 = admin_identity.identity.to_public_bytes();
-    let admin_sk_bytes = admin_identity.to_private_bytes();
-    let admin_ed_seed: [u8; 32] = admin_sk_bytes[32..64].try_into().unwrap();
-    let admin_signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&admin_ed_seed));
+    // ── Identities (ZEB-339 enrolled-device owners) ──────────────────────────
+    // actor = owner_id; events are signed by the enrolled device key (#2). The
+    // Join events carry each owner's Master cert so the engine learns their
+    // enrolled device key (epoch seal/open use the SAME device key).
+    //
+    // The 64-byte identity_pub resolved by the IdentityResolver carries the
+    // DEVICE ed25519 verifying key in bytes [32..64] (and its derived X25519 in
+    // [0..32]) — the observer seals each EpochCatchup to the recipient's X25519
+    // derived from this, and the recipient opens with their device signing key.
+    let pub64_for = |sk: &ed25519_dalek::SigningKey| -> [u8; 64] {
+        let ed = sk.verifying_key().to_bytes();
+        let x = harmony_app::dm_signing::ed25519_pub_to_x25519(&ed).expect("ed→x25519");
+        let mut out = [0u8; 64];
+        out[..32].copy_from_slice(&x);
+        out[32..].copy_from_slice(&ed);
+        out
+    };
 
-    let bob_identity = PrivateIdentity::from_seed(&[0xBB; 32]);
-    let bob_addr = OwnerAddr(bob_identity.identity.address_hash);
-    let bob_pub64 = bob_identity.identity.to_public_bytes();
-    let bob_sk_bytes = bob_identity.to_private_bytes();
-    let bob_ed_seed: [u8; 32] = bob_sk_bytes[32..64].try_into().unwrap();
-    let bob_signing_key = ed25519_dalek::SigningKey::from_bytes(&bob_ed_seed);
+    let admin = harmony_app::community_membership::mint_test_owner(0xAA);
+    let admin_addr = admin.owner;
+    let admin_signing_key = Arc::new(admin.device_key.clone());
+    let admin_pub64 = pub64_for(&admin_signing_key);
 
-    let dave_identity = PrivateIdentity::from_seed(&[0xDD; 32]);
-    let dave_addr = OwnerAddr(dave_identity.identity.address_hash);
-    let dave_pub64 = dave_identity.identity.to_public_bytes();
-    let dave_sk_bytes = dave_identity.to_private_bytes();
-    let dave_ed_seed: [u8; 32] = dave_sk_bytes[32..64].try_into().unwrap();
-    let dave_signing_key = ed25519_dalek::SigningKey::from_bytes(&dave_ed_seed);
+    let bob = harmony_app::community_membership::mint_test_owner(0xBB);
+    let bob_addr = bob.owner;
+    let bob_signing_key = bob.device_key.clone();
+    let bob_pub64 = pub64_for(&bob_signing_key);
+
+    let dave = harmony_app::community_membership::mint_test_owner(0xDD);
+    let dave_addr = dave.owner;
+    let dave_signing_key = dave.device_key.clone();
+    let dave_pub64 = pub64_for(&dave_signing_key);
 
     // ── Step 1: Epoch keys ───────────────────────────────────────────────────
     // k0: spawn-time key (the engine is spawned with this key — the observer's
@@ -849,27 +859,33 @@ async fn stale_invite_catchup_unlocks_decryption_end_to_end() {
     //   hlc(1001) admin EpochRotation (k0→k1, sealed to admin only — dave excluded)
     //   hlc(2000) dave Join (late — after rotation → pending_catchup_for)
 
-    let join_admin = make_signed_event(
-        0x01,
-        community_id,
-        admin_addr,
-        MembershipEventKind::Join,
-        100,
-        &admin_signing_key,
-    );
+    let join_admin = SignedMembershipEvent {
+        enrollment: Some(admin.cert.clone()),
+        ..make_signed_event(
+            0x01,
+            community_id,
+            admin_addr,
+            MembershipEventKind::Join,
+            100,
+            &admin_signing_key,
+        )
+    };
     engine
         .insert_local_event_with_pubs(join_admin.clone(), admin_pub64, None)
         .await
         .expect("insert admin join");
 
-    let join_bob = make_signed_event(
-        0x02,
-        community_id,
-        bob_addr,
-        MembershipEventKind::Join,
-        200,
-        &bob_signing_key,
-    );
+    let join_bob = SignedMembershipEvent {
+        enrollment: Some(bob.cert.clone()),
+        ..make_signed_event(
+            0x02,
+            community_id,
+            bob_addr,
+            MembershipEventKind::Join,
+            200,
+            &bob_signing_key,
+        )
+    };
     engine
         .insert_local_event_with_pubs(join_bob.clone(), bob_pub64, None)
         .await
@@ -920,14 +936,17 @@ async fn stale_invite_catchup_unlocks_decryption_end_to_end() {
         .expect("insert rotation");
 
     // Dave's late Join (after the rotation → pending_catchup_for in materialize).
-    let join_dave_late = make_signed_event(
-        0x04,
-        community_id,
-        dave_addr,
-        MembershipEventKind::Join,
-        2000,
-        &dave_signing_key,
-    );
+    let join_dave_late = SignedMembershipEvent {
+        enrollment: Some(dave.cert.clone()),
+        ..make_signed_event(
+            0x04,
+            community_id,
+            dave_addr,
+            MembershipEventKind::Join,
+            2000,
+            &dave_signing_key,
+        )
+    };
     engine
         .insert_local_event_with_pubs(join_dave_late.clone(), dave_pub64, None)
         .await
