@@ -2265,13 +2265,32 @@ pub fn materialize_with_now(
                                 m.pending_catchup_for.insert(event.actor);
                             }
                         } else if !expired {
+                            // ZEB-339: ingest the joiner's cert key even for an
+                            // un-countersigned PendingJoin. The PendingJoin event
+                            // is identity-introducing and carries the joiner's
+                            // cert; recording their enrolled device key here lets
+                            // their own subsequent events verify (e.g. cancelling
+                            // the pending join via Leave) before any countersign
+                            // arrives. Status stays PendingJoin, so the per-kind
+                            // authorization gates still block privileged actions.
+                            // Same SECURITY INVARIANT as the Join arm: the event
+                            // was already accepted by verify_event before reaching
+                            // the materialized log.
+                            let mut enrolled = m
+                                .members
+                                .get(&event.actor)
+                                .map(|s| s.enrolled_device_keys.clone())
+                                .unwrap_or_default();
+                            if let Some(cert) = event.enrollment.as_ref() {
+                                enrolled.insert(cert.device_pubkeys.classical.ed25519_verify);
+                            }
                             m.members.insert(
                                 event.actor,
                                 MemberState {
                                     status: MemberStatus::PendingJoin,
                                     joined_at: event.at.clone(),
                                     left_at: None,
-                                    enrolled_device_keys: BTreeSet::new(),
+                                    enrolled_device_keys: enrolled,
                                 },
                             );
                         }
