@@ -131,12 +131,14 @@ pub struct CommunityInvitePayload {
 
     /// Admin's 64-byte identity_pub (X25519_pub(32) || Ed25519_pub(32),
     /// matching `harmony_identity::Identity::to_public_bytes()`). Required
-    /// for invite-only payloads (ZEB-260) — used to verify
-    /// `admin_bootstrap` and passed into
-    /// `engine.insert_local_event_with_pubs(_, admin_identity_pub, None)`.
-    /// Bound to `admin_addr` via
-    /// `Identity::from_public_bytes(admin_identity_pub).address_hash ==
-    /// admin_addr.0`.
+    /// (present) for invite-only payloads (ZEB-260). ZEB-339: this is the
+    /// admin's RETICULUM transport pub; it is NO LONGER used to verify
+    /// `admin_bootstrap` (that now goes through the admin's EnrollmentCert
+    /// carried on the bootstrap event — see `verify_admin_bootstrap`), and
+    /// the old `address_hash(admin_identity_pub) == admin_addr` binding does
+    /// not hold under the owner/device split (admin_addr is the owner_id /
+    /// master hash). Still threaded into `insert_local_event_with_pubs`,
+    /// which ignores it post-ZEB-339.
     #[serde(
         rename = "ap",
         skip_serializing_if = "Option::is_none",
