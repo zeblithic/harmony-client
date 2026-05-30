@@ -14264,18 +14264,6 @@ mod create_community_inner_tests {
 
     // ── Fixture helper ────────────────────────────────────────────────────────
 
-    /// Extract the canonical Ed25519 signing key from a `PrivateIdentity`.
-    /// Mirrors the pattern used by all other test modules in this file.
-    fn signing_key_from_identity(
-        identity: &PrivateIdentity,
-    ) -> std::sync::Arc<ed25519_dalek::SigningKey> {
-        let sk_bytes_full = identity.to_private_bytes();
-        let ed_seed: [u8; 32] = sk_bytes_full[32..64]
-            .try_into()
-            .expect("ed25519 seed slice 32..64");
-        std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed_seed))
-    }
-
     struct CreateCommunityTestFixture {
         crdt_state: std::sync::Arc<tokio::sync::Mutex<OwnerState>>,
         hlc_tracker: std::sync::Arc<tokio::sync::Mutex<BTreeMap<String, Hlc>>>,
@@ -16821,14 +16809,23 @@ mod redeem_invite_inner_tests {
         // signing-key-derived joiner_identity_pub.
         let tmp = tempfile::TempDir::new().expect("tempdir");
 
+        // ZEB-339: the joiner is an enrolled-device owner. mint_redemption builds
+        // a PendingJoin whose actor = owner_id, signed by the device key, carrying
+        // the joiner's Master cert — verify_event resolves the signer via the cert
+        // (cert.owner_id == actor), superseding the old joiner-pub address-hash
+        // gate. A separate PrivateIdentity backs the DM-layer DmOutbox plumbing.
+        let joiner_owner = crate::community_membership::mint_test_owner(0xBB);
+        let joiner_self_owner = joiner_owner.owner;
+        let signing_key = std::sync::Arc::new(joiner_owner.device_key.clone());
         let joiner_identity = PrivateIdentity::from_seed(&[0xbb; 32]);
-        let signing_key = signing_key_from_identity(&joiner_identity);
         let admin_identity = PrivateIdentity::from_seed(&[0xaa; 32]);
         let admin_addr = OwnerAddr(admin_identity.identity.address_hash);
         let admin_pub = admin_identity.identity.to_public_bytes();
 
-        // Derive the joiner pub/addr the same way mint_redemption will.
-        let (joiner_self_owner, joiner_pub_64) = {
+        // The 64-byte joiner pub carried for the DM/transport layer (X25519 ||
+        // Ed25519 derived from the joiner's device key). Not consumed by the
+        // ZEB-339 membership signer-resolution path.
+        let joiner_pub_64 = {
             let x25519_priv = crate::dm_signing::ed25519_priv_to_x25519(&signing_key);
             let x25519_pub =
                 x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*x25519_priv));
@@ -16836,9 +16833,7 @@ mod redeem_invite_inner_tests {
             let mut combined = [0u8; 64];
             combined[..32].copy_from_slice(x25519_pub.as_bytes());
             combined[32..].copy_from_slice(&ed25519_pub);
-            let id = harmony_identity::Identity::from_public_bytes(&combined)
-                .expect("from_public_bytes (signing-key-derived joiner pub)");
-            (OwnerAddr(id.address_hash), combined)
+            combined
         };
 
         struct TwoOwnerResolver {
@@ -16895,7 +16890,10 @@ mod redeem_invite_inner_tests {
             ed25519_dalek::SigningKey::from_bytes(&test_owner_lib16712.device_key.to_bytes()),
         );
         let enrollment_cert_lib16712 = test_owner_lib16712.cert;
-        let enrollment_cert = enrollment_cert_lib16712.clone();
+        // ZEB-339: the cert passed to redeem_invite_inner is the JOINER's own
+        // cert (binds joiner_self_owner → signing_key); the DmOutbox cert above
+        // stays a separate DM-layer fixture.
+        let enrollment_cert = joiner_owner.cert.clone();
         let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new(
             "joiner-dev".into(),
             joiner_self_owner,
@@ -16997,7 +16995,10 @@ mod redeem_invite_inner_tests {
             admin_identity_pub: Some(admin_pub),
             forked_from: None,
             pre_fork_snapshot: None,
-            inviter_enrollment: None,
+            // ZEB-339: invite-only payloads must carry the inviter's
+            // EnrollmentCert. This test exercises the no-Reticulum-destinations
+            // fast-fail skip, not cert verification, so any valid cert suffices.
+            inviter_enrollment: Some(crate::community_membership::mint_test_owner(0xA1).cert),
         };
 
         let invite_url =
@@ -17277,10 +17278,15 @@ mod redeem_invite_inner_tests {
             crate::community_membership::MembershipEventKind::Join
         ));
 
-        // Self-join sig must verify against the joiner's identity_pub —
-        // the engine's verify_event runs the same check on insert.
-        crate::community_membership::verify_signature(&minted.bootstrap_join, &identity_pub)
-            .expect("self-join signature must verify against joiner identity_pub");
+        // ZEB-339: the self-join is signed by the enrolled device key (#2) and
+        // carries the joiner's Master cert; its signature resolves via the cert
+        // (owner_id → device key) — the engine's verify_event runs the same
+        // `enrolled_key_from_cert` + `verify_membership_signer` check on insert.
+        let _ = identity_pub;
+        let signer = crate::community_membership::enrolled_key_from_cert(&minted.bootstrap_join)
+            .expect("self-join cert must resolve enrolled device key");
+        crate::community_membership::verify_membership_signer(&minted.bootstrap_join, &signer)
+            .expect("self-join signature must verify against enrolled device key");
     }
 
     // ── ZEB-285 Task 7: fork-invite carry tests ────────────────────────────────

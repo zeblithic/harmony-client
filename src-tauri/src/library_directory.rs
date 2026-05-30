@@ -1427,7 +1427,10 @@ mod tests {
             admin_identity_pub: Some([0u8; 64]),
             forked_from: None,
             pre_fork_snapshot: None,
-            inviter_enrollment: None,
+            // ZEB-339: invite-only payloads must carry the inviter's
+            // EnrollmentCert. The directory rejects invite-only entries at
+            // verify time regardless of cert content, so any valid cert suffices.
+            inviter_enrollment: Some(crate::community_membership::mint_test_owner(0xA1).cert),
         };
         encode_invite_url(&payload).expect("encode invite-only url")
     }
@@ -2678,7 +2681,9 @@ mod tests {
             admin_identity_pub: Some(admin_identity.identity.to_public_bytes()),
             forked_from: None,
             pre_fork_snapshot: None,
-            inviter_enrollment: None,
+            // ZEB-339: invite-only payloads must carry the inviter's
+            // EnrollmentCert; rejected at receive regardless of cert content.
+            inviter_enrollment: Some(crate::community_membership::mint_test_owner(0xA2).cert),
         };
         let invite_url = encode_invite_url(&payload).expect("encode invite-only url");
 
