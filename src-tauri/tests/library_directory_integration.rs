@@ -863,6 +863,8 @@ async fn click_to_join_redeem_invite_smoke() {
         "joiner-dev".into(),
         joiner_owner,
         Arc::clone(&joiner_signing_key),
+        // ZEB-339: synthetic cert (compile/wiring only — allowed-RED until Task 10).
+        harmony_app::community_membership::mint_test_owner(0).cert,
         Arc::clone(&community_registry),
         community_adapter_tx,
         unicast_send_tx,

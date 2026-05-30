@@ -141,6 +141,8 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
         false, // open
         alice_addr,
         &alice_signing,
+        // ZEB-339: synthetic cert (compile/wiring only — allowed-RED until Task 10).
+        &harmony_app::community_membership::mint_test_owner(0).cert,
         bootstrap_hlc,
     )
     .expect("mint_community_creation");
@@ -229,6 +231,8 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
             &invite_payload,
             target_addr,
             target_signing,
+            // ZEB-339: synthetic cert (compile/wiring only — allowed-RED until Task 10).
+            &harmony_app::community_membership::mint_test_owner(0).cert,
             target_join_hlc,
         )
         .expect("mint_redemption");

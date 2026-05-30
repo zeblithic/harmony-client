@@ -311,6 +311,8 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         true,
         alice_addr,
         alice_sk.as_ref(),
+        // ZEB-339: synthetic cert (compile/wiring only — allowed-RED until Task 10).
+        &harmony_app::community_membership::mint_test_owner(0).cert,
         Hlc {
             wall_ms: 100_000,
             logical: 0,
@@ -499,6 +501,8 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         "bob-dev".into(),
         bob_addr,
         Arc::clone(&bob_sk),
+        // ZEB-339: synthetic cert (compile/wiring only — allowed-RED until Task 10).
+        harmony_app::community_membership::mint_test_owner(0).cert,
         Arc::clone(&registry_b),
         bob_adapter_tx,
         bob_unicast_tx,

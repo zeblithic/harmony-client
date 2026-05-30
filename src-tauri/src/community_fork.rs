@@ -406,10 +406,16 @@ pub async fn fork_community(
     // Uses create_community_inner with is_invite_only=false (fork can set
     // its own access policy post-creation; Task 8 may extend this).
     //
-    // We need the signing_key Arc for create_community_inner + snapshot sig.
-    let signing_key = {
+    // ZEB-339: the fork's bootstrap Join + #general ChannelCreate are
+    // community-membership events — sign with the enrolled device key (#2).
+    // The bootstrap Join is identity-introducing → carries this device's own
+    // EnrollmentCert; the ChannelCreate is steady-state → no cert.
+    let (signing_key, enrollment_cert) = {
         let outbox_g = dm_outbox.lock().await;
-        std::sync::Arc::clone(&outbox_g.signing_key)
+        (
+            std::sync::Arc::clone(&outbox_g.community_signing_key),
+            outbox_g.enrollment_cert.clone(),
+        )
     };
 
     // Mint the fork community — this internally generates the fork SpaceId.
@@ -442,6 +448,7 @@ pub async fn fork_community(
         false, // is_invite_only = false (fork starts open; Task 8 can extend)
         self_owner,
         signing_key.as_ref(),
+        &enrollment_cert,
         fork_hlc_for_create,
     )?;
 
@@ -706,11 +713,13 @@ pub async fn fork_community(
         // (Fix: PR #122 round-2 bot review — early return was wrong.)
         let maybe_fork_event = {
             let outbox_g = dm_outbox.lock().await;
+            // ZEB-339: Fork is a steady-state community-membership event in the
+            // original community — enrolled device key (#2), no cert.
             match mint_fork_event(
                 original_id,
                 self_owner,
                 fork_space_id,
-                outbox_g.signing_key.as_ref(),
+                outbox_g.community_signing_key.as_ref(),
                 fork_event_hlc,
             ) {
                 Ok(e) => Some(e),
@@ -856,10 +865,12 @@ pub async fn fork_community(
             // in Step 9 still runs. (Fix: PR #122 round-2 bot review.)
             let maybe_leave_event = {
                 let outbox_g = dm_outbox.lock().await;
+                // ZEB-339: Leave is a steady-state community-membership event —
+                // enrolled device key (#2), no cert.
                 match crate::mint_leave_event(
                     original_id,
                     self_owner,
-                    outbox_g.signing_key.as_ref(),
+                    outbox_g.community_signing_key.as_ref(),
                     leave_hlc,
                 ) {
                     Ok(e) => Some(e),

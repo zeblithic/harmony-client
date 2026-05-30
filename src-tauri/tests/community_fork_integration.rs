@@ -170,6 +170,8 @@ async fn run_fork_inner(
         false,
         forker_addr,
         signing_key.as_ref(),
+        // ZEB-339: synthetic cert (compile/wiring only — allowed-RED until Task 10).
+        &harmony_app::community_membership::mint_test_owner(0).cert,
         hlc.clone(),
     )
     .expect("mint_community_creation");

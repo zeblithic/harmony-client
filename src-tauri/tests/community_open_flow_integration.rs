@@ -150,6 +150,7 @@ async fn open_community_create_redeem_leave_round_trip() {
         false,
         owner_a,
         &signing_a,
+        &harmony_app::community_membership::mint_test_owner(0).cert,
         Hlc {
             wall_ms: 100_000,
             logical: 0,
@@ -301,6 +302,7 @@ async fn open_community_create_redeem_leave_round_trip() {
         &invite_payload,
         owner_b,
         &signing_b,
+        &harmony_app::community_membership::mint_test_owner(0).cert,
         Hlc {
             wall_ms: 200_000,
             logical: 0,
@@ -485,6 +487,7 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         false,
         owner_a,
         &signing_a,
+        &harmony_app::community_membership::mint_test_owner(0).cert,
         Hlc {
             wall_ms: 100_000,
             logical: 0,
@@ -622,6 +625,7 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         &invite_payload,
         owner_b,
         &signing_b,
+        &harmony_app::community_membership::mint_test_owner(0).cert,
         Hlc {
             wall_ms: 200_000,
             logical: 0,
@@ -671,8 +675,14 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         m
     }));
     let redeem2_hlc = reserve_next_hlc_for_device(&redeem2_tracker, "b-dev", 300_000).await;
-    let minted_b2 =
-        mint_redemption(&invite_payload, owner_b, &signing_b, redeem2_hlc).expect("mint redeem #2");
+    let minted_b2 = mint_redemption(
+        &invite_payload,
+        owner_b,
+        &signing_b,
+        &harmony_app::community_membership::mint_test_owner(0).cert,
+        redeem2_hlc,
+    )
+    .expect("mint redeem #2");
     assert_ne!(
         minted_b2.bootstrap_join.id, minted_b1.bootstrap_join.id,
         "second redemption must mint a fresh event_id"

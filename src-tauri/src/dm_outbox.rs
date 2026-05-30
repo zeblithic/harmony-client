@@ -427,15 +427,10 @@ pub struct DmOutbox {
     /// ZEB-339: the harmony-owner ENROLLED device signing key (#2). Distinct
     /// from `signing_key` (the Reticulum/transport key, #3). Community
     /// membership events sign with this; DM/transport keep `signing_key`.
-    // Task 7 will read this field for community-event signing; allow dead_code
-    // until that wiring lands.
-    #[allow(dead_code)]
     pub(crate) community_signing_key: Arc<ed25519_dalek::SigningKey>,
     /// ZEB-339: this device's own Master EnrollmentCert (owner_id -> device #2),
     /// attached to outbound identity-introducing events (bootstrap/redeem Join,
     /// PendingJoin).
-    // Task 7 will read this field for attaching the cert to community events.
-    #[allow(dead_code)]
     pub(crate) enrollment_cert: harmony_owner::certs::EnrollmentCert,
     in_flight: HashSet<(OutboxEntryId, OwnerAddr)>,
     backoff: HashMap<(OutboxEntryId, OwnerAddr), AttemptState>,

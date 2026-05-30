@@ -148,6 +148,42 @@ pub fn build_signed_payload(
     })
 }
 
+/// ZEB-339: sign a fresh `ReachabilityAnnouncePayload`'s inner
+/// `identity_signature` with the harmony-owner ENROLLED device key (#2).
+///
+/// T4 rewired RCH2 verification to check the inner `identity_signature`
+/// against the resolved enrolled device key (not the Reticulum identity),
+/// so the production reachability mint MUST sign the inner sig with device
+/// #2. Caller is responsible for ensuring `actor` matches the enrolled
+/// device key's owner.
+pub fn build_signed_payload_with_key(
+    iroh_node_id: [u8; 32],
+    home_relay_url: String,
+    direct_addresses: Vec<SocketAddr>,
+    announced_at_ms: u64,
+    actor: &OwnerAddr,
+    hlc: &Hlc,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<ReachabilityAnnouncePayload, CryptoError> {
+    use ed25519_dalek::Signer;
+    let inner = inner_signed_bytes(
+        &iroh_node_id,
+        &home_relay_url,
+        &direct_addresses,
+        announced_at_ms,
+        actor,
+        hlc,
+    )?;
+    let sig = signing_key.sign(&inner).to_bytes();
+    Ok(ReachabilityAnnouncePayload {
+        iroh_node_id,
+        home_relay_url,
+        direct_addresses,
+        announced_at_ms,
+        identity_signature: sig,
+    })
+}
+
 /// Verify the inner identity signature against the given Ed25519
 /// verifying key — the 32-byte Ed25519 half of the 64-byte
 /// `harmony_identity::Identity::to_public_bytes()`.

@@ -1988,6 +1988,8 @@ async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
         "test-dev".into(),
         self_owner,
         Arc::clone(&signing_key),
+        // ZEB-339: synthetic cert (compile/wiring only — allowed-RED until Task 10).
+        harmony_app::community_membership::mint_test_owner(0).cert,
         Arc::clone(&registry),
         adapter_tx,
         channel_log_registry,
@@ -2174,6 +2176,7 @@ mod task3_kick_setpower_round_trip {
             false,
             owner_a,
             &signing_a,
+            &harmony_app::community_membership::mint_test_owner(0).cert,
             Hlc {
                 wall_ms: 100_000,
                 logical: 0,
@@ -2304,6 +2307,7 @@ mod task3_kick_setpower_round_trip {
             &invite_payload,
             owner_b,
             &signing_b,
+            &harmony_app::community_membership::mint_test_owner(0).cert,
             Hlc {
                 wall_ms: 200_000,
                 logical: 0,
@@ -2753,6 +2757,8 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
         "bob-dev".into(),
         bob_addr,
         Arc::clone(&bob_signing_key),
+        // ZEB-339: synthetic cert (compile/wiring only — allowed-RED until Task 10).
+        harmony_app::community_membership::mint_test_owner(0).cert,
         Arc::clone(&registry),
         adapter_tx,
         unicast_tx,
