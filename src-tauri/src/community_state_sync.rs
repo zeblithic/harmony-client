@@ -1779,8 +1779,8 @@ async fn spawn_auto_counter_sign_task(
     signing_key: Arc<ed25519_dalek::SigningKey>,
     device_id: String,
     state: Arc<Mutex<CommunityState>>,
-    admin_identity_pub: Arc<std::sync::OnceLock<[u8; 64]>>,
-    identity_resolver: Option<Arc<dyn IdentityResolver>>,
+    _admin_identity_pub: Arc<std::sync::OnceLock<[u8; 64]>>,
+    _identity_resolver: Option<Arc<dyn IdentityResolver>>,
     is_invite_only: bool,
     notify_dirty: Arc<Notify>,
     has_pending_dirty: Arc<AtomicBool>,
@@ -1823,30 +1823,6 @@ async fn spawn_auto_counter_sign_task(
         return;
     }
 
-    // --- Resolve self's 64-byte identity pub (async, no lock held). ---
-    let self_pub: [u8; 64] = match identity_resolver.as_deref() {
-        Some(resolver) => match resolver.resolve(&self_owner).await {
-            Some(p) => p,
-            None => {
-                tracing::warn!(
-                    community_id = ?community_id,
-                    self_owner = ?self_owner,
-                    "ZEB-254 auto-counter-sign: identity_resolver returned None for self; \
-                     skipping JoinCountersign"
-                );
-                return;
-            }
-        },
-        None => {
-            tracing::warn!(
-                community_id = ?community_id,
-                "ZEB-254 auto-counter-sign: no identity_resolver configured; \
-                 skipping JoinCountersign"
-            );
-            return;
-        }
-    };
-
     // --- Build a HLC for the new event (wall-time, logical 0, self device). ---
     let wall_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1887,9 +1863,9 @@ async fn spawn_auto_counter_sign_task(
     // We bypass `insert_local_event` to avoid needing an Arc<CommunitySyncEngine>
     // back-reference (which would create a reference cycle). The insert uses
     // the same VerifyContext shape as `insert_event_with_resolved_pubs`.
-    // ZEB-339: signer resolved from materialized membership; self_pub /
-    // admin_identity_pub no longer feed the slim VerifyContext.
-    let _ = (&self_pub, &admin_identity_pub);
+    // ZEB-339: signer resolved from materialized enrolled keys (learned from
+    // cert-bearing Join events); the identity_resolver is not consulted because
+    // it caches Reticulum-keyed pubs and misses for owner_id actors.
     let ctx_v = crate::community_membership::VerifyContext {
         expected_community_id: community_id,
         admin_addr,
