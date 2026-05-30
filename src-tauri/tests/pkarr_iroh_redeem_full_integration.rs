@@ -212,18 +212,52 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
 
     tokio::time::timeout(Duration::from_secs(60), async {
         // ── 1. Identities. ───────────────────────────────────────────────
+        // ZEB-339 dual-identity model: each party has TWO identities.
+        //   - Community identity  = mint_test_owner(seed) → owner (OwnerAddr),
+        //     device_key (SigningKey #2), cert (EnrollmentCert). Used as the
+        //     community actor, to sign all community-membership events, and as
+        //     the DmOutbox community_signing_key + enrollment_cert.
+        //   - Transport identity  = PrivateIdentity::from_seed (Reticulum).
+        //     Used for iroh endpoints, DeviceIdentityHash, and DmOutbox
+        //     signing_key (Reticulum transport layer).
+
+        // Transport identities (Reticulum).
         let alice_identity = PrivateIdentity::from_seed(&[0xa1; 32]);
         let bob_identity = PrivateIdentity::from_seed(&[0xb2; 32]);
+        // Transport signing keys (Reticulum) — used for pkarr, DmOutbox.signing_key,
+        // and joiner_identity_pub derivation in the iroh handshake packet.
         let alice_sk = Arc::new(signing_key_from(&alice_identity));
         let bob_sk = Arc::new(signing_key_from(&bob_identity));
+        // Reticulum composite pubs: still needed for pkarr
+        // (PkarrInvitePublisher + admin_identity_pub in payload).
+        let (alice_transport_addr, alice_pub) = derive_composite_owner(&alice_sk);
+        let (bob_transport_addr, bob_pub) = derive_composite_owner(&bob_sk);
 
-        let (alice_addr, alice_pub) = derive_composite_owner(&alice_sk);
-        let (bob_addr, bob_pub) = derive_composite_owner(&bob_sk);
+        // Community identities (ZEB-339 owner model).
+        let alice_comm = harmony_app::community_membership::mint_test_owner(0xA1);
+        let bob_comm = harmony_app::community_membership::mint_test_owner(0xB2);
+        let alice_comm_sk = Arc::new(ed25519_dalek::SigningKey::from_bytes(
+            &alice_comm.device_key.to_bytes(),
+        ));
+        let bob_comm_sk = Arc::new(ed25519_dalek::SigningKey::from_bytes(
+            &bob_comm.device_key.to_bytes(),
+        ));
+        // Community owner addresses (used as community actor).
+        let alice_addr = alice_comm.owner;
+        let bob_addr = bob_comm.owner;
 
+        // Identity resolver: uses community owner addresses; the 64-byte pub
+        // is not used by the cert-based ZEB-339 verify path but is kept for
+        // structural compat (the Reticulum composite pubs serve double duty
+        // here since the resolver is queried by OwnerAddr, which under
+        // dual-identity is the community owner addr, not the Reticulum addr).
         let resolver: Arc<dyn IdentityResolver> = Arc::new(TwoIdentityResolver {
-            alice: (alice_addr, alice_pub),
-            bob: (bob_addr, bob_pub),
+            alice: (alice_addr, [0u8; 64]),
+            bob: (bob_addr, [0u8; 64]),
         });
+
+        // Suppress unused-variable warnings for the transport addrs.
+        let _ = (alice_transport_addr, bob_transport_addr);
 
         // ── 2. Iroh endpoints + link managers (one per "process"). ──────
         let alice_ep = build_hermetic_endpoint().await;
@@ -259,13 +293,15 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
         let _bob_accept = bob_link_mgr.spawn_accept_loop();
 
         // ── 3. Alice's community + engine. ──────────────────────────────
+        // ZEB-339: use alice_comm.owner as actor, alice_comm.device_key as signer,
+        // and alice_comm.cert as the EnrollmentCert. The bootstrap_join will carry
+        // alice_comm.cert so verify_admin_bootstrap passes (cert.owner_id == actor).
         let alice_minted = harmony_app::mint_community_creation(
             "OptionAHandshakeCommunity",
             true,
             alice_addr,
-            alice_sk.as_ref(),
-            // ZEB-339: synthetic cert (compile/wiring only — allowed-RED until Task 10).
-            &harmony_app::community_membership::mint_test_owner(0).cert,
+            alice_comm_sk.as_ref(),
+            &alice_comm.cert,
             Hlc {
                 wall_ms: 100_000,
                 logical: 0,
@@ -288,6 +324,10 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
         let dir_alice = tempfile::tempdir().expect("alice tempdir");
         let dir_bob = tempfile::tempdir().expect("bob tempdir");
 
+        // ZEB-339: registries use the community owner addr and device signing key.
+        // The auto-counter-sign task reads signing_key from the engine config
+        // (sourced from registry.cfg), so alice's JoinCountersign will be
+        // signed by alice_comm_sk and bear actor == alice_comm.owner.
         let registry_alice = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
             device_id: "alice-dev".into(),
             content_store: Arc::clone(&cs_alice),
@@ -297,7 +337,7 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             error_tx: None,
             delta_tx: None,
             self_owner: alice_addr,
-            signing_key: Arc::clone(&alice_sk),
+            signing_key: Arc::clone(&alice_comm_sk),
             crdt_state: None,
             nav_emitter: None,
         }));
@@ -310,12 +350,13 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             error_tx: None,
             delta_tx: None,
             self_owner: bob_addr,
-            signing_key: Arc::clone(&bob_sk),
+            signing_key: Arc::clone(&bob_comm_sk),
             crdt_state: None,
             nav_emitter: None,
         }));
 
         // Spawn Alice's engine + insert her bootstrap Join.
+        // admin_addr = alice_addr (community owner), matching alice_minted.bootstrap_join.actor.
         let (alice_pub_tx, _alice_pub_rx) = mpsc::channel::<Vec<u8>>(64);
         let (_alice_sub_tx, alice_sub_rx) = mpsc::channel::<Vec<u8>>(64);
         registry_alice
@@ -333,6 +374,9 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             .engine_arc(&community_id)
             .await
             .expect("alice engine arc");
+        // bind_admin_identity_pub: the _admin_identity_pub param in
+        // spawn_auto_counter_sign_task is unused (ZEB-339 cert path), so the
+        // exact bytes here don't affect correctness. Kept for structural parity.
         alice_engine.bind_admin_identity_pub(alice_pub);
         alice_engine
             .insert_local_event(alice_minted.bootstrap_join.clone())
@@ -340,28 +384,23 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             .expect("alice bootstrap insert");
 
         // ── 4. Alice's dm_outbox + crdt_state (acceptor dependencies). ──
-        // ZEB-339: supply synthetic community_signing_key + enrollment_cert.
-        let alice_test_owner_pkarr = harmony_app::community_membership::mint_test_owner(0xD9);
-        let alice_community_sk_pkarr = Arc::new(ed25519_dalek::SigningKey::from_bytes(
-            &alice_test_owner_pkarr.device_key.to_bytes(),
-        ));
-        let alice_enrollment_pkarr = alice_test_owner_pkarr.cert;
-        // Clone the cert before it is moved into DmOutbox; the invite
-        // payload below also needs it for inviter_enrollment.
-        let alice_enrollment_for_invite = alice_enrollment_pkarr.clone();
-        // ZEB-339: use new_synthetic because this test still uses synthetic
-        // enrollment material (cert owner_id ≠ alice_addr — a Reticulum-derived
-        // address). This wiring is intentionally incomplete and marked as
-        // "allowed-RED until Task 10". Production paths use DmOutbox::new
-        // with fully consistent mint_test_owner or LoadedOwnerState material.
-        let alice_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new_synthetic(
+        // ZEB-339 dual-identity DmOutbox wiring:
+        //   self_owner            = alice_comm.owner  (community actor)
+        //   signing_key           = alice_sk          (Reticulum transport — unchanged)
+        //   community_signing_key = alice_comm_sk     (enrolled device #2 key)
+        //   enrollment_cert       = alice_comm.cert   (cert.owner_id == alice_addr ✓)
+        // The three DmOutbox::new debug_asserts all pass:
+        //   ① cert.verify() ✓  ② cert.owner_id == alice_addr ✓
+        //   ③ cert.device_pubkeys.classical.ed25519_verify == alice_comm_sk.verifying_key() ✓
+        let alice_enrollment_for_invite = alice_comm.cert.clone();
+        let alice_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
             "alice-dev".into(),
             alice_addr,
             DeviceIdentityHash(alice_identity.identity.address_hash),
             Arc::clone(&alice_sk),
             Arc::new(dup_identity(&alice_identity)),
-            alice_community_sk_pkarr,
-            alice_enrollment_pkarr,
+            Arc::clone(&alice_comm_sk),
+            alice_comm.cert.clone(),
         )));
         let alice_crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
 
@@ -419,27 +458,28 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             }
         });
 
-        // ZEB-339: supply synthetic community_signing_key + enrollment_cert for Bob.
-        let bob_test_owner_pkarr = harmony_app::community_membership::mint_test_owner(0xDA);
-        let bob_community_sk_pkarr = Arc::new(ed25519_dalek::SigningKey::from_bytes(
-            &bob_test_owner_pkarr.device_key.to_bytes(),
-        ));
-        let bob_enrollment_pkarr = bob_test_owner_pkarr.cert;
-        // ZEB-339: same new_synthetic rationale as alice above — synthetic
-        // cert owner_id ≠ bob_addr (a Reticulum-derived address).
-        let bob_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new_synthetic(
+        // ZEB-339 dual-identity DmOutbox wiring for Bob:
+        //   self_owner            = bob_comm.owner  (community actor)
+        //   signing_key           = bob_sk          (Reticulum transport — unchanged)
+        //   community_signing_key = bob_comm_sk     (enrolled device #2 key)
+        //   enrollment_cert       = bob_comm.cert   (cert.owner_id == bob_addr ✓)
+        // redeem_invite_inner_with_overrides reads dm_outbox.signing_key for
+        // the Reticulum joiner_identity_pub derivation, and bob_comm_sk/cert
+        // flow through via the top-level signing_key/enrollment_cert params.
+        let bob_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
             "bob-dev".into(),
             bob_addr,
             DeviceIdentityHash(bob_identity.identity.address_hash),
             Arc::clone(&bob_sk),
             Arc::new(dup_identity(&bob_identity)),
-            bob_community_sk_pkarr,
-            bob_enrollment_pkarr,
+            Arc::clone(&bob_comm_sk),
+            bob_comm.cert.clone(),
         )));
 
         let (bob_channel_log_adapter_tx, _bob_channel_log_adapter_rx) =
             mpsc::unbounded_channel::<ChannelLogAdapterRequest>();
         let bob_app = tauri::test::mock_app();
+        // ZEB-339: channel log registry uses community owner addr and device key.
         let bob_channel_log_registry =
             Arc::new(ChannelLogRegistry::new(ChannelLogRegistryConfig {
                 adapter_request_tx: bob_channel_log_adapter_tx,
@@ -447,7 +487,7 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
                 identity_dir: dir_bob.path().to_path_buf(),
                 self_owner: bob_addr,
                 self_device_id: "bob-dev".into(),
-                signing_key: Arc::clone(&bob_sk),
+                signing_key: Arc::clone(&bob_comm_sk),
                 engine_config: ChannelLogEngineConfig::default(),
             }));
 
@@ -456,10 +496,11 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
 
         // ZEB-325 PR #159 R6 (Cursor HIGH): pre-populate bob's owner_device_cache
         // with a fabricated alice device so `resolve_destinations_for_owner`
-        // returns non-empty for alice_addr. This simulates "stale Reticulum
-        // DM cache from prior interactions" — the exact condition that, pre-
-        // fix, would have driven the iroh-redeem path into the Reticulum
+        // returns non-empty for alice_addr (community owner addr). This simulates
+        // "stale Reticulum DM cache from prior interactions" — the exact condition
+        // that, pre-fix, would have driven the iroh-redeem path into the Reticulum
         // fan-out branch and Err'd if every try_send failed.
+        // ZEB-339: key is alice_addr (community owner), matching payload.admin_addr.
         {
             let mut g = bob_crdt_state.lock().await;
             g.owner_device_cache.devices.insert(
@@ -480,6 +521,8 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
         // directly. The IPC's iroh dial uses the routing record from the
         // pkarr-verified ReachabilityAnnouncePayload it decoded; bypassing
         // the pkarr step keeps this test focused on the wire handshake.
+        // ZEB-339: seed key is alice_addr (community owner), matching
+        // payload.admin_addr which the IPC uses as inviter_addr.
         let alice_routing = ReachabilityAnnouncePayload {
             iroh_node_id: *alice_ep.node_id().as_bytes(),
             home_relay_url: alice_ep
@@ -499,6 +542,11 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             .await;
 
         // ── 6. Build the invite URL (invite-only). ──────────────────────
+        // ZEB-339: InviteToken.inviter = alice_comm.owner (community actor).
+        // The token is signed with alice_comm_sk (enrolled device #2 key).
+        // P5 verify_invite_token_sig_with_enrolled resolves alice's enrolled
+        // device key from materialized membership (populated after her
+        // bootstrap Join is inserted) and verifies against alice_comm_sk.
         let token_minted_at = Hlc {
             wall_ms: 100_500,
             logical: 0,
@@ -513,7 +561,7 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
         };
         let token_payload_bytes =
             canonical_invite_token_bytes(&invite_token_unsigned).expect("canonical token bytes");
-        let token_sig: [u8; 64] = alice_sk.sign(&token_payload_bytes).to_bytes();
+        let token_sig: [u8; 64] = alice_comm_sk.sign(&token_payload_bytes).to_bytes();
         let invite_token = InviteToken {
             inviter: alice_addr,
             invitee_hint: Some(bob_addr),
@@ -522,10 +570,14 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             sig: token_sig,
         };
 
+        // ZEB-339: seal epoch key to Bob's community device key's x25519 pub.
+        // mint_redemption decrypts the sealed_epoch_key using ed25519_priv_to_x25519
+        // applied to the `signing_key` param (= bob_comm_sk here). So the seal
+        // target must derive from bob_comm_sk, NOT from bob_sk (Reticulum).
         let bob_x25519_pub = {
-            let verifying_bytes = bob_sk.verifying_key().to_bytes();
+            let verifying_bytes = bob_comm_sk.verifying_key().to_bytes();
             harmony_app::dm_signing::ed25519_pub_to_x25519(&verifying_bytes)
-                .expect("bob ed25519→x25519")
+                .expect("bob_comm ed25519→x25519")
         };
         let sealed_epoch_key = harmony_app::dm_signing::seal_to_owner(
             &bob_x25519_pub,
@@ -533,6 +585,10 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
         )
         .expect("seal epoch key to bob");
 
+        // ZEB-339: invite payload uses community actor addresses throughout.
+        // admin_identity_pub still carries the Reticulum composite pub (alice_pub)
+        // because pkarr step 6 (verify_identity_match) checks it against the
+        // pkarr record's harmony_identity_pub, which is signed by alice_sk.
         let invite_payload = CommunityInvitePayload {
             community_id,
             epoch_snapshot: InviteEpochSnapshot {
@@ -546,13 +602,14 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             expires_at: None,
             invite_token: Some(invite_token),
             admin_bootstrap: Some(alice_minted.bootstrap_join.clone()),
+            // admin_identity_pub = Reticulum composite pub; used only for the
+            // pkarr verify_identity_match check (step 6) — not for membership.
             admin_identity_pub: Some(alice_pub),
             forked_from: None,
             pre_fork_snapshot: None,
-            // ZEB-339: invite-only payloads REQUIRE an inviter EnrollmentCert
-            // (encode_invite_url returns Err otherwise). Use Alice's enrolled-
-            // device cert (same cert that backs her DmOutbox) so the joiner
-            // can verify the inviter's owner→device binding.
+            // ZEB-339: invite-only payloads REQUIRE an inviter EnrollmentCert.
+            // alice_enrollment_for_invite = alice_comm.cert (cert.owner_id == alice_addr),
+            // so enrolled_key_from_cert will successfully bind the cert to the actor.
             inviter_enrollment: Some(alice_enrollment_for_invite),
         };
         let invite_url =
@@ -622,6 +679,11 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
         let nav_emits: Arc<Mutex<Vec<harmony_app::NavUpdatedPayload>>> =
             Arc::new(Mutex::new(Vec::new()));
         let nav_emits_sink = Arc::clone(&nav_emits);
+        // ZEB-339: self_owner = bob_comm.owner, signing_key = bob_comm_sk,
+        // enrollment_cert = bob_comm.cert. mint_redemption uses signing_key
+        // to sign Bob's PendingJoin event (actor = self_owner = bob_comm.owner)
+        // and enrollment_cert to attach the cert. The dm_outbox.signing_key
+        // (= bob_sk, Reticulum) is used for joiner_identity_pub derivation.
         let outcome = harmony_app::connectivity_redeem_invite_iroh_inner(
             invite_url,
             Some(Arc::clone(&pkarr_resolver)),
@@ -631,9 +693,8 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             Arc::clone(&bob_hlc_tracker),
             "bob-dev".to_string(),
             bob_addr,
-            Arc::clone(&bob_sk),
-            // ZEB-339: synthetic cert (compile/wiring only — allowed-RED until Task 10).
-            harmony_app::community_membership::mint_test_owner(0).cert,
+            Arc::clone(&bob_comm_sk),
+            bob_comm.cert.clone(),
             Arc::clone(&registry_bob),
             bob_adapter_tx,
             bob_unicast_tx,
