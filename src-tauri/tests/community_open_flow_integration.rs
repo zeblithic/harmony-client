@@ -26,7 +26,6 @@ use harmony_app::{
     delta_to_change, member_info_for, mint_community_creation, mint_leave_event, mint_redemption,
     MemberStatusDto, MembershipChangeType,
 };
-use harmony_identity::PrivateIdentity;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,33 +66,20 @@ where
     }
 }
 
-/// Reach into `PrivateIdentity`'s ed25519 seed the same way production
-/// does (see `lib.rs::start_node` and Task 9's unit test): the canonical
-/// 32-byte seed lives in bytes 32..64 of `to_private_bytes()`
-/// (`X25519_secret(32) || Ed25519_secret(32)`). Construct an
-/// `ed25519_dalek::SigningKey` from those bytes so the test signs with
-/// the same key the IPC will use in production.
-fn signing_key_from(identity: &PrivateIdentity) -> ed25519_dalek::SigningKey {
-    let private_bytes = identity.to_private_bytes();
-    let mut secret = [0u8; 32];
-    secret.copy_from_slice(&private_bytes[32..64]);
-    ed25519_dalek::SigningKey::from_bytes(&secret)
-}
-
 #[tokio::test]
 async fn open_community_create_redeem_leave_round_trip() {
-    let identity_a = PrivateIdentity::from_seed(&[0xa1; 32]);
-    let identity_b = PrivateIdentity::from_seed(&[0xb2; 32]);
-    let owner_a = OwnerAddr(identity_a.identity.address_hash);
-    let owner_b = OwnerAddr(identity_b.identity.address_hash);
-    let pub_a = identity_a.identity.to_public_bytes();
-    let pub_b = identity_b.identity.to_public_bytes();
-    let signing_a = signing_key_from(&identity_a);
-    let signing_b = signing_key_from(&identity_b);
+    let owner_a_test = harmony_app::community_membership::mint_test_owner(0xA1);
+    let owner_b_test = harmony_app::community_membership::mint_test_owner(0xB2);
+    let owner_a = owner_a_test.owner;
+    let owner_b = owner_b_test.owner;
+    let signing_a = owner_a_test.device_key.clone();
+    let signing_b = owner_b_test.device_key.clone();
 
+    // ZEB-339: signer resolution uses the EnrollmentCert / materialized enrolled
+    // keys, not the resolver — resolver identity_pubs unused for membership.
     let resolver: Arc<dyn IdentityResolver> = Arc::new(TwoIdentityResolver {
-        a: (owner_a, pub_a),
-        b: (owner_b, pub_b),
+        a: (owner_a, [0u8; 64]),
+        b: (owner_b, [0u8; 64]),
     });
 
     // Shared in-memory CAS servicer — A and B route their
@@ -150,7 +136,7 @@ async fn open_community_create_redeem_leave_round_trip() {
         false,
         owner_a,
         &signing_a,
-        &harmony_app::community_membership::mint_test_owner(0).cert,
+        &owner_a_test.cert,
         Hlc {
             wall_ms: 100_000,
             logical: 0,
@@ -303,7 +289,7 @@ async fn open_community_create_redeem_leave_round_trip() {
         &invite_payload,
         owner_b,
         &signing_b,
-        &harmony_app::community_membership::mint_test_owner(0).cert,
+        &owner_b_test.cert,
         Hlc {
             wall_ms: 200_000,
             logical: 0,
@@ -425,18 +411,18 @@ async fn open_community_create_redeem_leave_round_trip() {
 /// critical state-correctness invariant the fix preserves.
 #[tokio::test]
 async fn redeem_invite_twice_does_not_corrupt_state() {
-    let identity_a = PrivateIdentity::from_seed(&[0xa3; 32]);
-    let identity_b = PrivateIdentity::from_seed(&[0xb4; 32]);
-    let owner_a = OwnerAddr(identity_a.identity.address_hash);
-    let owner_b = OwnerAddr(identity_b.identity.address_hash);
-    let pub_a = identity_a.identity.to_public_bytes();
-    let pub_b = identity_b.identity.to_public_bytes();
-    let signing_a = signing_key_from(&identity_a);
-    let signing_b = signing_key_from(&identity_b);
+    let owner_a_test = harmony_app::community_membership::mint_test_owner(0xA3);
+    let owner_b_test = harmony_app::community_membership::mint_test_owner(0xB4);
+    let owner_a = owner_a_test.owner;
+    let owner_b = owner_b_test.owner;
+    let signing_a = owner_a_test.device_key.clone();
+    let signing_b = owner_b_test.device_key.clone();
 
+    // ZEB-339: signer resolution uses the EnrollmentCert / materialized enrolled
+    // keys, not the resolver — resolver identity_pubs unused for membership.
     let resolver: Arc<dyn IdentityResolver> = Arc::new(TwoIdentityResolver {
-        a: (owner_a, pub_a),
-        b: (owner_b, pub_b),
+        a: (owner_a, [0u8; 64]),
+        b: (owner_b, [0u8; 64]),
     });
 
     // Same shared in-memory CAS shape as the round-trip test.
@@ -488,7 +474,7 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         false,
         owner_a,
         &signing_a,
-        &harmony_app::community_membership::mint_test_owner(0).cert,
+        &owner_a_test.cert,
         Hlc {
             wall_ms: 100_000,
             logical: 0,
@@ -627,7 +613,7 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         &invite_payload,
         owner_b,
         &signing_b,
-        &harmony_app::community_membership::mint_test_owner(0).cert,
+        &owner_b_test.cert,
         Hlc {
             wall_ms: 200_000,
             logical: 0,
@@ -681,7 +667,7 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         &invite_payload,
         owner_b,
         &signing_b,
-        &harmony_app::community_membership::mint_test_owner(0).cert,
+        &owner_b_test.cert,
         redeem2_hlc,
     )
     .expect("mint redeem #2");
