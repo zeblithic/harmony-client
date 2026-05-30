@@ -260,6 +260,17 @@ async fn alice_redeems_invite_only_against_bob_admin() {
     // arg is plumbed for future expansion.
     let crdt_a = Arc::new(TokioMutex::new(OwnerState::default()));
 
+    // ZEB-339: supply synthetic community_signing_key + enrollment_cert per outbox.
+    let alice_test_owner_invite = harmony_app::community_membership::mint_test_owner(0xD7);
+    let alice_community_sk_invite = Arc::new(ed25519_dalek::SigningKey::from_bytes(
+        &alice_test_owner_invite.device_key.to_bytes(),
+    ));
+    let alice_enrollment_invite = alice_test_owner_invite.cert;
+    let bob_test_owner_invite = harmony_app::community_membership::mint_test_owner(0xD8);
+    let bob_community_sk_invite = Arc::new(ed25519_dalek::SigningKey::from_bytes(
+        &bob_test_owner_invite.device_key.to_bytes(),
+    ));
+    let bob_enrollment_invite = bob_test_owner_invite.cert;
     // Alice's dm_outbox carries the PrivateIdentity that handle_unicast
     // grabs to verify the InviteToken sig + countersign Bob's Join.
     let alice_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
@@ -268,6 +279,8 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         DeviceIdentityHash(alice.identity.address_hash),
         Arc::clone(&alice_sk),
         Arc::new(dup_identity(&alice)),
+        alice_community_sk_invite,
+        alice_enrollment_invite,
     )));
     // Bob's dm_outbox: redeem_invite_inner reads bob's
     // private_identity + signing_key under its lock.
@@ -277,6 +290,8 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         DeviceIdentityHash(bob.identity.address_hash),
         Arc::clone(&bob_sk),
         Arc::new(dup_identity(&bob)),
+        bob_community_sk_invite,
+        bob_enrollment_invite,
     )));
 
     // Bob's adapter request channel. Bob's redeem_invite_inner

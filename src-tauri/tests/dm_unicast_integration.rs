@@ -249,12 +249,25 @@ async fn dm_full_round_trip_through_unicast_channel() {
         alice_device,
         alice_signing_key.clone(),
     ));
+    // ZEB-339: supply synthetic community_signing_key + enrollment_cert per outbox.
+    let alice_test_owner_uni1 = harmony_app::community_membership::mint_test_owner(0xD3);
+    let alice_community_sk_uni1 = Arc::new(ed25519_dalek::SigningKey::from_bytes(
+        &alice_test_owner_uni1.device_key.to_bytes(),
+    ));
+    let alice_enrollment_uni1 = alice_test_owner_uni1.cert;
+    let bob_test_owner_uni1 = harmony_app::community_membership::mint_test_owner(0xD4);
+    let bob_community_sk_uni1 = Arc::new(ed25519_dalek::SigningKey::from_bytes(
+        &bob_test_owner_uni1.device_key.to_bytes(),
+    ));
+    let bob_enrollment_uni1 = bob_test_owner_uni1.cert;
     let alice_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
         "alice-device".into(),
         alice_owner,
         alice_device,
         alice_signing_key.clone(),
         Arc::clone(&alice_private_identity),
+        alice_community_sk_uni1,
+        alice_enrollment_uni1,
     )));
 
     let bob_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
@@ -263,6 +276,8 @@ async fn dm_full_round_trip_through_unicast_channel() {
         bob_device,
         bob_signing_key.clone(),
         Arc::clone(&bob_private_identity),
+        bob_community_sk_uni1,
+        bob_enrollment_uni1,
     )));
 
     // ── Send a DM from Alice → Bob. ──
@@ -562,12 +577,25 @@ async fn dm_offline_recipient_then_online_delivers() {
         alice_device,
         alice_signing_key.clone(),
     ));
+    // ZEB-339: supply synthetic community_signing_key + enrollment_cert per outbox.
+    let alice_test_owner_uni2 = harmony_app::community_membership::mint_test_owner(0xD5);
+    let alice_community_sk_uni2 = Arc::new(ed25519_dalek::SigningKey::from_bytes(
+        &alice_test_owner_uni2.device_key.to_bytes(),
+    ));
+    let alice_enrollment_uni2 = alice_test_owner_uni2.cert;
+    let bob_test_owner_uni2 = harmony_app::community_membership::mint_test_owner(0xD6);
+    let bob_community_sk_uni2 = Arc::new(ed25519_dalek::SigningKey::from_bytes(
+        &bob_test_owner_uni2.device_key.to_bytes(),
+    ));
+    let bob_enrollment_uni2 = bob_test_owner_uni2.cert;
     let alice_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
         "alice-device".into(),
         alice_owner,
         alice_device,
         alice_signing_key.clone(),
         Arc::clone(&alice_private_identity),
+        alice_community_sk_uni2,
+        alice_enrollment_uni2,
     )));
     let bob_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
         "bob-device".into(),
@@ -575,6 +603,8 @@ async fn dm_offline_recipient_then_online_delivers() {
         bob_device,
         bob_signing_key.clone(),
         Arc::clone(&bob_private_identity),
+        bob_community_sk_uni2,
+        bob_enrollment_uni2,
     )));
 
     // ── Pre-flight: confirm `resolve_destinations` returns [] for Bob

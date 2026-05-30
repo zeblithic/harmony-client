@@ -2523,6 +2523,43 @@ pub(crate) async fn start_node_inner(
                         .map(|b| format!("{b:02x}"))
                         .collect::<String>();
 
+                    // ZEB-339: carry the enrolled device key (#2) + this device's own cert
+                    // into runtime. `loaded.device_signing_key` is otherwise dropped after
+                    // deriving the device-id string above.
+                    //
+                    // `SigningKey::from_bytes(&sk.to_bytes())` is the safe clone —
+                    // ed25519-dalek `SigningKey` may not impl `Clone`; `to_bytes()` always
+                    // works (returns the 32-byte seed).
+                    //
+                    // `this_device_id_hash` is the 16-byte `[u8;16]` identity hash used
+                    // ONLY to key into `state.enrollments`. It is DISTINCT from the hex
+                    // `device_id: String` above (which is used for HLC device IDs). Both
+                    // are derived from the same verifying key but serve different roles —
+                    // name them distinctly to prevent confusion.
+                    //
+                    // `derive_this_device_id` in owner_commands.rs uses the exact same
+                    // `PubKeyBundle::classical_only(sk.verifying_key().to_bytes()).identity_hash()`
+                    // pattern, so the lookup key matches how enrollments are stored.
+                    let community_signing_key_arc =
+                        std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(
+                            &loaded.device_signing_key.to_bytes(),
+                        ));
+                    let this_device_id_hash = {
+                        use harmony_owner::pubkey_bundle::PubKeyBundle;
+                        PubKeyBundle::classical_only(
+                            loaded.device_signing_key.verifying_key().to_bytes(),
+                        )
+                        .identity_hash()
+                    };
+                    let own_enrollment_cert = loaded
+                        .state
+                        .enrollments
+                        .get(&this_device_id_hash)
+                        .cloned()
+                        .ok_or_else(|| {
+                            "owner state missing this device's enrollment cert".to_string()
+                        })?;
+
                     let crdt_path = identity_dir.join("owner_state_crdt.cbor");
                     let replay_path = identity_dir.join("state_root_replay.cbor");
                     let initial_crdt = crate::owner_state_persist::load_crdt(&crdt_path)
@@ -2598,6 +2635,8 @@ pub(crate) async fn start_node_inner(
                             our_signing_device_hash,
                             signing_key_arc.clone(),
                             std::sync::Arc::clone(&private_identity_arc),
+                            community_signing_key_arc.clone(),
+                            own_enrollment_cert,
                         ),
                     ));
                     // Production transport: RuntimeUnicastTransport pushes
@@ -16428,12 +16467,20 @@ mod redeem_invite_inner_tests {
             mpsc::channel::<crate::event_loop::CommunityAdapterRequest>(16);
         let (unicast_send_tx, _unicast_rx) = mpsc::channel::<UnicastSendRequest>(16);
 
+        // ZEB-339: supply synthetic community_signing_key + enrollment_cert.
+        let test_owner_lib16471 = crate::community_membership::mint_test_owner(0xE1);
+        let community_signing_key_lib16471 = std::sync::Arc::new(
+            ed25519_dalek::SigningKey::from_bytes(&test_owner_lib16471.device_key.to_bytes()),
+        );
+        let enrollment_cert_lib16471 = test_owner_lib16471.cert;
         let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new(
             "joiner-dev".into(),
             self_owner,
             DeviceIdentityHash(joiner_identity.identity.address_hash),
             std::sync::Arc::clone(&signing_key),
             std::sync::Arc::new(joiner_identity),
+            community_signing_key_lib16471,
+            enrollment_cert_lib16471,
         )));
 
         let (channel_log_adapter_tx, _channel_log_adapter_rx) =
@@ -16660,12 +16707,20 @@ mod redeem_invite_inner_tests {
             mpsc::channel::<crate::event_loop::CommunityAdapterRequest>(16);
         let (unicast_send_tx, _unicast_rx) = mpsc::channel::<UnicastSendRequest>(16);
 
+        // ZEB-339: supply synthetic community_signing_key + enrollment_cert.
+        let test_owner_lib16712 = crate::community_membership::mint_test_owner(0xE2);
+        let community_signing_key_lib16712 = std::sync::Arc::new(
+            ed25519_dalek::SigningKey::from_bytes(&test_owner_lib16712.device_key.to_bytes()),
+        );
+        let enrollment_cert_lib16712 = test_owner_lib16712.cert;
         let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new(
             "joiner-dev".into(),
             joiner_self_owner,
             DeviceIdentityHash(joiner_self_owner.0),
             std::sync::Arc::clone(&signing_key),
             std::sync::Arc::new(joiner_identity),
+            community_signing_key_lib16712,
+            enrollment_cert_lib16712,
         )));
 
         let (channel_log_adapter_tx, _channel_log_adapter_rx) =
@@ -16912,12 +16967,20 @@ mod redeem_invite_inner_tests {
         };
         let invite_url_b = crate::community_invite::encode_invite_url(&invite_payload_b)
             .expect("encode invite url (run 2)");
+        // ZEB-339: supply synthetic community_signing_key + enrollment_cert.
+        let test_owner_lib16973 = crate::community_membership::mint_test_owner(0xE3);
+        let community_signing_key_lib16973 = std::sync::Arc::new(
+            ed25519_dalek::SigningKey::from_bytes(&test_owner_lib16973.device_key.to_bytes()),
+        );
+        let enrollment_cert_lib16973 = test_owner_lib16973.cert;
         let dm_outbox_b = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new(
             "joiner-dev".into(),
             joiner_self_owner,
             DeviceIdentityHash(joiner_self_owner.0),
             std::sync::Arc::clone(&signing_key),
             std::sync::Arc::new(PrivateIdentity::from_seed(&[0xbb; 32])),
+            community_signing_key_lib16973,
+            enrollment_cert_lib16973,
         )));
         let (channel_log_adapter_tx_b, _channel_log_adapter_rx_b) =
             mpsc::unbounded_channel::<crate::event_loop::ChannelLogAdapterRequest>();
@@ -36344,12 +36407,20 @@ mod owner_loaded_tests {
 
         let device_hash = DeviceIdentityHash(identity.identity.address_hash);
         let private_identity = std::sync::Arc::new(identity);
+        // ZEB-339: supply synthetic community_signing_key + enrollment_cert.
+        let test_owner_lib36414 = crate::community_membership::mint_test_owner(0xE4);
+        let community_signing_key_lib36414 = std::sync::Arc::new(
+            ed25519_dalek::SigningKey::from_bytes(&test_owner_lib36414.device_key.to_bytes()),
+        );
+        let enrollment_cert_lib36414 = test_owner_lib36414.cert;
         let dm_outbox = std::sync::Arc::new(tokio::sync::Mutex::new(DmOutbox::new(
             "owner-loaded-test".into(),
             self_owner,
             device_hash,
             std::sync::Arc::clone(&signing_key),
             private_identity,
+            community_signing_key_lib36414,
+            enrollment_cert_lib36414,
         )));
 
         let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));

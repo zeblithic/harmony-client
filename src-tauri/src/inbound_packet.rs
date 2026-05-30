@@ -110,12 +110,20 @@ mod tests {
     fn make_outbox() -> Arc<TokioMutex<DmOutbox>> {
         let signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]));
         let private_identity = Arc::new(harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]));
+        // ZEB-339: supply synthetic community_signing_key + enrollment_cert.
+        let test_owner = crate::community_membership::mint_test_owner(0xDE);
+        let community_signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(
+            &test_owner.device_key.to_bytes(),
+        ));
+        let enrollment_cert = test_owner.cert;
         Arc::new(TokioMutex::new(DmOutbox::new(
             "dev".into(),
             OwnerAddr([0x01; 16]),
             DeviceIdentityHash([0xaa; 16]),
             signing_key,
             private_identity,
+            community_signing_key,
+            enrollment_cert,
         )))
     }
 

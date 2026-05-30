@@ -338,12 +338,20 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             .expect("alice bootstrap insert");
 
         // ── 4. Alice's dm_outbox + crdt_state (acceptor dependencies). ──
+        // ZEB-339: supply synthetic community_signing_key + enrollment_cert.
+        let alice_test_owner_pkarr = harmony_app::community_membership::mint_test_owner(0xD9);
+        let alice_community_sk_pkarr = Arc::new(ed25519_dalek::SigningKey::from_bytes(
+            &alice_test_owner_pkarr.device_key.to_bytes(),
+        ));
+        let alice_enrollment_pkarr = alice_test_owner_pkarr.cert;
         let alice_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
             "alice-dev".into(),
             alice_addr,
             DeviceIdentityHash(alice_identity.identity.address_hash),
             Arc::clone(&alice_sk),
             Arc::new(dup_identity(&alice_identity)),
+            alice_community_sk_pkarr,
+            alice_enrollment_pkarr,
         )));
         let alice_crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
 
@@ -401,12 +409,20 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             }
         });
 
+        // ZEB-339: supply synthetic community_signing_key + enrollment_cert for Bob.
+        let bob_test_owner_pkarr = harmony_app::community_membership::mint_test_owner(0xDA);
+        let bob_community_sk_pkarr = Arc::new(ed25519_dalek::SigningKey::from_bytes(
+            &bob_test_owner_pkarr.device_key.to_bytes(),
+        ));
+        let bob_enrollment_pkarr = bob_test_owner_pkarr.cert;
         let bob_dm_outbox = Arc::new(TokioMutex::new(DmOutbox::new(
             "bob-dev".into(),
             bob_addr,
             DeviceIdentityHash(bob_identity.identity.address_hash),
             Arc::clone(&bob_sk),
             Arc::new(dup_identity(&bob_identity)),
+            bob_community_sk_pkarr,
+            bob_enrollment_pkarr,
         )));
 
         let (bob_channel_log_adapter_tx, _bob_channel_log_adapter_rx) =

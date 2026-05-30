@@ -2700,12 +2700,20 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
     // dm_outbox for the inner helper to read `private_identity` +
     // `signing_key` under-lock. The DmOutbox::new signature matches
     // production; we share `bob` via Arc.
+    // ZEB-339: supply synthetic community_signing_key + enrollment_cert.
+    let bob_test_owner_sync = harmony_app::community_membership::mint_test_owner(0xDC);
+    let bob_community_sk_sync = Arc::new(ed25519_dalek::SigningKey::from_bytes(
+        &bob_test_owner_sync.device_key.to_bytes(),
+    ));
+    let bob_enrollment_sync = bob_test_owner_sync.cert;
     let dm_outbox = Arc::new(Mutex::new(DmOutbox::new(
         "bob-dev".into(),
         bob_addr,
         bob_device_hash,
         Arc::clone(&bob_signing_key),
         Arc::clone(&bob),
+        bob_community_sk_sync,
+        bob_enrollment_sync,
     )));
 
     // ZEB-271: ChannelLogRegistry required by the new redeem_invite_inner

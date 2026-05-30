@@ -84,12 +84,20 @@ async fn send_dm_round_trip_through_dm_outbox() {
     let our_device_hash = DeviceIdentityHash([0xaa; 16]);
     let private_identity =
         std::sync::Arc::new(harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]));
+    // ZEB-339: supply synthetic community_signing_key + enrollment_cert.
+    let test_owner_dm_send = harmony_app::community_membership::mint_test_owner(0xD1);
+    let community_signing_key_dm_send = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(
+        &test_owner_dm_send.device_key.to_bytes(),
+    ));
+    let enrollment_cert_dm_send = test_owner_dm_send.cert;
     let mut outbox = DmOutbox::new(
         "dev".into(),
         alice,
         our_device_hash,
         signing_key,
         private_identity,
+        community_signing_key_dm_send,
+        enrollment_cert_dm_send,
     );
     let transport = StubTransport::new();
 

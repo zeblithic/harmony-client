@@ -424,6 +424,19 @@ pub struct DmOutbox {
     /// `redeem_invite_inner` snapshots both fields under the outbox
     /// lock to feed `build_signed_invite_packet`.
     pub(crate) private_identity: Arc<harmony_identity::PrivateIdentity>,
+    /// ZEB-339: the harmony-owner ENROLLED device signing key (#2). Distinct
+    /// from `signing_key` (the Reticulum/transport key, #3). Community
+    /// membership events sign with this; DM/transport keep `signing_key`.
+    // Task 7 will read this field for community-event signing; allow dead_code
+    // until that wiring lands.
+    #[allow(dead_code)]
+    pub(crate) community_signing_key: Arc<ed25519_dalek::SigningKey>,
+    /// ZEB-339: this device's own Master EnrollmentCert (owner_id -> device #2),
+    /// attached to outbound identity-introducing events (bootstrap/redeem Join,
+    /// PendingJoin).
+    // Task 7 will read this field for attaching the cert to community events.
+    #[allow(dead_code)]
+    pub(crate) enrollment_cert: harmony_owner::certs::EnrollmentCert,
     in_flight: HashSet<(OutboxEntryId, OwnerAddr)>,
     backoff: HashMap<(OutboxEntryId, OwnerAddr), AttemptState>,
 }
@@ -435,6 +448,8 @@ impl DmOutbox {
         our_signing_device_hash: DeviceIdentityHash,
         signing_key: Arc<ed25519_dalek::SigningKey>,
         private_identity: Arc<harmony_identity::PrivateIdentity>,
+        community_signing_key: Arc<ed25519_dalek::SigningKey>,
+        enrollment_cert: harmony_owner::certs::EnrollmentCert,
     ) -> Self {
         Self {
             device_id,
@@ -442,6 +457,8 @@ impl DmOutbox {
             our_signing_device_hash,
             signing_key,
             private_identity,
+            community_signing_key,
+            enrollment_cert,
             in_flight: HashSet::new(),
             backoff: HashMap::new(),
         }
@@ -2195,12 +2212,23 @@ mod tests {
         let signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed_seed));
         let device_hash = DeviceIdentityHash(private_identity.identity.address_hash);
         let private_identity = std::sync::Arc::new(private_identity);
+        // ZEB-339: synthetic community_signing_key + enrollment_cert for tests
+        // that don't exercise community-signing paths. Uses a fixed seed so
+        // the helper stays deterministic; tests verifying community-signing
+        // semantics construct their own DmOutbox directly.
+        let test_owner = crate::community_membership::mint_test_owner(0xAB);
+        let community_signing_key = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(
+            &test_owner.device_key.to_bytes(),
+        ));
+        let enrollment_cert = test_owner.cert;
         DmOutbox::new(
             device_id.into(),
             self_owner,
             device_hash,
             signing_key,
             private_identity,
+            community_signing_key,
+            enrollment_cert,
         )
     }
 
@@ -2246,12 +2274,24 @@ mod tests {
         // production packets.
         let device_hash = DeviceIdentityHash(identity.identity.address_hash);
 
+        // ZEB-339: supply synthetic community_signing_key + enrollment_cert;
+        // this test only exercises the Reticulum signing_key / private_identity
+        // binding, so a deterministic test owner suffices.
+        let test_owner_for_countersign = crate::community_membership::mint_test_owner(0xCC);
+        let community_signing_key_for_countersign =
+            std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(
+                &test_owner_for_countersign.device_key.to_bytes(),
+            ));
+        let enrollment_cert_for_countersign = test_owner_for_countersign.cert;
+
         let outbox = DmOutbox::new(
             "dev".into(),
             self_owner,
             device_hash,
             std::sync::Arc::clone(&signing_key),
             std::sync::Arc::clone(&private_identity),
+            community_signing_key_for_countersign,
+            enrollment_cert_for_countersign,
         );
 
         let msg = b"countersig harness";
@@ -2393,6 +2433,76 @@ mod tests {
         assert_eq!(o.self_owner, OwnerAddr([0xaa; 16]));
         assert!(o.in_flight.is_empty());
         assert!(o.backoff.is_empty());
+    }
+
+    /// ZEB-339 Task 6: DmOutbox must carry the enrolled device #2 signing key
+    /// (`community_signing_key`) and this device's own EnrollmentCert
+    /// (`enrollment_cert`), DISTINCT from the Reticulum transport `signing_key`.
+    ///
+    /// Invariants:
+    ///   - `enrollment_cert.verify()` must succeed (cert is well-formed).
+    ///   - `enrollment_cert.device_pubkeys.classical.ed25519_verify` must match
+    ///     `community_signing_key.verifying_key().to_bytes()` (key–cert binding).
+    ///   - `community_signing_key` is a different Arc / key material from
+    ///     `signing_key` (the Reticulum transport key).
+    #[cfg(any(test, feature = "test-fixtures"))]
+    #[test]
+    fn dm_outbox_community_signing_key_and_enrollment_cert() {
+        use crate::community_membership::mint_test_owner;
+
+        let test_owner = mint_test_owner(0x77);
+
+        // Build the community-signing materials from mint_test_owner output.
+        let community_signing_key_arc = std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(
+            &test_owner.device_key.to_bytes(),
+        ));
+        let enrollment_cert = test_owner.cert.clone();
+
+        // Build the separate Reticulum/transport signing key from a different
+        // identity seed (the existing synthetic pattern from make_outbox_synthetic).
+        let private_identity = harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]);
+        let priv_bytes = private_identity.to_private_bytes();
+        let mut ed_seed = [0u8; 32];
+        ed_seed.copy_from_slice(&priv_bytes[32..64]);
+        let reticulum_signing_key =
+            std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&ed_seed));
+        let device_hash = DeviceIdentityHash(private_identity.identity.address_hash);
+        let private_identity_arc = std::sync::Arc::new(private_identity);
+        let self_owner = test_owner.owner;
+
+        let outbox = DmOutbox::new(
+            "dev".into(),
+            self_owner,
+            device_hash,
+            reticulum_signing_key.clone(),
+            private_identity_arc,
+            community_signing_key_arc.clone(),
+            enrollment_cert,
+        );
+
+        // 1. EnrollmentCert verifies.
+        outbox
+            .enrollment_cert
+            .verify()
+            .expect("enrollment_cert must verify");
+
+        // 2. cert.device_pubkeys.classical.ed25519_verify matches community_signing_key.
+        assert_eq!(
+            outbox
+                .enrollment_cert
+                .device_pubkeys
+                .classical
+                .ed25519_verify,
+            outbox.community_signing_key.verifying_key().to_bytes(),
+            "enrollment_cert must bind to community_signing_key's verifying key"
+        );
+
+        // 3. community_signing_key is distinct from the Reticulum signing_key.
+        assert_ne!(
+            outbox.community_signing_key.verifying_key().to_bytes(),
+            outbox.signing_key.verifying_key().to_bytes(),
+            "community_signing_key (#2) must be distinct from the Reticulum signing_key (#3)"
+        );
     }
 
     #[tokio::test]

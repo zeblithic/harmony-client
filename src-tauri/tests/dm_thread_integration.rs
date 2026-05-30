@@ -89,12 +89,20 @@ async fn fixture() -> (
     let signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]));
     let our_device_hash = DeviceIdentityHash([0xaa; 16]);
     let private_identity = Arc::new(harmony_identity::PrivateIdentity::from_seed(&[0x55; 32]));
+    // ZEB-339: supply synthetic community_signing_key + enrollment_cert.
+    let test_owner_thread = harmony_app::community_membership::mint_test_owner(0xD2);
+    let community_signing_key_thread = Arc::new(ed25519_dalek::SigningKey::from_bytes(
+        &test_owner_thread.device_key.to_bytes(),
+    ));
+    let enrollment_cert_thread = test_owner_thread.cert;
     let outbox = DmOutbox::new(
         "alice-device".into(),
         alice,
         our_device_hash,
         signing_key,
         private_identity,
+        community_signing_key_thread,
+        enrollment_cert_thread,
     );
 
     (state, outbox, cas, alice, space_id)

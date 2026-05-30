@@ -814,12 +814,20 @@ async fn click_to_join_redeem_invite_smoke() {
         mpsc::channel::<harmony_app::event_loop::CommunityAdapterRequest>(16);
     let (unicast_send_tx, _unicast_rx) = mpsc::channel::<UnicastSendRequest>(16);
 
+    // ZEB-339: supply synthetic community_signing_key + enrollment_cert.
+    let joiner_test_owner_lib = harmony_app::community_membership::mint_test_owner(0xDB);
+    let joiner_community_sk_lib = Arc::new(ed25519_dalek::SigningKey::from_bytes(
+        &joiner_test_owner_lib.device_key.to_bytes(),
+    ));
+    let joiner_enrollment_lib = joiner_test_owner_lib.cert;
     let dm_outbox = Arc::new(Mutex::new(DmOutbox::new(
         "joiner-dev".into(),
         joiner_owner,
         DeviceIdentityHash(joiner_identity.identity.address_hash),
         Arc::clone(&joiner_signing_key),
         Arc::new(joiner_identity),
+        joiner_community_sk_lib,
+        joiner_enrollment_lib,
     )));
 
     let (channel_log_adapter_tx, _channel_log_adapter_rx) =
