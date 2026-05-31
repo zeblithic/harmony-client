@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { CommunityMember } from '../types';
   import type { ResolvedCard } from '../member-card-service';
+  import Avatar from './Avatar.svelte';
 
   export type KebabAction =
     | 'kick'
@@ -15,6 +16,8 @@
     ownerIdHex: string;
     displayName: string;
     statusText: string;
+    /** Resolved avatar URL from CAS/MemberCardService. Undefined → identicon. */
+    avatarUrl?: string;
     power?: number;
     /** Community membership state ('joined'/'banned'). Distinct from the
      *  freeform `statusText` profile message. */
@@ -133,6 +136,7 @@
         ownerIdHex: member.address,
         displayName,
         statusText: resolveCard?.(member.address)?.statusText ?? '',
+        avatarUrl: resolveCard?.(member.address)?.avatarUrl,
         power: member.power,
         membershipStatus: member.status,
       },
@@ -143,9 +147,12 @@
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <li class="member-row" onkeydown={handleKeydown}>
-  <div class="avatar" aria-hidden="true">
-    {displayName.slice(0, 1).toUpperCase()}
-  </div>
+  <Avatar
+    address={member.address}
+    displayName={displayName}
+    avatarUrl={resolveCard?.(member.address)?.avatarUrl}
+    size={28}
+  />
   <div class="member-info">
     {#if onOpenCard}
       <button type="button" class="name name-btn" onclick={handleNameClick}>
@@ -205,19 +212,6 @@
   }
   .member-row:last-child {
     border-bottom: none;
-  }
-  .avatar {
-    width: 28px;
-    height: 28px;
-    min-width: 28px;
-    border-radius: 50%;
-    background: var(--accent);
-    color: var(--text-primary);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 0.75rem;
-    font-weight: bold;
   }
   .member-info {
     flex: 1;

@@ -17,6 +17,8 @@
     ownerIdHex: string;
     displayName: string;
     statusText: string;
+    /** Resolved avatar URL from CAS/MemberCardService. Undefined → identicon. */
+    avatarUrl?: string;
     /** Community power level. 100=Admin, 50=Moderator, else Member. Omitted
      *  (undefined) for message authors not in the member list → no role line. */
     power?: number;
@@ -249,7 +251,7 @@
 <div class="profile-popover" style="left: {x}px; top: {y}px;">
 {#if mode === 'owner-card' && card}
   <div class="popover-header">
-    <Avatar address={card.ownerIdHex} displayName={card.displayName} size={64} />
+    <Avatar address={card.ownerIdHex} displayName={card.displayName} avatarUrl={card.avatarUrl} size={64} />
     <div class="popover-identity">
       <div class="popover-name">{card.displayName || 'Name unavailable'}</div>
       {#if card.statusText}

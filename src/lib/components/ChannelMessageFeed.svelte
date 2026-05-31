@@ -321,6 +321,7 @@
         ownerIdHex: author,
         displayName: card?.displayName ?? author.slice(0, 8),
         statusText: card?.statusText ?? '',
+        avatarUrl: card?.avatarUrl,
         // No power known for message authors → role line omitted.
       },
       ev,
@@ -373,7 +374,7 @@
           class:pre-fork={row.isPreFork}
         >
           <div class="avatar-col">
-            <Avatar address={msg.author} {trustService} size={32} />
+            <Avatar address={msg.author} avatarUrl={resolveCard?.(msg.author)?.avatarUrl} size={32} />
           </div>
           <div class="content-col">
             <header class="msg-meta">

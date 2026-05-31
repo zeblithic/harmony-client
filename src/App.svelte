@@ -650,6 +650,7 @@
     ownerIdHex: string;
     displayName: string;
     statusText: string;
+    avatarUrl?: string;
     power?: number;
     membershipStatus?: string;
   } | null>(null);
@@ -661,6 +662,7 @@
       ownerIdHex: string;
       displayName: string;
       statusText: string;
+      avatarUrl?: string;
       power?: number;
       membershipStatus?: string;
     },
