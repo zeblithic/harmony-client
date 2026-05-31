@@ -43,7 +43,7 @@
       // Self-seed a local blob preview so the user sees the new avatar
       // immediately, with zero network round-trip.
       avatarUrl = URL.createObjectURL(
-        new Blob([bytes], { type: 'image/png' }),
+        new Blob([new Uint8Array(bytes)], { type: 'image/png' }),
       );
     } catch (err) {
       avatarError = err instanceof Error ? err.message : String(err);

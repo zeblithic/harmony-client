@@ -1099,6 +1099,7 @@
                 memberCardService.seedSelf(ownerState.ownerId, {
                   displayName: myProfile.displayName,
                   statusText: myProfile.statusText ?? '',
+                  avatarUrl: myProfile.avatarUrl,
                 });
               }
             } catch {
@@ -1129,10 +1130,12 @@
         ownerIdHex: string;
         displayName: string;
         statusText: string;
+        avatarCid?: string;
       }>('member-card-received', (event) => {
         memberCardService.applyCard(event.payload.ownerIdHex, {
           displayName: event.payload.displayName,
           statusText: event.payload.statusText,
+          avatarCid: event.payload.avatarCid,
         });
       });
       fileManagerService.addUnlisten(unlistenMemberCard);

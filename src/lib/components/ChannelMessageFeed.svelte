@@ -2,7 +2,6 @@
   import { onMount, onDestroy } from 'svelte';
   import type { ChannelMessageDto, HlcDto } from '../channel-message-service';
   import type { ChannelMessageService } from '../channel-message-service';
-  import type { TrustService } from '../trust-service';
   import type { VotingAdapter } from '../voting-adapter';
   import type { PollMeta } from '../types/voting';
   import Avatar from './Avatar.svelte';
@@ -16,7 +15,6 @@
     channelName,
     channelMessageService,
     ownAddress,
-    trustService,
     myPower,
     enableVirtualization = true,
     /** ZEB-285 Task 11: pre-fork snapshot messages for this channel (HLC-ascending). */
@@ -44,7 +42,6 @@
     channelName: string;
     channelMessageService: ChannelMessageService;
     ownAddress: string;
-    trustService?: TrustService;
     myPower: number;
     /** Disable for jsdom tests where IntersectionObserver isn't reliable. */
     enableVirtualization?: boolean;

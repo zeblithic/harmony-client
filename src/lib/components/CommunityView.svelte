@@ -404,7 +404,6 @@
         {channelMessageService}
         {votingAdapter}
         {ownAddress}
-        {trustService}
         {myPower}
         snapshotMessages={preForkSnapshot?.channelLog?.[activeChannel.channelId] ?? []}
         originalCommunityName={preForkSnapshot?.originalCommunityName ?? ''}
