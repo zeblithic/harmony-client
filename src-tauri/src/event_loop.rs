@@ -4457,6 +4457,138 @@ where
     })
 }
 
+/// ZEB-343: the peer-to-peer CAS serve primitive. Declares a single Zenoh
+/// queryable on `harmony/content/*/**` and answers content GETs for PUBLIC
+/// (unencrypted) CIDs held in the local store.
+///
+/// `lookup` is the local-store accessor (production wires it to a
+/// `CasOp::GetLocal` round-trip; tests wire a HashMap) — passed in to avoid an
+/// engine↔adapter circular dep, exactly like channel-log's `read_for_query`
+/// (event_loop.rs:4073).
+///
+/// Serve gate: a CID is servable iff `!cid.flags().encrypted` (spec §5.2). This
+/// is intrinsic to the CID (its header's leading bit) and holds per-chunk, so
+/// no public-membership registry is needed. Encrypted CIDs get no reply.
+///
+/// Returned bytes are inherently integrity-safe: the local cache only admits
+/// bytes that passed `hash==cid` (StorageTier::verify_cid), so anything `lookup`
+/// returns already verifies. We still re-check `cid.verify_hash` before replying
+/// as defense-in-depth (cheap; never serve corrupt bytes).
+#[allow(clippy::type_complexity)]
+pub fn spawn_content_serve_queryable<F>(
+    session: Arc<zenoh::Session>,
+    lookup: Arc<F>,
+    closing: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()>
+where
+    F: Fn(
+            ContentId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send>>
+        + Send
+        + Sync
+        + ?Sized
+        + 'static,
+{
+    let key_pattern = "harmony/content/*/**".to_string();
+
+    tokio::spawn(async move {
+        if closing.load(Ordering::SeqCst) {
+            return;
+        }
+        let qbl = match session.declare_queryable(&key_pattern).await {
+            Ok(q) => q,
+            Err(e) => {
+                if !closing.load(Ordering::SeqCst) {
+                    tracing::error!(error = %e, "failed to declare content-serve queryable");
+                }
+                return;
+            }
+        };
+        loop {
+            tokio::select! {
+                biased;
+                res = qbl.recv_async() => {
+                    let Ok(query) = res else { break; };
+                    let qkey = query.key_expr().to_string();
+                    let Some(cid) = parse_content_serve_cid(&qkey) else {
+                        continue;
+                    };
+                    if cid.flags().encrypted {
+                        continue;
+                    }
+                    let Some(bytes) = (lookup)(cid).await else {
+                        continue;
+                    };
+                    if !cid.verify_hash(&bytes) {
+                        tracing::warn!(%qkey, "content-serve: local bytes failed hash==cid; not serving");
+                        continue;
+                    }
+                    if let Err(e) = query.reply(query.key_expr(), bytes).await {
+                        tracing::warn!(%qkey, error = %e, "content-serve reply failed");
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                    if closing.load(Ordering::SeqCst) { break; }
+                }
+            }
+        }
+    })
+}
+
+/// Parse a `harmony/content/{shard}/{cid_hex}` serve key into a ContentId.
+/// Requires EXACTLY 4 slash-segments, a single-hex shard char, and a 64-hex
+/// cid. Returns None for publish/transit/stats keys or any malformed selector.
+fn parse_content_serve_cid(key: &str) -> Option<ContentId> {
+    let segs: Vec<&str> = key.split('/').collect();
+    if segs.len() != 4 || segs[0] != "harmony" || segs[1] != "content" {
+        return None;
+    }
+    let shard = segs[2];
+    if shard.len() != 1 || !shard.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let cid_hex = segs[3];
+    if cid_hex.len() != 64 || !cid_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let raw = hex::decode(cid_hex).ok()?;
+    let arr: [u8; 32] = raw.try_into().ok()?;
+    Some(ContentId::from_bytes(arr))
+}
+
+#[cfg(test)]
+mod content_serve_parse_tests {
+    use super::parse_content_serve_cid;
+
+    const HEX64: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn valid_serve_key_parses() {
+        let key = format!("harmony/content/3/{HEX64}");
+        assert!(parse_content_serve_cid(&key).is_some());
+    }
+
+    #[test]
+    fn publish_key_rejected() {
+        let key = format!("harmony/content/publish/{HEX64}");
+        assert!(parse_content_serve_cid(&key).is_none());
+    }
+
+    #[test]
+    fn short_cid_rejected() {
+        // 63 hex chars (one short of 64)
+        let cid63 = &HEX64[..63];
+        let key = format!("harmony/content/3/{cid63}");
+        assert!(parse_content_serve_cid(&key).is_none());
+    }
+
+    #[test]
+    fn five_segment_key_rejected() {
+        let key = format!("harmony/content/3/{HEX64}/extra");
+        assert!(parse_content_serve_cid(&key).is_none());
+    }
+}
+
 /// Per spec §6.2: default backfill limit when peer/local sends 0.
 /// Used by the engine config (`ChannelLogEngineConfig.backfill_default_limit`)
 /// as the production default; the adapter no longer references this
