@@ -84,4 +84,22 @@ describe('ProfileEditor avatar upload', () => {
     // A local blob preview URL is self-seeded for instant feedback.
     expect(saved.avatarUrl).toBe('blob:fake');
   });
+
+  it('does NOT drop an existing avatarCid when saving without picking a new file', async () => {
+    const profileWithAvatar: Profile = {
+      ...testProfile,
+      avatarCid: 'existing-cid',
+    };
+    const onSave = vi.fn();
+    render(ProfileEditor, { props: { profile: profileWithAvatar, onSave } });
+
+    // Save without picking any avatar file — stagedAvatarCid stays undefined,
+    // so handleSave must fall back to the profile's existing avatarCid.
+    await fireEvent.click(screen.getByText('Save'));
+    expect(onSave).toHaveBeenCalledWith(
+      expect.objectContaining({ avatarCid: 'existing-cid' }),
+    );
+    // No ingest should have been called.
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
 });
