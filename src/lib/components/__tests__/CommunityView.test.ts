@@ -248,4 +248,47 @@ describe('CommunityView', () => {
       expect(container.querySelector('.tier3-panel')).toBeTruthy();
     });
   });
+
+  it('drives card subscriptions for the JOINED member set in the channel view (no overlay) and tears down on destroy (ZEB-341)', async () => {
+    const subscribeVisibleCards = vi.fn();
+    const unsubscribeCards = vi.fn();
+    const bob: CommunityMember = {
+      address: 'bb'.repeat(20),
+      displayName: 'Bob',
+      power: 0,
+      status: 'joined',
+    };
+    const eve: CommunityMember = {
+      address: 'ee'.repeat(20),
+      displayName: 'Eve',
+      power: 0,
+      status: 'banned',
+    };
+    const { unmount } = await setup(undefined, {
+      members: [adminMember, bob, eve],
+      subscribeVisibleCards,
+      unsubscribeCards,
+    });
+
+    // The channel view itself drives subscription — the members overlay
+    // (.community-members-panel) is NOT mounted here, proving message-author
+    // name resolution no longer depends on the user opening that overlay
+    // (regression guard for Cursor Bugbot's "subscriber pool never active
+    // unless overlay panel open" finding on PR #171).
+    await waitFor(() => expect(subscribeVisibleCards).toHaveBeenCalled());
+    expect(document.querySelector('.community-members-panel')).toBeNull();
+    const lastCallArgs = subscribeVisibleCards.mock.calls.at(-1)![0] as string[];
+    // Joined members are subscribed; the banned member (Eve) is NOT — the
+    // active subscription count is bounded by live membership, not lifetime
+    // ban accumulation.
+    expect(lastCallArgs).toEqual(
+      expect.arrayContaining([adminMember.address, bob.address]),
+    );
+    expect(lastCallArgs).not.toContain(eve.address);
+
+    // Leaving the community view (component destroy = "view change" in the
+    // spec) tears down all subscriptions + the poll loop.
+    unmount();
+    expect(unsubscribeCards).toHaveBeenCalled();
+  });
 });

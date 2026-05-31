@@ -15,20 +15,18 @@
     communityService,
     ownAddress,
     resolveCard,
-    subscribeVisibleCards,
-    unsubscribeCards,
     onOpenCard,
   }: {
     communityId: string;
     communityName: string;
     communityService: CommunityService;
     ownAddress: string;
-    /** ZEB-341: optional card resolver for display names. */
+    /** ZEB-341: optional card resolver for display names. The card subscription
+     *  lifecycle is owned by CommunityView (the always-mounted-per-community
+     *  container), not this transient overlay, so member/author names resolve in
+     *  the channel view regardless of whether this panel is open. This panel is
+     *  a pure consumer of the resolved map. */
     resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
-    /** ZEB-341 Task 8: subscribe to cross-peer cards for the visible member set. */
-    subscribeVisibleCards?: (ownerIdHexes: string[]) => void;
-    /** ZEB-341 Task 8: tear down all card subscriptions when this panel unmounts. */
-    unsubscribeCards?: () => void;
     /** ZEB-341: open the owner_id card popover for a clicked member. */
     onOpenCard?: (payload: OpenCardPayload, ev: MouseEvent) => void;
   } = $props();
@@ -108,21 +106,6 @@
       (m) => m.status === 'banned' && matchesSearch(m, searchTrimmed)
     )
   );
-
-  // ZEB-341 Task 8: as the visible member set loads/changes, (re)subscribe to
-  // each member's owner_id card. The service diffs internally (subscribes new,
-  // unsubscribes departed) and excludes self, so calling it on every change is
-  // idempotent. `member.address` is the lowercase owner_id hex.
-  $effect(() => {
-    // Scope card subscriptions to the actually-shown rows: joined members are
-    // always visible; banned members only when the banned section is expanded.
-    // Don't subscribe to filtered-out / collapsed rows.
-    const addrs = [
-      ...joined.map((m) => m.address),
-      ...(bannedExpanded ? banned.map((m) => m.address) : []),
-    ];
-    subscribeVisibleCards?.(addrs);
-  });
 
   async function refresh() {
     // Only show the loading skeleton on the very first fetch — subsequent
@@ -252,8 +235,6 @@
 
   onDestroy(() => {
     communityService.onMembersChanged = prevOnMembersChanged;
-    // ZEB-341 Task 8: tear down card subscriptions + poll loop on unmount.
-    unsubscribeCards?.();
   });
 </script>
 

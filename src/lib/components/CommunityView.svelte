@@ -252,8 +252,37 @@
     };
   });
 
+  // ZEB-341: drive cross-peer card subscriptions for the whole community view,
+  // not just the (transient) members-panel overlay. CommunityView stays mounted
+  // for as long as a community is selected, so anchoring the subscription
+  // lifecycle here makes message-author names in ChannelMessageFeed resolve in
+  // the channel view itself — and keep updating — regardless of whether the
+  // members overlay is open. Previously this lived only in the overlay panel, so
+  // author names never resolved unless the user opened it (Cursor Bugbot,
+  // PR #171).
+  //
+  // Scope: currently-JOINED members only. They are the channel-view-visible set
+  // (message authors + the channel members list); banned members surface only in
+  // the members-overlay's collapsible section and are intentionally not
+  // subscribed here. This bounds the active subscription count by *live*
+  // membership rather than lifetime ban accumulation (spec §7 "bound the active
+  // subscription count"; CodeRabbit "subscribe only to visible rows"). The
+  // service diffs internally (subscribes new owner_ids, unsubscribes departed)
+  // and excludes self, so re-running on every `members` change is idempotent;
+  // `member.address` is the lowercase owner_id hex. Teardown is in onDestroy
+  // (fires on view change / leaving the community).
+  $effect(() => {
+    const joinedOwnerIds = members
+      .filter((m) => m.status === 'joined')
+      .map((m) => m.address);
+    subscribeVisibleCards?.(joinedOwnerIds);
+  });
+
   onDestroy(() => {
     communityService.onChannelConfigChanged = prevOnChannelConfigChanged;
+    // ZEB-341: tear down all card subscriptions + the poll loop when the
+    // community view goes away (switching to a non-community space / closing).
+    unsubscribeCards?.();
   });
 </script>
 
@@ -471,8 +500,6 @@
         {communityService}
         ownAddress={ownAddress}
         {resolveCard}
-        {subscribeVisibleCards}
-        {unsubscribeCards}
         {onOpenCard}
       />
     </div>
