@@ -46,6 +46,14 @@ pub struct ProfileCardBroadcast {
         deserialize_with = "crate::owner_state_types::deserialize_optional_bytes_from_bstr"
     )]
     pub avatar_cid: Option<[u8; 32]>,
+    #[serde(
+        rename = "pp",
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::owner_state_types::serialize_optional_bytes_as_bstr",
+        deserialize_with = "crate::owner_state_types::deserialize_optional_bytes_from_bstr"
+    )]
+    pub profile_page_root: Option<[u8; 32]>,
     #[serde(rename = "en")]
     pub enrollment: EnrollmentCert,
     #[serde(rename = "sa")]
@@ -79,12 +87,14 @@ pub enum CardError {
 /// Build + Ed25519-sign a card over canonical CBOR with `signature` zeroed.
 /// `signer` MUST be the enrolled device key (pub ==
 /// `enrollment.device_pubkeys.classical.ed25519_verify`).
+#[allow(clippy::too_many_arguments)]
 pub fn sign_card(
     signer: &SigningKey,
     owner_id: [u8; 16],
     display_name: String,
     status_text: String,
     avatar_cid: Option<[u8; 32]>,
+    profile_page_root: Option<[u8; 32]>,
     enrollment: EnrollmentCert,
     shared_at: Hlc,
 ) -> Result<ProfileCardBroadcast, CardError> {
@@ -107,6 +117,7 @@ pub fn sign_card(
         display_name,
         status_text,
         avatar_cid,
+        profile_page_root,
         enrollment,
         shared_at,
         signature: [0u8; 64],
@@ -187,6 +198,8 @@ pub struct DiscoveredCardInfo {
     pub status_text: String,
     #[serde(rename = "avatarCid", skip_serializing_if = "Option::is_none")]
     pub avatar_cid: Option<String>,
+    #[serde(rename = "profilePageRoot", skip_serializing_if = "Option::is_none")]
+    pub profile_page_root: Option<String>,
 }
 
 /// Per-subscription cached card entry. Holds the highest-HLC verified card
@@ -197,6 +210,7 @@ struct CachedCard {
     display_name: String,
     status_text: String,
     avatar_cid: Option<[u8; 32]>,
+    profile_page_root: Option<[u8; 32]>,
     shared_at: Hlc,
 }
 
@@ -253,6 +267,7 @@ impl ProfileCardCache {
                     display_name: card.display_name.clone(),
                     status_text: card.status_text.clone(),
                     avatar_cid: card.avatar_cid,
+                    profile_page_root: card.profile_page_root,
                     shared_at: card.shared_at.clone(),
                 });
             }
@@ -269,6 +284,7 @@ impl ProfileCardCache {
             display_name: c.display_name.clone(),
             status_text: c.status_text.clone(),
             avatar_cid: c.avatar_cid.map(hex::encode),
+            profile_page_root: c.profile_page_root.map(hex::encode),
         })
     }
 }
@@ -283,6 +299,7 @@ pub async fn publish_card_once(
     display_name: String,
     status_text: String,
     avatar_cid: Option<[u8; 32]>,
+    profile_page_root: Option<[u8; 32]>,
     enrollment: EnrollmentCert,
     shared_at: Hlc,
     sink: &dyn crate::profile_broadcast::ProfileBroadcastPublishSink,
@@ -293,6 +310,7 @@ pub async fn publish_card_once(
         display_name,
         status_text,
         avatar_cid,
+        profile_page_root,
         enrollment,
         shared_at,
     )
@@ -395,6 +413,7 @@ mod tests {
             "Pat".into(),
             "afk".into(),
             None,
+            None,
             owner.cert.clone(),
             Hlc {
                 wall_ms: 1,
@@ -423,6 +442,7 @@ mod tests {
             owner.owner.0,
             "Al".into(),
             "".into(),
+            None,
             None,
             owner.cert.clone(),
             Hlc {
@@ -455,6 +475,7 @@ mod tests {
             "Cy".into(),
             "yo".into(),
             None,
+            None,
             owner.cert.clone(),
             Hlc {
                 wall_ms: 5,
@@ -483,6 +504,7 @@ mod tests {
             "old".into(),
             "".into(),
             None,
+            None,
             owner.cert.clone(),
             Hlc {
                 wall_ms: 10,
@@ -496,6 +518,7 @@ mod tests {
             owner.owner.0,
             "new".into(),
             "".into(),
+            None,
             None,
             owner.cert.clone(),
             Hlc {
@@ -523,6 +546,7 @@ mod tests {
             "B".into(),
             "".into(),
             None,
+            None,
             b.cert.clone(),
             Hlc {
                 wall_ms: 1,
@@ -544,6 +568,7 @@ mod tests {
             owner.owner.0,
             "Jake (Koya Dev)".into(),
             "building".into(),
+            None,
             None,
             owner.cert.clone(),
             Hlc {
@@ -584,6 +609,7 @@ mod tests {
                 long,
                 "ok".into(),
                 None,
+                None,
                 owner.cert.clone(),
                 hlc.clone()
             ),
@@ -596,6 +622,7 @@ mod tests {
                 owner.owner.0,
                 "ok".into(),
                 longstatus,
+                None,
                 None,
                 owner.cert,
                 hlc
@@ -614,6 +641,7 @@ mod tests {
                 [0xFFu8; 16],
                 "n".into(),
                 "".into(),
+                None,
                 None,
                 a.cert.clone(),
                 Hlc {
@@ -638,6 +666,7 @@ mod tests {
                 "n".into(),
                 "".into(),
                 None,
+                None,
                 a.cert.clone(),
                 Hlc {
                     wall_ms: 1,
@@ -659,6 +688,7 @@ mod tests {
             "Ann".into(),
             "hi".into(),
             avatar,
+            None,
             owner.cert.clone(),
             Hlc {
                 wall_ms: 1,
@@ -679,6 +709,7 @@ mod tests {
             display_name: "Bo".into(),
             status_text: "".into(),
             avatar_cid: None,
+            profile_page_root: None,
             enrollment: owner.cert,
             shared_at: Hlc {
                 wall_ms: 9,
@@ -689,6 +720,64 @@ mod tests {
         };
         let bytes = crate::owner_state_crypto::canonical_cbor_encode(&card).expect("encode");
         assert_eq!(bytes[0], 0xA6, "no-avatar card must stay a 6-entry map");
+    }
+
+    #[test]
+    fn no_optional_cids_card_stays_six_entry_map() {
+        // ZEB-345: a card with BOTH avatar_cid and profile_page_root None must
+        // remain a 6-entry map (0xA6) — proving the new `pp` field is additive
+        // and byte-identical to a pre-ZEB-345 card when absent.
+        let owner = crate::community_membership::mint_test_owner(0x5C);
+        let card = sign_card(
+            &owner.device_key,
+            owner.owner.0,
+            "Bo".into(),
+            "".into(),
+            None,
+            None,
+            owner.cert.clone(),
+            Hlc {
+                wall_ms: 9,
+                logical: 1,
+                device_id: "x".into(),
+            },
+        )
+        .expect("sign");
+        let mut for_sig = card.clone();
+        for_sig.signature = [0u8; 64];
+        let bytes = crate::owner_state_crypto::canonical_cbor_encode(&for_sig).expect("encode");
+        assert_eq!(
+            bytes[0], 0xA6,
+            "card with no avatar and no profile_page_root must stay a 6-entry map"
+        );
+    }
+
+    #[test]
+    fn sign_verify_round_trips_with_profile_page_root() {
+        let owner = crate::community_membership::mint_test_owner(0x5D);
+        let page_root = Some([7u8; 32]);
+        let card = sign_card(
+            &owner.device_key,
+            owner.owner.0,
+            "Pp".into(),
+            "doc".into(),
+            None,
+            page_root,
+            owner.cert.clone(),
+            Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .expect("sign");
+        assert_eq!(card.profile_page_root, page_root);
+        // encode -> decode preserves the field (same pattern as avatar round-trip)
+        let bytes = canonical_cbor_encode(&card).expect("encode");
+        let decoded: ProfileCardBroadcast =
+            ciborium::de::from_reader(&bytes[..]).expect("decode struct");
+        assert_eq!(decoded.profile_page_root, page_root);
+        assert_eq!(verify_card(&decoded).expect("verify"), owner.owner.0);
     }
 
     #[test]
@@ -712,6 +801,7 @@ mod tests {
             "Ann".into(),
             "hi".into(),
             None,
+            None,
             owner.cert.clone(),
             Hlc {
                 wall_ms: 1,
@@ -732,6 +822,7 @@ mod tests {
             y.owner.0,
             "n".into(),
             "".into(),
+            None,
             None,
             y.cert.clone(),
             Hlc {
@@ -757,6 +848,7 @@ mod tests {
             "n".into(),
             "".into(),
             None,
+            None,
             owner.cert.clone(),
             Hlc {
                 wall_ms: 1,
@@ -780,6 +872,7 @@ mod tests {
             owner.owner.0,
             "n".into(),
             "".into(),
+            None,
             None,
             owner.cert.clone(),
             Hlc {
@@ -836,6 +929,7 @@ mod tests {
             owner_id,
             "n".into(),
             "".into(),
+            None,
             None,
             quorum_cert,
             Hlc {

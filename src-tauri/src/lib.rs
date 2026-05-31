@@ -5703,6 +5703,9 @@ async fn publish_owner_card(
         display_name,
         status_text,
         avatar_cid,
+        // ZEB-345 Task 1: card field exists, but the IPC/App plumbing that
+        // sources a self profile_page_root lands in Task 10. Pass None for now.
+        None,
         enrollment_cert,
         hlc,
     ) {

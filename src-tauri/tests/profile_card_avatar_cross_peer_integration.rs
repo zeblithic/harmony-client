@@ -34,6 +34,7 @@ async fn inner() {
         "Ann".into(),
         "hi".into(),
         Some(avatar_cid.to_bytes()),
+        None,
         owner.cert.clone(),
         Hlc {
             wall_ms: 1,

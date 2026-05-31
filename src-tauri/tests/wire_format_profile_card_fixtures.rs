@@ -11,6 +11,7 @@ fn profile_card_canonical_cbor_pins_field_codes() {
         display_name: "Ann".into(),
         status_text: "hi".into(),
         avatar_cid: None,
+        profile_page_root: None,
         enrollment: owner.cert,
         shared_at: Hlc {
             wall_ms: 1234,
@@ -51,6 +52,7 @@ fn profile_card_round_trips_through_canonical_cbor() {
         display_name: "Bo".into(),
         status_text: "".into(),
         avatar_cid: None,
+        profile_page_root: None,
         enrollment: owner.cert,
         shared_at: Hlc {
             wall_ms: 9,
