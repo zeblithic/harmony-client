@@ -27,6 +27,12 @@
   let saved = $state(false);
   let savedTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // Release any blob: preview URL we created when the editor unmounts, so
+  // object URLs don't accumulate across a long session.
+  $effect(() => () => {
+    if (avatarUrl?.startsWith('blob:')) URL.revokeObjectURL(avatarUrl);
+  });
+
   async function handleAvatarPick(e: Event) {
     const input = e.currentTarget as HTMLInputElement;
     const file = input.files?.[0];
@@ -41,7 +47,9 @@
       })) as string;
       avatarCid = cidHex;
       // Self-seed a local blob preview so the user sees the new avatar
-      // immediately, with zero network round-trip.
+      // immediately, with zero network round-trip. Revoke the previous
+      // preview URL first so repeated picks don't leak object URLs.
+      if (avatarUrl?.startsWith('blob:')) URL.revokeObjectURL(avatarUrl);
       avatarUrl = URL.createObjectURL(
         new Blob([new Uint8Array(bytes)], { type: 'image/png' }),
       );
