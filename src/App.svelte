@@ -207,14 +207,16 @@
   }
 
   async function handleProfileSave(profile: Profile) {
-    // Strip a `blob:`-scheme avatarUrl before PERSISTING: blob URLs are dead
-    // after a reload, and the avatar re-resolves from the persisted avatarCid on
-    // next load (same path peers use via the AvatarResolver). The in-session
-    // `profile`/`myProfile` keep the blob URL so the live preview stays instant.
-    const persisted: Profile = profile.avatarUrl?.startsWith('blob:')
+    // Strip a `blob:`-scheme avatarUrl before it leaves this session — for BOTH
+    // durable persistence AND the network publish. Blob URLs are session-local:
+    // dead after a reload, and unusable by peers. The avatar re-resolves from
+    // `avatarCid` (via the AvatarResolver) on reload and on peers. Only the
+    // in-session `myProfile`/preview keeps the blob URL so the live self-preview
+    // stays instant.
+    const sanitized: Profile = profile.avatarUrl?.startsWith('blob:')
       ? { ...profile, avatarUrl: undefined }
       : profile;
-    saveProfile(persisted);
+    saveProfile(sanitized);
     myProfile = profile;
     // Re-seed the card whenever the profile is saved so the name updates
     // immediately without a network round-trip (self-first, ZEB-341 Task 1).
@@ -227,8 +229,10 @@
     }
     // messageService.ownDisplayName / vineService.ownDisplayName are kept
     // in sync by a `$effect` later in the script (single source of truth).
-    // Publish to network if Tauri is available.
-    await publishProfileToNetwork(profile);
+    // Publish to network if Tauri is available — use the sanitized profile so a
+    // session-local blob: avatarUrl is never sent to peers (they resolve the
+    // avatar from avatarCid).
+    await publishProfileToNetwork(sanitized);
   }
 
   const vineService = new VineService();
