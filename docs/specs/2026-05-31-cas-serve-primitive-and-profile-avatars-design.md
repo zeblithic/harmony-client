@@ -3,7 +3,7 @@
 **Status:** approved (brainstormed 2026-05-31; revised 2026-05-30 after code validation of the leading-bit serve paradigm + single-PR directive)
 **Author:** Jake (J Eng) + Claude
 **Predecessor:** ZEB-341 (resolvable per-identity profile cards, merged PR #171, main `c82416a8`)
-**Linear:** to be filed (one fresh ticket — this ships as a single PR)
+**Linear:** ZEB-343 (one fresh ticket — this ships as a single PR)
 
 ## 1. Summary
 
