@@ -207,7 +207,14 @@
   }
 
   async function handleProfileSave(profile: Profile) {
-    saveProfile(profile);
+    // Strip a `blob:`-scheme avatarUrl before PERSISTING: blob URLs are dead
+    // after a reload, and the avatar re-resolves from the persisted avatarCid on
+    // next load (same path peers use via the AvatarResolver). The in-session
+    // `profile`/`myProfile` keep the blob URL so the live preview stays instant.
+    const persisted: Profile = profile.avatarUrl?.startsWith('blob:')
+      ? { ...profile, avatarUrl: undefined }
+      : profile;
+    saveProfile(persisted);
     myProfile = profile;
     // Re-seed the card whenever the profile is saved so the name updates
     // immediately without a network round-trip (self-first, ZEB-341 Task 1).

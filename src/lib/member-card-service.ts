@@ -134,8 +134,14 @@ export class MemberCardService {
   applyCard(ownerIdHex: string, card: ResolvedCard & { avatarCid?: string }): void {
     const key = ownerIdHex.toLowerCase();
     if (key === this.selfKey) return; // self stays authoritative (seedSelf)
-    if (card.avatarCid) this.cardAvatarCids.set(key, card.avatarCid);
-    const avatarUrl = this.resolveAvatarUrl(card.avatarCid ?? this.cardAvatarCids.get(key));
+    // Track the CURRENT avatarCid. A card that drops its avatar must clear the
+    // tracked cid AND the avatarUrl so a stale blob URL doesn't linger.
+    if (card.avatarCid) {
+      this.cardAvatarCids.set(key, card.avatarCid);
+    } else {
+      this.cardAvatarCids.delete(key);
+    }
+    const avatarUrl = card.avatarCid ? this.resolveAvatarUrl(card.avatarCid) : undefined;
     const next: ResolvedCard = {
       displayName: card.displayName,
       statusText: card.statusText,
@@ -253,10 +259,14 @@ export class MemberCardService {
             subscriptionId,
           })) as DiscoveredCardInfo | null;
           if (info === null) continue;
-          if (info.avatarCid) this.cardAvatarCids.set(owner, info.avatarCid);
-          const avatarUrl = this.resolveAvatarUrl(
-            info.avatarCid ?? this.cardAvatarCids.get(owner),
-          );
+          // Track the CURRENT avatarCid. A card that drops its avatar must clear
+          // the tracked cid AND the avatarUrl so a stale blob URL doesn't linger.
+          if (info.avatarCid) {
+            this.cardAvatarCids.set(owner, info.avatarCid);
+          } else {
+            this.cardAvatarCids.delete(owner);
+          }
+          const avatarUrl = info.avatarCid ? this.resolveAvatarUrl(info.avatarCid) : undefined;
           const prev = this.cards.get(owner);
           if (
             !prev ||

@@ -35,9 +35,13 @@ describe('MemberCardService avatar resolution', () => {
     svc.onUpdate = () => { updates++; };
     svc.applyCard('CC'.repeat(16), { displayName: 'Cy', statusText: '', avatarCid: 'cafe' } as any);
     expect(svc.resolve('cc'.repeat(16))?.avatarUrl).toBeUndefined(); // not resolved yet
+    // Capture the count BEFORE the refresh: applyCard already incremented
+    // `updates`, so asserting > 0 would pass even if onAvatarsRefreshed did
+    // nothing. Assert the DELTA so we know the refresh itself fired onUpdate.
+    const before = updates;
     map['cafe'] = 'blob:late-url'; // resolver now has it (simulating a completed fetch)
     svc.onAvatarsRefreshed();
     expect(svc.resolve('cc'.repeat(16))?.avatarUrl).toBe('blob:late-url');
-    expect(updates).toBeGreaterThan(0);
+    expect(updates).toBeGreaterThan(before);
   });
 });

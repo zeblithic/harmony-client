@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { validateAvatarInput, AVATAR_MAX_INPUT_BYTES } from '../avatar-normalize';
+import {
+  validateAvatarInput,
+  assertDecodedDimsOk,
+  AVATAR_MAX_INPUT_BYTES,
+  AVATAR_MAX_DECODED_DIM,
+} from '../avatar-normalize';
 
 describe('avatar-normalize input guards', () => {
   it('rejects a non-image file', () => {
@@ -16,5 +21,21 @@ describe('avatar-normalize input guards', () => {
   it('accepts a small png', () => {
     const f = new File([new Uint8Array([0x89, 0x50])], 'ok.png', { type: 'image/png' });
     expect(() => validateAvatarInput(f)).not.toThrow();
+  });
+});
+
+describe('avatar-normalize decompression-bomb guard', () => {
+  it('rejects an oversize decoded width', () => {
+    expect(() => assertDecodedDimsOk(AVATAR_MAX_DECODED_DIM + 1, 64)).toThrow(/too large/i);
+  });
+
+  it('rejects an oversize decoded height', () => {
+    expect(() => assertDecodedDimsOk(64, AVATAR_MAX_DECODED_DIM + 1)).toThrow(/too large/i);
+  });
+
+  it('accepts dimensions at the limit', () => {
+    expect(() =>
+      assertDecodedDimsOk(AVATAR_MAX_DECODED_DIM, AVATAR_MAX_DECODED_DIM),
+    ).not.toThrow();
   });
 });
