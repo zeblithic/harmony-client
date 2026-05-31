@@ -1434,6 +1434,37 @@ pub async fn run<R: Runtime>(
         });
     }
 
+    // ── ZEB-343: content-serve queryable ─────────────────────────
+    // Answer peer content GETs from the local StorageTier cache. The
+    // lookup closure routes through CasOp::GetLocal so the read happens
+    // on the event-loop-owned runtime (read-only; no recursive fetch).
+    {
+        let cas_op_tx_serve = cas_op_tx.clone();
+        let serve_lookup = std::sync::Arc::new(move |cid: ContentId| {
+            let tx = cas_op_tx_serve.clone();
+            Box::pin(async move {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                if tx
+                    .send(crate::content_store::CasOp::GetLocal {
+                        cid,
+                        reply: reply_tx,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return None;
+                }
+                reply_rx.await.ok().flatten()
+            })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send>>
+        });
+        let _serve_handle = spawn_content_serve_queryable(
+            std::sync::Arc::clone(&session_arc),
+            serve_lookup,
+            std::sync::Arc::clone(&closing),
+        );
+    }
+
     // ── Process startup actions (declare queryables + subscribers) ────
     for action in startup_actions {
         dispatch_action(
