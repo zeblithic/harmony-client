@@ -125,7 +125,12 @@ export class MemberCardService {
    *  self) fills in the URL when it lands. */
   seedSelf(ownerIdHex: string, profile: ResolvedCard & { avatarCid?: string }): void {
     this.selfKey = ownerIdHex.toLowerCase();
-    if (profile.avatarCid) {
+    // Track the self avatarCid for later resolution ONLY when there is no live
+    // blob preview. While a session-local `blob:` avatarUrl is active (just
+    // uploaded), tracking the cid would let onAvatarsRefreshed() overwrite that
+    // live preview with the resolver URL once the fetch completes. After a
+    // reload (no blob) the cid IS tracked so the avatar resolves from CAS.
+    if (profile.avatarCid && !profile.avatarUrl) {
       this.cardAvatarCids.set(this.selfKey, profile.avatarCid);
     } else {
       this.cardAvatarCids.delete(this.selfKey);

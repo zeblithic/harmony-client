@@ -59,8 +59,9 @@ describe('MemberCardService avatar resolution', () => {
     expect(svc.resolve('ff'.repeat(16))?.avatarUrl).toBe('blob:self-url');
   });
 
-  it('seedSelf prefers a live blob avatarUrl over the avatarCid (in-session)', () => {
+  it('seedSelf prefers a live blob avatarUrl, and onAvatarsRefreshed does not clobber it', () => {
     const svc = new MemberCardService();
+    // Resolver WOULD return a different URL for the cid — but the live blob must win.
     svc.setAvatarResolver(fakeResolver({ selfcid: 'blob:resolved' }) as any);
     svc.seedSelf('AB'.repeat(16), {
       displayName: 'Me',
@@ -68,6 +69,10 @@ describe('MemberCardService avatar resolution', () => {
       avatarUrl: 'blob:live-preview',
       avatarCid: 'selfcid',
     } as any);
+    expect(svc.resolve('ab'.repeat(16))?.avatarUrl).toBe('blob:live-preview');
+    // A later refresh (e.g. the resolver fetching some other card's avatar) must
+    // NOT overwrite the live self preview with the resolver URL.
+    svc.onAvatarsRefreshed();
     expect(svc.resolve('ab'.repeat(16))?.avatarUrl).toBe('blob:live-preview');
   });
 });
