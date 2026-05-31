@@ -3150,6 +3150,17 @@ where
         let cas_op_tx = cas_op_tx.clone();
         Box::pin(async move {
             let bytes = inner(cid).await?;
+            // ZEB-343 verify-on-fetch (spec §5.3): the StorageTier cache admit
+            // already verifies hash==cid, but the bytes RETURNED here go
+            // straight to the caller (e.g. the avatar resolver) regardless of
+            // admit success. Reject a tampered reply before it is returned OR
+            // admitted, so a malicious server can never get its bytes rendered.
+            if !cid.verify_hash(&bytes) {
+                return Err(format!(
+                    "fetched bytes for {} failed hash==CID verification",
+                    hex::encode(cid.to_bytes())
+                ));
+            }
             // Synchronous round-trip through the event loop's PutLocal
             // arm. `bytes.clone()` is load-bearing: `CasOp::PutLocal.blob`
             // consumes the bytes, but the caller (and `fetch_recursive`'s
@@ -3571,6 +3582,23 @@ mod fetch_one_wrapper_tests {
             result
         );
         assert_eq!(result.unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn wrap_rejects_bytes_that_fail_hash_eq_cid() {
+        let real = b"the real avatar bytes";
+        let cid = ContentId::for_book(real, ContentFlags::default()).unwrap();
+        let (cas_op_tx, _cas_op_rx) = mpsc::channel::<CasOp>(8);
+        let fetcher = move |_cid: ContentId| {
+            std::future::ready(Ok::<Vec<u8>, String>(b"TAMPERED".to_vec()))
+        };
+        let wrapped = wrap_fetch_one_with_admission(fetcher, cas_op_tx);
+        let result = wrapped(cid).await;
+        assert!(result.is_err(), "tampered bytes must be rejected, not returned");
+        assert!(
+            result.unwrap_err().contains("hash"),
+            "error should mention the hash==CID verification failure"
+        );
     }
 }
 
