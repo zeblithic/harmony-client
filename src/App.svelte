@@ -147,18 +147,35 @@
     }
   }
 
+  // ZEB-341: re-publish ONLY the owner_id card (not the full Reticulum profile)
+  // via the dedicated card-only IPC. Returns true if it landed (node ready).
+  async function republishOwnerCard(profile: Profile): Promise<boolean> {
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      await invoke('republish_owner_card', {
+        displayName: profile.displayName,
+        statusText: profile.statusText ?? '',
+      });
+      return true;
+    } catch {
+      return false; // node not ready — caller retries on zenoh-status connect
+    }
+  }
+
   // ZEB-341: attempt the one-shot boot card re-publish, but only mark it done on
   // a SUCCESSFUL publish. The publish can race Zenoh session startup (start_node
   // may return before the session connects); a failed early attempt leaves the
   // guard unset so a later trigger (the zenoh-status 'connected' handler)
   // retries. Without this, the guard would burn on a no-op and a returning
   // user's card would never publish (the 600s refresh only re-emits cached
-  // bytes, which stay empty until publish_now succeeds at least once).
+  // bytes, which stay empty until the card publish succeeds at least once).
+  // Publishes the CARD ONLY — not the full profile — so boot doesn't re-emit
+  // the unchanged Reticulum profile.
   async function tryBootPublishCard(): Promise<void> {
     if (hasPublishedCardOnBoot || selfOwnerId === null || !myProfile?.displayName) {
       return;
     }
-    if (await publishProfileToNetwork(myProfile)) {
+    if (await republishOwnerCard(myProfile)) {
       hasPublishedCardOnBoot = true;
     }
   }
@@ -634,6 +651,8 @@
       popoverCardX = Math.min(rect.right + 8, window.innerWidth - POPOVER_WIDTH - 8);
       popoverCardY = Math.min(rect.top, window.innerHeight - POPOVER_HEIGHT - 8);
     }
+    // Mutually exclusive with the Reticulum avatar popover — only one shows.
+    popoverProfile = null;
     popoverCard = payload;
   }
 
@@ -651,6 +670,8 @@
     const POPOVER_HEIGHT = 220;
     popoverX = Math.min(rect.right + 8, window.innerWidth - POPOVER_WIDTH - 8);
     popoverY = Math.min(rect.top, window.innerHeight - POPOVER_HEIGHT - 8);
+    // Mutually exclusive with the owner-card popover — only one shows.
+    popoverCard = null;
     popoverProfile = profile;
   }
 
@@ -1014,8 +1035,28 @@
         if (status.status === 'connected') {
           await fetchOwnAddress();
           await reloadBackendState();
-          // ZEB-341: the session is now confirmed up — (re)attempt the one-shot
-          // boot card publish in case an earlier attempt raced session startup.
+          // ZEB-341: the initial get_owner_state probe can return null when the
+          // owner finishes loading AFTER start_node returns; selfOwnerId would
+          // then stay null and tryBootPublishCard would be a permanent no-op.
+          // Re-fetch here (only while still unknown) so the boot card publish
+          // can proceed once the owner is available.
+          if (selfOwnerId === null) {
+            try {
+              const { invoke } = await import('@tauri-apps/api/core');
+              const ownerState = await invoke<OwnerStateView | null>('get_owner_state');
+              if (ownerState !== null) {
+                selfOwnerId = ownerState.ownerId;
+                memberCardService.seedSelf(ownerState.ownerId, {
+                  displayName: myProfile.displayName,
+                  statusText: myProfile.statusText ?? '',
+                });
+              }
+            } catch {
+              // owner still unavailable — leave selfOwnerId null for a later retry
+            }
+          }
+          // The session is now confirmed up — (re)attempt the one-shot boot card
+          // publish in case an earlier attempt raced session startup.
           await tryBootPublishCard();
         }
       });

@@ -5602,11 +5602,52 @@ async fn publish_profile(
         .await
         .map_err(|_| "event loop dropped publish request".to_string())??;
 
-    // ZEB-341: after the Reticulum profile publishes, sign + publish the
-    // owner_id profile card (device #2 key + EnrollmentCert) and hand the
-    // signed bytes to the card publisher for periodic 600s refresh. Skip
-    // silently if the owner runtime isn't fully wired (see binding comment).
-    if let (
+    // ZEB-341: after the Reticulum profile publishes, best-effort publish the
+    // owner_id profile card. A card-only failure must NOT fail this IPC — the
+    // Reticulum profile already committed, and surfacing an Err would make the
+    // frontend retry and double-publish it. `publish_owner_card` returns Err
+    // only when the owner runtime isn't ready; on save we just log + move on.
+    if let Err(e) = publish_owner_card(
+        dm_outbox,
+        dm_self_owner,
+        dm_device_id,
+        hlc_tracker,
+        profile_card_publisher,
+        profile.display_name.clone(),
+        profile.status_text.clone().unwrap_or_default(),
+    )
+    .await
+    {
+        tracing::debug!(error = %e, "owner card not published on save (runtime not ready)");
+    }
+
+    Ok(())
+}
+
+/// Sign + publish ONLY the owner_id profile card (device #2 key +
+/// EnrollmentCert), handing the signed bytes to the card publisher for the
+/// 600s refresh. Shared by `publish_profile` (best-effort on save) and
+/// `republish_owner_card` (card-only boot re-publish).
+///
+/// Returns `Err` ONLY when the owner runtime isn't ready yet (the caller may
+/// retry once the node connects). A bounds/encode failure is permanent for the
+/// given input, so it logs and returns `Ok(())` — there is nothing to retry.
+async fn publish_owner_card(
+    dm_outbox: Option<std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>>,
+    dm_self_owner: Option<crate::owner_state_types::OwnerAddr>,
+    dm_device_id: Option<String>,
+    hlc_tracker: Option<
+        std::sync::Arc<
+            tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        >,
+    >,
+    profile_card_publisher: Option<
+        std::sync::Arc<crate::profile_card_broadcast::ProfileCardPublisher>,
+    >,
+    display_name: String,
+    status_text: String,
+) -> Result<(), String> {
+    let (
         Some(dm_outbox),
         Some(self_owner),
         Some(device_id),
@@ -5618,53 +5659,83 @@ async fn publish_profile(
         dm_device_id,
         hlc_tracker,
         profile_card_publisher,
+    )
+    else {
+        return Err("owner card runtime not ready".to_string());
+    };
+    let owner_id = self_owner.0;
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let (signing_key, enrollment_cert) = {
+        let outbox_g = dm_outbox.lock().await;
+        (
+            std::sync::Arc::clone(&outbox_g.community_signing_key),
+            outbox_g.enrollment_cert.clone(),
+        )
+    };
+    let card = match crate::profile_card_broadcast::sign_card(
+        &signing_key,
+        owner_id,
+        display_name,
+        status_text,
+        enrollment_cert,
+        hlc,
     ) {
-        let owner_id = self_owner.0;
-        let wall_now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let hlc =
-            crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms)
-                .await;
-        let (signing_key, enrollment_cert) = {
-            let outbox_g = dm_outbox.lock().await;
-            (
-                std::sync::Arc::clone(&outbox_g.community_signing_key),
-                outbox_g.enrollment_cert.clone(),
-            )
-        };
-        // Card publish is BEST-EFFORT: the Reticulum profile already published
-        // above, so a card-publish failure must NOT surface as an IPC Err (the
-        // frontend would retry → double Reticulum publish). Spec §10: log + skip.
-        let card = match crate::profile_card_broadcast::sign_card(
-            &signing_key,
-            owner_id,
-            profile.display_name.clone(),
-            profile.status_text.clone().unwrap_or_default(),
-            enrollment_cert,
-            hlc,
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, "profile card sign failed; skipping card publish");
-                return Ok(());
-            }
-        };
-        let bytes = match crate::owner_state_crypto::canonical_cbor_encode(&card) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(error = %e, "profile card encode failed; skipping card publish");
-                return Ok(());
-            }
-        };
-        let topic = crate::profile_card_broadcast::card_topic_for(&owner_id);
-        if let Err(e) = card_publisher.publish_now(topic, bytes).await {
-            tracing::warn!(error = %e, "profile card publish failed after profile publish");
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "owner card sign failed; skipping card publish");
+            return Ok(());
         }
-    }
+    };
+    let bytes = match crate::owner_state_crypto::canonical_cbor_encode(&card) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "owner card encode failed; skipping card publish");
+            return Ok(());
+        }
+    };
+    let topic = crate::profile_card_broadcast::card_topic_for(&owner_id);
+    card_publisher
+        .publish_now(topic, bytes)
+        .await
+        .map_err(|e| format!("owner card publish failed: {e}"))
+}
 
-    Ok(())
+/// ZEB-341: re-publish ONLY the owner_id profile card (NOT the Reticulum
+/// profile). The frontend calls this once on boot so a returning user's card
+/// is resolvable to subscribing peers without re-publishing their full
+/// Reticulum profile. Returns `Err` when the owner runtime isn't ready yet, so
+/// the frontend can retry once the Zenoh session connects.
+#[tauri::command]
+async fn republish_owner_card(
+    display_name: String,
+    status_text: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let (dm_outbox, dm_self_owner, dm_device_id, hlc_tracker, profile_card_publisher) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        (
+            guard.dm_outbox.clone(),
+            guard.dm_self_owner,
+            guard.dm_device_id.clone(),
+            guard.hlc_tracker.clone(),
+            guard.profile_card_publisher.clone(),
+        )
+    };
+    publish_owner_card(
+        dm_outbox,
+        dm_self_owner,
+        dm_device_id,
+        hlc_tracker,
+        profile_card_publisher,
+        display_name,
+        status_text,
+    )
+    .await
 }
 
 /// Send a channel message to the mesh network via Zenoh pub/sub.
@@ -31580,6 +31651,7 @@ pub fn run() {
             connect_zenoh,
             disconnect_zenoh,
             publish_profile,
+            republish_owner_card,
             send_message,
             send_dm,
             read_dm_thread,
