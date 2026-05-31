@@ -146,6 +146,7 @@
           displayName: profile.displayName,
           statusText: profile.statusText,
           avatarUrl: profile.avatarUrl,
+          avatarCid: profile.avatarCid,
         },
       });
       return true;
@@ -163,6 +164,7 @@
       await invoke('republish_owner_card', {
         displayName: profile.displayName,
         statusText: profile.statusText ?? '',
+        avatarCid: profile.avatarCid ?? null,
       });
       return true;
     } catch {
@@ -213,6 +215,7 @@
       memberCardService.seedSelf(selfOwnerId, {
         displayName: profile.displayName,
         statusText: profile.statusText ?? '',
+        avatarUrl: profile.avatarUrl,
       });
     }
     // messageService.ownDisplayName / vineService.ownDisplayName are kept
@@ -420,6 +423,7 @@
     memberCardService.seedSelf(result.state.ownerId, {
       displayName: myProfile.displayName,
       statusText: myProfile.statusText ?? '',
+      avatarUrl: myProfile.avatarUrl,
     });
     drainQueuedInvite();
   }
@@ -633,8 +637,19 @@
 
   let navNodes = $state([...navService.nodes]);
 
-  // When avatar CIDs finish resolving, push blob URLs into stored profiles/nodes.
-  avatarResolver.onChange = () => navService.refreshAvatars();
+  // Share the same resolver with the member-card service so peer-card avatars
+  // (member rows, message feed) resolve through the identical fetch cache as
+  // nav nodes. Task 11's setAvatarResolver does NOT touch resolver.onChange, so
+  // setting the combined onChange immediately below is safe regardless of order.
+  memberCardService.setAvatarResolver(avatarResolver);
+
+  // When avatar CIDs finish resolving, push blob URLs into BOTH stored
+  // nav profiles/nodes AND peer member cards so every avatar surface
+  // re-renders after a late fetch completes.
+  avatarResolver.onChange = () => {
+    navService.refreshAvatars();
+    memberCardService.onAvatarsRefreshed();
+  };
   navService.onChange = () => {
     navNodes = [...navService.nodes];
   };
@@ -940,6 +955,7 @@
             memberCardService.seedSelf(ownerState.ownerId, {
               displayName: myProfile.displayName,
               statusText: myProfile.statusText ?? '',
+              avatarUrl: myProfile.avatarUrl,
             });
             // ZEB-341: re-publish this returning user's profile card on boot so
             // subscribing peers can resolve their name without a manual re-save.
