@@ -18,6 +18,7 @@
     resolver,
     docVersion = 0,
     onClose,
+    onHarmonyLink,
   }: {
     ownerIdHex: string;
     card: {
@@ -33,7 +34,44 @@
      *  (existing tests render without it and stay header-only until resolved). */
     docVersion?: number;
     onClose: () => void;
+    /**
+     * T11: dispatch a `harmony:` profile link for in-app navigation. App.svelte
+     * wires this to its deep-link routing (ZEB-338) — see header comment on
+     * `onLinkClick`. Optional so existing render-only tests work without it; a
+     * missing handler just means the `harmony:` click is swallowed (no raw
+     * navigation), never an external open.
+     */
+    onHarmonyLink?: (url: string) => void;
   } = $props();
+
+  // T11 render safety: scheme allowlist enforced on the RECEIVE side
+  // (defense-in-depth — fetch_profile_doc already rejects non-allowlisted
+  // schemes on ingest, but the UI must never be tricked into materializing a
+  // javascript:/data: href even if a malformed doc slips through).
+  //
+  //   - https://  → real <a target="_blank" rel="noopener noreferrer"> (external)
+  //   - harmony:  → preventDefault + dispatch via onHarmonyLink (in-app nav)
+  //   - anything else → rendered INERT (plain text label, no href, not clickable)
+  const ALLOWED_SCHEMES = ['https://', 'harmony:'];
+  function linkOk(u: string): boolean {
+    return ALLOWED_SCHEMES.some((s) => u.startsWith(s));
+  }
+  function onLinkClick(e: MouseEvent, url: string): void {
+    if (!linkOk(url)) {
+      // Belt-and-suspenders: a non-allowlisted url should never have rendered as
+      // an <a> at all (see {#if linkOk(link.url)} below), but if one ever does,
+      // refuse the navigation rather than honor a hostile href.
+      e.preventDefault();
+      return;
+    }
+    if (url.startsWith('harmony:')) {
+      // In-app deep link: stop the browser from doing a raw navigation and hand
+      // the url to App's ZEB-338 deep-link routing instead.
+      e.preventDefault();
+      onHarmonyLink?.(url);
+    }
+    // https: falls through to the default <a target="_blank" rel="noopener noreferrer">.
+  }
 
   // Lazy: resolve() kicks off the fetch on a cache miss and returns undefined
   // until it lands. The re-render after the fetch resolves is driven by App's
@@ -112,10 +150,22 @@
         <h3 class="section-label">Links</h3>
         <ul class="links-list">
           {#each doc.links as link}
-            <!-- T11: scheme-split + safety (https: external, harmony: deep-link
-                 router, frontend re-checks the scheme allowlist). Basic <a> for
-                 now. -->
-            <li><a href={link.url} rel="noopener noreferrer">{link.label}</a></li>
+            <!-- T11: scheme-split + render safety. Only an allowlisted scheme
+                 (https: external / harmony: in-app via onHarmonyLink) is rendered
+                 as a real <a>. Any other scheme is INERT text — no href, so the
+                 UI can't be tricked into a javascript:/data: navigation even if a
+                 malformed doc reaches us. -->
+            <li>
+              {#if linkOk(link.url)}
+                <a
+                  href={link.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onclick={(e) => onLinkClick(e, link.url)}>{link.label}</a>
+              {:else}
+                <span class="link-inert" title="Unsupported link">{link.label}</span>
+              {/if}
+            </li>
           {/each}
         </ul>
       </section>
@@ -278,6 +328,14 @@
   }
   .links-list a:hover {
     text-decoration: underline;
+  }
+  /* T11: a link with a non-allowlisted scheme renders as inert text (no href,
+     not clickable) — muted to signal it isn't actionable. */
+  .links-list .link-inert {
+    font-size: 13px;
+    color: var(--text-muted);
+    word-break: break-all;
+    cursor: default;
   }
 
   .fields-list {

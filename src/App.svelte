@@ -422,6 +422,25 @@
     showRedeemInvite = true;
   }
 
+  // ZEB-345 Task 11: dispatch a `harmony:` link clicked inside ProfilePanel
+  // through the same in-app deep-link routing the OS handoff uses (ZEB-338).
+  // The panel already enforced the scheme allowlist and preventDefault'd the
+  // raw navigation, so this only ever receives a `harmony:` url. Today the only
+  // in-app harmony route is the invite flow; an invite url goes through
+  // routeInviteUrl (queue pre-mint / redeem dialog post-mint), matching the OS
+  // deep-link path. Other harmony: links have no in-app destination yet, so they
+  // are intentionally a no-op (logged) rather than an external open — never a
+  // raw navigation. When a general harmony: route lands, extend the dispatch
+  // here.
+  function routeHarmonyLink(url: string): void {
+    const invite = extractHarmonyInviteUrl([url]);
+    if (invite) {
+      routeInviteUrl(invite);
+      return;
+    }
+    console.warn(`[harmony-client] no in-app route for harmony link: ${url}`);
+  }
+
   // ZEB-338: drain a queued invite into the redeem dialog (called post-mint and
   // post-boot-when-owner-already-present).
   function drainQueuedInvite(): void {
@@ -2180,6 +2199,7 @@
       resolver={profilePageResolver}
       docVersion={profileDocVersion}
       onClose={() => (openProfileOwnerId = null)}
+      onHarmonyLink={routeHarmonyLink}
     />
   </div>
 {/if}

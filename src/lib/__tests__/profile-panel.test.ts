@@ -63,9 +63,9 @@ describe('ProfilePanel', () => {
     expect(bio).toBeTruthy();
   });
 
-  it('escapes bio content (no {@html} injection)', () => {
+  it('escapes bio content (no {@html} injection: <script> + <img onerror>)', () => {
     const xssDto: ProfilePageDto = {
-      bio: '<img src=x onerror=alert(1)>',
+      bio: '<script>alert(1)</script><img src=x onerror=alert(1)>',
       links: [],
       fields: [],
     };
@@ -77,9 +77,12 @@ describe('ProfilePanel', () => {
         onClose: vi.fn(),
       },
     });
-    // The bio must be rendered as text, not parsed into an <img> element.
+    // The bio must be rendered as TEXT, not parsed into <script>/<img> elements.
     expect(container.querySelector('img')).toBeNull();
-    expect(screen.getByText('<img src=x onerror=alert(1)>')).toBeTruthy();
+    expect(container.querySelector('script')).toBeNull();
+    expect(
+      screen.getByText('<script>alert(1)</script><img src=x onerror=alert(1)>'),
+    ).toBeTruthy();
   });
 
   it('renders link rows with correct labels and hrefs', () => {
@@ -95,6 +98,92 @@ describe('ProfilePanel', () => {
     expect(site.getAttribute('href')).toBe('https://example.com');
     const room = screen.getByText('Harmony room') as HTMLAnchorElement;
     expect(room.getAttribute('href')).toBe('harmony:room/abc');
+  });
+
+  // ── T11: render safety — scheme allowlist + dispatch ─────────────────────
+  it('renders an https: link as <a target="_blank" rel="noopener noreferrer">', () => {
+    const dto: ProfilePageDto = {
+      bio: '',
+      links: [{ label: 'My site', url: 'https://example.com' }],
+      fields: [],
+    };
+    render(ProfilePanel, {
+      props: {
+        ownerIdHex: OWNER_HEX,
+        card: { displayName: 'Alice', profilePageRoot: ROOT_CID },
+        resolver: fakeResolver({ [ROOT_CID]: dto }),
+        onClose: vi.fn(),
+      },
+    });
+    const site = screen.getByText('My site') as HTMLAnchorElement;
+    expect(site.tagName).toBe('A');
+    expect(site.getAttribute('href')).toBe('https://example.com');
+    expect(site.getAttribute('target')).toBe('_blank');
+    expect(site.getAttribute('rel')).toBe('noopener noreferrer');
+  });
+
+  it('dispatches a harmony: link click via onHarmonyLink and prevents raw navigation', async () => {
+    const onHarmonyLink = vi.fn();
+    const dto: ProfilePageDto = {
+      bio: '',
+      links: [{ label: 'Harmony room', url: 'harmony:room/abc' }],
+      fields: [],
+    };
+    render(ProfilePanel, {
+      props: {
+        ownerIdHex: OWNER_HEX,
+        card: { displayName: 'Alice', profilePageRoot: ROOT_CID },
+        resolver: fakeResolver({ [ROOT_CID]: dto }),
+        onClose: vi.fn(),
+        onHarmonyLink,
+      },
+    });
+    const room = screen.getByText('Harmony room') as HTMLAnchorElement;
+    // The harmony: link still renders as a real <a> (allowlisted scheme) so the
+    // href is inspectable / right-clickable, but the click is intercepted.
+    expect(room.tagName).toBe('A');
+    expect(room.getAttribute('href')).toBe('harmony:room/abc');
+
+    // Dispatch a real click and confirm the default (navigation) was prevented.
+    const evt = new MouseEvent('click', { bubbles: true, cancelable: true });
+    room.dispatchEvent(evt);
+    expect(onHarmonyLink).toHaveBeenCalledTimes(1);
+    expect(onHarmonyLink).toHaveBeenCalledWith('harmony:room/abc');
+    expect(evt.defaultPrevented).toBe(true);
+  });
+
+  it('renders a disallowed-scheme link INERT (no anchor, not clickable)', () => {
+    const onHarmonyLink = vi.fn();
+    const dto: ProfilePageDto = {
+      bio: '',
+      links: [
+        { label: 'javascript bomb', url: 'javascript:alert(1)' },
+        { label: 'plain http', url: 'http://insecure.example' },
+        { label: 'data uri', url: 'data:text/html,<script>1</script>' },
+      ],
+      fields: [],
+    };
+    const { container } = render(ProfilePanel, {
+      props: {
+        ownerIdHex: OWNER_HEX,
+        card: { displayName: 'Eve', profilePageRoot: ROOT_CID },
+        resolver: fakeResolver({ [ROOT_CID]: dto }),
+        onClose: vi.fn(),
+        onHarmonyLink,
+      },
+    });
+    // None of the disallowed links produced an <a> at all.
+    const anchors = Array.from(container.querySelectorAll('a'));
+    expect(anchors.length).toBe(0);
+    // The labels still appear as inert text.
+    const inert = screen.getByText('javascript bomb');
+    expect(inert.tagName).not.toBe('A');
+    expect(inert.getAttribute('href')).toBeNull();
+    expect(screen.getByText('plain http').tagName).not.toBe('A');
+    expect(screen.getByText('data uri').tagName).not.toBe('A');
+    // Clicking the inert label does nothing.
+    inert.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    expect(onHarmonyLink).not.toHaveBeenCalled();
   });
 
   it('renders field rows as key/value pairs', () => {
