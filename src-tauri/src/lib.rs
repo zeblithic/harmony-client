@@ -8348,6 +8348,88 @@ async fn ingest_avatar_bytes(
     ingest_avatar_bytes_inner(&ingest_tx, bytes).await
 }
 
+/// ZEB-345: structured input for one profile-page link, deserialized from the
+/// frontend. Validated (cap + scheme) inside `encode_profile_doc`.
+#[derive(serde::Deserialize, Clone)]
+pub struct ProfileLinkInput {
+    pub label: String,
+    pub url: String,
+}
+
+/// ZEB-345: structured input for one profile-page key/value field.
+#[derive(serde::Deserialize, Clone)]
+pub struct ProfileFieldInput {
+    pub key: String,
+    pub value: String,
+}
+
+/// ZEB-345: build + validate + canonical-encode a `ProfilePageDoc` from
+/// structured frontend input, then ingest the bytes into CAS as a
+/// PublicDurable (unencrypted, publicly servable) object. Twin of
+/// `ingest_avatar_bytes_inner` — same ingest channel, same root→hex
+/// conversion — but the doc is encoded here rather than received pre-built, so
+/// caps/scheme/size are enforced by `encode_profile_doc` (the encode authority
+/// lives in `profile_page_doc`, never in the frontend). Like avatars, skips the
+/// sidecar insert so profile docs never appear in the file listing.
+pub(crate) async fn ingest_profile_doc_inner(
+    bio: String,
+    links: Vec<ProfileLinkInput>,
+    fields: Vec<ProfileFieldInput>,
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+) -> Result<String, String> {
+    use crate::profile_page_doc::{
+        encode_profile_doc, ProfileField, ProfileLink, ProfilePageDoc, PROFILE_DOC_VERSION,
+    };
+    use harmony_content::chunker::ChunkerConfig;
+
+    let doc = ProfilePageDoc {
+        version: PROFILE_DOC_VERSION,
+        bio,
+        links: links
+            .into_iter()
+            .map(|l| ProfileLink {
+                label: l.label,
+                url: l.url,
+            })
+            .collect(),
+        fields: fields
+            .into_iter()
+            .map(|f| ProfileField {
+                key: f.key,
+                value: f.value,
+            })
+            .collect(),
+    };
+    // Validates caps + link scheme + total encoded size, then returns the
+    // canonical-CBOR bytes (declaration-order keys). Any Err maps to a String
+    // surfaced to the IPC caller.
+    let bytes = encode_profile_doc(&doc).map_err(|e| e.to_string())?;
+    let reader = tokio::io::BufReader::new(std::io::Cursor::new(bytes));
+    let (root, _size) = streaming_ingest(reader, ingest_tx, ChunkerConfig::DEFAULT, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(hex::encode(root.to_bytes()))
+}
+
+/// ZEB-345 IPC: ingest a long-form profile document (bio + links + fields)
+/// into CAS, returning the root CID hex for the card's `profile_page_root`.
+#[tauri::command]
+async fn ingest_profile_doc(
+    bio: String,
+    links: Vec<ProfileLinkInput>,
+    fields: Vec<ProfileFieldInput>,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<String, String> {
+    let ingest_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .ingest_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    ingest_profile_doc_inner(bio, links, fields, &ingest_tx).await
+}
+
 /// Ingest a leaf file already present on disk through the same pipeline as
 /// `ingest_content`, but driven by an explicit path instead of an `rfd`
 /// dialog. Internal — kept for a future direct-leaf-ingest IPC (e.g. a
@@ -8591,6 +8673,92 @@ mod path_ingest_tests {
         let cid = ContentId::from_bytes(<[u8; 32]>::try_from(raw).unwrap());
         assert_eq!(cid.content_class(), ContentClass::PublicDurable);
         assert!(cid.verify_hash(&bytes), "cid must hash the ingested bytes");
+        drop(ingest_tx);
+        let _ = drainer.await;
+    }
+
+    #[tokio::test]
+    async fn ingest_profile_doc_yields_public_durable_cid() {
+        use crate::profile_page_doc::{encode_profile_doc, ProfilePageDoc, PROFILE_DOC_VERSION};
+        use harmony_content::cid::{ContentClass, ContentId};
+        let (ingest_tx, mut ingest_rx) =
+            tokio::sync::mpsc::channel::<event_loop::IngestRequest>(16);
+        let drainer = tokio::spawn(async move {
+            while let Some(req) = ingest_rx.recv().await {
+                let _ = req.reply.send(Ok(()));
+            }
+        });
+
+        let links = vec![ProfileLinkInput {
+            label: "Site".into(),
+            url: "https://example.com".into(),
+        }];
+        let fields = vec![ProfileFieldInput {
+            key: "Pronouns".into(),
+            value: "she/her".into(),
+        }];
+        let cid_hex = ingest_profile_doc_inner(
+            "hi\nthere".into(),
+            links.clone(),
+            fields.clone(),
+            &ingest_tx,
+        )
+        .await
+        .expect("ingest profile doc");
+
+        // The CID must be PublicDurable (leading bit clear) and hash the exact
+        // canonical-CBOR bytes the codec produces for the same structured input.
+        let raw = hex::decode(&cid_hex).unwrap();
+        let cid = ContentId::from_bytes(<[u8; 32]>::try_from(raw).unwrap());
+        assert_eq!(cid.content_class(), ContentClass::PublicDurable);
+
+        let expected_doc = ProfilePageDoc {
+            version: PROFILE_DOC_VERSION,
+            bio: "hi\nthere".into(),
+            links: links
+                .into_iter()
+                .map(|l| crate::profile_page_doc::ProfileLink {
+                    label: l.label,
+                    url: l.url,
+                })
+                .collect(),
+            fields: fields
+                .into_iter()
+                .map(|f| crate::profile_page_doc::ProfileField {
+                    key: f.key,
+                    value: f.value,
+                })
+                .collect(),
+        };
+        let expected_bytes = encode_profile_doc(&expected_doc).unwrap();
+        assert!(
+            cid.verify_hash(&expected_bytes),
+            "cid must hash the canonical profile-doc bytes"
+        );
+
+        drop(ingest_tx);
+        let _ = drainer.await;
+    }
+
+    #[tokio::test]
+    async fn ingest_profile_doc_rejects_oversize_input() {
+        use crate::profile_page_doc::MAX_BIO_BYTES;
+        let (ingest_tx, mut ingest_rx) =
+            tokio::sync::mpsc::channel::<event_loop::IngestRequest>(16);
+        let drainer = tokio::spawn(async move {
+            while let Some(req) = ingest_rx.recv().await {
+                let _ = req.reply.send(Ok(()));
+            }
+        });
+
+        // A bio one byte over the cap must fail at validation, before any
+        // bytes are streamed into CAS.
+        let oversize_bio = "x".repeat(MAX_BIO_BYTES + 1);
+        let err = ingest_profile_doc_inner(oversize_bio, Vec::new(), Vec::new(), &ingest_tx)
+            .await
+            .expect_err("oversize bio must be rejected");
+        assert!(err.contains("bio"), "expected bio-cap error, got: {err}");
+
         drop(ingest_tx);
         let _ = drainer.await;
     }
@@ -31771,6 +31939,7 @@ pub fn run() {
             export_content,
             ingest_content,
             ingest_avatar_bytes,
+            ingest_profile_doc,
             create_folder,
             ingest_folder_tree,
             cancel_folder_ingest,
