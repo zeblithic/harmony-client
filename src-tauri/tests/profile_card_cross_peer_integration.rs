@@ -47,6 +47,7 @@ async fn owner_b_resolves_owner_a_card_and_rejects_spoof() {
         a.owner.0,
         "Alice".into(),
         "hi".into(),
+        None,
         a.cert.clone(),
         hlc(1, "a"),
     )
@@ -70,6 +71,7 @@ async fn owner_b_resolves_owner_a_card_and_rejects_spoof() {
         b.owner.0,
         "NotAlice".into(),
         "".into(),
+        None,
         b.cert.clone(),
         hlc(2, "b"), // NEWER HLC than A's card — would win newer-wins if it ever inserted.
     )

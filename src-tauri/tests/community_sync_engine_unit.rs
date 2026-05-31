@@ -219,6 +219,10 @@ async fn engine_receives_remote_publish_and_merges_event() {
                     let v = cas_for_servicer.lock().await.get(&cid).cloned();
                     let _ = reply.send(Ok(v));
                 }
+                CasOp::GetLocal { cid, reply } => {
+                    let v = cas_for_servicer.lock().await.get(&cid).cloned();
+                    let _ = reply.send(v);
+                }
             }
         }
     });
@@ -471,6 +475,10 @@ async fn engine_emits_membership_delta_on_remote_insert() {
                 } => {
                     let v = cas_for_servicer.lock().await.get(&cid).cloned();
                     let _ = reply.send(Ok(v));
+                }
+                CasOp::GetLocal { cid, reply } => {
+                    let v = cas_for_servicer.lock().await.get(&cid).cloned();
+                    let _ = reply.send(v);
                 }
             }
         }
@@ -1088,6 +1096,10 @@ async fn spoofed_publisher_addr_rejected_with_publisher_sig_invalid() {
                     let v = cas_for_servicer.lock().await.get(&cid).cloned();
                     let _ = reply.send(Ok(v));
                 }
+                CasOp::GetLocal { cid, reply } => {
+                    let v = cas_for_servicer.lock().await.get(&cid).cloned();
+                    let _ = reply.send(v);
+                }
             }
         }
     });
@@ -1268,6 +1280,10 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
                 } => {
                     let v = cas_for_servicer.lock().await.get(&cid).cloned();
                     let _ = reply.send(Ok(v));
+                }
+                CasOp::GetLocal { cid, reply } => {
+                    let v = cas_for_servicer.lock().await.get(&cid).cloned();
+                    let _ = reply.send(v);
                 }
             }
         }
@@ -1502,6 +1518,10 @@ async fn cold_cache_publish_rejected_then_succeeds_after_propagation() {
                 } => {
                     let v = cas_for_servicer.lock().await.get(&cid).cloned();
                     let _ = reply.send(Ok(v));
+                }
+                CasOp::GetLocal { cid, reply } => {
+                    let v = cas_for_servicer.lock().await.get(&cid).cloned();
+                    let _ = reply.send(v);
                 }
             }
         }

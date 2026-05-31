@@ -3,6 +3,7 @@ import type { TauriAdapter } from './zenoh-service';
 export interface ResolvedCard {
   displayName: string;
   statusText: string;
+  avatarUrl?: string;
 }
 
 /**
@@ -14,6 +15,7 @@ export interface DiscoveredCardInfo {
   ownerIdHex: string;
   displayName: string;
   statusText: string;
+  avatarCid?: string;
 }
 
 /** Poll cadence for the cache-drain loop. 3s balances name-fill latency
@@ -64,6 +66,11 @@ export class MemberCardService {
     return next;
   }
 
+  private avatarResolver?: { resolve: (cid: string) => string | undefined };
+  /** ownerIdHex(lc) -> the card's avatarCid hex, tracked so onAvatarsRefreshed
+   *  can re-resolve to a blob URL once the resolver fetches it. */
+  private cardAvatarCids = new Map<string, string>();
+
   /**
    * Adapter is optional so the synchronous seedSelf/resolve unit tests can
    * construct the service with no Tauri runtime. Network methods no-op (with
@@ -80,10 +87,60 @@ export class MemberCardService {
     this.adapter = adapter;
   }
 
-  /** Seed (or overwrite) the self owner_id from the local profile. Synchronous. */
-  seedSelf(ownerIdHex: string, profile: ResolvedCard): void {
+  /** Attach the shared AvatarResolver. Does NOT touch resolver.onChange — the
+   *  owner (App.svelte) owns a combined onChange that calls both nav-service
+   *  and this service's onAvatarsRefreshed(). */
+  setAvatarResolver(resolver: { resolve: (cid: string) => string | undefined }): void {
+    this.avatarResolver = resolver;
+  }
+
+  private resolveAvatarUrl(avatarCid?: string): string | undefined {
+    if (!avatarCid || !this.avatarResolver) return undefined;
+    return this.avatarResolver.resolve(avatarCid);
+  }
+
+  /** Re-resolve avatarUrls for cards whose avatarCid newly resolved (called by
+   *  App after the AvatarResolver fetches a blob URL). Fires onUpdate if any
+   *  card changed. */
+  onAvatarsRefreshed(): void {
+    let changed = false;
+    for (const [owner, card] of this.cards) {
+      const cid = this.cardAvatarCids.get(owner);
+      if (!cid) continue;
+      const url = this.resolveAvatarUrl(cid);
+      if (url && card.avatarUrl !== url) {
+        this.cards.set(owner, { ...card, avatarUrl: url });
+        changed = true;
+      }
+    }
+    if (changed) this.onUpdate?.();
+  }
+
+  /** Seed (or overwrite) the self owner_id from the local profile. Synchronous.
+   *  When the profile carries an `avatarCid` but no live blob `avatarUrl` (e.g.
+   *  after a reload, where the session-local blob URL was stripped before
+   *  persisting), resolve the avatar from its CID via the AvatarResolver —
+   *  otherwise the self row/messages fall back to an identicon. The resolver
+   *  kicks off a fetch on a miss; `onAvatarsRefreshed()` (which does NOT skip
+   *  self) fills in the URL when it lands. */
+  seedSelf(ownerIdHex: string, profile: ResolvedCard & { avatarCid?: string }): void {
     this.selfKey = ownerIdHex.toLowerCase();
-    this.cards.set(this.selfKey, { ...profile });
+    // Track the self avatarCid for later resolution ONLY when there is no live
+    // blob preview. While a session-local `blob:` avatarUrl is active (just
+    // uploaded), tracking the cid would let onAvatarsRefreshed() overwrite that
+    // live preview with the resolver URL once the fetch completes. After a
+    // reload (no blob) the cid IS tracked so the avatar resolves from CAS.
+    if (profile.avatarCid && !profile.avatarUrl) {
+      this.cardAvatarCids.set(this.selfKey, profile.avatarCid);
+    } else {
+      this.cardAvatarCids.delete(this.selfKey);
+    }
+    const avatarUrl = profile.avatarUrl ?? this.resolveAvatarUrl(profile.avatarCid);
+    this.cards.set(this.selfKey, {
+      displayName: profile.displayName,
+      statusText: profile.statusText,
+      avatarUrl,
+    });
     this.onUpdate?.();
   }
 
@@ -95,14 +152,32 @@ export class MemberCardService {
   /** Apply a card delivered via the `member-card-received` push event (instant
    *  path; the poll loop is the fallback). Idempotent with the poll. Never
    *  overwrites the locally-seeded self entry. */
-  applyCard(ownerIdHex: string, card: ResolvedCard): void {
+  applyCard(ownerIdHex: string, card: ResolvedCard & { avatarCid?: string }): void {
     const key = ownerIdHex.toLowerCase();
     if (key === this.selfKey) return; // self stays authoritative (seedSelf)
+    // Track the CURRENT avatarCid. A card that drops its avatar must clear the
+    // tracked cid AND the avatarUrl so a stale blob URL doesn't linger.
+    if (card.avatarCid) {
+      this.cardAvatarCids.set(key, card.avatarCid);
+    } else {
+      this.cardAvatarCids.delete(key);
+    }
+    const avatarUrl = card.avatarCid ? this.resolveAvatarUrl(card.avatarCid) : undefined;
+    const next: ResolvedCard = {
+      displayName: card.displayName,
+      statusText: card.statusText,
+      avatarUrl,
+    };
     const prev = this.cards.get(key);
-    if (prev && prev.displayName === card.displayName && prev.statusText === card.statusText) {
+    if (
+      prev &&
+      prev.displayName === next.displayName &&
+      prev.statusText === next.statusText &&
+      prev.avatarUrl === next.avatarUrl
+    ) {
       return; // unchanged — no churn
     }
-    this.cards.set(key, { displayName: card.displayName, statusText: card.statusText });
+    this.cards.set(key, next);
     this.onUpdate?.();
   }
 
@@ -205,15 +280,25 @@ export class MemberCardService {
             subscriptionId,
           })) as DiscoveredCardInfo | null;
           if (info === null) continue;
+          // Track the CURRENT avatarCid. A card that drops its avatar must clear
+          // the tracked cid AND the avatarUrl so a stale blob URL doesn't linger.
+          if (info.avatarCid) {
+            this.cardAvatarCids.set(owner, info.avatarCid);
+          } else {
+            this.cardAvatarCids.delete(owner);
+          }
+          const avatarUrl = info.avatarCid ? this.resolveAvatarUrl(info.avatarCid) : undefined;
           const prev = this.cards.get(owner);
           if (
             !prev ||
             prev.displayName !== info.displayName ||
-            prev.statusText !== info.statusText
+            prev.statusText !== info.statusText ||
+            prev.avatarUrl !== avatarUrl
           ) {
             this.cards.set(owner, {
               displayName: info.displayName,
               statusText: info.statusText,
+              avatarUrl,
             });
             changed = true;
           }

@@ -138,6 +138,10 @@ fn spawn_shared_cas() -> mpsc::Sender<CasOp> {
                     let v = store.lock().await.get(&cid).cloned();
                     let _ = reply.send(Ok(v));
                 }
+                CasOp::GetLocal { cid, reply } => {
+                    let v = store.lock().await.get(&cid).cloned();
+                    let _ = reply.send(v);
+                }
             }
         }
     });
@@ -2163,6 +2167,10 @@ mod task3_kick_setpower_round_trip {
                         let v = cas_for_servicer.lock().await.get(&cid).cloned();
                         let _ = reply.send(Ok(v));
                     }
+                    CasOp::GetLocal { cid, reply } => {
+                        let v = cas_for_servicer.lock().await.get(&cid).cloned();
+                        let _ = reply.send(v);
+                    }
                 }
             }
         });
@@ -2695,6 +2703,9 @@ async fn redeem_invite_only_rolls_back_when_inviter_unreachable() {
                 }
                 CasOp::GetOrFetch { reply, .. } => {
                     let _ = reply.send(Ok(None));
+                }
+                CasOp::GetLocal { reply, .. } => {
+                    let _ = reply.send(None);
                 }
             }
         }

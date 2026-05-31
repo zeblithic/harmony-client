@@ -146,6 +146,7 @@
           displayName: profile.displayName,
           statusText: profile.statusText,
           avatarUrl: profile.avatarUrl,
+          avatarCid: profile.avatarCid,
         },
       });
       return true;
@@ -163,6 +164,7 @@
       await invoke('republish_owner_card', {
         displayName: profile.displayName,
         statusText: profile.statusText ?? '',
+        avatarCid: profile.avatarCid ?? null,
       });
       return true;
     } catch {
@@ -205,7 +207,16 @@
   }
 
   async function handleProfileSave(profile: Profile) {
-    saveProfile(profile);
+    // Strip a `blob:`-scheme avatarUrl before it leaves this session — for BOTH
+    // durable persistence AND the network publish. Blob URLs are session-local:
+    // dead after a reload, and unusable by peers. The avatar re-resolves from
+    // `avatarCid` (via the AvatarResolver) on reload and on peers. Only the
+    // in-session `myProfile`/preview keeps the blob URL so the live self-preview
+    // stays instant.
+    const sanitized: Profile = profile.avatarUrl?.startsWith('blob:')
+      ? { ...profile, avatarUrl: undefined }
+      : profile;
+    saveProfile(sanitized);
     myProfile = profile;
     // Re-seed the card whenever the profile is saved so the name updates
     // immediately without a network round-trip (self-first, ZEB-341 Task 1).
@@ -213,12 +224,16 @@
       memberCardService.seedSelf(selfOwnerId, {
         displayName: profile.displayName,
         statusText: profile.statusText ?? '',
+        avatarUrl: profile.avatarUrl,
+        avatarCid: profile.avatarCid,
       });
     }
     // messageService.ownDisplayName / vineService.ownDisplayName are kept
     // in sync by a `$effect` later in the script (single source of truth).
-    // Publish to network if Tauri is available.
-    await publishProfileToNetwork(profile);
+    // Publish to network if Tauri is available — use the sanitized profile so a
+    // session-local blob: avatarUrl is never sent to peers (they resolve the
+    // avatar from avatarCid).
+    await publishProfileToNetwork(sanitized);
   }
 
   const vineService = new VineService();
@@ -420,6 +435,8 @@
     memberCardService.seedSelf(result.state.ownerId, {
       displayName: myProfile.displayName,
       statusText: myProfile.statusText ?? '',
+      avatarUrl: myProfile.avatarUrl,
+      avatarCid: myProfile.avatarCid,
     });
     drainQueuedInvite();
   }
@@ -633,8 +650,19 @@
 
   let navNodes = $state([...navService.nodes]);
 
-  // When avatar CIDs finish resolving, push blob URLs into stored profiles/nodes.
-  avatarResolver.onChange = () => navService.refreshAvatars();
+  // Share the same resolver with the member-card service so peer-card avatars
+  // (member rows, message feed) resolve through the identical fetch cache as
+  // nav nodes. Task 11's setAvatarResolver does NOT touch resolver.onChange, so
+  // setting the combined onChange immediately below is safe regardless of order.
+  memberCardService.setAvatarResolver(avatarResolver);
+
+  // When avatar CIDs finish resolving, push blob URLs into BOTH stored
+  // nav profiles/nodes AND peer member cards so every avatar surface
+  // re-renders after a late fetch completes.
+  avatarResolver.onChange = () => {
+    navService.refreshAvatars();
+    memberCardService.onAvatarsRefreshed();
+  };
   navService.onChange = () => {
     navNodes = [...navService.nodes];
   };
@@ -650,6 +678,7 @@
     ownerIdHex: string;
     displayName: string;
     statusText: string;
+    avatarUrl?: string;
     power?: number;
     membershipStatus?: string;
   } | null>(null);
@@ -661,6 +690,7 @@
       ownerIdHex: string;
       displayName: string;
       statusText: string;
+      avatarUrl?: string;
       power?: number;
       membershipStatus?: string;
     },
@@ -938,6 +968,8 @@
             memberCardService.seedSelf(ownerState.ownerId, {
               displayName: myProfile.displayName,
               statusText: myProfile.statusText ?? '',
+              avatarUrl: myProfile.avatarUrl,
+              avatarCid: myProfile.avatarCid,
             });
             // ZEB-341: re-publish this returning user's profile card on boot so
             // subscribing peers can resolve their name without a manual re-save.
@@ -1081,6 +1113,8 @@
                 memberCardService.seedSelf(ownerState.ownerId, {
                   displayName: myProfile.displayName,
                   statusText: myProfile.statusText ?? '',
+                  avatarUrl: myProfile.avatarUrl,
+                  avatarCid: myProfile.avatarCid,
                 });
               }
             } catch {
@@ -1111,10 +1145,12 @@
         ownerIdHex: string;
         displayName: string;
         statusText: string;
+        avatarCid?: string;
       }>('member-card-received', (event) => {
         memberCardService.applyCard(event.payload.ownerIdHex, {
           displayName: event.payload.displayName,
           statusText: event.payload.statusText,
+          avatarCid: event.payload.avatarCid,
         });
       });
       fileManagerService.addUnlisten(unlistenMemberCard);

@@ -38,6 +38,14 @@ pub struct ProfileCardBroadcast {
     pub display_name: String,
     #[serde(rename = "st")]
     pub status_text: String,
+    #[serde(
+        rename = "av",
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::owner_state_types::serialize_optional_bytes_as_bstr",
+        deserialize_with = "crate::owner_state_types::deserialize_optional_bytes_from_bstr"
+    )]
+    pub avatar_cid: Option<[u8; 32]>,
     #[serde(rename = "en")]
     pub enrollment: EnrollmentCert,
     #[serde(rename = "sa")]
@@ -76,6 +84,7 @@ pub fn sign_card(
     owner_id: [u8; 16],
     display_name: String,
     status_text: String,
+    avatar_cid: Option<[u8; 32]>,
     enrollment: EnrollmentCert,
     shared_at: Hlc,
 ) -> Result<ProfileCardBroadcast, CardError> {
@@ -97,6 +106,7 @@ pub fn sign_card(
         owner_id,
         display_name,
         status_text,
+        avatar_cid,
         enrollment,
         shared_at,
         signature: [0u8; 64],
@@ -175,6 +185,8 @@ pub struct DiscoveredCardInfo {
     pub display_name: String,
     #[serde(rename = "statusText")]
     pub status_text: String,
+    #[serde(rename = "avatarCid", skip_serializing_if = "Option::is_none")]
+    pub avatar_cid: Option<String>,
 }
 
 /// Per-subscription cached card entry. Holds the highest-HLC verified card
@@ -184,6 +196,7 @@ struct CachedCard {
     owner_id: [u8; 16],
     display_name: String,
     status_text: String,
+    avatar_cid: Option<[u8; 32]>,
     shared_at: Hlc,
 }
 
@@ -239,6 +252,7 @@ impl ProfileCardCache {
                     owner_id: card.owner_id,
                     display_name: card.display_name.clone(),
                     status_text: card.status_text.clone(),
+                    avatar_cid: card.avatar_cid,
                     shared_at: card.shared_at.clone(),
                 });
             }
@@ -254,6 +268,7 @@ impl ProfileCardCache {
             owner_id_hex: hex::encode(c.owner_id),
             display_name: c.display_name.clone(),
             status_text: c.status_text.clone(),
+            avatar_cid: c.avatar_cid.map(hex::encode),
         })
     }
 }
@@ -261,11 +276,13 @@ impl ProfileCardCache {
 /// Sign a card, canonical-CBOR-encode it, and publish to its owner_id topic.
 /// Returns the (topic, bytes) actually published so callers can cache them
 /// for periodic refresh.
+#[allow(clippy::too_many_arguments)]
 pub async fn publish_card_once(
     signer: &SigningKey,
     owner_id: [u8; 16],
     display_name: String,
     status_text: String,
+    avatar_cid: Option<[u8; 32]>,
     enrollment: EnrollmentCert,
     shared_at: Hlc,
     sink: &dyn crate::profile_broadcast::ProfileBroadcastPublishSink,
@@ -275,6 +292,7 @@ pub async fn publish_card_once(
         owner_id,
         display_name,
         status_text,
+        avatar_cid,
         enrollment,
         shared_at,
     )
@@ -376,6 +394,7 @@ mod tests {
             owner.owner.0,
             "Pat".into(),
             "afk".into(),
+            None,
             owner.cert.clone(),
             Hlc {
                 wall_ms: 1,
@@ -404,6 +423,7 @@ mod tests {
             owner.owner.0,
             "Al".into(),
             "".into(),
+            None,
             owner.cert.clone(),
             Hlc {
                 wall_ms: 1,
@@ -434,6 +454,7 @@ mod tests {
             owner.owner.0,
             "Cy".into(),
             "yo".into(),
+            None,
             owner.cert.clone(),
             Hlc {
                 wall_ms: 5,
@@ -461,6 +482,7 @@ mod tests {
             owner.owner.0,
             "old".into(),
             "".into(),
+            None,
             owner.cert.clone(),
             Hlc {
                 wall_ms: 10,
@@ -474,6 +496,7 @@ mod tests {
             owner.owner.0,
             "new".into(),
             "".into(),
+            None,
             owner.cert.clone(),
             Hlc {
                 wall_ms: 20,
@@ -499,6 +522,7 @@ mod tests {
             b.owner.0,
             "B".into(),
             "".into(),
+            None,
             b.cert.clone(),
             Hlc {
                 wall_ms: 1,
@@ -520,6 +544,7 @@ mod tests {
             owner.owner.0,
             "Jake (Koya Dev)".into(),
             "building".into(),
+            None,
             owner.cert.clone(),
             Hlc {
                 wall_ms: 1_000,
@@ -558,6 +583,7 @@ mod tests {
                 owner.owner.0,
                 long,
                 "ok".into(),
+                None,
                 owner.cert.clone(),
                 hlc.clone()
             ),
@@ -570,6 +596,7 @@ mod tests {
                 owner.owner.0,
                 "ok".into(),
                 longstatus,
+                None,
                 owner.cert,
                 hlc
             ),
@@ -587,6 +614,7 @@ mod tests {
                 [0xFFu8; 16],
                 "n".into(),
                 "".into(),
+                None,
                 a.cert.clone(),
                 Hlc {
                     wall_ms: 1,
@@ -609,6 +637,7 @@ mod tests {
                 a.owner.0,
                 "n".into(),
                 "".into(),
+                None,
                 a.cert.clone(),
                 Hlc {
                     wall_ms: 1,
@@ -618,6 +647,48 @@ mod tests {
             ),
             Err(CardError::SignerKeyMismatch)
         ));
+    }
+
+    #[test]
+    fn sign_verify_round_trips_with_avatar() {
+        let owner = crate::community_membership::mint_test_owner(0x5A);
+        let avatar = Some([0xABu8; 32]);
+        let card = sign_card(
+            &owner.device_key,
+            owner.owner.0,
+            "Ann".into(),
+            "hi".into(),
+            avatar,
+            owner.cert.clone(),
+            Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .expect("sign");
+        assert_eq!(card.avatar_cid, avatar);
+        assert_eq!(verify_card(&card).expect("verify"), owner.owner.0);
+    }
+
+    #[test]
+    fn no_avatar_card_is_byte_identical_to_pre_field_encoding() {
+        let owner = crate::community_membership::mint_test_owner(0x5B);
+        let card = ProfileCardBroadcast {
+            owner_id: owner.owner.0,
+            display_name: "Bo".into(),
+            status_text: "".into(),
+            avatar_cid: None,
+            enrollment: owner.cert,
+            shared_at: Hlc {
+                wall_ms: 9,
+                logical: 1,
+                device_id: "x".into(),
+            },
+            signature: [0u8; 64],
+        };
+        let bytes = crate::owner_state_crypto::canonical_cbor_encode(&card).expect("encode");
+        assert_eq!(bytes[0], 0xA6, "no-avatar card must stay a 6-entry map");
     }
 
     #[test]
@@ -640,6 +711,7 @@ mod tests {
             owner.owner.0,
             "Ann".into(),
             "hi".into(),
+            None,
             owner.cert.clone(),
             Hlc {
                 wall_ms: 1,
@@ -660,6 +732,7 @@ mod tests {
             y.owner.0,
             "n".into(),
             "".into(),
+            None,
             y.cert.clone(),
             Hlc {
                 wall_ms: 1,
@@ -683,6 +756,7 @@ mod tests {
             owner.owner.0,
             "n".into(),
             "".into(),
+            None,
             owner.cert.clone(),
             Hlc {
                 wall_ms: 1,
@@ -706,6 +780,7 @@ mod tests {
             owner.owner.0,
             "n".into(),
             "".into(),
+            None,
             owner.cert.clone(),
             Hlc {
                 wall_ms: 1,
@@ -761,6 +836,7 @@ mod tests {
             owner_id,
             "n".into(),
             "".into(),
+            None,
             quorum_cert,
             Hlc {
                 wall_ms: 1,

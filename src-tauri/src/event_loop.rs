@@ -1397,6 +1397,7 @@ pub async fn run<R: Runtime>(
                                                         "ownerIdHex": info.owner_id_hex,
                                                         "displayName": info.display_name,
                                                         "statusText": info.status_text,
+                                                        "avatarCid": info.avatar_cid,
                                                     }),
                                                 );
                                             }
@@ -1432,6 +1433,47 @@ pub async fn run<R: Runtime>(
                 }
             }
         });
+    }
+
+    // ── ZEB-343: content-serve queryable ─────────────────────────
+    // Answer peer content GETs from the local StorageTier cache. The
+    // lookup closure routes through CasOp::GetLocal so the read happens
+    // on the event-loop-owned runtime (read-only; no recursive fetch).
+    {
+        let cas_op_tx_serve = cas_op_tx.clone();
+        let serve_lookup = std::sync::Arc::new(move |cid: ContentId| {
+            let tx = cas_op_tx_serve.clone();
+            Box::pin(async move {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                if tx
+                    .send(crate::content_store::CasOp::GetLocal {
+                        cid,
+                        reply: reply_tx,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return None;
+                }
+                reply_rx.await.ok().flatten()
+            })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send>>
+        });
+        let _serve_handle = match spawn_content_serve_queryable(
+            std::sync::Arc::clone(&session_arc),
+            serve_lookup,
+            std::sync::Arc::clone(&closing),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(e) => {
+                // Never report ready with peer content-serving silently disabled
+                // (CodeRabbit). Mirrors the other ready_tx failure paths above.
+                let _ = ready_tx.send(Err(e));
+                return;
+            }
+        };
     }
 
     // ── Process startup actions (declare queryables + subscribers) ────
@@ -2013,6 +2055,18 @@ pub async fn run<R: Runtime>(
                             let _ = reply.send(Ok(()));
                         }
                     }
+                    CasOp::GetLocal { cid, reply } => {
+                        // Read-only: pull from the in-memory StorageTier cache
+                        // without any network fetch. Mirrors the fast-path
+                        // cache check in GetOrFetch (event_loop.rs:2018) but
+                        // never spawns a Zenoh GET on a miss.
+                        let bytes = runtime
+                            .storage_tier()
+                            .cache()
+                            .get(&cid)
+                            .map(|b| b.to_vec());
+                        let _ = reply.send(bytes);
+                    }
                     CasOp::GetOrFetch { cid, timeout, reply } => {
                         // 1. Cache check first (fast path).
                         if let Some(bytes) = runtime.storage_tier().cache().get(&cid).map(|b| b.to_vec()) {
@@ -2035,6 +2089,24 @@ pub async fn run<R: Runtime>(
                                 let fetch = fetch_via_zenoh(&session_clone, &key);
                                 match tokio::time::timeout(timeout, fetch).await {
                                     Ok(Ok(bytes)) => {
+                                        // ZEB-343 verify-on-fetch (spec §5.3):
+                                        // mirror the wrap_fetch_one_with_admission
+                                        // gate (T4). A Zenoh reply is untrusted —
+                                        // verify hash==cid BEFORE admitting or
+                                        // returning. On failure, do NOT admit and
+                                        // reply Ok(None): treat a tampered reply as
+                                        // a cache miss so the caller falls through
+                                        // exactly as it would on a timeout (the
+                                        // CRDT carries recovery).
+                                        if !cid.verify_hash(&bytes) {
+                                            tracing::warn!(
+                                                cid = %cid_hex,
+                                                "GetOrFetch: fetched bytes failed hash==cid; \
+                                                 treating as cache miss (not admitting)"
+                                            );
+                                            let _ = reply.send(Ok(None));
+                                            return;
+                                        }
                                         // 3. Best-effort admit via try_send.
                                         //    We have the bytes for the caller
                                         //    regardless of whether caching
@@ -3107,6 +3179,17 @@ where
         let cas_op_tx = cas_op_tx.clone();
         Box::pin(async move {
             let bytes = inner(cid).await?;
+            // ZEB-343 verify-on-fetch (spec §5.3): the StorageTier cache admit
+            // already verifies hash==cid, but the bytes RETURNED here go
+            // straight to the caller (e.g. the avatar resolver) regardless of
+            // admit success. Reject a tampered reply before it is returned OR
+            // admitted, so a malicious server can never get its bytes rendered.
+            if !cid.verify_hash(&bytes) {
+                return Err(format!(
+                    "fetched bytes for {} failed hash==CID verification",
+                    hex::encode(cid.to_bytes())
+                ));
+            }
             // Synchronous round-trip through the event loop's PutLocal
             // arm. `bytes.clone()` is load-bearing: `CasOp::PutLocal.blob`
             // consumes the bytes, but the caller (and `fetch_recursive`'s
@@ -3338,6 +3421,9 @@ mod fetch_one_wrapper_tests {
                 CasOp::GetOrFetch { .. } => {
                     panic!("wrapper must not send GetOrFetch");
                 }
+                CasOp::GetLocal { .. } => {
+                    panic!("wrapper must not send GetLocal");
+                }
             }
         }
         out
@@ -3360,6 +3446,9 @@ mod fetch_one_wrapper_tests {
                 }
                 CasOp::GetOrFetch { .. } => {
                     panic!("wrapper must not send GetOrFetch");
+                }
+                CasOp::GetLocal { .. } => {
+                    panic!("wrapper must not send GetLocal");
                 }
             }
         }
@@ -3522,6 +3611,25 @@ mod fetch_one_wrapper_tests {
             result
         );
         assert_eq!(result.unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn wrap_rejects_bytes_that_fail_hash_eq_cid() {
+        let real = b"the real avatar bytes";
+        let cid = ContentId::for_book(real, ContentFlags::default()).unwrap();
+        let (cas_op_tx, _cas_op_rx) = mpsc::channel::<CasOp>(8);
+        let fetcher =
+            move |_cid: ContentId| std::future::ready(Ok::<Vec<u8>, String>(b"TAMPERED".to_vec()));
+        let wrapped = wrap_fetch_one_with_admission(fetcher, cas_op_tx);
+        let result = wrapped(cid).await;
+        assert!(
+            result.is_err(),
+            "tampered bytes must be rejected, not returned"
+        );
+        assert!(
+            result.unwrap_err().contains("hash"),
+            "error should mention the hash==CID verification failure"
+        );
     }
 }
 
@@ -4437,6 +4545,158 @@ where
         let _ = qbl_handle.await;
         let _ = qr_handle.await;
     })
+}
+
+/// ZEB-343: the peer-to-peer CAS serve primitive. Declares a single Zenoh
+/// queryable on `harmony/content/*/**` and answers content GETs for PUBLIC
+/// (unencrypted) CIDs held in the local store.
+///
+/// `lookup` is the local-store accessor (production wires it to a
+/// `CasOp::GetLocal` round-trip; tests wire a HashMap) — passed in to avoid an
+/// engine↔adapter circular dep, exactly like channel-log's `read_for_query`
+/// (event_loop.rs:4073).
+///
+/// Serve gate: a CID is servable iff `!cid.flags().encrypted` (spec §5.2). This
+/// is intrinsic to the CID (its header's leading bit) and holds per-chunk, so
+/// no public-membership registry is needed. Encrypted CIDs get no reply.
+///
+/// Returned bytes are inherently integrity-safe: the local cache only admits
+/// bytes that passed `hash==cid` (StorageTier::verify_cid), so anything `lookup`
+/// returns already verifies. We still re-check `cid.verify_hash` before replying
+/// as defense-in-depth (cheap; never serve corrupt bytes).
+#[allow(clippy::type_complexity)]
+pub async fn spawn_content_serve_queryable<F>(
+    session: Arc<zenoh::Session>,
+    lookup: Arc<F>,
+    closing: Arc<AtomicBool>,
+) -> Result<tokio::task::JoinHandle<()>, String>
+where
+    F: Fn(
+            ContentId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send>>
+        + Send
+        + Sync
+        + ?Sized
+        + 'static,
+{
+    let key_pattern = "harmony/content/*/**".to_string();
+
+    // Declare the queryable SYNCHRONOUSLY (await before returning) so the caller
+    // can sequence node-readiness AFTER we are actually able to serve. If the
+    // declare were inside the detached spawn, run()'s later readiness signal
+    // could win the race and the node would report ready before the queryable
+    // exists. A declare failure is propagated as Err so startup does NOT report
+    // healthy with peer content-serving silently disabled (the caller routes it
+    // into ready_tx, matching the other startup-failure paths).
+    if closing.load(Ordering::SeqCst) {
+        return Ok(tokio::spawn(async {}));
+    }
+    let qbl = match session.declare_queryable(&key_pattern).await {
+        Ok(q) => q,
+        Err(e) => {
+            return Err(format!("failed to declare content-serve queryable: {e}"));
+        }
+    };
+
+    Ok(tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                res = qbl.recv_async() => {
+                    let Ok(query) = res else { break; };
+                    let qkey = query.key_expr().to_string();
+                    let Some(cid) = parse_content_serve_cid(&qkey) else {
+                        continue;
+                    };
+                    if cid.flags().encrypted {
+                        continue;
+                    }
+                    let Some(bytes) = (lookup)(cid).await else {
+                        continue;
+                    };
+                    if !cid.verify_hash(&bytes) {
+                        tracing::warn!(%qkey, "content-serve: local bytes failed hash==cid; not serving");
+                        continue;
+                    }
+                    if let Err(e) = query.reply(query.key_expr(), bytes).await {
+                        tracing::warn!(%qkey, error = %e, "content-serve reply failed");
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                    if closing.load(Ordering::SeqCst) { break; }
+                }
+            }
+        }
+    }))
+}
+
+/// Parse a `harmony/content/{shard}/{cid_hex}` serve key into a ContentId.
+/// Requires EXACTLY 4 slash-segments, a single-hex shard char, and a 64-hex
+/// cid. Returns None for publish/transit/stats keys or any malformed selector.
+fn parse_content_serve_cid(key: &str) -> Option<ContentId> {
+    let segs: Vec<&str> = key.split('/').collect();
+    if segs.len() != 4 || segs[0] != "harmony" || segs[1] != "content" {
+        return None;
+    }
+    let shard = segs[2];
+    if shard.len() != 1 || !shard.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let cid_hex = segs[3];
+    if cid_hex.len() != 64 || !cid_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    // Enforce the sharding invariant: the shard token MUST equal the CID's 2nd
+    // hex nibble (how fetch_via_zenoh derives it). Reject a CID requested under a
+    // mismatched shard so a peer can't address content off its canonical shard.
+    if shard != &cid_hex[1..2] {
+        return None;
+    }
+    let raw = hex::decode(cid_hex).ok()?;
+    let arr: [u8; 32] = raw.try_into().ok()?;
+    Some(ContentId::from_bytes(arr))
+}
+
+#[cfg(test)]
+mod content_serve_parse_tests {
+    use super::parse_content_serve_cid;
+
+    const HEX64: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn valid_serve_key_parses() {
+        // Shard must match the CID's 2nd hex nibble (HEX64[1..2] == "1").
+        let key = format!("harmony/content/1/{HEX64}");
+        assert!(parse_content_serve_cid(&key).is_some());
+    }
+
+    #[test]
+    fn mismatched_shard_rejected() {
+        // A valid CID requested under a shard != its 2nd hex nibble is rejected
+        // (sharding invariant; Greptile P2).
+        let key = format!("harmony/content/3/{HEX64}");
+        assert!(parse_content_serve_cid(&key).is_none());
+    }
+
+    #[test]
+    fn publish_key_rejected() {
+        let key = format!("harmony/content/publish/{HEX64}");
+        assert!(parse_content_serve_cid(&key).is_none());
+    }
+
+    #[test]
+    fn short_cid_rejected() {
+        // 63 hex chars (one short of 64)
+        let cid63 = &HEX64[..63];
+        let key = format!("harmony/content/3/{cid63}");
+        assert!(parse_content_serve_cid(&key).is_none());
+    }
+
+    #[test]
+    fn five_segment_key_rejected() {
+        let key = format!("harmony/content/3/{HEX64}/extra");
+        assert!(parse_content_serve_cid(&key).is_none());
+    }
 }
 
 /// Per spec §6.2: default backfill limit when peer/local sends 0.

@@ -5585,6 +5585,21 @@ async fn publish_profile(
         )
     };
 
+    // Validate the avatar CID hex BEFORE committing the Reticulum profile: a
+    // malformed CID must fail the IPC with NOTHING published — no double-publish
+    // (Cursor) — rather than silently stripping the avatar from the card
+    // (CodeRabbit). None = no avatar (legitimate).
+    let avatar_cid_bytes: Option<[u8; 32]> = match profile.avatar_cid.as_deref() {
+        None => None,
+        Some(h) => {
+            let bytes = hex::decode(h).map_err(|e| format!("invalid avatar_cid hex: {e}"))?;
+            Some(
+                <[u8; 32]>::try_from(bytes)
+                    .map_err(|_| "avatar_cid must be 32 bytes".to_string())?,
+            )
+        }
+    };
+
     let key_expr = format!("harmony/profile/{}", profile.address);
     let payload = serde_json::to_vec(&profile).map_err(|e| format!("serialize: {e}"))?;
 
@@ -5607,6 +5622,8 @@ async fn publish_profile(
     // Reticulum profile already committed, and surfacing an Err would make the
     // frontend retry and double-publish it. `publish_owner_card` returns Err
     // only when the owner runtime isn't ready; on save we just log + move on.
+    // (avatar_cid_bytes was validated above, before the Reticulum commit, so a
+    // malformed CID already returned an Err with nothing published.)
     if let Err(e) = publish_owner_card(
         dm_outbox,
         dm_self_owner,
@@ -5615,6 +5632,7 @@ async fn publish_profile(
         profile_card_publisher,
         profile.display_name.clone(),
         profile.status_text.clone().unwrap_or_default(),
+        avatar_cid_bytes,
     )
     .await
     {
@@ -5632,6 +5650,7 @@ async fn publish_profile(
 /// Returns `Err` ONLY when the owner runtime isn't ready yet (the caller may
 /// retry once the node connects). A bounds/encode failure is permanent for the
 /// given input, so it logs and returns `Ok(())` — there is nothing to retry.
+#[allow(clippy::too_many_arguments)]
 async fn publish_owner_card(
     dm_outbox: Option<std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>>,
     dm_self_owner: Option<crate::owner_state_types::OwnerAddr>,
@@ -5646,6 +5665,7 @@ async fn publish_owner_card(
     >,
     display_name: String,
     status_text: String,
+    avatar_cid: Option<[u8; 32]>,
 ) -> Result<(), String> {
     let (
         Some(dm_outbox),
@@ -5682,6 +5702,7 @@ async fn publish_owner_card(
         owner_id,
         display_name,
         status_text,
+        avatar_cid,
         enrollment_cert,
         hlc,
     ) {
@@ -5714,8 +5735,21 @@ async fn publish_owner_card(
 async fn republish_owner_card(
     display_name: String,
     status_text: String,
+    avatar_cid: Option<String>,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
+    // None = no avatar (legitimate). A PRESENT-but-malformed hex must surface as
+    // an Err rather than silently stripping the avatar from the republished card.
+    let avatar_cid_bytes: Option<[u8; 32]> = match avatar_cid.as_deref() {
+        None => None,
+        Some(h) => {
+            let bytes = hex::decode(h).map_err(|e| format!("invalid avatar_cid hex: {e}"))?;
+            Some(
+                <[u8; 32]>::try_from(bytes)
+                    .map_err(|_| "avatar_cid must be 32 bytes".to_string())?,
+            )
+        }
+    };
     let (dm_outbox, dm_self_owner, dm_device_id, hlc_tracker, profile_card_publisher) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         (
@@ -5734,6 +5768,7 @@ async fn republish_owner_card(
         profile_card_publisher,
         display_name,
         status_text,
+        avatar_cid_bytes,
     )
     .await
 }
@@ -8267,6 +8302,48 @@ async fn ingest_content(
         .map_err(|e| e.to_string())
 }
 
+/// ZEB-343: ingest an in-memory byte buffer (a normalized avatar PNG from the
+/// frontend) into CAS, returning the root CID hex. Uses default ContentFlags
+/// (PublicDurable / unencrypted) so the resulting CID is publicly servable.
+/// Skips the sidecar insert (send_ingest_with_name) so avatars never appear in
+/// the file listing.
+pub(crate) async fn ingest_avatar_bytes_inner(
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    bytes: Vec<u8>,
+) -> Result<String, String> {
+    use harmony_content::chunker::ChunkerConfig;
+    const MAX_AVATAR_BYTES: usize = 512 * 1024;
+    if bytes.is_empty() {
+        return Err("empty avatar bytes".to_string());
+    }
+    if bytes.len() > MAX_AVATAR_BYTES {
+        return Err(format!(
+            "avatar too large: {} > {MAX_AVATAR_BYTES}",
+            bytes.len()
+        ));
+    }
+    let reader = tokio::io::BufReader::new(std::io::Cursor::new(bytes));
+    let (root, _size) = streaming_ingest(reader, ingest_tx, ChunkerConfig::DEFAULT, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(hex::encode(root.to_bytes()))
+}
+
+#[tauri::command]
+async fn ingest_avatar_bytes(
+    bytes: Vec<u8>,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<String, String> {
+    let ingest_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .ingest_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    ingest_avatar_bytes_inner(&ingest_tx, bytes).await
+}
+
 /// Ingest a leaf file already present on disk through the same pipeline as
 /// `ingest_content`, but driven by an explicit path instead of an `rfd`
 /// dialog. Internal — kept for a future direct-leaf-ingest IPC (e.g. a
@@ -8490,6 +8567,28 @@ mod path_ingest_tests {
         assert!(log.lock().unwrap().is_empty());
         // Sidecar must remain empty.
         assert_eq!(index.lock().unwrap().entries().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn ingest_avatar_bytes_yields_public_durable_cid() {
+        use harmony_content::cid::{ContentClass, ContentId};
+        let (ingest_tx, mut ingest_rx) =
+            tokio::sync::mpsc::channel::<event_loop::IngestRequest>(16);
+        let drainer = tokio::spawn(async move {
+            while let Some(req) = ingest_rx.recv().await {
+                let _ = req.reply.send(Ok(()));
+            }
+        });
+        let bytes = vec![0x89, 0x50, 0x4E, 0x47, 1, 2, 3, 4]; // PNG-magic-ish payload
+        let cid_hex = ingest_avatar_bytes_inner(&ingest_tx, bytes.clone())
+            .await
+            .expect("ingest");
+        let raw = hex::decode(&cid_hex).unwrap();
+        let cid = ContentId::from_bytes(<[u8; 32]>::try_from(raw).unwrap());
+        assert_eq!(cid.content_class(), ContentClass::PublicDurable);
+        assert!(cid.verify_hash(&bytes), "cid must hash the ingested bytes");
+        drop(ingest_tx);
+        let _ = drainer.await;
     }
 }
 
@@ -31667,6 +31766,7 @@ pub fn run() {
             fetch_content,
             export_content,
             ingest_content,
+            ingest_avatar_bytes,
             create_folder,
             ingest_folder_tree,
             cancel_folder_ingest,

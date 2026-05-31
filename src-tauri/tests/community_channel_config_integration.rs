@@ -82,6 +82,10 @@ fn spawn_shared_cas() -> mpsc::Sender<CasOp> {
                     let v = cas_for_servicer.lock().await.get(&cid).cloned();
                     let _ = reply.send(Ok(v));
                 }
+                CasOp::GetLocal { cid, reply } => {
+                    let v = cas_for_servicer.lock().await.get(&cid).cloned();
+                    let _ = reply.send(v);
+                }
             }
         }
     });

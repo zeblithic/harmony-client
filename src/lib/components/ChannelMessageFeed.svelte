@@ -2,7 +2,6 @@
   import { onMount, onDestroy } from 'svelte';
   import type { ChannelMessageDto, HlcDto } from '../channel-message-service';
   import type { ChannelMessageService } from '../channel-message-service';
-  import type { TrustService } from '../trust-service';
   import type { VotingAdapter } from '../voting-adapter';
   import type { PollMeta } from '../types/voting';
   import Avatar from './Avatar.svelte';
@@ -16,7 +15,6 @@
     channelName,
     channelMessageService,
     ownAddress,
-    trustService,
     myPower,
     enableVirtualization = true,
     /** ZEB-285 Task 11: pre-fork snapshot messages for this channel (HLC-ascending). */
@@ -44,7 +42,6 @@
     channelName: string;
     channelMessageService: ChannelMessageService;
     ownAddress: string;
-    trustService?: TrustService;
     myPower: number;
     /** Disable for jsdom tests where IntersectionObserver isn't reliable. */
     enableVirtualization?: boolean;
@@ -60,6 +57,7 @@
         statusText: string;
         power?: number;
         membershipStatus?: string;
+        avatarUrl?: string;
       },
       ev: MouseEvent,
     ) => void;
@@ -321,6 +319,7 @@
         ownerIdHex: author,
         displayName: card?.displayName ?? author.slice(0, 8),
         statusText: card?.statusText ?? '',
+        avatarUrl: card?.avatarUrl,
         // No power known for message authors → role line omitted.
       },
       ev,
@@ -373,7 +372,7 @@
           class:pre-fork={row.isPreFork}
         >
           <div class="avatar-col">
-            <Avatar address={msg.author} {trustService} size={32} />
+            <Avatar address={msg.author} avatarUrl={resolveCard?.(msg.author)?.avatarUrl} size={32} />
           </div>
           <div class="content-col">
             <header class="msg-meta">

@@ -1,0 +1,171 @@
+//! ZEB-343 Phase 0: two-node fetch-by-CID proof. Node A declares the content
+//! serve queryable backed by a stub store holding one blob; node B issues a
+//! Zenoh GET on harmony/content/{prefix}/{cid_hex} and must receive the exact
+//! bytes. This is the prove-first gate: it validates the Zenoh GET serve/fetch
+//! round-trip end-to-end, the unknown that blocked every prior CAS attempt.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use harmony_app::event_loop::spawn_content_serve_queryable;
+use harmony_content::cid::{ContentFlags, ContentId};
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn serves_public_cid_to_a_second_zenoh_node() {
+    tokio::time::timeout(Duration::from_secs(30), serve_inner())
+        .await
+        .expect("cas-serve two-node proof must complete within 30s");
+}
+
+async fn serve_inner() {
+    let cfg = zenoh::Config::default();
+    let session_a = Arc::new(zenoh::open(cfg.clone()).await.expect("session A"));
+    let session_b = Arc::new(zenoh::open(cfg).await.expect("session B"));
+
+    let blob = b"avatar-bytes-proof".to_vec();
+    let cid = ContentId::for_book(&blob, ContentFlags::default()).expect("cid");
+    let mut store: HashMap<ContentId, Vec<u8>> = HashMap::new();
+    store.insert(cid, blob.clone());
+    let store = Arc::new(store);
+
+    let lookup = {
+        let store = Arc::clone(&store);
+        Arc::new(move |cid: ContentId| {
+            let store = Arc::clone(&store);
+            Box::pin(async move { store.get(&cid).cloned() })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send>>
+        })
+    };
+
+    let closing = Arc::new(AtomicBool::new(false));
+    let _serve =
+        spawn_content_serve_queryable(Arc::clone(&session_a), lookup, Arc::clone(&closing))
+            .await
+            .expect("declare content-serve queryable");
+
+    let cid_hex = hex::encode(cid.to_bytes());
+    let prefix = &cid_hex[1..2];
+    let key = format!("harmony/content/{prefix}/{cid_hex}");
+
+    let mut got: Option<Vec<u8>> = None;
+    for _ in 0..60 {
+        let replies = session_b.get(&key).await.expect("get");
+        while let Ok(reply) = replies.recv_async().await {
+            if let Ok(sample) = reply.result() {
+                got = Some(sample.payload().to_bytes().to_vec());
+                break;
+            }
+        }
+        if got.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    assert_eq!(
+        got.as_deref(),
+        Some(blob.as_slice()),
+        "node B must receive A's served bytes"
+    );
+    closing.store(true, Ordering::SeqCst);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn does_not_serve_encrypted_cid() {
+    tokio::time::timeout(Duration::from_secs(30), encrypted_inner())
+        .await
+        .expect("encrypted-gate test must complete within 30s");
+}
+
+async fn encrypted_inner() {
+    let cfg = zenoh::Config::default();
+    let session_a = Arc::new(zenoh::open(cfg.clone()).await.expect("session A"));
+    let session_b = Arc::new(zenoh::open(cfg).await.expect("session B"));
+
+    // Seed the store with TWO CIDs:
+    //   1. A PUBLIC control CID — used to prove the Zenoh channel is live.
+    //   2. An ENCRYPTED CID     — must NOT be served (the gate under test).
+    let pub_blob = b"public-control".to_vec();
+    let pub_cid = ContentId::for_book(&pub_blob, ContentFlags::default()).expect("public cid");
+
+    let enc_blob = b"secret".to_vec();
+    let enc_flags = ContentFlags {
+        encrypted: true,
+        ..ContentFlags::default()
+    };
+    let enc_cid = ContentId::for_book(&enc_blob, enc_flags).expect("encrypted cid");
+
+    let mut store: HashMap<ContentId, Vec<u8>> = HashMap::new();
+    store.insert(pub_cid, pub_blob.clone());
+    store.insert(enc_cid, enc_blob.clone());
+    let store = Arc::new(store);
+
+    let lookup = {
+        let store = Arc::clone(&store);
+        Arc::new(move |cid: ContentId| {
+            let store = Arc::clone(&store);
+            Box::pin(async move { store.get(&cid).cloned() })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send>>
+        })
+    };
+    let closing = Arc::new(AtomicBool::new(false));
+    let _serve =
+        spawn_content_serve_queryable(Arc::clone(&session_a), lookup, Arc::clone(&closing))
+            .await
+            .expect("declare content-serve queryable");
+
+    // --- Step 1: Liveness proof ---
+    // Retry-loop (mirrors serve_inner) until the PUBLIC control CID is served,
+    // proving that Zenoh discovery has completed and the queryable is reachable.
+    let pub_hex = hex::encode(pub_cid.to_bytes());
+    let pub_key = format!("harmony/content/{}/{}", &pub_hex[1..2], pub_hex);
+
+    let mut pub_got: Option<Vec<u8>> = None;
+    for _ in 0..60 {
+        let replies = session_b.get(&pub_key).await.expect("get public control");
+        while let Ok(reply) = replies.recv_async().await {
+            if let Ok(sample) = reply.result() {
+                pub_got = Some(sample.payload().to_bytes().to_vec());
+                break;
+            }
+        }
+        if pub_got.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(
+        pub_got.as_deref(),
+        Some(pub_blob.as_slice()),
+        "public control CID must be served (liveness proof — Zenoh channel is live)"
+    );
+
+    // --- Step 2: Encrypted gate check ---
+    // The channel is now provably live. A missing reply for the encrypted CID
+    // can ONLY mean the !cid.flags().encrypted gate blocked it.
+    let enc_hex = hex::encode(enc_cid.to_bytes());
+    let enc_key = format!("harmony/content/{}/{}", &enc_hex[1..2], enc_hex);
+
+    let replies = session_b.get(&enc_key).await.expect("get encrypted");
+
+    // Use Arc<AtomicBool> to avoid borrow-checker conflict between the async
+    // block's mutable capture and the post-drain read.
+    let served_flag = Arc::new(AtomicBool::new(false));
+    let served_flag2 = Arc::clone(&served_flag);
+    let drain = tokio::time::timeout(Duration::from_secs(3), async move {
+        while let Ok(reply) = replies.recv_async().await {
+            if reply.result().is_ok() {
+                served_flag2.store(true, Ordering::SeqCst);
+            }
+        }
+    })
+    .await;
+    let _ = drain; // timeout is the expected "no more replies" terminator
+    assert!(
+        !served_flag.load(Ordering::SeqCst),
+        "encrypted CID must not be served"
+    );
+    closing.store(true, Ordering::SeqCst);
+}

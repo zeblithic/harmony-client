@@ -2,6 +2,7 @@
   import { untrack } from 'svelte';
   import type { Profile } from '../types';
   import Avatar from './Avatar.svelte';
+  import { normalizeAvatar } from '../avatar-normalize';
 
   let {
     profile,
@@ -16,14 +17,59 @@
   // updates the profile while the editor is open, add a $effect to re-sync.
   let displayName = $state(untrack(() => profile.displayName));
   let statusText = $state(untrack(() => profile.statusText ?? ''));
+  // Avatar edits are staged locally and folded into the saved profile on save.
+  // `undefined` means "no avatar change this session" → the existing
+  // avatarCid/avatarUrl on the profile are preserved.
+  let avatarCid = $state<string | undefined>(undefined);
+  let avatarUrl = $state<string | undefined>(untrack(() => profile.avatarUrl));
+  let avatarBusy = $state(false);
+  let avatarError = $state<string | null>(null);
   let saved = $state(false);
   let savedTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // Release any blob: preview URL we created when the editor unmounts, so
+  // object URLs don't accumulate across a long session.
+  $effect(() => () => {
+    if (avatarUrl?.startsWith('blob:')) URL.revokeObjectURL(avatarUrl);
+  });
+
+  async function handleAvatarPick(e: Event) {
+    const input = e.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    avatarBusy = true;
+    avatarError = null;
+    try {
+      const bytes = await normalizeAvatar(file);
+      const { invoke } = await import('@tauri-apps/api/core');
+      const cidHex = (await invoke('ingest_avatar_bytes', {
+        bytes: Array.from(bytes),
+      })) as string;
+      avatarCid = cidHex;
+      // Self-seed a local blob preview so the user sees the new avatar
+      // immediately, with zero network round-trip. Revoke the previous
+      // preview URL first so repeated picks don't leak object URLs.
+      if (avatarUrl?.startsWith('blob:')) URL.revokeObjectURL(avatarUrl);
+      avatarUrl = URL.createObjectURL(
+        new Blob([new Uint8Array(bytes)], { type: 'image/png' }),
+      );
+    } catch (err) {
+      avatarError = err instanceof Error ? err.message : String(err);
+    } finally {
+      avatarBusy = false;
+      input.value = '';
+    }
+  }
 
   function handleSave() {
     const updated: Profile = {
       ...profile,
       displayName: displayName.trim() || 'Anonymous',
       statusText: statusText.trim() || undefined,
+      // Only override avatarCid when the user staged a new avatar this
+      // session; otherwise keep whatever the spread carried.
+      ...(avatarCid !== undefined ? { avatarCid } : {}),
+      avatarUrl,
     };
     onSave(updated);
     saved = true;
@@ -46,9 +92,28 @@
     <Avatar
       address={profile.address}
       displayName={displayName || 'Anonymous'}
-      avatarUrl={profile.avatarUrl}
+      {avatarUrl}
       size={80}
     />
+  </div>
+
+  <div class="field">
+    <label class="field-label" for="avatar-input">Avatar</label>
+    <input
+      id="avatar-input"
+      class="field-input avatar-input"
+      type="file"
+      accept="image/*"
+      onchange={handleAvatarPick}
+      disabled={avatarBusy}
+      aria-label="Avatar image"
+    />
+    {#if avatarBusy}
+      <span class="avatar-status" role="status">Processing image…</span>
+    {/if}
+    {#if avatarError}
+      <span class="avatar-error" role="alert">{avatarError}</span>
+    {/if}
   </div>
 
   <div class="field">
@@ -144,6 +209,27 @@
 
   .field-input::placeholder {
     color: var(--text-muted);
+  }
+
+  .avatar-input {
+    padding: 6px 8px;
+    cursor: pointer;
+  }
+
+  .avatar-input:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+
+  .avatar-status {
+    font-size: 12px;
+    color: var(--text-muted);
+    font-style: italic;
+  }
+
+  .avatar-error {
+    font-size: 12px;
+    color: var(--danger, #d9534f);
   }
 
   .actions {

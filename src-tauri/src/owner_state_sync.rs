@@ -2292,6 +2292,10 @@ mod cas_op_protocol_tests {
                         let bytes = store.lock().await.get(&cid).cloned();
                         let _ = reply.send(Ok(bytes));
                     }
+                    CasOp::GetLocal { cid, reply } => {
+                        let bytes = store.lock().await.get(&cid).cloned();
+                        let _ = reply.send(bytes);
+                    }
                 }
             }
         })
@@ -2378,6 +2382,10 @@ mod cas_op_protocol_tests {
                             let bytes = store_ref.lock().await.get(&cid).cloned();
                             let _ = reply.send(Ok(bytes));
                         }
+                    }
+                    CasOp::GetLocal { cid, reply } => {
+                        let bytes = store_ref.lock().await.get(&cid).cloned();
+                        let _ = reply.send(bytes);
                     }
                 }
             }
@@ -2490,6 +2498,9 @@ mod cas_op_protocol_tests {
                         // Always None — simulates StorageTier silently
                         // dropping corrupted bytes from a peer's reply.
                         let _ = reply.send(Ok(None));
+                    }
+                    CasOp::GetLocal { reply, .. } => {
+                        let _ = reply.send(None);
                     }
                 }
             }

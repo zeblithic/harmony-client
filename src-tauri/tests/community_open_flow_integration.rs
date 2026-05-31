@@ -107,6 +107,10 @@ async fn open_community_create_redeem_leave_round_trip() {
                     let v = cas_for_servicer.lock().await.get(&cid).cloned();
                     let _ = reply.send(Ok(v));
                 }
+                CasOp::GetLocal { cid, reply } => {
+                    let v = cas_for_servicer.lock().await.get(&cid).cloned();
+                    let _ = reply.send(v);
+                }
             }
         }
     });
@@ -446,6 +450,10 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
                 } => {
                     let v = cas_for_servicer.lock().await.get(&cid).cloned();
                     let _ = reply.send(Ok(v));
+                }
+                CasOp::GetLocal { cid, reply } => {
+                    let v = cas_for_servicer.lock().await.get(&cid).cloned();
+                    let _ = reply.send(v);
                 }
             }
         }
