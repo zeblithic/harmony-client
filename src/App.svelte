@@ -225,6 +225,7 @@
         displayName: profile.displayName,
         statusText: profile.statusText ?? '',
         avatarUrl: profile.avatarUrl,
+        avatarCid: profile.avatarCid,
       });
     }
     // messageService.ownDisplayName / vineService.ownDisplayName are kept
@@ -435,6 +436,7 @@
       displayName: myProfile.displayName,
       statusText: myProfile.statusText ?? '',
       avatarUrl: myProfile.avatarUrl,
+      avatarCid: myProfile.avatarCid,
     });
     drainQueuedInvite();
   }
@@ -967,6 +969,7 @@
               displayName: myProfile.displayName,
               statusText: myProfile.statusText ?? '',
               avatarUrl: myProfile.avatarUrl,
+              avatarCid: myProfile.avatarCid,
             });
             // ZEB-341: re-publish this returning user's profile card on boot so
             // subscribing peers can resolve their name without a manual re-save.
@@ -1111,6 +1114,7 @@
                   displayName: myProfile.displayName,
                   statusText: myProfile.statusText ?? '',
                   avatarUrl: myProfile.avatarUrl,
+                  avatarCid: myProfile.avatarCid,
                 });
               }
             } catch {

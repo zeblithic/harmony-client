@@ -116,10 +116,26 @@ export class MemberCardService {
     if (changed) this.onUpdate?.();
   }
 
-  /** Seed (or overwrite) the self owner_id from the local profile. Synchronous. */
-  seedSelf(ownerIdHex: string, profile: ResolvedCard): void {
+  /** Seed (or overwrite) the self owner_id from the local profile. Synchronous.
+   *  When the profile carries an `avatarCid` but no live blob `avatarUrl` (e.g.
+   *  after a reload, where the session-local blob URL was stripped before
+   *  persisting), resolve the avatar from its CID via the AvatarResolver —
+   *  otherwise the self row/messages fall back to an identicon. The resolver
+   *  kicks off a fetch on a miss; `onAvatarsRefreshed()` (which does NOT skip
+   *  self) fills in the URL when it lands. */
+  seedSelf(ownerIdHex: string, profile: ResolvedCard & { avatarCid?: string }): void {
     this.selfKey = ownerIdHex.toLowerCase();
-    this.cards.set(this.selfKey, { ...profile });
+    if (profile.avatarCid) {
+      this.cardAvatarCids.set(this.selfKey, profile.avatarCid);
+    } else {
+      this.cardAvatarCids.delete(this.selfKey);
+    }
+    const avatarUrl = profile.avatarUrl ?? this.resolveAvatarUrl(profile.avatarCid);
+    this.cards.set(this.selfKey, {
+      displayName: profile.displayName,
+      statusText: profile.statusText,
+      avatarUrl,
+    });
     this.onUpdate?.();
   }
 

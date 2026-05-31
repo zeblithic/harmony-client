@@ -4646,6 +4646,12 @@ fn parse_content_serve_cid(key: &str) -> Option<ContentId> {
     if cid_hex.len() != 64 || !cid_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
+    // Enforce the sharding invariant: the shard token MUST equal the CID's 2nd
+    // hex nibble (how fetch_via_zenoh derives it). Reject a CID requested under a
+    // mismatched shard so a peer can't address content off its canonical shard.
+    if shard != &cid_hex[1..2] {
+        return None;
+    }
     let raw = hex::decode(cid_hex).ok()?;
     let arr: [u8; 32] = raw.try_into().ok()?;
     Some(ContentId::from_bytes(arr))
@@ -4659,8 +4665,17 @@ mod content_serve_parse_tests {
 
     #[test]
     fn valid_serve_key_parses() {
-        let key = format!("harmony/content/3/{HEX64}");
+        // Shard must match the CID's 2nd hex nibble (HEX64[1..2] == "1").
+        let key = format!("harmony/content/1/{HEX64}");
         assert!(parse_content_serve_cid(&key).is_some());
+    }
+
+    #[test]
+    fn mismatched_shard_rejected() {
+        // A valid CID requested under a shard != its 2nd hex nibble is rejected
+        // (sharding invariant; Greptile P2).
+        let key = format!("harmony/content/3/{HEX64}");
+        assert!(parse_content_serve_cid(&key).is_none());
     }
 
     #[test]

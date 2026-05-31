@@ -44,4 +44,30 @@ describe('MemberCardService avatar resolution', () => {
     expect(svc.resolve('cc'.repeat(16))?.avatarUrl).toBe('blob:late-url');
     expect(updates).toBeGreaterThan(before);
   });
+
+  it('seedSelf resolves the self avatarCid via the resolver (reload, no blob url)', () => {
+    // After reload the session-local blob: avatarUrl is gone; the self avatar
+    // must still resolve from its persisted avatarCid via the AvatarResolver,
+    // otherwise the user's own row/messages fall back to an identicon.
+    const svc = new MemberCardService();
+    svc.setAvatarResolver(fakeResolver({ selfcid: 'blob:self-url' }) as any);
+    svc.seedSelf('FF'.repeat(16), {
+      displayName: 'Me',
+      statusText: '',
+      avatarCid: 'selfcid',
+    } as any);
+    expect(svc.resolve('ff'.repeat(16))?.avatarUrl).toBe('blob:self-url');
+  });
+
+  it('seedSelf prefers a live blob avatarUrl over the avatarCid (in-session)', () => {
+    const svc = new MemberCardService();
+    svc.setAvatarResolver(fakeResolver({ selfcid: 'blob:resolved' }) as any);
+    svc.seedSelf('AB'.repeat(16), {
+      displayName: 'Me',
+      statusText: '',
+      avatarUrl: 'blob:live-preview',
+      avatarCid: 'selfcid',
+    } as any);
+    expect(svc.resolve('ab'.repeat(16))?.avatarUrl).toBe('blob:live-preview');
+  });
 });
