@@ -1048,7 +1048,9 @@
           // can proceed once the owner is available.
           if (selfOwnerId === null) {
             try {
-              const { invoke } = await import('@tauri-apps/api/core');
+              // `invoke` is already in scope from the enclosing Tauri-init IIFE
+              // (imported once at boot) — no need to re-import it on every
+              // reconnect.
               const ownerState = await invoke<OwnerStateView | null>('get_owner_state');
               if (ownerState !== null) {
                 selfOwnerId = ownerState.ownerId;

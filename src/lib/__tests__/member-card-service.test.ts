@@ -129,6 +129,21 @@ describe('MemberCardService cross-peer resolution', () => {
     expect(unsubscribed).toEqual([1]);
   });
 
+  it('stops the poll loop when reconciliation drains all subscriptions to empty', async () => {
+    const { adapter } = makeAdapter();
+    const svc = makeService(adapter);
+    const handle = () =>
+      (svc as unknown as { pollHandle: ReturnType<typeof setInterval> | null })
+        .pollHandle;
+    await svc.subscribeVisible([ownerA]);
+    expect(handle()).not.toBeNull(); // loop running while a sub is active
+    // Narrow the visible set to empty (the member departed / was filtered) —
+    // the diff-reconcile path, NOT unsubscribeAll. The 3s interval must stop
+    // rather than keep firing over an empty subs map.
+    await svc.subscribeVisible([]);
+    expect(handle()).toBeNull();
+  });
+
   it('unsubscribeAll cancels the poll loop and unsubscribes every active sub', async () => {
     const { adapter, unsubscribed } = makeAdapter();
     const svc = makeService(adapter);

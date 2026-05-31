@@ -157,7 +157,16 @@ export class MemberCardService {
       }
     }
 
-    this.ensurePolling();
+    // Start the poll loop only while at least one subscription is active; stop
+    // it when reconciliation has drained the set to empty (all visible members
+    // departed or were filtered as self). Without the else-branch the 3s
+    // interval would keep firing over an empty `subs` map until `unsubscribeAll`
+    // is explicitly called — wasted IPC-free ticks for the life of the view.
+    if (this.subs.size > 0) {
+      this.ensurePolling();
+    } else {
+      this.stopPolling();
+    }
   }
 
   /** Start the poll loop on first subscribe; no-op if already running. */
@@ -166,6 +175,14 @@ export class MemberCardService {
     this.pollHandle = setInterval(() => {
       void this.pollOnce();
     }, POLL_INTERVAL_MS);
+  }
+
+  /** Cancel the poll loop if running. Idempotent. */
+  private stopPolling(): void {
+    if (this.pollHandle !== null) {
+      clearInterval(this.pollHandle);
+      this.pollHandle = null;
+    }
   }
 
   /**
@@ -219,10 +236,7 @@ export class MemberCardService {
   }
 
   private async unsubscribeAllImpl(): Promise<void> {
-    if (this.pollHandle !== null) {
-      clearInterval(this.pollHandle);
-      this.pollHandle = null;
-    }
+    this.stopPolling();
     if (this.adapter) {
       for (const subscriptionId of this.subs.values()) {
         try {
