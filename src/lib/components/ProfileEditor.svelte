@@ -27,6 +27,70 @@
   let saved = $state(false);
   let savedTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // --- About section (ZEB-345 long-form profile page) -----------------------
+  // Caps mirror the backend `ingest_profile_doc` validation limits.
+  const BIO_MAX_BYTES = 4096;
+  const LINKS_MAX = 10;
+  const FIELDS_MAX = 16;
+
+  let bio = $state('');
+  let links = $state<{ label: string; url: string }[]>([]);
+  let fields = $state<{ key: string; value: string }[]>([]);
+  // Soft, non-blocking note shown if prefill fails — the editor still works.
+  let aboutNote = $state<string | null>(null);
+  let aboutError = $state<string | null>(null);
+
+  // UTF-8 byte length of the bio, for the counter (chars ≠ bytes once emoji /
+  // non-ASCII are present, and the backend cap is in bytes).
+  const bioBytes = $derived(new TextEncoder().encode(bio).length);
+
+  // Prefill from an existing profile-page doc, if the profile already has one,
+  // so opening the editor doesn't wipe an authored page. Runs once on mount.
+  // Failures are soft: leave the fields empty + a note; never block editing.
+  $effect(() => {
+    const root = untrack(() => profile.profilePageRoot);
+    if (!root) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const { invoke } = await import('@tauri-apps/api/core');
+        const dto = (await invoke('fetch_profile_doc', { cid: root })) as {
+          bio: string;
+          links: { label: string; url: string }[];
+          fields: { key: string; value: string }[];
+        };
+        if (cancelled) return;
+        bio = dto.bio ?? '';
+        links = (dto.links ?? []).map((l) => ({ label: l.label, url: l.url }));
+        fields = (dto.fields ?? []).map((f) => ({ key: f.key, value: f.value }));
+      } catch (err) {
+        if (!cancelled) {
+          aboutNote =
+            "Couldn't load your existing profile page — saving will replace it.";
+          console.warn('Profile-page prefill failed:', err);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  function addLink() {
+    if (links.length >= LINKS_MAX) return;
+    links = [...links, { label: '', url: '' }];
+  }
+  function removeLink(i: number) {
+    links = links.filter((_, idx) => idx !== i);
+  }
+  function addField() {
+    if (fields.length >= FIELDS_MAX) return;
+    fields = [...fields, { key: '', value: '' }];
+  }
+  function removeField(i: number) {
+    fields = fields.filter((_, idx) => idx !== i);
+  }
+
   // Release any blob: preview URL we created when the editor unmounts, so
   // object URLs don't accumulate across a long session.
   $effect(() => () => {
@@ -61,7 +125,38 @@
     }
   }
 
-  function handleSave() {
+  async function handleSave() {
+    aboutError = null;
+    // Drop rows the user added but left entirely blank, so an empty trailing
+    // row doesn't get ingested as `{ label: '', url: '' }`.
+    const cleanLinks = links
+      .map((l) => ({ label: l.label.trim(), url: l.url.trim() }))
+      .filter((l) => l.label !== '' || l.url !== '');
+    const cleanFields = fields
+      .map((f) => ({ key: f.key.trim(), value: f.value.trim() }))
+      .filter((f) => f.key !== '' || f.value !== '');
+
+    // An all-empty About → no doc → the emitted card stays byte-identical
+    // (no profilePageRoot), per spec §7.
+    let profilePageRoot: string | undefined;
+    const hasAbout =
+      bio.trim() !== '' || cleanLinks.length > 0 || cleanFields.length > 0;
+    if (hasAbout) {
+      try {
+        const { invoke } = await import('@tauri-apps/api/core');
+        profilePageRoot = (await invoke('ingest_profile_doc', {
+          bio,
+          links: cleanLinks,
+          fields: cleanFields,
+        })) as string;
+      } catch (err) {
+        // Surface like the avatar ingest error; abort the save so we never
+        // emit a profile referencing a doc that wasn't ingested.
+        aboutError = err instanceof Error ? err.message : String(err);
+        return;
+      }
+    }
+
     const updated: Profile = {
       ...profile,
       displayName: displayName.trim() || 'Anonymous',
@@ -70,6 +165,7 @@
       // session; otherwise keep whatever the spread carried.
       ...(avatarCid !== undefined ? { avatarCid } : {}),
       avatarUrl,
+      profilePageRoot,
     };
     onSave(updated);
     saved = true;
@@ -80,7 +176,7 @@
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      handleSave();
+      void handleSave();
     }
   }
 </script>
@@ -140,6 +236,117 @@
       onkeydown={handleKeydown}
       aria-label="Status text"
     />
+  </div>
+
+  <div class="about-section" aria-label="About">
+    <h4 class="section-subtitle">About</h4>
+
+    {#if aboutNote}
+      <p class="about-note" role="status">{aboutNote}</p>
+    {/if}
+
+    <div class="field">
+      <label class="field-label" for="profile-bio">Bio</label>
+      <textarea
+        id="profile-bio"
+        class="field-input bio-input"
+        bind:value={bio}
+        rows="4"
+        placeholder="Tell people about yourself…"
+        aria-label="Bio"
+      ></textarea>
+      <span
+        class="char-counter"
+        class:over-limit={bioBytes > BIO_MAX_BYTES}
+        aria-live="polite"
+      >
+        {bioBytes} / {BIO_MAX_BYTES} bytes
+      </span>
+    </div>
+
+    <div class="field">
+      <span class="field-label" id="links-label">Links</span>
+      <div class="repeat-list" aria-labelledby="links-label">
+        {#each links as link, i (i)}
+          <div class="repeat-row">
+            <input
+              class="field-input repeat-input"
+              type="text"
+              bind:value={link.label}
+              placeholder="Label"
+              aria-label={`Link label ${i + 1}`}
+            />
+            <input
+              class="field-input repeat-input"
+              type="text"
+              bind:value={link.url}
+              placeholder="https://…"
+              aria-label={`Link URL ${i + 1}`}
+            />
+            <button
+              type="button"
+              class="repeat-remove"
+              onclick={() => removeLink(i)}
+              aria-label={`Remove link ${i + 1}`}
+            >
+              ×
+            </button>
+          </div>
+        {/each}
+      </div>
+      <button
+        type="button"
+        class="repeat-add"
+        onclick={addLink}
+        disabled={links.length >= LINKS_MAX}
+      >
+        Add link
+      </button>
+    </div>
+
+    <div class="field">
+      <span class="field-label" id="fields-label">Fields</span>
+      <div class="repeat-list" aria-labelledby="fields-label">
+        {#each fields as field, i (i)}
+          <div class="repeat-row">
+            <input
+              class="field-input repeat-input"
+              type="text"
+              bind:value={field.key}
+              placeholder="Key"
+              aria-label={`Field key ${i + 1}`}
+            />
+            <input
+              class="field-input repeat-input"
+              type="text"
+              bind:value={field.value}
+              placeholder="Value"
+              aria-label={`Field value ${i + 1}`}
+            />
+            <button
+              type="button"
+              class="repeat-remove"
+              onclick={() => removeField(i)}
+              aria-label={`Remove field ${i + 1}`}
+            >
+              ×
+            </button>
+          </div>
+        {/each}
+      </div>
+      <button
+        type="button"
+        class="repeat-add"
+        onclick={addField}
+        disabled={fields.length >= FIELDS_MAX}
+      >
+        Add field
+      </button>
+    </div>
+
+    {#if aboutError}
+      <span class="avatar-error" role="alert">{aboutError}</span>
+    {/if}
   </div>
 
   <div class="actions">
@@ -230,6 +437,100 @@
   .avatar-error {
     font-size: 12px;
     color: var(--danger, #d9534f);
+  }
+
+  .about-section {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+  }
+
+  .section-subtitle {
+    margin: 0;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .about-note {
+    margin: 0;
+    font-size: 12px;
+    color: var(--text-muted);
+    font-style: italic;
+  }
+
+  .bio-input {
+    resize: vertical;
+    min-height: 64px;
+    font-family: inherit;
+  }
+
+  .char-counter {
+    align-self: flex-end;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .char-counter.over-limit {
+    color: var(--danger, #d9534f);
+  }
+
+  .repeat-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .repeat-row {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+  }
+
+  .repeat-input {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .repeat-remove {
+    flex: 0 0 auto;
+    width: 28px;
+    height: 28px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-primary);
+    color: var(--text-muted);
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+  }
+
+  .repeat-remove:hover {
+    color: var(--danger, #d9534f);
+    border-color: var(--danger, #d9534f);
+  }
+
+  .repeat-add {
+    align-self: flex-start;
+    padding: 4px 12px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-primary);
+    color: var(--text-secondary);
+    font-size: 12px;
+    cursor: pointer;
+  }
+
+  .repeat-add:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--text-primary);
+  }
+
+  .repeat-add:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
 
   .actions {

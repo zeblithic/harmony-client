@@ -16,6 +16,10 @@ export interface Profile extends Peer {
   avatarCid?: string;
   /** CID for thumbnail avatar — resolved via content transport (future) */
   avatarMiniCid?: string;
+  /** ZEB-345: CID (hex) of the long-form profile-page doc, if one was ingested.
+   *  Staged by the editor on save and resolved lazily via the
+   *  ProfilePageResolver when the owner's panel opens. */
+  profilePageRoot?: string;
   notificationSounds?: SoundOverrides;
 }
 
