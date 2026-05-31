@@ -203,10 +203,12 @@ Add to `ProfileCardBroadcast` (`profile_card_broadcast.rs`):
 ```rust
 // Encoded as a CBOR bstr(32), the same byte-array-as-bstr family used for
 // owner_id ([u8;16] via owner_state_types::serialize_bytes_as_bstr /
-// deserialize_bytes_from_bstr) — here wrapped for Option<[u8;32]> so `None`
-// omits the key entirely.
-#[serde(rename = "av", skip_serializing_if = "Option::is_none",
-        with = "avatar_cid_bstr_opt")]
+// deserialize_bytes_from_bstr). Uses the existing Option-wrapping helpers
+// serialize_optional_bytes_as_bstr / deserialize_optional_bytes_from_bstr
+// (the same pair LibraryDirectoryEntry uses) so `None` omits the key entirely.
+#[serde(rename = "av", default, skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::owner_state_types::serialize_optional_bytes_as_bstr",
+        deserialize_with = "crate::owner_state_types::deserialize_optional_bytes_from_bstr")]
 pub avatar_cid: Option<[u8; 32]>,
 ```
 
