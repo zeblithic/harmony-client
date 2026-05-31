@@ -88,6 +88,30 @@ describe('MemberCardService cross-peer resolution', () => {
     expect(svc.resolve(ownerA)).toEqual({ displayName: 'Alice', statusText: 'hi' });
   });
 
+  it('threads profilePageRoot from a polled DiscoveredCardInfo into the resolved card', async () => {
+    // ZEB-345: the cache-drain path must carry profilePageRoot the same way it
+    // carries displayName/statusText.
+    const invoke = vi.fn(async (cmd: string, args?: unknown) => {
+      const a = (args ?? {}) as Record<string, unknown>;
+      if (cmd === 'subscribe_member_card') return 1;
+      if (cmd === 'get_cached_member_card' && a.subscriptionId === 1) {
+        return {
+          ownerIdHex: ownerA,
+          displayName: 'Alice',
+          statusText: 'hi',
+          profilePageRoot: 'cid-polled-page',
+        };
+      }
+      if (cmd === 'unsubscribe_member_card') return undefined;
+      return null;
+    });
+    const adapter = { invoke, listen: vi.fn(async () => () => {}) } as unknown as TauriAdapter;
+    const svc = makeService(adapter);
+    await svc.subscribeVisible([ownerA]);
+    await svc.pollOnce();
+    expect(svc.resolve(ownerA)?.profilePageRoot).toBe('cid-polled-page');
+  });
+
   it('fires onUpdate when a poll caches a new card', async () => {
     const { adapter } = makeAdapter();
     const svc = makeService(adapter);

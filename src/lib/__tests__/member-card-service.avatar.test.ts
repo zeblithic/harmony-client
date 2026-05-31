@@ -76,3 +76,48 @@ describe('MemberCardService avatar resolution', () => {
     expect(svc.resolve('ab'.repeat(16))?.avatarUrl).toBe('blob:live-preview');
   });
 });
+
+// ── ZEB-345: profilePageRoot threading (mirrors the avatarCid path) ──
+describe('MemberCardService profilePageRoot threading', () => {
+  it('applyCard threads profilePageRoot through to the resolved card', () => {
+    const svc = new MemberCardService();
+    svc.applyCard('AA'.repeat(16), {
+      displayName: 'Ann',
+      statusText: 'hi',
+      profilePageRoot: 'cid-page-1',
+    } as any);
+    expect(svc.resolve('aa'.repeat(16))?.profilePageRoot).toBe('cid-page-1');
+  });
+
+  it('applyCard leaves profilePageRoot undefined when the card has no page', () => {
+    const svc = new MemberCardService();
+    svc.applyCard('BB'.repeat(16), { displayName: 'Bo', statusText: '' } as any);
+    expect(svc.resolve('bb'.repeat(16))?.profilePageRoot).toBeUndefined();
+  });
+
+  it('applyCard fires onUpdate when only profilePageRoot changed', () => {
+    const svc = new MemberCardService();
+    let updates = 0;
+    svc.onUpdate = () => { updates++; };
+    svc.applyCard('CC'.repeat(16), { displayName: 'Cy', statusText: '' } as any);
+    const before = updates;
+    // Same name/status, but now a profile page root appears → must re-fire.
+    svc.applyCard('CC'.repeat(16), {
+      displayName: 'Cy',
+      statusText: '',
+      profilePageRoot: 'cid-new',
+    } as any);
+    expect(svc.resolve('cc'.repeat(16))?.profilePageRoot).toBe('cid-new');
+    expect(updates).toBeGreaterThan(before);
+  });
+
+  it('seedSelf threads profilePageRoot through to the self card', () => {
+    const svc = new MemberCardService();
+    svc.seedSelf('FF'.repeat(16), {
+      displayName: 'Me',
+      statusText: '',
+      profilePageRoot: 'cid-self-page',
+    } as any);
+    expect(svc.resolve('ff'.repeat(16))?.profilePageRoot).toBe('cid-self-page');
+  });
+});

@@ -290,6 +290,35 @@ describe('ProfilePopover', () => {
     }
   });
 
+  it('owner-card mode shows "View full profile" and fires onViewProfile with the owner id', async () => {
+    const onViewProfile = vi.fn();
+    render(ProfilePopover, {
+      props: {
+        mode: 'owner-card',
+        card: { ownerIdHex: OWNER_HEX, displayName: 'Alice', statusText: '', power: 100 },
+        x: 0,
+        y: 0,
+        onClose: vi.fn(),
+        onViewProfile,
+      },
+    });
+    await fireEvent.click(screen.getByText('View full profile'));
+    expect(onViewProfile).toHaveBeenCalledWith(OWNER_HEX);
+  });
+
+  it('owner-card mode hides "View full profile" when no onViewProfile prop is given', () => {
+    render(ProfilePopover, {
+      props: {
+        mode: 'owner-card',
+        card: { ownerIdHex: OWNER_HEX, displayName: 'Alice', statusText: '', power: 100 },
+        x: 0,
+        y: 0,
+        onClose: vi.fn(),
+      },
+    });
+    expect(screen.queryByText('View full profile')).toBeNull();
+  });
+
   it('owner-card mode closes on Escape', async () => {
     const onClose = vi.fn();
     render(ProfilePopover, {
