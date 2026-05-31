@@ -5607,6 +5607,13 @@ async fn publish_profile(
     // Reticulum profile already committed, and surfacing an Err would make the
     // frontend retry and double-publish it. `publish_owner_card` returns Err
     // only when the owner runtime isn't ready; on save we just log + move on.
+    // ProfilePayload.avatar_cid is Option<String> (hex) — decode to [u8;32].
+    let avatar_cid_bytes: Option<[u8; 32]> = profile
+        .avatar_cid
+        .as_deref()
+        .and_then(|h| hex::decode(h).ok())
+        .and_then(|b| <[u8; 32]>::try_from(b).ok());
+
     if let Err(e) = publish_owner_card(
         dm_outbox,
         dm_self_owner,
@@ -5615,6 +5622,7 @@ async fn publish_profile(
         profile_card_publisher,
         profile.display_name.clone(),
         profile.status_text.clone().unwrap_or_default(),
+        avatar_cid_bytes,
     )
     .await
     {
@@ -5646,6 +5654,7 @@ async fn publish_owner_card(
     >,
     display_name: String,
     status_text: String,
+    avatar_cid: Option<[u8; 32]>,
 ) -> Result<(), String> {
     let (
         Some(dm_outbox),
@@ -5682,7 +5691,7 @@ async fn publish_owner_card(
         owner_id,
         display_name,
         status_text,
-        None, // ZEB-343 Task 8: thread avatar_cid from profile save IPC
+        avatar_cid,
         enrollment_cert,
         hlc,
     ) {
@@ -5715,8 +5724,13 @@ async fn publish_owner_card(
 async fn republish_owner_card(
     display_name: String,
     status_text: String,
+    avatar_cid: Option<String>,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
+    let avatar_cid_bytes: Option<[u8; 32]> = avatar_cid
+        .as_deref()
+        .and_then(|h| hex::decode(h).ok())
+        .and_then(|b| <[u8; 32]>::try_from(b).ok());
     let (dm_outbox, dm_self_owner, dm_device_id, hlc_tracker, profile_card_publisher) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         (
@@ -5735,6 +5749,7 @@ async fn republish_owner_card(
         profile_card_publisher,
         display_name,
         status_text,
+        avatar_cid_bytes,
     )
     .await
 }
