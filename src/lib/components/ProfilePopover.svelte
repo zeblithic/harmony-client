@@ -20,7 +20,10 @@
     /** Community power level. 100=Admin, 50=Moderator, else Member. Omitted
      *  (undefined) for message authors not in the member list → no role line. */
     power?: number;
-    status?: string;
+    /** Community membership state (e.g. 'joined' / 'banned'). Distinct from
+     *  `statusText` (the freeform profile status message). Omitted for message
+     *  authors whose membership isn't known. */
+    membershipStatus?: string;
   };
 
   let {
@@ -268,7 +271,7 @@
   {#if card.power !== undefined}
     <div class="popover-role">{roleLabel(card.power)}</div>
   {/if}
-  {#if card.status === 'banned'}
+  {#if card.membershipStatus === 'banned'}
     <div class="popover-status-flag">Banned</div>
   {/if}
 {:else if profile}

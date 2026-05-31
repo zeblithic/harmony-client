@@ -16,7 +16,9 @@
     displayName: string;
     statusText: string;
     power?: number;
-    status?: string;
+    /** Community membership state ('joined'/'banned'). Distinct from the
+     *  freeform `statusText` profile message. */
+    membershipStatus?: string;
   };
 
   let {
@@ -132,7 +134,7 @@
         displayName,
         statusText: resolveCard?.(member.address)?.statusText ?? '',
         power: member.power,
-        status: member.status,
+        membershipStatus: member.status,
       },
       ev,
     );

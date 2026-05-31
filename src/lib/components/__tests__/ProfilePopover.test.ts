@@ -224,7 +224,7 @@ describe('ProfilePopover', () => {
     render(ProfilePopover, {
       props: {
         mode: 'owner-card',
-        card: { ownerIdHex: OWNER_HEX, displayName: 'Bob', statusText: '', power: 0, status: 'banned' },
+        card: { ownerIdHex: OWNER_HEX, displayName: 'Bob', statusText: '', power: 0, membershipStatus: 'banned' },
         x: 0,
         y: 0,
         onClose: vi.fn(),
@@ -237,7 +237,7 @@ describe('ProfilePopover', () => {
     render(ProfilePopover, {
       props: {
         mode: 'owner-card',
-        card: { ownerIdHex: OWNER_HEX, displayName: 'Bob', statusText: '', power: 0, status: 'joined' },
+        card: { ownerIdHex: OWNER_HEX, displayName: 'Bob', statusText: '', power: 0, membershipStatus: 'joined' },
         x: 0,
         y: 0,
         onClose: vi.fn(),

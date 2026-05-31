@@ -627,13 +627,19 @@
     displayName: string;
     statusText: string;
     power?: number;
-    status?: string;
+    membershipStatus?: string;
   } | null>(null);
   let popoverCardX = $state(0);
   let popoverCardY = $state(0);
 
   function openMemberCard(
-    payload: { ownerIdHex: string; displayName: string; statusText: string; power?: number; status?: string },
+    payload: {
+      ownerIdHex: string;
+      displayName: string;
+      statusText: string;
+      power?: number;
+      membershipStatus?: string;
+    },
     event: MouseEvent,
   ) {
     // Toggle-close if the same owner_id is re-clicked (mirrors the avatar path).

@@ -54,7 +54,13 @@
     votingAdapter?: VotingAdapter;
     resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
     onOpenCard?: (
-      payload: { ownerIdHex: string; displayName: string; statusText: string; power?: number; status?: string },
+      payload: {
+        ownerIdHex: string;
+        displayName: string;
+        statusText: string;
+        power?: number;
+        membershipStatus?: string;
+      },
       ev: MouseEvent,
     ) => void;
   } = $props();
