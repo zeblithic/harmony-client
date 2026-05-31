@@ -60,6 +60,7 @@
         statusText: string;
         power?: number;
         membershipStatus?: string;
+        avatarUrl?: string;
       },
       ev: MouseEvent,
     ) => void;
