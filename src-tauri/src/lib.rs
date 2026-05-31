@@ -5640,6 +5640,7 @@ async fn publish_profile(
 /// Returns `Err` ONLY when the owner runtime isn't ready yet (the caller may
 /// retry once the node connects). A bounds/encode failure is permanent for the
 /// given input, so it logs and returns `Ok(())` — there is nothing to retry.
+#[allow(clippy::too_many_arguments)]
 async fn publish_owner_card(
     dm_outbox: Option<std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>>,
     dm_self_owner: Option<crate::owner_state_types::OwnerAddr>,
