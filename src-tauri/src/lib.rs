@@ -5585,6 +5585,21 @@ async fn publish_profile(
         )
     };
 
+    // Validate the avatar CID hex BEFORE committing the Reticulum profile: a
+    // malformed CID must fail the IPC with NOTHING published — no double-publish
+    // (Cursor) — rather than silently stripping the avatar from the card
+    // (CodeRabbit). None = no avatar (legitimate).
+    let avatar_cid_bytes: Option<[u8; 32]> = match profile.avatar_cid.as_deref() {
+        None => None,
+        Some(h) => {
+            let bytes = hex::decode(h).map_err(|e| format!("invalid avatar_cid hex: {e}"))?;
+            Some(
+                <[u8; 32]>::try_from(bytes)
+                    .map_err(|_| "avatar_cid must be 32 bytes".to_string())?,
+            )
+        }
+    };
+
     let key_expr = format!("harmony/profile/{}", profile.address);
     let payload = serde_json::to_vec(&profile).map_err(|e| format!("serialize: {e}"))?;
 
@@ -5607,20 +5622,8 @@ async fn publish_profile(
     // Reticulum profile already committed, and surfacing an Err would make the
     // frontend retry and double-publish it. `publish_owner_card` returns Err
     // only when the owner runtime isn't ready; on save we just log + move on.
-    // ProfilePayload.avatar_cid is Option<String> (hex) — decode to [u8;32].
-    // None = no avatar (legitimate). A PRESENT-but-malformed hex must surface as
-    // an Err rather than silently stripping the avatar from the published card.
-    let avatar_cid_bytes: Option<[u8; 32]> = match profile.avatar_cid.as_deref() {
-        None => None,
-        Some(h) => {
-            let bytes = hex::decode(h).map_err(|e| format!("invalid avatar_cid hex: {e}"))?;
-            Some(
-                <[u8; 32]>::try_from(bytes)
-                    .map_err(|_| "avatar_cid must be 32 bytes".to_string())?,
-            )
-        }
-    };
-
+    // (avatar_cid_bytes was validated above, before the Reticulum commit, so a
+    // malformed CID already returned an Err with nothing published.)
     if let Err(e) = publish_owner_card(
         dm_outbox,
         dm_self_owner,

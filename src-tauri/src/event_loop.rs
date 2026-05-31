@@ -1459,12 +1459,21 @@ pub async fn run<R: Runtime>(
             })
                 as std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send>>
         });
-        let _serve_handle = spawn_content_serve_queryable(
+        let _serve_handle = match spawn_content_serve_queryable(
             std::sync::Arc::clone(&session_arc),
             serve_lookup,
             std::sync::Arc::clone(&closing),
         )
-        .await;
+        .await
+        {
+            Ok(handle) => handle,
+            Err(e) => {
+                // Never report ready with peer content-serving silently disabled
+                // (CodeRabbit). Mirrors the other ready_tx failure paths above.
+                let _ = ready_tx.send(Err(e));
+                return;
+            }
+        };
     }
 
     // ── Process startup actions (declare queryables + subscribers) ────
@@ -4560,7 +4569,7 @@ pub async fn spawn_content_serve_queryable<F>(
     session: Arc<zenoh::Session>,
     lookup: Arc<F>,
     closing: Arc<AtomicBool>,
-) -> tokio::task::JoinHandle<()>
+) -> Result<tokio::task::JoinHandle<()>, String>
 where
     F: Fn(
             ContentId,
@@ -4576,22 +4585,20 @@ where
     // can sequence node-readiness AFTER we are actually able to serve. If the
     // declare were inside the detached spawn, run()'s later readiness signal
     // could win the race and the node would report ready before the queryable
-    // exists. On declare failure we log and return an already-completed no-op
-    // JoinHandle so the signature stays uniform for callers.
+    // exists. A declare failure is propagated as Err so startup does NOT report
+    // healthy with peer content-serving silently disabled (the caller routes it
+    // into ready_tx, matching the other startup-failure paths).
     if closing.load(Ordering::SeqCst) {
-        return tokio::spawn(async {});
+        return Ok(tokio::spawn(async {}));
     }
     let qbl = match session.declare_queryable(&key_pattern).await {
         Ok(q) => q,
         Err(e) => {
-            if !closing.load(Ordering::SeqCst) {
-                tracing::error!(error = %e, "failed to declare content-serve queryable");
-            }
-            return tokio::spawn(async {});
+            return Err(format!("failed to declare content-serve queryable: {e}"));
         }
     };
 
-    tokio::spawn(async move {
+    Ok(tokio::spawn(async move {
         loop {
             tokio::select! {
                 biased;
@@ -4620,7 +4627,7 @@ where
                 }
             }
         }
-    })
+    }))
 }
 
 /// Parse a `harmony/content/{shard}/{cid_hex}` serve key into a ContentId.
