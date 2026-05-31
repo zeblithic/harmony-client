@@ -5682,6 +5682,7 @@ async fn publish_owner_card(
         owner_id,
         display_name,
         status_text,
+        None, // ZEB-343 Task 8: thread avatar_cid from profile save IPC
         enrollment_cert,
         hlc,
     ) {
