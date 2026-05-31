@@ -21,6 +21,7 @@
   import MintLedger from './lib/components/MintLedger.svelte';
   import NetworkHealthView from './lib/components/NetworkHealthView.svelte';
   import ProfilePopover from './lib/components/ProfilePopover.svelte';
+  import ProfilePanel from './lib/components/ProfilePanel.svelte';
   import VinePublishDialog from './lib/components/VinePublishDialog.svelte';
   import DmCreateDialog from './lib/components/DmCreateDialog.svelte';
   import ConfirmDialog from './lib/components/ConfirmDialog.svelte';
@@ -50,6 +51,7 @@
   import { resolveOriginalCreator } from './lib/vine-utils';
   import { NavService } from './lib/nav-service';
   import { AvatarResolver } from './lib/avatar-resolver';
+  import { ProfilePageResolver } from './lib/profile-page-resolver';
   import type { AppMode, Message, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier, MailFolderKind, MailMessageDetail, ContentItem, CleanupRecommendation } from './lib/types';
   import { getThreadMeta } from './lib/feed-utils';
   import { findNode, findNearestFolder } from './lib/nav-utils';
@@ -147,6 +149,10 @@
           statusText: profile.statusText,
           avatarUrl: profile.avatarUrl,
           avatarCid: profile.avatarCid,
+          // ZEB-345: carry the long-form profile-page root CID (hex). Unlike
+          // avatarUrl it needs no blob: sanitization — it's a content CID, not
+          // a session-local object URL — so it flows to peers verbatim.
+          profilePageRoot: profile.profilePageRoot,
         },
       });
       return true;
@@ -165,6 +171,8 @@
         displayName: profile.displayName,
         statusText: profile.statusText ?? '',
         avatarCid: profile.avatarCid ?? null,
+        // ZEB-345: card-only republish carries the profile-page root CID hex.
+        profilePageRoot: profile.profilePageRoot ?? null,
       });
       return true;
     } catch {
@@ -226,6 +234,9 @@
         statusText: profile.statusText ?? '',
         avatarUrl: profile.avatarUrl,
         avatarCid: profile.avatarCid,
+        // ZEB-345: seed the self profile-page root so the owner's own panel
+        // resolves locally without a network round-trip (mirrors avatarCid).
+        profilePageRoot: profile.profilePageRoot,
       });
     }
     // messageService.ownDisplayName / vineService.ownDisplayName are kept
@@ -437,6 +448,7 @@
       statusText: myProfile.statusText ?? '',
       avatarUrl: myProfile.avatarUrl,
       avatarCid: myProfile.avatarCid,
+      profilePageRoot: myProfile.profilePageRoot,
     });
     drainQueuedInvite();
   }
@@ -634,6 +646,23 @@
 
   const avatarResolver = new AvatarResolver();
   $effect(() => () => avatarResolver.destroy());
+
+  // ── ZEB-345 Task 10: long-form profile-page resolver ───────────────
+  // Lazy DTO resolver (twin of AvatarResolver, but NOT eagerly per-member —
+  // resolve() only fires when a panel opens). connectAdapter runs in the
+  // Tauri-init IIFE alongside avatarResolver.connectAdapter. The open panel
+  // re-renders via profileDocVersion (bumped in onChange below) — a separate
+  // counter from avatarResolver's nav/card refresh path so the two never
+  // clobber each other's onChange.
+  const profilePageResolver = new ProfilePageResolver();
+  $effect(() => () => profilePageResolver.destroy());
+  let profileDocVersion = $state(0);
+  profilePageResolver.onChange = () => {
+    profileDocVersion++;
+  };
+  // Owner_id (hex) whose long-form profile panel is open, or null. Set from
+  // the owner-card popover's "View full profile" action (onViewProfile).
+  let openProfileOwnerId = $state<string | null>(null);
 
   const navService = new NavService();
   navService.setAvatarResolver(avatarResolver);
@@ -970,6 +999,7 @@
               statusText: myProfile.statusText ?? '',
               avatarUrl: myProfile.avatarUrl,
               avatarCid: myProfile.avatarCid,
+              profilePageRoot: myProfile.profilePageRoot,
             });
             // ZEB-341: re-publish this returning user's profile card on boot so
             // subscribing peers can resolve their name without a manual re-save.
@@ -1033,6 +1063,9 @@
       await tryConnect('community', communityService.connectAdapter(adapter));
       await tryConnect('channelMessage', channelMessageService.connectAdapter(adapter));
       avatarResolver.connectAdapter(adapter);
+      // ZEB-345 Task 10: wire the lazy profile-page resolver so panel opens can
+      // fetch_profile_doc. No eager per-member resolution (unlike avatars).
+      profilePageResolver.connectAdapter(adapter);
       resolveVideoFn = async (cid: string) => {
         const bytes = (await adapter.invoke('fetch_content', { cid })) as number[];
         const mime = detectVideoMime(bytes);
@@ -1115,6 +1148,7 @@
                   statusText: myProfile.statusText ?? '',
                   avatarUrl: myProfile.avatarUrl,
                   avatarCid: myProfile.avatarCid,
+                  profilePageRoot: myProfile.profilePageRoot,
                 });
               }
             } catch {
@@ -1146,11 +1180,15 @@
         displayName: string;
         statusText: string;
         avatarCid?: string;
+        profilePageRoot?: string;
       }>('member-card-received', (event) => {
         memberCardService.applyCard(event.payload.ownerIdHex, {
           displayName: event.payload.displayName,
           statusText: event.payload.statusText,
           avatarCid: event.payload.avatarCid,
+          // ZEB-345: forward the profile-page root CID so an open panel for
+          // this owner re-resolves once a fresh card lands.
+          profilePageRoot: event.payload.profilePageRoot,
         });
       });
       fileManagerService.addUnlisten(unlistenMemberCard);
@@ -2119,7 +2157,31 @@
     x={popoverCardX}
     y={popoverCardY}
     onClose={() => (popoverCard = null)}
+    onViewProfile={(ownerIdHex) => {
+      // ZEB-345 Task 10: open the right-side long-form profile panel and
+      // dismiss the popover so the two surfaces don't overlap.
+      openProfileOwnerId = ownerIdHex;
+      popoverCard = null;
+    }}
   />
+{/if}
+
+{#if openProfileOwnerId}
+  <!-- ZEB-345 Task 10: right-side long-form profile panel. Rendered as a
+       fixed-position sibling of Layout (like the popovers) so it floats over
+       the right column regardless of the active mode. The resolved card comes
+       from the same MemberCardService resolution the popover used; reading
+       cardVersion (via resolveCard) keeps the header live as the card fills
+       in, and docVersion re-resolves the doc once fetch_profile_doc lands. -->
+  <div class="profile-panel-host">
+    <ProfilePanel
+      ownerIdHex={openProfileOwnerId}
+      card={resolveCard(openProfileOwnerId) ?? { displayName: '' }}
+      resolver={profilePageResolver}
+      docVersion={profileDocVersion}
+      onClose={() => (openProfileOwnerId = null)}
+    />
+  </div>
 {/if}
 
 {#if dmCreateDialogOpen}
@@ -2489,6 +2551,18 @@
     background: var(--bg-secondary, #222);
     border-radius: 8px;
     box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
+  }
+
+  /* ZEB-345 Task 10: floating host for the long-form profile panel. Pins the
+     320px panel to the right edge, full viewport height, above the layout. The
+     panel supplies its own width/background/border-left. */
+  .profile-panel-host {
+    position: fixed;
+    top: 0;
+    right: 0;
+    height: 100vh;
+    z-index: 90;
+    box-shadow: -4px 0 16px rgba(0, 0, 0, 0.3);
   }
 
   /* ZEB-254: transient join-status banner (pending vs joined). */

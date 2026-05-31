@@ -16,6 +16,7 @@
     ownerIdHex,
     card,
     resolver,
+    docVersion = 0,
     onClose,
   }: {
     ownerIdHex: string;
@@ -27,13 +28,21 @@
       profilePageRoot?: string;
     };
     resolver: ProfilePageResolver;
+    /** T10: bumped by App.svelte on resolver.onChange so this component's `doc`
+     *  $derived re-evaluates once a lazy fetch_profile_doc lands. Defaults to 0
+     *  (existing tests render without it and stay header-only until resolved). */
+    docVersion?: number;
     onClose: () => void;
   } = $props();
 
   // Lazy: resolve() kicks off the fetch on a cache miss and returns undefined
   // until it lands. The re-render after the fetch resolves is driven by App's
-  // resolver.onChange → version bump (see header comment), not from here.
-  const doc = $derived(card?.profilePageRoot ? resolver.resolve(card.profilePageRoot) : undefined);
+  // resolver.onChange → docVersion bump (see header comment): reading docVersion
+  // inside the derived registers it as a reactive dep so this re-runs on bump.
+  const doc = $derived.by(() => {
+    docVersion; // reactive dep: re-resolve when App signals a fetch resolved
+    return card?.profilePageRoot ? resolver.resolve(card.profilePageRoot) : undefined;
+  });
 
   let copied = $state(false);
   let copyTimer: ReturnType<typeof setTimeout> | null = null;
