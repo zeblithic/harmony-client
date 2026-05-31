@@ -808,6 +808,10 @@ async fn stale_invite_catchup_unlocks_decryption_end_to_end() {
                     let v = store.get(&cid).cloned();
                     let _ = reply.send(Ok(v));
                 }
+                CasOp::GetLocal { cid, reply } => {
+                    let v = store.get(&cid).cloned();
+                    let _ = reply.send(v);
+                }
             }
         }
     });

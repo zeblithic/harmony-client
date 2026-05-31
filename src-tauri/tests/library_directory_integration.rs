@@ -793,6 +793,9 @@ async fn click_to_join_redeem_invite_smoke() {
                 harmony_app::content_store::CasOp::GetOrFetch { reply, .. } => {
                     let _ = reply.send(Ok(None));
                 }
+                harmony_app::content_store::CasOp::GetLocal { reply, .. } => {
+                    let _ = reply.send(None);
+                }
             }
         }
     });

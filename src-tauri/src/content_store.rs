@@ -88,6 +88,18 @@ pub enum CasOp {
         timeout: std::time::Duration,
         reply: tokio::sync::oneshot::Sender<Result<Option<Vec<u8>>, ContentStoreError>>,
     },
+    /// Read-only local-cache lookup: return the bytes held under `cid` in the
+    /// StorageTier cache, or `None` on a cache miss. Unlike `GetOrFetch`, this
+    /// NEVER triggers a network fetch — it is the lookup path for the
+    /// content-serve queryable, which must not recursively fetch while
+    /// answering a peer's GET (that would invert the serve relationship and
+    /// could deadlock the event loop). The cache only holds bytes that passed
+    /// `hash==cid` verification at admit time (StorageTier::verify_cid), so a
+    /// `Some(bytes)` reply is already integrity-checked.
+    GetLocal {
+        cid: ContentId,
+        reply: tokio::sync::oneshot::Sender<Option<Vec<u8>>>,
+    },
 }
 
 /// Default fetch budget for `RuntimeContentStore::get`. Wraps the
@@ -350,5 +362,42 @@ mod tests {
             }
         }
         stub.await.unwrap();
+    }
+
+    /// Guard the `CasOp::GetLocal` enum shape and oneshot reply plumbing.
+    ///
+    /// This test does NOT construct a `NodeRuntime` (no cheap harness exists;
+    /// building one for a 3-line read-only handler is not warranted). Instead
+    /// it constructs the variant, pattern-matches to extract `cid`/`reply`,
+    /// manually sends a reply, and asserts the receiver gets it. The
+    /// handler's runtime-cache read is covered end-to-end by the Task 14
+    /// cross-peer e2e (owner A serving its cached avatar).
+    #[tokio::test]
+    async fn cas_getlocal_variant_shape_and_reply_plumbing() {
+        use harmony_content::cid::{ContentFlags, ContentId as HcContentId};
+
+        let cid = HcContentId::for_book(b"hi", ContentFlags::default()).unwrap();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<Option<Vec<u8>>>();
+
+        let op = CasOp::GetLocal {
+            cid,
+            reply: reply_tx,
+        };
+
+        // Pattern-match to verify the variant exists and fields are accessible.
+        match op {
+            CasOp::GetLocal {
+                cid: extracted_cid,
+                reply,
+            } => {
+                assert_eq!(extracted_cid, cid);
+                // Simulate the handler: send Some(bytes) through the oneshot.
+                let _ = reply.send(Some(vec![104, 105]));
+            }
+            _ => panic!("expected CasOp::GetLocal"),
+        }
+
+        let result = reply_rx.await.expect("oneshot should not be dropped");
+        assert_eq!(result, Some(vec![104, 105]));
     }
 }

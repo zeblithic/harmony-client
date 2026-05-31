@@ -2013,6 +2013,18 @@ pub async fn run<R: Runtime>(
                             let _ = reply.send(Ok(()));
                         }
                     }
+                    CasOp::GetLocal { cid, reply } => {
+                        // Read-only: pull from the in-memory StorageTier cache
+                        // without any network fetch. Mirrors the fast-path
+                        // cache check in GetOrFetch (event_loop.rs:2018) but
+                        // never spawns a Zenoh GET on a miss.
+                        let bytes = runtime
+                            .storage_tier()
+                            .cache()
+                            .get(&cid)
+                            .map(|b| b.to_vec());
+                        let _ = reply.send(bytes);
+                    }
                     CasOp::GetOrFetch { cid, timeout, reply } => {
                         // 1. Cache check first (fast path).
                         if let Some(bytes) = runtime.storage_tier().cache().get(&cid).map(|b| b.to_vec()) {
@@ -3338,6 +3350,9 @@ mod fetch_one_wrapper_tests {
                 CasOp::GetOrFetch { .. } => {
                     panic!("wrapper must not send GetOrFetch");
                 }
+                CasOp::GetLocal { .. } => {
+                    panic!("wrapper must not send GetLocal");
+                }
             }
         }
         out
@@ -3360,6 +3375,9 @@ mod fetch_one_wrapper_tests {
                 }
                 CasOp::GetOrFetch { .. } => {
                     panic!("wrapper must not send GetOrFetch");
+                }
+                CasOp::GetLocal { .. } => {
+                    panic!("wrapper must not send GetLocal");
                 }
             }
         }
