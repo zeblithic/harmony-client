@@ -271,6 +271,7 @@ impl ProfileCardCache {
 /// Sign a card, canonical-CBOR-encode it, and publish to its owner_id topic.
 /// Returns the (topic, bytes) actually published so callers can cache them
 /// for periodic refresh.
+#[allow(clippy::too_many_arguments)]
 pub async fn publish_card_once(
     signer: &SigningKey,
     owner_id: [u8; 16],
