@@ -126,7 +126,10 @@
   // the same 'publish_profile' command. Swallows errors: not-in-Tauri /
   // not-connected leaves the profile saved locally only, and the backend
   // already best-effort-skips the card publish when the node isn't wired.
-  async function publishProfileToNetwork(profile: Profile): Promise<void> {
+  // Returns true if the IPC actually landed (session connected). A successful
+  // invoke means the Reticulum publish committed, which implies the node is
+  // wired enough for the backend's best-effort card publish to have run too.
+  async function publishProfileToNetwork(profile: Profile): Promise<boolean> {
     try {
       const { invoke } = await import('@tauri-apps/api/core');
       await invoke('publish_profile', {
@@ -137,8 +140,26 @@
           avatarUrl: profile.avatarUrl,
         },
       });
+      return true;
     } catch {
-      // Not in Tauri or not connected — profile saved locally only
+      // Not in Tauri or not connected — profile saved locally only.
+      return false;
+    }
+  }
+
+  // ZEB-341: attempt the one-shot boot card re-publish, but only mark it done on
+  // a SUCCESSFUL publish. The publish can race Zenoh session startup (start_node
+  // may return before the session connects); a failed early attempt leaves the
+  // guard unset so a later trigger (the zenoh-status 'connected' handler)
+  // retries. Without this, the guard would burn on a no-op and a returning
+  // user's card would never publish (the 600s refresh only re-emits cached
+  // bytes, which stay empty until publish_now succeeds at least once).
+  async function tryBootPublishCard(): Promise<void> {
+    if (hasPublishedCardOnBoot || selfOwnerId === null || !myProfile?.displayName) {
+      return;
+    }
+    if (await publishProfileToNetwork(myProfile)) {
+      hasPublishedCardOnBoot = true;
     }
   }
 
@@ -870,12 +891,9 @@
             // ZEB-341: re-publish this returning user's profile card on boot so
             // subscribing peers can resolve their name without a manual re-save.
             // (The 600s refresh only re-emits CACHED bytes, which are empty on a
-            // fresh process.) One-shot; skip an empty card. The backend skips the
-            // card publish gracefully if the node isn't fully connected yet.
-            if (!hasPublishedCardOnBoot && myProfile.displayName) {
-              hasPublishedCardOnBoot = true;
-              void publishProfileToNetwork(myProfile);
-            }
+            // fresh process.) Only marks done on success; if the Zenoh session
+            // isn't up yet, the zenoh-status 'connected' handler retries.
+            void tryBootPublishCard();
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -996,6 +1014,9 @@
         if (status.status === 'connected') {
           await fetchOwnAddress();
           await reloadBackendState();
+          // ZEB-341: the session is now confirmed up — (re)attempt the one-shot
+          // boot card publish in case an earlier attempt raced session startup.
+          await tryBootPublishCard();
         }
       });
       // zenoh-status serves messages, vines, and nav (fetchOwnAddress sets
