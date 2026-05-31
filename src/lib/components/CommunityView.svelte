@@ -63,7 +63,7 @@
     unsubscribeCards?: () => void;
     /** ZEB-341: open the owner_id card popover for a clicked member/author. */
     onOpenCard?: (
-      payload: { ownerIdHex: string; displayName: string; statusText: string; power?: number; status?: string },
+      payload: { ownerIdHex: string; displayName: string; statusText: string; power?: number; membershipStatus?: string },
       ev: MouseEvent,
     ) => void;
     /** ZEB-291 Phase 2: connected VotingAdapter. When present, a
