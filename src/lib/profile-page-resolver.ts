@@ -39,6 +39,7 @@ export class ProfilePageResolver {
    *  resolved. Automatically kicks off a fetch if the CID hasn't been seen
    *  before (or its failure cooldown has elapsed). */
   resolve(cid: string): ProfilePageDto | undefined {
+    if (this.destroyed) return undefined;
     const cached = this.cache.get(cid);
     if (cached) return cached;
     const failTime = this.failedAt.get(cid);
@@ -59,7 +60,8 @@ export class ProfilePageResolver {
       this.onChange?.();
     } catch (err) {
       if (!this.destroyed) {
-        console.warn(`Profile doc fetch failed for CID ${cid}:`, err);
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`Profile doc fetch failed for CID ${cid}: ${msg}`);
         this.failedAt.set(cid, Date.now());
       }
     } finally {

@@ -103,7 +103,9 @@ describe('MemberCardService cross-peer resolution', () => {
         };
       }
       if (cmd === 'unsubscribe_member_card') return undefined;
-      return null;
+      // Fail loudly on any unexpected IPC so an accidental call surfaces instead
+      // of silently resolving to null (matches makeAdapter's posture).
+      throw new Error(`unexpected IPC ${cmd}`);
     });
     const adapter = { invoke, listen: vi.fn(async () => () => {}) } as unknown as TauriAdapter;
     const svc = makeService(adapter);

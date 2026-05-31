@@ -39,6 +39,18 @@
   // Soft, non-blocking note shown if prefill fails — the editor still works.
   let aboutNote = $state<string | null>(null);
   let aboutError = $state<string | null>(null);
+  // True once the user makes ANY edit to the About section. Used to avoid
+  // clobbering their edits with a late-resolving prefill (ZEB-345 prefill race).
+  let aboutDirty = $state(false);
+  // True once the prefill has SETTLED into a known state — either there's no
+  // existing page (nothing to load) or a fetch succeeded. Stays false while a
+  // fetch is pending OR after a fetch FAILURE, so handleSave knows the existing
+  // page hasn't been loaded and must be preserved rather than dropped.
+  let prefillLoaded = $state(false);
+
+  function markAboutDirty() {
+    aboutDirty = true;
+  }
 
   // UTF-8 byte length of the bio, for the counter (chars ≠ bytes once emoji /
   // non-ASCII are present, and the backend cap is in bytes).
@@ -49,7 +61,11 @@
   // Failures are soft: leave the fields empty + a note; never block editing.
   $effect(() => {
     const root = untrack(() => profile.profilePageRoot);
-    if (!root) return;
+    // No existing page → nothing to load; the prefill is "settled" immediately.
+    if (!root) {
+      prefillLoaded = true;
+      return;
+    }
     let cancelled = false;
     (async () => {
       try {
@@ -60,14 +76,22 @@
           fields: { key: string; value: string }[];
         };
         if (cancelled) return;
-        bio = dto.bio ?? '';
-        links = (dto.links ?? []).map((l) => ({ label: l.label, url: l.url }));
-        fields = (dto.fields ?? []).map((f) => ({ key: f.key, value: f.value }));
+        // Only apply the fetched content if the user hasn't started editing —
+        // a late prefill must never clobber edits already typed.
+        if (!aboutDirty) {
+          bio = dto.bio ?? '';
+          links = (dto.links ?? []).map((l) => ({ label: l.label, url: l.url }));
+          fields = (dto.fields ?? []).map((f) => ({ key: f.key, value: f.value }));
+        }
+        prefillLoaded = true;
       } catch (err) {
         if (!cancelled) {
+          // Leave prefillLoaded false: the existing page didn't load, so
+          // handleSave must preserve the existing root rather than drop it.
+          const msg = err instanceof Error ? err.message : String(err);
           aboutNote =
             "Couldn't load your existing profile page — saving will replace it.";
-          console.warn('Profile-page prefill failed:', err);
+          console.warn('Profile-page prefill failed:', msg);
         }
       }
     })();
@@ -78,16 +102,20 @@
 
   function addLink() {
     if (links.length >= LINKS_MAX) return;
+    markAboutDirty();
     links = [...links, { label: '', url: '' }];
   }
   function removeLink(i: number) {
+    markAboutDirty();
     links = links.filter((_, idx) => idx !== i);
   }
   function addField() {
     if (fields.length >= FIELDS_MAX) return;
+    markAboutDirty();
     fields = [...fields, { key: '', value: '' }];
   }
   function removeField(i: number) {
+    markAboutDirty();
     fields = fields.filter((_, idx) => idx !== i);
   }
 
@@ -136,8 +164,12 @@
       .map((f) => ({ key: f.key.trim(), value: f.value.trim() }))
       .filter((f) => f.key !== '' || f.value !== '');
 
-    // An all-empty About → no doc → the emitted card stays byte-identical
-    // (no profilePageRoot), per spec §7.
+    // Page-root computation has three cases:
+    //  - The user authored About content → ingest a fresh doc.
+    //  - No authored content, but the profile already HAS a page that hasn't
+    //    finished prefilling (fetch pending or failed) → PRESERVE the existing
+    //    root rather than silently dropping the page (ZEB-345 prefill race).
+    //  - Genuinely no/cleared page → undefined (card stays byte-identical, §7).
     let profilePageRoot: string | undefined;
     const hasAbout =
       bio.trim() !== '' || cleanLinks.length > 0 || cleanFields.length > 0;
@@ -155,6 +187,12 @@
         aboutError = err instanceof Error ? err.message : String(err);
         return;
       }
+    } else if (profile.profilePageRoot && !prefillLoaded) {
+      // Existing page not yet loaded (prefill pending/failed) and the user
+      // didn't author anything → preserve the existing root.
+      profilePageRoot = profile.profilePageRoot;
+    } else {
+      profilePageRoot = undefined; // genuinely no/cleared page
     }
 
     const updated: Profile = {
@@ -251,6 +289,7 @@
         id="profile-bio"
         class="field-input bio-input"
         bind:value={bio}
+        oninput={markAboutDirty}
         rows="4"
         placeholder="Tell people about yourself…"
         aria-label="Bio"
@@ -273,6 +312,7 @@
               class="field-input repeat-input"
               type="text"
               bind:value={link.label}
+              oninput={markAboutDirty}
               placeholder="Label"
               aria-label={`Link label ${i + 1}`}
             />
@@ -280,6 +320,7 @@
               class="field-input repeat-input"
               type="text"
               bind:value={link.url}
+              oninput={markAboutDirty}
               placeholder="https://…"
               aria-label={`Link URL ${i + 1}`}
             />
@@ -313,6 +354,7 @@
               class="field-input repeat-input"
               type="text"
               bind:value={field.key}
+              oninput={markAboutDirty}
               placeholder="Key"
               aria-label={`Field key ${i + 1}`}
             />
@@ -320,6 +362,7 @@
               class="field-input repeat-input"
               type="text"
               bind:value={field.value}
+              oninput={markAboutDirty}
               placeholder="Value"
               aria-label={`Field value ${i + 1}`}
             />

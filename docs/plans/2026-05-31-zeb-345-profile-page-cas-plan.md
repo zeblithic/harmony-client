@@ -122,7 +122,7 @@ fn card_with_page_root_round_trips_and_verifies() {
   - Every `sign_card(...)` / `publish_card_once(...)` call in the test module: insert `None,` (or `Some(...)`) for the new param.
   - `verify_card`: **no change**.
 
-- [ ] **Step 5: Run** `cargo nextest run -p harmony-app --features test-fixtures -E 'test(profile_card)'` → PASS.
+- [ ] **Step 5: Run** `cargo nextest run --locked -p harmony-app --features test-fixtures -E 'test(profile_card)'` → PASS.
 
 - [ ] **Step 6: Wire-format fixture** — in `tests/wire_format_profile_card_avatar_fixtures.rs` add a `0xA8` (avatar + pp) pinned-bytes case and a pp-only `0xA7` case, mirroring the existing avatar fixture's structure (deterministic cert/signer/HLC helpers from `test-fixtures`).
 
@@ -451,7 +451,7 @@ Twin `tests/profile_card_avatar_cross_peer_integration.rs` + `tests/cas_serve_tw
 
 - [ ] **Step 1: Write the test** — node A: `ingest_profile_doc_inner` a doc → CID; node B: fetch by CID over the two-node Zenoh harness; decode → DTO equals A's input. Include a negative: an **encrypted** CID is not served (reuse the ZEB-343 control-CID pattern so a slow-discovery false-pass can't happen).
 
-- [ ] **Step 2: Run** `cargo nextest run --test profile_page_cross_peer_integration --features test-fixtures` → PASS (allow the known transport-orphan retry pattern; assert on the real fetch).
+- [ ] **Step 2: Run** `cargo nextest run --locked --test profile_page_cross_peer_integration --features test-fixtures` → PASS (allow the known transport-orphan retry pattern; assert on the real fetch).
 
 - [ ] **Step 3:** Gate + commit `"test(zeb-345): cross-peer profile doc fetch (T6)"`.
 
@@ -584,7 +584,7 @@ Render links only when `linkOk(url)`; bio always via `{dto.bio}` text interpolat
 
 - [ ] **Step 1: Full backend gate**
 
-Run: `cd src-tauri && cargo fmt --all -- --check && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings && cargo nextest run --locked --workspace --all-targets --features test-fixtures`
+Run: `cd src-tauri && cargo fmt --all -- --check && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings && cargo nextest run --locked --workspace --all-targets --features test-fixtures && cargo check --locked --all-targets --features test-fixtures`
 Expected: clean (note any known transport-orphan flakes; re-run that test to confirm it's not the diff).
 
 - [ ] **Step 2: Full frontend gate**

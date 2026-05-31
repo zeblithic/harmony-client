@@ -46,8 +46,10 @@ describe('ProfilePanel', () => {
     expect(screen.getByText('Alice')).toBeTruthy();
     expect(screen.getByText('hi')).toBeTruthy();
     expect(screen.getByText(OWNER_HEX)).toBeTruthy();
-    // No doc yet → the "No page content." placeholder, not About/Links/Details.
-    expect(screen.getByText('No page content.')).toBeTruthy();
+    // Root is set but the doc hasn't resolved yet → Loading placeholder, not
+    // the "No page content." empty state and not About/Links/Details.
+    expect(screen.getByText('Loading profile…')).toBeTruthy();
+    expect(screen.queryByText('No page content.')).toBeNull();
     expect(screen.queryByText('About')).toBeNull();
   });
 
@@ -62,8 +64,9 @@ describe('ProfilePanel', () => {
         onClose: vi.fn(),
       },
     });
-    // Initial render: resolver returns undefined → header-only.
-    expect(screen.getByText('No page content.')).toBeTruthy();
+    // Initial render: resolver returns undefined but a root is set → Loading.
+    expect(screen.getByText('Loading profile…')).toBeTruthy();
+    expect(screen.queryByText('No page content.')).toBeNull();
     expect(screen.queryByText('Builder of meshes')).toBeNull();
 
     // Simulate the fetch resolving, then App bumping docVersion (resolver.onChange).

@@ -184,6 +184,10 @@
         </dl>
       </section>
     {/if}
+  {:else if card?.profilePageRoot}
+    <!-- A page root is set but the lazy fetch_profile_doc hasn't resolved yet:
+         show a loading placeholder rather than a misleading "no content". -->
+    <div class="panel-empty" role="status">Loading profile…</div>
   {:else}
     <div class="panel-empty">No page content.</div>
   {/if}

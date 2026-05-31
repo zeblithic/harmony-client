@@ -85,6 +85,12 @@ pub enum ProfileDocError {
 /// field count + per-field key/value bytes, every link URL `starts_with` an
 /// allowed scheme, and total canonical-encoded bytes <= `MAX_PROFILE_DOC_BYTES`.
 pub fn validate_profile_doc(doc: &ProfilePageDoc) -> Result<(), ProfileDocError> {
+    // Keep encode/decode symmetric: decode_profile_doc rejects an unknown
+    // version, so validate (and therefore encode) must reject it too — otherwise
+    // encode could emit a doc its own decode path refuses.
+    if doc.version != PROFILE_DOC_VERSION {
+        return Err(ProfileDocError::UnsupportedVersion);
+    }
     if doc.bio.len() > MAX_BIO_BYTES {
         return Err(ProfileDocError::BioTooLong);
     }
@@ -355,6 +361,26 @@ mod tests {
         let bytes = canonical_cbor_encode(&doc).unwrap();
         assert!(matches!(
             decode_profile_doc(&bytes),
+            Err(ProfileDocError::UnsupportedVersion)
+        ));
+    }
+
+    #[test]
+    fn encode_rejects_unknown_version() {
+        // Symmetry with decode_rejects_unknown_version: encode must refuse a
+        // wrong-version doc rather than emitting bytes its own decode rejects.
+        let doc = ProfilePageDoc {
+            version: PROFILE_DOC_VERSION + 1,
+            bio: "hi".into(),
+            links: vec![],
+            fields: vec![],
+        };
+        assert!(matches!(
+            encode_profile_doc(&doc),
+            Err(ProfileDocError::UnsupportedVersion)
+        ));
+        assert!(matches!(
+            validate_profile_doc(&doc),
             Err(ProfileDocError::UnsupportedVersion)
         ));
     }

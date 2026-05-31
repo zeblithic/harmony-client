@@ -101,4 +101,16 @@ describe('ProfilePageResolver', () => {
     // Cache cleared: a post-destroy resolve no longer returns the DTO.
     expect(r.resolve('cid1')).toBeUndefined();
   });
+
+  it('resolve() after destroy() does not invoke fetch_profile_doc', () => {
+    const adapter = fakeAdapter(async () => SAMPLE_DTO);
+    const r = new ProfilePageResolver();
+    r.connectAdapter(adapter as any);
+
+    r.destroy();
+    // A fresh CID never seen before: resolve must short-circuit on destroyed
+    // and NOT kick off an IPC fetch.
+    expect(r.resolve('never-seen')).toBeUndefined();
+    expect(adapter.invoke).not.toHaveBeenCalled();
+  });
 });

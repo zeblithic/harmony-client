@@ -5612,10 +5612,16 @@ async fn publish_profile(
         Some(h) => {
             let bytes =
                 hex::decode(h).map_err(|e| format!("invalid profile_page_root hex: {e}"))?;
-            Some(
-                <[u8; 32]>::try_from(bytes)
-                    .map_err(|_| "profile_page_root must be 32 bytes".to_string())?,
-            )
+            let root_arr = <[u8; 32]>::try_from(bytes)
+                .map_err(|_| "profile_page_root must be 32 bytes".to_string())?;
+            // ZEB-345: profile pages are fetched over the PUBLIC CAS path only, so
+            // an encrypted root would be unresolvable by peers — reject it before
+            // the Reticulum commit (same pre-commit ordering as the decode above).
+            let cid = harmony_content::cid::ContentId::from_bytes(root_arr);
+            if cid.flags().encrypted {
+                return Err("profile_page_root must be a public (unencrypted) CID".to_string());
+            }
+            Some(root_arr)
         }
     };
 
@@ -5780,10 +5786,15 @@ async fn republish_owner_card(
         Some(h) => {
             let bytes =
                 hex::decode(h).map_err(|e| format!("invalid profile_page_root hex: {e}"))?;
-            Some(
-                <[u8; 32]>::try_from(bytes)
-                    .map_err(|_| "profile_page_root must be 32 bytes".to_string())?,
-            )
+            let root_arr = <[u8; 32]>::try_from(bytes)
+                .map_err(|_| "profile_page_root must be 32 bytes".to_string())?;
+            // ZEB-345: profile pages are fetched over the PUBLIC CAS path only, so
+            // an encrypted root would be unresolvable by peers — reject it.
+            let cid = harmony_content::cid::ContentId::from_bytes(root_arr);
+            if cid.flags().encrypted {
+                return Err("profile_page_root must be a public (unencrypted) CID".to_string());
+            }
+            Some(root_arr)
         }
     };
     let (dm_outbox, dm_self_owner, dm_device_id, hlc_tracker, profile_card_publisher) = {
@@ -11469,8 +11480,10 @@ async fn fetch_profile_doc(
     cid: String,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<ProfilePageDocDto, String> {
-    // Validate hex CID
-    if cid.is_empty() || !cid.bytes().all(|b| b.is_ascii_hexdigit()) {
+    // Validate hex CID. Profile-page roots are fixed 32-byte CIDs, so reject any
+    // hex that isn't exactly 64 chars BEFORE doing any fetch work — `"ab"` is
+    // valid hex but can never be a CID (CodeRabbit).
+    if cid.len() != 64 || !cid.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(format!("invalid CID hex: {cid}"));
     }
 

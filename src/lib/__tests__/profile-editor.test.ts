@@ -170,4 +170,92 @@ describe('ProfileEditor — About section', () => {
       'city',
     );
   });
+
+  it('preserves the existing root when saving before the prefill resolves', async () => {
+    // fetch_profile_doc never resolves within the test → prefill stays pending.
+    // Saving with an empty (unedited) About must NOT drop the existing page:
+    // it must re-emit profile.profilePageRoot and never call ingest_profile_doc.
+    let resolvePrefill: ((v: unknown) => void) | undefined;
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'fetch_profile_doc') {
+        return new Promise((res) => {
+          resolvePrefill = res;
+        });
+      }
+      return Promise.resolve('cid-should-not-be-used');
+    });
+    const onSave = vi.fn();
+    render(ProfileEditor, {
+      props: {
+        profile: baseProfile({ profilePageRoot: 'cid-existing' }),
+        onSave,
+      },
+    });
+
+    // Prefill fetch was kicked off but is still pending.
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith('fetch_profile_doc', {
+        cid: 'cid-existing',
+      }),
+    );
+
+    await fireEvent.click(screen.getByText('Save'));
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+
+    // No re-ingest of an empty doc...
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      'ingest_profile_doc',
+      expect.anything(),
+    );
+    // ...and the existing root is preserved rather than dropped.
+    const emitted = onSave.mock.calls[0][0] as Profile;
+    expect(emitted.profilePageRoot).toBe('cid-existing');
+
+    // Drain the pending prefill so the unmount handler is clean.
+    resolvePrefill?.({ bio: '', links: [], fields: [] });
+  });
+
+  it('does not overwrite user edits when a late prefill resolves', async () => {
+    // Prefill resolves only after the user has already typed into the bio.
+    let resolvePrefill: ((v: unknown) => void) | undefined;
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'fetch_profile_doc') {
+        return new Promise((res) => {
+          resolvePrefill = res;
+        });
+      }
+      return Promise.resolve('cid-new');
+    });
+    const onSave = vi.fn();
+    render(ProfileEditor, {
+      props: {
+        profile: baseProfile({ profilePageRoot: 'cid-existing' }),
+        onSave,
+      },
+    });
+
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith('fetch_profile_doc', {
+        cid: 'cid-existing',
+      }),
+    );
+
+    // User types BEFORE the prefill lands.
+    await fireEvent.input(screen.getByLabelText('Bio'), {
+      target: { value: 'My own words' },
+    });
+
+    // Late prefill resolves — it must NOT clobber the user's edit.
+    resolvePrefill?.({
+      bio: 'Stale prefilled bio',
+      links: [],
+      fields: [],
+    });
+
+    await waitFor(() =>
+      expect((screen.getByLabelText('Bio') as HTMLTextAreaElement).value).toBe(
+        'My own words',
+      ),
+    );
+  });
 });

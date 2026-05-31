@@ -219,7 +219,7 @@ describe('ProfilePanel', () => {
     expect(screen.getByText('No page content.')).toBeTruthy();
   });
 
-  it('renders header-only when the doc is still unresolved (resolve returns undefined)', () => {
+  it('shows a Loading placeholder when a root is set but the doc is still unresolved', () => {
     render(ProfilePanel, {
       props: {
         ownerIdHex: OWNER_HEX,
@@ -231,7 +231,9 @@ describe('ProfilePanel', () => {
     });
     expect(screen.getByText('Carol')).toBeTruthy();
     expect(screen.queryByText('About')).toBeNull();
-    expect(screen.getByText('No page content.')).toBeTruthy();
+    // A root is present → loading, NOT the "no content" empty state.
+    expect(screen.getByText('Loading profile…')).toBeTruthy();
+    expect(screen.queryByText('No page content.')).toBeNull();
   });
 
   it('omits the Links section when the doc has no links', () => {
