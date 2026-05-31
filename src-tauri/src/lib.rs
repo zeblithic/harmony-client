@@ -1049,6 +1049,9 @@ pub struct ProfilePayload {
     /// Hex-encoded CID for full-size avatar content.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub avatar_cid: Option<String>,
+    /// Hex-encoded root CID for the long-form profile page document.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_page_root: Option<String>,
     /// Hex-encoded CID for thumbnail avatar content.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub avatar_mini_cid: Option<String>,
@@ -5601,6 +5604,21 @@ async fn publish_profile(
         }
     };
 
+    // ZEB-345: validate the profile_page_root CID hex BEFORE the Reticulum
+    // commit too, same ordering as avatar_cid above — a malformed root must fail
+    // the IPC with NOTHING published. None = no profile page (legitimate).
+    let profile_page_root_bytes: Option<[u8; 32]> = match profile.profile_page_root.as_deref() {
+        None => None,
+        Some(h) => {
+            let bytes =
+                hex::decode(h).map_err(|e| format!("invalid profile_page_root hex: {e}"))?;
+            Some(
+                <[u8; 32]>::try_from(bytes)
+                    .map_err(|_| "profile_page_root must be 32 bytes".to_string())?,
+            )
+        }
+    };
+
     let key_expr = format!("harmony/profile/{}", profile.address);
     let payload = serde_json::to_vec(&profile).map_err(|e| format!("serialize: {e}"))?;
 
@@ -5634,6 +5652,7 @@ async fn publish_profile(
         profile.display_name.clone(),
         profile.status_text.clone().unwrap_or_default(),
         avatar_cid_bytes,
+        profile_page_root_bytes,
     )
     .await
     {
@@ -5667,6 +5686,7 @@ async fn publish_owner_card(
     display_name: String,
     status_text: String,
     avatar_cid: Option<[u8; 32]>,
+    profile_page_root: Option<[u8; 32]>,
 ) -> Result<(), String> {
     let (
         Some(dm_outbox),
@@ -5704,9 +5724,7 @@ async fn publish_owner_card(
         display_name,
         status_text,
         avatar_cid,
-        // ZEB-345 Task 1: card field exists, but the IPC/App plumbing that
-        // sources a self profile_page_root lands in Task 10. Pass None for now.
-        None,
+        profile_page_root,
         enrollment_cert,
         hlc,
     ) {
@@ -5740,6 +5758,7 @@ async fn republish_owner_card(
     display_name: String,
     status_text: String,
     avatar_cid: Option<String>,
+    profile_page_root: Option<String>,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
     // None = no avatar (legitimate). A PRESENT-but-malformed hex must surface as
@@ -5751,6 +5770,19 @@ async fn republish_owner_card(
             Some(
                 <[u8; 32]>::try_from(bytes)
                     .map_err(|_| "avatar_cid must be 32 bytes".to_string())?,
+            )
+        }
+    };
+    // ZEB-345: same posture as avatar_cid — None = no profile page (legitimate),
+    // a present-but-malformed hex surfaces an Err rather than silent strip.
+    let profile_page_root_bytes: Option<[u8; 32]> = match profile_page_root.as_deref() {
+        None => None,
+        Some(h) => {
+            let bytes =
+                hex::decode(h).map_err(|e| format!("invalid profile_page_root hex: {e}"))?;
+            Some(
+                <[u8; 32]>::try_from(bytes)
+                    .map_err(|_| "profile_page_root must be 32 bytes".to_string())?,
             )
         }
     };
@@ -5773,6 +5805,7 @@ async fn republish_owner_card(
         display_name,
         status_text,
         avatar_cid_bytes,
+        profile_page_root_bytes,
     )
     .await
 }
@@ -32372,6 +32405,7 @@ mod tests {
             status_text: Some("Building".to_string()),
             avatar_url: None,
             avatar_cid: None,
+            profile_page_root: Some("ab".repeat(32)),
             avatar_mini_cid: None,
         };
         let json = serde_json::to_vec(&profile).unwrap();
@@ -32380,6 +32414,10 @@ mod tests {
         assert_eq!(parsed.display_name, "Alice");
         assert_eq!(parsed.status_text.as_deref(), Some("Building"));
         assert!(parsed.avatar_url.is_none());
+        assert_eq!(
+            parsed.profile_page_root.as_deref(),
+            Some("ab".repeat(32).as_str())
+        );
     }
 
     #[test]
@@ -32390,6 +32428,7 @@ mod tests {
             status_text: None,
             avatar_url: None,
             avatar_cid: None,
+            profile_page_root: None,
             avatar_mini_cid: None,
         };
         let json = String::from_utf8(serde_json::to_vec(&profile).unwrap()).unwrap();
@@ -32403,6 +32442,10 @@ mod tests {
         );
         assert!(
             !json.contains("statusText"),
+            "None field should be skipped: {json}"
+        );
+        assert!(
+            !json.contains("profilePageRoot"),
             "None field should be skipped: {json}"
         );
     }
