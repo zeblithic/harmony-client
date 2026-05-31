@@ -148,6 +148,28 @@ describe('MemberCardService cross-peer resolution', () => {
     }
   });
 
+  it('applyCard (push path) resolves a card and fires onUpdate; unchanged re-apply is a no-op', () => {
+    const svc = makeService(); // no adapter needed for the push path
+    const onUpdate = vi.fn();
+    svc.onUpdate = onUpdate;
+    svc.applyCard(ownerA, { displayName: 'Alice', statusText: 'hi' });
+    expect(svc.resolve(ownerA)).toEqual({ displayName: 'Alice', statusText: 'hi' });
+    expect(onUpdate).toHaveBeenCalledTimes(1);
+    // Re-applying the identical card must NOT churn / re-fire onUpdate.
+    svc.applyCard(ownerA, { displayName: 'Alice', statusText: 'hi' });
+    expect(onUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it('applyCard never overwrites the self entry seeded via seedSelf', () => {
+    const svc = makeService();
+    svc.seedSelf(selfKey, { displayName: 'Me', statusText: 'local' });
+    const onUpdate = vi.fn();
+    svc.onUpdate = onUpdate;
+    svc.applyCard(selfKey, { displayName: 'Spoofed', statusText: 'evil' });
+    expect(svc.resolve(selfKey)).toEqual({ displayName: 'Me', statusText: 'local' });
+    expect(onUpdate).not.toHaveBeenCalled();
+  });
+
   it('network methods no-op without an adapter (non-connected boot)', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {

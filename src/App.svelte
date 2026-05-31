@@ -1005,6 +1005,25 @@
       // listen() returns UnlistenFn (= () => void), matching addUnlisten's
       // signature directly — no cast needed.
       fileManagerService.addUnlisten(unlistenStatus);
+
+      // ZEB-341: instant card resolution. The backend emits
+      // `member-card-received` whenever a verified card is cached; apply it
+      // immediately so names don't lag the 3s poll. The poll loop remains the
+      // fallback (applyCard is idempotent with it). Registered here next to
+      // the zenoh-status listener so the adapter/event system is confirmed
+      // ready, and torn down via the same addUnlisten path on unmount.
+      const unlistenMemberCard = await listen<{
+        subscriptionId: number;
+        ownerIdHex: string;
+        displayName: string;
+        statusText: string;
+      }>('member-card-received', (event) => {
+        memberCardService.applyCard(event.payload.ownerIdHex, {
+          displayName: event.payload.displayName,
+          statusText: event.payload.statusText,
+        });
+      });
+      fileManagerService.addUnlisten(unlistenMemberCard);
     } catch (err) {
       console.warn('[harmony-client] Tauri init failed:', err);
     }

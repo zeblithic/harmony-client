@@ -74,6 +74,20 @@ export class MemberCardService {
     return this.cards.get(ownerIdHex.toLowerCase());
   }
 
+  /** Apply a card delivered via the `member-card-received` push event (instant
+   *  path; the poll loop is the fallback). Idempotent with the poll. Never
+   *  overwrites the locally-seeded self entry. */
+  applyCard(ownerIdHex: string, card: ResolvedCard): void {
+    const key = ownerIdHex.toLowerCase();
+    if (key === this.selfKey) return; // self stays authoritative (seedSelf)
+    const prev = this.cards.get(key);
+    if (prev && prev.displayName === card.displayName && prev.statusText === card.statusText) {
+      return; // unchanged — no churn
+    }
+    this.cards.set(key, { displayName: card.displayName, statusText: card.statusText });
+    this.onUpdate?.();
+  }
+
   /**
    * Reconcile the set of visible members against active subscriptions.
    * Subscribes to newly-visible owners, unsubscribes owners that left the

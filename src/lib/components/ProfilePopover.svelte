@@ -257,6 +257,9 @@
   {#if card.power !== undefined}
     <div class="popover-role">{roleLabel(card.power)}</div>
   {/if}
+  {#if card.status === 'banned'}
+    <div class="popover-status-flag">Banned</div>
+  {/if}
 {:else if profile}
   <div class="popover-header">
     <Avatar address={profile.address} displayName={profile.displayName} avatarUrl={profile.avatarUrl} size={64} />
@@ -389,6 +392,13 @@
     font-size: 12px;
     font-weight: 600;
     color: var(--text-secondary);
+  }
+
+  .popover-status-flag {
+    margin-top: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--danger, var(--text-muted));
   }
 
   .popover-sounds {

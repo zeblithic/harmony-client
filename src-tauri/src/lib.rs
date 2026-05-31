@@ -5557,23 +5557,12 @@ async fn publish_profile(
         return Err(format!("invalid address: {}", profile.address));
     }
 
-    // ZEB-341: reject over-long card fields BEFORE any publish so an invalid
-    // name/status fails fast (mirrors sign_card's bounds; checked here so the
-    // Reticulum profile isn't published when the card would be rejected).
-    if profile.display_name.len() > crate::profile_card_broadcast::MAX_DISPLAY_NAME_BYTES {
-        return Err(format!(
-            "display_name exceeds {} bytes",
-            crate::profile_card_broadcast::MAX_DISPLAY_NAME_BYTES
-        ));
-    }
-    if let Some(st) = &profile.status_text {
-        if st.len() > crate::profile_card_broadcast::MAX_STATUS_TEXT_BYTES {
-            return Err(format!(
-                "status_text exceeds {} bytes",
-                crate::profile_card_broadcast::MAX_STATUS_TEXT_BYTES
-            ));
-        }
-    }
+    // ZEB-341: card-field length limits are NOT enforced here — doing so would
+    // block the unrelated Reticulum profile publish (which has no such limit)
+    // for names/status exceeding the card bounds (easily reached with CJK or
+    // emoji). The owner_id card publish below is best-effort: `sign_card`
+    // enforces MAX_DISPLAY_NAME_BYTES / MAX_STATUS_TEXT_BYTES and an over-long
+    // field is logged + skipped, leaving the Reticulum publish unaffected.
 
     // Clone everything we need out of the std `NodeState` guard, then DROP the
     // guard before any `.await` (the std MutexGuard is `!Send` across await).

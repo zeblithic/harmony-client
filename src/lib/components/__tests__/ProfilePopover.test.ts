@@ -220,6 +220,33 @@ describe('ProfilePopover', () => {
     expect(screen.queryByText('Member')).toBeNull();
   });
 
+  it('owner-card mode renders a "Banned" flag when status is banned', () => {
+    render(ProfilePopover, {
+      props: {
+        mode: 'owner-card',
+        card: { ownerIdHex: OWNER_HEX, displayName: 'Bob', statusText: '', power: 0, status: 'banned' },
+        x: 0,
+        y: 0,
+        onClose: vi.fn(),
+      },
+    });
+    expect(screen.getByText('Banned')).toBeTruthy();
+  });
+
+  it('owner-card mode does NOT render "Banned" for the normal joined status', () => {
+    render(ProfilePopover, {
+      props: {
+        mode: 'owner-card',
+        card: { ownerIdHex: OWNER_HEX, displayName: 'Bob', statusText: '', power: 0, status: 'joined' },
+        x: 0,
+        y: 0,
+        onClose: vi.fn(),
+      },
+    });
+    expect(screen.getByText('Bob')).toBeTruthy();
+    expect(screen.queryByText('Banned')).toBeNull();
+  });
+
   it('owner-card mode shows "Name unavailable" when displayName is empty', () => {
     render(ProfilePopover, {
       props: {
