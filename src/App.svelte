@@ -119,6 +119,14 @@
   // ZEB-341: one-shot guard so the boot-time card re-publish fires at most
   // once per process (the 600s refresh re-emits cached bytes thereafter).
   let hasPublishedCardOnBoot = false;
+  // ZEB-341: in-flight promise for the boot card publish. The boot path fires
+  // tryBootPublishCard un-awaited while the zenoh-status 'connected' handler
+  // awaits it, so two calls can be in flight at once. `hasPublishedCardOnBoot`
+  // is a plain boolean checked before an await, so without joining the in-flight
+  // attempt both calls would pass the check before either sets the guard and
+  // publish a duplicate card (async TOCTOU). Concurrent callers join this promise
+  // instead of starting a second publish; it clears once the attempt settles.
+  let bootCardPublishInFlight: Promise<void> | null = null;
 
   // Publish the profile (and, backend-side, the owner_id card) to the network.
   // Uses direct invoke rather than ZenohService.publishProfile() because
@@ -171,13 +179,29 @@
   // bytes, which stay empty until the card publish succeeds at least once).
   // Publishes the CARD ONLY — not the full profile — so boot doesn't re-emit
   // the unchanged Reticulum profile.
-  async function tryBootPublishCard(): Promise<void> {
+  function tryBootPublishCard(): Promise<void> {
     if (hasPublishedCardOnBoot || selfOwnerId === null || !myProfile?.displayName) {
-      return;
+      return Promise.resolve();
     }
-    if (await republishOwnerCard(myProfile)) {
-      hasPublishedCardOnBoot = true;
+    // Join an already-running attempt rather than starting a second publish.
+    // The check-decide-assign below is synchronous (no await between the guard
+    // read and the assignment), so it's atomic w.r.t. concurrent callers; the
+    // first await happens only inside the memoized closure.
+    if (bootCardPublishInFlight) {
+      return bootCardPublishInFlight;
     }
+    bootCardPublishInFlight = (async () => {
+      try {
+        if (await republishOwnerCard(myProfile)) {
+          hasPublishedCardOnBoot = true;
+        }
+      } finally {
+        // Clear so a FAILED attempt (guard still false) can retry on the next
+        // trigger; a SUCCEEDED attempt is short-circuited by the guard above.
+        bootCardPublishInFlight = null;
+      }
+    })();
+    return bootCardPublishInFlight;
   }
 
   async function handleProfileSave(profile: Profile) {

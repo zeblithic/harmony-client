@@ -314,11 +314,13 @@
   }
 
   function handleAuthorClick(author: string, ev: MouseEvent) {
+    // Resolve once — a single map lookup and a single reactive cardVersion read.
+    const card = resolveCard?.(author);
     onOpenCard?.(
       {
         ownerIdHex: author,
-        displayName: resolveCard?.(author)?.displayName ?? author.slice(0, 8),
-        statusText: resolveCard?.(author)?.statusText ?? '',
+        displayName: card?.displayName ?? author.slice(0, 8),
+        statusText: card?.statusText ?? '',
         // No power known for message authors → role line omitted.
       },
       ev,
