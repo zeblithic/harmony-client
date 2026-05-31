@@ -31,7 +31,7 @@ Concretely today:
 
 A new **`owner_id`-keyed, `EnrollmentCert`-verified profile-card broadcast**, mirroring the proven `ProfileMembershipBroadcast` machinery (`profile_broadcast.rs` + the `subscribe_peer_profile`/`get_cached_peer_profile` subscriber-pool + cache trio at `lib.rs:18541+`), but keyed by `owner_id` and verified through the cert model instead of a Reticulum `address_hash`.
 
-```
+```text
 Publisher (you)                         Subscriber (another member)
 ─────────────                           ───────────────────────────
 ProfileEditor save ──┐

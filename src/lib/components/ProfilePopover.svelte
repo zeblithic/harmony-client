@@ -55,18 +55,25 @@
   const SOUND_LABELS = { quiet: 'Quiet', standard: 'Standard', loud: 'Loud' } as const;
 
   function roleLabel(power: number): string {
-    if (power === 100) return 'Admin';
-    if (power === 50) return 'Moderator';
-    return 'Member';
+    // Mirror MemberRow's tierLabel thresholds (>= 50 Moderator) so the popover
+    // role line matches the roster badge for power levels between tiers.
+    return power >= 100 ? 'Admin' : power >= 50 ? 'Moderator' : 'Member';
   }
 
   let copied = $state(false);
   let copyTimer: ReturnType<typeof setTimeout> | null = null;
 
-  function copyOwnerId() {
+  async function copyOwnerId() {
     const hex = card?.ownerIdHex;
     if (!hex) return;
-    void navigator.clipboard?.writeText(hex);
+    // Only surface "Copied" after the write actually succeeds — don't claim a
+    // copy if the clipboard is unavailable or the write rejects.
+    if (!navigator.clipboard) return;
+    try {
+      await navigator.clipboard.writeText(hex);
+    } catch {
+      return;
+    }
     copied = true;
     if (copyTimer) clearTimeout(copyTimer);
     copyTimer = setTimeout(() => {
@@ -78,7 +85,7 @@
   function onCopyKeydown(e: KeyboardEvent) {
     if (e.key === 'Enter' || e.key === ' ') {
       e.preventDefault();
-      copyOwnerId();
+      void copyOwnerId();
     }
   }
 

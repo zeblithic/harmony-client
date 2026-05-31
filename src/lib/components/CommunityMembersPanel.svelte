@@ -114,7 +114,13 @@
   // unsubscribes departed) and excludes self, so calling it on every change is
   // idempotent. `member.address` is the lowercase owner_id hex.
   $effect(() => {
-    const addrs = members.map((m) => m.address);
+    // Scope card subscriptions to the actually-shown rows: joined members are
+    // always visible; banned members only when the banned section is expanded.
+    // Don't subscribe to filtered-out / collapsed rows.
+    const addrs = [
+      ...joined.map((m) => m.address),
+      ...(bannedExpanded ? banned.map((m) => m.address) : []),
+    ];
     subscribeVisibleCards?.(addrs);
   });
 

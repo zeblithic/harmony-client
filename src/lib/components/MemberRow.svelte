@@ -104,7 +104,7 @@
   // Read through resolveCard() inside $derived so Task 8's reactive Map upgrade
   // triggers a re-render automatically — no one-time snapshot.
   let displayName = $derived(
-    member.displayName ?? resolveCard?.(member.address)?.displayName ?? member.address.slice(0, 8)
+    resolveCard?.(member.address)?.displayName ?? member.displayName ?? member.address.slice(0, 8)
   );
   let joinedDate = $derived(
     member.joinedAt != null

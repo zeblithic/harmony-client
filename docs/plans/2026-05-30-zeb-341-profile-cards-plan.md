@@ -908,6 +908,7 @@ cargo fmt --all -- --check; echo FMT=$?
 cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings 2>&1 | tail -8; echo CLIPPY=${PIPESTATUS[0]}
 cargo nextest run --locked --workspace --all-targets --features test-fixtures 2>&1 | tail -30; echo NEXTEST=${PIPESTATUS[0]}
 ```
+
 Expected: FMT=0, CLIPPY=0, NEXTEST=0 modulo the pre-existing orphan transport/port flakes recorded in Task 0 (any NEW membership/card/verify failure is blocking). If the full sweep risks >10 min cold, it's fine to rely on the Bash 600000ms timeout; on overrun report `DONE_WITH_CONCERNS`.
 
 - [ ] **Step 2: Large-tests + MSRV.** From `src-tauri/`:
@@ -916,6 +917,7 @@ Expected: FMT=0, CLIPPY=0, NEXTEST=0 modulo the pre-existing orphan transport/po
 HARMONY_LARGE_TESTS=1 cargo nextest run --locked --features test-fixtures -E 'test(folder_ingest_walker_integration)' 2>&1 | tail -15; echo LARGE=${PIPESTATUS[0]}
 cargo check --locked --all-targets --features test-fixtures 2>&1 | tail -8; echo MSRV=${PIPESTATUS[0]}
 ```
+
 Expected: both 0. (MSRV uses the declared toolchain; if a separate MSRV toolchain isn't installed locally, note it — CI runs it authoritatively.)
 
 - [ ] **Step 3: Frontend gates.** From repo root:
@@ -924,6 +926,7 @@ Expected: both 0. (MSRV uses the declared toolchain; if a separate MSRV toolchai
 npx tsc --noEmit; echo TSC=$?
 npx vitest run 2>&1 | tail -20; echo VITEST=${PIPESTATUS[0]}
 ```
+
 Expected: TSC=0, VITEST=0.
 
 - [ ] **Step 4: Push + open PR**
@@ -931,6 +934,7 @@ Expected: TSC=0, VITEST=0.
 ```bash
 git push -u origin zeb-341-profile-cards
 ```
+
 Then `gh pr create` with title `ZEB-341: resolvable per-identity profile cards (display name + status) by owner_id` and a body that:
 - markdown-links **ZEB-341** (so Linear attaches; per feedback_linear_pr_auto_close the parent **ZEB-218** must NOT be over-closed on merge — note to verify post-merge).
 - Summary: new owner_id-keyed cert-verified `ProfileCardBroadcast`; publish via device #2 + cert; subscriber pool + cache + 3 IPCs; frontend `member-card-service` (self-seed + cross-peer) + clickable popover; name+status only; CAS avatar/profile-page reserved as additive fields (not implemented).
@@ -938,7 +942,7 @@ Then `gh pr create` with title `ZEB-341: resolvable per-identity profile cards (
 - Test plan: the 5 backend gates + 2 frontend gates above, wire-format fixture, verify negatives, cross-peer e2e.
 - 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 
-- [ ] **Step 5:** Report the PR URL. Controller then enters the autonomous bot-review loop (CodeRabbit/Cursor/CodeAnt/Qodo + 5 CI jobs), addresses findings as bundled pushes, NEVER triggers Greptile, and pushovers Jake at ready-to-merge. Do NOT merge.
+- [ ] **Step 5:** Report the PR URL. Controller then enters the autonomous bot-review loop (CodeRabbit/Cursor/CodeAnt/Qodo + 5 CI jobs), addresses findings as bundled pushes, NEVER triggers Greptile, and pings Jake when ready to merge. Do NOT merge.
 
 ---
 

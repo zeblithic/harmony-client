@@ -5645,19 +5645,34 @@ async fn publish_profile(
                 outbox_g.enrollment_cert.clone(),
             )
         };
-        let card = crate::profile_card_broadcast::sign_card(
+        // Card publish is BEST-EFFORT: the Reticulum profile already published
+        // above, so a card-publish failure must NOT surface as an IPC Err (the
+        // frontend would retry → double Reticulum publish). Spec §10: log + skip.
+        let card = match crate::profile_card_broadcast::sign_card(
             &signing_key,
             owner_id,
             profile.display_name.clone(),
             profile.status_text.clone().unwrap_or_default(),
             enrollment_cert,
             hlc,
-        )
-        .map_err(|e| e.to_string())?;
-        let bytes =
-            crate::owner_state_crypto::canonical_cbor_encode(&card).map_err(|e| e.to_string())?;
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "profile card sign failed; skipping card publish");
+                return Ok(());
+            }
+        };
+        let bytes = match crate::owner_state_crypto::canonical_cbor_encode(&card) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "profile card encode failed; skipping card publish");
+                return Ok(());
+            }
+        };
         let topic = crate::profile_card_broadcast::card_topic_for(&owner_id);
-        card_publisher.publish_now(topic, bytes).await?;
+        if let Err(e) = card_publisher.publish_now(topic, bytes).await {
+            tracing::warn!(error = %e, "profile card publish failed after profile publish");
+        }
     }
 
     Ok(())
@@ -18863,18 +18878,27 @@ async fn unsubscribe_member_card(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     subscription_id: u64,
 ) -> Result<(), String> {
-    let request_tx = {
+    let (cache, request_tx) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        g.profile_card_request_tx
-            .clone()
-            .ok_or(OWNER_NOT_LOADED_MSG)?
+        (
+            g.profile_card_cache.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.profile_card_request_tx
+                .clone()
+                .ok_or(OWNER_NOT_LOADED_MSG)?,
+        )
     };
-    request_tx
+    // Symmetry with subscribe: if the request channel is closing (event-loop
+    // shutdown raced this IPC), roll back the local cache entry before
+    // surfacing the error so we don't leave a phantom subscription.
+    if let Err(e) = request_tx
         .send(crate::event_loop::ProfileCardRequest::Unsubscribe { subscription_id })
         .await
-        .map_err(|e| format!("profile_card_request_tx send: {e}"))?;
+    {
+        cache.drop_subscription(subscription_id).await;
+        return Err(format!("profile_card_request_tx send: {e}"));
+    }
     Ok(())
 }
 

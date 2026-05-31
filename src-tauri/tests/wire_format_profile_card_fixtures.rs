@@ -20,13 +20,26 @@ fn profile_card_canonical_cbor_pins_field_codes() {
     };
     let bytes = canonical_cbor_encode(&card).expect("encode");
     assert_eq!(bytes[0], 0xA6, "expected 6-entry CBOR map header");
-    for code in ["oi", "dn", "st", "en", "sa", "sg"] {
-        let needle = [0x62, code.as_bytes()[0], code.as_bytes()[1]];
-        assert!(
-            bytes.windows(3).any(|w| w == needle),
-            "missing field code {code}"
-        );
-    }
+    // Decode into a CBOR map and assert the EXACT key-set. A raw byte-window
+    // scan can false-pass on payload bytes that happen to match a field code.
+    let value: ciborium::value::Value = ciborium::de::from_reader(&bytes[..]).expect("decode");
+    let map = match value {
+        ciborium::value::Value::Map(m) => m,
+        other => panic!("expected CBOR map, got {other:?}"),
+    };
+    let keys: std::collections::HashSet<String> = map
+        .iter()
+        .filter_map(|(k, _)| match k {
+            ciborium::value::Value::Text(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        std::collections::HashSet::from_iter(
+            ["oi", "dn", "st", "en", "sa", "sg"].map(str::to_string)
+        )
+    );
 }
 
 #[test]

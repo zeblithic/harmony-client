@@ -235,19 +235,32 @@ describe('ProfilePopover', () => {
   });
 
   it('owner-card mode copies owner_id on click', async () => {
-    const writeText = vi.fn();
-    Object.assign(navigator, { clipboard: { writeText } });
-    render(ProfilePopover, {
-      props: {
-        mode: 'owner-card',
-        card: { ownerIdHex: OWNER_HEX, displayName: 'Alice', statusText: '', power: 100 },
-        x: 0,
-        y: 0,
-        onClose: vi.fn(),
-      },
-    });
-    await fireEvent.click(screen.getByLabelText('Copy owner ID'));
-    expect(writeText).toHaveBeenCalledWith(OWNER_HEX);
+    const writeText = vi.fn(async () => {});
+    // Save + restore navigator.clipboard so this test doesn't leak a mutated
+    // global into later tests (some environments expose a real clipboard).
+    const prevClipboard = navigator.clipboard;
+    try {
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        value: { writeText },
+      });
+      render(ProfilePopover, {
+        props: {
+          mode: 'owner-card',
+          card: { ownerIdHex: OWNER_HEX, displayName: 'Alice', statusText: '', power: 100 },
+          x: 0,
+          y: 0,
+          onClose: vi.fn(),
+        },
+      });
+      await fireEvent.click(screen.getByLabelText('Copy owner ID'));
+      expect(writeText).toHaveBeenCalledWith(OWNER_HEX);
+    } finally {
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        value: prevClipboard,
+      });
+    }
   });
 
   it('owner-card mode closes on Escape', async () => {

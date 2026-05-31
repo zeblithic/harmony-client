@@ -116,6 +116,32 @@
     void memberCardService.unsubscribeAll();
   }
 
+  // ZEB-341: one-shot guard so the boot-time card re-publish fires at most
+  // once per process (the 600s refresh re-emits cached bytes thereafter).
+  let hasPublishedCardOnBoot = false;
+
+  // Publish the profile (and, backend-side, the owner_id card) to the network.
+  // Uses direct invoke rather than ZenohService.publishProfile() because
+  // ZenohService lives in NetworkApp (not accessible here). Both paths invoke
+  // the same 'publish_profile' command. Swallows errors: not-in-Tauri /
+  // not-connected leaves the profile saved locally only, and the backend
+  // already best-effort-skips the card publish when the node isn't wired.
+  async function publishProfileToNetwork(profile: Profile): Promise<void> {
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      await invoke('publish_profile', {
+        profile: {
+          address: profile.address,
+          displayName: profile.displayName,
+          statusText: profile.statusText,
+          avatarUrl: profile.avatarUrl,
+        },
+      });
+    } catch {
+      // Not in Tauri or not connected — profile saved locally only
+    }
+  }
+
   async function handleProfileSave(profile: Profile) {
     saveProfile(profile);
     myProfile = profile;
@@ -130,22 +156,7 @@
     // messageService.ownDisplayName / vineService.ownDisplayName are kept
     // in sync by a `$effect` later in the script (single source of truth).
     // Publish to network if Tauri is available.
-    // Uses direct invoke rather than ZenohService.publishProfile() because
-    // ZenohService lives in NetworkApp (not accessible here). Both paths
-    // invoke the same 'publish_profile' command.
-    try {
-      const { invoke } = await import('@tauri-apps/api/core');
-      await invoke('publish_profile', {
-        profile: {
-          address: profile.address,
-          displayName: profile.displayName,
-          statusText: profile.statusText,
-          avatarUrl: profile.avatarUrl,
-        },
-      });
-    } catch {
-      // Not in Tauri or not connected — profile saved locally only
-    }
+    await publishProfileToNetwork(profile);
   }
 
   const vineService = new VineService();
@@ -856,9 +867,19 @@
               displayName: myProfile.displayName,
               statusText: myProfile.statusText ?? '',
             });
+            // ZEB-341: re-publish this returning user's profile card on boot so
+            // subscribing peers can resolve their name without a manual re-save.
+            // (The 600s refresh only re-emits CACHED bytes, which are empty on a
+            // fresh process.) One-shot; skip an empty card. The backend skips the
+            // card publish gracefully if the node isn't fully connected yet.
+            if (!hasPublishedCardOnBoot && myProfile.displayName) {
+              hasPublishedCardOnBoot = true;
+              void publishProfileToNetwork(myProfile);
+            }
           }
         } catch (err) {
-          console.debug('[harmony-client] get_owner_state not yet available:', err);
+          const msg = err instanceof Error ? err.message : String(err);
+          console.debug('[harmony-client] get_owner_state not yet available:', msg);
         }
         // Returning user who clicked an invite before start_node resolved:
         // drain it. (routeInviteUrl queued it because the owner wasn't loaded

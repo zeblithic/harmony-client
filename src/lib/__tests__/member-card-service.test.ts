@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { MemberCardService } from '../member-card-service';
 import type { TauriAdapter } from '../zenoh-service';
 
@@ -23,6 +23,24 @@ describe('MemberCardService self-seed', () => {
 describe('MemberCardService cross-peer resolution', () => {
   const ownerA = 'aa'.repeat(16); // 32-char hex
   const selfKey = 'bb'.repeat(16);
+
+  // Track every service these tests create so afterEach can tear down their
+  // timer-driven poll loops + subscriptions — otherwise a subscribed service
+  // leaks its setInterval into later tests.
+  let services: MemberCardService[] = [];
+  function makeService(adapter?: TauriAdapter): MemberCardService {
+    const svc = new MemberCardService(adapter);
+    services.push(svc);
+    return svc;
+  }
+
+  afterEach(async () => {
+    for (const svc of services) {
+      await svc.unsubscribeAll();
+    }
+    services = [];
+    vi.useRealTimers();
+  });
 
   /** Builds a fake adapter that mirrors the 3 card IPCs. */
   function makeAdapter() {
@@ -58,7 +76,7 @@ describe('MemberCardService cross-peer resolution', () => {
 
   it('subscribes to a visible peer and resolves its card after a poll', async () => {
     const { adapter, subscribed } = makeAdapter();
-    const svc = new MemberCardService(adapter);
+    const svc = makeService(adapter);
     await svc.subscribeVisible([ownerA]);
     expect(subscribed).toEqual([ownerA]);
     expect(svc.resolve(ownerA)).toBeUndefined(); // not yet drained
@@ -68,7 +86,7 @@ describe('MemberCardService cross-peer resolution', () => {
 
   it('fires onUpdate when a poll caches a new card', async () => {
     const { adapter } = makeAdapter();
-    const svc = new MemberCardService(adapter);
+    const svc = makeService(adapter);
     const onUpdate = vi.fn();
     svc.onUpdate = onUpdate;
     await svc.subscribeVisible([ownerA]);
@@ -82,7 +100,7 @@ describe('MemberCardService cross-peer resolution', () => {
 
   it('does NOT subscribe to the self owner_id even when in the visible list', async () => {
     const { adapter, subscribed } = makeAdapter();
-    const svc = new MemberCardService(adapter);
+    const svc = makeService(adapter);
     svc.seedSelf(selfKey, { displayName: 'Me', statusText: '' });
     await svc.subscribeVisible([selfKey, ownerA]);
     expect(subscribed).toEqual([ownerA]);
@@ -91,7 +109,7 @@ describe('MemberCardService cross-peer resolution', () => {
 
   it('keeps self authoritative — poll never overwrites the self card', async () => {
     const { adapter } = makeAdapter();
-    const svc = new MemberCardService(adapter);
+    const svc = makeService(adapter);
     svc.seedSelf(ownerA, { displayName: 'MySelf', statusText: 'local' });
     // ownerA is self here; subscribeVisible filters it, so no network card lands.
     await svc.subscribeVisible([ownerA]);
@@ -101,7 +119,7 @@ describe('MemberCardService cross-peer resolution', () => {
 
   it('unsubscribes departed owners on a narrowed visible set', async () => {
     const { adapter, unsubscribed } = makeAdapter();
-    const svc = new MemberCardService(adapter);
+    const svc = makeService(adapter);
     await svc.subscribeVisible([ownerA]); // id 1
     await svc.subscribeVisible([]); // ownerA departed
     expect(unsubscribed).toEqual([1]);
@@ -109,7 +127,7 @@ describe('MemberCardService cross-peer resolution', () => {
 
   it('unsubscribeAll cancels the poll loop and unsubscribes every active sub', async () => {
     const { adapter, unsubscribed } = makeAdapter();
-    const svc = new MemberCardService(adapter);
+    const svc = makeService(adapter);
     await svc.subscribeVisible([ownerA, 'cc'.repeat(16)]); // ids 1, 2
     await svc.unsubscribeAll();
     expect(unsubscribed.sort()).toEqual([1, 2]);
@@ -119,7 +137,7 @@ describe('MemberCardService cross-peer resolution', () => {
     vi.useFakeTimers();
     try {
       const { adapter } = makeAdapter();
-      const svc = new MemberCardService(adapter);
+      const svc = makeService(adapter);
       await svc.subscribeVisible([ownerA]);
       // Advance past POLL_INTERVAL_MS (3000ms) and flush the async tick.
       await vi.advanceTimersByTimeAsync(3000);
@@ -133,7 +151,7 @@ describe('MemberCardService cross-peer resolution', () => {
   it('network methods no-op without an adapter (non-connected boot)', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
-      const svc = new MemberCardService(); // no adapter
+      const svc = makeService(); // no adapter
       await expect(svc.subscribeVisible([ownerA])).resolves.toBeUndefined();
       await expect(svc.pollOnce()).resolves.toBeUndefined();
       expect(svc.resolve(ownerA)).toBeUndefined();

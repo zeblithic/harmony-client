@@ -60,6 +60,10 @@ pub enum CardError {
     DisplayNameTooLong,
     #[error("status_text exceeds {MAX_STATUS_TEXT_BYTES} bytes")]
     StatusTextTooLong,
+    #[error("cert.owner_id does not match requested owner_id")]
+    EnrollmentOwnerMismatch,
+    #[error("signer does not match enrollment device ed25519 key")]
+    SignerKeyMismatch,
     #[error("canonical CBOR encode failed: {0}")]
     Encode(#[from] CryptoError),
 }
@@ -75,6 +79,14 @@ pub fn sign_card(
     enrollment: EnrollmentCert,
     shared_at: Hlc,
 ) -> Result<ProfileCardBroadcast, CardError> {
+    // Fail-fast on cert/owner + signer/key binding so we never emit a card that
+    // can't verify at peers (verify_card enforces the same bindings).
+    if enrollment.owner_id != owner_id {
+        return Err(CardError::EnrollmentOwnerMismatch);
+    }
+    if signer.verifying_key().to_bytes() != enrollment.device_pubkeys.classical.ed25519_verify {
+        return Err(CardError::SignerKeyMismatch);
+    }
     if display_name.len() > MAX_DISPLAY_NAME_BYTES {
         return Err(CardError::DisplayNameTooLong);
     }
@@ -562,6 +574,49 @@ mod tests {
                 hlc
             ),
             Err(CardError::StatusTextTooLong)
+        ));
+    }
+
+    #[test]
+    fn sign_card_rejects_owner_cert_mismatch() {
+        let a = crate::community_membership::mint_test_owner(0x43);
+        // A's signer + A's cert, but a DIFFERENT requested owner_id.
+        assert!(matches!(
+            sign_card(
+                &a.device_key,
+                [0xFFu8; 16],
+                "n".into(),
+                "".into(),
+                a.cert.clone(),
+                Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "d".into(),
+                },
+            ),
+            Err(CardError::EnrollmentOwnerMismatch)
+        ));
+    }
+
+    #[test]
+    fn sign_card_rejects_signer_key_mismatch() {
+        let a = crate::community_membership::mint_test_owner(0x44);
+        let b = crate::community_membership::mint_test_owner(0x45);
+        // B's device_key against A's owner_id + A's cert → signer ≠ enrolled key.
+        assert!(matches!(
+            sign_card(
+                &b.device_key,
+                a.owner.0,
+                "n".into(),
+                "".into(),
+                a.cert.clone(),
+                Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "d".into(),
+                },
+            ),
+            Err(CardError::SignerKeyMismatch)
         ));
     }
 
