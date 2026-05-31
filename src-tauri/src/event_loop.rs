@@ -3589,12 +3589,14 @@ mod fetch_one_wrapper_tests {
         let real = b"the real avatar bytes";
         let cid = ContentId::for_book(real, ContentFlags::default()).unwrap();
         let (cas_op_tx, _cas_op_rx) = mpsc::channel::<CasOp>(8);
-        let fetcher = move |_cid: ContentId| {
-            std::future::ready(Ok::<Vec<u8>, String>(b"TAMPERED".to_vec()))
-        };
+        let fetcher =
+            move |_cid: ContentId| std::future::ready(Ok::<Vec<u8>, String>(b"TAMPERED".to_vec()));
         let wrapped = wrap_fetch_one_with_admission(fetcher, cas_op_tx);
         let result = wrapped(cid).await;
-        assert!(result.is_err(), "tampered bytes must be rejected, not returned");
+        assert!(
+            result.is_err(),
+            "tampered bytes must be rejected, not returned"
+        );
         assert!(
             result.unwrap_err().contains("hash"),
             "error should mention the hash==CID verification failure"
