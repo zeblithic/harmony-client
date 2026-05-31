@@ -258,4 +258,85 @@ describe('ProfileEditor — About section', () => {
       ),
     );
   });
+
+  it('lets the user remove an existing page when the prefill FAILED', async () => {
+    // Prefill rejects → fields never populate, prefillLoaded stays false. The
+    // user clicks "Remove profile page" then saves: the emitted profilePageRoot
+    // must be undefined (page removed) and ingest_profile_doc must NOT be called.
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'fetch_profile_doc') {
+        return Promise.reject(new Error('fetch boom'));
+      }
+      return Promise.resolve('cid-should-not-be-used');
+    });
+    const onSave = vi.fn();
+    render(ProfileEditor, {
+      props: {
+        profile: baseProfile({ profilePageRoot: 'cid-existing' }),
+        onSave,
+      },
+    });
+
+    // Prefill attempted and failed → the removal button appears.
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith('fetch_profile_doc', {
+        cid: 'cid-existing',
+      }),
+    );
+    const removeBtn = await screen.findByText('Remove profile page');
+    await fireEvent.click(removeBtn);
+    // Inline confirm appears in place of the button.
+    expect(
+      screen.getByText('Your profile page will be removed when you save.'),
+    ).toBeTruthy();
+    expect(screen.queryByText('Remove profile page')).toBeNull();
+
+    await fireEvent.click(screen.getByText('Save'));
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+
+    // Page was removed, and no fresh doc was ingested.
+    const emitted = onSave.mock.calls[0][0] as Profile;
+    expect(emitted.profilePageRoot).toBeUndefined();
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      'ingest_profile_doc',
+      expect.anything(),
+    );
+  });
+
+  it('preserves the existing page on a failed prefill when Remove is NOT clicked', async () => {
+    // Prefill rejects, the user saves an empty (unedited) About WITHOUT clicking
+    // Remove → no accidental drop: the existing root is re-emitted, and
+    // ingest_profile_doc is not called.
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'fetch_profile_doc') {
+        return Promise.reject(new Error('fetch boom'));
+      }
+      return Promise.resolve('cid-should-not-be-used');
+    });
+    const onSave = vi.fn();
+    render(ProfileEditor, {
+      props: {
+        profile: baseProfile({ profilePageRoot: 'cid-existing' }),
+        onSave,
+      },
+    });
+
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith('fetch_profile_doc', {
+        cid: 'cid-existing',
+      }),
+    );
+    // The removal affordance is present but the user does NOT use it.
+    await screen.findByText('Remove profile page');
+
+    await fireEvent.click(screen.getByText('Save'));
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+
+    const emitted = onSave.mock.calls[0][0] as Profile;
+    expect(emitted.profilePageRoot).toBe('cid-existing');
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      'ingest_profile_doc',
+      expect.anything(),
+    );
+  });
 });

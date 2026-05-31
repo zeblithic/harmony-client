@@ -86,6 +86,38 @@ describe('ProfilePageResolver', () => {
     expect(adapter.invoke).toHaveBeenCalledTimes(2);
   });
 
+  it('status() transitions loading → resolved over a successful fetch', async () => {
+    let resolveFetch: (v: ProfilePageDto) => void = () => {};
+    const adapter = fakeAdapter(() => new Promise<ProfilePageDto>((res) => { resolveFetch = res; }));
+    const r = new ProfilePageResolver();
+    r.connectAdapter(adapter as any);
+
+    // Never attempted yet → treated as loading (resolve() will kick a fetch).
+    expect(r.status('cid1')).toBe('loading');
+    // resolve() starts the fetch; while pending, status stays 'loading'.
+    expect(r.resolve('cid1')).toBeUndefined();
+    expect(r.status('cid1')).toBe('loading');
+
+    resolveFetch(SAMPLE_DTO);
+    await vi.waitFor(() => expect(r.status('cid1')).toBe('resolved'));
+  });
+
+  it('status() reports error after a failed fetch (so the UI stops showing Loading)', async () => {
+    vi.useFakeTimers();
+    const adapter = fakeAdapter(async () => { throw new Error('boom'); });
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const r = new ProfilePageResolver();
+    r.connectAdapter(adapter as any);
+
+    expect(r.resolve('cid1')).toBeUndefined();
+    // Flush the rejected fetch so failedAt is recorded.
+    await vi.runAllTimersAsync();
+    // resolve() still returns undefined, but status() now distinguishes the
+    // failure from an in-flight fetch.
+    expect(r.resolve('cid1')).toBeUndefined();
+    expect(r.status('cid1')).toBe('error');
+  });
+
   it('destroy() clears the cache', async () => {
     const adapter = fakeAdapter(async () => SAMPLE_DTO);
     const r = new ProfilePageResolver();

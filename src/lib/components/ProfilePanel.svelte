@@ -82,6 +82,17 @@
     return card?.profilePageRoot ? resolver.resolve(card.profilePageRoot) : undefined;
   });
 
+  // Resolution status, so a FAILED fetch shows an error state instead of an
+  // endless "Loading…": resolver.resolve() returns undefined both while a fetch
+  // is in flight AND after it has failed (during the retry cooldown), so the
+  // panel can't tell the two apart from `doc` alone. Reads docVersion so it
+  // re-evaluates on the same resolver.onChange bump that drives `doc`.
+  // 'none' → no page root on the card at all (header-only).
+  const docStatus = $derived.by(() => {
+    docVersion; // reactive dep: re-evaluate when App signals a fetch settled
+    return card?.profilePageRoot ? resolver.status(card.profilePageRoot) : 'none';
+  });
+
   let copied = $state(false);
   let copyTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -184,9 +195,15 @@
         </dl>
       </section>
     {/if}
+  {:else if card?.profilePageRoot && docStatus === 'error'}
+    <!-- The lazy fetch_profile_doc FAILED (resolve() stays undefined through the
+         retry cooldown, so without this branch the panel would show "Loading…"
+         forever). Surface a real error state instead. -->
+    <div class="panel-empty" role="alert">Couldn't load this profile page.</div>
   {:else if card?.profilePageRoot}
-    <!-- A page root is set but the lazy fetch_profile_doc hasn't resolved yet:
-         show a loading placeholder rather than a misleading "no content". -->
+    <!-- A page root is set but the lazy fetch_profile_doc hasn't resolved yet
+         (in flight or not-yet-attempted): show a loading placeholder rather
+         than a misleading "no content". -->
     <div class="panel-empty" role="status">Loading profile…</div>
   {:else}
     <div class="panel-empty">No page content.</div>

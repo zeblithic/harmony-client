@@ -28,6 +28,33 @@ const SAMPLE_DTO: ProfilePageDto = {
 function fakeResolver(map: Record<string, ProfilePageDto>): ProfilePageResolver {
   return {
     resolve: (cid: string) => map[cid],
+    // A cached CID is 'resolved'; anything else is treated as still 'loading'
+    // (mirrors the real resolver, where an unseen CID kicks a fetch).
+    status: (cid: string) => (cid in map ? 'resolved' : 'loading'),
+  } as unknown as ProfilePageResolver;
+}
+
+/**
+ * A resolver whose fetch has FAILED for the given root: resolve() returns
+ * undefined (as the real one does during the retry cooldown) and status()
+ * reports 'error'. Used to assert the panel shows an error state, not an
+ * endless "Loading…".
+ */
+function failedResolver(failedCid: string): ProfilePageResolver {
+  return {
+    resolve: () => undefined,
+    status: (cid: string) => (cid === failedCid ? 'error' : 'loading'),
+  } as unknown as ProfilePageResolver;
+}
+
+/**
+ * A resolver whose fetch is still in flight: resolve() returns undefined and
+ * status() reports 'loading' for every CID.
+ */
+function loadingResolver(): ProfilePageResolver {
+  return {
+    resolve: () => undefined,
+    status: () => 'loading',
   } as unknown as ProfilePageResolver;
 }
 
@@ -233,6 +260,43 @@ describe('ProfilePanel', () => {
     expect(screen.queryByText('About')).toBeNull();
     // A root is present → loading, NOT the "no content" empty state.
     expect(screen.getByText('Loading profile…')).toBeTruthy();
+    expect(screen.queryByText('No page content.')).toBeNull();
+  });
+
+  it('shows an error state (role=alert) when the fetch FAILED, not endless Loading', () => {
+    const failedCid = 'cid-that-failed';
+    render(ProfilePanel, {
+      props: {
+        ownerIdHex: OWNER_HEX,
+        card: { displayName: 'Frank', profilePageRoot: failedCid },
+        resolver: failedResolver(failedCid),
+        onClose: vi.fn(),
+      },
+    });
+    expect(screen.getByText('Frank')).toBeTruthy();
+    // A failed fetch must NOT keep showing "Loading…": it surfaces the error.
+    const alert = screen.getByText("Couldn't load this profile page.");
+    expect(alert).toBeTruthy();
+    expect(alert.getAttribute('role')).toBe('alert');
+    expect(screen.queryByText('Loading profile…')).toBeNull();
+    expect(screen.queryByText('No page content.')).toBeNull();
+    expect(screen.queryByText('About')).toBeNull();
+  });
+
+  it('still shows the loading state (role=status) while the fetch is in flight', () => {
+    render(ProfilePanel, {
+      props: {
+        ownerIdHex: OWNER_HEX,
+        card: { displayName: 'Grace', profilePageRoot: 'cid-loading' },
+        resolver: loadingResolver(),
+        onClose: vi.fn(),
+      },
+    });
+    expect(screen.getByText('Grace')).toBeTruthy();
+    const loading = screen.getByText('Loading profile…');
+    expect(loading).toBeTruthy();
+    expect(loading.getAttribute('role')).toBe('status');
+    expect(screen.queryByText("Couldn't load this profile page.")).toBeNull();
     expect(screen.queryByText('No page content.')).toBeNull();
   });
 

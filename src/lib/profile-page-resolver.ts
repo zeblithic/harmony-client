@@ -50,6 +50,24 @@ export class ProfilePageResolver {
     return undefined;
   }
 
+  /**
+   * Coarse resolution state for a CID, so the UI can distinguish "still
+   * loading" from "fetch failed" — `resolve()` returns `undefined` for BOTH a
+   * fetch in flight AND a failed fetch (during the retry cooldown), so a panel
+   * keying only off `resolve()` would show "Loading…" forever after a failure.
+   *
+   *   - 'resolved' → the doc is cached and `resolve()` returns it.
+   *   - 'loading'  → a fetch is in flight (or hasn't been attempted yet, in
+   *                  which case `resolve()` will kick one off).
+   *   - 'error'    → the last fetch failed and we're inside the retry cooldown.
+   */
+  status(cid: string): 'resolved' | 'loading' | 'error' {
+    if (this.cache.has(cid)) return 'resolved';
+    if (this.pending.has(cid)) return 'loading';
+    if (this.failedAt.has(cid)) return 'error';
+    return 'loading'; // not yet attempted — resolve() will kick a fetch
+  }
+
   private async fetch(cid: string): Promise<void> {
     if (!this.adapter) return;
     this.pending.add(cid);

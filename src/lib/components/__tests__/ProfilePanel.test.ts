@@ -19,12 +19,19 @@ const SAMPLE_DOC: ProfilePageDto = {
  */
 function makeResolver(initial: ProfilePageDto | undefined) {
   let nextResult = initial;
+  let nextStatus: 'resolved' | 'loading' | 'error' = initial ? 'resolved' : 'loading';
   const resolve = vi.fn(() => nextResult);
+  const status = vi.fn(() => nextStatus);
   return {
-    resolver: { resolve } as unknown as ProfilePageResolver,
+    resolver: { resolve, status } as unknown as ProfilePageResolver,
     resolve,
+    status,
     setResolved(dto: ProfilePageDto | undefined) {
       nextResult = dto;
+      nextStatus = dto ? 'resolved' : 'loading';
+    },
+    setStatus(s: 'resolved' | 'loading' | 'error') {
+      nextStatus = s;
     },
   };
 }
@@ -49,6 +56,24 @@ describe('ProfilePanel', () => {
     // Root is set but the doc hasn't resolved yet → Loading placeholder, not
     // the "No page content." empty state and not About/Links/Details.
     expect(screen.getByText('Loading profile…')).toBeTruthy();
+    expect(screen.queryByText('No page content.')).toBeNull();
+    expect(screen.queryByText('About')).toBeNull();
+  });
+
+  it('shows an error state when the fetch failed (status=error), not endless Loading', () => {
+    const { resolver, setStatus } = makeResolver(undefined);
+    setStatus('error');
+    render(ProfilePanel, {
+      props: {
+        ownerIdHex: OWNER_HEX,
+        card: { displayName: 'Alice', profilePageRoot: PAGE_CID },
+        resolver,
+        onClose: vi.fn(),
+      },
+    });
+    const alert = screen.getByText("Couldn't load this profile page.");
+    expect(alert.getAttribute('role')).toBe('alert');
+    expect(screen.queryByText('Loading profile…')).toBeNull();
     expect(screen.queryByText('No page content.')).toBeNull();
     expect(screen.queryByText('About')).toBeNull();
   });

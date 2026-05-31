@@ -47,6 +47,19 @@
   // fetch is pending OR after a fetch FAILURE, so handleSave knows the existing
   // page hasn't been loaded and must be preserved rather than dropped.
   let prefillLoaded = $state(false);
+  // True if the prefill fetch FAILED outright. Distinct from "still pending":
+  // both leave prefillLoaded false (so the existing root is preserved on save),
+  // but a failure has no escape hatch otherwise — the fields never populate, so
+  // the user could never remove their page by clearing them. Drives the explicit
+  // "Remove profile page" affordance below.
+  let prefillFailed = $state(false);
+  // Set when the user explicitly asks to remove their existing (unloaded) page.
+  // Forces profilePageRoot → undefined on save, overriding the preserve path.
+  let removePage = $state(false);
+
+  function requestRemovePage() {
+    removePage = true;
+  }
 
   function markAboutDirty() {
     aboutDirty = true;
@@ -87,10 +100,14 @@
       } catch (err) {
         if (!cancelled) {
           // Leave prefillLoaded false: the existing page didn't load, so
-          // handleSave must preserve the existing root rather than drop it.
+          // handleSave preserves the existing root rather than dropping it.
+          // Flag the failure so the UI offers an explicit removal affordance —
+          // otherwise the fields never populate and the user could never clear
+          // the page by editing.
+          prefillFailed = true;
           const msg = err instanceof Error ? err.message : String(err);
           aboutNote =
-            "Couldn't load your existing profile page — saving will replace it.";
+            "Couldn't load your existing profile page — saving will keep it, or use “Remove profile page” to clear it.";
           console.warn('Profile-page prefill failed:', msg);
         }
       }
@@ -164,7 +181,11 @@
       .map((f) => ({ key: f.key.trim(), value: f.value.trim() }))
       .filter((f) => f.key !== '' || f.value !== '');
 
-    // Page-root computation has three cases:
+    // Page-root computation, in priority order:
+    //  - The user explicitly asked to remove the page → undefined (the escape
+    //    hatch when the existing page never loaded into the fields, so it can't
+    //    be cleared inline; without this a failed prefill would preserve the
+    //    root forever).
     //  - The user authored About content → ingest a fresh doc.
     //  - No authored content, but the profile already HAS a page that hasn't
     //    finished prefilling (fetch pending or failed) → PRESERVE the existing
@@ -173,7 +194,9 @@
     let profilePageRoot: string | undefined;
     const hasAbout =
       bio.trim() !== '' || cleanLinks.length > 0 || cleanFields.length > 0;
-    if (hasAbout) {
+    if (removePage) {
+      profilePageRoot = undefined; // explicit removal
+    } else if (hasAbout) {
       try {
         const { invoke } = await import('@tauri-apps/api/core');
         profilePageRoot = (await invoke('ingest_profile_doc', {
@@ -281,6 +304,23 @@
 
     {#if aboutNote}
       <p class="about-note" role="status">{aboutNote}</p>
+    {/if}
+
+    <!-- Explicit removal affordance for an existing page that hasn't loaded into
+         the editable fields (prefill pending or failed). When the fields ARE
+         populated (prefillLoaded), the user removes the page by clearing them —
+         no button needed. Without this, a failed prefill would make the page
+         un-removable (the empty-About save always preserves the old root). -->
+    {#if profile.profilePageRoot && !prefillLoaded}
+      {#if removePage}
+        <p class="about-note about-remove-pending" role="status">
+          Your profile page will be removed when you save.
+        </p>
+      {:else}
+        <button type="button" class="remove-page-btn" onclick={requestRemovePage}>
+          Remove profile page
+        </button>
+      {/if}
     {/if}
 
     <div class="field">
@@ -502,6 +542,26 @@
     font-size: 12px;
     color: var(--text-muted);
     font-style: italic;
+  }
+
+  .about-remove-pending {
+    color: var(--danger, #d9534f);
+    font-style: normal;
+  }
+
+  .remove-page-btn {
+    align-self: flex-start;
+    padding: 4px 12px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-primary);
+    color: var(--danger, #d9534f);
+    font-size: 12px;
+    cursor: pointer;
+  }
+
+  .remove-page-btn:hover {
+    border-color: var(--danger, #d9534f);
   }
 
   .bio-input {
