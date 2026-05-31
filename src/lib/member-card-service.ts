@@ -3,6 +3,7 @@ import type { TauriAdapter } from './zenoh-service';
 export interface ResolvedCard {
   displayName: string;
   statusText: string;
+  avatarUrl?: string;
 }
 
 /**
@@ -14,6 +15,7 @@ export interface DiscoveredCardInfo {
   ownerIdHex: string;
   displayName: string;
   statusText: string;
+  avatarCid?: string;
 }
 
 /** Poll cadence for the cache-drain loop. 3s balances name-fill latency
@@ -64,6 +66,11 @@ export class MemberCardService {
     return next;
   }
 
+  private avatarResolver?: { resolve: (cid: string) => string | undefined };
+  /** ownerIdHex(lc) -> the card's avatarCid hex, tracked so onAvatarsRefreshed
+   *  can re-resolve to a blob URL once the resolver fetches it. */
+  private cardAvatarCids = new Map<string, string>();
+
   /**
    * Adapter is optional so the synchronous seedSelf/resolve unit tests can
    * construct the service with no Tauri runtime. Network methods no-op (with
@@ -78,6 +85,35 @@ export class MemberCardService {
   /** Wire the Tauri adapter after it becomes available (post-boot). */
   setAdapter(adapter: TauriAdapter): void {
     this.adapter = adapter;
+  }
+
+  /** Attach the shared AvatarResolver. Does NOT touch resolver.onChange — the
+   *  owner (App.svelte) owns a combined onChange that calls both nav-service
+   *  and this service's onAvatarsRefreshed(). */
+  setAvatarResolver(resolver: { resolve: (cid: string) => string | undefined }): void {
+    this.avatarResolver = resolver;
+  }
+
+  private resolveAvatarUrl(avatarCid?: string): string | undefined {
+    if (!avatarCid || !this.avatarResolver) return undefined;
+    return this.avatarResolver.resolve(avatarCid);
+  }
+
+  /** Re-resolve avatarUrls for cards whose avatarCid newly resolved (called by
+   *  App after the AvatarResolver fetches a blob URL). Fires onUpdate if any
+   *  card changed. */
+  onAvatarsRefreshed(): void {
+    let changed = false;
+    for (const [owner, card] of this.cards) {
+      const cid = this.cardAvatarCids.get(owner);
+      if (!cid) continue;
+      const url = this.resolveAvatarUrl(cid);
+      if (url && card.avatarUrl !== url) {
+        this.cards.set(owner, { ...card, avatarUrl: url });
+        changed = true;
+      }
+    }
+    if (changed) this.onUpdate?.();
   }
 
   /** Seed (or overwrite) the self owner_id from the local profile. Synchronous. */
@@ -95,14 +131,26 @@ export class MemberCardService {
   /** Apply a card delivered via the `member-card-received` push event (instant
    *  path; the poll loop is the fallback). Idempotent with the poll. Never
    *  overwrites the locally-seeded self entry. */
-  applyCard(ownerIdHex: string, card: ResolvedCard): void {
+  applyCard(ownerIdHex: string, card: ResolvedCard & { avatarCid?: string }): void {
     const key = ownerIdHex.toLowerCase();
     if (key === this.selfKey) return; // self stays authoritative (seedSelf)
+    if (card.avatarCid) this.cardAvatarCids.set(key, card.avatarCid);
+    const avatarUrl = this.resolveAvatarUrl(card.avatarCid ?? this.cardAvatarCids.get(key));
+    const next: ResolvedCard = {
+      displayName: card.displayName,
+      statusText: card.statusText,
+      avatarUrl,
+    };
     const prev = this.cards.get(key);
-    if (prev && prev.displayName === card.displayName && prev.statusText === card.statusText) {
+    if (
+      prev &&
+      prev.displayName === next.displayName &&
+      prev.statusText === next.statusText &&
+      prev.avatarUrl === next.avatarUrl
+    ) {
       return; // unchanged — no churn
     }
-    this.cards.set(key, { displayName: card.displayName, statusText: card.statusText });
+    this.cards.set(key, next);
     this.onUpdate?.();
   }
 
@@ -205,15 +253,21 @@ export class MemberCardService {
             subscriptionId,
           })) as DiscoveredCardInfo | null;
           if (info === null) continue;
+          if (info.avatarCid) this.cardAvatarCids.set(owner, info.avatarCid);
+          const avatarUrl = this.resolveAvatarUrl(
+            info.avatarCid ?? this.cardAvatarCids.get(owner),
+          );
           const prev = this.cards.get(owner);
           if (
             !prev ||
             prev.displayName !== info.displayName ||
-            prev.statusText !== info.statusText
+            prev.statusText !== info.statusText ||
+            prev.avatarUrl !== avatarUrl
           ) {
             this.cards.set(owner, {
               displayName: info.displayName,
               statusText: info.statusText,
+              avatarUrl,
             });
             changed = true;
           }
