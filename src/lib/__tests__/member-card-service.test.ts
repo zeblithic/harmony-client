@@ -46,13 +46,17 @@ describe('MemberCardService cross-peer resolution', () => {
   function makeAdapter() {
     let nextId = 1;
     const subscribed: string[] = [];
+    const createdIds: number[] = [];
     const unsubscribed: number[] = [];
     const invoke = vi.fn(async (cmd: string, args?: unknown) => {
       const a = (args ?? {}) as Record<string, unknown>;
       switch (cmd) {
-        case 'subscribe_member_card':
+        case 'subscribe_member_card': {
           subscribed.push(a.ownerIdHex as string);
-          return nextId++;
+          const id = nextId++;
+          createdIds.push(id);
+          return id;
+        }
         case 'get_cached_member_card':
           // Return a fixed card for the target owner's subscription (id 1),
           // null for any other.
@@ -71,7 +75,7 @@ describe('MemberCardService cross-peer resolution', () => {
       invoke,
       listen: vi.fn(async () => () => {}),
     } as unknown as TauriAdapter;
-    return { adapter, invoke, subscribed, unsubscribed };
+    return { adapter, invoke, subscribed, createdIds, unsubscribed };
   }
 
   it('subscribes to a visible peer and resolves its card after a poll', async () => {
@@ -179,6 +183,25 @@ describe('MemberCardService cross-peer resolution', () => {
       expect(svc.resolve(ownerA)).toBeUndefined();
     } finally {
       warn.mockRestore();
+    }
+  });
+
+  it('serializes subscribeVisible / unsubscribeAll so a race orphans no backend subscription', async () => {
+    const { adapter, createdIds, unsubscribed } = makeAdapter();
+    const svc = makeService(adapter);
+    // Simulate a community switch: a teardown (unsubscribeAll) and a
+    // (re)subscribe fired concurrently — both are void/fire-and-forget at the
+    // App.svelte call sites, so without serialization unsubscribeAll's
+    // subs.clear() could wipe an entry subscribeVisible just added.
+    await Promise.all([svc.subscribeVisible([ownerA]), svc.unsubscribeAll()]);
+    const tracked = new Set(
+      (svc as unknown as { subs: Map<string, number> }).subs.values(),
+    );
+    // Invariant: every backend subscription that was created is either still
+    // tracked by the frontend OR was explicitly unsubscribed — never orphaned
+    // (live on the backend but absent from `subs`).
+    for (const id of createdIds) {
+      expect(tracked.has(id) || unsubscribed.includes(id)).toBe(true);
     }
   });
 });

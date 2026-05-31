@@ -45,6 +45,24 @@ export class MemberCardService {
   private pollHandle: ReturnType<typeof setInterval> | null = null;
   /** Guards against overlapping ticks when an IPC round-trip is slow. */
   private polling = false;
+  /**
+   * Serializes the async mutators of `subs` ({@link subscribeVisible} /
+   * {@link unsubscribeAll}) so they never interleave across their `await`
+   * points. Without this, a panel unmount (unsubscribeAll) racing a remount
+   * (subscribeVisible) on a community switch could let `unsubscribeAll`'s final
+   * `subs.clear()` wipe an entry the concurrent `subscribeVisible` just added,
+   * orphaning a backend subscription with no frontend tracking.
+   */
+  private opChain: Promise<void> = Promise.resolve();
+
+  /** Run `fn` after any in-flight subs-mutating op completes. */
+  private runExclusive(fn: () => Promise<void>): Promise<void> {
+    const next = this.opChain.then(fn, fn);
+    // Keep the chain alive regardless of fn's outcome (a rejection must not
+    // poison every subsequent op).
+    this.opChain = next.catch(() => {});
+    return next;
+  }
 
   /**
    * Adapter is optional so the synchronous seedSelf/resolve unit tests can
@@ -93,7 +111,11 @@ export class MemberCardService {
    * Subscribes to newly-visible owners, unsubscribes owners that left the
    * view, and excludes self (kept authoritative via seedSelf). Idempotent.
    */
-  async subscribeVisible(ownerIdHexes: string[]): Promise<void> {
+  subscribeVisible(ownerIdHexes: string[]): Promise<void> {
+    return this.runExclusive(() => this.subscribeVisibleImpl(ownerIdHexes));
+  }
+
+  private async subscribeVisibleImpl(ownerIdHexes: string[]): Promise<void> {
     if (!this.adapter) {
       console.warn('MemberCardService.subscribeVisible: no adapter; skipping');
       return;
@@ -192,7 +214,11 @@ export class MemberCardService {
   }
 
   /** Cancel the poll loop and unsubscribe every active subscription (best-effort). */
-  async unsubscribeAll(): Promise<void> {
+  unsubscribeAll(): Promise<void> {
+    return this.runExclusive(() => this.unsubscribeAllImpl());
+  }
+
+  private async unsubscribeAllImpl(): Promise<void> {
     if (this.pollHandle !== null) {
       clearInterval(this.pollHandle);
       this.pollHandle = null;
