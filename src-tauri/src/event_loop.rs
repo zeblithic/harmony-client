@@ -1397,6 +1397,7 @@ pub async fn run<R: Runtime>(
                                                         "ownerIdHex": info.owner_id_hex,
                                                         "displayName": info.display_name,
                                                         "statusText": info.status_text,
+                                                        "avatarCid": info.avatar_cid,
                                                     }),
                                                 );
                                             }

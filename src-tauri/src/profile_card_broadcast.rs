@@ -185,6 +185,8 @@ pub struct DiscoveredCardInfo {
     pub display_name: String,
     #[serde(rename = "statusText")]
     pub status_text: String,
+    #[serde(rename = "avatarCid", skip_serializing_if = "Option::is_none")]
+    pub avatar_cid: Option<String>,
 }
 
 /// Per-subscription cached card entry. Holds the highest-HLC verified card
@@ -194,6 +196,7 @@ struct CachedCard {
     owner_id: [u8; 16],
     display_name: String,
     status_text: String,
+    avatar_cid: Option<[u8; 32]>,
     shared_at: Hlc,
 }
 
@@ -249,6 +252,7 @@ impl ProfileCardCache {
                     owner_id: card.owner_id,
                     display_name: card.display_name.clone(),
                     status_text: card.status_text.clone(),
+                    avatar_cid: card.avatar_cid,
                     shared_at: card.shared_at.clone(),
                 });
             }
@@ -264,6 +268,7 @@ impl ProfileCardCache {
             owner_id_hex: hex::encode(c.owner_id),
             display_name: c.display_name.clone(),
             status_text: c.status_text.clone(),
+            avatar_cid: c.avatar_cid.map(hex::encode),
         })
     }
 }
