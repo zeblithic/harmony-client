@@ -1463,7 +1463,8 @@ pub async fn run<R: Runtime>(
             std::sync::Arc::clone(&session_arc),
             serve_lookup,
             std::sync::Arc::clone(&closing),
-        );
+        )
+        .await;
     }
 
     // ── Process startup actions (declare queryables + subscribers) ────
@@ -2079,6 +2080,24 @@ pub async fn run<R: Runtime>(
                                 let fetch = fetch_via_zenoh(&session_clone, &key);
                                 match tokio::time::timeout(timeout, fetch).await {
                                     Ok(Ok(bytes)) => {
+                                        // ZEB-343 verify-on-fetch (spec §5.3):
+                                        // mirror the wrap_fetch_one_with_admission
+                                        // gate (T4). A Zenoh reply is untrusted —
+                                        // verify hash==cid BEFORE admitting or
+                                        // returning. On failure, do NOT admit and
+                                        // reply Ok(None): treat a tampered reply as
+                                        // a cache miss so the caller falls through
+                                        // exactly as it would on a timeout (the
+                                        // CRDT carries recovery).
+                                        if !cid.verify_hash(&bytes) {
+                                            tracing::warn!(
+                                                cid = %cid_hex,
+                                                "GetOrFetch: fetched bytes failed hash==cid; \
+                                                 treating as cache miss (not admitting)"
+                                            );
+                                            let _ = reply.send(Ok(None));
+                                            return;
+                                        }
                                         // 3. Best-effort admit via try_send.
                                         //    We have the bytes for the caller
                                         //    regardless of whether caching
@@ -4537,7 +4556,7 @@ where
 /// returns already verifies. We still re-check `cid.verify_hash` before replying
 /// as defense-in-depth (cheap; never serve corrupt bytes).
 #[allow(clippy::type_complexity)]
-pub fn spawn_content_serve_queryable<F>(
+pub async fn spawn_content_serve_queryable<F>(
     session: Arc<zenoh::Session>,
     lookup: Arc<F>,
     closing: Arc<AtomicBool>,
@@ -4553,19 +4572,26 @@ where
 {
     let key_pattern = "harmony/content/*/**".to_string();
 
-    tokio::spawn(async move {
-        if closing.load(Ordering::SeqCst) {
-            return;
-        }
-        let qbl = match session.declare_queryable(&key_pattern).await {
-            Ok(q) => q,
-            Err(e) => {
-                if !closing.load(Ordering::SeqCst) {
-                    tracing::error!(error = %e, "failed to declare content-serve queryable");
-                }
-                return;
+    // Declare the queryable SYNCHRONOUSLY (await before returning) so the caller
+    // can sequence node-readiness AFTER we are actually able to serve. If the
+    // declare were inside the detached spawn, run()'s later readiness signal
+    // could win the race and the node would report ready before the queryable
+    // exists. On declare failure we log and return an already-completed no-op
+    // JoinHandle so the signature stays uniform for callers.
+    if closing.load(Ordering::SeqCst) {
+        return tokio::spawn(async {});
+    }
+    let qbl = match session.declare_queryable(&key_pattern).await {
+        Ok(q) => q,
+        Err(e) => {
+            if !closing.load(Ordering::SeqCst) {
+                tracing::error!(error = %e, "failed to declare content-serve queryable");
             }
-        };
+            return tokio::spawn(async {});
+        }
+    };
+
+    tokio::spawn(async move {
         loop {
             tokio::select! {
                 biased;

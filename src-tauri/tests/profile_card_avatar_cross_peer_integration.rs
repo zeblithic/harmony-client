@@ -67,7 +67,7 @@ async fn inner() {
     };
     let closing = Arc::new(AtomicBool::new(false));
     let _serve =
-        spawn_content_serve_queryable(Arc::clone(&session_a), lookup, Arc::clone(&closing));
+        spawn_content_serve_queryable(Arc::clone(&session_a), lookup, Arc::clone(&closing)).await;
 
     let cid_hex = hex::encode(cid_to_fetch.to_bytes());
     let key = format!("harmony/content/{}/{}", &cid_hex[1..2], cid_hex);

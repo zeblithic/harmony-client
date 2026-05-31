@@ -5608,11 +5608,18 @@ async fn publish_profile(
     // frontend retry and double-publish it. `publish_owner_card` returns Err
     // only when the owner runtime isn't ready; on save we just log + move on.
     // ProfilePayload.avatar_cid is Option<String> (hex) — decode to [u8;32].
-    let avatar_cid_bytes: Option<[u8; 32]> = profile
-        .avatar_cid
-        .as_deref()
-        .and_then(|h| hex::decode(h).ok())
-        .and_then(|b| <[u8; 32]>::try_from(b).ok());
+    // None = no avatar (legitimate). A PRESENT-but-malformed hex must surface as
+    // an Err rather than silently stripping the avatar from the published card.
+    let avatar_cid_bytes: Option<[u8; 32]> = match profile.avatar_cid.as_deref() {
+        None => None,
+        Some(h) => {
+            let bytes = hex::decode(h).map_err(|e| format!("invalid avatar_cid hex: {e}"))?;
+            Some(
+                <[u8; 32]>::try_from(bytes)
+                    .map_err(|_| "avatar_cid must be 32 bytes".to_string())?,
+            )
+        }
+    };
 
     if let Err(e) = publish_owner_card(
         dm_outbox,
@@ -5728,10 +5735,18 @@ async fn republish_owner_card(
     avatar_cid: Option<String>,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
-    let avatar_cid_bytes: Option<[u8; 32]> = avatar_cid
-        .as_deref()
-        .and_then(|h| hex::decode(h).ok())
-        .and_then(|b| <[u8; 32]>::try_from(b).ok());
+    // None = no avatar (legitimate). A PRESENT-but-malformed hex must surface as
+    // an Err rather than silently stripping the avatar from the republished card.
+    let avatar_cid_bytes: Option<[u8; 32]> = match avatar_cid.as_deref() {
+        None => None,
+        Some(h) => {
+            let bytes = hex::decode(h).map_err(|e| format!("invalid avatar_cid hex: {e}"))?;
+            Some(
+                <[u8; 32]>::try_from(bytes)
+                    .map_err(|_| "avatar_cid must be 32 bytes".to_string())?,
+            )
+        }
+    };
     let (dm_outbox, dm_self_owner, dm_device_id, hlc_tracker, profile_card_publisher) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         (
