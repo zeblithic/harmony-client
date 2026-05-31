@@ -11359,6 +11359,175 @@ async fn fetch_content(
         .map_err(|_| "event loop dropped fetch request".to_string())?
 }
 
+/// ZEB-345: structured profile-page document returned to the frontend.
+///
+/// The frontend NEVER parses untrusted CBOR — `fetch_profile_doc` decodes +
+/// validates the fetched bytes through the `profile_page_doc` codec and hands
+/// back this camelCase DTO. Twin shape of the `ingest_profile_doc` input types.
+#[derive(serde::Serialize, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfilePageDocDto {
+    pub bio: String,
+    pub links: Vec<ProfileLinkDto>,
+    pub fields: Vec<ProfileFieldDto>,
+}
+
+/// ZEB-345: one profile-page link in the fetched DTO.
+#[derive(serde::Serialize, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileLinkDto {
+    pub label: String,
+    pub url: String,
+}
+
+/// ZEB-345: one profile-page key/value field in the fetched DTO.
+#[derive(serde::Serialize, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileFieldDto {
+    pub key: String,
+    pub value: String,
+}
+
+/// ZEB-345: pure, event-loop-free core of `fetch_profile_doc`.
+///
+/// Enforces the doc-specific byte cap up front (defense-in-depth before the
+/// codec's own check), then decodes + validates through the `profile_page_doc`
+/// codec — so a fetched doc is bound by the exact same caps/scheme/version
+/// rules as an ingested one — and maps the validated struct into the camelCase
+/// DTO. Any error maps to a `String` surfaced to the IPC caller. Unit-tested
+/// directly (no event loop); the transport path is covered by T6's cross-peer
+/// test.
+fn profile_doc_dto_from_bytes(bytes: &[u8]) -> Result<ProfilePageDocDto, String> {
+    if bytes.len() > crate::profile_page_doc::MAX_PROFILE_DOC_BYTES {
+        return Err("profile doc exceeds size cap".to_string());
+    }
+    let doc = crate::profile_page_doc::decode_profile_doc(bytes).map_err(|e| e.to_string())?;
+    Ok(ProfilePageDocDto {
+        bio: doc.bio,
+        links: doc
+            .links
+            .into_iter()
+            .map(|l| ProfileLinkDto {
+                label: l.label,
+                url: l.url,
+            })
+            .collect(),
+        fields: doc
+            .fields
+            .into_iter()
+            .map(|f| ProfileFieldDto {
+                key: f.key,
+                value: f.value,
+            })
+            .collect(),
+    })
+}
+
+/// ZEB-345 IPC: fetch a long-form profile document by hex CID over CAS,
+/// enforce the doc byte-cap, decode + validate, and return a structured
+/// camelCase DTO so the frontend never parses untrusted CBOR.
+///
+/// Twin of `fetch_content`: same hex validation, same `fetch_tx`/`FetchRequest`
+/// oneshot path. `FetchRequest` already returns hash-verified bytes (ZEB-343
+/// verify-on-fetch), so this does NOT re-verify hash==CID — it adds the
+/// doc-specific byte cap + decode via `profile_doc_dto_from_bytes`.
+#[tauri::command]
+async fn fetch_profile_doc(
+    cid: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<ProfilePageDocDto, String> {
+    // Validate hex CID
+    if cid.is_empty() || !cid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("invalid CID hex: {cid}"));
+    }
+
+    let fetch_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .fetch_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    fetch_tx
+        .send(event_loop::FetchRequest {
+            cid_hex: cid,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+
+    let bytes = reply_rx
+        .await
+        .map_err(|_| "event loop dropped fetch request".to_string())??;
+
+    profile_doc_dto_from_bytes(&bytes)
+}
+
+#[cfg(test)]
+mod fetch_profile_doc_tests {
+    use super::*;
+    use crate::profile_page_doc::{
+        encode_profile_doc, ProfileField, ProfileLink, ProfilePageDoc, MAX_PROFILE_DOC_BYTES,
+        PROFILE_DOC_VERSION,
+    };
+
+    #[test]
+    fn profile_doc_dto_from_bytes_round_trips() {
+        // Encode a known doc through the T2 codec, then decode it back through
+        // the pure inner and assert the DTO fields equal the input.
+        let doc = ProfilePageDoc {
+            version: PROFILE_DOC_VERSION,
+            bio: "hi\nthere".into(),
+            links: vec![ProfileLink {
+                label: "Site".into(),
+                url: "https://example.com".into(),
+            }],
+            fields: vec![ProfileField {
+                key: "Pronouns".into(),
+                value: "she/her".into(),
+            }],
+        };
+        let bytes = encode_profile_doc(&doc).expect("encode known doc");
+
+        let dto = profile_doc_dto_from_bytes(&bytes).expect("decode + map to DTO");
+        assert_eq!(
+            dto,
+            ProfilePageDocDto {
+                bio: "hi\nthere".into(),
+                links: vec![ProfileLinkDto {
+                    label: "Site".into(),
+                    url: "https://example.com".into(),
+                }],
+                fields: vec![ProfileFieldDto {
+                    key: "Pronouns".into(),
+                    value: "she/her".into(),
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn profile_doc_dto_from_bytes_rejects_oversize() {
+        // One byte over the doc cap must be rejected before any decode.
+        let oversize = vec![0u8; MAX_PROFILE_DOC_BYTES + 1];
+        let err = profile_doc_dto_from_bytes(&oversize).expect_err("oversize must error");
+        assert!(err.contains("size cap"), "got: {err}");
+    }
+
+    #[test]
+    fn profile_doc_dto_from_bytes_rejects_malformed() {
+        // Non-CBOR garbage (within the byte cap) must surface a decode error,
+        // never panic or yield a partial DTO.
+        let garbage = [0xFFu8; 64];
+        assert!(
+            profile_doc_dto_from_bytes(&garbage).is_err(),
+            "malformed bytes must error"
+        );
+    }
+}
+
 // ── Voice commands ──────────────────────────────────────────────────────
 
 /// Reject channel IDs that could escape the intended Zenoh key namespace.
@@ -31936,6 +32105,7 @@ pub fn run() {
             archive_content,
             set_replication_tier,
             fetch_content,
+            fetch_profile_doc,
             export_content,
             ingest_content,
             ingest_avatar_bytes,
