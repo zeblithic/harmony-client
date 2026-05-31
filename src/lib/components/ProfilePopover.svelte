@@ -102,7 +102,18 @@
     }
     function onClickOutside(e: MouseEvent) {
       const target = e.target as HTMLElement;
-      if (!target.closest('.profile-popover') && !target.closest('.avatar.interactive')) {
+      // Exclude the popover itself AND every element that OPENS a popover — the
+      // avatar (Reticulum popover) and the member-name / message-author buttons
+      // (owner-card popover). Without the latter two, clicking a different
+      // member's name to SWITCH popovers would open the new one (button onclick)
+      // and then immediately close it (this handler), so a switch would wrongly
+      // require two clicks.
+      if (
+        !target.closest('.profile-popover') &&
+        !target.closest('.avatar.interactive') &&
+        !target.closest('.name-btn') &&
+        !target.closest('.author-btn')
+      ) {
         close();
       }
     }

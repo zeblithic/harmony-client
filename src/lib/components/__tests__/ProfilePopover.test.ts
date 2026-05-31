@@ -305,6 +305,50 @@ describe('ProfilePopover', () => {
     expect(onClose).toHaveBeenCalled();
   });
 
+  it('owner-card mode: clicking a member-name/author button does NOT close (allows switching)', async () => {
+    const onClose = vi.fn();
+    render(ProfilePopover, {
+      props: {
+        mode: 'owner-card',
+        card: { ownerIdHex: OWNER_HEX, displayName: 'Alice', statusText: '', power: 100 },
+        x: 0,
+        y: 0,
+        onClose,
+      },
+    });
+    // The click-outside listener attaches on a setTimeout(0); let it register.
+    await new Promise((r) => setTimeout(r, 5));
+    for (const cls of ['name name-btn', 'author author-btn']) {
+      const btn = document.createElement('button');
+      btn.className = cls;
+      document.body.appendChild(btn);
+      await fireEvent.click(btn);
+      btn.remove();
+    }
+    // Clicking a popover-opening trigger must not close — openMemberCard handles
+    // the switch, so the popover stays open for the newly clicked member.
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it('owner-card mode: clicking truly outside closes', async () => {
+    const onClose = vi.fn();
+    render(ProfilePopover, {
+      props: {
+        mode: 'owner-card',
+        card: { ownerIdHex: OWNER_HEX, displayName: 'Alice', statusText: '', power: 100 },
+        x: 0,
+        y: 0,
+        onClose,
+      },
+    });
+    await new Promise((r) => setTimeout(r, 5));
+    const div = document.createElement('div');
+    document.body.appendChild(div);
+    await fireEvent.click(div);
+    div.remove();
+    expect(onClose).toHaveBeenCalled();
+  });
+
   it('popover_shows_no_memberships_after_timeout', async () => {
     vi.useFakeTimers();
     try {
