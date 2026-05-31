@@ -71,6 +71,7 @@ pub mod pkarr_invite_publisher;
 pub mod pkarr_resolver_adapter;
 pub mod pkarr_settings;
 pub mod profile_broadcast;
+pub mod profile_card_broadcast;
 // ZEB-321 Phase 1 Task 7: debounced background task that re-emits this
 // device's ReachabilityAnnounce on startup / network change / idle tick /
 // manual force-notify. Wired into the event loop by Task 8.
@@ -561,6 +562,11 @@ pub struct NodeState {
     /// joined so the in-flight publish drains.
     profile_broadcast_publisher:
         Option<std::sync::Arc<crate::profile_broadcast::ProfileBroadcastPublisher>>,
+    /// ZEB-341: self owner_id profile-card publisher. Caches the last signed
+    /// card and re-publishes it on a 600s interval so late subscribers
+    /// receive it. Wired by start_node; shut down on stop/restart.
+    profile_card_publisher:
+        Option<std::sync::Arc<crate::profile_card_broadcast::ProfileCardPublisher>>,
     /// ZEB-281 Sub-D Phase 4: peer-broadcast cache. Shared with the
     /// event-loop's subscriber task pool. Always Some while node is
     /// running.
@@ -576,6 +582,16 @@ pub struct NodeState {
     /// Persisted only across IPC calls within a single node lifetime;
     /// reset on stop_node.
     profile_broadcast_next_subscription_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// ZEB-341: profile-card peer cache. Shared with the event-loop's
+    /// card subscriber task pool. Always Some while node is running.
+    profile_card_cache: Option<std::sync::Arc<crate::profile_card_broadcast::ProfileCardCache>>,
+    /// ZEB-341: control channel into the event-loop's profile-card
+    /// subscriber task pool. IPC handlers send `Subscribe`/`Unsubscribe`.
+    profile_card_request_tx:
+        Option<tokio::sync::mpsc::Sender<crate::event_loop::ProfileCardRequest>>,
+    /// ZEB-341: monotonic subscription-id allocator for card subscriptions.
+    /// Reset on stop_node.
+    profile_card_next_subscription_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// ZEB-290 Phase 1 Task 11 (+ ZEB-291 Phase 2 Task 19 shape migration):
     /// per-community voting-event logs. Holds an `Arc<tokio::Mutex<VotingLog>>`
     /// per `SpaceId`; lazily populated on first local
@@ -908,9 +924,15 @@ impl Default for NodeState {
             // None until start_node wires them; the SubscriptionId
             // allocator starts at 1 (0 reserved as "uninitialized").
             profile_broadcast_publisher: None,
+            profile_card_publisher: None,
             profile_broadcast_cache: None,
             profile_broadcast_request_tx: None,
             profile_broadcast_next_subscription_id: std::sync::Arc::new(
+                std::sync::atomic::AtomicU64::new(1),
+            ),
+            profile_card_cache: None,
+            profile_card_request_tx: None,
+            profile_card_next_subscription_id: std::sync::Arc::new(
                 std::sync::atomic::AtomicU64::new(1),
             ),
             // ZEB-290 Phase 1 Task 11 + ZEB-291 Task 19 migration: voting
@@ -1147,6 +1169,11 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
     let profile_broadcast_publisher_for_shutdown: Option<
         std::sync::Arc<crate::profile_broadcast::ProfileBroadcastPublisher>,
     >;
+    // ZEB-341: sibling outer-scope binding for the self profile-card
+    // publisher, shut down on the same ephemeral runtime below.
+    let profile_card_publisher_for_shutdown: Option<
+        std::sync::Arc<crate::profile_card_broadcast::ProfileCardPublisher>,
+    >;
     // ZEB-307 Task 8 (R1 fix — wire registry): declared in outer scope so
     // we can drive the registry's async `shutdown()` on an ephemeral
     // runtime after the std `MutexGuard` is released. Mirrors
@@ -1303,9 +1330,15 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         // cache + request_tx + reset the SubscriptionId allocator so a
         // restart starts at 1 again.
         profile_broadcast_publisher_for_shutdown = guard.profile_broadcast_publisher.take();
+        // ZEB-341: take the card publisher into the outer-scope binding too.
+        profile_card_publisher_for_shutdown = guard.profile_card_publisher.take();
         guard.profile_broadcast_cache = None;
         guard.profile_broadcast_request_tx = None;
         guard.profile_broadcast_next_subscription_id =
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        guard.profile_card_cache = None;
+        guard.profile_card_request_tx = None;
+        guard.profile_card_next_subscription_id =
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
         // Mint Phase 2 sync: take before releasing the lock so a concurrent
         // IPC doesn't race to call notify_dirty on a shutting-down engine.
@@ -1343,7 +1376,13 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
     // channel Err. `stop_inner` is sync but the publisher's shutdown is
     // async — use the same `thread::scope` + ephemeral-runtime pattern
     // as the other registry shutdowns below.
-    if let Some(publisher) = profile_broadcast_publisher_for_shutdown {
+    // ZEB-341: shut down both the profile-broadcast publisher and the
+    // self profile-card publisher on the same ephemeral current-thread
+    // runtime (both `shutdown()`s are async; the std `MutexGuard` is
+    // already dropped here).
+    if profile_broadcast_publisher_for_shutdown.is_some()
+        || profile_card_publisher_for_shutdown.is_some()
+    {
         std::thread::scope(|s| {
             s.spawn(|| {
                 match tokio::runtime::Builder::new_current_thread()
@@ -1351,13 +1390,20 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
                     .build()
                 {
                     Ok(rt) => {
-                        rt.block_on(publisher.shutdown());
+                        rt.block_on(async {
+                            if let Some(publisher) = profile_broadcast_publisher_for_shutdown {
+                                publisher.shutdown().await;
+                            }
+                            if let Some(publisher) = profile_card_publisher_for_shutdown {
+                                publisher.shutdown().await;
+                            }
+                        });
                     }
                     Err(e) => {
                         tracing::error!(
                             error = %e,
                             "could not build ephemeral tokio runtime for \
-                             ProfileBroadcastPublisher shutdown — task abort skipped"
+                             profile publisher shutdown — task abort skipped"
                         );
                     }
                 }
@@ -1818,6 +1864,11 @@ pub(crate) async fn start_node_inner(
     let old_profile_broadcast_publisher: Option<
         std::sync::Arc<crate::profile_broadcast::ProfileBroadcastPublisher>,
     >;
+    // ZEB-341: prior identity's self profile-card publisher, shut down
+    // alongside the profile-broadcast publisher below.
+    let old_profile_card_publisher: Option<
+        std::sync::Arc<crate::profile_card_broadcast::ProfileCardPublisher>,
+    >;
     // ZEB-234: outer-scope bindings for the old fence handles. Taken
     // inside the lock (below) and drained outside after the lock is
     // released — mirrors stop_inner's pattern. Declared here so they
@@ -1955,9 +2006,15 @@ pub(crate) async fn start_node_inner(
         // the SubscriptionId allocator so the new identity's IPCs
         // start from id=1 again.
         old_profile_broadcast_publisher = guard.profile_broadcast_publisher.take();
+        // ZEB-341: take the prior identity's card publisher too.
+        old_profile_card_publisher = guard.profile_card_publisher.take();
         guard.profile_broadcast_cache = None;
         guard.profile_broadcast_request_tx = None;
         guard.profile_broadcast_next_subscription_id =
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        guard.profile_card_cache = None;
+        guard.profile_card_request_tx = None;
+        guard.profile_card_next_subscription_id =
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
         // Mint Phase 2 sync: take the prior identity's engine so it can be
         // shut down outside the lock below (same pattern as sync_engine).
@@ -1999,6 +2056,10 @@ pub(crate) async fn start_node_inner(
     // wake during teardown and surface a closed-sink Err. Mirrors the
     // ordering in stop_inner.
     if let Some(publisher) = old_profile_broadcast_publisher {
+        publisher.shutdown().await;
+    }
+    // ZEB-341: same ordering for the prior identity's card publisher.
+    if let Some(publisher) = old_profile_card_publisher {
         publisher.shutdown().await;
     }
     drop(old_publish);
@@ -2307,10 +2368,21 @@ pub(crate) async fn start_node_inner(
         let mut profile_broadcast_publisher_arc: Option<
             std::sync::Arc<crate::profile_broadcast::ProfileBroadcastPublisher>,
         > = None;
+        // ZEB-341: self owner_id profile-card publisher (sibling to the
+        // profile-broadcast publisher; spawned alongside it below).
+        let mut profile_card_publisher_arc: Option<
+            std::sync::Arc<crate::profile_card_broadcast::ProfileCardPublisher>,
+        > = None;
         let profile_broadcast_cache_arc =
             std::sync::Arc::new(crate::profile_broadcast::ProfileBroadcastCache::default());
         let (profile_broadcast_request_tx, profile_broadcast_request_rx) =
             tokio::sync::mpsc::channel::<crate::event_loop::ProfileBroadcastRequest>(64);
+        // ZEB-341: profile-card subscriber cache + request channel (sibling
+        // to the profile-broadcast pair above; rx moved into event_loop::run).
+        let profile_card_cache_arc =
+            std::sync::Arc::new(crate::profile_card_broadcast::ProfileCardCache::default());
+        let (profile_card_request_tx, profile_card_request_rx) =
+            tokio::sync::mpsc::channel::<crate::event_loop::ProfileCardRequest>(64);
 
         // ── ZEB-323 Phase 2b: pkarr lifted state holders ─────────────────
         //
@@ -4307,6 +4379,19 @@ pub(crate) async fn start_node_inner(
                             crate::profile_broadcast::PUBLISHER_REFRESH_INTERVAL,
                         ));
 
+                    // ZEB-341: spawn the self profile-card publisher alongside
+                    // the profile-broadcast publisher. Name/status arrive per
+                    // publish_profile IPC call (no persisted backend home), so
+                    // this only caches the last signed card + re-publishes it
+                    // on the 600s refresh interval for late subscribers.
+                    profile_card_publisher_arc =
+                        Some(crate::profile_card_broadcast::ProfileCardPublisher::spawn(
+                            std::sync::Arc::new(crate::profile_broadcast::EventLoopPublishSink {
+                                publish_tx: publish_tx.clone(),
+                            }),
+                            crate::profile_card_broadcast::PROFILE_CARD_REFRESH_INTERVAL,
+                        ));
+
                     // ZEB-325 Phase 2c: install the iroh invite-handshake
                     // dispatcher onto the iroh link manager now that
                     // community_registry + dm_outbox + crdt_state are all
@@ -4597,6 +4682,11 @@ pub(crate) async fn start_node_inner(
                 let profile_broadcast_cache_for_loop =
                     Some(std::sync::Arc::clone(&profile_broadcast_cache_arc));
                 let profile_broadcast_request_rx_for_loop = Some(profile_broadcast_request_rx);
+                // ZEB-341: thread the profile-card cache + request rx into
+                // event_loop::run, mirroring the profile-broadcast pair.
+                let profile_card_cache_for_loop =
+                    Some(std::sync::Arc::clone(&profile_card_cache_arc));
+                let profile_card_request_rx_for_loop = Some(profile_card_request_rx);
                 // Mint Phase 2 sync: thread handles into event_loop::run.
                 let mint_sync_handles_for_loop = mint_sync_handles_opt;
                 // ZEB-321 Phase 1 Task 8: shadow the outer-scope binding into
@@ -4706,6 +4796,8 @@ pub(crate) async fn start_node_inner(
                                 library_request_rx_for_loop,
                                 profile_broadcast_cache_for_loop,
                                 profile_broadcast_request_rx_for_loop,
+                                profile_card_cache_for_loop,
+                                profile_card_request_rx_for_loop,
                                 mint_sync_handles_for_loop,
                                 iroh_handles_into_loop,
                             )
@@ -4846,10 +4938,18 @@ pub(crate) async fn start_node_inner(
                         // identity, set_space_shared_in_profile IPC will still
                         // fail with "publisher missing" so the absence is fine.
                         guard.profile_broadcast_publisher = profile_broadcast_publisher_arc.clone();
+                        guard.profile_card_publisher = profile_card_publisher_arc.clone();
                         guard.profile_broadcast_cache =
                             Some(std::sync::Arc::clone(&profile_broadcast_cache_arc));
                         guard.profile_broadcast_request_tx = Some(profile_broadcast_request_tx);
                         guard.profile_broadcast_next_subscription_id =
+                            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+                        // ZEB-341: store the profile-card cache + request_tx,
+                        // mirroring the profile-broadcast assignment above.
+                        guard.profile_card_cache =
+                            Some(std::sync::Arc::clone(&profile_card_cache_arc));
+                        guard.profile_card_request_tx = Some(profile_card_request_tx);
+                        guard.profile_card_next_subscription_id =
                             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
                         // Mint Phase 2 sync: store the engine Arc so IPC handlers
                         // can call notify_dirty() after mutations.
@@ -5006,6 +5106,9 @@ pub(crate) async fn start_node_inner(
             community_registry_arc.clone(),
             channel_log_registry_arc.clone(),
             profile_broadcast_publisher_arc.clone(),
+            // ZEB-341: surface the card publisher to the failure-cleanup
+            // branch so its refresh task is aborted before this attempt errors.
+            profile_card_publisher_arc.clone(),
             // ZEB-307 Task 8 (R1 fix — wire registry): also surface the
             // D-FROST registry to the failure-cleanup branch so its
             // shutdown can run before this start_node attempt errors out.
@@ -5025,6 +5128,7 @@ pub(crate) async fn start_node_inner(
         registry_for_cleanup,
         channel_log_registry_for_cleanup,
         profile_broadcast_publisher_for_cleanup,
+        profile_card_publisher_for_cleanup,
         dfrost_log_registry_for_cleanup,
         mint_engine_for_cleanup,
         node_addr_for_response,
@@ -5052,6 +5156,12 @@ pub(crate) async fn start_node_inner(
         // aborting it deterministically releases the clone before the
         // other registries shut down.
         if let Some(publisher) = profile_broadcast_publisher_for_cleanup {
+            publisher.shutdown().await;
+        }
+        // ZEB-341: same rationale for the profile-card publisher — its
+        // refresh task holds a clone of `publish_tx`; abort it before the
+        // other registries tear down.
+        if let Some(publisher) = profile_card_publisher_for_cleanup {
             publisher.shutdown().await;
         }
         // ZEB-270 Phase 3 Task 4.5: shutdown the channel-log registry
@@ -5447,12 +5557,32 @@ async fn publish_profile(
         return Err(format!("invalid address: {}", profile.address));
     }
 
-    let publish_tx = {
+    // ZEB-341: card-field length limits are NOT enforced here — doing so would
+    // block the unrelated Reticulum profile publish (which has no such limit)
+    // for names/status exceeding the card bounds (easily reached with CJK or
+    // emoji). The owner_id card publish below is best-effort: `sign_card`
+    // enforces MAX_DISPLAY_NAME_BYTES / MAX_STATUS_TEXT_BYTES and an over-long
+    // field is logged + skipped, leaving the Reticulum publish unaffected.
+
+    // Clone everything we need out of the std `NodeState` guard, then DROP the
+    // guard before any `.await` (the std MutexGuard is `!Send` across await).
+    // The card-publish inputs are all `Option` — when any is None the node
+    // lacks a fully-initialised owner runtime, so we skip the card publish
+    // (the Reticulum profile still publishes) rather than failing the IPC.
+    let (publish_tx, dm_outbox, dm_self_owner, dm_device_id, hlc_tracker, profile_card_publisher) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard
+        let tx = guard
             .publish_tx
             .clone()
-            .ok_or_else(|| "not connected".to_string())?
+            .ok_or_else(|| "not connected".to_string())?;
+        (
+            tx,
+            guard.dm_outbox.clone(),
+            guard.dm_self_owner,
+            guard.dm_device_id.clone(),
+            guard.hlc_tracker.clone(),
+            guard.profile_card_publisher.clone(),
+        )
     };
 
     let key_expr = format!("harmony/profile/{}", profile.address);
@@ -5470,7 +5600,142 @@ async fn publish_profile(
 
     reply_rx
         .await
-        .map_err(|_| "event loop dropped publish request".to_string())?
+        .map_err(|_| "event loop dropped publish request".to_string())??;
+
+    // ZEB-341: after the Reticulum profile publishes, best-effort publish the
+    // owner_id profile card. A card-only failure must NOT fail this IPC — the
+    // Reticulum profile already committed, and surfacing an Err would make the
+    // frontend retry and double-publish it. `publish_owner_card` returns Err
+    // only when the owner runtime isn't ready; on save we just log + move on.
+    if let Err(e) = publish_owner_card(
+        dm_outbox,
+        dm_self_owner,
+        dm_device_id,
+        hlc_tracker,
+        profile_card_publisher,
+        profile.display_name.clone(),
+        profile.status_text.clone().unwrap_or_default(),
+    )
+    .await
+    {
+        tracing::debug!(error = %e, "owner card not published on save (runtime not ready)");
+    }
+
+    Ok(())
+}
+
+/// Sign + publish ONLY the owner_id profile card (device #2 key +
+/// EnrollmentCert), handing the signed bytes to the card publisher for the
+/// 600s refresh. Shared by `publish_profile` (best-effort on save) and
+/// `republish_owner_card` (card-only boot re-publish).
+///
+/// Returns `Err` ONLY when the owner runtime isn't ready yet (the caller may
+/// retry once the node connects). A bounds/encode failure is permanent for the
+/// given input, so it logs and returns `Ok(())` — there is nothing to retry.
+async fn publish_owner_card(
+    dm_outbox: Option<std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>>,
+    dm_self_owner: Option<crate::owner_state_types::OwnerAddr>,
+    dm_device_id: Option<String>,
+    hlc_tracker: Option<
+        std::sync::Arc<
+            tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        >,
+    >,
+    profile_card_publisher: Option<
+        std::sync::Arc<crate::profile_card_broadcast::ProfileCardPublisher>,
+    >,
+    display_name: String,
+    status_text: String,
+) -> Result<(), String> {
+    let (
+        Some(dm_outbox),
+        Some(self_owner),
+        Some(device_id),
+        Some(hlc_tracker),
+        Some(card_publisher),
+    ) = (
+        dm_outbox,
+        dm_self_owner,
+        dm_device_id,
+        hlc_tracker,
+        profile_card_publisher,
+    )
+    else {
+        return Err("owner card runtime not ready".to_string());
+    };
+    let owner_id = self_owner.0;
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let (signing_key, enrollment_cert) = {
+        let outbox_g = dm_outbox.lock().await;
+        (
+            std::sync::Arc::clone(&outbox_g.community_signing_key),
+            outbox_g.enrollment_cert.clone(),
+        )
+    };
+    let card = match crate::profile_card_broadcast::sign_card(
+        &signing_key,
+        owner_id,
+        display_name,
+        status_text,
+        enrollment_cert,
+        hlc,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "owner card sign failed; skipping card publish");
+            return Ok(());
+        }
+    };
+    let bytes = match crate::owner_state_crypto::canonical_cbor_encode(&card) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "owner card encode failed; skipping card publish");
+            return Ok(());
+        }
+    };
+    let topic = crate::profile_card_broadcast::card_topic_for(&owner_id);
+    card_publisher
+        .publish_now(topic, bytes)
+        .await
+        .map_err(|e| format!("owner card publish failed: {e}"))
+}
+
+/// ZEB-341: re-publish ONLY the owner_id profile card (NOT the Reticulum
+/// profile). The frontend calls this once on boot so a returning user's card
+/// is resolvable to subscribing peers without re-publishing their full
+/// Reticulum profile. Returns `Err` when the owner runtime isn't ready yet, so
+/// the frontend can retry once the Zenoh session connects.
+#[tauri::command]
+async fn republish_owner_card(
+    display_name: String,
+    status_text: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let (dm_outbox, dm_self_owner, dm_device_id, hlc_tracker, profile_card_publisher) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        (
+            guard.dm_outbox.clone(),
+            guard.dm_self_owner,
+            guard.dm_device_id.clone(),
+            guard.hlc_tracker.clone(),
+            guard.profile_card_publisher.clone(),
+        )
+    };
+    publish_owner_card(
+        dm_outbox,
+        dm_self_owner,
+        dm_device_id,
+        hlc_tracker,
+        profile_card_publisher,
+        display_name,
+        status_text,
+    )
+    .await
 }
 
 /// Send a channel message to the mesh network via Zenoh pub/sub.
@@ -18622,6 +18887,109 @@ async fn get_cached_peer_profile(
     Ok(cache.get_cached(subscription_id).await)
 }
 
+/// IPC: ZEB-341. Subscribe to a peer's profile-card topic (keyed by their
+/// 16-byte owner_id). Returns a u64 SubscriptionId the frontend uses to
+/// address subsequent unsubscribe/get_cached calls + to filter incoming
+/// `member-card-received` events.
+#[tauri::command]
+async fn subscribe_member_card(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    owner_id_hex: String,
+) -> Result<u64, String> {
+    let (cache, request_tx, next_id) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.profile_card_cache.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.profile_card_request_tx
+                .clone()
+                .ok_or(OWNER_NOT_LOADED_MSG)?,
+            std::sync::Arc::clone(&g.profile_card_next_subscription_id),
+        )
+    };
+
+    let parsed = crate::library_directory::parse_owner_addr_hex(&owner_id_hex)
+        .map_err(|e| format!("invalid owner_id hex: {e}"))?;
+    let owner_id = parsed.0;
+    let id = next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    cache.register(id, owner_id).await;
+    // If the request channel is closing (event-loop shutdown raced this
+    // IPC), roll back the cache entry before surfacing the error so we
+    // don't leave a phantom subscription.
+    if let Err(e) = request_tx
+        .send(crate::event_loop::ProfileCardRequest::Subscribe {
+            subscription_id: id,
+            owner_id,
+        })
+        .await
+    {
+        cache.drop_subscription(id).await;
+        return Err(format!("profile_card_request_tx send: {e}"));
+    }
+    Ok(id)
+}
+
+/// IPC: ZEB-341. Unsubscribe from a previously-registered peer card
+/// subscription. The event-loop's subscriber pool aborts the Zenoh
+/// subscriber task AND drops the cache entry.
+#[tauri::command]
+async fn unsubscribe_member_card(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    subscription_id: u64,
+) -> Result<(), String> {
+    let (cache, request_tx) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.profile_card_cache.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.profile_card_request_tx
+                .clone()
+                .ok_or(OWNER_NOT_LOADED_MSG)?,
+        )
+    };
+    // Symmetry with subscribe: if the request channel is closing (event-loop
+    // shutdown raced this IPC), roll back the local cache entry before
+    // surfacing the error so we don't leave a phantom subscription.
+    if let Err(e) = request_tx
+        .send(crate::event_loop::ProfileCardRequest::Unsubscribe { subscription_id })
+        .await
+    {
+        cache.drop_subscription(subscription_id).await;
+        return Err(format!("profile_card_request_tx send: {e}"));
+    }
+    Ok(())
+}
+
+/// IPC: ZEB-341. Snapshot the latest verified card for a subscription.
+/// Returns `Ok(None)` when the subscription is known but no card has been
+/// received yet (loading state) or when the subscription has been dropped.
+#[tauri::command]
+async fn get_cached_member_card(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    subscription_id: u64,
+) -> Result<Option<crate::profile_card_broadcast::DiscoveredCardInfo>, String> {
+    let cache = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.profile_card_cache.clone().ok_or(OWNER_NOT_LOADED_MSG)?
+    };
+    Ok(cache.get_cached(subscription_id).await)
+}
+
+#[cfg(test)]
+mod member_card_ipc_tests {
+    //! ZEB-341: contract test for the hex parser the subscribe IPC relies on.
+    #[test]
+    fn member_card_owner_id_hex_parses_16_bytes() {
+        let id = crate::library_directory::parse_owner_addr_hex(&"ab".repeat(16)).unwrap();
+        assert_eq!(id.0.len(), 16);
+        assert!(crate::library_directory::parse_owner_addr_hex("zz").is_err());
+    }
+}
+
 #[cfg(test)]
 mod library_directory_lww_tests {
     //! Unit tests for the pure LWW helpers behind `add_library` /
@@ -31283,6 +31651,7 @@ pub fn run() {
             connect_zenoh,
             disconnect_zenoh,
             publish_profile,
+            republish_owner_card,
             send_message,
             send_dm,
             read_dm_thread,
@@ -31370,6 +31739,10 @@ pub fn run() {
             subscribe_peer_profile,
             unsubscribe_peer_profile,
             get_cached_peer_profile,
+            // ZEB-341: profile-card subscriber IPC trio.
+            subscribe_member_card,
+            unsubscribe_member_card,
+            get_cached_member_card,
             // ZEB-290 Phase 1 Task 11: Tier 1 voting IPCs.
             voting_create_tier1_poll,
             voting_cast_tier1_ballot,
@@ -34653,9 +35026,15 @@ mod start_node_race_tests {
             beacon_requester: None,
             library_directory: None,
             profile_broadcast_publisher: None,
+            profile_card_publisher: None,
             profile_broadcast_cache: None,
             profile_broadcast_request_tx: None,
             profile_broadcast_next_subscription_id: std::sync::Arc::new(
+                std::sync::atomic::AtomicU64::new(1),
+            ),
+            profile_card_cache: None,
+            profile_card_request_tx: None,
+            profile_card_next_subscription_id: std::sync::Arc::new(
                 std::sync::atomic::AtomicU64::new(1),
             ),
             voting_logs: std::sync::Arc::new(tokio::sync::Mutex::new(

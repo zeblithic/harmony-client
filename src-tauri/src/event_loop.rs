@@ -262,6 +262,20 @@ pub enum ProfileBroadcastRequest {
     },
 }
 
+/// ZEB-341 profile-card subscriber pool requests. Mirrors
+/// `ProfileBroadcastRequest` but carries a raw `owner_id: [u8;16]` (the
+/// card topic's owner) rather than an `OwnerAddr`, because the card topic
+/// is keyed directly off the 16-byte owner id.
+pub enum ProfileCardRequest {
+    Subscribe {
+        subscription_id: crate::profile_broadcast::SubscriptionId,
+        owner_id: [u8; 16],
+    },
+    Unsubscribe {
+        subscription_id: crate::profile_broadcast::SubscriptionId,
+    },
+}
+
 /// Events bridged from spawned Zenoh tasks back to the main select loop.
 enum ZenohEvent {
     Query {
@@ -446,6 +460,11 @@ pub async fn run<R: Runtime>(
     // announce subscriber). `None` when `profile_broadcast_cache` is
     // `None`.
     profile_broadcast_request_rx: Option<mpsc::Receiver<ProfileBroadcastRequest>>,
+    // ZEB-341: profile-card peer cache + request receiver. Mirrors the
+    // profile-broadcast pair above. `None` when no owner identity is
+    // loaded; always `Some` when started by production `start_node`.
+    profile_card_cache: Option<Arc<crate::profile_card_broadcast::ProfileCardCache>>,
+    profile_card_request_rx: Option<mpsc::Receiver<ProfileCardRequest>>,
     // Mint Phase 2 sync: channel pair bridging MintSyncEngine to Zenoh.
     // `None` when no owner identity is loaded.
     mut mint_sync_handles: Option<MintSyncHandles>,
@@ -1227,6 +1246,184 @@ pub async fn run<R: Runtime>(
                         handles.insert(subscription_id, handle);
                     }
                     ProfileBroadcastRequest::Unsubscribe { subscription_id } => {
+                        if let Some(h) = handles.remove(&subscription_id) {
+                            h.abort();
+                        }
+                        cache_for_loop.drop_subscription(subscription_id).await;
+                    }
+                }
+            }
+        });
+    }
+
+    // ── ZEB-341: profile-card subscriber pool ────────────────────────
+    // One Zenoh subscriber per (active) subscription_id, keyed off
+    // ProfileCardRequest::{Subscribe, Unsubscribe} from NodeState. Same
+    // retry/backoff shape as the profile-broadcast pool above (5s initial
+    // backoff, max 60s). MAX_CARD_WIRE_BYTES gates the payload before we
+    // materialize an owned Vec<u8>; on decode the card is verified (cert
+    // model via `verify_card`) AND attribution-checked (verified owner ==
+    // subscribed owner) before caching, then the FLAT
+    // `member-card-received` event is emitted to the frontend.
+    if let (Some(profile_card_cache), Some(profile_card_request_rx)) =
+        (profile_card_cache, profile_card_request_rx)
+    {
+        let session_for_card = Arc::clone(&session_arc);
+        let app_for_card = app.clone();
+        let closing_for_card = Arc::clone(&closing);
+        let cache_for_loop = Arc::clone(&profile_card_cache);
+        let mut request_rx = profile_card_request_rx;
+        tokio::spawn(async move {
+            use std::collections::HashMap;
+            let mut handles: HashMap<
+                crate::profile_broadcast::SubscriptionId,
+                tokio::task::JoinHandle<()>,
+            > = HashMap::new();
+            while let Some(req) = request_rx.recv().await {
+                match req {
+                    ProfileCardRequest::Subscribe {
+                        subscription_id,
+                        owner_id,
+                    } => {
+                        // Self-heal: prune any subscriber tasks that have
+                        // already exited.
+                        handles.retain(|_, h| !h.is_finished());
+                        if handles.contains_key(&subscription_id) {
+                            tracing::warn!(
+                                subscription_id,
+                                "ProfileCardRequest::Subscribe duplicate id — ignoring"
+                            );
+                            continue;
+                        }
+                        let key_expr = crate::profile_card_broadcast::card_topic_for(&owner_id);
+                        let session = Arc::clone(&session_for_card);
+                        let app_for_task = app_for_card.clone();
+                        let closing_task = Arc::clone(&closing_for_card);
+                        let cache_for_task = Arc::clone(&cache_for_loop);
+                        let handle = tokio::spawn(async move {
+                            let mut backoff = std::time::Duration::from_secs(5);
+                            const MAX_BACKOFF: std::time::Duration =
+                                std::time::Duration::from_secs(60);
+                            loop {
+                                if closing_task.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                let sub = match session.declare_subscriber(&key_expr).await {
+                                    Ok(s) => {
+                                        backoff = std::time::Duration::from_secs(5);
+                                        s
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            subscription_id,
+                                            backoff_s = backoff.as_secs(),
+                                            "profile card declare_subscriber failed; \
+                                             retrying after backoff"
+                                        );
+                                        tokio::time::sleep(backoff).await;
+                                        backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+                                        continue;
+                                    }
+                                };
+                                loop {
+                                    match sub.recv_async().await {
+                                        Ok(sample) => {
+                                            let bytes_view = sample.payload().to_bytes();
+                                            // Drop oversized payloads BEFORE
+                                            // materializing into an owned
+                                            // Vec<u8>.
+                                            if bytes_view.len()
+                                                > crate::profile_card_broadcast::MAX_CARD_WIRE_BYTES
+                                            {
+                                                tracing::warn!(
+                                                    size = bytes_view.len(),
+                                                    max = crate::profile_card_broadcast::MAX_CARD_WIRE_BYTES,
+                                                    subscription_id,
+                                                    "oversized profile card dropped"
+                                                );
+                                                continue;
+                                            }
+                                            let bytes = bytes_view.to_vec();
+                                            let card: crate::profile_card_broadcast::ProfileCardBroadcast =
+                                                match ciborium::from_reader(&bytes[..]) {
+                                                    Ok(c) => c,
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            error = ?e,
+                                                            subscription_id,
+                                                            "profile card CBOR decode failed"
+                                                        );
+                                                        continue;
+                                                    }
+                                                };
+                                            // Cert model + signature.
+                                            let verified_owner =
+                                                match crate::profile_card_broadcast::verify_card(
+                                                    &card,
+                                                ) {
+                                                    Ok(o) => o,
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            error = ?e,
+                                                            subscription_id,
+                                                            "profile card verify failed"
+                                                        );
+                                                        continue;
+                                                    }
+                                                };
+                                            // Attribution: bind the verified
+                                            // owner to the SUBSCRIBED owner
+                                            // (the topic's owner).
+                                            if verified_owner != owner_id {
+                                                tracing::warn!(
+                                                    subscription_id,
+                                                    "profile card attribution mismatch"
+                                                );
+                                                continue;
+                                            }
+                                            cache_for_task
+                                                .insert_verified(subscription_id, &card)
+                                                .await;
+                                            if let Some(info) =
+                                                cache_for_task.get_cached(subscription_id).await
+                                            {
+                                                // Flat payload (subscriptionId +
+                                                // DiscoveredCardInfo fields hoisted).
+                                                let _ = app_for_task.emit(
+                                                    "member-card-received",
+                                                    serde_json::json!({
+                                                        "subscriptionId": subscription_id,
+                                                        "ownerIdHex": info.owner_id_hex,
+                                                        "displayName": info.display_name,
+                                                        "statusText": info.status_text,
+                                                    }),
+                                                );
+                                            }
+                                        }
+                                        Err(_) => {
+                                            if !closing_task.load(Ordering::SeqCst) {
+                                                tracing::warn!(
+                                                    subscription_id,
+                                                    "profile card subscriber closed; \
+                                                     reconnecting"
+                                                );
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                                if closing_task.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                // Brief pause before re-declaring on
+                                // mid-session recv_async failure.
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            }
+                        });
+                        handles.insert(subscription_id, handle);
+                    }
+                    ProfileCardRequest::Unsubscribe { subscription_id } => {
                         if let Some(h) = handles.remove(&subscription_id) {
                             h.abort();
                         }

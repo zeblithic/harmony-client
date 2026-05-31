@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { CommunityMember } from '../types';
+  import type { ResolvedCard } from '../member-card-service';
 
   export type KebabAction =
     | 'kick'
@@ -9,14 +10,31 @@
     | 'demote-mod'
     | 'demote-member';
 
+  /** ZEB-341: payload the leaf assembles for the owner_id card popover. */
+  export type OpenCardPayload = {
+    ownerIdHex: string;
+    displayName: string;
+    statusText: string;
+    power?: number;
+    /** Community membership state ('joined'/'banned'). Distinct from the
+     *  freeform `statusText` profile message. */
+    membershipStatus?: string;
+  };
+
   let {
     member,
     viewer,
     onaction,
+    resolveCard,
+    onOpenCard,
   }: {
     member: CommunityMember;
     viewer: { addr: string; power: number; isLastAdmin: boolean };
     onaction?: (detail: { action: KebabAction; member: CommunityMember }) => void;
+    /** ZEB-341: optional card resolver for member display names. */
+    resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
+    /** ZEB-341: open the owner_id card popover for this member. */
+    onOpenCard?: (payload: OpenCardPayload, ev: MouseEvent) => void;
   } = $props();
 
   let menuOpen = $state(false);
@@ -83,7 +101,13 @@
     kebabActions(viewer.power, member.power, member.status, isSelf, viewer.isLastAdmin)
   );
   let label = $derived(tierLabel(member.power, member.status));
-  let displayName = $derived(member.displayName ?? member.address.slice(0, 8));
+  // ZEB-341 Task 1: resolve display name via card service (self-first, offline).
+  // Falls back to member.displayName (backend-provided) then address prefix.
+  // Read through resolveCard() inside $derived so Task 8's reactive Map upgrade
+  // triggers a re-render automatically — no one-time snapshot.
+  let displayName = $derived(
+    resolveCard?.(member.address)?.displayName ?? member.displayName ?? member.address.slice(0, 8)
+  );
   let joinedDate = $derived(
     member.joinedAt != null
       ? new Date(member.joinedAt).toLocaleDateString()
@@ -102,6 +126,19 @@
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape') menuOpen = false;
   }
+
+  function handleNameClick(ev: MouseEvent) {
+    onOpenCard?.(
+      {
+        ownerIdHex: member.address,
+        displayName,
+        statusText: resolveCard?.(member.address)?.statusText ?? '',
+        power: member.power,
+        membershipStatus: member.status,
+      },
+      ev,
+    );
+  }
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -110,7 +147,13 @@
     {displayName.slice(0, 1).toUpperCase()}
   </div>
   <div class="member-info">
-    <span class="name">{displayName}{isSelf ? ' (you)' : ''}</span>
+    {#if onOpenCard}
+      <button type="button" class="name name-btn" onclick={handleNameClick}>
+        {displayName}{isSelf ? ' (you)' : ''}
+      </button>
+    {:else}
+      <span class="name">{displayName}{isSelf ? ' (you)' : ''}</span>
+    {/if}
     <span class="addr">{member.address}</span>
   </div>
   <span class="tier-badge" data-status={member.status} data-power={member.power}>
@@ -188,6 +231,24 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .name-btn {
+    background: transparent;
+    border: none;
+    padding: 0;
+    margin: 0;
+    text-align: left;
+    cursor: pointer;
+    font: inherit;
+    max-width: 100%;
+  }
+  .name-btn:hover {
+    text-decoration: underline;
+  }
+  .name-btn:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 1px;
+    border-radius: 2px;
   }
   .addr {
     font-size: 0.65rem;

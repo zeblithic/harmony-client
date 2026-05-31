@@ -65,8 +65,9 @@
   import UpdateAvailableToast from './lib/components/UpdateAvailableToast.svelte';
   import WelcomeModal from './lib/components/WelcomeModal.svelte';
   import BackupReminderBanner from './lib/components/BackupReminderBanner.svelte';
-  import type { MintIpcResult } from './lib/owner-service';
+  import type { MintIpcResult, OwnerStateView } from './lib/owner-service';
   import type { StartNodeResponse } from './lib/types/onboarding';
+  import { MemberCardService } from './lib/member-card-service';
   import { classifyOwnerIdentity, type OwnerIdentityState } from './lib/owner-gate';
   import { trapFocus } from './lib/focus-trap';
   import HelpMenuButton from './lib/components/HelpMenuButton.svelte';
@@ -80,15 +81,63 @@
 
   let myProfile = $state(loadProfile());
 
-  async function handleProfileSave(profile: Profile) {
-    saveProfile(profile);
-    myProfile = profile;
-    // messageService.ownDisplayName / vineService.ownDisplayName are kept
-    // in sync by a `$effect` later in the script (single source of truth).
-    // Publish to network if Tauri is available.
-    // Uses direct invoke rather than ZenohService.publishProfile() because
-    // ZenohService lives in NetworkApp (not accessible here). Both paths
-    // invoke the same 'publish_profile' command.
+  // ZEB-341 Task 1: self-first member-card resolution.
+  // A single MemberCardService instance for the app lifetime. Task 8 will
+  // convert the internal Map to Svelte 5 $state so peer cards re-render;
+  // components read through resolveCard() inside $derived so the upgrade
+  // is transparent — no snapshot, always a live read.
+  const memberCardService = new MemberCardService();
+  // ZEB-341 Task 8: reactivity seam. The service stays a plain class with a
+  // plain Map; it calls onUpdate() after any poll mutates the card map. We
+  // bump this $state counter so the resolveCard() reads inside MemberRow /
+  // ChannelMessageFeed $derived re-run and peer names fill in live.
+  let cardVersion = $state(0);
+  memberCardService.onUpdate = () => {
+    cardVersion++;
+  };
+  // selfOwnerId is the OwnerAddr hex (32 chars) obtained from get_owner_state.
+  // Set at startup (after start_node) and kept stable for the session.
+  let selfOwnerId = $state<string | null>(null);
+
+  // Expose a resolver function that components call inside $derived.
+  // Reading cardVersion registers the reactive dependency so consumers
+  // re-run when a peer card arrives (Task 8).
+  function resolveCard(ownerIdHex: string) {
+    cardVersion; // reactive dep: re-run derived consumers when cards change
+    return memberCardService.resolve(ownerIdHex);
+  }
+
+  // ZEB-341 Task 8: lifecycle hooks threaded down to CommunityMembersPanel,
+  // which knows the visible-member set. No-ops until the adapter wires up.
+  function subscribeVisibleCards(ownerIdHexes: string[]) {
+    void memberCardService.subscribeVisible(ownerIdHexes);
+  }
+  function unsubscribeCards() {
+    void memberCardService.unsubscribeAll();
+  }
+
+  // ZEB-341: one-shot guard so the boot-time card re-publish fires at most
+  // once per process (the 600s refresh re-emits cached bytes thereafter).
+  let hasPublishedCardOnBoot = false;
+  // ZEB-341: in-flight promise for the boot card publish. The boot path fires
+  // tryBootPublishCard un-awaited while the zenoh-status 'connected' handler
+  // awaits it, so two calls can be in flight at once. `hasPublishedCardOnBoot`
+  // is a plain boolean checked before an await, so without joining the in-flight
+  // attempt both calls would pass the check before either sets the guard and
+  // publish a duplicate card (async TOCTOU). Concurrent callers join this promise
+  // instead of starting a second publish; it clears once the attempt settles.
+  let bootCardPublishInFlight: Promise<void> | null = null;
+
+  // Publish the profile (and, backend-side, the owner_id card) to the network.
+  // Uses direct invoke rather than ZenohService.publishProfile() because
+  // ZenohService lives in NetworkApp (not accessible here). Both paths invoke
+  // the same 'publish_profile' command. Swallows errors: not-in-Tauri /
+  // not-connected leaves the profile saved locally only, and the backend
+  // already best-effort-skips the card publish when the node isn't wired.
+  // Returns true if the IPC actually landed (session connected). A successful
+  // invoke means the Reticulum publish committed, which implies the node is
+  // wired enough for the backend's best-effort card publish to have run too.
+  async function publishProfileToNetwork(profile: Profile): Promise<boolean> {
     try {
       const { invoke } = await import('@tauri-apps/api/core');
       await invoke('publish_profile', {
@@ -99,9 +148,77 @@
           avatarUrl: profile.avatarUrl,
         },
       });
+      return true;
     } catch {
-      // Not in Tauri or not connected — profile saved locally only
+      // Not in Tauri or not connected — profile saved locally only.
+      return false;
     }
+  }
+
+  // ZEB-341: re-publish ONLY the owner_id card (not the full Reticulum profile)
+  // via the dedicated card-only IPC. Returns true if it landed (node ready).
+  async function republishOwnerCard(profile: Profile): Promise<boolean> {
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      await invoke('republish_owner_card', {
+        displayName: profile.displayName,
+        statusText: profile.statusText ?? '',
+      });
+      return true;
+    } catch {
+      return false; // node not ready — caller retries on zenoh-status connect
+    }
+  }
+
+  // ZEB-341: attempt the one-shot boot card re-publish, but only mark it done on
+  // a SUCCESSFUL publish. The publish can race Zenoh session startup (start_node
+  // may return before the session connects); a failed early attempt leaves the
+  // guard unset so a later trigger (the zenoh-status 'connected' handler)
+  // retries. Without this, the guard would burn on a no-op and a returning
+  // user's card would never publish (the 600s refresh only re-emits cached
+  // bytes, which stay empty until the card publish succeeds at least once).
+  // Publishes the CARD ONLY — not the full profile — so boot doesn't re-emit
+  // the unchanged Reticulum profile.
+  function tryBootPublishCard(): Promise<void> {
+    if (hasPublishedCardOnBoot || selfOwnerId === null || !myProfile?.displayName) {
+      return Promise.resolve();
+    }
+    // Join an already-running attempt rather than starting a second publish.
+    // The check-decide-assign below is synchronous (no await between the guard
+    // read and the assignment), so it's atomic w.r.t. concurrent callers; the
+    // first await happens only inside the memoized closure.
+    if (bootCardPublishInFlight) {
+      return bootCardPublishInFlight;
+    }
+    bootCardPublishInFlight = (async () => {
+      try {
+        if (await republishOwnerCard(myProfile)) {
+          hasPublishedCardOnBoot = true;
+        }
+      } finally {
+        // Clear so a FAILED attempt (guard still false) can retry on the next
+        // trigger; a SUCCEEDED attempt is short-circuited by the guard above.
+        bootCardPublishInFlight = null;
+      }
+    })();
+    return bootCardPublishInFlight;
+  }
+
+  async function handleProfileSave(profile: Profile) {
+    saveProfile(profile);
+    myProfile = profile;
+    // Re-seed the card whenever the profile is saved so the name updates
+    // immediately without a network round-trip (self-first, ZEB-341 Task 1).
+    if (selfOwnerId !== null) {
+      memberCardService.seedSelf(selfOwnerId, {
+        displayName: profile.displayName,
+        statusText: profile.statusText ?? '',
+      });
+    }
+    // messageService.ownDisplayName / vineService.ownDisplayName are kept
+    // in sync by a `$effect` later in the script (single source of truth).
+    // Publish to network if Tauri is available.
+    await publishProfileToNetwork(profile);
   }
 
   const vineService = new VineService();
@@ -293,10 +410,17 @@
   // ZEB-338: WelcomeModal hard-gate completion. Flip owner-present, close the
   // gate, and drain any invite that was queued pre-mint (Flow 3).
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  async function onMinted(_result: MintIpcResult): Promise<void> {
+  async function onMinted(result: MintIpcResult): Promise<void> {
     ownerIdentityState = 'present';
     startNodeError = null;
     showWelcomeModal = false;
+    // ZEB-341 Task 1: seed the card using the newly-minted owner identity.
+    // MintIpcResult.state.ownerId is available from the mint response.
+    selfOwnerId = result.state.ownerId;
+    memberCardService.seedSelf(result.state.ownerId, {
+      displayName: myProfile.displayName,
+      statusText: myProfile.statusText ?? '',
+    });
     drainQueuedInvite();
   }
 
@@ -519,6 +643,49 @@
   let popoverX = $state(0);
   let popoverY = $state(0);
 
+  // ── ZEB-341: owner_id card popover (click-to-view on members/authors) ──
+  // Keyed by owner_id hex — a distinct world from the Reticulum `Profile`
+  // popover above. Its own x/y avoids regressing the avatar-click path.
+  let popoverCard = $state<{
+    ownerIdHex: string;
+    displayName: string;
+    statusText: string;
+    power?: number;
+    membershipStatus?: string;
+  } | null>(null);
+  let popoverCardX = $state(0);
+  let popoverCardY = $state(0);
+
+  function openMemberCard(
+    payload: {
+      ownerIdHex: string;
+      displayName: string;
+      statusText: string;
+      power?: number;
+      membershipStatus?: string;
+    },
+    event: MouseEvent,
+  ) {
+    // Toggle-close if the same owner_id is re-clicked (mirrors the avatar path).
+    if (popoverCard?.ownerIdHex === payload.ownerIdHex) {
+      popoverCard = null;
+      return;
+    }
+    const el =
+      (event.currentTarget as HTMLElement | null) ??
+      ((event.target as HTMLElement).closest('button') as HTMLElement | null);
+    const rect = el?.getBoundingClientRect();
+    const POPOVER_WIDTH = 300;
+    const POPOVER_HEIGHT = 180;
+    if (rect) {
+      popoverCardX = Math.min(rect.right + 8, window.innerWidth - POPOVER_WIDTH - 8);
+      popoverCardY = Math.min(rect.top, window.innerHeight - POPOVER_HEIGHT - 8);
+    }
+    // Mutually exclusive with the Reticulum avatar popover — only one shows.
+    popoverProfile = null;
+    popoverCard = payload;
+  }
+
   function handleAvatarClick(address: string, event: MouseEvent) {
     if (popoverProfile?.address === address) {
       popoverProfile = null;
@@ -533,6 +700,8 @@
     const POPOVER_HEIGHT = 220;
     popoverX = Math.min(rect.right + 8, window.innerWidth - POPOVER_WIDTH - 8);
     popoverY = Math.min(rect.top, window.innerHeight - POPOVER_HEIGHT - 8);
+    // Mutually exclusive with the owner-card popover — only one shows.
+    popoverCard = null;
     popoverProfile = profile;
   }
 
@@ -697,6 +866,10 @@
       tauriAdapter = adapter;
       libraryDirectoryService = new LibraryDirectoryService(adapter);
       profileBroadcastService = new ProfileBroadcastService(adapter);
+      // ZEB-341 Task 8: the MemberCardService is constructed early (so
+      // seedSelf/resolve work at boot before Tauri-init); wire the adapter
+      // now so cross-peer subscriptions can start.
+      memberCardService.setAdapter(adapter);
 
       // ZEB-298 PR 2 Task 10 — wire the voting adapter so the
       // delegate-on-behalf Tauri event can fire toast notifications.
@@ -754,6 +927,29 @@
       ownerIdentityState = classifyOwnerIdentity(startResp, startFailed);
       if (ownerIdentityState === 'present') {
         showWelcomeModal = false;
+        // ZEB-341 Task 1: fetch the owner identity hex so we can seed
+        // MemberCardService with the viewer's own display name immediately.
+        // owner_id is the 32-char lowercase hex of the 16-byte OwnerAddr —
+        // same format as MemberInfoDto.addr and ChannelMessageDto.author.
+        try {
+          const ownerState = await invoke<OwnerStateView | null>('get_owner_state');
+          if (ownerState !== null) {
+            selfOwnerId = ownerState.ownerId;
+            memberCardService.seedSelf(ownerState.ownerId, {
+              displayName: myProfile.displayName,
+              statusText: myProfile.statusText ?? '',
+            });
+            // ZEB-341: re-publish this returning user's profile card on boot so
+            // subscribing peers can resolve their name without a manual re-save.
+            // (The 600s refresh only re-emits CACHED bytes, which are empty on a
+            // fresh process.) Only marks done on success; if the Zenoh session
+            // isn't up yet, the zenoh-status 'connected' handler retries.
+            void tryBootPublishCard();
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.debug('[harmony-client] get_owner_state not yet available:', msg);
+        }
         // Returning user who clicked an invite before start_node resolved:
         // drain it. (routeInviteUrl queued it because the owner wasn't loaded
         // yet at the time.)
@@ -869,6 +1065,31 @@
         if (status.status === 'connected') {
           await fetchOwnAddress();
           await reloadBackendState();
+          // ZEB-341: the initial get_owner_state probe can return null when the
+          // owner finishes loading AFTER start_node returns; selfOwnerId would
+          // then stay null and tryBootPublishCard would be a permanent no-op.
+          // Re-fetch here (only while still unknown) so the boot card publish
+          // can proceed once the owner is available.
+          if (selfOwnerId === null) {
+            try {
+              // `invoke` is already in scope from the enclosing Tauri-init IIFE
+              // (imported once at boot) — no need to re-import it on every
+              // reconnect.
+              const ownerState = await invoke<OwnerStateView | null>('get_owner_state');
+              if (ownerState !== null) {
+                selfOwnerId = ownerState.ownerId;
+                memberCardService.seedSelf(ownerState.ownerId, {
+                  displayName: myProfile.displayName,
+                  statusText: myProfile.statusText ?? '',
+                });
+              }
+            } catch {
+              // owner still unavailable — leave selfOwnerId null for a later retry
+            }
+          }
+          // The session is now confirmed up — (re)attempt the one-shot boot card
+          // publish in case an earlier attempt raced session startup.
+          await tryBootPublishCard();
         }
       });
       // zenoh-status serves messages, vines, and nav (fetchOwnAddress sets
@@ -878,6 +1099,25 @@
       // listen() returns UnlistenFn (= () => void), matching addUnlisten's
       // signature directly — no cast needed.
       fileManagerService.addUnlisten(unlistenStatus);
+
+      // ZEB-341: instant card resolution. The backend emits
+      // `member-card-received` whenever a verified card is cached; apply it
+      // immediately so names don't lag the 3s poll. The poll loop remains the
+      // fallback (applyCard is idempotent with it). Registered here next to
+      // the zenoh-status listener so the adapter/event system is confirmed
+      // ready, and torn down via the same addUnlisten path on unmount.
+      const unlistenMemberCard = await listen<{
+        subscriptionId: number;
+        ownerIdHex: string;
+        displayName: string;
+        statusText: string;
+      }>('member-card-received', (event) => {
+        memberCardService.applyCard(event.payload.ownerIdHex, {
+          displayName: event.payload.displayName,
+          statusText: event.payload.statusText,
+        });
+      });
+      fileManagerService.addUnlisten(unlistenMemberCard);
     } catch (err) {
       console.warn('[harmony-client] Tauri init failed:', err);
     }
@@ -1580,6 +1820,10 @@
           next.set(cid, shared);
           sharedInProfileByCommunity = next;
         }}
+        {resolveCard}
+        {subscribeVisibleCards}
+        {unsubscribeCards}
+        onOpenCard={openMemberCard}
       />
     {:else}
       <TextFeed
@@ -1829,6 +2073,16 @@
       );
       return node?.name ?? null;
     }}
+  />
+{/if}
+
+{#if popoverCard}
+  <ProfilePopover
+    mode="owner-card"
+    card={popoverCard}
+    x={popoverCardX}
+    y={popoverCardY}
+    onClose={() => (popoverCard = null)}
   />
 {/if}
 

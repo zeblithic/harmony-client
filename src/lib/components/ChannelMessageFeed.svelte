@@ -8,6 +8,7 @@
   import Avatar from './Avatar.svelte';
   import PollMessage from './PollMessage.svelte';
   import { buildUnifiedTimeline, type TimelineRow } from '../fork-timeline';
+  import type { ResolvedCard } from '../member-card-service';
 
   let {
     communityId,
@@ -33,6 +34,10 @@
      * the card renders instantly without a per-message round trip.
      */
     votingAdapter,
+    /** ZEB-341: optional card resolver for author display names. */
+    resolveCard,
+    /** ZEB-341: open the owner_id card popover for a message author. */
+    onOpenCard,
   }: {
     communityId: string;
     channelId: string;
@@ -47,6 +52,17 @@
     originalCommunityName?: string;
     forkedAtMs?: number;
     votingAdapter?: VotingAdapter;
+    resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
+    onOpenCard?: (
+      payload: {
+        ownerIdHex: string;
+        displayName: string;
+        statusText: string;
+        power?: number;
+        membershipStatus?: string;
+      },
+      ev: MouseEvent,
+    ) => void;
   } = $props();
 
   // Local mirror of service.byChannel cache for this channel.
@@ -296,6 +312,20 @@
   function formatTimestamp(at: HlcDto): string {
     return new Date(at.wallMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
+
+  function handleAuthorClick(author: string, ev: MouseEvent) {
+    // Resolve once — a single map lookup and a single reactive cardVersion read.
+    const card = resolveCard?.(author);
+    onOpenCard?.(
+      {
+        ownerIdHex: author,
+        displayName: card?.displayName ?? author.slice(0, 8),
+        statusText: card?.statusText ?? '',
+        // No power known for message authors → role line omitted.
+      },
+      ev,
+    );
+  }
 </script>
 
 <div class="channel-message-feed">
@@ -347,7 +377,16 @@
           </div>
           <div class="content-col">
             <header class="msg-meta">
-              <span class="author">{msg.author.slice(0, 8)}</span>
+              <!-- ZEB-341 Task 1: show resolved display name when available (self-first, offline). -->
+              {#if onOpenCard}
+                <button
+                  type="button"
+                  class="author author-btn"
+                  onclick={(e) => handleAuthorClick(msg.author, e)}
+                >{resolveCard?.(msg.author)?.displayName ?? msg.author.slice(0, 8)}</button>
+              {:else}
+                <span class="author">{resolveCard?.(msg.author)?.displayName ?? msg.author.slice(0, 8)}</span>
+              {/if}
               <time class="ts" datetime={new Date(msg.at.wallMs).toISOString()}>{formatTimestamp(msg.at)}</time>
               {#if row.isPreFork}
                 <span class="pre-fork-badge" aria-label="From original community">from {originalCommunityName}</span>
@@ -433,6 +472,22 @@
   .content-col { flex: 1; min-width: 0; }
   .msg-meta { display: flex; gap: 8px; align-items: baseline; }
   .author { color: var(--text-primary); font-weight: 500; font-size: 0.9rem; }
+  .author-btn {
+    background: transparent;
+    border: none;
+    padding: 0;
+    margin: 0;
+    cursor: pointer;
+    font: inherit;
+    font-weight: 500;
+    color: var(--text-primary);
+  }
+  .author-btn:hover { text-decoration: underline; }
+  .author-btn:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 1px;
+    border-radius: 2px;
+  }
   .ts { color: var(--text-secondary); font-size: 0.7rem; }
   .body { margin: 2px 0 0; color: var(--text-primary); white-space: pre-wrap; word-wrap: break-word; }
   .compose {

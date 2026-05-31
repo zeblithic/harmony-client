@@ -3,7 +3,8 @@
   import type { CommunityService } from '../community-service';
   import type { CommunityMember, ModerationEvent } from '../types';
   import MemberRow from './MemberRow.svelte';
-  import type { KebabAction } from './MemberRow.svelte';
+  import type { KebabAction, OpenCardPayload } from './MemberRow.svelte';
+  import type { ResolvedCard } from '../member-card-service';
   import ModerationReasonDialog from './ModerationReasonDialog.svelte';
   import LastAdminWarningDialog from './LastAdminWarningDialog.svelte';
   import RecentActionsBadge from './RecentActionsBadge.svelte';
@@ -13,11 +14,21 @@
     communityName,
     communityService,
     ownAddress,
+    resolveCard,
+    onOpenCard,
   }: {
     communityId: string;
     communityName: string;
     communityService: CommunityService;
     ownAddress: string;
+    /** ZEB-341: optional card resolver for display names. The card subscription
+     *  lifecycle is owned by CommunityView (the always-mounted-per-community
+     *  container), not this transient overlay, so member/author names resolve in
+     *  the channel view regardless of whether this panel is open. This panel is
+     *  a pure consumer of the resolved map. */
+    resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
+    /** ZEB-341: open the owner_id card popover for a clicked member. */
+    onOpenCard?: (payload: OpenCardPayload, ev: MouseEvent) => void;
   } = $props();
 
   let members: CommunityMember[] = $state([]);
@@ -283,6 +294,8 @@
         <MemberRow
           {member}
           {viewer}
+          {resolveCard}
+          {onOpenCard}
           onaction={(detail) => onMemberAction(detail)}
         />
       {/each}
@@ -299,6 +312,8 @@
             <MemberRow
               {member}
               {viewer}
+              {resolveCard}
+              {onOpenCard}
               onaction={(detail) => onMemberAction(detail)}
             />
           {/each}

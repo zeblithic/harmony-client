@@ -16,6 +16,7 @@
   import CommunityProposalsPanel from './CommunityProposalsPanel.svelte';
   import Tier3ProposalPanel from './Tier3ProposalPanel.svelte';
   import type { VotingAdapter } from '../voting-adapter';
+  import type { ResolvedCard } from '../member-card-service';
 
   let {
     communityId,
@@ -38,6 +39,10 @@
     onForkSuccess,
     onSelectCommunity,
     votingAdapter,
+    resolveCard,
+    subscribeVisibleCards,
+    unsubscribeCards,
+    onOpenCard,
   }: {
     communityId: string;
     communityName: string;
@@ -50,6 +55,17 @@
     communityService: CommunityService;
     channelMessageService: ChannelMessageService;
     trustService?: TrustService;
+    /** ZEB-341: optional card resolver — undefined until owner identity loads. */
+    resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
+    /** ZEB-341 Task 8: subscribe to cross-peer cards for the visible member set. */
+    subscribeVisibleCards?: (ownerIdHexes: string[]) => void;
+    /** ZEB-341 Task 8: tear down all card subscriptions when the panel unmounts. */
+    unsubscribeCards?: () => void;
+    /** ZEB-341: open the owner_id card popover for a clicked member/author. */
+    onOpenCard?: (
+      payload: { ownerIdHex: string; displayName: string; statusText: string; power?: number; membershipStatus?: string },
+      ev: MouseEvent,
+    ) => void;
     /** ZEB-291 Phase 2: connected VotingAdapter. When present, a
      *  Proposals tab appears next to Channels — switches the middle
      *  column to the Tier 2 governance panel. Optional so existing
@@ -236,8 +252,37 @@
     };
   });
 
+  // ZEB-341: drive cross-peer card subscriptions for the whole community view,
+  // not just the (transient) members-panel overlay. CommunityView stays mounted
+  // for as long as a community is selected, so anchoring the subscription
+  // lifecycle here makes message-author names in ChannelMessageFeed resolve in
+  // the channel view itself — and keep updating — regardless of whether the
+  // members overlay is open. Previously this lived only in the overlay panel, so
+  // author names never resolved unless the user opened it (Cursor Bugbot,
+  // PR #171).
+  //
+  // Scope: currently-JOINED members only. They are the channel-view-visible set
+  // (message authors + the channel members list); banned members surface only in
+  // the members-overlay's collapsible section and are intentionally not
+  // subscribed here. This bounds the active subscription count by *live*
+  // membership rather than lifetime ban accumulation (spec §7 "bound the active
+  // subscription count"; CodeRabbit "subscribe only to visible rows"). The
+  // service diffs internally (subscribes new owner_ids, unsubscribes departed)
+  // and excludes self, so re-running on every `members` change is idempotent;
+  // `member.address` is the lowercase owner_id hex. Teardown is in onDestroy
+  // (fires on view change / leaving the community).
+  $effect(() => {
+    const joinedOwnerIds = members
+      .filter((m) => m.status === 'joined')
+      .map((m) => m.address);
+    subscribeVisibleCards?.(joinedOwnerIds);
+  });
+
   onDestroy(() => {
     communityService.onChannelConfigChanged = prevOnChannelConfigChanged;
+    // ZEB-341: tear down all card subscriptions + the poll loop when the
+    // community view goes away (switching to a non-community space / closing).
+    unsubscribeCards?.();
   });
 </script>
 
@@ -364,6 +409,8 @@
         snapshotMessages={preForkSnapshot?.channelLog?.[activeChannel.channelId] ?? []}
         originalCommunityName={preForkSnapshot?.originalCommunityName ?? ''}
         forkedAtMs={preForkSnapshot?.forkedAtMs ?? 0}
+        {resolveCard}
+        {onOpenCard}
       />
     {:else}
       <div class="empty-channels">
@@ -452,6 +499,8 @@
         {communityName}
         {communityService}
         ownAddress={ownAddress}
+        {resolveCard}
+        {onOpenCard}
       />
     </div>
   </div>
