@@ -12831,6 +12831,7 @@ mod list_community_forks_tests {
                     channel_id: ChannelId([0; 16]),
                     name: "general".to_string(),
                     write_power: 0,
+                    kind: crate::community_membership::ChannelKind::Text,
                 },
                 caller,
                 300,
@@ -13119,6 +13120,10 @@ mod list_community_forks_tests {
 /// ZEB-267: Caller pre-reserves `hlc` via
 /// `dm_outbox::reserve_next_hlc_for_device`. This helper is now pure
 /// on the HLC — it does not call `next_hlc` internally.
+// ZEB-349: 8 args (added `kind`) — over clippy's 7-arg threshold. These are
+// all distinct event fields, not a candidate for a params struct; matches the
+// `#[allow]` idiom used by the other mint/IPC helpers in this file.
+#[allow(clippy::too_many_arguments)]
 pub fn mint_channel_create_event(
     community_id: crate::owner_state_types::SpaceId,
     self_owner: crate::owner_state_types::OwnerAddr,
@@ -13127,6 +13132,7 @@ pub fn mint_channel_create_event(
     write_power: u8,
     signing_key: &ed25519_dalek::SigningKey,
     hlc: crate::owner_state_types::Hlc,
+    kind: crate::community_membership::ChannelKind,
 ) -> Result<crate::community_membership::SignedMembershipEvent, String> {
     use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
     use rand::RngCore;
@@ -13138,15 +13144,53 @@ pub fn mint_channel_create_event(
     let payload = EventPayload {
         id: event_id_bytes,
         community_id,
+        // ZEB-349: real ChannelKind threaded from create_channel's IPC `kind`
+        // param (replaces the former temporary Text hardcode).
         kind: MembershipEventKind::ChannelCreate {
             channel_id,
             name,
             write_power,
+            kind,
         },
         actor: self_owner,
         at: hlc,
     };
     sign_event(&payload, signing_key).map_err(|e| format!("sign channel_create: {e}"))
+}
+
+/// ZEB-349: parse the `create_channel` IPC `kind` param (`Option<String>`,
+/// camelCase boundary) into a `ChannelKind`. `None`/`"text"` → Text,
+/// `"voice"` → Voice, anything else → `Err` (mentions "kind" + the bad
+/// value). Factored out of `create_channel` so the boundary parse is
+/// unit-testable without `tauri::State`.
+fn parse_channel_kind(
+    kind: Option<&str>,
+) -> Result<crate::community_membership::ChannelKind, String> {
+    match kind {
+        None | Some("text") => Ok(crate::community_membership::ChannelKind::Text),
+        Some("voice") => Ok(crate::community_membership::ChannelKind::Voice),
+        Some(other) => Err(format!("invalid channel kind: {other}")),
+    }
+}
+
+/// ZEB-349: map a materialized `ChannelInfo` (+ its `ChannelId`) into the
+/// IPC `ChannelInfoDto`, stringifying `channel_id` to hex and `kind` to
+/// `"text"`/`"voice"`. Shared by `list_channels` and its unit test.
+fn channel_info_dto(
+    channel_id: &crate::community_membership::ChannelId,
+    info: &crate::community_membership::ChannelInfo,
+) -> ChannelInfoDto {
+    ChannelInfoDto {
+        channel_id: hex::encode(channel_id.0),
+        name: info.name.clone(),
+        write_power: info.write_power,
+        kind: match info.kind {
+            crate::community_membership::ChannelKind::Text => "text".to_string(),
+            crate::community_membership::ChannelKind::Voice => "voice".to_string(),
+        },
+        created_at: info.created_at.clone(),
+        deleted_at: info.deleted_at.clone(),
+    }
 }
 
 /// Tauri IPC: create a new channel in a community we currently
@@ -13178,7 +13222,13 @@ async fn create_channel(
     community_id: String,
     name: String,
     write_power: u8,
+    kind: Option<String>,
 ) -> Result<String, String> {
+    // ZEB-349: parse the channel kind at the IPC boundary. `None`/`"text"`
+    // → Text, `"voice"` → Voice, anything else → Err. Done first so an
+    // unknown kind surfaces fast without minting anything.
+    let channel_kind = parse_channel_kind(kind.as_deref())?;
+
     // IPC-boundary validation. Rejecting here surfaces fast to the JS
     // caller without minting+inserting an invalid event. verify_event
     // also validates these (defense-in-depth for remote events).
@@ -13243,6 +13293,7 @@ async fn create_channel(
             write_power,
             signing_key,
             hlc,
+            channel_kind,
         )?
     };
 
@@ -13826,13 +13877,7 @@ async fn list_channels(
     let mut rows: Vec<ChannelInfoDto> = materialized
         .channels
         .iter()
-        .map(|(channel_id, info)| ChannelInfoDto {
-            channel_id: hex::encode(channel_id.0),
-            name: info.name.clone(),
-            write_power: info.write_power,
-            created_at: info.created_at.clone(),
-            deleted_at: info.deleted_at.clone(),
-        })
+        .map(|(channel_id, info)| channel_info_dto(channel_id, info))
         .collect();
     // Sort by created_at ascending so #general (auto-created first in
     // Task 7's create_community extension) is always at the top of the
@@ -14730,6 +14775,8 @@ pub async fn create_community_inner<R: tauri::Runtime>(
             channel_id: default_channel_id,
             name: "general".to_string(),
             write_power: 0,
+            // ZEB-349: minted-community default channel is always Text.
+            kind: crate::community_membership::ChannelKind::Text,
         },
         actor: self_owner,
         at: default_channel_at.clone(),
@@ -22450,6 +22497,11 @@ pub struct ChannelInfoDto {
     pub channel_id: String,
     pub name: String,
     pub write_power: u8,
+    /// ZEB-349: channel kind as `"text"` | `"voice"`. **Always emitted**
+    /// (no `skip_serializing_if`) — this DTO is IPC-only with no pinned wire
+    /// fixture, and the frontend needs `kind` on every channel to route
+    /// text vs. voice. Mapped from the materialized `ChannelInfo.kind`.
+    pub kind: String,
     pub created_at: crate::owner_state_types::Hlc,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<crate::owner_state_types::Hlc>,
@@ -22600,6 +22652,13 @@ pub fn delta_to_channel_config_change(
             channel_id,
             name,
             write_power,
+            // ZEB-349: kind is intentionally NOT carried on the
+            // channel-config-updated event in V1. The frontend reads a
+            // channel's kind from the `list_channels` IPC (ChannelInfoDto.kind,
+            // always present), which it re-fetches on this event — so the event
+            // itself doesn't need it. A future slice may add it here only if an
+            // optimistic-update path needs the kind without a re-list.
+            kind: _,
         } => (
             hex::encode(channel_id.0),
             ChannelConfigChangeAction::Created,
@@ -33813,6 +33872,7 @@ mod create_channel_delta_tests {
                 channel_id: ch_id,
                 name: "general".into(),
                 write_power: 0,
+                kind: crate::community_membership::ChannelKind::Text,
             },
             actor,
             at: Hlc {
@@ -33903,6 +33963,7 @@ mod create_channel_delta_tests {
                 channel_id: ChannelId([0xAB; 16]),
                 name: "general".into(),
                 write_power: 0,
+                kind: crate::community_membership::ChannelKind::Text,
             },
             actor,
             at: Hlc {
@@ -33966,6 +34027,7 @@ mod create_channel_delta_tests {
                 channel_id: ChannelId([0xAB; 16]),
                 name: "general".into(),
                 write_power: 0,
+                kind: crate::community_membership::ChannelKind::Text,
             },
             actor: OwnerAddr([0x10; 16]),
             at: Hlc {
@@ -33993,6 +34055,105 @@ mod create_channel_delta_tests {
             captured_channel.lock().await[0].action,
             ChannelConfigChangeAction::Created
         );
+    }
+
+    // ── ZEB-349 Task 4: create_channel `kind` IPC param + ChannelInfoDto.kind ──
+
+    /// `create_channel`'s string→`ChannelKind` boundary parse:
+    /// `None`/`"text"` → Text, `"voice"` → Voice, anything else → Err
+    /// mentioning "kind". This is the load-bearing IPC-boundary slice;
+    /// the full `create_channel` command needs `tauri::State` + a running
+    /// node (covered end-to-end by the channel-config integration test),
+    /// so the parse is factored into `parse_channel_kind` and unit-tested
+    /// here.
+    #[test]
+    fn create_channel_parse_kind_maps_strings() {
+        use crate::community_membership::ChannelKind;
+        assert_eq!(parse_channel_kind(None).unwrap(), ChannelKind::Text);
+        assert_eq!(parse_channel_kind(Some("text")).unwrap(), ChannelKind::Text);
+        assert_eq!(
+            parse_channel_kind(Some("voice")).unwrap(),
+            ChannelKind::Voice
+        );
+    }
+
+    #[test]
+    fn create_channel_rejects_unknown_kind() {
+        let err = parse_channel_kind(Some("video")).expect_err("must reject unknown kind");
+        assert!(err.contains("kind"), "error should mention kind: {err}");
+        assert!(
+            err.contains("video"),
+            "error should echo the bad value: {err}"
+        );
+    }
+
+    /// `mint_channel_create_event` threads the real `ChannelKind` into the
+    /// minted `ChannelCreate` event (replacing the former temporary Text
+    /// hardcode). A Voice mint must carry `kind: Voice`.
+    #[test]
+    fn mint_channel_create_event_threads_voice_kind() {
+        use crate::community_membership::{ChannelId, ChannelKind, MembershipEventKind};
+        use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x07; 32]);
+        let hlc = Hlc {
+            wall_ms: 1_000,
+            logical: 0,
+            device_id: "d".into(),
+        };
+        let event = mint_channel_create_event(
+            SpaceId([0x37; 16]),
+            OwnerAddr([0x10; 16]),
+            ChannelId([0x42; 16]),
+            "hangout".into(),
+            0,
+            &signing_key,
+            hlc,
+            ChannelKind::Voice,
+        )
+        .expect("mint voice channel-create");
+        match event.kind {
+            MembershipEventKind::ChannelCreate { kind, .. } => {
+                assert_eq!(kind, ChannelKind::Voice, "minted kind must be threaded");
+            }
+            other => panic!("expected ChannelCreate, got {other:?}"),
+        }
+    }
+
+    /// `ChannelInfoDto` carries a `kind: String` ("text"|"voice"), always
+    /// emitted, mapped from the materialized `ChannelInfo.kind`.
+    #[test]
+    fn channel_info_dto_maps_kind() {
+        use crate::community_membership::{ChannelId, ChannelInfo, ChannelKind};
+        use crate::owner_state_types::Hlc;
+
+        let created_at = Hlc {
+            wall_ms: 1_000,
+            logical: 0,
+            device_id: "d".into(),
+        };
+        let voice = ChannelInfo {
+            name: "hangout".into(),
+            write_power: 0,
+            kind: ChannelKind::Voice,
+            created_at: created_at.clone(),
+            deleted_at: None,
+        };
+        let text = ChannelInfo {
+            name: "general".into(),
+            write_power: 0,
+            kind: ChannelKind::Text,
+            created_at,
+            deleted_at: None,
+        };
+        let dto_voice = channel_info_dto(&ChannelId([0x42; 16]), &voice);
+        let dto_text = channel_info_dto(&ChannelId([0x43; 16]), &text);
+        assert_eq!(dto_voice.kind, "voice");
+        assert_eq!(dto_text.kind, "text");
+
+        // Always emitted (not skipped): the serialized JSON carries `kind`.
+        let json = serde_json::to_value(&dto_text).expect("serialize dto");
+        assert_eq!(json.get("kind").and_then(|v| v.as_str()), Some("text"));
     }
 }
 

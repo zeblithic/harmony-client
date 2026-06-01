@@ -21,6 +21,7 @@ const baseChannel: ChannelInfo = {
   channelId: 'cc'.repeat(16),
   name: 'general',
   writePower: 0,
+  kind: 'text',
   createdAt: { wallMs: 100, logical: 0, deviceId: 'd1' },
 };
 

@@ -9,6 +9,7 @@
 
 use harmony_owner::certs::EnrollmentCert;
 use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
@@ -133,6 +134,12 @@ pub enum MembershipEventKind {
         name: String,
         #[serde(rename = "wp")]
         write_power: u8,
+        /// ZEB-349: channel kind (Text|Voice). `Text` is the default and is
+        /// omitted from the CBOR map (`skip_serializing_if`), so a Text
+        /// `ChannelCreate` stays byte-identical to pre-ZEB-349 wire; only a
+        /// Voice channel carries the extra `ck` map entry. Immutable once set.
+        #[serde(rename = "ck", default, skip_serializing_if = "ChannelKind::is_text")]
+        kind: ChannelKind,
     },
 
     /// Channel-config event: a mod-tier+ actor modifies an existing
@@ -310,6 +317,37 @@ use crate::owner_state_types::{Hlc, SpaceId};
 /// 16-byte ULID identifying a single signed membership event within
 /// a community's CRDT log. Generated client-side at event creation.
 pub type EventId = [u8; 16];
+
+/// The kind of a community channel. Serialized on the wire as a `u8` tag
+/// (`Text = 0`, `Voice = 1`). `Text` is the default and is **omitted** from
+/// the CBOR map by `skip_serializing_if = "ChannelKind::is_text"`, keeping a
+/// Text `ChannelCreate`/`ChannelInfo` byte-identical to pre-ZEB-349 wire.
+/// Voice channels are introduced by ZEB-349 (epic ZEB-348); kind is immutable
+/// once a channel is created.
+///
+/// `serde_repr` is load-bearing here (mirrors `Tier` in
+/// `community_voting_core.rs`): without it, the standard `#[derive(Serialize)]`
+/// would encode variants by NAME ("Voice"), not by the u8 discriminant the wire
+/// format mandates. `#[repr(u8)]` alone only affects Rust memory layout, not
+/// serde. `serde_repr` also rejects unknown discriminants on decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
+pub enum ChannelKind {
+    #[default]
+    Text = 0,
+    Voice = 1,
+}
+
+impl ChannelKind {
+    /// `skip_serializing_if` / default-omission predicate: Text is the default
+    /// and is never written to the CBOR map.
+    pub fn is_text(&self) -> bool {
+        matches!(self, ChannelKind::Text)
+    }
+}
+
+impl CanonicalPayloadSealed for ChannelKind {}
+impl CanonicalPayload for ChannelKind {}
 
 /// 16-byte ULID identifying a single channel within a community.
 /// Generated client-side at `ChannelCreate` time. Tuple-struct newtype
@@ -1470,6 +1508,14 @@ pub struct ChannelInfo {
     pub name: String,
     #[serde(rename = "wp")]
     pub write_power: u8,
+    /// ZEB-349: channel kind (Text|Voice). `Text` is the default and is omitted
+    /// from the CBOR map (`skip_serializing_if`), keeping a Text `ChannelInfo`
+    /// byte-identical to pre-ZEB-349 wire. `canonical_cbor_encode` (ciborium)
+    /// preserves serde field-declaration order, so a Voice `ck` entry is
+    /// emitted here between `wp` and `ca`. Immutable (set only by
+    /// `ChannelCreate`).
+    #[serde(rename = "ck", default, skip_serializing_if = "ChannelKind::is_text")]
+    pub kind: ChannelKind,
     #[serde(rename = "ca")]
     pub created_at: Hlc,
     #[serde(rename = "da", skip_serializing_if = "Option::is_none", default)]
@@ -1943,6 +1989,7 @@ pub fn materialize_with_now(
                 channel_id,
                 name,
                 write_power,
+                kind,
             } => {
                 // Idempotent on duplicate channel_id: first create wins
                 // (replays + reorderings under DAG-sync may deliver the
@@ -1951,11 +1998,14 @@ pub fn materialize_with_now(
                 // a duplicate-emit refresh created_at and reset history
                 // markers). A subsequent ChannelModify is the right path
                 // to update fields; a duplicate ChannelCreate is a no-op.
+                // `kind` is set here only (immutable — ChannelModify can't
+                // touch it).
                 m.channels
                     .entry(*channel_id)
                     .or_insert_with(|| ChannelInfo {
                         name: name.clone(),
                         write_power: *write_power,
+                        kind: *kind,
                         created_at: event.at.clone(),
                         deleted_at: None,
                     });
@@ -2993,6 +3043,10 @@ pub fn verify_event(
             channel_id: _,
             name,
             write_power,
+            // ZEB-349: kind needs no verification gate (any valid kind tag is
+            // accepted; immutability is enforced by ChannelModify lacking the
+            // field, not here).
+            kind: _,
         } => {
             if actor_power < POWER_THRESHOLDS.kick {
                 return Err(VerifyError::ChannelAdminInsufficientPower);
@@ -4099,6 +4153,38 @@ mod auto_exec_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_kind_defaults_to_text_and_reports_is_text() {
+        assert_eq!(ChannelKind::default(), ChannelKind::Text);
+        assert!(ChannelKind::Text.is_text());
+        assert!(!ChannelKind::Voice.is_text());
+    }
+
+    #[test]
+    fn channel_kind_serializes_as_cbor_u8() {
+        // serde_repr encodes each variant as its bare u8 discriminant:
+        // Text -> the single CBOR byte 0x00, Voice -> 0x01.
+        let text = crate::owner_state_crypto::canonical_cbor_encode(&ChannelKind::Text)
+            .expect("encode text");
+        assert_eq!(text, vec![0x00]);
+        let voice = crate::owner_state_crypto::canonical_cbor_encode(&ChannelKind::Voice)
+            .expect("encode voice");
+        assert_eq!(voice, vec![0x01]);
+        // Both round-trip back through ciborium decode.
+        let text_back: ChannelKind = ciborium::de::from_reader(&text[..]).expect("decode text");
+        assert_eq!(text_back, ChannelKind::Text);
+        let voice_back: ChannelKind = ciborium::de::from_reader(&voice[..]).expect("decode voice");
+        assert_eq!(voice_back, ChannelKind::Voice);
+    }
+
+    #[test]
+    fn channel_kind_cbor_unknown_tag_is_rejected() {
+        // serde_repr rejects unknown discriminants on decode: 0x02 is neither
+        // Text (0) nor Voice (1), so it must fail rather than silently default.
+        let result: Result<ChannelKind, _> = ciborium::de::from_reader(&[0x02u8][..]);
+        assert!(result.is_err(), "tag 2 must be rejected");
+    }
 
     fn make_kick_event(
         id_byte: u8,
@@ -5543,6 +5629,7 @@ mod tests {
                 channel_id,
                 name: "test".into(),
                 write_power: 0,
+                kind: ChannelKind::Text,
             },
             MembershipEventKind::ChannelModify {
                 channel_id,

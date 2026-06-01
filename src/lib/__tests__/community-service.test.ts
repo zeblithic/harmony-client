@@ -216,7 +216,7 @@ describe('CommunityService', () => {
     expect(adapter.listeners.has('channel-config-updated')).toBe(true);
   });
 
-  it('createChannel invokes create_channel with camelCase args', async () => {
+  it('createChannel invokes create_channel with camelCase args (defaults kind to text)', async () => {
     await service.connectAdapter(adapter);
     (adapter.invoke as any).mockResolvedValue('cc'.repeat(16));
     const id = await service.createChannel('aa'.repeat(16), 'announcements', 0);
@@ -224,8 +224,21 @@ describe('CommunityService', () => {
       communityId: 'aa'.repeat(16),
       name: 'announcements',
       writePower: 0,
+      kind: 'text',
     });
     expect(id).toBe('cc'.repeat(16));
+  });
+
+  it('createChannel passes kind through to the IPC', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue('cc'.repeat(16));
+    await service.createChannel('aa'.repeat(16), 'hangout', 0, 'voice');
+    expect(adapter.invoke).toHaveBeenCalledWith('create_channel', {
+      communityId: 'aa'.repeat(16),
+      name: 'hangout',
+      writePower: 0,
+      kind: 'voice',
+    });
   });
 
   it('modifyChannel forwards both name and writePower', async () => {
@@ -269,6 +282,7 @@ describe('CommunityService', () => {
         channelId: 'cc'.repeat(16),
         name: 'general',
         writePower: 0,
+        kind: 'text',
         createdAt: { wallMs: 1, logical: 0, deviceId: 'd' },
       },
     ];

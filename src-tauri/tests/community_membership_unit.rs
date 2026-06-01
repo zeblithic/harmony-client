@@ -1,7 +1,7 @@
 //! Unit-style integration tests for community_membership.rs.
 //! Phase 1 (ZEB-217 Sub-C) — types, materialization, verification.
 
-use harmony_app::community_membership::{ChannelId, MembershipEventKind};
+use harmony_app::community_membership::{ChannelId, ChannelKind, MembershipEventKind};
 use harmony_app::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
 use harmony_app::owner_state_types::OwnerAddr;
 
@@ -26,6 +26,7 @@ fn membership_event_kind_round_trips_all_variants() {
             channel_id: ChannelId([0xAB; 16]),
             name: "general".to_string(),
             write_power: 0,
+            kind: ChannelKind::Text,
         },
         MembershipEventKind::ChannelModify {
             channel_id: ChannelId([0xAB; 16]),
@@ -2751,6 +2752,7 @@ fn materialize_channel_create_adds_to_map() {
             channel_id: ch_id,
             name: "general".to_string(),
             write_power: 0,
+            kind: ChannelKind::Text,
         },
         actor: admin,
         at: Hlc {
@@ -2801,6 +2803,7 @@ fn materialize_channel_create_duplicate_is_first_wins_idempotent() {
             channel_id: ch_id,
             name: "first".to_string(),
             write_power: 0,
+            kind: ChannelKind::Text,
         },
         actor: admin,
         at: Hlc {
@@ -2819,6 +2822,7 @@ fn materialize_channel_create_duplicate_is_first_wins_idempotent() {
             channel_id: ch_id, // same channel_id
             name: "second".to_string(),
             write_power: 50,
+            kind: ChannelKind::Text,
         },
         actor: admin,
         at: Hlc {
@@ -2866,6 +2870,7 @@ fn materialize_channel_modify_partial_update_preserves_unmodified_field() {
             channel_id: ch_id,
             name: "general".to_string(),
             write_power: 0,
+            kind: ChannelKind::Text,
         },
         actor: admin,
         at: Hlc {
@@ -2906,6 +2911,142 @@ fn materialize_channel_modify_partial_update_preserves_unmodified_field() {
 }
 
 #[test]
+fn materialize_channel_create_records_kind() {
+    // A Voice ChannelCreate materializes ChannelInfo.kind == Voice; a Text
+    // (default) ChannelCreate materializes kind == Text. (ZEB-349.)
+    let admin = OwnerAddr([0x10; 16]);
+    let admin_join = SignedMembershipEvent {
+        id: [0x01; 16],
+        community_id: SpaceId([0x37; 16]),
+        kind: MembershipEventKind::Join,
+        actor: admin,
+        at: Hlc {
+            wall_ms: 1_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+        sig: [0; 64],
+        countersig: None,
+        enrollment: None,
+    };
+    let ch_voice = ChannelId([0x42; 16]);
+    let voice_create = SignedMembershipEvent {
+        id: [0x02; 16],
+        community_id: SpaceId([0x37; 16]),
+        kind: MembershipEventKind::ChannelCreate {
+            channel_id: ch_voice,
+            name: "hangout".to_string(),
+            write_power: 0,
+            kind: ChannelKind::Voice,
+        },
+        actor: admin,
+        at: Hlc {
+            wall_ms: 2_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+        sig: [0; 64],
+        countersig: None,
+        enrollment: None,
+    };
+    let ch_text = ChannelId([0x43; 16]);
+    let text_create = SignedMembershipEvent {
+        id: [0x03; 16],
+        community_id: SpaceId([0x37; 16]),
+        kind: MembershipEventKind::ChannelCreate {
+            channel_id: ch_text,
+            name: "general".to_string(),
+            write_power: 0,
+            kind: ChannelKind::Text,
+        },
+        actor: admin,
+        at: Hlc {
+            wall_ms: 3_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+        sig: [0; 64],
+        countersig: None,
+        enrollment: None,
+    };
+
+    let m = materialize(&[admin_join, voice_create, text_create], admin);
+    assert_eq!(
+        m.channels.get(&ch_voice).expect("voice channel").kind,
+        ChannelKind::Voice
+    );
+    assert_eq!(
+        m.channels.get(&ch_text).expect("text channel").kind,
+        ChannelKind::Text
+    );
+}
+
+#[test]
+fn channel_modify_cannot_change_kind() {
+    // Invariant: kind is immutable. ChannelModify has no kind field, so a
+    // modify on a Voice channel leaves kind == Voice. (ZEB-349.)
+    let admin = OwnerAddr([0x10; 16]);
+    let admin_join = SignedMembershipEvent {
+        id: [0x01; 16],
+        community_id: SpaceId([0x37; 16]),
+        kind: MembershipEventKind::Join,
+        actor: admin,
+        at: Hlc {
+            wall_ms: 1_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+        sig: [0; 64],
+        countersig: None,
+        enrollment: None,
+    };
+    let ch_id = ChannelId([0x42; 16]);
+    let voice_create = SignedMembershipEvent {
+        id: [0x02; 16],
+        community_id: SpaceId([0x37; 16]),
+        kind: MembershipEventKind::ChannelCreate {
+            channel_id: ch_id,
+            name: "hangout".to_string(),
+            write_power: 0,
+            kind: ChannelKind::Voice,
+        },
+        actor: admin,
+        at: Hlc {
+            wall_ms: 2_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+        sig: [0; 64],
+        countersig: None,
+        enrollment: None,
+    };
+    let modify = SignedMembershipEvent {
+        id: [0x03; 16],
+        community_id: SpaceId([0x37; 16]),
+        kind: MembershipEventKind::ChannelModify {
+            channel_id: ch_id,
+            name: Some("renamed".to_string()),
+            write_power: Some(50),
+        },
+        actor: admin,
+        at: Hlc {
+            wall_ms: 3_000,
+            logical: 0,
+            device_id: "a".into(),
+        },
+        sig: [0; 64],
+        countersig: None,
+        enrollment: None,
+    };
+
+    let m = materialize(&[admin_join, voice_create, modify], admin);
+    let info = m.channels.get(&ch_id).expect("channel still present");
+    assert_eq!(info.name, "renamed");
+    assert_eq!(info.write_power, 50);
+    assert_eq!(info.kind, ChannelKind::Voice, "kind must be immutable");
+}
+
+#[test]
 fn materialize_channel_delete_tombstones_in_place() {
     let admin = OwnerAddr([0x10; 16]);
     let admin_join = SignedMembershipEvent {
@@ -2930,6 +3071,7 @@ fn materialize_channel_delete_tombstones_in_place() {
             channel_id: ch_id,
             name: "general".to_string(),
             write_power: 0,
+            kind: ChannelKind::Text,
         },
         actor: admin,
         at: Hlc {
@@ -3045,6 +3187,7 @@ fn verify_event_channel_create_succeeds_for_admin_at_bootstrap_power() {
             channel_id: ChannelId([0xAB; 16]),
             name: "general".to_string(),
             write_power: 0,
+            kind: ChannelKind::Text,
         },
         actor: admin_addr,
         at: Hlc {
@@ -3108,6 +3251,7 @@ fn verify_event_channel_create_rejects_below_mod_power() {
             channel_id: ChannelId([0xAB; 16]),
             name: "spam-channel".to_string(),
             write_power: 0,
+            kind: ChannelKind::Text,
         },
         actor: sub_addr,
         at: Hlc {
@@ -3189,6 +3333,7 @@ fn verify_event_channel_create_accepts_at_kick_threshold() {
             channel_id: ChannelId([0xAB; 16]),
             name: "mods-channel".to_string(),
             write_power: 0,
+            kind: ChannelKind::Text,
         },
         actor: mod_addr,
         at: Hlc {
@@ -3256,6 +3401,7 @@ fn admin_with_channel_prior_state(
             channel_id: ch_id,
             name: ch_name.to_string(),
             write_power: 0,
+            kind: ChannelKind::Text,
         },
         actor: admin_addr,
         at: Hlc {
@@ -3294,6 +3440,7 @@ fn verify_event_channel_create_rejects_empty_name() {
             channel_id: ChannelId([0xAB; 16]),
             name: "   ".to_string(),
             write_power: 0,
+            kind: ChannelKind::Text,
         },
         actor: admin_addr,
         at: Hlc {
@@ -3342,6 +3489,7 @@ fn verify_event_channel_create_rejects_oversized_name() {
             channel_id: ChannelId([0xAB; 16]),
             name: oversized,
             write_power: 0,
+            kind: ChannelKind::Text,
         },
         actor: admin_addr,
         at: Hlc {
@@ -3389,6 +3537,7 @@ fn verify_event_channel_create_rejects_write_power_above_max() {
             channel_id: ChannelId([0xAB; 16]),
             name: "general".to_string(),
             write_power: 200,
+            kind: ChannelKind::Text,
         },
         actor: admin_addr,
         at: Hlc {
@@ -3524,6 +3673,7 @@ fn verify_event_channel_delete_allows_already_tombstoned_for_replica_convergence
             channel_id: ch_id,
             name: "general".to_string(),
             write_power: 0,
+            kind: ChannelKind::Text,
         },
         actor: admin_addr,
         at: Hlc {
@@ -3604,6 +3754,7 @@ fn verify_event_channel_modify_allows_value_matching_for_replica_convergence() {
             channel_id: ch_id,
             name: "general".to_string(),
             write_power: 0,
+            kind: ChannelKind::Text,
         },
         actor: admin_addr,
         at: Hlc {
@@ -3672,6 +3823,7 @@ fn verify_event_channel_modify_accepts_partial_change() {
             channel_id: ch_id,
             name: "general".to_string(),
             write_power: 0,
+            kind: ChannelKind::Text,
         },
         actor: admin_addr,
         at: Hlc {
@@ -3789,6 +3941,7 @@ fn verify_event_channel_create_allows_duplicate_channel_id_for_replica_convergen
             channel_id: ch_id,
             name: "first".to_string(),
             write_power: 0,
+            kind: ChannelKind::Text,
         },
         actor: admin_addr,
         at: Hlc {
@@ -3810,6 +3963,7 @@ fn verify_event_channel_create_allows_duplicate_channel_id_for_replica_convergen
             channel_id: ch_id,
             name: "second".to_string(),
             write_power: 50,
+            kind: ChannelKind::Text,
         },
         actor: admin_addr,
         at: Hlc {

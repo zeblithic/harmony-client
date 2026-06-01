@@ -37,6 +37,9 @@ export interface ChannelInfo {
   channelId: string;
   name: string;
   writePower: number;
+  /** ZEB-349: channel kind. The Rust `ChannelInfoDto` always emits this
+   *  as the camelCase string "text" | "voice", so it is required. */
+  kind: 'text' | 'voice';
   createdAt: { wallMs: number; logical: number; deviceId: string };
   deletedAt?: { wallMs: number; logical: number; deviceId: string };
 }
@@ -57,6 +60,10 @@ export interface PreForkSnapshotDto {
  *  shape is the literal strings 'created' | 'modified' | 'deleted'. */
 export type ChannelConfigAction = 'created' | 'modified' | 'deleted';
 
+/** Mirrors `ChannelConfigChangedPayload` in src-tauri/src/lib.rs.
+ *  Note (ZEB-349): `kind` is intentionally NOT on this event — consumers
+ *  re-fetch `list_channels` (whose `ChannelInfo.kind` is always present) on
+ *  a config change, so the event itself doesn't carry it. */
 interface ChannelConfigChangedPayload {
   communityId: string;
   channelId: string;
@@ -273,11 +280,13 @@ export class CommunityService {
     communityId: string,
     name: string,
     writePower: number,
+    kind: 'text' | 'voice' = 'text',
   ): Promise<string> {
     return this.invoke<string>('create_channel', {
       communityId,
       name,
       writePower,
+      kind,
     });
   }
 

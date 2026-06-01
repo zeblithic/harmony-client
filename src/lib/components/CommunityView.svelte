@@ -7,6 +7,7 @@
   import type { NavService } from '../nav-service';
   import ChannelSubSidebar from './ChannelSubSidebar.svelte';
   import ChannelMessageFeed from './ChannelMessageFeed.svelte';
+  import VoiceChannelView from './VoiceChannelView.svelte';
   import ChannelMembersPanel from './ChannelMembersPanel.svelte';
   import CommunityMembersPanel from './CommunityMembersPanel.svelte';
   import CreateChannelDialog from './CreateChannelDialog.svelte';
@@ -397,20 +398,24 @@
         communityMembers={members}
       />
     {:else if activeChannel}
-      <ChannelMessageFeed
-        {communityId}
-        channelId={activeChannel.channelId}
-        channelName={activeChannel.name}
-        {channelMessageService}
-        {votingAdapter}
-        {ownAddress}
-        {myPower}
-        snapshotMessages={preForkSnapshot?.channelLog?.[activeChannel.channelId] ?? []}
-        originalCommunityName={preForkSnapshot?.originalCommunityName ?? ''}
-        forkedAtMs={preForkSnapshot?.forkedAtMs ?? 0}
-        {resolveCard}
-        {onOpenCard}
-      />
+      {#if activeChannel.kind === 'voice'}
+        <VoiceChannelView channelName={activeChannel.name} />
+      {:else}
+        <ChannelMessageFeed
+          {communityId}
+          channelId={activeChannel.channelId}
+          channelName={activeChannel.name}
+          {channelMessageService}
+          {votingAdapter}
+          {ownAddress}
+          {myPower}
+          snapshotMessages={preForkSnapshot?.channelLog?.[activeChannel.channelId] ?? []}
+          originalCommunityName={preForkSnapshot?.originalCommunityName ?? ''}
+          forkedAtMs={preForkSnapshot?.forkedAtMs ?? 0}
+          {resolveCard}
+          {onOpenCard}
+        />
+      {/if}
     {:else}
       <div class="empty-channels">
         <p>No channels in this community yet.</p>

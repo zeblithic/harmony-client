@@ -20,6 +20,7 @@
   } = $props();
 
   let name = $state('');
+  let kind = $state<'text' | 'voice'>('text'); // ZEB-349: Text|Voice channel kind
   let writePower = $state(0); // v2 always 0; the slider+number pair below is hidden behind `// v3 unhide`
   let submitting = $state(false);
   let error = $state<string | null>(null);
@@ -40,16 +41,33 @@
     }
   });
 
+  // ZEB-349: the dialog instance stays mounted in CommunityView (only `open`
+  // toggles the inner Modal), so component state survives a close. Reset the
+  // form on each open (edge-detected) so a canceled Voice selection — or a
+  // stale name — never carries into the next open and creates the wrong kind.
+  let wasOpen = false;
+  $effect(() => {
+    if (open && !wasOpen) {
+      name = '';
+      kind = 'text';
+      writePower = 0;
+      error = null;
+      submitting = false;
+    }
+    wasOpen = open;
+  });
+
   async function handleSubmit(e?: Event) {
     e?.preventDefault();
     if (!canSubmit) return;
     submitting = true;
     error = null;
     try {
-      const channelId = await communityService.createChannel(communityId, trimmed, writePower);
+      const channelId = await communityService.createChannel(communityId, trimmed, writePower, kind);
       onCreated(channelId);
       // Reset for next open; the modal's open=false from the parent is what unmounts.
       name = '';
+      kind = 'text';
       writePower = 0;
       onClose();
     } catch (e) {
@@ -64,6 +82,29 @@
   <Modal canCancel={!submitting} ariaLabelledby={titleId} onCancel={onClose}>
     <h3 class="dialog-title" id={titleId}>New channel</h3>
     <form onsubmit={handleSubmit}>
+      <div class="kind-selector" role="group" aria-label="Channel type">
+        <button
+          type="button"
+          class="kind-option"
+          class:selected={kind === 'text'}
+          aria-pressed={kind === 'text'}
+          disabled={submitting}
+          onclick={() => (kind = 'text')}
+        >
+          <span aria-hidden="true">#</span> Text
+        </button>
+        <button
+          type="button"
+          class="kind-option"
+          class:selected={kind === 'voice'}
+          aria-pressed={kind === 'voice'}
+          disabled={submitting}
+          onclick={() => (kind = 'voice')}
+        >
+          <span aria-hidden="true">🔊</span> Voice
+        </button>
+      </div>
+
       <label for="channel-name-input" class="sr-only">Channel name</label>
       <input
         id="channel-name-input"
@@ -122,6 +163,20 @@
     position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
     overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
   }
+  .kind-selector {
+    display: flex; gap: 0; margin-bottom: 16px;
+    border: 1px solid var(--border); border-radius: 4px; overflow: hidden;
+  }
+  .kind-option {
+    flex: 1; padding: 8px 12px; background: var(--bg-tertiary);
+    border: none; color: var(--text-secondary); font-size: 0.85rem;
+    cursor: pointer;
+  }
+  .kind-option + .kind-option { border-left: 1px solid var(--border); }
+  .kind-option:hover:not(:disabled) { color: var(--text-primary); }
+  .kind-option.selected { background: var(--accent); color: var(--text-primary); }
+  .kind-option:disabled { opacity: 0.5; cursor: not-allowed; }
+  .kind-option:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
   .name-input {
     width: 100%; padding: 8px 12px; background: var(--bg-tertiary);
     border: 1px solid var(--border); border-radius: 4px;

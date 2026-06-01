@@ -9,7 +9,7 @@ use harmony_app::community_invite::{
     CommunityInvitePayload, InviteEpochSnapshot, InviteToken, MaterializedCommunityState,
 };
 use harmony_app::community_membership::{
-    ChannelId, CounterSignature, MembershipEventKind, SignedMembershipEvent,
+    ChannelId, ChannelKind, CounterSignature, MembershipEventKind, SignedMembershipEvent,
 };
 use harmony_app::owner_state_crypto::canonical_cbor_encode;
 use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
@@ -423,6 +423,10 @@ fn signed_event_channel_create_wire_bytes_pinned() {
         channel_id: ch_id,
         name: "general".to_string(),
         write_power: 0,
+        // ZEB-349: an explicit Text kind MUST serialize byte-identically to the
+        // pre-ZEB-349 wire (kind is skipped when Text). The original pinned hex
+        // below is the byte-identity proof — it is unchanged.
+        kind: ChannelKind::Text,
     });
     let bytes = canonical_cbor_encode(&event).expect("encode");
     let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
@@ -432,6 +436,59 @@ fn signed_event_channel_create_wire_bytes_pinned() {
         "a662696450424242424242424242424242424242426263695037373737373737373737373737373737626b6ea2627467616362766ca36263685042424242424242424242424242424242626e6d6767656e6572616c627770006261635011111111111111111111111111111111626174a361771b0000018bcfe56800616c006164636669786273675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "ChannelCreate wire format changed"
     );
+}
+
+#[test]
+fn signed_event_channel_create_voice_wire_bytes_pinned() {
+    // ZEB-349: a Voice ChannelCreate differs from the Text fixture above (whose
+    // hex is byte-identical to pre-ZEB-349 wire) by exactly the added `ck`->0x01
+    // map entry: the inner `c`-payload map header bumps from a3 (ch, nm, wp) to
+    // a4 (ch, nm, wp, ck) and `62636b01` (b"ck" -> 0x01) is appended after `wp`.
+    // (ciborium preserves serde field-declaration order, so `ck` lands last.)
+    let ch_id = ChannelId([0x42; 16]);
+    let event = fixture_signed_event(MembershipEventKind::ChannelCreate {
+        channel_id: ch_id,
+        name: "general".to_string(),
+        write_power: 0,
+        kind: ChannelKind::Voice,
+    });
+    let bytes = canonical_cbor_encode(&event).expect("encode");
+    let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    assert_eq!(
+        hex,
+        "a662696450424242424242424242424242424242426263695037373737373737373737373737373737626b6ea2627467616362766ca46263685042424242424242424242424242424242626e6d6767656e6572616c6277700062636b016261635011111111111111111111111111111111626174a361771b0000018bcfe56800616c006164636669786273675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "Voice ChannelCreate wire format changed"
+    );
+}
+
+/// ZEB-349 back-compat: a pre-ZEB-349 `ChannelCreate` carries no `ck` key
+/// (the field did not exist). Such bytes MUST still decode, with `kind`
+/// defaulting to `ChannelKind::Text` (the `default` serde attr's job).
+///
+/// Mirrors `signed_event_join_certless_back_compat_decodes` (ZEB-339): pin the
+/// pre-feature hex (here, the same bytes asserted by
+/// `signed_event_channel_create_wire_bytes_pinned`, which is byte-identical to
+/// pre-ZEB-349 Text wire), decode it, and assert the new field defaults.
+#[test]
+fn signed_event_channel_create_back_compat_decodes_text_default() {
+    use harmony_app::community_membership::SignedMembershipEvent;
+    use harmony_app::owner_state_crypto::canonical_cbor_decode;
+
+    // Identical to the hex asserted by signed_event_channel_create_wire_bytes_pinned.
+    // These bytes predate ZEB-349 (no `ck` key in the inner ChannelCreate map).
+    let pre_zeb349_text_hex = "a662696450424242424242424242424242424242426263695037373737373737373737373737373737626b6ea2627467616362766ca36263685042424242424242424242424242424242626e6d6767656e6572616c627770006261635011111111111111111111111111111111626174a361771b0000018bcfe56800616c006164636669786273675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let bytes = hex::decode(pre_zeb349_text_hex).expect("decode hex");
+    let event: SignedMembershipEvent = canonical_cbor_decode(&bytes).expect("back-compat decode");
+    match event.kind {
+        MembershipEventKind::ChannelCreate { kind, .. } => {
+            assert_eq!(
+                kind,
+                ChannelKind::Text,
+                "pre-ZEB-349 ChannelCreate without `ck` key must decode with kind=Text"
+            );
+        }
+        other => panic!("expected ChannelCreate, got {other:?}"),
+    }
 }
 
 #[test]

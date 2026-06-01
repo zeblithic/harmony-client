@@ -30,13 +30,22 @@ const general = {
   channelId: '01'.repeat(16),
   name: 'general',
   writePower: 0,
+  kind: 'text',
   createdAt: { wallMs: 100, logical: 0, deviceId: 'd' },
 };
 const announcements = {
   channelId: '02'.repeat(16),
   name: 'announcements',
   writePower: 50,
+  kind: 'text',
   createdAt: { wallMs: 200, logical: 0, deviceId: 'd' },
+};
+const voiceLounge = {
+  channelId: '04'.repeat(16),
+  name: 'lounge',
+  writePower: 0,
+  kind: 'voice',
+  createdAt: { wallMs: 400, logical: 0, deviceId: 'd' },
 };
 
 async function setup(channelList: any[] = [general, announcements], propOverrides: Record<string, unknown> = {}) {
@@ -90,6 +99,25 @@ describe('CommunityView', () => {
       const active = container.querySelector('.channel-item.active');
       expect(active?.querySelector('.channel-name')?.textContent?.trim()).toBe('general');
     });
+  });
+
+  it('routes a voice channel to VoiceChannelView (not the message feed)', async () => {
+    const { container } = await setup([voiceLounge]);
+    await waitFor(() => {
+      // The voice scaffold mounts instead of ChannelMessageFeed.
+      expect(container.querySelector('.voice-channel')).toBeTruthy();
+    });
+    expect(container.querySelector('.channel-message-feed')).toBeNull();
+    const join = container.querySelector('.voice-join') as HTMLButtonElement;
+    expect(join?.disabled).toBe(true);
+  });
+
+  it('keeps a text channel on ChannelMessageFeed', async () => {
+    const { container } = await setup([general]);
+    await waitFor(() => {
+      expect(container.querySelector('.channel-message-feed')).toBeTruthy();
+    });
+    expect(container.querySelector('.voice-channel')).toBeNull();
   });
 
   it('clicking ⚙️ opens CommunitySettingsPanel modal', async () => {

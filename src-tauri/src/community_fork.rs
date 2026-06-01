@@ -607,6 +607,10 @@ pub async fn fork_community(
             channel_id: default_channel_id,
             name: "general".to_string(),
             write_power: 0,
+            // ZEB-349: fork default channel is always Text. (Voice channels are
+            // member-created via create_channel; a later slice wires the real
+            // value through the IPC.)
+            kind: crate::community_membership::ChannelKind::Text,
         },
         actor: self_owner,
         at: default_channel_at,

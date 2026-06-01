@@ -7,19 +7,29 @@ const general: ChannelInfo = {
   channelId: '01'.repeat(16),
   name: 'general',
   writePower: 0,
+  kind: 'text',
   createdAt: { wallMs: 100, logical: 0, deviceId: 'd1' },
 };
 const announcements: ChannelInfo = {
   channelId: '02'.repeat(16),
   name: 'announcements',
   writePower: 50,
+  kind: 'text',
   createdAt: { wallMs: 200, logical: 0, deviceId: 'd1' },
 };
 const devTalk: ChannelInfo = {
   channelId: '03'.repeat(16),
   name: 'dev-talk',
   writePower: 0,
+  kind: 'text',
   createdAt: { wallMs: 300, logical: 0, deviceId: 'd1' },
+};
+const voiceLounge: ChannelInfo = {
+  channelId: '04'.repeat(16),
+  name: 'lounge',
+  writePower: 0,
+  kind: 'voice',
+  createdAt: { wallMs: 400, logical: 0, deviceId: 'd1' },
 };
 
 const baseProps = {
@@ -33,6 +43,16 @@ const baseProps = {
 };
 
 describe('ChannelSubSidebar', () => {
+  it('renders a speaker glyph for voice channels and # for text', () => {
+    const { getByText } = render(ChannelSubSidebar, {
+      props: { ...baseProps, channels: [general, voiceLounge] },
+    });
+    expect(getByText('lounge').closest('button')?.textContent).toContain('🔊');
+    expect(getByText('general').closest('button')?.textContent).toContain('#');
+    // The voice row must NOT show the text hash, and vice versa.
+    expect(getByText('lounge').closest('button')?.textContent).not.toContain('#');
+  });
+
   it('renders all channels in the order received (parent guarantees oldest-first)', () => {
     const { container } = render(ChannelSubSidebar, { props: baseProps });
     const items = Array.from(container.querySelectorAll('.channel-item .channel-name'))

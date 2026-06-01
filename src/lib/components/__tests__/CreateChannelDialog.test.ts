@@ -68,21 +68,80 @@ describe('CreateChannelDialog', () => {
     expect(submit.disabled).toBe(true);
   });
 
-  it('submit invokes createChannel with name + writePower=0 (v2 default)', async () => {
+  it('submit invokes createChannel with name + writePower=0 + kind=text (v2 default)', async () => {
     const { getByPlaceholderText, getByRole, adapter, props } = await setupDialog();
     (adapter.invoke as any).mockResolvedValue('cc'.repeat(16));
     const input = getByPlaceholderText(/Channel name/i) as HTMLInputElement;
     await fireEvent.input(input, { target: { value: 'announcements' } });
-    await fireEvent.click(getByRole('button', { name: /Create/i }));
+    await fireEvent.click(getByRole('button', { name: /^Create/i }));
     await waitFor(() => {
       expect(adapter.invoke).toHaveBeenCalledWith('create_channel', {
         communityId: 'aa'.repeat(16),
         name: 'announcements',
         writePower: 0,
+        kind: 'text',
       });
     });
     expect(props.onCreated).toHaveBeenCalledWith('cc'.repeat(16));
     expect(props.onClose).toHaveBeenCalled();
+  });
+
+  it('creates a voice channel when Voice is selected', async () => {
+    const { getByPlaceholderText, getByRole, adapter } = await setupDialog();
+    (adapter.invoke as any).mockResolvedValue('dd'.repeat(16));
+    await fireEvent.click(getByRole('button', { name: /voice/i }));
+    await fireEvent.input(getByPlaceholderText(/Channel name/i), {
+      target: { value: 'hangout' },
+    });
+    await fireEvent.click(getByRole('button', { name: /^Create/i }));
+    await waitFor(() => {
+      expect(adapter.invoke).toHaveBeenCalledWith('create_channel', {
+        communityId: 'aa'.repeat(16),
+        name: 'hangout',
+        writePower: 0,
+        kind: 'voice',
+      });
+    });
+  });
+
+  it('defaults to a text channel', async () => {
+    const { getByPlaceholderText, getByRole, adapter } = await setupDialog();
+    (adapter.invoke as any).mockResolvedValue('ee'.repeat(16));
+    await fireEvent.input(getByPlaceholderText(/Channel name/i), {
+      target: { value: 'general' },
+    });
+    await fireEvent.click(getByRole('button', { name: /^Create/i }));
+    await waitFor(() => {
+      expect(adapter.invoke).toHaveBeenCalledWith('create_channel', {
+        communityId: 'aa'.repeat(16),
+        name: 'general',
+        writePower: 0,
+        kind: 'text',
+      });
+    });
+  });
+
+  it('Voice/Text toggle reflects selection via aria-pressed', async () => {
+    const { getByRole } = await setupDialog();
+    const textBtn = getByRole('button', { name: /text/i });
+    const voiceBtn = getByRole('button', { name: /voice/i });
+    expect(textBtn.getAttribute('aria-pressed')).toBe('true');
+    expect(voiceBtn.getAttribute('aria-pressed')).toBe('false');
+    await fireEvent.click(voiceBtn);
+    expect(textBtn.getAttribute('aria-pressed')).toBe('false');
+    expect(voiceBtn.getAttribute('aria-pressed')).toBe('true');
+  });
+
+  it('resets kind to text when reopened after selecting Voice (mounted instance)', async () => {
+    const { getByRole, rerender, props } = await setupDialog();
+    await fireEvent.click(getByRole('button', { name: /voice/i }));
+    expect(getByRole('button', { name: /voice/i }).getAttribute('aria-pressed')).toBe('true');
+    // The dialog instance stays mounted; only `open` toggles. Closing then
+    // reopening must reset the kind selection (regression: Qodo "kind not reset on cancel").
+    await rerender({ ...props, open: false });
+    await rerender({ ...props, open: true });
+    expect(getByRole('button', { name: /text/i }).getAttribute('aria-pressed')).toBe('true');
+    expect(getByRole('button', { name: /voice/i }).getAttribute('aria-pressed')).toBe('false');
   });
 
   it('shows inline error when createChannel rejects', async () => {
