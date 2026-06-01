@@ -2584,6 +2584,19 @@ pub async fn run<R: Runtime>(
                             let mut g = voice_presence_map.lock().await;
                             g.remove_channel(&community_id, &channel_id);
                         }
+                        // After remove_channel the roster for this channel is
+                        // empty, so emit the now-empty roster once. Without
+                        // this, a UI listening on `voice-presence-changed`
+                        // keeps showing participants for the channel we left
+                        // until some unrelated update fires (final-review fix).
+                        let _ = app.emit(
+                            "voice-presence-changed",
+                            serde_json::json!({
+                                "community": hex::encode(community_id.0),
+                                "channel": hex::encode(channel_id.0),
+                                "roster": Vec::<crate::voice_presence::RosterEntry>::new(),
+                            }),
+                        );
                     }
                 }
             }

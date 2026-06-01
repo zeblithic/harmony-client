@@ -203,16 +203,42 @@ impl VoicePresenceMap {
         now_ms: u64,
     ) -> bool {
         let chan = self.inner.entry((*c, *ch)).or_default();
+        // Freshness is keyed PRIMARILY on `joined_hlc` (the signed join-session
+        // identifier), with `seq` only the tiebreak WITHIN a session.
+        // `spawn_voice_presence_publisher` restarts `seq` at 0 on every
+        // (re)join, so a seq-primary rule rejects the new session's beacons as
+        // stale until the 12 s TTL evicts the old higher-seq entry — breaking
+        // roster convergence on exactly the rejoin / key-rotation path. Keying
+        // on `joined_hlc` lets a newer session supersede regardless of seq.
         if beacon.left {
+            // Only honour a tombstone if it is NOT from a strictly-older
+            // session than what we hold: a delayed old-session tombstone must
+            // not evict a freshly-rejoined entry.
+            if let Some(e) = chan.get(&beacon.device) {
+                if e.joined_hlc.is_strictly_newer_than(&beacon.joined_hlc) {
+                    return false;
+                }
+            }
             return chan.remove(&beacon.device).is_some();
         }
         match chan.get_mut(&beacon.device) {
-            Some(e) if beacon.seq <= e.seq => false, // stale or duplicate
+            Some(e) if beacon.joined_hlc.is_strictly_newer_than(&e.joined_hlc) => {
+                // A NEW join session supersedes regardless of seq (seq restarts
+                // at 0 on rejoin).
+                e.owner = beacon.owner;
+                e.muted = beacon.muted;
+                e.seq = beacon.seq;
+                e.joined_hlc = beacon.joined_hlc.clone();
+                e.last_seen_ms = now_ms;
+                true
+            }
+            Some(e) if e.joined_hlc.is_strictly_newer_than(&beacon.joined_hlc) => false, // older session → stale
+            Some(e) if beacon.seq <= e.seq => false, // same session, stale or duplicate seq
             Some(e) => {
+                // Same session, newer seq. `joined_hlc` is unchanged.
                 e.muted = beacon.muted;
                 e.seq = beacon.seq;
                 e.last_seen_ms = now_ms;
-                e.joined_hlc = beacon.joined_hlc.clone();
                 // A newer beacon always advances liveness (last_seen), which is
                 // itself a roster-relevant change for the heartbeat/emit cadence
                 // — so any seq advance reports `true`. The call site may
@@ -575,6 +601,43 @@ mod map_tests {
     const CH: ChannelId = ChannelId([0xc1; 16]);
     const TTL_MS: u64 = 12_000;
 
+    // Two HLCs where H2 is strictly newer than H1 (later wall clock). Used to
+    // model distinct join sessions in the rejoin-convergence tests.
+    fn h1() -> Hlc {
+        Hlc {
+            wall_ms: 1000,
+            logical: 0,
+            device_id: "d".into(),
+        }
+    }
+    fn h2() -> Hlc {
+        Hlc {
+            wall_ms: 2000,
+            logical: 0,
+            device_id: "d".into(),
+        }
+    }
+
+    // Beacon with an explicit `joined_hlc` (the `b` helper above pins one fixed
+    // session HLC; these tests need to vary it to model rejoins).
+    fn bh(
+        owner: u8,
+        device: u8,
+        seq: u64,
+        muted: bool,
+        left: bool,
+        joined_hlc: Hlc,
+    ) -> VoicePresenceBeacon {
+        VoicePresenceBeacon {
+            owner: [owner; 16],
+            device: [device; 32],
+            muted,
+            joined_hlc,
+            seq,
+            left,
+        }
+    }
+
     #[test]
     fn apply_then_roster_lists_member() {
         let mut m = VoicePresenceMap::new();
@@ -627,6 +690,59 @@ mod map_tests {
             "left=true → change (removal)"
         );
         assert!(m.roster(&C, &CH).is_empty());
+    }
+
+    #[test]
+    fn hlc_ordering_sanity() {
+        assert!(h2().is_strictly_newer_than(&h1()));
+        assert!(!h1().is_strictly_newer_than(&h2()));
+    }
+
+    #[test]
+    fn rejoin_newer_session_supersedes_lower_seq() {
+        // Device D present at session H1 with a high seq.
+        let mut m = VoicePresenceMap::new();
+        assert!(m.apply(&C, &CH, &bh(1, 1, 5, true, false, h1()), 0));
+        assert_eq!(m.roster(&C, &CH).len(), 1);
+        // Rejoin: NEW session H2, seq restarted at 0. Even though seq dropped,
+        // the newer joined_hlc must win — seq 0 is accepted, NOT rejected.
+        assert!(
+            m.apply(&C, &CH, &bh(1, 1, 0, false, false, h2()), 100),
+            "newer session supersedes regardless of lower seq"
+        );
+        let r = m.roster(&C, &CH);
+        assert_eq!(r.len(), 1);
+        assert!(!r[0].muted, "roster reflects the new session (muted=false)");
+    }
+
+    #[test]
+    fn older_session_heartbeat_is_stale() {
+        // Device D present at session H2.
+        let mut m = VoicePresenceMap::new();
+        assert!(m.apply(&C, &CH, &bh(1, 1, 0, false, false, h2()), 0));
+        // A delayed heartbeat from the OLDER session H1, even with a huge seq,
+        // must be rejected as stale and leave the entry untouched.
+        assert!(
+            !m.apply(&C, &CH, &bh(1, 1, 99, true, false, h1()), 100),
+            "older session → stale even with higher seq"
+        );
+        let r = m.roster(&C, &CH);
+        assert_eq!(r.len(), 1);
+        assert!(!r[0].muted, "entry unchanged (still muted=false from H2)");
+    }
+
+    #[test]
+    fn stale_old_session_tombstone_is_ignored() {
+        // Device D freshly rejoined at session H2.
+        let mut m = VoicePresenceMap::new();
+        assert!(m.apply(&C, &CH, &bh(1, 1, 0, false, false, h2()), 0));
+        // A delayed tombstone from the OLD session H1 must NOT evict the
+        // freshly-rejoined entry.
+        assert!(
+            !m.apply(&C, &CH, &bh(1, 1, 1, false, true, h1()), 100),
+            "old-session tombstone is ignored"
+        );
+        assert_eq!(m.roster(&C, &CH).len(), 1, "freshly-rejoined entry remains");
     }
 
     #[test]
