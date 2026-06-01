@@ -11629,7 +11629,7 @@ async fn join_voice_channel(
 
     // Snapshot the handles we need out of NodeState without holding the lock
     // across awaits (the guard is !Send).
-    let (tx, registry, dm_outbox, self_owner, self_device) = {
+    let (tx, registry, dm_outbox, self_owner, device_hex, self_device, hlc_tracker) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         let tx = guard
             .voice_channel_tx
@@ -11656,7 +11656,22 @@ async fn join_voice_channel(
                 .as_slice(),
         )
         .map_err(|_| "device id must be 32 bytes".to_string())?;
-        (tx, registry, dm_outbox, self_owner, self_device)
+        // ZEB-350 Task 7: reserve the join-session HLC against the same
+        // per-device tracker the DM / state-root paths use, so the presence
+        // beacon's `joined_hlc` stays monotone with this device's other HLCs.
+        let hlc_tracker = guard
+            .hlc_tracker
+            .clone()
+            .ok_or_else(|| "no hlc tracker".to_string())?;
+        (
+            tx,
+            registry,
+            dm_outbox,
+            self_owner,
+            device_hex,
+            self_device,
+            hlc_tracker,
+        )
     };
 
     let engine = registry
@@ -11666,6 +11681,15 @@ async fn join_voice_channel(
     let channel_key = engine.channel_key_arc();
     let signing_key = { dm_outbox.lock().await.community_signing_key.clone() };
 
+    // ZEB-350 Task 7: stamp the join HLC (own device). Carried as identifying
+    // beacon metadata; beacon freshness orders by `seq`, not by this HLC.
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let joined_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_hex, wall_now_ms).await;
+
     tx.send(voice::VoiceChannelRequest::Join {
         community_id: community,
         channel_id: channel,
@@ -11674,6 +11698,7 @@ async fn join_voice_channel(
             signing_key,
             self_owner,
             self_device,
+            joined_hlc,
         },
     })
     .await

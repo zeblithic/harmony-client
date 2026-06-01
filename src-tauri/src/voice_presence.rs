@@ -4,7 +4,7 @@
 //! materialized-membership check (Task 7) prevents intra-member spoofing.
 
 use crate::community_membership::ChannelId;
-use crate::owner_state_types::{Hlc, SpaceId};
+use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 use serde::{Deserialize, Serialize};
 
 /// The unsigned presence claim. Canonical CBOR, 2-char keys (same-length
@@ -268,6 +268,201 @@ impl VoicePresenceMap {
     }
 }
 
+// ── Task 7: membership verification + pub/sub spawn helpers ──────────────
+
+use crate::community_state_sync::CommunitySyncRegistry;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tauri::Emitter;
+use tokio::task::JoinHandle;
+
+/// Pure membership predicate over a resolved `MaterializedMembership`:
+/// `(owner, device)` must map to a currently-`Joined` member whose
+/// `enrolled_device_keys` contains `device`. Factored out of
+/// [`beacon_signer_is_member`] so it is unit-testable without standing up a
+/// `CommunitySyncRegistry`, and reusable by the two-engine integration test.
+pub fn device_is_enrolled(
+    materialized: &crate::community_membership::MaterializedMembership,
+    owner: &OwnerAddr,
+    device: &[u8; 32],
+) -> bool {
+    materialized.members.get(owner).is_some_and(|m| {
+        m.status == crate::community_membership::MemberStatus::Joined
+            && m.enrolled_device_keys.contains(device)
+    })
+}
+
+/// Resolve whether `(owner, device)` is an enrolled, currently-Joined member
+/// of `community` per materialized membership (the ZEB-339 norm). Cheap:
+/// `materialized()` returns an owned clone keyed off the engine's cached admin
+/// addr. Returns false on any missing piece (no engine, owner absent, device
+/// not enrolled, status != Joined) — the caller drops the beacon.
+pub async fn beacon_signer_is_member(
+    registry: &Arc<CommunitySyncRegistry>,
+    community: &SpaceId,
+    owner: &OwnerAddr,
+    device: &[u8; 32],
+) -> bool {
+    let Some(engine) = registry.engine_arc(community).await else {
+        return false;
+    };
+    let admin = engine.admin_addr();
+    // `materialized(&self) -> MaterializedMembership` returns an owned clone,
+    // so the owned value outlives the dropped guard. Bind the `Arc<Mutex<_>>`
+    // first — `engine.state()` returns it by value, so locking it inline would
+    // drop the temporary while the guard still borrows it.
+    let state = engine.state();
+    let materialized = {
+        let guard = state.lock().await;
+        guard.materialized(admin)
+    };
+    device_is_enrolled(&materialized, owner, device)
+}
+
+/// Spawn a presence subscriber on `topic`: open the seal → verify the device-#2
+/// signature → verify materialized membership → apply to the shared map →
+/// emit `voice-presence-changed` on change. Drops on any failure. Mirrors the
+/// channel-log subscriber idiom (`recv_async` → `payload().to_bytes()`).
+///
+/// `session` is an owned, cheaply-cloned `zenoh::Session` (call sites pass
+/// `session.clone()`); `now_ms` is the loop's monotonic clock.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_voice_presence_subscriber<R: tauri::Runtime>(
+    session: zenoh::Session,
+    topic: String,
+    channel_key: Arc<ChannelKey>,
+    community: SpaceId,
+    channel: ChannelId,
+    registry: Arc<CommunitySyncRegistry>,
+    map: Arc<tokio::sync::Mutex<VoicePresenceMap>>,
+    app: tauri::AppHandle<R>,
+    closing: Arc<AtomicBool>,
+    now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let sub = match session.declare_subscriber(&topic).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(%topic, err = %e, "presence subscribe failed");
+                return;
+            }
+        };
+        while let Ok(sample) = sub.recv_async().await {
+            let bytes = sample.payload().to_bytes().to_vec();
+            let Some(signed) = open_presence_beacon(&channel_key, &community, &channel, &bytes)
+            else {
+                continue; // non-member key / wrong scope / tamper → drop
+            };
+            if verify_presence_beacon_sig(&signed).is_err() {
+                continue; // bad device-#2 signature → drop
+            }
+            let owner = OwnerAddr(signed.beacon.owner);
+            if !beacon_signer_is_member(&registry, &community, &owner, &signed.beacon.device).await
+            {
+                continue; // signer not an enrolled, Joined member → drop
+            }
+            let changed = {
+                let mut g = map.lock().await;
+                g.apply(&community, &channel, &signed.beacon, (now_ms)())
+            };
+            if changed {
+                let roster = {
+                    let g = map.lock().await;
+                    g.roster(&community, &channel)
+                };
+                let _ = app.emit(
+                    "voice-presence-changed",
+                    serde_json::json!({
+                        "community": hex::encode(community.0),
+                        "channel": hex::encode(channel.0),
+                        "roster": roster,
+                    }),
+                );
+            }
+        }
+        if !closing.load(Ordering::SeqCst) {
+            tracing::warn!(%topic, "presence subscriber closed unexpectedly");
+        }
+    })
+}
+
+/// Spawn a heartbeat publisher: emit an immediate beacon, then one every
+/// `interval` (4 s in V2). `muted` is hardcoded `true` — V2 has no mic capture,
+/// so every session starts (and stays) muted. A per-publisher monotone `seq`
+/// drives roster freshness. Honors `closing` for shutdown.
+///
+/// `session` is an owned, cheaply-cloned `zenoh::Session`.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_voice_presence_publisher(
+    session: zenoh::Session,
+    topic: String,
+    channel_key: Arc<ChannelKey>,
+    community: SpaceId,
+    channel: ChannelId,
+    signing_key: Arc<ed25519_dalek::SigningKey>,
+    self_owner: OwnerAddr,
+    self_device: [u8; 32],
+    joined_hlc: Hlc,
+    interval: std::time::Duration,
+    closing: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut seq: u64 = 0;
+        // `interval` fires immediately on the first `tick()`, giving us the
+        // "immediate first beacon then every 4 s" cadence for free.
+        let mut tick = tokio::time::interval(interval);
+        loop {
+            tick.tick().await;
+            if closing.load(Ordering::SeqCst) {
+                break;
+            }
+            let beacon = VoicePresenceBeacon {
+                owner: self_owner.0,
+                device: self_device,
+                muted: true,
+                joined_hlc: joined_hlc.clone(),
+                seq,
+                left: false,
+            };
+            seq = seq.wrapping_add(1);
+            let Ok(signed) = sign_presence_beacon(beacon, &signing_key) else {
+                continue;
+            };
+            let Ok(sealed) = seal_presence_beacon(&channel_key, &community, &channel, &signed)
+            else {
+                continue;
+            };
+            if let Err(e) = session.put(&topic, sealed).await {
+                tracing::warn!(%topic, err = %e, "presence publish failed");
+            }
+        }
+    })
+}
+
+/// Build + sign + seal a single `left=true` tombstone for instant roster
+/// removal on leave. `seq = u64::MAX` so it always wins freshness, and `left`
+/// short-circuits ordering in `apply` anyway. Returns `None` on encode failure.
+pub fn build_presence_tombstone(
+    channel_key: &ChannelKey,
+    community: &SpaceId,
+    channel: &ChannelId,
+    signing_key: &ed25519_dalek::SigningKey,
+    self_owner: OwnerAddr,
+    self_device: [u8; 32],
+    joined_hlc: Hlc,
+) -> Option<Vec<u8>> {
+    let beacon = VoicePresenceBeacon {
+        owner: self_owner.0,
+        device: self_device,
+        muted: true,
+        joined_hlc,
+        seq: u64::MAX,
+        left: true,
+    };
+    let signed = sign_presence_beacon(beacon, signing_key).ok()?;
+    seal_presence_beacon(channel_key, community, channel, &signed).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,5 +611,69 @@ mod map_tests {
             "left=true → change (removal)"
         );
         assert!(m.roster(&C, &CH).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod membership_tests {
+    use super::*;
+    use crate::community_membership::{MaterializedMembership, MemberState, MemberStatus};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn member(status: MemberStatus, device: [u8; 32]) -> MemberState {
+        let mut keys = BTreeSet::new();
+        keys.insert(device);
+        MemberState {
+            status,
+            joined_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "x".into(),
+            },
+            left_at: None,
+            enrolled_device_keys: keys,
+        }
+    }
+
+    fn materialized_with(owner: OwnerAddr, member: MemberState) -> MaterializedMembership {
+        let mut members = BTreeMap::new();
+        members.insert(owner, member);
+        MaterializedMembership {
+            members,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn enrolled_joined_member_passes() {
+        let owner = OwnerAddr([0xa1; 16]);
+        let device = [0x22; 32];
+        let m = materialized_with(owner, member(MemberStatus::Joined, device));
+        assert!(device_is_enrolled(&m, &owner, &device));
+    }
+
+    #[test]
+    fn unknown_owner_fails() {
+        let owner = OwnerAddr([0xa1; 16]);
+        let device = [0x22; 32];
+        let m = materialized_with(owner, member(MemberStatus::Joined, device));
+        assert!(!device_is_enrolled(&m, &OwnerAddr([0xff; 16]), &device));
+    }
+
+    #[test]
+    fn non_joined_status_fails() {
+        let owner = OwnerAddr([0xa1; 16]);
+        let device = [0x22; 32];
+        let m = materialized_with(owner, member(MemberStatus::Invited, device));
+        assert!(!device_is_enrolled(&m, &owner, &device));
+    }
+
+    #[test]
+    fn unenrolled_device_fails() {
+        let owner = OwnerAddr([0xa1; 16]);
+        let device = [0x22; 32];
+        let m = materialized_with(owner, member(MemberStatus::Joined, device));
+        // same Joined owner, but a different device key → rejected
+        assert!(!device_is_enrolled(&m, &owner, &[0x33; 32]));
     }
 }
