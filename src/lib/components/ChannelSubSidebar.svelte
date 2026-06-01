@@ -95,7 +95,11 @@
           onclick={(e) => { e.stopPropagation(); onSelect(channel.channelId); }}
           oncontextmenu={(e) => handleContextMenu(e, channel)}
         >
-          <span class="channel-hash" aria-hidden="true">#</span>
+          {#if channel.kind === 'voice'}
+            <span class="channel-glyph" aria-hidden="true">🔊</span>
+          {:else}
+            <span class="channel-hash" aria-hidden="true">#</span>
+          {/if}
           <span class="channel-name">{channel.name}</span>
         </button>
       </li>
@@ -152,6 +156,7 @@
   .channel-item:hover { background: var(--bg-tertiary); color: var(--text-primary); }
   .channel-item.active { background: var(--bg-tertiary); color: var(--text-primary); font-weight: 500; }
   .channel-hash { color: var(--text-tertiary, var(--text-secondary)); margin-right: 6px; }
+  .channel-glyph { margin-right: 6px; font-size: 0.85em; }
   .channel-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .create-channel-btn {
     display: flex;
