@@ -36,9 +36,10 @@
     onClose: () => void;
     /**
      * T11: dispatch a `harmony:` profile link for in-app navigation. App.svelte
-     * wires this to its deep-link routing (ZEB-338) — see header comment on
-     * `onLinkClick`. Optional so existing render-only tests work without it; a
-     * missing handler just means the `harmony:` click is swallowed (no raw
+     * wires this to its deep-link routing (ZEB-338). A `harmony:` link renders
+     * as a <button> (no live href — see the scheme-split comment below) whose
+     * click calls this. Optional so existing render-only tests work without it;
+     * a missing handler just means the `harmony:` click is swallowed (no raw
      * navigation), never an external open.
      */
     onHarmonyLink?: (url: string) => void;
@@ -50,27 +51,18 @@
   // javascript:/data: href even if a malformed doc slips through).
   //
   //   - https://  → real <a target="_blank" rel="noopener noreferrer"> (external)
-  //   - harmony:  → preventDefault + dispatch via onHarmonyLink (in-app nav)
+  //   - harmony:  → a <button> (NO href, NO target) that dispatches via
+  //                 onHarmonyLink. We deliberately do NOT render a live href for
+  //                 a harmony: link: under Tauri's WebView a live href +
+  //                 target="_blank" is reachable via the right-click context
+  //                 menu ("Open in new tab"), which would fire a raw OS
+  //                 harmony: deep-link and skip the in-app router entirely.
   //   - anything else → rendered INERT (plain text label, no href, not clickable)
-  const ALLOWED_SCHEMES = ['https://', 'harmony:'];
-  function linkOk(u: string): boolean {
-    return ALLOWED_SCHEMES.some((s) => u.startsWith(s));
+  function isHttps(u: string): boolean {
+    return u.startsWith('https://');
   }
-  function onLinkClick(e: MouseEvent, url: string): void {
-    if (!linkOk(url)) {
-      // Belt-and-suspenders: a non-allowlisted url should never have rendered as
-      // an <a> at all (see {#if linkOk(link.url)} below), but if one ever does,
-      // refuse the navigation rather than honor a hostile href.
-      e.preventDefault();
-      return;
-    }
-    if (url.startsWith('harmony:')) {
-      // In-app deep link: stop the browser from doing a raw navigation and hand
-      // the url to App's ZEB-338 deep-link routing instead.
-      e.preventDefault();
-      onHarmonyLink?.(url);
-    }
-    // https: falls through to the default <a target="_blank" rel="noopener noreferrer">.
+  function isHarmony(u: string): boolean {
+    return u.startsWith('harmony:');
   }
 
   // Lazy: resolve() kicks off the fetch on a cache miss and returns undefined
@@ -161,18 +153,28 @@
         <h3 class="section-label">Links</h3>
         <ul class="links-list">
           {#each doc.links as link}
-            <!-- T11: scheme-split + render safety. Only an allowlisted scheme
-                 (https: external / harmony: in-app via onHarmonyLink) is rendered
-                 as a real <a>. Any other scheme is INERT text — no href, so the
-                 UI can't be tricked into a javascript:/data: navigation even if a
-                 malformed doc reaches us. -->
+            <!-- T11: scheme-split + render safety, rendered per-scheme:
+                 - https: → real <a target="_blank" rel="noopener noreferrer">
+                   (external open is intended).
+                 - harmony: → a <button> with NO href / NO target, dispatched via
+                   onHarmonyLink. A live href would be reachable through the
+                   WebView right-click "Open in new tab", firing a raw OS
+                   harmony: deep-link and bypassing the in-app router — so we
+                   never materialize one.
+                 - anything else → INERT text (no href, not clickable) so the UI
+                   can't be tricked into a javascript:/data: navigation even if a
+                   malformed doc reaches us. -->
             <li>
-              {#if linkOk(link.url)}
+              {#if isHttps(link.url)}
                 <a
                   href={link.url}
                   target="_blank"
-                  rel="noopener noreferrer"
-                  onclick={(e) => onLinkClick(e, link.url)}>{link.label}</a>
+                  rel="noopener noreferrer">{link.label}</a>
+              {:else if isHarmony(link.url)}
+                <button
+                  type="button"
+                  class="profile-link"
+                  onclick={() => onHarmonyLink?.(link.url)}>{link.label}</button>
               {:else}
                 <span class="link-inert" title="Unsupported link">{link.label}</span>
               {/if}
@@ -341,14 +343,32 @@
   .links-list li {
     padding: 3px 0;
   }
-  .links-list a {
+  .links-list a,
+  .links-list .profile-link {
     font-size: 13px;
     color: var(--accent, #5865f2);
     text-decoration: none;
     word-break: break-all;
   }
-  .links-list a:hover {
+  .links-list a:hover,
+  .links-list .profile-link:hover {
     text-decoration: underline;
+  }
+  /* T11: harmony: links render as a text-button (no live href — see script
+     comment). Strip the native button chrome so it reads as a link. */
+  .links-list .profile-link {
+    display: inline;
+    padding: 0;
+    margin: 0;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    font: inherit;
+    text-align: left;
+  }
+  .links-list .profile-link:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 1px;
   }
   /* T11: a link with a non-allowlisted scheme renders as inert text (no href,
      not clickable) — muted to signal it isn't actionable. */

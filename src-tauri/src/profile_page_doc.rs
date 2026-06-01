@@ -15,8 +15,6 @@ pub const MAX_FIELDS: usize = 16;
 pub const MAX_FIELD_KEY_BYTES: usize = 32;
 pub const MAX_FIELD_VALUE_BYTES: usize = 256;
 pub const MAX_PROFILE_DOC_BYTES: usize = 16_384;
-/// URL scheme allowlist for links.
-const ALLOWED_LINK_SCHEMES: [&str; 2] = ["https://", "harmony:"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfilePageDoc {
@@ -81,9 +79,28 @@ pub enum ProfileDocError {
     Decode,
 }
 
-/// Enforce every cap dimension: bio bytes, link count + per-link label/url bytes,
-/// field count + per-field key/value bytes, every link URL `starts_with` an
-/// allowed scheme, and total canonical-encoded bytes <= `MAX_PROFILE_DOC_BYTES`.
+/// A link URL is allowed only if it is a non-empty `https://` URL or a
+/// `harmony:` deep-link with a non-empty path that contains no further scheme
+/// separator. The `:` guard is the load-bearing part: it rejects scheme
+/// lookalikes like `harmony:javascript:alert(1)` and `harmony:data:...` (and
+/// the bare `harmony:`), which a plain `starts_with("harmony:")` would accept.
+fn link_scheme_allowed(url: &str) -> bool {
+    if let Some(rest) = url.strip_prefix("https://") {
+        return !rest.is_empty();
+    }
+    if let Some(rest) = url.strip_prefix("harmony:") {
+        // Require a non-empty path with no embedded scheme separator, so
+        // harmony:javascript:..., harmony:data:..., and bare harmony: are rejected.
+        return !rest.is_empty() && !rest.contains(':');
+    }
+    false
+}
+
+/// Enforce every per-dimension cap: bio bytes, link count + per-link label/url
+/// bytes + allowed scheme, field count + per-field key/value bytes, and the doc
+/// version. Does NOT enforce the total-encoded-bytes cap (`DocTooLarge`): that
+/// is checked on produced bytes in `encode_profile_doc` and on input bytes in
+/// `decode_profile_doc`, so the canonical encode runs at most once per call.
 pub fn validate_profile_doc(doc: &ProfilePageDoc) -> Result<(), ProfileDocError> {
     // Keep encode/decode symmetric: decode_profile_doc rejects an unknown
     // version, so validate (and therefore encode) must reject it too — otherwise
@@ -104,7 +121,7 @@ pub fn validate_profile_doc(doc: &ProfilePageDoc) -> Result<(), ProfileDocError>
         if l.url.len() > MAX_LINK_URL_BYTES {
             return Err(ProfileDocError::LinkUrlTooLong);
         }
-        if !ALLOWED_LINK_SCHEMES.iter().any(|s| l.url.starts_with(s)) {
+        if !link_scheme_allowed(&l.url) {
             return Err(ProfileDocError::LinkSchemeNotAllowed);
         }
     }
@@ -119,22 +136,26 @@ pub fn validate_profile_doc(doc: &ProfilePageDoc) -> Result<(), ProfileDocError>
             return Err(ProfileDocError::FieldValueTooLong);
         }
     }
+    Ok(())
+}
+
+/// Validate caps, canonical-CBOR encode (declaration-order keys), then reject if
+/// the produced bytes exceed `MAX_PROFILE_DOC_BYTES`. The total-bytes cap is
+/// enforced here (on the single produced encoding) rather than inside
+/// `validate_profile_doc`, so the canonical encode runs only once.
+pub fn encode_profile_doc(doc: &ProfilePageDoc) -> Result<Vec<u8>, ProfileDocError> {
+    validate_profile_doc(doc)?;
     let bytes = canonical_cbor_encode(doc)?;
     if bytes.len() > MAX_PROFILE_DOC_BYTES {
         return Err(ProfileDocError::DocTooLarge);
     }
-    Ok(())
+    Ok(bytes)
 }
 
-/// Validate caps, then canonical-CBOR encode (declaration-order keys).
-pub fn encode_profile_doc(doc: &ProfilePageDoc) -> Result<Vec<u8>, ProfileDocError> {
-    validate_profile_doc(doc)?;
-    Ok(canonical_cbor_encode(doc)?)
-}
-
-/// Reject oversize blobs up front, parse, reject unknown version, then re-run
-/// `validate_profile_doc` so a fetched doc is bound by the same caps as an
-/// ingested one.
+/// Reject oversize blobs up front, parse, reject unknown version, then run
+/// `validate_profile_doc` so a fetched doc is bound by the same per-dimension
+/// caps as an ingested one. The input bytes already bound the total size (the
+/// up-front `DocTooLarge` check), so no re-encode is needed.
 pub fn decode_profile_doc(bytes: &[u8]) -> Result<ProfilePageDoc, ProfileDocError> {
     if bytes.len() > MAX_PROFILE_DOC_BYTES {
         return Err(ProfileDocError::DocTooLarge);
@@ -298,6 +319,29 @@ mod tests {
     fn accepts_https_and_harmony_schemes() {
         assert!(validate_profile_doc(&doc_with_link("a", "https://x.example")).is_ok());
         assert!(validate_profile_doc(&doc_with_link("b", "harmony:community/abc")).is_ok());
+        // https with an explicit port is still a valid https URL (the embedded
+        // ':' is part of the authority, not a second scheme).
+        assert!(validate_profile_doc(&doc_with_link("c", "https://host:8443/p")).is_ok());
+    }
+
+    #[test]
+    fn rejects_scheme_lookalikes() {
+        // A harmony: prefix wrapping another scheme must NOT slip through the
+        // allowlist — the link_scheme_allowed `:` guard rejects these.
+        for url in [
+            "harmony:javascript:alert(1)",
+            "harmony:data:text/html,<script>1</script>",
+            "harmony:", // bare scheme, empty path
+            "https://", // empty https authority
+        ] {
+            assert!(
+                matches!(
+                    validate_profile_doc(&doc_with_link("L", url)),
+                    Err(ProfileDocError::LinkSchemeNotAllowed)
+                ),
+                "expected LinkSchemeNotAllowed for {url:?}"
+            );
+        }
     }
 
     #[test]
@@ -338,10 +382,11 @@ mod tests {
     #[test]
     fn rejects_total_bytes_over_cap() {
         // Exercise the DocTooLarge branch directly: decode_profile_doc rejects any
-        // blob larger than the total byte cap up front. (validate_profile_doc's
-        // own total-bytes check is an unreachable-by-construction backstop given
-        // the per-dimension caps — see total_bytes_cap_is_a_correctly_sized_backstop —
-        // so the cap's enforcement on untrusted input lives on the decode path.)
+        // blob larger than the total byte cap up front. The cap is enforced on
+        // input bytes here (decode) and on produced bytes in encode_profile_doc;
+        // validate_profile_doc no longer re-encodes to measure size (the
+        // per-dimension caps make an over-cap valid doc unreachable by
+        // construction — see total_bytes_cap_is_a_correctly_sized_backstop).
         assert!(matches!(
             decode_profile_doc(&vec![0u8; MAX_PROFILE_DOC_BYTES + 1]),
             Err(ProfileDocError::DocTooLarge)

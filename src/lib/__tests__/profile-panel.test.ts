@@ -112,7 +112,7 @@ describe('ProfilePanel', () => {
     ).toBeTruthy();
   });
 
-  it('renders link rows with correct labels and hrefs', () => {
+  it('renders an https: link as an anchor with its href; a harmony: link as a hrefless button', () => {
     render(ProfilePanel, {
       props: {
         ownerIdHex: OWNER_HEX,
@@ -122,9 +122,13 @@ describe('ProfilePanel', () => {
       },
     });
     const site = screen.getByText('My site') as HTMLAnchorElement;
+    expect(site.tagName).toBe('A');
     expect(site.getAttribute('href')).toBe('https://example.com');
-    const room = screen.getByText('Harmony room') as HTMLAnchorElement;
-    expect(room.getAttribute('href')).toBe('harmony:room/abc');
+    // The harmony: link is a <button> with NO href (the live-href context-menu
+    // bypass surface is removed) — navigation is dispatched via onHarmonyLink.
+    const room = screen.getByText('Harmony room');
+    expect(room.tagName).toBe('BUTTON');
+    expect(room.getAttribute('href')).toBeNull();
   });
 
   // ── T11: render safety — scheme allowlist + dispatch ─────────────────────
@@ -149,14 +153,14 @@ describe('ProfilePanel', () => {
     expect(site.getAttribute('rel')).toBe('noopener noreferrer');
   });
 
-  it('dispatches a harmony: link click via onHarmonyLink and prevents raw navigation', async () => {
+  it('dispatches a harmony: link click via onHarmonyLink (button, no live href)', async () => {
     const onHarmonyLink = vi.fn();
     const dto: ProfilePageDto = {
       bio: '',
       links: [{ label: 'Harmony room', url: 'harmony:room/abc' }],
       fields: [],
     };
-    render(ProfilePanel, {
+    const { container } = render(ProfilePanel, {
       props: {
         ownerIdHex: OWNER_HEX,
         card: { displayName: 'Alice', profilePageRoot: ROOT_CID },
@@ -165,18 +169,18 @@ describe('ProfilePanel', () => {
         onHarmonyLink,
       },
     });
-    const room = screen.getByText('Harmony room') as HTMLAnchorElement;
-    // The harmony: link still renders as a real <a> (allowlisted scheme) so the
-    // href is inspectable / right-clickable, but the click is intercepted.
-    expect(room.tagName).toBe('A');
-    expect(room.getAttribute('href')).toBe('harmony:room/abc');
+    const room = screen.getByText('Harmony room');
+    // The harmony: link renders as a <button> — NO anchor, NO href — so there's
+    // no live-href surface for the WebView right-click "Open in new tab" to
+    // dispatch a raw OS deep-link past the in-app router.
+    expect(room.tagName).toBe('BUTTON');
+    expect(room.getAttribute('href')).toBeNull();
+    expect(container.querySelector('a')).toBeNull();
 
-    // Dispatch a real click and confirm the default (navigation) was prevented.
-    const evt = new MouseEvent('click', { bubbles: true, cancelable: true });
-    room.dispatchEvent(evt);
+    // Clicking it routes the url through onHarmonyLink.
+    room.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
     expect(onHarmonyLink).toHaveBeenCalledTimes(1);
     expect(onHarmonyLink).toHaveBeenCalledWith('harmony:room/abc');
-    expect(evt.defaultPrevented).toBe(true);
   });
 
   it('renders a disallowed-scheme link INERT (no anchor, not clickable)', () => {
