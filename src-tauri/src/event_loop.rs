@@ -1759,6 +1759,12 @@ pub async fn run<R: Runtime>(
     // 12 s TTL = 3 missed 4 s heartbeats.
     const VOICE_PRESENCE_TTL_MS: u64 = 12_000;
     let mut voice_sweep_tick = tokio::time::interval(Duration::from_secs(4));
+    // The sweep arm below is `select!`-gated on `!voice_keys.is_empty()`, so the
+    // tick is only polled while at least one voice channel is joined — a node
+    // that never uses voice (the common case) pays zero periodic wakeups.
+    // `Skip` prevents a catch-up burst of ticks when voice resumes after a long
+    // idle gap during which the gated branch wasn't polled.
+    voice_sweep_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // ZEB-227 PR #80 review fix: retry buffer for RuntimeActions whose
     // dispatch transiently failed because dm_outbox/crdt_state locks were
@@ -2605,8 +2611,9 @@ pub async fn run<R: Runtime>(
             // A dedicated 4 s interval tick (NOT a bare `sleep` arm, which
             // would reset every loop iteration and starve). Evicts entries
             // silent for >12 s, then re-emits the roster for each affected
-            // (community, channel) exactly once.
-            _ = voice_sweep_tick.tick() => {
+            // (community, channel) exactly once. Gated on active voice channels
+            // so a node with none joined never wakes here (Cursor review).
+            _ = voice_sweep_tick.tick(), if !voice_keys.is_empty() => {
                 let now = (voice_now_ms)();
                 let evicted = {
                     let mut g = voice_presence_map.lock().await;
