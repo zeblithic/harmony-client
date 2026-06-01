@@ -462,6 +462,36 @@ fn signed_event_channel_create_voice_wire_bytes_pinned() {
     );
 }
 
+/// ZEB-349 back-compat: a pre-ZEB-349 `ChannelCreate` carries no `ck` key
+/// (the field did not exist). Such bytes MUST still decode, with `kind`
+/// defaulting to `ChannelKind::Text` (the `default` serde attr's job).
+///
+/// Mirrors `signed_event_join_certless_back_compat_decodes` (ZEB-339): pin the
+/// pre-feature hex (here, the same bytes asserted by
+/// `signed_event_channel_create_wire_bytes_pinned`, which is byte-identical to
+/// pre-ZEB-349 Text wire), decode it, and assert the new field defaults.
+#[test]
+fn signed_event_channel_create_back_compat_decodes_text_default() {
+    use harmony_app::community_membership::SignedMembershipEvent;
+    use harmony_app::owner_state_crypto::canonical_cbor_decode;
+
+    // Identical to the hex asserted by signed_event_channel_create_wire_bytes_pinned.
+    // These bytes predate ZEB-349 (no `ck` key in the inner ChannelCreate map).
+    let pre_zeb349_text_hex = "a662696450424242424242424242424242424242426263695037373737373737373737373737373737626b6ea2627467616362766ca36263685042424242424242424242424242424242626e6d6767656e6572616c627770006261635011111111111111111111111111111111626174a361771b0000018bcfe56800616c006164636669786273675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let bytes = hex::decode(pre_zeb349_text_hex).expect("decode hex");
+    let event: SignedMembershipEvent = canonical_cbor_decode(&bytes).expect("back-compat decode");
+    match event.kind {
+        MembershipEventKind::ChannelCreate { kind, .. } => {
+            assert_eq!(
+                kind,
+                ChannelKind::Text,
+                "pre-ZEB-349 ChannelCreate without `ck` key must decode with kind=Text"
+            );
+        }
+        other => panic!("expected ChannelCreate, got {other:?}"),
+    }
+}
+
 #[test]
 fn signed_event_channel_modify_full_wire_bytes_pinned() {
     let ch_id = ChannelId([0x42; 16]);

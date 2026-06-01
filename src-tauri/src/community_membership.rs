@@ -9,6 +9,7 @@
 
 use harmony_owner::certs::EnrollmentCert;
 use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
@@ -323,12 +324,18 @@ pub type EventId = [u8; 16];
 /// Text `ChannelCreate`/`ChannelInfo` byte-identical to pre-ZEB-349 wire.
 /// Voice channels are introduced by ZEB-349 (epic ZEB-348); kind is immutable
 /// once a channel is created.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-#[serde(into = "u8", try_from = "u8")]
+///
+/// `serde_repr` is load-bearing here (mirrors `Tier` in
+/// `community_voting_core.rs`): without it, the standard `#[derive(Serialize)]`
+/// would encode variants by NAME ("Voice"), not by the u8 discriminant the wire
+/// format mandates. `#[repr(u8)]` alone only affects Rust memory layout, not
+/// serde. `serde_repr` also rejects unknown discriminants on decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
 pub enum ChannelKind {
     #[default]
-    Text,
-    Voice,
+    Text = 0,
+    Voice = 1,
 }
 
 impl ChannelKind {
@@ -336,27 +343,6 @@ impl ChannelKind {
     /// and is never written to the CBOR map.
     pub fn is_text(&self) -> bool {
         matches!(self, ChannelKind::Text)
-    }
-}
-
-impl From<ChannelKind> for u8 {
-    fn from(kind: ChannelKind) -> u8 {
-        match kind {
-            ChannelKind::Text => 0,
-            ChannelKind::Voice => 1,
-        }
-    }
-}
-
-impl TryFrom<u8> for ChannelKind {
-    type Error = String;
-
-    fn try_from(tag: u8) -> Result<Self, Self::Error> {
-        match tag {
-            0 => Ok(ChannelKind::Text),
-            1 => Ok(ChannelKind::Voice),
-            other => Err(format!("invalid ChannelKind tag: {other}")),
-        }
     }
 }
 
@@ -4176,26 +4162,28 @@ mod tests {
     }
 
     #[test]
-    fn channel_kind_u8_round_trip() {
-        assert_eq!(u8::from(ChannelKind::Text), 0);
-        assert_eq!(u8::from(ChannelKind::Voice), 1);
-        assert_eq!(ChannelKind::try_from(0u8).unwrap(), ChannelKind::Text);
-        assert_eq!(ChannelKind::try_from(1u8).unwrap(), ChannelKind::Voice);
-        assert!(ChannelKind::try_from(2u8).is_err());
-    }
-
-    #[test]
     fn channel_kind_serializes_as_cbor_u8() {
-        // Voice encodes as the single CBOR byte 0x01; Text as 0x00.
-        let voice = crate::owner_state_crypto::canonical_cbor_encode(&ChannelKind::Voice)
-            .expect("encode voice");
-        assert_eq!(voice, vec![0x01]);
+        // serde_repr encodes each variant as its bare u8 discriminant:
+        // Text -> the single CBOR byte 0x00, Voice -> 0x01.
         let text = crate::owner_state_crypto::canonical_cbor_encode(&ChannelKind::Text)
             .expect("encode text");
         assert_eq!(text, vec![0x00]);
-        // Round-trips through ciborium.
-        let back: ChannelKind = ciborium::de::from_reader(&voice[..]).expect("decode voice");
-        assert_eq!(back, ChannelKind::Voice);
+        let voice = crate::owner_state_crypto::canonical_cbor_encode(&ChannelKind::Voice)
+            .expect("encode voice");
+        assert_eq!(voice, vec![0x01]);
+        // Both round-trip back through ciborium decode.
+        let text_back: ChannelKind = ciborium::de::from_reader(&text[..]).expect("decode text");
+        assert_eq!(text_back, ChannelKind::Text);
+        let voice_back: ChannelKind = ciborium::de::from_reader(&voice[..]).expect("decode voice");
+        assert_eq!(voice_back, ChannelKind::Voice);
+    }
+
+    #[test]
+    fn channel_kind_cbor_unknown_tag_is_rejected() {
+        // serde_repr rejects unknown discriminants on decode: 0x02 is neither
+        // Text (0) nor Voice (1), so it must fail rather than silently default.
+        let result: Result<ChannelKind, _> = ciborium::de::from_reader(&[0x02u8][..]);
+        assert!(result.is_err(), "tag 2 must be rejected");
     }
 
     fn make_kick_event(
