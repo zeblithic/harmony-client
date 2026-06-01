@@ -12831,6 +12831,7 @@ mod list_community_forks_tests {
                     channel_id: ChannelId([0; 16]),
                     name: "general".to_string(),
                     write_power: 0,
+                    kind: crate::community_membership::ChannelKind::Text,
                 },
                 caller,
                 300,
@@ -13142,6 +13143,9 @@ pub fn mint_channel_create_event(
             channel_id,
             name,
             write_power,
+            // ZEB-349: temporary Text default — a later slice threads the real
+            // ChannelKind through create_channel's IPC `kind` param.
+            kind: crate::community_membership::ChannelKind::Text,
         },
         actor: self_owner,
         at: hlc,
@@ -14730,6 +14734,8 @@ pub async fn create_community_inner<R: tauri::Runtime>(
             channel_id: default_channel_id,
             name: "general".to_string(),
             write_power: 0,
+            // ZEB-349: minted-community default channel is always Text.
+            kind: crate::community_membership::ChannelKind::Text,
         },
         actor: self_owner,
         at: default_channel_at.clone(),
@@ -22600,6 +22606,9 @@ pub fn delta_to_channel_config_change(
             channel_id,
             name,
             write_power,
+            // ZEB-349: kind is not surfaced through this channel-config-change
+            // DTO in V1 (a later slice threads it into the IPC layer).
+            kind: _,
         } => (
             hex::encode(channel_id.0),
             ChannelConfigChangeAction::Created,
@@ -33813,6 +33822,7 @@ mod create_channel_delta_tests {
                 channel_id: ch_id,
                 name: "general".into(),
                 write_power: 0,
+                kind: crate::community_membership::ChannelKind::Text,
             },
             actor,
             at: Hlc {
@@ -33903,6 +33913,7 @@ mod create_channel_delta_tests {
                 channel_id: ChannelId([0xAB; 16]),
                 name: "general".into(),
                 write_power: 0,
+                kind: crate::community_membership::ChannelKind::Text,
             },
             actor,
             at: Hlc {
@@ -33966,6 +33977,7 @@ mod create_channel_delta_tests {
                 channel_id: ChannelId([0xAB; 16]),
                 name: "general".into(),
                 write_power: 0,
+                kind: crate::community_membership::ChannelKind::Text,
             },
             actor: OwnerAddr([0x10; 16]),
             at: Hlc {

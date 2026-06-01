@@ -9,7 +9,7 @@ use harmony_app::community_invite::{
     CommunityInvitePayload, InviteEpochSnapshot, InviteToken, MaterializedCommunityState,
 };
 use harmony_app::community_membership::{
-    ChannelId, CounterSignature, MembershipEventKind, SignedMembershipEvent,
+    ChannelId, ChannelKind, CounterSignature, MembershipEventKind, SignedMembershipEvent,
 };
 use harmony_app::owner_state_crypto::canonical_cbor_encode;
 use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
@@ -423,6 +423,10 @@ fn signed_event_channel_create_wire_bytes_pinned() {
         channel_id: ch_id,
         name: "general".to_string(),
         write_power: 0,
+        // ZEB-349: an explicit Text kind MUST serialize byte-identically to the
+        // pre-ZEB-349 wire (kind is skipped when Text). The original pinned hex
+        // below is the byte-identity proof — it is unchanged.
+        kind: ChannelKind::Text,
     });
     let bytes = canonical_cbor_encode(&event).expect("encode");
     let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();

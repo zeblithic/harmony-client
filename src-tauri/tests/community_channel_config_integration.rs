@@ -14,7 +14,7 @@
 //! per-engine.
 
 use harmony_app::community_membership::{
-    mint_test_owner, sign_event, ChannelId, EventPayload, MembershipEventKind,
+    mint_test_owner, sign_event, ChannelId, ChannelKind, EventPayload, MembershipEventKind,
     SignedMembershipEvent, TestOwner, VerifyError,
 };
 use harmony_app::community_state_crdt::InsertOutcome;
@@ -314,6 +314,7 @@ async fn alice_creates_channel_bob_materializes_via_state_sync() {
             channel_id: ch_id,
             name: "general".into(),
             write_power: 0,
+            kind: ChannelKind::Text,
         },
         actor: alice_addr,
         at: alice_create_at,
@@ -333,7 +334,7 @@ async fn alice_creates_channel_bob_materializes_via_state_sync() {
     .await;
     assert!(matches!(
         alice_ch_delta.event.kind,
-        MembershipEventKind::ChannelCreate { ref name, write_power: 0, channel_id }
+        MembershipEventKind::ChannelCreate { ref name, write_power: 0, channel_id, .. }
             if name == "general" && channel_id == ch_id
     ));
 
@@ -352,10 +353,12 @@ async fn alice_creates_channel_bob_materializes_via_state_sync() {
             channel_id,
             name,
             write_power,
+            kind,
         } => {
             assert_eq!(*channel_id, ch_id);
             assert_eq!(name, "general");
             assert_eq!(*write_power, 0);
+            assert_eq!(*kind, ChannelKind::Text);
         }
         other => panic!("expected ChannelCreate, got {other:?}"),
     }
@@ -515,6 +518,7 @@ async fn joined_sub_mod_member_channel_create_rejected_with_channel_admin_insuff
             channel_id: ChannelId([0x77; 16]),
             name: "spam".into(),
             write_power: 0,
+            kind: ChannelKind::Text,
         },
         actor: bob_addr,
         at: Hlc {
@@ -702,6 +706,7 @@ async fn default_general_channel_round_trips_through_state_sync() {
             channel_id: default_ch_id,
             name: "general".into(),
             write_power: 0,
+            kind: ChannelKind::Text,
         },
         actor: alice_addr,
         at: default_create_at,

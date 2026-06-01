@@ -1883,6 +1883,7 @@ mod tests {
                 Some(ChannelInfo {
                     name: "test".to_string(),
                     write_power: 0,
+                    kind: crate::community_membership::ChannelKind::Text,
                     created_at: Hlc {
                         wall_ms: 0,
                         logical: 0,
@@ -3136,6 +3137,7 @@ mod tests {
             crate::community_membership::ChannelInfo {
                 name: "live".to_string(),
                 write_power: 0,
+                kind: crate::community_membership::ChannelKind::Text,
                 created_at: Hlc {
                     wall_ms: 1,
                     logical: 0,
@@ -3149,6 +3151,7 @@ mod tests {
             crate::community_membership::ChannelInfo {
                 name: "dead".to_string(),
                 write_power: 0,
+                kind: crate::community_membership::ChannelKind::Text,
                 created_at: Hlc {
                     wall_ms: 2,
                     logical: 0,
@@ -3201,6 +3204,7 @@ mod tests {
             crate::community_membership::ChannelInfo {
                 name: "live".to_string(),
                 write_power: 0,
+                kind: crate::community_membership::ChannelKind::Text,
                 created_at: Hlc {
                     wall_ms: 1,
                     logical: 0,
@@ -3347,6 +3351,7 @@ mod tests {
         let info = |name: &str| crate::community_membership::ChannelInfo {
             name: name.to_string(),
             write_power: 0,
+            kind: crate::community_membership::ChannelKind::Text,
             created_at: Hlc {
                 wall_ms: 1,
                 logical: 0,

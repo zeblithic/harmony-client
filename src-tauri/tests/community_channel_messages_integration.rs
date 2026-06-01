@@ -16,7 +16,7 @@ use harmony_app::community_channel_log::{
 use harmony_app::community_channel_log_engine::{
     ChannelLogEngineConfig, ChannelLogRegistry, ChannelLogRegistryConfig, SpawnOutcome,
 };
-use harmony_app::community_membership::{ChannelId, ChannelInfo};
+use harmony_app::community_membership::{ChannelId, ChannelInfo, ChannelKind};
 use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
 use harmony_identity::PrivateIdentity;
 use tempfile::TempDir;
@@ -63,6 +63,7 @@ impl CommunityStateAtHlc for BothJoinedState {
             Some(ChannelInfo {
                 name: "general".to_string(),
                 write_power: 0,
+                kind: ChannelKind::Text,
                 created_at: Hlc {
                     wall_ms: 1,
                     logical: 0,

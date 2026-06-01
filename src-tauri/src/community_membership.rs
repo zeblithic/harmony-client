@@ -133,6 +133,12 @@ pub enum MembershipEventKind {
         name: String,
         #[serde(rename = "wp")]
         write_power: u8,
+        /// ZEB-349: channel kind (Text|Voice). `Text` is the default and is
+        /// omitted from the CBOR map (`skip_serializing_if`), so a Text
+        /// `ChannelCreate` stays byte-identical to pre-ZEB-349 wire; only a
+        /// Voice channel carries the extra `ck` map entry. Immutable once set.
+        #[serde(rename = "ck", default, skip_serializing_if = "ChannelKind::is_text")]
+        kind: ChannelKind,
     },
 
     /// Channel-config event: a mod-tier+ actor modifies an existing
@@ -1516,6 +1522,12 @@ pub struct ChannelInfo {
     pub name: String,
     #[serde(rename = "wp")]
     pub write_power: u8,
+    /// ZEB-349: channel kind (Text|Voice). `Text` is the default and is omitted
+    /// from the CBOR map, keeping a Text `ChannelInfo` byte-identical to
+    /// pre-ZEB-349 wire. Canonical CBOR sorts keys, so declaration order does
+    /// not affect wire bytes. Immutable (set only by `ChannelCreate`).
+    #[serde(rename = "ck", default, skip_serializing_if = "ChannelKind::is_text")]
+    pub kind: ChannelKind,
     #[serde(rename = "ca")]
     pub created_at: Hlc,
     #[serde(rename = "da", skip_serializing_if = "Option::is_none", default)]
@@ -1989,6 +2001,7 @@ pub fn materialize_with_now(
                 channel_id,
                 name,
                 write_power,
+                kind,
             } => {
                 // Idempotent on duplicate channel_id: first create wins
                 // (replays + reorderings under DAG-sync may deliver the
@@ -1997,11 +2010,14 @@ pub fn materialize_with_now(
                 // a duplicate-emit refresh created_at and reset history
                 // markers). A subsequent ChannelModify is the right path
                 // to update fields; a duplicate ChannelCreate is a no-op.
+                // `kind` is set here only (immutable — ChannelModify can't
+                // touch it).
                 m.channels
                     .entry(*channel_id)
                     .or_insert_with(|| ChannelInfo {
                         name: name.clone(),
                         write_power: *write_power,
+                        kind: *kind,
                         created_at: event.at.clone(),
                         deleted_at: None,
                     });
@@ -3039,6 +3055,10 @@ pub fn verify_event(
             channel_id: _,
             name,
             write_power,
+            // ZEB-349: kind needs no verification gate (any valid kind tag is
+            // accepted; immutability is enforced by ChannelModify lacking the
+            // field, not here).
+            kind: _,
         } => {
             if actor_power < POWER_THRESHOLDS.kick {
                 return Err(VerifyError::ChannelAdminInsufficientPower);
@@ -5619,6 +5639,7 @@ mod tests {
                 channel_id,
                 name: "test".into(),
                 write_power: 0,
+                kind: ChannelKind::Text,
             },
             MembershipEventKind::ChannelModify {
                 channel_id,

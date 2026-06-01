@@ -1775,6 +1775,7 @@ mod tests {
                 ChannelInfo {
                     name: "general".into(),
                     write_power: 0,
+                    kind: crate::community_membership::ChannelKind::Text,
                     created_at: creator_hlc,
                     deleted_at: None,
                 },
@@ -1936,6 +1937,7 @@ mod tests {
                 ChannelInfo {
                     name: "ops".into(),
                     write_power: 50,
+                    kind: crate::community_membership::ChannelKind::Text,
                     created_at: creator_hlc,
                     deleted_at: None,
                 },
@@ -1997,6 +1999,7 @@ mod tests {
                 ChannelInfo {
                     name: "deleted".into(),
                     write_power: 0,
+                    kind: crate::community_membership::ChannelKind::Text,
                     created_at: creator_hlc,
                     // Channel deleted at wall=80_000.
                     deleted_at: Some(Hlc {
