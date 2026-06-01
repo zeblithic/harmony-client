@@ -58,11 +58,19 @@
   //                 menu ("Open in new tab"), which would fire a raw OS
   //                 harmony: deep-link and skip the in-app router entirely.
   //   - anything else → rendered INERT (plain text label, no href, not clickable)
+  // These mirror the backend `link_scheme_allowed` (profile_page_doc.rs) exactly:
+  // a non-empty https:// URL, or a harmony: deep-link with a non-empty path and
+  // NO embedded scheme separator. The `:` guard rejects scheme lookalikes like
+  // `harmony:javascript:alert(1)`, `harmony:data:…`, and the bare `harmony:`,
+  // which a plain `startsWith('harmony:')` would wrongly render as a dispatching
+  // <button>. A URL matching neither falls through to the inert <span> branch.
   function isHttps(u: string): boolean {
-    return u.startsWith('https://');
+    return u.startsWith('https://') && u.length > 'https://'.length;
   }
   function isHarmony(u: string): boolean {
-    return u.startsWith('harmony:');
+    if (!u.startsWith('harmony:')) return false;
+    const rest = u.slice('harmony:'.length);
+    return rest.length > 0 && !rest.includes(':'); // non-empty path, no embedded scheme
   }
 
   // Lazy: resolve() kicks off the fetch on a cache miss and returns undefined

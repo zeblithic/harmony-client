@@ -58,6 +58,12 @@
   let removePage = $state(false);
 
   function requestRemovePage() {
+    // Only latchable once the prefill has FAILED. While the prefill is still
+    // pending, a click must NOT latch removePage: if the fetch then SUCCEEDS,
+    // the latch would wrongly win handleSave and drop the just-loaded page.
+    // The button is also hidden outside the failed state (see template), so
+    // this guard is belt-and-suspenders against a stray programmatic call.
+    if (!prefillFailed) return;
     removePage = true;
   }
 
@@ -229,6 +235,24 @@
       profilePageRoot,
     };
     onSave(updated);
+
+    // Reflect the saved result so the editor stays consistent and a subsequent
+    // save is idempotent (a removed page stays removed, not re-ingested from
+    // stale About fields). `profile` is a prop that App updates post-save, but
+    // the local About $state was untrack-seeded and won't auto-resync — hence
+    // the explicit reset. Runs only on the SUCCESS path (the ingest-error path
+    // above `return`s before reaching here).
+    removePage = false;
+    aboutDirty = false;
+    prefillFailed = false;
+    aboutNote = null;
+    prefillLoaded = true;
+    if (profilePageRoot === undefined) {
+      bio = '';
+      links = [];
+      fields = [];
+    }
+
     saved = true;
     if (savedTimer !== null) clearTimeout(savedTimer);
     savedTimer = setTimeout(() => { saved = false; savedTimer = null; }, 2000);
@@ -306,12 +330,15 @@
       <p class="about-note" role="status">{aboutNote}</p>
     {/if}
 
-    <!-- Explicit removal affordance for an existing page that hasn't loaded into
-         the editable fields (prefill pending or failed). When the fields ARE
-         populated (prefillLoaded), the user removes the page by clearing them —
-         no button needed. Without this, a failed prefill would make the page
-         un-removable (the empty-About save always preserves the old root). -->
-    {#if profile.profilePageRoot && !prefillLoaded}
+    <!-- Explicit removal affordance ONLY when the prefill FAILED. While the
+         prefill is still PENDING we must NOT offer it: a click that latched
+         removePage would wrongly win handleSave if the fetch then SUCCEEDED,
+         dropping the just-loaded page. On success the fields are populated, so
+         the user removes the page by clearing them inline — no button needed.
+         A failed prefill leaves the fields empty forever, so without this the
+         page would be un-removable (the empty-About save always preserves the
+         old root). -->
+    {#if profile.profilePageRoot && prefillFailed}
       {#if removePage}
         <p class="about-note about-remove-pending" role="status">
           Your profile page will be removed when you save.

@@ -118,6 +118,42 @@ describe('ProfilePageResolver', () => {
     expect(r.status('cid1')).toBe('error');
   });
 
+  it('status() transitions error → loading once the retry cooldown elapses', async () => {
+    vi.useFakeTimers();
+    let attempt = 0;
+    const adapter = fakeAdapter(async () => {
+      attempt++;
+      // First attempt fails; a post-cooldown retry would be the second invoke.
+      // Keep it pending forever so we can observe the 'loading' status without
+      // it racing back to 'error' on a second immediate failure.
+      if (attempt === 1) throw new Error('boom');
+      return new Promise<ProfilePageDto>(() => {});
+    });
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const r = new ProfilePageResolver();
+    r.connectAdapter(adapter as any);
+
+    expect(r.resolve('cid1')).toBeUndefined();
+    await vi.runAllTimersAsync();
+    expect(adapter.invoke).toHaveBeenCalledTimes(1);
+
+    // Still inside the cooldown → error, and resolve() does NOT re-invoke.
+    vi.advanceTimersByTime(29_000);
+    expect(r.status('cid1')).toBe('error');
+    expect(r.resolve('cid1')).toBeUndefined();
+    expect(adapter.invoke).toHaveBeenCalledTimes(1);
+
+    // Advance past RETRY_COOLDOWN_MS (30s): a retry is now imminent, so status
+    // reports 'loading' even before resolve() is called again.
+    vi.advanceTimersByTime(2_000);
+    expect(r.status('cid1')).toBe('loading');
+    // ...and the next resolve() actually kicks the retry.
+    expect(r.resolve('cid1')).toBeUndefined();
+    expect(adapter.invoke).toHaveBeenCalledTimes(2);
+    // While that retry is in flight, status stays 'loading'.
+    expect(r.status('cid1')).toBe('loading');
+  });
+
   it('destroy() clears the cache', async () => {
     const adapter = fakeAdapter(async () => SAMPLE_DTO);
     const r = new ProfilePageResolver();

@@ -57,15 +57,24 @@ export class ProfilePageResolver {
    * keying only off `resolve()` would show "Loading…" forever after a failure.
    *
    *   - 'resolved' → the doc is cached and `resolve()` returns it.
-   *   - 'loading'  → a fetch is in flight (or hasn't been attempted yet, in
-   *                  which case `resolve()` will kick one off).
-   *   - 'error'    → the last fetch failed and we're inside the retry cooldown.
+   *   - 'loading'  → a fetch is in flight, hasn't been attempted yet, OR a
+   *                  prior failure has cooled off (so the next `resolve()` will
+   *                  retry) — in every case `resolve()` will kick/has-kicked a
+   *                  fetch, so the UI should show "Loading…", not an error.
+   *   - 'error'    → the last fetch failed and we're STILL inside the retry
+   *                  cooldown (no retry is imminent yet).
    */
   status(cid: string): 'resolved' | 'loading' | 'error' {
     if (this.cache.has(cid)) return 'resolved';
     if (this.pending.has(cid)) return 'loading';
-    if (this.failedAt.has(cid)) return 'error';
-    return 'loading'; // not yet attempted — resolve() will kick a fetch
+    const failTime = this.failedAt.get(cid);
+    // Only report 'error' while still inside the cooldown. Once it has elapsed,
+    // the next resolve() would retry, so report 'loading' (a retry is imminent)
+    // rather than leaving the panel stuck on a stale error.
+    if (failTime !== undefined && Date.now() - failTime < RETRY_COOLDOWN_MS) {
+      return 'error';
+    }
+    return 'loading'; // never attempted, or cooled-off → next resolve() retries
   }
 
   private async fetch(cid: string): Promise<void> {

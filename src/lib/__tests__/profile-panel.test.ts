@@ -217,6 +217,62 @@ describe('ProfilePanel', () => {
     expect(onHarmonyLink).not.toHaveBeenCalled();
   });
 
+  it('renders harmony-scheme lookalikes INERT, but a real harmony: path as a button (Fix 3)', () => {
+    // Mirror the backend `link_scheme_allowed` `:` guard: a harmony: link with an
+    // embedded scheme separator (or an empty path) is a lookalike and must render
+    // inert — never a dispatching <button> that could route a hostile URL.
+    const onHarmonyLink = vi.fn();
+    const dto: ProfilePageDto = {
+      bio: '',
+      links: [
+        { label: 'harmony js', url: 'harmony:javascript:alert(1)' },
+        { label: 'harmony data', url: 'harmony:data:text/html,1' },
+        { label: 'bare harmony', url: 'harmony:' },
+        { label: 'real harmony', url: 'harmony:room/abc' },
+        { label: 'https with port', url: 'https://x.com:8443/p' },
+      ],
+      fields: [],
+    };
+    const { container } = render(ProfilePanel, {
+      props: {
+        ownerIdHex: OWNER_HEX,
+        card: { displayName: 'Eve', profilePageRoot: ROOT_CID },
+        resolver: fakeResolver({ [ROOT_CID]: dto }),
+        onClose: vi.fn(),
+        onHarmonyLink,
+      },
+    });
+
+    // Lookalikes: inert <span>, no <button>, no <a>.
+    for (const label of ['harmony js', 'harmony data', 'bare harmony']) {
+      const el = screen.getByText(label);
+      expect(el.tagName).not.toBe('BUTTON');
+      expect(el.tagName).not.toBe('A');
+      expect(el.getAttribute('href')).toBeNull();
+      el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    }
+    expect(onHarmonyLink).not.toHaveBeenCalled();
+
+    // A real harmony: path still renders a dispatching <button>.
+    const real = screen.getByText('real harmony');
+    expect(real.tagName).toBe('BUTTON');
+    expect(real.getAttribute('href')).toBeNull();
+    real.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    expect(onHarmonyLink).toHaveBeenCalledTimes(1);
+    expect(onHarmonyLink).toHaveBeenCalledWith('harmony:room/abc');
+
+    // A https: URL with a port still renders a real <a> (the port colon is in
+    // the authority, not a forbidden embedded scheme — only harmony: forbids ':').
+    const https = screen.getByText('https with port') as HTMLAnchorElement;
+    expect(https.tagName).toBe('A');
+    expect(https.getAttribute('href')).toBe('https://x.com:8443/p');
+
+    // Exactly two anchors-or-buttons among the actionable links, no stray <a>
+    // from a lookalike: only the real harmony button + the https anchor.
+    expect(container.querySelectorAll('a').length).toBe(1);
+    expect(container.querySelectorAll('button.profile-link').length).toBe(1);
+  });
+
   it('renders field rows as key/value pairs', () => {
     render(ProfilePanel, {
       props: {

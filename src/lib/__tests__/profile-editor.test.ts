@@ -303,6 +303,93 @@ describe('ProfileEditor — About section', () => {
     );
   });
 
+  it('does NOT show the Remove button while the prefill is still PENDING (Fix 2)', async () => {
+    // While the prefill is in flight, the removal affordance must be hidden:
+    // latching removePage and then having the fetch SUCCEED would drop the
+    // just-loaded page. The button only appears once the prefill has FAILED.
+    let resolvePrefill: ((v: unknown) => void) | undefined;
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'fetch_profile_doc') {
+        return new Promise((res) => {
+          resolvePrefill = res;
+        });
+      }
+      return Promise.resolve('cid-should-not-be-used');
+    });
+    const onSave = vi.fn();
+    render(ProfileEditor, {
+      props: {
+        profile: baseProfile({ profilePageRoot: 'cid-existing' }),
+        onSave,
+      },
+    });
+
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith('fetch_profile_doc', {
+        cid: 'cid-existing',
+      }),
+    );
+    // Prefill pending → no removal affordance.
+    expect(screen.queryByText('Remove profile page')).toBeNull();
+
+    // Resolve the prefill with a real page → still no button (fields populate,
+    // removal is inline). The page loaded successfully, so a stale Remove latch
+    // would have wrongly clobbered it — the hidden button prevents that.
+    resolvePrefill?.({
+      bio: 'Loaded after pending',
+      links: [],
+      fields: [],
+    });
+    await waitFor(() =>
+      expect((screen.getByLabelText('Bio') as HTMLTextAreaElement).value).toBe(
+        'Loaded after pending',
+      ),
+    );
+    expect(screen.queryByText('Remove profile page')).toBeNull();
+  });
+
+  it('after removing a failed-prefill page, a SECOND save stays removed (Fix 1)', async () => {
+    // Regression for the Cursor finding: after a save clears profilePageRoot,
+    // the local About $state must be reset so a subsequent save is idempotent —
+    // it must NOT re-ingest a doc and recreate the removed page.
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'fetch_profile_doc') {
+        return Promise.reject(new Error('fetch boom'));
+      }
+      return Promise.resolve('cid-recreated-should-not-happen');
+    });
+    const onSave = vi.fn();
+    render(ProfileEditor, {
+      props: {
+        profile: baseProfile({ profilePageRoot: 'cid-existing' }),
+        onSave,
+      },
+    });
+
+    // Prefill failed → Remove button appears; click it, then save.
+    const removeBtn = await screen.findByText('Remove profile page');
+    await fireEvent.click(removeBtn);
+    await fireEvent.click(screen.getByText('Save'));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect((onSave.mock.calls[0][0] as Profile).profilePageRoot).toBeUndefined();
+
+    // The removal affordance is gone (prefillFailed reset, root now undefined).
+    expect(screen.queryByText('Remove profile page')).toBeNull();
+    expect(
+      screen.queryByText('Your profile page will be removed when you save.'),
+    ).toBeNull();
+
+    // SECOND save with no further edits → still undefined, and crucially NO
+    // ingest (stale bio/links/fields were cleared by the post-save reset).
+    await fireEvent.click(screen.getByText('Save'));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(2));
+    expect((onSave.mock.calls[1][0] as Profile).profilePageRoot).toBeUndefined();
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      'ingest_profile_doc',
+      expect.anything(),
+    );
+  });
+
   it('preserves the existing page on a failed prefill when Remove is NOT clicked', async () => {
     // Prefill rejects, the user saves an empty (unedited) About WITHOUT clicking
     // Remove → no accidental drop: the existing root is re-emitted, and
