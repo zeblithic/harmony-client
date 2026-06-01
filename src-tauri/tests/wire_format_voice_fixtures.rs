@@ -1,5 +1,5 @@
 //! ZEB-350 Voice V2 wire-format pins. Locks the sealed voice-packet framing
-//! (and, in Task 5, the signed+sealed presence beacon). A drift here means
+//! (and the signed+sealed presence beacon). A drift here means
 //! the on-the-wire format changed — bump the version domain and re-pin
 //! deliberately, never silently.
 #![cfg(feature = "test-fixtures")]

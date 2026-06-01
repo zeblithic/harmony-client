@@ -16,6 +16,12 @@ pub const VOICE_PACKET_AAD: &[u8] = b"harmony-voice-pkt-v1";
 /// Domain separator for sealed presence beacons.
 pub const VOICE_PRESENCE_AAD: &[u8] = b"harmony-voice-presence-v1";
 
+/// Upper bound on an inbound voice/presence Zenoh payload before any
+/// allocation. A sealed 20 ms voice frame (23 B header + ≤510 B Opus +
+/// 28 B nonce/tag) and a sealed presence beacon both fit well under this;
+/// the cap bounds DoS allocation from a peer flooding the joined topic.
+pub const MAX_VOICE_PACKET_BYTES: usize = 4096;
+
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 const MIN_PACKET_LEN: usize = NONCE_LEN + TAG_LEN; // empty plaintext still carries a tag

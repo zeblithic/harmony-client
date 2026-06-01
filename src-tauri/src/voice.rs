@@ -35,7 +35,7 @@ pub struct VoiceJoinCaps {
     pub self_owner: OwnerAddr,
     /// 32-byte ed25519 verifying key of this device (device #2).
     pub self_device: [u8; 32],
-    /// ZEB-350 Task 7: the HLC reserved for this join session (own device),
+    /// ZEB-350: the HLC reserved for this join session (own device),
     /// stamped at the IPC boundary via `reserve_next_hlc_for_device`. Carried
     /// as identifying metadata in every presence beacon (beacons order by
     /// `seq`, not HLC) and reused for the `left` tombstone on leave.

@@ -1,7 +1,7 @@
 //! ZEB-350 Voice V2 presence: ephemeral signed+sealed beacons + the live
 //! roster. Beacons ride a dedicated Zenoh topic (never the CRDT); the seal
 //! under `ChannelKey` gates non-members, and the device-#2 signature +
-//! materialized-membership check (Task 7) prevents intra-member spoofing.
+//! materialized-membership check prevents intra-member spoofing.
 
 use crate::community_membership::ChannelId;
 use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
@@ -84,7 +84,7 @@ pub fn sign_presence_beacon(
 
 /// Verify the detached signature against the verifying key embedded in
 /// `beacon.device`. This proves the holder of `device`'s private key signed
-/// it; Task 7 additionally checks `device ∈ owner.enrolled_device_keys`.
+/// it; the membership check additionally requires `device ∈ owner.enrolled_device_keys`.
 pub fn verify_presence_beacon_sig(signed: &SignedVoicePresenceBeacon) -> Result<(), BeaconError> {
     let bytes = canonical_cbor_encode(&signed.beacon).map_err(|_| BeaconError::Encode)?;
     let vk = ed25519_dalek::VerifyingKey::from_bytes(&signed.beacon.device)
@@ -178,7 +178,7 @@ pub struct RosterEntry {
 }
 
 /// One row returned by [`VoicePresenceMap::sweep`]: the `(community, channel)`
-/// key plus the `(owner, device)` of an evicted entry. The caller (Task 7's
+/// key plus the `(owner, device)` of an evicted entry. The caller (the
 /// event-loop sweep arm) re-emits the affected channel's roster.
 pub type SweptEntry = ((SpaceId, ChannelId), [u8; 16], [u8; 32]);
 
@@ -215,7 +215,7 @@ impl VoicePresenceMap {
                 e.joined_hlc = beacon.joined_hlc.clone();
                 // A newer beacon always advances liveness (last_seen), which is
                 // itself a roster-relevant change for the heartbeat/emit cadence
-                // — so any seq advance reports `true`. The call site (Task 7) may
+                // — so any seq advance reports `true`. The call site may
                 // additionally gate the frontend emit on mute/membership change.
                 true
             }
@@ -276,7 +276,7 @@ impl VoicePresenceMap {
     }
 }
 
-// ── Task 7: membership verification + pub/sub spawn helpers ──────────────
+// ── Membership verification + pub/sub spawn helpers ──────────────
 
 use crate::community_state_sync::CommunitySyncRegistry;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -356,6 +356,14 @@ pub fn spawn_voice_presence_subscriber<R: tauri::Runtime>(
             }
         };
         while let Ok(sample) = sub.recv_async().await {
+            if sample.payload().len() > crate::voice_crypto::MAX_VOICE_PACKET_BYTES {
+                tracing::warn!(
+                    len = sample.payload().len(),
+                    max = crate::voice_crypto::MAX_VOICE_PACKET_BYTES,
+                    "oversized voice packet dropped"
+                );
+                continue;
+            }
             let bytes = sample.payload().to_bytes().to_vec();
             let Some(signed) = open_presence_beacon(&channel_key, &community, &channel, &bytes)
             else {

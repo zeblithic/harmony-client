@@ -1714,7 +1714,7 @@ pub async fn run<R: Runtime>(
     > = std::collections::HashMap::new();
     let mut voice_own_device: Option<String> = None; // hex of self ed25519 vk
 
-    // ZEB-350 Task 7: presence layer. One shared roster map for the loop's
+    // ZEB-350: presence layer. One shared roster map for the loop's
     // lifetime; per-join publisher/subscriber handles; a `voice_identity`
     // stash so Leave can build the `left` tombstone without re-resolving caps;
     // a monotonic clock (reusing `start`) for apply/sweep; and a 4 s sweep
@@ -2411,31 +2411,37 @@ pub async fn run<R: Runtime>(
             Some(req) = voice_channel_rx.recv() => {
                 match req {
                     crate::voice::VoiceChannelRequest::Join { community_id, channel_id, caps } => {
-                        // Cache the channel key (seals/open media + beacons) and
-                        // the node's own device id (names the outbound topic).
-                        voice_keys.insert(
-                            (community_id, channel_id),
-                            std::sync::Arc::clone(&caps.channel_key),
-                        );
-                        if voice_own_device.is_none() {
-                            voice_own_device = Some(hex::encode(caps.self_device));
-                        }
                         let sub_key = format!(
                             "harmony/voice/{}/{}/*",
                             hex::encode(community_id.0),
                             hex::encode(channel_id.0),
                         );
-                        // The subscriber opens (decrypts) before emitting; an
-                        // AEAD failure (non-member / stale epoch / tamper) is
-                        // dropped silently.
+                        // Declare the media subscriber FIRST: all state mutation
+                        // (cached key, own-device id, presence pub/sub) only
+                        // happens after this succeeds, so a subscribe failure
+                        // can't leave outbound sealing with a key that has no
+                        // matching inbound task (split-brain). On failure we
+                        // leave any prior state for this (community, channel)
+                        // intact — old subscriber keeps running with the old key.
                         let key_for_sub = std::sync::Arc::clone(&caps.channel_key);
                         let (c_sub, ch_sub) = (community_id, channel_id);
                         let app_sub = app.clone();
                         let closing_sub = closing.clone();
                         match session.declare_subscriber(&sub_key).await {
                             Ok(sub) => {
+                                // The subscriber opens (decrypts) before emitting;
+                                // an AEAD failure (non-member / stale epoch /
+                                // tamper) is dropped silently.
                                 let handle = tokio::spawn(async move {
                                     while let Ok(sample) = sub.recv_async().await {
+                                        if sample.payload().len() > crate::voice_crypto::MAX_VOICE_PACKET_BYTES {
+                                            tracing::warn!(
+                                                len = sample.payload().len(),
+                                                max = crate::voice_crypto::MAX_VOICE_PACKET_BYTES,
+                                                "oversized voice packet dropped"
+                                            );
+                                            continue;
+                                        }
                                         let sealed = sample.payload().to_bytes().to_vec();
                                         match crate::voice_crypto::decrypt_voice_packet(
                                             &key_for_sub,
@@ -2460,66 +2466,81 @@ pub async fn run<R: Runtime>(
                                 if let Some(old) = voice_subs.insert((community_id, channel_id), handle) {
                                     old.abort();
                                 }
+                                // Subscriber is live — now safe to cache the
+                                // channel key (seals/opens media + beacons) and
+                                // the node's own device id (names the outbound
+                                // topic).
+                                voice_keys.insert(
+                                    (community_id, channel_id),
+                                    std::sync::Arc::clone(&caps.channel_key),
+                                );
+                                if voice_own_device.is_none() {
+                                    voice_own_device = Some(hex::encode(caps.self_device));
+                                }
+                                // ZEB-350: presence. Membership verification
+                                // needs the community registry — guard the whole
+                                // presence leg behind it (None = no verifier, skip).
+                                if let Some(registry) = community_registry.clone() {
+                                    let pres_topic = format!(
+                                        "harmony/voice-presence/{}/{}",
+                                        hex::encode(community_id.0),
+                                        hex::encode(channel_id.0),
+                                    );
+                                    // Stash identity (+ signing key) so Leave can
+                                    // mint and sign the tombstone.
+                                    voice_identity.insert(
+                                        (community_id, channel_id),
+                                        (
+                                            caps.self_owner,
+                                            caps.self_device,
+                                            caps.joined_hlc.clone(),
+                                            std::sync::Arc::clone(&caps.signing_key),
+                                        ),
+                                    );
+                                    let pres_sub = crate::voice_presence::spawn_voice_presence_subscriber(
+                                        session.clone(),
+                                        pres_topic.clone(),
+                                        std::sync::Arc::clone(&caps.channel_key),
+                                        community_id,
+                                        channel_id,
+                                        registry,
+                                        std::sync::Arc::clone(&voice_presence_map),
+                                        app.clone(),
+                                        closing.clone(),
+                                        std::sync::Arc::clone(&voice_now_ms),
+                                    );
+                                    let pubh = crate::voice_presence::spawn_voice_presence_publisher(
+                                        session.clone(),
+                                        pres_topic,
+                                        std::sync::Arc::clone(&caps.channel_key),
+                                        community_id,
+                                        channel_id,
+                                        std::sync::Arc::clone(&caps.signing_key),
+                                        caps.self_owner,
+                                        caps.self_device,
+                                        caps.joined_hlc.clone(),
+                                        Duration::from_secs(4),
+                                        closing.clone(),
+                                    );
+                                    if let Some(h) = voice_presence_subs.insert((community_id, channel_id), pres_sub) {
+                                        h.abort();
+                                    }
+                                    if let Some(h) = voice_presence_pubs.insert((community_id, channel_id), pubh) {
+                                        h.abort();
+                                    }
+                                }
                             }
                             Err(e) => {
-                                tracing::error!(%sub_key, err = %e, "voice subscribe failed");
-                            }
-                        }
-                        // ZEB-350 Task 7: presence. Membership verification
-                        // needs the community registry — guard the whole
-                        // presence leg behind it (None = no verifier, skip).
-                        if let Some(registry) = community_registry.clone() {
-                            let pres_topic = format!(
-                                "harmony/voice-presence/{}/{}",
-                                hex::encode(community_id.0),
-                                hex::encode(channel_id.0),
-                            );
-                            // Stash identity (+ signing key) so Leave can mint
-                            // and sign the tombstone.
-                            voice_identity.insert(
-                                (community_id, channel_id),
-                                (
-                                    caps.self_owner,
-                                    caps.self_device,
-                                    caps.joined_hlc.clone(),
-                                    std::sync::Arc::clone(&caps.signing_key),
-                                ),
-                            );
-                            let sub = crate::voice_presence::spawn_voice_presence_subscriber(
-                                session.clone(),
-                                pres_topic.clone(),
-                                std::sync::Arc::clone(&caps.channel_key),
-                                community_id,
-                                channel_id,
-                                registry,
-                                std::sync::Arc::clone(&voice_presence_map),
-                                app.clone(),
-                                closing.clone(),
-                                std::sync::Arc::clone(&voice_now_ms),
-                            );
-                            let pubh = crate::voice_presence::spawn_voice_presence_publisher(
-                                session.clone(),
-                                pres_topic,
-                                std::sync::Arc::clone(&caps.channel_key),
-                                community_id,
-                                channel_id,
-                                std::sync::Arc::clone(&caps.signing_key),
-                                caps.self_owner,
-                                caps.self_device,
-                                caps.joined_hlc.clone(),
-                                Duration::from_secs(4),
-                                closing.clone(),
-                            );
-                            if let Some(h) = voice_presence_subs.insert((community_id, channel_id), sub) {
-                                h.abort();
-                            }
-                            if let Some(h) = voice_presence_pubs.insert((community_id, channel_id), pubh) {
-                                h.abort();
+                                tracing::error!(
+                                    %sub_key,
+                                    err = %e,
+                                    "voice subscribe failed; join not established"
+                                );
                             }
                         }
                     }
                     crate::voice::VoiceChannelRequest::Leave { community_id, channel_id } => {
-                        // ZEB-350 Task 7: stop the presence pub/sub, then send a
+                        // ZEB-350: stop the presence pub/sub, then send a
                         // best-effort `left` tombstone so peers drop us instantly
                         // (don't wait out the 12 s eviction).
                         if let Some(h) = voice_presence_pubs.remove(&(community_id, channel_id)) {
@@ -2551,7 +2572,7 @@ pub async fn run<R: Runtime>(
                                 }
                             }
                         }
-                        // Media leg (Task 4): drop the cached key + abort the sub.
+                        // Media leg: drop the cached key + abort the sub.
                         voice_keys.remove(&(community_id, channel_id));
                         if let Some(handle) = voice_subs.remove(&(community_id, channel_id)) {
                             handle.abort();
@@ -2567,7 +2588,7 @@ pub async fn run<R: Runtime>(
                 }
             }
 
-            // ── ZEB-350 Task 7: presence roster sweep ───────────────
+            // ── ZEB-350: presence roster sweep ───────────────
             // A dedicated 4 s interval tick (NOT a bare `sleep` arm, which
             // would reset every loop iteration and starve). Evicts entries
             // silent for >12 s, then re-emits the roster for each affected
@@ -2728,7 +2749,7 @@ pub async fn run<R: Runtime>(
     for (_, handle) in voice_subs.drain() {
         handle.abort();
     }
-    // ZEB-350 Task 7: abort the presence publisher/subscriber tasks too.
+    // ZEB-350: abort the presence publisher/subscriber tasks too.
     for (_, handle) in voice_presence_subs.drain() {
         handle.abort();
     }
