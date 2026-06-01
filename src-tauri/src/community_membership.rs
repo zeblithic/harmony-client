@@ -1523,9 +1523,11 @@ pub struct ChannelInfo {
     #[serde(rename = "wp")]
     pub write_power: u8,
     /// ZEB-349: channel kind (Text|Voice). `Text` is the default and is omitted
-    /// from the CBOR map, keeping a Text `ChannelInfo` byte-identical to
-    /// pre-ZEB-349 wire. Canonical CBOR sorts keys, so declaration order does
-    /// not affect wire bytes. Immutable (set only by `ChannelCreate`).
+    /// from the CBOR map (`skip_serializing_if`), keeping a Text `ChannelInfo`
+    /// byte-identical to pre-ZEB-349 wire. `canonical_cbor_encode` (ciborium)
+    /// preserves serde field-declaration order, so a Voice `ck` entry is
+    /// emitted here between `wp` and `ca`. Immutable (set only by
+    /// `ChannelCreate`).
     #[serde(rename = "ck", default, skip_serializing_if = "ChannelKind::is_text")]
     pub kind: ChannelKind,
     #[serde(rename = "ca")]
