@@ -45,6 +45,7 @@ function makeConfig(): {
 
   const config: VoiceSenderConfig = {
     senderHash: makeSenderHash(),
+    communityId: 'a'.repeat(32),
     channelId: 'chan-abc',
     invoke: mockInvoke,
     codec: mockCodec,
@@ -96,6 +97,7 @@ describe('VoiceSender', () => {
 
     // Tauri v2 wraps in parameter name — Rust param is `payload`
     const payload = args.payload as Record<string, unknown>;
+    expect(payload.communityId).toBe('a'.repeat(32));
     expect(payload.channelId).toBe('chan-abc');
 
     // frameBytes must be an array

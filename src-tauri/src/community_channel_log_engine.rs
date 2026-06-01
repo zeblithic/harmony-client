@@ -1007,6 +1007,12 @@ impl<R: tauri::Runtime> ChannelLogEngine<R> {
     pub(crate) fn channel_key_ref(&self) -> &ChannelKey {
         self.channel_key.as_ref()
     }
+
+    /// ZEB-350: clone the `Arc<ChannelKey>` so the voice relay can hold the key
+    /// for the lifetime of a join without borrowing the engine.
+    pub(crate) fn channel_key_arc(&self) -> std::sync::Arc<ChannelKey> {
+        std::sync::Arc::clone(&self.channel_key)
+    }
 }
 
 // ── Registry ───────────────────────────────────────────────────────────────

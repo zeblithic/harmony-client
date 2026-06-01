@@ -8,6 +8,8 @@ const TAIL_FRAME_COUNT = 3;
 export interface VoiceSenderConfig {
   /** 16-byte node address (Reticulum-compatible sender hash). */
   senderHash: Uint8Array;
+  /** Community ID that scopes the voice channel (publish scope). */
+  communityId: string;
   /** Voice channel ID used as the Zenoh topic segment. */
   channelId: string;
   /** Tauri invoke function — wraps window.__TAURI__.invoke in production. */
@@ -129,6 +131,7 @@ export class VoiceSender {
     // Uint8Array → number[] for JSON serialization over IPC.
     const promise = this.config.invoke('send_voice_frame', {
       payload: {
+        communityId: this.config.communityId,
         channelId: this.config.channelId,
         frameBytes: Array.from(frame),
       },
