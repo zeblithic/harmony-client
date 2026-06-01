@@ -282,6 +282,7 @@ describe('CommunityService', () => {
         channelId: 'cc'.repeat(16),
         name: 'general',
         writePower: 0,
+        kind: 'text',
         createdAt: { wallMs: 1, logical: 0, deviceId: 'd' },
       },
     ];
