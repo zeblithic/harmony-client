@@ -568,20 +568,31 @@ async fn run_inner() {
     // with `now` advanced past 12 s evicts it — using logical time, not a real
     // 12 s sleep. We drive `apply`/`sweep` on B's map directly with the
     // injected clock.
+    //
+    // After Assertion 2's tombstone, B holds a hidden `left` *gravestone* for A
+    // (joined_hlc + u64::MAX seq barrier). A same-session beacon would now be
+    // (correctly) rejected as a reordered post-tombstone duplicate — that is the
+    // resurrection guard. So the re-seed models a genuine REJOIN: a strictly
+    // newer `joined_hlc`, which revives the gravestone into a fresh live entry.
     {
         let mut g = map_b.lock().await;
+        let rejoin_hlc = Hlc {
+            wall_ms: joined_hlc.wall_ms + 1,
+            logical: joined_hlc.logical,
+            device_id: joined_hlc.device_id.clone(),
+        };
         // last_seen at clock=0; entry is live.
         let beacon = harmony_app::voice_presence::VoicePresenceBeacon {
             owner: owner_a.0,
             device: device_a,
             muted: true,
-            joined_hlc: joined_hlc.clone(),
+            joined_hlc: rejoin_hlc,
             seq: 0,
             left: false,
         };
         assert!(
             g.apply(&community, &channel, &beacon, 0),
-            "re-seeded entry should be a roster change"
+            "re-seeded entry (newer session) should revive the gravestone — a roster change"
         );
         assert!(
             !g.roster(&community, &channel).is_empty(),
