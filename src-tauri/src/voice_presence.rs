@@ -229,8 +229,15 @@ impl VoicePresenceMap {
                 // Stored row is from a strictly-newer session → ignore a stale
                 // old-session tombstone (must not evict a freshly-rejoined row).
                 Some(e) if e.joined_hlc.is_strictly_newer_than(&beacon.joined_hlc) => false,
-                // Already a gravestone → keep the barrier fresh, roster unchanged.
+                // Already a gravestone → advance the barrier to this tombstone's
+                // session. Older-session tombstones were filtered by the arm
+                // above, so this is same-or-newer; updating `joined_hlc` keeps
+                // the barrier pinned to the NEWEST departed session. Without it,
+                // a reordered heartbeat from that newer session would pass the
+                // strictly-newer check below and resurrect a member who already
+                // left. Roster unchanged (still hidden).
                 Some(e) if e.left => {
+                    e.joined_hlc = beacon.joined_hlc.clone();
                     e.seq = beacon.seq;
                     e.last_seen_ms = now_ms;
                     false
@@ -874,6 +881,40 @@ mod map_tests {
             "gravestone GC is silent"
         );
         assert!(m.inner.is_empty(), "gravestone sub-map reclaimed");
+    }
+
+    #[test]
+    fn newer_session_tombstone_advances_gravestone_barrier() {
+        let mut m = VoicePresenceMap::new();
+        // Session H1 joins, then leaves → gravestone pinned at H1.
+        assert!(m.apply(&C, &CH, &bh(1, 1, 0, true, false, h1()), 0));
+        assert!(m.apply(&C, &CH, &bh(1, 1, u64::MAX, true, true, h1()), 10));
+        assert!(m.roster(&C, &CH).is_empty());
+        // A NEWER session H2 also departs while we still hold the H1 gravestone
+        // (H2's live beacons reordered after its tombstone, or never seen). The
+        // gravestone barrier must ADVANCE to H2 — not stay pinned at H1.
+        assert!(
+            !m.apply(&C, &CH, &bh(1, 1, u64::MAX, true, true, h2()), 20),
+            "newer-session tombstone on a gravestone is not a roster change"
+        );
+        // A reordered heartbeat from H2 (the now-departed newer session) must be
+        // rejected; without the barrier advance it would resurrect H2.
+        assert!(
+            !m.apply(&C, &CH, &bh(1, 1, 5, false, false, h2()), 30),
+            "H2 heartbeat must not revive: barrier advanced to H2"
+        );
+        assert!(m.roster(&C, &CH).is_empty(), "no resurrection");
+        // Only a still-newer session (H3) legitimately revives the gravestone.
+        let h3 = Hlc {
+            wall_ms: 3000,
+            logical: 0,
+            device_id: "d".into(),
+        };
+        assert!(
+            m.apply(&C, &CH, &bh(1, 1, 0, false, false, h3), 40),
+            "a genuinely newer session (H3) revives the gravestone"
+        );
+        assert_eq!(m.roster(&C, &CH).len(), 1);
     }
 }
 
