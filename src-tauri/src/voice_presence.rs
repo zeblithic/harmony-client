@@ -266,6 +266,14 @@ impl VoicePresenceMap {
             })
             .unwrap_or_default()
     }
+
+    /// Drop a channel's entire roster. Called on `Leave` so the periodic sweep
+    /// stops emitting `voice-presence-changed` for a channel the user has left
+    /// (otherwise stale entries linger up to the 12 s TTL) and the empty
+    /// sub-map is reclaimed rather than accumulating across channel visits.
+    pub fn remove_channel(&mut self, c: &SpaceId, ch: &ChannelId) {
+        self.inner.remove(&(*c, *ch));
+    }
 }
 
 // ── Task 7: membership verification + pub/sub spawn helpers ──────────────
@@ -611,6 +619,20 @@ mod map_tests {
             "left=true → change (removal)"
         );
         assert!(m.roster(&C, &CH).is_empty());
+    }
+
+    #[test]
+    fn remove_channel_clears_roster() {
+        let mut m = VoicePresenceMap::new();
+        m.apply(&C, &CH, &b(1, 1, 0, true, false), 0);
+        assert!(!m.roster(&C, &CH).is_empty());
+        m.remove_channel(&C, &CH);
+        assert!(
+            m.roster(&C, &CH).is_empty(),
+            "remove_channel drops the channel's roster so the sweep stops emitting for it"
+        );
+        // A subsequent sweep must not resurrect or report the cleared entry.
+        assert!(m.sweep(99_999, 12_000).is_empty());
     }
 }
 

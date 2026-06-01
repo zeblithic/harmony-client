@@ -2556,6 +2556,13 @@ pub async fn run<R: Runtime>(
                         if let Some(handle) = voice_subs.remove(&(community_id, channel_id)) {
                             handle.abort();
                         }
+                        // Clear our local roster for this channel so the periodic
+                        // sweep stops emitting `voice-presence-changed` for a
+                        // channel we've left (final-review fix).
+                        {
+                            let mut g = voice_presence_map.lock().await;
+                            g.remove_channel(&community_id, &channel_id);
+                        }
                     }
                 }
             }
