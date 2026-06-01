@@ -1398,6 +1398,14 @@ pub async fn run<R: Runtime>(
                                                         "displayName": info.display_name,
                                                         "statusText": info.status_text,
                                                         "avatarCid": info.avatar_cid,
+                                                        // ZEB-345: include the
+                                                        // long-form page root on the
+                                                        // instant PUSH path too, so an
+                                                        // open panel updates without
+                                                        // waiting for the poll fallback
+                                                        // (Cursor). DiscoveredCardInfo
+                                                        // already carries it hex-encoded.
+                                                        "profilePageRoot": info.profile_page_root,
                                                     }),
                                                 );
                                             }

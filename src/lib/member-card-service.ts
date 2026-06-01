@@ -4,6 +4,10 @@ export interface ResolvedCard {
   displayName: string;
   statusText: string;
   avatarUrl?: string;
+  /** ZEB-345: CID (hex) of the member's long-form profile-page doc, if any.
+   *  Pass-through (unlike avatarCid, no URL resolution): the ProfilePanel feeds
+   *  it to the lazy ProfilePageResolver only when the panel opens. */
+  profilePageRoot?: string;
 }
 
 /**
@@ -16,6 +20,9 @@ export interface DiscoveredCardInfo {
   displayName: string;
   statusText: string;
   avatarCid?: string;
+  /** ZEB-345: CID (hex) of the member's long-form profile-page doc, if any.
+   *  Matches the backend DiscoveredCardInfo serde `profilePageRoot`. */
+  profilePageRoot?: string;
 }
 
 /** Poll cadence for the cache-drain loop. 3s balances name-fill latency
@@ -140,6 +147,7 @@ export class MemberCardService {
       displayName: profile.displayName,
       statusText: profile.statusText,
       avatarUrl,
+      profilePageRoot: profile.profilePageRoot,
     });
     this.onUpdate?.();
   }
@@ -167,13 +175,15 @@ export class MemberCardService {
       displayName: card.displayName,
       statusText: card.statusText,
       avatarUrl,
+      profilePageRoot: card.profilePageRoot,
     };
     const prev = this.cards.get(key);
     if (
       prev &&
       prev.displayName === next.displayName &&
       prev.statusText === next.statusText &&
-      prev.avatarUrl === next.avatarUrl
+      prev.avatarUrl === next.avatarUrl &&
+      prev.profilePageRoot === next.profilePageRoot
     ) {
       return; // unchanged — no churn
     }
@@ -293,12 +303,14 @@ export class MemberCardService {
             !prev ||
             prev.displayName !== info.displayName ||
             prev.statusText !== info.statusText ||
-            prev.avatarUrl !== avatarUrl
+            prev.avatarUrl !== avatarUrl ||
+            prev.profilePageRoot !== info.profilePageRoot
           ) {
             this.cards.set(owner, {
               displayName: info.displayName,
               statusText: info.statusText,
               avatarUrl,
+              profilePageRoot: info.profilePageRoot,
             });
             changed = true;
           }

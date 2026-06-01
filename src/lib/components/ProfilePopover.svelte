@@ -38,6 +38,7 @@
     ownAddress,
     profileBroadcastService,
     resolveCommunityName,
+    onViewProfile,
   }: {
     /** 'reticulum' = existing avatar-click profile popover; 'owner-card' =
      *  ZEB-341 owner_id card popover. */
@@ -55,6 +56,10 @@
     profileBroadcastService?: ProfileBroadcastService;
     /** Required in 'reticulum' mode. */
     resolveCommunityName?: (communityIdHex: string) => string | null;
+    /** ZEB-345: owner-card mode only. Opens the right-side ProfilePanel for the
+     *  card's owner_id. App.svelte (T10) owns the openProfileOwnerId state this
+     *  sets. Omitted → the "View full profile" action is hidden. */
+    onViewProfile?: (ownerIdHex: string) => void;
   } = $props();
 
   const SOUND_LABELS = { quiet: 'Quiet', standard: 'Standard', loud: 'Loud' } as const;
@@ -276,6 +281,15 @@
   {#if card.membershipStatus === 'banned'}
     <div class="popover-status-flag">Banned</div>
   {/if}
+  {#if onViewProfile}
+    <button
+      type="button"
+      class="popover-view-profile"
+      onclick={() => onViewProfile?.(card.ownerIdHex)}
+    >
+      View full profile
+    </button>
+  {/if}
 {:else if profile}
   <div class="popover-header">
     <Avatar address={profile.address} displayName={profile.displayName} avatarUrl={profile.avatarUrl} size={64} />
@@ -415,6 +429,28 @@
     font-size: 12px;
     font-weight: 600;
     color: var(--danger, var(--text-muted));
+  }
+
+  .popover-view-profile {
+    display: block;
+    width: 100%;
+    margin-top: 10px;
+    padding: 6px 8px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--accent, #5865f2);
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+    text-align: center;
+  }
+  .popover-view-profile:hover {
+    background: var(--bg-secondary);
+  }
+  .popover-view-profile:focus-visible {
+    outline: 2px solid var(--accent, #5865f2);
+    outline-offset: 1px;
   }
 
   .popover-sounds {

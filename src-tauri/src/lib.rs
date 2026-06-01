@@ -72,6 +72,7 @@ pub mod pkarr_resolver_adapter;
 pub mod pkarr_settings;
 pub mod profile_broadcast;
 pub mod profile_card_broadcast;
+pub mod profile_page_doc;
 // ZEB-321 Phase 1 Task 7: debounced background task that re-emits this
 // device's ReachabilityAnnounce on startup / network change / idle tick /
 // manual force-notify. Wired into the event loop by Task 8.
@@ -1048,6 +1049,9 @@ pub struct ProfilePayload {
     /// Hex-encoded CID for full-size avatar content.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub avatar_cid: Option<String>,
+    /// Hex-encoded root CID for the long-form profile page document.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_page_root: Option<String>,
     /// Hex-encoded CID for thumbnail avatar content.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub avatar_mini_cid: Option<String>,
@@ -5600,6 +5604,27 @@ async fn publish_profile(
         }
     };
 
+    // ZEB-345: validate the profile_page_root CID hex BEFORE the Reticulum
+    // commit too, same ordering as avatar_cid above — a malformed root must fail
+    // the IPC with NOTHING published. None = no profile page (legitimate).
+    let profile_page_root_bytes: Option<[u8; 32]> = match profile.profile_page_root.as_deref() {
+        None => None,
+        Some(h) => {
+            let bytes =
+                hex::decode(h).map_err(|e| format!("invalid profile_page_root hex: {e}"))?;
+            let root_arr = <[u8; 32]>::try_from(bytes)
+                .map_err(|_| "profile_page_root must be 32 bytes".to_string())?;
+            // ZEB-345: profile pages are fetched over the PUBLIC CAS path only, so
+            // an encrypted root would be unresolvable by peers — reject it before
+            // the Reticulum commit (same pre-commit ordering as the decode above).
+            let cid = harmony_content::cid::ContentId::from_bytes(root_arr);
+            if cid.flags().encrypted {
+                return Err("profile_page_root must be a public (unencrypted) CID".to_string());
+            }
+            Some(root_arr)
+        }
+    };
+
     let key_expr = format!("harmony/profile/{}", profile.address);
     let payload = serde_json::to_vec(&profile).map_err(|e| format!("serialize: {e}"))?;
 
@@ -5633,6 +5658,7 @@ async fn publish_profile(
         profile.display_name.clone(),
         profile.status_text.clone().unwrap_or_default(),
         avatar_cid_bytes,
+        profile_page_root_bytes,
     )
     .await
     {
@@ -5666,6 +5692,7 @@ async fn publish_owner_card(
     display_name: String,
     status_text: String,
     avatar_cid: Option<[u8; 32]>,
+    profile_page_root: Option<[u8; 32]>,
 ) -> Result<(), String> {
     let (
         Some(dm_outbox),
@@ -5703,6 +5730,7 @@ async fn publish_owner_card(
         display_name,
         status_text,
         avatar_cid,
+        profile_page_root,
         enrollment_cert,
         hlc,
     ) {
@@ -5736,6 +5764,7 @@ async fn republish_owner_card(
     display_name: String,
     status_text: String,
     avatar_cid: Option<String>,
+    profile_page_root: Option<String>,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
     // None = no avatar (legitimate). A PRESENT-but-malformed hex must surface as
@@ -5748,6 +5777,24 @@ async fn republish_owner_card(
                 <[u8; 32]>::try_from(bytes)
                     .map_err(|_| "avatar_cid must be 32 bytes".to_string())?,
             )
+        }
+    };
+    // ZEB-345: same posture as avatar_cid — None = no profile page (legitimate),
+    // a present-but-malformed hex surfaces an Err rather than silent strip.
+    let profile_page_root_bytes: Option<[u8; 32]> = match profile_page_root.as_deref() {
+        None => None,
+        Some(h) => {
+            let bytes =
+                hex::decode(h).map_err(|e| format!("invalid profile_page_root hex: {e}"))?;
+            let root_arr = <[u8; 32]>::try_from(bytes)
+                .map_err(|_| "profile_page_root must be 32 bytes".to_string())?;
+            // ZEB-345: profile pages are fetched over the PUBLIC CAS path only, so
+            // an encrypted root would be unresolvable by peers — reject it.
+            let cid = harmony_content::cid::ContentId::from_bytes(root_arr);
+            if cid.flags().encrypted {
+                return Err("profile_page_root must be a public (unencrypted) CID".to_string());
+            }
+            Some(root_arr)
         }
     };
     let (dm_outbox, dm_self_owner, dm_device_id, hlc_tracker, profile_card_publisher) = {
@@ -5769,6 +5816,7 @@ async fn republish_owner_card(
         display_name,
         status_text,
         avatar_cid_bytes,
+        profile_page_root_bytes,
     )
     .await
 }
@@ -8344,6 +8392,88 @@ async fn ingest_avatar_bytes(
     ingest_avatar_bytes_inner(&ingest_tx, bytes).await
 }
 
+/// ZEB-345: structured input for one profile-page link, deserialized from the
+/// frontend. Validated (cap + scheme) inside `encode_profile_doc`.
+#[derive(serde::Deserialize, Clone)]
+pub struct ProfileLinkInput {
+    pub label: String,
+    pub url: String,
+}
+
+/// ZEB-345: structured input for one profile-page key/value field.
+#[derive(serde::Deserialize, Clone)]
+pub struct ProfileFieldInput {
+    pub key: String,
+    pub value: String,
+}
+
+/// ZEB-345: build + validate + canonical-encode a `ProfilePageDoc` from
+/// structured frontend input, then ingest the bytes into CAS as a
+/// PublicDurable (unencrypted, publicly servable) object. Twin of
+/// `ingest_avatar_bytes_inner` — same ingest channel, same root→hex
+/// conversion — but the doc is encoded here rather than received pre-built, so
+/// caps/scheme/size are enforced by `encode_profile_doc` (the encode authority
+/// lives in `profile_page_doc`, never in the frontend). Like avatars, skips the
+/// sidecar insert so profile docs never appear in the file listing.
+pub(crate) async fn ingest_profile_doc_inner(
+    bio: String,
+    links: Vec<ProfileLinkInput>,
+    fields: Vec<ProfileFieldInput>,
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+) -> Result<String, String> {
+    use crate::profile_page_doc::{
+        encode_profile_doc, ProfileField, ProfileLink, ProfilePageDoc, PROFILE_DOC_VERSION,
+    };
+    use harmony_content::chunker::ChunkerConfig;
+
+    let doc = ProfilePageDoc {
+        version: PROFILE_DOC_VERSION,
+        bio,
+        links: links
+            .into_iter()
+            .map(|l| ProfileLink {
+                label: l.label,
+                url: l.url,
+            })
+            .collect(),
+        fields: fields
+            .into_iter()
+            .map(|f| ProfileField {
+                key: f.key,
+                value: f.value,
+            })
+            .collect(),
+    };
+    // Validates caps + link scheme + total encoded size, then returns the
+    // canonical-CBOR bytes (declaration-order keys). Any Err maps to a String
+    // surfaced to the IPC caller.
+    let bytes = encode_profile_doc(&doc).map_err(|e| e.to_string())?;
+    let reader = tokio::io::BufReader::new(std::io::Cursor::new(bytes));
+    let (root, _size) = streaming_ingest(reader, ingest_tx, ChunkerConfig::DEFAULT, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(hex::encode(root.to_bytes()))
+}
+
+/// ZEB-345 IPC: ingest a long-form profile document (bio + links + fields)
+/// into CAS, returning the root CID hex for the card's `profile_page_root`.
+#[tauri::command]
+async fn ingest_profile_doc(
+    bio: String,
+    links: Vec<ProfileLinkInput>,
+    fields: Vec<ProfileFieldInput>,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<String, String> {
+    let ingest_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .ingest_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    ingest_profile_doc_inner(bio, links, fields, &ingest_tx).await
+}
+
 /// Ingest a leaf file already present on disk through the same pipeline as
 /// `ingest_content`, but driven by an explicit path instead of an `rfd`
 /// dialog. Internal — kept for a future direct-leaf-ingest IPC (e.g. a
@@ -8587,6 +8717,92 @@ mod path_ingest_tests {
         let cid = ContentId::from_bytes(<[u8; 32]>::try_from(raw).unwrap());
         assert_eq!(cid.content_class(), ContentClass::PublicDurable);
         assert!(cid.verify_hash(&bytes), "cid must hash the ingested bytes");
+        drop(ingest_tx);
+        let _ = drainer.await;
+    }
+
+    #[tokio::test]
+    async fn ingest_profile_doc_yields_public_durable_cid() {
+        use crate::profile_page_doc::{encode_profile_doc, ProfilePageDoc, PROFILE_DOC_VERSION};
+        use harmony_content::cid::{ContentClass, ContentId};
+        let (ingest_tx, mut ingest_rx) =
+            tokio::sync::mpsc::channel::<event_loop::IngestRequest>(16);
+        let drainer = tokio::spawn(async move {
+            while let Some(req) = ingest_rx.recv().await {
+                let _ = req.reply.send(Ok(()));
+            }
+        });
+
+        let links = vec![ProfileLinkInput {
+            label: "Site".into(),
+            url: "https://example.com".into(),
+        }];
+        let fields = vec![ProfileFieldInput {
+            key: "Pronouns".into(),
+            value: "she/her".into(),
+        }];
+        let cid_hex = ingest_profile_doc_inner(
+            "hi\nthere".into(),
+            links.clone(),
+            fields.clone(),
+            &ingest_tx,
+        )
+        .await
+        .expect("ingest profile doc");
+
+        // The CID must be PublicDurable (leading bit clear) and hash the exact
+        // canonical-CBOR bytes the codec produces for the same structured input.
+        let raw = hex::decode(&cid_hex).unwrap();
+        let cid = ContentId::from_bytes(<[u8; 32]>::try_from(raw).unwrap());
+        assert_eq!(cid.content_class(), ContentClass::PublicDurable);
+
+        let expected_doc = ProfilePageDoc {
+            version: PROFILE_DOC_VERSION,
+            bio: "hi\nthere".into(),
+            links: links
+                .into_iter()
+                .map(|l| crate::profile_page_doc::ProfileLink {
+                    label: l.label,
+                    url: l.url,
+                })
+                .collect(),
+            fields: fields
+                .into_iter()
+                .map(|f| crate::profile_page_doc::ProfileField {
+                    key: f.key,
+                    value: f.value,
+                })
+                .collect(),
+        };
+        let expected_bytes = encode_profile_doc(&expected_doc).unwrap();
+        assert!(
+            cid.verify_hash(&expected_bytes),
+            "cid must hash the canonical profile-doc bytes"
+        );
+
+        drop(ingest_tx);
+        let _ = drainer.await;
+    }
+
+    #[tokio::test]
+    async fn ingest_profile_doc_rejects_oversize_input() {
+        use crate::profile_page_doc::MAX_BIO_BYTES;
+        let (ingest_tx, mut ingest_rx) =
+            tokio::sync::mpsc::channel::<event_loop::IngestRequest>(16);
+        let drainer = tokio::spawn(async move {
+            while let Some(req) = ingest_rx.recv().await {
+                let _ = req.reply.send(Ok(()));
+            }
+        });
+
+        // A bio one byte over the cap must fail at validation, before any
+        // bytes are streamed into CAS.
+        let oversize_bio = "x".repeat(MAX_BIO_BYTES + 1);
+        let err = ingest_profile_doc_inner(oversize_bio, Vec::new(), Vec::new(), &ingest_tx)
+            .await
+            .expect_err("oversize bio must be rejected");
+        assert!(err.contains("bio"), "expected bio-cap error, got: {err}");
+
         drop(ingest_tx);
         let _ = drainer.await;
     }
@@ -11185,6 +11401,177 @@ async fn fetch_content(
     reply_rx
         .await
         .map_err(|_| "event loop dropped fetch request".to_string())?
+}
+
+/// ZEB-345: structured profile-page document returned to the frontend.
+///
+/// The frontend NEVER parses untrusted CBOR — `fetch_profile_doc` decodes +
+/// validates the fetched bytes through the `profile_page_doc` codec and hands
+/// back this camelCase DTO. Twin shape of the `ingest_profile_doc` input types.
+#[derive(serde::Serialize, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfilePageDocDto {
+    pub bio: String,
+    pub links: Vec<ProfileLinkDto>,
+    pub fields: Vec<ProfileFieldDto>,
+}
+
+/// ZEB-345: one profile-page link in the fetched DTO.
+#[derive(serde::Serialize, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileLinkDto {
+    pub label: String,
+    pub url: String,
+}
+
+/// ZEB-345: one profile-page key/value field in the fetched DTO.
+#[derive(serde::Serialize, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileFieldDto {
+    pub key: String,
+    pub value: String,
+}
+
+/// ZEB-345: pure, event-loop-free core of `fetch_profile_doc`.
+///
+/// Enforces the doc-specific byte cap up front (defense-in-depth before the
+/// codec's own check), then decodes + validates through the `profile_page_doc`
+/// codec — so a fetched doc is bound by the exact same caps/scheme/version
+/// rules as an ingested one — and maps the validated struct into the camelCase
+/// DTO. Any error maps to a `String` surfaced to the IPC caller. Unit-tested
+/// directly (no event loop); the transport path is covered by T6's cross-peer
+/// test.
+fn profile_doc_dto_from_bytes(bytes: &[u8]) -> Result<ProfilePageDocDto, String> {
+    if bytes.len() > crate::profile_page_doc::MAX_PROFILE_DOC_BYTES {
+        return Err("profile doc exceeds size cap".to_string());
+    }
+    let doc = crate::profile_page_doc::decode_profile_doc(bytes).map_err(|e| e.to_string())?;
+    Ok(ProfilePageDocDto {
+        bio: doc.bio,
+        links: doc
+            .links
+            .into_iter()
+            .map(|l| ProfileLinkDto {
+                label: l.label,
+                url: l.url,
+            })
+            .collect(),
+        fields: doc
+            .fields
+            .into_iter()
+            .map(|f| ProfileFieldDto {
+                key: f.key,
+                value: f.value,
+            })
+            .collect(),
+    })
+}
+
+/// ZEB-345 IPC: fetch a long-form profile document by hex CID over CAS,
+/// enforce the doc byte-cap, decode + validate, and return a structured
+/// camelCase DTO so the frontend never parses untrusted CBOR.
+///
+/// Twin of `fetch_content`: same hex validation, same `fetch_tx`/`FetchRequest`
+/// oneshot path. `FetchRequest` already returns hash-verified bytes (ZEB-343
+/// verify-on-fetch), so this does NOT re-verify hash==CID — it adds the
+/// doc-specific byte cap + decode via `profile_doc_dto_from_bytes`.
+#[tauri::command]
+async fn fetch_profile_doc(
+    cid: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<ProfilePageDocDto, String> {
+    // Validate hex CID. Profile-page roots are fixed 32-byte CIDs, so reject any
+    // hex that isn't exactly 64 chars BEFORE doing any fetch work — `"ab"` is
+    // valid hex but can never be a CID (CodeRabbit).
+    if cid.len() != 64 || !cid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("invalid CID hex: {cid}"));
+    }
+
+    let fetch_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .fetch_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    fetch_tx
+        .send(event_loop::FetchRequest {
+            cid_hex: cid,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+
+    let bytes = reply_rx
+        .await
+        .map_err(|_| "event loop dropped fetch request".to_string())??;
+
+    profile_doc_dto_from_bytes(&bytes)
+}
+
+#[cfg(test)]
+mod fetch_profile_doc_tests {
+    use super::*;
+    use crate::profile_page_doc::{
+        encode_profile_doc, ProfileField, ProfileLink, ProfilePageDoc, MAX_PROFILE_DOC_BYTES,
+        PROFILE_DOC_VERSION,
+    };
+
+    #[test]
+    fn profile_doc_dto_from_bytes_round_trips() {
+        // Encode a known doc through the T2 codec, then decode it back through
+        // the pure inner and assert the DTO fields equal the input.
+        let doc = ProfilePageDoc {
+            version: PROFILE_DOC_VERSION,
+            bio: "hi\nthere".into(),
+            links: vec![ProfileLink {
+                label: "Site".into(),
+                url: "https://example.com".into(),
+            }],
+            fields: vec![ProfileField {
+                key: "Pronouns".into(),
+                value: "she/her".into(),
+            }],
+        };
+        let bytes = encode_profile_doc(&doc).expect("encode known doc");
+
+        let dto = profile_doc_dto_from_bytes(&bytes).expect("decode + map to DTO");
+        assert_eq!(
+            dto,
+            ProfilePageDocDto {
+                bio: "hi\nthere".into(),
+                links: vec![ProfileLinkDto {
+                    label: "Site".into(),
+                    url: "https://example.com".into(),
+                }],
+                fields: vec![ProfileFieldDto {
+                    key: "Pronouns".into(),
+                    value: "she/her".into(),
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn profile_doc_dto_from_bytes_rejects_oversize() {
+        // One byte over the doc cap must be rejected before any decode.
+        let oversize = vec![0u8; MAX_PROFILE_DOC_BYTES + 1];
+        let err = profile_doc_dto_from_bytes(&oversize).expect_err("oversize must error");
+        assert!(err.contains("size cap"), "got: {err}");
+    }
+
+    #[test]
+    fn profile_doc_dto_from_bytes_rejects_malformed() {
+        // Non-CBOR garbage (within the byte cap) must surface a decode error,
+        // never panic or yield a partial DTO.
+        let garbage = [0xFFu8; 64];
+        assert!(
+            profile_doc_dto_from_bytes(&garbage).is_err(),
+            "malformed bytes must error"
+        );
+    }
 }
 
 // ── Voice commands ──────────────────────────────────────────────────────
@@ -31764,9 +32151,11 @@ pub fn run() {
             archive_content,
             set_replication_tier,
             fetch_content,
+            fetch_profile_doc,
             export_content,
             ingest_content,
             ingest_avatar_bytes,
+            ingest_profile_doc,
             create_folder,
             ingest_folder_tree,
             cancel_folder_ingest,
@@ -32029,6 +32418,7 @@ mod tests {
             status_text: Some("Building".to_string()),
             avatar_url: None,
             avatar_cid: None,
+            profile_page_root: Some("ab".repeat(32)),
             avatar_mini_cid: None,
         };
         let json = serde_json::to_vec(&profile).unwrap();
@@ -32037,6 +32427,10 @@ mod tests {
         assert_eq!(parsed.display_name, "Alice");
         assert_eq!(parsed.status_text.as_deref(), Some("Building"));
         assert!(parsed.avatar_url.is_none());
+        assert_eq!(
+            parsed.profile_page_root.as_deref(),
+            Some("ab".repeat(32).as_str())
+        );
     }
 
     #[test]
@@ -32047,6 +32441,7 @@ mod tests {
             status_text: None,
             avatar_url: None,
             avatar_cid: None,
+            profile_page_root: None,
             avatar_mini_cid: None,
         };
         let json = String::from_utf8(serde_json::to_vec(&profile).unwrap()).unwrap();
@@ -32060,6 +32455,10 @@ mod tests {
         );
         assert!(
             !json.contains("statusText"),
+            "None field should be skipped: {json}"
+        );
+        assert!(
+            !json.contains("profilePageRoot"),
             "None field should be skipped: {json}"
         );
     }
