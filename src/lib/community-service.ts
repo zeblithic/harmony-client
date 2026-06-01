@@ -60,6 +60,10 @@ export interface PreForkSnapshotDto {
  *  shape is the literal strings 'created' | 'modified' | 'deleted'. */
 export type ChannelConfigAction = 'created' | 'modified' | 'deleted';
 
+/** Mirrors `ChannelConfigChangedPayload` in src-tauri/src/lib.rs.
+ *  Note (ZEB-349): `kind` is intentionally NOT on this event — consumers
+ *  re-fetch `list_channels` (whose `ChannelInfo.kind` is always present) on
+ *  a config change, so the event itself doesn't carry it. */
 interface ChannelConfigChangedPayload {
   communityId: string;
   channelId: string;

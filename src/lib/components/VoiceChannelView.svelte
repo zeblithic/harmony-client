@@ -13,8 +13,8 @@
 
   <div class="voice-body">
     <p class="voice-roster-placeholder">No one is here yet.</p>
-    <button type="button" class="voice-join" disabled>Join</button>
-    <p class="voice-note">Voice chat is coming soon.</p>
+    <button type="button" class="voice-join" disabled aria-describedby="voice-coming-soon">Join</button>
+    <p id="voice-coming-soon" class="voice-note">Voice chat is coming soon.</p>
   </div>
 </section>
 
