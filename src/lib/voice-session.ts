@@ -16,6 +16,8 @@ export interface RosterMember {
   deviceHex: string;
   muted: boolean;
   speaking: boolean;    // derived (Task 5)
+  displayName?: string; // resolved from member card (Task 5)
+  avatarUrl?: string;   // resolved from member card (Task 5)
 }
 
 export interface VoiceSessionState {
@@ -43,6 +45,10 @@ export interface VoiceSessionDeps {
   makeSender?: (gate: FrameGate) => Pick<VoiceSender, 'start' | 'stop'>;
   makeReceiver?: () => Pick<VoiceReceiver, 'init' | 'destroy' | 'getActiveSenders' | 'isSpeaking'>;
   makeMixer?: () => Pick<VoiceMixer, 'init' | 'pushFrame' | 'drain' | 'setDeafened' | 'destroy'>;
+  /** Resolve an owner hex → { displayName, avatarUrl } for tiles (optional). */
+  resolveCard?: (ownerHex: string) => { displayName?: string; avatarUrl?: string } | undefined;
+  /** Subscribe/refresh member cards for visible roster owners (optional). */
+  onRosterOwners?: (ownerHexes: string[]) => void;
 }
 
 const INITIAL: VoiceSessionState = {
@@ -81,11 +87,19 @@ export class VoiceSession {
 
   /** The per-frame send decision (mute / PTT / VAD). */
   private gate: FrameGate = (pcm) => {
-    if (this.muted || this.deafened) return { send: false, ptt: false };
-    if (this.pttMode) return { send: this.pttHeld, ptt: true };
+    if (this.muted || this.deafened) { this.setSelfSpeaking(false); return { send: false, ptt: false }; }
+    if (this.pttMode) { this.setSelfSpeaking(this.pttHeld); return { send: this.pttHeld, ptt: true }; }
     const speaking = this.vad.process(pcm);
+    this.setSelfSpeaking(speaking);
     return { send: speaking, ptt: speaking };
   };
+
+  private setSelfSpeaking(v: boolean): void {
+    if (v !== this.lastSelfSpeaking) { this.lastSelfSpeaking = v; this.refreshRoster(); }
+  }
+
+  private lastSelfSpeaking = false;
+  private lastRoster: { ownerHex: string; deviceHex: string; muted: boolean }[] = [];
 
   async join(community: string, channel: string): Promise<void> {
     let phase: SessionPhase = 'idle';
@@ -125,7 +139,7 @@ export class VoiceSession {
     await this.sender.start();   // capture starts; muted gate ⇒ nothing transmits
 
     // 20ms mixer drain.
-    this.drainTimer = setInterval(() => this.mixer?.drain(), 20);
+    this.drainTimer = setInterval(() => { this.mixer?.drain(); this.refreshRoster(); }, 20);
 
     await this.subscribePresence();   // Task 5
 
@@ -169,6 +183,34 @@ export class VoiceSession {
     this.store.set({ ...INITIAL });
   }
 
-  // Placeholder; implemented in Task 5.
-  protected async subscribePresence(): Promise<void> {}
+  protected async subscribePresence(): Promise<void> {
+    const un = await this.deps.listen('voice-presence-changed', (e) => {
+      const p = e.payload as { community: string; channel: string;
+        roster: { owner: string; device: string; muted: boolean }[] };
+      if (p.community !== this.community || p.channel !== this.channel) return;
+      this.lastRoster = p.roster.map((r) => ({
+        ownerHex: r.owner, deviceHex: r.device, muted: r.muted,
+      }));
+      this.deps.onRosterOwners?.(this.lastRoster.map((r) => r.ownerHex));
+      this.refreshRoster();
+    });
+    this.unlisteners.push(un);
+  }
+
+  /** Recompute roster view (speaking + card resolution). Call on presence + each drain. */
+  private refreshRoster(): void {
+    const roster: RosterMember[] = this.lastRoster.map((r) => {
+      const isSelf = r.deviceHex.slice(0, 32) === this.deps.selfDeviceHex.slice(0, 32);
+      const speaking = isSelf
+        ? (!this.muted && !this.deafened && this.lastSelfSpeaking)
+        : (this.receiver?.isSpeaking(r.deviceHex.slice(0, 32)) ?? false);
+      const card = this.deps.resolveCard?.(r.ownerHex);
+      return {
+        ownerHex: r.ownerHex, deviceHex: r.deviceHex, muted: r.muted, speaking,
+        ...(card?.displayName ? { displayName: card.displayName } : {}),
+        ...(card?.avatarUrl ? { avatarUrl: card.avatarUrl } : {}),
+      } as RosterMember;
+    });
+    this.patch({ roster });
+  }
 }

@@ -108,4 +108,28 @@ describe('VoiceSession lifecycle + gate', () => {
     expect(d.mixer.destroy).toHaveBeenCalled();
     expect(d.receiver.destroy).toHaveBeenCalled();
   });
+
+  it('updates roster from voice-presence-changed for the active channel', async () => {
+    const s = newSession();
+    await s.join('comm', 'chan');
+    d.emit('voice-presence-changed', {
+      community: 'comm', channel: 'chan',
+      roster: [
+        { owner: 'cc'.repeat(16), device: 'dd'.repeat(16), muted: false },
+        { owner: 'ee'.repeat(16), device: 'ff'.repeat(16), muted: true },
+      ],
+    });
+    const roster = get(s.state).roster;
+    expect(roster.map((m) => m.ownerHex)).toEqual(['cc'.repeat(16), 'ee'.repeat(16)]);
+    expect(roster[1].muted).toBe(true);
+  });
+
+  it('ignores presence for a different channel', async () => {
+    const s = newSession();
+    await s.join('comm', 'chan');
+    d.emit('voice-presence-changed', { community: 'comm', channel: 'other', roster: [
+      { owner: 'cc'.repeat(16), device: 'dd'.repeat(16), muted: false },
+    ] });
+    expect(get(s.state).roster).toHaveLength(0);
+  });
 });
