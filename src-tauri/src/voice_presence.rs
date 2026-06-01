@@ -162,6 +162,12 @@ pub struct PresenceEntry {
     pub joined_hlc: Hlc,
     /// Monotonic-ms timestamp of the last applied beacon (injected by caller).
     pub last_seen_ms: u64,
+    /// True once a `left` tombstone has been applied: the row is hidden from the
+    /// roster but retained as a freshness *gravestone* (the `joined_hlc` + `seq`
+    /// barrier), so a same-session heartbeat the network reordered to arrive
+    /// after the tombstone can't resurrect the member before the TTL sweep GCs
+    /// it. A strictly-newer `joined_hlc` (a genuine rejoin) revives the row.
+    pub left: bool,
 }
 
 /// One roster row surfaced to the frontend. `owner`/`device` are kept as raw
@@ -211,39 +217,80 @@ impl VoicePresenceMap {
         // roster convergence on exactly the rejoin / key-rotation path. Keying
         // on `joined_hlc` lets a newer session supersede regardless of seq.
         if beacon.left {
-            // Only honour a tombstone if it is NOT from a strictly-older
-            // session than what we hold: a delayed old-session tombstone must
-            // not evict a freshly-rejoined entry.
-            if let Some(e) = chan.get(&beacon.device) {
-                if e.joined_hlc.is_strictly_newer_than(&beacon.joined_hlc) {
-                    return false;
+            // Tombstone. Convert the live row into a freshness *gravestone*
+            // rather than deleting it: a same-session heartbeat the network
+            // reordered to arrive AFTER this tombstone must not recreate the
+            // member (deleting outright would let the `None` arm below resurrect
+            // it). The gravestone keeps the `joined_hlc` + (u64::MAX) `seq`
+            // barrier, stays hidden from the roster, and the TTL sweep GCs it
+            // ~12 s later. A strictly-newer `joined_hlc` (a genuine rejoin)
+            // revives it at once.
+            return match chan.get_mut(&beacon.device) {
+                // Stored row is from a strictly-newer session → ignore a stale
+                // old-session tombstone (must not evict a freshly-rejoined row).
+                Some(e) if e.joined_hlc.is_strictly_newer_than(&beacon.joined_hlc) => false,
+                // Already a gravestone → keep the barrier fresh, roster unchanged.
+                Some(e) if e.left => {
+                    e.seq = beacon.seq;
+                    e.last_seen_ms = now_ms;
+                    false
                 }
-            }
-            return chan.remove(&beacon.device).is_some();
+                // Live row → bury it. The roster shrinks, so report a change.
+                Some(e) => {
+                    e.muted = beacon.muted;
+                    e.seq = beacon.seq;
+                    e.joined_hlc = beacon.joined_hlc.clone();
+                    e.last_seen_ms = now_ms;
+                    e.left = true;
+                    true
+                }
+                // No row yet → install the gravestone so a later reordered
+                // heartbeat is rejected. Nothing was visible → no roster change.
+                None => {
+                    chan.insert(
+                        beacon.device,
+                        PresenceEntry {
+                            owner: beacon.owner,
+                            muted: beacon.muted,
+                            seq: beacon.seq,
+                            joined_hlc: beacon.joined_hlc.clone(),
+                            last_seen_ms: now_ms,
+                            left: true,
+                        },
+                    );
+                    false
+                }
+            };
         }
         match chan.get_mut(&beacon.device) {
             Some(e) if beacon.joined_hlc.is_strictly_newer_than(&e.joined_hlc) => {
                 // A NEW join session supersedes regardless of seq (seq restarts
-                // at 0 on rejoin).
+                // at 0 on rejoin) — and revives a gravestone.
                 e.owner = beacon.owner;
                 e.muted = beacon.muted;
                 e.seq = beacon.seq;
                 e.joined_hlc = beacon.joined_hlc.clone();
                 e.last_seen_ms = now_ms;
+                e.left = false;
                 true
             }
             Some(e) if e.joined_hlc.is_strictly_newer_than(&beacon.joined_hlc) => false, // older session → stale
+            Some(e) if e.left => false, // same session, buried → reject until TTL GC or a newer session
             Some(e) if beacon.seq <= e.seq => false, // same session, stale or duplicate seq
             Some(e) => {
-                // Same session, newer seq. `joined_hlc` is unchanged.
+                // Same session, newer seq: advance liveness, but only report a
+                // roster-VISIBLE change when `muted` actually flipped. A bare
+                // seq/last_seen advance is invisible to the frontend (RosterEntry
+                // carries no seq/last_seen), so emitting on it spams
+                // `voice-presence-changed` once per heartbeat per peer — including
+                // our own beacon echoed back on the shared Zenoh session.
+                // `last_seen_ms` is updated regardless so the TTL sweep still
+                // sees liveness.
+                let muted_changed = e.muted != beacon.muted;
                 e.muted = beacon.muted;
                 e.seq = beacon.seq;
                 e.last_seen_ms = now_ms;
-                // A newer beacon always advances liveness (last_seen), which is
-                // itself a roster-relevant change for the heartbeat/emit cadence
-                // — so any seq advance reports `true`. The call site may
-                // additionally gate the frontend emit on mute/membership change.
-                true
+                muted_changed
             }
             None => {
                 chan.insert(
@@ -254,6 +301,7 @@ impl VoicePresenceMap {
                         seq: beacon.seq,
                         joined_hlc: beacon.joined_hlc.clone(),
                         last_seen_ms: now_ms,
+                        left: false,
                     },
                 );
                 true
@@ -269,12 +317,18 @@ impl VoicePresenceMap {
         for (key, chan) in self.inner.iter_mut() {
             chan.retain(|device, e| {
                 let alive = now_ms.saturating_sub(e.last_seen_ms) < ttl_ms;
-                if !alive {
+                if !alive && !e.left {
+                    // Only a VISIBLE row's eviction changes the roster; a
+                    // gravestone is already hidden, so its GC is silent.
                     evicted.push((*key, e.owner, *device));
                 }
                 alive
             });
         }
+        // Reclaim channel sub-maps emptied by eviction so they don't accumulate
+        // as ghost entries that every future sweep re-scans, across a long
+        // session that visits many channels (Greptile P2 / Cursor).
+        self.inner.retain(|_, chan| !chan.is_empty());
         evicted
     }
 
@@ -283,6 +337,7 @@ impl VoicePresenceMap {
             .get(&(*c, *ch))
             .map(|chan| {
                 chan.iter()
+                    .filter(|(_, e)| !e.left) // gravestones are hidden
                     .map(|(device, e)| RosterEntry {
                         owner: e.owner,
                         device: *device,
@@ -757,6 +812,68 @@ mod map_tests {
         );
         // A subsequent sweep must not resurrect or report the cleared entry.
         assert!(m.sweep(99_999, 12_000).is_empty());
+    }
+
+    #[test]
+    fn tombstone_blocks_reordered_same_session_heartbeat() {
+        // Member present at session H1 (production tombstones carry seq u64::MAX).
+        let mut m = VoicePresenceMap::new();
+        assert!(m.apply(&C, &CH, &bh(1, 1, 3, true, false, h1()), 0));
+        // Leave: tombstone buries the live member (roster shrinks → change).
+        assert!(
+            m.apply(&C, &CH, &bh(1, 1, u64::MAX, true, true, h1()), 100),
+            "tombstone buries the live member"
+        );
+        assert!(m.roster(&C, &CH).is_empty(), "buried → hidden from roster");
+        // A heartbeat from the SAME session, reordered to arrive AFTER the
+        // tombstone, must NOT resurrect the member.
+        assert!(
+            !m.apply(&C, &CH, &bh(1, 1, 4, false, false, h1()), 150),
+            "reordered same-session heartbeat is rejected by the gravestone"
+        );
+        assert!(m.roster(&C, &CH).is_empty(), "no resurrection");
+        // But a genuine NEW session (strictly-newer joined_hlc) revives at once.
+        assert!(
+            m.apply(&C, &CH, &bh(1, 1, 0, false, false, h2()), 200),
+            "newer session revives the gravestone"
+        );
+        let r = m.roster(&C, &CH);
+        assert_eq!(r.len(), 1, "fresh session is live");
+        assert!(!r[0].muted, "roster reflects the new session");
+    }
+
+    #[test]
+    fn sweep_prunes_empty_channel_submaps() {
+        let mut m = VoicePresenceMap::new();
+        m.apply(&C, &CH, &b(1, 1, 0, true, false), 0);
+        // TTL-evict the only member (not an explicit leave / remove_channel).
+        assert_eq!(
+            m.sweep(TTL_MS, TTL_MS).len(),
+            1,
+            "the live member is evicted"
+        );
+        // The now-empty (community, channel) sub-map must be reclaimed, not left
+        // as a ghost that every future sweep re-scans.
+        assert!(
+            m.inner.is_empty(),
+            "empty channel sub-map pruned after eviction"
+        );
+    }
+
+    #[test]
+    fn gravestone_is_gc_d_silently_by_ttl_sweep() {
+        let mut m = VoicePresenceMap::new();
+        m.apply(&C, &CH, &b(1, 1, 0, true, false), 0);
+        m.apply(&C, &CH, &b(1, 1, 1, true, true), 100); // tombstone → gravestone
+                                                        // The gravestone is hidden but retained as a barrier until TTL.
+        assert!(m.roster(&C, &CH).is_empty());
+        // TTL sweep GCs the gravestone — and reports NO eviction (it was already
+        // hidden, so its removal is not a roster-visible change).
+        assert!(
+            m.sweep(100 + TTL_MS, TTL_MS).is_empty(),
+            "gravestone GC is silent"
+        );
+        assert!(m.inner.is_empty(), "gravestone sub-map reclaimed");
     }
 }
 
