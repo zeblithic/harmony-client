@@ -311,6 +311,52 @@ use crate::owner_state_types::{Hlc, SpaceId};
 /// a community's CRDT log. Generated client-side at event creation.
 pub type EventId = [u8; 16];
 
+/// The kind of a community channel. Serialized on the wire as a `u8` tag
+/// (`Text = 0`, `Voice = 1`). `Text` is the default and is **omitted** from
+/// the CBOR map by `skip_serializing_if = "ChannelKind::is_text"`, keeping a
+/// Text `ChannelCreate`/`ChannelInfo` byte-identical to pre-ZEB-349 wire.
+/// Voice channels are introduced by ZEB-349 (epic ZEB-348); kind is immutable
+/// once a channel is created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(into = "u8", try_from = "u8")]
+pub enum ChannelKind {
+    #[default]
+    Text,
+    Voice,
+}
+
+impl ChannelKind {
+    /// `skip_serializing_if` / default-omission predicate: Text is the default
+    /// and is never written to the CBOR map.
+    pub fn is_text(&self) -> bool {
+        matches!(self, ChannelKind::Text)
+    }
+}
+
+impl From<ChannelKind> for u8 {
+    fn from(kind: ChannelKind) -> u8 {
+        match kind {
+            ChannelKind::Text => 0,
+            ChannelKind::Voice => 1,
+        }
+    }
+}
+
+impl TryFrom<u8> for ChannelKind {
+    type Error = String;
+
+    fn try_from(tag: u8) -> Result<Self, Self::Error> {
+        match tag {
+            0 => Ok(ChannelKind::Text),
+            1 => Ok(ChannelKind::Voice),
+            other => Err(format!("invalid ChannelKind tag: {other}")),
+        }
+    }
+}
+
+impl CanonicalPayloadSealed for ChannelKind {}
+impl CanonicalPayload for ChannelKind {}
+
 /// 16-byte ULID identifying a single channel within a community.
 /// Generated client-side at `ChannelCreate` time. Tuple-struct newtype
 /// (not type alias) so the type system catches accidental substitution
@@ -4099,6 +4145,36 @@ mod auto_exec_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_kind_defaults_to_text_and_reports_is_text() {
+        assert_eq!(ChannelKind::default(), ChannelKind::Text);
+        assert!(ChannelKind::Text.is_text());
+        assert!(!ChannelKind::Voice.is_text());
+    }
+
+    #[test]
+    fn channel_kind_u8_round_trip() {
+        assert_eq!(u8::from(ChannelKind::Text), 0);
+        assert_eq!(u8::from(ChannelKind::Voice), 1);
+        assert_eq!(ChannelKind::try_from(0u8).unwrap(), ChannelKind::Text);
+        assert_eq!(ChannelKind::try_from(1u8).unwrap(), ChannelKind::Voice);
+        assert!(ChannelKind::try_from(2u8).is_err());
+    }
+
+    #[test]
+    fn channel_kind_serializes_as_cbor_u8() {
+        // Voice encodes as the single CBOR byte 0x01; Text as 0x00.
+        let voice = crate::owner_state_crypto::canonical_cbor_encode(&ChannelKind::Voice)
+            .expect("encode voice");
+        assert_eq!(voice, vec![0x01]);
+        let text = crate::owner_state_crypto::canonical_cbor_encode(&ChannelKind::Text)
+            .expect("encode text");
+        assert_eq!(text, vec![0x00]);
+        // Round-trips through ciborium.
+        let back: ChannelKind = ciborium::de::from_reader(&voice[..]).expect("decode voice");
+        assert_eq!(back, ChannelKind::Voice);
+    }
 
     fn make_kick_event(
         id_byte: u8,
