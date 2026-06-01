@@ -20,6 +20,13 @@ export interface VoiceSenderConfig {
   capture: AudioCapture;
   /** Sample rate for audio capture and codec init. Default: 16000. */
   sampleRate?: number;
+  /**
+   * Optional per-frame gate. Called with each captured PCM frame; returns
+   * whether to transmit it and the PTT bit to stamp. Absent ⇒ always
+   * { send: true, ptt: true } (legacy behavior). The session controller
+   * supplies a gate encoding mute / PTT / VAD (DTX).
+   */
+  frameGate?: (pcm: Float32Array) => { send: boolean; ptt: boolean };
 }
 
 /**
@@ -60,7 +67,12 @@ export class VoiceSender {
       await this.config.codec.init(sr, 1);
       try {
         await this.config.capture.start(
-          (pcm) => this.sendFrame(pcm, true),
+          (pcm) => {
+            const decision = this.config.frameGate
+              ? this.config.frameGate(pcm)
+              : { send: true, ptt: true };
+            if (decision.send) this.sendFrame(pcm, decision.ptt);
+          },
           undefined,
           undefined,
           sr,

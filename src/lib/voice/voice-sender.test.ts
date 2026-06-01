@@ -267,4 +267,33 @@ describe('VoiceSender', () => {
 
     expect((ctx.mockCodec.init as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith(8000, 1);
   });
+
+  it('skips frames the gate rejects and uses the gate ptt flag', async () => {
+    const invoke = vi.fn().mockResolvedValue(undefined);
+    let onFrame!: (pcm: Float32Array) => void;
+    const capture = {
+      start: vi.fn(async (cb: (pcm: Float32Array) => void) => { onFrame = cb; }),
+      stop: vi.fn(async () => {}),
+      isActive: () => true,
+    };
+    const codec = {
+      init: vi.fn(async () => {}), encode: () => new Uint8Array([1, 2, 3]),
+      decode: () => new Float32Array(0), destroy: vi.fn(), codecType: 'opus' as const,
+    };
+    let allow = false;
+    const sender = new VoiceSender({
+      senderHash: new Uint8Array(16), communityId: 'c', channelId: 'ch',
+      invoke, codec, capture: capture as never,
+      frameGate: () => ({ send: allow, ptt: allow }),
+    });
+    await sender.start();
+    onFrame(new Float32Array(320));          // gate rejects
+    expect(invoke).not.toHaveBeenCalled();
+    allow = true;
+    onFrame(new Float32Array(320));          // gate accepts
+    expect(invoke).toHaveBeenCalledTimes(1);
+    const arg = invoke.mock.calls[0][1] as { payload: { frameBytes: number[] } };
+    // ptt bit lives in header byte 0 bit 3 (0x08)
+    expect((arg.payload.frameBytes[0] & 0x08) !== 0).toBe(true);
+  });
 });
