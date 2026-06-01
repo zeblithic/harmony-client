@@ -16,6 +16,17 @@ function fakeAdapter(invoke: (cmd: string, args?: Record<string, unknown>) => Pr
   };
 }
 
+/**
+ * Flush the pending rejected-fetch microtask chain WITHOUT advancing fake
+ * timers. The resolver schedules a "cooldown elapsed" setTimeout on failure;
+ * `vi.runAllTimersAsync()` would fire it and jump the virtual clock past the
+ * 30s window, defeating the within-cooldown assertions below. A plain
+ * microtask flush settles the rejection while leaving the clock untouched.
+ */
+async function flushMicrotasks() {
+  for (let i = 0; i < 5; i++) await Promise.resolve();
+}
+
 describe('ProfilePageResolver', () => {
   beforeEach(() => {
     vi.useRealTimers();
@@ -71,7 +82,7 @@ describe('ProfilePageResolver', () => {
 
     expect(r.resolve('cid1')).toBeUndefined();
     // Flush the rejected fetch promise so failedAt is recorded.
-    await vi.runAllTimersAsync();
+    await flushMicrotasks();
     expect(adapter.invoke).toHaveBeenCalledTimes(1);
     expect(warn).toHaveBeenCalled();
 
@@ -111,7 +122,7 @@ describe('ProfilePageResolver', () => {
 
     expect(r.resolve('cid1')).toBeUndefined();
     // Flush the rejected fetch so failedAt is recorded.
-    await vi.runAllTimersAsync();
+    await flushMicrotasks();
     // resolve() still returns undefined, but status() now distinguishes the
     // failure from an in-flight fetch.
     expect(r.resolve('cid1')).toBeUndefined();
@@ -134,7 +145,7 @@ describe('ProfilePageResolver', () => {
     r.connectAdapter(adapter as any);
 
     expect(r.resolve('cid1')).toBeUndefined();
-    await vi.runAllTimersAsync();
+    await flushMicrotasks();
     expect(adapter.invoke).toHaveBeenCalledTimes(1);
 
     // Still inside the cooldown → error, and resolve() does NOT re-invoke.
@@ -152,6 +163,71 @@ describe('ProfilePageResolver', () => {
     expect(adapter.invoke).toHaveBeenCalledTimes(2);
     // While that retry is in flight, status stays 'loading'.
     expect(r.status('cid1')).toBe('loading');
+  });
+
+  it('fires onChange the moment a fetch fails so the panel can leave Loading', async () => {
+    // status() is time-based, but a panel only re-evaluates it when onChange
+    // fires. A failure must notify immediately, or the panel stays on "Loading…"
+    // until some unrelated re-render happens.
+    vi.useFakeTimers();
+    const adapter = fakeAdapter(async () => { throw new Error('boom'); });
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const r = new ProfilePageResolver();
+    let changes = 0;
+    r.onChange = () => { changes++; };
+    r.connectAdapter(adapter as any);
+
+    expect(r.resolve('cid1')).toBeUndefined();
+    await flushMicrotasks();
+    // The failure itself fired onChange (so the panel re-renders into 'error').
+    expect(changes).toBe(1);
+    expect(r.status('cid1')).toBe('error');
+  });
+
+  it('fires onChange again once the cooldown elapses, waking a stuck panel', async () => {
+    // The second notify is what lets a panel that failed and is sitting on the
+    // 'error' state re-render exactly when status() flips back to 'loading' and
+    // its next resolve() can kick the retry.
+    vi.useFakeTimers();
+    const adapter = fakeAdapter(async () => { throw new Error('boom'); });
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const r = new ProfilePageResolver();
+    let changes = 0;
+    r.onChange = () => { changes++; };
+    r.connectAdapter(adapter as any);
+
+    expect(r.resolve('cid1')).toBeUndefined();
+    await flushMicrotasks();
+    expect(changes).toBe(1); // immediate failure notify
+
+    // Inside the cooldown: no further notify.
+    vi.advanceTimersByTime(29_000);
+    expect(changes).toBe(1);
+
+    // Crossing the cooldown boundary fires the second notify.
+    vi.advanceTimersByTime(2_000);
+    expect(changes).toBe(2);
+  });
+
+  it('does not fire the cooldown notify after destroy()', async () => {
+    // A pending cooldown timer must not call onChange once the resolver is torn
+    // down (e.g. the panel/App unmounted) — destroy() clears it.
+    vi.useFakeTimers();
+    const adapter = fakeAdapter(async () => { throw new Error('boom'); });
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const r = new ProfilePageResolver();
+    let changes = 0;
+    r.onChange = () => { changes++; };
+    r.connectAdapter(adapter as any);
+
+    expect(r.resolve('cid1')).toBeUndefined();
+    await flushMicrotasks();
+    expect(changes).toBe(1);
+
+    r.destroy();
+    // Would fire the cooldown timer if it weren't cleared on destroy.
+    vi.advanceTimersByTime(60_000);
+    expect(changes).toBe(1);
   });
 
   it('destroy() clears the cache', async () => {

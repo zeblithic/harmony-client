@@ -198,6 +198,10 @@
     //    root rather than silently dropping the page (ZEB-345 prefill race).
     //  - Genuinely no/cleared page → undefined (card stays byte-identical, §7).
     let profilePageRoot: string | undefined;
+    // True when we save by PRESERVING an existing page that never loaded into
+    // the fields (prefill pending/failed). The post-save reset below must NOT
+    // mark such a page as loaded — see the reset comment.
+    let preservedExistingUnloaded = false;
     const hasAbout =
       bio.trim() !== '' || cleanLinks.length > 0 || cleanFields.length > 0;
     if (removePage) {
@@ -220,6 +224,7 @@
       // Existing page not yet loaded (prefill pending/failed) and the user
       // didn't author anything → preserve the existing root.
       profilePageRoot = profile.profilePageRoot;
+      preservedExistingUnloaded = true;
     } else {
       profilePageRoot = undefined; // genuinely no/cleared page
     }
@@ -243,14 +248,25 @@
     // the explicit reset. Runs only on the SUCCESS path (the ingest-error path
     // above `return`s before reaching here).
     removePage = false;
-    aboutDirty = false;
-    prefillFailed = false;
-    aboutNote = null;
-    prefillLoaded = true;
-    if (profilePageRoot === undefined) {
-      bio = '';
-      links = [];
-      fields = [];
+    if (preservedExistingUnloaded) {
+      // We just preserved an existing page that NEVER loaded into the fields
+      // (prefill still pending or failed). Local About state does not represent
+      // that page, so we must NOT mark it loaded: keep prefillLoaded=false (and
+      // prefillFailed/aboutNote intact) so a SECOND save from this same open
+      // dialog still takes the preserve branch instead of falling through to
+      // the removal branch and silently dropping the page. A late-arriving
+      // prefill (if it was merely pending) can still populate the fields and
+      // set prefillLoaded itself; aboutDirty is left as-is so it isn't blocked.
+    } else {
+      aboutDirty = false;
+      prefillFailed = false;
+      aboutNote = null;
+      prefillLoaded = true;
+      if (profilePageRoot === undefined) {
+        bio = '';
+        links = [];
+        fields = [];
+      }
     }
 
     saved = true;

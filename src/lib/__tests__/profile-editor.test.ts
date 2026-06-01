@@ -215,6 +215,48 @@ describe('ProfileEditor — About section', () => {
     resolvePrefill?.({ bio: '', links: [], fields: [] });
   });
 
+  it('preserves the existing page on a SECOND save when the prefill never loaded', async () => {
+    // Regression for the round-4 CodeRabbit finding: the post-save reset used to
+    // force prefillLoaded=true even on the PRESERVE path, so a second save from
+    // the same open dialog fell through to the undefined branch and silently
+    // dropped the page. The preserve-path reset must keep the unloaded state so
+    // repeated saves keep preserving the existing root.
+    mockInvoke.mockImplementation((cmd: string) => {
+      // Prefill never resolves → the existing page stays unloaded the whole time.
+      if (cmd === 'fetch_profile_doc') return new Promise(() => {});
+      return Promise.resolve('cid-should-not-be-used');
+    });
+    const onSave = vi.fn();
+    render(ProfileEditor, {
+      props: {
+        profile: baseProfile({ profilePageRoot: 'cid-existing' }),
+        onSave,
+      },
+    });
+
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith('fetch_profile_doc', {
+        cid: 'cid-existing',
+      }),
+    );
+
+    // First save preserves.
+    await fireEvent.click(screen.getByText('Save'));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect((onSave.mock.calls[0][0] as Profile).profilePageRoot).toBe('cid-existing');
+
+    // Second save from the same open dialog must STILL preserve, not drop.
+    await fireEvent.click(screen.getByText('Save'));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(2));
+    expect((onSave.mock.calls[1][0] as Profile).profilePageRoot).toBe('cid-existing');
+
+    // Neither save re-ingested an empty doc.
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      'ingest_profile_doc',
+      expect.anything(),
+    );
+  });
+
   it('does not overwrite user edits when a late prefill resolves', async () => {
     // Prefill resolves only after the user has already typed into the bio.
     let resolvePrefill: ((v: unknown) => void) | undefined;

@@ -29,6 +29,8 @@ export class ProfilePageResolver {
   private pending = new Set<string>();
   /** CID → timestamp of last failure. Retryable after RETRY_COOLDOWN_MS. */
   private failedAt = new Map<string, number>();
+  /** CID → pending "cooldown elapsed" notify timer (see scheduleCooldownNotify). */
+  private retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private destroyed = false;
 
   connectAdapter(adapter: TauriAdapter): void {
@@ -90,10 +92,38 @@ export class ProfilePageResolver {
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(`Profile doc fetch failed for CID ${cid}: ${msg}`);
         this.failedAt.set(cid, Date.now());
+        // status() is time-based, but consumers (e.g. ProfilePanel) only
+        // re-evaluate it when onChange fires. Without notifying here, a real
+        // failure would leave a panel stuck on "Loading…" forever:
+        //   1. Notify NOW so the panel flips Loading → error immediately.
+        //   2. Notify AGAIN once the retry cooldown elapses (below) so the
+        //      panel re-renders, status() flips error → loading, and the next
+        //      resolve() can kick a retry — otherwise nothing wakes it.
+        this.onChange?.();
+        this.scheduleCooldownNotify(cid);
       }
     } finally {
       this.pending.delete(cid);
     }
+  }
+
+  /**
+   * Fire {@link onChange} once RETRY_COOLDOWN_MS has elapsed after a failure, so
+   * a panel keyed off onChange re-renders exactly when status() flips from
+   * 'error' back to 'loading' (a retry is now imminent) and its resolve() will
+   * kick the retry. Without this, a failed fetch only re-renders on some
+   * unrelated change and the retry could be delayed indefinitely.
+   */
+  private scheduleCooldownNotify(cid: string): void {
+    const existing = this.retryTimers.get(cid);
+    if (existing !== undefined) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      this.retryTimers.delete(cid);
+      // Only nudge if still unresolved — a re-render lets the panel's resolve()
+      // observe the cooled-off failure and kick the retry.
+      if (!this.destroyed && !this.cache.has(cid)) this.onChange?.();
+    }, RETRY_COOLDOWN_MS);
+    this.retryTimers.set(cid, timer);
   }
 
   destroy(): void {
@@ -101,5 +131,7 @@ export class ProfilePageResolver {
     this.cache.clear();
     this.pending.clear();
     this.failedAt.clear();
+    for (const timer of this.retryTimers.values()) clearTimeout(timer);
+    this.retryTimers.clear();
   }
 }
