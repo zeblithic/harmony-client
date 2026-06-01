@@ -8,19 +8,27 @@
 // AudioWorkletNode so that tests can inject mocks without touching jsdom's
 // (non-existent) Web Audio implementation — mirroring audio-capture.ts.
 
+/** Below this magnitude the limiter is transparent (pure identity). */
+const SOFT_CLIP_KNEE = 0.8;
+
 /**
- * Soft clip: identity inside the [-1, 1] linear region, clamped to ±1 beyond.
+ * Soft-clip limiter for summed audio.
  *
- * A function that is the identity on [-1, 1] yet never exceeds ±1 is, by
- * construction, a clamp at the boundary — any smooth knee would either break
- * identity below ±1 or overshoot ±1 above it. We round through float32
- * (Math.fround) so the value matches what mixFrames stores in its
- * Float32Array output, keeping the mix bit-exact.
+ * Transparent (identity) for |x| <= SOFT_CLIP_KNEE, so a single speaker or a
+ * quiet mix passes through untouched. Above the knee it smoothly compresses
+ * only the overshoot via tanh, asymptotically bounded to ±1 — graceful
+ * limiting instead of a hard clamp's audible crackle when several speakers
+ * overlap. The mapping is C¹-continuous at the knee (tanh'(0) = 1 matches the
+ * identity slope), so there is no kink, and the output never reaches ±1 for a
+ * finite input.
  */
 export function softClip(x: number): number {
-  if (x > 1) return 1;
-  if (x < -1) return -1;
-  return Math.fround(x);
+  const mag = Math.abs(x);
+  if (mag <= SOFT_CLIP_KNEE) return x;
+  const sign = x < 0 ? -1 : 1;
+  const over = mag - SOFT_CLIP_KNEE; // amount past the knee
+  const range = 1 - SOFT_CLIP_KNEE; // headroom up to the ±1 ceiling
+  return sign * (SOFT_CLIP_KNEE + range * Math.tanh(over / range));
 }
 
 /** Sum N equal-length frames sample-wise with soft-clip. Missing → silence. */
