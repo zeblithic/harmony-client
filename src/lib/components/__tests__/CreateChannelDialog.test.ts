@@ -132,6 +132,18 @@ describe('CreateChannelDialog', () => {
     expect(voiceBtn.getAttribute('aria-pressed')).toBe('true');
   });
 
+  it('resets kind to text when reopened after selecting Voice (mounted instance)', async () => {
+    const { getByRole, rerender, props } = await setupDialog();
+    await fireEvent.click(getByRole('button', { name: /voice/i }));
+    expect(getByRole('button', { name: /voice/i }).getAttribute('aria-pressed')).toBe('true');
+    // The dialog instance stays mounted; only `open` toggles. Closing then
+    // reopening must reset the kind selection (regression: Qodo "kind not reset on cancel").
+    await rerender({ ...props, open: false });
+    await rerender({ ...props, open: true });
+    expect(getByRole('button', { name: /text/i }).getAttribute('aria-pressed')).toBe('true');
+    expect(getByRole('button', { name: /voice/i }).getAttribute('aria-pressed')).toBe('false');
+  });
+
   it('shows inline error when createChannel rejects', async () => {
     const { getByPlaceholderText, getByRole, getByText, adapter } = await setupDialog();
     (adapter.invoke as any).mockRejectedValue(new Error('channel name is empty or exceeds 32 chars'));

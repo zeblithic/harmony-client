@@ -36,25 +36,31 @@
 - [ ] **Step 1: Run the Rust test suite**
 
 Run (from `src-tauri/`):
+
 ```bash
 cargo nextest run --locked --features test-fixtures -E 'test(channel)' 2>&1 | tail -20
 ```
+
 Expected: all channel-related tests PASS (this is the pre-change baseline; the `signed_event_channel_create_wire_bytes_pinned` fixture passes).
 
 - [ ] **Step 2: Run the frontend baseline**
 
 Run (from repo root):
+
 ```bash
 npx vitest run src/lib/components/__tests__/CreateChannelDialog.test.ts src/lib/components/__tests__/ChannelSubSidebar.test.ts 2>&1 | tail -20
 ```
+
 Expected: PASS.
 
 - [ ] **Step 3: Confirm tsc baseline**
 
 Run (from repo root):
+
 ```bash
 npx tsc --noEmit 2>&1 | tail -20
 ```
+
 Expected: no NEW errors (the pre-existing `src/lib/voice/*` TS errors from ZEB-153 may appear — note them but do NOT fix here; they are out of scope and tracked separately. If `tsc` is clean, even better.)
 
 > If the baseline is not green for channel code, STOP and report — do not build on a broken base.
@@ -109,9 +115,11 @@ fn channel_kind_serializes_as_cbor_u8() {
 - [ ] **Step 2: Run to verify failure**
 
 Run (from `src-tauri/`):
+
 ```bash
 cargo nextest run --locked --features test-fixtures -E 'test(channel_kind)'
 ```
+
 Expected: FAIL — `cannot find type ChannelKind`.
 
 - [ ] **Step 3: Implement `ChannelKind`**
@@ -170,9 +178,11 @@ impl TryFrom<u8> for ChannelKind {
 - [ ] **Step 4: Run to verify pass**
 
 Run (from `src-tauri/`):
+
 ```bash
 cargo nextest run --locked --features test-fixtures -E 'test(channel_kind)'
 ```
+
 Expected: PASS (3 tests).
 
 - [ ] **Step 5: Commit**
@@ -262,9 +272,11 @@ fn channel_modify_cannot_change_kind() {
 - [ ] **Step 2: Run to verify failure**
 
 Run (from `src-tauri/`):
+
 ```bash
 cargo nextest run --locked --features test-fixtures -E 'test(materialize_channel_create_records_kind) + test(channel_modify_cannot_change_kind)'
 ```
+
 Expected: FAIL — `ChannelCreate` has no field `kind` / `ChannelInfo` has no field `kind`.
 
 - [ ] **Step 3: Add `kind` to the `ChannelCreate` variant**
@@ -337,14 +349,17 @@ Compile to find every place that constructs a `ChannelCreate` literal or a `Chan
 ```bash
 cargo build --locked --features test-fixtures 2>&1 | grep -A3 'missing field' | head -40
 ```
+
 Address each. (Expect: `mint_channel_create_event` in `lib.rs`, and the fixture constructors in `wire_format_community_fixtures.rs` — Task 3 & 4 finalize those, but the tree must compile here.)
 
 - [ ] **Step 7: Run to verify pass**
 
 Run (from `src-tauri/`):
+
 ```bash
 cargo nextest run --locked --features test-fixtures -E 'test(materialize_channel_create_records_kind) + test(channel_modify_cannot_change_kind) + test(channel)'
 ```
+
 Expected: the two new tests PASS; **all existing channel tests still PASS** (including `signed_event_channel_create_wire_bytes_pinned` — proving Text wire is byte-identical, since the existing fixture builds a Text `ChannelCreate` and `kind` is skipped).
 
 - [ ] **Step 8: Commit**
@@ -365,9 +380,11 @@ git commit -m "feat(zeb-349): kind on ChannelCreate + ChannelInfo + materialize 
 - [ ] **Step 1: Confirm the existing Text fixture is unchanged**
 
 Run (from `src-tauri/`):
+
 ```bash
 cargo nextest run --locked --features test-fixtures -E 'test(signed_event_channel_create_wire_bytes_pinned)'
 ```
+
 Expected: PASS with the **original** pinned hex (the Text `ChannelCreate` fixture must still match — this is the byte-identity proof; do NOT edit its hex). If it FAILS, the additive pattern is broken — STOP and fix Task 2 (likely `skip_serializing_if`/`default` missing).
 
 - [ ] **Step 2: Add a Voice fixture test (assertion intentionally wrong, to capture real bytes)**
@@ -402,9 +419,11 @@ fn signed_event_channel_create_voice_wire_bytes_pinned() {
 - [ ] **Step 3: Run to capture the real hex**
 
 Run (from `src-tauri/`):
+
 ```bash
 cargo nextest run --locked --features test-fixtures -E 'test(signed_event_channel_create_voice_wire_bytes_pinned)' 2>&1 | grep -A2 'assertion' | head
 ```
+
 Expected: FAIL — the panic prints `left: "<actual hex>"`. Copy that exact hex string.
 
 - [ ] **Step 4: Pin the captured hex**
@@ -414,9 +433,11 @@ Replace `REPLACE_WITH_ACTUAL_HEX` with the captured hex from Step 3.
 - [ ] **Step 5: Verify the Voice fixture passes and Text is still byte-identical**
 
 Run (from `src-tauri/`):
+
 ```bash
 cargo nextest run --locked --features test-fixtures -E 'test(signed_event_channel_create)'
 ```
+
 Expected: BOTH `signed_event_channel_create_wire_bytes_pinned` (Text, original hex) and `signed_event_channel_create_voice_wire_bytes_pinned` (Voice, new hex) PASS. Confirm the two hex strings differ by exactly the inserted `ck`/`0x01` entry and the bumped map header byte.
 
 - [ ] **Step 6: Commit**
@@ -475,6 +496,7 @@ async fn create_channel_rejects_unknown_kind() {
 ```bash
 cargo nextest run --locked --features test-fixtures -E 'test(create_voice_channel_surfaces_kind_in_list) + test(create_channel_rejects_unknown_kind)'
 ```
+
 Expected: FAIL — arity mismatch on `create_channel` / `ChannelInfoDto` has no field `kind`.
 
 - [ ] **Step 3: Add `kind` to `ChannelInfoDto`**
@@ -506,6 +528,7 @@ kind: match info.kind {
     crate::community_membership::ChannelKind::Voice => "voice".to_string(),
 },
 ```
+
 (Use the import path that file already uses for `ChannelInfo`.)
 
 - [ ] **Step 5: Thread `kind` through `mint_channel_create_event` + `create_channel`**
@@ -553,6 +576,7 @@ async fn create_channel(
 ```bash
 cargo nextest run --locked --features test-fixtures -E 'test(create_voice_channel_surfaces_kind_in_list) + test(create_channel_rejects_unknown_kind) + test(channel)'
 ```
+
 Expected: new tests PASS; all existing channel tests still PASS.
 
 - [ ] **Step 7: Full clippy + fmt gate**
@@ -560,6 +584,7 @@ Expected: new tests PASS; all existing channel tests still PASS.
 ```bash
 cd src-tauri && cargo fmt --all && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings 2>&1 | tail -20 && cd ..
 ```
+
 Expected: 0 warnings.
 
 - [ ] **Step 8: Commit**
@@ -614,6 +639,7 @@ it('createChannel defaults kind to text when omitted', async () => {
 ```bash
 npx vitest run src/lib/__tests__/community-service.test.ts 2>&1 | tail -20
 ```
+
 Expected: FAIL — `createChannel` ignores the 4th arg / sends no `kind`.
 
 - [ ] **Step 3: Update the `ChannelInfo` type**
@@ -656,6 +682,7 @@ async createChannel(
 ```bash
 npx vitest run src/lib/__tests__/community-service.test.ts 2>&1 | tail -20
 ```
+
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
@@ -710,6 +737,7 @@ it('defaults to a text channel', async () => {
 ```bash
 npx vitest run src/lib/components/__tests__/CreateChannelDialog.test.ts 2>&1 | tail -20
 ```
+
 Expected: FAIL — no Voice button / `createChannel` called with 3 args.
 
 - [ ] **Step 3: Add the selector + thread `kind`**
@@ -758,6 +786,7 @@ Add minimal styles consistent with the dialog's existing CSS (segmented look: tw
 ```bash
 npx vitest run src/lib/components/__tests__/CreateChannelDialog.test.ts 2>&1 | tail -20
 ```
+
 Expected: PASS (incl. existing tests).
 
 - [ ] **Step 5: Commit**
@@ -803,6 +832,7 @@ it('renders a speaker glyph for voice channels and # for text', async () => {
 ```bash
 npx vitest run src/lib/components/__tests__/ChannelSubSidebar.test.ts 2>&1 | tail -20
 ```
+
 Expected: FAIL — voice row renders `#`, not `🔊` (and TS errors on missing `kind` until fixtures updated).
 
 - [ ] **Step 3: Branch the glyph**
@@ -824,6 +854,7 @@ In `ChannelSubSidebar.svelte` (~line 98), replace the hardcoded hash span:
 ```bash
 npx vitest run src/lib/components/__tests__/ChannelSubSidebar.test.ts 2>&1 | tail -20
 ```
+
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -867,6 +898,7 @@ describe('VoiceChannelView (V1 scaffold)', () => {
 ```bash
 npx vitest run src/lib/components/__tests__/VoiceChannelView.test.ts 2>&1 | tail -20
 ```
+
 Expected: FAIL — module does not exist.
 
 - [ ] **Step 3: Create the scaffold**
@@ -909,6 +941,7 @@ Create `src/lib/components/VoiceChannelView.svelte`:
 ```bash
 npx vitest run src/lib/components/__tests__/VoiceChannelView.test.ts 2>&1 | tail -20
 ```
+
 Expected: PASS.
 
 - [ ] **Step 5: Route voice channels in `CommunityView`**
@@ -939,6 +972,7 @@ In `CommunityView.svelte`, import the scaffold and branch the main-area render (
 ```
 
 Add the import near the other component imports:
+
 ```svelte
 import VoiceChannelView from './VoiceChannelView.svelte';
 ```
@@ -949,6 +983,7 @@ import VoiceChannelView from './VoiceChannelView.svelte';
 npx vitest run 2>&1 | tail -25
 npx tsc --noEmit 2>&1 | tail -25
 ```
+
 Expected: vitest PASS; tsc shows no NEW errors (pre-existing ZEB-153 `src/lib/voice/*` errors, if present, are unchanged — do not fix here).
 
 - [ ] **Step 7: Commit**
@@ -973,6 +1008,7 @@ cd src-tauri \
   && cargo nextest run --locked --workspace --all-targets --features test-fixtures \
   && cd ..
 ```
+
 Expected: fmt clean, 0 clippy warnings, all tests pass. (Watch for the known transport/port-flake orphan tests — those are unrelated; if any flake, re-run that one. They are NOT caused by this diff.)
 
 - [ ] **Step 2: Frontend gates**
@@ -981,6 +1017,7 @@ Expected: fmt clean, 0 clippy warnings, all tests pass. (Watch for the known tra
 npx tsc --noEmit 2>&1 | tail -25
 npx vitest run 2>&1 | tail -25
 ```
+
 Expected: tsc no new errors; vitest all pass.
 
 - [ ] **Step 3: MSRV check**
@@ -988,6 +1025,7 @@ Expected: tsc no new errors; vitest all pass.
 ```bash
 cd src-tauri && cargo check --locked --all-targets --features test-fixtures && cd ..
 ```
+
 Expected: clean.
 
 - [ ] **Step 4: Confirm Text byte-identity one more time (the headline invariant)**
@@ -995,6 +1033,7 @@ Expected: clean.
 ```bash
 cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(signed_event_channel_create_wire_bytes_pinned)' && cd ..
 ```
+
 Expected: PASS with the ORIGINAL hex (Text `ChannelCreate` unchanged on the wire).
 
 - [ ] **Step 5: Commit any fmt fixups**

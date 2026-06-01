@@ -454,7 +454,6 @@ fn signed_event_channel_create_voice_wire_bytes_pinned() {
     });
     let bytes = canonical_cbor_encode(&event).expect("encode");
     let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    eprintln!("signed_event_channel_create_voice hex: {hex}");
     assert_eq!(
         hex,
         "a662696450424242424242424242424242424242426263695037373737373737373737373737373737626b6ea2627467616362766ca46263685042424242424242424242424242424242626e6d6767656e6572616c6277700062636b016261635011111111111111111111111111111111626174a361771b0000018bcfe56800616c006164636669786273675840bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",

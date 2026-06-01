@@ -63,7 +63,7 @@ The work is the **channel/call layer** on top of this engine, not the engine.
 
 ### One data path, two scopes
 
-```
+```text
 capture (AudioWorklet)
   → VAD gate / PTT / mute  [browser]
   → encode Opus|codec2     [browser]

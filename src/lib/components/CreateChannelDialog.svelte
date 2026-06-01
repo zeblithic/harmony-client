@@ -41,6 +41,22 @@
     }
   });
 
+  // ZEB-349: the dialog instance stays mounted in CommunityView (only `open`
+  // toggles the inner Modal), so component state survives a close. Reset the
+  // form on each open (edge-detected) so a canceled Voice selection — or a
+  // stale name — never carries into the next open and creates the wrong kind.
+  let wasOpen = false;
+  $effect(() => {
+    if (open && !wasOpen) {
+      name = '';
+      kind = 'text';
+      writePower = 0;
+      error = null;
+      submitting = false;
+    }
+    wasOpen = open;
+  });
+
   async function handleSubmit(e?: Event) {
     e?.preventDefault();
     if (!canSubmit) return;
