@@ -141,6 +141,133 @@ pub fn seal_presence_beacon_with_nonce(
     .map_err(|_| BeaconError::Encode)
 }
 
+use std::collections::BTreeMap;
+
+/// Serialize a 16-byte id as a lowercase hex string (JSON-friendly — the
+/// roster is emitted to the frontend as a `voice-presence-changed` payload).
+fn ser_hex_16<S: serde::Serializer>(b: &[u8; 16], s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&hex::encode(b))
+}
+
+/// Serialize a 32-byte id as a lowercase hex string (see [`ser_hex_16`]).
+fn ser_hex_32<S: serde::Serializer>(b: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&hex::encode(b))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresenceEntry {
+    pub owner: [u8; 16],
+    pub muted: bool,
+    pub seq: u64,
+    pub joined_hlc: Hlc,
+    /// Monotonic-ms timestamp of the last applied beacon (injected by caller).
+    pub last_seen_ms: u64,
+}
+
+/// One roster row surfaced to the frontend. `owner`/`device` are kept as raw
+/// byte arrays for byte-level Rust assertions, but serialize as hex strings so
+/// the JSON `voice-presence-changed` payload is clean (no CBOR bstr-in-JSON).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RosterEntry {
+    #[serde(serialize_with = "ser_hex_16")]
+    pub owner: [u8; 16],
+    #[serde(serialize_with = "ser_hex_32")]
+    pub device: [u8; 32],
+    pub muted: bool,
+}
+
+/// One row returned by [`VoicePresenceMap::sweep`]: the `(community, channel)`
+/// key plus the `(owner, device)` of an evicted entry. The caller (Task 7's
+/// event-loop sweep arm) re-emits the affected channel's roster.
+pub type SweptEntry = ((SpaceId, ChannelId), [u8; 16], [u8; 32]);
+
+#[derive(Debug, Default)]
+pub struct VoicePresenceMap {
+    // (community, channel) → device → entry
+    inner: BTreeMap<(SpaceId, ChannelId), BTreeMap<[u8; 32], PresenceEntry>>,
+}
+
+impl VoicePresenceMap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Apply a (verified, opened) beacon. `now_ms` is a monotonic clock the
+    /// caller supplies. Returns true if the roster changed.
+    pub fn apply(
+        &mut self,
+        c: &SpaceId,
+        ch: &ChannelId,
+        beacon: &VoicePresenceBeacon,
+        now_ms: u64,
+    ) -> bool {
+        let chan = self.inner.entry((*c, *ch)).or_default();
+        if beacon.left {
+            return chan.remove(&beacon.device).is_some();
+        }
+        match chan.get_mut(&beacon.device) {
+            Some(e) if beacon.seq <= e.seq => false, // stale or duplicate
+            Some(e) => {
+                e.muted = beacon.muted;
+                e.seq = beacon.seq;
+                e.last_seen_ms = now_ms;
+                e.joined_hlc = beacon.joined_hlc.clone();
+                // A newer beacon always advances liveness (last_seen), which is
+                // itself a roster-relevant change for the heartbeat/emit cadence
+                // — so any seq advance reports `true`. The call site (Task 7) may
+                // additionally gate the frontend emit on mute/membership change.
+                true
+            }
+            None => {
+                chan.insert(
+                    beacon.device,
+                    PresenceEntry {
+                        owner: beacon.owner,
+                        muted: beacon.muted,
+                        seq: beacon.seq,
+                        joined_hlc: beacon.joined_hlc.clone(),
+                        last_seen_ms: now_ms,
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    /// Evict entries whose last beacon is older than `ttl_ms`. Returns the
+    /// `(community, channel)` key plus the `(owner, device)` of each evicted
+    /// entry, so the caller can re-emit the affected channel's roster.
+    pub fn sweep(&mut self, now_ms: u64, ttl_ms: u64) -> Vec<SweptEntry> {
+        let mut evicted = Vec::new();
+        for (key, chan) in self.inner.iter_mut() {
+            chan.retain(|device, e| {
+                let alive = now_ms.saturating_sub(e.last_seen_ms) < ttl_ms;
+                if !alive {
+                    evicted.push((*key, e.owner, *device));
+                }
+                alive
+            });
+        }
+        evicted
+    }
+
+    pub fn roster(&self, c: &SpaceId, ch: &ChannelId) -> Vec<RosterEntry> {
+        self.inner
+            .get(&(*c, *ch))
+            .map(|chan| {
+                chan.iter()
+                    .map(|(device, e)| RosterEntry {
+                        owner: e.owner,
+                        device: *device,
+                        muted: e.muted,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +339,82 @@ mod tests {
         assert_eq!(open_presence_beacon(&key, &c, &ch, &sealed), Some(signed));
         let other = derive_channel_key(&EpochKey::new([0x22; 32]), &c, &ch);
         assert_eq!(open_presence_beacon(&other, &c, &ch, &sealed), None);
+    }
+}
+
+#[cfg(test)]
+mod map_tests {
+    use super::*;
+
+    fn b(owner: u8, device: u8, seq: u64, muted: bool, left: bool) -> VoicePresenceBeacon {
+        VoicePresenceBeacon {
+            owner: [owner; 16],
+            device: [device; 32],
+            muted,
+            joined_hlc: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "x".into(),
+            },
+            seq,
+            left,
+        }
+    }
+    const C: SpaceId = SpaceId([0xc0; 16]);
+    const CH: ChannelId = ChannelId([0xc1; 16]);
+    const TTL_MS: u64 = 12_000;
+
+    #[test]
+    fn apply_then_roster_lists_member() {
+        let mut m = VoicePresenceMap::new();
+        assert!(m.apply(&C, &CH, &b(1, 1, 0, true, false), 0));
+        let r = m.roster(&C, &CH);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].owner, [1; 16]);
+        assert!(r[0].muted);
+    }
+
+    #[test]
+    fn stale_seq_ignored_newer_applied() {
+        let mut m = VoicePresenceMap::new();
+        m.apply(&C, &CH, &b(1, 1, 5, true, false), 0);
+        assert!(
+            !m.apply(&C, &CH, &b(1, 1, 3, false, false), 0),
+            "older seq → no change"
+        );
+        assert!(m.roster(&C, &CH)[0].muted, "still muted=true from seq 5");
+        assert!(
+            m.apply(&C, &CH, &b(1, 1, 6, false, false), 0),
+            "newer seq → change"
+        );
+        assert!(!m.roster(&C, &CH)[0].muted);
+    }
+
+    #[test]
+    fn heartbeat_keeps_alive_silence_evicts() {
+        let mut m = VoicePresenceMap::new();
+        m.apply(&C, &CH, &b(1, 1, 0, true, false), 0);
+        m.apply(&C, &CH, &b(1, 1, 1, true, false), 8_000); // heartbeat at 8s
+        assert!(
+            m.sweep(11_000, TTL_MS).is_empty(),
+            "within TTL of last beacon"
+        );
+        assert_eq!(
+            m.sweep(21_000, TTL_MS),
+            vec![((C, CH), [1u8; 16], [1u8; 32])],
+            "12s after last → evict"
+        );
+        assert!(m.roster(&C, &CH).is_empty());
+    }
+
+    #[test]
+    fn tombstone_removes_instantly() {
+        let mut m = VoicePresenceMap::new();
+        m.apply(&C, &CH, &b(1, 1, 0, true, false), 0);
+        assert!(
+            m.apply(&C, &CH, &b(1, 1, 1, true, true), 100),
+            "left=true → change (removal)"
+        );
+        assert!(m.roster(&C, &CH).is_empty());
     }
 }
