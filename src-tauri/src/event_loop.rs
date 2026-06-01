@@ -1693,9 +1693,26 @@ pub async fn run<R: Runtime>(
         .collect();
     let mut peer_refresh_counter: u64 = 0;
 
-    // Dynamic voice channel subscriptions — keyed by channel_id.
-    let mut voice_subs: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
-        std::collections::HashMap::new();
+    // Dynamic voice channel subscriptions — keyed by (community, channel).
+    let mut voice_subs: std::collections::HashMap<
+        (
+            crate::owner_state_types::SpaceId,
+            crate::community_membership::ChannelId,
+        ),
+        tokio::task::JoinHandle<()>,
+    > = std::collections::HashMap::new();
+
+    // ZEB-350: per-join channel key (seals/open media + beacons) and the node's
+    // own device id (names the outbound topic segment). Keyed identically to
+    // voice_subs so Join/Leave keep them in lockstep.
+    let mut voice_keys: std::collections::HashMap<
+        (
+            crate::owner_state_types::SpaceId,
+            crate::community_membership::ChannelId,
+        ),
+        std::sync::Arc<crate::community_channel_log::ChannelKey>,
+    > = std::collections::HashMap::new();
+    let mut voice_own_device: Option<String> = None; // hex of self ed25519 vk
 
     // ZEB-227 PR #80 review fix: retry buffer for RuntimeActions whose
     // dispatch transiently failed because dm_outbox/crdt_state locks were
@@ -2314,48 +2331,106 @@ pub async fn run<R: Runtime>(
             // Await directly instead of spawning per-frame tasks — preserves
             // ordering and applies natural backpressure from Zenoh.
             Some(voice) = voice_rx.recv() => {
-                if voice.frame.len() >= 23 {
-                    let node_addr = hex::encode(&voice.frame[7..23]);
-                    let key_expr = format!("harmony/voice/{}/{}", voice.channel_id, node_addr);
-                    if let Err(e) = session.put(&key_expr, voice.frame).await {
-                        tracing::warn!(%key_expr, err = %e, "voice publish failed");
+                // ZEB-350: seal the whole frame (header + payload) under the
+                // per-(community, channel) ChannelKey, then publish to an
+                // own-device-named topic segment. Sender routing now lives in
+                // the topic, not the cleartext header.
+                if let Some(key) = voice_keys.get(&(voice.community_id, voice.channel_id)) {
+                    let own = voice_own_device.as_deref().unwrap_or("self");
+                    match crate::voice_crypto::encrypt_voice_packet(
+                        key,
+                        &voice.community_id,
+                        &voice.channel_id,
+                        crate::voice_crypto::VOICE_PACKET_AAD,
+                        &voice.frame,
+                    ) {
+                        Ok(sealed) => {
+                            let key_expr = format!(
+                                "harmony/voice/{}/{}/{}",
+                                hex::encode(voice.community_id.0),
+                                hex::encode(voice.channel_id.0),
+                                own,
+                            );
+                            if let Err(e) = session.put(&key_expr, sealed).await {
+                                tracing::warn!(%key_expr, err = %e, "voice publish failed");
+                            }
+                        }
+                        Err(e) => tracing::warn!(err = %e, "voice seal failed; dropping frame"),
                     }
                 }
+                // else: not joined to that (community, channel) — drop.
             }
 
             // ── Voice channel join/leave ────────────────────────────
             Some(req) = voice_channel_rx.recv() => {
                 match req {
-                    crate::voice::VoiceChannelRequest::Join { channel_id } => {
-                        let key_expr = format!("harmony/voice/{}/*", channel_id);
-                        let app = app.clone();
-                        let closing = closing.clone();
-                        match session.declare_subscriber(&key_expr).await {
+                    crate::voice::VoiceChannelRequest::Join { community_id, channel_id, caps } => {
+                        // Cache the channel key (seals/open media + beacons) and
+                        // the node's own device id (names the outbound topic).
+                        voice_keys.insert(
+                            (community_id, channel_id),
+                            std::sync::Arc::clone(&caps.channel_key),
+                        );
+                        if voice_own_device.is_none() {
+                            voice_own_device = Some(hex::encode(caps.self_device));
+                        }
+                        let sub_key = format!(
+                            "harmony/voice/{}/{}/*",
+                            hex::encode(community_id.0),
+                            hex::encode(channel_id.0),
+                        );
+                        // The subscriber opens (decrypts) before emitting; an
+                        // AEAD failure (non-member / stale epoch / tamper) is
+                        // dropped silently.
+                        let key_for_sub = std::sync::Arc::clone(&caps.channel_key);
+                        let (c_sub, ch_sub) = (community_id, channel_id);
+                        let app_sub = app.clone();
+                        let closing_sub = closing.clone();
+                        match session.declare_subscriber(&sub_key).await {
                             Ok(sub) => {
                                 let handle = tokio::spawn(async move {
                                     while let Ok(sample) = sub.recv_async().await {
-                                        let payload = sample.payload().to_bytes().to_vec();
-                                        let _ = app.emit("voice-frame-received", serde_json::json!({
-                                            "frameBytes": payload,
-                                        }));
+                                        let sealed = sample.payload().to_bytes().to_vec();
+                                        match crate::voice_crypto::decrypt_voice_packet(
+                                            &key_for_sub,
+                                            &c_sub,
+                                            &ch_sub,
+                                            crate::voice_crypto::VOICE_PACKET_AAD,
+                                            &sealed,
+                                        ) {
+                                            Ok(frame) => {
+                                                let _ = app_sub.emit(
+                                                    "voice-frame-received",
+                                                    serde_json::json!({ "frameBytes": frame }),
+                                                );
+                                            }
+                                            Err(_) => { /* non-member / stale epoch / tamper → drop silently */ }
+                                        }
                                     }
-                                    if !closing.load(std::sync::atomic::Ordering::SeqCst) {
+                                    if !closing_sub.load(std::sync::atomic::Ordering::SeqCst) {
                                         tracing::warn!("voice subscriber closed unexpectedly");
                                     }
                                 });
-                                if let Some(old) = voice_subs.insert(channel_id, handle) {
+                                if let Some(old) = voice_subs.insert((community_id, channel_id), handle) {
                                     old.abort();
                                 }
                             }
                             Err(e) => {
-                                tracing::error!(%key_expr, err = %e, "voice subscribe failed");
+                                tracing::error!(%sub_key, err = %e, "voice subscribe failed");
                             }
                         }
+                        // Task 7: spawn presence publisher + subscriber (sealed
+                        // beacons under VOICE_PRESENCE_AAD) here, after the
+                        // media subscriber, using `caps.signing_key`,
+                        // `caps.self_owner`, `caps.self_device`.
                     }
-                    crate::voice::VoiceChannelRequest::Leave { channel_id } => {
-                        if let Some(handle) = voice_subs.remove(&channel_id) {
+                    crate::voice::VoiceChannelRequest::Leave { community_id, channel_id } => {
+                        voice_keys.remove(&(community_id, channel_id));
+                        if let Some(handle) = voice_subs.remove(&(community_id, channel_id)) {
                             handle.abort();
                         }
+                        // Task 7: send presence tombstone + stop presence
+                        // publisher/subscriber/sweep here.
                     }
                 }
             }

@@ -11577,19 +11577,14 @@ mod fetch_profile_doc_tests {
 
 // ── Voice commands ──────────────────────────────────────────────────────
 
-/// Reject channel IDs that could escape the intended Zenoh key namespace.
-/// Same forbidden characters as send_message's channel/hub validation.
-fn validate_voice_channel_id(channel_id: &str) -> Result<(), String> {
-    if channel_id.is_empty()
-        || channel_id.contains('/')
-        || channel_id.contains('*')
-        || channel_id.contains('?')
-        || channel_id.contains('#')
-        || channel_id.contains('$')
-    {
-        return Err(format!("invalid voice channel_id: {channel_id}"));
-    }
-    Ok(())
+/// ZEB-350: parse a hex community/channel id (32 hex chars → 16 bytes).
+/// Rejects bad length or non-hex. Reused by all three voice IPCs. Hex
+/// decoding inherently rejects the Zenoh-escaping characters the old
+/// `validate_voice_channel_id` blacklisted (`/ * ? # $`), so the V2 ids
+/// are namespace-safe by construction.
+fn parse_voice_id_16(label: &str, s: &str) -> Result<[u8; 16], String> {
+    let bytes = hex::decode(s).map_err(|_| format!("{label} not hex"))?;
+    <[u8; 16]>::try_from(bytes.as_slice()).map_err(|_| format!("{label} must be 16 bytes"))
 }
 
 #[tauri::command]
@@ -11597,7 +11592,12 @@ async fn send_voice_frame(
     payload: voice::SendVoiceFramePayload,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
-    validate_voice_channel_id(&payload.channel_id)?;
+    let community_id =
+        crate::owner_state_types::SpaceId(parse_voice_id_16("communityId", &payload.community_id)?);
+    let channel_id = crate::community_membership::ChannelId(parse_voice_id_16(
+        "channelId",
+        &payload.channel_id,
+    )?);
     let voice_tx = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         guard
@@ -11607,7 +11607,8 @@ async fn send_voice_frame(
     };
     voice_tx
         .send(voice::VoiceOutbound {
-            channel_id: payload.channel_id,
+            community_id,
+            channel_id,
             frame: payload.frame_bytes,
         })
         .await
@@ -11616,28 +11617,78 @@ async fn send_voice_frame(
 
 #[tauri::command]
 async fn join_voice_channel(
+    community_id: String,
     channel_id: String,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
-    validate_voice_channel_id(&channel_id)?;
-    let tx = {
+    let community =
+        crate::owner_state_types::SpaceId(parse_voice_id_16("communityId", &community_id)?);
+    let channel =
+        crate::community_membership::ChannelId(parse_voice_id_16("channelId", &channel_id)?);
+
+    // Snapshot the handles we need out of NodeState without holding the lock
+    // across awaits (the guard is !Send).
+    let (tx, registry, dm_outbox, self_owner, self_device) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard
+        let tx = guard
             .voice_channel_tx
             .clone()
-            .ok_or_else(|| "not connected".to_string())?
+            .ok_or_else(|| "not connected".to_string())?;
+        let registry = guard
+            .channel_log_registry
+            .clone()
+            .ok_or_else(|| "no channel registry".to_string())?;
+        let dm_outbox = guard
+            .dm_outbox
+            .clone()
+            .ok_or_else(|| "no dm outbox".to_string())?;
+        let self_owner = guard
+            .dm_self_owner
+            .ok_or_else(|| "no owner identity".to_string())?;
+        let device_hex = guard
+            .dm_device_id
+            .clone()
+            .ok_or_else(|| "no device id".to_string())?;
+        let self_device = <[u8; 32]>::try_from(
+            hex::decode(&device_hex)
+                .map_err(|_| "device id not hex".to_string())?
+                .as_slice(),
+        )
+        .map_err(|_| "device id must be 32 bytes".to_string())?;
+        (tx, registry, dm_outbox, self_owner, self_device)
     };
-    tx.send(voice::VoiceChannelRequest::Join { channel_id })
+
+    let engine = registry
+        .engine(&community, &channel)
         .await
-        .map_err(|_| "event loop not running".to_string())
+        .ok_or_else(|| "voice channel not ready (no channel engine)".to_string())?;
+    let channel_key = engine.channel_key_arc();
+    let signing_key = { dm_outbox.lock().await.community_signing_key.clone() };
+
+    tx.send(voice::VoiceChannelRequest::Join {
+        community_id: community,
+        channel_id: channel,
+        caps: voice::VoiceJoinCaps {
+            channel_key,
+            signing_key,
+            self_owner,
+            self_device,
+        },
+    })
+    .await
+    .map_err(|_| "event loop not running".to_string())
 }
 
 #[tauri::command]
 async fn leave_voice_channel(
+    community_id: String,
     channel_id: String,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
-    validate_voice_channel_id(&channel_id)?;
+    let community =
+        crate::owner_state_types::SpaceId(parse_voice_id_16("communityId", &community_id)?);
+    let channel =
+        crate::community_membership::ChannelId(parse_voice_id_16("channelId", &channel_id)?);
     let tx = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         guard
@@ -11645,9 +11696,24 @@ async fn leave_voice_channel(
             .clone()
             .ok_or_else(|| "not connected".to_string())?
     };
-    tx.send(voice::VoiceChannelRequest::Leave { channel_id })
-        .await
-        .map_err(|_| "event loop not running".to_string())
+    tx.send(voice::VoiceChannelRequest::Leave {
+        community_id: community,
+        channel_id: channel,
+    })
+    .await
+    .map_err(|_| "event loop not running".to_string())
+}
+
+#[cfg(test)]
+mod voice_id_tests {
+    use super::parse_voice_id_16;
+
+    #[test]
+    fn parse_voice_id_16_accepts_32_hex_and_rejects_else() {
+        assert!(parse_voice_id_16("x", &"ab".repeat(16)).is_ok()); // 32 hex chars
+        assert!(parse_voice_id_16("x", "zz").is_err()); // non-hex
+        assert!(parse_voice_id_16("x", &"ab".repeat(8)).is_err()); // wrong length (8 bytes)
+    }
 }
 
 // ── Mail commands ────────────────────────────────────────────────────────
