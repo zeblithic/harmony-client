@@ -16,8 +16,13 @@
 //! 4. **Sealed media relay** — A `encrypt_voice_packet`s a frame and `put`s it
 //!    to `harmony/voice/{c}/{ch}/{deviceA}`; B opens it on
 //!    `harmony/voice/{c}/{ch}/*` and recovers the original frame.
-//! 5. **Wrong-scope reject** — a beacon sealed under channel A is NOT applied
-//!    by a channel-B subscriber.
+//! 5. **Wrong-scope reject (delivery-canary)** — on one wire topic and one
+//!    subscriber, a beacon sealed under the RIGHT scope is accepted (proving
+//!    delivery) while a beacon sealed under the WRONG scope is dropped at AEAD
+//!    open — distinguished by identity, so the rejection is observable.
+//!
+//! Plus a **negative membership path**: a non-enrolled rogue signer whose
+//! beacon opens and self-verifies is still gated out by `beacon_signer_is_member`.
 //!
 //! Path taken: the **real `spawn_voice_presence_subscriber` + real
 //! `CommunitySyncRegistry`** path (NOT the manual fallback). Seeding membership
@@ -42,7 +47,8 @@ use harmony_app::content_store::{ContentStore, RuntimeContentStore};
 use harmony_app::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
 use harmony_app::voice_crypto::{decrypt_voice_packet, encrypt_voice_packet, VOICE_PACKET_AAD};
 use harmony_app::voice_presence::{
-    build_presence_tombstone, spawn_voice_presence_publisher, spawn_voice_presence_subscriber,
+    build_presence_tombstone, seal_presence_beacon, sign_presence_beacon,
+    spawn_voice_presence_publisher, spawn_voice_presence_subscriber, VoicePresenceBeacon,
     VoicePresenceMap,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -80,14 +86,18 @@ where
 
 /// Build a `CommunitySyncRegistry` and spawn an engine for `community`, then
 /// seed its `CommunityState` materialized-membership bootstrap hint so that
-/// `beacon_signer_is_member(community, owner, device)` resolves true while the
-/// event log stays empty. `device` is A's enrolled ed25519 verify key.
+/// `beacon_signer_is_member(community, owner, device)` resolves true for every
+/// `(owner, device)` in `members` while the event log stays empty. Each
+/// `device` is that owner's enrolled ed25519 verify key.
+///
+/// A sanity pre-assertion confirms the FIRST member resolves as Joined+enrolled
+/// so a subscriber-side false negative can't be silently mistaken for a
+/// transport problem during convergence polling.
 async fn seeded_registry(
     community: SpaceId,
     membership_key: &EpochKey,
     admin: OwnerAddr,
-    member_owner: OwnerAddr,
-    member_device: [u8; 32],
+    members_in: &[(OwnerAddr, [u8; 32])],
 ) -> Arc<CommunitySyncRegistry> {
     let (cas_op_tx, _cas_op_rx) = mpsc::channel(8);
     let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
@@ -128,47 +138,53 @@ async fn seeded_registry(
         .await
         .expect("spawn membership engine");
 
-    // Seed the materialized membership: member_owner is Joined with
-    // member_device enrolled. `materialized()` returns this hint verbatim while
-    // `events` is empty (which it is — no CRDT events flow in this test).
+    // Seed the materialized membership: each `(owner, device)` in `members_in`
+    // is Joined with its device enrolled. `materialized()` returns this hint
+    // verbatim while `events` is empty (which it is — no CRDT events flow in
+    // this test).
     let engine = registry
         .engine_arc(&community)
         .await
         .expect("engine present after spawn");
     let mut members = BTreeMap::new();
-    let mut keys = BTreeSet::new();
-    keys.insert(member_device);
-    members.insert(
-        member_owner,
-        MemberState {
-            status: MemberStatus::Joined,
-            joined_at: Hlc {
-                wall_ms: 1,
-                logical: 0,
-                device_id: "seed".into(),
+    for (member_owner, member_device) in members_in {
+        let mut keys = BTreeSet::new();
+        keys.insert(*member_device);
+        members.insert(
+            *member_owner,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "seed".into(),
+                },
+                left_at: None,
+                enrolled_device_keys: keys,
             },
-            left_at: None,
-            enrolled_device_keys: keys,
-        },
-    );
+        );
+    }
     let hint = MaterializedMembership {
         members,
         ..Default::default()
     };
     engine.state().lock().await.seed_bootstrap_hint(hint);
 
-    // Sanity: confirm the seeded hint resolves the member as enrolled+Joined,
-    // so a subscriber-side false negative can't be silently mistaken for a
-    // transport problem during convergence polling.
+    // Sanity: confirm the seeded hint resolves the FIRST member as
+    // enrolled+Joined, so a subscriber-side false negative can't be silently
+    // mistaken for a transport problem during convergence polling.
+    let (first_owner, first_device) = members_in
+        .first()
+        .expect("seeded_registry requires at least one member");
     assert!(
         harmony_app::voice_presence::beacon_signer_is_member(
             &registry,
             &community,
-            &member_owner,
-            &member_device,
+            first_owner,
+            first_device,
         )
         .await,
-        "seeded registry must admit A as an enrolled Joined member"
+        "seeded registry must admit the first member as enrolled + Joined"
     );
 
     registry
@@ -198,6 +214,23 @@ async fn run_inner() {
     let signing_a = Arc::new(owner_a_seed.device_key);
     let device_a: [u8; 32] = signing_a.verifying_key().to_bytes();
 
+    // ── Identity C: a SECOND enrolled member, used as the right-scope delivery
+    //    canary in Assertion 5. Distinct identity from A so a beacon it sends
+    //    under `channel_other` is observable in `map_other` by owner id.
+    let owner_c_seed = mint_test_owner(0xC3);
+    let owner_c = owner_c_seed.owner;
+    let signing_c = Arc::new(owner_c_seed.device_key);
+    let device_c: [u8; 32] = signing_c.verifying_key().to_bytes();
+
+    // ── Identity R: a ROGUE identity that is NEVER enrolled in B's registry.
+    //    Used in the negative-membership assertion: a beacon it self-signs and
+    //    seals under the REAL channel key opens fine and verifies, but the
+    //    `beacon_signer_is_member` gate must drop it.
+    let owner_r_seed = mint_test_owner(0x55);
+    let owner_r = owner_r_seed.owner;
+    let signing_r = Arc::new(owner_r_seed.device_key);
+    let device_r: [u8; 32] = signing_r.verifying_key().to_bytes();
+
     // ── Shared community + channel + derived ChannelKey ─────────────────────
     let community = SpaceId([0xc0; 16]);
     let channel = ChannelId([0xc1; 16]);
@@ -205,8 +238,16 @@ async fn run_inner() {
     let membership_key = EpochKey::new([0x77; 32]);
     let channel_key = Arc::new(derive_channel_key(&membership_key, &community, &channel));
 
-    // ── B's real registry, seeded so A is a Joined+enrolled member ──────────
-    let registry_b = seeded_registry(community, &membership_key, admin, owner_a, device_a).await;
+    // ── B's real registry, seeded so BOTH A and C are Joined+enrolled members.
+    //    A drives convergence/tombstone/eviction; C is the right-scope canary
+    //    that proves wire delivery in the wrong-scope-reject assertion. ──────
+    let registry_b = seeded_registry(
+        community,
+        &membership_key,
+        admin,
+        &[(owner_a, device_a), (owner_c, device_c)],
+    )
+    .await;
 
     // ── Shared map + clock for B's subscriber ───────────────────────────────
     let map_b = Arc::new(Mutex::new(VoicePresenceMap::new()));
@@ -280,11 +321,68 @@ async fn run_inner() {
     .await
     .expect("B's roster should converge to include A");
 
-    // ── Assertion 5 (wrong-scope reject): a channel-B subscriber must not ───
-    //    apply a beacon sealed under a DIFFERENT channel. We open a second
-    //    subscriber bound to channel_other (own map) on the SAME presence
-    //    topic family, then confirm A's channel-`channel` beacons never land
-    //    in it (the seal AAD binds to (community, channel), so the open fails).
+    // ── Negative membership path: a non-enrolled signer is gated out ─────────
+    //    R holds the real channel key (so its beacon opens) and self-signs a
+    //    valid beacon (so the signature verifies), but R is NOT enrolled in
+    //    B's registry. The subscriber's `beacon_signer_is_member` gate must
+    //    drop it. We publish R's beacon directly to the MAIN presence topic
+    //    while the MAIN subscriber (`sub_handle`) is still alive and `closing`
+    //    is false. If the gate regressed (e.g. it was removed), R would land in
+    //    `map_b` — so this assertion is load-bearing for the membership check.
+    let rogue_beacon = VoicePresenceBeacon {
+        owner: owner_r.0,
+        device: device_r,
+        muted: false,
+        joined_hlc: Hlc {
+            wall_ms: 2_000,
+            logical: 0,
+            device_id: hex::encode(device_r),
+        },
+        seq: 0,
+        left: false,
+    };
+    let signed_rogue = sign_presence_beacon(rogue_beacon, &signing_r).expect("sign rogue beacon");
+    // Sealed under the REAL channel key + scope: opens cleanly on B's side,
+    // signature verifies — the ONLY thing that can stop it is the member gate.
+    let sealed_rogue = seal_presence_beacon(&channel_key, &community, &channel, &signed_rogue)
+        .expect("seal rogue beacon");
+    session_a
+        .put(&pres_topic, sealed_rogue)
+        .await
+        .expect("publish rogue beacon");
+
+    // Give the subscriber several poll cycles to (attempt to) process it, then
+    // assert R never appears while A is still present (subscriber is alive and
+    // processing — so R's absence is a genuine gate rejection, not a dead loop).
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    {
+        let g = map_b.lock().await;
+        let roster = g.roster(&community, &channel);
+        assert!(
+            !roster.iter().any(|r| r.owner == owner_r.0),
+            "a non-enrolled (rogue) signer must be gated out by beacon_signer_is_member"
+        );
+        assert!(
+            roster
+                .iter()
+                .any(|r| r.owner == owner_a.0 && r.device == device_a),
+            "A must still be present — proves the subscriber is alive and processing, \
+             so R's absence is a real gate rejection, not a stalled loop"
+        );
+    }
+
+    // ── Assertion 5 (wrong-scope reject, delivery-canary form): on the SAME
+    //    wire topic and SAME subscriber, a beacon sealed under the RIGHT scope
+    //    (`channel_other`) is accepted, while one sealed under the WRONG scope
+    //    (`channel`) is rejected — distinguished by IDENTITY.
+    //
+    //    Why the canary is load-bearing: the two beacons are published
+    //    back-to-back on the same topic, and Zenoh delivers same-topic samples
+    //    in order. So once we observe the RIGHT-scope canary (`owner_c`) land
+    //    in `map_other`, we KNOW the wrong-scope beacon (`owner_a`) was also
+    //    delivered to `sub_other`. Its absence is therefore a genuine AEAD-open
+    //    rejection (wrong scope key + AAD), not a transport miss. The old
+    //    "sleep 2s, assert empty" form proved neither delivery nor rejection.
     let channel_other = ChannelId([0xc2; 16]);
     let channel_key_other = Arc::new(derive_channel_key(
         &membership_key,
@@ -304,16 +402,82 @@ async fn run_inner() {
         Arc::clone(&closing),
         Arc::clone(&now_ms),
     );
-    // Give it time to settle + receive several of A's heartbeats; it must stay
-    // empty because every beacon's AAD is bound to `channel`, not `channel_other`.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Let the second subscriber's declaration settle before publishing.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // (1) RIGHT-scope canary: C, sealed under `channel_key_other`. This is the
+    //     correct scope for `sub_other`, so it must be accepted.
+    let canary_beacon = VoicePresenceBeacon {
+        owner: owner_c.0,
+        device: device_c,
+        muted: false,
+        joined_hlc: Hlc {
+            wall_ms: 3_000,
+            logical: 0,
+            device_id: hex::encode(device_c),
+        },
+        seq: 0,
+        left: false,
+    };
+    let signed_c = sign_presence_beacon(canary_beacon, &signing_c).expect("sign canary beacon");
+    let sealed_canary =
+        seal_presence_beacon(&channel_key_other, &community, &channel_other, &signed_c)
+            .expect("seal right-scope canary");
+
+    // (2) WRONG-scope: A, sealed under `channel_key` (the `channel` scope).
+    //     Delivered on the same topic but to a subscriber configured for
+    //     `channel_other` — the AEAD open with the wrong key/AAD must fail.
+    let wrong_beacon = VoicePresenceBeacon {
+        owner: owner_a.0,
+        device: device_a,
+        muted: false,
+        joined_hlc: joined_hlc.clone(),
+        seq: 1,
+        left: false,
+    };
+    let signed_wrong =
+        sign_presence_beacon(wrong_beacon, &signing_a).expect("sign wrong-scope beacon");
+    let sealed_wrong = seal_presence_beacon(&channel_key, &community, &channel, &signed_wrong)
+        .expect("seal wrong-scope beacon");
+
+    // Publish back-to-back on the same topic (in-order delivery to sub_other).
+    session_a
+        .put(&pres_topic, sealed_canary)
+        .await
+        .expect("publish right-scope canary");
+    session_a
+        .put(&pres_topic, sealed_wrong)
+        .await
+        .expect("publish wrong-scope beacon");
+
+    // The canary's arrival PROVES the wire delivers to sub_other and its
+    // open→verify→apply pipeline works for the correct scope.
+    wait_until(Duration::from_secs(5), || {
+        let map_other = Arc::clone(&map_other);
+        async move {
+            map_other
+                .lock()
+                .await
+                .roster(&community, &channel_other)
+                .iter()
+                .any(|r| r.owner == owner_c.0 && r.device == device_c)
+        }
+    })
+    .await
+    .expect("right-scope canary (owner_c) must be delivered + applied by sub_other");
+
+    // Now the wrong-scope beacon: it was delivered on the same topic before the
+    // canary's pipeline completed (same-topic in-order), so its absence is a
+    // genuine AEAD-open rejection, not a transport miss.
     assert!(
-        map_other
+        !map_other
             .lock()
             .await
             .roster(&community, &channel_other)
-            .is_empty(),
-        "a channel-A beacon must NOT be applied by a wrong-scope (channel-B) subscriber"
+            .iter()
+            .any(|r| r.owner == owner_a.0),
+        "a wrong-scope beacon (sealed under `channel`) must NOT be applied by a \
+         `channel_other` subscriber — it is delivered but fails AEAD open"
     );
     sub_other.abort();
 
