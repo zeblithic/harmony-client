@@ -22652,8 +22652,12 @@ pub fn delta_to_channel_config_change(
             channel_id,
             name,
             write_power,
-            // ZEB-349: kind is not surfaced through this channel-config-change
-            // DTO in V1 (a later slice threads it into the IPC layer).
+            // ZEB-349: kind is intentionally NOT carried on the
+            // channel-config-updated event in V1. The frontend reads a
+            // channel's kind from the `list_channels` IPC (ChannelInfoDto.kind,
+            // always present), which it re-fetches on this event — so the event
+            // itself doesn't need it. A future slice may add it here only if an
+            // optimistic-update path needs the kind without a re-list.
             kind: _,
         } => (
             hex::encode(channel_id.0),
