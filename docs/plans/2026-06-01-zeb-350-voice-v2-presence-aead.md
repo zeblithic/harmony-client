@@ -14,6 +14,8 @@
 
 These facts were verified against the current tree (branch `zeb-350-voice-presence-aead` off `origin/main` `81ecdc7`). Line numbers drift as you edit — re-grep before trusting an offset.
 
+> **IMPORT CORRECTION (verified during Task 1):** `ChannelId` is `pub struct ChannelId(pub [u8; 16])` in **`crate::community_membership`** — it is NOT in `owner_state_types`. Import it as `use crate::community_membership::ChannelId;` (and `harmony_app::community_membership::ChannelId` in `tests/`), matching `community_channel_log.rs`. `SpaceId`, `EpochKey`, `OwnerAddr`, and `Hlc` ARE in `crate::owner_state_types`. Wherever a code snippet below writes `owner_state_types::{ChannelId, ...}`, split `ChannelId` out to `community_membership`. Also: `encrypt_voice_packet`'s production body needs `use chacha20poly1305::AeadCore;` (for `generate_nonce`) — already handled in `voice_crypto.rs`.
+
 **The three voice IPCs** live in `src-tauri/src/lib.rs`:
 - `send_voice_frame` (≈ lines 11594–11614) — takes `payload: voice::SendVoiceFramePayload`, sends `voice::VoiceOutbound { channel_id, frame }` over `NodeState.voice_tx`.
 - `join_voice_channel` (≈ 11616–11632) — takes `channel_id: String`, sends `voice::VoiceChannelRequest::Join { channel_id }` over `NodeState.voice_channel_tx`.
