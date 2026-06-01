@@ -37,6 +37,9 @@ export interface ChannelInfo {
   channelId: string;
   name: string;
   writePower: number;
+  /** ZEB-349: channel kind. The Rust `ChannelInfoDto` always emits this
+   *  as the camelCase string "text" | "voice", so it is required. */
+  kind: 'text' | 'voice';
   createdAt: { wallMs: number; logical: number; deviceId: string };
   deletedAt?: { wallMs: number; logical: number; deviceId: string };
 }
@@ -273,11 +276,13 @@ export class CommunityService {
     communityId: string,
     name: string,
     writePower: number,
+    kind: 'text' | 'voice' = 'text',
   ): Promise<string> {
     return this.invoke<string>('create_channel', {
       communityId,
       name,
       writePower,
+      kind,
     });
   }
 
