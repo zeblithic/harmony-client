@@ -429,3 +429,61 @@ describe('VoiceSession mic-blocked → listen-only join (ZEB-353)', () => {
     expect(invoke).toHaveBeenCalledWith('leave_voice_channel', { communityId: 'comm', channelId: 'chan' });
   });
 });
+
+describe('VoiceSession moderation (ZEB-358)', () => {
+  let d: ReturnType<typeof deps>;
+  beforeEach(() => { d = deps(); });
+  const newSession = () => new VoiceSession({
+    invoke: d.invoke, listen: d.listen,
+    selfOwnerHex: 'aa'.repeat(16), selfDeviceHex: 'bb'.repeat(16),
+    senderHash: new Uint8Array(16), ...d.factories,
+  });
+
+  it('overlay marks roster modMuted + power and hides kicked owners', async () => {
+    const s = newSession();
+    await s.join('comm', 'chan');
+    d.emit('voice-presence-changed', { community: 'comm', channel: 'chan', roster: [
+      { owner: 'a'.repeat(32), device: 'a'.repeat(64), muted: false },
+      { owner: 'c'.repeat(32), device: 'c'.repeat(64), muted: false },
+    ]});
+    d.emit('voice-moderation-changed', { community: 'comm', channel: 'chan',
+      mutedOwners: ['a'.repeat(32)], kickedOwners: ['c'.repeat(32)],
+      powers: { ['a'.repeat(32)]: 0 }, selfPower: 60, selfModMuted: false, selfKicked: false });
+    const st = get(s.state);
+    expect(st.roster.find((m) => m.ownerHex === 'a'.repeat(32))?.modMuted).toBe(true);
+    expect(st.roster.find((m) => m.ownerHex === 'c'.repeat(32))).toBeUndefined();
+    expect(st.selfPower).toBe(60);
+  });
+
+  it('selfModMuted force-mutes, blocks self-unmute, and stays muted after it clears', async () => {
+    const s = newSession();
+    await s.join('comm', 'chan');
+    await s.setMuted(false);                       // allowed: not moderated yet
+    expect(get(s.state).muted).toBe(false);
+    d.emit('voice-moderation-changed', { community: 'comm', channel: 'chan',
+      mutedOwners: ['aa'.repeat(16)], kickedOwners: [], powers: {}, selfPower: 0, selfModMuted: true, selfKicked: false });
+    expect(get(s.state).muted).toBe(true);         // force-muted
+    await s.setMuted(false);                        // blocked
+    expect(get(s.state).muted).toBe(true);
+    d.emit('voice-moderation-changed', { community: 'comm', channel: 'chan',
+      mutedOwners: [], kickedOwners: [], powers: {}, selfPower: 0, selfModMuted: false, selfKicked: false });
+    expect(get(s.state).muted).toBe(true);         // unattended-mic guard: stays muted
+  });
+
+  it('moderate() invokes moderate_voice', async () => {
+    const s = newSession();
+    await s.join('comm', 'chan');
+    await s.moderate('cc'.repeat(16), 'mute');
+    expect(d.invoke).toHaveBeenCalledWith('moderate_voice',
+      { communityId: 'comm', channelId: 'chan', targetOwnerHex: 'cc'.repeat(16), action: 'mute' });
+  });
+
+  it('selfKicked is exposed and silences', async () => {
+    const s = newSession();
+    await s.join('comm', 'chan');
+    d.emit('voice-moderation-changed', { community: 'comm', channel: 'chan',
+      mutedOwners: [], kickedOwners: ['aa'.repeat(16)], powers: {}, selfPower: 0, selfModMuted: false, selfKicked: true });
+    expect(get(s.state).selfKicked).toBe(true);
+    expect(get(s.state).muted).toBe(true);
+  });
+});
