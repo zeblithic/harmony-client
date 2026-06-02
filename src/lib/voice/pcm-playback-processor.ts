@@ -31,15 +31,18 @@ class PcmPlaybackProcessor extends AudioWorkletProcessor {
   }
 
   process(_inputs: Float32Array[][], outputs: Float32Array[][]): boolean {
-    const out = outputs[0][0];
-    for (let i = 0; i < out.length; i++) {
+    const channels = outputs[0];
+    const frameLen = channels[0].length;
+    for (let i = 0; i < frameLen; i++) {
+      let sample = 0;
       if (this.available > 0) {
-        out[i] = this.ring[this.readIdx];
+        sample = this.ring[this.readIdx];
         this.readIdx = (this.readIdx + 1) % this.ring.length;
         this.available--;
-      } else {
-        out[i] = 0;
       }
+      // Mono mix → fan out to every output channel. Writing only channels[0]
+      // leaves the right speaker/ear silent on stereo (multi-channel) outputs.
+      for (let c = 0; c < channels.length; c++) channels[c][i] = sample;
     }
     return true;
   }

@@ -12,6 +12,16 @@
 const SOFT_CLIP_KNEE = 0.8;
 
 /**
+ * Output AudioContext sample rate. MUST match the capture/codec pipeline:
+ * audio-capture.ts opens its context at 16 kHz and the Opus path emits 20 ms /
+ * 320-sample frames. A bare `new AudioContext()` picks the hardware rate
+ * (commonly 48 kHz); the playback worklet would then drain ~960 samples per
+ * 20 ms while only 320 are produced — a 3:1 underrun heard as rhythmic
+ * dropouts. Pinning to 16 kHz keeps producer and consumer rates equal.
+ */
+const PLAYBACK_SAMPLE_RATE = 16000;
+
+/**
  * Soft-clip limiter for summed audio.
  *
  * Transparent (identity) for |x| <= SOFT_CLIP_KNEE, so a single speaker or a
@@ -63,14 +73,15 @@ export class VoiceMixer {
   private pending = new Map<string, Float32Array>();
   private senderGain = new Map<string, number>();
   private masterGain = 1;
-  private frameLen = 320;
 
   constructor(config: VoiceMixerConfig = {}) {
     this.config = config;
   }
 
   async init(): Promise<void> {
-    const ctx = this.config.createContext ? this.config.createContext() : new AudioContext();
+    const ctx = this.config.createContext
+      ? this.config.createContext()
+      : new AudioContext({ sampleRate: PLAYBACK_SAMPLE_RATE });
     this.ctx = ctx;
     // Mirror audio-capture.ts's addModule(worklet URL) mechanism exactly.
     if (!this.config.createWorkletNode) {
@@ -91,7 +102,6 @@ export class VoiceMixer {
       // Copy: the source may be a view into the jitter buffer's internal storage,
       // which can be overwritten before the next drain() reads it.
       this.pending.set(senderHex, new Float32Array(pcm));
-      this.frameLen = pcm.length;
     }
   }
 
@@ -105,6 +115,16 @@ export class VoiceMixer {
 
   drain(): void {
     if (!this.node) return;
+    // Output length = the longest pending frame, recomputed every drain. With
+    // mixed frame sizes (codec2 160 vs opus 320) a single global length taken
+    // from whichever frame arrived last would truncate the others; taking the
+    // max and letting mixFrames zero-pad the shorter streams is lossless.
+    // Computed over `pending` (not the post-gain `frames`) so a deafened drain
+    // (all gains 0 ⇒ no frames) still emits a correctly-sized silence frame.
+    let frameLen = 0;
+    for (const pcm of this.pending.values()) {
+      if (pcm.length > frameLen) frameLen = pcm.length;
+    }
     const frames: Float32Array[] = [];
     for (const [hex, pcm] of this.pending) {
       const g = this.senderGain.get(hex) ?? 1;
@@ -116,7 +136,7 @@ export class VoiceMixer {
         frames.push(scaled);
       }
     }
-    const mixed = mixFrames(frames, this.frameLen);
+    const mixed = mixFrames(frames, frameLen);
     this.node.port.postMessage(mixed, [mixed.buffer]);
     this.pending.clear();
   }

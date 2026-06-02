@@ -76,6 +76,27 @@ describe('VoiceMixer', () => {
     expect(sent[1]).toBeCloseTo(0.3, 5);
   });
 
+  it('mixes streams of different lengths without truncating the longer one', async () => {
+    // Regression (CodeAnt): a single global frameLen from the last-pushed frame
+    // truncated other streams. With codec2 (160) and opus (320) frames active,
+    // the output must be the LONGEST length, zero-padding the shorter stream.
+    const { ctx, node } = mockCtx();
+    const mixer = new VoiceMixer({
+      createContext: () => ctx as unknown as AudioContext,
+      createWorkletNode: () => node as unknown as AudioWorkletNode,
+    });
+    await mixer.init();
+    mixer.pushFrame('short', new Float32Array([0.1, 0.1]));
+    mixer.pushFrame('long', new Float32Array([0.2, 0.2, 0.2, 0.2]));
+    mixer.drain();
+    const sent = node.port.postMessage.mock.calls[0][0] as Float32Array;
+    expect(sent.length).toBe(4); // longest stream preserved, not truncated to 2
+    expect(sent[0]).toBeCloseTo(0.3, 5); // overlap: 0.1 + 0.2
+    expect(sent[1]).toBeCloseTo(0.3, 5);
+    expect(sent[2]).toBeCloseTo(0.2, 5); // only the long stream past index 1
+    expect(sent[3]).toBeCloseTo(0.2, 5);
+  });
+
   it('deafen (master gain 0) emits silence', async () => {
     const { ctx, node } = mockCtx();
     const mixer = new VoiceMixer({
