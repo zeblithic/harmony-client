@@ -328,4 +328,23 @@ describe('TextFeed Integration', () => {
     const img = screen.getByAltText('Screenshot');
     expect(img).toBeTruthy();
   });
+
+  // ── 8. DM header Call button (ZEB-352) ────────────────────────────
+
+  it('renders a "Start call" button when channelType is dm', () => {
+    renderFeed({ channelType: 'dm', channelId: 'space-abc', channelName: 'Alice' });
+    expect(screen.getByRole('button', { name: 'Start call' })).toBeTruthy();
+  });
+
+  it('does not render a "Start call" button when channelType is channel', () => {
+    renderFeed({ channelType: 'channel', channelId: 'chan-1', channelName: 'general' });
+    expect(screen.queryByRole('button', { name: 'Start call' })).toBeNull();
+  });
+
+  it('calls onStartCall with channelId when the Call button is clicked', async () => {
+    const onStartCall = vi.fn();
+    renderFeed({ channelType: 'dm', channelId: 'space-xyz', onStartCall });
+    await fireEvent.click(screen.getByRole('button', { name: 'Start call' }));
+    expect(onStartCall).toHaveBeenCalledWith('space-xyz');
+  });
 });
