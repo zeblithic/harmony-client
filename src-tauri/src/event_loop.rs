@@ -1527,7 +1527,7 @@ pub async fn run<R: Runtime>(
                                 // below — never re-opening. The decoded caller is
                                 // unverified until verify_decoded_signal binds the
                                 // signature to a cached identity.
-                                let signed = match crate::voice_signal::open_and_decode(
+                                let signed = match crate::voice_signal::open_and_decode_unverified(
                                     &self_x25519_priv,
                                     &sealed,
                                 ) {
@@ -3195,6 +3195,12 @@ pub async fn run<R: Runtime>(
         handle.abort();
     }
     for (_, handle) in voice_presence_pubs.drain() {
+        handle.abort();
+    }
+    // ZEB-352: abort the DM-call media subscriber tasks too, so they don't run
+    // detached past shutdown (emitting into a stale AppHandle or racing a
+    // subsequent start_node restart that builds fresh state maps).
+    for (_, handle) in dm_voice_subs.drain() {
         handle.abort();
     }
     let _ = session.close().await;

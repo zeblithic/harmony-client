@@ -130,17 +130,18 @@ pub fn open_sealed_signal(
     caller_identity_pub: &[u8; 64],
     caller_signing_device_hash: DeviceIdentityHash,
 ) -> Result<VoiceSignal, DmReceiveError> {
-    let signed = open_and_decode(self_x25519_priv, sealed)?;
+    let signed = open_and_decode_unverified(self_x25519_priv, sealed)?;
     verify_decoded_signal(&signed, caller_identity_pub, caller_signing_device_hash)
 }
 
 /// Hybrid-open + CBOR-decode a sealed signal **without** verifying the
-/// signature. The result is untrusted until passed through
-/// `verify_decoded_signal`. Splitting open from verify lets the inbound path
+/// signature. The returned `SignedVoiceSignal` is UNTRUSTED until passed
+/// through `verify_decoded_signal` (the `_unverified` suffix is a deliberate
+/// trust-boundary marker). Splitting open from verify lets the inbound path
 /// open the sealed box once and then verify against each candidate device key
 /// (the sealed box is sealed to the recipient's X25519 key — identical for
 /// every candidate — so re-opening per device is wasted work).
-pub fn open_and_decode(
+pub fn open_and_decode_unverified(
     self_x25519_priv: &[u8; 32],
     sealed: &[u8],
 ) -> Result<SignedVoiceSignal, DmReceiveError> {
@@ -167,17 +168,6 @@ pub fn verify_decoded_signal(
         caller_signing_device_hash,
     )?;
     Ok(signed.body.clone())
-}
-
-/// Decode just the (unverified) caller from a sealed envelope so the inbound
-/// path can look up the right identity key before verifying.
-///
-/// Never trust the returned `OwnerAddr` without completing the full verify via
-/// `verify_decoded_signal` (or `open_sealed_signal`) — this only peeks.
-pub fn peek_caller(self_x25519_priv: &[u8; 32], sealed: &[u8]) -> Option<OwnerAddr> {
-    open_and_decode(self_x25519_priv, sealed)
-        .ok()
-        .map(|signed| signed.body.caller)
 }
 
 // ── CBOR helpers ─────────────────────────────────────────────────────────────
@@ -364,9 +354,10 @@ mod tests {
         );
     }
 
-    /// `peek_caller` extracts the caller OwnerAddr without full verification.
+    /// `open_and_decode_unverified` decodes the (unverified) caller from a
+    /// valid sealed signal without checking the signature.
     #[test]
-    fn peek_caller_returns_caller_addr() {
+    fn open_and_decode_unverified_returns_caller() {
         let (signing_key, _identity_pub, _device_hash) = make_caller_identity(0x42);
         let (callee_priv, callee_pub) = make_callee_x25519(0x77);
 
@@ -374,15 +365,15 @@ mod tests {
         let sealed =
             build_sealed_signal(&signal, &signing_key, &callee_pub).expect("seal must succeed");
 
-        let caller = peek_caller(&callee_priv, &sealed)
-            .expect("peek_caller must return Some for valid sealed signal");
-        assert_eq!(caller, signal.caller);
+        let decoded = open_and_decode_unverified(&callee_priv, &sealed)
+            .expect("open_and_decode_unverified must succeed for a valid sealed signal");
+        assert_eq!(decoded.body.caller, signal.caller);
     }
 
-    /// `peek_caller` on a sealed blob addressed to a different recipient
-    /// (wrong priv) must return None.
+    /// `open_and_decode_unverified` on a sealed blob addressed to a different
+    /// recipient (wrong priv) must fail to open.
     #[test]
-    fn peek_caller_wrong_priv_returns_none() {
+    fn open_and_decode_unverified_wrong_priv_fails() {
         let (signing_key, _identity_pub, _device_hash) = make_caller_identity(0x42);
         let (_callee_priv, callee_pub) = make_callee_x25519(0x77);
         let (wrong_priv, _wrong_pub) = make_callee_x25519(0x88);
@@ -392,8 +383,8 @@ mod tests {
             build_sealed_signal(&signal, &signing_key, &callee_pub).expect("seal must succeed");
 
         assert!(
-            peek_caller(&wrong_priv, &sealed).is_none(),
-            "peek_caller with wrong priv must return None"
+            open_and_decode_unverified(&wrong_priv, &sealed).is_err(),
+            "open_and_decode_unverified with wrong priv must fail to open"
         );
     }
 

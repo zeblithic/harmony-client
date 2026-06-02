@@ -122,12 +122,15 @@ export class CallSession {
     this.store.update((s) => ({ ...s, ...p }));
   }
 
-  private resetToIdle(): void {
+  private resetToIdle(endReason: string | null = null): void {
     this.clearRingTimer();
     this.muted = true; this.deafened = false; this.pttMode = false; this.pttHeld = false;
     this.callId = null; this.spaceId = null;
     this.vad.reset();
-    this.store.set({ ...INITIAL });
+    // Single store notification: callers that need to surface an end reason pass
+    // it here rather than reset-then-patch, which would briefly flash endReason
+    // null to subscribers.
+    this.store.set({ ...INITIAL, endReason });
   }
 
   private clearRingTimer(): void {
@@ -243,8 +246,7 @@ export class CallSession {
   /** Caller side: the callee declined — surface the reason and reset. */
   onRemoteDeclined(callId: string, reason: string): void {
     if (this.callId !== callId || get(this.store).phase !== 'ringingOut') return;
-    this.resetToIdle();
-    this.patch({ endReason: reason });
+    this.resetToIdle(reason);
   }
 
   /** Callee side: the caller canceled before we answered. */
