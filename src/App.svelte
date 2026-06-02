@@ -132,6 +132,18 @@
   // torn down on unmount via fileManagerService.addUnlisten.
   let callStateUnsub: (() => void) | null = null;
 
+  // ── ZEB-353 Voice V5: SPA-unmount teardown ────────────────────────
+  // Leave any active voice channel / end any in-progress DM call when the
+  // component unmounts (hot-reload, SPA teardown). Mirrors the service
+  // `$effect(() => () => service.destroy())` cleanup pattern above. The native
+  // window-close path is handled separately via onCloseRequested in Tauri-init
+  // (Svelte unmount does NOT fire on a native window close), so both paths are
+  // covered. Errors are swallowed — teardown must never throw on the way out.
+  $effect(() => () => {
+    void voiceSession?.leave().catch(() => {});
+    void callSession?.end().catch(() => {});
+  });
+
   /** Fire-and-forget: swallow a (possibly async) result so a click handler never
    *  surfaces an unhandled rejection. Mirrors VoiceChannelView's `swallow`. */
   const swallow = (p: unknown) => { void Promise.resolve(p).catch(() => {}); };
@@ -1414,6 +1426,26 @@
       // Tear down the callSession.state subscription (set in buildVoiceSession)
       // on unmount, alongside the listeners.
       fileManagerService.addUnlisten(() => { callStateUnsub?.(); callStateUnsub = null; });
+
+      // ── ZEB-353 Voice V5: native window-close teardown ──────────────
+      // Svelte's $effect-cleanup does NOT fire on a native window close, so the
+      // SPA-unmount hook above can't cover the real-world "user closes the app"
+      // path. Intercept the OS close request, leave/end the voice channel & DM
+      // call so the leave/end IPCs flush (otherwise the user lingers in peers'
+      // rosters until the 12s presence TTL and the mic stays open until the OS
+      // force-closes the process), THEN destroy the window. preventDefault +
+      // explicit destroy() is the documented Tauri v2 pattern to run async
+      // cleanup before the window actually closes. Dynamic import matches the
+      // core/event imports above (no static @tauri-apps import in this file).
+      const { getCurrentWebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+      const appWin = getCurrentWebviewWindow();
+      const unlistenClose = await appWin.onCloseRequested(async (event) => {
+        event.preventDefault();
+        await voiceSession?.leave().catch(() => {});
+        await callSession?.end().catch(() => {});
+        await appWin.destroy();
+      });
+      fileManagerService.addUnlisten(unlistenClose);
     } catch (err) {
       console.warn('[harmony-client] Tauri init failed:', err);
     }
