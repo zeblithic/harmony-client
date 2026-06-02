@@ -10,12 +10,16 @@ use harmony_app::community_membership::ChannelId;
 use harmony_app::dm_signing::{
     derive_device_hash_from_identity_pub, sign_dm_packet, verify_dm_packet_signature,
 };
+use harmony_app::owner_state_crypto::canonical_cbor_encode;
 use harmony_app::owner_state_types::{
     DeviceIdentityHash, DmContentKey, EpochKey, Hlc, OwnerAddr, SpaceId,
 };
 use harmony_app::voice_crypto::{
     encrypt_dm_voice_packet_with_nonce, encrypt_voice_packet_with_nonce, VOICE_DM_PACKET_AAD,
     VOICE_PACKET_AAD,
+};
+use harmony_app::voice_moderation::{
+    seal_directive_with_nonce, sign_directive, ModAction, VoiceModerationDirective,
 };
 use harmony_app::voice_presence::{
     open_presence_beacon, seal_presence_beacon_with_nonce, sign_presence_beacon,
@@ -197,5 +201,62 @@ fn voice_signal_invite_signed_inner_wire_bytes_pinned() {
     assert_eq!(
         derived_hash, device_hash,
         "device_hash must match derived value"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ZEB-358 — voice moderation directive wire-format pins
+// ---------------------------------------------------------------------------
+
+/// Fully deterministic unsigned directive: fixed actor/target bytes, fixed HLC,
+/// seq 3. All fields are compile-time constants so the CBOR is stable.
+fn fixture_directive() -> VoiceModerationDirective {
+    VoiceModerationDirective {
+        actor_owner: [0xA1; 16],
+        actor_device: [0xD2; 32],
+        target_owner: [0xB3; 16],
+        action: ModAction::Mute,
+        issued_hlc: Hlc {
+            wall_ms: 42,
+            logical: 7,
+            device_id: "fixture-dev".into(),
+        },
+        seq: 3,
+    }
+}
+
+/// Pin the canonical-CBOR encoding of an unsigned `VoiceModerationDirective`.
+/// A drift here means a field rename (serde rename attr), a field added/removed,
+/// or the CBOR codec changed. Re-pin deliberately — never silently.
+#[test]
+fn voice_moderation_directive_canonical_cbor_is_pinned() {
+    let bytes = canonical_cbor_encode(&fixture_directive()).unwrap();
+    assert_eq!(
+        hex::encode(&bytes),
+        "a662616f50a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a16261645820d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d262746f50b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b362616300626968a36177182a616c0761646b666978747572652d64657662737103",
+        "VoiceModerationDirective canonical-CBOR wire format drifted"
+    );
+}
+
+/// Pin the sealed (signed + ChannelKey-encrypted) directive wire format.
+/// Signing key is `[7u8; 32]`, nonce is `[9u8; 12]`, channel key/community/channel
+/// match the existing presence-beacon fixture exactly.
+#[test]
+fn voice_moderation_sealed_directive_is_pinned() {
+    let signing = SigningKey::from_bytes(&[7u8; 32]);
+    let signed = sign_directive(fixture_directive(), &signing).expect("sign");
+    let key = derive_channel_key(
+        &EpochKey::new([0x11; 32]),
+        &SpaceId([0xc0; 16]),
+        &ChannelId([0xc1; 16]),
+    );
+    let community = SpaceId([0xc0; 16]);
+    let channel = ChannelId([0xc1; 16]);
+    let sealed =
+        seal_directive_with_nonce(&key, &community, &channel, &signed, [9u8; 12]).expect("seal");
+    assert_eq!(
+        hex::encode(&sealed),
+        "090909090909090909090909f76ed9e6ed6f16b7af2d4cdeba79cd9b2b52875c6c8dd9f55e6a6d3821f4d63429d7a213a9ab872b13a88a2971adb9ccd2822d7fc5dd3b69ab982f4105affa78f3b765450ad1ebcb42c289f12efb521c3095d4204761a6235672205ac88454a330218cf5e02f8710576af956a769a71b5e1b2657eb6af19d0b66f2b533d7a78aba3942a4b54ecaecdcfa9c2ef189be53bbf4e90d2714385fa3240d3d6b5de306bb001bb992cdbdfb6b76d2f5718f52661172b4896ba123192d89ac32f40bd384dcff58c9081cf754",
+        "sealed VoiceModerationDirective wire format drifted"
     );
 }
