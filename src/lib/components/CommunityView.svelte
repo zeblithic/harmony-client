@@ -47,6 +47,7 @@
     unsubscribeCards,
     onOpenCard,
     voiceSession,
+    onBeforeVoiceJoin,
   }: {
     communityId: string;
     communityName: string;
@@ -98,6 +99,9 @@
      *  get_self_voice_identity IPC resolves — the voice routing is guarded so
      *  the brief pre-ready window simply shows nothing. */
     voiceSession?: VoiceSession | null;
+    /** ZEB-352 D12: forwarded to VoiceChannelView — the app tears down any
+     *  active DM call before this community channel's voice join proceeds. */
+    onBeforeVoiceJoin?: () => Promise<void>;
   } = $props();
 
   let channels = $state<ChannelInfo[]>([]);
@@ -439,6 +443,7 @@
             channelName={activeChannel.name}
             {communityId}
             channelId={activeChannel.channelId}
+            onBeforeJoin={onBeforeVoiceJoin}
           />
         {/if}
       {:else}
