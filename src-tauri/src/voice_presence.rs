@@ -64,6 +64,11 @@ pub enum BeaconError {
     Encode,
     #[error("beacon signature invalid")]
     BadSig,
+    /// `session.put` failed — a transport/runtime fault, distinct from an
+    /// encode/seal fault, so callers can diagnose (and one day retry) network
+    /// failures without conflating them with CBOR bugs.
+    #[error("beacon transport publish failed")]
+    Publish,
 }
 
 use crate::community_channel_log::ChannelKey;
@@ -367,7 +372,7 @@ impl VoicePresenceMap {
 // ── Membership verification + pub/sub spawn helpers ──────────────
 
 use crate::community_state_sync::CommunitySyncRegistry;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tauri::Emitter;
 use tokio::task::JoinHandle;
@@ -536,14 +541,21 @@ pub async fn publish_presence_once(
     session
         .put(topic, sealed)
         .await
-        .map_err(|_| BeaconError::Encode)
+        .map_err(|_| BeaconError::Publish)
 }
 
 /// Spawn a heartbeat publisher: emit an immediate beacon, then one every
 /// `interval` (4 s in V2). ZEB-351 Voice V3: each tick reads the shared
 /// `muted` flag (flipped by `set_voice_muted` → `VoiceChannelRequest::SetMuted`)
-/// instead of the old hardcoded `true`. A per-publisher monotone `seq` drives
-/// roster freshness. Honors `closing` for shutdown.
+/// instead of the old hardcoded `true`. Honors `closing` for shutdown.
+///
+/// `seq_counter` is a per-(community, channel) monotone `Arc<AtomicU64>` SHARED
+/// with the event loop's immediate-beacon path (`publish_presence_once` on a
+/// `SetMuted` toggle). Each beacon — heartbeat OR immediate — draws a strictly
+/// increasing `seq` via `fetch_add`, so the immediate mute beacon can never
+/// outrank later heartbeats (the bug a private `0..` counter + a `u64::MAX-1`
+/// sentinel produced: the sentinel permanently poisoned same-session freshness,
+/// stalling the roster). `u64::MAX` stays reserved for the leave tombstone.
 ///
 /// `session` is an owned, cheaply-cloned `zenoh::Session`.
 #[allow(clippy::too_many_arguments)]
@@ -558,11 +570,11 @@ pub fn spawn_voice_presence_publisher(
     self_device: [u8; 32],
     joined_hlc: Hlc,
     muted: Arc<AtomicBool>,
+    seq_counter: Arc<AtomicU64>,
     interval: std::time::Duration,
     closing: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut seq: u64 = 0;
         // `interval` fires immediately on the first `tick()`, giving us the
         // "immediate first beacon then every 4 s" cadence for free.
         let mut tick = tokio::time::interval(interval);
@@ -571,6 +583,7 @@ pub fn spawn_voice_presence_publisher(
             if closing.load(Ordering::SeqCst) {
                 break;
             }
+            let seq = seq_counter.fetch_add(1, Ordering::SeqCst);
             let beacon = build_heartbeat_beacon(
                 self_owner,
                 self_device,
@@ -578,7 +591,6 @@ pub fn spawn_voice_presence_publisher(
                 seq,
                 muted.load(Ordering::SeqCst),
             );
-            seq = seq.wrapping_add(1);
             let Ok(signed) = sign_presence_beacon(beacon, &signing_key) else {
                 continue;
             };
@@ -786,6 +798,57 @@ mod map_tests {
             "newer seq → change"
         );
         assert!(!m.roster(&C, &CH)[0].muted);
+    }
+
+    #[test]
+    fn shared_seq_counter_keeps_heartbeats_fresh_after_immediate_beacon() {
+        // Regression (Cursor/CodeAnt/CodeRabbit): the immediate mute beacon used
+        // to jump to `u64::MAX - 1`, which then permanently outranked the
+        // publisher's `0..` heartbeats — every later heartbeat was rejected as
+        // stale, `last_seen_ms` froze, and the device TTL-evicted from its own
+        // channel while a second toggle (reusing the sentinel) stopped
+        // propagating. The fix shares ONE monotone counter so the immediate
+        // beacon sits strictly between surrounding heartbeats. Model that order:
+        let mut m = VoicePresenceMap::new();
+        // Heartbeats seq 0,1 (muted=true from the start-muted join).
+        assert!(m.apply(&C, &CH, &b(1, 1, 0, true, false), 1_000));
+        m.apply(&C, &CH, &b(1, 1, 1, true, false), 2_000);
+        // Immediate unmute beacon seq 2 (drawn from the SHARED counter).
+        assert!(
+            m.apply(&C, &CH, &b(1, 1, 2, false, false), 3_000),
+            "immediate beacon (newer seq) flips muted"
+        );
+        assert!(!m.roster(&C, &CH)[0].muted);
+        // A subsequent heartbeat seq 3 MUST still advance liveness…
+        m.apply(&C, &CH, &b(1, 1, 3, false, false), 9_000);
+        assert!(
+            m.sweep(15_000, TTL_MS).is_empty(),
+            "heartbeat seq 3 advanced last_seen → NOT evicted",
+        );
+        // …and a second toggle (seq 4) MUST still propagate.
+        assert!(
+            m.apply(&C, &CH, &b(1, 1, 4, true, false), 10_000),
+            "second toggle (seq 4) still propagates — not a duplicate sentinel",
+        );
+        assert!(m.roster(&C, &CH)[0].muted);
+    }
+
+    #[test]
+    fn immediate_beacon_sentinel_seq_would_poison_heartbeats() {
+        // Documents the OLD bug the shared counter removes: an immediate beacon
+        // at a near-`u64::MAX` sentinel makes every later `0..` heartbeat look
+        // stale, freezing liveness until the TTL wrongly evicts a live member.
+        let mut m = VoicePresenceMap::new();
+        m.apply(&C, &CH, &b(1, 1, 0, true, false), 1_000);
+        m.apply(&C, &CH, &b(1, 1, u64::MAX - 1, false, false), 2_000); // old sentinel
+        assert!(
+            !m.apply(&C, &CH, &b(1, 1, 1, false, false), 9_000),
+            "low-seq heartbeat rejected after sentinel — the poisoning we removed",
+        );
+        assert!(
+            !m.sweep(15_000, TTL_MS).is_empty(),
+            "last_seen frozen at the toggle → live member wrongly evicted",
+        );
     }
 
     #[test]

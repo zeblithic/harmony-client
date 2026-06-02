@@ -1726,6 +1726,19 @@ pub async fn run<R: Runtime>(
         std::sync::Arc<std::sync::atomic::AtomicBool>,
     > = std::collections::HashMap::new();
 
+    // ZEB-351 Voice V3: (community, channel) → the monotone presence-beacon `seq`
+    // counter SHARED between that channel's heartbeat publisher and the immediate
+    // mute beacon fired on `SetMuted`. Both draw strictly-increasing `seq`s from
+    // this one `Arc<AtomicU64>`, so an immediate beacon can never outrank later
+    // heartbeats. Kept in lockstep with `voice_mute_flags` on Join/Leave.
+    let mut voice_presence_seq: std::collections::HashMap<
+        (
+            crate::owner_state_types::SpaceId,
+            crate::community_membership::ChannelId,
+        ),
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+    > = std::collections::HashMap::new();
+
     // ZEB-350: presence layer. One shared roster map for the loop's
     // lifetime; per-join publisher/subscriber handles; a `voice_identity`
     // stash so Leave can build the `left` tombstone without re-resolving caps;
@@ -2538,6 +2551,16 @@ pub async fn run<R: Runtime>(
                                         (community_id, channel_id),
                                         std::sync::Arc::clone(&mute_flag),
                                     );
+                                    // Shared monotone beacon `seq` source for both
+                                    // the publisher loop and the `SetMuted`
+                                    // immediate beacon (see voice_presence_seq).
+                                    let seq_counter = std::sync::Arc::new(
+                                        std::sync::atomic::AtomicU64::new(0),
+                                    );
+                                    voice_presence_seq.insert(
+                                        (community_id, channel_id),
+                                        std::sync::Arc::clone(&seq_counter),
+                                    );
                                     let pubh = crate::voice_presence::spawn_voice_presence_publisher(
                                         session.clone(),
                                         pres_topic,
@@ -2549,6 +2572,7 @@ pub async fn run<R: Runtime>(
                                         caps.self_device,
                                         caps.joined_hlc.clone(),
                                         mute_flag,
+                                        seq_counter,
                                         Duration::from_secs(4),
                                         closing.clone(),
                                     );
@@ -2606,6 +2630,7 @@ pub async fn run<R: Runtime>(
                         // with the media key so a later `SetMuted` for a left
                         // channel is a no-op.
                         voice_mute_flags.remove(&(community_id, channel_id));
+                        voice_presence_seq.remove(&(community_id, channel_id));
                         // Media leg: drop the cached key + abort the sub.
                         voice_keys.remove(&(community_id, channel_id));
                         if let Some(handle) = voice_subs.remove(&(community_id, channel_id)) {
@@ -2640,21 +2665,27 @@ pub async fn run<R: Runtime>(
                             flag.store(muted, std::sync::atomic::Ordering::SeqCst);
                             // Immediate beacon so the roster reflects the new mute
                             // state without waiting out the next ≤4 s heartbeat.
-                            // Best-effort: needs the channel key (voice_keys) and
-                            // the signing key + identity (voice_identity, stashed on
-                            // Join). `seq = u64::MAX - 1` keeps this one-shot above
-                            // the publisher's monotone-from-0 heartbeat seq (so it
-                            // wins same-session freshness) while staying strictly
-                            // below the `u64::MAX` tombstone barrier.
-                            if let (Some(key), Some((owner, device, joined_hlc, signing_key))) = (
+                            // Best-effort: needs the channel key (voice_keys), the
+                            // signing key + identity (voice_identity, stashed on
+                            // Join), and the shared `seq` counter (voice_presence_seq).
+                            // Drawing `seq` from that shared counter via `fetch_add`
+                            // keeps it strictly between surrounding heartbeats — so
+                            // this one-shot wins same-session freshness over OLDER
+                            // beacons yet never outranks LATER heartbeats (the bug
+                            // the old `u64::MAX - 1` sentinel caused). `u64::MAX`
+                            // stays reserved for the leave tombstone.
+                            if let (Some(key), Some((owner, device, joined_hlc, signing_key)), Some(seq_counter)) = (
                                 voice_keys.get(&(community_id, channel_id)),
                                 voice_identity.get(&(community_id, channel_id)),
+                                voice_presence_seq.get(&(community_id, channel_id)),
                             ) {
                                 let pres_topic = format!(
                                     "harmony/voice-presence/{}/{}",
                                     hex::encode(community_id.0),
                                     hex::encode(channel_id.0),
                                 );
+                                let seq = seq_counter
+                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                 if let Err(e) = crate::voice_presence::publish_presence_once(
                                     &session,
                                     &pres_topic,
@@ -2665,7 +2696,7 @@ pub async fn run<R: Runtime>(
                                     *owner,
                                     *device,
                                     joined_hlc,
-                                    u64::MAX - 1,
+                                    seq,
                                     muted,
                                 )
                                 .await
