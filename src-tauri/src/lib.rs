@@ -87,6 +87,7 @@ pub mod state_snapshot;
 pub mod vine_feed_cache;
 pub mod voice;
 pub mod voice_crypto;
+pub mod voice_moderation;
 pub mod voice_presence;
 pub mod voice_signal;
 // ZEB-321 Phase 1 Task 5: zenoh-link::LinkUnicastTrait impl over an

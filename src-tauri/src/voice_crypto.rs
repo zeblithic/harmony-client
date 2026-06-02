@@ -17,6 +17,10 @@ pub const VOICE_PACKET_AAD: &[u8] = b"harmony-voice-pkt-v1";
 pub const VOICE_PRESENCE_AAD: &[u8] = b"harmony-voice-presence-v1";
 /// Domain separator for sealed DM-call voice media packets.
 pub const VOICE_DM_PACKET_AAD: &[u8] = b"harmony-voice-dm-pkt-v1";
+/// Domain tag for sealed voice-moderation directives (ZEB-358). Distinct from
+/// presence/media so a moderation packet can never be opened under another
+/// domain's AAD.
+pub const VOICE_MODERATION_AAD: &[u8] = b"harmony-voice-moderation-v1";
 
 /// Upper bound on an inbound voice/presence Zenoh payload before any
 /// allocation. A sealed 20 ms voice frame (23 B header + ≤510 B Opus +
