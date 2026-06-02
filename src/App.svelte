@@ -2202,7 +2202,10 @@
               members: [],
               parentId: null,
             });
-            changeSelectedCommunity(null);
+            // ZEB-334 (Cursor PR #180): after leaving, fall back to the private
+            // Notes default rather than the legacy #general void — clearing the
+            // community alone would drop through to TextFeed on 'general'.
+            selectNotes();
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e);
             console.error('leaveCommunity failed:', msg);
@@ -2244,7 +2247,7 @@
     {:else if notesSelected}
       <NotesView
         {notesService}
-        ownerId={myAddress}
+        ownerId={selfOwnerId ?? ''}
         displayName={myProfile.displayName}
       />
     {:else}
