@@ -149,7 +149,7 @@ export class MessageService {
 
         const text = hexToUtf8(payload.body);
         const sender = (this.ownAddress && payload.from === this.ownAddress)
-          ? { address: 'self', displayName: 'You' }
+          ? { address: 'self', displayName: this.ownDisplayName }
           : {
               address: payload.from,
               displayName: payload.from.slice(0, 8),
@@ -281,7 +281,7 @@ export class MessageService {
     this.seenIds.add(id);
     const msg: Message = {
       id,
-      sender: { address: 'self', displayName: 'You' },
+      sender: { address: 'self', displayName: this.ownDisplayName },
       text,
       timestamp: Date.now(),
       media: [],
@@ -417,7 +417,7 @@ export class MessageService {
       .map((r) => {
         const text = hexToUtf8(r.body);
         const sender = r.isSelfOutbound
-          ? { address: 'self', displayName: 'You' }
+          ? { address: 'self', displayName: this.ownDisplayName }
           : { address: r.from, displayName: r.from.slice(0, 8) };
         const msg: Message = {
           id: r.messageCid,
@@ -470,10 +470,10 @@ export class MessageService {
 
   /** Convert wire format to frontend Message type. */
   private wireToMessage(wire: ChannelMessageEvent): Message {
-    // Self-sent messages echo back via Zenoh — map to 'self'/'You'
+    // Self-sent messages echo back via Zenoh — map to 'self'/ownDisplayName
     // so the rest of the UI (knownPeers filter, display name) works.
     const sender = (this.ownAddress && wire.senderAddress === this.ownAddress)
-      ? { address: 'self', displayName: 'You' }
+      ? { address: 'self', displayName: this.ownDisplayName }
       : {
           address: wire.senderAddress,
           displayName: wire.senderName || wire.senderAddress.slice(0, 8),
