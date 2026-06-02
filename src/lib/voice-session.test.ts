@@ -1,7 +1,7 @@
 // src/lib/voice-session.test.ts
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { get } from 'svelte/store';
-import { VoiceSession } from './voice-session';
+import { VoiceSession, classifyMicError } from './voice-session';
 
 function deps() {
   const invoke = vi.fn().mockResolvedValue(undefined);
@@ -314,8 +314,9 @@ describe('VoiceSession leave/join race (C2 regression)', () => {
 });
 
 describe('VoiceSession join failure (transactional teardown)', () => {
-  it('a failing sender.start() resets to idle, tears down, and leaves the backend', async () => {
-    // Models a denied-microphone permission: backend join succeeds, then
+  it('a failing sender.start() (non-mic) resets to idle, tears down, and leaves the backend', async () => {
+    // A NON-mic sender fault (NOT a denied-mic permission — that path now joins
+    // listen-only, covered separately): backend join succeeds, then
     // sender.start() rejects. The session must not wedge in 'joining' or leak
     // the partially-built mixer/receiver/timer — and must release the backend.
     const invoke = vi.fn(async () => undefined);
@@ -323,7 +324,7 @@ describe('VoiceSession join failure (transactional teardown)', () => {
     const receiver = { init: vi.fn(async () => {}), destroy: vi.fn(), getActiveSenders: () => [], isSpeaking: () => false };
     const mixer = { init: vi.fn(async () => {}), pushFrame: vi.fn(), drain: vi.fn(), setDeafened: vi.fn(), destroy: vi.fn(async () => {}) };
     const sender = {
-      start: vi.fn(async () => { throw new Error('NotAllowedError: mic denied'); }),
+      start: vi.fn(async () => { throw new Error('encoder init failed'); }),
       stop: vi.fn(async () => {}),
     };
     const s = new VoiceSession({
@@ -332,7 +333,7 @@ describe('VoiceSession join failure (transactional teardown)', () => {
       makeSender: () => sender as never, makeReceiver: () => receiver as never, makeMixer: () => mixer as never,
     });
 
-    await expect(s.join('comm', 'chan')).rejects.toThrow(/mic denied/);
+    await expect(s.join('comm', 'chan')).rejects.toThrow(/encoder init failed/);
     expect(get(s.state).phase).toBe('idle');          // not wedged in 'joining'
     expect(mixer.destroy).toHaveBeenCalled();          // partial audio torn down
     expect(receiver.destroy).toHaveBeenCalled();
@@ -341,6 +342,76 @@ describe('VoiceSession join failure (transactional teardown)', () => {
     expect(invoke).toHaveBeenCalledWith('leave_voice_channel', { communityId: 'comm', channelId: 'chan' });
     // Retryable: a second join is rejected by the failing sender, NOT by an
     // "already active" guard left over from the wedged first attempt.
-    await expect(s.join('comm', 'chan')).rejects.toThrow(/mic denied/);
+    await expect(s.join('comm', 'chan')).rejects.toThrow(/encoder init failed/);
+  });
+});
+
+describe('classifyMicError', () => {
+  it('classifies permission/blocked errors', () => {
+    expect(classifyMicError(Object.assign(new Error('x'), { name: 'NotAllowedError' }))).toBe('blocked');
+    expect(classifyMicError(Object.assign(new Error('x'), { name: 'PermissionDeniedError' }))).toBe('blocked');
+    expect(classifyMicError(Object.assign(new Error('x'), { name: 'SecurityError' }))).toBe('blocked');
+    expect(classifyMicError(new Error('Permission denied'))).toBe('blocked');
+  });
+  it('classifies notfound/device errors', () => {
+    expect(classifyMicError(Object.assign(new Error('x'), { name: 'NotFoundError' }))).toBe('notfound');
+    expect(classifyMicError(Object.assign(new Error('x'), { name: 'OverconstrainedError' }))).toBe('notfound');
+    expect(classifyMicError(new Error('Requested device not found'))).toBe('notfound');
+    expect(classifyMicError(new Error('no microphone available'))).toBe('notfound');
+  });
+  it('returns null for non-mic errors', () => {
+    expect(classifyMicError(new Error('boom'))).toBe(null);
+    expect(classifyMicError(undefined)).toBe(null);
+  });
+});
+
+describe('VoiceSession mic-blocked → listen-only join (ZEB-353)', () => {
+  function makeDeps(senderStart: () => Promise<void>) {
+    const invoke = vi.fn(async () => undefined);
+    const listen = vi.fn(async () => () => {});
+    const receiver = { init: vi.fn(async () => {}), destroy: vi.fn(), getActiveSenders: () => [], isSpeaking: () => false };
+    const mixer = { init: vi.fn(async () => {}), pushFrame: vi.fn(), drain: vi.fn(), setDeafened: vi.fn(), destroy: vi.fn(async () => {}) };
+    let capturedGate: ((pcm: Float32Array) => { send: boolean; ptt: boolean }) | undefined;
+    const sender = {
+      start: vi.fn(senderStart),
+      stop: vi.fn(async () => {}),
+    };
+    const s = new VoiceSession({
+      invoke, listen, selfOwnerHex: 'aa'.repeat(16), selfDeviceHex: 'bb'.repeat(16),
+      senderHash: new Uint8Array(16),
+      makeSender: (g) => { capturedGate = g; return sender as never; },
+      makeReceiver: () => receiver as never, makeMixer: () => mixer as never,
+    });
+    return { s, invoke, receiver, mixer, sender, getGate: () => capturedGate };
+  }
+
+  it('a mic-permission error joins listen-only (connected, micBlocked, no sender)', async () => {
+    const { s, invoke, receiver, mixer, sender, getGate } = makeDeps(
+      async () => { throw Object.assign(new Error('Permission denied'), { name: 'NotAllowedError' }); },
+    );
+    await s.join('comm', 'chan'); // resolves — does NOT reject
+
+    expect(get(s.state).phase).toBe('connected'); // listen-only still connects
+    expect(get(s.state).micBlocked).toBe(true);
+    // The mixer + receiver were built and inited before the sender, so they're up.
+    expect(mixer.init).toHaveBeenCalled();
+    expect(receiver.init).toHaveBeenCalled();
+    expect(sender.start).toHaveBeenCalled();
+    // The half-started sender is dropped — gate has nothing to publish through.
+    expect(getGate()!(new Float32Array(320)).send).toBe(false); // muted anyway
+    // We stayed joined — no teardown of the backend channel.
+    expect(invoke).not.toHaveBeenCalledWith('leave_voice_channel', { communityId: 'comm', channelId: 'chan' });
+  });
+
+  it('a NON-mic error still rolls back to idle and rejects (transactional)', async () => {
+    const { s, invoke, mixer, receiver } = makeDeps(
+      async () => { throw new Error('boom'); },
+    );
+    await expect(s.join('comm', 'chan')).rejects.toThrow(/boom/);
+    expect(get(s.state).phase).toBe('idle');
+    expect(get(s.state).micBlocked).toBe(false); // never flips for a non-mic fault
+    expect(mixer.destroy).toHaveBeenCalled();
+    expect(receiver.destroy).toHaveBeenCalled();
+    expect(invoke).toHaveBeenCalledWith('leave_voice_channel', { communityId: 'comm', channelId: 'chan' });
   });
 });

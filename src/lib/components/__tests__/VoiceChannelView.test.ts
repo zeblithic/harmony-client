@@ -86,6 +86,23 @@ describe('VoiceChannelView (V3): join flow + control bar', () => {
     render(VoiceChannelView, { props: { session: session as never, ...base } });
     expect(screen.getByRole('alert')).toHaveTextContent(/voice channel full/i);
   });
+
+  it('shows a persistent "listening only" note when micBlocked (ZEB-353)', () => {
+    // Mic permission denied / no device → listen-only join; surface a persistent
+    // informational note (role=status, not an error alert).
+    const session = fakeSession({ phase: 'connected', micBlocked: true });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    const note = screen.getByTestId('voice-mic-blocked');
+    expect(note).toBeInTheDocument();
+    expect(note).toHaveTextContent(/listening only/i);
+    expect(note).toHaveAttribute('role', 'status');
+  });
+
+  it('hides the "listening only" note when the mic is not blocked', () => {
+    const session = fakeSession({ phase: 'connected', micBlocked: false });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    expect(screen.queryByTestId('voice-mic-blocked')).not.toBeInTheDocument();
+  });
 });
 
 describe('VoiceChannelView (V3): hybrid grid<->list roster', () => {

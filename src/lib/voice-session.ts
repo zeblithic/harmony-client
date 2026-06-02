@@ -53,6 +53,14 @@ export interface VoiceSessionState {
    * around its re-declare-with-backoff loop). Surfaces a "Reconnecting…" badge.
    */
   reconnecting: boolean;
+  /**
+   * Set true when the mic capture couldn't start because the microphone
+   * permission was denied or no input device exists. We DON'T tear the join
+   * down for this — the mixer + receiver are already up, so we join listen-only
+   * (no sender) and surface a persistent "Mic blocked — listening only" note.
+   * Reset to false on the next join attempt.
+   */
+  micBlocked: boolean;
 }
 
 type Invoke = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
@@ -111,8 +119,42 @@ export interface VoiceSessionDeps {
 const INITIAL: VoiceSessionState = {
   phase: 'idle', community: null, channel: null,
   muted: true, deafened: false, pttMode: false, pttHeld: false, roster: [],
-  channelFull: false, reconnecting: false,
+  channelFull: false, reconnecting: false, micBlocked: false,
 };
+
+/**
+ * Classify a `sender.start()` rejection as a recoverable microphone error.
+ * A mic permission/device fault should not tear the whole join down — the user
+ * can still LISTEN — so we match the standard `getUserMedia` `DOMException`
+ * names (and a message fallback for non-DOMException test/polyfill errors):
+ *
+ *  - `'blocked'`  → permission denied / blocked by policy. The user can grant it
+ *                   and retry.
+ *  - `'notfound'` → no usable input device (unplugged, or constraints unmet).
+ *  - `null`       → not a mic error; the caller rethrows for full rollback.
+ */
+export function classifyMicError(e: unknown): 'blocked' | 'notfound' | null {
+  const name = (e as { name?: unknown })?.name;
+  const nameStr = typeof name === 'string' ? name : '';
+  const msg = e instanceof Error ? e.message
+    : typeof (e as { message?: unknown })?.message === 'string'
+      ? (e as { message: string }).message
+      : String(e ?? '');
+  if (
+    nameStr === 'NotAllowedError' || nameStr === 'PermissionDeniedError' ||
+    nameStr === 'SecurityError' || /permission|notallowed|denied/i.test(msg)
+  ) {
+    return 'blocked';
+  }
+  if (
+    nameStr === 'NotFoundError' || nameStr === 'DevicesNotFoundError' ||
+    nameStr === 'OverconstrainedError' ||
+    /notfound|no.*(microphone|audio|device)|requested device/i.test(msg)
+  ) {
+    return 'notfound';
+  }
+  return null;
+}
 
 export class VoiceSession {
   readonly state: Readable<VoiceSessionState>;
@@ -206,6 +248,7 @@ export class VoiceSession {
       muted: true, deafened: false, pttMode: false, pttHeld: false, roster: [],
       channelFull: false, // fresh attempt clears any prior bounce banner
       reconnecting: false, // fresh attempt clears any stale reconnect badge
+      micBlocked: false, // fresh attempt clears any prior listen-only note
     });
 
     // Transactional: once the backend join succeeds we own teardown for every
@@ -238,14 +281,28 @@ export class VoiceSession {
           });
       await this.receiver.init();
 
-      this.sender = this.deps.makeSender
-        ? this.deps.makeSender(this.gate)
-        : new VoiceSender({
-            senderHash: this.deps.senderHash, communityId: community, channelId: channel,
-            invoke: this.deps.invoke, codec: new OpusCodec(), capture: new AudioCapture(),
-            frameGate: this.gate,
-          });
-      await this.sender.start();   // capture starts; muted gate ⇒ nothing transmits
+      // Isolate the sender build+start. Mixer + receiver are already up above, so
+      // a mic permission/device failure here doesn't have to abort the join — we
+      // can still LISTEN. Only a non-mic fault rethrows into the outer catch for
+      // the full transactional rollback (unchanged behavior).
+      try {
+        this.sender = this.deps.makeSender
+          ? this.deps.makeSender(this.gate)
+          : new VoiceSender({
+              senderHash: this.deps.senderHash, communityId: community, channelId: channel,
+              invoke: this.deps.invoke, codec: new OpusCodec(), capture: new AudioCapture(),
+              frameGate: this.gate,
+            });
+        await this.sender.start();   // capture starts; muted gate ⇒ nothing transmits
+      } catch (senderErr) {
+        if (classifyMicError(senderErr) === null) throw senderErr; // non-mic → full rollback
+        // Mic blocked / no device: drop the (possibly half-started) sender and
+        // continue listen-only. The gate just has no sender to publish through;
+        // the drain/mixer/receiver path below is unaffected.
+        await this.sender?.stop().catch(() => {});
+        this.sender = null;
+        this.patch({ micBlocked: true });
+      }
 
       // Drain the mixer every 20ms (audio cadence). Refresh the roster view at a
       // far lower rate (~10Hz) — the drain-tick refresh only updates remote

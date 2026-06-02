@@ -99,6 +99,16 @@
     <div class="voice-error" role="alert">{error}</div>
   {/if}
 
+  {#if $voiceState.micBlocked}
+    <!-- Listen-only fallback (ZEB-353): mic permission was denied or no input
+         device exists, so the join continued without a sender. Persistent and
+         informational (not an error) — distinct from the transient join `error`
+         alert and the `channelFull` alert above. -->
+    <div class="voice-mic-blocked" role="status" data-testid="voice-mic-blocked">
+      🎤 Mic blocked — listening only
+    </div>
+  {/if}
+
   {#if $voiceState.phase === 'idle'}
     <div class="voice-join-pane">
       <button class="btn-primary" onclick={onJoin} disabled={joining}>
@@ -237,6 +247,19 @@
     background: var(--bg-tertiary);
     border: 1px solid var(--danger);
     color: var(--danger);
+    padding: 8px 14px;
+    border-radius: 4px;
+    margin: 8px 16px;
+    font-size: 0.85rem;
+  }
+
+  /* Listen-only note: a persistent, non-error info banner shown when the mic is
+     blocked/absent and the session joined without a sender. Amber/informational,
+     visually distinct from the red `.voice-error` alert. */
+  .voice-mic-blocked {
+    background: color-mix(in srgb, var(--warning, #d8a200) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warning, #d8a200) 40%, transparent);
+    color: var(--warning, #d8a200);
     padding: 8px 14px;
     border-radius: 4px;
     margin: 8px 16px;
