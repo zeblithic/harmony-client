@@ -12,6 +12,15 @@ import type { CodecType } from './voice/voice-codec';
 
 export type SessionPhase = 'idle' | 'joining' | 'connected' | 'leaving';
 
+/**
+ * Soft cap on community voice-channel participants. The roster is decentralized
+ * — a joining client only learns the count AFTER it subscribes to presence — so
+ * this is a best-effort REACTIVE bounce, not a blocking pre-join gate. A join
+ * with 64 OTHER members already present (you'd be the 65th) is refused shortly
+ * after the roster arrives; the common under-cap join pays zero added latency.
+ */
+export const VOICE_CHANNEL_SOFT_CAP = 64;
+
 export interface RosterMember {
   ownerHex: string;     // 32 hex
   deviceHex: string;
@@ -31,6 +40,27 @@ export interface VoiceSessionState {
   /** Push-to-talk hold state — true only while the talk control is held. */
   pttHeld: boolean;
   roster: RosterMember[];
+  /**
+   * Set true when a join was reactively bounced because the channel was at/over
+   * the soft cap (VOICE_CHANNEL_SOFT_CAP others already present). The session is
+   * back at idle-phase; the join pane surfaces this so the user knows why. Reset
+   * to false on the next join attempt.
+   */
+  channelFull: boolean;
+  /**
+   * True while the inbound media subscriber is re-establishing after a transport
+   * drop (the backend emits `voice-transport-lost`/`voice-transport-restored`
+   * around its re-declare-with-backoff loop). Surfaces a "Reconnecting…" badge.
+   */
+  reconnecting: boolean;
+  /**
+   * Set true when the mic capture couldn't start because the microphone
+   * permission was denied or no input device exists. We DON'T tear the join
+   * down for this — the mixer + receiver are already up, so we join listen-only
+   * (no sender) and surface a persistent "Mic blocked — listening only" note.
+   * Reset to false on the next join attempt.
+   */
+  micBlocked: boolean;
 }
 
 type Invoke = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
@@ -89,7 +119,45 @@ export interface VoiceSessionDeps {
 const INITIAL: VoiceSessionState = {
   phase: 'idle', community: null, channel: null,
   muted: true, deafened: false, pttMode: false, pttHeld: false, roster: [],
+  channelFull: false, reconnecting: false, micBlocked: false,
 };
+
+/**
+ * Classify a `sender.start()` rejection as a recoverable microphone error.
+ * A mic permission/device fault should not tear the whole join down — the user
+ * can still LISTEN — so we match the standard `getUserMedia` `DOMException`
+ * names (and a message fallback for non-DOMException test/polyfill errors):
+ *
+ *  - `'blocked'`  → permission denied / blocked by policy. The user can grant it
+ *                   and retry.
+ *  - `'notfound'` → no usable input device (unplugged, or constraints unmet).
+ *  - `null`       → not a mic error; the caller rethrows for full rollback.
+ */
+export function classifyMicError(e: unknown): 'blocked' | 'notfound' | null {
+  const name = (e as { name?: unknown })?.name;
+  const nameStr = typeof name === 'string' ? name : '';
+  const msg = e instanceof Error ? e.message
+    : typeof (e as { message?: unknown })?.message === 'string'
+      ? (e as { message: string }).message
+      : String(e ?? '');
+  if (
+    nameStr === 'NotAllowedError' || nameStr === 'PermissionDeniedError' ||
+    nameStr === 'SecurityError' || /permission|notallowed|denied/i.test(msg)
+  ) {
+    return 'blocked';
+  }
+  if (
+    nameStr === 'NotFoundError' || nameStr === 'DevicesNotFoundError' ||
+    nameStr === 'OverconstrainedError' ||
+    // `\bno\b` (whole word) so "Cannot initialize audio context" / "unknown" /
+    // "connection" don't false-match "no" as a substring and misroute a generic
+    // system error into the silent listen-only path.
+    /notfound|requested device|\bno\b[^.]*\b(microphone|audio|device)\b/i.test(msg)
+  ) {
+    return 'notfound';
+  }
+  return null;
+}
 
 export class VoiceSession {
   readonly state: Readable<VoiceSessionState>;
@@ -111,6 +179,13 @@ export class VoiceSession {
   private drainTimer: ReturnType<typeof setInterval> | null = null;
   /** Set while join() is in flight so leave() can serialize behind it. */
   private joinPromise: Promise<void> | null = null;
+  /**
+   * Monotonic deadline (Date.now ms) until which a fresh join is still eligible
+   * for the soft-cap bounce. Set on a successful connect; cleared once we bounce
+   * or the window lapses. Outside the window an over-cap roster is tolerated
+   * (you were already admitted; don't kick a settled participant).
+   */
+  private joinGraceUntilMs = 0;
   /** Last roster pushed to the store, for the change-only patch guard. */
   private lastEmittedRoster: RosterMember[] = [];
 
@@ -127,6 +202,15 @@ export class VoiceSession {
 
   private patch(p: Partial<VoiceSessionState>): void {
     this.store.update((s) => ({ ...s, ...p }));
+  }
+
+  /**
+   * Clear the soft-cap "voice channel full" banner. `channelFull` lives on this
+   * app-wide singleton, so a bounce on one channel would otherwise leak its
+   * banner onto a different channel's view — callers clear it on navigation.
+   */
+  clearChannelFull(): void {
+    if (get(this.store).channelFull) this.patch({ channelFull: false });
   }
 
   /**
@@ -170,9 +254,13 @@ export class VoiceSession {
     this.muted = true; this.deafened = false; this.pttMode = false; this.pttHeld = false;
     this.vad.reset();
     this.lastRoster = []; this.lastEmittedRoster = []; this.lastSelfSpeaking = false;
+    this.joinGraceUntilMs = 0;
     this.patch({
       phase: 'joining', community, channel,
       muted: true, deafened: false, pttMode: false, pttHeld: false, roster: [],
+      channelFull: false, // fresh attempt clears any prior bounce banner
+      reconnecting: false, // fresh attempt clears any stale reconnect badge
+      micBlocked: false, // fresh attempt clears any prior listen-only note
     });
 
     // Transactional: once the backend join succeeds we own teardown for every
@@ -205,14 +293,28 @@ export class VoiceSession {
           });
       await this.receiver.init();
 
-      this.sender = this.deps.makeSender
-        ? this.deps.makeSender(this.gate)
-        : new VoiceSender({
-            senderHash: this.deps.senderHash, communityId: community, channelId: channel,
-            invoke: this.deps.invoke, codec: new OpusCodec(), capture: new AudioCapture(),
-            frameGate: this.gate,
-          });
-      await this.sender.start();   // capture starts; muted gate ⇒ nothing transmits
+      // Isolate the sender build+start. Mixer + receiver are already up above, so
+      // a mic permission/device failure here doesn't have to abort the join — we
+      // can still LISTEN. Only a non-mic fault rethrows into the outer catch for
+      // the full transactional rollback (unchanged behavior).
+      try {
+        this.sender = this.deps.makeSender
+          ? this.deps.makeSender(this.gate)
+          : new VoiceSender({
+              senderHash: this.deps.senderHash, communityId: community, channelId: channel,
+              invoke: this.deps.invoke, codec: new OpusCodec(), capture: new AudioCapture(),
+              frameGate: this.gate,
+            });
+        await this.sender.start();   // capture starts; muted gate ⇒ nothing transmits
+      } catch (senderErr) {
+        if (classifyMicError(senderErr) === null) throw senderErr; // non-mic → full rollback
+        // Mic blocked / no device: drop the (possibly half-started) sender and
+        // continue listen-only. The gate just has no sender to publish through;
+        // the drain/mixer/receiver path below is unaffected.
+        await this.sender?.stop().catch(() => {});
+        this.sender = null;
+        this.patch({ micBlocked: true });
+      }
 
       // Drain the mixer every 20ms (audio cadence). Refresh the roster view at a
       // far lower rate (~10Hz) — the drain-tick refresh only updates remote
@@ -225,6 +327,12 @@ export class VoiceSession {
       }, 20);
 
       await this.subscribePresence();
+      await this.subscribeTransport();
+
+      // Open the soft-cap grace window: an over-cap roster arriving within the
+      // next few seconds bounces this join (see maybeBounceForFull). The window
+      // covers both the first presence event and the 10Hz drain-tick refreshes.
+      this.joinGraceUntilMs = Date.now() + 3000;
 
       this.patch({ phase: 'connected' });
     } catch (err) {
@@ -340,6 +448,33 @@ export class VoiceSession {
     this.unlisteners.push(un);
   }
 
+  /**
+   * Subscribe to the backend's media-transport lifecycle events. The inbound
+   * media subscriber re-declares itself with backoff on a transport drop and
+   * brackets that with `voice-transport-lost` / `voice-transport-restored`
+   * events tagged by community+channel. We filter to the active channel and flip
+   * `reconnecting` so the UI can show "Reconnecting…". Torn down with the rest of
+   * the unlisteners on leave (cleanupEngine).
+   */
+  protected async subscribeTransport(): Promise<void> {
+    const matches = (p: unknown): boolean => {
+      const e = p as { communityId?: string; channelId?: string };
+      return e.communityId === this.community && e.channelId === this.channel;
+    };
+    // Track each handle the instant it resolves — if the second listen() rejects,
+    // teardown still unsubscribes the first instead of leaking it.
+    const unLost = await this.deps.listen('voice-transport-lost', (e) => {
+      if (!matches(e.payload)) return;
+      this.patch({ reconnecting: true });
+    });
+    this.unlisteners.push(unLost);
+    const unRestored = await this.deps.listen('voice-transport-restored', (e) => {
+      if (!matches(e.payload)) return;
+      this.patch({ reconnecting: false });
+    });
+    this.unlisteners.push(unRestored);
+  }
+
   /** Recompute roster view (speaking + card resolution). Call on presence + each drain. */
   private refreshRoster(): void {
     const roster: RosterMember[] = this.lastRoster.map((r) => {
@@ -356,9 +491,42 @@ export class VoiceSession {
     });
     // Only touch the store when the view actually changed — the drain tick calls
     // this ~10×/s, but most ticks produce an identical roster.
-    if (rostersEqual(roster, this.lastEmittedRoster)) return;
-    this.lastEmittedRoster = roster;
-    this.patch({ roster });
+    if (!rostersEqual(roster, this.lastEmittedRoster)) {
+      this.lastEmittedRoster = roster;
+      this.patch({ roster });
+    }
+    // Run the soft-cap check on every refresh (presence events AND drain ticks),
+    // so a roster that arrives during the grace window bounces us even if the
+    // roster view itself was unchanged by the diff guard above.
+    this.maybeBounceForFull();
+  }
+
+  /**
+   * Soft-cap reactive bounce. If we're connected, still inside the post-join
+   * grace window, and the channel already holds VOICE_CHANNEL_SOFT_CAP OTHER
+   * members (we'd be the (cap+1)th), refuse the join: tear down and surface
+   * `channelFull` so the join pane re-renders with the reason.
+   *
+   * Ordering is the subtle part: leave() resets the store to INITIAL (which has
+   * channelFull:false), so we must stamp channelFull:true AFTER leave() settles,
+   * not before — otherwise the reset clobbers the banner. We also clear the
+   * grace deadline up front so a racing drain tick can't fire a second bounce.
+   */
+  private maybeBounceForFull(): void {
+    if (get(this.store).phase !== 'connected') return;
+    if (Date.now() >= this.joinGraceUntilMs) return;
+    // Count OTHERS using the same self-identification refreshRoster uses.
+    const selfPrefix = this.deps.selfDeviceHex.slice(0, 32);
+    const others = this.lastRoster.reduce(
+      (n, r) => n + (r.deviceHex.slice(0, 32) === selfPrefix ? 0 : 1), 0);
+    if (others < VOICE_CHANNEL_SOFT_CAP) return;
+    this.joinGraceUntilMs = 0; // one-shot: don't let the drain tick re-bounce
+    // leave() reset the store to INITIAL (channelFull:false); stamp the banner
+    // afterward so it survives, leaving idle-phase + channelFull:true for the UI.
+    // Stamp on BOTH settle paths so a rejecting leave() still surfaces the reason
+    // (and never leaks an unhandled rejection).
+    const stampFull = () => this.patch({ channelFull: true });
+    void this.leave().then(stampFull, stampFull);
   }
 }
 

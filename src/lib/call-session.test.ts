@@ -327,3 +327,47 @@ describe('CallSession ring timeout', () => {
     expect(get(s.state).phase).toBe('active');
   });
 });
+
+describe('CallSession transport reconnect (ZEB-353)', () => {
+  let d: ReturnType<typeof deps>;
+  beforeEach(() => { d = deps(); });
+
+  function newSession() {
+    return new CallSession({
+      invoke: d.invoke, listen: d.listen,
+      selfOwnerHex: 'aa'.repeat(16), selfDeviceHex: 'bb'.repeat(16),
+      senderHash: new Uint8Array(16),
+      ...d.factories,
+    });
+  }
+
+  /** Bring a session up to an active call on 'call-1'. */
+  async function activeCall() {
+    const s = newSession();
+    s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
+    await s.accept();
+    expect(get(s.state).phase).toBe('active');
+    return s;
+  }
+
+  it('voice-transport-lost for the active call sets reconnecting', async () => {
+    const s = await activeCall();
+    expect(get(s.state).reconnecting).toBe(false);
+    d.emit('voice-transport-lost', { callId: 'call-1' });
+    expect(get(s.state).reconnecting).toBe(true);
+  });
+
+  it('voice-transport-restored clears reconnecting', async () => {
+    const s = await activeCall();
+    d.emit('voice-transport-lost', { callId: 'call-1' });
+    expect(get(s.state).reconnecting).toBe(true);
+    d.emit('voice-transport-restored', { callId: 'call-1' });
+    expect(get(s.state).reconnecting).toBe(false);
+  });
+
+  it('ignores transport events for a different call', async () => {
+    const s = await activeCall();
+    d.emit('voice-transport-lost', { callId: 'call-2' });
+    expect(get(s.state).reconnecting).toBe(false);
+  });
+});

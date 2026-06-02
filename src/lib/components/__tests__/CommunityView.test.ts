@@ -33,6 +33,7 @@ function makeVoiceSessionStub(): VoiceSession {
     setDeafened: vi.fn(async () => {}),
     setPttMode: vi.fn(),
     setPttHeld: vi.fn(),
+    clearChannelFull: vi.fn(),
   } as unknown as VoiceSession;
 }
 

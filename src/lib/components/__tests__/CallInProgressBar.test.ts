@@ -17,6 +17,7 @@ function fakeSession(stateOverrides: Partial<CallSessionState> = {}) {
     deafened: false,
     startedAt: null,
     endReason: null,
+    reconnecting: false,
     ...stateOverrides,
   });
   return {
@@ -77,11 +78,44 @@ describe('CallInProgressBar', () => {
     expect(session.setPttMode).toHaveBeenCalledWith(true);
   });
 
+  it('clicking Deafen calls session.setDeafened(true) when not deafened', async () => {
+    const session = fakeSession({ phase: 'active', deafened: false });
+    render(CallInProgressBar, { props: { session: session as never, onEnd: vi.fn() } });
+    const btn = screen.getByTestId('deafen');
+    expect(btn).toHaveTextContent('🔈 Deafen');
+    expect(btn).toHaveAttribute('aria-pressed', 'false');
+    await fireEvent.click(btn);
+    expect(session.setDeafened).toHaveBeenCalledWith(true);
+  });
+
+  it('clicking Deafen calls session.setDeafened(false) when already deafened', async () => {
+    const session = fakeSession({ phase: 'active', deafened: true });
+    render(CallInProgressBar, { props: { session: session as never, onEnd: vi.fn() } });
+    const btn = screen.getByTestId('deafen');
+    expect(btn).toHaveTextContent('🔕 Deafened');
+    expect(btn).toHaveAttribute('aria-pressed', 'true');
+    await fireEvent.click(btn);
+    expect(session.setDeafened).toHaveBeenCalledWith(false);
+  });
+
   it('clicking End calls onEnd', async () => {
     const onEnd = vi.fn();
     const session = fakeSession({ phase: 'active' });
     render(CallInProgressBar, { props: { session: session as never, onEnd } });
     await fireEvent.click(screen.getByRole('button', { name: /end call/i }));
     expect(onEnd).toHaveBeenCalled();
+  });
+
+  it('shows a Reconnecting… badge while reconnecting (ZEB-353)', () => {
+    const session = fakeSession({ phase: 'active', startedAt: Date.now(), reconnecting: true });
+    render(CallInProgressBar, { props: { session: session as never, onEnd: vi.fn() } });
+    expect(screen.getByTestId('call-reconnecting')).toBeInTheDocument();
+    expect(screen.getByText(/Reconnecting/)).toBeInTheDocument();
+  });
+
+  it('hides the Reconnecting… badge when not reconnecting', () => {
+    const session = fakeSession({ phase: 'active', startedAt: Date.now(), reconnecting: false });
+    render(CallInProgressBar, { props: { session: session as never, onEnd: vi.fn() } });
+    expect(screen.queryByTestId('call-reconnecting')).toBeNull();
   });
 });

@@ -27,6 +27,15 @@
   let joining = $state(false);
   let error = $state<string | null>(null);
 
+  // Clear a stale soft-cap banner when this view switches channels: `channelFull`
+  // lives on the app-wide singleton session, so a bounce on one channel must not
+  // surface "voice channel full" on another. Re-runs on `channelId` change (and
+  // once at mount — a no-op when nothing was bounced).
+  $effect(() => {
+    channelId; // track: re-run when the viewed channel changes
+    session.clearChannelFull();
+  });
+
   // Beyond this count the avatar-tile grid collapses to a compact list.
   const GRID_MAX = 12;
 
@@ -91,8 +100,22 @@
     <span class="voice-count">· {$voiceState.roster.length} here</span>
   </header>
 
-  {#if error}
+  {#if $voiceState.channelFull}
+    <!-- Soft-cap bounce (ZEB-353): the join was reactively refused because the
+         channel was full. Session is back at idle; this explains why. -->
+    <div class="voice-error" role="alert">Voice channel full — try again later.</div>
+  {:else if error}
     <div class="voice-error" role="alert">{error}</div>
+  {/if}
+
+  {#if $voiceState.micBlocked}
+    <!-- Listen-only fallback (ZEB-353): mic permission was denied or no input
+         device exists, so the join continued without a sender. Persistent and
+         informational (not an error) — distinct from the transient join `error`
+         alert and the `channelFull` alert above. -->
+    <div class="voice-mic-blocked" role="status" data-testid="voice-mic-blocked">
+      🎤 Mic blocked — listening only
+    </div>
   {/if}
 
   {#if $voiceState.phase === 'idle'}
@@ -140,6 +163,13 @@
     </div>
 
     <div class="voice-controls">
+      {#if $voiceState.reconnecting}
+        <!-- ZEB-353: the inbound media subscriber dropped and is re-declaring
+             with backoff; surface a non-blocking "Reconnecting…" badge. -->
+        <span class="reconnecting" role="status" data-testid="voice-reconnecting">
+          Reconnecting…
+        </span>
+      {/if}
       {#if $voiceState.pttMode}
         <!-- In PTT mode the mic is hold-gated, so the talk control replaces the
              mute toggle. Press-and-hold (pointer) or hold Space to transmit. -->
@@ -226,6 +256,19 @@
     background: var(--bg-tertiary);
     border: 1px solid var(--danger);
     color: var(--danger);
+    padding: 8px 14px;
+    border-radius: 4px;
+    margin: 8px 16px;
+    font-size: 0.85rem;
+  }
+
+  /* Listen-only note: a persistent, non-error info banner shown when the mic is
+     blocked/absent and the session joined without a sender. Amber/informational,
+     visually distinct from the red `.voice-error` alert. */
+  .voice-mic-blocked {
+    background: color-mix(in srgb, var(--warning, #d8a200) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warning, #d8a200) 40%, transparent);
+    color: var(--warning, #d8a200);
     padding: 8px 14px;
     border-radius: 4px;
     margin: 8px 16px;
@@ -388,6 +431,17 @@
     background: var(--accent);
     border-color: var(--accent);
     color: var(--text-primary);
+  }
+  /* Reconnecting badge: a small amber pill on the control bar while the inbound
+     media transport is re-establishing. */
+  .reconnecting {
+    font-size: 0.78rem;
+    color: var(--warning, #d8a200);
+    background: color-mix(in srgb, var(--warning, #d8a200) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warning, #d8a200) 40%, transparent);
+    padding: 3px 9px;
+    border-radius: 999px;
+    white-space: nowrap;
   }
   /* Hold-to-talk: suppress touch scroll/selection so a press-hold-release
      gesture stays a clean PTT hold on touch devices. */

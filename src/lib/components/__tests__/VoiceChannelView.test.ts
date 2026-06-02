@@ -22,6 +22,7 @@ function fakeSession(state: object) {
     setDeafened: vi.fn(async () => {}),
     setPttMode: vi.fn(async () => {}),
     setPttHeld: vi.fn(),
+    clearChannelFull: vi.fn(),
   };
 }
 
@@ -77,6 +78,43 @@ describe('VoiceChannelView (V3): join flow + control bar', () => {
     render(VoiceChannelView, { props: { session: session as never, ...base } });
     await fireEvent.click(screen.getByRole('button', { name: /leave/i }));
     expect(session.leave).toHaveBeenCalled();
+  });
+
+  it('shows a "voice channel full" alert when the session bounced (channelFull)', () => {
+    // The soft cap bounces an over-cap join back to idle with channelFull:true;
+    // the join pane must surface the reason so the user knows why.
+    const session = fakeSession({ phase: 'idle', channelFull: true });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    expect(screen.getByRole('alert')).toHaveTextContent(/voice channel full/i);
+  });
+
+  it('clears a stale channelFull banner on mount and when navigating channels', async () => {
+    // channelFull lives on the app-wide singleton; the view clears it on mount
+    // and whenever it switches to a different channel so a bounce on one channel
+    // never leaks "voice channel full" onto another.
+    const session = fakeSession({ phase: 'idle', channelFull: true });
+    const { rerender } = render(VoiceChannelView, { props: { session: session as never, ...base } });
+    expect(session.clearChannelFull).toHaveBeenCalled();
+    (session.clearChannelFull as ReturnType<typeof vi.fn>).mockClear();
+    await rerender({ session: session as never, ...base, channelId: 'ch-other' });
+    expect(session.clearChannelFull).toHaveBeenCalled();
+  });
+
+  it('shows a persistent "listening only" note when micBlocked (ZEB-353)', () => {
+    // Mic permission denied / no device → listen-only join; surface a persistent
+    // informational note (role=status, not an error alert).
+    const session = fakeSession({ phase: 'connected', micBlocked: true });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    const note = screen.getByTestId('voice-mic-blocked');
+    expect(note).toBeInTheDocument();
+    expect(note).toHaveTextContent(/listening only/i);
+    expect(note).toHaveAttribute('role', 'status');
+  });
+
+  it('hides the "listening only" note when the mic is not blocked', () => {
+    const session = fakeSession({ phase: 'connected', micBlocked: false });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    expect(screen.queryByTestId('voice-mic-blocked')).not.toBeInTheDocument();
   });
 });
 
@@ -146,5 +184,18 @@ describe('VoiceChannelView (V3): push-to-talk hold', () => {
     render(VoiceChannelView, { props: { session: session as never, ...base } });
     await fireEvent.keyDown(window, { code: 'Space' });
     expect(session.setPttHeld).not.toHaveBeenCalled();
+  });
+
+  it('shows a Reconnecting… badge while reconnecting (ZEB-353)', () => {
+    const session = fakeSession({ phase: 'connected', reconnecting: true });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    expect(screen.getByTestId('voice-reconnecting')).toBeInTheDocument();
+    expect(screen.getByText(/Reconnecting/)).toBeInTheDocument();
+  });
+
+  it('hides the Reconnecting… badge when not reconnecting', () => {
+    const session = fakeSession({ phase: 'connected', reconnecting: false });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    expect(screen.queryByTestId('voice-reconnecting')).not.toBeInTheDocument();
   });
 });
