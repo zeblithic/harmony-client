@@ -5,7 +5,7 @@
 //! time-boxed directive. Mirrors `voice_presence.rs`.
 
 use crate::community_membership::ChannelId;
-use crate::owner_state_types::{Hlc, SpaceId};
+use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::collections::BTreeMap;
@@ -165,6 +165,62 @@ pub fn open_directive(
 ) -> Option<SignedVoiceModerationDirective> {
     let plain = decrypt_voice_packet(key, community, channel, VOICE_MODERATION_AAD, packet).ok()?;
     ciborium::from_reader(plain.as_slice()).ok()
+}
+
+/// The middle of the 5-step receive pipeline (step 1 = open under ChannelKey,
+/// done by the caller; step 5 = `ActiveModeration::apply`). This function runs,
+/// in order: the device-#2 **signature** check; the **membership** check —
+/// `actor_device ∈ actor_owner.enrolled_device_keys` AND `actor_owner` is Joined,
+/// via `device_is_enrolled`; and the **power** gate — `power(actor) ≥ MOD_POWER`
+/// AND `power(actor) > power(target)` (the `>` rejects equal-power peers and makes
+/// self-moderation impossible).
+pub fn verify_directive_authority(
+    materialized: &crate::community_membership::MaterializedMembership,
+    signed: &SignedVoiceModerationDirective,
+) -> Result<(), ModError> {
+    verify_directive_sig(signed)?;
+    let d = &signed.directive;
+    if !crate::voice_presence::device_is_enrolled(
+        materialized,
+        &OwnerAddr(d.actor_owner),
+        &d.actor_device,
+    ) {
+        return Err(ModError::NotMember);
+    }
+    let actor_power = materialized
+        .power_levels
+        .get(&OwnerAddr(d.actor_owner))
+        .copied()
+        .unwrap_or(0);
+    let target_power = materialized
+        .power_levels
+        .get(&OwnerAddr(d.target_owner))
+        .copied()
+        .unwrap_or(0);
+    if actor_power < MOD_POWER || actor_power <= target_power {
+        return Err(ModError::NotAuthorized);
+    }
+    Ok(())
+}
+
+/// Async wrapper resolving materialized membership off the registry (mirrors
+/// `voice_presence::beacon_signer_is_member`), then applying the authority
+/// check. Returns Ok(()) only if the directive's signer is authorized.
+pub async fn directive_signer_is_authorized(
+    registry: &std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
+    community: &SpaceId,
+    signed: &SignedVoiceModerationDirective,
+) -> Result<(), ModError> {
+    let Some(engine) = registry.engine_arc(community).await else {
+        return Err(ModError::NotMember);
+    };
+    let admin = engine.admin_addr();
+    let state = engine.state();
+    let materialized = {
+        let guard = state.lock().await;
+        guard.materialized(admin)
+    };
+    verify_directive_authority(&materialized, signed)
 }
 
 #[cfg(any(test, feature = "test-fixtures"))]
@@ -474,5 +530,111 @@ mod tests {
         let lapsed = am.sweep(1_000 + ENFORCE_TTL_MS);
         assert_eq!(lapsed, vec![(C, CH)]);
         assert!(!am.is_muted(&C, &CH, &[0xBB; 16], 1_000 + ENFORCE_TTL_MS));
+    }
+
+    use crate::community_membership::{MaterializedMembership, MemberState, MemberStatus};
+    use std::collections::BTreeSet;
+
+    fn joined_member(device: [u8; 32]) -> MemberState {
+        let mut keys = BTreeSet::new();
+        keys.insert(device);
+        MemberState {
+            status: MemberStatus::Joined,
+            joined_at: Hlc {
+                wall_ms: 0,
+                logical: 0,
+                device_id: "x".into(),
+            },
+            left_at: None,
+            enrolled_device_keys: keys,
+        }
+    }
+
+    fn membership(
+        actor_power: u8,
+        target_power: u8,
+        actor_dev: [u8; 32],
+    ) -> MaterializedMembership {
+        let mut m = MaterializedMembership::default();
+        m.members
+            .insert(OwnerAddr([0xAA; 16]), joined_member(actor_dev));
+        m.members
+            .insert(OwnerAddr([0xBB; 16]), joined_member([0xCC; 32]));
+        m.power_levels.insert(OwnerAddr([0xAA; 16]), actor_power);
+        m.power_levels.insert(OwnerAddr([0xBB; 16]), target_power);
+        m
+    }
+
+    #[test]
+    fn authority_accepts_powerful_member() {
+        let signing = sk();
+        let vk = signing.verifying_key().to_bytes();
+        let signed = sign_directive(directive(ModAction::Mute, vk), &signing).unwrap();
+        let mm = membership(60, 0, vk);
+        assert!(verify_directive_authority(&mm, &signed).is_ok());
+    }
+
+    #[test]
+    fn authority_rejects_non_member() {
+        let signing = sk();
+        let vk = signing.verifying_key().to_bytes();
+        let signed = sign_directive(directive(ModAction::Mute, vk), &signing).unwrap();
+        let mm = MaterializedMembership::default();
+        assert_eq!(
+            verify_directive_authority(&mm, &signed),
+            Err(ModError::NotMember)
+        );
+    }
+
+    #[test]
+    fn authority_rejects_insufficient_power() {
+        let signing = sk();
+        let vk = signing.verifying_key().to_bytes();
+        let signed = sign_directive(directive(ModAction::Mute, vk), &signing).unwrap();
+        let mm = membership(49, 0, vk);
+        assert_eq!(
+            verify_directive_authority(&mm, &signed),
+            Err(ModError::NotAuthorized)
+        );
+    }
+
+    #[test]
+    fn authority_rejects_power_not_greater_than_target() {
+        let signing = sk();
+        let vk = signing.verifying_key().to_bytes();
+        let signed = sign_directive(directive(ModAction::Kick, vk), &signing).unwrap();
+        let mm = membership(60, 60, vk);
+        assert_eq!(
+            verify_directive_authority(&mm, &signed),
+            Err(ModError::NotAuthorized)
+        );
+    }
+
+    #[test]
+    fn authority_rejects_device_not_enrolled_for_actor() {
+        let signing = sk();
+        let vk = signing.verifying_key().to_bytes();
+        let signed = sign_directive(directive(ModAction::Mute, vk), &signing).unwrap();
+        let mm = membership(60, 0, [0x11; 32]); // actor enrolled with a DIFFERENT device
+        assert_eq!(
+            verify_directive_authority(&mm, &signed),
+            Err(ModError::NotMember)
+        );
+    }
+
+    #[test]
+    fn authority_rejects_left_member() {
+        // A member who has Left the community must not moderate, even though
+        // their device key may still sit in `enrolled_device_keys` and their
+        // stale `power_levels` entry persists (power is not cleaned up on Leave).
+        let signing = sk();
+        let vk = signing.verifying_key().to_bytes();
+        let signed = sign_directive(directive(ModAction::Mute, vk), &signing).unwrap();
+        let mut mm = membership(60, 0, vk);
+        mm.members.get_mut(&OwnerAddr([0xAA; 16])).unwrap().status = MemberStatus::Left;
+        assert_eq!(
+            verify_directive_authority(&mm, &signed),
+            Err(ModError::NotMember)
+        );
     }
 }
