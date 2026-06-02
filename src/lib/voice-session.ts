@@ -250,10 +250,20 @@ export class VoiceSession {
    * `set_voice_muted`.
    */
   async setPttMode(on: boolean): Promise<void> {
+    const prevMode = this.pttMode;
     this.pttMode = on;
     this.patch({ pttMode: on });
     if (!on) this.setPttHeld(false);
-    await this.setMuted(!on);
+    try {
+      await this.setMuted(!on);
+    } catch (err) {
+      // The coupled mute toggle was rejected by the backend (setMuted already
+      // rolled its own muted state back). Roll pttMode back too so mode and
+      // mute stay consistent instead of stranding the UI in "PTT on but muted".
+      this.pttMode = prevMode;
+      this.patch({ pttMode: prevMode });
+      throw err;
+    }
   }
 
   setPttHeld(held: boolean): void {

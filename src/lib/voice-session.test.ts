@@ -124,6 +124,16 @@ describe('VoiceSession lifecycle + gate', () => {
     expect(get(s.state).pttHeld).toBe(false);
   });
 
+  it('setPttMode rolls back pttMode when the coupled setMuted fails', async () => {
+    const s = newSession();
+    await s.join('comm', 'chan');
+    d.invoke.mockRejectedValueOnce(new Error('mute refused'));
+    await expect(s.setPttMode(true)).rejects.toThrow(/refused/);
+    // Mode and mute roll back together — no "PTT on but muted" limbo.
+    expect(get(s.state).pttMode).toBe(false);
+    expect(get(s.state).muted).toBe(true);
+  });
+
   it('leave returns to idle and tears down', async () => {
     const s = newSession();
     await s.join('comm', 'chan');
