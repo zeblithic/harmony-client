@@ -27,6 +27,15 @@
   let joining = $state(false);
   let error = $state<string | null>(null);
 
+  // Clear a stale soft-cap banner when this view switches channels: `channelFull`
+  // lives on the app-wide singleton session, so a bounce on one channel must not
+  // surface "voice channel full" on another. Re-runs on `channelId` change (and
+  // once at mount — a no-op when nothing was bounced).
+  $effect(() => {
+    channelId; // track: re-run when the viewed channel changes
+    session.clearChannelFull();
+  });
+
   // Beyond this count the avatar-tile grid collapses to a compact list.
   const GRID_MAX = 12;
 

@@ -202,6 +202,15 @@ export class VoiceSession {
   }
 
   /**
+   * Clear the soft-cap "voice channel full" banner. `channelFull` lives on this
+   * app-wide singleton, so a bounce on one channel would otherwise leak its
+   * banner onto a different channel's view — callers clear it on navigation.
+   */
+  clearChannelFull(): void {
+    if (get(this.store).channelFull) this.patch({ channelFull: false });
+  }
+
+  /**
    * The per-frame send decision (mute / PTT / VAD). The core muted / PTT / VAD
    * logic lives in the shared `makeTalkGate` (so the DM CallSession can't drift
    * from it); here we fold deafen into the muted bit (deafen implies self-mute)

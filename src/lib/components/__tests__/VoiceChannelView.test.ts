@@ -22,6 +22,7 @@ function fakeSession(state: object) {
     setDeafened: vi.fn(async () => {}),
     setPttMode: vi.fn(async () => {}),
     setPttHeld: vi.fn(),
+    clearChannelFull: vi.fn(),
   };
 }
 
@@ -85,6 +86,18 @@ describe('VoiceChannelView (V3): join flow + control bar', () => {
     const session = fakeSession({ phase: 'idle', channelFull: true });
     render(VoiceChannelView, { props: { session: session as never, ...base } });
     expect(screen.getByRole('alert')).toHaveTextContent(/voice channel full/i);
+  });
+
+  it('clears a stale channelFull banner on mount and when navigating channels', async () => {
+    // channelFull lives on the app-wide singleton; the view clears it on mount
+    // and whenever it switches to a different channel so a bounce on one channel
+    // never leaks "voice channel full" onto another.
+    const session = fakeSession({ phase: 'idle', channelFull: true });
+    const { rerender } = render(VoiceChannelView, { props: { session: session as never, ...base } });
+    expect(session.clearChannelFull).toHaveBeenCalled();
+    (session.clearChannelFull as ReturnType<typeof vi.fn>).mockClear();
+    await rerender({ session: session as never, ...base, channelId: 'ch-other' });
+    expect(session.clearChannelFull).toHaveBeenCalled();
   });
 
   it('shows a persistent "listening only" note when micBlocked (ZEB-353)', () => {
