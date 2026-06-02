@@ -2782,12 +2782,15 @@ pub async fn run<R: Runtime>(
                                         // instead of spinning. The `closing` re-check
                                         // inside the re-declare loop still owns
                                         // shutdown during the sleep.
-                                        if made_progress {
-                                            backoff = std::time::Duration::from_secs(5);
-                                        } else {
-                                            tokio::time::sleep(backoff).await;
-                                            backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
-                                        }
+                                        // Surface "reconnecting" to the UI BEFORE the
+                                        // no-progress backoff sleep. The session drives
+                                        // its reconnecting flag off this event, so
+                                        // emitting first means a flapping (no-progress)
+                                        // reconnect shows "reconnecting" for the whole
+                                        // backoff window rather than only flipping right
+                                        // before "...restored". The sleep below still
+                                        // rate-limits the re-declare; it just no longer
+                                        // gates the UI signal.
                                         tracing::warn!(
                                             key = %sub_key_retry,
                                             "voice subscriber closed unexpectedly; reconnecting"
@@ -2799,6 +2802,12 @@ pub async fn run<R: Runtime>(
                                                 "channelId": channel_hex,
                                             }),
                                         );
+                                        if made_progress {
+                                            backoff = std::time::Duration::from_secs(5);
+                                        } else {
+                                            tokio::time::sleep(backoff).await;
+                                            backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+                                        }
                                         // Re-declare the subscriber. Like the
                                         // voice-signal sub, try immediately on the
                                         // first attempt and only back off *after* a
@@ -3138,12 +3147,15 @@ pub async fn run<R: Runtime>(
                                         // instead of spinning. The `closing` re-check
                                         // inside the re-declare loop still owns
                                         // shutdown during the sleep.
-                                        if made_progress {
-                                            backoff = std::time::Duration::from_secs(5);
-                                        } else {
-                                            tokio::time::sleep(backoff).await;
-                                            backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
-                                        }
+                                        // Surface "reconnecting" to the UI BEFORE the
+                                        // no-progress backoff sleep. The call session
+                                        // drives its reconnecting flag off this event, so
+                                        // emitting first means a flapping (no-progress)
+                                        // reconnect shows "reconnecting" for the whole
+                                        // backoff window rather than only flipping right
+                                        // before "...restored". The sleep below still
+                                        // rate-limits the re-declare; it just no longer
+                                        // gates the UI signal.
                                         tracing::warn!(
                                             key = %sub_key_retry,
                                             "dm voice subscriber closed unexpectedly; reconnecting"
@@ -3152,6 +3164,12 @@ pub async fn run<R: Runtime>(
                                             "voice-transport-lost",
                                             serde_json::json!({ "callId": call_hex }),
                                         );
+                                        if made_progress {
+                                            backoff = std::time::Duration::from_secs(5);
+                                        } else {
+                                            tokio::time::sleep(backoff).await;
+                                            backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+                                        }
                                         // Re-declare the subscriber. Like the
                                         // voice-signal sub, try immediately on the
                                         // first attempt and only back off *after* a

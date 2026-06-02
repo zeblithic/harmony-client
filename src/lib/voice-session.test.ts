@@ -363,6 +363,20 @@ describe('classifyMicError', () => {
     expect(classifyMicError(new Error('boom'))).toBe(null);
     expect(classifyMicError(undefined)).toBe(null);
   });
+  it('does not false-match "no" as a substring of a generic system error (round 5)', () => {
+    // "Cannot initialize audio context" contains "no" (in "Cannot") and "audio",
+    // but is NOT a mic device fault — the tightened `\bno\b` word boundary must
+    // keep this on the null (full-rollback) path, not the silent listen-only one.
+    expect(classifyMicError(new Error('Cannot initialize audio context'))).toBe(null);
+    // A real "no microphone found" still classifies as notfound.
+    expect(
+      classifyMicError(Object.assign(new Error('no microphone found'), { name: 'NotFoundError' })),
+    ).toBe('notfound');
+    // Sanity: a denied-permission error still classifies as blocked.
+    expect(
+      classifyMicError(Object.assign(new Error('Permission denied'), { name: 'NotAllowedError' })),
+    ).toBe('blocked');
+  });
 });
 
 describe('VoiceSession mic-blocked → listen-only join (ZEB-353)', () => {

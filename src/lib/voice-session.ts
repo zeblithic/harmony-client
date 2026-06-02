@@ -149,7 +149,10 @@ export function classifyMicError(e: unknown): 'blocked' | 'notfound' | null {
   if (
     nameStr === 'NotFoundError' || nameStr === 'DevicesNotFoundError' ||
     nameStr === 'OverconstrainedError' ||
-    /notfound|no.*(microphone|audio|device)|requested device/i.test(msg)
+    // `\bno\b` (whole word) so "Cannot initialize audio context" / "unknown" /
+    // "connection" don't false-match "no" as a substring and misroute a generic
+    // system error into the silent listen-only path.
+    /notfound|requested device|\bno\b[^.]*\b(microphone|audio|device)\b/i.test(msg)
   ) {
     return 'notfound';
   }
