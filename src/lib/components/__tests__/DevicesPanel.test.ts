@@ -15,6 +15,18 @@ vi.mock('../../profile-service', () => ({
   saveProfile: vi.fn(),
 }));
 
+import {
+  loadDeviceLabel,
+  saveDeviceLabel,
+  resolveDefaultDeviceLabel,
+} from '../../device-label-service';
+
+vi.mock('../../device-label-service', () => ({
+  loadDeviceLabel: vi.fn(),
+  saveDeviceLabel: vi.fn(),
+  resolveDefaultDeviceLabel: vi.fn(),
+}));
+
 const mockedInvoke = invoke as unknown as ReturnType<typeof vi.fn>;
 
 // File-level beforeEach: runs before EVERY test in this file, including those
@@ -165,7 +177,7 @@ describe('DevicesPanel — rename', () => {
     expect((input as HTMLInputElement).value).toBe('KRILE');
   });
 
-  it('saving the rename calls profile-service.saveProfile', async () => {
+  it('saving the rename persists the device label, not the owner profile', async () => {
     mockedInvoke.mockResolvedValueOnce({
       ownerId: 'a4f1', ownerDisplayName: 'zeblith',
       devices: [{
@@ -175,7 +187,7 @@ describe('DevicesPanel — rename', () => {
       }],
       canBackUp: true,
     });
-    (loadProfile as ReturnType<typeof vi.fn>).mockReturnValue({ address: 'a', displayName: 'KRILE' });
+    (loadDeviceLabel as ReturnType<typeof vi.fn>).mockReturnValue('KRILE');
 
     render(DevicesPanel);
     const renameBtn = await screen.findByRole('button', { name: /rename/i });
@@ -184,9 +196,9 @@ describe('DevicesPanel — rename', () => {
     await fireEvent.input(input, { target: { value: 'KRILE-prime' } });
     const saveBtn = screen.getByRole('button', { name: /save/i });
     await fireEvent.click(saveBtn);
-    expect(saveProfile).toHaveBeenCalledWith(
-      expect.objectContaining({ displayName: 'KRILE-prime' })
-    );
+    // ZEB-336: rename writes the per-device LABEL, never the owner profile.
+    expect(saveDeviceLabel).toHaveBeenCalledWith('KRILE-prime');
+    expect(saveProfile).not.toHaveBeenCalled();
   });
 });
 
@@ -247,17 +259,16 @@ describe('DevicesPanel — degraded state (canBackUp: false)', () => {
   });
 });
 
-describe('DevicesPanel — rename overlay survives refresh', () => {
-  it('overlays profile.displayName onto the isThisDevice row after refresh', async () => {
-    // Backend returns the placeholder "this device" — but localStorage holds
-    // a previously-renamed value. The panel must overlay the local value so
-    // the rename survives refresh/restart (Qodo + CodeAnt finding).
+describe('DevicesPanel — owner name and device label are separated (ZEB-336)', () => {
+  it('shows the owner name in the header and the device label in the row', async () => {
+    // Backend returns placeholders for both; the local stores override them
+    // INDEPENDENTLY — the owner name and device label are distinct values.
     mockedInvoke.mockResolvedValueOnce({
       ownerId: 'a4f1c8239b7dd809abcdef0123456789',
-      ownerDisplayName: 'this device',  // backend placeholder
+      ownerDisplayName: 'backend-placeholder',
       devices: [{
         deviceId: 'aa11bb22cc33dd44ee55ff6677889900',
-        displayName: 'this device',  // backend placeholder
+        displayName: 'this device', // backend placeholder
         isThisDevice: true,
         trustDecision: { kind: 'full', reason: null },
         enrolledAt: 1_700_000_000,
@@ -265,18 +276,56 @@ describe('DevicesPanel — rename overlay survives refresh', () => {
       }],
       canBackUp: true,
     });
-    (loadProfile as ReturnType<typeof vi.fn>).mockReturnValue({
-      address: 'addr',
-      displayName: 'KRILE-renamed',
-    });
+    (loadProfile as ReturnType<typeof vi.fn>).mockReturnValue({ address: 'addr', displayName: 'zeblith' });
+    (loadDeviceLabel as ReturnType<typeof vi.fn>).mockReturnValue('KRILE');
 
     render(DevicesPanel);
-    // Both the owner header AND the device row should show the renamed value.
-    const matches = await screen.findAllByText('KRILE-renamed');
-    expect(matches.length).toBe(2);
-    // The "this device" string still appears as the marker label on the row,
-    // confirming the overlay only replaced the displayName, not the marker.
-    expect(screen.queryByText('this device')).toBeInTheDocument();
+    await screen.findByText('zeblith');           // owner header ← profile
+    expect(screen.getByText('KRILE')).toBeInTheDocument();   // device row ← label store
+    expect(screen.queryByText('backend-placeholder')).not.toBeInTheDocument();
+  });
+
+  it('renaming the device does not change the owner display name', async () => {
+    // Regression guard for the conflation: pre-split this rename rewrote
+    // profile.displayName (the owner name).
+    mockedInvoke.mockResolvedValueOnce({
+      ownerId: 'a4f1', ownerDisplayName: 'backend',
+      devices: [{
+        deviceId: 'aa11bb22', displayName: 'this device', isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000, fingerprint: 'aa11·bb22',
+      }],
+      canBackUp: true,
+    });
+    (loadProfile as ReturnType<typeof vi.fn>).mockReturnValue({ address: 'addr', displayName: 'zeblith' });
+    (loadDeviceLabel as ReturnType<typeof vi.fn>).mockReturnValue('KRILE');
+
+    render(DevicesPanel);
+    const renameBtn = await screen.findByRole('button', { name: /rename/i });
+    await fireEvent.click(renameBtn);
+    const input = screen.getByRole('textbox', { name: /device name/i });
+    await fireEvent.input(input, { target: { value: 'KRILE-prime' } });
+    await fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    expect(screen.getByText('KRILE-prime')).toBeInTheDocument(); // device row updated
+    expect(screen.getByText('zeblith')).toBeInTheDocument();     // owner header unchanged
+  });
+
+  it('defaults the device label to the OS hostname when none is stored', async () => {
+    mockedInvoke.mockResolvedValueOnce({
+      ownerId: 'a4f1', ownerDisplayName: 'zeblith',
+      devices: [{
+        deviceId: 'aa11bb22', displayName: 'this device', isThisDevice: true,
+        trustDecision: { kind: 'full', reason: null },
+        enrolledAt: 1_700_000_000, fingerprint: 'aa11·bb22',
+      }],
+      canBackUp: true,
+    });
+    (loadDeviceLabel as ReturnType<typeof vi.fn>).mockReturnValue(null);
+    (resolveDefaultDeviceLabel as ReturnType<typeof vi.fn>).mockResolvedValue('HOSTBOX');
+
+    render(DevicesPanel);
+    await screen.findByText('HOSTBOX');                 // resolved hostname shown
+    expect(saveDeviceLabel).toHaveBeenCalledWith('HOSTBOX'); // persisted once
   });
 });
 
