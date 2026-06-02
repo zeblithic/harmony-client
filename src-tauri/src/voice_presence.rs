@@ -367,6 +367,21 @@ impl VoicePresenceMap {
     pub fn remove_channel(&mut self, c: &SpaceId, ch: &ChannelId) {
         self.inner.remove(&(*c, *ch));
     }
+
+    /// Resolve the owner for a device currently known in (c, ch), for media-drop
+    /// resolution (works even for entries hidden from the visible roster, i.e.
+    /// gravestones, since this looks at the raw entry map, not `roster()`).
+    pub fn owner_for_device(
+        &self,
+        c: &SpaceId,
+        ch: &ChannelId,
+        device: &[u8; 32],
+    ) -> Option<[u8; 16]> {
+        self.inner
+            .get(&(*c, *ch))
+            .and_then(|m| m.get(device))
+            .map(|e| e.owner)
+    }
 }
 
 // ── Membership verification + pub/sub spawn helpers ──────────────
@@ -930,6 +945,20 @@ mod map_tests {
             "old-session tombstone is ignored"
         );
         assert_eq!(m.roster(&C, &CH).len(), 1, "freshly-rejoined entry remains");
+    }
+
+    #[test]
+    fn owner_for_device_resolves_known_and_gravestone_entries() {
+        let mut m = VoicePresenceMap::new();
+        m.apply(&C, &CH, &b(1, 1, 0, true, false), 0);
+        assert_eq!(m.owner_for_device(&C, &CH, &[1u8; 32]), Some([1u8; 16]));
+        // Unknown device → None.
+        assert_eq!(m.owner_for_device(&C, &CH, &[9u8; 32]), None);
+        // A buried (gravestone) entry is hidden from the roster but still
+        // resolvable here, so a muted-then-departing sender's last frames drop.
+        m.apply(&C, &CH, &b(1, 1, 1, true, true), 100);
+        assert!(m.roster(&C, &CH).is_empty());
+        assert_eq!(m.owner_for_device(&C, &CH, &[1u8; 32]), Some([1u8; 16]));
     }
 
     #[test]

@@ -85,6 +85,8 @@ pub enum VoiceChannelRequest {
         action: crate::voice_moderation::ModAction,
         /// Issuer-side duration; how long to keep re-asserting. None → default.
         duration_ms: Option<u64>,
+        /// HLC minted at the IPC boundary for directive LWW ordering.
+        issued_hlc: crate::owner_state_types::Hlc,
     },
 }
 

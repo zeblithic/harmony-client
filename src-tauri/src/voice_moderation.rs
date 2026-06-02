@@ -390,6 +390,34 @@ impl ActiveModeration {
     pub fn remove_channel(&mut self, c: &SpaceId, ch: &ChannelId) {
         self.inner.remove(&(*c, *ch));
     }
+
+    /// Enumerate currently-enforced targets in (c, ch): (muted_owners, kicked_owners).
+    pub fn snapshot(
+        &self,
+        c: &SpaceId,
+        ch: &ChannelId,
+        now_ms: u64,
+    ) -> (Vec<[u8; 16]>, Vec<[u8; 16]>) {
+        let mut muted = Vec::new();
+        let mut kicked = Vec::new();
+        if let Some(targets) = self.inner.get(&(*c, *ch)) {
+            for (owner, t) in targets {
+                if t.mute
+                    .as_ref()
+                    .is_some_and(|s| s.enforced && now_ms < s.enforce_until_ms)
+                {
+                    muted.push(*owner);
+                }
+                if t.kick
+                    .as_ref()
+                    .is_some_and(|s| s.enforced && now_ms < s.enforce_until_ms)
+                {
+                    kicked.push(*owner);
+                }
+            }
+        }
+        (muted, kicked)
+    }
 }
 
 #[cfg(test)]
@@ -530,6 +558,34 @@ mod tests {
         let lapsed = am.sweep(1_000 + ENFORCE_TTL_MS);
         assert_eq!(lapsed, vec![(C, CH)]);
         assert!(!am.is_muted(&C, &CH, &[0xBB; 16], 1_000 + ENFORCE_TTL_MS));
+    }
+
+    #[test]
+    fn snapshot_lists_enforced_targets() {
+        let mut am = ActiveModeration::default();
+        // Mute owner [0xBB;16] (the default target the `directive` helper uses).
+        applied(&mut am, ModAction::Mute, 100, 1, 1_000);
+        // Kick a SECOND owner [0xDD;16] — build the directive directly so the
+        // target differs from the helper's hardcoded [0xBB;16].
+        let mut kd = directive(ModAction::Kick, [0u8; 32]);
+        kd.target_owner = [0xDD; 16];
+        kd.issued_hlc = Hlc {
+            wall_ms: 100,
+            logical: 0,
+            device_id: "x".into(),
+        };
+        kd.seq = 1;
+        assert!(am.apply(&C, &CH, &kd, 1_000, ENFORCE_TTL_MS));
+
+        let (muted, kicked) = am.snapshot(&C, &CH, 1_000);
+        assert_eq!(muted, vec![[0xBB; 16]]);
+        assert_eq!(kicked, vec![[0xDD; 16]]);
+
+        // After both TTLs lapse (sweep marks them un-enforced), snapshot is empty.
+        am.sweep(1_000 + ENFORCE_TTL_MS);
+        let (muted, kicked) = am.snapshot(&C, &CH, 1_000 + ENFORCE_TTL_MS);
+        assert!(muted.is_empty());
+        assert!(kicked.is_empty());
     }
 
     use crate::community_membership::{MaterializedMembership, MemberState, MemberStatus};
