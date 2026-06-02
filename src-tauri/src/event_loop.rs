@@ -2732,7 +2732,14 @@ pub async fn run<R: Runtime>(
                                     const MAX_BACKOFF: std::time::Duration =
                                         std::time::Duration::from_secs(60);
                                     loop {
+                                        // Track whether this subscription ever
+                                        // carried a frame. Only a connection that
+                                        // made real progress is allowed to reset the
+                                        // backoff; one that declares OK but never
+                                        // receives is flapping and must rate-limit.
+                                        let mut made_progress = false;
                                         while let Ok(sample) = sub.recv_async().await {
+                                            made_progress = true;
                                             if sample.payload().len() > crate::voice_crypto::MAX_VOICE_PACKET_BYTES {
                                                 tracing::warn!(
                                                     len = sample.payload().len(),
@@ -2763,6 +2770,24 @@ pub async fn run<R: Runtime>(
                                         if closing_sub.load(std::sync::atomic::Ordering::SeqCst) {
                                             break;
                                         }
+                                        // Reset/grow the backoff based on real
+                                        // progress, not mere re-subscription. A
+                                        // connection that carried frames then dropped
+                                        // is a healthy blip → reset to the initial 5s
+                                        // and re-declare immediately. A connection
+                                        // that declared OK but never received a frame
+                                        // is flapping → sleep the current backoff and
+                                        // grow it (5s → … → 60s cap) so the
+                                        // lost/restored event rate stays bounded
+                                        // instead of spinning. The `closing` re-check
+                                        // inside the re-declare loop still owns
+                                        // shutdown during the sleep.
+                                        if made_progress {
+                                            backoff = std::time::Duration::from_secs(5);
+                                        } else {
+                                            tokio::time::sleep(backoff).await;
+                                            backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+                                        }
                                         tracing::warn!(
                                             key = %sub_key_retry,
                                             "voice subscriber closed unexpectedly; reconnecting"
@@ -2788,7 +2813,9 @@ pub async fn run<R: Runtime>(
                                                 .await
                                             {
                                                 Ok(s) => {
-                                                    backoff = std::time::Duration::from_secs(5);
+                                                    // Backoff reset is owned by the
+                                                    // made_progress logic above, not
+                                                    // by mere re-subscription.
                                                     sub = s;
                                                     let _ = app_sub.emit(
                                                         "voice-transport-restored",
@@ -3056,7 +3083,14 @@ pub async fn run<R: Runtime>(
                                     const MAX_BACKOFF: std::time::Duration =
                                         std::time::Duration::from_secs(60);
                                     loop {
+                                        // Track whether this subscription ever
+                                        // carried a frame. Only a connection that
+                                        // made real progress is allowed to reset the
+                                        // backoff; one that declares OK but never
+                                        // receives is flapping and must rate-limit.
+                                        let mut made_progress = false;
                                         while let Ok(sample) = sub.recv_async().await {
+                                            made_progress = true;
                                             // Skip our own published frames: on a 2-party
                                             // DM the `.../*` sub also matches our own
                                             // {senderDevice} segment, and decrypting +
@@ -3092,6 +3126,24 @@ pub async fn run<R: Runtime>(
                                         if closing_sub.load(std::sync::atomic::Ordering::SeqCst) {
                                             break;
                                         }
+                                        // Reset/grow the backoff based on real
+                                        // progress, not mere re-subscription. A
+                                        // connection that carried frames then dropped
+                                        // is a healthy blip → reset to the initial 5s
+                                        // and re-declare immediately. A connection
+                                        // that declared OK but never received a frame
+                                        // is flapping → sleep the current backoff and
+                                        // grow it (5s → … → 60s cap) so the
+                                        // lost/restored event rate stays bounded
+                                        // instead of spinning. The `closing` re-check
+                                        // inside the re-declare loop still owns
+                                        // shutdown during the sleep.
+                                        if made_progress {
+                                            backoff = std::time::Duration::from_secs(5);
+                                        } else {
+                                            tokio::time::sleep(backoff).await;
+                                            backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+                                        }
                                         tracing::warn!(
                                             key = %sub_key_retry,
                                             "dm voice subscriber closed unexpectedly; reconnecting"
@@ -3114,7 +3166,9 @@ pub async fn run<R: Runtime>(
                                                 .await
                                             {
                                                 Ok(s) => {
-                                                    backoff = std::time::Duration::from_secs(5);
+                                                    // Backoff reset is owned by the
+                                                    // made_progress logic above, not
+                                                    // by mere re-subscription.
                                                     sub = s;
                                                     let _ = app_sub.emit(
                                                         "voice-transport-restored",
