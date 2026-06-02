@@ -184,6 +184,60 @@ describe('VoiceSession lifecycle + gate', () => {
   });
 });
 
+describe('VoiceSession 64-participant soft cap (ZEB-353 reactive bounce)', () => {
+  let d: ReturnType<typeof deps>;
+  beforeEach(() => { d = deps(); });
+
+  function newSession() {
+    return new VoiceSession({
+      invoke: d.invoke, listen: d.listen,
+      selfOwnerHex: 'aa'.repeat(16), selfDeviceHex: 'bb'.repeat(16),
+      senderHash: new Uint8Array(16),
+      ...d.factories,
+    });
+  }
+
+  // A roster of `n` distinct NON-self members (self device is 'bb'.repeat(16)).
+  function others(n: number) {
+    return Array.from({ length: n }, (_, i) => ({
+      // 64 hex chars per device, unique per member, none == self prefix.
+      owner: (i + 0x10).toString(16).padStart(2, '0').repeat(16),
+      device: ((i + 0x100).toString(16).padStart(4, '0') + 'cc'.repeat(14)),
+      muted: false,
+    }));
+  }
+
+  it('bounces an over-cap join: 64 non-self members → idle + channelFull', async () => {
+    const s = newSession();
+    await s.join('comm', 'chan');
+    expect(get(s.state).phase).toBe('connected');
+    expect(get(s.state).channelFull).toBe(false);
+
+    // 64 others already present → joining would be the 65th → refuse.
+    d.emit('voice-presence-changed', { community: 'comm', channel: 'chan', roster: others(64) });
+    // The bounce fires leave() (several async teardown awaits) then stamps the
+    // banner in a trailing .then(); drain the microtask queue until the final
+    // channelFull:true settles (leave() resets to idle first, then the patch).
+    for (let i = 0; i < 30 && !get(s.state).channelFull; i++) await Promise.resolve();
+
+    expect(get(s.state).phase).toBe('idle');
+    expect(get(s.state).channelFull).toBe(true);
+    expect(d.invoke).toHaveBeenCalledWith('leave_voice_channel', { communityId: 'comm', channelId: 'chan' });
+  });
+
+  it('allows an at-cap join: 63 non-self members stays connected (you are the 64th)', async () => {
+    const s = newSession();
+    await s.join('comm', 'chan');
+    d.emit('voice-presence-changed', { community: 'comm', channel: 'chan', roster: others(63) });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(get(s.state).phase).toBe('connected');
+    expect(get(s.state).channelFull).toBe(false);
+    expect(d.invoke).not.toHaveBeenCalledWith('leave_voice_channel', { communityId: 'comm', channelId: 'chan' });
+  });
+});
+
 describe('VoiceSession leave/join race (C2 regression)', () => {
   it('leave() during an in-flight join serializes and ends fully torn down', async () => {
     // Hang join_voice_channel until released, opening a mid-join window.

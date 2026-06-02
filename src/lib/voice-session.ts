@@ -12,6 +12,15 @@ import type { CodecType } from './voice/voice-codec';
 
 export type SessionPhase = 'idle' | 'joining' | 'connected' | 'leaving';
 
+/**
+ * Soft cap on community voice-channel participants. The roster is decentralized
+ * — a joining client only learns the count AFTER it subscribes to presence — so
+ * this is a best-effort REACTIVE bounce, not a blocking pre-join gate. A join
+ * with 64 OTHER members already present (you'd be the 65th) is refused shortly
+ * after the roster arrives; the common under-cap join pays zero added latency.
+ */
+export const VOICE_CHANNEL_SOFT_CAP = 64;
+
 export interface RosterMember {
   ownerHex: string;     // 32 hex
   deviceHex: string;
@@ -31,6 +40,13 @@ export interface VoiceSessionState {
   /** Push-to-talk hold state — true only while the talk control is held. */
   pttHeld: boolean;
   roster: RosterMember[];
+  /**
+   * Set true when a join was reactively bounced because the channel was at/over
+   * the soft cap (VOICE_CHANNEL_SOFT_CAP others already present). The session is
+   * back at idle-phase; the join pane surfaces this so the user knows why. Reset
+   * to false on the next join attempt.
+   */
+  channelFull: boolean;
 }
 
 type Invoke = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
@@ -89,6 +105,7 @@ export interface VoiceSessionDeps {
 const INITIAL: VoiceSessionState = {
   phase: 'idle', community: null, channel: null,
   muted: true, deafened: false, pttMode: false, pttHeld: false, roster: [],
+  channelFull: false,
 };
 
 export class VoiceSession {
@@ -111,6 +128,13 @@ export class VoiceSession {
   private drainTimer: ReturnType<typeof setInterval> | null = null;
   /** Set while join() is in flight so leave() can serialize behind it. */
   private joinPromise: Promise<void> | null = null;
+  /**
+   * Monotonic deadline (Date.now ms) until which a fresh join is still eligible
+   * for the soft-cap bounce. Set on a successful connect; cleared once we bounce
+   * or the window lapses. Outside the window an over-cap roster is tolerated
+   * (you were already admitted; don't kick a settled participant).
+   */
+  private joinGraceUntilMs = 0;
   /** Last roster pushed to the store, for the change-only patch guard. */
   private lastEmittedRoster: RosterMember[] = [];
 
@@ -170,9 +194,11 @@ export class VoiceSession {
     this.muted = true; this.deafened = false; this.pttMode = false; this.pttHeld = false;
     this.vad.reset();
     this.lastRoster = []; this.lastEmittedRoster = []; this.lastSelfSpeaking = false;
+    this.joinGraceUntilMs = 0;
     this.patch({
       phase: 'joining', community, channel,
       muted: true, deafened: false, pttMode: false, pttHeld: false, roster: [],
+      channelFull: false, // fresh attempt clears any prior bounce banner
     });
 
     // Transactional: once the backend join succeeds we own teardown for every
@@ -225,6 +251,11 @@ export class VoiceSession {
       }, 20);
 
       await this.subscribePresence();
+
+      // Open the soft-cap grace window: an over-cap roster arriving within the
+      // next few seconds bounces this join (see maybeBounceForFull). The window
+      // covers both the first presence event and the 10Hz drain-tick refreshes.
+      this.joinGraceUntilMs = Date.now() + 3000;
 
       this.patch({ phase: 'connected' });
     } catch (err) {
@@ -356,9 +387,41 @@ export class VoiceSession {
     });
     // Only touch the store when the view actually changed — the drain tick calls
     // this ~10×/s, but most ticks produce an identical roster.
-    if (rostersEqual(roster, this.lastEmittedRoster)) return;
-    this.lastEmittedRoster = roster;
-    this.patch({ roster });
+    if (!rostersEqual(roster, this.lastEmittedRoster)) {
+      this.lastEmittedRoster = roster;
+      this.patch({ roster });
+    }
+    // Run the soft-cap check on every refresh (presence events AND drain ticks),
+    // so a roster that arrives during the grace window bounces us even if the
+    // roster view itself was unchanged by the diff guard above.
+    this.maybeBounceForFull();
+  }
+
+  /**
+   * Soft-cap reactive bounce. If we're connected, still inside the post-join
+   * grace window, and the channel already holds VOICE_CHANNEL_SOFT_CAP OTHER
+   * members (we'd be the (cap+1)th), refuse the join: tear down and surface
+   * `channelFull` so the join pane re-renders with the reason.
+   *
+   * Ordering is the subtle part: leave() resets the store to INITIAL (which has
+   * channelFull:false), so we must stamp channelFull:true AFTER leave() settles,
+   * not before — otherwise the reset clobbers the banner. We also clear the
+   * grace deadline up front so a racing drain tick can't fire a second bounce.
+   */
+  private maybeBounceForFull(): void {
+    if (get(this.store).phase !== 'connected') return;
+    if (Date.now() >= this.joinGraceUntilMs) return;
+    // Count OTHERS using the same self-identification refreshRoster uses.
+    const selfPrefix = this.deps.selfDeviceHex.slice(0, 32);
+    const others = this.lastRoster.reduce(
+      (n, r) => n + (r.deviceHex.slice(0, 32) === selfPrefix ? 0 : 1), 0);
+    if (others < VOICE_CHANNEL_SOFT_CAP) return;
+    this.joinGraceUntilMs = 0; // one-shot: don't let the drain tick re-bounce
+    void this.leave().then(() => {
+      // leave() reset the store to INITIAL (channelFull:false); stamp the banner
+      // now so it survives, leaving idle-phase + channelFull:true for the UI.
+      this.patch({ channelFull: true });
+    });
   }
 }
 

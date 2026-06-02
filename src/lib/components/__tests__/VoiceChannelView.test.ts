@@ -78,6 +78,14 @@ describe('VoiceChannelView (V3): join flow + control bar', () => {
     await fireEvent.click(screen.getByRole('button', { name: /leave/i }));
     expect(session.leave).toHaveBeenCalled();
   });
+
+  it('shows a "voice channel full" alert when the session bounced (channelFull)', () => {
+    // The soft cap bounces an over-cap join back to idle with channelFull:true;
+    // the join pane must surface the reason so the user knows why.
+    const session = fakeSession({ phase: 'idle', channelFull: true });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    expect(screen.getByRole('alert')).toHaveTextContent(/voice channel full/i);
+  });
 });
 
 describe('VoiceChannelView (V3): hybrid grid<->list roster', () => {

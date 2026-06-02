@@ -91,7 +91,11 @@
     <span class="voice-count">· {$voiceState.roster.length} here</span>
   </header>
 
-  {#if error}
+  {#if $voiceState.channelFull}
+    <!-- Soft-cap bounce (ZEB-353): the join was reactively refused because the
+         channel was full. Session is back at idle; this explains why. -->
+    <div class="voice-error" role="alert">Voice channel full — try again later.</div>
+  {:else if error}
     <div class="voice-error" role="alert">{error}</div>
   {/if}
 
