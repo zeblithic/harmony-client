@@ -11730,6 +11730,37 @@ async fn leave_voice_channel(
     .map_err(|_| "event loop not running".to_string())
 }
 
+/// ZEB-351 Voice V3: flip the mute state of an active voice channel. Sends a
+/// `VoiceChannelRequest::SetMuted` to the event loop, which flips the shared
+/// `Arc<AtomicBool>` the presence publisher reads (and emits an immediate
+/// beacon). Modeled on `leave_voice_channel`'s id-parsing + tx access.
+#[tauri::command]
+async fn set_voice_muted(
+    payload: voice::SetVoiceMutedPayload,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let community =
+        crate::owner_state_types::SpaceId(parse_voice_id_16("communityId", &payload.community_id)?);
+    let channel = crate::community_membership::ChannelId(parse_voice_id_16(
+        "channelId",
+        &payload.channel_id,
+    )?);
+    let tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .voice_channel_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    tx.send(voice::VoiceChannelRequest::SetMuted {
+        community_id: community,
+        channel_id: channel,
+        muted: payload.muted,
+    })
+    .await
+    .map_err(|_| "event loop not running".to_string())
+}
+
 #[cfg(test)]
 mod voice_id_tests {
     use super::parse_voice_id_16;
@@ -32316,6 +32347,7 @@ pub fn run() {
             send_voice_frame,
             join_voice_channel,
             leave_voice_channel,
+            set_voice_muted,
             send_mail,
             list_mail,
             get_mail,

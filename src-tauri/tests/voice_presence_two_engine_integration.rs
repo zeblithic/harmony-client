@@ -292,6 +292,10 @@ async fn run_inner() {
         logical: 0,
         device_id: hex::encode(device_a),
     };
+    // ZEB-351 Voice V3: the publisher now reads a shared mute flag. This test's
+    // assertions don't depend on the mute bit (only presence/scope/tombstone),
+    // so a `true` flag preserves the prior `muted: true` semantics.
+    let mute_flag_a = Arc::new(AtomicBool::new(true));
     let pub_handle = spawn_voice_presence_publisher(
         session_a.clone(),
         pres_topic.clone(),
@@ -302,6 +306,7 @@ async fn run_inner() {
         owner_a,
         device_a,
         joined_hlc.clone(),
+        Arc::clone(&mute_flag_a),
         Duration::from_secs(4),
         Arc::clone(&closing),
     );

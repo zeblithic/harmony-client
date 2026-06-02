@@ -490,10 +490,60 @@ pub fn spawn_voice_presence_subscriber<R: tauri::Runtime>(
     })
 }
 
+/// ZEB-351 Voice V3: build the heartbeat beacon for the current mute state.
+/// Pure (no I/O) so the publisher loop and the one-shot immediate-beacon path
+/// share exactly one construction site, and the mute-tracking is unit-testable
+/// (and integration-testable) without standing up Zenoh.
+pub fn build_heartbeat_beacon(
+    self_owner: OwnerAddr,
+    self_device: [u8; 32],
+    joined_hlc: &Hlc,
+    seq: u64,
+    muted: bool,
+) -> VoicePresenceBeacon {
+    VoicePresenceBeacon {
+        owner: self_owner.0,
+        device: self_device,
+        muted,
+        joined_hlc: joined_hlc.clone(),
+        seq,
+        left: false,
+    }
+}
+
+/// ZEB-351 Voice V3: publish a single heartbeat beacon immediately (build →
+/// sign → seal → `session.put`). The event loop calls this on a `SetMuted`
+/// toggle so the roster reflects the new mute state without waiting out the
+/// next ≤4 s heartbeat. Best-effort: returns `Err` on sign/seal/put failure so
+/// the caller can log without blocking the flag flip itself.
+#[allow(clippy::too_many_arguments)]
+pub async fn publish_presence_once(
+    session: &zenoh::Session,
+    topic: &str,
+    channel_key: &ChannelKey,
+    community: &SpaceId,
+    channel: &ChannelId,
+    signing_key: &ed25519_dalek::SigningKey,
+    self_owner: OwnerAddr,
+    self_device: [u8; 32],
+    joined_hlc: &Hlc,
+    seq: u64,
+    muted: bool,
+) -> Result<(), BeaconError> {
+    let beacon = build_heartbeat_beacon(self_owner, self_device, joined_hlc, seq, muted);
+    let signed = sign_presence_beacon(beacon, signing_key)?;
+    let sealed = seal_presence_beacon(channel_key, community, channel, &signed)?;
+    session
+        .put(topic, sealed)
+        .await
+        .map_err(|_| BeaconError::Encode)
+}
+
 /// Spawn a heartbeat publisher: emit an immediate beacon, then one every
-/// `interval` (4 s in V2). `muted` is hardcoded `true` — V2 has no mic capture,
-/// so every session starts (and stays) muted. A per-publisher monotone `seq`
-/// drives roster freshness. Honors `closing` for shutdown.
+/// `interval` (4 s in V2). ZEB-351 Voice V3: each tick reads the shared
+/// `muted` flag (flipped by `set_voice_muted` → `VoiceChannelRequest::SetMuted`)
+/// instead of the old hardcoded `true`. A per-publisher monotone `seq` drives
+/// roster freshness. Honors `closing` for shutdown.
 ///
 /// `session` is an owned, cheaply-cloned `zenoh::Session`.
 #[allow(clippy::too_many_arguments)]
@@ -507,6 +557,7 @@ pub fn spawn_voice_presence_publisher(
     self_owner: OwnerAddr,
     self_device: [u8; 32],
     joined_hlc: Hlc,
+    muted: Arc<AtomicBool>,
     interval: std::time::Duration,
     closing: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
@@ -520,14 +571,13 @@ pub fn spawn_voice_presence_publisher(
             if closing.load(Ordering::SeqCst) {
                 break;
             }
-            let beacon = VoicePresenceBeacon {
-                owner: self_owner.0,
-                device: self_device,
-                muted: true,
-                joined_hlc: joined_hlc.clone(),
+            let beacon = build_heartbeat_beacon(
+                self_owner,
+                self_device,
+                &joined_hlc,
                 seq,
-                left: false,
-            };
+                muted.load(Ordering::SeqCst),
+            );
             seq = seq.wrapping_add(1);
             let Ok(signed) = sign_presence_beacon(beacon, &signing_key) else {
                 continue;
@@ -585,6 +635,18 @@ mod tests {
             seq,
             left: false,
         }
+    }
+
+    #[test]
+    fn heartbeat_beacon_tracks_mute_flag() {
+        let hlc = Hlc {
+            wall_ms: 1,
+            logical: 0,
+            device_id: "aa".repeat(32),
+        };
+        let owner = OwnerAddr([7u8; 16]);
+        assert!(build_heartbeat_beacon(owner, [1u8; 32], &hlc, 0, true).muted);
+        assert!(!build_heartbeat_beacon(owner, [1u8; 32], &hlc, 1, false).muted);
     }
 
     #[test]

@@ -54,6 +54,15 @@ pub enum VoiceChannelRequest {
         community_id: SpaceId,
         channel_id: ChannelId,
     },
+    /// ZEB-351 Voice V3: flip the shared mute flag the presence publisher reads,
+    /// driven by the `set_voice_muted` IPC. The event loop flips the channel's
+    /// `Arc<AtomicBool>` (and emits an immediate beacon) so the roster updates
+    /// without waiting for the next ≤4 s heartbeat.
+    SetMuted {
+        community_id: SpaceId,
+        channel_id: ChannelId,
+        muted: bool,
+    },
 }
 
 /// Payload for the send_voice_frame Tauri command.
@@ -63,4 +72,14 @@ pub struct SendVoiceFramePayload {
     pub community_id: String,
     pub channel_id: String,
     pub frame_bytes: Vec<u8>,
+}
+
+/// ZEB-351 Voice V3: payload for the `set_voice_muted` Tauri command. Flips the
+/// presence publisher's shared mute flag for an active voice channel.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetVoiceMutedPayload {
+    pub community_id: String,
+    pub channel_id: String,
+    pub muted: bool,
 }

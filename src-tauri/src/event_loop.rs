@@ -1714,6 +1714,18 @@ pub async fn run<R: Runtime>(
     > = std::collections::HashMap::new();
     let mut voice_own_device: Option<String> = None; // hex of self ed25519 vk
 
+    // ZEB-351 Voice V3: (community, channel) → the shared mute flag handed to
+    // that channel's presence publisher. `set_voice_muted` →
+    // `VoiceChannelRequest::SetMuted` flips this `Arc<AtomicBool>`; the publisher
+    // reads it each heartbeat. Kept in lockstep with `voice_keys` on Join/Leave.
+    let mut voice_mute_flags: std::collections::HashMap<
+        (
+            crate::owner_state_types::SpaceId,
+            crate::community_membership::ChannelId,
+        ),
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    > = std::collections::HashMap::new();
+
     // ZEB-350: presence layer. One shared roster map for the loop's
     // lifetime; per-join publisher/subscriber handles; a `voice_identity`
     // stash so Leave can build the `left` tombstone without re-resolving caps;
@@ -2515,6 +2527,17 @@ pub async fn run<R: Runtime>(
                                         closing.clone(),
                                         std::sync::Arc::clone(&voice_now_ms),
                                     );
+                                    // ZEB-351 Voice V3: the publisher now reads a
+                                    // shared mute flag instead of hardcoding
+                                    // `muted: true`. Start muted (V3 join flow is
+                                    // start-muted); `SetMuted` flips it later.
+                                    let mute_flag = std::sync::Arc::new(
+                                        std::sync::atomic::AtomicBool::new(true),
+                                    );
+                                    voice_mute_flags.insert(
+                                        (community_id, channel_id),
+                                        std::sync::Arc::clone(&mute_flag),
+                                    );
                                     let pubh = crate::voice_presence::spawn_voice_presence_publisher(
                                         session.clone(),
                                         pres_topic,
@@ -2525,6 +2548,7 @@ pub async fn run<R: Runtime>(
                                         caps.self_owner,
                                         caps.self_device,
                                         caps.joined_hlc.clone(),
+                                        mute_flag,
                                         Duration::from_secs(4),
                                         closing.clone(),
                                     );
@@ -2578,6 +2602,10 @@ pub async fn run<R: Runtime>(
                                 }
                             }
                         }
+                        // ZEB-351 Voice V3: drop the shared mute flag in lockstep
+                        // with the media key so a later `SetMuted` for a left
+                        // channel is a no-op.
+                        voice_mute_flags.remove(&(community_id, channel_id));
                         // Media leg: drop the cached key + abort the sub.
                         voice_keys.remove(&(community_id, channel_id));
                         if let Some(handle) = voice_subs.remove(&(community_id, channel_id)) {
@@ -2603,6 +2631,49 @@ pub async fn run<R: Runtime>(
                                 "roster": Vec::<crate::voice_presence::RosterEntry>::new(),
                             }),
                         );
+                    }
+                    crate::voice::VoiceChannelRequest::SetMuted { community_id, channel_id, muted } => {
+                        // ZEB-351 Voice V3: flip the shared mute flag the presence
+                        // publisher reads each heartbeat. A no-op if the channel
+                        // isn't joined (flag absent).
+                        if let Some(flag) = voice_mute_flags.get(&(community_id, channel_id)) {
+                            flag.store(muted, std::sync::atomic::Ordering::SeqCst);
+                            // Immediate beacon so the roster reflects the new mute
+                            // state without waiting out the next ≤4 s heartbeat.
+                            // Best-effort: needs the channel key (voice_keys) and
+                            // the signing key + identity (voice_identity, stashed on
+                            // Join). `seq = u64::MAX - 1` keeps this one-shot above
+                            // the publisher's monotone-from-0 heartbeat seq (so it
+                            // wins same-session freshness) while staying strictly
+                            // below the `u64::MAX` tombstone barrier.
+                            if let (Some(key), Some((owner, device, joined_hlc, signing_key))) = (
+                                voice_keys.get(&(community_id, channel_id)),
+                                voice_identity.get(&(community_id, channel_id)),
+                            ) {
+                                let pres_topic = format!(
+                                    "harmony/voice-presence/{}/{}",
+                                    hex::encode(community_id.0),
+                                    hex::encode(channel_id.0),
+                                );
+                                if let Err(e) = crate::voice_presence::publish_presence_once(
+                                    &session,
+                                    &pres_topic,
+                                    key,
+                                    &community_id,
+                                    &channel_id,
+                                    signing_key,
+                                    *owner,
+                                    *device,
+                                    joined_hlc,
+                                    u64::MAX - 1,
+                                    muted,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(%pres_topic, err = ?e, "immediate mute beacon publish failed");
+                                }
+                            }
+                        }
                     }
                 }
             }
