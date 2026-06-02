@@ -1439,10 +1439,29 @@
       // core/event imports above (no static @tauri-apps import in this file).
       const { getCurrentWebviewWindow } = await import('@tauri-apps/api/webviewWindow');
       const appWin = getCurrentWebviewWindow();
+      let closing = false;
       const unlistenClose = await appWin.onCloseRequested(async (event) => {
+        // Re-entry guard: a second close request mid-teardown must not double-run
+        // (or re-preventDefault) — let the in-flight teardown finish the close.
+        if (closing) return;
+        closing = true;
         event.preventDefault();
-        await voiceSession?.leave().catch(() => {});
-        await callSession?.end().catch(() => {});
+        // Bound the teardown: leave()/end() await IPCs that could in principle
+        // hang, and preventDefault means a hung promise would block the close
+        // forever. Race the (best-effort, never-rejecting) teardown against a
+        // 1.5s deadline so the window always closes; log if the deadline wins.
+        const teardown = Promise.allSettled([
+          voiceSession?.leave() ?? Promise.resolve(),
+          callSession?.end() ?? Promise.resolve(),
+        ]);
+        const timedOut = Symbol('timeout');
+        const raced = await Promise.race([
+          teardown,
+          new Promise((r) => setTimeout(() => r(timedOut), 1500)),
+        ]);
+        if (raced === timedOut) {
+          console.warn('[harmony-client] voice teardown on close exceeded 1.5s; closing anyway');
+        }
         await appWin.destroy();
       });
       fileManagerService.addUnlisten(unlistenClose);

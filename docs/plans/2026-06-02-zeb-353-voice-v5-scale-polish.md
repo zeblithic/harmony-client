@@ -14,7 +14,7 @@
 
 ---
 
-### Task 0: Baseline
+## Task 0: Baseline
 
 **Files:** none (verification only).
 
@@ -25,7 +25,7 @@
 
 ---
 
-### Task 1: DM Deafen control (`CallInProgressBar`)
+## Task 1: DM Deafen control (`CallInProgressBar`)
 
 Deafen is fully implemented in `CallSession.setDeafened` + `VoiceMixer.setDeafened` (mute all inbound, implies self-mute) — only the DM bar lacks a button. Channel `VoiceChannelView` already has one.
 
@@ -39,7 +39,7 @@ Deafen is fully implemented in `CallSession.setDeafened` + `VoiceMixer.setDeafen
 
 ---
 
-### Task 2: 64 soft-cap (best-effort post-join refusal)
+## Task 2: 64 soft-cap (best-effort post-join refusal)
 
 **Design:** The roster is decentralized (a joiner only learns the count after subscribing to presence), so the cap is a **soft, best-effort** check on the joining client. After the backend join resolves, `VoiceSession` watches the first roster snapshot(s) for a short grace window; if the channel roster (excluding self) is `≥ 64`, it leaves and surfaces "voice channel full." Solo/first-joiner (empty roster) proceeds with no added latency. Document the best-effort nature (concurrent joiners may briefly exceed before bouncing).
 
@@ -57,7 +57,7 @@ Deafen is fully implemented in `CallSession.setDeafened` + `VoiceMixer.setDeafen
 
 ---
 
-### Task 3: Transport-blip reconnect (backend retry + frontend `reconnecting` state)
+## Task 3: Transport-blip reconnect (backend retry + frontend `reconnecting` state)
 
 Media subscribers (channel `event_loop.rs:~2715`, DM `~2971`) currently exit on `recv_async` error with only a warning — no retry. Mirror the voice-signal subscriber's retry/backoff loop, emit a `voice-transport-lost`/`voice-transport-restored` event, and add a `reconnecting` state + "Reconnecting…" UI.
 
@@ -75,7 +75,7 @@ Media subscribers (channel `event_loop.rs:~2715`, DM `~2971`) currently exit on 
 
 ---
 
-### Task 4: Mic-device-error surfacing + listen-only fallback
+## Task 4: Mic-device-error surfacing + listen-only fallback
 
 Mic permission/device errors currently propagate the raw browser string and roll back the entire join. V5: classify the error, and if it's a permission/device error, **join listen-only** (no sender) with a persistent "mic blocked — listening only" note instead of failing.
 
@@ -91,7 +91,7 @@ Mic permission/device errors currently propagate the raw browser string and roll
 
 ---
 
-### Task 5: Leave-on-app-close
+## Task 5: Leave-on-app-close
 
 Nothing tears down an active voice channel/DM call on app/window close → stale roster (until 12s TTL) + lingering mic. Add Svelte unmount cleanup + a Tauri window-close handler that leaves/ends first.
 
@@ -105,7 +105,7 @@ Nothing tears down an active voice channel/DM call on app/window close → stale
 
 ---
 
-### Task 6: N-publisher scale validation test
+## Task 6: N-publisher scale validation test
 
 Mirror `src-tauri/tests/voice_presence_two_engine_integration.rs`: spawn N (e.g. 64) presence publishers on one session + one subscriber session; assert all N roster entries converge; assert the roster sweep handles the N-load. Carry the iroh/zenoh loopback-flake disclaimer comment.
 
@@ -118,7 +118,7 @@ Mirror `src-tauri/tests/voice_presence_two_engine_integration.rs`: spawn N (e.g.
 
 ---
 
-### Task 7: Final sweep + push + PR
+## Task 7: Final sweep + push + PR
 
 **Files:** none (verification + PR).
 

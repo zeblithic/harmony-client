@@ -449,15 +449,18 @@ export class VoiceSession {
       const e = p as { communityId?: string; channelId?: string };
       return e.communityId === this.community && e.channelId === this.channel;
     };
+    // Track each handle the instant it resolves — if the second listen() rejects,
+    // teardown still unsubscribes the first instead of leaking it.
     const unLost = await this.deps.listen('voice-transport-lost', (e) => {
       if (!matches(e.payload)) return;
       this.patch({ reconnecting: true });
     });
+    this.unlisteners.push(unLost);
     const unRestored = await this.deps.listen('voice-transport-restored', (e) => {
       if (!matches(e.payload)) return;
       this.patch({ reconnecting: false });
     });
-    this.unlisteners.push(unLost, unRestored);
+    this.unlisteners.push(unRestored);
   }
 
   /** Recompute roster view (speaking + card resolution). Call on presence + each drain. */
@@ -506,11 +509,12 @@ export class VoiceSession {
       (n, r) => n + (r.deviceHex.slice(0, 32) === selfPrefix ? 0 : 1), 0);
     if (others < VOICE_CHANNEL_SOFT_CAP) return;
     this.joinGraceUntilMs = 0; // one-shot: don't let the drain tick re-bounce
-    void this.leave().then(() => {
-      // leave() reset the store to INITIAL (channelFull:false); stamp the banner
-      // now so it survives, leaving idle-phase + channelFull:true for the UI.
-      this.patch({ channelFull: true });
-    });
+    // leave() reset the store to INITIAL (channelFull:false); stamp the banner
+    // afterward so it survives, leaving idle-phase + channelFull:true for the UI.
+    // Stamp on BOTH settle paths so a rejecting leave() still surfaces the reason
+    // (and never leaks an unhandled rejection).
+    const stampFull = () => this.patch({ channelFull: true });
+    void this.leave().then(stampFull, stampFull);
   }
 }
 

@@ -356,15 +356,18 @@ export class CallSession {
   private async subscribeTransport(): Promise<void> {
     const matches = (p: unknown): boolean =>
       (p as { callId?: string }).callId === this.callId;
+    // Track each handle the instant it resolves — if the second listen() rejects,
+    // teardown still unsubscribes the first instead of leaking it.
     const unLost = await this.deps.listen('voice-transport-lost', (e) => {
       if (!matches(e.payload)) return;
       this.patch({ reconnecting: true });
     });
+    this.unlisteners.push(unLost);
     const unRestored = await this.deps.listen('voice-transport-restored', (e) => {
       if (!matches(e.payload)) return;
       this.patch({ reconnecting: false });
     });
-    this.unlisteners.push(unLost, unRestored);
+    this.unlisteners.push(unRestored);
   }
 
   /** Dismantle the media engine + leave the DM call room. Best-effort. */
