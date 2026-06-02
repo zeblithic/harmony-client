@@ -160,7 +160,7 @@
                 <div class="avatar avatar-fallback" aria-hidden="true"></div>
               {/if}
               <span class="name">{label(m)}</span>
-              {#if m.muted}<span class="mute-glyph" aria-label="muted">🔇</span>{/if}
+              {#if m.muted && !m.modMuted}<span class="mute-glyph" aria-label="muted">🔇</span>{/if}
               {#if m.modMuted}
                 <span class="mod-badge" data-testid="mod-muted-badge" title="Muted by a moderator" aria-label="muted by a moderator">🛡️🔇</span>
               {/if}
@@ -192,7 +192,7 @@
             >
               <span class="dot" class:on={m.speaking} aria-hidden="true"></span>
               <span class="name">{label(m)}</span>
-              {#if m.muted}<span class="mute-glyph" aria-label="muted">🔇</span>{/if}
+              {#if m.muted && !m.modMuted}<span class="mute-glyph" aria-label="muted">🔇</span>{/if}
               {#if m.modMuted}
                 <span class="mod-badge" data-testid="mod-muted-badge" title="Muted by a moderator" aria-label="muted by a moderator">🛡️🔇</span>
               {/if}

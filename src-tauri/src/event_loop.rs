@@ -2856,7 +2856,12 @@ pub async fn run<R: Runtime>(
                                             // ZEB-358 media-drop: resolve this frame's
                                             // sender device (last topic segment) → owner
                                             // and drop the frame if that owner is muted
-                                            // or kicked in this channel right now.
+                                            // or kicked in this channel right now. Fails
+                                            // open on an unparseable/unknown sender (not
+                                            // 32-byte hex, or not yet in the roster): such
+                                            // a frame can't carry a validly-sealed payload
+                                            // for this channel anyway, and the sender
+                                            // resolves within ~4 s once presence lands.
                                             let key = sample.key_expr().as_str();
                                             if let Some(sender_hex) = key.rsplit('/').next() {
                                                 if let Ok(dev_bytes) = hex::decode(sender_hex) {
@@ -3658,6 +3663,13 @@ pub async fn run<R: Runtime>(
                                 }
                                 Err(e) => tracing::warn!(err = ?e, "moderation directive sign failed"),
                             }
+                        } else {
+                            // Not joined to this (community, channel): no caps to
+                            // sign/seal with, so the directive can't be issued. Log
+                            // rather than drop silently.
+                            tracing::warn!(
+                                "moderate request for a channel we are not joined to; dropped"
+                            );
                         }
                     }
                 }

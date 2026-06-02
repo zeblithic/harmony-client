@@ -11788,6 +11788,13 @@ async fn set_voice_muted(
 /// `targetOwnerHex` in a community voice channel. Mints a fresh issue-time HLC so
 /// cross-moderator last-writer-wins orders by issue time, then hands off to the
 /// event loop, which re-verifies the moderator's power before broadcasting.
+///
+/// Fire-and-forget beyond input validation: authority is enforced independently
+/// by EVERY receiver (and the issuer's own loopback), so an under-powered or
+/// not-joined request is dropped with a server-side log rather than surfaced
+/// here. The UI only renders moderation controls when the client already holds
+/// sufficient power, so the unauthorized path is a rare race (power changed
+/// underneath the moderator).
 #[tauri::command]
 async fn moderate_voice(
     payload: voice::ModerateVoicePayload,
