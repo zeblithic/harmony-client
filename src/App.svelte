@@ -70,6 +70,7 @@
   } from './lib/deep-link-router';
   import UpdateAvailableToast from './lib/components/UpdateAvailableToast.svelte';
   import WelcomeModal from './lib/components/WelcomeModal.svelte';
+  import NamePromptModal from './lib/components/NamePromptModal.svelte';
   import BackupReminderBanner from './lib/components/BackupReminderBanner.svelte';
   import type { MintIpcResult, OwnerStateView } from './lib/owner-service';
   import type { StartNodeResponse } from './lib/types/onboarding';
@@ -388,6 +389,14 @@
     await publishProfileToNetwork(sanitized);
   }
 
+  // ZEB-336: persist the first-run name through the normal profile-save path
+  // (saves locally, re-seeds the self card, publishes to the network), then
+  // close the prompt.
+  async function handleNamePromptSave(name: string): Promise<void> {
+    await handleProfileSave({ ...myProfile, displayName: name });
+    showNamePrompt = false;
+  }
+
   const vineService = new VineService();
   $effect(() => () => vineService.destroy());
 
@@ -528,6 +537,9 @@
   let availableUpdate = $state<Update | null>(null);
   // ── ZEB-331: first-run welcome + feedback + about ─────────────────
   let showWelcomeModal = $state(false);
+  // ZEB-336: first-run display-name prompt, shown after onboarding when the
+  // profile name is still the "Anonymous" default.
+  let showNamePrompt = $state(false);
   // ZEB-338 / PR #169: backend-authoritative owner-identity gate. Four states
   // (see owner-gate.ts) so a start_node *failure* is never mistaken for "no
   // owner identity" — that mistake trapped returning users in the mint gate.
@@ -610,6 +622,10 @@
       avatarCid: myProfile.avatarCid,
       profilePageRoot: myProfile.profilePageRoot,
     });
+    // ZEB-336: a freshly-minted owner has no name yet — prompt for one. Skippable.
+    if (!myProfile.displayName || myProfile.displayName === 'Anonymous') {
+      showNamePrompt = true;
+    }
     // ZEB-351: build the voice session for a freshly-minted owner. The adapter
     // is wired up by the Tauri-init IIFE; if it hasn't landed yet (mint can
     // race init), the zenoh-status reconnect handler retries via the same guard.
@@ -2749,6 +2765,11 @@
      dismissable, closed by onMinted on successful mint. A start_node *failure*
      shows the startup-error overlay below instead — never this mint gate. -->
 <WelcomeModal open={showWelcomeModal} {onMinted} />
+<NamePromptModal
+  open={showNamePrompt}
+  onSave={handleNamePromptSave}
+  onSkip={() => { showNamePrompt = false; }}
+/>
 
 <!-- ZEB-338 / PR #169: startup-error overlay. When start_node fails we must not
      show the mint gate (an existing-but-unloaded identity would deadlock it),
