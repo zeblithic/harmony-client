@@ -82,6 +82,14 @@
   let confirmingKick = $state<string | null>(null);
   const askKick = (m: RosterMember) => { confirmingKick = m.deviceHex; };
   const doKick = (m: RosterMember) => { confirmingKick = null; swallow(session.moderate(m.ownerHex, 'kick')); };
+  // The kick-confirm is transient: any click outside the moderation controls
+  // cancels it, so a pending "Confirm" never lingers (Greptile P2). The kick
+  // buttons live inside `.mod-controls`, so their own clicks are excluded.
+  function onWindowClick(e: MouseEvent) {
+    if (!confirmingKick) return;
+    const t = e.target as HTMLElement | null;
+    if (!t?.closest?.('.mod-controls')) confirmingKick = null;
+  }
 
   // True while a moderator has server-muted or kicked us: the talk controls are
   // disabled (the session also blocks self-unmute defensively).
@@ -110,7 +118,7 @@
   }
 </script>
 
-<svelte:window onkeydown={onKeyDown} onkeyup={onKeyUp} onblur={onWindowBlur} />
+<svelte:window onkeydown={onKeyDown} onkeyup={onKeyUp} onblur={onWindowBlur} onclick={onWindowClick} />
 
 <section class="voice-view" aria-label="Voice channel">
   <header class="voice-header">

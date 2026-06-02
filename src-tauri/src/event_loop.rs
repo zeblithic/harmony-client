@@ -3334,10 +3334,19 @@ pub async fn run<R: Runtime>(
                             h.abort();
                         }
                         voice_self_kicked_flags.remove(&(community_id, channel_id));
-                        {
+                        // Drop this channel's enforcement state AND recompute the
+                        // global moderation-active flag in the same lock — the
+                        // channel we left may have held the only enforced
+                        // directives, so without this the atomic could stay true
+                        // and force needless per-frame lookups on later joins
+                        // (Cursor: "Leave skips moderation flag refresh").
+                        let mod_active_after_leave = {
                             let mut g = voice_moderation_map.lock().await;
                             g.remove_channel(&community_id, &channel_id);
-                        }
+                            g.any_enforced((voice_now_ms)())
+                        };
+                        voice_moderation_active
+                            .store(mod_active_after_leave, std::sync::atomic::Ordering::Relaxed);
                         voice_issuer_directives.retain(|(c, ch, _t, _m), _| {
                             !(*c == community_id && *ch == channel_id)
                         });

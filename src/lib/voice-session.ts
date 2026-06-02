@@ -537,7 +537,11 @@ export class VoiceSession {
       // On ANY transition of the silenced state, force local self-mute. On a
       // LIFT (nowSilenced=false, wasSilenced=true) this keeps the mic muted —
       // the unattended-mic guard: a server-mute lapsing must NOT auto-resume
-      // transmitting; the user opts back in explicitly.
+      // transmitting; the user opts back in explicitly. This INTENTIONALLY
+      // extends the spec's D3 guard to the kick class too: an unkick (or a
+      // kick's TTL expiry) is a reinstatement, not a presence signal, so we
+      // don't know the user is back at the mic — keep them muted until they
+      // choose to talk again (Greptile P2).
       if (nowSilenced !== wasSilenced) {
         this.forceLocalMute();
       }
