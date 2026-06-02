@@ -32,8 +32,15 @@
     void onSave(trimmed);
   }
 
-  function handleKeydown(e: KeyboardEvent) {
+  // Enter is scoped to the input only — so pressing Enter while the "Skip for
+  // now" button is focused activates Skip (its native click), not Save.
+  // (CodeRabbit, PR #180.)
+  function handleInputKeydown(e: KeyboardEvent) {
     if (e.key === 'Enter') { e.preventDefault(); handleSave(); }
+  }
+
+  // Escape anywhere in the dialog skips (this is not a hard gate).
+  function handleDialogKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape') { e.preventDefault(); onSkip(); }
   }
 </script>
@@ -48,7 +55,7 @@
       aria-modal="true"
       aria-labelledby="name-prompt-title"
       tabindex="-1"
-      onkeydown={handleKeydown}
+      onkeydown={handleDialogKeydown}
     >
       <h2 id="name-prompt-title">What should we call you?</h2>
       <p class="muted">
@@ -63,6 +70,7 @@
         bind:value={name}
         placeholder="Anonymous"
         aria-label="Display name"
+        onkeydown={handleInputKeydown}
       />
       <div class="actions">
         <button

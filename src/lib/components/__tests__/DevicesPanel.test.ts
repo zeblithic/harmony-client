@@ -310,7 +310,7 @@ describe('DevicesPanel — owner name and device label are separated (ZEB-336)',
     expect(screen.getByText('zeblith')).toBeInTheDocument();     // owner header unchanged
   });
 
-  it('defaults the device label to the OS hostname when none is stored', async () => {
+  it('defaults the device label to the OS hostname when none is stored, without persisting it', async () => {
     mockedInvoke.mockResolvedValueOnce({
       ownerId: 'a4f1', ownerDisplayName: 'zeblith',
       devices: [{
@@ -324,8 +324,11 @@ describe('DevicesPanel — owner name and device label are separated (ZEB-336)',
     (resolveDefaultDeviceLabel as ReturnType<typeof vi.fn>).mockResolvedValue('HOSTBOX');
 
     render(DevicesPanel);
-    await screen.findByText('HOSTBOX');                 // resolved hostname shown
-    expect(saveDeviceLabel).toHaveBeenCalledWith('HOSTBOX'); // persisted once
+    await screen.findByText('HOSTBOX'); // resolved hostname shown as the label
+    // The auto-default is DISPLAY-only and resolved fresh each launch — it must
+    // NOT be persisted, so a transient hostname failure can't lock in a
+    // fallback. Only a user rename persists. (CodeRabbit, PR #180.)
+    expect(saveDeviceLabel).not.toHaveBeenCalled();
   });
 });
 

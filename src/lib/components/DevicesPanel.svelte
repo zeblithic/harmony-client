@@ -58,18 +58,16 @@
     } finally {
       loading = false;
     }
-    // ZEB-336: if this device has no label yet, default it to the OS hostname
-    // (persisted once so it's stable across restarts), then re-apply overlay.
-    // Isolated from the refresh try/catch above so a hostname-resolution hiccup
-    // can never blank the already-loaded devices list via the loadError banner.
+    // ZEB-336: when this device has no user-set label, default the DISPLAY to
+    // the OS hostname, resolved FRESH each launch. NOT persisted — only a user
+    // rename (saveRename) writes the store — so a one-off hostname-resolution
+    // hiccup can never lock in the "This device" fallback. (CodeRabbit, PR #180.)
+    // Isolated from the refresh try/catch above so a hostname hiccup can't blank
+    // the already-loaded devices list via the loadError banner.
     if (!deviceLabel) {
       try {
-        const def = await resolveDefaultDeviceLabel();
-        if (def) {
-          saveDeviceLabel(def);
-          deviceLabel = def;
-          state = applyLocalOverlay(svc.state);
-        }
+        deviceLabel = await resolveDefaultDeviceLabel();
+        state = applyLocalOverlay(svc.state);
       } catch {
         // Non-fatal: keep the backend device label until the user sets one.
       }
