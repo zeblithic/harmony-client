@@ -50,7 +50,13 @@ pub struct VoiceSignal {
         deserialize_with = "crate::owner_state_types::deserialize_bytes_from_bstr"
     )]
     pub call_id: [u8; 16],
-    /// OwnerAddr of the calling party.
+    /// OwnerAddr of this signal's **sender** (the signing device's owner). For
+    /// an `Invite` that is the party initiating the call; for `Accept` /
+    /// `Decline` / `End` it is the responder. The inbound handler always uses it
+    /// to select the *sender's* cached device keys for signature verification,
+    /// so the value is correct for every kind. The Invite-only space-resolution
+    /// path also reads it as the caller — correct, since only `Invite` signals
+    /// run that path. (Field name kept as `caller` for the common Invite case.)
     #[serde(rename = "cl")]
     pub caller: OwnerAddr,
     /// Optional decline reason; only present on `Decline` signals.

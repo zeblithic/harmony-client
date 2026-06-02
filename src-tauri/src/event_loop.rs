@@ -1462,8 +1462,10 @@ pub async fn run<R: Runtime>(
     // The `JoinHandle` is bound to a `_`-prefixed run()-scope variable
     // (mirrors `_serve_handle` / `_iroh_handles_keepalive`) so the spawned
     // task survives for the lifetime of the event loop instead of being
-    // dropped (and aborted) at the end of this block.
-    let _voice_signal_sub_handle: Option<tokio::task::JoinHandle<()>> =
+    // dropped (and aborted) at the end of this block. It is explicitly aborted
+    // in the shutdown drain below (like the media subscribers) rather than left
+    // to terminate on the `closing` flag + a `recv_async` error.
+    let voice_signal_sub_handle: Option<tokio::task::JoinHandle<()>> =
         if let (Some(dm_outbox), Some(crdt_state)) = (dm_outbox.as_ref(), crdt_state.as_ref()) {
             // Snapshot self owner + derive our X25519 private once, under the
             // outbox lock, before spawning the long-lived subscriber.
@@ -3219,6 +3221,12 @@ pub async fn run<R: Runtime>(
     // detached past shutdown (emitting into a stale AppHandle or racing a
     // subsequent start_node restart that builds fresh state maps).
     for (_, handle) in dm_voice_subs.drain() {
+        handle.abort();
+    }
+    // ZEB-352: abort the always-on voice-signal subscriber too, so it can't emit
+    // signaling events into a stale AppHandle during the closing→session-close
+    // window or race a subsequent start_node restart.
+    if let Some(handle) = voice_signal_sub_handle {
         handle.abort();
     }
     let _ = session.close().await;
