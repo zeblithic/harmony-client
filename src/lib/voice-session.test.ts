@@ -124,6 +124,31 @@ describe('VoiceSession lifecycle + gate', () => {
     expect(get(s.state).pttHeld).toBe(false);
   });
 
+  it('setPttMode rolls back pttMode when the coupled setMuted fails', async () => {
+    const s = newSession();
+    await s.join('comm', 'chan');
+    d.invoke.mockRejectedValueOnce(new Error('mute refused'));
+    await expect(s.setPttMode(true)).rejects.toThrow(/refused/);
+    // Mode and mute roll back together — no "PTT on but muted" limbo.
+    expect(get(s.state).pttMode).toBe(false);
+    expect(get(s.state).muted).toBe(true);
+  });
+
+  it('setPttMode(false) failure restores pttHeld, not just pttMode', async () => {
+    const s = newSession();
+    await s.join('comm', 'chan');
+    await s.setPttMode(true); // enter PTT (unmutes)
+    s.setPttHeld(true); // user is holding the key
+    expect(get(s.state).pttHeld).toBe(true);
+    // Leaving PTT couples a setMuted(true) round-trip; make it fail.
+    d.invoke.mockRejectedValueOnce(new Error('mute refused'));
+    await expect(s.setPttMode(false)).rejects.toThrow(/refused/);
+    // Leaving PTT already forced pttHeld=false; a failed round-trip must restore
+    // BOTH mode and hold, or the gate is stranded in a state mode doesn't match.
+    expect(get(s.state).pttMode).toBe(true);
+    expect(get(s.state).pttHeld).toBe(true);
+  });
+
   it('leave returns to idle and tears down', async () => {
     const s = newSession();
     await s.join('comm', 'chan');

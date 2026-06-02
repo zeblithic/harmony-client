@@ -18,6 +18,7 @@
 
 use crate::community_membership::ChannelId;
 use crate::community_membership::ChannelInfo;
+use crate::owner_state_types::DmContentKey;
 use crate::owner_state_types::EpochKey;
 use crate::owner_state_types::Hlc;
 use crate::owner_state_types::OwnerAddr;
@@ -75,6 +76,19 @@ pub fn derive_channel_key(
     let mut out = zeroize::Zeroizing::new([0u8; 32]);
     Hkdf::<Sha256>::new(Some(&salt), mk.as_bytes())
         .expand(&info, out.as_mut())
+        .expect("32 ≤ 8160");
+    ChannelKey(*out)
+}
+
+/// HKDF-SHA256 derivation of a per-call DM voice key from the DM space's
+/// `DmContentKey`. Mirrors `derive_channel_key`: any party holding the DM
+/// content key derives the same per-call subkey from the (caller-generated)
+/// `call_id`, with no out-of-band coordination and no per-call rekey (D3 /
+/// V4 non-goals). Salt = `call_id` (per-call scope); Info = `b"voice-dm:"`.
+pub fn derive_dm_voice_key(dm_key: &DmContentKey, call_id: &[u8; 16]) -> ChannelKey {
+    let mut out = zeroize::Zeroizing::new([0u8; 32]);
+    Hkdf::<Sha256>::new(Some(&call_id[..]), dm_key.as_bytes())
+        .expand(b"voice-dm:", out.as_mut())
         .expect("32 ≤ 8160");
     ChannelKey(*out)
 }
@@ -2642,5 +2656,17 @@ mod tests {
             reloaded.manifest.segments[1].range.0.wall_ms, 200,
             "reload must sort segments ascending by range.0"
         );
+    }
+
+    #[test]
+    fn dm_voice_key_is_deterministic_and_call_scoped() {
+        let dm = crate::owner_state_types::DmContentKey::new([7u8; 32]);
+        let call_a = [1u8; 16];
+        let call_b = [2u8; 16];
+        let k_a1 = derive_dm_voice_key(&dm, &call_a);
+        let k_a2 = derive_dm_voice_key(&dm, &call_a);
+        let k_b = derive_dm_voice_key(&dm, &call_b);
+        assert_eq!(k_a1.as_bytes(), k_a2.as_bytes());
+        assert_ne!(k_a1.as_bytes(), k_b.as_bytes());
     }
 }

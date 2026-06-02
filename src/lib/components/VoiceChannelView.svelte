@@ -5,11 +5,14 @@
   // to a compact list beyond.
   import type { VoiceSession, RosterMember } from '../voice-session';
 
-  let { session, channelName, communityId, channelId }: {
+  let { session, channelName, communityId, channelId, onBeforeJoin }: {
     session: VoiceSession;
     channelName: string;
     communityId: string;
     channelId: string;
+    /** ZEB-352 D12: invoked before joining channel voice, so the app can tear
+     *  down any active DM call first (one media engine at a time). */
+    onBeforeJoin?: () => Promise<void>;
   } = $props();
 
   // Alias the store to a NON-rune name: `$state` is a Svelte 5 rune, so
@@ -31,6 +34,7 @@
     joining = true;
     error = null;
     try {
+      await onBeforeJoin?.();
       await session.join(communityId, channelId);
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);

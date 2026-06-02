@@ -15,6 +15,8 @@ use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 pub const VOICE_PACKET_AAD: &[u8] = b"harmony-voice-pkt-v1";
 /// Domain separator for sealed presence beacons.
 pub const VOICE_PRESENCE_AAD: &[u8] = b"harmony-voice-presence-v1";
+/// Domain separator for sealed DM-call voice media packets.
+pub const VOICE_DM_PACKET_AAD: &[u8] = b"harmony-voice-dm-pkt-v1";
 
 /// Upper bound on an inbound voice/presence Zenoh payload before any
 /// allocation. A sealed 20 ms voice frame (23 B header + ≤510 B Opus +
@@ -43,6 +45,15 @@ fn scope_aad(domain: &[u8], community: &SpaceId, channel: &ChannelId) -> Vec<u8>
     aad.extend_from_slice(domain);
     aad.extend_from_slice(&community.0);
     aad.extend_from_slice(&channel.0);
+    aad
+}
+
+/// AAD = domain ‖ call_id (16B). Binds every sealed DM-call packet to its
+/// domain and `call_id`, so a packet from one call can't open in another.
+fn scope_aad_dm(domain: &[u8], call_id: &[u8; 16]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(domain.len() + 16);
+    aad.extend_from_slice(domain);
+    aad.extend_from_slice(&call_id[..]);
     aad
 }
 
@@ -109,6 +120,82 @@ pub fn decrypt_voice_packet(
             Payload { msg: ct, aad: &aad },
         )
         .map_err(|_| VoiceCryptoError::OpenFailed)
+}
+
+/// Seal `plaintext` under `key` for a DM call identified by `call_id`, with
+/// a random nonce. Output: `[12B nonce][ChaCha20-Poly1305 ciphertext+tag]`.
+pub fn encrypt_dm_voice_packet(
+    key: &ChannelKey,
+    call_id: &[u8; 16],
+    domain: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, VoiceCryptoError> {
+    use chacha20poly1305::aead::OsRng;
+    use chacha20poly1305::AeadCore;
+    let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let nonce_bytes: [u8; NONCE_LEN] = nonce.into();
+    seal_inner_dm(key, call_id, domain, plaintext, nonce_bytes)
+}
+
+fn seal_inner_dm(
+    key: &ChannelKey,
+    call_id: &[u8; 16],
+    domain: &[u8],
+    plaintext: &[u8],
+    nonce_bytes: [u8; NONCE_LEN],
+) -> Result<Vec<u8>, VoiceCryptoError> {
+    let cipher = ChaCha20Poly1305::new(key.as_bytes().into());
+    let aad = scope_aad_dm(domain, call_id);
+    let ct = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| VoiceCryptoError::SealFailed)?;
+    let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// Open a DM-call packet sealed by [`encrypt_dm_voice_packet`]. Any failure
+/// (wrong key, wrong call_id, wrong domain, tamper, truncation) returns an
+/// error — callers drop silently.
+pub fn decrypt_dm_voice_packet(
+    key: &ChannelKey,
+    call_id: &[u8; 16],
+    domain: &[u8],
+    packet: &[u8],
+) -> Result<Vec<u8>, VoiceCryptoError> {
+    if packet.len() < MIN_PACKET_LEN {
+        return Err(VoiceCryptoError::TooShort(packet.len()));
+    }
+    let (nonce_bytes, ct) = packet.split_at(NONCE_LEN);
+    let cipher = ChaCha20Poly1305::new(key.as_bytes().into());
+    let aad = scope_aad_dm(domain, call_id);
+    cipher
+        .decrypt(
+            Nonce::from_slice(nonce_bytes),
+            Payload { msg: ct, aad: &aad },
+        )
+        .map_err(|_| VoiceCryptoError::OpenFailed)
+}
+
+/// Deterministic-nonce DM variant for wire-format fixtures. NEVER call from
+/// production — a fixed nonce with a reused key is catastrophic nonce reuse.
+#[cfg(any(test, feature = "test-fixtures"))]
+#[doc(hidden)]
+pub fn encrypt_dm_voice_packet_with_nonce(
+    key: &ChannelKey,
+    call_id: &[u8; 16],
+    domain: &[u8],
+    plaintext: &[u8],
+    nonce: [u8; NONCE_LEN],
+) -> Result<Vec<u8>, VoiceCryptoError> {
+    seal_inner_dm(key, call_id, domain, plaintext, nonce)
 }
 
 /// Deterministic-nonce variant for wire-format fixtures. NEVER call from
@@ -203,5 +290,43 @@ mod tests {
             .unwrap();
         assert_eq!(a, b);
         assert_eq!(&a[..NONCE_LEN], &[7u8; 12]);
+    }
+}
+
+#[cfg(test)]
+mod dm_tests {
+    use super::*;
+    use crate::community_channel_log::derive_dm_voice_key;
+    use crate::owner_state_types::DmContentKey;
+
+    fn key(call: &[u8; 16]) -> ChannelKey {
+        derive_dm_voice_key(&DmContentKey::new([9u8; 32]), call)
+    }
+
+    #[test]
+    fn dm_round_trip() {
+        let call = [3u8; 16];
+        let k = key(&call);
+        let frame = (0u8..30).collect::<Vec<_>>();
+        let sealed = encrypt_dm_voice_packet(&k, &call, VOICE_DM_PACKET_AAD, &frame).unwrap();
+        let opened = decrypt_dm_voice_packet(&k, &call, VOICE_DM_PACKET_AAD, &sealed).unwrap();
+        assert_eq!(opened, frame);
+    }
+
+    #[test]
+    fn dm_wrong_call_id_drops() {
+        let k = key(&[3u8; 16]);
+        let frame = (0u8..30).collect::<Vec<_>>();
+        let sealed = encrypt_dm_voice_packet(&k, &[3u8; 16], VOICE_DM_PACKET_AAD, &frame).unwrap();
+        assert!(decrypt_dm_voice_packet(&k, &[4u8; 16], VOICE_DM_PACKET_AAD, &sealed).is_err());
+    }
+
+    #[test]
+    fn dm_wrong_domain_drops() {
+        let call = [3u8; 16];
+        let k = key(&call);
+        let frame = (0u8..30).collect::<Vec<_>>();
+        let sealed = encrypt_dm_voice_packet(&k, &call, VOICE_DM_PACKET_AAD, &frame).unwrap();
+        assert!(decrypt_dm_voice_packet(&k, &call, VOICE_PACKET_AAD, &sealed).is_err());
     }
 }

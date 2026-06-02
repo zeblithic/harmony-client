@@ -47,6 +47,23 @@ export interface VoiceReceiverConfig {
   /** Hex-encoded local sender hash — frames from this sender are filtered
    *  out to prevent self-echo (Zenoh delivers local puts to local subscribers). */
   ownSenderHex?: string;
+  /**
+   * Tauri event the receiver subscribes to for inbound frames. Default
+   * `'voice-frame-received'` (channel voice). The DM call controller listens on
+   * `'dm-voice-frame-received'`.
+   */
+  frameEvent?: string;
+  /**
+   * Extract the raw frame bytes from an inbound event payload, or `null` to
+   * drop the event (e.g. a DM frame for a different callId). Default: pull
+   * `(payload as { frameBytes: number[] }).frameBytes`.
+   */
+  frameFilter?: (payload: unknown) => number[] | null;
+}
+
+/** Default payload→frameBytes extraction (channel voice shape). */
+function defaultFrameFilter(payload: unknown): number[] | null {
+  return (payload as { frameBytes: number[] }).frameBytes ?? null;
 }
 
 export class VoiceReceiver {
@@ -59,9 +76,13 @@ export class VoiceReceiver {
   }
 
   async init(): Promise<void> {
+    const filter = this.config.frameFilter ?? defaultFrameFilter;
     this.unlisten = await this.config.listen(
-      'voice-frame-received',
-      (event) => this.handleFrame(event.payload as { frameBytes: number[] }),
+      this.config.frameEvent ?? 'voice-frame-received',
+      (event) => {
+        const f = filter(event.payload);
+        if (f) this.handleFrame({ frameBytes: f });
+      },
     );
   }
 

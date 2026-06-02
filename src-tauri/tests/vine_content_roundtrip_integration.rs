@@ -196,6 +196,13 @@ fn spawn_event_loop(
                     follow_rx,
                     voice_rx,
                     voice_ch_rx,
+                    {
+                        // ZEB-352: voice-signal relay rx; tx dropped immediately
+                        // so the relay arm idles (not exercised in this test).
+                        let (_tx, rx) =
+                            mpsc::channel::<harmony_app::voice_signal::VoiceSignalRequest>(1);
+                        rx
+                    },
                     followed_set,
                     vine_feed_cache,
                     mail_mgr,

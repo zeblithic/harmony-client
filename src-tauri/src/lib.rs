@@ -88,6 +88,7 @@ pub mod vine_feed_cache;
 pub mod voice;
 pub mod voice_crypto;
 pub mod voice_presence;
+pub mod voice_signal;
 // ZEB-321 Phase 1 Task 5: zenoh-link::LinkUnicastTrait impl over an
 // iroh QUIC bidi stream pair. Consumed by Task 6's IrohZenohLinkManager.
 pub mod zenoh_iroh_link;
@@ -376,6 +377,10 @@ pub struct NodeState {
     voice_tx: Option<tokio::sync::mpsc::Sender<voice::VoiceOutbound>>,
     /// Channel for voice channel join/leave requests.
     voice_channel_tx: Option<tokio::sync::mpsc::Sender<voice::VoiceChannelRequest>>,
+    /// ZEB-352: channel for outbound DM-call signaling requests. The event
+    /// loop's select! arm publishes each `VoiceSignalRequest` to
+    /// `harmony/voice-signal/{callee_owner_hex}`.
+    voice_signal_tx: Option<tokio::sync::mpsc::Sender<voice_signal::VoiceSignalRequest>>,
     /// Persistent follow manager (disk-backed follow list).
     follow_mgr: Option<follows::FollowManager>,
     /// Shared set of followed addresses (read by the event loop for source tagging).
@@ -877,6 +882,7 @@ impl Default for NodeState {
             follow_tx: None,
             voice_tx: None,
             voice_channel_tx: None,
+            voice_signal_tx: None,
             follow_mgr: None,
             followed_set: None,
             vine_feed_cache: None,
@@ -1276,6 +1282,11 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         // create_community calls in this lifetime) so a restart's
         // fresh `Sender` doesn't collide with a leaked one.
         let _ = guard.community_adapter_request_tx.take();
+        // ZEB-352: drop the voice-signal relay sender. The event_loop's
+        // matching receiver gets None on next recv(); the relay arm goes
+        // dormant. Cleared even when unused so a restart's fresh Sender
+        // doesn't collide with a leaked one.
+        let _ = guard.voice_signal_tx.take();
         // ZEB-298+ZEB-312 PR 1: drop the voting-log adapter-request
         // sender. The event_loop's matching receiver gets None on next
         // recv(); the select arm exits cleanly. Cleared even when the
@@ -1794,6 +1805,11 @@ pub(crate) async fn start_node_inner(
     let (follow_tx, follow_rx) = tokio::sync::mpsc::channel(64);
     let (voice_tx, voice_rx) = tokio::sync::mpsc::channel(100);
     let (voice_channel_tx, voice_channel_rx) = tokio::sync::mpsc::channel(16);
+    // ZEB-352: DM-call signaling relay channel. The event loop's select!
+    // arm publishes each outbound `VoiceSignalRequest` to
+    // `harmony/voice-signal/{callee_owner_hex}`.
+    let (voice_signal_tx, voice_signal_rx) =
+        tokio::sync::mpsc::channel::<crate::voice_signal::VoiceSignalRequest>(64);
     let (content_verb_tx, content_verb_rx) =
         tokio::sync::mpsc::channel::<event_loop::ContentVerbRequest>(32);
     // Mail refresh channel. MailSync (constructed below once identity is
@@ -1977,6 +1993,10 @@ pub(crate) async fn start_node_inner(
         // loop. The new event loop is constructed below with a fresh
         // channel pair.
         let _ = guard.community_adapter_request_tx.take();
+        // ZEB-352: clear the previous voice-signal relay sender so it
+        // doesn't outlive the previous event loop. A fresh channel pair is
+        // constructed below.
+        let _ = guard.voice_signal_tx.take();
         // ZEB-298+ZEB-312 PR 1: clear the previous voting-log adapter-
         // request sender so it doesn't outlive the previous event loop.
         // A fresh channel pair is constructed below.
@@ -4777,6 +4797,7 @@ pub(crate) async fn start_node_inner(
                                 follow_rx,
                                 voice_rx,
                                 voice_channel_rx,
+                                voice_signal_rx,
                                 followed_set_clone,
                                 vine_feed_cache_clone,
                                 mail_mgr_clone,
@@ -4840,6 +4861,7 @@ pub(crate) async fn start_node_inner(
                         guard.follow_tx = Some(follow_tx);
                         guard.voice_tx = Some(voice_tx);
                         guard.voice_channel_tx = Some(voice_channel_tx);
+                        guard.voice_signal_tx = Some(voice_signal_tx);
                         guard.follow_mgr = Some(follow_mgr);
                         guard.followed_set = Some(followed_set);
                         guard.vine_feed_cache = Some(vine_feed_cache);
@@ -11607,7 +11629,7 @@ async fn send_voice_frame(
             .ok_or_else(|| "not connected".to_string())?
     };
     voice_tx
-        .send(voice::VoiceOutbound {
+        .send(voice::VoiceOutbound::Channel {
             community_id,
             channel_id,
             frame: payload.frame_bytes,
@@ -11796,6 +11818,400 @@ async fn get_self_voice_identity(
     )
     .map_err(|_| "device id must be 32 bytes".to_string())?;
     Ok(voice::self_voice_identity_from_vk(vk))
+}
+
+// ── ZEB-352 Voice V4: DM-call signaling + media IPCs ─────────────────────────
+
+/// Parse a 32-hex-char call-id string into a `[u8; 16]` byte array.
+/// Mirrors `parse_voice_id_16`.
+fn parse_call_id(hex: &str) -> Result<[u8; 16], String> {
+    parse_voice_id_16("callId", hex)
+}
+
+/// Resolve everything needed to send a voice signal or join a DM call from a
+/// `space_id_hex`.
+///
+/// Returns `(peer_owner, peer_x25519_pubs, dm_key, signing_key, self_owner)`.
+/// `peer_x25519_pubs` is the X25519 pub half (first 32 bytes of each 64-byte
+/// identity_pub) for EVERY enrolled device of the peer — signaling is sealed to
+/// all of the callee's devices so any one of them can open and answer the call.
+///
+/// Snapshots under the sync mutex (no await while locked), then does the
+/// async CRDT + outbox reads outside the lock.
+async fn resolve_dm_call_peer(
+    state: &std::sync::Mutex<NodeState>,
+    space_id_hex: &str,
+) -> Result<
+    (
+        crate::owner_state_types::OwnerAddr, // peer
+        Vec<[u8; 32]>,                       // peer x25519 pubs (one per device)
+        crate::owner_state_types::DmContentKey,
+        std::sync::Arc<ed25519_dalek::SigningKey>, // self device#2
+        crate::owner_state_types::OwnerAddr,       // self
+    ),
+    String,
+> {
+    // Parse space_id.
+    let space_bytes = hex::decode(space_id_hex).map_err(|e| format!("space_id hex: {e}"))?;
+    let space_arr: [u8; 16] = space_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("space_id must be 16 bytes, got {}", space_bytes.len()))?;
+    let space_id = crate::owner_state_types::SpaceId(space_arr);
+
+    // Snapshot handles under the std mutex — no await while locked.
+    let (crdt_state, dm_outbox, self_owner) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        let crdt = g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?;
+        let outbox = g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?;
+        let owner = g.dm_self_owner.ok_or("dm_self_owner missing")?;
+        (crdt, outbox, owner)
+    };
+
+    // Find the Space in OwnerState.
+    let (peer, dm_key, peer_x25519_pubs) = {
+        let os = crdt_state.lock().await;
+        let space = os
+            .spaces
+            .get(&space_id)
+            .ok_or_else(|| "dm space not found".to_string())?;
+        let dm_key = space
+            .content_key
+            .clone()
+            .ok_or_else(|| "not a dm space".to_string())?;
+        // 1:1 DM only — reject group-DM spaces, matching the inbound Invite
+        // handler's `members.len() == 2` guard. Without this a group-DM spaceId
+        // would resolve an arbitrary non-self member and seal the call to them
+        // under that group's content key.
+        if space.members.len() != 2 {
+            return Err("not a 1:1 dm space".to_string());
+        }
+        // Find the single member that is not self.
+        let peer = space
+            .members
+            .iter()
+            .find(|m| **m != self_owner)
+            .copied()
+            .ok_or_else(|| "no peer in dm space".to_string())?;
+        // Resolve the peer's X25519 pub for EVERY enrolled device. Signal
+        // delivery is owner-scoped (harmony/voice-signal/{owner}), so a signal
+        // sealed to a single device can only be opened by that one device —
+        // every other device of the callee would get ciphertext it can't
+        // decrypt. We fan out one sealed envelope per device (see
+        // send_voice_signal), mirroring the inbound verifier which already
+        // tries every cached device pub for the caller.
+        // Layout: [0..32] = X25519 pub, [32..64] = Ed25519 pub.
+        let mut peer_x25519_pubs: Vec<[u8; 32]> = os
+            .owner_device_cache
+            .devices
+            .get(&peer)
+            .map(|entry| {
+                entry
+                    .device_identity_pubs
+                    .iter()
+                    .filter_map(|p| *p)
+                    .map(|identity_pub| {
+                        let mut x = [0u8; 32];
+                        x.copy_from_slice(&identity_pub[..32]);
+                        x
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Dedup identical device pubs (defensive — entries should be unique).
+        peer_x25519_pubs.sort_unstable();
+        peer_x25519_pubs.dedup();
+        if peer_x25519_pubs.is_empty() {
+            return Err("peer key unknown".to_string());
+        }
+        (peer, dm_key, peer_x25519_pubs)
+    };
+
+    // Clone the community signing key from dm_outbox.
+    let signing_key = dm_outbox.lock().await.community_signing_key.clone();
+
+    Ok((peer, peer_x25519_pubs, dm_key, signing_key, self_owner))
+}
+
+/// Inner helper: resolve peer, build, sign, seal, and send a `VoiceSignal`.
+/// Used by all 5 signaling IPCs; `place_call` calls this after generating
+/// the call_id.
+async fn send_voice_signal(
+    state: &std::sync::Mutex<NodeState>,
+    space_id: &str,
+    kind: crate::voice_signal::VoiceSignalKind,
+    call_id: [u8; 16],
+    reason: Option<crate::voice_signal::DeclineReason>,
+) -> Result<(), String> {
+    let (peer, peer_x25519_pubs, _dm_key, signing_key, self_owner) =
+        resolve_dm_call_peer(state, space_id).await?;
+
+    let signal = crate::voice_signal::VoiceSignal {
+        kind,
+        call_id,
+        caller: self_owner,
+        decline_reason: reason,
+    };
+
+    let voice_signal_tx = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.voice_signal_tx
+            .clone()
+            .ok_or_else(|| "voice signal not running".to_string())?
+    };
+
+    // Fan out: seal the signal once per enrolled callee device and enqueue one
+    // envelope each on the owner-scoped signaling topic. Any device that is
+    // online + subscribed can then open its own envelope and surface/answer the
+    // call. All share the same callee_owner_hex (the topic is per-owner).
+    let callee_owner_hex = hex::encode(peer.0);
+    for peer_x25519_pub in &peer_x25519_pubs {
+        let sealed =
+            crate::voice_signal::build_sealed_signal(&signal, &signing_key, peer_x25519_pub)
+                .map_err(|e| format!("seal signal: {e}"))?;
+        voice_signal_tx
+            .send(crate::voice_signal::VoiceSignalRequest {
+                callee_owner_hex: callee_owner_hex.clone(),
+                sealed,
+            })
+            .await
+            .map_err(|_| "event loop not running".to_string())?;
+    }
+    Ok(())
+}
+
+/// ZEB-352: initiate a 1:1 DM voice call. Generates a random 16-byte
+/// call-id, sends an `Invite` signal to the peer, and returns the
+/// call-id hex to the frontend for correlation.
+#[tauri::command]
+async fn place_call(
+    space_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<String, String> {
+    use rand::RngCore;
+    let mut call_id = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut call_id);
+    send_voice_signal(
+        &state,
+        &space_id,
+        crate::voice_signal::VoiceSignalKind::Invite,
+        call_id,
+        None,
+    )
+    .await?;
+    Ok(hex::encode(call_id))
+}
+
+/// ZEB-352: accept an incoming DM voice call.
+#[tauri::command]
+async fn accept_call(
+    call_id: String,
+    space_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let call = parse_call_id(&call_id)?;
+    send_voice_signal(
+        &state,
+        &space_id,
+        crate::voice_signal::VoiceSignalKind::Accept,
+        call,
+        None,
+    )
+    .await
+}
+
+/// ZEB-352: decline an incoming DM voice call.
+#[tauri::command]
+async fn decline_call(
+    call_id: String,
+    space_id: String,
+    reason: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    use crate::voice_signal::DeclineReason;
+    let call = parse_call_id(&call_id)?;
+    let dr = match reason.as_str() {
+        "busy" => DeclineReason::Busy,
+        "timeout" => DeclineReason::Timeout,
+        _ => DeclineReason::User,
+    };
+    send_voice_signal(
+        &state,
+        &space_id,
+        crate::voice_signal::VoiceSignalKind::Decline,
+        call,
+        Some(dr),
+    )
+    .await
+}
+
+/// ZEB-352: cancel an outgoing DM voice call (caller-side abort).
+#[tauri::command]
+async fn cancel_call(
+    call_id: String,
+    space_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let call = parse_call_id(&call_id)?;
+    send_voice_signal(
+        &state,
+        &space_id,
+        crate::voice_signal::VoiceSignalKind::Cancel,
+        call,
+        None,
+    )
+    .await
+}
+
+/// ZEB-352: end an active DM voice call.
+#[tauri::command]
+async fn end_call(
+    call_id: String,
+    space_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let call = parse_call_id(&call_id)?;
+    send_voice_signal(
+        &state,
+        &space_id,
+        crate::voice_signal::VoiceSignalKind::End,
+        call,
+        None,
+    )
+    .await
+}
+
+/// ZEB-352: join a 1:1 DM voice call media session. Derives the per-call
+/// `K_voice` from the DM content key + call-id and sends a
+/// `VoiceChannelRequest::JoinDmCall` to the event loop.
+#[tauri::command]
+async fn join_dm_call(
+    call_id: String,
+    space_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let call = parse_call_id(&call_id)?;
+
+    let (peer, _peer_x25519_pubs, dm_key, signing_key, self_owner) =
+        resolve_dm_call_peer(&state, &space_id).await?;
+    let _ = peer; // not needed for media join
+
+    // Snapshot voice_channel_tx + device fields.
+    let (voice_channel_tx, device_hex, self_device, hlc_tracker) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        let tx = guard
+            .voice_channel_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?;
+        let device_hex = guard
+            .dm_device_id
+            .clone()
+            .ok_or_else(|| "no device id".to_string())?;
+        let self_device = <[u8; 32]>::try_from(
+            hex::decode(&device_hex)
+                .map_err(|_| "device id not hex".to_string())?
+                .as_slice(),
+        )
+        .map_err(|_| "device id must be 32 bytes".to_string())?;
+        let hlc_tracker = guard
+            .hlc_tracker
+            .clone()
+            .ok_or_else(|| "no hlc tracker".to_string())?;
+        (tx, device_hex, self_device, hlc_tracker)
+    };
+
+    // Derive the per-call voice key.
+    let k_voice = crate::community_channel_log::derive_dm_voice_key(&dm_key, &call);
+
+    // Reserve the join HLC.
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let joined_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_hex, wall_now_ms).await;
+
+    voice_channel_tx
+        .send(voice::VoiceChannelRequest::JoinDmCall {
+            call_id: call,
+            caps: voice::VoiceJoinCaps {
+                channel_key: std::sync::Arc::new(k_voice),
+                signing_key,
+                self_owner,
+                self_device,
+                joined_hlc,
+            },
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())
+}
+
+/// ZEB-352: leave an active DM voice call media session.
+#[tauri::command]
+async fn leave_dm_call(
+    call_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let call = parse_call_id(&call_id)?;
+    let tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .voice_channel_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    tx.send(voice::VoiceChannelRequest::LeaveDmCall { call_id: call })
+        .await
+        .map_err(|_| "event loop not running".to_string())
+}
+
+/// ZEB-352: send a voice frame on an active DM call.
+#[tauri::command]
+async fn send_dm_voice_frame(
+    payload: voice::SendDmVoiceFramePayload,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let call = parse_call_id(&payload.call_id)?;
+    let voice_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .voice_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    voice_tx
+        .send(voice::VoiceOutbound::Dm {
+            call_id: call,
+            frame: payload.frame_bytes,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())
+}
+
+/// ZEB-352: flip the mute flag for an active DM call.
+#[tauri::command]
+async fn set_dm_call_muted(
+    payload: voice::SetDmCallMutedPayload,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let call = parse_call_id(&payload.call_id)?;
+    let tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .voice_channel_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    tx.send(voice::VoiceChannelRequest::SetDmCallMuted {
+        call_id: call,
+        muted: payload.muted,
+    })
+    .await
+    .map_err(|_| "event loop not running".to_string())
 }
 
 #[cfg(test)]
@@ -32386,6 +32802,16 @@ pub fn run() {
             leave_voice_channel,
             set_voice_muted,
             get_self_voice_identity,
+            // ZEB-352 Voice V4: DM-call signaling + media IPCs.
+            place_call,
+            accept_call,
+            decline_call,
+            cancel_call,
+            end_call,
+            join_dm_call,
+            leave_dm_call,
+            send_dm_voice_frame,
+            set_dm_call_muted,
             send_mail,
             list_mail,
             get_mail,
@@ -32581,6 +33007,16 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         dfrost_request_vrf_beacon,
         dfrost_contribute_threshold_sign,
         dfrost_propose_refresh,
+        // ZEB-352 Voice V4: DM-call signaling + media IPCs.
+        place_call,
+        accept_call,
+        decline_call,
+        cancel_call,
+        end_call,
+        join_dm_call,
+        leave_dm_call,
+        send_dm_voice_frame,
+        set_dm_call_muted,
     ])
 }
 
@@ -35815,6 +36251,7 @@ mod start_node_race_tests {
             follow_tx: None,
             voice_tx: None,
             voice_channel_tx: None,
+            voice_signal_tx: None,
             follow_mgr: None,
             followed_set: None,
             vine_feed_cache: None,

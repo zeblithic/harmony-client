@@ -351,6 +351,10 @@ pub async fn run<R: Runtime>(
     mut follow_rx: mpsc::Receiver<FollowRequest>,
     mut voice_rx: mpsc::Receiver<crate::voice::VoiceOutbound>,
     mut voice_channel_rx: mpsc::Receiver<crate::voice::VoiceChannelRequest>,
+    // ZEB-352: outbound DM-call signaling relay receiver. The select! arm
+    // publishes each `VoiceSignalRequest` to
+    // `harmony/voice-signal/{callee_owner_hex}`.
+    mut voice_signal_rx: mpsc::Receiver<crate::voice_signal::VoiceSignalRequest>,
     followed_set: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     vine_feed_cache: std::sync::Arc<std::sync::Mutex<crate::vine_feed_cache::VineFeedCache>>,
     mail_mgr: std::sync::Arc<std::sync::Mutex<crate::mail::MailManager>>,
@@ -1443,6 +1447,203 @@ pub async fn run<R: Runtime>(
         });
     }
 
+    // ── ZEB-352: always-on DM-call signaling subscriber ──────────────
+    // Subscribe to our OWN owner-scoped signaling topic so inbound
+    // Invite/Accept/Decline/Cancel/End signals can be opened, verified,
+    // and surfaced to the frontend as call events. Gated on the owner
+    // identity being loaded at run() start (mirrors the dm_outbox /
+    // crdt_state shape used by the DM machinery): we need (a) the
+    // device-#2 signing key + self_owner from `dm_outbox`, and (b) the
+    // `OwnerDeviceCache` (inside `crdt_state`) to resolve the caller's
+    // identity_pub for signature verification. v1 requires the identity to
+    // exist at startup; a node that adopts an identity later picks up the
+    // subscription on the next start_node.
+    //
+    // The `JoinHandle` is bound to a `_`-prefixed run()-scope variable
+    // (mirrors `_serve_handle` / `_iroh_handles_keepalive`) so the spawned
+    // task survives for the lifetime of the event loop instead of being
+    // dropped (and aborted) at the end of this block. It is explicitly aborted
+    // in the shutdown drain below (like the media subscribers) rather than left
+    // to terminate on the `closing` flag + a `recv_async` error.
+    let voice_signal_sub_handle: Option<tokio::task::JoinHandle<()>> =
+        if let (Some(dm_outbox), Some(crdt_state)) = (dm_outbox.as_ref(), crdt_state.as_ref()) {
+            // Snapshot self owner + derive our X25519 private once, under the
+            // outbox lock, before spawning the long-lived subscriber.
+            let (self_owner_hex, self_x25519_priv) = {
+                let g = dm_outbox.lock().await;
+                let hex = hex::encode(g.self_owner.0);
+                let x_priv = crate::dm_signing::ed25519_priv_to_x25519(&g.community_signing_key);
+                (hex, x_priv)
+            };
+            let key_expr = format!("harmony/voice-signal/{self_owner_hex}");
+            let session_for_signal = Arc::clone(&session_arc);
+            let crdt_for_signal = Arc::clone(crdt_state);
+            let app_for_signal = app.clone();
+            let closing_for_signal = Arc::clone(&closing);
+            let signal_handle = tokio::spawn(async move {
+                let mut backoff = std::time::Duration::from_secs(5);
+                const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+                loop {
+                    if closing_for_signal.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let sub = match session_for_signal.declare_subscriber(&key_expr).await {
+                        Ok(s) => {
+                            backoff = std::time::Duration::from_secs(5);
+                            s
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                %key_expr,
+                                error = %e,
+                                backoff_s = backoff.as_secs(),
+                                "voice signal declare_subscriber failed; retrying after backoff"
+                            );
+                            tokio::time::sleep(backoff).await;
+                            backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+                            continue;
+                        }
+                    };
+                    loop {
+                        match sub.recv_async().await {
+                            Ok(sample) => {
+                                // The signaling topic is peer-writable, so bound
+                                // the payload BEFORE allocating: a sealed signal
+                                // is a few hundred bytes; cap well above that so
+                                // one oversized sample can't force an unbounded
+                                // heap allocation ahead of peek_caller's reject.
+                                const MAX_VOICE_SIGNAL_BYTES: usize = 8 * 1024;
+                                if sample.payload().len() > MAX_VOICE_SIGNAL_BYTES {
+                                    tracing::warn!(
+                                        size = sample.payload().len(),
+                                        max = MAX_VOICE_SIGNAL_BYTES,
+                                        "oversized voice signal dropped"
+                                    );
+                                    continue;
+                                }
+                                let sealed = sample.payload().to_bytes().to_vec();
+                                // Open + decode the sealed box ONCE. The box is
+                                // sealed to our X25519 key (identical for every
+                                // candidate device), so we open here and only
+                                // re-verify the Ed25519 signature per candidate
+                                // below — never re-opening. The decoded caller is
+                                // unverified until verify_decoded_signal binds the
+                                // signature to a cached identity.
+                                let signed = match crate::voice_signal::open_and_decode_unverified(
+                                    &self_x25519_priv,
+                                    &sealed,
+                                ) {
+                                    Ok(s) => s,
+                                    Err(_) => continue,
+                                };
+                                let caller = signed.body.caller;
+                                // Collect ALL cached identity pubs for the
+                                // caller — Harmony is multi-device, so the
+                                // caller may have signed with any enrolled
+                                // device. Try each until one verifies.
+                                let candidate_pubs: Vec<[u8; 64]> = {
+                                    let g = crdt_for_signal.lock().await;
+                                    g.owner_device_cache
+                                        .devices
+                                        .get(&caller)
+                                        .map(|entry| {
+                                            entry
+                                                .device_identity_pubs
+                                                .iter()
+                                                .filter_map(|p| *p)
+                                                .collect()
+                                        })
+                                        .unwrap_or_default()
+                                };
+                                let mut emitted = false;
+                                for identity_pub in candidate_pubs {
+                                    let Some(device_hash) =
+                                        crate::dm_signing::derive_device_hash_from_identity_pub(
+                                            &identity_pub,
+                                        )
+                                    else {
+                                        continue;
+                                    };
+                                    if let Ok(signal) = crate::voice_signal::verify_decoded_signal(
+                                        &signed,
+                                        &identity_pub,
+                                        device_hash,
+                                    ) {
+                                        if matches!(
+                                            signal.kind,
+                                            crate::voice_signal::VoiceSignalKind::Invite
+                                        ) {
+                                            // Resolve the shared DM space for this caller so the
+                                            // frontend can pass spaceId to accept_call/decline_call.
+                                            let space_hex = {
+                                                let g = crdt_for_signal.lock().await;
+                                                g.spaces.iter().find_map(|(sid, sp)| {
+                                                    // Match the 1:1 DM space with this caller only.
+                                                    // `members.len() == 2` excludes group-DM spaces
+                                                    // (which also have a content_key and include the
+                                                    // caller) — the send side likewise assumes a
+                                                    // 2-member DM (resolve_dm_call_peer).
+                                                    if sp.content_key.is_some()
+                                                        && sp.members.len() == 2
+                                                        && sp.members.contains(&signal.caller)
+                                                    {
+                                                        Some(hex::encode(sid.0))
+                                                    } else {
+                                                        None
+                                                    }
+                                                })
+                                            };
+                                            match space_hex {
+                                                Some(ref sh) => {
+                                                    emit_voice_signal_event(
+                                                        &app_for_signal,
+                                                        &signal,
+                                                        Some(sh.as_str()),
+                                                    );
+                                                }
+                                                None => {
+                                                    // No shared DM space with the caller — callee
+                                                    // cannot service this invite; drop silently.
+                                                    tracing::debug!(
+                                                        caller = %hex::encode(signal.caller.0),
+                                                        "voice Invite dropped: no shared DM space"
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                            emit_voice_signal_event(&app_for_signal, &signal, None);
+                                        }
+                                        emitted = true;
+                                        break;
+                                    }
+                                }
+                                let _ = emitted;
+                            }
+                            Err(_) => {
+                                if !closing_for_signal.load(Ordering::SeqCst) {
+                                    tracing::warn!(
+                                        %key_expr,
+                                        "voice signal subscriber closed; reconnecting"
+                                    );
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    if closing_for_signal.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    // Brief pause before re-declaring on mid-session failure.
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            });
+            // Hand the handle back as the block's tail value so the run()-scope
+            // binding keeps the task alive (vs. dropping it here, which aborts).
+            Some(signal_handle)
+        } else {
+            None
+        };
+
     // ── ZEB-343: content-serve queryable ─────────────────────────
     // Answer peer content GETs from the local StorageTier cache. The
     // lookup closure routes through CasOp::GetLocal so the read happens
@@ -1737,6 +1938,18 @@ pub async fn run<R: Runtime>(
             crate::community_membership::ChannelId,
         ),
         std::sync::Arc<std::sync::atomic::AtomicU64>,
+    > = std::collections::HashMap::new();
+
+    // ZEB-352: DM call state — keyed by 16-byte call_id. No presence (2-party implicit).
+    let mut dm_voice_subs: std::collections::HashMap<[u8; 16], tokio::task::JoinHandle<()>> =
+        std::collections::HashMap::new();
+    let mut dm_voice_keys: std::collections::HashMap<
+        [u8; 16],
+        std::sync::Arc<crate::community_channel_log::ChannelKey>,
+    > = std::collections::HashMap::new();
+    let mut dm_voice_mute_flags: std::collections::HashMap<
+        [u8; 16],
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
     > = std::collections::HashMap::new();
 
     // ZEB-350: presence layer. One shared roster map for the loop's
@@ -2408,34 +2621,70 @@ pub async fn run<R: Runtime>(
             // Await directly instead of spawning per-frame tasks — preserves
             // ordering and applies natural backpressure from Zenoh.
             Some(voice) = voice_rx.recv() => {
-                // ZEB-350: seal the whole frame (header + payload) under the
-                // per-(community, channel) ChannelKey, then publish to an
-                // own-device-named topic segment. Sender routing now lives in
-                // the topic, not the cleartext header.
-                if let Some(key) = voice_keys.get(&(voice.community_id, voice.channel_id)) {
-                    let own = voice_own_device.as_deref().unwrap_or("self");
-                    match crate::voice_crypto::encrypt_voice_packet(
-                        key,
-                        &voice.community_id,
-                        &voice.channel_id,
-                        crate::voice_crypto::VOICE_PACKET_AAD,
-                        &voice.frame,
-                    ) {
-                        Ok(sealed) => {
-                            let key_expr = format!(
-                                "harmony/voice/{}/{}/{}",
-                                hex::encode(voice.community_id.0),
-                                hex::encode(voice.channel_id.0),
-                                own,
-                            );
-                            if let Err(e) = session.put(&key_expr, sealed).await {
-                                tracing::warn!(%key_expr, err = %e, "voice publish failed");
+                match voice {
+                    crate::voice::VoiceOutbound::Channel { community_id, channel_id, frame } => {
+                        // ZEB-350: seal the whole frame (header + payload) under the
+                        // per-(community, channel) ChannelKey, then publish to an
+                        // own-device-named topic segment. Sender routing now lives in
+                        // the topic, not the cleartext header.
+                        if let Some(key) = voice_keys.get(&(community_id, channel_id)) {
+                            let own = voice_own_device.as_deref().unwrap_or("self");
+                            match crate::voice_crypto::encrypt_voice_packet(
+                                key,
+                                &community_id,
+                                &channel_id,
+                                crate::voice_crypto::VOICE_PACKET_AAD,
+                                &frame,
+                            ) {
+                                Ok(sealed) => {
+                                    let key_expr = format!(
+                                        "harmony/voice/{}/{}/{}",
+                                        hex::encode(community_id.0),
+                                        hex::encode(channel_id.0),
+                                        own,
+                                    );
+                                    if let Err(e) = session.put(&key_expr, sealed).await {
+                                        tracing::warn!(%key_expr, err = %e, "voice publish failed");
+                                    }
+                                }
+                                Err(e) => tracing::warn!(err = %e, "voice seal failed; dropping frame"),
                             }
                         }
-                        Err(e) => tracing::warn!(err = %e, "voice seal failed; dropping frame"),
+                        // else: not joined to that (community, channel) — drop.
+                    }
+                    // ZEB-352: DM call outbound — seal under the per-call K_voice and
+                    // publish to harmony/voice/dm/{callId}/{own}.
+                    crate::voice::VoiceOutbound::Dm { call_id, frame } => {
+                        // Server-side mute enforcement: SetDmCallMuted flips this
+                        // flag; honor it here so a muted call never emits sealed
+                        // audio even if the frontend gate misbehaves (defense in
+                        // depth — the talk-gate also withholds frames). The flag
+                        // starts `true` (start-muted, D10) until the user unmutes;
+                        // a MISSING entry defaults to muted too, so a frame racing
+                        // JoinDmCall can never leak audio (start-muted semantics).
+                        let muted = dm_voice_mute_flags
+                            .get(&call_id)
+                            .map(|f| f.load(std::sync::atomic::Ordering::SeqCst))
+                            .unwrap_or(true);
+                        if muted {
+                            continue;
+                        }
+                        if let Some(key) = dm_voice_keys.get(&call_id) {
+                            let own = voice_own_device.as_deref().unwrap_or("self");
+                            match crate::voice_crypto::encrypt_dm_voice_packet(
+                                key, &call_id, crate::voice_crypto::VOICE_DM_PACKET_AAD, &frame,
+                            ) {
+                                Ok(sealed) => {
+                                    let key_expr = format!("harmony/voice/dm/{}/{}", hex::encode(call_id), own);
+                                    if let Err(e) = session.put(&key_expr, sealed).await {
+                                        tracing::warn!(%key_expr, err = %e, "dm voice publish failed");
+                                    }
+                                }
+                                Err(e) => tracing::warn!(err = %e, "dm voice seal failed; dropping frame"),
+                            }
+                        }
                     }
                 }
-                // else: not joined to that (community, channel) — drop.
             }
 
             // ── Voice channel join/leave ────────────────────────────
@@ -2706,6 +2955,96 @@ pub async fn run<R: Runtime>(
                             }
                         }
                     }
+                    // ── ZEB-352: DM call lifecycle ────────────────────────
+                    crate::voice::VoiceChannelRequest::JoinDmCall { call_id, caps } => {
+                        let sub_key = format!("harmony/voice/dm/{}/*", hex::encode(call_id));
+                        let key_for_sub = std::sync::Arc::clone(&caps.channel_key);
+                        let app_sub = app.clone();
+                        let closing_sub = closing.clone();
+                        let call_hex = hex::encode(call_id);
+                        let own_device_hex = hex::encode(caps.self_device);
+                        if voice_own_device.is_none() {
+                            voice_own_device = Some(own_device_hex.clone());
+                        }
+                        match session.declare_subscriber(&sub_key).await {
+                            Ok(sub) => {
+                                let handle = tokio::spawn(async move {
+                                    while let Ok(sample) = sub.recv_async().await {
+                                        // Skip our own published frames: on a 2-party
+                                        // DM the `.../*` sub also matches our own
+                                        // {senderDevice} segment, and decrypting +
+                                        // emitting them just to have the frontend drop
+                                        // them by sender hash wastes CPU on the audio
+                                        // hot path (self is ~half of DM traffic).
+                                        if sample.key_expr().as_str().rsplit('/').next()
+                                            == Some(own_device_hex.as_str())
+                                        {
+                                            continue;
+                                        }
+                                        if sample.payload().len() > crate::voice_crypto::MAX_VOICE_PACKET_BYTES {
+                                            continue;
+                                        }
+                                        let sealed = sample.payload().to_bytes().to_vec();
+                                        if let Ok(frame) = crate::voice_crypto::decrypt_dm_voice_packet(
+                                            &key_for_sub,
+                                            &call_id,
+                                            crate::voice_crypto::VOICE_DM_PACKET_AAD,
+                                            &sealed,
+                                        ) {
+                                            let _ = app_sub.emit(
+                                                "dm-voice-frame-received",
+                                                serde_json::json!({
+                                                    "callId": call_hex,
+                                                    "frameBytes": frame,
+                                                }),
+                                            );
+                                        }
+                                    }
+                                    if !closing_sub.load(std::sync::atomic::Ordering::SeqCst) {
+                                        tracing::warn!("dm voice subscriber closed unexpectedly");
+                                    }
+                                });
+                                dm_voice_keys.insert(call_id, caps.channel_key);
+                                dm_voice_mute_flags.insert(
+                                    call_id,
+                                    std::sync::Arc::new(AtomicBool::new(true)),
+                                );
+                                // Abort any prior subscriber for this call_id —
+                                // HashMap::insert returns the old handle, and
+                                // merely dropping it detaches (doesn't stop) the
+                                // task, which would double-emit remote frames on
+                                // a rejoin until shutdown.
+                                if let Some(old) = dm_voice_subs.insert(call_id, handle) {
+                                    old.abort();
+                                }
+                            }
+                            Err(e) => tracing::warn!(err = %e, "dm voice subscribe failed"),
+                        }
+                    }
+                    crate::voice::VoiceChannelRequest::LeaveDmCall { call_id } => {
+                        dm_voice_mute_flags.remove(&call_id);
+                        dm_voice_keys.remove(&call_id);
+                        if let Some(handle) = dm_voice_subs.remove(&call_id) {
+                            handle.abort();
+                        }
+                    }
+                    crate::voice::VoiceChannelRequest::SetDmCallMuted { call_id, muted } => {
+                        if let Some(flag) = dm_voice_mute_flags.get(&call_id) {
+                            flag.store(muted, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                }
+            }
+
+            // ── ZEB-352: outbound DM-call signaling relay ─────
+            // Each resolved `VoiceSignalRequest` (sealed by the IPC seam)
+            // is published to the callee's owner-scoped signaling topic.
+            // Fire-and-forget: a publish failure is logged but doesn't
+            // tear down the loop (the frontend retries via timeout).
+            Some(req) = voice_signal_rx.recv() => {
+                let key_expr = format!("harmony/voice-signal/{}", req.callee_owner_hex);
+                if let Err(e) = session.put(&key_expr, req.sealed).await {
+                    tracing::warn!(%key_expr, err = %e, "voice signal publish failed");
                 }
             }
 
@@ -2878,8 +3217,65 @@ pub async fn run<R: Runtime>(
     for (_, handle) in voice_presence_pubs.drain() {
         handle.abort();
     }
+    // ZEB-352: abort the DM-call media subscriber tasks too, so they don't run
+    // detached past shutdown (emitting into a stale AppHandle or racing a
+    // subsequent start_node restart that builds fresh state maps).
+    for (_, handle) in dm_voice_subs.drain() {
+        handle.abort();
+    }
+    // ZEB-352: abort the always-on voice-signal subscriber too, so it can't emit
+    // signaling events into a stale AppHandle during the closing→session-close
+    // window or race a subsequent start_node restart.
+    if let Some(handle) = voice_signal_sub_handle {
+        handle.abort();
+    }
     let _ = session.close().await;
     tracing::info!("event loop stopped");
+}
+
+/// ZEB-352: map a verified inbound `VoiceSignal` to the matching frontend
+/// event and emit it. The call state machine lives in the frontend; this
+/// only translates the transport-level signal into a Tauri event with the
+/// hex-encoded call-ID (and caller / decline reason where applicable).
+fn emit_voice_signal_event<R: Runtime>(
+    app: &AppHandle<R>,
+    signal: &crate::voice_signal::VoiceSignal,
+    space_id_hex: Option<&str>,
+) {
+    use crate::voice_signal::{DeclineReason, VoiceSignalKind};
+    let call_hex = hex::encode(signal.call_id);
+    match signal.kind {
+        VoiceSignalKind::Invite => {
+            let _ = app.emit(
+                "incoming-call",
+                serde_json::json!({
+                    "callId": call_hex,
+                    "callerOwner": hex::encode(signal.caller.0),
+                    "spaceId": space_id_hex,
+                }),
+            );
+        }
+        VoiceSignalKind::Accept => {
+            let _ = app.emit("call-accepted", serde_json::json!({ "callId": call_hex }));
+        }
+        VoiceSignalKind::Decline => {
+            let reason = match signal.decline_reason {
+                Some(DeclineReason::User) | None => "user",
+                Some(DeclineReason::Busy) => "busy",
+                Some(DeclineReason::Timeout) => "timeout",
+            };
+            let _ = app.emit(
+                "call-declined",
+                serde_json::json!({ "callId": call_hex, "reason": reason }),
+            );
+        }
+        VoiceSignalKind::Cancel => {
+            let _ = app.emit("call-canceled", serde_json::json!({ "callId": call_hex }));
+        }
+        VoiceSignalKind::End => {
+            let _ = app.emit("call-ended", serde_json::json!({ "callId": call_hex }));
+        }
+    }
 }
 
 /// ZEB-227 Path B Task 11: handle a single `RuntimeAction`, peeling off

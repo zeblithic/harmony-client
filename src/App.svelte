@@ -30,6 +30,8 @@
   import CommunityView from './lib/components/CommunityView.svelte';
   import LibraryDirectoryBrowser from './lib/components/LibraryDirectoryBrowser.svelte';
   import ToastHost from './lib/components/ToastHost.svelte';
+  import IncomingCallToast from './lib/components/IncomingCallToast.svelte';
+  import CallInProgressBar from './lib/components/CallInProgressBar.svelte';
   import { VotingAdapter } from './lib/voting-adapter';
   import { setupDelegateOnBehalfToast } from './lib/voting-toast-wiring';
   import { LibraryDirectoryService } from './lib/library-directory-service';
@@ -71,6 +73,9 @@
   import type { StartNodeResponse } from './lib/types/onboarding';
   import { MemberCardService } from './lib/member-card-service';
   import { getVoiceSession, type VoiceSession } from './lib/voice-session';
+  import { getCallSession, type CallSession } from './lib/call-session';
+  import { toastStore } from './lib/stores/toast';
+  import { get } from 'svelte/store';
   import { classifyOwnerIdentity, type OwnerIdentityState } from './lib/owner-gate';
   import { trapFocus } from './lib/focus-trap';
   import HelpMenuButton from './lib/components/HelpMenuButton.svelte';
@@ -114,6 +119,43 @@
   // must be built exactly once.
   let voiceSessionInit = false;
 
+  // ── ZEB-352 Voice V4: 1:1 DM calls ────────────────────────────────
+  // The app-lifetime singleton CallSession, built alongside voiceSession from
+  // the same identity + adapter deps. Drives the global incoming-call toast and
+  // the in-call bar. null until buildVoiceSession() resolves.
+  let callSession = $state<CallSession | null>(null);
+  // Incoming-call banner model. Set when an `incoming-call` event lands AND the
+  // session actually entered the 'incoming' phase (not busy-auto-declined);
+  // cleared whenever the call leaves that phase (accepted / declined / canceled).
+  let incomingCall = $state<{ callId: string; spaceId: string; callerName: string; callerAvatarUrl?: string } | null>(null);
+  // Unsubscribe for the callSession.state subscription that clears the toast;
+  // torn down on unmount via fileManagerService.addUnlisten.
+  let callStateUnsub: (() => void) | null = null;
+
+  /** Fire-and-forget: swallow a (possibly async) result so a click handler never
+   *  surfaces an unhandled rejection. Mirrors VoiceChannelView's `swallow`. */
+  const swallow = (p: unknown) => { void Promise.resolve(p).catch(() => {}); };
+
+  /** D12 one-active-session coordinator: if a channel voice session is currently
+   *  connected, leave it before entering a DM call, so the two media engines
+   *  never run at once. */
+  async function leaveOtherVoiceThen<T>(fn: () => Promise<T>): Promise<T> {
+    if (voiceSession && get(voiceSession.state).phase === 'connected') {
+      await voiceSession.leave().catch(() => {});
+    }
+    // D12: also end an in-progress DM call before starting/answering another, so
+    // a DM→DM transition doesn't hit "a call is already in progress". 'incoming'
+    // is excluded — the accept path runs in that phase and must NOT tear down
+    // the very call it's about to answer.
+    if (callSession) {
+      const p = get(callSession.state).phase;
+      if (p === 'ringingOut' || p === 'connecting' || p === 'active') {
+        await callSession.end().catch(() => {});
+      }
+    }
+    return fn();
+  }
+
   /** ZEB-351: typed wrapper for the get_self_voice_identity IPC.
    *  Returns the 64-hex device verifying key + the 16-byte sender hash the
    *  voice engine stamps into outbound packet headers. */
@@ -152,6 +194,31 @@
         onRosterOwners: (ownerHexes: string[]) => {
           void memberCardService.subscribeVisible(ownerHexes);
         },
+      });
+      // ZEB-352: build the DM-call session from the same identity + adapter deps
+      // (getCallSession is a singleton, so reconnect re-runs are no-ops). The
+      // remote-event listeners are wired in the Tauri-init block once this is up.
+      callSession = getCallSession({
+        invoke,
+        listen,
+        selfOwnerHex,
+        selfDeviceHex: deviceVkHex,
+        senderHash: new Uint8Array(senderHash),
+        resolveCard: (ownerHex: string) => {
+          const card = resolveCard(ownerHex);
+          if (!card) return undefined;
+          return {
+            displayName: card.displayName,
+            ...(card.avatarUrl ? { avatarUrl: card.avatarUrl } : {}),
+          };
+        },
+      });
+      // Clear the incoming-call banner whenever the call leaves the 'incoming'
+      // phase (accepted, declined, canceled, or busy-rejected). Subscribed once;
+      // the unsubscribe is registered for unmount cleanup below.
+      callStateUnsub?.();
+      callStateUnsub = callSession.state.subscribe((s) => {
+        if (s.phase !== 'incoming') incomingCall = null;
       });
     } catch (err) {
       // Allow a retry on a later trigger (reconnect) if the IPC wasn't ready.
@@ -1285,6 +1352,68 @@
         });
       });
       fileManagerService.addUnlisten(unlistenMemberCard);
+
+      // ── ZEB-352 Voice V4: DM-call signaling listeners ───────────────
+      // The backend emits these once per call-state transition; route each into
+      // the CallSession state machine (built lazily in buildVoiceSession, so
+      // guard with `callSession?.`). Each handler is callId-guarded inside the
+      // session, so stale events for an old call can't disturb a current one.
+      const unlistenIncomingCall = await listen('incoming-call', (event) => {
+        const p = (event as { payload: { callId: string; callerOwner: string; spaceId: string } }).payload;
+        callSession?.onIncoming(p.callId, p.callerOwner, p.spaceId);
+        // Only raise the banner if we actually entered 'incoming' (a busy session
+        // auto-declines with reason 'busy' and stays put — no banner then).
+        if (callSession && get(callSession.state).phase === 'incoming') {
+          const card = resolveCard(p.callerOwner);
+          incomingCall = {
+            callId: p.callId,
+            spaceId: p.spaceId,
+            callerName: card?.displayName ?? p.callerOwner.slice(0, 8),
+            ...(card?.avatarUrl ? { callerAvatarUrl: card.avatarUrl } : {}),
+          };
+        }
+      });
+      fileManagerService.addUnlisten(unlistenIncomingCall);
+
+      const unlistenCallAccepted = await listen('call-accepted', (event) => {
+        const p = (event as { payload: { callId: string } }).payload;
+        void callSession?.onRemoteAccepted(p.callId);
+      });
+      fileManagerService.addUnlisten(unlistenCallAccepted);
+
+      const unlistenCallDeclined = await listen('call-declined', (event) => {
+        const p = (event as { payload: { callId: string; reason: string } }).payload;
+        // Only surface a toast when the decline targets the call we're actually
+        // ringing out on — a delayed decline for an old call must not pop "No
+        // answer"/"Call declined" over an unrelated, later session. Capture the
+        // match BEFORE onRemoteDeclined resets the state machine to idle.
+        const isActiveCall = !!callSession && get(callSession.state).callId === p.callId;
+        callSession?.onRemoteDeclined(p.callId, p.reason);
+        if (!isActiveCall) return;
+        const msg = p.reason === 'busy'
+          ? 'User is on another call'
+          : p.reason === 'timeout'
+            ? 'No answer'
+            : 'Call declined';
+        toastStore.show(msg);
+      });
+      fileManagerService.addUnlisten(unlistenCallDeclined);
+
+      const unlistenCallCanceled = await listen('call-canceled', (event) => {
+        const p = (event as { payload: { callId: string } }).payload;
+        callSession?.onRemoteCanceled(p.callId);
+      });
+      fileManagerService.addUnlisten(unlistenCallCanceled);
+
+      const unlistenCallEnded = await listen('call-ended', (event) => {
+        const p = (event as { payload: { callId: string } }).payload;
+        void callSession?.onRemoteEnded(p.callId);
+      });
+      fileManagerService.addUnlisten(unlistenCallEnded);
+
+      // Tear down the callSession.state subscription (set in buildVoiceSession)
+      // on unmount, alongside the listeners.
+      fileManagerService.addUnlisten(() => { callStateUnsub?.(); callStateUnsub = null; });
     } catch (err) {
       console.warn('[harmony-client] Tauri init failed:', err);
     }
@@ -1860,6 +1989,25 @@
 -->
 <ToastHost />
 
+<!--
+  ZEB-352 Voice V4: the global DM-call surfaces. The incoming-call banner and
+  the in-call bar live at the app root (above Layout) so a call is reachable
+  regardless of which view is active. Both are gated on the lazily-built
+  callSession. `accept()` takes the spaceId carried in the incoming-call event.
+-->
+{#if callSession}
+  <IncomingCallToast
+    {incomingCall}
+    onAccept={() => {
+      // accept() uses the spaceId pinned by onIncoming() — guard only on there
+      // being an incoming call to acknowledge.
+      if (incomingCall) swallow(leaveOtherVoiceThen(() => callSession!.accept()));
+    }}
+    onDecline={() => swallow(callSession!.decline('user'))}
+  />
+  <CallInProgressBar session={callSession} onEnd={() => swallow(callSession!.end())} />
+{/if}
+
 <BackupStalenessWarning onExportRequested={handleExportRequested} />
 
 <Layout {collapsed} {showSettings} mode={appMode} mailSelected={selectedMailCid !== null}>
@@ -1992,6 +2140,13 @@
         {unsubscribeCards}
         onOpenCard={openMemberCard}
         {voiceSession}
+        onBeforeVoiceJoin={async () => {
+          // ZEB-352 D12 (reverse): tear down an active DM call before joining
+          // channel voice, so the two media engines never run concurrently.
+          if (callSession && get(callSession.state).phase !== 'idle') {
+            await callSession.end().catch(() => {});
+          }
+        }}
       />
     {:else}
       <TextFeed
@@ -1999,6 +2154,8 @@
         {collapsed}
         channelName={activeChannelName}
         channelType={activeChannelType}
+        channelId={activeChannel}
+        onStartCall={(spaceId) => { if (callSession) swallow(leaveOtherVoiceThen(() => callSession!.placeCall(spaceId))); }}
         onMediaClick={scrollToMedia}
         onSend={handleSend}
         onAvatarClick={handleAvatarClick}

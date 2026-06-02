@@ -1,17 +1,27 @@
-//! ZEB-350 Voice V2 wire-format pins. Locks the sealed voice-packet framing
-//! (and the signed+sealed presence beacon). A drift here means
-//! the on-the-wire format changed — bump the version domain and re-pin
+//! ZEB-350 Voice V2 / ZEB-352 Voice V4 wire-format pins. Locks the sealed
+//! voice-packet framing (and the signed+sealed presence beacon). A drift here
+//! means the on-the-wire format changed — bump the version domain and re-pin
 //! deliberately, never silently.
 #![cfg(feature = "test-fixtures")]
 
-use harmony_app::community_channel_log::derive_channel_key;
+use ed25519_dalek::SigningKey;
+use harmony_app::community_channel_log::{derive_channel_key, derive_dm_voice_key};
 use harmony_app::community_membership::ChannelId;
-use harmony_app::owner_state_types::{EpochKey, Hlc, SpaceId};
-use harmony_app::voice_crypto::{encrypt_voice_packet_with_nonce, VOICE_PACKET_AAD};
+use harmony_app::dm_signing::{
+    derive_device_hash_from_identity_pub, sign_dm_packet, verify_dm_packet_signature,
+};
+use harmony_app::owner_state_types::{
+    DeviceIdentityHash, DmContentKey, EpochKey, Hlc, OwnerAddr, SpaceId,
+};
+use harmony_app::voice_crypto::{
+    encrypt_dm_voice_packet_with_nonce, encrypt_voice_packet_with_nonce, VOICE_DM_PACKET_AAD,
+    VOICE_PACKET_AAD,
+};
 use harmony_app::voice_presence::{
     open_presence_beacon, seal_presence_beacon_with_nonce, sign_presence_beacon,
     SignedVoicePresenceBeacon, VoicePresenceBeacon,
 };
+use harmony_app::voice_signal::{SignedVoiceSignal, VoiceSignal, VoiceSignalKind};
 
 #[test]
 fn voice_packet_wire_bytes_pinned() {
@@ -84,4 +94,108 @@ fn presence_beacon_wire_bytes_pinned() {
     let opened = open_presence_beacon(&key, &SpaceId([0xc0; 16]), &ChannelId([0xc1; 16]), &sealed)
         .expect("open pinned beacon");
     assert_eq!(opened, signed, "pinned beacon decoded to a different value");
+}
+
+/// Pin the DM voice-packet wire format. A drift here means the AEAD
+/// framing or AAD construction changed — re-pin deliberately.
+#[test]
+fn dm_voice_packet_wire_bytes_pinned() {
+    let k = derive_dm_voice_key(&DmContentKey::new([0x11; 32]), &[0x22u8; 16]);
+    let frame: Vec<u8> = (0u8..30).collect();
+    let sealed = encrypt_dm_voice_packet_with_nonce(
+        &k,
+        &[0x22u8; 16],
+        VOICE_DM_PACKET_AAD,
+        &frame,
+        [0u8; 12],
+    )
+    .expect("seal DM voice packet");
+    assert_eq!(
+        hex::encode(&sealed),
+        "000000000000000000000000cd09efe51676e64ad943d44c33fbb6725e68212e87f719879d5f5b1147459b32d7e0bb54f49c35ae7499d9c6a27e",
+        "DM voice-packet wire format drifted"
+    );
+}
+
+/// Build the caller identity (SigningKey + identity_pub + DeviceIdentityHash)
+/// from a fixed seed byte, using the same HKDF derivation as
+/// `PrivateIdentity::from_seed` in harmony-identity.
+///
+/// This is bit-identical to the `make_caller_identity` helper in
+/// `voice_signal.rs`'s tests; replicated here so the integration test has no
+/// coupling to private test helpers.
+fn fixture_caller_identity(seed_byte: u8) -> (SigningKey, [u8; 64], DeviceIdentityHash) {
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+    let seed = [seed_byte; 32];
+    let private = harmony_identity::PrivateIdentity::from_seed(&seed);
+    let public = private.public_identity();
+    let identity_pub = public.to_public_bytes();
+    let device_hash = DeviceIdentityHash(public.address_hash);
+
+    // Derive the signing key via HKDF — bit-identical to PrivateIdentity::sign.
+    let hk = Hkdf::<Sha256>::new(None, &seed);
+    let mut ed_arr = [0u8; 32];
+    hk.expand(b"harmony-identity-ed25519-v1", &mut ed_arr)
+        .expect("HKDF 32 bytes always succeeds");
+    let signing_key = SigningKey::from_bytes(&ed_arr);
+
+    (signing_key, identity_pub, device_hash)
+}
+
+/// Pin the signed inner CBOR of a voice-signal Invite. Because the envelope
+/// uses an ephemeral X25519 key it is non-deterministic; instead we pin the
+/// `SignedVoiceSignal` CBOR directly — that is fully deterministic for a
+/// fixed signing key + body. A drift here means either the CBOR field-key
+/// renaming or the Ed25519 signing path changed.
+///
+/// The pinned bytes are also verified end-to-end with
+/// `verify_dm_packet_signature`, so the fixture is meaningful rather than an
+/// opaque byte blob.
+#[test]
+fn voice_signal_invite_signed_inner_wire_bytes_pinned() {
+    // Build a deterministic signing identity from seed 0x42.
+    let (signing_key, identity_pub, device_hash) = fixture_caller_identity(0x42);
+
+    // Construct the VoiceSignal body.
+    let body = VoiceSignal {
+        kind: VoiceSignalKind::Invite,
+        call_id: [0x22; 16],
+        caller: OwnerAddr([0x33; 16]),
+        decline_reason: None,
+    };
+
+    // Canonical-CBOR encode the body (replicate voice_signal::canonical_cbor inline).
+    let mut body_bytes = Vec::new();
+    ciborium::into_writer(&body, &mut body_bytes)
+        .expect("CBOR serialize VoiceSignal: infallible for well-typed values");
+
+    // Sign with device-#2 key.
+    let sig = sign_dm_packet(&body_bytes, &signing_key);
+
+    // Build SignedVoiceSignal and encode as canonical CBOR.
+    let signed = SignedVoiceSignal { body, sig };
+    let mut signed_bytes = Vec::new();
+    ciborium::into_writer(&signed, &mut signed_bytes)
+        .expect("CBOR serialize SignedVoiceSignal: infallible for well-typed values");
+
+    // Assert the pinned hex value.
+    assert_eq!(
+        hex::encode(&signed_bytes),
+        "a2626264a3616b66696e76697465626369502222222222222222222222222222222262636c5033333333333333333333333333333333627367584054b358000dd6c00fe0614b13bcf707df035a330f1031d93b5423d56124748b55c35f831c13dcc16440c53be125be52df9acb80d01c9c17a4225d6cde2cb6a10f",
+        "SignedVoiceSignal signed-inner CBOR wire format drifted"
+    );
+
+    // Verify round-trip: the pinned bytes must verify with the matching
+    // identity_pub + device_hash, proving the fixture is self-consistent.
+    verify_dm_packet_signature(&body_bytes, &sig, &identity_pub, device_hash)
+        .expect("SignedVoiceSignal: signature must verify with matching identity");
+
+    // Verify the device_hash round-trips through derive_device_hash_from_identity_pub.
+    let derived_hash =
+        derive_device_hash_from_identity_pub(&identity_pub).expect("identity_pub must be valid");
+    assert_eq!(
+        derived_hash, device_hash,
+        "device_hash must match derived value"
+    );
 }

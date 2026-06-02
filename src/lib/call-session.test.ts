@@ -1,0 +1,329 @@
+// src/lib/call-session.test.ts
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { get } from 'svelte/store';
+import { CallSession } from './call-session';
+
+function deps() {
+  const invoke = vi.fn().mockResolvedValue(undefined);
+  const listeners = new Map<string, ((e: { payload: unknown }) => void)[]>();
+  const listen = vi.fn(async (ev: string, h: (e: { payload: unknown }) => void) => {
+    (listeners.get(ev) ?? listeners.set(ev, []).get(ev)!).push(h);
+    return () => {};
+  });
+  const emit = (ev: string, payload: unknown) =>
+    (listeners.get(ev) ?? []).forEach((h) => h({ payload }));
+  // Capture the frameGate the controller hands to its sender.
+  let capturedGate: ((pcm: Float32Array) => { send: boolean; ptt: boolean }) | undefined;
+  const sender = {
+    start: vi.fn(async () => {}), stop: vi.fn(async () => {}),
+    __setGate: (g: never) => { capturedGate = g; },
+  };
+  const receiver = { init: vi.fn(async () => {}), destroy: vi.fn(), getActiveSenders: () => [], isSpeaking: () => false };
+  const mixer = { init: vi.fn(async () => {}), pushFrame: vi.fn(), drain: vi.fn(), setDeafened: vi.fn(), destroy: vi.fn(async () => {}) };
+  return {
+    invoke, listen, emit,
+    getGate: () => capturedGate,
+    factories: {
+      makeSender: (gate: (pcm: Float32Array) => { send: boolean; ptt: boolean }) => { sender.__setGate(gate as never); return sender as never; },
+      makeReceiver: () => receiver as never,
+      makeMixer: () => mixer as never,
+    },
+    sender, receiver, mixer,
+  };
+}
+
+/** First arg-object of the most recent invoke(cmd, args) call for `cmd`. */
+function lastArgsFor(invoke: ReturnType<typeof vi.fn>, cmd: string): Record<string, unknown> | undefined {
+  for (let i = invoke.mock.calls.length - 1; i >= 0; i--) {
+    if (invoke.mock.calls[i][0] === cmd) return invoke.mock.calls[i][1] as Record<string, unknown>;
+  }
+  return undefined;
+}
+
+describe('CallSession DM signaling', () => {
+  let d: ReturnType<typeof deps>;
+  beforeEach(() => { d = deps(); });
+
+  function newSession() {
+    return new CallSession({
+      invoke: d.invoke, listen: d.listen,
+      selfOwnerHex: 'aa'.repeat(16), selfDeviceHex: 'bb'.repeat(16),
+      senderHash: new Uint8Array(16),
+      ...d.factories,
+    });
+  }
+
+  it('placeCall → ringingOut, invokes place_call, returns the callId', async () => {
+    d.invoke.mockImplementation(async (cmd: string) =>
+      cmd === 'place_call' ? 'call-xyz' : undefined);
+    const s = newSession();
+    const callId = await s.placeCall('space-1');
+    expect(callId).toBe('call-xyz');
+    expect(get(s.state).phase).toBe('ringingOut');
+    expect(get(s.state).callId).toBe('call-xyz');
+    expect(get(s.state).peerOwnerHex).toBeNull();
+    expect(d.invoke).toHaveBeenCalledWith('place_call', { spaceId: 'space-1' });
+  });
+
+  it('incoming invite → incoming; accept invokes accept_call + join_dm_call, connects muted', async () => {
+    const s = newSession();
+    s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
+    expect(get(s.state).phase).toBe('incoming');
+    expect(get(s.state).peerOwnerHex).toBe('cc'.repeat(16));
+
+    await s.accept();
+    expect(get(s.state).phase).toBe('active');
+    expect(get(s.state).muted).toBe(true); // starts muted (D10)
+    expect(d.invoke).toHaveBeenCalledWith('accept_call', { callId: 'call-1', spaceId: 'space-1' });
+    expect(d.invoke).toHaveBeenCalledWith('join_dm_call', { callId: 'call-1', spaceId: 'space-1' });
+    // Media engine built.
+    expect(d.sender.start).toHaveBeenCalled();
+    expect(d.receiver.init).toHaveBeenCalled();
+    expect(d.mixer.init).toHaveBeenCalled();
+    // Muted gate transmits nothing.
+    expect(d.getGate()!(new Float32Array(320)).send).toBe(false);
+  });
+
+  it('decline on an incoming invite invokes decline_call(user) and resets to idle', async () => {
+    const s = newSession();
+    s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
+    await s.decline('user');
+    expect(get(s.state).phase).toBe('idle');
+    expect(get(s.state).callId).toBeNull();
+    expect(d.invoke).toHaveBeenCalledWith('decline_call',
+      { callId: 'call-1', spaceId: 'space-1', reason: 'user' });
+  });
+
+  it('busy: onIncoming while active auto-declines with reason busy and leaves the active call untouched', async () => {
+    const s = newSession();
+    // Establish an active call first.
+    s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
+    await s.accept();
+    expect(get(s.state).phase).toBe('active');
+    d.invoke.mockClear();
+
+    // A second invite arrives while busy.
+    s.onIncoming('call-2', 'dd'.repeat(16), 'space-2');
+    // Phase unchanged; original call still active.
+    expect(get(s.state).phase).toBe('active');
+    expect(get(s.state).callId).toBe('call-1');
+    expect(d.invoke).toHaveBeenCalledWith('decline_call',
+      { callId: 'call-2', spaceId: 'space-2', reason: 'busy' });
+  });
+
+  it('caller cancel before answer invokes cancel_call and resets', async () => {
+    d.invoke.mockImplementation(async (cmd: string) =>
+      cmd === 'place_call' ? 'call-9' : undefined);
+    const s = newSession();
+    await s.placeCall('space-1');
+    expect(get(s.state).phase).toBe('ringingOut');
+    await s.cancel();
+    expect(get(s.state).phase).toBe('idle');
+    expect(d.invoke).toHaveBeenCalledWith('cancel_call', { callId: 'call-9', spaceId: 'space-1' });
+  });
+
+  it('onRemoteAccepted (caller) → active + join_dm_call', async () => {
+    d.invoke.mockImplementation(async (cmd: string) =>
+      cmd === 'place_call' ? 'call-7' : undefined);
+    const s = newSession();
+    await s.placeCall('space-1');
+    await s.onRemoteAccepted('call-7');
+    expect(get(s.state).phase).toBe('active');
+    expect(get(s.state).muted).toBe(true);
+    expect(d.invoke).toHaveBeenCalledWith('join_dm_call', { callId: 'call-7', spaceId: 'space-1' });
+    expect(d.sender.start).toHaveBeenCalled();
+  });
+
+  it('onRemoteAccepted ignores a mismatched callId', async () => {
+    d.invoke.mockImplementation(async (cmd: string) =>
+      cmd === 'place_call' ? 'call-7' : undefined);
+    const s = newSession();
+    await s.placeCall('space-1');
+    await s.onRemoteAccepted('call-OTHER');
+    expect(get(s.state).phase).toBe('ringingOut'); // unchanged
+    expect(d.sender.start).not.toHaveBeenCalled();
+  });
+
+  it('onRemoteDeclined surfaces the reason and resets the caller', async () => {
+    d.invoke.mockImplementation(async (cmd: string) =>
+      cmd === 'place_call' ? 'call-7' : undefined);
+    const s = newSession();
+    await s.placeCall('space-1');
+    s.onRemoteDeclined('call-7', 'busy');
+    expect(get(s.state).phase).toBe('idle');
+    expect(get(s.state).endReason).toBe('busy');
+  });
+
+  it('onRemoteEnded tears down (leave_dm_call) and resets to idle', async () => {
+    const s = newSession();
+    s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
+    await s.accept();
+    expect(get(s.state).phase).toBe('active');
+
+    await s.onRemoteEnded('call-1');
+    expect(get(s.state).phase).toBe('idle');
+    expect(d.invoke).toHaveBeenCalledWith('leave_dm_call', { callId: 'call-1' });
+    expect(d.sender.stop).toHaveBeenCalled();
+    expect(d.receiver.destroy).toHaveBeenCalled();
+    expect(d.mixer.destroy).toHaveBeenCalled();
+  });
+
+  it('end tears down media + invokes end_call and leave_dm_call', async () => {
+    const s = newSession();
+    s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
+    await s.accept();
+    await s.end();
+    expect(get(s.state).phase).toBe('idle');
+    expect(d.invoke).toHaveBeenCalledWith('end_call', { callId: 'call-1', spaceId: 'space-1' });
+    expect(d.invoke).toHaveBeenCalledWith('leave_dm_call', { callId: 'call-1' });
+  });
+
+  it('destroy() tears down live media + timers and resets to idle', async () => {
+    const s = newSession();
+    s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
+    await s.accept();
+    expect(get(s.state).phase).toBe('active');
+    s.destroy();
+    expect(get(s.state).phase).toBe('idle');
+    expect(d.sender.stop).toHaveBeenCalled();
+    expect(d.receiver.destroy).toHaveBeenCalled();
+    expect(d.mixer.destroy).toHaveBeenCalled();
+  });
+
+  it('wires the receiver to the dm-voice-frame-received event, callId-filtered', async () => {
+    // Use the REAL receiver factory (no makeReceiver override) so we can assert
+    // the default DM wiring (frameEvent + frameFilter) the controller sets.
+    const realDeps = deps();
+    const s = new CallSession({
+      invoke: realDeps.invoke, listen: realDeps.listen,
+      selfOwnerHex: 'aa'.repeat(16), selfDeviceHex: 'bb'.repeat(16),
+      senderHash: new Uint8Array(16),
+      // Only stub sender + mixer; let the receiver be the real VoiceReceiver.
+      makeSender: realDeps.factories.makeSender,
+      makeMixer: realDeps.factories.makeMixer,
+    });
+    s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
+    await s.accept();
+    // The real receiver subscribed to the DM event, not the channel one.
+    expect(realDeps.listen).toHaveBeenCalledWith('dm-voice-frame-received', expect.any(Function));
+    expect(realDeps.listen).not.toHaveBeenCalledWith('voice-frame-received', expect.any(Function));
+  });
+
+  it('the sender publishFrame routes through send_dm_voice_frame by callId', async () => {
+    // Real sender so we can drive a captured frame through publishFrame.
+    const realDeps = deps();
+    const captures: { onFrame?: (pcm: Float32Array) => void } = {};
+    const codec = {
+      codecType: 'opus' as const, init: vi.fn(async () => {}),
+      encode: () => new Uint8Array([1, 2, 3]), decode: () => new Float32Array(0), destroy: vi.fn(),
+    };
+    const capture = {
+      start: vi.fn(async (cb: (pcm: Float32Array) => void) => { captures.onFrame = cb; }),
+      stop: vi.fn(async () => {}), isActive: () => true,
+    };
+    // Patch the module's default sender by injecting a makeSender that builds a
+    // real VoiceSender with our fake codec/capture + the DM publishFrame.
+    const { VoiceSender } = await import('./voice/voice-sender');
+    const s = new CallSession({
+      invoke: realDeps.invoke, listen: realDeps.listen,
+      selfOwnerHex: 'aa'.repeat(16), selfDeviceHex: 'bb'.repeat(16),
+      senderHash: new Uint8Array(16),
+      makeReceiver: realDeps.factories.makeReceiver,
+      makeMixer: realDeps.factories.makeMixer,
+      makeSender: (gate) => new VoiceSender({
+        senderHash: new Uint8Array(16), communityId: '', channelId: '',
+        invoke: realDeps.invoke, codec: codec as never, capture: capture as never,
+        frameGate: gate,
+        publishFrame: (frameBytes) =>
+          realDeps.invoke('send_dm_voice_frame', {
+            payload: { callId: 'call-1', frameBytes },
+          }),
+      }),
+    });
+    s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
+    await s.accept();
+    await s.setMuted(false); // open the gate
+    captures.onFrame!(new Float32Array(320).fill(0.2)); // loud → sent
+    const args = lastArgsFor(realDeps.invoke, 'send_dm_voice_frame');
+    expect(args).toBeDefined();
+    // The Tauri command takes a single `payload` struct (snake_case Rust side):
+    // the frame fields must be wrapped, not passed top-level (ZEB-352 review).
+    const payload = (args as { payload: { callId: string; frameBytes: number[] } }).payload;
+    expect(payload.callId).toBe('call-1');
+    expect(Array.isArray(payload.frameBytes)).toBe(true);
+  });
+
+  it('setMuted rolls back local state when set_dm_call_muted rejects', async () => {
+    const s = newSession();
+    s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
+    await s.accept();
+    d.invoke.mockRejectedValueOnce(new Error('backend refused'));
+    await expect(s.setMuted(false)).rejects.toThrow(/refused/);
+    // Local gate + store must NOT advertise unmuted when the backend stayed muted.
+    expect(get(s.state).muted).toBe(true);
+    expect(d.getGate()!(new Float32Array(320)).send).toBe(false);
+  });
+
+  it('setPttMode rolls back pttMode when the coupled setMuted fails (ZEB-351)', async () => {
+    const s = newSession();
+    s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
+    await s.accept();
+    d.invoke.mockRejectedValueOnce(new Error('mute refused'));
+    await expect(s.setPttMode(true)).rejects.toThrow(/refused/);
+    // Mode and mute roll back together — no "PTT on but muted" limbo.
+    expect(get(s.state).pttMode).toBe(false);
+    expect(get(s.state).muted).toBe(true);
+  });
+
+  it('setPttMode(false) failure restores pttHeld, not just pttMode (ZEB-352 review)', async () => {
+    const s = newSession();
+    s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
+    await s.accept();
+    await s.setPttMode(true); // enter PTT (unmutes)
+    s.setPttHeld(true); // user is holding the key
+    expect(get(s.state).pttHeld).toBe(true);
+    // Leaving PTT couples a setMuted(true) round-trip; make it fail.
+    d.invoke.mockRejectedValueOnce(new Error('mute refused'));
+    await expect(s.setPttMode(false)).rejects.toThrow(/refused/);
+    // Leaving PTT already forced pttHeld=false; a failed round-trip must restore
+    // BOTH mode and hold, or the gate is stranded in a state mode doesn't match.
+    expect(get(s.state).pttMode).toBe(true);
+    expect(get(s.state).pttHeld).toBe(true);
+  });
+});
+
+describe('CallSession ring timeout', () => {
+  let d: ReturnType<typeof deps>;
+  beforeEach(() => { vi.useFakeTimers(); d = deps(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  function newSession() {
+    return new CallSession({
+      invoke: d.invoke, listen: d.listen,
+      selfOwnerHex: 'aa'.repeat(16), selfDeviceHex: 'bb'.repeat(16),
+      senderHash: new Uint8Array(16),
+      ...d.factories,
+    });
+  }
+
+  it('auto-declines an unanswered incoming call after 30s with reason timeout', async () => {
+    const s = newSession();
+    s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
+    expect(get(s.state).phase).toBe('incoming');
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(get(s.state).phase).toBe('idle');
+    expect(d.invoke).toHaveBeenCalledWith('decline_call',
+      { callId: 'call-1', spaceId: 'space-1', reason: 'timeout' });
+  });
+
+  it('accepting before the timeout cancels the auto-decline', async () => {
+    const s = newSession();
+    s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
+    await s.accept();
+    d.invoke.mockClear();
+    await vi.advanceTimersByTimeAsync(30_000);
+    // No decline fired after accept cleared the ring timer.
+    expect(d.invoke).not.toHaveBeenCalledWith('decline_call', expect.anything());
+    expect(get(s.state).phase).toBe('active');
+  });
+});

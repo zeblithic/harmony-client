@@ -1,6 +1,7 @@
 // src/lib/voice-session.ts
 import { writable, get, type Readable } from 'svelte/store';
 import { VoiceActivityDetector } from './voice/vad';
+import { makeTalkGate } from './voice/talk-gate';
 import { VoiceSender } from './voice/voice-sender';
 import { VoiceReceiver } from './voice/voice-receiver';
 import { VoiceMixer } from './voice/voice-mixer';
@@ -117,19 +118,29 @@ export class VoiceSession {
     this.deps = deps;
     this.state = this.store;
     this.vad = new VoiceActivityDetector({ threshold: deps.vadThreshold ?? 0.02 });
+    // Built here (not as a field initializer) so `this.vad` is already assigned.
+    this.coreGate = makeTalkGate(
+      () => ({ muted: this.muted || this.deafened, pttMode: this.pttMode, pttHeld: this.pttHeld }),
+      this.vad,
+    );
   }
 
   private patch(p: Partial<VoiceSessionState>): void {
     this.store.update((s) => ({ ...s, ...p }));
   }
 
-  /** The per-frame send decision (mute / PTT / VAD). */
+  /**
+   * The per-frame send decision (mute / PTT / VAD). The core muted / PTT / VAD
+   * logic lives in the shared `makeTalkGate` (so the DM CallSession can't drift
+   * from it); here we fold deafen into the muted bit (deafen implies self-mute)
+   * and layer the self-speaking side-effect that drives the roster's speaking
+   * indicator on top of the pure result.
+   */
+  private coreGate: FrameGate;
   private gate: FrameGate = (pcm) => {
-    if (this.muted || this.deafened) { this.setSelfSpeaking(false); return { send: false, ptt: false }; }
-    if (this.pttMode) { this.setSelfSpeaking(this.pttHeld); return { send: this.pttHeld, ptt: true }; }
-    const speaking = this.vad.process(pcm);
-    this.setSelfSpeaking(speaking);
-    return { send: speaking, ptt: speaking };
+    const decision = this.coreGate(pcm);
+    this.setSelfSpeaking(decision.send);
+    return decision;
   };
 
   private setSelfSpeaking(v: boolean): void {
@@ -250,10 +261,24 @@ export class VoiceSession {
    * `set_voice_muted`.
    */
   async setPttMode(on: boolean): Promise<void> {
+    const prevMode = this.pttMode;
+    const prevHeld = this.pttHeld;
     this.pttMode = on;
     this.patch({ pttMode: on });
     if (!on) this.setPttHeld(false);
-    await this.setMuted(!on);
+    try {
+      await this.setMuted(!on);
+    } catch (err) {
+      // The coupled mute toggle was rejected by the backend (setMuted already
+      // rolled its own muted state back). Roll BOTH mode and hold back: turning
+      // PTT off already forced pttHeld=false above, so without restoring it a
+      // failed round-trip would strand the gate in a hold state the rolled-back
+      // mode doesn't match.
+      this.pttMode = prevMode;
+      this.pttHeld = prevHeld;
+      this.patch({ pttMode: prevMode, pttHeld: prevHeld });
+      throw err;
+    }
   }
 
   setPttHeld(held: boolean): void {

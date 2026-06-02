@@ -15,9 +15,11 @@
     collapsed = false,
     channelName = 'general',
     channelType = 'channel',
+    channelId = '',
     onMediaClick,
     onSend,
     onAvatarClick,
+    onStartCall,
     trustService,
     trustVersion = 0,
     threadRoot = null,
@@ -36,9 +38,14 @@
     collapsed?: boolean;
     channelName?: string;
     channelType?: 'channel' | 'dm' | 'group-chat';
+    /** The space/channel id for this feed. Used to initiate a DM call. */
+    channelId?: string;
     onMediaClick?: (mediaId: string) => void;
     onSend?: (text: string, priority: MessagePriority) => void;
     onAvatarClick?: (address: string, event: MouseEvent) => void;
+    /** ZEB-352: invoked when the user clicks "Call" in the DM header. Only
+     *  rendered when channelType === 'dm'. */
+    onStartCall?: (spaceId: string) => void;
     trustService?: TrustService;
     trustVersion?: number;
     threadRoot?: Message | null;
@@ -136,6 +143,19 @@
   onmouseleave={handleDragEnd}
 >
   <div class="main-section" style={showThreadPanel ? `flex: 0 0 ${splitPercent}%` : ''}>
+    {#if channelType === 'dm'}
+      <div class="dm-header">
+        <span class="dm-name">{channelName}</span>
+        <button
+          type="button"
+          class="btn-call"
+          aria-label="Start call"
+          onclick={() => onStartCall?.(channelId)}
+        >
+          📞 Call
+        </button>
+      </div>
+    {/if}
     <FloatingThreadBar
       {threadMeta}
       {pinnedThreadIds}
@@ -213,6 +233,39 @@
     display: flex;
     flex-direction: column;
     height: 100%;
+  }
+
+  .dm-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 1rem;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .dm-name {
+    flex: 1;
+    font-weight: 600;
+    font-size: 0.95rem;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .btn-call {
+    border: 1px solid var(--border);
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    padding: 4px 12px;
+    border-radius: 4px;
+    font-size: 0.85rem;
+    cursor: pointer;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .btn-call:hover {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
   }
 
   .main-section {
