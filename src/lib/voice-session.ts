@@ -1,5 +1,5 @@
 // src/lib/voice-session.ts
-import { writable, type Readable } from 'svelte/store';
+import { writable, get, type Readable } from 'svelte/store';
 import { VoiceActivityDetector } from './voice/vad';
 import { VoiceSender } from './voice/voice-sender';
 import { VoiceReceiver } from './voice/voice-receiver';
@@ -34,12 +34,44 @@ type Invoke = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
 type Listen = (ev: string, h: (e: { payload: unknown }) => void) => Promise<() => void>;
 type FrameGate = (pcm: Float32Array) => { send: boolean; ptt: boolean };
 
+/** Lowercase hex-encode a byte array (16-byte senderHash → 32 hex chars). */
+function bytesToHex(b: Uint8Array): string {
+  return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
+}
+
+/** Shallow per-member equality so refreshRoster only patches the store on real change. */
+function rostersEqual(a: RosterMember[], b: RosterMember[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i], y = b[i];
+    if (
+      x.ownerHex !== y.ownerHex || x.deviceHex !== y.deviceHex ||
+      x.muted !== y.muted || x.speaking !== y.speaking ||
+      x.displayName !== y.displayName || x.avatarUrl !== y.avatarUrl
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export interface VoiceSessionDeps {
   invoke: Invoke;
   listen: Listen;
   selfOwnerHex: string;
   selfDeviceHex: string;
-  senderHash: Uint8Array;          // 16 bytes
+  /**
+   * 16-byte sender hash stamped into every outbound voice packet header; the
+   * receiver keys (and self-filters) senders by its hex.
+   *
+   * INVARIANT: this MUST be the first 16 bytes of this node's 32-byte device id
+   * (`selfDeviceHex`). The presence roster keys members by the full 32-byte
+   * device (64 hex); the receiver keys speaking senders by this 16-byte hash
+   * (32 hex). Correlating a roster member to "is speaking" relies on
+   * `device.slice(0, 32) === hex(senderHash)`, which only holds when senderHash
+   * is the device prefix. The app wiring (getVoiceSession) MUST build it so.
+   */
+  senderHash: Uint8Array;
   vadThreshold?: number;
   // Factories (injected in tests; real defaults below).
   makeSender?: (gate: FrameGate) => Pick<VoiceSender, 'start' | 'stop'>;
@@ -74,6 +106,10 @@ export class VoiceSession {
   private channel: string | null = null;
   private unlisteners: (() => void)[] = [];
   private drainTimer: ReturnType<typeof setInterval> | null = null;
+  /** Set while join() is in flight so leave() can serialize behind it. */
+  private joinPromise: Promise<void> | null = null;
+  /** Last roster pushed to the store, for the change-only patch guard. */
+  private lastEmittedRoster: RosterMember[] = [];
 
   constructor(deps: VoiceSessionDeps) {
     this.deps = deps;
@@ -102,14 +138,25 @@ export class VoiceSession {
   private lastRoster: { ownerHex: string; deviceHex: string; muted: boolean }[] = [];
 
   async join(community: string, channel: string): Promise<void> {
-    let phase: SessionPhase = 'idle';
-    this.store.update((s) => { phase = s.phase; return s; });
-    if (phase !== 'idle') throw new Error('A voice session is already active');
+    if (get(this.store).phase !== 'idle') {
+      throw new Error('A voice session is already active');
+    }
+    // Track the in-flight join so a racing leave() serializes behind it rather
+    // than tearing down half-built state (dangling drain timer / live sender).
+    this.joinPromise = this._doJoin(community, channel);
+    try {
+      await this.joinPromise;
+    } finally {
+      this.joinPromise = null;
+    }
+  }
 
+  private async _doJoin(community: string, channel: string): Promise<void> {
     this.community = community;
     this.channel = channel;
     this.muted = true; this.deafened = false; this.pttMode = false; this.pttHeld = false;
     this.vad.reset();
+    this.lastRoster = []; this.lastEmittedRoster = []; this.lastSelfSpeaking = false;
     this.patch({ phase: 'joining', community, channel, muted: true, deafened: false, pttMode: false, roster: [] });
 
     // Backend join (spawns subscribers + presence publisher, starts muted).
@@ -125,7 +172,10 @@ export class VoiceSession {
           listen: this.deps.listen,
           createCodec: (t: CodecType) => (t === 'codec2' ? new Codec2Codec() : new OpusCodec()),
           onPlayFrame: (hex, pcm) => this.mixer?.pushFrame(hex, pcm),
-          ownSenderHex: this.deps.selfDeviceHex.slice(0, 32),
+          // Self-echo filter: the receiver keys senders by hex(senderHash), so
+          // filter on the actual senderHash we stamp into packets — NOT a slice
+          // of the device id (correct only because senderHash = device[0..16]).
+          ownSenderHex: bytesToHex(this.deps.senderHash),
         });
     await this.receiver.init();
 
@@ -138,10 +188,17 @@ export class VoiceSession {
         });
     await this.sender.start();   // capture starts; muted gate ⇒ nothing transmits
 
-    // 20ms mixer drain.
-    this.drainTimer = setInterval(() => { this.mixer?.drain(); this.refreshRoster(); }, 20);
+    // Drain the mixer every 20ms (audio cadence). Refresh the roster view at a
+    // far lower rate (~10Hz) — the drain-tick refresh only updates remote
+    // speaking state, and refreshRoster() is a no-op unless the view actually
+    // changed (diff guard), so this avoids a 50Hz Svelte re-render storm.
+    let drainTick = 0;
+    this.drainTimer = setInterval(() => {
+      this.mixer?.drain();
+      if (++drainTick % 5 === 0) this.refreshRoster();
+    }, 20);
 
-    await this.subscribePresence();   // Task 5
+    await this.subscribePresence();
 
     this.patch({ phase: 'connected' });
   }
@@ -167,6 +224,9 @@ export class VoiceSession {
   }
 
   async leave(): Promise<void> {
+    // Serialize behind an in-flight join so we never tear down half-built state.
+    if (this.joinPromise) await this.joinPromise.catch(() => {});
+    if (get(this.store).phase === 'idle') return; // nothing to tear down (also guards double-leave)
     this.patch({ phase: 'leaving' });
     if (this.drainTimer) { clearInterval(this.drainTimer); this.drainTimer = null; }
     for (const u of this.unlisteners) u();
@@ -177,6 +237,7 @@ export class VoiceSession {
     this.sender = null; this.receiver = null; this.mixer = null;
     const community = this.community, channel = this.channel;
     this.community = null; this.channel = null;
+    this.lastRoster = []; this.lastEmittedRoster = []; this.lastSelfSpeaking = false;
     if (community && channel) {
       await this.deps.invoke('leave_voice_channel', { communityId: community, channelId: channel }).catch(() => {});
     }
@@ -211,6 +272,10 @@ export class VoiceSession {
         ...(card?.avatarUrl ? { avatarUrl: card.avatarUrl } : {}),
       } as RosterMember;
     });
+    // Only touch the store when the view actually changed — the drain tick calls
+    // this ~10×/s, but most ticks produce an identical roster.
+    if (rostersEqual(roster, this.lastEmittedRoster)) return;
+    this.lastEmittedRoster = roster;
     this.patch({ roster });
   }
 }

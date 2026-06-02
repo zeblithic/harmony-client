@@ -88,7 +88,9 @@ export class VoiceMixer {
 
   pushFrame(senderHex: string, pcm: Float32Array | null): void {
     if (pcm) {
-      this.pending.set(senderHex, pcm);
+      // Copy: the source may be a view into the jitter buffer's internal storage,
+      // which can be overwritten before the next drain() reads it.
+      this.pending.set(senderHex, new Float32Array(pcm));
       this.frameLen = pcm.length;
     }
   }

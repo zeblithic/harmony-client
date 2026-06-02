@@ -133,3 +133,38 @@ describe('VoiceSession lifecycle + gate', () => {
     expect(get(s.state).roster).toHaveLength(0);
   });
 });
+
+describe('VoiceSession leave/join race (C2 regression)', () => {
+  it('leave() during an in-flight join serializes and ends fully torn down', async () => {
+    // Hang join_voice_channel until released, opening a mid-join window.
+    let releaseJoin!: () => void;
+    const joinGate = new Promise<void>((res) => { releaseJoin = res; });
+    const invoke = vi.fn(async (cmd: string) => {
+      if (cmd === 'join_voice_channel') await joinGate;
+      return undefined;
+    });
+    const listen = vi.fn(async () => () => {});
+    const receiver = { init: vi.fn(async () => {}), destroy: vi.fn(), getActiveSenders: () => [], isSpeaking: () => false };
+    const mixer = { init: vi.fn(async () => {}), pushFrame: vi.fn(), drain: vi.fn(), setDeafened: vi.fn(), destroy: vi.fn(async () => {}) };
+    const sender = { start: vi.fn(async () => {}), stop: vi.fn(async () => {}) };
+    const s = new VoiceSession({
+      invoke, listen, selfOwnerHex: 'aa'.repeat(16), selfDeviceHex: 'bb'.repeat(16),
+      senderHash: new Uint8Array(16),
+      makeSender: () => sender as never, makeReceiver: () => receiver as never, makeMixer: () => mixer as never,
+    });
+
+    const joinP = s.join('comm', 'chan'); // hangs at the join_voice_channel await
+    await Promise.resolve();
+    expect(get(s.state).phase).toBe('joining');
+
+    const leaveP = s.leave();             // must serialize behind the in-flight join
+    releaseJoin();                        // let join run to completion
+    await Promise.all([joinP, leaveP]);
+
+    expect(get(s.state).phase).toBe('idle');         // not a phantom 'connected'
+    expect(sender.stop).toHaveBeenCalled();          // sender torn down
+    expect(receiver.destroy).toHaveBeenCalled();
+    expect(mixer.destroy).toHaveBeenCalled();
+    expect(invoke).toHaveBeenCalledWith('leave_voice_channel', { communityId: 'comm', channelId: 'chan' });
+  });
+});
