@@ -93,7 +93,7 @@ Verified against the current tree on `main` at `9537c27` (the ZEB-350 V2 merge).
 - [ ] **Step 1: Create the branch off latest main**
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony-client
+cd <repo-root>
 git checkout main && git pull --ff-only
 git checkout -b zeb-351-voice-v3-talk
 git rev-parse HEAD   # expect 9537c27…
@@ -103,7 +103,7 @@ git rev-parse HEAD   # expect 9537c27…
 
 ```bash
 npx vitest run src/lib/voice    # all engine unit tests pass
-cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(voice_presence)' -E 'test(voice_crypto)'
+cd src-tauri && cargo nextest run --locked --workspace --all-targets --features test-fixtures -E 'test(voice_presence)' -E 'test(voice_crypto)'
 ```
 
 Expected: PASS. Record the voice test count as the regression floor.
@@ -111,7 +111,7 @@ Expected: PASS. Record the voice test count as the regression floor.
 - [ ] **Step 3: Re-grep the moving offsets** (record actual line numbers for later tasks)
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri
+cd <repo-root>/src-tauri
 grep -n "send_voice_frame\|join_voice_channel\|leave_voice_channel" src/lib.rs
 grep -n "muted: true" src/voice_presence.rs
 grep -n "VoiceChannelRequest::Join\|spawn_voice_presence_publisher\|voice-presence-changed\|voice-frame-received" src/event_loop.rs
@@ -1111,7 +1111,7 @@ Use `build_heartbeat_beacon` inside the publisher loop so the path is shared.
 
 ```bash
 cd src-tauri
-cargo nextest run --locked --features test-fixtures -E 'test(voice_presence)'
+cargo nextest run --locked --workspace --all-targets --features test-fixtures -E 'test(voice_presence)'
 ```
 
 - [ ] **Step 5: Commit**
@@ -1203,7 +1203,8 @@ async fn set_voice_muted(
 ) -> Result<(), String> {
     let community_id = parse_space_id(&payload.community_id)?;   // reuse the same parser join uses
     let channel_id = parse_channel_id(&payload.channel_id)?;
-    let tx = { state.lock().await.voice_channel_tx.clone() };
+    // NodeState is behind a std::sync::Mutex (sync lock(), NOT tokio .await).
+    let tx = { state.lock().map_err(|e| format!("lock: {e}"))?.voice_channel_tx.clone() };
     tx.send(voice::VoiceChannelRequest::SetMuted { community_id, channel_id, muted: payload.muted })
         .await
         .map_err(|e| format!("voice channel tx: {e}"))?;
@@ -1530,7 +1531,7 @@ git commit -m "feat(zeb-351): wire VoiceChannelView to a singleton VoiceSession 
 - [ ] **Step 1: Full local gate**
 
 ```bash
-cd /Users/zeblith/work/zeblithic/harmony-client
+cd <repo-root>
 npx tsc --noEmit && npx vitest run
 cd src-tauri
 cargo fmt --all -- --check
