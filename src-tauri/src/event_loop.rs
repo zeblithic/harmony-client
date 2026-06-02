@@ -1549,7 +1549,44 @@ pub async fn run<R: Runtime>(
                                         &identity_pub,
                                         device_hash,
                                     ) {
-                                        emit_voice_signal_event(&app_for_signal, &signal);
+                                        if matches!(
+                                            signal.kind,
+                                            crate::voice_signal::VoiceSignalKind::Invite
+                                        ) {
+                                            // Resolve the shared DM space for this caller so the
+                                            // frontend can pass spaceId to accept_call/decline_call.
+                                            let space_hex = {
+                                                let g = crdt_for_signal.lock().await;
+                                                g.spaces.iter().find_map(|(sid, sp)| {
+                                                    if sp.content_key.is_some()
+                                                        && sp.members.contains(&signal.caller)
+                                                    {
+                                                        Some(hex::encode(sid.0))
+                                                    } else {
+                                                        None
+                                                    }
+                                                })
+                                            };
+                                            match space_hex {
+                                                Some(ref sh) => {
+                                                    emit_voice_signal_event(
+                                                        &app_for_signal,
+                                                        &signal,
+                                                        Some(sh.as_str()),
+                                                    );
+                                                }
+                                                None => {
+                                                    // No shared DM space with the caller — callee
+                                                    // cannot service this invite; drop silently.
+                                                    tracing::debug!(
+                                                        caller = %hex::encode(signal.caller.0),
+                                                        "voice Invite dropped: no shared DM space"
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                            emit_voice_signal_event(&app_for_signal, &signal, None);
+                                        }
                                         emitted = true;
                                         break;
                                     }
@@ -3132,6 +3169,7 @@ pub async fn run<R: Runtime>(
 fn emit_voice_signal_event<R: Runtime>(
     app: &AppHandle<R>,
     signal: &crate::voice_signal::VoiceSignal,
+    space_id_hex: Option<&str>,
 ) {
     use crate::voice_signal::{DeclineReason, VoiceSignalKind};
     let call_hex = hex::encode(signal.call_id);
@@ -3142,6 +3180,7 @@ fn emit_voice_signal_event<R: Runtime>(
                 serde_json::json!({
                     "callId": call_hex,
                     "callerOwner": hex::encode(signal.caller.0),
+                    "spaceId": space_id_hex,
                 }),
             );
         }
