@@ -71,7 +71,7 @@ describe('CallSession DM signaling', () => {
     expect(get(s.state).phase).toBe('incoming');
     expect(get(s.state).peerOwnerHex).toBe('cc'.repeat(16));
 
-    await s.accept('space-1');
+    await s.accept();
     expect(get(s.state).phase).toBe('active');
     expect(get(s.state).muted).toBe(true); // starts muted (D10)
     expect(d.invoke).toHaveBeenCalledWith('accept_call', { callId: 'call-1', spaceId: 'space-1' });
@@ -98,7 +98,7 @@ describe('CallSession DM signaling', () => {
     const s = newSession();
     // Establish an active call first.
     s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
-    await s.accept('space-1');
+    await s.accept();
     expect(get(s.state).phase).toBe('active');
     d.invoke.mockClear();
 
@@ -157,7 +157,7 @@ describe('CallSession DM signaling', () => {
   it('onRemoteEnded tears down (leave_dm_call) and resets to idle', async () => {
     const s = newSession();
     s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
-    await s.accept('space-1');
+    await s.accept();
     expect(get(s.state).phase).toBe('active');
 
     await s.onRemoteEnded('call-1');
@@ -171,7 +171,7 @@ describe('CallSession DM signaling', () => {
   it('end tears down media + invokes end_call and leave_dm_call', async () => {
     const s = newSession();
     s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
-    await s.accept('space-1');
+    await s.accept();
     await s.end();
     expect(get(s.state).phase).toBe('idle');
     expect(d.invoke).toHaveBeenCalledWith('end_call', { callId: 'call-1', spaceId: 'space-1' });
@@ -191,7 +191,7 @@ describe('CallSession DM signaling', () => {
       makeMixer: realDeps.factories.makeMixer,
     });
     s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
-    await s.accept('space-1');
+    await s.accept();
     // The real receiver subscribed to the DM event, not the channel one.
     expect(realDeps.listen).toHaveBeenCalledWith('dm-voice-frame-received', expect.any(Function));
     expect(realDeps.listen).not.toHaveBeenCalledWith('voice-frame-received', expect.any(Function));
@@ -223,23 +223,28 @@ describe('CallSession DM signaling', () => {
         invoke: realDeps.invoke, codec: codec as never, capture: capture as never,
         frameGate: gate,
         publishFrame: (frameBytes) =>
-          realDeps.invoke('send_dm_voice_frame', { callId: 'call-1', frameBytes }),
+          realDeps.invoke('send_dm_voice_frame', {
+            payload: { callId: 'call-1', frameBytes },
+          }),
       }),
     });
     s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
-    await s.accept('space-1');
+    await s.accept();
     await s.setMuted(false); // open the gate
     captures.onFrame!(new Float32Array(320).fill(0.2)); // loud → sent
     const args = lastArgsFor(realDeps.invoke, 'send_dm_voice_frame');
     expect(args).toBeDefined();
-    expect(args!.callId).toBe('call-1');
-    expect(Array.isArray(args!.frameBytes)).toBe(true);
+    // The Tauri command takes a single `payload` struct (snake_case Rust side):
+    // the frame fields must be wrapped, not passed top-level (ZEB-352 review).
+    const payload = (args as { payload: { callId: string; frameBytes: number[] } }).payload;
+    expect(payload.callId).toBe('call-1');
+    expect(Array.isArray(payload.frameBytes)).toBe(true);
   });
 
   it('setMuted rolls back local state when set_dm_call_muted rejects', async () => {
     const s = newSession();
     s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
-    await s.accept('space-1');
+    await s.accept();
     d.invoke.mockRejectedValueOnce(new Error('backend refused'));
     await expect(s.setMuted(false)).rejects.toThrow(/refused/);
     // Local gate + store must NOT advertise unmuted when the backend stayed muted.
@@ -250,12 +255,28 @@ describe('CallSession DM signaling', () => {
   it('setPttMode rolls back pttMode when the coupled setMuted fails (ZEB-351)', async () => {
     const s = newSession();
     s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
-    await s.accept('space-1');
+    await s.accept();
     d.invoke.mockRejectedValueOnce(new Error('mute refused'));
     await expect(s.setPttMode(true)).rejects.toThrow(/refused/);
     // Mode and mute roll back together — no "PTT on but muted" limbo.
     expect(get(s.state).pttMode).toBe(false);
     expect(get(s.state).muted).toBe(true);
+  });
+
+  it('setPttMode(false) failure restores pttHeld, not just pttMode (ZEB-352 review)', async () => {
+    const s = newSession();
+    s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
+    await s.accept();
+    await s.setPttMode(true); // enter PTT (unmutes)
+    s.setPttHeld(true); // user is holding the key
+    expect(get(s.state).pttHeld).toBe(true);
+    // Leaving PTT couples a setMuted(true) round-trip; make it fail.
+    d.invoke.mockRejectedValueOnce(new Error('mute refused'));
+    await expect(s.setPttMode(false)).rejects.toThrow(/refused/);
+    // Leaving PTT already forced pttHeld=false; a failed round-trip must restore
+    // BOTH mode and hold, or the gate is stranded in a state mode doesn't match.
+    expect(get(s.state).pttMode).toBe(true);
+    expect(get(s.state).pttHeld).toBe(true);
   });
 });
 
@@ -286,7 +307,7 @@ describe('CallSession ring timeout', () => {
   it('accepting before the timeout cancels the auto-decline', async () => {
     const s = newSession();
     s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
-    await s.accept('space-1');
+    await s.accept();
     d.invoke.mockClear();
     await vi.advanceTimersByTimeAsync(30_000);
     // No decline fired after accept cleared the ring timer.

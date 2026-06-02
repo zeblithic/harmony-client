@@ -210,6 +210,7 @@
       callStateUnsub = callSession.state.subscribe((s) => {
         if (s.phase !== 'incoming') incomingCall = null;
       });
+    } catch (err) {
       // Allow a retry on a later trigger (reconnect) if the IPC wasn't ready.
       voiceSessionInit = false;
       const msg = err instanceof Error ? err.message : String(err);
@@ -1372,7 +1373,13 @@
 
       const unlistenCallDeclined = await listen('call-declined', (event) => {
         const p = (event as { payload: { callId: string; reason: string } }).payload;
+        // Only surface a toast when the decline targets the call we're actually
+        // ringing out on — a delayed decline for an old call must not pop "No
+        // answer"/"Call declined" over an unrelated, later session. Capture the
+        // match BEFORE onRemoteDeclined resets the state machine to idle.
+        const isActiveCall = !!callSession && get(callSession.state).callId === p.callId;
         callSession?.onRemoteDeclined(p.callId, p.reason);
+        if (!isActiveCall) return;
         const msg = p.reason === 'busy'
           ? 'User is on another call'
           : p.reason === 'timeout'
@@ -1982,8 +1989,9 @@
   <IncomingCallToast
     {incomingCall}
     onAccept={() => {
-      const sp = incomingCall?.spaceId;
-      if (sp) swallow(leaveOtherVoiceThen(() => callSession!.accept(sp)));
+      // accept() uses the spaceId pinned by onIncoming() — guard only on there
+      // being an incoming call to acknowledge.
+      if (incomingCall) swallow(leaveOtherVoiceThen(() => callSession!.accept()));
     }}
     onDecline={() => swallow(callSession!.decline('user'))}
   />

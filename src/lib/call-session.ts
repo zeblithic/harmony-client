@@ -189,11 +189,15 @@ export class CallSession {
   }
 
   /** Callee side: accept the inbound call and connect the media engine. */
-  async accept(spaceId: string): Promise<void> {
+  async accept(): Promise<void> {
     if (get(this.store).phase !== 'incoming') return;
     this.clearRingTimer();
     const callId = this.callId!;
-    this.spaceId = spaceId;
+    // Use the spaceId pinned by onIncoming() — the single source of truth for
+    // which DM this call belongs to. Taking it from the caller risks a stale UI
+    // prop acknowledging one invite while join_dm_call targets a different room.
+    const spaceId = this.spaceId;
+    if (!spaceId) throw new Error('missing DM space for incoming call');
     await this.deps.invoke('accept_call', { callId, spaceId });
     this.patch({ phase: 'connecting' });
     await this.connect(spaceId);
@@ -268,48 +272,61 @@ export class CallSession {
    */
   private async connect(spaceId: string): Promise<void> {
     const callId = this.callId!;
-    await this.deps.invoke('join_dm_call', { callId, spaceId });
+    try {
+      await this.deps.invoke('join_dm_call', { callId, spaceId });
 
-    this.mixer = this.deps.makeMixer ? this.deps.makeMixer() : new VoiceMixer();
-    await this.mixer.init();
+      this.mixer = this.deps.makeMixer ? this.deps.makeMixer() : new VoiceMixer();
+      await this.mixer.init();
 
-    this.receiver = this.deps.makeReceiver
-      ? this.deps.makeReceiver()
-      : new VoiceReceiver({
-          listen: this.deps.listen,
-          createCodec: (t: CodecType) => (t === 'codec2' ? new Codec2Codec() : new OpusCodec()),
-          onPlayFrame: (hex, pcm) => this.mixer?.pushFrame(hex, pcm),
-          ownSenderHex: bytesToHex(this.deps.senderHash),
-          // DM frames arrive on a distinct event and carry a callId; only this
-          // call's frames are admitted.
-          frameEvent: 'dm-voice-frame-received',
-          frameFilter: (p) =>
-            (p as { callId?: string }).callId === this.callId
-              ? (p as { frameBytes: number[] }).frameBytes
-              : null,
-        });
-    await this.receiver.init();
+      this.receiver = this.deps.makeReceiver
+        ? this.deps.makeReceiver()
+        : new VoiceReceiver({
+            listen: this.deps.listen,
+            createCodec: (t: CodecType) => (t === 'codec2' ? new Codec2Codec() : new OpusCodec()),
+            onPlayFrame: (hex, pcm) => this.mixer?.pushFrame(hex, pcm),
+            ownSenderHex: bytesToHex(this.deps.senderHash),
+            // DM frames arrive on a distinct event and carry a callId; only this
+            // call's frames are admitted.
+            frameEvent: 'dm-voice-frame-received',
+            frameFilter: (p) =>
+              (p as { callId?: string }).callId === this.callId
+                ? (p as { frameBytes: number[] }).frameBytes
+                : null,
+          });
+      await this.receiver.init();
 
-    this.sender = this.deps.makeSender
-      ? this.deps.makeSender(this.gate)
-      : new VoiceSender({
-          senderHash: this.deps.senderHash,
-          communityId: '', channelId: '', // unused on the DM path; publishFrame routes instead.
-          invoke: this.deps.invoke, codec: new OpusCodec(), capture: new AudioCapture(),
-          frameGate: this.gate,
-          publishFrame: (frameBytes) =>
-            this.deps.invoke('send_dm_voice_frame', { callId: this.callId, frameBytes }),
-        });
-    await this.sender.start(); // capture starts; muted gate ⇒ nothing transmits
+      this.sender = this.deps.makeSender
+        ? this.deps.makeSender(this.gate)
+        : new VoiceSender({
+            senderHash: this.deps.senderHash,
+            communityId: '', channelId: '', // unused on the DM path; publishFrame routes instead.
+            invoke: this.deps.invoke, codec: new OpusCodec(), capture: new AudioCapture(),
+            frameGate: this.gate,
+            publishFrame: (frameBytes) =>
+              this.deps.invoke('send_dm_voice_frame', {
+                payload: { callId: this.callId, frameBytes },
+              }),
+          });
+      await this.sender.start(); // capture starts; muted gate ⇒ nothing transmits
 
-    // Drain the mixer every 20ms (audio cadence), mirroring VoiceSession.
-    this.drainTimer = setInterval(() => { this.mixer?.drain(); }, 20);
+      // Drain the mixer every 20ms (audio cadence), mirroring VoiceSession.
+      this.drainTimer = setInterval(() => { this.mixer?.drain(); }, 20);
 
-    this.muted = true; this.deafened = false; this.pttMode = false; this.pttHeld = false;
-    this.patch({
-      phase: 'active', startedAt: Date.now(),
-      muted: true, deafened: false, pttMode: false, pttHeld: false,
-    });
+      this.muted = true; this.deafened = false; this.pttMode = false; this.pttHeld = false;
+      this.patch({
+        phase: 'active', startedAt: Date.now(),
+        muted: true, deafened: false, pttMode: false, pttHeld: false,
+      });
+    } catch (err) {
+      // A step after join_dm_call failed — tear down any partially-built media
+      // and leave the backend room so the session returns to idle instead of
+      // stranding in 'connecting' (which would block all future calls until a
+      // reload and could leak capture/playback resources). teardownMedia is
+      // best-effort and null-safe, so a partial setup is fine to unwind.
+      await this.teardownMedia(callId);
+      this.resetToIdle();
+      throw err;
+    }
   }
 
   /** The per-frame send decision (mute / PTT / VAD), via the shared talk-gate. */
@@ -341,7 +358,9 @@ export class CallSession {
     this.patch({ muted });
     if (get(this.store).phase === 'active' && this.callId) {
       try {
-        await this.deps.invoke('set_dm_call_muted', { callId: this.callId, muted });
+        await this.deps.invoke('set_dm_call_muted', {
+          payload: { callId: this.callId, muted },
+        });
       } catch (err) {
         // Backend rejected the toggle — roll the local gate + store back so the
         // UI never advertises a mute state the backend won't reflect.
@@ -359,6 +378,7 @@ export class CallSession {
    */
   async setPttMode(on: boolean): Promise<void> {
     const prevMode = this.pttMode;
+    const prevHeld = this.pttHeld;
     this.pttMode = on;
     this.patch({ pttMode: on });
     if (!on) this.setPttHeld(false);
@@ -366,10 +386,12 @@ export class CallSession {
       await this.setMuted(!on);
     } catch (err) {
       // The coupled mute toggle was rejected (setMuted already rolled its own
-      // muted state back). Roll pttMode back too so mode and mute stay
-      // consistent instead of stranding the UI in "PTT on but muted".
+      // muted state back). Roll BOTH mode and hold back: turning PTT off already
+      // forced pttHeld=false above, so without restoring it a failed round-trip
+      // would strand the gate in a hold state the rolled-back mode doesn't match.
       this.pttMode = prevMode;
-      this.patch({ pttMode: prevMode });
+      this.pttHeld = prevHeld;
+      this.patch({ pttMode: prevMode, pttHeld: prevHeld });
       throw err;
     }
   }

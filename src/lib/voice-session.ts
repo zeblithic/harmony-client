@@ -262,6 +262,7 @@ export class VoiceSession {
    */
   async setPttMode(on: boolean): Promise<void> {
     const prevMode = this.pttMode;
+    const prevHeld = this.pttHeld;
     this.pttMode = on;
     this.patch({ pttMode: on });
     if (!on) this.setPttHeld(false);
@@ -269,10 +270,13 @@ export class VoiceSession {
       await this.setMuted(!on);
     } catch (err) {
       // The coupled mute toggle was rejected by the backend (setMuted already
-      // rolled its own muted state back). Roll pttMode back too so mode and
-      // mute stay consistent instead of stranding the UI in "PTT on but muted".
+      // rolled its own muted state back). Roll BOTH mode and hold back: turning
+      // PTT off already forced pttHeld=false above, so without restoring it a
+      // failed round-trip would strand the gate in a hold state the rolled-back
+      // mode doesn't match.
       this.pttMode = prevMode;
-      this.patch({ pttMode: prevMode });
+      this.pttHeld = prevHeld;
+      this.patch({ pttMode: prevMode, pttHeld: prevHeld });
       throw err;
     }
   }
