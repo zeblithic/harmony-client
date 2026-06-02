@@ -351,6 +351,10 @@ pub async fn run<R: Runtime>(
     mut follow_rx: mpsc::Receiver<FollowRequest>,
     mut voice_rx: mpsc::Receiver<crate::voice::VoiceOutbound>,
     mut voice_channel_rx: mpsc::Receiver<crate::voice::VoiceChannelRequest>,
+    // ZEB-352: outbound DM-call signaling relay receiver. The select! arm
+    // publishes each `VoiceSignalRequest` to
+    // `harmony/voice-signal/{callee_owner_hex}`.
+    mut voice_signal_rx: mpsc::Receiver<crate::voice_signal::VoiceSignalRequest>,
     followed_set: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     vine_feed_cache: std::sync::Arc<std::sync::Mutex<crate::vine_feed_cache::VineFeedCache>>,
     mail_mgr: std::sync::Arc<std::sync::Mutex<crate::mail::MailManager>>,
@@ -1442,6 +1446,131 @@ pub async fn run<R: Runtime>(
             }
         });
     }
+
+    // ── ZEB-352: always-on DM-call signaling subscriber ──────────────
+    // Subscribe to our OWN owner-scoped signaling topic so inbound
+    // Invite/Accept/Decline/Cancel/End signals can be opened, verified,
+    // and surfaced to the frontend as call events. Gated on the owner
+    // identity being loaded at run() start (mirrors the dm_outbox /
+    // crdt_state shape used by the DM machinery): we need (a) the
+    // device-#2 signing key + self_owner from `dm_outbox`, and (b) the
+    // `OwnerDeviceCache` (inside `crdt_state`) to resolve the caller's
+    // identity_pub for signature verification. v1 requires the identity to
+    // exist at startup; a node that adopts an identity later picks up the
+    // subscription on the next start_node.
+    //
+    // The `JoinHandle` is bound to a `_`-prefixed run()-scope variable
+    // (mirrors `_serve_handle` / `_iroh_handles_keepalive`) so the spawned
+    // task survives for the lifetime of the event loop instead of being
+    // dropped (and aborted) at the end of this block.
+    let _voice_signal_sub_handle: Option<tokio::task::JoinHandle<()>> =
+        if let (Some(dm_outbox), Some(crdt_state)) = (dm_outbox.as_ref(), crdt_state.as_ref()) {
+            // Snapshot self owner + derive our X25519 private once, under the
+            // outbox lock, before spawning the long-lived subscriber.
+            let (self_owner_hex, self_x25519_priv) = {
+                let g = dm_outbox.lock().await;
+                let hex = hex::encode(g.self_owner.0);
+                let x_priv = crate::dm_signing::ed25519_priv_to_x25519(&g.community_signing_key);
+                (hex, x_priv)
+            };
+            let key_expr = format!("harmony/voice-signal/{self_owner_hex}");
+            let session_for_signal = Arc::clone(&session_arc);
+            let crdt_for_signal = Arc::clone(crdt_state);
+            let app_for_signal = app.clone();
+            let closing_for_signal = Arc::clone(&closing);
+            let signal_handle = tokio::spawn(async move {
+                let mut backoff = std::time::Duration::from_secs(5);
+                const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+                loop {
+                    if closing_for_signal.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let sub = match session_for_signal.declare_subscriber(&key_expr).await {
+                        Ok(s) => {
+                            backoff = std::time::Duration::from_secs(5);
+                            s
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                %key_expr,
+                                error = %e,
+                                backoff_s = backoff.as_secs(),
+                                "voice signal declare_subscriber failed; retrying after backoff"
+                            );
+                            tokio::time::sleep(backoff).await;
+                            backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+                            continue;
+                        }
+                    };
+                    loop {
+                        match sub.recv_async().await {
+                            Ok(sample) => {
+                                let sealed = sample.payload().to_bytes().to_vec();
+                                // Unverified peek to learn the claimed caller —
+                                // never trusted until open_sealed_signal binds the
+                                // signature to the cached identity.
+                                let caller = match crate::voice_signal::peek_caller(
+                                    &self_x25519_priv,
+                                    &sealed,
+                                ) {
+                                    Some(c) => c,
+                                    None => continue,
+                                };
+                                // Resolve the caller's identity_pub + device hash
+                                // from the OwnerDeviceCache. Take the first cached
+                                // pub for that owner; drop if none is known yet.
+                                let identity_pub = {
+                                    let g = crdt_for_signal.lock().await;
+                                    g.owner_device_cache.devices.get(&caller).and_then(|entry| {
+                                        entry.device_identity_pubs.iter().find_map(|p| *p)
+                                    })
+                                };
+                                let identity_pub = match identity_pub {
+                                    Some(p) => p,
+                                    None => continue,
+                                };
+                                let device_hash =
+                                    match crate::dm_signing::derive_device_hash_from_identity_pub(
+                                        &identity_pub,
+                                    ) {
+                                        Some(h) => h,
+                                        None => continue,
+                                    };
+                                // Open + verify; any failure (wrong recipient,
+                                // tamper, signature/hash mismatch) drops silently.
+                                if let Ok(signal) = crate::voice_signal::open_sealed_signal(
+                                    &self_x25519_priv,
+                                    &sealed,
+                                    &identity_pub,
+                                    device_hash,
+                                ) {
+                                    emit_voice_signal_event(&app_for_signal, &signal);
+                                }
+                            }
+                            Err(_) => {
+                                if !closing_for_signal.load(Ordering::SeqCst) {
+                                    tracing::warn!(
+                                        %key_expr,
+                                        "voice signal subscriber closed; reconnecting"
+                                    );
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    if closing_for_signal.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    // Brief pause before re-declaring on mid-session failure.
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            });
+            // Hand the handle back as the block's tail value so the run()-scope
+            // binding keeps the task alive (vs. dropping it here, which aborts).
+            Some(signal_handle)
+        } else {
+            None
+        };
 
     // ── ZEB-343: content-serve queryable ─────────────────────────
     // Answer peer content GETs from the local StorageTier cache. The
@@ -2802,6 +2931,18 @@ pub async fn run<R: Runtime>(
                 }
             }
 
+            // ── ZEB-352: outbound DM-call signaling relay ─────
+            // Each resolved `VoiceSignalRequest` (sealed by the IPC seam)
+            // is published to the callee's owner-scoped signaling topic.
+            // Fire-and-forget: a publish failure is logged but doesn't
+            // tear down the loop (the frontend retries via timeout).
+            Some(req) = voice_signal_rx.recv() => {
+                let key_expr = format!("harmony/voice-signal/{}", req.callee_owner_hex);
+                if let Err(e) = session.put(&key_expr, req.sealed).await {
+                    tracing::warn!(%key_expr, err = %e, "voice signal publish failed");
+                }
+            }
+
             // ── ZEB-350: presence roster sweep ───────────────
             // A dedicated 4 s interval tick (NOT a bare `sleep` arm, which
             // would reset every loop iteration and starve). Evicts entries
@@ -2973,6 +3114,49 @@ pub async fn run<R: Runtime>(
     }
     let _ = session.close().await;
     tracing::info!("event loop stopped");
+}
+
+/// ZEB-352: map a verified inbound `VoiceSignal` to the matching frontend
+/// event and emit it. The call state machine lives in the frontend; this
+/// only translates the transport-level signal into a Tauri event with the
+/// hex-encoded call-ID (and caller / decline reason where applicable).
+fn emit_voice_signal_event<R: Runtime>(
+    app: &AppHandle<R>,
+    signal: &crate::voice_signal::VoiceSignal,
+) {
+    use crate::voice_signal::{DeclineReason, VoiceSignalKind};
+    let call_hex = hex::encode(signal.call_id);
+    match signal.kind {
+        VoiceSignalKind::Invite => {
+            let _ = app.emit(
+                "incoming-call",
+                serde_json::json!({
+                    "callId": call_hex,
+                    "callerOwner": hex::encode(signal.caller.0),
+                }),
+            );
+        }
+        VoiceSignalKind::Accept => {
+            let _ = app.emit("call-accepted", serde_json::json!({ "callId": call_hex }));
+        }
+        VoiceSignalKind::Decline => {
+            let reason = match signal.decline_reason {
+                Some(DeclineReason::User) | None => "user",
+                Some(DeclineReason::Busy) => "busy",
+                Some(DeclineReason::Timeout) => "timeout",
+            };
+            let _ = app.emit(
+                "call-declined",
+                serde_json::json!({ "callId": call_hex, "reason": reason }),
+            );
+        }
+        VoiceSignalKind::Cancel => {
+            let _ = app.emit("call-canceled", serde_json::json!({ "callId": call_hex }));
+        }
+        VoiceSignalKind::End => {
+            let _ = app.emit("call-ended", serde_json::json!({ "callId": call_hex }));
+        }
+    }
 }
 
 /// ZEB-227 Path B Task 11: handle a single `RuntimeAction`, peeling off

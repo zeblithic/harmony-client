@@ -133,6 +133,13 @@ async fn ingest_list_pin_burn_roundtrip() {
                     follow_rx,
                     voice_rx,
                     voice_ch_rx,
+                    {
+                        // ZEB-352: voice-signal relay rx; tx dropped immediately
+                        // so the relay arm idles (not exercised in this test).
+                        let (_tx, rx) =
+                            mpsc::channel::<harmony_app::voice_signal::VoiceSignalRequest>(1);
+                        rx
+                    },
                     followed_set,
                     vine_feed_cache,
                     mail_mgr,
@@ -420,6 +427,13 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
                     follow_rx,
                     voice_rx,
                     voice_ch_rx,
+                    {
+                        // ZEB-352: voice-signal relay rx; tx dropped immediately
+                        // so the relay arm idles (not exercised in this test).
+                        let (_tx, rx) =
+                            mpsc::channel::<harmony_app::voice_signal::VoiceSignalRequest>(1);
+                        rx
+                    },
                     followed_set,
                     vine_feed_cache,
                     mail_mgr,
@@ -809,6 +823,13 @@ async fn fetch_complete_arm_pins_root_in_intent() {
                     follow_rx,
                     voice_rx,
                     voice_ch_rx,
+                    {
+                        // ZEB-352: voice-signal relay rx; tx dropped immediately
+                        // so the relay arm idles (not exercised in this test).
+                        let (_tx, rx) =
+                            mpsc::channel::<harmony_app::voice_signal::VoiceSignalRequest>(1);
+                        rx
+                    },
                     followed_set,
                     vine_feed_cache,
                     mail_mgr,
@@ -1061,6 +1082,13 @@ async fn unpin_folder_leaves_independently_pinned_leaf_in_cache() {
                     follow_rx,
                     voice_rx,
                     voice_ch_rx,
+                    {
+                        // ZEB-352: voice-signal relay rx; tx dropped immediately
+                        // so the relay arm idles (not exercised in this test).
+                        let (_tx, rx) =
+                            mpsc::channel::<harmony_app::voice_signal::VoiceSignalRequest>(1);
+                        rx
+                    },
                     followed_set,
                     vine_feed_cache,
                     mail_mgr,
@@ -1370,6 +1398,13 @@ async fn rapid_pin_unpin_toggling_keeps_sidecar_and_runtime_consistent() {
                     follow_rx,
                     voice_rx,
                     voice_ch_rx,
+                    {
+                        // ZEB-352: voice-signal relay rx; tx dropped immediately
+                        // so the relay arm idles (not exercised in this test).
+                        let (_tx, rx) =
+                            mpsc::channel::<harmony_app::voice_signal::VoiceSignalRequest>(1);
+                        rx
+                    },
                     followed_set,
                     vine_feed_cache,
                     mail_mgr,

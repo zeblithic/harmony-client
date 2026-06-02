@@ -377,6 +377,10 @@ pub struct NodeState {
     voice_tx: Option<tokio::sync::mpsc::Sender<voice::VoiceOutbound>>,
     /// Channel for voice channel join/leave requests.
     voice_channel_tx: Option<tokio::sync::mpsc::Sender<voice::VoiceChannelRequest>>,
+    /// ZEB-352: channel for outbound DM-call signaling requests. The event
+    /// loop's select! arm publishes each `VoiceSignalRequest` to
+    /// `harmony/voice-signal/{callee_owner_hex}`.
+    voice_signal_tx: Option<tokio::sync::mpsc::Sender<voice_signal::VoiceSignalRequest>>,
     /// Persistent follow manager (disk-backed follow list).
     follow_mgr: Option<follows::FollowManager>,
     /// Shared set of followed addresses (read by the event loop for source tagging).
@@ -878,6 +882,7 @@ impl Default for NodeState {
             follow_tx: None,
             voice_tx: None,
             voice_channel_tx: None,
+            voice_signal_tx: None,
             follow_mgr: None,
             followed_set: None,
             vine_feed_cache: None,
@@ -1277,6 +1282,11 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         // create_community calls in this lifetime) so a restart's
         // fresh `Sender` doesn't collide with a leaked one.
         let _ = guard.community_adapter_request_tx.take();
+        // ZEB-352: drop the voice-signal relay sender. The event_loop's
+        // matching receiver gets None on next recv(); the relay arm goes
+        // dormant. Cleared even when unused so a restart's fresh Sender
+        // doesn't collide with a leaked one.
+        let _ = guard.voice_signal_tx.take();
         // ZEB-298+ZEB-312 PR 1: drop the voting-log adapter-request
         // sender. The event_loop's matching receiver gets None on next
         // recv(); the select arm exits cleanly. Cleared even when the
@@ -1795,6 +1805,11 @@ pub(crate) async fn start_node_inner(
     let (follow_tx, follow_rx) = tokio::sync::mpsc::channel(64);
     let (voice_tx, voice_rx) = tokio::sync::mpsc::channel(100);
     let (voice_channel_tx, voice_channel_rx) = tokio::sync::mpsc::channel(16);
+    // ZEB-352: DM-call signaling relay channel. The event loop's select!
+    // arm publishes each outbound `VoiceSignalRequest` to
+    // `harmony/voice-signal/{callee_owner_hex}`.
+    let (voice_signal_tx, voice_signal_rx) =
+        tokio::sync::mpsc::channel::<crate::voice_signal::VoiceSignalRequest>(64);
     let (content_verb_tx, content_verb_rx) =
         tokio::sync::mpsc::channel::<event_loop::ContentVerbRequest>(32);
     // Mail refresh channel. MailSync (constructed below once identity is
@@ -1978,6 +1993,10 @@ pub(crate) async fn start_node_inner(
         // loop. The new event loop is constructed below with a fresh
         // channel pair.
         let _ = guard.community_adapter_request_tx.take();
+        // ZEB-352: clear the previous voice-signal relay sender so it
+        // doesn't outlive the previous event loop. A fresh channel pair is
+        // constructed below.
+        let _ = guard.voice_signal_tx.take();
         // ZEB-298+ZEB-312 PR 1: clear the previous voting-log adapter-
         // request sender so it doesn't outlive the previous event loop.
         // A fresh channel pair is constructed below.
@@ -4778,6 +4797,7 @@ pub(crate) async fn start_node_inner(
                                 follow_rx,
                                 voice_rx,
                                 voice_channel_rx,
+                                voice_signal_rx,
                                 followed_set_clone,
                                 vine_feed_cache_clone,
                                 mail_mgr_clone,
@@ -4841,6 +4861,7 @@ pub(crate) async fn start_node_inner(
                         guard.follow_tx = Some(follow_tx);
                         guard.voice_tx = Some(voice_tx);
                         guard.voice_channel_tx = Some(voice_channel_tx);
+                        guard.voice_signal_tx = Some(voice_signal_tx);
                         guard.follow_mgr = Some(follow_mgr);
                         guard.followed_set = Some(followed_set);
                         guard.vine_feed_cache = Some(vine_feed_cache);
@@ -35816,6 +35837,7 @@ mod start_node_race_tests {
             follow_tx: None,
             voice_tx: None,
             voice_channel_tx: None,
+            voice_signal_tx: None,
             follow_mgr: None,
             followed_set: None,
             vine_feed_cache: None,
