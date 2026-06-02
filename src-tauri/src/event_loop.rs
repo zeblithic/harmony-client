@@ -1520,16 +1520,21 @@ pub async fn run<R: Runtime>(
                                     continue;
                                 }
                                 let sealed = sample.payload().to_bytes().to_vec();
-                                // Unverified peek to learn the claimed caller —
-                                // never trusted until open_sealed_signal binds the
-                                // signature to the cached identity.
-                                let caller = match crate::voice_signal::peek_caller(
+                                // Open + decode the sealed box ONCE. The box is
+                                // sealed to our X25519 key (identical for every
+                                // candidate device), so we open here and only
+                                // re-verify the Ed25519 signature per candidate
+                                // below — never re-opening. The decoded caller is
+                                // unverified until verify_decoded_signal binds the
+                                // signature to a cached identity.
+                                let signed = match crate::voice_signal::open_and_decode(
                                     &self_x25519_priv,
                                     &sealed,
                                 ) {
-                                    Some(c) => c,
-                                    None => continue,
+                                    Ok(s) => s,
+                                    Err(_) => continue,
                                 };
+                                let caller = signed.body.caller;
                                 // Collect ALL cached identity pubs for the
                                 // caller — Harmony is multi-device, so the
                                 // caller may have signed with any enrolled
@@ -1557,9 +1562,8 @@ pub async fn run<R: Runtime>(
                                     else {
                                         continue;
                                     };
-                                    if let Ok(signal) = crate::voice_signal::open_sealed_signal(
-                                        &self_x25519_priv,
-                                        &sealed,
+                                    if let Ok(signal) = crate::voice_signal::verify_decoded_signal(
+                                        &signed,
                                         &identity_pub,
                                         device_hash,
                                     ) {
@@ -2647,11 +2651,13 @@ pub async fn run<R: Runtime>(
                         // flag; honor it here so a muted call never emits sealed
                         // audio even if the frontend gate misbehaves (defense in
                         // depth — the talk-gate also withholds frames). The flag
-                        // starts `true` (start-muted, D10) until the user unmutes.
+                        // starts `true` (start-muted, D10) until the user unmutes;
+                        // a MISSING entry defaults to muted too, so a frame racing
+                        // JoinDmCall can never leak audio (start-muted semantics).
                         let muted = dm_voice_mute_flags
                             .get(&call_id)
                             .map(|f| f.load(std::sync::atomic::Ordering::SeqCst))
-                            .unwrap_or(false);
+                            .unwrap_or(true);
                         if muted {
                             continue;
                         }

@@ -130,10 +130,35 @@ pub fn open_sealed_signal(
     caller_identity_pub: &[u8; 64],
     caller_signing_device_hash: DeviceIdentityHash,
 ) -> Result<VoiceSignal, DmReceiveError> {
+    let signed = open_and_decode(self_x25519_priv, sealed)?;
+    verify_decoded_signal(&signed, caller_identity_pub, caller_signing_device_hash)
+}
+
+/// Hybrid-open + CBOR-decode a sealed signal **without** verifying the
+/// signature. The result is untrusted until passed through
+/// `verify_decoded_signal`. Splitting open from verify lets the inbound path
+/// open the sealed box once and then verify against each candidate device key
+/// (the sealed box is sealed to the recipient's X25519 key — identical for
+/// every candidate — so re-opening per device is wasted work).
+pub fn open_and_decode(
+    self_x25519_priv: &[u8; 32],
+    sealed: &[u8],
+) -> Result<SignedVoiceSignal, DmReceiveError> {
     let signed_bytes = dm_signing::open_from_owner(self_x25519_priv, sealed)
         .map_err(|_| DmReceiveError::DecryptFailed)?;
-    let signed: SignedVoiceSignal = decode_cbor(&signed_bytes)
-        .map_err(|e| DmReceiveError::Decode(format!("voice_signal cbor: {e}")))?;
+    decode_cbor(&signed_bytes)
+        .map_err(|e| DmReceiveError::Decode(format!("voice_signal cbor: {e}")))
+}
+
+/// Verify an already-decoded signal's Ed25519 signature against
+/// `caller_identity_pub` + `caller_signing_device_hash`. Returns the verified
+/// body on success. Re-canonicalizes the body so the verified bytes match
+/// exactly what was signed.
+pub fn verify_decoded_signal(
+    signed: &SignedVoiceSignal,
+    caller_identity_pub: &[u8; 64],
+    caller_signing_device_hash: DeviceIdentityHash,
+) -> Result<VoiceSignal, DmReceiveError> {
     let body_bytes = canonical_cbor(&signed.body);
     dm_signing::verify_dm_packet_signature(
         &body_bytes,
@@ -141,19 +166,18 @@ pub fn open_sealed_signal(
         caller_identity_pub,
         caller_signing_device_hash,
     )?;
-    Ok(signed.body)
+    Ok(signed.body.clone())
 }
 
 /// Decode just the (unverified) caller from a sealed envelope so the inbound
-/// path can look up the right identity key before calling `open_sealed_signal`.
+/// path can look up the right identity key before verifying.
 ///
-/// The full `open_sealed_signal` still binds the signature to that identity —
-/// this is a convenience helper only; never trust the returned `OwnerAddr`
-/// without completing the full open+verify.
+/// Never trust the returned `OwnerAddr` without completing the full verify via
+/// `verify_decoded_signal` (or `open_sealed_signal`) — this only peeks.
 pub fn peek_caller(self_x25519_priv: &[u8; 32], sealed: &[u8]) -> Option<OwnerAddr> {
-    let signed_bytes = dm_signing::open_from_owner(self_x25519_priv, sealed).ok()?;
-    let signed: SignedVoiceSignal = decode_cbor(&signed_bytes).ok()?;
-    Some(signed.body.caller)
+    open_and_decode(self_x25519_priv, sealed)
+        .ok()
+        .map(|signed| signed.body.caller)
 }
 
 // ── CBOR helpers ─────────────────────────────────────────────────────────────
