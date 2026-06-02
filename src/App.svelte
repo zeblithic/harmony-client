@@ -1441,11 +1441,15 @@
       const appWin = getCurrentWebviewWindow();
       let closing = false;
       const unlistenClose = await appWin.onCloseRequested(async (event) => {
-        // Re-entry guard: a second close request mid-teardown must not double-run
-        // (or re-preventDefault) — let the in-flight teardown finish the close.
+        // Each close-request event independently proceeds to the default close
+        // unless THIS event calls preventDefault() — so always prevent first, or
+        // a second request (e.g. a double-click) would close via the default path
+        // and interrupt the first request's in-flight teardown.
+        event.preventDefault();
+        // Re-entry guard: only the first request runs teardown + destroy; a
+        // second just defers (it already prevented its own default above).
         if (closing) return;
         closing = true;
-        event.preventDefault();
         // Bound the teardown: leave()/end() await IPCs that could in principle
         // hang, and preventDefault means a hung promise would block the close
         // forever. Race the (best-effort, never-rejecting) teardown against a
