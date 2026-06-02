@@ -92,24 +92,35 @@ async fn run_inner() {
         "recovered DM media frame must equal the original"
     );
 
-    // ── Negative assertion: wrong call_id key must reject ────────────────────
-    // Seal a packet under k_voice (call_id A), then try to open it under
-    // k_voice_other (call_id B). This must fail — the call_id is bound in the
-    // AAD, so a cross-call replay is detectable.
+    // ── Negative assertions: the two bindings, isolated ──────────────────────
+    // A single packet sealed under K_voice(call_id=A) is opened under two
+    // deliberately-different conditions, each varying ONE factor so the failure
+    // can be attributed to that factor alone (the original test varied both key
+    // AND call_id at once, so key-mismatch could mask a missing AAD binding).
     let frame2: Vec<u8> = (0u8..20).collect();
     let sealed_for_a = encrypt_dm_voice_packet(&k_voice, &call_id, VOICE_DM_PACKET_AAD, &frame2)
         .expect("seal frame under call_id A");
 
-    let open_under_b = decrypt_dm_voice_packet(
-        &k_voice_other,
-        &call_id_other,
-        VOICE_DM_PACKET_AAD,
-        &sealed_for_a,
-    );
+    // (1) Call-scope AAD binding: SAME key, different call_id in the AAD. The
+    // key is held constant, so the only thing that changed is the AAD-bound
+    // call_id — this proves a cross-call replay is rejected by the AAD itself.
+    let open_wrong_call_id =
+        decrypt_dm_voice_packet(&k_voice, &call_id_other, VOICE_DM_PACKET_AAD, &sealed_for_a);
     assert_eq!(
-        open_under_b,
+        open_wrong_call_id,
         Err(VoiceCryptoError::OpenFailed),
-        "a packet sealed under K_voice(call_id=A) must FAIL to open under K_voice(call_id=B)"
+        "same key but wrong call_id in the AAD must FAIL (call-scope AAD binding)"
+    );
+
+    // (2) Per-call key binding: different derived key, MATCHING call_id. This
+    // proves the per-call HKDF key (the production cross-call defense, since the
+    // key is salted by call_id) also rejects the frame on its own.
+    let open_wrong_key =
+        decrypt_dm_voice_packet(&k_voice_other, &call_id, VOICE_DM_PACKET_AAD, &sealed_for_a);
+    assert_eq!(
+        open_wrong_key,
+        Err(VoiceCryptoError::OpenFailed),
+        "a different per-call key must FAIL to open (per-call key binding)"
     );
 
     drop(media_sub);

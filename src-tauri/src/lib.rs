@@ -11831,9 +11831,10 @@ fn parse_call_id(hex: &str) -> Result<[u8; 16], String> {
 /// Resolve everything needed to send a voice signal or join a DM call from a
 /// `space_id_hex`.
 ///
-/// Returns `(peer_owner, peer_x25519_pub, dm_key, signing_key, self_owner)`.
-/// The peer_x25519_pub is the first 32 bytes of the peer's 64-byte
-/// identity_pub (the X25519 pub half).
+/// Returns `(peer_owner, peer_x25519_pubs, dm_key, signing_key, self_owner)`.
+/// `peer_x25519_pubs` is the X25519 pub half (first 32 bytes of each 64-byte
+/// identity_pub) for EVERY enrolled device of the peer — signaling is sealed to
+/// all of the callee's devices so any one of them can open and answer the call.
 ///
 /// Snapshots under the sync mutex (no await while locked), then does the
 /// async CRDT + outbox reads outside the lock.
@@ -11843,7 +11844,7 @@ async fn resolve_dm_call_peer(
 ) -> Result<
     (
         crate::owner_state_types::OwnerAddr, // peer
-        [u8; 32],                            // peer x25519 pub
+        Vec<[u8; 32]>,                       // peer x25519 pubs (one per device)
         crate::owner_state_types::DmContentKey,
         std::sync::Arc<ed25519_dalek::SigningKey>, // self device#2
         crate::owner_state_types::OwnerAddr,       // self
@@ -11870,7 +11871,7 @@ async fn resolve_dm_call_peer(
     };
 
     // Find the Space in OwnerState.
-    let (peer, dm_key, peer_x25519_pub) = {
+    let (peer, dm_key, peer_x25519_pubs) = {
         let os = crdt_state.lock().await;
         let space = os
             .spaces
@@ -11887,23 +11888,44 @@ async fn resolve_dm_call_peer(
             .find(|m| **m != self_owner)
             .copied()
             .ok_or_else(|| "no peer in dm space".to_string())?;
-        // Resolve peer X25519 pub from the device cache.
-        let identity_pub = os
+        // Resolve the peer's X25519 pub for EVERY enrolled device. Signal
+        // delivery is owner-scoped (harmony/voice-signal/{owner}), so a signal
+        // sealed to a single device can only be opened by that one device —
+        // every other device of the callee would get ciphertext it can't
+        // decrypt. We fan out one sealed envelope per device (see
+        // send_voice_signal), mirroring the inbound verifier which already
+        // tries every cached device pub for the caller.
+        // Layout: [0..32] = X25519 pub, [32..64] = Ed25519 pub.
+        let mut peer_x25519_pubs: Vec<[u8; 32]> = os
             .owner_device_cache
             .devices
             .get(&peer)
-            .and_then(|entry| entry.device_identity_pubs.iter().find_map(|p| *p))
-            .ok_or_else(|| "peer key unknown".to_string())?;
-        // Layout: [0..32] = X25519 pub, [32..64] = Ed25519 pub.
-        let mut x25519_pub = [0u8; 32];
-        x25519_pub.copy_from_slice(&identity_pub[..32]);
-        (peer, dm_key, x25519_pub)
+            .map(|entry| {
+                entry
+                    .device_identity_pubs
+                    .iter()
+                    .filter_map(|p| *p)
+                    .map(|identity_pub| {
+                        let mut x = [0u8; 32];
+                        x.copy_from_slice(&identity_pub[..32]);
+                        x
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Dedup identical device pubs (defensive — entries should be unique).
+        peer_x25519_pubs.sort_unstable();
+        peer_x25519_pubs.dedup();
+        if peer_x25519_pubs.is_empty() {
+            return Err("peer key unknown".to_string());
+        }
+        (peer, dm_key, peer_x25519_pubs)
     };
 
     // Clone the community signing key from dm_outbox.
     let signing_key = dm_outbox.lock().await.community_signing_key.clone();
 
-    Ok((peer, peer_x25519_pub, dm_key, signing_key, self_owner))
+    Ok((peer, peer_x25519_pubs, dm_key, signing_key, self_owner))
 }
 
 /// Inner helper: resolve peer, build, sign, seal, and send a `VoiceSignal`.
@@ -11916,7 +11938,7 @@ async fn send_voice_signal(
     call_id: [u8; 16],
     reason: Option<crate::voice_signal::DeclineReason>,
 ) -> Result<(), String> {
-    let (peer, peer_x25519_pub, _dm_key, signing_key, self_owner) =
+    let (peer, peer_x25519_pubs, _dm_key, signing_key, self_owner) =
         resolve_dm_call_peer(state, space_id).await?;
 
     let signal = crate::voice_signal::VoiceSignal {
@@ -11925,8 +11947,6 @@ async fn send_voice_signal(
         caller: self_owner,
         decline_reason: reason,
     };
-    let sealed = crate::voice_signal::build_sealed_signal(&signal, &signing_key, &peer_x25519_pub)
-        .map_err(|e| format!("seal signal: {e}"))?;
 
     let voice_signal_tx = {
         let g = state
@@ -11937,13 +11957,24 @@ async fn send_voice_signal(
             .ok_or_else(|| "voice signal not running".to_string())?
     };
 
-    voice_signal_tx
-        .send(crate::voice_signal::VoiceSignalRequest {
-            callee_owner_hex: hex::encode(peer.0),
-            sealed,
-        })
-        .await
-        .map_err(|_| "event loop not running".to_string())
+    // Fan out: seal the signal once per enrolled callee device and enqueue one
+    // envelope each on the owner-scoped signaling topic. Any device that is
+    // online + subscribed can then open its own envelope and surface/answer the
+    // call. All share the same callee_owner_hex (the topic is per-owner).
+    let callee_owner_hex = hex::encode(peer.0);
+    for peer_x25519_pub in &peer_x25519_pubs {
+        let sealed =
+            crate::voice_signal::build_sealed_signal(&signal, &signing_key, peer_x25519_pub)
+                .map_err(|e| format!("seal signal: {e}"))?;
+        voice_signal_tx
+            .send(crate::voice_signal::VoiceSignalRequest {
+                callee_owner_hex: callee_owner_hex.clone(),
+                sealed,
+            })
+            .await
+            .map_err(|_| "event loop not running".to_string())?;
+    }
+    Ok(())
 }
 
 /// ZEB-352: initiate a 1:1 DM voice call. Generates a random 16-byte
@@ -12058,7 +12089,7 @@ async fn join_dm_call(
 ) -> Result<(), String> {
     let call = parse_call_id(&call_id)?;
 
-    let (peer, _peer_x25519_pub, dm_key, signing_key, self_owner) =
+    let (peer, _peer_x25519_pubs, dm_key, signing_key, self_owner) =
         resolve_dm_call_peer(&state, &space_id).await?;
     let _ = peer; // not needed for media join
 

@@ -1505,6 +1505,20 @@ pub async fn run<R: Runtime>(
                     loop {
                         match sub.recv_async().await {
                             Ok(sample) => {
+                                // The signaling topic is peer-writable, so bound
+                                // the payload BEFORE allocating: a sealed signal
+                                // is a few hundred bytes; cap well above that so
+                                // one oversized sample can't force an unbounded
+                                // heap allocation ahead of peek_caller's reject.
+                                const MAX_VOICE_SIGNAL_BYTES: usize = 8 * 1024;
+                                if sample.payload().len() > MAX_VOICE_SIGNAL_BYTES {
+                                    tracing::warn!(
+                                        size = sample.payload().len(),
+                                        max = MAX_VOICE_SIGNAL_BYTES,
+                                        "oversized voice signal dropped"
+                                    );
+                                    continue;
+                                }
                                 let sealed = sample.payload().to_bytes().to_vec();
                                 // Unverified peek to learn the claimed caller —
                                 // never trusted until open_sealed_signal binds the
@@ -2629,6 +2643,18 @@ pub async fn run<R: Runtime>(
                     // ZEB-352: DM call outbound — seal under the per-call K_voice and
                     // publish to harmony/voice/dm/{callId}/{own}.
                     crate::voice::VoiceOutbound::Dm { call_id, frame } => {
+                        // Server-side mute enforcement: SetDmCallMuted flips this
+                        // flag; honor it here so a muted call never emits sealed
+                        // audio even if the frontend gate misbehaves (defense in
+                        // depth — the talk-gate also withholds frames). The flag
+                        // starts `true` (start-muted, D10) until the user unmutes.
+                        let muted = dm_voice_mute_flags
+                            .get(&call_id)
+                            .map(|f| f.load(std::sync::atomic::Ordering::SeqCst))
+                            .unwrap_or(false);
+                        if muted {
+                            continue;
+                        }
                         if let Some(key) = dm_voice_keys.get(&call_id) {
                             let own = voice_own_device.as_deref().unwrap_or("self");
                             match crate::voice_crypto::encrypt_dm_voice_packet(
@@ -2957,7 +2983,14 @@ pub async fn run<R: Runtime>(
                                     call_id,
                                     std::sync::Arc::new(AtomicBool::new(true)),
                                 );
-                                dm_voice_subs.insert(call_id, handle);
+                                // Abort any prior subscriber for this call_id —
+                                // HashMap::insert returns the old handle, and
+                                // merely dropping it detaches (doesn't stop) the
+                                // task, which would double-emit remote frames on
+                                // a rejoin until shutdown.
+                                if let Some(old) = dm_voice_subs.insert(call_id, handle) {
+                                    old.abort();
+                                }
                             }
                             Err(e) => tracing::warn!(err = %e, "dm voice subscribe failed"),
                         }
