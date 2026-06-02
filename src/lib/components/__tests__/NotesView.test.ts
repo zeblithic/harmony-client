@@ -42,4 +42,16 @@ describe('NotesView — ZEB-334 self-notes', () => {
     await fireEvent.keyDown(box, { key: 'Enter' });
     expect(svc.getEntries('owner-1')).toHaveLength(0);
   });
+
+  it('keeps the compose text when the note cannot be saved (owner id not ready)', async () => {
+    // Cursor (PR #180): with an empty ownerId, append is a no-op — the text
+    // must NOT be cleared, or the user silently loses what they typed.
+    const svc = new NotesService();
+    render(NotesView, { notesService: svc, ownerId: '', displayName: 'Jake' });
+    const box = screen.getByTestId('notes-compose') as HTMLTextAreaElement;
+    await fireEvent.input(box, { target: { value: 'unsaved thought' } });
+    await fireEvent.keyDown(box, { key: 'Enter' });
+    expect(box.value).toBe('unsaved thought');
+    expect(svc.getEntries('')).toEqual([]);
+  });
 });

@@ -393,8 +393,14 @@
   // (saves locally, re-seeds the self card, publishes to the network), then
   // close the prompt.
   async function handleNamePromptSave(name: string): Promise<void> {
-    await handleProfileSave({ ...myProfile, displayName: name });
-    showNamePrompt = false;
+    // Close the prompt even if the network publish inside handleProfileSave
+    // rejects — the local profile save already persisted the name, so the modal
+    // must never get stuck open behind a swallowed rejection. (Greptile PR #180.)
+    try {
+      await handleProfileSave({ ...myProfile, displayName: name });
+    } finally {
+      showNamePrompt = false;
+    }
   }
 
   const vineService = new VineService();
@@ -1801,7 +1807,12 @@
   // avoids reusing activeChannel for community ids — activeChannel
   // is consumed by message-send paths that only make sense for
   // channels/DMs.
-  let navActiveNodeId = $derived(selectedCommunityId ?? activeChannel);
+  // ZEB-334 (Cursor PR #180): when the Notes space is selected, no real nav
+  // node is active — the Notes row carries its own active state — so don't let
+  // navActiveNodeId keep highlighting the last channel/community.
+  let navActiveNodeId = $derived(
+    notesSelected ? null : (selectedCommunityId ?? activeChannel),
+  );
 
   function switchMode(mode: AppMode) {
     appMode = mode;

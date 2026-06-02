@@ -35,7 +35,11 @@
   function submit() {
     const text = composeText.trim();
     if (!text) return;
-    notesService.append(ownerId, text);
+    // Keep the text if it couldn't be saved (e.g. the owner id hasn't loaded
+    // yet, so append is a no-op) — clearing it would silently lose the note.
+    // (Cursor PR #180.)
+    const entry = notesService.append(ownerId, text);
+    if (!entry) return;
     entries = notesService.getEntries(ownerId);
     composeText = '';
   }
