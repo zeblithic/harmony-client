@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import { get } from 'svelte/store';
   import type { CommunityService, ChannelInfo, PreForkSnapshotDto } from '../community-service';
   import type { ChannelMessageService } from '../channel-message-service';
   import type { CommunityMember } from '../types';
@@ -18,6 +19,7 @@
   import Tier3ProposalPanel from './Tier3ProposalPanel.svelte';
   import type { VotingAdapter } from '../voting-adapter';
   import type { ResolvedCard } from '../member-card-service';
+  import type { VoiceSession } from '../voice-session';
 
   let {
     communityId,
@@ -44,6 +46,7 @@
     subscribeVisibleCards,
     unsubscribeCards,
     onOpenCard,
+    voiceSession,
   }: {
     communityId: string;
     communityName: string;
@@ -90,6 +93,11 @@
      *  fork lineage tree. Routes the target SpaceId through the parent's
      *  changeSelectedCommunity primitive. */
     onSelectCommunity?: (spaceId: string) => void;
+    /** ZEB-351 Voice V3: the app-lifetime singleton voice session. Threaded
+     *  into VoiceChannelView for voice channels. Null until App.svelte's
+     *  get_self_voice_identity IPC resolves — the voice routing is guarded so
+     *  the brief pre-ready window simply shows nothing. */
+    voiceSession?: VoiceSession | null;
   } = $props();
 
   let channels = $state<ChannelInfo[]>([]);
@@ -279,11 +287,37 @@
     subscribeVisibleCards?.(joinedOwnerIds);
   });
 
+  // ZEB-351 Voice V3: leave the voice session when the user navigates away from
+  // the channel it's connected to. The session is a single app-lifetime
+  // instance, so switching to a different channel (text or another voice
+  // channel) — or switching communities — must tear down the live mic/transport.
+  // We compare the newly-active channel against the session's CONNECTED channel
+  // (read from its state store); if they differ while connected, leave.
+  // Reading `activeChannelId` registers the reactive dependency so this re-runs
+  // on every channel switch. We deliberately do NOT depend on the store value
+  // reactively (it isn't a rune) — a one-shot `get()` at switch time is the
+  // intent: "on navigation, if we're parked on a now-unselected voice channel,
+  // disconnect."
+  $effect(() => {
+    const nowActive = activeChannelId;
+    if (!voiceSession) return;
+    const vs = get(voiceSession.state);
+    if (vs.phase !== 'idle' && vs.channel !== null && vs.channel !== nowActive) {
+      void voiceSession.leave().catch(() => {});
+    }
+  });
+
   onDestroy(() => {
     communityService.onChannelConfigChanged = prevOnChannelConfigChanged;
     // ZEB-341: tear down all card subscriptions + the poll loop when the
     // community view goes away (switching to a non-community space / closing).
     unsubscribeCards?.();
+    // ZEB-351: best-effort leave on unmount (switching to a non-community
+    // space / closing the community view) so a live voice session doesn't
+    // outlive the view that owns its UI.
+    if (voiceSession && get(voiceSession.state).phase !== 'idle') {
+      void voiceSession.leave().catch(() => {});
+    }
   });
 </script>
 
@@ -399,7 +433,14 @@
       />
     {:else if activeChannel}
       {#if activeChannel.kind === 'voice'}
-        <VoiceChannelView channelName={activeChannel.name} />
+        {#if voiceSession}
+          <VoiceChannelView
+            session={voiceSession}
+            channelName={activeChannel.name}
+            {communityId}
+            channelId={activeChannel.channelId}
+          />
+        {/if}
       {:else}
         <ChannelMessageFeed
           {communityId}

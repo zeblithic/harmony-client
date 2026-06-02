@@ -11730,6 +11730,74 @@ async fn leave_voice_channel(
     .map_err(|_| "event loop not running".to_string())
 }
 
+/// ZEB-351 Voice V3: flip the mute state of an active voice channel. Sends a
+/// `VoiceChannelRequest::SetMuted` to the event loop, which flips the shared
+/// `Arc<AtomicBool>` the presence publisher reads (and emits an immediate
+/// beacon). Modeled on `leave_voice_channel`'s id-parsing + tx access.
+#[tauri::command]
+async fn set_voice_muted(
+    payload: voice::SetVoiceMutedPayload,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let community =
+        crate::owner_state_types::SpaceId(parse_voice_id_16("communityId", &payload.community_id)?);
+    let channel = crate::community_membership::ChannelId(parse_voice_id_16(
+        "channelId",
+        &payload.channel_id,
+    )?);
+    let tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .voice_channel_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    tx.send(voice::VoiceChannelRequest::SetMuted {
+        community_id: community,
+        channel_id: channel,
+        muted: payload.muted,
+    })
+    .await
+    .map_err(|_| "event loop not running".to_string())
+}
+
+/// ZEB-351 Voice V3: return this node's own device verifying key (64 hex) and
+/// the derived 16-byte voice `senderHash` (`VK[0..16]`).
+///
+/// The frontend voice-session controller needs the raw device VK to (a)
+/// self-detect its own presence-roster row (the roster keys members by their
+/// 32-byte device VK via `RosterEntry.device`) and (b) correlate the receiver's
+/// speaking senders (keyed by `hex(senderHash)`) back to roster tiles. The
+/// frontend otherwise only has the Reticulum *identity hash* (a one-way hash of
+/// the VK, via `get_owner_state` → `DeviceView.device_id`), which cannot be
+/// inverted to the VK.
+///
+/// Resolves the VK the SAME way `join_voice_channel` resolves
+/// `VoiceJoinCaps::self_device`: from `NodeState::dm_device_id`, the 64-hex
+/// encoding of `device_signing_key.verifying_key().to_bytes()` stashed at node
+/// start. This is global to the loaded owner identity (not community-scoped), so
+/// the command takes no `community_id`. Returns `Err` if no owner/device
+/// identity is loaded yet.
+#[tauri::command]
+async fn get_self_voice_identity(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<voice::SelfVoiceIdentity, String> {
+    let device_hex = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .dm_device_id
+            .clone()
+            .ok_or_else(|| "no device id".to_string())?
+    };
+    let vk = <[u8; 32]>::try_from(
+        hex::decode(&device_hex)
+            .map_err(|_| "device id not hex".to_string())?
+            .as_slice(),
+    )
+    .map_err(|_| "device id must be 32 bytes".to_string())?;
+    Ok(voice::self_voice_identity_from_vk(vk))
+}
+
 #[cfg(test)]
 mod voice_id_tests {
     use super::parse_voice_id_16;
@@ -32316,6 +32384,8 @@ pub fn run() {
             send_voice_frame,
             join_voice_channel,
             leave_voice_channel,
+            set_voice_muted,
+            get_self_voice_identity,
             send_mail,
             list_mail,
             get_mail,

@@ -70,6 +70,7 @@
   import type { MintIpcResult, OwnerStateView } from './lib/owner-service';
   import type { StartNodeResponse } from './lib/types/onboarding';
   import { MemberCardService } from './lib/member-card-service';
+  import { getVoiceSession, type VoiceSession } from './lib/voice-session';
   import { classifyOwnerIdentity, type OwnerIdentityState } from './lib/owner-gate';
   import { trapFocus } from './lib/focus-trap';
   import HelpMenuButton from './lib/components/HelpMenuButton.svelte';
@@ -100,6 +101,65 @@
   // selfOwnerId is the OwnerAddr hex (32 chars) obtained from get_owner_state.
   // Set at startup (after start_node) and kept stable for the session.
   let selfOwnerId = $state<string | null>(null);
+
+  // ── ZEB-351 Voice V3: app-lifetime voice session ───────────────────
+  // Built once after owner identity loads (the get_self_voice_identity IPC
+  // supplies the device VK + senderHash the frontend can't derive itself).
+  // null until that IPC resolves; CommunityView/VoiceChannelView only mount
+  // the join UI behind an `{#if voiceSession}` guard, so the brief pre-ready
+  // window degrades gracefully. Threaded down into <CommunityView>.
+  let voiceSession = $state<VoiceSession | null>(null);
+  // One-shot guard: the owner-present path can run from up to three triggers
+  // (boot get_owner_state, zenoh-status reconnect, onMinted), but the session
+  // must be built exactly once.
+  let voiceSessionInit = false;
+
+  /** ZEB-351: typed wrapper for the get_self_voice_identity IPC.
+   *  Returns the 64-hex device verifying key + the 16-byte sender hash the
+   *  voice engine stamps into outbound packet headers. */
+  async function getSelfVoiceIdentity(
+    invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>,
+  ): Promise<{ deviceVkHex: string; senderHash: number[] }> {
+    return invoke('get_self_voice_identity') as Promise<{ deviceVkHex: string; senderHash: number[] }>;
+  }
+
+  /** ZEB-351: build the singleton voice session once owner identity is present.
+   *  Idempotent (one-shot guard); fetches device identity via the new IPC, then
+   *  wires identity + the Tauri adapter + member-card resolution into the session. */
+  async function buildVoiceSession(
+    invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>,
+    listen: (event: string, handler: (e: { payload: unknown }) => void) => Promise<() => void>,
+    selfOwnerHex: string,
+  ): Promise<void> {
+    if (voiceSessionInit) return;
+    voiceSessionInit = true;
+    try {
+      const { deviceVkHex, senderHash } = await getSelfVoiceIdentity(invoke);
+      voiceSession = getVoiceSession({
+        invoke,
+        listen,
+        selfOwnerHex,
+        selfDeviceHex: deviceVkHex,
+        senderHash: new Uint8Array(senderHash),
+        resolveCard: (ownerHex: string) => {
+          const card = resolveCard(ownerHex);
+          if (!card) return undefined;
+          return {
+            displayName: card.displayName,
+            ...(card.avatarUrl ? { avatarUrl: card.avatarUrl } : {}),
+          };
+        },
+        onRosterOwners: (ownerHexes: string[]) => {
+          void memberCardService.subscribeVisible(ownerHexes);
+        },
+      });
+    } catch (err) {
+      // Allow a retry on a later trigger (reconnect) if the IPC wasn't ready.
+      voiceSessionInit = false;
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn('[harmony-client] get_self_voice_identity not yet available:', msg);
+    }
+  }
 
   // Expose a resolver function that components call inside $derived.
   // Reading cardVersion registers the reactive dependency so consumers
@@ -469,6 +529,12 @@
       avatarCid: myProfile.avatarCid,
       profilePageRoot: myProfile.profilePageRoot,
     });
+    // ZEB-351: build the voice session for a freshly-minted owner. The adapter
+    // is wired up by the Tauri-init IIFE; if it hasn't landed yet (mint can
+    // race init), the zenoh-status reconnect handler retries via the same guard.
+    if (tauriAdapter) {
+      void buildVoiceSession(tauriAdapter.invoke, tauriAdapter.listen, result.state.ownerId);
+    }
     drainQueuedInvite();
   }
 
@@ -1026,6 +1092,8 @@
             // fresh process.) Only marks done on success; if the Zenoh session
             // isn't up yet, the zenoh-status 'connected' handler retries.
             void tryBootPublishCard();
+            // ZEB-351: build the voice session now owner identity is present.
+            void buildVoiceSession(adapter.invoke, adapter.listen, ownerState.ownerId);
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -1173,6 +1241,12 @@
             } catch {
               // owner still unavailable — leave selfOwnerId null for a later retry
             }
+          }
+          // ZEB-351: (re)attempt the voice-session build on reconnect — the
+          // get_self_voice_identity IPC may not have been ready at boot. The
+          // one-shot guard inside makes this a no-op once it has succeeded.
+          if (selfOwnerId !== null) {
+            void buildVoiceSession(adapter.invoke, adapter.listen, selfOwnerId);
           }
           // The session is now confirmed up — (re)attempt the one-shot boot card
           // publish in case an earlier attempt raced session startup.
@@ -1917,6 +1991,7 @@
         {subscribeVisibleCards}
         {unsubscribeCards}
         onOpenCard={openMemberCard}
+        {voiceSession}
       />
     {:else}
       <TextFeed

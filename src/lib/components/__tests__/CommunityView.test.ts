@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, fireEvent, waitFor } from '@testing-library/svelte';
+import { writable } from 'svelte/store';
 import CommunityView from '../CommunityView.svelte';
 import { CommunityService } from '../../community-service';
 import { ChannelMessageService } from '../../channel-message-service';
@@ -7,6 +8,33 @@ import { NavService } from '../../nav-service';
 import { VotingAdapter } from '../../voting-adapter';
 import type { TauriAdapter } from '../../zenoh-service';
 import type { CommunityMember } from '../../types';
+import type { VoiceSession } from '../../voice-session';
+
+/** ZEB-351: minimal VoiceSession stub for the voice routing path. A fresh
+ *  instance per render so its `state` store isn't shared across tests. The
+ *  initial state is the real VoiceSessionState shape: idle / muted / empty. */
+function makeVoiceSessionStub(): VoiceSession {
+  // Structural stub satisfying the parts CommunityView/VoiceChannelView touch
+  // (state store + control methods). Cast through unknown — the real class has
+  // private engine fields we deliberately don't reconstruct here.
+  return {
+    state: writable({
+      phase: 'idle' as const,
+      community: null,
+      channel: null,
+      muted: true,
+      deafened: false,
+      pttMode: false,
+      roster: [] as never[],
+    }),
+    join: vi.fn(async () => {}),
+    leave: vi.fn(async () => {}),
+    setMuted: vi.fn(async () => {}),
+    setDeafened: vi.fn(async () => {}),
+    setPttMode: vi.fn(),
+    setPttHeld: vi.fn(),
+  } as unknown as VoiceSession;
+}
 
 function makeAdapter(): TauriAdapter & { listeners: Map<string, Function> } {
   const listeners = new Map<string, Function>();
@@ -77,6 +105,10 @@ async function setup(channelList: any[] = [general, announcements], propOverride
     onSetPowerLevel: vi.fn(),
     onGenerateInvite: vi.fn().mockResolvedValue('harmony://invite/...'),
     onToggleSharedInProfile: vi.fn().mockResolvedValue(undefined),
+    // ZEB-351: a ready voice session by default so voice channels route to
+    // VoiceChannelView. Tests can override with null to exercise the
+    // pre-ready (IPC not yet resolved) guard.
+    voiceSession: makeVoiceSessionStub(),
     ...propOverrides,
   };
   const renderResult = render(CommunityView, { props });
@@ -102,14 +134,28 @@ describe('CommunityView', () => {
   });
 
   it('routes a voice channel to VoiceChannelView (not the message feed)', async () => {
-    const { container } = await setup([voiceLounge]);
+    // ZEB-351: V3 contract — a voice channel mounts the V3 VoiceChannelView
+    // (root .voice-view) wired to the injected voiceSession, NOT the message
+    // feed. The idle session shows the "Join Voice" pane.
+    const { container, getByText } = await setup([voiceLounge]);
     await waitFor(() => {
-      // The voice scaffold mounts instead of ChannelMessageFeed.
-      expect(container.querySelector('.voice-channel')).toBeTruthy();
+      expect(container.querySelector('.voice-view')).toBeTruthy();
     });
     expect(container.querySelector('.channel-message-feed')).toBeNull();
-    const join = container.querySelector('.voice-join') as HTMLButtonElement;
-    expect(join?.disabled).toBe(true);
+    // The V3 join control (idle phase) is present.
+    expect(getByText('Join Voice')).toBeTruthy();
+  });
+
+  it('does not mount the voice view until a voiceSession is provided (ZEB-351)', async () => {
+    // Pre-ready window: get_self_voice_identity hasn't resolved, so
+    // voiceSession is null. The voice routing is guarded — neither the voice
+    // view nor the message feed renders for a voice channel.
+    const { container } = await setup([voiceLounge], { voiceSession: null });
+    await waitFor(() => {
+      expect(container.querySelector('.channel-sub-sidebar')).toBeTruthy();
+    });
+    expect(container.querySelector('.voice-view')).toBeNull();
+    expect(container.querySelector('.channel-message-feed')).toBeNull();
   });
 
   it('keeps a text channel on ChannelMessageFeed', async () => {
@@ -117,7 +163,7 @@ describe('CommunityView', () => {
     await waitFor(() => {
       expect(container.querySelector('.channel-message-feed')).toBeTruthy();
     });
-    expect(container.querySelector('.voice-channel')).toBeNull();
+    expect(container.querySelector('.voice-view')).toBeNull();
   });
 
   it('clicking ⚙️ opens CommunitySettingsPanel modal', async () => {
