@@ -14,6 +14,9 @@ function fakeSession(state: object) {
       pttMode: false,
       pttHeld: false,
       roster: [],
+      selfPower: 0,
+      selfModMuted: false,
+      selfKicked: false,
       ...state,
     }),
     join: vi.fn(async () => {}),
@@ -23,6 +26,7 @@ function fakeSession(state: object) {
     setPttMode: vi.fn(async () => {}),
     setPttHeld: vi.fn(),
     clearChannelFull: vi.fn(),
+    moderate: vi.fn(async () => {}),
   };
 }
 
@@ -35,6 +39,8 @@ function roster(n: number) {
     muted: false,
     speaking: i === 0,
     displayName: `User${i}`,
+    modMuted: false,
+    power: 0,
   }));
 }
 
@@ -197,5 +203,72 @@ describe('VoiceChannelView (V3): push-to-talk hold', () => {
     const session = fakeSession({ phase: 'connected', reconnecting: false });
     render(VoiceChannelView, { props: { session: session as never, ...base } });
     expect(screen.queryByTestId('voice-reconnecting')).not.toBeInTheDocument();
+  });
+});
+
+describe('VoiceChannelView (ZEB-358): moderation', () => {
+  it('shows mod controls only when self has power over the member', () => {
+    const session = fakeSession({ phase: 'connected', selfPower: 60,
+      roster: [{ ownerHex: 'b'.repeat(32), deviceHex: 'b'.repeat(64), muted: false, speaking: false, modMuted: false, power: 0 }] });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    expect(screen.getByTestId('mod-mute')).toBeInTheDocument();
+    expect(screen.getByTestId('mod-remove')).toBeInTheDocument();
+  });
+
+  it('hides mod controls when self lacks power over the member (equal power)', () => {
+    const session = fakeSession({ phase: 'connected', selfPower: 50,
+      roster: [{ ownerHex: 'b'.repeat(32), deviceHex: 'b'.repeat(64), muted: false, speaking: false, modMuted: false, power: 50 }] });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    expect(screen.queryByTestId('mod-mute')).not.toBeInTheDocument();
+  });
+
+  it('mute control calls moderate("mute")', async () => {
+    const session = fakeSession({ phase: 'connected', selfPower: 60,
+      roster: [{ ownerHex: 'b'.repeat(32), deviceHex: 'b'.repeat(64), muted: false, speaking: false, modMuted: false, power: 0 }] });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    await fireEvent.click(screen.getByTestId('mod-mute'));
+    expect(session.moderate).toHaveBeenCalledWith('b'.repeat(32), 'mute');
+  });
+
+  it('mute control calls moderate("unmute") when already mod-muted', async () => {
+    const session = fakeSession({ phase: 'connected', selfPower: 60,
+      roster: [{ ownerHex: 'b'.repeat(32), deviceHex: 'b'.repeat(64), muted: false, speaking: false, modMuted: true, power: 0 }] });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    await fireEvent.click(screen.getByTestId('mod-mute'));
+    expect(session.moderate).toHaveBeenCalledWith('b'.repeat(32), 'unmute');
+  });
+
+  it('Remove requires a confirm click before kicking', async () => {
+    const session = fakeSession({ phase: 'connected', selfPower: 60,
+      roster: [{ ownerHex: 'b'.repeat(32), deviceHex: 'b'.repeat(64), muted: false, speaking: false, modMuted: false, power: 0 }] });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    await fireEvent.click(screen.getByTestId('mod-remove'));
+    expect(session.moderate).not.toHaveBeenCalled();
+    await fireEvent.click(screen.getByTestId('mod-remove-confirm'));
+    expect(session.moderate).toHaveBeenCalledWith('b'.repeat(32), 'kick');
+  });
+
+  it('renders a mod-muted badge distinct from self-mute', () => {
+    const session = fakeSession({ phase: 'connected', selfPower: 0,
+      roster: [{ ownerHex: 'b'.repeat(32), deviceHex: 'b'.repeat(64), muted: false, speaking: false, modMuted: true, power: 0 }] });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    expect(screen.getByTestId('mod-muted-badge')).toBeInTheDocument();
+  });
+
+  it('shows the moderator banners', () => {
+    const muted = fakeSession({ phase: 'connected', selfModMuted: true });
+    const { unmount } = render(VoiceChannelView, { props: { session: muted as never, ...base } });
+    expect(screen.getByTestId('self-mod-muted')).toHaveAttribute('role', 'status');
+    unmount();
+    const kicked = fakeSession({ phase: 'connected', selfKicked: true });
+    render(VoiceChannelView, { props: { session: kicked as never, ...base } });
+    expect(screen.getByTestId('self-kicked')).toHaveAttribute('role', 'alert');
+  });
+
+  it('disables the mute toggle while server-muted', () => {
+    const session = fakeSession({ phase: 'connected', selfModMuted: true, muted: true });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    const muteBtn = screen.getByRole('button', { name: /unmute|muted/i });
+    expect(muteBtn).toBeDisabled();
   });
 });

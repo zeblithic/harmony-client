@@ -68,6 +68,25 @@
   const pttDown = () => session.setPttHeld(true);
   const pttUp = () => session.setPttHeld(false);
 
+  // ZEB-358 moderation. A moderator (power ≥ 50) can act on lower-power members.
+  // Self and co-equal admins are excluded automatically: self's roster `power`
+  // equals selfPower, so `selfPower > m.power` is false.
+  const MOD_POWER = 50;
+  const canModerate = (m: RosterMember): boolean =>
+    $voiceState.selfPower >= MOD_POWER && $voiceState.selfPower > m.power;
+  const modMute = (m: RosterMember) =>
+    swallow(session.moderate(m.ownerHex, m.modMuted ? 'unmute' : 'mute'));
+  // Remove (kick) is a severe-but-reversible action → require a confirming
+  // second click (tier-confirmation-to-severity). Tracks the device being
+  // confirmed; any other click resets it.
+  let confirmingKick = $state<string | null>(null);
+  const askKick = (m: RosterMember) => { confirmingKick = m.deviceHex; };
+  const doKick = (m: RosterMember) => { confirmingKick = null; swallow(session.moderate(m.ownerHex, 'kick')); };
+
+  // True while a moderator has server-muted or kicked us: the talk controls are
+  // disabled (the session also blocks self-unmute defensively).
+  const silenced = $derived($voiceState.selfModMuted || $voiceState.selfKicked);
+
   function isTypingTarget(t: EventTarget | null): boolean {
     const el = t as HTMLElement | null;
     if (!el || !el.tagName) return false;
@@ -142,6 +161,24 @@
               {/if}
               <span class="name">{label(m)}</span>
               {#if m.muted}<span class="mute-glyph" aria-label="muted">🔇</span>{/if}
+              {#if m.modMuted}
+                <span class="mod-badge" data-testid="mod-muted-badge" title="Muted by a moderator" aria-label="muted by a moderator">🛡️🔇</span>
+              {/if}
+              {#if canModerate(m)}
+                <div class="mod-controls">
+                  <button class="mod-btn" data-testid="mod-mute" onclick={() => modMute(m)}
+                    aria-label={m.modMuted ? 'Unmute (moderator)' : 'Mute (moderator)'}>
+                    {m.modMuted ? 'Unmute' : 'Mute'}
+                  </button>
+                  {#if confirmingKick === m.deviceHex}
+                    <button class="mod-btn danger" data-testid="mod-remove-confirm" onclick={() => doKick(m)}
+                      aria-label="Confirm remove">Confirm</button>
+                  {:else}
+                    <button class="mod-btn" data-testid="mod-remove" onclick={() => askKick(m)}
+                      aria-label="Remove from voice">Remove</button>
+                  {/if}
+                </div>
+              {/if}
             </div>
           {/each}
         </div>
@@ -156,11 +193,40 @@
               <span class="dot" class:on={m.speaking} aria-hidden="true"></span>
               <span class="name">{label(m)}</span>
               {#if m.muted}<span class="mute-glyph" aria-label="muted">🔇</span>{/if}
+              {#if m.modMuted}
+                <span class="mod-badge" data-testid="mod-muted-badge" title="Muted by a moderator" aria-label="muted by a moderator">🛡️🔇</span>
+              {/if}
+              {#if canModerate(m)}
+                <div class="mod-controls">
+                  <button class="mod-btn" data-testid="mod-mute" onclick={() => modMute(m)}
+                    aria-label={m.modMuted ? 'Unmute (moderator)' : 'Mute (moderator)'}>
+                    {m.modMuted ? 'Unmute' : 'Mute'}
+                  </button>
+                  {#if confirmingKick === m.deviceHex}
+                    <button class="mod-btn danger" data-testid="mod-remove-confirm" onclick={() => doKick(m)}
+                      aria-label="Confirm remove">Confirm</button>
+                  {:else}
+                    <button class="mod-btn" data-testid="mod-remove" onclick={() => askKick(m)}
+                      aria-label="Remove from voice">Remove</button>
+                  {/if}
+                </div>
+              {/if}
             </li>
           {/each}
         </ul>
       {/if}
     </div>
+
+    {#if $voiceState.selfModMuted}
+      <div class="voice-mod-note" role="status" data-testid="self-mod-muted">
+        🛡️ You've been muted by a moderator.
+      </div>
+    {/if}
+    {#if $voiceState.selfKicked}
+      <div class="voice-error" role="alert" data-testid="self-kicked">
+        🛡️ You were removed from voice by a moderator.
+      </div>
+    {/if}
 
     <div class="voice-controls">
       {#if $voiceState.reconnecting}
@@ -183,6 +249,7 @@
           onpointerleave={pttUp}
           onpointercancel={pttUp}
           aria-label="Hold to talk (or hold Space)"
+          disabled={silenced}
         >
           {$voiceState.pttHeld ? '🎙 Talking…' : '🎙 Hold to Talk'}
         </button>
@@ -193,6 +260,8 @@
           aria-pressed={!$voiceState.muted}
           onclick={toggleMute}
           aria-label={$voiceState.muted ? 'Unmute' : 'Mute'}
+          disabled={silenced}
+          title={silenced ? 'Muted by a moderator' : ''}
         >
           {$voiceState.muted ? '🔇 Muted' : '🎙 Live'}
         </button>
@@ -203,6 +272,7 @@
         aria-pressed={$voiceState.pttMode}
         onclick={togglePtt}
         aria-label="Push to talk mode"
+        disabled={silenced}
       >
         PTT
       </button>
@@ -462,4 +532,14 @@
   .btn-danger:hover {
     filter: brightness(1.1);
   }
+
+  .mod-controls { display: flex; gap: 4px; margin-top: 4px; }
+  .mod-btn { border: 1px solid var(--border); background: var(--bg-tertiary); color: var(--text-secondary);
+    font-size: 0.7rem; padding: 2px 6px; border-radius: 3px; cursor: pointer; }
+  .mod-btn:hover { color: var(--text-primary); }
+  .mod-btn.danger { color: var(--danger); border-color: var(--danger); }
+  .mod-badge { position: absolute; top: 6px; left: 6px; font-size: 0.7rem; line-height: 1; }
+  .voice-mod-note { background: color-mix(in srgb, var(--warning, #d8a200) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warning, #d8a200) 40%, transparent);
+    color: var(--warning, #d8a200); padding: 6px 14px; border-radius: 4px; margin: 0 16px 8px; font-size: 0.85rem; }
 </style>
