@@ -72,6 +72,15 @@ export class VoiceSender {
               ? this.config.frameGate(pcm)
               : { send: true, ptt: true };
             if (decision.send) this.sendFrame(pcm, decision.ptt);
+            // Advance the stream clock for EVERY captured frame, even gated
+            // (DTX / VAD-silence) ones we don't transmit. The receiver's jitter
+            // buffer advances its playhead every 20 ms regardless of arrivals;
+            // if the sender froze its sequence across a silence gap, the first
+            // resumed frame would land "behind" the playhead and be discarded
+            // as late — silently killing speech after every pause. Advancing
+            // per captured frame keeps sequence/timestamp aligned with
+            // wall-clock playback so resumed audio stays in sync.
+            this.advanceClock();
           },
           undefined,
           undefined,
@@ -110,6 +119,7 @@ export class VoiceSender {
     const silence = new Float32Array(frameSize);
     for (let i = 0; i < TAIL_FRAME_COUNT; i++) {
       await this.sendFrame(silence, false);
+      this.advanceClock();
     }
     this.config.codec.destroy();
     this.active = false;
@@ -123,8 +133,8 @@ export class VoiceSender {
    * value is ignored (fire-and-forget). In stop(), tail frames are awaited
    * to ensure end-of-transmission reaches the mesh before teardown.
    *
-   * The sequence number wraps at 65535 (u16); the timestamp accumulates
-   * FRAME_MS (20 ms) per frame and wraps naturally as a u32.
+   * Stamps the CURRENT stream clock (sequence/timestamp); advancing the clock
+   * is the caller's job (advanceClock) so gated DTX frames still tick it.
    */
   private sendFrame(pcm: Float32Array, pttActive: boolean): Promise<unknown> {
     const encoded = this.config.codec.encode(pcm);
@@ -141,7 +151,7 @@ export class VoiceSender {
     // Tauri v2 deserializes invoke args by parameter name — the Rust command
     // parameter is `payload: SendVoiceFramePayload`, so we wrap accordingly.
     // Uint8Array → number[] for JSON serialization over IPC.
-    const promise = this.config.invoke('send_voice_frame', {
+    return this.config.invoke('send_voice_frame', {
       payload: {
         communityId: this.config.communityId,
         channelId: this.config.channelId,
@@ -150,8 +160,16 @@ export class VoiceSender {
     }).catch(() => {
       // IPC errors are non-fatal for individual frames
     });
+  }
+
+  /**
+   * Advance the RTP-style stream clock by one frame. Called once per CAPTURED
+   * frame (transmitted or gated) so the sequence/timestamp track wall-clock
+   * elapsed audio, not just sent packets. The sequence wraps at 65535 (u16);
+   * the timestamp accumulates FRAME_MS (20 ms) per frame and wraps as a u32.
+   */
+  private advanceClock(): void {
     this.sequence = (this.sequence + 1) & 0xffff;
-    this.timestamp += FRAME_MS;
-    return promise;
+    this.timestamp = (this.timestamp + FRAME_MS) >>> 0;
   }
 }
