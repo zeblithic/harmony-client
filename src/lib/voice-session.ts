@@ -279,3 +279,16 @@ export class VoiceSession {
     this.patch({ roster });
   }
 }
+
+/**
+ * App-lifetime singleton. There is at most one active voice session per process
+ * (joining a second channel throws while one is connected), so the whole app
+ * shares a single VoiceSession built once from the wiring deps. The first caller
+ * constructs it with its deps; subsequent calls return the same instance and
+ * ignore their deps (identity/adapter are stable for the session).
+ */
+let _voiceSessionSingleton: VoiceSession | null = null;
+export function getVoiceSession(deps: VoiceSessionDeps): VoiceSession {
+  if (!_voiceSessionSingleton) _voiceSessionSingleton = new VoiceSession(deps);
+  return _voiceSessionSingleton;
+}
