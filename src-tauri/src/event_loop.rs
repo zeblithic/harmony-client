@@ -1739,6 +1739,18 @@ pub async fn run<R: Runtime>(
         std::sync::Arc<std::sync::atomic::AtomicU64>,
     > = std::collections::HashMap::new();
 
+    // ZEB-352: DM call state — keyed by 16-byte call_id. No presence (2-party implicit).
+    let mut dm_voice_subs: std::collections::HashMap<[u8; 16], tokio::task::JoinHandle<()>> =
+        std::collections::HashMap::new();
+    let mut dm_voice_keys: std::collections::HashMap<
+        [u8; 16],
+        std::sync::Arc<crate::community_channel_log::ChannelKey>,
+    > = std::collections::HashMap::new();
+    let mut dm_voice_mute_flags: std::collections::HashMap<
+        [u8; 16],
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    > = std::collections::HashMap::new();
+
     // ZEB-350: presence layer. One shared roster map for the loop's
     // lifetime; per-join publisher/subscriber handles; a `voice_identity`
     // stash so Leave can build the `left` tombstone without re-resolving caps;
@@ -2408,34 +2420,56 @@ pub async fn run<R: Runtime>(
             // Await directly instead of spawning per-frame tasks — preserves
             // ordering and applies natural backpressure from Zenoh.
             Some(voice) = voice_rx.recv() => {
-                // ZEB-350: seal the whole frame (header + payload) under the
-                // per-(community, channel) ChannelKey, then publish to an
-                // own-device-named topic segment. Sender routing now lives in
-                // the topic, not the cleartext header.
-                if let Some(key) = voice_keys.get(&(voice.community_id, voice.channel_id)) {
-                    let own = voice_own_device.as_deref().unwrap_or("self");
-                    match crate::voice_crypto::encrypt_voice_packet(
-                        key,
-                        &voice.community_id,
-                        &voice.channel_id,
-                        crate::voice_crypto::VOICE_PACKET_AAD,
-                        &voice.frame,
-                    ) {
-                        Ok(sealed) => {
-                            let key_expr = format!(
-                                "harmony/voice/{}/{}/{}",
-                                hex::encode(voice.community_id.0),
-                                hex::encode(voice.channel_id.0),
-                                own,
-                            );
-                            if let Err(e) = session.put(&key_expr, sealed).await {
-                                tracing::warn!(%key_expr, err = %e, "voice publish failed");
+                match voice {
+                    crate::voice::VoiceOutbound::Channel { community_id, channel_id, frame } => {
+                        // ZEB-350: seal the whole frame (header + payload) under the
+                        // per-(community, channel) ChannelKey, then publish to an
+                        // own-device-named topic segment. Sender routing now lives in
+                        // the topic, not the cleartext header.
+                        if let Some(key) = voice_keys.get(&(community_id, channel_id)) {
+                            let own = voice_own_device.as_deref().unwrap_or("self");
+                            match crate::voice_crypto::encrypt_voice_packet(
+                                key,
+                                &community_id,
+                                &channel_id,
+                                crate::voice_crypto::VOICE_PACKET_AAD,
+                                &frame,
+                            ) {
+                                Ok(sealed) => {
+                                    let key_expr = format!(
+                                        "harmony/voice/{}/{}/{}",
+                                        hex::encode(community_id.0),
+                                        hex::encode(channel_id.0),
+                                        own,
+                                    );
+                                    if let Err(e) = session.put(&key_expr, sealed).await {
+                                        tracing::warn!(%key_expr, err = %e, "voice publish failed");
+                                    }
+                                }
+                                Err(e) => tracing::warn!(err = %e, "voice seal failed; dropping frame"),
                             }
                         }
-                        Err(e) => tracing::warn!(err = %e, "voice seal failed; dropping frame"),
+                        // else: not joined to that (community, channel) — drop.
+                    }
+                    // ZEB-352: DM call outbound — seal under the per-call K_voice and
+                    // publish to harmony/voice/dm/{callId}/{own}.
+                    crate::voice::VoiceOutbound::Dm { call_id, frame } => {
+                        if let Some(key) = dm_voice_keys.get(&call_id) {
+                            let own = voice_own_device.as_deref().unwrap_or("self");
+                            match crate::voice_crypto::encrypt_dm_voice_packet(
+                                key, &call_id, crate::voice_crypto::VOICE_DM_PACKET_AAD, &frame,
+                            ) {
+                                Ok(sealed) => {
+                                    let key_expr = format!("harmony/voice/dm/{}/{}", hex::encode(call_id), own);
+                                    if let Err(e) = session.put(&key_expr, sealed).await {
+                                        tracing::warn!(%key_expr, err = %e, "dm voice publish failed");
+                                    }
+                                }
+                                Err(e) => tracing::warn!(err = %e, "dm voice seal failed; dropping frame"),
+                            }
+                        }
                     }
                 }
-                // else: not joined to that (community, channel) — drop.
             }
 
             // ── Voice channel join/leave ────────────────────────────
@@ -2704,6 +2738,65 @@ pub async fn run<R: Runtime>(
                                     tracing::warn!(%pres_topic, err = ?e, "immediate mute beacon publish failed");
                                 }
                             }
+                        }
+                    }
+                    // ── ZEB-352: DM call lifecycle ────────────────────────
+                    crate::voice::VoiceChannelRequest::JoinDmCall { call_id, caps } => {
+                        let sub_key = format!("harmony/voice/dm/{}/*", hex::encode(call_id));
+                        let key_for_sub = std::sync::Arc::clone(&caps.channel_key);
+                        let app_sub = app.clone();
+                        let closing_sub = closing.clone();
+                        let call_hex = hex::encode(call_id);
+                        if voice_own_device.is_none() {
+                            voice_own_device = Some(hex::encode(caps.self_device));
+                        }
+                        match session.declare_subscriber(&sub_key).await {
+                            Ok(sub) => {
+                                let handle = tokio::spawn(async move {
+                                    while let Ok(sample) = sub.recv_async().await {
+                                        if sample.payload().len() > crate::voice_crypto::MAX_VOICE_PACKET_BYTES {
+                                            continue;
+                                        }
+                                        let sealed = sample.payload().to_bytes().to_vec();
+                                        if let Ok(frame) = crate::voice_crypto::decrypt_dm_voice_packet(
+                                            &key_for_sub,
+                                            &call_id,
+                                            crate::voice_crypto::VOICE_DM_PACKET_AAD,
+                                            &sealed,
+                                        ) {
+                                            let _ = app_sub.emit(
+                                                "dm-voice-frame-received",
+                                                serde_json::json!({
+                                                    "callId": call_hex,
+                                                    "frameBytes": frame,
+                                                }),
+                                            );
+                                        }
+                                    }
+                                    if !closing_sub.load(std::sync::atomic::Ordering::SeqCst) {
+                                        tracing::warn!("dm voice subscriber closed unexpectedly");
+                                    }
+                                });
+                                dm_voice_keys.insert(call_id, caps.channel_key);
+                                dm_voice_mute_flags.insert(
+                                    call_id,
+                                    std::sync::Arc::new(AtomicBool::new(true)),
+                                );
+                                dm_voice_subs.insert(call_id, handle);
+                            }
+                            Err(e) => tracing::warn!(err = %e, "dm voice subscribe failed"),
+                        }
+                    }
+                    crate::voice::VoiceChannelRequest::LeaveDmCall { call_id } => {
+                        dm_voice_mute_flags.remove(&call_id);
+                        dm_voice_keys.remove(&call_id);
+                        if let Some(handle) = dm_voice_subs.remove(&call_id) {
+                            handle.abort();
+                        }
+                    }
+                    crate::voice::VoiceChannelRequest::SetDmCallMuted { call_id, muted } => {
+                        if let Some(flag) = dm_voice_mute_flags.get(&call_id) {
+                            flag.store(muted, std::sync::atomic::Ordering::SeqCst);
                         }
                     }
                 }

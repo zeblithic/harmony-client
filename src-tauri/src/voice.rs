@@ -18,10 +18,15 @@ use std::sync::Arc;
 
 /// An outbound voice frame from the frontend, ready to publish to Zenoh.
 #[derive(Debug)]
-pub struct VoiceOutbound {
-    pub community_id: SpaceId,
-    pub channel_id: ChannelId,
-    pub frame: Vec<u8>,
+pub enum VoiceOutbound {
+    Channel {
+        community_id: SpaceId,
+        channel_id: ChannelId,
+        frame: Vec<u8>,
+    },
+    /// ZEB-352: a frame for a 1:1 DM call, sealed under per-call K_voice and
+    /// published to harmony/voice/dm/{callId}/{own}.
+    Dm { call_id: [u8; 16], frame: Vec<u8> },
 }
 
 /// Capabilities resolved at the IPC boundary (which holds `NodeState`) and
@@ -63,6 +68,15 @@ pub enum VoiceChannelRequest {
         channel_id: ChannelId,
         muted: bool,
     },
+    /// ZEB-352: join a 1:1 DM voice call. No presence — 2-party implicit.
+    JoinDmCall {
+        call_id: [u8; 16],
+        caps: VoiceJoinCaps,
+    },
+    /// ZEB-352: leave a 1:1 DM voice call.
+    LeaveDmCall { call_id: [u8; 16] },
+    /// ZEB-352: flip the mute flag for an active DM call.
+    SetDmCallMuted { call_id: [u8; 16], muted: bool },
 }
 
 /// Payload for the send_voice_frame Tauri command.
@@ -81,6 +95,22 @@ pub struct SendVoiceFramePayload {
 pub struct SetVoiceMutedPayload {
     pub community_id: String,
     pub channel_id: String,
+    pub muted: bool,
+}
+
+/// ZEB-352: payload for the `send_dm_voice_frame` Tauri command.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendDmVoiceFramePayload {
+    pub call_id: String,
+    pub frame_bytes: Vec<u8>,
+}
+
+/// ZEB-352: payload for the `set_dm_call_muted` Tauri command.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetDmCallMutedPayload {
+    pub call_id: String,
     pub muted: bool,
 }
 

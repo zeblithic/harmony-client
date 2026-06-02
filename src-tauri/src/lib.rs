@@ -11608,7 +11608,7 @@ async fn send_voice_frame(
             .ok_or_else(|| "not connected".to_string())?
     };
     voice_tx
-        .send(voice::VoiceOutbound {
+        .send(voice::VoiceOutbound::Channel {
             community_id,
             channel_id,
             frame: payload.frame_bytes,
