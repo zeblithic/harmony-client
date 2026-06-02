@@ -27,6 +27,14 @@ export interface VoiceSenderConfig {
    * supplies a gate encoding mute / PTT / VAD (DTX).
    */
   frameGate?: (pcm: Float32Array) => { send: boolean; ptt: boolean };
+  /**
+   * Optional transport override for publishing an assembled voice frame. When
+   * present it replaces the default `invoke('send_voice_frame', …)` call —
+   * the DM call controller supplies one that addresses by `callId` via
+   * `send_dm_voice_frame`. Receives the raw frame bytes (header + payload) as a
+   * plain number[] (JSON-serializable over IPC). Absent ⇒ legacy channel path.
+   */
+  publishFrame?: (frameBytes: number[]) => Promise<unknown>;
 }
 
 /**
@@ -148,16 +156,22 @@ export class VoiceSender {
     const frame = new Uint8Array(HEADER_SIZE + encoded.byteLength);
     frame.set(header, 0);
     frame.set(encoded, HEADER_SIZE);
+    // Uint8Array → number[] for JSON serialization over IPC.
+    const frameBytes = Array.from(frame);
+    // A supplied publishFrame override replaces the default channel transport
+    // (the DM call controller routes through send_dm_voice_frame by callId).
     // Tauri v2 deserializes invoke args by parameter name — the Rust command
     // parameter is `payload: SendVoiceFramePayload`, so we wrap accordingly.
-    // Uint8Array → number[] for JSON serialization over IPC.
-    return this.config.invoke('send_voice_frame', {
-      payload: {
-        communityId: this.config.communityId,
-        channelId: this.config.channelId,
-        frameBytes: Array.from(frame),
-      },
-    }).catch(() => {
+    const publish = this.config.publishFrame
+      ? this.config.publishFrame(frameBytes)
+      : this.config.invoke('send_voice_frame', {
+          payload: {
+            communityId: this.config.communityId,
+            channelId: this.config.channelId,
+            frameBytes,
+          },
+        });
+    return publish.catch(() => {
       // IPC errors are non-fatal for individual frames
     });
   }
