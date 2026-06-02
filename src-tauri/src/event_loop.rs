@@ -2082,6 +2082,22 @@ pub async fn run<R: Runtime>(
         ),
         tokio::task::JoinHandle<()>,
     > = std::collections::HashMap::new();
+    // ZEB-358 (Cursor HIGH): per-channel "this node is kicked" flag, SHARED with
+    // that channel's presence publisher (gates beacon publishing) and its control
+    // sub (sets it from the moderation map after each apply). Kept in lockstep
+    // with `voice_control_subs` on Join/Leave.
+    let mut voice_self_kicked_flags: std::collections::HashMap<
+        (
+            crate::owner_state_types::SpaceId,
+            crate::community_membership::ChannelId,
+        ),
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    > = std::collections::HashMap::new();
+    // ZEB-358 (Qodo perf): true iff ANY moderation is currently enforced in ANY
+    // channel. The audio media subscriber reads this to skip the per-frame
+    // presence+moderation `Mutex` locks when no moderation is active (the common
+    // case). Updated after every apply (control sub + Moderate) and every sweep.
+    let voice_moderation_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Directives THIS node issued and is re-asserting until `stop_after_ms`.
     // Key: (community, channel, target_owner, is_mute_class). Main-loop owned.
     #[allow(clippy::type_complexity)]
@@ -2819,6 +2835,9 @@ pub async fn run<R: Runtime>(
                         let mod_map_media = std::sync::Arc::clone(&voice_moderation_map);
                         let presence_map_media = std::sync::Arc::clone(&voice_presence_map);
                         let voice_now_ms_media = std::sync::Arc::clone(&voice_now_ms);
+                        // ZEB-358 (Qodo perf): skip the per-frame presence+moderation
+                        // lookups entirely while no moderation is active.
+                        let mod_active_media = std::sync::Arc::clone(&voice_moderation_active);
                         match session.declare_subscriber(&sub_key).await {
                             Ok(sub) => {
                                 // The subscriber opens (decrypts) before emitting;
@@ -2862,21 +2881,28 @@ pub async fn run<R: Runtime>(
                                             // a frame can't carry a validly-sealed payload
                                             // for this channel anyway, and the sender
                                             // resolves within ~4 s once presence lands.
-                                            let key = sample.key_expr().as_str();
-                                            if let Some(sender_hex) = key.rsplit('/').next() {
-                                                if let Ok(dev_bytes) = hex::decode(sender_hex) {
-                                                    if let Ok(dev) = <[u8; 32]>::try_from(dev_bytes.as_slice()) {
-                                                        let owner = {
-                                                            let g = presence_map_media.lock().await;
-                                                            g.owner_for_device(&c_sub, &ch_sub, &dev)
-                                                        };
-                                                        if let Some(owner) = owner {
-                                                            let now = (voice_now_ms_media)();
-                                                            let g = mod_map_media.lock().await;
-                                                            if g.is_muted(&c_sub, &ch_sub, &owner, now)
-                                                                || g.is_kicked(&c_sub, &ch_sub, &owner, now)
-                                                            {
-                                                                continue; // drop moderated sender's frame
+                                            //
+                                            // Gated on the `voice_moderation_active` flag
+                                            // so the hot path does ZERO extra locks/parsing
+                                            // in the common case where no moderation is in
+                                            // effect (Qodo perf).
+                                            if mod_active_media.load(std::sync::atomic::Ordering::Relaxed) {
+                                                let key = sample.key_expr().as_str();
+                                                if let Some(sender_hex) = key.rsplit('/').next() {
+                                                    if let Ok(dev_bytes) = hex::decode(sender_hex) {
+                                                        if let Ok(dev) = <[u8; 32]>::try_from(dev_bytes.as_slice()) {
+                                                            let owner = {
+                                                                let g = presence_map_media.lock().await;
+                                                                g.owner_for_device(&c_sub, &ch_sub, &dev)
+                                                            };
+                                                            if let Some(owner) = owner {
+                                                                let now = (voice_now_ms_media)();
+                                                                let g = mod_map_media.lock().await;
+                                                                if g.is_muted(&c_sub, &ch_sub, &owner, now)
+                                                                    || g.is_kicked(&c_sub, &ch_sub, &owner, now)
+                                                                {
+                                                                    continue; // drop moderated sender's frame
+                                                                }
                                                             }
                                                         }
                                                     }
@@ -3051,6 +3077,17 @@ pub async fn run<R: Runtime>(
                                         (community_id, channel_id),
                                         std::sync::Arc::clone(&seq_counter),
                                     );
+                                    // ZEB-358: per-channel self-kicked flag gating the
+                                    // presence publisher (a kicked owner stops beaconing
+                                    // so peers presence-evict us). Set by the control sub
+                                    // + sweep tick from the moderation map.
+                                    let self_kicked_flag = std::sync::Arc::new(
+                                        std::sync::atomic::AtomicBool::new(false),
+                                    );
+                                    voice_self_kicked_flags.insert(
+                                        (community_id, channel_id),
+                                        std::sync::Arc::clone(&self_kicked_flag),
+                                    );
                                     let pubh = crate::voice_presence::spawn_voice_presence_publisher(
                                         session.clone(),
                                         pres_topic,
@@ -3062,6 +3099,7 @@ pub async fn run<R: Runtime>(
                                         caps.self_device,
                                         caps.joined_hlc.clone(),
                                         mute_flag,
+                                        std::sync::Arc::clone(&self_kicked_flag),
                                         seq_counter,
                                         Duration::from_secs(4),
                                         closing.clone(),
@@ -3097,6 +3135,14 @@ pub async fn run<R: Runtime>(
                                     let ctrl_self_owner = caps.self_owner;
                                     let ctrl_community = community_id;
                                     let ctrl_channel = channel_id;
+                                    // ZEB-358: the control sub updates the self-kicked
+                                    // flag (gates presence publishing) and the global
+                                    // moderation-active flag (gates the audio hot path)
+                                    // from the moderation map after each apply.
+                                    let ctrl_self_kicked =
+                                        std::sync::Arc::clone(&self_kicked_flag);
+                                    let ctrl_mod_active =
+                                        std::sync::Arc::clone(&voice_moderation_active);
                                     let handle = tokio::spawn(async move {
                                         let mut backoff = std::time::Duration::from_secs(5);
                                         const MAX_BACKOFF: std::time::Duration =
@@ -3150,13 +3196,13 @@ pub async fn run<R: Runtime>(
                                                 else {
                                                     continue;
                                                 };
-                                                if crate::voice_moderation::verify_directive_sig(
-                                                    &signed,
-                                                )
-                                                .is_err()
-                                                {
-                                                    continue;
-                                                }
+                                                // `directive_signer_is_authorized`
+                                                // verifies the device-#2 signature
+                                                // (via `verify_directive_authority`)
+                                                // before the membership + power
+                                                // gates, so an explicit
+                                                // `verify_directive_sig` here would
+                                                // be redundant (Qodo).
                                                 if crate::voice_moderation::directive_signer_is_authorized(
                                                     &ctrl_registry,
                                                     &ctrl_community,
@@ -3178,6 +3224,26 @@ pub async fn run<R: Runtime>(
                                                         crate::voice_moderation::ENFORCE_TTL_MS,
                                                     )
                                                 };
+                                                // ZEB-358: refresh the self-kicked flag
+                                                // (gates our presence publisher) and the
+                                                // global moderation-active flag (gates the
+                                                // audio hot path) from the just-applied map.
+                                                {
+                                                    let g = ctrl_mod_map.lock().await;
+                                                    ctrl_self_kicked.store(
+                                                        g.is_kicked(
+                                                            &ctrl_community,
+                                                            &ctrl_channel,
+                                                            &ctrl_self_owner.0,
+                                                            now,
+                                                        ),
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                    ctrl_mod_active.store(
+                                                        g.any_enforced(now),
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                }
                                                 if changed {
                                                     emit_moderation_changed(
                                                         &ctrl_app,
@@ -3267,6 +3333,7 @@ pub async fn run<R: Runtime>(
                         if let Some(h) = voice_control_subs.remove(&(community_id, channel_id)) {
                             h.abort();
                         }
+                        voice_self_kicked_flags.remove(&(community_id, channel_id));
                         {
                             let mut g = voice_moderation_map.lock().await;
                             g.remove_channel(&community_id, &channel_id);
@@ -3642,6 +3709,15 @@ pub async fn run<R: Runtime>(
                                                 crate::voice_moderation::ENFORCE_TTL_MS,
                                             )
                                         };
+                                        // ZEB-358 (Qodo perf): refresh the hot-path
+                                        // moderation-active flag after the issuer apply.
+                                        voice_moderation_active.store(
+                                            {
+                                                let g = voice_moderation_map.lock().await;
+                                                g.any_enforced(now)
+                                            },
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
                                         if changed {
                                             emit_moderation_changed(
                                                 &app,
@@ -3729,12 +3805,31 @@ pub async fn run<R: Runtime>(
                     let mut g = voice_moderation_map.lock().await;
                     g.sweep(now2)
                 };
+                // ZEB-358 (Qodo perf): refresh the hot-path moderation-active flag
+                // after the sweep (a lapse can flip the last enforcement off).
+                voice_moderation_active.store(
+                    {
+                        let g = voice_moderation_map.lock().await;
+                        g.any_enforced(now2)
+                    },
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 if let Some(registry) = community_registry.clone() {
                     for (c, ch) in mod_changed {
                         // self_owner for this channel from voice_identity.
                         if let Some((self_owner, _d, _h, _k)) =
                             voice_identity.get(&(c, ch))
                         {
+                            // ZEB-358 (Cursor HIGH): a sweep that lapses our own
+                            // kick must clear the self-kicked flag so the presence
+                            // publisher resumes beaconing.
+                            if let Some(flag) = voice_self_kicked_flags.get(&(c, ch)) {
+                                let kicked = {
+                                    let g = voice_moderation_map.lock().await;
+                                    g.is_kicked(&c, &ch, &self_owner.0, now2)
+                                };
+                                flag.store(kicked, std::sync::atomic::Ordering::Relaxed);
+                            }
                             emit_moderation_changed(
                                 &app,
                                 &registry,
@@ -3905,6 +4000,11 @@ pub async fn run<R: Runtime>(
         handle.abort();
     }
     for (_, handle) in voice_presence_pubs.drain() {
+        handle.abort();
+    }
+    // ZEB-358: abort the per-channel moderation control subscriber tasks too, so
+    // they don't run detached past shutdown (CodeRabbit).
+    for (_, handle) in voice_control_subs.drain() {
         handle.abort();
     }
     // ZEB-352: abort the DM-call media subscriber tasks too, so they don't run

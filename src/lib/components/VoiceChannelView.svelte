@@ -446,6 +446,9 @@
     gap: 0.5rem;
     padding: 6px 8px;
     border-radius: 4px;
+    /* Anchor the absolutely-positioned `.mod-badge` to the row in the >12
+       compact-list layout (the grid `.voice-tile` is already relative). */
+    position: relative;
   }
   .voice-list-row:hover {
     background: var(--bg-secondary);

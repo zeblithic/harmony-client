@@ -378,6 +378,19 @@ export class VoiceSession {
     }
   }
 
+  /** Force the local mic muted and best-effort publish it, WITHOUT rolling back
+   *  on IPC failure — a moderator server-mute/kick must stick locally even if
+   *  the presence beacon publish transiently fails. */
+  private forceLocalMute(): void {
+    this.muted = true;
+    this.patch({ muted: true });
+    if (this.community && this.channel) {
+      void this.deps
+        .invoke('set_voice_muted', { communityId: this.community, channelId: this.channel, muted: true })
+        .catch(() => {});
+    }
+  }
+
   /**
    * Issue a moderation directive against another participant (requires power).
    * Backend re-verifies the moderator's power before broadcasting.
@@ -526,7 +539,7 @@ export class VoiceSession {
       // the unattended-mic guard: a server-mute lapsing must NOT auto-resume
       // transmitting; the user opts back in explicitly.
       if (nowSilenced !== wasSilenced) {
-        void this.setMuted(true).catch(() => {});
+        this.forceLocalMute();
       }
       this.refreshRoster();
     });
@@ -577,10 +590,18 @@ export class VoiceSession {
   private maybeBounceForFull(): void {
     if (get(this.store).phase !== 'connected') return;
     if (Date.now() >= this.joinGraceUntilMs) return;
-    // Count OTHERS using the same self-identification refreshRoster uses.
+    // Count OTHERS using the same self-identification refreshRoster uses, and
+    // EXCLUDE kicked owners (Cursor Medium): a kicked member is presence-evicted
+    // and must not inflate the count into a false "channel full" bounce.
     const selfPrefix = this.deps.selfDeviceHex.slice(0, 32);
     const others = this.lastRoster.reduce(
-      (n, r) => n + (r.deviceHex.slice(0, 32) === selfPrefix ? 0 : 1), 0);
+      (n, r) =>
+        n +
+        (r.deviceHex.slice(0, 32) === selfPrefix || this.kickedOwners.has(r.ownerHex)
+          ? 0
+          : 1),
+      0,
+    );
     if (others < VOICE_CHANNEL_SOFT_CAP) return;
     this.joinGraceUntilMs = 0; // one-shot: don't let the drain tick re-bounce
     // leave() reset the store to INITIAL (channelFull:false); stamp the banner

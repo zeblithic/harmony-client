@@ -241,10 +241,18 @@ fn voice_moderation_directive_canonical_cbor_is_pinned() {
 /// Pin the sealed (signed + ChannelKey-encrypted) directive wire format.
 /// Signing key is `[7u8; 32]`, nonce is `[9u8; 12]`, channel key/community/channel
 /// match the existing presence-beacon fixture exactly.
+///
+/// Unlike the unsigned-CBOR pin above (which keeps the synthetic `[0xD2; 32]`
+/// actor_device to lock serialization), this sealed fixture sets
+/// `actor_device = verifying_key([7u8; 32])` so it is a VALID wire example: the
+/// embedded device key matches the signer, so the packet passes
+/// `verify_directive_sig` (CodeRabbit Minor).
 #[test]
 fn voice_moderation_sealed_directive_is_pinned() {
     let signing = SigningKey::from_bytes(&[7u8; 32]);
-    let signed = sign_directive(fixture_directive(), &signing).expect("sign");
+    let mut directive = fixture_directive();
+    directive.actor_device = signing.verifying_key().to_bytes();
+    let signed = sign_directive(directive, &signing).expect("sign");
     let key = derive_channel_key(
         &EpochKey::new([0x11; 32]),
         &SpaceId([0xc0; 16]),
@@ -256,7 +264,7 @@ fn voice_moderation_sealed_directive_is_pinned() {
         seal_directive_with_nonce(&key, &community, &channel, &signed, [9u8; 12]).expect("seal");
     assert_eq!(
         hex::encode(&sealed),
-        "090909090909090909090909f76ed9e6ed6f16b7af2d4cdeba79cd9b2b52875c6c8dd9f55e6a6d3821f4d63429d7a213a9ab872b13a88a2971adb9ccd2822d7fc5dd3b69ab982f4105affa78f3b765450ad1ebcb42c289f12efb521c3095d4204761a6235672205ac88454a330218cf5e02f8710576af956a769a71b5e1b2657eb6af19d0b66f2b533d7a78aba3942a4b54ecaecdcfa9c2ef189be53bbf4e90d2714385fa3240d3d6b5de306bb001bb992cdbdfb6b76d2f5718f52661172b4896ba123192d89ac32f40bd384dcff58c9081cf754",
+        "090909090909090909090909f76ed9e6ed6f16b7af2d4cdeba79cd9b2b52875c6c8dd9f55e6a6d3821f4eeac9766925d2973eb0c91014bd56686fe5976fe41136c9daba59323e9d50551fa78f3b765450ad1ebcb42c289f12efb521c3095d4204761a6235672205ac88454a330218cf5e02f8710576af956a769a71b5e1b2657eb6af19d43c5f0f7b0f6f9a4dec3298f7901d7979496c8a3f5583bbc5af6476b76332a0dc6b2e2fe15062fa509a2c1e8066233fa4ef0398626296a5d10440184ad8b9a19f02d566de18e35546864bc95e6788401",
         "sealed VoiceModerationDirective wire format drifted"
     );
 }

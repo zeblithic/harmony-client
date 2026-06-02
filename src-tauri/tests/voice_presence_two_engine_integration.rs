@@ -296,6 +296,7 @@ async fn run_inner() {
     // assertions don't depend on the mute bit (only presence/scope/tombstone),
     // so a `true` flag preserves the prior `muted: true` semantics.
     let mute_flag_a = Arc::new(AtomicBool::new(true));
+    let self_kicked_a = Arc::new(AtomicBool::new(false));
     let seq_counter_a = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let pub_handle = spawn_voice_presence_publisher(
         session_a.clone(),
@@ -308,6 +309,7 @@ async fn run_inner() {
         device_a,
         joined_hlc.clone(),
         Arc::clone(&mute_flag_a),
+        Arc::clone(&self_kicked_a),
         Arc::clone(&seq_counter_a),
         Duration::from_secs(4),
         Arc::clone(&closing),

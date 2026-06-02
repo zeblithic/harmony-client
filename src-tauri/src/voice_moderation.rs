@@ -367,6 +367,15 @@ impl ActiveModeration {
 
     /// Lapse any enforced class whose TTL passed; return the (community, channel)
     /// pairs whose effective state changed so the caller re-emits the roster.
+    ///
+    /// After lapsing, PRUNE long-expired class slots so rows don't accumulate
+    /// forever: a `!enforced` slot is removed once `now_ms > enforce_until_ms +
+    /// ENFORCE_TTL_MS` — a ≥2×TTL grace, so the LWW tombstone still blocks a
+    /// reordered stale re-apply within the enforcement window (the
+    /// `newer_unmute_clears_and_blocks_stale_mute` invariant). Then empty
+    /// `TargetState`s (both classes None) and empty `(community, channel)` maps
+    /// are dropped. Pruning never changes the *effective* state (a pruned slot was
+    /// already un-enforced), so it does not affect the returned `changed` set.
     pub fn sweep(&mut self, now_ms: u64) -> Vec<(SpaceId, ChannelId)> {
         let mut changed = Vec::new();
         for (scope, targets) in self.inner.iter_mut() {
@@ -382,8 +391,40 @@ impl ActiveModeration {
             if any {
                 changed.push(*scope);
             }
+            // Prune long-expired (≥2×TTL) un-enforced slots, then drop emptied
+            // target rows. The grace keeps the LWW tombstone alive long enough to
+            // reject a network-reordered stale re-apply.
+            for t in targets.values_mut() {
+                for slot in [&mut t.mute, &mut t.kick] {
+                    let prune = slot.as_ref().is_some_and(|s| {
+                        !s.enforced && now_ms > s.enforce_until_ms.saturating_add(ENFORCE_TTL_MS)
+                    });
+                    if prune {
+                        *slot = None;
+                    }
+                }
+            }
+            targets.retain(|_, t| t.mute.is_some() || t.kick.is_some());
         }
+        // Reclaim channel sub-maps emptied by pruning so they don't accumulate as
+        // ghost entries every future sweep re-scans.
+        self.inner.retain(|_, targets| !targets.is_empty());
         changed
+    }
+
+    /// True iff any target in any channel is currently enforced & unexpired. The
+    /// event loop caches this in an `AtomicBool` so the audio hot path can skip
+    /// the per-frame presence+moderation `Mutex` locks when no moderation is
+    /// active (the common case) — Qodo perf.
+    pub fn any_enforced(&self, now_ms: u64) -> bool {
+        self.inner.values().any(|targets| {
+            targets.values().any(|t| {
+                [&t.mute, &t.kick]
+                    .into_iter()
+                    .flatten()
+                    .any(|s| s.enforced && now_ms < s.enforce_until_ms)
+            })
+        })
     }
 
     /// Drop all moderation state for a channel (called on Leave).
@@ -417,6 +458,15 @@ impl ActiveModeration {
             }
         }
         (muted, kicked)
+    }
+
+    /// Number of target rows currently retained for `(c, ch)` (enforced or not).
+    /// Test-only: lets the prune test assert the internal map shrank, since the
+    /// public surface (`snapshot`/`is_*`) can't distinguish "un-enforced row
+    /// retained" from "row pruned".
+    #[cfg(test)]
+    fn target_count(&self, c: &SpaceId, ch: &ChannelId) -> usize {
+        self.inner.get(&(*c, *ch)).map_or(0, |m| m.len())
     }
 }
 
@@ -558,6 +608,32 @@ mod tests {
         let lapsed = am.sweep(1_000 + ENFORCE_TTL_MS);
         assert_eq!(lapsed, vec![(C, CH)]);
         assert!(!am.is_muted(&C, &CH, &[0xBB; 16], 1_000 + ENFORCE_TTL_MS));
+    }
+
+    #[test]
+    fn sweep_prunes_long_expired_rows() {
+        let mut am = ActiveModeration::default();
+        // Mute at t=1_000 → enforce_until_ms = 1_000 + ENFORCE_TTL_MS.
+        assert!(applied(&mut am, ModAction::Mute, 100, 1, 1_000));
+        assert_eq!(am.target_count(&C, &CH), 1);
+        // First sweep AT the TTL edge lapses it (enforced→false) but RETAINS the
+        // row as a tombstone within the grace window.
+        let lapsed = am.sweep(1_000 + ENFORCE_TTL_MS);
+        assert_eq!(lapsed, vec![(C, CH)]);
+        assert_eq!(
+            am.target_count(&C, &CH),
+            1,
+            "lapsed-but-recent row retained as a stale-re-apply tombstone"
+        );
+        // A sweep well past 2×TTL (the grace) prunes the row entirely and reclaims
+        // the now-empty channel sub-map.
+        let lapsed2 = am.sweep(1_000 + 3 * ENFORCE_TTL_MS);
+        assert!(lapsed2.is_empty(), "no effective change on the prune sweep");
+        assert_eq!(
+            am.target_count(&C, &CH),
+            0,
+            "long-expired row pruned so rows don't accumulate forever"
+        );
     }
 
     #[test]

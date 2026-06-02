@@ -572,6 +572,10 @@ pub async fn publish_presence_once(
 /// sentinel produced: the sentinel permanently poisoned same-session freshness,
 /// stalling the roster). `u64::MAX` stays reserved for the leave tombstone.
 ///
+/// `self_kicked` is a per-(community, channel) `Arc<AtomicBool>` SHARED with the
+/// control sub / sweep tick. While set, the publisher skips publishing so peers
+/// presence-evict this kicked client (ZEB-358).
+///
 /// `session` is an owned, cheaply-cloned `zenoh::Session`.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_voice_presence_publisher(
@@ -585,6 +589,7 @@ pub fn spawn_voice_presence_publisher(
     self_device: [u8; 32],
     joined_hlc: Hlc,
     muted: Arc<AtomicBool>,
+    self_kicked: Arc<AtomicBool>,
     seq_counter: Arc<AtomicU64>,
     interval: std::time::Duration,
     closing: Arc<AtomicBool>,
@@ -597,6 +602,15 @@ pub fn spawn_voice_presence_publisher(
             tick.tick().await;
             if closing.load(Ordering::SeqCst) {
                 break;
+            }
+            // ZEB-358 (Cursor HIGH): a kicked owner must stop advertising
+            // presence so peers presence-evict us (the 12 s TTL backstops; the FE
+            // overlay hides us immediately). Skip publishing while the per-channel
+            // `self_kicked` flag is set — set by the control sub / sweep tick from
+            // the moderation map. We keep ticking (no break) so a later
+            // un-kick within the same session resumes beacons.
+            if self_kicked.load(Ordering::Relaxed) {
+                continue;
             }
             let seq = seq_counter.fetch_add(1, Ordering::SeqCst);
             let beacon = build_heartbeat_beacon(

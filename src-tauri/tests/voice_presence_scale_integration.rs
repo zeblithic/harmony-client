@@ -286,6 +286,7 @@ async fn run_inner() {
     let mut pub_handles = Vec::with_capacity(N);
     for m in &members {
         let mute_flag = Arc::new(AtomicBool::new(true));
+        let self_kicked = Arc::new(AtomicBool::new(false));
         let seq_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let handle = spawn_voice_presence_publisher(
             session_pub.clone(),
@@ -298,6 +299,7 @@ async fn run_inner() {
             m.device,
             m.joined_hlc.clone(),
             mute_flag,
+            self_kicked,
             seq_counter,
             Duration::from_secs(4),
             Arc::clone(&closing),

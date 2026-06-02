@@ -470,6 +470,20 @@ describe('VoiceSession moderation (ZEB-358)', () => {
     expect(get(s.state).muted).toBe(true);         // unattended-mic guard: stays muted
   });
 
+  it('force-mute stays muted even when set_voice_muted rejects (no rollback)', async () => {
+    const s = newSession();
+    await s.join('comm', 'chan');
+    await s.setMuted(false);                        // open the mic first
+    expect(get(s.state).muted).toBe(false);
+    // Make ONLY set_voice_muted reject; everything else still resolves.
+    d.invoke.mockImplementation((cmd: string) =>
+      cmd === 'set_voice_muted' ? Promise.reject(new Error('x')) : Promise.resolve(undefined));
+    d.emit('voice-moderation-changed', { community: 'comm', channel: 'chan',
+      mutedOwners: ['aa'.repeat(16)], kickedOwners: [], powers: {}, selfPower: 0, selfModMuted: true, selfKicked: false });
+    expect(get(s.state).muted).toBe(true);          // mic STAYS muted despite the IPC rejection
+    d.invoke.mockResolvedValue(undefined);          // restore the mock
+  });
+
   it('moderate() invokes moderate_voice', async () => {
     const s = newSession();
     await s.join('comm', 'chan');
