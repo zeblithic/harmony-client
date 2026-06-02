@@ -4,11 +4,12 @@
 
   let { session, onEnd }: { session: CallSession | null; onEnd: () => void } = $props();
 
-  // Alias the store to a NON-rune name: `$state` is a Svelte 5 rune, so
-  // `$state.foo` would collide with the rune rather than auto-subscribe to the
-  // store. Use `$callState` for store auto-subscription throughout the markup.
-  // svelte-ignore state_referenced_locally
-  const callState = session?.state;
+  // Track the session's state store reactively so a replaced `session` prop
+  // (e.g. the singleton rebuilt on an identity switch) re-points the
+  // subscription instead of staying bound to the old store. Aliased to a
+  // NON-rune name so `$callState` auto-subscribes in the markup (`$state` is a
+  // rune and would collide).
+  const callState = $derived(session?.state);
 
   // Timer tick — updated every second when the call is active.
   let nowMs = $state(Date.now());

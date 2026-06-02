@@ -1576,7 +1576,13 @@ pub async fn run<R: Runtime>(
                                             let space_hex = {
                                                 let g = crdt_for_signal.lock().await;
                                                 g.spaces.iter().find_map(|(sid, sp)| {
+                                                    // Match the 1:1 DM space with this caller only.
+                                                    // `members.len() == 2` excludes group-DM spaces
+                                                    // (which also have a content_key and include the
+                                                    // caller) — the send side likewise assumes a
+                                                    // 2-member DM (resolve_dm_call_peer).
                                                     if sp.content_key.is_some()
+                                                        && sp.members.len() == 2
                                                         && sp.members.contains(&signal.caller)
                                                     {
                                                         Some(hex::encode(sid.0))

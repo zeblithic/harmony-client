@@ -413,13 +413,19 @@ export class CallSession {
 }
 
 /**
- * App-lifetime singleton. There is at most one active DM call per process; the
- * whole app shares a single CallSession built once from the wiring deps. The
- * first caller constructs it; subsequent calls return the same instance and
- * ignore their deps (identity/adapter are stable for the session).
+ * Per-identity singleton. There is at most one active DM call per process, so
+ * the app shares a single CallSession. It is rebuilt when the identity changes
+ * (e.g. the user switches identity via stop_node / start_node) so the session
+ * never signs signals or joins media rooms with a previous identity's keys or
+ * IPC handles; calls with the same identity return the cached instance.
  */
 let _callSessionSingleton: CallSession | null = null;
+let _callSessionIdentity: string | null = null;
 export function getCallSession(deps: CallSessionDeps): CallSession {
-  if (!_callSessionSingleton) _callSessionSingleton = new CallSession(deps);
+  const identity = `${deps.selfOwnerHex}:${deps.selfDeviceHex}`;
+  if (!_callSessionSingleton || _callSessionIdentity !== identity) {
+    _callSessionSingleton = new CallSession(deps);
+    _callSessionIdentity = identity;
+  }
   return _callSessionSingleton;
 }
