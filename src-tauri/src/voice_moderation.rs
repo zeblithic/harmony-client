@@ -8,6 +8,7 @@ use crate::community_membership::ChannelId;
 use crate::owner_state_types::{Hlc, SpaceId};
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
+use std::collections::BTreeMap;
 
 /// Liveness TTL: a directive stays effective this long after last receipt.
 pub const ENFORCE_TTL_MS: u64 = 12_000;
@@ -187,6 +188,154 @@ pub fn seal_directive_with_nonce(
     .map_err(|_| ModError::Seal)
 }
 
+#[derive(Debug, Clone)]
+struct ClassState {
+    latest_hlc: Hlc,
+    latest_seq: u64,
+    enforced: bool,
+    enforce_until_ms: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TargetState {
+    mute: Option<ClassState>,
+    kick: Option<ClassState>,
+}
+
+/// In-memory enforcement state: which owners are currently muted/kicked per
+/// (community, channel). Never persisted. Two independent classes per target
+/// (mute-class {Mute,Unmute}, kick-class {Kick,Unkick}), each last-writer-wins
+/// by `(issued_hlc, seq)`. Mirrors the freshness discipline of `VoicePresenceMap`.
+#[derive(Debug, Default)]
+pub struct ActiveModeration {
+    inner: BTreeMap<(SpaceId, ChannelId), BTreeMap<[u8; 16], TargetState>>,
+}
+
+/// True iff `(a_hlc, a_seq)` is strictly newer than `(b_hlc, b_seq)` — HLC first
+/// (via `is_strictly_newer_than`), seq as the tiebreak when the HLCs are equal.
+fn strictly_newer(a_hlc: &Hlc, a_seq: u64, b_hlc: &Hlc, b_seq: u64) -> bool {
+    if a_hlc.is_strictly_newer_than(b_hlc) {
+        true
+    } else if b_hlc.is_strictly_newer_than(a_hlc) {
+        false
+    } else {
+        a_seq > b_seq
+    }
+}
+
+impl ActiveModeration {
+    /// Apply a (verified) directive. Returns true iff the *effective* state
+    /// (enforced or not) changed, so the caller re-emits the roster. Stale
+    /// directives are ignored; an exact re-assert refreshes the TTL only.
+    pub fn apply(
+        &mut self,
+        c: &SpaceId,
+        ch: &ChannelId,
+        d: &VoiceModerationDirective,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> bool {
+        let target = self
+            .inner
+            .entry((*c, *ch))
+            .or_default()
+            .entry(d.target_owner)
+            .or_default();
+        let slot = if d.action.is_mute_class() {
+            &mut target.mute
+        } else {
+            &mut target.kick
+        };
+        match slot.as_ref() {
+            Some(s) => {
+                let is_same = !d.issued_hlc.is_strictly_newer_than(&s.latest_hlc)
+                    && !s.latest_hlc.is_strictly_newer_than(&d.issued_hlc)
+                    && d.seq == s.latest_seq;
+                if is_same {
+                    // Re-assert of the current directive: refresh TTL, no flip.
+                    if s.enforced {
+                        let until = now_ms.saturating_add(ttl_ms);
+                        slot.as_mut().expect("slot is Some").enforce_until_ms = until;
+                    }
+                    false
+                } else if strictly_newer(&d.issued_hlc, d.seq, &s.latest_hlc, s.latest_seq) {
+                    let was = s.enforced;
+                    let enforced = d.action.enforces();
+                    *slot = Some(ClassState {
+                        latest_hlc: d.issued_hlc.clone(),
+                        latest_seq: d.seq,
+                        enforced,
+                        enforce_until_ms: now_ms.saturating_add(ttl_ms),
+                    });
+                    was != enforced
+                } else {
+                    false // stale → ignore (tombstone retains latest order)
+                }
+            }
+            None => {
+                let enforced = d.action.enforces();
+                *slot = Some(ClassState {
+                    latest_hlc: d.issued_hlc.clone(),
+                    latest_seq: d.seq,
+                    enforced,
+                    enforce_until_ms: now_ms.saturating_add(ttl_ms),
+                });
+                enforced // previously absent (== not enforced) → changed iff now enforced
+            }
+        }
+    }
+
+    fn is(&self, c: &SpaceId, ch: &ChannelId, owner: &[u8; 16], now_ms: u64, mute: bool) -> bool {
+        self.inner
+            .get(&(*c, *ch))
+            .and_then(|m| m.get(owner))
+            .and_then(|t| {
+                if mute {
+                    t.mute.as_ref()
+                } else {
+                    t.kick.as_ref()
+                }
+            })
+            .is_some_and(|s| s.enforced && now_ms < s.enforce_until_ms)
+    }
+
+    /// True iff `owner` is currently server-muted in `(c, ch)`.
+    pub fn is_muted(&self, c: &SpaceId, ch: &ChannelId, owner: &[u8; 16], now_ms: u64) -> bool {
+        self.is(c, ch, owner, now_ms, true)
+    }
+
+    /// True iff `owner` is currently kicked from voice in `(c, ch)`.
+    pub fn is_kicked(&self, c: &SpaceId, ch: &ChannelId, owner: &[u8; 16], now_ms: u64) -> bool {
+        self.is(c, ch, owner, now_ms, false)
+    }
+
+    /// Lapse any enforced class whose TTL passed; return the (community, channel)
+    /// pairs whose effective state changed so the caller re-emits the roster.
+    pub fn sweep(&mut self, now_ms: u64) -> Vec<(SpaceId, ChannelId)> {
+        let mut changed = Vec::new();
+        for (scope, targets) in self.inner.iter_mut() {
+            let mut any = false;
+            for t in targets.values_mut() {
+                for s in [&mut t.mute, &mut t.kick].into_iter().flatten() {
+                    if s.enforced && now_ms >= s.enforce_until_ms {
+                        s.enforced = false;
+                        any = true;
+                    }
+                }
+            }
+            if any {
+                changed.push(*scope);
+            }
+        }
+        changed
+    }
+
+    /// Drop all moderation state for a channel (called on Leave).
+    pub fn remove_channel(&mut self, c: &SpaceId, ch: &ChannelId) {
+        self.inner.remove(&(*c, *ch));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +409,70 @@ mod tests {
         assert_eq!(opened, signed);
         let other_ch = ChannelId([0xEE; 16]);
         assert!(open_directive(&key(), &C, &other_ch, &sealed).is_none());
+    }
+
+    fn applied(
+        am: &mut ActiveModeration,
+        action: ModAction,
+        hlc_wall: u64,
+        seq: u64,
+        now: u64,
+    ) -> bool {
+        let mut d = directive(action, [0u8; 32]);
+        d.issued_hlc = Hlc {
+            wall_ms: hlc_wall,
+            logical: 0,
+            device_id: "x".into(),
+        };
+        d.seq = seq;
+        am.apply(&C, &CH, &d, now, ENFORCE_TTL_MS)
+    }
+
+    #[test]
+    fn mute_then_expire() {
+        let mut am = ActiveModeration::default();
+        assert!(applied(&mut am, ModAction::Mute, 100, 1, 1_000));
+        assert!(am.is_muted(&C, &CH, &[0xBB; 16], 1_000));
+        assert!(am.is_muted(&C, &CH, &[0xBB; 16], 1_000 + ENFORCE_TTL_MS - 1));
+        assert!(!am.is_muted(&C, &CH, &[0xBB; 16], 1_000 + ENFORCE_TTL_MS));
+    }
+
+    #[test]
+    fn reassert_refreshes_ttl() {
+        let mut am = ActiveModeration::default();
+        applied(&mut am, ModAction::Mute, 100, 1, 1_000);
+        applied(&mut am, ModAction::Mute, 100, 1, 10_000);
+        assert!(am.is_muted(&C, &CH, &[0xBB; 16], 10_000 + ENFORCE_TTL_MS - 1));
+    }
+
+    #[test]
+    fn newer_unmute_clears_and_blocks_stale_mute() {
+        let mut am = ActiveModeration::default();
+        applied(&mut am, ModAction::Mute, 100, 1, 1_000);
+        assert!(applied(&mut am, ModAction::Unmute, 200, 2, 1_100));
+        assert!(!am.is_muted(&C, &CH, &[0xBB; 16], 1_100));
+        assert!(!applied(&mut am, ModAction::Mute, 100, 1, 1_200)); // stale, ignored
+        assert!(!am.is_muted(&C, &CH, &[0xBB; 16], 1_200));
+    }
+
+    #[test]
+    fn mute_and_kick_are_independent_classes() {
+        let mut am = ActiveModeration::default();
+        applied(&mut am, ModAction::Mute, 100, 1, 1_000);
+        applied(&mut am, ModAction::Kick, 100, 1, 1_000);
+        assert!(am.is_muted(&C, &CH, &[0xBB; 16], 1_000));
+        assert!(am.is_kicked(&C, &CH, &[0xBB; 16], 1_000));
+        applied(&mut am, ModAction::Unmute, 200, 2, 1_100);
+        assert!(!am.is_muted(&C, &CH, &[0xBB; 16], 1_100));
+        assert!(am.is_kicked(&C, &CH, &[0xBB; 16], 1_100));
+    }
+
+    #[test]
+    fn sweep_reports_lapsed_targets() {
+        let mut am = ActiveModeration::default();
+        applied(&mut am, ModAction::Mute, 100, 1, 1_000);
+        let lapsed = am.sweep(1_000 + ENFORCE_TTL_MS);
+        assert_eq!(lapsed, vec![(C, CH)]);
+        assert!(!am.is_muted(&C, &CH, &[0xBB; 16], 1_000 + ENFORCE_TTL_MS));
     }
 }
