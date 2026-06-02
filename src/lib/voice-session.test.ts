@@ -184,6 +184,46 @@ describe('VoiceSession lifecycle + gate', () => {
   });
 });
 
+describe('VoiceSession transport reconnect (ZEB-353)', () => {
+  let d: ReturnType<typeof deps>;
+  beforeEach(() => { d = deps(); });
+
+  function newSession() {
+    return new VoiceSession({
+      invoke: d.invoke, listen: d.listen,
+      selfOwnerHex: 'aa'.repeat(16), selfDeviceHex: 'bb'.repeat(16),
+      senderHash: new Uint8Array(16),
+      ...d.factories,
+    });
+  }
+
+  it('voice-transport-lost for the active channel sets reconnecting', async () => {
+    const s = newSession();
+    await s.join('comm', 'chan');
+    expect(get(s.state).reconnecting).toBe(false);
+    d.emit('voice-transport-lost', { communityId: 'comm', channelId: 'chan' });
+    expect(get(s.state).reconnecting).toBe(true);
+  });
+
+  it('voice-transport-restored clears reconnecting', async () => {
+    const s = newSession();
+    await s.join('comm', 'chan');
+    d.emit('voice-transport-lost', { communityId: 'comm', channelId: 'chan' });
+    expect(get(s.state).reconnecting).toBe(true);
+    d.emit('voice-transport-restored', { communityId: 'comm', channelId: 'chan' });
+    expect(get(s.state).reconnecting).toBe(false);
+  });
+
+  it('ignores transport events for a different channel', async () => {
+    const s = newSession();
+    await s.join('comm', 'chan');
+    d.emit('voice-transport-lost', { communityId: 'comm', channelId: 'other' });
+    expect(get(s.state).reconnecting).toBe(false);
+    d.emit('voice-transport-lost', { communityId: 'other', channelId: 'chan' });
+    expect(get(s.state).reconnecting).toBe(false);
+  });
+});
+
 describe('VoiceSession 64-participant soft cap (ZEB-353 reactive bounce)', () => {
   let d: ReturnType<typeof deps>;
   beforeEach(() => { d = deps(); });

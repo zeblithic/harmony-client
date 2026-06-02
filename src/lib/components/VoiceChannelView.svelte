@@ -144,6 +144,13 @@
     </div>
 
     <div class="voice-controls">
+      {#if $voiceState.reconnecting}
+        <!-- ZEB-353: the inbound media subscriber dropped and is re-declaring
+             with backoff; surface a non-blocking "Reconnecting…" badge. -->
+        <span class="reconnecting" role="status" data-testid="voice-reconnecting">
+          Reconnecting…
+        </span>
+      {/if}
       {#if $voiceState.pttMode}
         <!-- In PTT mode the mic is hold-gated, so the talk control replaces the
              mute toggle. Press-and-hold (pointer) or hold Space to transmit. -->
@@ -392,6 +399,17 @@
     background: var(--accent);
     border-color: var(--accent);
     color: var(--text-primary);
+  }
+  /* Reconnecting badge: a small amber pill on the control bar while the inbound
+     media transport is re-establishing. */
+  .reconnecting {
+    font-size: 0.78rem;
+    color: var(--warning, #d8a200);
+    background: color-mix(in srgb, var(--warning, #d8a200) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warning, #d8a200) 40%, transparent);
+    padding: 3px 9px;
+    border-radius: 999px;
+    white-space: nowrap;
   }
   /* Hold-to-talk: suppress touch scroll/selection so a press-hold-release
      gesture stays a clean PTT hold on touch devices. */

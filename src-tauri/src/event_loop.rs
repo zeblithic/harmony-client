@@ -2707,40 +2707,111 @@ pub async fn run<R: Runtime>(
                         let (c_sub, ch_sub) = (community_id, channel_id);
                         let app_sub = app.clone();
                         let closing_sub = closing.clone();
+                        // Captured for the retry loop: re-declare the subscriber
+                        // off the shared session, and tag transport-lost/restored
+                        // events so the frontend can filter by active channel.
+                        let session_for_media = Arc::clone(&session_arc);
+                        let sub_key_retry = sub_key.clone();
+                        let community_hex = hex::encode(community_id.0);
+                        let channel_hex = hex::encode(channel_id.0);
                         match session.declare_subscriber(&sub_key).await {
                             Ok(sub) => {
                                 // The subscriber opens (decrypts) before emitting;
                                 // an AEAD failure (non-member / stale epoch /
                                 // tamper) is dropped silently.
+                                //
+                                // ZEB-353: on a transport drop the inner receive
+                                // loop ends; instead of returning we re-declare
+                                // the subscriber with exponential backoff (mirror
+                                // the voice-signal sub), emitting transport-lost
+                                // on drop and transport-restored on re-declare so
+                                // the frontend can show "Reconnecting…".
                                 let handle = tokio::spawn(async move {
-                                    while let Ok(sample) = sub.recv_async().await {
-                                        if sample.payload().len() > crate::voice_crypto::MAX_VOICE_PACKET_BYTES {
-                                            tracing::warn!(
-                                                len = sample.payload().len(),
-                                                max = crate::voice_crypto::MAX_VOICE_PACKET_BYTES,
-                                                "oversized voice packet dropped"
-                                            );
-                                            continue;
-                                        }
-                                        let sealed = sample.payload().to_bytes().to_vec();
-                                        match crate::voice_crypto::decrypt_voice_packet(
-                                            &key_for_sub,
-                                            &c_sub,
-                                            &ch_sub,
-                                            crate::voice_crypto::VOICE_PACKET_AAD,
-                                            &sealed,
-                                        ) {
-                                            Ok(frame) => {
-                                                let _ = app_sub.emit(
-                                                    "voice-frame-received",
-                                                    serde_json::json!({ "frameBytes": frame }),
+                                    let mut sub = sub;
+                                    let mut backoff = std::time::Duration::from_secs(5);
+                                    const MAX_BACKOFF: std::time::Duration =
+                                        std::time::Duration::from_secs(60);
+                                    loop {
+                                        while let Ok(sample) = sub.recv_async().await {
+                                            if sample.payload().len() > crate::voice_crypto::MAX_VOICE_PACKET_BYTES {
+                                                tracing::warn!(
+                                                    len = sample.payload().len(),
+                                                    max = crate::voice_crypto::MAX_VOICE_PACKET_BYTES,
+                                                    "oversized voice packet dropped"
                                                 );
+                                                continue;
                                             }
-                                            Err(_) => { /* non-member / stale epoch / tamper → drop silently */ }
+                                            let sealed = sample.payload().to_bytes().to_vec();
+                                            match crate::voice_crypto::decrypt_voice_packet(
+                                                &key_for_sub,
+                                                &c_sub,
+                                                &ch_sub,
+                                                crate::voice_crypto::VOICE_PACKET_AAD,
+                                                &sealed,
+                                            ) {
+                                                Ok(frame) => {
+                                                    let _ = app_sub.emit(
+                                                        "voice-frame-received",
+                                                        serde_json::json!({ "frameBytes": frame }),
+                                                    );
+                                                }
+                                                Err(_) => { /* non-member / stale epoch / tamper → drop silently */ }
+                                            }
                                         }
-                                    }
-                                    if !closing_sub.load(std::sync::atomic::Ordering::SeqCst) {
-                                        tracing::warn!("voice subscriber closed unexpectedly");
+                                        // Inner receive loop ended on a transport
+                                        // error. Stop if we're shutting down.
+                                        if closing_sub.load(std::sync::atomic::Ordering::SeqCst) {
+                                            break;
+                                        }
+                                        tracing::warn!(
+                                            key = %sub_key_retry,
+                                            "voice subscriber closed unexpectedly; reconnecting"
+                                        );
+                                        let _ = app_sub.emit(
+                                            "voice-transport-lost",
+                                            serde_json::json!({
+                                                "communityId": community_hex,
+                                                "channelId": channel_hex,
+                                            }),
+                                        );
+                                        // Re-declare the subscriber. Like the
+                                        // voice-signal sub, try immediately on the
+                                        // first attempt and only back off *after* a
+                                        // failed re-declare, so a momentary blip
+                                        // recovers without waiting out the backoff.
+                                        loop {
+                                            if closing_sub.load(std::sync::atomic::Ordering::SeqCst) {
+                                                return;
+                                            }
+                                            match session_for_media
+                                                .declare_subscriber(&sub_key_retry)
+                                                .await
+                                            {
+                                                Ok(s) => {
+                                                    backoff = std::time::Duration::from_secs(5);
+                                                    sub = s;
+                                                    let _ = app_sub.emit(
+                                                        "voice-transport-restored",
+                                                        serde_json::json!({
+                                                            "communityId": community_hex,
+                                                            "channelId": channel_hex,
+                                                        }),
+                                                    );
+                                                    break;
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        key = %sub_key_retry,
+                                                        error = %e,
+                                                        backoff_s = backoff.as_secs(),
+                                                        "voice subscriber re-declare failed; retrying"
+                                                    );
+                                                    tokio::time::sleep(backoff).await;
+                                                    backoff =
+                                                        std::cmp::min(backoff * 2, MAX_BACKOFF);
+                                                }
+                                            }
+                                        }
                                     }
                                 });
                                 if let Some(old) = voice_subs.insert((community_id, channel_id), handle) {
@@ -2966,42 +3037,104 @@ pub async fn run<R: Runtime>(
                         if voice_own_device.is_none() {
                             voice_own_device = Some(own_device_hex.clone());
                         }
+                        // Captured for the retry loop: re-declare the subscriber
+                        // off the shared session, and tag transport-lost/restored
+                        // events so the frontend can filter by active call.
+                        let session_for_media = Arc::clone(&session_arc);
+                        let sub_key_retry = sub_key.clone();
                         match session.declare_subscriber(&sub_key).await {
                             Ok(sub) => {
+                                // ZEB-353: on a transport drop the inner receive
+                                // loop ends; instead of returning we re-declare the
+                                // subscriber with exponential backoff (mirror the
+                                // voice-signal sub), emitting transport-lost on drop
+                                // and transport-restored on re-declare so the
+                                // frontend can show "Reconnecting…".
                                 let handle = tokio::spawn(async move {
-                                    while let Ok(sample) = sub.recv_async().await {
-                                        // Skip our own published frames: on a 2-party
-                                        // DM the `.../*` sub also matches our own
-                                        // {senderDevice} segment, and decrypting +
-                                        // emitting them just to have the frontend drop
-                                        // them by sender hash wastes CPU on the audio
-                                        // hot path (self is ~half of DM traffic).
-                                        if sample.key_expr().as_str().rsplit('/').next()
-                                            == Some(own_device_hex.as_str())
-                                        {
-                                            continue;
+                                    let mut sub = sub;
+                                    let mut backoff = std::time::Duration::from_secs(5);
+                                    const MAX_BACKOFF: std::time::Duration =
+                                        std::time::Duration::from_secs(60);
+                                    loop {
+                                        while let Ok(sample) = sub.recv_async().await {
+                                            // Skip our own published frames: on a 2-party
+                                            // DM the `.../*` sub also matches our own
+                                            // {senderDevice} segment, and decrypting +
+                                            // emitting them just to have the frontend drop
+                                            // them by sender hash wastes CPU on the audio
+                                            // hot path (self is ~half of DM traffic).
+                                            if sample.key_expr().as_str().rsplit('/').next()
+                                                == Some(own_device_hex.as_str())
+                                            {
+                                                continue;
+                                            }
+                                            if sample.payload().len() > crate::voice_crypto::MAX_VOICE_PACKET_BYTES {
+                                                continue;
+                                            }
+                                            let sealed = sample.payload().to_bytes().to_vec();
+                                            if let Ok(frame) = crate::voice_crypto::decrypt_dm_voice_packet(
+                                                &key_for_sub,
+                                                &call_id,
+                                                crate::voice_crypto::VOICE_DM_PACKET_AAD,
+                                                &sealed,
+                                            ) {
+                                                let _ = app_sub.emit(
+                                                    "dm-voice-frame-received",
+                                                    serde_json::json!({
+                                                        "callId": call_hex,
+                                                        "frameBytes": frame,
+                                                    }),
+                                                );
+                                            }
                                         }
-                                        if sample.payload().len() > crate::voice_crypto::MAX_VOICE_PACKET_BYTES {
-                                            continue;
+                                        // Inner receive loop ended on a transport
+                                        // error. Stop if we're shutting down.
+                                        if closing_sub.load(std::sync::atomic::Ordering::SeqCst) {
+                                            break;
                                         }
-                                        let sealed = sample.payload().to_bytes().to_vec();
-                                        if let Ok(frame) = crate::voice_crypto::decrypt_dm_voice_packet(
-                                            &key_for_sub,
-                                            &call_id,
-                                            crate::voice_crypto::VOICE_DM_PACKET_AAD,
-                                            &sealed,
-                                        ) {
-                                            let _ = app_sub.emit(
-                                                "dm-voice-frame-received",
-                                                serde_json::json!({
-                                                    "callId": call_hex,
-                                                    "frameBytes": frame,
-                                                }),
-                                            );
+                                        tracing::warn!(
+                                            key = %sub_key_retry,
+                                            "dm voice subscriber closed unexpectedly; reconnecting"
+                                        );
+                                        let _ = app_sub.emit(
+                                            "voice-transport-lost",
+                                            serde_json::json!({ "callId": call_hex }),
+                                        );
+                                        // Re-declare the subscriber. Like the
+                                        // voice-signal sub, try immediately on the
+                                        // first attempt and only back off *after* a
+                                        // failed re-declare, so a momentary blip
+                                        // recovers without waiting out the backoff.
+                                        loop {
+                                            if closing_sub.load(std::sync::atomic::Ordering::SeqCst) {
+                                                return;
+                                            }
+                                            match session_for_media
+                                                .declare_subscriber(&sub_key_retry)
+                                                .await
+                                            {
+                                                Ok(s) => {
+                                                    backoff = std::time::Duration::from_secs(5);
+                                                    sub = s;
+                                                    let _ = app_sub.emit(
+                                                        "voice-transport-restored",
+                                                        serde_json::json!({ "callId": call_hex }),
+                                                    );
+                                                    break;
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        key = %sub_key_retry,
+                                                        error = %e,
+                                                        backoff_s = backoff.as_secs(),
+                                                        "dm voice subscriber re-declare failed; retrying"
+                                                    );
+                                                    tokio::time::sleep(backoff).await;
+                                                    backoff =
+                                                        std::cmp::min(backoff * 2, MAX_BACKOFF);
+                                                }
+                                            }
                                         }
-                                    }
-                                    if !closing_sub.load(std::sync::atomic::Ordering::SeqCst) {
-                                        tracing::warn!("dm voice subscriber closed unexpectedly");
                                     }
                                 });
                                 dm_voice_keys.insert(call_id, caps.channel_key);

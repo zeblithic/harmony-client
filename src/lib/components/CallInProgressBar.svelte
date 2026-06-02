@@ -46,6 +46,13 @@
   <div class="call-bar" data-testid="call-bar">
     <span class="peer-label">{peerLabel($callState?.peerOwnerHex)}</span>
     <time class="elapsed">{fmtElapsed($callState?.startedAt)}</time>
+    {#if $callState?.reconnecting}
+      <!-- ZEB-353: the inbound DM media subscriber dropped and is re-declaring
+           with backoff; surface a non-blocking "Reconnecting…" badge. -->
+      <span class="reconnecting" role="status" data-testid="call-reconnecting">
+        Reconnecting…
+      </span>
+    {/if}
 
     <div class="controls">
       {#if $callState?.pttMode}
@@ -124,6 +131,15 @@
   .elapsed {
     color: var(--text-secondary, rgba(255, 255, 255, 0.7));
     font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .reconnecting {
+    font-size: 0.78rem;
+    color: var(--warning, #d8a200);
+    background: color-mix(in srgb, var(--warning, #d8a200) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warning, #d8a200) 40%, transparent);
+    padding: 2px 8px;
+    border-radius: 999px;
     white-space: nowrap;
   }
   .controls {

@@ -40,6 +40,13 @@ export interface CallSessionState {
   startedAt: number | null;
   /** Last decline/end reason surfaced to the UI ("No answer", "busy", …). */
   endReason: string | null;
+  /**
+   * True while the inbound DM media subscriber is re-establishing after a
+   * transport drop (the backend emits `voice-transport-lost` /
+   * `voice-transport-restored` tagged by callId around its re-declare loop).
+   * Surfaces a "Reconnecting…" indicator in the in-call bar.
+   */
+  reconnecting: boolean;
 }
 
 type Invoke = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
@@ -80,6 +87,7 @@ const INITIAL: CallSessionState = {
   deafened: false,
   startedAt: null,
   endReason: null,
+  reconnecting: false,
 };
 
 export class CallSession {
@@ -103,6 +111,9 @@ export class CallSession {
   private spaceId: string | null = null;
   private drainTimer: ReturnType<typeof setInterval> | null = null;
   private ringTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Transport-lifecycle unlisteners (voice-transport-lost/restored). Torn down
+   *  by teardownMedia/destroy alongside the rest of the media engine. */
+  private unlisteners: (() => void)[] = [];
 
   constructor(deps: CallSessionDeps) {
     this.deps = deps;
@@ -276,6 +287,7 @@ export class CallSession {
     const callId = this.callId!;
     try {
       await this.deps.invoke('join_dm_call', { callId, spaceId });
+      await this.subscribeTransport();
 
       this.mixer = this.deps.makeMixer ? this.deps.makeMixer() : new VoiceMixer();
       await this.mixer.init();
@@ -334,9 +346,32 @@ export class CallSession {
   /** The per-frame send decision (mute / PTT / VAD), via the shared talk-gate. */
   private gate: FrameGate = (pcm) => this.coreGate(pcm);
 
+  /**
+   * Subscribe to the backend's DM media-transport lifecycle events. The inbound
+   * subscriber re-declares itself with backoff on a transport drop and brackets
+   * that with `voice-transport-lost` / `voice-transport-restored` events tagged
+   * by callId. We filter to the active call and flip `reconnecting` so the
+   * in-call bar can show "Reconnecting…". Torn down with the media engine.
+   */
+  private async subscribeTransport(): Promise<void> {
+    const matches = (p: unknown): boolean =>
+      (p as { callId?: string }).callId === this.callId;
+    const unLost = await this.deps.listen('voice-transport-lost', (e) => {
+      if (!matches(e.payload)) return;
+      this.patch({ reconnecting: true });
+    });
+    const unRestored = await this.deps.listen('voice-transport-restored', (e) => {
+      if (!matches(e.payload)) return;
+      this.patch({ reconnecting: false });
+    });
+    this.unlisteners.push(unLost, unRestored);
+  }
+
   /** Dismantle the media engine + leave the DM call room. Best-effort. */
   private async teardownMedia(callId: string | null): Promise<void> {
     if (this.drainTimer) { clearInterval(this.drainTimer); this.drainTimer = null; }
+    for (const u of this.unlisteners) u();
+    this.unlisteners = [];
     await this.sender?.stop().catch(() => {});
     this.receiver?.destroy();
     await this.mixer?.destroy().catch(() => {});
@@ -420,6 +455,8 @@ export class CallSession {
   destroy(): void {
     this.clearRingTimer();
     if (this.drainTimer) { clearInterval(this.drainTimer); this.drainTimer = null; }
+    for (const u of this.unlisteners) u();
+    this.unlisteners = [];
     void this.sender?.stop().catch(() => {});
     this.receiver?.destroy();
     void this.mixer?.destroy().catch(() => {});

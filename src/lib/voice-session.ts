@@ -47,6 +47,12 @@ export interface VoiceSessionState {
    * to false on the next join attempt.
    */
   channelFull: boolean;
+  /**
+   * True while the inbound media subscriber is re-establishing after a transport
+   * drop (the backend emits `voice-transport-lost`/`voice-transport-restored`
+   * around its re-declare-with-backoff loop). Surfaces a "Reconnecting…" badge.
+   */
+  reconnecting: boolean;
 }
 
 type Invoke = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
@@ -105,7 +111,7 @@ export interface VoiceSessionDeps {
 const INITIAL: VoiceSessionState = {
   phase: 'idle', community: null, channel: null,
   muted: true, deafened: false, pttMode: false, pttHeld: false, roster: [],
-  channelFull: false,
+  channelFull: false, reconnecting: false,
 };
 
 export class VoiceSession {
@@ -199,6 +205,7 @@ export class VoiceSession {
       phase: 'joining', community, channel,
       muted: true, deafened: false, pttMode: false, pttHeld: false, roster: [],
       channelFull: false, // fresh attempt clears any prior bounce banner
+      reconnecting: false, // fresh attempt clears any stale reconnect badge
     });
 
     // Transactional: once the backend join succeeds we own teardown for every
@@ -251,6 +258,7 @@ export class VoiceSession {
       }, 20);
 
       await this.subscribePresence();
+      await this.subscribeTransport();
 
       // Open the soft-cap grace window: an over-cap roster arriving within the
       // next few seconds bounces this join (see maybeBounceForFull). The window
@@ -369,6 +377,30 @@ export class VoiceSession {
       this.refreshRoster();
     });
     this.unlisteners.push(un);
+  }
+
+  /**
+   * Subscribe to the backend's media-transport lifecycle events. The inbound
+   * media subscriber re-declares itself with backoff on a transport drop and
+   * brackets that with `voice-transport-lost` / `voice-transport-restored`
+   * events tagged by community+channel. We filter to the active channel and flip
+   * `reconnecting` so the UI can show "Reconnecting…". Torn down with the rest of
+   * the unlisteners on leave (cleanupEngine).
+   */
+  protected async subscribeTransport(): Promise<void> {
+    const matches = (p: unknown): boolean => {
+      const e = p as { communityId?: string; channelId?: string };
+      return e.communityId === this.community && e.channelId === this.channel;
+    };
+    const unLost = await this.deps.listen('voice-transport-lost', (e) => {
+      if (!matches(e.payload)) return;
+      this.patch({ reconnecting: true });
+    });
+    const unRestored = await this.deps.listen('voice-transport-restored', (e) => {
+      if (!matches(e.payload)) return;
+      this.patch({ reconnecting: false });
+    });
+    this.unlisteners.push(unLost, unRestored);
   }
 
   /** Recompute roster view (speaking + card resolution). Call on presence + each drain. */

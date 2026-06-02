@@ -17,6 +17,7 @@ function fakeSession(stateOverrides: Partial<CallSessionState> = {}) {
     deafened: false,
     startedAt: null,
     endReason: null,
+    reconnecting: false,
     ...stateOverrides,
   });
   return {
@@ -103,5 +104,18 @@ describe('CallInProgressBar', () => {
     render(CallInProgressBar, { props: { session: session as never, onEnd } });
     await fireEvent.click(screen.getByRole('button', { name: /end call/i }));
     expect(onEnd).toHaveBeenCalled();
+  });
+
+  it('shows a Reconnecting… badge while reconnecting (ZEB-353)', () => {
+    const session = fakeSession({ phase: 'active', startedAt: Date.now(), reconnecting: true });
+    render(CallInProgressBar, { props: { session: session as never, onEnd: vi.fn() } });
+    expect(screen.getByTestId('call-reconnecting')).toBeInTheDocument();
+    expect(screen.getByText(/Reconnecting/)).toBeInTheDocument();
+  });
+
+  it('hides the Reconnecting… badge when not reconnecting', () => {
+    const session = fakeSession({ phase: 'active', startedAt: Date.now(), reconnecting: false });
+    render(CallInProgressBar, { props: { session: session as never, onEnd: vi.fn() } });
+    expect(screen.queryByTestId('call-reconnecting')).toBeNull();
   });
 });

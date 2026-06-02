@@ -155,4 +155,17 @@ describe('VoiceChannelView (V3): push-to-talk hold', () => {
     await fireEvent.keyDown(window, { code: 'Space' });
     expect(session.setPttHeld).not.toHaveBeenCalled();
   });
+
+  it('shows a Reconnecting… badge while reconnecting (ZEB-353)', () => {
+    const session = fakeSession({ phase: 'connected', reconnecting: true });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    expect(screen.getByTestId('voice-reconnecting')).toBeInTheDocument();
+    expect(screen.getByText(/Reconnecting/)).toBeInTheDocument();
+  });
+
+  it('hides the Reconnecting… badge when not reconnecting', () => {
+    const session = fakeSession({ phase: 'connected', reconnecting: false });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    expect(screen.queryByTestId('voice-reconnecting')).not.toBeInTheDocument();
+  });
 });
