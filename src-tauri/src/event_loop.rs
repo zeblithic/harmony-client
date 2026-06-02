@@ -3238,6 +3238,8 @@ pub async fn run<R: Runtime>(
                             flag.store(muted, std::sync::atomic::Ordering::SeqCst);
                         }
                     }
+                    // ZEB-358 Task 7 wires this
+                    crate::voice::VoiceChannelRequest::Moderate { .. } => {}
                 }
             }
 

@@ -77,6 +77,15 @@ pub enum VoiceChannelRequest {
     LeaveDmCall { call_id: [u8; 16] },
     /// ZEB-352: flip the mute flag for an active DM call.
     SetDmCallMuted { call_id: [u8; 16], muted: bool },
+    /// ZEB-358: a moderator issues a voice-moderation directive against `target_owner`.
+    Moderate {
+        community_id: SpaceId,
+        channel_id: ChannelId,
+        target_owner: OwnerAddr,
+        action: crate::voice_moderation::ModAction,
+        /// Issuer-side duration; how long to keep re-asserting. None → default.
+        duration_ms: Option<u64>,
+    },
 }
 
 /// Payload for the send_voice_frame Tauri command.
@@ -114,6 +123,31 @@ pub struct SetDmCallMutedPayload {
     pub muted: bool,
 }
 
+/// ZEB-358: payload for the `moderate_voice` Tauri command.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModerateVoicePayload {
+    pub community_id: String,
+    pub channel_id: String,
+    pub target_owner_hex: String,
+    pub action: String, // "mute" | "unmute" | "kick" | "unkick"
+    pub duration_ms: Option<u64>,
+}
+
+impl ModerateVoicePayload {
+    /// Parse the wire action string into a `ModAction`.
+    pub fn parse_action(s: &str) -> Result<crate::voice_moderation::ModAction, String> {
+        use crate::voice_moderation::ModAction::*;
+        match s {
+            "mute" => Ok(Mute),
+            "unmute" => Ok(Unmute),
+            "kick" => Ok(Kick),
+            "unkick" => Ok(Unkick),
+            other => Err(format!("unknown moderation action: {other}")),
+        }
+    }
+}
+
 /// ZEB-351 Voice V3: this node's own voice identity, returned by the
 /// `get_self_voice_identity` Tauri command.
 ///
@@ -140,6 +174,24 @@ pub fn self_voice_identity_from_vk(vk: [u8; 32]) -> SelfVoiceIdentity {
     SelfVoiceIdentity {
         device_vk_hex: hex::encode(vk),
         sender_hash: vk[..16].to_vec(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ModerateVoicePayload;
+
+    #[test]
+    fn moderate_payload_parses_action() {
+        let json = r#"{"communityId":"aa","channelId":"bb","targetOwnerHex":"cc","action":"mute","durationMs":60000}"#;
+        let p: ModerateVoicePayload = serde_json::from_str(json).unwrap();
+        assert_eq!(p.action, "mute");
+        assert_eq!(p.duration_ms, Some(60000));
+        assert_eq!(
+            ModerateVoicePayload::parse_action("kick").unwrap(),
+            crate::voice_moderation::ModAction::Kick
+        );
+        assert!(ModerateVoicePayload::parse_action("bogus").is_err());
     }
 }
 
