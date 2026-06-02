@@ -11820,6 +11820,362 @@ async fn get_self_voice_identity(
     Ok(voice::self_voice_identity_from_vk(vk))
 }
 
+// ── ZEB-352 Voice V4: DM-call signaling + media IPCs ─────────────────────────
+
+/// Parse a 32-hex-char call-id string into a `[u8; 16]` byte array.
+/// Mirrors `parse_voice_id_16`.
+fn parse_call_id(hex: &str) -> Result<[u8; 16], String> {
+    parse_voice_id_16("callId", hex)
+}
+
+/// Resolve everything needed to send a voice signal or join a DM call from a
+/// `space_id_hex`.
+///
+/// Returns `(peer_owner, peer_x25519_pub, dm_key, signing_key, self_owner)`.
+/// The peer_x25519_pub is the first 32 bytes of the peer's 64-byte
+/// identity_pub (the X25519 pub half).
+///
+/// Snapshots under the sync mutex (no await while locked), then does the
+/// async CRDT + outbox reads outside the lock.
+async fn resolve_dm_call_peer(
+    state: &std::sync::Mutex<NodeState>,
+    space_id_hex: &str,
+) -> Result<
+    (
+        crate::owner_state_types::OwnerAddr, // peer
+        [u8; 32],                            // peer x25519 pub
+        crate::owner_state_types::DmContentKey,
+        std::sync::Arc<ed25519_dalek::SigningKey>, // self device#2
+        crate::owner_state_types::OwnerAddr,       // self
+    ),
+    String,
+> {
+    // Parse space_id.
+    let space_bytes = hex::decode(space_id_hex).map_err(|e| format!("space_id hex: {e}"))?;
+    let space_arr: [u8; 16] = space_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("space_id must be 16 bytes, got {}", space_bytes.len()))?;
+    let space_id = crate::owner_state_types::SpaceId(space_arr);
+
+    // Snapshot handles under the std mutex — no await while locked.
+    let (crdt_state, dm_outbox, self_owner) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        let crdt = g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?;
+        let outbox = g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?;
+        let owner = g.dm_self_owner.ok_or("dm_self_owner missing")?;
+        (crdt, outbox, owner)
+    };
+
+    // Find the Space in OwnerState.
+    let (peer, dm_key, peer_x25519_pub) = {
+        let os = crdt_state.lock().await;
+        let space = os
+            .spaces
+            .get(&space_id)
+            .ok_or_else(|| "dm space not found".to_string())?;
+        let dm_key = space
+            .content_key
+            .clone()
+            .ok_or_else(|| "not a dm space".to_string())?;
+        // Find the single member that is not self.
+        let peer = space
+            .members
+            .iter()
+            .find(|m| **m != self_owner)
+            .copied()
+            .ok_or_else(|| "no peer in dm space".to_string())?;
+        // Resolve peer X25519 pub from the device cache.
+        let identity_pub = os
+            .owner_device_cache
+            .devices
+            .get(&peer)
+            .and_then(|entry| entry.device_identity_pubs.iter().find_map(|p| *p))
+            .ok_or_else(|| "peer key unknown".to_string())?;
+        // Layout: [0..32] = X25519 pub, [32..64] = Ed25519 pub.
+        let mut x25519_pub = [0u8; 32];
+        x25519_pub.copy_from_slice(&identity_pub[..32]);
+        (peer, dm_key, x25519_pub)
+    };
+
+    // Clone the community signing key from dm_outbox.
+    let signing_key = dm_outbox.lock().await.community_signing_key.clone();
+
+    Ok((peer, peer_x25519_pub, dm_key, signing_key, self_owner))
+}
+
+/// Inner helper: resolve peer, build, sign, seal, and send a `VoiceSignal`.
+/// Used by all 5 signaling IPCs; `place_call` calls this after generating
+/// the call_id.
+async fn send_voice_signal(
+    state: &std::sync::Mutex<NodeState>,
+    space_id: &str,
+    kind: crate::voice_signal::VoiceSignalKind,
+    call_id: [u8; 16],
+    reason: Option<crate::voice_signal::DeclineReason>,
+) -> Result<(), String> {
+    let (peer, peer_x25519_pub, _dm_key, signing_key, self_owner) =
+        resolve_dm_call_peer(state, space_id).await?;
+
+    let signal = crate::voice_signal::VoiceSignal {
+        kind,
+        call_id,
+        caller: self_owner,
+        decline_reason: reason,
+    };
+    let sealed = crate::voice_signal::build_sealed_signal(&signal, &signing_key, &peer_x25519_pub)
+        .map_err(|e| format!("seal signal: {e}"))?;
+
+    let voice_signal_tx = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.voice_signal_tx
+            .clone()
+            .ok_or_else(|| "voice signal not running".to_string())?
+    };
+
+    voice_signal_tx
+        .send(crate::voice_signal::VoiceSignalRequest {
+            callee_owner_hex: hex::encode(peer.0),
+            sealed,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())
+}
+
+/// ZEB-352: initiate a 1:1 DM voice call. Generates a random 16-byte
+/// call-id, sends an `Invite` signal to the peer, and returns the
+/// call-id hex to the frontend for correlation.
+#[tauri::command]
+async fn place_call(
+    space_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<String, String> {
+    use rand::RngCore;
+    let mut call_id = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut call_id);
+    send_voice_signal(
+        &state,
+        &space_id,
+        crate::voice_signal::VoiceSignalKind::Invite,
+        call_id,
+        None,
+    )
+    .await?;
+    Ok(hex::encode(call_id))
+}
+
+/// ZEB-352: accept an incoming DM voice call.
+#[tauri::command]
+async fn accept_call(
+    call_id: String,
+    space_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let call = parse_call_id(&call_id)?;
+    send_voice_signal(
+        &state,
+        &space_id,
+        crate::voice_signal::VoiceSignalKind::Accept,
+        call,
+        None,
+    )
+    .await
+}
+
+/// ZEB-352: decline an incoming DM voice call.
+#[tauri::command]
+async fn decline_call(
+    call_id: String,
+    space_id: String,
+    reason: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    use crate::voice_signal::DeclineReason;
+    let call = parse_call_id(&call_id)?;
+    let dr = match reason.as_str() {
+        "busy" => DeclineReason::Busy,
+        "timeout" => DeclineReason::Timeout,
+        _ => DeclineReason::User,
+    };
+    send_voice_signal(
+        &state,
+        &space_id,
+        crate::voice_signal::VoiceSignalKind::Decline,
+        call,
+        Some(dr),
+    )
+    .await
+}
+
+/// ZEB-352: cancel an outgoing DM voice call (caller-side abort).
+#[tauri::command]
+async fn cancel_call(
+    call_id: String,
+    space_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let call = parse_call_id(&call_id)?;
+    send_voice_signal(
+        &state,
+        &space_id,
+        crate::voice_signal::VoiceSignalKind::Cancel,
+        call,
+        None,
+    )
+    .await
+}
+
+/// ZEB-352: end an active DM voice call.
+#[tauri::command]
+async fn end_call(
+    call_id: String,
+    space_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let call = parse_call_id(&call_id)?;
+    send_voice_signal(
+        &state,
+        &space_id,
+        crate::voice_signal::VoiceSignalKind::End,
+        call,
+        None,
+    )
+    .await
+}
+
+/// ZEB-352: join a 1:1 DM voice call media session. Derives the per-call
+/// `K_voice` from the DM content key + call-id and sends a
+/// `VoiceChannelRequest::JoinDmCall` to the event loop.
+#[tauri::command]
+async fn join_dm_call(
+    call_id: String,
+    space_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let call = parse_call_id(&call_id)?;
+
+    let (peer, _peer_x25519_pub, dm_key, signing_key, self_owner) =
+        resolve_dm_call_peer(&state, &space_id).await?;
+    let _ = peer; // not needed for media join
+
+    // Snapshot voice_channel_tx + device fields.
+    let (voice_channel_tx, device_hex, self_device, hlc_tracker) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        let tx = guard
+            .voice_channel_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?;
+        let device_hex = guard
+            .dm_device_id
+            .clone()
+            .ok_or_else(|| "no device id".to_string())?;
+        let self_device = <[u8; 32]>::try_from(
+            hex::decode(&device_hex)
+                .map_err(|_| "device id not hex".to_string())?
+                .as_slice(),
+        )
+        .map_err(|_| "device id must be 32 bytes".to_string())?;
+        let hlc_tracker = guard
+            .hlc_tracker
+            .clone()
+            .ok_or_else(|| "no hlc tracker".to_string())?;
+        (tx, device_hex, self_device, hlc_tracker)
+    };
+
+    // Derive the per-call voice key.
+    let k_voice = crate::community_channel_log::derive_dm_voice_key(&dm_key, &call);
+
+    // Reserve the join HLC.
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let joined_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_hex, wall_now_ms).await;
+
+    voice_channel_tx
+        .send(voice::VoiceChannelRequest::JoinDmCall {
+            call_id: call,
+            caps: voice::VoiceJoinCaps {
+                channel_key: std::sync::Arc::new(k_voice),
+                signing_key,
+                self_owner,
+                self_device,
+                joined_hlc,
+            },
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())
+}
+
+/// ZEB-352: leave an active DM voice call media session.
+#[tauri::command]
+async fn leave_dm_call(
+    call_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let call = parse_call_id(&call_id)?;
+    let tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .voice_channel_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    tx.send(voice::VoiceChannelRequest::LeaveDmCall { call_id: call })
+        .await
+        .map_err(|_| "event loop not running".to_string())
+}
+
+/// ZEB-352: send a voice frame on an active DM call.
+#[tauri::command]
+async fn send_dm_voice_frame(
+    payload: voice::SendDmVoiceFramePayload,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let call = parse_call_id(&payload.call_id)?;
+    let voice_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .voice_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    voice_tx
+        .send(voice::VoiceOutbound::Dm {
+            call_id: call,
+            frame: payload.frame_bytes,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())
+}
+
+/// ZEB-352: flip the mute flag for an active DM call.
+#[tauri::command]
+async fn set_dm_call_muted(
+    payload: voice::SetDmCallMutedPayload,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    let call = parse_call_id(&payload.call_id)?;
+    let tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .voice_channel_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+    tx.send(voice::VoiceChannelRequest::SetDmCallMuted {
+        call_id: call,
+        muted: payload.muted,
+    })
+    .await
+    .map_err(|_| "event loop not running".to_string())
+}
+
 #[cfg(test)]
 mod voice_id_tests {
     use super::parse_voice_id_16;
@@ -32408,6 +32764,16 @@ pub fn run() {
             leave_voice_channel,
             set_voice_muted,
             get_self_voice_identity,
+            // ZEB-352 Voice V4: DM-call signaling + media IPCs.
+            place_call,
+            accept_call,
+            decline_call,
+            cancel_call,
+            end_call,
+            join_dm_call,
+            leave_dm_call,
+            send_dm_voice_frame,
+            set_dm_call_muted,
             send_mail,
             list_mail,
             get_mail,
@@ -32603,6 +32969,16 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         dfrost_request_vrf_beacon,
         dfrost_contribute_threshold_sign,
         dfrost_propose_refresh,
+        // ZEB-352 Voice V4: DM-call signaling + media IPCs.
+        place_call,
+        accept_call,
+        decline_call,
+        cancel_call,
+        end_call,
+        join_dm_call,
+        leave_dm_call,
+        send_dm_voice_frame,
+        set_dm_call_muted,
     ])
 }
 

@@ -1516,36 +1516,45 @@ pub async fn run<R: Runtime>(
                                     Some(c) => c,
                                     None => continue,
                                 };
-                                // Resolve the caller's identity_pub + device hash
-                                // from the OwnerDeviceCache. Take the first cached
-                                // pub for that owner; drop if none is known yet.
-                                let identity_pub = {
+                                // Collect ALL cached identity pubs for the
+                                // caller — Harmony is multi-device, so the
+                                // caller may have signed with any enrolled
+                                // device. Try each until one verifies.
+                                let candidate_pubs: Vec<[u8; 64]> = {
                                     let g = crdt_for_signal.lock().await;
-                                    g.owner_device_cache.devices.get(&caller).and_then(|entry| {
-                                        entry.device_identity_pubs.iter().find_map(|p| *p)
-                                    })
+                                    g.owner_device_cache
+                                        .devices
+                                        .get(&caller)
+                                        .map(|entry| {
+                                            entry
+                                                .device_identity_pubs
+                                                .iter()
+                                                .filter_map(|p| *p)
+                                                .collect()
+                                        })
+                                        .unwrap_or_default()
                                 };
-                                let identity_pub = match identity_pub {
-                                    Some(p) => p,
-                                    None => continue,
-                                };
-                                let device_hash =
-                                    match crate::dm_signing::derive_device_hash_from_identity_pub(
-                                        &identity_pub,
-                                    ) {
-                                        Some(h) => h,
-                                        None => continue,
+                                let mut emitted = false;
+                                for identity_pub in candidate_pubs {
+                                    let Some(device_hash) =
+                                        crate::dm_signing::derive_device_hash_from_identity_pub(
+                                            &identity_pub,
+                                        )
+                                    else {
+                                        continue;
                                     };
-                                // Open + verify; any failure (wrong recipient,
-                                // tamper, signature/hash mismatch) drops silently.
-                                if let Ok(signal) = crate::voice_signal::open_sealed_signal(
-                                    &self_x25519_priv,
-                                    &sealed,
-                                    &identity_pub,
-                                    device_hash,
-                                ) {
-                                    emit_voice_signal_event(&app_for_signal, &signal);
+                                    if let Ok(signal) = crate::voice_signal::open_sealed_signal(
+                                        &self_x25519_priv,
+                                        &sealed,
+                                        &identity_pub,
+                                        device_hash,
+                                    ) {
+                                        emit_voice_signal_event(&app_for_signal, &signal);
+                                        emitted = true;
+                                        break;
+                                    }
                                 }
+                                let _ = emitted;
                             }
                             Err(_) => {
                                 if !closing_for_signal.load(Ordering::SeqCst) {
