@@ -3050,7 +3050,7 @@ pub async fn run<R: Runtime>(
                                         std::sync::Arc::clone(&caps.channel_key),
                                         community_id,
                                         channel_id,
-                                        registry,
+                                        registry.clone(),
                                         std::sync::Arc::clone(&voice_presence_map),
                                         app.clone(),
                                         closing.clone(),
@@ -3283,6 +3283,23 @@ pub async fn run<R: Runtime>(
                                     {
                                         old.abort();
                                     }
+                                    // Emit the moderation overlay once on join so the
+                                    // frontend gets `selfPower` immediately — otherwise a
+                                    // moderator joining a quiet channel (no active
+                                    // directives) would see no Mute/Remove controls until
+                                    // the next moderation apply/sweep (Cursor: "overlay
+                                    // missing on join").
+                                    emit_moderation_changed(
+                                        &app,
+                                        &registry,
+                                        &voice_presence_map,
+                                        &voice_moderation_map,
+                                        community_id,
+                                        channel_id,
+                                        caps.self_owner,
+                                        (voice_now_ms)(),
+                                    )
+                                    .await;
                                 }
                             }
                             Err(e) => {
@@ -3672,17 +3689,28 @@ pub async fn run<R: Runtime>(
                                             hex::encode(community_id.0),
                                             hex::encode(channel_id.0),
                                         );
-                                        if let Ok(sealed) = crate::voice_moderation::seal_directive(
+                                        match crate::voice_moderation::seal_directive(
                                             key,
                                             &community_id,
                                             &channel_id,
                                             &signed,
                                         ) {
+                                            // Seal failed: do NOT enforce locally or
+                                            // register a re-assert — peers would never
+                                            // get a valid directive, so the issuer must
+                                            // not show phantom enforcement (Cursor).
+                                            Err(e) => tracing::warn!(
+                                                err = ?e,
+                                                "moderation directive seal failed; not applied"
+                                            ),
+                                            Ok(sealed) => {
+                                            // A publish failure here is transient — the
+                                            // 4 s re-assert retries — so we still enforce
+                                            // locally + register the directive.
                                             if let Err(e) = session.put(&control_topic, sealed).await {
                                                 tracing::warn!(%control_topic, err = %e, "moderation directive publish failed");
                                             }
-                                        }
-                                        let now = (voice_now_ms)();
+                                            let now = (voice_now_ms)();
                                         let stop_after = now
                                             + duration_ms.unwrap_or(
                                                 crate::voice_moderation::DEFAULT_MODERATION_MS,
@@ -3739,6 +3767,8 @@ pub async fn run<R: Runtime>(
                                                 now,
                                             )
                                             .await;
+                                        }
+                                            }
                                         }
                                     } else {
                                         tracing::warn!(
