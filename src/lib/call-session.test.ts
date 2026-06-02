@@ -178,6 +178,18 @@ describe('CallSession DM signaling', () => {
     expect(d.invoke).toHaveBeenCalledWith('leave_dm_call', { callId: 'call-1' });
   });
 
+  it('destroy() tears down live media + timers and resets to idle', async () => {
+    const s = newSession();
+    s.onIncoming('call-1', 'cc'.repeat(16), 'space-1');
+    await s.accept();
+    expect(get(s.state).phase).toBe('active');
+    s.destroy();
+    expect(get(s.state).phase).toBe('idle');
+    expect(d.sender.stop).toHaveBeenCalled();
+    expect(d.receiver.destroy).toHaveBeenCalled();
+    expect(d.mixer.destroy).toHaveBeenCalled();
+  });
+
   it('wires the receiver to the dm-voice-frame-received event, callId-filtered', async () => {
     // Use the REAL receiver factory (no makeReceiver override) so we can assert
     // the default DM wiring (frameEvent + frameFilter) the controller sets.

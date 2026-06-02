@@ -143,6 +143,16 @@
     if (voiceSession && get(voiceSession.state).phase === 'connected') {
       await voiceSession.leave().catch(() => {});
     }
+    // D12: also end an in-progress DM call before starting/answering another, so
+    // a DM→DM transition doesn't hit "a call is already in progress". 'incoming'
+    // is excluded — the accept path runs in that phase and must NOT tear down
+    // the very call it's about to answer.
+    if (callSession) {
+      const p = get(callSession.state).phase;
+      if (p === 'ringingOut' || p === 'connecting' || p === 'active') {
+        await callSession.end().catch(() => {});
+      }
+    }
     return fn();
   }
 

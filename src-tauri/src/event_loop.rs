@@ -2960,13 +2960,25 @@ pub async fn run<R: Runtime>(
                         let app_sub = app.clone();
                         let closing_sub = closing.clone();
                         let call_hex = hex::encode(call_id);
+                        let own_device_hex = hex::encode(caps.self_device);
                         if voice_own_device.is_none() {
-                            voice_own_device = Some(hex::encode(caps.self_device));
+                            voice_own_device = Some(own_device_hex.clone());
                         }
                         match session.declare_subscriber(&sub_key).await {
                             Ok(sub) => {
                                 let handle = tokio::spawn(async move {
                                     while let Ok(sample) = sub.recv_async().await {
+                                        // Skip our own published frames: on a 2-party
+                                        // DM the `.../*` sub also matches our own
+                                        // {senderDevice} segment, and decrypting +
+                                        // emitting them just to have the frontend drop
+                                        // them by sender hash wastes CPU on the audio
+                                        // hot path (self is ~half of DM traffic).
+                                        if sample.key_expr().as_str().rsplit('/').next()
+                                            == Some(own_device_hex.as_str())
+                                        {
+                                            continue;
+                                        }
                                         if sample.payload().len() > crate::voice_crypto::MAX_VOICE_PACKET_BYTES {
                                             continue;
                                         }

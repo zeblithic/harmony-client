@@ -410,6 +410,22 @@ export class CallSession {
     this.patch({ deafened: deaf });
     if (deaf && !this.muted) await this.setMuted(true); // deafen implies self-mute
   }
+
+  /**
+   * Dispose this session before it is discarded (e.g. on identity switch, when
+   * getCallSession rebuilds the singleton). Clears timers and tears down any
+   * live media so a replaced instance never leaves the mic open, the drain/ring
+   * timers firing, or media bound to stale IPC handles. Fire-and-forget.
+   */
+  destroy(): void {
+    this.clearRingTimer();
+    if (this.drainTimer) { clearInterval(this.drainTimer); this.drainTimer = null; }
+    void this.sender?.stop().catch(() => {});
+    this.receiver?.destroy();
+    void this.mixer?.destroy().catch(() => {});
+    this.sender = null; this.receiver = null; this.mixer = null;
+    this.resetToIdle();
+  }
 }
 
 /**
@@ -424,6 +440,9 @@ let _callSessionIdentity: string | null = null;
 export function getCallSession(deps: CallSessionDeps): CallSession {
   const identity = `${deps.selfOwnerHex}:${deps.selfDeviceHex}`;
   if (!_callSessionSingleton || _callSessionIdentity !== identity) {
+    // Tear down the outgoing instance so its media/timers don't keep running on
+    // the previous identity's handles after the swap.
+    _callSessionSingleton?.destroy();
     _callSessionSingleton = new CallSession(deps);
     _callSessionIdentity = identity;
   }
