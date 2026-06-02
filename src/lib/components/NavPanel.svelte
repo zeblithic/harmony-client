@@ -29,6 +29,8 @@
     onNewCommunity,
     onRedeemInvite,
     onBrowseLibraries,
+    onSelectNotes,
+    notesActive = false,
   }: {
     nodes: NavNode[];
     collapsed: boolean;
@@ -53,6 +55,10 @@
     onRedeemInvite?: () => void;
     /** ZEB-218 Sub-D Phase 1: opens the library directory browser. */
     onBrowseLibraries?: () => void;
+    /** ZEB-334: select the private self-notes space. */
+    onSelectNotes?: () => void;
+    /** ZEB-334: whether the self-notes space is the active view. */
+    notesActive?: boolean;
   } = $props();
 
   // ── ZEB-263 FAB + fan-out menu ──────────────────────────────────────
@@ -229,6 +235,18 @@
       {:else if appMode === 'spellbook'}
         <!-- Spellbook mode uses its own tab content -->
       {:else}
+        {#if appMode === 'messages' && onSelectNotes}
+          <button
+            type="button"
+            class="notes-nav-row"
+            class:active={notesActive}
+            aria-pressed={notesActive}
+            onclick={() => onSelectNotes?.()}
+          >
+            <span class="notes-nav-icon" aria-hidden="true">📝</span>
+            <span>Notes</span>
+          </button>
+        {/if}
         <NavTree
           nodes={filteredNodes}
           parentId={null}
@@ -341,6 +359,28 @@
     overflow-y: auto;
   }
 
+  /* ZEB-334: pinned, always-present self-notes row at the top of the
+     messages nav. Not a NavNode — a fixed affordance for the private
+     scratchpad that doubles as the zero-community default view. */
+  .notes-nav-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: calc(100% - 16px);
+    margin: 0 8px 4px;
+    padding: 6px 8px;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text-primary);
+    font-size: 0.875rem;
+    text-align: left;
+    cursor: pointer;
+  }
+  .notes-nav-row:hover { background: var(--bg-tertiary); }
+  .notes-nav-row.active { background: var(--accent); color: var(--text-primary); }
+  .notes-nav-icon { font-size: 0.95rem; }
+
   .collapsed-icons {
     display: flex;
     flex-direction: column;
@@ -393,8 +433,21 @@
     color: var(--text-primary);
   }
 
-  .mode-toggles { display: flex; gap: 2px; }
-  .mode-toggles .mode-toggle { flex: 1; font-size: 0.75rem; padding: 4px 6px; }
+  /* ZEB-333: wrap the mode toggles into a responsive grid so every mode
+     (including the trailing Mint + Network buttons) stays visible at the
+     narrow default nav width on Windows. The previous non-wrapping flex
+     row (flex:1 + min-width:auto) overflowed and clipped the last buttons,
+     forcing a horizontal scroll to reach Mint / Peer Network. */
+  .mode-toggles {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
+    gap: 4px;
+  }
+  .mode-toggles .mode-toggle {
+    font-size: 0.75rem;
+    padding: 4px 6px;
+    text-align: center;
+  }
 
   .mode-toggle.active {
     background: var(--accent);
