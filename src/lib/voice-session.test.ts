@@ -99,6 +99,31 @@ describe('VoiceSession lifecycle + gate', () => {
       { communityId: 'comm', channelId: 'chan', muted: false });
   });
 
+  it('setMuted rolls back local state when the backend rejects', async () => {
+    const s = newSession();
+    await s.join('comm', 'chan');
+    d.invoke.mockRejectedValueOnce(new Error('backend refused'));
+    await expect(s.setMuted(false)).rejects.toThrow(/refused/);
+    // Local gate + store must NOT advertise unmuted when the backend stayed muted.
+    expect(get(s.state).muted).toBe(true);
+    expect(d.getGate()!(new Float32Array(320)).send).toBe(false);
+  });
+
+  it('PTT mode enters unmuted (hold-gated) and tracks hold state', async () => {
+    const s = newSession();
+    await s.join('comm', 'chan');
+    await s.setPttMode(true);
+    expect(get(s.state).pttMode).toBe(true);
+    expect(get(s.state).muted).toBe(false); // entering PTT unmutes; gate is hold-driven
+    s.setPttHeld(true);
+    expect(get(s.state).pttHeld).toBe(true);
+    s.setPttHeld(false);
+    expect(get(s.state).pttHeld).toBe(false);
+    await s.setPttMode(false);
+    expect(get(s.state).muted).toBe(true); // leaving PTT re-mutes to the safe default
+    expect(get(s.state).pttHeld).toBe(false);
+  });
+
   it('leave returns to idle and tears down', async () => {
     const s = newSession();
     await s.join('comm', 'chan');
@@ -166,5 +191,37 @@ describe('VoiceSession leave/join race (C2 regression)', () => {
     expect(receiver.destroy).toHaveBeenCalled();
     expect(mixer.destroy).toHaveBeenCalled();
     expect(invoke).toHaveBeenCalledWith('leave_voice_channel', { communityId: 'comm', channelId: 'chan' });
+  });
+});
+
+describe('VoiceSession join failure (transactional teardown)', () => {
+  it('a failing sender.start() resets to idle, tears down, and leaves the backend', async () => {
+    // Models a denied-microphone permission: backend join succeeds, then
+    // sender.start() rejects. The session must not wedge in 'joining' or leak
+    // the partially-built mixer/receiver/timer — and must release the backend.
+    const invoke = vi.fn(async () => undefined);
+    const listen = vi.fn(async () => () => {});
+    const receiver = { init: vi.fn(async () => {}), destroy: vi.fn(), getActiveSenders: () => [], isSpeaking: () => false };
+    const mixer = { init: vi.fn(async () => {}), pushFrame: vi.fn(), drain: vi.fn(), setDeafened: vi.fn(), destroy: vi.fn(async () => {}) };
+    const sender = {
+      start: vi.fn(async () => { throw new Error('NotAllowedError: mic denied'); }),
+      stop: vi.fn(async () => {}),
+    };
+    const s = new VoiceSession({
+      invoke, listen, selfOwnerHex: 'aa'.repeat(16), selfDeviceHex: 'bb'.repeat(16),
+      senderHash: new Uint8Array(16),
+      makeSender: () => sender as never, makeReceiver: () => receiver as never, makeMixer: () => mixer as never,
+    });
+
+    await expect(s.join('comm', 'chan')).rejects.toThrow(/mic denied/);
+    expect(get(s.state).phase).toBe('idle');          // not wedged in 'joining'
+    expect(mixer.destroy).toHaveBeenCalled();          // partial audio torn down
+    expect(receiver.destroy).toHaveBeenCalled();
+    expect(sender.stop).toHaveBeenCalled();
+    // Backend join succeeded, so it must be released on the failure path.
+    expect(invoke).toHaveBeenCalledWith('leave_voice_channel', { communityId: 'comm', channelId: 'chan' });
+    // Retryable: a second join is rejected by the failing sender, NOT by an
+    // "already active" guard left over from the wedged first attempt.
+    await expect(s.join('comm', 'chan')).rejects.toThrow(/mic denied/);
   });
 });

@@ -27,6 +27,8 @@ export interface VoiceSessionState {
   muted: boolean;
   deafened: boolean;
   pttMode: boolean;
+  /** Push-to-talk hold state — true only while the talk control is held. */
+  pttHeld: boolean;
   roster: RosterMember[];
 }
 
@@ -85,7 +87,7 @@ export interface VoiceSessionDeps {
 
 const INITIAL: VoiceSessionState = {
   phase: 'idle', community: null, channel: null,
-  muted: true, deafened: false, pttMode: false, roster: [],
+  muted: true, deafened: false, pttMode: false, pttHeld: false, roster: [],
 };
 
 export class VoiceSession {
@@ -157,64 +159,108 @@ export class VoiceSession {
     this.muted = true; this.deafened = false; this.pttMode = false; this.pttHeld = false;
     this.vad.reset();
     this.lastRoster = []; this.lastEmittedRoster = []; this.lastSelfSpeaking = false;
-    this.patch({ phase: 'joining', community, channel, muted: true, deafened: false, pttMode: false, roster: [] });
+    this.patch({
+      phase: 'joining', community, channel,
+      muted: true, deafened: false, pttMode: false, pttHeld: false, roster: [],
+    });
 
-    // Backend join (spawns subscribers + presence publisher, starts muted).
-    await this.deps.invoke('join_voice_channel', { communityId: community, channelId: channel });
+    // Transactional: once the backend join succeeds we own teardown for every
+    // subsequent step. If any of them rejects — most realistically
+    // `sender.start()` on a denied-microphone permission, but also mixer/
+    // receiver init or the presence subscribe — we must dismantle the partial
+    // state (open AudioContext, live subscriber, 20 ms drain timer), best-effort
+    // leave the backend channel, and reset to idle so the join pane re-renders
+    // for a clean retry rather than wedging the UI in 'joining' forever.
+    let backendJoined = false;
+    try {
+      // Backend join (spawns subscribers + presence publisher, starts muted).
+      await this.deps.invoke('join_voice_channel', { communityId: community, channelId: channel });
+      backendJoined = true;
 
-    // Build engine pieces.
-    this.mixer = this.deps.makeMixer ? this.deps.makeMixer() : new VoiceMixer();
-    await this.mixer.init();
+      // Build engine pieces.
+      this.mixer = this.deps.makeMixer ? this.deps.makeMixer() : new VoiceMixer();
+      await this.mixer.init();
 
-    this.receiver = this.deps.makeReceiver
-      ? this.deps.makeReceiver()
-      : new VoiceReceiver({
-          listen: this.deps.listen,
-          createCodec: (t: CodecType) => (t === 'codec2' ? new Codec2Codec() : new OpusCodec()),
-          onPlayFrame: (hex, pcm) => this.mixer?.pushFrame(hex, pcm),
-          // Self-echo filter: the receiver keys senders by hex(senderHash), so
-          // filter on the actual senderHash we stamp into packets — NOT a slice
-          // of the device id (correct only because senderHash = device[0..16]).
-          ownSenderHex: bytesToHex(this.deps.senderHash),
-        });
-    await this.receiver.init();
+      this.receiver = this.deps.makeReceiver
+        ? this.deps.makeReceiver()
+        : new VoiceReceiver({
+            listen: this.deps.listen,
+            createCodec: (t: CodecType) => (t === 'codec2' ? new Codec2Codec() : new OpusCodec()),
+            onPlayFrame: (hex, pcm) => this.mixer?.pushFrame(hex, pcm),
+            // Self-echo filter: the receiver keys senders by hex(senderHash), so
+            // filter on the actual senderHash we stamp into packets — NOT a slice
+            // of the device id (correct only because senderHash = device[0..16]).
+            ownSenderHex: bytesToHex(this.deps.senderHash),
+          });
+      await this.receiver.init();
 
-    this.sender = this.deps.makeSender
-      ? this.deps.makeSender(this.gate)
-      : new VoiceSender({
-          senderHash: this.deps.senderHash, communityId: community, channelId: channel,
-          invoke: this.deps.invoke, codec: new OpusCodec(), capture: new AudioCapture(),
-          frameGate: this.gate,
-        });
-    await this.sender.start();   // capture starts; muted gate ⇒ nothing transmits
+      this.sender = this.deps.makeSender
+        ? this.deps.makeSender(this.gate)
+        : new VoiceSender({
+            senderHash: this.deps.senderHash, communityId: community, channelId: channel,
+            invoke: this.deps.invoke, codec: new OpusCodec(), capture: new AudioCapture(),
+            frameGate: this.gate,
+          });
+      await this.sender.start();   // capture starts; muted gate ⇒ nothing transmits
 
-    // Drain the mixer every 20ms (audio cadence). Refresh the roster view at a
-    // far lower rate (~10Hz) — the drain-tick refresh only updates remote
-    // speaking state, and refreshRoster() is a no-op unless the view actually
-    // changed (diff guard), so this avoids a 50Hz Svelte re-render storm.
-    let drainTick = 0;
-    this.drainTimer = setInterval(() => {
-      this.mixer?.drain();
-      if (++drainTick % 5 === 0) this.refreshRoster();
-    }, 20);
+      // Drain the mixer every 20ms (audio cadence). Refresh the roster view at a
+      // far lower rate (~10Hz) — the drain-tick refresh only updates remote
+      // speaking state, and refreshRoster() is a no-op unless the view actually
+      // changed (diff guard), so this avoids a 50Hz Svelte re-render storm.
+      let drainTick = 0;
+      this.drainTimer = setInterval(() => {
+        this.mixer?.drain();
+        if (++drainTick % 5 === 0) this.refreshRoster();
+      }, 20);
 
-    await this.subscribePresence();
+      await this.subscribePresence();
 
-    this.patch({ phase: 'connected' });
+      this.patch({ phase: 'connected' });
+    } catch (err) {
+      await this.cleanupEngine(backendJoined);
+      this.store.set({ ...INITIAL });
+      throw err;
+    }
   }
 
   async setMuted(muted: boolean): Promise<void> {
+    const prev = this.muted;
     this.muted = muted;
     if (muted) this.vad.reset();
     this.patch({ muted });
     if (this.community && this.channel) {
-      await this.deps.invoke('set_voice_muted',
-        { communityId: this.community, channelId: this.channel, muted });
+      try {
+        await this.deps.invoke('set_voice_muted',
+          { communityId: this.community, channelId: this.channel, muted });
+      } catch (err) {
+        // Backend rejected the toggle — roll the local gate + store back so the
+        // UI never advertises a mute state the presence roster won't reflect
+        // (and the send gate can't silently disagree with the backend flag).
+        this.muted = prev;
+        this.patch({ muted: prev });
+        throw err;
+      }
     }
   }
 
-  setPttMode(on: boolean): void { this.pttMode = on; this.patch({ pttMode: on }); }
-  setPttHeld(held: boolean): void { this.pttHeld = held; }
+  /**
+   * Switch push-to-talk mode. PTT makes the mic "available but gated by hold":
+   * entering PTT unmutes (the gate then transmits only while held) and leaving
+   * it re-mutes to the safe default. Async because the mute coupling round-trips
+   * `set_voice_muted`.
+   */
+  async setPttMode(on: boolean): Promise<void> {
+    this.pttMode = on;
+    this.patch({ pttMode: on });
+    if (!on) this.setPttHeld(false);
+    await this.setMuted(!on);
+  }
+
+  setPttHeld(held: boolean): void {
+    if (held === this.pttHeld) return;
+    this.pttHeld = held;
+    this.patch({ pttHeld: held });
+  }
 
   async setDeafened(deaf: boolean): Promise<void> {
     this.deafened = deaf;
@@ -228,6 +274,18 @@ export class VoiceSession {
     if (this.joinPromise) await this.joinPromise.catch(() => {});
     if (get(this.store).phase === 'idle') return; // nothing to tear down (also guards double-leave)
     this.patch({ phase: 'leaving' });
+    await this.cleanupEngine(true);
+    this.store.set({ ...INITIAL });
+  }
+
+  /**
+   * Dismantle every engine piece, timer, and listener and clear the connection
+   * fields. Shared by leave() and the _doJoin() failure path. `invokeLeave`
+   * gates the `leave_voice_channel` IPC so the join-failure path only calls it
+   * when the backend actually joined. Best-effort throughout — never throws, so
+   * a teardown fault can't mask the original error or wedge the session.
+   */
+  private async cleanupEngine(invokeLeave: boolean): Promise<void> {
     if (this.drainTimer) { clearInterval(this.drainTimer); this.drainTimer = null; }
     for (const u of this.unlisteners) u();
     this.unlisteners = [];
@@ -238,10 +296,9 @@ export class VoiceSession {
     const community = this.community, channel = this.channel;
     this.community = null; this.channel = null;
     this.lastRoster = []; this.lastEmittedRoster = []; this.lastSelfSpeaking = false;
-    if (community && channel) {
+    if (invokeLeave && community && channel) {
       await this.deps.invoke('leave_voice_channel', { communityId: community, channelId: channel }).catch(() => {});
     }
-    this.store.set({ ...INITIAL });
   }
 
   protected async subscribePresence(): Promise<void> {

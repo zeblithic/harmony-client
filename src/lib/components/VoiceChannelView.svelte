@@ -39,15 +39,46 @@
     }
   }
 
-  const toggleMute = () => session.setMuted(!$voiceState.muted);
-  const toggleDeafen = () => session.setDeafened(!$voiceState.deafened);
-  const togglePtt = () => session.setPttMode(!$voiceState.pttMode);
-  const onLeave = () => session.leave();
+  // Fire-and-forget control actions. These call async session methods; an IPC
+  // failure (e.g. set_voice_muted) must not surface as an unhandled promise
+  // rejection from a click handler. setMuted already rolls its local state back
+  // on failure. Promise.resolve() tolerates sync- or async-returning methods.
+  const swallow = (p: unknown) => { void Promise.resolve(p).catch(() => {}); };
+  const toggleMute = () => swallow(session.setMuted(!$voiceState.muted));
+  const toggleDeafen = () => swallow(session.setDeafened(!$voiceState.deafened));
+  const togglePtt = () => swallow(session.setPttMode(!$voiceState.pttMode));
+  const onLeave = () => swallow(session.leave());
+
+  // Push-to-talk hold. Pointer events cover mouse/touch; a window-level Space
+  // hotkey covers keyboard. Both drive session.setPttHeld so PTT mode actually
+  // transmits (the gate sends only while held).
+  const pttDown = () => session.setPttHeld(true);
+  const pttUp = () => session.setPttHeld(false);
+
+  function isTypingTarget(t: EventTarget | null): boolean {
+    const el = t as HTMLElement | null;
+    if (!el || !el.tagName) return false;
+    return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable;
+  }
+  function onKeyDown(e: KeyboardEvent) {
+    if (!$voiceState.pttMode || e.code !== 'Space' || e.repeat) return;
+    if (isTypingTarget(e.target)) return;
+    e.preventDefault(); // stop page scroll / focused-button activation
+    session.setPttHeld(true);
+  }
+  function onKeyUp(e: KeyboardEvent) {
+    if (e.code !== 'Space' || isTypingTarget(e.target)) return;
+    session.setPttHeld(false);
+  }
+  // Losing focus (alt-tab) must drop the hold so the mic can't stick open.
+  const onWindowBlur = () => session.setPttHeld(false);
 
   function label(m: Pick<RosterMember, 'displayName' | 'ownerHex'>): string {
     return m.displayName ?? `${m.ownerHex.slice(0, 6)}…`;
   }
 </script>
+
+<svelte:window onkeydown={onKeyDown} onkeyup={onKeyUp} onblur={onWindowBlur} />
 
 <section class="voice-view" aria-label="Voice channel">
   <header class="voice-header">
@@ -105,15 +136,33 @@
     </div>
 
     <div class="voice-controls">
-      <button
-        class="ctrl"
-        class:active={!$voiceState.muted}
-        aria-pressed={!$voiceState.muted}
-        onclick={toggleMute}
-        aria-label={$voiceState.muted ? 'Unmute' : 'Mute'}
-      >
-        {$voiceState.muted ? '🔇 Muted' : '🎙 Live'}
-      </button>
+      {#if $voiceState.pttMode}
+        <!-- In PTT mode the mic is hold-gated, so the talk control replaces the
+             mute toggle. Press-and-hold (pointer) or hold Space to transmit. -->
+        <button
+          class="ctrl ptt-hold"
+          class:active={$voiceState.pttHeld}
+          aria-pressed={$voiceState.pttHeld}
+          data-testid="ptt-hold"
+          onpointerdown={pttDown}
+          onpointerup={pttUp}
+          onpointerleave={pttUp}
+          onpointercancel={pttUp}
+          aria-label="Hold to talk (or hold Space)"
+        >
+          {$voiceState.pttHeld ? '🎙 Talking…' : '🎙 Hold to Talk'}
+        </button>
+      {:else}
+        <button
+          class="ctrl"
+          class:active={!$voiceState.muted}
+          aria-pressed={!$voiceState.muted}
+          onclick={toggleMute}
+          aria-label={$voiceState.muted ? 'Unmute' : 'Mute'}
+        >
+          {$voiceState.muted ? '🔇 Muted' : '🎙 Live'}
+        </button>
+      {/if}
       <button
         class="ctrl"
         class:active={$voiceState.pttMode}
@@ -335,6 +384,12 @@
     background: var(--accent);
     border-color: var(--accent);
     color: var(--text-primary);
+  }
+  /* Hold-to-talk: suppress touch scroll/selection so a press-hold-release
+     gesture stays a clean PTT hold on touch devices. */
+  .ptt-hold {
+    touch-action: none;
+    user-select: none;
   }
   .btn-danger {
     margin-left: auto;

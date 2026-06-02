@@ -12,6 +12,7 @@ function fakeSession(state: object) {
       muted: true,
       deafened: false,
       pttMode: false,
+      pttHeld: false,
       roster: [],
       ...state,
     }),
@@ -19,7 +20,7 @@ function fakeSession(state: object) {
     leave: vi.fn(async () => {}),
     setMuted: vi.fn(async () => {}),
     setDeafened: vi.fn(async () => {}),
-    setPttMode: vi.fn(),
+    setPttMode: vi.fn(async () => {}),
     setPttHeld: vi.fn(),
   };
 }
@@ -102,5 +103,48 @@ describe('VoiceChannelView (V3): hybrid grid<->list roster', () => {
     const tiles = screen.getAllByTestId('voice-tile');
     expect(tiles[0].className).toMatch(/speaking/);
     expect(tiles[1].className).not.toMatch(/speaking/);
+  });
+});
+
+describe('VoiceChannelView (V3): push-to-talk hold', () => {
+  it('toggles PTT mode via session.setPttMode', async () => {
+    const session = fakeSession({ phase: 'connected' });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    await fireEvent.click(screen.getByRole('button', { name: /push to talk/i }));
+    expect(session.setPttMode).toHaveBeenCalledWith(true);
+  });
+
+  it('in PTT mode shows a Hold-to-Talk control instead of the mute toggle', () => {
+    const session = fakeSession({ phase: 'connected', pttMode: true, muted: false });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    expect(screen.getByTestId('ptt-hold')).toBeInTheDocument();
+    // The mute toggle is replaced while in PTT mode.
+    expect(screen.queryByRole('button', { name: /unmute|^mute$/i })).not.toBeInTheDocument();
+  });
+
+  it('pointer press/release on the hold control drives setPttHeld', async () => {
+    const session = fakeSession({ phase: 'connected', pttMode: true, muted: false });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    const hold = screen.getByTestId('ptt-hold');
+    await fireEvent.pointerDown(hold);
+    expect(session.setPttHeld).toHaveBeenCalledWith(true);
+    await fireEvent.pointerUp(hold);
+    expect(session.setPttHeld).toHaveBeenCalledWith(false);
+  });
+
+  it('Space holds and releases PTT while in PTT mode', async () => {
+    const session = fakeSession({ phase: 'connected', pttMode: true, muted: false });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    await fireEvent.keyDown(window, { code: 'Space' });
+    expect(session.setPttHeld).toHaveBeenCalledWith(true);
+    await fireEvent.keyUp(window, { code: 'Space' });
+    expect(session.setPttHeld).toHaveBeenCalledWith(false);
+  });
+
+  it('Space is ignored when not in PTT mode', async () => {
+    const session = fakeSession({ phase: 'connected', pttMode: false });
+    render(VoiceChannelView, { props: { session: session as never, ...base } });
+    await fireEvent.keyDown(window, { code: 'Space' });
+    expect(session.setPttHeld).not.toHaveBeenCalled();
   });
 });
