@@ -11881,6 +11881,13 @@ async fn resolve_dm_call_peer(
             .content_key
             .clone()
             .ok_or_else(|| "not a dm space".to_string())?;
+        // 1:1 DM only — reject group-DM spaces, matching the inbound Invite
+        // handler's `members.len() == 2` guard. Without this a group-DM spaceId
+        // would resolve an arbitrary non-self member and seal the call to them
+        // under that group's content key.
+        if space.members.len() != 2 {
+            return Err("not a 1:1 dm space".to_string());
+        }
         // Find the single member that is not self.
         let peer = space
             .members
