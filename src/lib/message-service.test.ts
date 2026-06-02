@@ -949,4 +949,20 @@ describe('MessageService — ZEB-337: self messages use configured ownDisplayNam
     expect(msg.sender.address).toBe('self');
     expect(msg.sender.displayName).toBe('Jake Englund');
   });
+
+  // CodeAnt (PR #180): a whitespace-only display name (e.g. a legacy untrimmed
+  // profile) must not render a blank self author label — fall back to "You".
+  it('falls back to "You" when ownDisplayName is whitespace-only', async () => {
+    const { adapter, emit } = createMockAdapter();
+    svc.ownAddress = 'myaddr';
+    svc.ownDisplayName = '   ';
+    await svc.connectAdapter(adapter);
+    emit('message-received', {
+      id: 'self-echo-ws', senderAddress: 'myaddr', senderName: 'whatever',
+      channel: 'c', hub: 'h', text: 'echo', timestamp: 1, priority: 'standard',
+    } satisfies ChannelMessageEvent);
+    const msg = svc.messages.find((m) => m.id === 'self-echo-ws')!;
+    expect(msg.sender.address).toBe('self');
+    expect(msg.sender.displayName).toBe('You');
+  });
 });

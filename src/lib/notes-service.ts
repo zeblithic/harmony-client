@@ -33,27 +33,30 @@ export class NotesService {
   onChange?: () => void;
 
   /** Read all notes for an owner from storage (oldest-first). Returns an
-   *  empty list for unknown owners or when no owner id is available. Also
-   *  refreshes `entries` to the returned list. */
+   *  empty list for unknown owners or when no owner id is available. Pure read:
+   *  does not mutate `entries` (use `load` to hydrate the instance). */
   getEntries(ownerId: string): NoteEntry[] {
-    const list = ownerId ? readNotes(ownerId) : [];
-    this.entries = list;
-    return list;
+    return ownerId ? readNotes(ownerId) : [];
   }
 
-  /** Hydrate `entries` from storage for the given owner. */
+  /** Hydrate `entries` from storage for the given owner and notify observers
+   *  (the onChange contract: fires whenever `entries` changes). */
   load(ownerId: string): void {
     this.entries = ownerId ? readNotes(ownerId) : [];
+    this.onChange?.();
   }
 
   /** Append a note for an owner, persist it, and fire onChange. Returns the
    *  new entry, or null when no owner id is available (never writes to an
-   *  un-keyed bucket). */
+   *  un-keyed bucket) or the text is empty/whitespace-only (never persists a
+   *  blank note — CodeAnt, PR #180). */
   append(ownerId: string, text: string): NoteEntry | null {
     if (!ownerId) return null;
+    const trimmed = text.trim();
+    if (!trimmed) return null;
     const entry: NoteEntry = {
-      id: `note-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
-      text,
+      id: crypto.randomUUID(),
+      text: trimmed,
       timestamp: Date.now(),
     };
     const list = readNotes(ownerId);

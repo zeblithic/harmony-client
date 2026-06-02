@@ -44,6 +44,19 @@ describe('NotesService — ZEB-334 local self-notes store', () => {
     expect(svc.getEntries('')).toEqual([]);
   });
 
+  it('rejects blank / whitespace-only note text (never persists an empty note)', () => {
+    const svc = new NotesService();
+    expect(svc.append('owner-abc', '')).toBeNull();
+    expect(svc.append('owner-abc', '   \n\t ')).toBeNull();
+    expect(svc.getEntries('owner-abc')).toEqual([]);
+  });
+
+  it('trims surrounding whitespace from a stored note', () => {
+    const svc = new NotesService();
+    const entry = svc.append('owner-abc', '  padded note  ');
+    expect(entry?.text).toBe('padded note');
+  });
+
   it('fires onChange and updates entries on append', () => {
     const svc = new NotesService();
     svc.onChange = vi.fn();
