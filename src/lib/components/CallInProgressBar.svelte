@@ -37,6 +37,7 @@
   const swallow = (p: unknown) => { void Promise.resolve(p).catch(() => {}); };
   const toggleMute = () => { if (session && $callState) swallow(session.setMuted(!$callState.muted)); };
   const togglePtt = () => { if (session && $callState) swallow(session.setPttMode(!$callState.pttMode)); };
+  const toggleDeafen = () => { if (session && $callState) swallow(session.setDeafened(!$callState.deafened)); };
   const pttDown = () => session?.setPttHeld(true);
   const pttUp = () => session?.setPttHeld(false);
 </script>
@@ -80,6 +81,16 @@
         aria-label="Push to talk mode"
       >
         PTT
+      </button>
+      <button
+        class="ctrl"
+        class:active={$callState?.deafened}
+        data-testid="deafen"
+        aria-pressed={$callState?.deafened}
+        onclick={toggleDeafen}
+        aria-label={$callState?.deafened ? 'Undeafen' : 'Deafen'}
+      >
+        {$callState?.deafened ? '🔕 Deafened' : '🔈 Deafen'}
       </button>
     </div>
 
