@@ -3,6 +3,7 @@
   import Layout from './lib/components/Layout.svelte';
   import NavPanel from './lib/components/NavPanel.svelte';
   import TextFeed from './lib/components/TextFeed.svelte';
+  import NotesView from './lib/components/NotesView.svelte';
   import MediaFeed from './lib/components/MediaFeed.svelte';
   import VineFeed from './lib/components/VineFeed.svelte';
   import FileBrowser from './lib/components/FileBrowser.svelte';
@@ -48,6 +49,7 @@
   import { TrustService } from './lib/trust-service';
   import { FileManagerService } from './lib/file-manager-service';
   import { MessageService } from './lib/message-service';
+  import { NotesService } from './lib/notes-service';
   import { MailService } from './lib/mail-service';
   import { VineService } from './lib/vine-service';
   import { resolveOriginalCreator } from './lib/vine-utils';
@@ -942,6 +944,10 @@
   const messageService = new MessageService();
   $effect(() => () => messageService.destroy());
 
+  // ZEB-334: local-only self-notes store backing the private "Notes" space —
+  // the always-present default shown when no community is joined.
+  const notesService = new NotesService();
+
   const mailService = new MailService();
   $effect(() => () => mailService.destroy());
   let mailEntries = $state([...mailService.entries]);
@@ -1769,6 +1775,10 @@
   let activeHub = $state('harmony-dev');
   let activeChannelName = $state('general');
   let activeChannelType = $state<'channel' | 'dm' | 'group-chat'>('channel');
+  // ZEB-334: when true (and no community is selected) the main feed renders the
+  // private self-notes space instead of the legacy "#general" void. Defaults
+  // true so a fresh, community-less user lands in Notes, not the void.
+  let notesSelected = $state(true);
   // The nav row to render with active styling. When a community is
   // selected, highlight the community node; otherwise fall back to
   // the active channel/DM. Keeping these in separate $state fields
@@ -1788,9 +1798,19 @@
     currentFolderCid = null;
   }
 
+  // ZEB-334: select the private self-notes space — clears any community so the
+  // feed pane renders NotesView (the zero-community default).
+  function selectNotes() {
+    notesSelected = true;
+    changeSelectedCommunity(null);
+    if (appMode !== 'messages') switchMode('messages');
+  }
+
   function handleNodeClick(id: string) {
     const node = findNode(navNodes, id);
     if (!node || node.type === 'folder') return;
+    // ZEB-334: selecting any real space leaves the self-notes view.
+    notesSelected = false;
     // ZEB-263: community nodes route to the right-pane overview placeholder
     // instead of the message feed (no channels yet — that's a later phase).
     if (node.type === 'community') {
@@ -2089,6 +2109,8 @@
         onNewCommunity={() => { showCreateCommunity = true; createError = null; }}
         onRedeemInvite={() => { showRedeemInvite = true; redeemError = null; redeemUrl = ''; }}
         onBrowseLibraries={() => { libraryDirectoryOpen = true; }}
+        onSelectNotes={selectNotes}
+        notesActive={notesSelected && !selectedCommunityNode}
       />
       {#if !collapsed && appMode === 'messages'}
         <button
@@ -2202,6 +2224,12 @@
             await callSession.end().catch(() => {});
           }
         }}
+      />
+    {:else if notesSelected}
+      <NotesView
+        {notesService}
+        ownerId={myAddress}
+        displayName={myProfile.displayName}
       />
     {:else}
       <TextFeed
