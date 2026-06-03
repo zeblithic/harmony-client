@@ -130,8 +130,9 @@ async fn friend_token_roundtrip_mutual_active_token_friends() {
         .try_init();
 
     // ZEB-347: generous outer timeout so a wedged handshake fails the test fast
-    // rather than hanging the whole suite.
-    tokio::time::timeout(Duration::from_secs(45), async {
+    // rather than hanging the whole suite. Bumped 45s→60s to cover the added
+    // second (replay) redeem that asserts the one-shot property.
+    tokio::time::timeout(Duration::from_secs(60), async {
         // ── 1. Identities. ──────────────────────────────────────────────
         // Each party has a master owner identity (mint_test_owner) carrying the
         // owner_id + enrolled device-#2 key + Master EnrollmentCert that the
@@ -201,6 +202,11 @@ async fn friend_token_roundtrip_mutual_active_token_friends() {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64,
+            // Stub: on the FRIEND path this signature is intentionally NOT
+            // verified — auth rests on the inviter's EnrollmentCert + accept
+            // signature, so the redeem deliberately skips `verify_identity_match`
+            // (unlike an invite, the friend token carries no transport composite
+            // pub to match against). Any consistent placeholder works here.
             identity_signature: [0xCDu8; 64],
         };
         let alice_routing_blob = {
@@ -276,7 +282,7 @@ async fn friend_token_roundtrip_mutual_active_token_friends() {
         let bob_hlc_tracker = Arc::new(TokioMutex::new(BTreeMap::<String, Hlc>::new()));
 
         let outcome = harmony_app::connectivity_link_friend_iroh_inner(
-            token_url,
+            token_url.clone(),
             Some(Arc::clone(&pkarr_resolver)),
             Some(Arc::clone(&bob_ep)),
             bob.owner,
@@ -370,15 +376,58 @@ async fn friend_token_roundtrip_mutual_active_token_friends() {
              the friend token is consumed"
         );
 
-        // ── 9. Teardown. ────────────────────────────────────────────────
+        // (d) One-shot property: once the Case-A publication is gone, a SECOND
+        //     redeem with the SAME friend-token URL must FAIL — the inviter is no
+        //     longer resolvable, so the redeem returns `Err` ("inviter_unreachable").
+        //
+        //     Modeling "the publication is gone": `unregister_friend_token` only
+        //     STOPS Alice's republish loop (asserted in (c) — handle dropped from
+        //     active_handles); it does not delete the already-PUT record, and the
+        //     mock relay has no TTL, so the bytes linger in the in-memory store. In
+        //     production the record simply expires once republication stops. To
+        //     exercise that end-state deterministically here we (1) abort the
+        //     publisher driver, (2) drop the mock relay (its axum server stops
+        //     serving GETs), and (3) resolve through a COLD resolver so no warm
+        //     positive-cache entry papers over the now-absent record. With nothing
+        //     to resolve, `resolve_window` errors on every epoch key →
+        //     `inviter_unreachable`.
         publisher_handle.abort();
+        drop(relay); // mock relay stops answering GETs → record unreachable
+        let cold_resolver = Arc::new(harmony_pkarr::PkarrResolver::new(Arc::clone(&client)));
+
+        let replay = harmony_app::connectivity_link_friend_iroh_inner(
+            token_url,
+            Some(cold_resolver),
+            Some(Arc::clone(&bob_ep)),
+            bob.owner,
+            bob.cert.clone(),
+            Arc::clone(&bob_device2),
+            Some("bob".to_string()),
+            Arc::clone(&bob_crdt_state),
+            Arc::clone(&bob_hlc_tracker),
+            "bob-dev".to_string(),
+            harmony_app::HandshakeDialConfig {
+                connect_timeout: Duration::from_millis(10_000),
+                open_bi_timeout: Duration::from_millis(10_000),
+                response_read_timeout: Duration::from_millis(10_000),
+                write_timeout: Duration::from_millis(10_000),
+            },
+        )
+        .await;
+        assert!(
+            replay.is_err(),
+            "ZEB-370: re-redeeming the consumed friend token must fail (Case-A \
+             publication gone → inviter unreachable), got Ok: {replay:?}"
+        );
+
+        // ── 9. Teardown. (publisher_handle + relay already torn down in (d).) ─
         alice_accept.abort();
         bob_accept.abort();
         alice_ep.shutdown().await;
         bob_ep.shutdown().await;
     })
     .await
-    .expect("friend_token_roundtrip_mutual_active_token_friends timed out at 45s");
+    .expect("friend_token_roundtrip_mutual_active_token_friends timed out at 60s");
 }
 
 /// No-op dispatcher for the multiplexer's invite slot — this test only ever

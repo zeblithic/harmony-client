@@ -566,10 +566,8 @@ where
             .map_err(FriendAcceptError::Handshake)?
         };
 
-        // Success side-effects: free the consumed Case-A one-shot, signal UI.
-        if let Some(pub_) = self.pkarr_invite_publisher.as_ref() {
-            pub_.unregister_friend_token(&req.token_sig).await;
-        }
+        // Success side-effect: signal the UI a friend was added. The token is
+        // NOT unregistered yet — see below.
         match self.app.as_ref() {
             Some(app) => app.emit_friend_list_changed(),
             None => tracing::debug!(
@@ -603,6 +601,17 @@ where
         // `send.finish()` is sync — no timeout needed.
         send.finish()
             .map_err(|e| FriendAcceptError::Finish(e.to_string()))?;
+
+        // Free the consumed Case-A one-shot ONLY after the accept has been fully
+        // handed off (write_all + finish succeeded). If the write/finish above
+        // fails, leaving the token live is benign — a re-redeem just re-applies
+        // the same `FriendEntry` (idempotent `Merged` via LWW, keyed on the same
+        // authenticated `owner_id`) — whereas unregistering early would leave the
+        // friend committed and the token consumed while the redeemer never got the
+        // accept, an asymmetric, non-recoverable state.
+        if let Some(pub_) = self.pkarr_invite_publisher.as_ref() {
+            pub_.unregister_friend_token(&req.token_sig).await;
+        }
         Ok(())
     }
 }
