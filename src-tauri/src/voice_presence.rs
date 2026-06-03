@@ -734,6 +734,209 @@ pub fn build_presence_tombstone(
     seal_presence_beacon(channel_key, community, channel, &signed).ok()
 }
 
+// ── ZEB-360: group-DM presence pub/sub + membership ─────────────
+
+/// ZEB-360: a group-DM presence beacon is admissible iff its signer
+/// (`owner` + 32-byte Ed25519 `device` key) is an enrolled device of a current
+/// member of `space_id`. The CRDT `OwnerState` is the authority here (mirrors
+/// the voice-signal invite handler in `event_loop.rs`, which reads exactly
+/// these field paths): `spaces[space_id].members` gates owner-membership, and
+/// `owner_device_cache.devices[owner].device_identity_pubs` carries the
+/// enrolled devices. Each cached identity_pub is `[X25519(32) || Ed25519(32)]`,
+/// so the beacon `device` (the Ed25519 half) is compared against bytes
+/// `[32..64]`. Returns false on any missing piece (space absent, owner not a
+/// member, no cached devices, device not enrolled) — the caller drops the
+/// beacon.
+pub async fn groupdm_beacon_signer_is_member(
+    crdt_state: &tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>,
+    space_id: &SpaceId,
+    owner: &OwnerAddr,
+    device: &[u8; 32],
+) -> bool {
+    let os = crdt_state.lock().await;
+    let Some(space) = os.spaces.get(space_id) else {
+        return false;
+    };
+    if !space.members.contains(owner) {
+        return false;
+    }
+    let Some(entry) = os.owner_device_cache.devices.get(owner) else {
+        return false;
+    };
+    // `device_identity_pubs` is `Vec<Option<[u8; 64]>>`; `.flatten()` yields
+    // `&[u8; 64]` only over the populated (`Some`) slots — a known-by-hash
+    // device whose pub hasn't propagated yet contributes nothing (matches the
+    // invite handler's `.filter_map(|p| *p)`).
+    entry
+        .device_identity_pubs
+        .iter()
+        .flatten()
+        .any(|ip| &ip[32..64] == device.as_slice())
+}
+
+/// ZEB-360: spawn a group-DM presence heartbeat publisher. Build → sign → wrap
+/// (with `call_id`) → seal under the group-DM presence key (scoped to
+/// `space_id`) → `session.put` every `interval`, drawing a strictly-increasing
+/// `seq` from the SHARED `seq_counter` (so an immediate mute beacon can never
+/// outrank later heartbeats; `u64::MAX` is reserved for the leave tombstone).
+/// Honors `closing` for shutdown. Mirrors [`spawn_voice_presence_publisher`].
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_groupdm_presence_publisher(
+    session: zenoh::Session,
+    topic: String,
+    presence_key: Arc<ChannelKey>,
+    space_id: SpaceId,
+    call_id: [u8; 16],
+    signing_key: Arc<ed25519_dalek::SigningKey>,
+    self_owner: OwnerAddr,
+    self_device: [u8; 32],
+    joined_hlc: Hlc,
+    muted: Arc<AtomicBool>,
+    seq_counter: Arc<AtomicU64>,
+    interval: std::time::Duration,
+    closing: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        // `interval` fires immediately on the first `tick()` for the
+        // "immediate first beacon then every `interval`" cadence.
+        let mut tick = tokio::time::interval(interval);
+        loop {
+            tick.tick().await;
+            if closing.load(Ordering::SeqCst) {
+                break;
+            }
+            let seq = seq_counter.fetch_add(1, Ordering::SeqCst);
+            let beacon = build_heartbeat_beacon(
+                self_owner,
+                self_device,
+                &joined_hlc,
+                seq,
+                muted.load(Ordering::SeqCst),
+            );
+            let Ok(signed) = sign_presence_beacon(beacon, &signing_key) else {
+                continue;
+            };
+            let wrapped = GroupSignedPresenceBeacon { call_id, signed };
+            let Ok(sealed) = seal_groupdm_presence_beacon(&presence_key, &space_id, &wrapped)
+            else {
+                continue;
+            };
+            if let Err(e) = session.put(&topic, sealed).await {
+                tracing::warn!(%topic, err = %e, "group presence publish failed");
+            }
+        }
+    })
+}
+
+/// ZEB-360: publish a single `left` tombstone so peers evict us immediately
+/// rather than waiting out the TTL. `seq = u64::MAX` so it always wins freshness
+/// within the session, and `left` short-circuits ordering in
+/// [`VoicePresenceMap::apply`] anyway. Best-effort (drops on sign/seal/put
+/// failure). Mirrors [`build_presence_tombstone`] for the group-DM wire shape.
+#[allow(clippy::too_many_arguments)]
+pub async fn publish_groupdm_leave_tombstone(
+    session: &zenoh::Session,
+    topic: &str,
+    presence_key: &ChannelKey,
+    space_id: &SpaceId,
+    call_id: [u8; 16],
+    signing_key: &ed25519_dalek::SigningKey,
+    self_owner: OwnerAddr,
+    self_device: [u8; 32],
+    joined_hlc: &Hlc,
+) {
+    let mut beacon = build_heartbeat_beacon(self_owner, self_device, joined_hlc, u64::MAX, true);
+    beacon.left = true;
+    let Ok(signed) = sign_presence_beacon(beacon, signing_key) else {
+        return;
+    };
+    let wrapped = GroupSignedPresenceBeacon { call_id, signed };
+    if let Ok(sealed) = seal_groupdm_presence_beacon(presence_key, space_id, &wrapped) {
+        let _ = session.put(topic, sealed).await;
+    }
+}
+
+/// ZEB-360: spawn a group-DM presence subscriber on `topic`: open the seal
+/// (scoped to `space_id` under the group-DM presence key) → verify the device-#2
+/// signature → verify CRDT-backed group membership → apply to the shared map →
+/// emit `group-call-presence-changed` on change. Drops on any failure. Reuses
+/// [`VoicePresenceMap`] keyed by `(space_id, ChannelId(call_id))` so
+/// `apply`/`roster` are shared verbatim with community voice. Mirrors
+/// [`spawn_voice_presence_subscriber`].
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_groupdm_presence_subscriber<R: tauri::Runtime>(
+    session: zenoh::Session,
+    topic: String,
+    presence_key: Arc<ChannelKey>,
+    space_id: SpaceId,
+    crdt_state: Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    map: Arc<tokio::sync::Mutex<VoicePresenceMap>>,
+    app: tauri::AppHandle<R>,
+    closing: Arc<AtomicBool>,
+    now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let sub = match session.declare_subscriber(&topic).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(%topic, err = %e, "group presence subscribe failed");
+                return;
+            }
+        };
+        while let Ok(sample) = sub.recv_async().await {
+            if sample.payload().len() > crate::voice_crypto::MAX_VOICE_PACKET_BYTES {
+                tracing::warn!(
+                    len = sample.payload().len(),
+                    max = crate::voice_crypto::MAX_VOICE_PACKET_BYTES,
+                    "oversized group voice packet dropped"
+                );
+                continue;
+            }
+            let bytes = sample.payload().to_bytes().to_vec();
+            let Some(wrapped) = open_groupdm_presence_beacon(&presence_key, &space_id, &bytes)
+            else {
+                continue; // wrong key / wrong scope / tamper → drop
+            };
+            if verify_presence_beacon_sig(&wrapped.signed).is_err() {
+                continue; // bad device-#2 signature → drop
+            }
+            let owner = OwnerAddr(wrapped.signed.beacon.owner);
+            if !groupdm_beacon_signer_is_member(
+                &crdt_state,
+                &space_id,
+                &owner,
+                &wrapped.signed.beacon.device,
+            )
+            .await
+            {
+                continue; // signer not an enrolled device of a current member → drop
+            }
+            let call_chan = ChannelId(wrapped.call_id);
+            let changed = {
+                let mut g = map.lock().await;
+                g.apply(&space_id, &call_chan, &wrapped.signed.beacon, (now_ms)())
+            };
+            if changed {
+                let roster = {
+                    let g = map.lock().await;
+                    g.roster(&space_id, &call_chan)
+                };
+                let _ = app.emit(
+                    "group-call-presence-changed",
+                    serde_json::json!({
+                        "spaceId": hex::encode(space_id.0),
+                        "callId": hex::encode(wrapped.call_id),
+                        "roster": roster,
+                    }),
+                );
+            }
+        }
+        if !closing.load(Ordering::SeqCst) {
+            tracing::warn!(%topic, "group presence subscriber closed unexpectedly");
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1223,5 +1426,113 @@ mod membership_tests {
         let m = materialized_with(owner, member(MemberStatus::Joined, device));
         // same Joined owner, but a different device key → rejected
         assert!(!device_is_enrolled(&m, &owner, &[0x33; 32]));
+    }
+}
+
+#[cfg(test)]
+mod groupdm_membership_tests {
+    use super::*;
+    use crate::owner_state_crdt::OwnerState;
+    use crate::owner_state_types::{
+        DeviceIdentityHash, DmContentKey, OwnerDeviceEntry, Space, SpaceKind, TransportBinding,
+    };
+
+    fn hlc() -> Hlc {
+        Hlc {
+            wall_ms: 1,
+            logical: 0,
+            device_id: "t".into(),
+        }
+    }
+
+    /// A 64-byte identity_pub `[X25519(32) || Ed25519(32)]` whose Ed25519 half
+    /// (bytes `[32..64]`) is `device`. The X25519 half is filler — the
+    /// membership check only inspects the upper half.
+    fn identity_pub_for(device: &[u8; 32]) -> [u8; 64] {
+        let mut ip = [0u8; 64];
+        ip[32..64].copy_from_slice(device);
+        ip
+    }
+
+    fn group_dm_space(id: SpaceId, members: Vec<OwnerAddr>) -> Space {
+        Space {
+            id,
+            kind: SpaceKind::GroupDm,
+            parent: None,
+            community_id: None,
+            name: "Group".into(),
+            transport: Some(TransportBinding::Reticulum {
+                participants: vec![],
+            }),
+            members,
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc(),
+            updated_at: hlc(),
+            content_key: Some(DmContentKey::new([0xaa; 32])),
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: false,
+            pending_join_at: None,
+        }
+    }
+
+    /// Build an `OwnerState` with a 3-member `GroupDm` space and one cached,
+    /// enrolled device per the given `(owner, device)` pairs.
+    fn state_with(space_id: SpaceId, enrolled: &[(OwnerAddr, [u8; 32])]) -> OwnerState {
+        let members: Vec<OwnerAddr> = enrolled.iter().map(|(o, _)| *o).collect();
+        let mut os = OwnerState::default();
+        os.spaces
+            .insert(space_id, group_dm_space(space_id, members));
+        for (owner, device) in enrolled {
+            os.owner_device_cache.devices.insert(
+                *owner,
+                OwnerDeviceEntry {
+                    devices: vec![DeviceIdentityHash([0u8; 16])],
+                    device_identity_pubs: vec![Some(identity_pub_for(device))],
+                    learned_at: hlc(),
+                },
+            );
+        }
+        os
+    }
+
+    #[tokio::test]
+    async fn groupdm_member_with_enrolled_device_passes() {
+        let space_id = SpaceId([0x5d; 16]);
+        let m1 = (OwnerAddr([0x01; 16]), [0x11; 32]);
+        let m2 = (OwnerAddr([0x02; 16]), [0x22; 32]);
+        let m3 = (OwnerAddr([0x03; 16]), [0x33; 32]);
+        let state = tokio::sync::Mutex::new(state_with(space_id, &[m1, m2, m3]));
+        // (a) a member whose enrolled device matches → true
+        assert!(groupdm_beacon_signer_is_member(&state, &space_id, &m2.0, &m2.1).await);
+    }
+
+    #[tokio::test]
+    async fn groupdm_non_member_fails() {
+        let space_id = SpaceId([0x5d; 16]);
+        let m1 = (OwnerAddr([0x01; 16]), [0x11; 32]);
+        let m2 = (OwnerAddr([0x02; 16]), [0x22; 32]);
+        let m3 = (OwnerAddr([0x03; 16]), [0x33; 32]);
+        let state = tokio::sync::Mutex::new(state_with(space_id, &[m1, m2, m3]));
+        // (b) a non-member owner (not in `members`) → false
+        let outsider = OwnerAddr([0xff; 16]);
+        assert!(!groupdm_beacon_signer_is_member(&state, &space_id, &outsider, &[0x11; 32]).await);
+    }
+
+    #[tokio::test]
+    async fn groupdm_member_with_unenrolled_device_fails() {
+        let space_id = SpaceId([0x5d; 16]);
+        let m1 = (OwnerAddr([0x01; 16]), [0x11; 32]);
+        let m2 = (OwnerAddr([0x02; 16]), [0x22; 32]);
+        let m3 = (OwnerAddr([0x03; 16]), [0x33; 32]);
+        let state = tokio::sync::Mutex::new(state_with(space_id, &[m1, m2, m3]));
+        // (c) a current member, but a device NOT in their enrolled set → false
+        assert!(!groupdm_beacon_signer_is_member(&state, &space_id, &m2.0, &[0x99; 32]).await);
     }
 }
