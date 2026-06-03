@@ -628,10 +628,6 @@
       avatarCid: myProfile.avatarCid,
       profilePageRoot: myProfile.profilePageRoot,
     });
-    // ZEB-336: a freshly-minted owner has no name yet — prompt for one. Skippable.
-    if (!myProfile.displayName || myProfile.displayName === 'Anonymous') {
-      showNamePrompt = true;
-    }
     // ZEB-351: build the voice session for a freshly-minted owner. The adapter
     // is wired up by the Tauri-init IIFE; if it hasn't landed yet (mint can
     // race init), the zenoh-status reconnect handler retries via the same guard.
@@ -639,6 +635,13 @@
       void buildVoiceSession(tauriAdapter.invoke, tauriAdapter.listen, result.state.ownerId);
     }
     drainQueuedInvite();
+    // ZEB-336: a freshly-minted owner has no name yet — prompt for one, but only
+    // when a queued invite didn't just open the redeem dialog, so the two
+    // first-run modals don't stack. (Cursor PR #180.) The name prompt is
+    // skippable and editable later in Settings, so deferring it here is fine.
+    if (!showRedeemInvite && (!myProfile.displayName || myProfile.displayName === 'Anonymous')) {
+      showNamePrompt = true;
+    }
   }
 
   let showCreateCommunity = $state(false);
