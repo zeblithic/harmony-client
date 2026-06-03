@@ -139,6 +139,8 @@ impl From<CrdtFileV2> for OwnerState {
             owner_device_cache: f.owner_device_cache,
             libraries: f.libraries,
             outbox_tombstones: f.outbox_tombstones,
+            // ZEB-370: persisted in Task 3; default until that wiring lands.
+            friend_graph: Default::default(),
         }
     }
 }

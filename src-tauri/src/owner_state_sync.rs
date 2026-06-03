@@ -547,6 +547,8 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         owner_device_cache,
         libraries,
         outbox_tombstones,
+        // ZEB-370: merged in Task 3; ignored here until that wiring lands.
+        friend_graph: _,
     } = remote;
 
     // ZEB-243: apply remote outbox tombstones FIRST. LWW per id by HLC;
