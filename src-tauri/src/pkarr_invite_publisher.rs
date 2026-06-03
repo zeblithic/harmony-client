@@ -87,6 +87,11 @@ impl PkarrInvitePublisher {
     async fn register_case_a(&self, handle: String, ikm: [u8; 64]) {
         let key_builder: EphemeralKeyBuilder = Arc::new(move |at_ms| {
             let epoch_id = current_epoch_id(at_ms);
+            // TODO(ZEB-370 Phase 1b): this helper is shared by community invites
+            // (`invite:` handles) and friend tokens (`friend:` handles); both keep
+            // `PkarrCase::Invite` for now. When harmony-core ships `PkarrCase::Friend`,
+            // parameterize the case so the friend path derives under it (the resolver
+            // side must switch atomically). See `register_friend_token` doc comment.
             derive_ephemeral_key(PkarrCase::Invite, &ikm, &epoch_id.to_be_bytes())
         });
 
