@@ -12353,6 +12353,39 @@ async fn decline_group_call(
     .await
 }
 
+/// ZEB-360: return a group-DM space's member owner addresses as lowercase hex.
+/// Read-only; the CRDT `space.members` is the authoritative membership the
+/// frontend needs to render ringing/declined roster rows for members who have
+/// not yet sent a presence beacon. Includes self (the caller); the frontend
+/// roster merge excludes self.
+#[tauri::command]
+async fn get_group_dm_members(
+    space_id: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<String>, String> {
+    let space_bytes = hex::decode(&space_id).map_err(|e| format!("space_id hex: {e}"))?;
+    let space_arr: [u8; 16] = space_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "space_id must be 16 bytes".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(space_arr);
+    let crdt_state = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?
+    };
+    let os = crdt_state.lock().await;
+    let space = os
+        .spaces
+        .get(&space_id)
+        .ok_or_else(|| "group dm space not found".to_string())?;
+    if space.kind != crate::owner_state_types::SpaceKind::GroupDm {
+        return Err("not a group-dm space".to_string());
+    }
+    Ok(space.members.iter().map(|m| hex::encode(m.0)).collect())
+}
+
 // ── ZEB-360 Group-DM voice: media + presence IPCs ────────────────────────────
 
 fn parse_space_id_16(s: &str) -> Result<[u8; 16], String> {
@@ -33395,6 +33428,7 @@ pub fn run() {
             // ZEB-360 Group-DM voice calls (signaling + media + presence IPCs).
             place_group_call,
             decline_group_call,
+            get_group_dm_members,
             watch_group_call,
             unwatch_group_call,
             join_group_call,
@@ -33609,6 +33643,7 @@ pub fn add_dm_ipc_handlers<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tau
         // ZEB-360 Group-DM voice calls (signaling + media + presence IPCs).
         place_group_call,
         decline_group_call,
+        get_group_dm_members,
         watch_group_call,
         unwatch_group_call,
         join_group_call,
