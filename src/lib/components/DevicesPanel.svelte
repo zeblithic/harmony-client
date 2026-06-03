@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { OwnerService, extractError, type OwnerStateView } from '../owner-service';
-  import { loadProfile, saveProfile } from '../profile-service';
+  import { loadProfile } from '../profile-service';
+  import { loadDeviceLabel, saveDeviceLabel, resolveDefaultDeviceLabel } from '../device-label-service';
   import {
     MAX_RECOVERY_COMMENT_BYTES,
     MIN_RECOVERY_PASSPHRASE_LEN,
@@ -19,40 +20,35 @@
   let mintError = $state<string | null>(null);
   let recoveryToken = $state<string | null>(null);
 
+  // Per-device label (owner-private). Seeded from the store; defaulted to the
+  // OS hostname on first run in onMount.
+  let deviceLabel = $state<string | null>(loadDeviceLabel());
+
   /**
-   * Backend always returns the placeholder name "this device" for the
-   * isThisDevice row (it has no access to localStorage). Overlay the
-   * locally-persisted profile.displayName so the rename survives refresh
-   * and restart. Cross-device names will eventually come via gossip
-   * (deferred); v1 only overlays the local entry.
+   * ZEB-336: the owner header and the this-device row are DISTINCT names.
    *
-   * v1 coupling: ownerDisplayName and the local device's displayName both
-   * come from `profile.displayName`. These ARE conceptually distinct (the
-   * owner identity name vs. a per-device label), but profile-service ships
-   * a single displayName field and there's no v1 UI to distinguish them.
-   * When multi-device support lands and per-device names propagate via
-   * gossip, this overlay should be split: ownerDisplayName from the local
-   * profile, device displayNames from the per-device gossip layer.
+   * - Owner header ← `profile.displayName` (the owner's canonical name, also
+   *   broadcast owner-keyed by profile_card_broadcast).
+   * - This-device row ← the per-device LABEL store (`device-label-service`),
+   *   which is owner-private and never overlaid from the owner name.
    *
-   * Defensive: if loadProfile returns no usable name (e.g., localStorage
-   * unavailable in private-mode browsers), pass the view through unchanged
-   * so the user still sees the backend placeholder rather than a crash.
+   * The backend has no access to localStorage, so it returns placeholders for
+   * both; we overlay each from its own local store. Defensive: a missing store
+   * value leaves the backend value in place rather than blanking the field.
    */
-  function applyLocalProfileOverlay(view: OwnerStateView | null): OwnerStateView | null {
+  function applyLocalOverlay(view: OwnerStateView | null): OwnerStateView | null {
     if (!view) return null;
-    const profile = loadProfile();
-    const localName = profile?.displayName;
-    if (!localName) return view;
+    const ownerName = loadProfile()?.displayName;
     return {
       ...view,
-      ownerDisplayName: localName,
+      ...(ownerName ? { ownerDisplayName: ownerName } : {}),
       devices: view.devices.map((d) =>
-        d.isThisDevice ? { ...d, displayName: localName } : d,
+        d.isThisDevice && deviceLabel ? { ...d, displayName: deviceLabel } : d,
       ),
     };
   }
 
-  svc.onChange = () => { state = applyLocalProfileOverlay(svc.state); };
+  svc.onChange = () => { state = applyLocalOverlay(svc.state); };
 
   onMount(async () => {
     try {
@@ -61,6 +57,20 @@
       loadError = extractError(e);
     } finally {
       loading = false;
+    }
+    // ZEB-336: when this device has no user-set label, default the DISPLAY to
+    // the OS hostname, resolved FRESH each launch. NOT persisted — only a user
+    // rename (saveRename) writes the store — so a one-off hostname-resolution
+    // hiccup can never lock in the "This device" fallback. (CodeRabbit, PR #180.)
+    // Isolated from the refresh try/catch above so a hostname hiccup can't blank
+    // the already-loaded devices list via the loadError banner.
+    if (!deviceLabel) {
+      try {
+        deviceLabel = await resolveDefaultDeviceLabel();
+        state = applyLocalOverlay(svc.state);
+      } catch {
+        // Non-fatal: keep the backend device label until the user sets one.
+      }
     }
   });
 
@@ -92,16 +102,13 @@
   function saveRename(deviceId: string) {
     const trimmed = renameDraft.trim();
     if (trimmed.length === 0) return;
-    const profile = loadProfile();
-    saveProfile({ ...profile, displayName: trimmed });
+    // ZEB-336: a device rename writes the per-device LABEL, never the owner
+    // profile. (Pre-split this wrote profile.displayName, renaming the owner.)
+    saveDeviceLabel(trimmed);
+    deviceLabel = trimmed;
     if (state) {
-      // Optimistic local update — must mirror what applyLocalProfileOverlay
-      // does on refresh, so the owner header doesn't show the OLD name
-      // while the device row already shows the new one. v1 sources both
-      // names from profile.displayName (single field; see overlay docs).
       state = {
         ...state,
-        ownerDisplayName: trimmed,
         devices: state.devices.map((d) =>
           d.deviceId === deviceId ? { ...d, displayName: trimmed } : d,
         ),

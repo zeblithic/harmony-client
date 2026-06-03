@@ -9,9 +9,18 @@ function generateRandomAddress(): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-/** Load the local user's profile from localStorage, or create a new one
- *  with a unique random address. The address is generated once on first
- *  launch and persisted — all subsequent loads return the same address. */
+/** Load the local user's profile from localStorage, or create a new one with
+ *  a unique random address.
+ *
+ *  `displayName` is the OWNER's canonical name — it is broadcast owner-keyed by
+ *  profile_card_broadcast and resolved by peers per ownerIdHex. It is NOT a
+ *  per-device label (see device-label-service for that, ZEB-336).
+ *
+ *  `address` is a local placeholder id (random 16 bytes), NOT the owner
+ *  identity (`owner_id`) and NOT a device key. It predates real key management
+ *  and carries no identity-bearing role; treat it as a legacy local handle.
+ *  The address is generated once on first launch and persisted — all
+ *  subsequent loads return the same address. */
 export function loadProfile(): Profile {
   try {
     const stored = localStorage.getItem(STORAGE_KEY);

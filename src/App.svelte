@@ -3,6 +3,7 @@
   import Layout from './lib/components/Layout.svelte';
   import NavPanel from './lib/components/NavPanel.svelte';
   import TextFeed from './lib/components/TextFeed.svelte';
+  import NotesView from './lib/components/NotesView.svelte';
   import MediaFeed from './lib/components/MediaFeed.svelte';
   import VineFeed from './lib/components/VineFeed.svelte';
   import FileBrowser from './lib/components/FileBrowser.svelte';
@@ -48,6 +49,7 @@
   import { TrustService } from './lib/trust-service';
   import { FileManagerService } from './lib/file-manager-service';
   import { MessageService } from './lib/message-service';
+  import { NotesService } from './lib/notes-service';
   import { MailService } from './lib/mail-service';
   import { VineService } from './lib/vine-service';
   import { resolveOriginalCreator } from './lib/vine-utils';
@@ -68,6 +70,7 @@
   } from './lib/deep-link-router';
   import UpdateAvailableToast from './lib/components/UpdateAvailableToast.svelte';
   import WelcomeModal from './lib/components/WelcomeModal.svelte';
+  import NamePromptModal from './lib/components/NamePromptModal.svelte';
   import BackupReminderBanner from './lib/components/BackupReminderBanner.svelte';
   import type { MintIpcResult, OwnerStateView } from './lib/owner-service';
   import type { StartNodeResponse } from './lib/types/onboarding';
@@ -386,6 +389,20 @@
     await publishProfileToNetwork(sanitized);
   }
 
+  // ZEB-336: persist the first-run name through the normal profile-save path
+  // (saves locally, re-seeds the self card, publishes to the network), then
+  // close the prompt.
+  async function handleNamePromptSave(name: string): Promise<void> {
+    // Close the prompt even if the network publish inside handleProfileSave
+    // rejects — the local profile save already persisted the name, so the modal
+    // must never get stuck open behind a swallowed rejection. (Greptile PR #180.)
+    try {
+      await handleProfileSave({ ...myProfile, displayName: name });
+    } finally {
+      showNamePrompt = false;
+    }
+  }
+
   const vineService = new VineService();
   $effect(() => () => vineService.destroy());
 
@@ -526,6 +543,9 @@
   let availableUpdate = $state<Update | null>(null);
   // ── ZEB-331: first-run welcome + feedback + about ─────────────────
   let showWelcomeModal = $state(false);
+  // ZEB-336: first-run display-name prompt, shown after onboarding when the
+  // profile name is still the "Anonymous" default.
+  let showNamePrompt = $state(false);
   // ZEB-338 / PR #169: backend-authoritative owner-identity gate. Four states
   // (see owner-gate.ts) so a start_node *failure* is never mistaken for "no
   // owner identity" — that mistake trapped returning users in the mint gate.
@@ -615,6 +635,13 @@
       void buildVoiceSession(tauriAdapter.invoke, tauriAdapter.listen, result.state.ownerId);
     }
     drainQueuedInvite();
+    // ZEB-336: a freshly-minted owner has no name yet — prompt for one, but only
+    // when a queued invite didn't just open the redeem dialog, so the two
+    // first-run modals don't stack. (Cursor PR #180.) The name prompt is
+    // skippable and editable later in Settings, so deferring it here is fine.
+    if (!showRedeemInvite && (!myProfile.displayName || myProfile.displayName === 'Anonymous')) {
+      showNamePrompt = true;
+    }
   }
 
   let showCreateCommunity = $state(false);
@@ -696,6 +723,11 @@
     if (selectedCommunityId !== id) {
       communityMembers = [];
     }
+    // ZEB-334 (Cursor PR #180): selecting a real community leaves the Notes
+    // space, so the nav highlights the community and the feed shows it. Passing
+    // null (e.g. from selectNotes/leave) does NOT touch notesSelected — those
+    // callers manage it themselves.
+    if (id !== null) notesSelected = false;
     selectedCommunityId = id;
     isCurrentCommunityDegraded = id != null ? communityService.isDegraded(id) : false;
   }
@@ -941,6 +973,10 @@
   fileManagerService.onChange = () => { fileManagerVersion++; };
   const messageService = new MessageService();
   $effect(() => () => messageService.destroy());
+
+  // ZEB-334: local-only self-notes store backing the private "Notes" space —
+  // the always-present default shown when no community is joined.
+  const notesService = new NotesService();
 
   const mailService = new MailService();
   $effect(() => () => mailService.destroy());
@@ -1769,13 +1805,22 @@
   let activeHub = $state('harmony-dev');
   let activeChannelName = $state('general');
   let activeChannelType = $state<'channel' | 'dm' | 'group-chat'>('channel');
+  // ZEB-334: when true (and no community is selected) the main feed renders the
+  // private self-notes space instead of the legacy "#general" void. Defaults
+  // true so a fresh, community-less user lands in Notes, not the void.
+  let notesSelected = $state(true);
   // The nav row to render with active styling. When a community is
   // selected, highlight the community node; otherwise fall back to
   // the active channel/DM. Keeping these in separate $state fields
   // avoids reusing activeChannel for community ids — activeChannel
   // is consumed by message-send paths that only make sense for
   // channels/DMs.
-  let navActiveNodeId = $derived(selectedCommunityId ?? activeChannel);
+  // ZEB-334 (Cursor PR #180): when the Notes space is selected, no real nav
+  // node is active — the Notes row carries its own active state — so don't let
+  // navActiveNodeId keep highlighting the last channel/community.
+  let navActiveNodeId = $derived(
+    notesSelected ? null : (selectedCommunityId ?? activeChannel),
+  );
 
   function switchMode(mode: AppMode) {
     appMode = mode;
@@ -1788,9 +1833,19 @@
     currentFolderCid = null;
   }
 
+  // ZEB-334: select the private self-notes space — clears any community so the
+  // feed pane renders NotesView (the zero-community default).
+  function selectNotes() {
+    notesSelected = true;
+    changeSelectedCommunity(null);
+    if (appMode !== 'messages') switchMode('messages');
+  }
+
   function handleNodeClick(id: string) {
     const node = findNode(navNodes, id);
     if (!node || node.type === 'folder') return;
+    // ZEB-334: selecting any real space leaves the self-notes view.
+    notesSelected = false;
     // ZEB-263: community nodes route to the right-pane overview placeholder
     // instead of the message feed (no channels yet — that's a later phase).
     if (node.type === 'community') {
@@ -2089,6 +2144,8 @@
         onNewCommunity={() => { showCreateCommunity = true; createError = null; }}
         onRedeemInvite={() => { showRedeemInvite = true; redeemError = null; redeemUrl = ''; }}
         onBrowseLibraries={() => { libraryDirectoryOpen = true; }}
+        onSelectNotes={selectNotes}
+        notesActive={notesSelected && !selectedCommunityNode}
       />
       {#if !collapsed && appMode === 'messages'}
         <button
@@ -2164,7 +2221,10 @@
               members: [],
               parentId: null,
             });
-            changeSelectedCommunity(null);
+            // ZEB-334 (Cursor PR #180): after leaving, fall back to the private
+            // Notes default rather than the legacy #general void — clearing the
+            // community alone would drop through to TextFeed on 'general'.
+            selectNotes();
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e);
             console.error('leaveCommunity failed:', msg);
@@ -2202,6 +2262,12 @@
             await callSession.end().catch(() => {});
           }
         }}
+      />
+    {:else if notesSelected}
+      <NotesView
+        {notesService}
+        ownerId={selfOwnerId ?? ''}
+        displayName={myProfile.displayName}
       />
     {:else}
       <TextFeed
@@ -2721,6 +2787,11 @@
      dismissable, closed by onMinted on successful mint. A start_node *failure*
      shows the startup-error overlay below instead — never this mint gate. -->
 <WelcomeModal open={showWelcomeModal} {onMinted} />
+<NamePromptModal
+  open={showNamePrompt}
+  onSave={handleNamePromptSave}
+  onSkip={() => { showNamePrompt = false; }}
+/>
 
 <!-- ZEB-338 / PR #169: startup-error overlay. When start_node fails we must not
      show the mint gate (an existing-but-unloaded identity would deadlock it),
