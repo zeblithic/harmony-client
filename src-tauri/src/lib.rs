@@ -12018,6 +12018,7 @@ async fn send_voice_signal(
         kind,
         call_id,
         caller: self_owner,
+        space_id: None,
         decline_reason: reason,
     };
 

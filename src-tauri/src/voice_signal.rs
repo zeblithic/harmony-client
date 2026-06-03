@@ -59,6 +59,14 @@ pub struct VoiceSignal {
     /// run that path. (Field name kept as `caller` for the common Invite case.)
     #[serde(rename = "cl")]
     pub caller: OwnerAddr,
+    /// Group-DM space this call belongs to. `Some` only for group-DM calls
+    /// (ZEB-360): the inbound handler resolves *this* space directly instead of
+    /// scanning for a 2-member DM, lifting the `members.len() == 2` gate for the
+    /// group path. `None` for 1:1 DM calls — and because it is skipped when
+    /// `None`, the 1:1 canonical-CBOR bytes are unchanged (back-compat fixture
+    /// guard in tests/wire_format_voice_fixtures.rs).
+    #[serde(rename = "si", default, skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<crate::owner_state_types::SpaceId>,
     /// Optional decline reason; only present on `Decline` signals.
     #[serde(rename = "dr", default, skip_serializing_if = "Option::is_none")]
     pub decline_reason: Option<DeclineReason>,
@@ -256,6 +264,7 @@ mod tests {
             kind,
             call_id: [0xca; 16],
             caller: OwnerAddr([0x11; 16]),
+            space_id: None,
             decline_reason: None,
         }
     }
@@ -404,6 +413,7 @@ mod tests {
             kind: VoiceSignalKind::Decline,
             call_id: [0xde; 16],
             caller: OwnerAddr([0x22; 16]),
+            space_id: None,
             decline_reason: Some(DeclineReason::Busy),
         };
         let sealed =

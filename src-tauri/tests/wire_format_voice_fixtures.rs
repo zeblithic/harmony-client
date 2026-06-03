@@ -166,6 +166,7 @@ fn voice_signal_invite_signed_inner_wire_bytes_pinned() {
         kind: VoiceSignalKind::Invite,
         call_id: [0x22; 16],
         caller: OwnerAddr([0x33; 16]),
+        space_id: None,
         decline_reason: None,
     };
 
@@ -202,6 +203,35 @@ fn voice_signal_invite_signed_inner_wire_bytes_pinned() {
         derived_hash, device_hash,
         "device_hash must match derived value"
     );
+}
+
+/// ZEB-360: pin the signed-inner CBOR of a GROUP-DM voice Invite (space_id set).
+/// Distinct from the 1:1 fixture by exactly the added `si` bstr(16) field; the
+/// 1:1 fixture's byte-identity is the back-compat guard that proves the field is
+/// skipped when None.
+#[test]
+fn voice_signal_group_invite_signed_inner_wire_bytes_pinned() {
+    let (signing_key, identity_pub, device_hash) = fixture_caller_identity(0x42);
+    let body = VoiceSignal {
+        kind: VoiceSignalKind::Invite,
+        call_id: [0x22; 16],
+        caller: OwnerAddr([0x33; 16]),
+        space_id: Some(SpaceId([0x44; 16])),
+        decline_reason: None,
+    };
+    let mut body_bytes = Vec::new();
+    ciborium::into_writer(&body, &mut body_bytes).expect("CBOR serialize VoiceSignal");
+    let sig = sign_dm_packet(&body_bytes, &signing_key);
+    let signed = SignedVoiceSignal { body, sig };
+    let mut signed_bytes = Vec::new();
+    ciborium::into_writer(&signed, &mut signed_bytes).expect("CBOR serialize SignedVoiceSignal");
+    assert_eq!(
+        hex::encode(&signed_bytes),
+        "a2626264a4616b66696e76697465626369502222222222222222222222222222222262636c50333333333333333333333333333333336273695044444444444444444444444444444444627367584007d34024a63e25c951df586b6e179a9e5fdf3b4cdb47ae5fdf9819b0ba24cb30d360ab2c88e499f5cbc0c3b2f87f4611cacf761d269ef0b2453abeedbf53f10c",
+        "GroupDm SignedVoiceSignal signed-inner CBOR wire format drifted"
+    );
+    verify_dm_packet_signature(&body_bytes, &sig, &identity_pub, device_hash)
+        .expect("group Invite signature must verify");
 }
 
 // ---------------------------------------------------------------------------
